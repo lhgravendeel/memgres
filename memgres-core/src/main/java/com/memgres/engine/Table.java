@@ -863,6 +863,20 @@ public class Table {
     public void setUnlogged(boolean unlogged) { this.unlogged = unlogged; }
 
     // FROM-function (SRF) result provenance
+    /**
+     * Whether this relation's column types were worked out rather than declared.
+     *
+     * <p>A derived table, a CTE, a view's projection and a VALUES list are all built here as a
+     * Table whose columns carry whatever type the builder could infer, which is not always the
+     * type the value really has. A check that refuses a statement on the strength of a column's
+     * type may only trust a type that was declared, so it has to be able to tell the two apart.
+     */
+    public boolean hasInferredColumnTypes() { return inferredColumnTypes; }
+
+    public void setInferredColumnTypes(boolean inferred) { this.inferredColumnTypes = inferred; }
+
+    private boolean inferredColumnTypes;
+
     public boolean isFunctionResult() { return functionResult; }
     public void setFunctionResult(boolean functionResult) { this.functionResult = functionResult; }
 

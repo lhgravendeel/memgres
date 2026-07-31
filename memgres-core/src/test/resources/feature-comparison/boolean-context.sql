@@ -775,3 +775,88 @@ DROP TABLE IF EXISTS bc_bad CASCADE;
 DROP FUNCTION IF EXISTS bc_f() CASCADE;
 DROP TABLE IF EXISTS bc_t CASCADE;
 DROP TABLE IF EXISTS bc_u CASCADE;
+
+-- ============================================================================
+-- A column a derived relation supplies is that relation's, not an outer one's
+-- ============================================================================
+-- The boolean checks read a column's declared type. A derived table, a CTE, a
+-- view and a VALUES list expose columns whose type was worked out rather than
+-- declared, and two things went wrong with that: the worked-out type was
+-- trusted even where it was wrong, and a name the derived relation supplied but
+-- could not type was followed out to the enclosing query level, which typed a
+-- different column of the same name. An ordinary join and an ordinary sub-query
+-- were both refused as a result.
+DROP TABLE IF EXISTS bctx_t CASCADE;
+DROP TABLE IF EXISTS bctx_u CASCADE;
+DROP VIEW IF EXISTS bctx_v CASCADE;
+CREATE TABLE bctx_t (id int PRIMARY KEY, txt text, d date, n int);
+CREATE TABLE bctx_u (id int PRIMARY KEY, flag boolean);
+INSERT INTO bctx_t VALUES (1,'aa','2020-01-01',1),(2,'ab','2020-01-02',0);
+INSERT INTO bctx_u VALUES (1,true),(2,false);
+CREATE VIEW bctx_v AS SELECT id, flag AS n FROM bctx_u;
+
+-- a join whose condition is a boolean the sub-query computed
+-- begin-expected
+-- columns: n
+-- row: 4
+-- end-expected
+SELECT count(*)::text AS n FROM bctx_t a
+  JOIN (SELECT id, starts_with(txt,'a') AS f FROM bctx_t) s ON s.f;
+
+-- begin-expected
+-- columns: n
+-- row: 4
+-- end-expected
+SELECT count(*)::text AS n FROM bctx_t a
+  JOIN (SELECT id, isfinite(d) AS f FROM bctx_t) s ON s.f;
+
+-- the same through a WITH item
+-- begin-expected
+-- columns: n
+-- row: 4
+-- end-expected
+WITH q AS (SELECT id, starts_with(txt,'a') AS f FROM bctx_t)
+SELECT count(*)::text AS n FROM bctx_t a JOIN q ON q.f;
+
+-- an inner WHERE over a boolean the derived relation supplies, where the outer
+-- relation has an integer of the same name
+-- begin-expected
+-- columns: id
+-- row: 1
+-- row: 2
+-- end-expected
+SELECT id::text AS id FROM bctx_t
+ WHERE EXISTS (SELECT 1 FROM (SELECT flag AS n FROM bctx_u) q WHERE n) ORDER BY id;
+
+-- begin-expected
+-- columns: id
+-- row: 1
+-- row: 2
+-- end-expected
+SELECT id::text AS id FROM bctx_t
+ WHERE EXISTS (SELECT 1 FROM bctx_v WHERE n) ORDER BY id;
+
+-- begin-expected
+-- columns: id
+-- row: 1
+-- row: 2
+-- end-expected
+SELECT id::text AS id FROM bctx_t
+ WHERE EXISTS (SELECT 1 FROM (VALUES (true)) v(n) WHERE n) ORDER BY id;
+
+-- and the refusals a declared column still earns
+-- begin-expected-error
+-- sqlstate: 42804
+-- message-like: argument of WHERE must be type boolean, not type integer
+-- end-expected-error
+SELECT id FROM bctx_t WHERE n;
+
+-- begin-expected-error
+-- sqlstate: 42804
+-- message-like: argument of JOIN/ON must be type boolean, not type integer
+-- end-expected-error
+SELECT count(*) FROM bctx_t a JOIN bctx_t b ON a.n;
+
+DROP VIEW IF EXISTS bctx_v CASCADE;
+DROP TABLE IF EXISTS bctx_t CASCADE;
+DROP TABLE IF EXISTS bctx_u CASCADE;

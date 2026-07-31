@@ -222,6 +222,7 @@ class FromResolver {
             if (cte != null) {
                 QueryResult cteResult = executor.selectExecutor.executeCte(cte);
                 Table virtualTable = new Table(alias, cteResult.getColumns());
+                virtualTable.setInferredColumnTypes(true);
                 bindings.add(new RowContext.TableBinding(virtualTable, alias, new Object[virtualTable.getColumns().size()]));
                 return;
             }
@@ -289,6 +290,7 @@ class FromResolver {
                                 new ArrayList<>(sqResult.getColumns()), subqFrom.columnAliases());
                         String sqAlias = subqFrom.alias();
                         Table virtualTable = new Table(sqAlias, columns);
+                        virtualTable.setInferredColumnTypes(true);
                         bindings.add(new RowContext.TableBinding(virtualTable, sqAlias,
                                 new Object[columns.size()]));
                     }
@@ -308,6 +310,7 @@ class FromResolver {
                     cols.add(new Column(parts[0], dt != null ? dt : DataType.TEXT, true, false, null));
                 }
                 Table virtualTable = new Table(alias, cols);
+                virtualTable.setInferredColumnTypes(true);
                 bindings.add(new RowContext.TableBinding(virtualTable, alias, new Object[cols.size()]));
             }
             // JSON_TABLE: extract column definitions from the JsonTableExpr
@@ -317,6 +320,7 @@ class FromResolver {
                 List<Column> cols = new ArrayList<>();
                 collectJsonTableColumnDefs(jt.columns, cols);
                 Table virtualTable = new Table(alias, cols);
+                virtualTable.setInferredColumnTypes(true);
                 bindings.add(new RowContext.TableBinding(virtualTable, alias, new Object[cols.size()]));
             } else {
                 // The shape describes an item that produced no row, so the type has to come from
@@ -344,6 +348,7 @@ class FromResolver {
                     }
                 }
                 Table virtualTable = new Table(alias, cols);
+                virtualTable.setInferredColumnTypes(true);
                 bindings.add(new RowContext.TableBinding(virtualTable, alias, new Object[cols.size()]));
             }
         }
@@ -673,6 +678,7 @@ class FromResolver {
                         List<Column> columns = FromFunctionResolver.applyColumnAliases(
                                 new ArrayList<>(subResult.getColumns()), sqf.columnAliases());
                         Table virtualTable = new Table(alias, columns);
+                        virtualTable.setInferredColumnTypes(true);
 
                         if (subResult.getRows().isEmpty()) {
                             // Implicit INNER JOIN semantics, skip
@@ -856,6 +862,7 @@ class FromResolver {
                 rows = viewResult.getRows();
             }
             Table virtualTable = new Table(alias, cols);
+            virtualTable.setInferredColumnTypes(true);
             lastResolvedRightTable = virtualTable;
             lastResolvedRightAlias = alias;
             for (Object[] row : rows) {
@@ -1283,6 +1290,7 @@ class FromResolver {
         List<Column> columns = FromFunctionResolver.applyColumnAliases(
                 new ArrayList<>(subResult.getColumns()), subqFrom.columnAliases(), alias);
         Table virtualTable = new Table(alias, columns);
+        virtualTable.setInferredColumnTypes(true);
         for (Object[] row : subResult.getRows()) {
             virtualTable.insertRow(row);
         }

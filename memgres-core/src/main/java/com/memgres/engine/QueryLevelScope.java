@@ -179,7 +179,13 @@ final class QueryLevelScope {
                 ref.table() == null ? bindings : bindingsNamed(ref.table());
         DataType found = null;
         for (RowContext.TableBinding b : candidates) {
-            if (b.table() == null || b.table().isFunctionResult()) return null;
+            // Only a declared column type is certain. A derived table, a CTE, a view and a
+            // VALUES list all carry inferred types, and refusing a statement because one of those
+            // was guessed wrong is how an ordinary join on a boolean column came to be rejected.
+            if (b.table() == null || b.table().isFunctionResult()
+                    || b.table().hasInferredColumnTypes()) {
+                return null;
+            }
             int idx = b.table().getColumnIndex(column);
             if (idx < 0) continue;
             DataType type = b.table().getColumns().get(idx).getType();

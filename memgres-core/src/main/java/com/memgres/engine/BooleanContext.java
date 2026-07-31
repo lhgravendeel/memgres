@@ -125,13 +125,35 @@ final class BooleanContext {
             if (bindings == null || executor == null) return null;
             String found = supplied(bindings, ref, column);
             if (found != null) return found;
+            // A name this level DOES supply is this level's, even where its type could not be
+            // read -- a derived table, a CTE and a VALUES list all expose columns whose type was
+            // inferred rather than declared. Reaching past one of those to an enclosing level
+            // types the wrong column, and an inner WHERE over a boolean was refused because the
+            // outer relation happened to have an integer of the same name.
+            if (exposes(bindings, ref, column)) return null;
             // A name this level does not supply is a correlated reference to an enclosing one,
             // which PostgreSQL resolves and types exactly as it does one of its own.
             for (RowContext outer : executor.outerContextStack) {
                 found = supplied(outer.getBindings(), ref, column);
                 if (found != null) return found;
+                if (exposes(outer.getBindings(), ref, column)) return null;
             }
             return null;
+        }
+
+        /** Whether these relations expose the column at all, whatever type it turned out to be. */
+        private boolean exposes(List<RowContext.TableBinding> from, ColumnRef ref, String column) {
+            if (from == null) return false;
+            for (RowContext.TableBinding b : from) {
+                if (b.table() == null) continue;
+                String exposed = b.alias() != null ? b.alias() : nameOf(b.table());
+                if (ref.table() != null
+                        && (exposed == null || !ref.table().equalsIgnoreCase(exposed))) {
+                    continue;
+                }
+                if (b.table().getColumnIndex(column) >= 0) return true;
+            }
+            return false;
         }
 
         private String supplied(List<RowContext.TableBinding> from, ColumnRef ref, String column) {
