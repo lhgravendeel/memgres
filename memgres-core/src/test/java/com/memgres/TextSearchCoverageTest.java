@@ -670,18 +670,31 @@ class TextSearchCoverageTest {
         }
     }
 
+    // PostgreSQL raises 42704 for an ALTER on a text search object that was never created, so
+    // these create the one they alter rather than relying on a silent no-op.
     @Test
     void testAlterTextSearchConfiguration() throws SQLException {
         try (Statement stmt = conn.createStatement()) {
-            stmt.execute("ALTER TEXT SEARCH CONFIGURATION my_config ADD MAPPING FOR asciiword WITH english_stem");
+            stmt.execute("CREATE TEXT SEARCH CONFIGURATION my_config_a (COPY = simple)");
+            stmt.execute("ALTER TEXT SEARCH CONFIGURATION my_config_a ADD MAPPING FOR asciiword WITH english_stem");
         }
     }
 
     @Test
     void testAlterTextSearchDictionary() throws SQLException {
         try (Statement stmt = conn.createStatement()) {
-            stmt.execute("ALTER TEXT SEARCH DICTIONARY my_dict (StopWords = english)");
+            stmt.execute("CREATE TEXT SEARCH DICTIONARY my_dict_a (TEMPLATE = simple)");
+            stmt.execute("ALTER TEXT SEARCH DICTIONARY my_dict_a (StopWords = english)");
         }
+    }
+
+    @Test
+    void testAlterTextSearchConfigurationThatIsNotThere() {
+        assertThrows(SQLException.class, () -> {
+            try (Statement stmt = conn.createStatement()) {
+                stmt.execute("ALTER TEXT SEARCH CONFIGURATION ts_nosuch RENAME TO ts_other");
+            }
+        });
     }
 
     @Test

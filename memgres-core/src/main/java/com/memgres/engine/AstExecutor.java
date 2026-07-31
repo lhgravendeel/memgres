@@ -508,6 +508,9 @@ public class AstExecutor {
         }
         if (stmt instanceof AlterSchemaOwnerStmt) {
             AlterSchemaOwnerStmt s = (AlterSchemaOwnerStmt) stmt;
+            // A schema that was never created has no owner to change, and reporting success
+            // leaves a script believing the schema is there.
+            ddlExecutor.requireSchemaExists(s.name());
             String newOwner = ddlExecutor.resolveOwnerName(s.newOwner());
             if (!database.hasRole(newOwner)) {
                 throw new MemgresException("role \"" + newOwner + "\" does not exist", "42704");

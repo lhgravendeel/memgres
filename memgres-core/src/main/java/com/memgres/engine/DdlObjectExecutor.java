@@ -157,7 +157,24 @@ class DdlObjectExecutor {
 
     private QueryResult executeAlterCompositeType(AlterTypeStmt stmt) {
         List<CreateTypeStmt.CompositeField> fields = executor.database.getCompositeType(stmt.typeName());
-        if (fields == null) throw new MemgresException("type \"" + stmt.typeName() + "\" does not exist", "42704");
+        if (fields == null) {
+            // An attribute lives on the relation a composite type owns, so this is a relation
+            // lookup: PostgreSQL reports a name that owns no relation as a missing relation, and a
+            // name that owns one of the wrong kind as not a composite type. Only RENAME TO and SET
+            // SCHEMA, which any type takes, still report a missing type.
+            if (stmt.action() == AlterTypeStmt.Action.RENAME_TO
+                    || stmt.action() == AlterTypeStmt.Action.SET_SCHEMA) {
+                throw new MemgresException(
+                        "type \"" + stmt.typeName() + "\" does not exist", "42704");
+            }
+            if (RelationNamespace.kindOf(executor.database, executor.defaultSchema(),
+                    stmt.typeName()) != null) {
+                throw new MemgresException(
+                        "\"" + stmt.typeName() + "\" is not a composite type", "42809");
+            }
+            throw new MemgresException(
+                    "relation \"" + stmt.typeName() + "\" does not exist", "42P01");
+        }
 
         switch (stmt.action()) {
             case ADD_ATTRIBUTE: {
@@ -280,7 +297,7 @@ class DdlObjectExecutor {
     }
 
     /** A destination schema that does not exist has nowhere to put the object. */
-    private void requireSchemaExists(String schemaName) {
+    void requireSchemaExists(String schemaName) {
         if (schemaName == null) return;
         if (executor.database.getSchema(schemaName) == null) {
             throw new MemgresException("schema \"" + schemaName + "\" does not exist", "3F000");
@@ -1884,6 +1901,26 @@ class DdlObjectExecutor {
 
     // ---- DROP (generic) ----
 
+    /**
+     * PostgreSQL says what CASCADE took with the object that was named: it names a single
+     * dependent and counts more than one. Without it a script that meant to drop one table has no
+     * way of learning it dropped four.
+     */
+    static void noticeDropCascades(AstExecutor executor, List<String> objects) {
+        if (objects == null || objects.isEmpty() || executor.session == null) return;
+        String text = objects.size() == 1
+                ? "drop cascades to " + objects.get(0)
+                : "drop cascades to " + objects.size() + " other objects";
+        executor.session.addNotice("NOTICE", "00000", text, null);
+    }
+
+    /** IF EXISTS says what to skip, and PostgreSQL says which one it skipped. */
+    private void noticeSkipped(String what) {
+        if (executor.session != null) {
+            executor.session.addNotice("NOTICE", "00000", what + " does not exist, skipping", null);
+        }
+    }
+
     QueryResult executeDropStmt(DropStmt stmt) {
         // A DROP that names a schema of its own is looking in that schema, so a schema which is
         // not there is what is missing — PostgreSQL reports 3F000 rather than naming an object
@@ -1905,6 +1942,7 @@ class DdlObjectExecutor {
                 dropIndex(stmt);
                 break;
             case FUNCTION:
+            case PROCEDURE:
                 dropFunction(stmt);
                 break;
             case TRIGGER:
@@ -1917,8 +1955,12 @@ class DdlObjectExecutor {
                 dropSchema(stmt);
                 break;
             case DOMAIN: {
-                if (!stmt.ifExists() && !executor.database.isDomain(stmt.name())) {
-                    throw new MemgresException("type \"" + stmt.name() + "\" does not exist", "42704");
+                if (!executor.database.isDomain(stmt.name())) {
+                    if (!stmt.ifExists()) {
+                        throw new MemgresException(
+                                "type \"" + stmt.name() + "\" does not exist", "42704");
+                    }
+                    noticeSkipped("type \"" + stmt.name() + "\"");
                 }
                 executor.database.removeDomain(stmt.name());
                 break;
@@ -1944,10 +1986,25 @@ class DdlObjectExecutor {
                 break;
             }
             case EXTENSION: {
+                if (!objectExists("extension", stmt.name())) {
+                    if (!stmt.ifExists()) {
+                        throw new MemgresException(
+                                "extension \"" + stmt.name() + "\" does not exist", "42704");
+                    }
+                    noticeSkipped("extension \"" + stmt.name() + "\"");
+                }
                 executor.database.removeExtension(stmt.name());
                 break;
             }
-            case COLLATION:
+            case COLLATION: {
+                // Which locale-derived collations a machine has is a property of the machine, so
+                // an unknown name is not something to refuse — but IF EXISTS still says what it
+                // skipped when memgres has no collation of that name.
+                if (stmt.ifExists() && executor.database.getCollation(stmt.name()) == null) {
+                    noticeSkipped("collation \"" + stmt.name() + "\"");
+                }
+                break;
+            }
             case CONVERSION: {
                 break; // no-op
             }
@@ -2036,8 +2093,8 @@ class DdlObjectExecutor {
         // does not turn the wrong kind into "nothing to do".
         RelationNamespace.requireKind(executor.database, executor.defaultSchema(), stmt.name(),
                 wantMaterialized ? RelationNamespace.MATVIEW : RelationNamespace.VIEW);
-        if (!stmt.ifExists()) {
-            if (existing == null) {
+        if (existing == null) {
+            if (!stmt.ifExists()) {
                 if (ddl.resolveTableOrNull(stmt.name()) != null) {
                     throw new MemgresException("\"" + stmt.name() + "\" is not a "
                             + (wantMaterialized ? "materialized view" : "view"), "42809");
@@ -2045,6 +2102,8 @@ class DdlObjectExecutor {
                 throw new MemgresException((wantMaterialized ? "materialized view \"" : "view \"")
                         + stmt.name() + "\" does not exist", "42P01");
             }
+            noticeSkipped((wantMaterialized ? "materialized view \"" : "view \"")
+                    + stmt.name() + "\"");
         }
         Database.ViewDef oldView = executor.database.getView(stmt.name());
         if (oldView != null) {
@@ -2062,10 +2121,13 @@ class DdlObjectExecutor {
                     + bareViewName + " because other objects depend on it", "2BP01");
         }
         if (oldView != null && stmt.cascade()) {
+            List<String> cascaded = new ArrayList<>();
             for (String dependent : ViewDependencies.cascadeDependents(
                     executor.database, dropViewSchema, bareViewName)) {
+                cascaded.add("view " + RelationNamespace.bareName(dependent));
                 executor.database.removeView(dependent);
             }
+            noticeDropCascades(executor, cascaded);
         }
         executor.database.removeObjectOwner("view:" + dropViewSchema + "." + stmt.name());
         executor.database.removeView(stmt.name());
@@ -2077,15 +2139,16 @@ class DdlObjectExecutor {
         String bareSeqName = seqName.contains(".") ? seqName.substring(seqName.lastIndexOf('.') + 1) : seqName;
         RelationNamespace.requireKind(executor.database, executor.defaultSchema(), bareSeqName,
                 RelationNamespace.SEQUENCE);
-        if (!stmt.ifExists()) {
-            if (!executor.database.hasSequence(bareSeqName)) {
+        if (!executor.database.hasSequence(bareSeqName)) {
+            if (!stmt.ifExists()) {
                 if (ddl.resolveTableOrNull(bareSeqName) != null || executor.database.hasView(bareSeqName)) {
                     throw new MemgresException("\"" + bareSeqName + "\" is not a sequence", "42809");
                 }
                 throw new MemgresException("sequence \"" + bareSeqName + "\" does not exist", "42P01");
             }
+            noticeSkipped("sequence \"" + bareSeqName + "\"");
+            return;
         }
-        if (!executor.database.hasSequence(bareSeqName)) return;
         // Check for dependent columns
         List<String[]> dependents = findSequenceDependents(bareSeqName);
         if (!dependents.isEmpty() && !stmt.cascade()) {
@@ -2094,6 +2157,11 @@ class DdlObjectExecutor {
         }
         // CASCADE: remove the default from dependent columns
         if (stmt.cascade()) {
+            List<String> cascaded = new ArrayList<>();
+            for (String[] dep : dependents) {
+                cascaded.add("default value for column " + dep[1] + " of table " + dep[0]);
+            }
+            noticeDropCascades(executor, cascaded);
             for (String[] dep : dependents) {
                 String tblName = dep[0];
                 String colName = dep[1];
@@ -2164,10 +2232,13 @@ class DdlObjectExecutor {
         // that is not on it is not found — dropping it needs the schema written out.
         boolean visible = executor.database.hasIndex(bareIndexName)
                 && RelationNamespace.kindOf(executor.database, indexSchema, bareIndexName) != null;
-        if (!stmt.ifExists() && !visible) {
-            throw new MemgresException("index \"" + bareIndexName + "\" does not exist", "42704");
+        if (!visible) {
+            if (!stmt.ifExists()) {
+                throw new MemgresException("index \"" + bareIndexName + "\" does not exist", "42704");
+            }
+            noticeSkipped("index \"" + bareIndexName + "\"");
+            return;
         }
-        if (!visible) return;
         String storedTable = executor.database.getIndexTable(bareIndexName);
         if (storedTable != null) {
             try {
@@ -2191,6 +2262,9 @@ class DdlObjectExecutor {
             if (!stmt.ifExists()) {
                 throw new MemgresException("function " + stmt.name() + "() does not exist", "42883");
             }
+            noticeSkipped((stmt.objectType() == DropStmt.ObjectType.PROCEDURE
+                    ? "procedure " : "function ") + stmt.name()
+                    + "(" + pgArgumentList(stmt.paramTypes()) + ")");
             return;
         }
         if (stmt.paramTypes() != null) {
@@ -2201,6 +2275,48 @@ class DdlObjectExecutor {
         if (executor.database.getFunctionOverloads(stmt.name()).isEmpty()) {
             executor.database.removeObjectOwner("function:" + stmt.name());
         }
+    }
+
+    /**
+     * The argument list as PostgreSQL prints it when it names a routine that is not there. It
+     * echoes the type as it was written, except that the names the grammar keeps as aliases for a
+     * built-in type are printed as that type's own name in pg_catalog.
+     */
+    private static String pgArgumentList(List<String> paramTypes) {
+        if (paramTypes == null || paramTypes.isEmpty()) return "";
+        StringBuilder sb = new StringBuilder();
+        for (String t : paramTypes) {
+            if (sb.length() > 0) sb.append(",");
+            String written = t == null ? "" : t.trim().toLowerCase();
+            String internal = GRAMMAR_TYPE_ALIASES.get(written);
+            sb.append(internal != null ? "pg_catalog." + internal : written);
+        }
+        return sb.toString();
+    }
+
+    /** Type names PostgreSQL's grammar reads as an alias for a catalog type. */
+    private static final Map<String, String> GRAMMAR_TYPE_ALIASES = grammarTypeAliases();
+
+    private static Map<String, String> grammarTypeAliases() {
+        Map<String, String> m = new HashMap<>();
+        m.put("int", "int4");
+        m.put("integer", "int4");
+        m.put("smallint", "int2");
+        m.put("bigint", "int8");
+        m.put("real", "float4");
+        m.put("float", "float8");
+        m.put("double precision", "float8");
+        m.put("boolean", "bool");
+        m.put("decimal", "numeric");
+        m.put("dec", "numeric");
+        m.put("numeric", "numeric");
+        m.put("varchar", "varchar");
+        m.put("character varying", "varchar");
+        m.put("char", "bpchar");
+        m.put("character", "bpchar");
+        m.put("timestamp", "timestamp");
+        m.put("time", "time");
+        return m;
     }
 
     /** First schema on the search_path that holds a function of this name, or null if none does. */
@@ -2217,13 +2333,26 @@ class DdlObjectExecutor {
 
     private void dropTrigger(DropStmt stmt) {
         if (stmt.onTable() != null) {
-            if (!stmt.ifExists()) {
-                List<PgTrigger> tableTriggers = executor.database.getTriggersForTable(stmt.onTable());
-                boolean found = tableTriggers.stream()
-                        .anyMatch(t -> t.getName().equalsIgnoreCase(stmt.name()));
-                if (!found) {
+            List<PgTrigger> tableTriggers = executor.database.getTriggersForTable(stmt.onTable());
+            boolean found = false;
+            for (PgTrigger t : tableTriggers) {
+                if (t.getName().equalsIgnoreCase(stmt.name())) { found = true; break; }
+            }
+            if (!found) {
+                // A trigger is named by its relation, so a relation that is not there is what is
+                // missing — PostgreSQL names that rather than the trigger it never looked for.
+                boolean relationThere = ddl.resolveTableOrNull(stmt.onTable()) != null
+                        || executor.database.hasView(stmt.onTable());
+                if (!stmt.ifExists()) {
+                    if (!relationThere) {
+                        throw new MemgresException(
+                                "relation \"" + stmt.onTable() + "\" does not exist", "42P01");
+                    }
                     throw new MemgresException("trigger \"" + stmt.name() + "\" for table \"" + stmt.onTable() + "\" does not exist", "42704");
                 }
+                noticeSkipped(relationThere
+                        ? "trigger \"" + stmt.name() + "\" for relation \"" + stmt.onTable() + "\""
+                        : "relation \"" + stmt.onTable() + "\"");
             }
             executor.database.removeTrigger(stmt.name(), stmt.onTable());
         }
@@ -2238,11 +2367,12 @@ class DdlObjectExecutor {
             if (!stmt.ifExists()) {
                 throw new MemgresException("type \"" + stmt.name() + "\" does not exist", "42704");
             }
+            noticeSkipped("type \"" + stmt.name() + "\"");
             return;
         }
+        // Dropping a type a column is declared as would leave that column pointing at nothing
+        List<String> dependents = columnsDeclaredAsType(stmt.name());
         if (!stmt.cascade()) {
-            // Dropping a type a column is declared as would leave that column pointing at nothing
-            List<String> dependents = columnsDeclaredAsType(stmt.name());
             if (!dependents.isEmpty()) {
                 StringBuilder detail = new StringBuilder();
                 for (String d : dependents) {
@@ -2251,6 +2381,13 @@ class DdlObjectExecutor {
                 throw new MemgresException("cannot drop type " + stmt.name()
                         + " because other objects depend on it" + detail, "2BP01");
             }
+        } else {
+            List<String> cascaded = new ArrayList<>();
+            for (String d : dependents) {
+                int dot = d.indexOf('.');
+                cascaded.add("column " + d.substring(dot + 1) + " of table " + d.substring(0, dot));
+            }
+            noticeDropCascades(executor, cascaded);
         }
         if (existing != null) executor.database.removeCustomEnum(stmt.name());
         if (isComposite) executor.database.removeCompositeType(stmt.name());
@@ -2366,13 +2503,22 @@ class DdlObjectExecutor {
 
     private void dropPolicy(DropStmt stmt) {
         if (stmt.onTable() != null) {
+            // A policy is named by its relation, so IF EXISTS skips on a relation that is not
+            // there just as it does on a policy that is not.
+            if (stmt.ifExists() && ddl.resolveTableOrNull(stmt.onTable()) == null) {
+                noticeSkipped("relation \"" + stmt.onTable() + "\"");
+                return;
+            }
             Table table = executor.resolveTable("public", stmt.onTable());
-            if (!stmt.ifExists()) {
-                boolean found = table.getRlsPolicies().stream()
-                        .anyMatch(p -> p.getName().equalsIgnoreCase(stmt.name()));
-                if (!found) {
+            boolean found = false;
+            for (RlsPolicy p : table.getRlsPolicies()) {
+                if (p.getName().equalsIgnoreCase(stmt.name())) { found = true; break; }
+            }
+            if (!found) {
+                if (!stmt.ifExists()) {
                     throw new MemgresException("policy \"" + stmt.name() + "\" for table \"" + stmt.onTable() + "\" does not exist", "42704");
                 }
+                noticeSkipped("policy \"" + stmt.name() + "\" for table \"" + stmt.onTable() + "\"");
             }
             table.getRlsPolicies().removeIf(p -> p.getName().equalsIgnoreCase(stmt.name()));
         } else if (!stmt.ifExists()) {
@@ -2381,14 +2527,21 @@ class DdlObjectExecutor {
     }
 
     private void dropRule(DropStmt stmt) {
-        if (stmt.onTable() != null && !stmt.ifExists()) {
-            executor.resolveTable(executor.defaultSchema(), stmt.onTable());
-        }
         String onTable = stmt.onTable() != null ? stmt.onTable() : "";
+        if (stmt.onTable() != null && ddl.resolveTableOrNull(stmt.onTable()) == null
+                && !executor.database.hasView(stmt.onTable())) {
+            if (!stmt.ifExists()) {
+                executor.resolveTable(executor.defaultSchema(), stmt.onTable());
+            }
+            noticeSkipped("relation \"" + stmt.onTable() + "\"");
+            return;
+        }
         if (executor.database.hasRule(stmt.name(), onTable)) {
             executor.database.removeRule(stmt.name(), onTable);
         } else if (!stmt.ifExists()) {
             throw new MemgresException("rule \"" + stmt.name() + "\" for relation \"" + onTable + "\" does not exist", "42704");
+        } else {
+            noticeSkipped("rule \"" + stmt.name() + "\" for relation \"" + onTable + "\"");
         }
     }
 
@@ -2549,6 +2702,8 @@ class DdlObjectExecutor {
         domain.setTypmod(typmod[0] < 0 ? null : Integer.valueOf(typmod[0]),
                 typmod[1] < 0 ? null : Integer.valueOf(typmod[1]));
         domain.setBaseTypeFacts(DataType.intervalQualifier(stmt.baseType()), elementType);
+        // The default is read with the base type's input function here, not at the first insert.
+        domain.setDefaultValue(requireDefaultReadableAsDomain(domain, domain.getDefaultValue()));
         String domainSchema = stmt.schemaName() != null ? stmt.schemaName() : executor.defaultSchema();
         domain.setSchemaName(domainSchema);
         executor.database.addDomain(domain);
@@ -2630,6 +2785,52 @@ class DdlObjectExecutor {
         return false;
     }
 
+    /**
+     * A domain default written as a bare quoted literal is read with the base type's input
+     * function when the domain is defined, so one that is not a value of the type is refused there
+     * rather than at the first insert. Only that shape is checked: a literal of a known type, an
+     * expression or a number is coerced at use, and PostgreSQL takes those without complaint even
+     * when they will overflow later.
+     */
+    private String requireDefaultReadableAsDomain(DomainType domain, String rawDefault) {
+        String literal = bareStringLiteral(rawDefault);
+        if (literal == null || domain.getBaseType() == null) return rawDefault;
+        Object value = executor.castEvaluator.applyCast(literal, domain.getBaseTypeName() != null
+                ? domain.getBaseTypeName() : domain.getBaseType().getPgName(), true);
+        // What the catalogs then report is the value the input function read, not the text it was
+        // written as — but only for the types whose values PostgreSQL prints unquoted.
+        if (value != null && UNQUOTED_DEFAULT_TYPES.contains(domain.getBaseType())) {
+            return String.valueOf(value);
+        }
+        return rawDefault;
+    }
+
+    /** Base types whose default PostgreSQL prints as a bare value rather than a quoted literal. */
+    private static final Set<DataType> UNQUOTED_DEFAULT_TYPES = Cols.setOf(
+            DataType.SMALLINT, DataType.INTEGER, DataType.BIGINT, DataType.REAL,
+            DataType.DOUBLE_PRECISION, DataType.NUMERIC, DataType.BOOLEAN);
+
+    /** The text of {@code 'abc'} when that is the whole expression, else null. */
+    private static String bareStringLiteral(String raw) {
+        if (raw == null) return null;
+        String text = raw.trim();
+        if (text.length() < 2 || text.charAt(0) != '\'' || text.charAt(text.length() - 1) != '\'') {
+            return null;
+        }
+        StringBuilder sb = new StringBuilder();
+        int i = 1;
+        while (i < text.length() - 1) {
+            char c = text.charAt(i);
+            if (c == '\'') {
+                if (i + 2 < text.length() && text.charAt(i + 1) == '\'') { sb.append('\''); i += 2; continue; }
+                return null; // the literal ended before the expression did
+            }
+            sb.append(c);
+            i++;
+        }
+        return sb.toString();
+    }
+
     QueryResult executeAlterDomain(AlterDomainStmt stmt) {
         DomainType domain = executor.database.getDomain(stmt.domainName());
         if (domain == null) {
@@ -2639,9 +2840,14 @@ class DdlObjectExecutor {
         // like before this statement has to be recoverable if the transaction rolls back.
         executor.recordUndo(new Session.AlterDomainUndo(domain));
         switch (stmt.action()) {
-            case "SET_DEFAULT":
-                domain.setDefaultValue(stmt.defaultValue());
+            case "SET_DEFAULT": {
+                String newDefault = requireDefaultReadableAsDomain(domain, stmt.defaultValue());
+                // SET DEFAULT NULL leaves the domain with no default at all, which is what
+                // information_schema then reports.
+                if (newDefault != null && newDefault.trim().equalsIgnoreCase("NULL")) newDefault = null;
+                domain.setDefaultValue(newDefault);
                 break;
+            }
             case "DROP_DEFAULT":
                 domain.setDefaultValue(null);
                 break;
@@ -3548,6 +3754,200 @@ class DdlObjectExecutor {
             case LINE: return "24/f/d";
             case CIRCLE: return "24/f/d";
             default: return "-1/f/i";
+        }
+    }
+
+    // ---- ALTER on an object kind memgres records but does not implement ----
+
+    /** Separator inside the encoded payload of an ALTER stub; SQL text cannot contain it. */
+    private static final String OBJ_SEP = "\u0001";
+
+    /** Text search objects PostgreSQL ships with, which exist without ever being created. */
+    private static final Set<String> BUILTIN_TS_CONFIGS = Cols.setOf("simple", "english");
+    private static final Set<String> BUILTIN_TS_DICTS = Cols.setOf("simple", "english_stem");
+    private static final Set<String> BUILTIN_TS_PARSERS = Cols.setOf("default");
+    private static final Set<String> BUILTIN_TS_TEMPLATES =
+            Cols.setOf("simple", "snowball", "synonym");
+
+    /** Extensions a PostgreSQL database has without installing them, and their versions. */
+    private static final Map<String, String> BUILTIN_EXTENSIONS = builtinExtensions();
+
+    private static Map<String, String> builtinExtensions() {
+        Map<String, String> m = new HashMap<>();
+        m.put("plpgsql", "1.0");
+        return m;
+    }
+
+    /**
+     * {@code ALTER <kind> name ...} for the kinds memgres keeps in a registry of its own. None of
+     * these alterations change anything memgres stores, but reporting success for one on a name
+     * that was never created is what lets a script go on believing the object is there.
+     */
+    QueryResult executeAlterObject(String payload) {
+        String[] parts = (payload == null ? "" : payload).split(OBJ_SEP, -1);
+        String kind = parts.length > 0 ? parts[0] : "";
+        String name = parts.length > 1 ? parts[1] : "";
+        String newName = parts.length > 2 ? parts[2] : "";
+        String extra = parts.length > 3 ? parts[3] : "";
+        requireObjectExists(kind, name);
+        if (!newName.isEmpty()) renameRegisteredObject(kind, name, newName);
+        // ALTER EXTENSION ... UPDATE with nothing to update to says so. Only an extension whose
+        // version memgres actually knows can be named honestly here; the ones it accepts without
+        // implementing carry no version PostgreSQL would agree with.
+        if (kind.equals("extension") && extra.equals("update") && executor.session != null) {
+            String version = BUILTIN_EXTENSIONS.get(name.toLowerCase());
+            if (version != null) {
+                executor.session.addNotice("NOTICE", "00000", "version \"" + version
+                        + "\" of extension \"" + name + "\" is already installed", null);
+            }
+        }
+        return QueryResult.command(QueryResult.Type.SET, 0);
+    }
+
+    /**
+     * {@code DROP <kind> [IF EXISTS] name} for those same kinds. A DROP that reports success on a
+     * name that was never created reads as if the object had been there.
+     */
+    QueryResult executeDropObject(String payload) {
+        String[] parts = (payload == null ? "" : payload).split(OBJ_SEP, -1);
+        String kind = parts.length > 0 ? parts[0] : "";
+        String name = parts.length > 1 ? parts[1] : "";
+        boolean ifExists = parts.length > 2 && parts[2].equals("1");
+        Database db = executor.database;
+        if (!objectExists(kind, name)) {
+            if (!ifExists) {
+                throw new MemgresException(kind + " \"" + name + "\" does not exist", "42704");
+            }
+            noticeSkipped(kind + " \"" + name + "\"");
+            return QueryResult.command(QueryResult.Type.SET, 0);
+        }
+        if (kind.equals("text search configuration")) db.removeTsConfig(name);
+        else if (kind.equals("text search dictionary")) db.removeTsDict(name);
+        else if (kind.equals("foreign-data wrapper")) db.removeForeignDataWrapper(name);
+        else if (kind.equals("server")) db.removeForeignServer(name);
+        else if (kind.equals("publication")) db.removePublication(name);
+        else if (kind.equals("subscription")) db.removeSubscription(name);
+        return QueryResult.command(QueryResult.Type.SET, 0);
+    }
+
+    /** Refuse a name of this kind that was never created, in PostgreSQL's words for the kind. */
+    void requireObjectExists(String kind, String name) {
+        if (name == null || name.isEmpty()) return;
+        String lower = name.toLowerCase();
+        Database db = executor.database;
+        boolean exists;
+        if (kind.equals("publication")) {
+            exists = db.getPublication(name) != null;
+        } else if (kind.equals("text search configuration")) {
+            exists = BUILTIN_TS_CONFIGS.contains(lower) || db.getTsConfigs().containsKey(lower);
+        } else if (kind.equals("text search dictionary")) {
+            exists = BUILTIN_TS_DICTS.contains(lower) || db.getTsDicts().containsKey(lower);
+        } else if (kind.equals("text search parser")) {
+            exists = BUILTIN_TS_PARSERS.contains(lower);
+        } else if (kind.equals("text search template")) {
+            exists = BUILTIN_TS_TEMPLATES.contains(lower);
+        } else if (kind.equals("foreign-data wrapper")) {
+            exists = db.getForeignDataWrappers().containsKey(lower);
+        } else if (kind.equals("server")) {
+            exists = db.getForeignServer(name) != null;
+        } else if (kind.equals("subscription")) {
+            exists = db.getSubscriptions().containsKey(lower);
+        } else if (kind.equals("extension")) {
+            exists = db.hasExtension(name) || BUILTIN_EXTENSIONS.containsKey(lower);
+        } else if (kind.equals("large object")) {
+            exists = db.getLargeObjectStore().exists(parseLargeObjectId(name));
+            if (!exists) {
+                throw new MemgresException("large object " + name + " does not exist", "42704");
+            }
+            return;
+        } else if (kind.equals("foreign table")) {
+            // A foreign table lives in the relation namespace, so PostgreSQL reports the name as
+            // a relation rather than naming the kind.
+            exists = db.getForeignTables().containsKey(lower);
+            if (!exists) {
+                throw new MemgresException("relation \"" + name + "\" does not exist", "42P01");
+            }
+            return;
+        } else {
+            return;
+        }
+        if (!exists) {
+            throw new MemgresException(kind + " \"" + name + "\" does not exist", "42704");
+        }
+    }
+
+    /** True when a name of this kind is one memgres has recorded or PostgreSQL ships with. */
+    private boolean objectExists(String kind, String name) {
+        try {
+            requireObjectExists(kind, name);
+            return true;
+        } catch (MemgresException e) {
+            return false;
+        }
+    }
+
+    private static long parseLargeObjectId(String text) {
+        try {
+            return Long.parseLong(text.trim());
+        } catch (NumberFormatException e) {
+            return -1L;
+        }
+    }
+
+    /** A rename that reports success has to move the name the object answers to. */
+    private void renameRegisteredObject(String kind, String name, String newName) {
+        Database db = executor.database;
+        String lower = name.toLowerCase();
+        if (kind.equals("text search configuration")) {
+            Database.TsConfigDef cfg = db.getTsConfigs().get(lower);
+            if (cfg == null) return;
+            if (!lower.equals(newName.toLowerCase())
+                    && (BUILTIN_TS_CONFIGS.contains(newName.toLowerCase())
+                        || db.getTsConfigs().containsKey(newName.toLowerCase()))) {
+                throw new MemgresException("text search configuration \"" + newName
+                        + "\" already exists in schema \"" + executor.defaultSchema() + "\"", "42710");
+            }
+            db.removeTsConfig(name);
+            db.addTsConfig(new Database.TsConfigDef(newName, cfg.parserName, cfg.copyFrom));
+        } else if (kind.equals("text search dictionary")) {
+            Database.TsDictDef dict = db.getTsDicts().get(lower);
+            if (dict == null) return;
+            if (!lower.equals(newName.toLowerCase())
+                    && (BUILTIN_TS_DICTS.contains(newName.toLowerCase())
+                        || db.getTsDicts().containsKey(newName.toLowerCase()))) {
+                throw new MemgresException("text search dictionary \"" + newName
+                        + "\" already exists in schema \"" + executor.defaultSchema() + "\"", "42710");
+            }
+            db.removeTsDict(name);
+            db.addTsDict(new Database.TsDictDef(newName, dict.template, dict.options));
+        } else if (kind.equals("server")) {
+            Database.FdwServer srv = db.getForeignServer(name);
+            if (srv == null) return;
+            if (db.getForeignServer(newName) != null && !lower.equals(newName.toLowerCase())) {
+                throw new MemgresException("server \"" + newName + "\" already exists", "42710");
+            }
+            db.removeForeignServer(name);
+            db.addForeignServer(new Database.FdwServer(newName, srv.fdwName, srv.options));
+        } else if (kind.equals("foreign-data wrapper")) {
+            Database.FdwWrapper fdw = db.getForeignDataWrappers().get(lower);
+            if (fdw == null) return;
+            if (db.getForeignDataWrappers().containsKey(newName.toLowerCase())
+                    && !lower.equals(newName.toLowerCase())) {
+                throw new MemgresException(
+                        "foreign-data wrapper \"" + newName + "\" already exists", "42710");
+            }
+            db.removeForeignDataWrapper(name);
+            db.addForeignDataWrapper(new Database.FdwWrapper(newName, fdw.options));
+        } else if (kind.equals("subscription")) {
+            Database.SubDef sub = db.getSubscriptions().get(lower);
+            if (sub == null) return;
+            if (db.getSubscriptions().containsKey(newName.toLowerCase())
+                    && !lower.equals(newName.toLowerCase())) {
+                throw new MemgresException(
+                        "subscription \"" + newName + "\" already exists", "42710");
+            }
+            db.removeSubscription(name);
+            db.addSubscription(new Database.SubDef(newName, sub.conninfo, sub.publication));
         }
     }
 

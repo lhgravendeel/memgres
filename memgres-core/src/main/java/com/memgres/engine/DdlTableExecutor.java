@@ -1092,16 +1092,30 @@ class DdlTableExecutor {
     // ---- DROP TABLE ----
 
     QueryResult executeDropTable(DropTableStmt stmt) {
-        dropSingleTable(stmt.schema(), stmt.name(), stmt.ifExists(), stmt.cascade());
+        // One DROP naming several tables drops them together, so a table in the list is not a
+        // dependency that blocks another one in the same list — PostgreSQL takes the whole set.
+        Set<String> together = new HashSet<>();
+        together.add(RelationNamespace.bareName(stmt.name()).toLowerCase());
         if (stmt.additionalTables() != null) {
             for (String tableName : stmt.additionalTables()) {
-                dropSingleTable(null, tableName, stmt.ifExists(), stmt.cascade());
+                together.add(RelationNamespace.bareName(tableName).toLowerCase());
+            }
+        }
+        dropSingleTable(stmt.schema(), stmt.name(), stmt.ifExists(), stmt.cascade(), together);
+        if (stmt.additionalTables() != null) {
+            for (String tableName : stmt.additionalTables()) {
+                dropSingleTable(null, tableName, stmt.ifExists(), stmt.cascade(), together);
             }
         }
         return QueryResult.command(QueryResult.Type.DROP_TABLE, 0);
     }
 
     void dropSingleTable(String schemaHint, String name, boolean ifExists, boolean cascade) {
+        dropSingleTable(schemaHint, name, ifExists, cascade, java.util.Collections.<String>emptySet());
+    }
+
+    void dropSingleTable(String schemaHint, String name, boolean ifExists, boolean cascade,
+                         Set<String> together) {
         if (checkDropSchemaExists(schemaHint, ifExists)) return;
         String schemaName = schemaHint != null ? schemaHint : executor.defaultSchema();
         String tempSchema = executor.session != null ? executor.session.getTempSchemaName() : "pg_temp";
@@ -1144,9 +1158,27 @@ class DdlTableExecutor {
                             }
                         }
                     }
-                    if (!ViewDependencies.directDependents(executor.database, schemaName, name).isEmpty()) {
-                        throw new MemgresException("cannot drop table " + visibleName(schemaName, name)
+                    // An inheritance child reads its parent's definition, so the parent cannot go
+                    // while the child is still there — and a reader of either would otherwise find
+                    // a child whose inherited columns come from a table that no longer exists.
+                    List<String> dependents = new ArrayList<>();
+                    for (Table child : droppedTable.getChildren()) {
+                        if (together.contains(child.getName().toLowerCase())) continue;
+                        dependents.add("table " + child.getName()
+                                + " depends on table " + visibleName(schemaName, name));
+                    }
+                    for (String v : ViewDependencies.directDependents(
+                            executor.database, schemaName, name)) {
+                        dependents.add("view " + RelationNamespace.bareName(v)
+                                + " depends on table " + visibleName(schemaName, name));
+                    }
+                    if (!dependents.isEmpty()) {
+                        MemgresException e = new MemgresException("cannot drop table "
+                                + visibleName(schemaName, name)
                                 + " because other objects depend on it", "2BP01");
+                        e.setDetail(String.join("\n", dependents));
+                        e.setHint("Use DROP ... CASCADE to drop the dependent objects too.");
+                        throw e;
                     }
                     // Check function dependencies (%ROWTYPE, %TYPE, RETURNS table_type, SETOF table_type)
                     for (PgFunction fn : executor.database.getFunctions().values()) {
@@ -1181,6 +1213,9 @@ class DdlTableExecutor {
                         }
                     }
                 } else {
+                    // CASCADE names what it took with it, so a script that meant to drop one
+                    // table learns it dropped four.
+                    List<String> cascaded = new ArrayList<>();
                     // CASCADE: remove FK constraints from tables referencing this table
                     for (Schema s : executor.database.getSchemas().values()) {
                         for (Table otherTable : s.getTables().values()) {
@@ -1193,13 +1228,41 @@ class DdlTableExecutor {
                                         && !sc.getReferencesSchema().equalsIgnoreCase(schemaName)) continue;
                                 fksToRemove.add(sc.getName());
                             }
-                            for (String fkName : fksToRemove) otherTable.removeConstraint(fkName);
+                            for (String fkName : fksToRemove) {
+                                cascaded.add("constraint " + fkName + " on table " + otherTable.getName());
+                                otherTable.removeConstraint(fkName);
+                            }
                         }
                     }
-                    // A view over a dependent view has to go too, or it is left reading a view
-                    // that no longer exists.
+                    // An inheritance child goes with its parent, and so does everything reading
+                    // either — all of it named in one notice, because that is what PostgreSQL
+                    // reports for one DROP.
+                    List<Table> descendants = inheritanceDescendants(droppedTable);
+                    List<String> viewsToDrop = new ArrayList<>();
                     for (String v : ViewDependencies.cascadeDependents(executor.database, schemaName, name)) {
+                        if (!viewsToDrop.contains(v)) viewsToDrop.add(v);
+                    }
+                    for (Table child : descendants) {
+                        String childSchema = findSchemaNameOf(child, schemaName);
+                        for (String v : ViewDependencies.cascadeDependents(
+                                executor.database, childSchema, child.getName())) {
+                            if (!viewsToDrop.contains(v)) viewsToDrop.add(v);
+                        }
+                    }
+                    for (String v : viewsToDrop) {
+                        cascaded.add("view " + RelationNamespace.bareName(v));
                         executor.database.removeView(v);
+                    }
+                    for (Table child : descendants) {
+                        cascaded.add("table " + child.getName());
+                    }
+                    // The whole tree is accounted for here, so each child is dropped with no
+                    // children of its own left — one DROP reports one cascade, not one per level.
+                    droppedTable.getChildren().clear();
+                    for (Table child : descendants) child.getChildren().clear();
+                    for (int d = descendants.size() - 1; d >= 0; d--) {
+                        Table child = descendants.get(d);
+                        dropSingleTable(findSchemaNameOf(child, schemaName), child.getName(), true, true);
                     }
                     // CASCADE: also drop dependent functions (e.g., BEGIN ATOMIC bodies referencing this table)
                     List<String> funcsToDrop = new ArrayList<>();
@@ -1208,7 +1271,11 @@ class DdlTableExecutor {
                             funcsToDrop.add(fn.getName());
                         }
                     }
-                    for (String f : funcsToDrop) executor.database.removeFunction(f);
+                    for (String f : funcsToDrop) {
+                        cascaded.add("function " + f + "()");
+                        executor.database.removeFunction(f);
+                    }
+                    DdlObjectExecutor.noticeDropCascades(executor, cascaded);
                 }
                 // PG drops all partitions together with a partitioned parent (no CASCADE needed)
                 if (!droppedTable.getPartitions().isEmpty()) {
@@ -1222,6 +1289,13 @@ class DdlTableExecutor {
                 Table partitionParent = droppedTable.getPartitionParent();
                 if (partitionParent != null) {
                     partitionParent.removePartition(droppedTable);
+                }
+                // Dropping an inheritance child must unlink it from its parent for the same
+                // reason: a parent still listing a child that is gone is a dependency on nothing,
+                // and the parent could then never be dropped.
+                Table inheritanceParent = droppedTable.getParentTable();
+                if (inheritanceParent != null) {
+                    inheritanceParent.removeChild(droppedTable);
                 }
                 executor.recordUndo(new Session.DropTableUndo(schemaName, name, droppedTable,
                         executor.database.getTriggersForTable(schemaName, name)));
@@ -1291,6 +1365,19 @@ class DdlTableExecutor {
                     "schema \"" + schemaHint + "\" does not exist, skipping", null);
         }
         return true;
+    }
+
+    /** Every table below this one in the inheritance tree, parents before their own children. */
+    private static List<Table> inheritanceDescendants(Table parent) {
+        List<Table> out = new ArrayList<>();
+        List<Table> queue = new ArrayList<>(parent.getChildren());
+        while (!queue.isEmpty()) {
+            Table next = queue.remove(0);
+            if (out.contains(next)) continue;
+            out.add(next);
+            queue.addAll(next.getChildren());
+        }
+        return out;
     }
 
     /** Find the schema name that holds this exact table instance, falling back to the given name. */

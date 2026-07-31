@@ -49,6 +49,10 @@ class DdlExecutor {
     QueryResult executeAlterEventTrigger(AlterEventTriggerStmt stmt) { return objectExecutor.executeAlterEventTrigger(stmt); }
     QueryResult executeDropEventTrigger(DropEventTriggerStmt stmt) { return objectExecutor.executeDropEventTrigger(stmt); }
     QueryResult executeDropStmt(DropStmt stmt) { return objectExecutor.executeDropStmt(stmt); }
+    QueryResult executeAlterObject(String payload) { return objectExecutor.executeAlterObject(payload); }
+    QueryResult executeDropObject(String payload) { return objectExecutor.executeDropObject(payload); }
+    void requireObjectExists(String kind, String name) { objectExecutor.requireObjectExists(kind, name); }
+    void requireSchemaExists(String schemaName) { objectExecutor.requireSchemaExists(schemaName); }
     QueryResult executeCreateSequence(CreateSequenceStmt stmt) { return objectExecutor.executeCreateSequence(stmt); }
     QueryResult executeAlterSequence(AlterSequenceStmt stmt) { return objectExecutor.executeAlterSequence(stmt); }
     QueryResult executeCreateDomain(CreateDomainStmt stmt) { return objectExecutor.executeCreateDomain(stmt); }

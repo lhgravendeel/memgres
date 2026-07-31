@@ -449,12 +449,23 @@ class DdlAdminExecutor {
 
     QueryResult executeAlterPolicy(AlterPolicyStmt stmt) {
         Table table = executor.resolveTable("public", stmt.table());
-        boolean policyFound = false;
+        RlsPolicy found = null;
         for (RlsPolicy p : table.getRlsPolicies()) {
-            if (p.getName().equalsIgnoreCase(stmt.name())) { policyFound = true; break; }
+            if (p.getName().equalsIgnoreCase(stmt.name())) { found = p; break; }
         }
-        if (!policyFound) {
+        if (found == null) {
             throw new MemgresException("policy \"" + stmt.name() + "\" for table \"" + stmt.table() + "\" does not exist", "42704");
+        }
+        // Which clause a policy may carry follows from the command it guards, and ALTER cannot
+        // change that command — so a clause the command has no use for is refused here too. A
+        // SELECT or DELETE creates no row to check; an INSERT has no existing row to test.
+        String policyCommand = found.getCommand() == null ? "ALL" : found.getCommand().toUpperCase();
+        if (stmt.withCheckExpr() != null
+                && ("SELECT".equals(policyCommand) || "DELETE".equals(policyCommand))) {
+            throw PgErrors.syntax("only USING expression allowed for SELECT, DELETE");
+        }
+        if (stmt.usingExpr() != null && "INSERT".equals(policyCommand)) {
+            throw PgErrors.syntax("only WITH CHECK expression allowed for INSERT");
         }
         if (stmt.renameTo() != null) {
             for (int i = 0; i < table.getRlsPolicies().size(); i++) {
