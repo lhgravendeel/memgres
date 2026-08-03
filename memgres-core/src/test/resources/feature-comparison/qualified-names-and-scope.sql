@@ -629,6 +629,82 @@ SELECT * FROM qs_t for;
 
 DROP TABLE IF EXISTS qs_q2 CASCADE;
 DROP TABLE IF EXISTS qs_q3 CASCADE;
+-- ============================================================================
+-- M. An integer's shift and bitwise operators
+-- ============================================================================
+-- PostgreSQL spells these the same way for other types: >> also asks whether
+-- one network address contains another and whether one range lies wholly to the
+-- right of another, and those answer with a boolean. Over two integers it is a
+-- shift, and a shift is no condition.
+
+-- begin-expected-error
+-- sqlstate: 42804
+-- message-like: argument of WHERE must be type boolean, not type integer
+-- end-expected-error
+SELECT * FROM qs_t WHERE v >> 1;
+
+-- begin-expected-error
+-- sqlstate: 42804
+-- message-like: argument of WHERE must be type boolean, not type integer
+-- end-expected-error
+SELECT * FROM qs_t WHERE v << 1;
+
+-- begin-expected-error
+-- sqlstate: 42804
+-- message-like: argument of WHERE must be type boolean, not type integer
+-- end-expected-error
+SELECT * FROM qs_t WHERE v & 1;
+
+-- begin-expected-error
+-- sqlstate: 42804
+-- message-like: argument of WHERE must be type boolean, not type integer
+-- end-expected-error
+SELECT * FROM qs_t WHERE 4 >> 1;
+
+-- begin-expected-error
+-- sqlstate: 42804
+-- message-like: argument of AND must be type boolean, not type integer
+-- end-expected-error
+SELECT * FROM qs_t WHERE v >> 1 AND true;
+
+-- a shift keeps the width of the value being shifted
+-- begin-expected
+-- columns: c
+-- row: integer
+-- end-expected
+SELECT pg_typeof(v >> 1)::text AS c FROM qs_t LIMIT 1;
+
+-- begin-expected
+-- columns: c
+-- row: integer
+-- end-expected
+SELECT pg_typeof(4 >> 1)::text AS c;
+
+-- begin-expected
+-- columns: c
+-- row: integer
+-- end-expected
+SELECT pg_typeof(v & 1)::text AS c FROM qs_t LIMIT 1;
+
+-- begin-expected
+-- columns: c
+-- row: bigint
+-- end-expected
+SELECT pg_typeof(9000000000::bigint >> 1)::text AS c;
+
+-- begin-expected
+-- columns: c
+-- row: 5
+-- end-expected
+SELECT (10 >> 1) AS c;
+
+-- over a network address the same word is a containment test
+-- begin-expected
+-- columns: c
+-- row: t
+-- end-expected
+SELECT ('10.0.0.0/8'::inet >> '10.1.2.3'::inet) AS c;
+
 DROP TABLE IF EXISTS qs_q1 CASCADE;
 DROP TABLE IF EXISTS qs_u CASCADE;
 DROP TABLE IF EXISTS qs_t CASCADE;

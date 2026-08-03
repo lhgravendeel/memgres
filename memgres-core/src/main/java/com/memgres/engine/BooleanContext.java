@@ -345,6 +345,9 @@ final class BooleanContext {
             if (isArithmetic(bin.op())) {
                 return arithmeticResult(typeOf(bin.left(), types), typeOf(bin.right(), types));
             }
+            if (isBitwise(bin.op())) {
+                return bitwiseResult(bin.op(), typeOf(bin.left(), types), typeOf(bin.right(), types));
+            }
             if (bin.op() == BinaryExpr.BinOp.CONCAT) {
                 // || over a string is text whatever the other side is written as; over an array,
                 // a jsonb or a bit string it is that instead, so only a known string decides it.
@@ -586,6 +589,45 @@ final class BooleanContext {
             default:
                 return false;
         }
+    }
+
+    /**
+     * The operators PostgreSQL spells the same way for an integer and for something else.
+     *
+     * <p>{@code >>} shifts an integer, and it also asks whether one network address contains
+     * another and whether one range lies wholly to the right of another -- and those answer with a
+     * boolean. Which one a query means is settled by what it hands them, so nothing follows from
+     * the operator alone.
+     */
+    private static boolean isBitwise(BinaryExpr.BinOp op) {
+        switch (op) {
+            case BIT_AND:
+            case BIT_OR:
+            case BIT_XOR:
+            case SHIFT_LEFT:
+            case SHIFT_RIGHT:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * What one of those produces when both sides are certainly integers, and null otherwise.
+     *
+     * <p>A shift keeps the width of the value being shifted -- the other side is a distance, not a
+     * second operand -- so {@code int8 >> int4} is bigint and {@code int4 >> int4} is integer.
+     * PostgreSQL declares the bitwise operators only over two integers of the same width, so a
+     * mixed pair resolves to nothing this can name.
+     */
+    private static String bitwiseResult(BinaryExpr.BinOp op, String left, String right) {
+        if (!isIntegerType(left) || !isIntegerType(right)) return null;
+        if (op == BinaryExpr.BinOp.SHIFT_LEFT || op == BinaryExpr.BinOp.SHIFT_RIGHT) return left;
+        return left.equals(right) ? left : null;
+    }
+
+    private static boolean isIntegerType(String type) {
+        return "smallint".equals(type) || "integer".equals(type) || "bigint".equals(type);
     }
 
     private static boolean isArithmetic(BinaryExpr.BinOp op) {

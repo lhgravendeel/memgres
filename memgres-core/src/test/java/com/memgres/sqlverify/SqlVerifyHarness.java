@@ -292,7 +292,11 @@ public class SqlVerifyHarness {
      */
     public static List<FileResult> loadResults(Path inputPath) throws IOException {
         List<FileResult> results = new ArrayList<>();
-        String content = IO.readString(inputPath);
+        // Read back with one kind of line ending whatever the checkout wrote. The sections below
+        // are found by matching a newline, so a baseline checked out with CRLF matched nothing at
+        // all: every section was skipped, the comparison had nothing left to compare and passed,
+        // while the same run on a checkout with LF reported the difference.
+        String content = IO.readString(inputPath).replace("\r\n", "\n").replace("\r", "\n");
         String[] fileSections = content.split("=== FILE: ");
 
         for (String section : fileSections) {

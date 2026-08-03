@@ -1016,7 +1016,8 @@ class BinaryOpEvaluator {
                     return result;
                 }
                 { long r = executor.toLong(left) & executor.toLong(right);
-                return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE) ? r : (int) r; }
+                return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE)
+                        ? (Object) Long.valueOf(r) : (Object) Integer.valueOf((int) r); }
             }
             case BIT_OR: {
                 if (left == null || right == null) return null;
@@ -1037,7 +1038,8 @@ class BinaryOpEvaluator {
                     return ((Macaddr8Value) left).bitwiseOr((Macaddr8Value) right);
                 }
                 { long r = executor.toLong(left) | executor.toLong(right);
-                return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE) ? r : (int) r; }
+                return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE)
+                        ? (Object) Long.valueOf(r) : (Object) Integer.valueOf((int) r); }
             }
             case BIT_XOR: {
                 if (left == null || right == null) return null;
@@ -1056,7 +1058,8 @@ class BinaryOpEvaluator {
                     return result != null ? GeometricOperations.format(result) : null;
                 }
                 { long r = executor.toLong(left) ^ executor.toLong(right);
-                return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE) ? r : (int) r; }
+                return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE)
+                        ? (Object) Long.valueOf(r) : (Object) Integer.valueOf((int) r); }
             }
             case SHIFT_LEFT: {
                 if (left == null || right == null) return null;
@@ -1081,7 +1084,8 @@ class BinaryOpEvaluator {
                 if (rangeCmp != null) return rangeCmp; }
                 rejectRangeShiftMismatch(left, right, true);
                 { long r = executor.toLong(left) << executor.toLong(right);
-                return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE) ? r : (int) r; }
+                return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE)
+                        ? (Object) Long.valueOf(r) : (Object) Integer.valueOf((int) r); }
             }
             case SHIFT_RIGHT: {
                 if (left == null || right == null) return null;
@@ -1106,7 +1110,8 @@ class BinaryOpEvaluator {
                 if (rangeCmp != null) return rangeCmp; }
                 rejectRangeShiftMismatch(left, right, false);
                 { long r = executor.toLong(left) >> executor.toLong(right);
-                return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE) ? r : (int) r; }
+                return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE)
+                        ? (Object) Long.valueOf(r) : (Object) Integer.valueOf((int) r); }
             }
             case INET_CONTAINS_EQUALS: {
                 if (left == null || right == null) return null;
@@ -2405,7 +2410,8 @@ class BinaryOpEvaluator {
                     return ((Macaddr8Value) left).bitwiseAnd((Macaddr8Value) right);
                 }
                 { long r = executor.toLong(left) & executor.toLong(right);
-                return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE) ? r : (int) r; }
+                return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE)
+                        ? (Object) Long.valueOf(r) : (Object) Integer.valueOf((int) r); }
             }
             case BIT_OR: {
                 if (left == null || right == null) return null;
@@ -2426,7 +2432,8 @@ class BinaryOpEvaluator {
                     return ((Macaddr8Value) left).bitwiseOr((Macaddr8Value) right);
                 }
                 { long r = executor.toLong(left) | executor.toLong(right);
-                return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE) ? r : (int) r; }
+                return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE)
+                        ? (Object) Long.valueOf(r) : (Object) Integer.valueOf((int) r); }
             }
             case BIT_XOR: {
                 if (left == null || right == null) return null;
@@ -2445,7 +2452,8 @@ class BinaryOpEvaluator {
                     return result != null ? GeometricOperations.format(result) : null;
                 }
                 { long r = executor.toLong(left) ^ executor.toLong(right);
-                return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE) ? r : (int) r; }
+                return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE)
+                        ? (Object) Long.valueOf(r) : (Object) Integer.valueOf((int) r); }
             }
             case SHIFT_LEFT: {
                 if (left == null || right == null) return null;
@@ -2457,7 +2465,8 @@ class BinaryOpEvaluator {
                 if (rangeCmp != null) return rangeCmp; }
                 rejectRangeShiftMismatch(left, right, true);
                 { long r = executor.toLong(left) << executor.toLong(right);
-                return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE) ? r : (int) r; }
+                return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE)
+                        ? (Object) Long.valueOf(r) : (Object) Integer.valueOf((int) r); }
             }
             case SHIFT_RIGHT: {
                 if (left == null || right == null) return null;
@@ -2469,7 +2478,8 @@ class BinaryOpEvaluator {
                 if (rangeCmp != null) return rangeCmp; }
                 rejectRangeShiftMismatch(left, right, false);
                 { long r = executor.toLong(left) >> executor.toLong(right);
-                return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE) ? r : (int) r; }
+                return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE)
+                        ? (Object) Long.valueOf(r) : (Object) Integer.valueOf((int) r); }
             }
             case INET_CONTAINS_EQUALS: {
                 if (left == null || right == null) return null;

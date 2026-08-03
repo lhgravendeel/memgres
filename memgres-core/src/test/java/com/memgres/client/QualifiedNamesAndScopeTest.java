@@ -366,4 +366,42 @@ class QualifiedNamesAndScopeTest {
         assertEquals("OK", stateOf("SELECT * FROM qst_t FOR KEY SHARE"));
         assertEquals("OK", stateOf("SELECT * FROM qst_t FOR SHARE"));
     }
+
+    /**
+     * A shift is no condition. PostgreSQL spells {@code >>} the same way for a network address and
+     * for a range, where it does answer with a boolean, so which one a query means is settled by
+     * what it hands the operator.
+     */
+    @Test
+    void anIntegerShiftIsNotACondition() {
+        assertEquals("argument of WHERE must be type boolean, not type integer",
+                messageOf("SELECT * FROM qst_t WHERE v >> 1"));
+        assertEquals("argument of WHERE must be type boolean, not type integer",
+                messageOf("SELECT * FROM qst_t WHERE v << 1"));
+        assertEquals("argument of WHERE must be type boolean, not type integer",
+                messageOf("SELECT * FROM qst_t WHERE v & 1"));
+        assertEquals("argument of WHERE must be type boolean, not type integer",
+                messageOf("SELECT * FROM qst_t WHERE 4 >> 1"));
+        assertEquals("argument of AND must be type boolean, not type integer",
+                messageOf("SELECT * FROM qst_t WHERE v >> 1 AND true"));
+    }
+
+    /** A shift keeps the width of the value being shifted; the other side is a distance. */
+    @Test
+    void aShiftKeepsTheWidthOfWhatItShifts() throws Exception {
+        assertEquals("integer", scalar("SELECT pg_typeof(v >> 1)::text FROM qst_t LIMIT 1"));
+        assertEquals("integer", scalar("SELECT pg_typeof(4 >> 1)::text"));
+        assertEquals("integer", scalar("SELECT pg_typeof(v & 1)::text FROM qst_t LIMIT 1"));
+        assertEquals("bigint", scalar("SELECT pg_typeof(9000000000::bigint >> 1)::text"));
+        assertEquals("5", scalar("SELECT 10 >> 1"));
+    }
+
+    /** Over a network address the same word is a containment test, and that is a condition. */
+    @Test
+    void theSameWordOverANetworkAddressIsACondition() throws Exception {
+        assertEquals("yes", scalar("SELECT CASE WHEN '10.0.0.0/8'::inet >> '10.1.2.3'::inet"
+                + " THEN 'yes' ELSE 'no' END"));
+        assertEquals("2", scalar("SELECT count(*)::text FROM qst_t"
+                + " WHERE '10.0.0.0/8'::inet >> '10.1.2.3'::inet"));
+    }
 }
