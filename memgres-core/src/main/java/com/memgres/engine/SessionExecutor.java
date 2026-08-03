@@ -765,12 +765,13 @@ class SessionExecutor {
                 Database targetDb = reg.getDatabase(dbName);
                 if (targetDb != null) {
                     java.util.Set<Session> otherSessions = targetDb.getActiveSessions();
-                    if (!otherSessions.isEmpty()) {
-                        if (force) {
-                            for (Session s : new java.util.ArrayList<>(otherSessions)) {
-                                s.close();
-                            }
-                        } else {
+                    if (force) {
+                        for (Session s : new java.util.ArrayList<>(otherSessions)) {
+                            s.close();
+                        }
+                    } else {
+                        otherSessions = waitForSessionsToEnd(targetDb);
+                        if (!otherSessions.isEmpty()) {
                             throw new MemgresException(
                                 "database \"" + dbName + "\" is being accessed by other users", "55006");
                         }
@@ -798,7 +799,7 @@ class SessionExecutor {
                 throw new MemgresException("current database cannot be renamed", "55006");
             } else {
                 Database targetDb = reg.getDatabase(oldName);
-                if (targetDb != null && !targetDb.getActiveSessions().isEmpty()) {
+                if (targetDb != null && !waitForSessionsToEnd(targetDb).isEmpty()) {
                     throw new MemgresException(
                         "database \"" + oldName + "\" is being accessed by other users", "55006");
                 }
@@ -1286,6 +1287,37 @@ class SessionExecutor {
             "SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER", "MAINTAIN",
             "EXECUTE", "USAGE", "CREATE", "TEMPORARY", "TEMP", "CONNECT", "SET", "ALTER SYSTEM",
             "RULE", "ALL");
+
+    /**
+     * The sessions still on a database once those that are leaving have left.
+     *
+     * <p>A client that has just disconnected is not gone the moment its own {@code close()}
+     * returns: the bytes are on their way, and the server takes the connection down when it reads
+     * them. So a script that closes its connection and immediately drops the database it was using
+     * is racing its own disconnection, and it is a script PostgreSQL runs -- because DROP DATABASE
+     * there does not read the count once and give up. It waits for the other backends to exit,
+     * polling for five seconds before it reports the database as in use, and only a connection
+     * that is really still there outlasts that.
+     *
+     * <p>The wait costs nothing where there is nothing to wait for, and it ends the moment the
+     * last one goes.
+     */
+    private java.util.Set<Session> waitForSessionsToEnd(Database targetDb) {
+        java.util.Set<Session> others = targetDb.getActiveSessions();
+        if (others.isEmpty()) return others;
+        long deadline = System.currentTimeMillis() + 5000L;
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                Thread.sleep(100L);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+            others = targetDb.getActiveSessions();
+            if (others.isEmpty()) break;
+        }
+        return others;
+    }
 
     QueryResult executeGrant(GrantStmt s) {
         // Validate GRANTED BY grantor matches current user
