@@ -214,4 +214,34 @@ class ListenNotifyDeliveryTest {
             // No error should occur even though no one is listening
         }
     }
+
+    /**
+     * A notification is delivered by the listener's very next statement, however many are sent and
+     * whichever way they were sent.
+     *
+     * <p>A push to a listener that is sitting idle and the drain the listener's own statement does
+     * are two ways to write the same queue, and a notification must not fall between them: it is
+     * written by whichever gets there first, and it stays queued until one of them writes it. A
+     * listener that asks for its notifications when its statement returns has them all -- reading
+     * one only on the statement after is a statement too late, and the loop below is here because
+     * that is decided by which thread ran first, so a single round says nothing.
+     */
+    @Test
+    void everyNotificationArrivesByTheNextStatement() throws Exception {
+        for (int round = 0; round < 40; round++) {
+            try (Connection listener = connect(); Connection notifier = connect()) {
+                try (Statement s = listener.createStatement()) { s.execute("LISTEN race_ch"); }
+                try (Statement s = notifier.createStatement()) {
+                    s.execute("SELECT pg_notify('race_ch', 'via function')");
+                    s.execute("NOTIFY race_ch, 'via statement'");
+                }
+                PGNotification[] notes = poll(listener);
+                assertNotNull(notes, "round " + round);
+                assertEquals(2, notes.length, "both should arrive on round " + round);
+                assertEquals("race_ch", notes[0].getName());
+                assertEquals("via function", notes[0].getParameter());
+                assertEquals("via statement", notes[1].getParameter());
+            }
+        }
+    }
 }

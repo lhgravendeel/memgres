@@ -362,12 +362,11 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
      */
     private void installNotificationSink(ChannelHandlerContext ctx) {
         final Session target = this.session;
-        target.setNotificationSink(notification -> {
+        target.setNotificationSink(() -> {
             if (!ctx.channel().isActive()) return;
             ctx.channel().eventLoop().execute(() -> {
                 if (!ctx.channel().isActive()) return;
-                sendNotificationResponse(ctx, notification);
-                ctx.flush();
+                if (drainNotifications(ctx, target)) ctx.flush();
             });
         });
     }
@@ -1191,12 +1190,24 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
         ctx.write(buf);
     }
 
-    static void sendReadyForQuery(ChannelHandlerContext ctx, Session session) {
-        // Drain pending NOTIFY messages
+    /**
+     * Writes whatever notifications this session is holding, and says whether it wrote any.
+     *
+     * <p>Both the push and the ReadyForQuery drain take from the one queue, so each notification
+     * is written once by whichever gets there first and none is lost between them.
+     */
+    private static boolean drainNotifications(ChannelHandlerContext ctx, Session session) {
+        boolean wrote = false;
         Notification notification;
         while ((notification = session.getPendingNotifications().poll()) != null) {
             sendNotificationResponse(ctx, notification);
+            wrote = true;
         }
+        return wrote;
+    }
+
+    static void sendReadyForQuery(ChannelHandlerContext ctx, Session session) {
+        drainNotifications(ctx, session);
 
         ByteBuf buf = ctx.alloc().buffer();
         buf.writeByte('Z');
