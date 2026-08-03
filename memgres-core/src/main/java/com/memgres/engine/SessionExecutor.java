@@ -43,6 +43,9 @@ class SessionExecutor {
                     int dot = objName.indexOf('.');
                     schemaName = objName.substring(0, dot);
                     bareName = objName.substring(dot + 1);
+                    // COMMENT resolves the schema first and reports that when it is not there,
+                    // rather than the object it never got as far as looking for.
+                    SchemaQualifier.requireSchema(executor.database, executor.session, schemaName);
                 }
                 if (objType.equals("TABLE") || objType.equals("RELATION")) {
                     try {
@@ -90,6 +93,8 @@ class SessionExecutor {
                             int dot = tablePart.indexOf('.');
                             colSchema = tablePart.substring(0, dot);
                             colTable = tablePart.substring(dot + 1);
+                            SchemaQualifier.requireSchema(
+                                    executor.database, executor.session, colSchema);
                         }
                         try {
                             Table commentTable = executor.resolveTable(colSchema, colTable);
@@ -1321,6 +1326,8 @@ class SessionExecutor {
                 int dot = grantTable.indexOf('.');
                 grantSchema = grantTable.substring(0, dot);
                 grantTable = grantTable.substring(dot + 1);
+                // As for every DDL statement that opens a relation by a written qualifier.
+                SchemaQualifier.requireSchema(executor.database, executor.session, grantSchema);
             }
             try { executor.resolveTable(grantSchema, grantTable); }
             catch (MemgresException e) {

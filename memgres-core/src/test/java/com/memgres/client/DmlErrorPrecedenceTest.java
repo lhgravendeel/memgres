@@ -339,44 +339,75 @@ class DmlErrorPrecedenceTest {
         exec("DROP SCHEMA IF EXISTS dep_s CASCADE");
     }
 
+    /**
+     * The clause a fault is reported from, where both faults are plain column references.
+     *
+     * <p>PostgreSQL transforms one query level in a fixed order — WITH items, the FROM clause and
+     * its join conditions, the select list, WHERE, HAVING, ORDER BY, GROUP BY — and a call's
+     * arguments before the call itself. Each of these is wrong in two places, and the one reported
+     * is the one the earlier clause is wrong about, whatever memgres would have run into first.
+     */
+    @Test
+    void theEarliestClauseAndTheLeftmostFaultAreTheOnesReported() {
+        assertEquals("column \"nosuch2\" does not exist",
+                messageOf("SELECT abs(nosuch2) FROM dep_t ORDER BY nosuch3"));
+        assertEquals("column \"nosuch2\" does not exist",
+                messageOf("SELECT abs(nosuch2) FROM dep_t WHERE sum(v) > 1"));
+        assertEquals("column \"nosuch2\" does not exist",
+                messageOf("SELECT dep_nosuchfn(nosuch2) FROM dep_t"),
+                "a call's arguments are transformed before the function is resolved");
+        assertEquals("column \"nosuch_c\" does not exist",
+                messageOf("SELECT v FROM dep_t GROUP BY nosuch_b HAVING nosuch_c > 1"),
+                "GROUP BY is transformed last, so HAVING's fault is the one reported");
+    }
+
     // =========================================================================
     // Where memgres still reports the later fault — measured, not yet fixed
     // =========================================================================
 
     /**
-     * Each of these is a statement PostgreSQL refuses for an earlier fault than memgres names. They
-     * are asserted against memgres's present answer, so closing one fails this test and says so.
+     * A name that is no function outranks the clause it carries, and a call with a number of
+     * arguments no signature of that name takes is no function either. Both are PostgreSQL's own
+     * answers, measured on the reference server.
      *
-     * <p>What the first three have in common is a name that is no function. Deciding that outside
-     * the evaluator needs a complete register of the names memgres can call, and there is none:
-     * {@code BuiltinFunctionNames} is the catalog's list and is missing names the evaluator handles
-     * (sin, cos, coalesce, greatest among them), so a rule reading "not in that list" would refuse
-     * calls that work. The rest are faults memgres finds only by running something.
+     * <p>Neither could be decided outside the evaluator until the two tables the rules read were
+     * completed: the register of names memgres can dispatch, which the catalog's list is not, and
+     * the signature table, which recorded several names only in the long form PostgreSQL keeps
+     * internally. The last three used to reach the implementation and come back as XX000 — an
+     * index off the end of the argument list, reported to the client as an internal error.
      */
     @Test
-    void theCasesStillOutOfOrderAreRecordedRatherThanAsserted() {
-        // PostgreSQL: 42883 on the first target — a name that is no function is resolved before
-        // the clause on the second target is judged.
-        assertEquals("42809",
+    void aCallIsResolvedBeforeTheClauseCarryingItIsJudged() {
+        assertEquals("42883",
                 stateOf("SELECT dep_nosuchfn(1), abs(1) FILTER (WHERE true) FROM dep_t"));
-        assertEquals("42703", stateOf("SELECT dep_nosuchfn(1), nosuchcol FROM dep_t"));
-        assertEquals("42809", stateOf("SELECT dep_nosuchfn(v) OVER () FROM dep_t"));
+        assertEquals("42883", stateOf("SELECT dep_nosuchfn(1), nosuchcol FROM dep_t"));
+        assertEquals("42883", stateOf("SELECT dep_nosuchfn(v) OVER () FROM dep_t"));
+        assertEquals("42883", stateOf("SELECT lpad('a')"));
+        assertEquals("42883", stateOf("SELECT split_part('a,b', ',')"));
+        assertEquals("42883", stateOf("SELECT age()"));
+        // random takes none or two, and one of them is neither.
+        assertEquals("42883", stateOf("SELECT random(1)"));
 
-        // PostgreSQL: 42703 on nosuch2 — the select list is transformed before ORDER BY, before
-        // an aggregate's placement is judged, and before the arguments of a call are resolved.
-        assertEquals("42703", stateOf("SELECT abs(nosuch2) FROM dep_t ORDER BY nosuch3"));
-        assertEquals("42803", stateOf("SELECT abs(nosuch2) FROM dep_t WHERE sum(v) > 1"));
-        assertEquals("42883", stateOf("SELECT dep_nosuchfn(nosuch2) FROM dep_t"));
-
-        // PostgreSQL: 42703 on nosuch_c — HAVING is transformed before GROUP BY.
-        assertEquals("42703", stateOf("SELECT v FROM dep_t GROUP BY nosuch_b HAVING nosuch_c > 1"));
-
-        // PostgreSQL: 42883 — too FEW arguments is the same fault as too many, but the signature
-        // table under-records the short forms of several names, so only "too many" is judged.
-        assertEquals("XX000", stateOf("SELECT lpad('a')"));
-        assertEquals("XX000", stateOf("SELECT split_part('a,b', ',')"));
-        assertEquals("XX000", stateOf("SELECT age()"));
-        // random() takes none or two, so one is neither too few nor more than the longest.
-        assertEquals("OK", stateOf("SELECT random(1)"));
+        // The ordinary shapes each of those stands next to, which PostgreSQL runs.
+        assertEquals("OK", stateOf("SELECT abs(1) FROM dep_t"));
+        assertEquals("OK", stateOf("SELECT sum(v) FILTER (WHERE true) FROM dep_t"));
+        assertEquals("OK", stateOf("SELECT row_number() OVER () FROM dep_t"));
+        assertEquals("OK", stateOf("SELECT lpad('a', 2)"));
+        assertEquals("OK", stateOf("SELECT lpad('a', 2, 'x')"));
+        assertEquals("OK", stateOf("SELECT split_part('a,b', ',', 1)"));
+        assertEquals("OK", stateOf("SELECT age(now())"));
+        assertEquals("OK", stateOf("SELECT age(now(), now())"));
+        assertEquals("OK", stateOf("SELECT random()"));
+        assertEquals("OK", stateOf("SELECT random(1, 5)"));
+        assertEquals("OK", stateOf("SELECT sin(1), cos(1), coalesce(1, 2), greatest(1, 2)"));
+        assertEquals("OK", stateOf("SELECT concat('a', 'b'), format('%s', 'a'), num_nonnulls(1)"));
+        assertEquals("OK", stateOf("SELECT json_build_object(), jsonb_build_array()"));
     }
+
+    /**
+     * Nothing is left to record here. Each branch of this work closed the cases the other had
+     * written down: a name that is no function and a wrong arity are now resolved before the
+     * clause on the call is judged, and a query level's clauses are read in PostgreSQL's own
+     * order. The orderings they used to record are asserted above and in KnownGapsTest.
+     */
 }

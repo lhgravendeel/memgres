@@ -638,6 +638,7 @@ class DdlObjectExecutor {
     }
 
     QueryResult executeCreateFunction(CreateFunctionStmt stmt) {
+        SchemaQualifier.requireSchema(executor.database, executor.session, stmt.schema());
         if ("pg_catalog".equalsIgnoreCase(stmt.schema())) {
             throw new MemgresException("permission denied to create function in schema pg_catalog", "42501");
         }
@@ -1612,6 +1613,7 @@ class DdlObjectExecutor {
     // ---- CREATE TRIGGER ----
 
     QueryResult executeCreateTrigger(CreateTriggerStmt stmt) {
+        SchemaQualifier.requireSchema(executor.database, executor.session, stmt.schema());
         String triggerTableSchema = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
         PgTrigger.Timing timing;
         switch (stmt.timing()) {
@@ -1649,6 +1651,10 @@ class DdlObjectExecutor {
             }
         }
         checkTriggerShape(stmt, timing, trigEvents, triggerTableSchema, isView);
+        // The WHEN condition is analysed against the relation before the function the trigger will
+        // call is looked for, so a condition that cannot stand is what PostgreSQL reports even when
+        // the function is missing too.
+        checkTriggerWhen(stmt, trigEvents, triggerTableSchema, isView);
         if (stmt.functionName() != null) {
             PgFunction trigFunc = executor.database.getFunction(stmt.functionName());
             if (trigFunc == null) {
@@ -1660,7 +1666,6 @@ class DdlObjectExecutor {
                 throw new MemgresException("function " + stmt.functionName() + " must return type trigger", "42P17");
             }
         }
-        checkTriggerWhen(stmt, trigEvents, triggerTableSchema, isView);
         if (stmt.orReplace()) {
             executor.database.removeTrigger(stmt.name(), stmt.table());
         }
@@ -1766,7 +1771,7 @@ class DdlObjectExecutor {
             throw PgErrors.invalidObjectState(
                     "DELETE trigger's WHEN condition cannot reference NEW values");
         }
-        StoredExprCheck.forTriggerWhen(target).check(whenExpr);
+        StoredExprCheck.forTriggerWhen(target).check(whenExpr, executor.selectExecutor);
     }
 
     private static boolean referencesRow(Expression expr, String alias) {
@@ -2548,6 +2553,7 @@ class DdlObjectExecutor {
     // ---- CREATE SEQUENCE ----
 
     QueryResult executeCreateSequence(CreateSequenceStmt stmt) {
+        SchemaQualifier.requireSchema(executor.database, executor.session, stmt.schema());
         String seqName = stmt.name();
         if (stmt.temporary() && executor.session != null) {
             seqName = executor.session.getTempSchemaName() + "." + seqName;
@@ -2648,6 +2654,7 @@ class DdlObjectExecutor {
     // ---- CREATE DOMAIN ----
 
     QueryResult executeCreateDomain(CreateDomainStmt stmt) {
+        SchemaQualifier.requireSchema(executor.database, executor.session, stmt.schemaName());
         if (executor.database.getDomain(stmt.name()) != null) {
             throw new MemgresException("type \"" + stmt.name() + "\" already exists", "42710");
         }
@@ -2747,6 +2754,10 @@ class DdlObjectExecutor {
             throw new MemgresException(
                     "column \"" + ((ColumnRef) bad).column() + "\" does not exist", "42703");
         }
+        // A domain constraint is tested against one value with no row and no query around it, so
+        // it is judged like every other stored expression.
+        executor.selectExecutor.placementCheck.rejectStoredDefinition(
+                checkExpr, "check constraints", "check constraint");
     }
 
     // ---- ALTER DOMAIN ----
@@ -2888,6 +2899,7 @@ class DdlObjectExecutor {
             case "ADD_CONSTRAINT": {
                 String constraintName = stmt.constraintName() != null
                         ? stmt.constraintName() : generatedCheckName(domain);
+                checkDomainConstraintExpr(stmt.checkExpr());
                 if (stmt.checkExpr() != null) {
                     try {
                         Table valueTable = new Table("_domain_check",
@@ -3051,7 +3063,10 @@ class DdlObjectExecutor {
             throw PgErrors.wrongObjectType("cannot open relation \"" + s.table() + "\"");
         }
         try {
-            return executor.resolveTable(s.schema() != null ? s.schema() : executor.defaultSchema(), s.table());
+            // A qualified reference that found nothing is reported the way it was written.
+            return executor.resolveTable(
+                    s.schema() != null ? s.schema() : executor.defaultSchema(), s.table(),
+                    s.schema() != null);
         } catch (MemgresException e) {
             if ("42P01".equals(e.getSqlState()) && view == null) throw e;
             return null;
@@ -3068,26 +3083,37 @@ class DdlObjectExecutor {
     private void checkIndexExpressionsAndPredicate(CreateIndexStmt s) {
         if (s.columns() != null) {
             for (String col : s.columns()) {
-                if (!col.contains("(")) continue;
+                // An index key is kept as the text it was written as, so its type names are read
+                // here rather than when the statement itself was parsed. What tells a key that is
+                // an expression from one that names a column is what it parses to: the parentheses
+                // an expression key is written in are stripped before it is stored, so
+                // "((id::int4))" arrives here with none left to recognise it by.
+                List<String> typeSchemas = new ArrayList<>();
                 Expression expr;
                 try {
-                    expr = com.memgres.engine.parser.Parser.parseExpression(col);
+                    expr = com.memgres.engine.parser.Parser.parseExpression(col, typeSchemas);
                 } catch (Exception ignored) {
                     continue;
                 }
-                executor.selectExecutor.placementCheck.rejectSubquery(expr, "index expression");
-                executor.selectExecutor.placementCheck.reject(expr, "index expressions");
+                if (expr instanceof ColumnRef) continue;
+                SchemaQualifier.rejectMissingTypeSchemas(
+                        executor.database, executor.session, typeSchemas);
+                executor.selectExecutor.placementCheck.rejectStoredDefinition(
+                        expr, "index expressions", "index expression");
             }
         }
         if (s.whereClause() != null) {
+            List<String> typeSchemas = new ArrayList<>();
             Expression pred;
             try {
-                pred = com.memgres.engine.parser.Parser.parseExpression(s.whereClause());
+                pred = com.memgres.engine.parser.Parser.parseExpression(s.whereClause(), typeSchemas);
             } catch (Exception ignored) {
                 return;
             }
-            executor.selectExecutor.placementCheck.rejectSubquery(pred, "index predicate");
-            executor.selectExecutor.placementCheck.reject(pred, "index predicates");
+            SchemaQualifier.rejectMissingTypeSchemas(
+                    executor.database, executor.session, typeSchemas);
+            executor.selectExecutor.placementCheck.rejectStoredDefinition(
+                    pred, "index predicates", "index predicate");
         }
     }
 
@@ -3149,6 +3175,9 @@ class DdlObjectExecutor {
     }
 
     QueryResult executeCreateIndex(CreateIndexStmt s) {
+        // The relation is opened before the statement is analysed, and opening it starts by
+        // finding the schema it was written under.
+        SchemaQualifier.requireSchema(executor.database, executor.session, s.schema());
         String indexSchema = s.schema() != null ? s.schema() : executor.defaultSchema();
         boolean nameTaken = s.name() != null
                 && (executor.database.hasIndex(s.name())
@@ -3257,15 +3286,16 @@ class DdlObjectExecutor {
                                     // SQL/JSON special forms are not regular functions — skip validation
                                     if (isJsonSpecialForm(funcName)) continue;
                                     if (executor.database.getFunction(funcName) != null) continue;
-                                    try {
-                                        executor.functionEvaluator.evalFunction(
-                                            new FunctionCallExpr(funcName,
-                                                Cols.listOf(Literal.ofNull())), null);
-                                    } catch (MemgresException me2) {
-                                        if ("42883".equals(me2.getSqlState())) {
-                                            throw new MemgresException("function " + funcName + "(text) does not exist", "42883");
-                                        }
-                                    } catch (Exception ignored2) {}
+                                    // Whether the name is a function at all is what this asks, and
+                                    // the register answers it. It used to call the name with one
+                                    // NULL argument and read a 42883 as proof the name was
+                                    // unknown, which confused "no function of that name" with "no
+                                    // signature taking one argument" — so an index on
+                                    // exist(hstore, text) was refused as a missing function once
+                                    // the arity rule could say exist(unknown) resolves to nothing.
+                                    if (BuiltinFunctionNames.isCallable(funcName)) continue;
+                                    throw new MemgresException(
+                                            "function " + funcName + "(text) does not exist", "42883");
                                 }
                             }
                         } catch (Exception ignored) {}

@@ -2,12 +2,16 @@ package com.memgres.engine;
 
 import com.memgres.engine.parser.ast.BinaryExpr;
 import com.memgres.engine.parser.ast.ColumnRef;
+import com.memgres.engine.parser.ast.CompositeStarExpr;
 import com.memgres.engine.parser.ast.Expression;
 import com.memgres.engine.parser.ast.FunctionCallExpr;
+import com.memgres.engine.parser.ast.Literal;
 import com.memgres.engine.parser.ast.NamedArgExpr;
 import com.memgres.engine.parser.ast.SelectStmt;
 import com.memgres.engine.parser.ast.Statement;
+import com.memgres.engine.parser.ast.WildcardExpr;
 import com.memgres.engine.parser.ast.WindowFuncExpr;
+import com.memgres.engine.util.Cols;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -49,8 +53,17 @@ import java.util.Locale;
  *
  * <p>The rest of this class is about order. A statement with several faults reports one of them,
  * and which one is decided by the order PostgreSQL analyses it in rather than by the order memgres
- * happens to check things. {@link Ordered} walks a query level's clauses in that order once a
- * refusal at that level has been found, so what changes is which fault a doomed statement reports.
+ * happens to check things. {@link Resolve} resolves every call the statement makes before any
+ * clause is judged, which is where PostgreSQL resolves it. {@link Ordered} then walks a query
+ * level's clauses in that order — WITH items, the FROM clause and its join conditions, the select
+ * list, WHERE, HAVING, ORDER BY, and GROUP BY last of all — and refuses the first fault it finds.
+ *
+ * <p>It walks every statement, not only one already known to be doomed, which is what lets a fault
+ * be found in a clause of a query that would have read no rows. What makes that safe is that every
+ * refusal it raises is one of {@link QueryLevelScope}'s, and those speak only where the relations
+ * this query level supplies are all described and settle the answer. A relation the description
+ * could not follow, a call in FROM whose columns only running it settles, an enclosing query that
+ * may supply a name this one does not — each of those is a scope this says nothing about.
  */
 final class FilterCheck {
 
@@ -60,27 +73,24 @@ final class FilterCheck {
     /**
      * Refuses the statement for the fault PostgreSQL would name first.
      *
-     * <p>A call written with a number of arguments no signature of its name has resolves to no
-     * function, so that is settled before anything else. Then, for a query level whose relations
-     * are described, the clauses are read in the order PostgreSQL reads them and the first fault
-     * of the earliest one is reported. What is left is the older, coarser walk: the reflective one,
-     * which reaches every expression position in the statement — including inside sub-queries and
-     * CTEs, which is where PostgreSQL raises this too — and refuses the call it finds there.
+     * <p>A call resolves to a function or it resolves to nothing, and that is settled before any
+     * clause is judged: first for an aggregate written with a number of arguments it does not
+     * take, then by {@link Resolve} for every other call in the statement. Then, for a query level
+     * whose relations are described, the clauses are read in the order PostgreSQL reads them and
+     * the first fault of the earliest one is reported. What is left is the older, coarser walk:
+     * the reflective one, which reaches every expression position in the statement — including
+     * inside sub-queries and CTEs, which is where PostgreSQL raises this too — and refuses the
+     * call it finds there.
      *
      * <p>{@code scope} is null wherever the query level's relations are not resolved yet, in which
      * case a call is refused on its name alone as before.
      */
     static void reject(SelectExecutor select, Object root, QueryLevelScope scope) {
         rejectAggregateArity(select, root, scope);
-        // The ordered walk only ever chooses which fault a statement already doomed at this query
-        // level reports, so it runs only once one has been found. The checks it consults answer
-        // from the bindings alone and are one-sided by design: run over a statement that was going
-        // to succeed they would refuse it, which is the worse mistake by far.
+        Resolve resolve = new Resolve(select);
+        resolve.node(root, scope != null ? scope : resolve.nested);
         if (scope != null && root instanceof SelectStmt) {
-            Object doomed = AstWalk.findFirst(root, node -> carriesRefusedFilter(select, node));
-            if (doomed != null && QueryLevelScope.isOwnLevel(root, doomed)) {
-                new Ordered(select, scope).statement((SelectStmt) root);
-            }
+            new Ordered(select, scope).statement((SelectStmt) root);
         }
         rejectByName(select, root, scope);
     }
@@ -143,6 +153,102 @@ final class FilterCheck {
     }
 
     /**
+     * Resolving every call in a statement, in the order PostgreSQL resolves them.
+     *
+     * <p>PostgreSQL resolves a call — name, then argument count, then argument types — before it
+     * judges the clause the call stands in, so an unknown name outranks a complaint about FILTER,
+     * about OVER, and about a column further along the select list. memgres resolved names while
+     * it ran, so those complaints came first; this walk moves resolution to where PostgreSQL does
+     * it. Unlike {@link Ordered} it runs whether or not the statement is already doomed, which it
+     * can only do because it asks nothing but {@link QueryLevelScope#rejectUnresolvableCall} —
+     * which reads a complete register of the names the engine can dispatch and a complete table of
+     * the signatures PostgreSQL declares, and says nothing about anything either leaves open.
+     *
+     * <p>The clause order is the same one {@link Ordered} walks. A nested query level is walked
+     * too, because a call in one resolves against the same catalog; only its bindings are out of
+     * reach, and a scope with none answers for the literals and casts and stays silent about the
+     * rest.
+     */
+    private static final class Resolve {
+
+        private final QueryLevelScope nested;
+
+        Resolve(SelectExecutor select) {
+            this.nested = new QueryLevelScope(select, Cols.listOf(), null, null);
+        }
+
+        /**
+         * @param here the bindings to read a column's type from, which are this query level's; a
+         *             nested statement has a FROM clause of its own, so descending into one
+         *             carries the bindingless scope instead
+         */
+        void node(Object n, QueryLevelScope here) {
+            if (n == null) return;
+            if (n instanceof SelectStmt) {
+                statement((SelectStmt) n, here);
+                return;
+            }
+            if (n instanceof FunctionCallExpr || n instanceof WindowFuncExpr) {
+                call(n, here);
+                return;
+            }
+            if (n instanceof BinaryExpr) {
+                node(((BinaryExpr) n).left(), here);
+                node(((BinaryExpr) n).right(), here);
+                return;
+            }
+            QueryLevelScope inner = n instanceof Statement ? nested : here;
+            List<Object> children = new ArrayList<Object>();
+            AstWalk.forEachChild(n, children::add);
+            for (Object child : children) node(child, inner);
+        }
+
+        private void statement(SelectStmt stmt, QueryLevelScope here) {
+            if (stmt.withClauses() != null) {
+                for (SelectStmt.CommonTableExpr cte : stmt.withClauses()) node(cte.query(), nested);
+            }
+            if (stmt.from() != null) {
+                for (SelectStmt.FromItem item : stmt.from()) node(item, here);
+            }
+            if (stmt.targets() != null) {
+                for (SelectStmt.SelectTarget target : stmt.targets()) node(target.expr(), here);
+            }
+            node(stmt.where(), here);
+            node(stmt.having(), here);
+            if (stmt.orderBy() != null) {
+                for (SelectStmt.OrderByItem item : stmt.orderBy()) node(item.expr(), here);
+            }
+            if (stmt.groupBy() != null) {
+                for (Expression group : stmt.groupBy()) node(group, here);
+            }
+        }
+
+        /** Arguments are transformed before the function is resolved, so they are read first. */
+        private void call(Object c, QueryLevelScope here) {
+            List<Expression> args = c instanceof FunctionCallExpr
+                    ? ((FunctionCallExpr) c).args() : ((WindowFuncExpr) c).args();
+            if (args != null) {
+                for (Expression arg : args) node(arg, here);
+            }
+            node(filterOf(c), here);
+            if (c instanceof WindowFuncExpr) {
+                WindowFuncExpr window = (WindowFuncExpr) c;
+                if (window.partitionBy() != null) {
+                    for (Expression p : window.partitionBy()) node(p, here);
+                }
+                if (window.orderBy() != null) {
+                    for (SelectStmt.OrderByItem o : window.orderBy()) node(o.expr(), here);
+                }
+            }
+            String name = nameOf(c);
+            if (name == null) return;
+            // count(*) has no argument list to resolve against.
+            if (c instanceof FunctionCallExpr && ((FunctionCallExpr) c).star()) return;
+            here.rejectUnresolvableCall(c, QueryLevelScope.bareName(name), true);
+        }
+    }
+
+    /**
      * The order PostgreSQL analyses one query level in, which is the order its faults are reported.
      *
      * <p>WITH items first, then the FROM clause with its join conditions, then the select list,
@@ -152,8 +258,8 @@ final class FilterCheck {
      * predicate, which is read before the function itself is resolved.
      *
      * <p>Every refusal raised here is one of {@link QueryLevelScope}'s, which only speak when the
-     * bindings settle the answer. This changes which fault a doomed statement reports; it does not
-     * decide that a statement is doomed.
+     * bindings settle the answer. What that costs is a fault reported one clause too late wherever
+     * the bindings settle nothing; what it buys is that no statement is refused on a guess.
      */
     private static final class Ordered {
 
@@ -179,12 +285,51 @@ final class FilterCheck {
             }
             node(stmt.where());
             node(stmt.having());
-            if (stmt.orderBy() != null) {
-                for (SelectStmt.OrderByItem item : stmt.orderBy()) node(item.expr());
-            }
+            orderBy(stmt);
             if (stmt.groupBy() != null) {
                 for (Expression group : stmt.groupBy()) node(group);
             }
+        }
+
+        /**
+         * ORDER BY, read the way PostgreSQL reads it. A constant there is an output-column
+         * position and nothing else, so a position outside the select list is out of range before
+         * a name in any later clause is looked up, and a constant that is not an integer at all
+         * names no column. The target a position names was read with the select list already.
+         *
+         * <p>A star stands for however many columns the relations hold, which this does not
+         * count, so a select list carrying one leaves the position to the later check that does.
+         */
+        private void orderBy(SelectStmt stmt) {
+            if (stmt.orderBy() == null) return;
+            List<SelectStmt.SelectTarget> targets = stmt.targets();
+            boolean counted = targets != null && !carriesStar(targets);
+            for (SelectStmt.OrderByItem item : stmt.orderBy()) {
+                Expression expr = item.expr();
+                Integer position = GroupByValidator.integerConstant(expr);
+                if (position != null) {
+                    if (counted
+                            && (position.intValue() < 1 || position.intValue() > targets.size())) {
+                        throw new MemgresException(
+                                "ORDER BY position " + position + " is not in select list", "42P10");
+                    }
+                    continue;
+                }
+                if (expr instanceof Literal) {
+                    throw new MemgresException("non-integer constant in ORDER BY", "42601");
+                }
+                node(expr);
+            }
+        }
+
+        private static boolean carriesStar(List<SelectStmt.SelectTarget> targets) {
+            for (SelectStmt.SelectTarget target : targets) {
+                if (target.expr() instanceof WildcardExpr
+                        || target.expr() instanceof CompositeStarExpr) {
+                    return true;
+                }
+            }
+            return false;
         }
 
         /** A join condition belongs to the FROM clause and is read while it is being built. */
@@ -247,15 +392,10 @@ final class FilterCheck {
                 // comes first; coercing the predicate would replace it.
                 if (!select.containsAggregate(filter)) scope.rejectNonBooleanFilter(filter);
             }
-            if (c instanceof WindowFuncExpr) {
-                WindowFuncExpr window = (WindowFuncExpr) c;
-                if (window.partitionBy() != null) {
-                    for (Expression p : window.partitionBy()) node(p);
-                }
-                if (window.orderBy() != null) {
-                    for (SelectStmt.OrderByItem o : window.orderBy()) node(o.expr());
-                }
-            }
+            // The OVER specification is deliberately not read here. PostgreSQL collects the window
+            // definitions and transforms them once every clause has been read, so nothing written
+            // in one is reached while the clause holding the call is being judged: a window call
+            // standing in WHERE is refused for standing there, whatever its OVER names.
             String name = nameOf(c);
             if (name == null) return;
             scope.rejectUnresolvableCall(c, QueryLevelScope.bareName(name));
@@ -264,7 +404,7 @@ final class FilterCheck {
     }
 
     /** The 42809 a call carrying a clause it may not have is refused with. */
-    private static MemgresException refusal(Object found) {
+    static MemgresException refusal(Object found) {
         String name = nameOf(found);
         MemgresException e = new MemgresException(
                 clauseOf(found) + " specified, but " + name + " is not an aggregate function",
@@ -301,7 +441,7 @@ final class FilterCheck {
         scope.rejectUnresolvableCall(found, QueryLevelScope.bareName(nameOf(found)));
     }
 
-    private static boolean carriesRefusedFilter(SelectExecutor select, Object node) {
+    static boolean carriesRefusedFilter(SelectExecutor select, Object node) {
         String rawName = nameOf(node);
         if (rawName == null) return false;
         Expression filter = filterOf(node);

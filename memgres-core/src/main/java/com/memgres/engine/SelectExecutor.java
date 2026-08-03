@@ -151,6 +151,10 @@ class SelectExecutor {
         // is read: reading a FROM item is observable -- a WITH item that writes would be applied,
         // a fault inside a derived table would surface -- and the statement may yet be refused.
         executor.fromResolver.checkRelationNamesExist(stmt);
+        // The range table is finished before a clause is read, and two FROM items answering to one
+        // name is a fault of the range table rather than of any clause. It is decided from the
+        // written names alone, so it costs nothing and reads nothing.
+        validateFromClause(stmt.from());
 
         boolean noFromClause = stmt.from() == null || stmt.from().isEmpty();
         // A query with no FROM clause has no range table to build, so nothing can outrank its
@@ -227,8 +231,13 @@ class SelectExecutor {
         if (hasDataModifyingCte(stmt)) {
             scope = null;
         } else {
-            scope = new QueryLevelScope(this,
-                    executor.fromResolver.resolveTableBindings(stmt.from()), null, stmt);
+            List<RowContext.TableBinding> described =
+                    executor.fromResolver.resolveTableBindings(stmt.from());
+            // Describing swallows every relation it cannot follow, so a short list is a list with
+            // a relation missing from it and the columns that relation holds would look like
+            // columns nothing holds.
+            scope = new QueryLevelScope(this, described, null, stmt,
+                    described.size() == FromResolver.relationCount(stmt.from()));
         }
         // A join condition belongs to the FROM clause, which PostgreSQL transforms before it reads
         // any other clause, so this is judged before the select list's calls are.
@@ -239,29 +248,27 @@ class SelectExecutor {
         List<RowContext> contexts = executor.fromResolver.resolveFromClause(
                 stmt.from(), stmt.where(), stmt.having(), stmt);
 
-        // PostgreSQL builds the range table before it analyses the rest of the query, so a name
-        // that does not resolve is reported on its own even when the clauses are also wrong, and
-        // two FROM items answering to one name are reported before any clause is read at all.
-        validateFromClause(stmt.from());
-
         List<RowContext.TableBinding> baseBindings;
         // What the FROM clause exposes, in order: every relation's columns except where a USING
         // or NATURAL join merged two into one, which SELECT * lists first. Taken from a row when
         // there is one and worked out from the clause itself when there is not.
         List<RowContext.OutCol> baseOutput;
+        boolean everyRelation;
         if (!contexts.isEmpty()) {
             baseBindings = contexts.get(0).getBindings();
             baseOutput = contexts.get(0).outputColumnsOrDefault();
+            everyRelation = true;
         } else {
             baseBindings = executor.fromResolver.resolveTableBindings(stmt.from());
             baseOutput = executor.fromResolver.resolveClauseOutput(stmt.from(), baseBindings);
+            everyRelation = baseBindings.size() == FromResolver.relationCount(stmt.from());
         }
 
         // What the relations supply is now known, which is what the checks below consult to report
         // an unresolvable column or call before the clause it stands in is complained about. The
         // clause-level refusals themselves keep the order they had when they ran ahead of the
         // query: a call carrying a FILTER it may not have is judged first.
-        scope = new QueryLevelScope(this, baseBindings, baseOutput, stmt);
+        scope = new QueryLevelScope(this, baseBindings, baseOutput, stmt, everyRelation);
         rejectSrfInAggregates(stmt);
         validateDistinctOn(stmt);
 
@@ -2134,12 +2141,71 @@ class SelectExecutor {
             String name = ((CastExpr) expr).typeName().replaceAll("\\(.*\\)", "").trim();
             type = DataType.fromPgName(name);
         } else if (expr instanceof FunctionCallExpr) {
-            type = soleReturnType((FunctionCallExpr) expr);
+            FunctionCallExpr call = (FunctionCallExpr) expr;
+            type = resolvedReturnType(call, scope);
+            if (type == null) type = soleReturnType(call);
         } else if (scope != null) {
             type = scope.certainTypeOf(expr);
         }
         if (type == DataType.BOOLEAN) return type;
         return CERTAINLY_NOT_BOOLEAN.contains(type) ? type : null;
+    }
+
+    /**
+     * The type a built-in call produces once it has been resolved by its argument types.
+     *
+     * <p>A name every signature of which returns one type can be answered from the name alone,
+     * which is what {@link #soleReturnType} does; an overloaded one cannot. {@code upper} returns
+     * text of a text argument and the element type of a range, so nothing is settled until the
+     * argument is looked at — and that is why {@code JOIN ... ON upper('a')} used to reach
+     * evaluation and complain about the value {@code 'A'} rather than about the type text.
+     *
+     * <p>Only an exact match counts, of the whole argument list, at one signature and no other.
+     * An unadorned string literal is read as text because that is what PostgreSQL resolves an
+     * unknown literal to when a text signature is there to take it.
+     */
+    private DataType resolvedReturnType(FunctionCallExpr call, QueryLevelScope scope) {
+        if (call.filter() != null || call.distinct || call.star) return null;
+        if (call.args() == null || call.args().isEmpty()) return null;
+        String bare = FunctionEvaluator.stripSchemaPrefix(call.name().toLowerCase(Locale.ROOT));
+        if (hasUserFunction(bare) || isAggregateFunction(bare)) return null;
+        if (PlacementCheck.isWindowFunctionName(bare)) return null;
+        int[] oids = new int[call.args().size()];
+        for (int i = 0; i < oids.length; i++) {
+            Expression arg = call.args().get(i);
+            DataType argType = scope == null ? null : scope.certainTypeOf(arg);
+            if (argType == null && arg instanceof Literal
+                    && ((Literal) arg).literalType() == Literal.LiteralType.STRING) {
+                argType = DataType.TEXT;
+            }
+            if (argType == null) return null;
+            oids[i] = argType.getOid();
+        }
+        DataType found = null;
+        for (String[] signature : BuiltinFunctionSignatures.SIGNATURES) {
+            if (!signature[0].equalsIgnoreCase(bare)) continue;
+            // A row memgres wrote for itself names the types it happened to write down, so an
+            // argument list matching one settles nothing about which form was resolved to.
+            if (!BuiltinFunctionSignatures.isPostgresSignature(signature)) return null;
+            String[] params = signature[2].isEmpty() ? new String[0] : signature[2].split(" ");
+            if (params.length != oids.length) continue;
+            boolean same = true;
+            for (int i = 0; i < params.length; i++) {
+                if (!params[i].equals(String.valueOf(oids[i]))) {
+                    same = false;
+                    break;
+                }
+            }
+            if (!same) continue;
+            // A function that returns a set returns rows, not a value of a type.
+            if (signature[3] == null || signature[3].isEmpty()) return null;
+            if (signature[3].charAt(0) == 't') return null;
+            DataType returned = DataType.fromOid(Integer.parseInt(signature[1]));
+            if (returned == null) return null;
+            if (found != null && found != returned) return null;
+            found = returned;
+        }
+        return found;
     }
 
     /**
@@ -2434,25 +2500,76 @@ class SelectExecutor {
         throw e;
     }
 
-    /** The first qualified reference under {@code node} naming one of {@code names}, or null. */
+    /**
+     * The first qualified reference under {@code node} naming one of {@code names}, or null.
+     *
+     * <p>A query level that binds one of the names itself takes it over for everything written
+     * inside it — its own FROM entries and its own WITH items both — so the search drops that name
+     * on the way down rather than reporting a reference that reaches something else entirely.
+     * The name is dropped for that level and every level under it, and comes back for the levels
+     * beside it.
+     */
     static String firstReferenceTo(Object node, Set<String> names) {
-        Set<String> outer = new HashSet<>(names);
+        Set<String> visible = new HashSet<>();
+        for (String name : names) visible.add(name.toLowerCase());
+        return firstReferenceIn(node, visible);
+    }
+
+    /**
+     * Every name a FROM item brings into its own query level.
+     *
+     * <p>A join has no name of its own and binds the names of everything under it, so the walk goes
+     * down both sides. A table binds the name it is written under and, where an alias renamed it,
+     * its own name as well: the alias hides it for resolution, but this list decides only whether a
+     * reference reaches something else entirely, and a name that may have been meant for the entry
+     * here is not one that reaches out.
+     */
+    private static void collectBoundNames(SelectStmt.FromItem item, Set<String> bound) {
+        if (item == null) return;
+        if (item instanceof SelectStmt.JoinFrom) {
+            collectBoundNames(((SelectStmt.JoinFrom) item).left(), bound);
+            collectBoundNames(((SelectStmt.JoinFrom) item).right(), bound);
+            return;
+        }
+        String exposed = exposedNameOf(item);
+        if (exposed != null) bound.add(exposed.toLowerCase());
+        if (item instanceof SelectStmt.TableRef) {
+            String written = ((SelectStmt.TableRef) item).table();
+            if (written != null) bound.add(written.toLowerCase());
+        }
+    }
+
+    private static String firstReferenceIn(Object node, Set<String> visible) {
+        if (node == null || visible.isEmpty()) return null;
+        Set<String> here = visible;
         if (node instanceof SelectStmt) {
-            // A name the item re-uses for its own FROM entry shadows the outer one
-            Map<String, String> own = new LinkedHashMap<>();
-            List<SelectStmt.FromItem> from = ((SelectStmt) node).from();
-            if (from != null) {
-                for (SelectStmt.FromItem f : from) {
-                    String n = exposedNameOf(f);
-                    if (n != null) own.put(n.toLowerCase(), n);
+            Set<String> bound = new HashSet<>();
+            SelectStmt sel = (SelectStmt) node;
+            if (sel.from() != null) {
+                for (SelectStmt.FromItem f : sel.from()) collectBoundNames(f, bound);
+            }
+            if (sel.withClauses() != null) {
+                for (SelectStmt.CommonTableExpr cte : sel.withClauses()) {
+                    if (cte.name() != null) bound.add(cte.name().toLowerCase());
                 }
             }
-            outer.removeAll(own.keySet());
+            if (!bound.isEmpty()) {
+                here = new HashSet<>(visible);
+                here.removeAll(bound);
+                if (here.isEmpty()) return null;
+            }
         }
-        Object found = AstWalk.findFirst(node, n -> n instanceof ColumnRef
-                && ((ColumnRef) n).table() != null
-                && outer.contains(((ColumnRef) n).table().toLowerCase()));
-        return found == null ? null : ((ColumnRef) found).table();
+        if (node instanceof ColumnRef) {
+            ColumnRef ref = (ColumnRef) node;
+            return ref.table() != null && here.contains(ref.table().toLowerCase())
+                    ? ref.table() : null;
+        }
+        final Set<String> inScope = here;
+        final String[] answer = new String[1];
+        AstWalk.forEachChild(node, child -> {
+            if (answer[0] == null) answer[0] = firstReferenceIn(child, inScope);
+        });
+        return answer[0];
     }
 
     /**

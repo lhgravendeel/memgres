@@ -65,11 +65,15 @@ final class BooleanContext {
     }
 
     /**
-     * What the names in an expression are declared to be. Deliberately minimal: only relations
-     * whose declared column types are the ones the user wrote are consulted, because a derived
-     * column carries whatever type the engine defaulted it to while building a result — text far
-     * more often than it should be — and refusing a condition on the strength of that would reject
-     * valid SQL.
+     * What the names in an expression are known to be.
+     *
+     * <p>Two kinds of relation answer. One is a relation the catalogue holds, whose columns carry
+     * the types the user declared. The other is one built from a query — a derived table, a WITH
+     * item, a view, a VALUES list, a function in FROM — whose columns carry whatever type the
+     * builder read off a value, which is a guess and often wrong; for those the answer comes from
+     * {@link DefinedTypes}, which works the type out from the definition instead and says nothing
+     * where the definition does not settle it. A column no relation types is a column this says
+     * nothing about, because refusing a condition on the strength of a guess rejects valid SQL.
      */
     static final class Types {
 
@@ -183,6 +187,11 @@ final class BooleanContext {
             if (table == null) return null;
             if (qualifier != null && (exposed == null || !qualifier.equalsIgnoreCase(exposed))) {
                 return null;
+            }
+            // A relation built from a query carries the type its definition settles, where the
+            // definition settles one; the type the builder read off a value is not that type.
+            if (table.hasDefinedColumnTypes()) {
+                return table.definedColumnType(table.getColumnIndex(column));
             }
             // Only a relation the catalogue actually holds carries the types the user declared.
             if (bindings != null && executor.baseTableNamed(table.getName()) != table) return null;
@@ -440,20 +449,35 @@ final class BooleanContext {
         return exact != null ? exact : SINGLE_RETURN_TYPES.get(bare);
     }
 
-    /** The result type of the signatures whose parameters are exactly these argument types. */
+    /**
+     * The result type of the signatures whose parameters are exactly these argument types.
+     *
+     * <p>An unadorned string literal has no type of its own — PostgreSQL calls it {@code unknown}
+     * and settles it from the call it stands in — and where the name has a signature taking text
+     * there, that is the one PostgreSQL resolves to: {@code upper('a')} is upper(text) and returns
+     * text, not the {@code anyelement} its range overloads return. Reading the literal as text is
+     * that preference and nothing more; a name with no text signature of that shape stays untyped.
+     */
     private static String exactSignatureType(String bare, List<Expression> args, Types types) {
         if (args == null || args.isEmpty()) return null;
         int[] oids = new int[args.size()];
         for (int i = 0; i < args.size(); i++) {
-            DataType arg = scalarType(typeOf(args.get(i), types));
-            if (arg == null) return null;
-            oids[i] = arg.getOid();
+            Expression arg = args.get(i);
+            DataType declared = scalarType(typeOf(arg, types));
+            if (declared == null && isUntypedStringLiteral(arg)) declared = DataType.TEXT;
+            if (declared == null) return null;
+            oids[i] = declared.getOid();
         }
         String found = null;
         for (String[][] table : new String[][][]{
                 BuiltinAggregateSignatures.AGGREGATES, BuiltinFunctionSignatures.SIGNATURES}) {
             for (String[] sig : table) {
                 if (!sig[0].equalsIgnoreCase(bare)) continue;
+                // A row memgres wrote for itself names the types it happened to write down, so an
+                // argument list matching one settles nothing about which form was resolved to.
+                if (sig.length > 4 && !BuiltinFunctionSignatures.isPostgresSignature(sig)) {
+                    return null;
+                }
                 String[] params = sig[2].isEmpty() ? new String[0] : sig[2].split(" ");
                 if (params.length != oids.length) continue;
                 boolean same = true;
@@ -472,6 +496,12 @@ final class BooleanContext {
             }
         }
         return found;
+    }
+
+    /** A string literal written without a type on it, which PostgreSQL leaves as unknown. */
+    private static boolean isUntypedStringLiteral(Expression expr) {
+        return expr instanceof Literal
+                && ((Literal) expr).literalType() == Literal.LiteralType.STRING;
     }
 
     private static int parseOid(String oid) {

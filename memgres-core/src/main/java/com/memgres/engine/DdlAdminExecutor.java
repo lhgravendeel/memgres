@@ -438,8 +438,8 @@ class DdlAdminExecutor {
         // StoredExprCheck names the same context and reaches the boolean check itself, after the
         // aggregate one PostgreSQL raises first.
         StoredExprCheck check = StoredExprCheck.forPolicy(table);
-        check.check(stmt.usingExpr());
-        check.check(stmt.withCheckExpr());
+        check.check(stmt.usingExpr(), executor.selectExecutor);
+        check.check(stmt.withCheckExpr(), executor.selectExecutor);
         table.addRlsPolicy(new RlsPolicy(stmt.name(), stmt.command(),
                 stmt.usingExpr(), stmt.withCheckExpr(), stmt.roles(), stmt.policyType()));
         return QueryResult.message(QueryResult.Type.SET, "CREATE POLICY");
@@ -793,19 +793,24 @@ class DdlAdminExecutor {
      */
     private void checkRuleQualification(CreateRuleStmt s, Table on) {
         if (s.whereClause() == null) return;
+        // A qualification is kept as the text it was written as, so its type names are read here
+        // rather than when the statement itself was parsed.
+        java.util.List<String> typeSchemas = new java.util.ArrayList<String>();
         Expression qualification;
         try {
-            qualification = com.memgres.engine.parser.Parser.parseExpression(s.whereClause());
+            qualification = com.memgres.engine.parser.Parser.parseExpression(
+                    s.whereClause(), typeSchemas);
         } catch (RuntimeException ignored) {
             return; // a qualification this cannot read is reported when the rule fires
         }
+        SchemaQualifier.rejectMissingTypeSchemas(executor.database, executor.session, typeSchemas);
         java.util.Set<String> aliases = new java.util.LinkedHashSet<>();
         aliases.add("old");
         aliases.add("new");
         if (on != null && on.getName() != null) aliases.add(on.getName().toLowerCase());
         // A qualification is read one row at a time, so nothing needing a group belongs in it,
-        // and that is what PostgreSQL complains about first.
-        executor.selectExecutor.placementCheck.reject(qualification, "WHERE");
+        // and no call in it may carry a clause only an aggregate has a use for.
+        executor.selectExecutor.placementCheck.rejectStoredDefinition(qualification, "WHERE", null);
         BooleanContext.check(qualification, "WHERE", BooleanContext.Types.of(on, aliases));
     }
 

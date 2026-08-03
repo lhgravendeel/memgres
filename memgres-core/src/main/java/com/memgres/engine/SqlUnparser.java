@@ -366,6 +366,11 @@ public class SqlUnparser {
                     .collect(Collectors.joining(", "));
             return "(" + exprToSql(in.expr()) + (in.negated() ? " <> ALL (ARRAY[" : " = ANY (ARRAY[")
                     + list + "]))";
+        } else if (expr instanceof ParamRef) {
+            // A parameter is written $1 and reads back as $1. Without a case here it fell through
+            // to Object.toString and a Java field dump was rendered as SQL — which then re-parsed
+            // as an identifier, so a prepared statement's own body named a column nothing holds.
+            return "$" + ((ParamRef) expr).index();
         } else if (expr instanceof ArrayExpr) {
             ArrayExpr arr = (ArrayExpr) expr;
             return arr.isRow() ? "ROW(" +

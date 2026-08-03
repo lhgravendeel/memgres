@@ -864,18 +864,36 @@ public class Table {
 
     // FROM-function (SRF) result provenance
     /**
-     * Whether this relation's column types were worked out rather than declared.
+     * Whether this relation was built from a query rather than declared.
      *
-     * <p>A derived table, a CTE, a view's projection and a VALUES list are all built here as a
-     * Table whose columns carry whatever type the builder could infer, which is not always the
-     * type the value really has. A check that refuses a statement on the strength of a column's
-     * type may only trust a type that was declared, so it has to be able to tell the two apart.
+     * <p>A derived table, a CTE, a view's projection, a VALUES list and a FROM-function are all
+     * built here as a Table whose columns carry whatever type the builder could read off the
+     * values it produced, which is not always the type the expression behind them has. A check
+     * that refuses a statement on the strength of a column's type may not trust one of those, so
+     * it has to be able to tell the two apart — and where the definition <em>does</em> settle a
+     * type, {@link #definedColumnType} is the one to read instead of the column's own.
      */
-    public boolean hasInferredColumnTypes() { return inferredColumnTypes; }
+    public boolean hasDefinedColumnTypes() { return definedColumnTypes != null; }
 
-    public void setInferredColumnTypes(boolean inferred) { this.inferredColumnTypes = inferred; }
+    /**
+     * The type this column certainly has, worked out from the definition the relation was built
+     * from, as PostgreSQL spells the type; null where the definition does not settle it.
+     */
+    public String definedColumnType(int columnIndex) {
+        if (definedColumnTypes == null || columnIndex < 0
+                || columnIndex >= definedColumnTypes.length) {
+            return null;
+        }
+        return definedColumnTypes[columnIndex];
+    }
 
-    private boolean inferredColumnTypes;
+    /**
+     * Records this as a relation built from a query, along with the types its definition settles.
+     * One entry per column, null where the definition settles nothing.
+     */
+    public void setDefinedColumnTypes(String[] types) { this.definedColumnTypes = types; }
+
+    private String[] definedColumnTypes;
 
     public boolean isFunctionResult() { return functionResult; }
     public void setFunctionResult(boolean functionResult) { this.functionResult = functionResult; }

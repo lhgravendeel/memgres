@@ -38,17 +38,38 @@ public class Parser extends ExpressionParser {
 
     /** Parse a standalone expression (e.g. for generated column or CHECK constraint validation). */
     public static Expression parseExpression(String expr) {
+        return parseExpression(expr, null);
+    }
+
+    /**
+     * @param typeSchemas filled, when not null, with the schema every qualified type name in the
+     *        expression was written under. A definition kept as text and read back later goes
+     *        through here rather than through {@link #parse}, so this is where its qualifiers are.
+     */
+    public static Expression parseExpression(String expr, List<String> typeSchemas) {
         Lexer lexer = new Lexer(expr);
         List<Token> tokens = lexer.tokenize();
         Parser parser = new Parser(tokens);
-        return parser.parseExpression();
+        Expression parsed = parser.parseExpression();
+        if (typeSchemas != null) typeSchemas.addAll(parser.typeSchemaQualifiers());
+        return parsed;
     }
 
     public static Statement parse(String sql) {
+        return parse(sql, null);
+    }
+
+    /**
+     * @param typeSchemas filled, when not null, with the schema every qualified type name in the
+     *        statement was written under, leftmost first. A qualifier is the one part of a type
+     *        name the parser does not keep, and it still has to name a schema that exists.
+     */
+    public static Statement parse(String sql, List<String> typeSchemas) {
         Lexer lexer = new Lexer(sql);
         List<Token> tokens = lexer.tokenize();
         Parser parser = new Parser(tokens);
         Statement stmt = parser.parseStatement();
+        if (typeSchemas != null) typeSchemas.addAll(parser.typeSchemaQualifiers());
         // Check for unexpected trailing tokens (after skipping semicolons)
         parser.skipSemicolons();
         if (!parser.isAtEnd()) {

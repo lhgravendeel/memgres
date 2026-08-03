@@ -1,5 +1,6 @@
 package com.memgres.engine.parser;
 
+import com.memgres.engine.BuiltinFunctionSignatures;
 import com.memgres.engine.MemgresException;
 import com.memgres.engine.util.Cols;
 
@@ -19,10 +20,28 @@ public class ExpressionParser {
     protected int pos;
     private final ExprSpecialFormParser specialFormParser;
 
+    /**
+     * The schema every qualified type name in this statement was written under, in the order the
+     * statement writes them.
+     *
+     * <p>A type name is the one place a schema qualifier is read and thrown away: {@code int4} is
+     * what the engine goes on to work with whether the statement wrote {@code int4},
+     * {@code pg_catalog.int4} or {@code nosuch.int4}. PostgreSQL resolves the qualifier first and
+     * refuses the statement when it names no schema, so the qualifiers are kept here for whoever
+     * runs the statement to resolve, rather than being widened into every type name the engine
+     * carries around.
+     */
+    private final List<String> typeSchemaQualifiers = new ArrayList<>();
+
     protected ExpressionParser(List<Token> tokens) {
         this.tokens = tokens;
         this.pos = 0;
         this.specialFormParser = new ExprSpecialFormParser(this);
+    }
+
+    /** Every schema a type name in this statement was qualified with, leftmost first. */
+    public List<String> typeSchemaQualifiers() {
+        return typeSchemaQualifiers;
     }
 
     // ---- Token navigation ----
@@ -262,10 +281,16 @@ public class ExpressionParser {
         StringBuilder sb = new StringBuilder();
         boolean qualified = false;  // an interval field qualifier has already taken its precision
         String name = readIdentifier();
-        // Handle schema-qualified types: schema.typename (strip schema prefix)
+        // A schema-qualified type is written schema.typename. The engine works with the bare name,
+        // so the qualifier is recorded rather than carried: it still has to name a schema that
+        // exists, which is something only whoever runs the statement can say.
         if (check(TokenType.DOT)) {
             advance();
+            String qualifier = name;
             name = readIdentifier();
+            // Recorded whole, because both halves are read: the schema has to be one that exists,
+            // and the type has to be one that schema holds.
+            typeSchemaQualifiers.add(qualifier + "." + name);
         }
         sb.append(name);
 
@@ -1730,7 +1755,15 @@ public class ExpressionParser {
         if (checkKeyword("OVER")) {
             // An aggregate's own ORDER BY decides the order it accumulates its input in, which a
             // window frame already fixes; PostgreSQL has never implemented the combination.
-            if (innerOrderBy != null) {
+            //
+            // It resolves the call first, though, and says so about the combination only once the
+            // call is a function at all: row_number takes no arguments, so
+            // row_number(v ORDER BY v) OVER () is "function row_number(integer) does not exist"
+            // and never reaches this. The call is left to be resolved where the register and the
+            // signature table are -- but only where the written argument list settles that it
+            // cannot resolve, so every combination that does resolve is still refused here.
+            if (innerOrderBy != null
+                    && !BuiltinFunctionSignatures.windowCallCannotResolve(name, args.size())) {
                 throw new MemgresException(
                         "aggregate ORDER BY is not implemented for window functions", "0A000");
             }

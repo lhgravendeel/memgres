@@ -264,18 +264,32 @@ class ErrorPrecedenceTest {
      * reference is still resolved a row at a time everywhere except a query level's own clauses,
      * so a query that reads no rows never reaches it.
      *
-     * <p>Two groups that stood here are now the other way round. The relation a data-modifying
+     * <p>Three groups that stood here are now the other way round. The relation a data-modifying
      * statement writes is resolved before its clauses are judged, so those report 42P01 and are
-     * asserted in {@code DmlErrorPrecedenceTest}. And a FILTER predicate is coerced to boolean
-     * wherever it hangs, an aggregate's included, so those are asserted above.
+     * asserted in {@code DmlErrorPrecedenceTest}. A FILTER predicate is coerced to boolean
+     * wherever it hangs, an aggregate's included, so those are asserted above. And a query level's
+     * own clauses are now read in PostgreSQL's order whether or not the statement was already
+     * doomed, so a column reference in one of them is resolved without a row — asserted in
+     * {@link #aClauseIsJudgedWithoutARowToJudgeItOn}.
      */
     @Test
     void theCasesStillOutOfOrderAreRecordedRatherThanAsserted() {
-        // PostgreSQL: 42703 — a column reference nested in an expression is resolved when the
-        // clause is analysed, not when a row reaches it.
-        assertEquals("OK", stateOf("SELECT abs(nosuchcol) FROM ept_t WHERE false"));
         assertEquals("42809", stateOf(
                 "SELECT * FROM ept_t t WHERE EXISTS (SELECT abs(t.nosuchcol) FILTER (WHERE true))"),
                 "a sub-query's own scope is not this query level's, so it is not judged here");
+    }
+
+    /**
+     * A clause is transformed against the relations the FROM clause supplies, not against a row,
+     * so a name none of them holds is refused whether or not the query would have read anything.
+     */
+    @Test
+    void aClauseIsJudgedWithoutARowToJudgeItOn() {
+        assertEquals("column \"nosuchcol\" does not exist",
+                messageOf("SELECT abs(nosuchcol) FROM ept_t WHERE false"));
+        assertEquals("column \"nosuchcol\" does not exist",
+                messageOf("SELECT v FROM ept_t WHERE nosuchcol = 1 AND false"));
+        assertEquals("column \"nosuchcol\" does not exist",
+                messageOf("SELECT v FROM ept_t WHERE id > 1000 ORDER BY abs(nosuchcol)"));
     }
 }

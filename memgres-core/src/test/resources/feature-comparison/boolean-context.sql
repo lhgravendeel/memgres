@@ -860,3 +860,340 @@ SELECT count(*) FROM bctx_t a JOIN bctx_t b ON a.n;
 DROP VIEW IF EXISTS bctx_v CASCADE;
 DROP TABLE IF EXISTS bctx_t CASCADE;
 DROP TABLE IF EXISTS bctx_u CASCADE;
+
+-- ============================================================================
+-- The type a derived relation's definition settles is the column's type
+-- ============================================================================
+-- A derived table, a WITH item, a view, a VALUES list and a function in FROM
+-- are all built by running something and describing what came back, so their
+-- columns carry the type the builder read off a value. That guess was wrong
+-- often enough that nothing could be refused on the strength of it. The type
+-- is now worked out from the definition instead -- the select-list expression,
+-- the non-recursive term of a recursive WITH item, the view's query, what the
+-- function returns -- and a condition over a column whose type that settles is
+-- refused exactly as one over a declared column is. Where the definition
+-- settles nothing the column stays as untyped as it was.
+DROP VIEW IF EXISTS bcdt_v CASCADE;
+DROP TABLE IF EXISTS bcdt_u CASCADE;
+DROP TABLE IF EXISTS bcdt_t CASCADE;
+CREATE TABLE bcdt_t (id int PRIMARY KEY, i int, n numeric, s text, b boolean, d date);
+INSERT INTO bcdt_t VALUES (1,1,1.5,'aa',true,'2020-01-01'),(2,0,0.0,'ab',false,'2020-01-02');
+CREATE TABLE bcdt_u (id int PRIMARY KEY, flag boolean);
+INSERT INTO bcdt_u VALUES (1,true),(2,false);
+CREATE VIEW bcdt_v AS SELECT id, flag AS n FROM bcdt_u;
+
+-- a column a derived table, a WITH item, a view or a VALUES list supplies
+-- begin-expected-error
+-- sqlstate: 42804
+-- message-like: argument of WHERE must be type boolean, not type integer
+-- end-expected-error
+SELECT id FROM (SELECT id, i FROM bcdt_t) q WHERE i;
+
+-- begin-expected-error
+-- sqlstate: 42804
+-- message-like: argument of WHERE must be type boolean, not type integer
+-- end-expected-error
+WITH c AS (SELECT id, i FROM bcdt_t) SELECT id FROM c WHERE i;
+
+-- begin-expected-error
+-- sqlstate: 42804
+-- message-like: argument of WHERE must be type boolean, not type integer
+-- end-expected-error
+SELECT count(*) FROM (VALUES (1)) v(k) WHERE k;
+
+-- begin-expected-error
+-- sqlstate: 42804
+-- message-like: argument of WHERE must be type boolean, not type integer
+-- end-expected-error
+SELECT count(*) FROM (SELECT * FROM bcdt_v) q WHERE id;
+
+-- a star stands for the columns of the relations behind it, types and all
+-- begin-expected-error
+-- sqlstate: 42804
+-- message-like: argument of WHERE must be type boolean, not type integer
+-- end-expected-error
+SELECT id FROM (SELECT * FROM bcdt_t) d WHERE i;
+
+-- begin-expected-error
+-- sqlstate: 42804
+-- message-like: argument of WHERE must be type boolean, not type numeric
+-- end-expected-error
+SELECT id FROM (SELECT * FROM bcdt_t) d WHERE n;
+
+-- begin-expected-error
+-- sqlstate: 42804
+-- message-like: argument of WHERE must be type boolean, not type text
+-- end-expected-error
+SELECT id FROM (SELECT * FROM bcdt_t) d WHERE s;
+
+-- what a function in FROM returns
+-- begin-expected-error
+-- sqlstate: 42804
+-- message-like: argument of WHERE must be type boolean, not type integer
+-- end-expected-error
+SELECT g FROM generate_series(1, 2) g WHERE g;
+
+-- begin-expected-error
+-- sqlstate: 42804
+-- message-like: argument of WHERE must be type boolean, not type integer
+-- end-expected-error
+SELECT count(*) FROM (SELECT * FROM generate_series(1, 2) AS g(x)) q WHERE x;
+
+-- begin-expected-error
+-- sqlstate: 42804
+-- message-like: argument of WHERE must be type boolean, not type integer
+-- end-expected-error
+SELECT count(*) FROM unnest(ARRAY[1,2]) u WHERE u;
+
+-- begin-expected
+-- columns: n
+-- row: 1
+-- end-expected
+SELECT count(*)::text AS n FROM unnest(ARRAY[true,false]) u WHERE u;
+
+-- a recursive WITH item's columns are its non-recursive term's
+-- begin-expected-error
+-- sqlstate: 42804
+-- message-like: argument of WHERE must be type boolean, not type integer
+-- end-expected-error
+WITH RECURSIVE r(k) AS (SELECT 1 UNION ALL SELECT k + 1 FROM r WHERE k < 3)
+SELECT count(*) FROM r WHERE k;
+
+-- begin-expected
+-- columns: n
+-- row: 1
+-- end-expected
+WITH RECURSIVE r(k) AS (SELECT true UNION ALL SELECT false FROM r WHERE k)
+SELECT count(*)::text AS n FROM r WHERE k;
+
+-- a set operation's arms have to agree before the type is the column's
+-- begin-expected-error
+-- sqlstate: 42804
+-- message-like: argument of WHERE must be type boolean, not type integer
+-- end-expected-error
+SELECT count(*) FROM (SELECT id FROM bcdt_t UNION SELECT id FROM bcdt_t) q WHERE id;
+
+-- begin-expected
+-- columns: n
+-- row: 2
+-- end-expected
+SELECT count(*)::text AS n
+  FROM (SELECT b FROM bcdt_t UNION ALL SELECT NOT b FROM bcdt_t) q WHERE b;
+
+-- renaming a column does not retype it, at any depth
+-- begin-expected-error
+-- sqlstate: 42804
+-- message-like: argument of WHERE must be type boolean, not type integer
+-- end-expected-error
+SELECT count(*) FROM (SELECT i FROM bcdt_t) q(z) WHERE z;
+
+-- begin-expected
+-- columns: n
+-- row: 1
+-- end-expected
+SELECT count(*)::text AS n FROM (SELECT b FROM bcdt_t) q(z) WHERE z;
+
+-- begin-expected-error
+-- sqlstate: 42804
+-- message-like: argument of WHERE must be type boolean, not type integer
+-- end-expected-error
+SELECT count(*) FROM bcdt_t x(c1,c2,c3,c4,c5,c6) WHERE c2;
+
+-- begin-expected
+-- columns: n
+-- row: 1
+-- end-expected
+SELECT count(*)::text AS n FROM bcdt_t x(c1,c2,c3,c4,c5,c6) WHERE c5;
+
+-- begin-expected-error
+-- sqlstate: 42804
+-- message-like: argument of WHERE must be type boolean, not type integer
+-- end-expected-error
+SELECT count(*) FROM (SELECT * FROM (SELECT i AS k FROM bcdt_t) y) z WHERE k;
+
+-- begin-expected
+-- columns: n
+-- row: 1
+-- end-expected
+SELECT count(*)::text AS n FROM (SELECT * FROM (SELECT b AS k FROM bcdt_t) y) z WHERE k;
+
+-- a condition over a join's derived side
+-- begin-expected-error
+-- sqlstate: 42804
+-- message-like: argument of JOIN/ON must be type boolean, not type integer
+-- end-expected-error
+SELECT count(*) FROM bcdt_t a JOIN (SELECT id, i FROM bcdt_t) x ON x.i;
+
+-- begin-expected-error
+-- sqlstate: 42804
+-- message-like: argument of JOIN/ON must be type boolean, not type integer
+-- end-expected-error
+SELECT count(*) FROM bcdt_t a JOIN bcdt_v x ON x.id;
+
+-- begin-expected-error
+-- sqlstate: 42804
+-- message-like: argument of JOIN/ON must be type boolean, not type integer
+-- end-expected-error
+SELECT count(*) FROM (SELECT i FROM bcdt_t) q JOIN (SELECT flag FROM bcdt_u) r ON q.i;
+
+-- ...and the ordinary ones over a boolean the definition computed, which are
+-- what refusing on a guessed type used to reject. Every join form, and LATERAL.
+-- begin-expected
+-- columns: n
+-- row: 4
+-- end-expected
+SELECT count(*)::text AS n FROM bcdt_t a
+  JOIN (SELECT id, starts_with(s,'a') AS f FROM bcdt_t) x ON x.f;
+
+-- begin-expected
+-- columns: n
+-- row: 4
+-- end-expected
+SELECT count(*)::text AS n FROM bcdt_t a
+  LEFT JOIN (SELECT id, starts_with(s,'a') AS f FROM bcdt_t) x ON x.f;
+
+-- begin-expected
+-- columns: n
+-- row: 4
+-- end-expected
+SELECT count(*)::text AS n FROM bcdt_t a
+  RIGHT JOIN (SELECT id, isfinite(d) AS f FROM bcdt_t) x ON x.f;
+
+-- begin-expected
+-- columns: n
+-- row: 2
+-- end-expected
+SELECT count(*)::text AS n FROM bcdt_t a
+  JOIN LATERAL (SELECT starts_with(a.s,'a') AS f) x ON x.f;
+
+-- begin-expected
+-- columns: n
+-- row: 2
+-- end-expected
+SELECT count(*)::text AS n FROM bcdt_t a,
+  LATERAL (SELECT starts_with(a.s,'a') AS f) x WHERE x.f;
+
+-- begin-expected
+-- columns: n
+-- row: 4
+-- end-expected
+WITH q AS (SELECT id, starts_with(s,'a') AS f FROM bcdt_t)
+SELECT count(*)::text AS n FROM bcdt_t a JOIN q ON q.f;
+
+-- begin-expected
+-- columns: n
+-- row: 2
+-- end-expected
+SELECT count(*)::text AS n FROM bcdt_t a JOIN bcdt_v x ON x.n;
+
+-- begin-expected
+-- columns: n
+-- row: 2
+-- end-expected
+SELECT count(*)::text AS n FROM bcdt_t a JOIN (VALUES (1,true)) v(k,f) ON v.f;
+
+-- a name the derived relation supplies is that relation's, whatever an
+-- enclosing relation calls its own column of the same name
+-- begin-expected
+-- columns: n
+-- row: 2
+-- end-expected
+SELECT count(*)::text AS n FROM bcdt_t a
+ WHERE EXISTS (SELECT 1 FROM (SELECT b AS i FROM bcdt_t) q WHERE i);
+
+-- begin-expected-error
+-- sqlstate: 42804
+-- message-like: argument of WHERE must be type boolean, not type integer
+-- end-expected-error
+SELECT count(*) FROM bcdt_u a
+ WHERE EXISTS (SELECT 1 FROM (SELECT id AS flag FROM bcdt_t) q WHERE flag);
+
+-- begin-expected
+-- columns: id
+-- row: 1
+-- row: 2
+-- end-expected
+SELECT id::text AS id FROM bcdt_t
+ WHERE EXISTS (SELECT 1 FROM (SELECT flag AS n FROM bcdt_u) q WHERE n) ORDER BY id;
+
+-- begin-expected
+-- columns: id
+-- row: 1
+-- row: 2
+-- end-expected
+SELECT id::text AS id FROM bcdt_t WHERE EXISTS (SELECT 1 FROM bcdt_v WHERE n) ORDER BY id;
+
+-- begin-expected
+-- columns: id
+-- row: 1
+-- row: 2
+-- end-expected
+SELECT id::text AS id FROM bcdt_t
+ WHERE EXISTS (SELECT 1 FROM (VALUES (true)) v(n) WHERE n) ORDER BY id;
+
+-- a record-returning call still answers to its own column names
+-- begin-expected
+-- columns: key
+-- row: a
+-- end-expected
+SELECT key FROM jsonb_each('{"a":1}');
+
+-- begin-expected
+-- columns: n
+-- row: 1
+-- end-expected
+SELECT count(*)::text AS n FROM (SELECT * FROM jsonb_each('{"a":1}')) q WHERE key = 'a';
+
+-- and everything else a derived column is written into
+-- begin-expected
+-- columns: n
+-- row: 2
+-- end-expected
+SELECT count(*)::text AS n FROM (SELECT g FROM generate_series(1,2) g) q WHERE g > 0;
+
+-- begin-expected
+-- columns: n
+-- row: 1
+-- end-expected
+SELECT count(*)::text AS n FROM (SELECT * FROM bcdt_t a JOIN bcdt_u u USING (id)) q WHERE flag;
+
+-- begin-expected
+-- columns: n
+-- row: 2
+-- end-expected
+SELECT count(*)::text AS n FROM (SELECT * FROM bcdt_t a CROSS JOIN bcdt_u u) q WHERE flag;
+
+-- begin-expected
+-- columns: n
+-- row: 2
+-- end-expected
+SELECT count(*)::text AS n FROM (SELECT (SELECT true) AS k FROM bcdt_t) q WHERE k;
+
+-- begin-expected
+-- columns: n
+-- row: 1
+-- end-expected
+SELECT count(*)::text AS n FROM (SELECT count(*) AS k FROM bcdt_t) q WHERE k > 0;
+
+-- begin-expected
+-- columns: n
+-- row: 1
+-- end-expected
+SELECT count(*)::text AS n FROM (SELECT n AS k FROM bcdt_t) q WHERE k > 0;
+
+-- begin-expected
+-- columns: n
+-- row: 2
+-- end-expected
+SELECT count(*)::text AS n FROM (SELECT d AS k FROM bcdt_t) q WHERE k > DATE '2019-01-01';
+
+-- begin-expected
+-- columns: n
+-- row: 2
+-- end-expected
+SELECT count(*)::text AS n
+  FROM (SELECT id, row_number() OVER () AS k FROM bcdt_t) q WHERE k > 0;
+
+DROP VIEW IF EXISTS bcdt_v CASCADE;
+DROP TABLE IF EXISTS bcdt_u CASCADE;
+DROP TABLE IF EXISTS bcdt_t CASCADE;

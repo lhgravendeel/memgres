@@ -27,7 +27,9 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
  * still of type {@code unknown}, so boolean's own input function reads it: {@code WHERE 't'} is
  * accepted and {@code WHERE 'zzz'} is 22P02, while {@code WHERE 'zzz'::text} — the same text, now
  * carrying a type — is 42804. And an expression whose type cannot be settled without evaluating it
- * is left alone, so a column of a derived table or a CTE is accepted where PostgreSQL refuses it.
+ * is left alone. A derived table's, a CTE's, a view's, a VALUES list's and a FROM-function's
+ * columns are typed by the definitions behind them, so a condition over one of those is refused
+ * exactly as a condition over a declared column is.
  *
  * <p>PL/pgSQL is deliberately different: it has the value in hand, so it does not raise the type
  * system's error at all but puts the value through boolean's input function. {@code IF i} where i
@@ -415,15 +417,46 @@ class BooleanContextTest {
     }
 
     /**
-     * A type this cannot settle is a type it says nothing about. A derived table's and a CTE's
-     * columns carry whatever the engine inferred while building the result, so a condition over
-     * one is accepted here where PostgreSQL refuses it — a gap, and deliberately on that side.
+     * A derived relation's columns are typed by the definition behind them, so a condition over
+     * one is refused exactly as a condition over a declared column is.
+     *
+     * <p>These three were accepted while the only type available was the one the engine read off
+     * the values it had built — a guess, and wrong often enough that nothing could be refused on
+     * its strength. Every message here is PostgreSQL 18's own.
+     */
+    @Test
+    void aTypeADerivedRelationSettlesIsRefusedLikeADeclaredOne() {
+        assertEquals("argument of WHERE must be type boolean, not type integer",
+                messageOf("SELECT id FROM (SELECT * FROM bct_t) d WHERE i"));
+        assertEquals("argument of WHERE must be type boolean, not type integer",
+                messageOf("WITH w AS (SELECT * FROM bct_t) SELECT id FROM w WHERE i"));
+        assertEquals("argument of WHERE must be type boolean, not type integer",
+                messageOf("SELECT g FROM generate_series(1, 2) g WHERE g"));
+        assertEquals("argument of WHERE must be type boolean, not type integer[]",
+                messageOf("SELECT count(*) FROM (SELECT * FROM bct_t) d WHERE arr"));
+        assertEquals("argument of WHERE must be type boolean, not type jsonb",
+                messageOf("SELECT count(*) FROM (SELECT * FROM bct_t) d WHERE j"));
+    }
+
+    /**
+     * A type this cannot settle is a type it says nothing about, and there are still definitions
+     * it cannot read through: a call whose result type is decided by resolving it, a bare literal
+     * or NULL that PostgreSQL resolves to text at the sub-query boundary, a record-returning call
+     * with no column definition list, and a star over a USING join, whose merged column changes
+     * both how many columns the star stands for and which relation each came from. PostgreSQL
+     * refuses all five with 42804; these are accepted, which is the safe side of the gap.
      */
     @Test
     void aTypeThatCannotBeSettledIsLeftAlone() {
-        assertEquals("OK", stateOf("SELECT id FROM (SELECT * FROM bct_t) d WHERE i"));
-        assertEquals("OK", stateOf("WITH w AS (SELECT * FROM bct_t) SELECT id FROM w WHERE i"));
-        assertEquals("OK", stateOf("SELECT g FROM generate_series(1, 2) g WHERE g"));
+        assertEquals("OK",
+                stateOf("SELECT count(*) FROM (SELECT greatest(i, 0) AS k FROM bct_t) q WHERE k"));
+        assertEquals("OK", stateOf("SELECT count(*) FROM (SELECT 'x' AS k) q WHERE k"));
+        assertEquals("OK",
+                stateOf("SELECT count(*) FROM (SELECT NULL AS k FROM bct_t) q WHERE k"));
+        assertEquals("OK",
+                stateOf("SELECT count(*) FROM jsonb_each('{\"a\":1}') e WHERE e.key"));
+        assertEquals("OK", stateOf(
+                "SELECT count(*) FROM (SELECT * FROM bct_t a JOIN bct_u u USING (id)) q WHERE i"));
     }
 
     @Test

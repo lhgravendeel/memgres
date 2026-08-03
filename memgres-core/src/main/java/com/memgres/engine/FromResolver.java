@@ -88,6 +88,30 @@ class FromResolver {
         return bindings;
     }
 
+    /**
+     * How many relations a FROM clause names, counting a join as the items on either side of it.
+     *
+     * <p>{@link #resolveTableBindings} adds exactly one binding per named relation and silently
+     * adds none for one it cannot describe — a sequence, a WITH item still being defined, a
+     * lateral it cannot read — so a count that comes up short is a description that is missing a
+     * relation. Anything reading the bindings as <em>everything</em> this query level supplies has
+     * to know that, or a column the missing relation holds looks like a column nothing holds.
+     */
+    static int relationCount(List<SelectStmt.FromItem> fromItems) {
+        if (fromItems == null) return 0;
+        int n = 0;
+        for (SelectStmt.FromItem item : fromItems) n += relationCount(item);
+        return n;
+    }
+
+    private static int relationCount(SelectStmt.FromItem item) {
+        if (item instanceof SelectStmt.JoinFrom) {
+            SelectStmt.JoinFrom join = (SelectStmt.JoinFrom) item;
+            return relationCount(join.left()) + relationCount(join.right());
+        }
+        return 1;
+    }
+
     /** A LATERAL sub-select, and a function in FROM, which is lateral whether or not it says so. */
     private static boolean readsItemsToItsLeft(SelectStmt.FromItem item) {
         if (item instanceof SelectStmt.FunctionFrom) return true;
@@ -212,6 +236,32 @@ class FromResolver {
                 left.output, left.bindings.size(), right.output, using).output);
     }
 
+    private static void addBinding(List<RowContext.TableBinding> bindings, Table table,
+                                   String alias) {
+        bindings.add(new RowContext.TableBinding(table, alias,
+                new Object[table.getColumns().size()]));
+    }
+
+    /**
+     * The relation as this FROM item exposes it.
+     *
+     * <p>An alias list renames the columns for this query level and nothing else about them: the
+     * types behind the new names are the relation's own. A description that kept the stored names
+     * would answer for names the query cannot write and refuse the ones it can, so every relation
+     * a name can reach — a stored table, a WITH item, a view, a catalog — is renamed here.
+     */
+    private static Table asWritten(Table table, String alias, List<String> columnAliases) {
+        if (columnAliases == null || columnAliases.isEmpty()) return table;
+        List<Column> renamed = FromFunctionResolver.applyColumnAliases(
+                new ArrayList<>(table.getColumns()), columnAliases);
+        Table exposed = new Table(alias, renamed);
+        String[] defined = new String[renamed.size()];
+        for (int i = 0; i < renamed.size(); i++) defined[i] = DefinedTypes.typeIn(table, i);
+        exposed.setDefinedColumnTypes(defined);
+        exposed.setFunctionResult(table.isFunctionResult());
+        return exposed;
+    }
+
     private void resolveTableBindingsFromItem(SelectStmt.FromItem item, List<RowContext.TableBinding> bindings) {
         if (item instanceof SelectStmt.TableRef) {
             SelectStmt.TableRef tableRef = (SelectStmt.TableRef) item;
@@ -222,8 +272,8 @@ class FromResolver {
             if (cte != null) {
                 QueryResult cteResult = executor.selectExecutor.executeCte(cte);
                 Table virtualTable = new Table(alias, cteResult.getColumns());
-                virtualTable.setInferredColumnTypes(true);
-                bindings.add(new RowContext.TableBinding(virtualTable, alias, new Object[virtualTable.getColumns().size()]));
+                defineFromCte(virtualTable, cte);
+                addBinding(bindings, asWritten(virtualTable, alias, tableRef.columnAliases()), alias);
                 return;
             }
             // Check views
@@ -232,16 +282,17 @@ class FromResolver {
                 // Materialized views know their columns without re-running the query
                 // (and an unpopulated matview must still be describable).
                 if (view.materialized() && view.cachedColumns() != null && !view.cachedColumns().isEmpty()) {
-                    List<Column> mvCols = view.cachedColumns();
-                    bindings.add(new RowContext.TableBinding(
-                            new Table(alias, mvCols), alias, new Object[mvCols.size()]));
+                    Table mv = new Table(alias, view.cachedColumns());
+                    addBinding(bindings, asWritten(mv, alias, tableRef.columnAliases()), alias);
                     return;
                 }
                 try {
                     QueryResult vr = executor.executeViewQuery(tableRef.table(), view.query());
                     if (!vr.getColumns().isEmpty()) {
-                        bindings.add(new RowContext.TableBinding(
-                                new Table(alias, vr.getColumns()), alias, new Object[vr.getColumns().size()]));
+                        Table virtualTable = new Table(alias, vr.getColumns());
+                        defineFromView(virtualTable, view);
+                        addBinding(bindings,
+                                asWritten(virtualTable, alias, tableRef.columnAliases()), alias);
                     }
                 } catch (Exception e) { /* skip */ }
                 return;
@@ -252,14 +303,15 @@ class FromResolver {
             if (!userTableExists && SystemCatalog.isSystemCatalog(tableRef.schema(), tableRef.table())) {
                 Table catalogTable = executor.systemCatalog.resolve(tableRef.schema(), tableRef.table(), executor.session);
                 if (catalogTable != null) {
-                    bindings.add(new RowContext.TableBinding(catalogTable, alias, new Object[catalogTable.getColumns().size()]));
+                    addBinding(bindings,
+                            asWritten(catalogTable, alias, tableRef.columnAliases()), alias);
                     return;
                 }
             }
             // Regular table
             try {
                 Table table = executor.resolveTable(schemaName, tableRef.table());
-                bindings.add(new RowContext.TableBinding(table, alias, new Object[table.getColumns().size()]));
+                addBinding(bindings, asWritten(table, alias, tableRef.columnAliases()), alias);
             } catch (MemgresException e) { /* table not found, skip */ }
         } else if (item instanceof SelectStmt.JoinFrom) {
             SelectStmt.JoinFrom joinFrom = (SelectStmt.JoinFrom) item;
@@ -290,7 +342,7 @@ class FromResolver {
                                 new ArrayList<>(sqResult.getColumns()), subqFrom.columnAliases());
                         String sqAlias = subqFrom.alias();
                         Table virtualTable = new Table(sqAlias, columns);
-                        virtualTable.setInferredColumnTypes(true);
+                        defineFromQuery(virtualTable, subqFrom.subquery());
                         bindings.add(new RowContext.TableBinding(virtualTable, sqAlias,
                                 new Object[columns.size()]));
                     }
@@ -310,7 +362,9 @@ class FromResolver {
                     cols.add(new Column(parts[0], dt != null ? dt : DataType.TEXT, true, false, null));
                 }
                 Table virtualTable = new Table(alias, cols);
-                virtualTable.setInferredColumnTypes(true);
+                // The columns above fall back to text wherever the definition list named a type
+                // this does not read, so none of them is a type to be trusted.
+                virtualTable.setDefinedColumnTypes(new String[cols.size()]);
                 bindings.add(new RowContext.TableBinding(virtualTable, alias, new Object[cols.size()]));
             }
             // JSON_TABLE: extract column definitions from the JsonTableExpr
@@ -320,7 +374,9 @@ class FromResolver {
                 List<Column> cols = new ArrayList<>();
                 collectJsonTableColumnDefs(jt.columns, cols);
                 Table virtualTable = new Table(alias, cols);
-                virtualTable.setInferredColumnTypes(true);
+                // Every column here is described as text whatever the definition list said, so
+                // there is no type of one to be trusted.
+                virtualTable.setDefinedColumnTypes(new String[cols.size()]);
                 bindings.add(new RowContext.TableBinding(virtualTable, alias, new Object[cols.size()]));
             } else {
                 // The shape describes an item that produced no row, so the type has to come from
@@ -348,10 +404,52 @@ class FromResolver {
                     }
                 }
                 Table virtualTable = new Table(alias, cols);
-                virtualTable.setInferredColumnTypes(true);
+                defineFromFunction(virtualTable, funcFrom);
+                // What a call in FROM actually produces is decided by running it: a record with
+                // no column definition list holds whatever fields it holds, and a single column
+                // answers to names it does not carry through attribute notation. The columns above
+                // are a shape to pad rows with, not the register of what this relation supplies,
+                // and marking the provenance is what keeps the analysis from reading them as one --
+                // exactly as FromFunctionResolver marks the relation it builds from real rows.
+                virtualTable.setFunctionResult(true);
                 bindings.add(new RowContext.TableBinding(virtualTable, alias, new Object[cols.size()]));
             }
         }
+    }
+
+    // ---- What a relation built from a definition may be trusted about ----
+    //
+    // Every relation below is built by running something and describing whatever came back, so its
+    // columns carry the type the builder read off a value rather than the type the definition
+    // gives them. Each is marked as such, along with the types its definition does settle, so that
+    // a check reading a column's type knows which of the two it has. See {@link DefinedTypes}.
+
+    /** A derived table, a VALUES list, or a parenthesized join given an alias. */
+    private void defineFromQuery(Table virtualTable, Statement query) {
+        virtualTable.setDefinedColumnTypes(
+                executor.definedTypes.ofQuery(query, virtualTable.getColumns().size()));
+    }
+
+    private void defineFromCte(Table virtualTable, SelectStmt.CommonTableExpr cte) {
+        virtualTable.setDefinedColumnTypes(
+                executor.definedTypes.ofCte(cte, virtualTable.getColumns().size()));
+    }
+
+    private void defineFromView(Table virtualTable, Database.ViewDef view) {
+        virtualTable.setDefinedColumnTypes(
+                executor.definedTypes.ofView(view, virtualTable.getColumns().size()));
+    }
+
+    /** A stored relation rebuilt behind an alias list: its own declared types, under new names. */
+    private static void defineAsDeclared(Table renamed, Table declared) {
+        String[] types = new String[renamed.getColumns().size()];
+        for (int i = 0; i < types.length; i++) types[i] = DefinedTypes.typeIn(declared, i);
+        renamed.setDefinedColumnTypes(types);
+    }
+
+    private void defineFromFunction(Table virtualTable, SelectStmt.FunctionFrom funcFrom) {
+        virtualTable.setDefinedColumnTypes(
+                executor.definedTypes.ofFunction(funcFrom, virtualTable.getColumns().size()));
     }
 
     /** Recursively collect leaf column definitions from JSON_TABLE columns. */
@@ -445,7 +543,7 @@ class FromResolver {
     }
 
     /**
-     * A FROM item that is not LATERAL cannot read the item beside it.
+     * A FROM item that is not LATERAL cannot read a relation entered beside it.
      *
      * <p>The relations of one FROM clause are computed side by side, so a sub-select written as one
      * of them has no row of its neighbour to read — LATERAL is the word that says to compute it
@@ -453,41 +551,102 @@ class FromResolver {
      * word that would bring it into reach; reporting the entry as missing sent the reader looking
      * for a relation they had written.
      *
-     * <p>Only a name a sibling actually exposes is reported. A name nothing in the query has is
-     * missing, and PostgreSQL says so.
+     * <p>Which entries count is decided by position and nothing else. PostgreSQL builds the range
+     * table left to right — a join's left side before its right, and a nested join in the place it
+     * stands — and a sub-select is transformed against the entries made <em>before</em> it. So
+     * {@code FROM t a, (SELECT a.v) b} names an entry that is there and out of reach, while
+     * {@code FROM (SELECT a.v) b, t a} names one that has not been entered yet and is simply
+     * missing. Whether a comma or a JOIN stands between them makes no difference: both enter the
+     * relations in the order they are written, which is why this walks the whole clause rather
+     * than its top-level items.
+     *
+     * <p>An entry answers both to the name it exposes and, where an alias renamed it, to the
+     * relation's own name — PostgreSQL finds it either way, reports the name that was written and
+     * names the entry in the detail.
      */
     private void rejectSiblingReferenceWithoutLateral(List<SelectStmt.FromItem> fromItems) {
-        if (fromItems == null || fromItems.size() < 2) return;
-        for (int i = 0; i < fromItems.size(); i++) {
-            SelectStmt.FromItem item = fromItems.get(i);
-            if (!(item instanceof SelectStmt.SubqueryFrom)) continue;
-            SelectStmt.SubqueryFrom sub = (SelectStmt.SubqueryFrom) item;
-            if (sub.lateral()) continue;
-            Set<String> siblings = new LinkedHashSet<>();
-            for (int j = 0; j < fromItems.size(); j++) {
-                if (j != i) collectExposedNames(fromItems.get(j), siblings);
+        if (fromItems == null || fromItems.isEmpty()) return;
+        Map<String, String> entered = new LinkedHashMap<>();
+        for (SelectStmt.FromItem item : fromItems) enterRangeTableItem(item, entered, true);
+    }
+
+    /**
+     * Whether a query level above this one supplies a relation of that name.
+     *
+     * <p>A sub-select written beside a relation cannot read it, but it can read the levels this
+     * whole query is nested inside — that is an ordinary correlated reference and needs no LATERAL.
+     * When both could be meant PostgreSQL takes the outer one, because the sibling is not in scope
+     * at all: {@code SELECT 1 FROM t WHERE EXISTS (SELECT 1 FROM t z, (SELECT t.v) q)} reads the
+     * outermost {@code t} and runs. So a name something above supplies is never this rule's.
+     */
+    private boolean enclosingLevelSupplies(String written) {
+        if (written == null || executor == null) return false;
+        for (RowContext outer : executor.outerContextStack) {
+            List<RowContext.TableBinding> bindings = outer == null ? null : outer.getBindings();
+            if (bindings == null) continue;
+            for (RowContext.TableBinding b : bindings) {
+                if (written.equalsIgnoreCase(b.alias())) return true;
+                if (b.table() != null && written.equalsIgnoreCase(b.table().getName())) return true;
             }
-            if (siblings.isEmpty()) continue;
-            String referenced = SelectExecutor.firstReferenceTo(sub.subquery(), siblings);
-            if (referenced == null) continue;
-            MemgresException e = new MemgresException(
-                    "invalid reference to FROM-clause entry for table \"" + referenced + "\"", "42P01");
-            e.setDetail("There is an entry for table \"" + referenced
-                    + "\", but it cannot be referenced from this part of the query.");
-            e.setHint("To reference that table, you must mark this subquery with LATERAL.");
-            throw e;
+        }
+        return false;
+    }
+
+    /**
+     * Walks one FROM tree in the order its relations enter the range table, judging each.
+     *
+     * @param lateralWouldHelp whether writing LATERAL on the item would be legal where it stands.
+     *                         On the nullable side of a RIGHT or FULL join it would not — the rows
+     *                         it would read are not determined when it is evaluated — so
+     *                         PostgreSQL leaves the advice off there.
+     */
+    private void enterRangeTableItem(SelectStmt.FromItem item, Map<String, String> entered,
+                                     boolean lateralWouldHelp) {
+        if (item instanceof SelectStmt.JoinFrom) {
+            SelectStmt.JoinFrom join = (SelectStmt.JoinFrom) item;
+            enterRangeTableItem(join.left(), entered, lateralWouldHelp);
+            enterRangeTableItem(join.right(), entered,
+                    lateralWouldHelp && !nullsTheLeftSide(join.joinType()));
+            return;
+        }
+        if (item instanceof SelectStmt.SubqueryFrom
+                && !((SelectStmt.SubqueryFrom) item).lateral()
+                && !entered.isEmpty()) {
+            String written = SelectExecutor.firstReferenceTo(
+                    ((SelectStmt.SubqueryFrom) item).subquery(), entered.keySet());
+            if (written != null && enclosingLevelSupplies(written)) written = null;
+            if (written != null) {
+                String exposed = entered.get(written.toLowerCase());
+                MemgresException e = new MemgresException(
+                        "invalid reference to FROM-clause entry for table \"" + written + "\"",
+                        "42P01");
+                e.setDetail("There is an entry for table \"" + (exposed == null ? written : exposed)
+                        + "\", but it cannot be referenced from this part of the query.");
+                if (lateralWouldHelp) {
+                    e.setHint("To reference that table, you must mark this subquery with LATERAL.");
+                }
+                throw e;
+            }
+        }
+        String exposed = SelectExecutor.exposedNameOf(item);
+        if (exposed == null) return;
+        rememberEntry(entered, exposed, exposed);
+        if (item instanceof SelectStmt.TableRef) {
+            rememberEntry(entered, ((SelectStmt.TableRef) item).table(), exposed);
         }
     }
 
-    /** Every name a FROM item answers to, at any depth of a join below it. */
-    static void collectExposedNames(SelectStmt.FromItem item, Set<String> out) {
-        if (item instanceof SelectStmt.JoinFrom) {
-            collectExposedNames(((SelectStmt.JoinFrom) item).left(), out);
-            collectExposedNames(((SelectStmt.JoinFrom) item).right(), out);
-            return;
-        }
-        String name = SelectExecutor.exposedNameOf(item);
-        if (name != null) out.add(name);
+    /** A join whose right side may be read before the left is known, so no LATERAL may stand there. */
+    private static boolean nullsTheLeftSide(SelectStmt.JoinType type) {
+        return type == SelectStmt.JoinType.RIGHT || type == SelectStmt.JoinType.FULL
+                || type == SelectStmt.JoinType.NATURAL_RIGHT
+                || type == SelectStmt.JoinType.NATURAL_FULL;
+    }
+
+    private static void rememberEntry(Map<String, String> entered, String name, String exposed) {
+        if (name == null) return;
+        String key = name.toLowerCase(Locale.ROOT);
+        if (!entered.containsKey(key)) entered.put(key, exposed);
     }
 
     /**
@@ -664,6 +823,9 @@ class FromResolver {
                 }
 
                 List<RowContext> newAccumulated = new ArrayList<>();
+                // The definition is the same text for every left row, so what it settles about
+                // the sub-query's columns is worked out once rather than once per row.
+                String[] settled = null;
                 for (RowContext leftCtx : accumulated) {
                     executor.outerContextStack.push(leftCtx);
                     try {
@@ -678,7 +840,10 @@ class FromResolver {
                         List<Column> columns = FromFunctionResolver.applyColumnAliases(
                                 new ArrayList<>(subResult.getColumns()), sqf.columnAliases());
                         Table virtualTable = new Table(alias, columns);
-                        virtualTable.setInferredColumnTypes(true);
+                        if (settled == null || settled.length != columns.size()) {
+                            settled = executor.definedTypes.ofQuery(sqf.subquery(), columns.size());
+                        }
+                        virtualTable.setDefinedColumnTypes(settled);
 
                         if (subResult.getRows().isEmpty()) {
                             // Implicit INNER JOIN semantics, skip
@@ -816,6 +981,7 @@ class FromResolver {
             QueryResult cteResult = executor.selectExecutor.executeCte(cte);
             Table virtualTable = new Table(alias,
                     renameColumns(alias, cteResult.getColumns(), tableRef.columnAliases()));
+            defineFromCte(virtualTable, cte);
             lastResolvedRightTable = virtualTable;
             lastResolvedRightAlias = alias;
             for (Object[] row : cteResult.getRows()) {
@@ -862,7 +1028,7 @@ class FromResolver {
                 rows = viewResult.getRows();
             }
             Table virtualTable = new Table(alias, cols);
-            virtualTable.setInferredColumnTypes(true);
+            defineFromView(virtualTable, view);
             lastResolvedRightTable = virtualTable;
             lastResolvedRightAlias = alias;
             for (Object[] row : rows) {
@@ -929,6 +1095,9 @@ class FromResolver {
         if (tableRef.columnAliases() != null && !tableRef.columnAliases().isEmpty()) {
             Table renamed = new Table(alias,
                     renameColumns(alias, table.getColumns(), tableRef.columnAliases()));
+            // Renaming a column does not retype it, and the relation this stands in front of
+            // declared every one of them, so the types stay as certain as they were.
+            defineAsDeclared(renamed, table);
             for (Object[] row : table.getAllRows()) renamed.insertRow(row);
             table = renamed;
         }
@@ -1290,7 +1459,7 @@ class FromResolver {
         List<Column> columns = FromFunctionResolver.applyColumnAliases(
                 new ArrayList<>(subResult.getColumns()), subqFrom.columnAliases(), alias);
         Table virtualTable = new Table(alias, columns);
-        virtualTable.setInferredColumnTypes(true);
+        defineFromQuery(virtualTable, subqFrom.subquery());
         for (Object[] row : subResult.getRows()) {
             virtualTable.insertRow(row);
         }

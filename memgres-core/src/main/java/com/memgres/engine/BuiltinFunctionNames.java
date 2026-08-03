@@ -1,7 +1,13 @@
 package com.memgres.engine;
 
 /**
- * The names of the functions memgres implements as built-ins.
+ * The names of the functions memgres implements as built-ins, and the register of every name it
+ * can call.
+ *
+ * <p>Two lists, because they answer two questions. {@link #NAMES} is what the catalog reports;
+ * {@link #isCallable} is what the engine can dispatch, which is a larger thing and the one a
+ * refusal has to be decided from. The second is {@link #NAMES} together with
+ * {@link #ALSO_CALLABLE}, and the difference between them is explained there.
  *
  * <p>PostgreSQL lists every built-in in {@code pg_catalog.pg_proc}, and tools read that list
  * to decide what the server can do: the JDBC driver answers
@@ -17,7 +23,7 @@ package com.memgres.engine;
  * {@code current_date}). Listing one of those as a function is the same mistake as omitting a
  * real one: a client that resolves it writes a call the server has never accepted.
  */
-final class BuiltinFunctionNames {
+public final class BuiltinFunctionNames {
 
     private BuiltinFunctionNames() {
     }
@@ -127,11 +133,123 @@ final class BuiltinFunctionNames {
             "version", "websearch_to_tsquery", "width", "xml"
     };
 
+    /**
+     * The rest of the register: names the engine dispatches that have no pg_proc row of their own.
+     *
+     * <p>{@link #NAMES} is what the catalog reports, and it is not the same question as what the
+     * engine can call. The two differ in both directions. PostgreSQL evaluates {@code coalesce},
+     * {@code greatest}, {@code trim} and {@code current_date} without a pg_proc row, so listing
+     * them above would put a row in the catalog PostgreSQL does not have — but memgres can call
+     * every one of them, so leaving them out of the register would refuse working SQL. The same
+     * goes for the contrib functions memgres implements natively ({@code levenshtein},
+     * {@code similarity}, {@code digest}, the uuid-ossp generators), the type names the grammar
+     * spells like a call ({@code integer}, {@code jsonb}, {@code record}), and the handful of
+     * internal names the parser writes for syntax it desugars ({@code __xmltable__} and friends),
+     * and the few the engine answers for with something other than "no such function" —
+     * {@code values} is a syntax error where it stands, {@code open} and {@code close} are a type
+     * and not a function at all, and each of those answers is better than 42883.
+     *
+     * <p>This list was built by sweeping the engine's own dispatch — every case label of every
+     * switch on a folded function name, every name compared against one, every name the parser
+     * synthesises — and adding the aggregates, the window functions and every name the signature
+     * table records. {@code FunctionRegisterTest} sweeps the sources again and fails if a name the
+     * engine can dispatch is missing from here, because a name missing from the register is one
+     * the resolution check would refuse a working call to.
+     */
+    private static final String[] ALSO_CALLABLE = {
+            "__array_assign_slice__", "__is_normalized__", "__json_table__", "__rows_from__",
+            "__similar_to_escape__", "__subscript_assign__", "__tsquery_not__",
+            "__xmlattributes__", "__xmltable__", "abbrev", "acos", "acosd", "acosh", "any_value",
+            "array_to_json",
+            "arraycontained", "arraycontains", "arrayoverlap", "asin", "asind", "asinh", "atan",
+            "atan2", "atan2d", "atand", "atanh", "bigint", "bit_count", "bool", "boolean",
+            "bpchar", "broadcast", "casefold", "cbrt", "character", "close", "coalesce",
+            "convert_from",
+            "convert_to", "corr", "cos", "cosd", "cosh", "cot", "cotd", "covar_pop", "covar_samp",
+            "cube", "cube_dim", "cume_dist", "current_catalog", "current_date", "current_role",
+            "current_time", "current_timestamp", "database_to_xml", "datemultirange", "daterange",
+            "decimal", "degrees", "digest", "every", "factorial", "family", "gcd",
+            "gen_random_uuid", "gen_salt", "get_bit", "get_byte", "greatest", "grouping", "hmac",
+            "host", "hostmask", "inet_merge", "inet_same_family", "int", "int4multirange",
+            "int4range", "int8multirange", "int8range", "integer", "isempty", "json", "json_array",
+            "json_array_constructor", "json_array_subquery", "json_arrayagg", "json_each_text",
+            "json_exists", "json_insert", "json_object", "json_object_agg",
+            "json_object_constructor", "json_path_query", "json_path_query_first", "json_set",
+            "json_set_lax",
+            "json_objectagg", "json_populate_record", "json_populate_recordset", "json_query",
+            "json_scalar", "json_serialize", "json_strip_nulls", "json_table", "json_to_record",
+            "json_to_recordset", "json_value", "jsonb", "jsonb_exists_all", "jsonb_exists_any",
+            "jsonb_object", "jsonb_object_agg", "jsonb_path_match", "jsonb_path_match_tz",
+            "jsonb_populate_record", "jsonb_populate_recordset", "jsonb_strip_nulls",
+            "jsonb_to_record", "jsonb_to_recordset", "lcm", "least", "levenshtein", "localtime",
+            "localtimestamp", "lower_inc", "lower_inf", "macaddr8_set7bit", "masklen", "min_scale",
+            "mode", "multirange", "netmask", "network", "nullif", "nummultirange", "numrange",
+            "open", "parse_ident", "percent_rank", "percentile_cont", "percentile_disc",
+            "pg_advisory_lock_shared", "pg_advisory_unlock_all", "pg_advisory_unlock_shared",
+            "pg_advisory_xact_lock_shared", "pg_available_extension_versions",
+            "pg_available_extensions", "pg_backup_start", "pg_backup_stop",
+            "pg_create_logical_replication_slot", "pg_create_physical_replication_slot",
+            "pg_create_restore_point", "pg_event_trigger_ddl_commands",
+            "pg_event_trigger_dropped_objects", "pg_event_trigger_table_rewrite_oid",
+            "pg_event_trigger_table_rewrite_reason", "pg_get_sequence_data",
+            "pg_logical_slot_get_changes", "pg_logical_slot_peek_changes", "pg_options_to_table",
+            "pg_replication_slot_advance", "pg_show_all_settings", "pg_switch_wal",
+            "pg_try_advisory_lock", "pg_try_advisory_lock_shared", "pg_try_advisory_xact_lock",
+            "pg_try_advisory_xact_lock_shared", "pg_wal_replay_pause", "pg_wal_replay_resume",
+            "pg_walfile_name", "pow", "query_to_xml", "radians", "random_normal", "range_agg",
+            "range_intersect_agg", "range_merge", "real", "record", "regexp_split_to_table",
+            "regr_avgx", "regr_avgy", "regr_count", "regr_intercept", "regr_r2", "regr_slope",
+            "regr_sxx", "regr_sxy", "regr_syy", "row", "row_to_json", "scale", "schema_to_xml",
+            "set_bit", "set_byte", "set_masklen", "show_trgm", "similarity", "sin", "sind", "sinh",
+            "smallint", "soundex", "stddev", "stddev_pop", "stddev_samp", "string_to_table",
+            "substring_similar", "table_to_xml", "tan", "tand", "tanh", "to_json", "to_jsonb",
+            "trigger", "trim", "trim_scale", "tsmultirange", "tsrange", "tstzmultirange",
+            "tstzrange", "unaccent", "unicode", "unicode_assigned", "unicode_version", "upper_inc",
+            "upper_inf", "uuid", "uuid_extract_timestamp", "uuid_extract_version", "values",
+            "uuid_generate_v1", "uuid_generate_v3", "uuid_generate_v4", "uuid_generate_v5",
+            "uuid_nil", "uuid_ns_dns", "uuid_ns_url", "uuidv4", "var_pop", "var_samp", "variance",
+            "void", "width_bucket", "xml_is_well_formed", "xml_is_well_formed_content",
+            "xml_is_well_formed_document", "xmlagg", "xmlcomment", "xmlconcat", "xmlelement",
+            "xmlexists", "xmlforest", "xmlparse", "xmlpi", "xmlroot", "xmlserialize", "xmltable",
+            "xmltext", "xpath", "xpath_exists",
+    };
+
     private static final java.util.Set<String> NAME_SET =
             new java.util.HashSet<String>(java.util.Arrays.asList(NAMES));
+
+    private static final java.util.Set<String> REGISTER = buildRegister();
+
+    private static java.util.Set<String> buildRegister() {
+        java.util.Set<String> all = new java.util.HashSet<String>(NAME_SET);
+        all.addAll(java.util.Arrays.asList(ALSO_CALLABLE));
+        return java.util.Collections.unmodifiableSet(all);
+    }
+
+    /** Every name in the register, for the sweep that checks nothing the engine calls is missing. */
+    static java.util.Set<String> register() {
+        return REGISTER;
+    }
 
     /** True when {@code name} — already lower case and unqualified — is one of these. */
     static boolean contains(String name) {
         return NAME_SET.contains(name);
+    }
+
+    /**
+     * Whether the engine can dispatch a call to this name at all.
+     *
+     * <p>The question a refusal turns on. PostgreSQL resolves a call before it judges the clause
+     * carrying it, so an unknown name outranks a complaint about FILTER, about OVER, or about a
+     * column further along the select list — but only a register that is complete may be read that
+     * way, because a name missing from it would refuse SQL that works. This one is complete by
+     * construction and by sweep, and it is deliberately generous at the edges: a type name spelled
+     * like a call is cast syntax rather than a function, and answering yes to one costs nothing but
+     * the earlier message. Names a user declared are not here — the caller asks the database for
+     * those, which is where they live.
+     */
+    public static boolean isCallable(String name) {
+        if (name == null) return false;
+        if (REGISTER.contains(name)) return true;
+        return DataType.fromPgName(name) != null;
     }
 }

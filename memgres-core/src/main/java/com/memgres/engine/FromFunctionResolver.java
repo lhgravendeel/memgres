@@ -63,9 +63,18 @@ class FromFunctionResolver {
         checkColumnAliasCount(funcFrom, contexts);
         // TABLESAMPLE binds the real stored table; never flag persistent tables.
         if (!funcFrom.functionName().toLowerCase().startsWith("__tablesample__:")) {
+            // The columns carry whatever type the resolver read off the values it built, so what
+            // the call itself settles is recorded beside them. See DefinedTypes. The call settles
+            // the same thing for every row it produced, so it is worked out once.
+            String[] settled = null;
             for (RowContext rc : contexts) {
                 for (RowContext.TableBinding b : rc.getBindings()) {
                     b.table().setFunctionResult(true);
+                    int width = b.table().getColumns().size();
+                    if (settled == null || settled.length != width) {
+                        settled = executor.definedTypes.ofFunction(funcFrom, width);
+                    }
+                    b.table().setDefinedColumnTypes(settled);
                 }
             }
         }

@@ -67,16 +67,28 @@ final class StoredExprCheck {
                 "aggregate functions are not allowed in policy expressions", false);
     }
 
-    void check(Expression expr) {
+    /** @param select the engine, which is what says whether a call is an aggregate */
+    void check(Expression expr, SelectExecutor select) {
         if (expr == null) return;
         if (subqueryError != null && AstWalk.anyMatch(expr, StoredExprCheck::isSubquery)) {
             throw PgErrors.notImplemented(subqueryError);
         }
+        // A call carrying FILTER, DISTINCT or an aggregate ORDER BY without being an aggregate is
+        // refused by the same walk that finds a misplaced aggregate, because PostgreSQL reports
+        // whichever of the two it reads first rather than one kind before the other.
+        select.placementCheck.rejectStoredDefinition(expr, aggregateClause(), null);
         if (aggregateError != null && aggregatesOutsideSubquery(expr)) {
             throw new MemgresException(aggregateError, "42803");
         }
         checkColumnRefs(expr);
         BooleanContext.check(expr, argumentLabel, BooleanContext.Types.of(table, rowAliases));
+    }
+
+    /** The clause name in {@link #aggregateError}, which is what a misplaced call is refused for. */
+    private String aggregateClause() {
+        String prefix = "aggregate functions are not allowed in ";
+        return aggregateError != null && aggregateError.startsWith(prefix)
+                ? aggregateError.substring(prefix.length()) : argumentLabel;
     }
 
     /**

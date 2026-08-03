@@ -57,7 +57,7 @@ final class PlacementCheck {
     }
 
     /** What a node is, when it is one of the calls a clause may forbid. */
-    private enum Kind { WINDOW, NO_OVER, WITHIN_GROUP, GROUPING, AGGREGATE }
+    private enum Kind { WINDOW, NO_OVER, WITHIN_GROUP, GROUPING, AGGREGATE, NOT_AGGREGATE, SUBQUERY }
 
     /**
      * Rejects the first misplaced call written anywhere in {@code node}'s own scope.
@@ -88,7 +88,7 @@ final class PlacementCheck {
      * exist; a null one leaves the misplacement to be reported on its own as before.
      */
     void reject(Object node, String clause, QueryLevelScope scope) {
-        Object found = findInScope(node, false);
+        Object found = findInScope(node, Mode.PLACEMENT);
         if (found == null) return;
         // What PostgreSQL has already transformed when it refuses the call is the call's own
         // arguments, not its OVER specification: the window definitions of a query are transformed
@@ -115,8 +115,59 @@ final class PlacementCheck {
      * against the rows it is helping to define.
      */
     void rejectWindowCall(Object node, String clause) {
-        Object found = findInScope(node, true);
+        Object found = findInScope(node, Mode.WINDOWS_ONLY);
         if (found != null) throw misplaced(found, clause);
+    }
+
+    /**
+     * The leftmost fault in an expression PostgreSQL stores and replays — a CHECK on a column or on
+     * a table, a DEFAULT, an index expression or predicate, a generated column, a policy, a rule's
+     * qualification, a domain's constraint, a partition bound.
+     *
+     * <p>These are analysed exactly like an expression written in a query, and the fault reported is
+     * whichever comes first as PostgreSQL reads the expression from its leaves outwards: an
+     * aggregate that may not stand here, a window call, a sub-query where a definition replayed
+     * against one row has no query to run one in, and a call carrying FILTER, DISTINCT or an
+     * aggregate ORDER BY without being an aggregate at all. One walk finds all four, because
+     * measured against the reference server none of them outranks the others —
+     * {@code CHECK (count(*) > 0 AND abs(i) FILTER (WHERE true) > 0)} names the aggregate and the
+     * same two the other way round name the FILTER.
+     *
+     * @param clause what PostgreSQL calls this position when it says a call may not stand here
+     * @param subqueryWhat the phrase completing "cannot use subquery in ...", or null where a
+     *        sub-query is ordinary here — a policy expression is a query fragment and may hold one
+     */
+    void rejectStoredDefinition(Object node, String clause, String subqueryWhat) {
+        Mode mode = subqueryWhat == null ? Mode.STORED : Mode.STORED_NO_SUBQUERY;
+        Object found = findInScope(node, mode);
+        if (found == null) return;
+        Kind kind = kindOf(found, mode);
+        if (kind == Kind.SUBQUERY) {
+            throw PgErrors.notImplemented("cannot use subquery in " + subqueryWhat);
+        }
+        if (kind == Kind.NOT_AGGREGATE) throw FilterCheck.refusal(found);
+        throw misplaced(found, clause);
+    }
+
+    /**
+     * Which faults a walk is looking for. The walk itself is the same one either way; what changes
+     * is what counts as a hit, and so which of a statement's faults is reached first.
+     */
+    private enum Mode {
+        /** Every call a clause may not hold: an aggregate, a window call, GROUPING. */
+        PLACEMENT,
+        /** A window call alone, for the clauses that may hold an aggregate but not one of those. */
+        WINDOWS_ONLY,
+        /**
+         * The same as PLACEMENT, plus the fault only a stored definition is walked for: a call
+         * carrying a clause only an aggregate may have.
+         */
+        STORED,
+        /**
+         * STORED, and a sub-query counts as a fault too, for the definitions that are replayed
+         * one row at a time with no query around them for a nested one to run in.
+         */
+        STORED_NO_SUBQUERY
     }
 
     /**
@@ -125,17 +176,17 @@ final class PlacementCheck {
      * refuse a subtree, and refusing the subtree is the whole scope rule — and because the order
      * matters as well as the answer, which {@link #forEachAnalysedChild} is what settles.
      */
-    private Object findInScope(Object node, boolean windowsOnly) {
+    private Object findInScope(Object node, Mode mode) {
         if (node == null || node instanceof Statement) return null;
         Object[] found = new Object[1];
         forEachAnalysedChild(node, child -> {
             if (found[0] == null) {
-                Object hit = findInScope(child, windowsOnly);
+                Object hit = findInScope(child, mode);
                 if (hit != null) found[0] = hit;
             }
         });
         if (found[0] != null) return found[0];
-        return kindOf(node, windowsOnly) != null ? node : null;
+        return kindOf(node, mode) != null ? node : null;
     }
 
     /**
@@ -161,7 +212,8 @@ final class PlacementCheck {
         if (wf.filter() != null) action.accept(wf.filter());
     }
 
-    private Kind kindOf(Object node, boolean windowsOnly) {
+    private Kind kindOf(Object node, Mode mode) {
+        if (mode == Mode.STORED_NO_SUBQUERY && isStoredSubquery(node)) return Kind.SUBQUERY;
         if (node instanceof WindowFuncExpr) return Kind.WINDOW;
         if (node instanceof FunctionCallExpr) {
             FunctionCallExpr fn = (FunctionCallExpr) node;
@@ -174,17 +226,26 @@ final class PlacementCheck {
                 }
                 if (WINDOW_ONLY_FUNCTIONS.contains(name)) return Kind.NO_OVER;
             }
-            if (windowsOnly) return null;
+            if (mode == Mode.WINDOWS_ONLY) return null;
             if (GroupByValidator.isGroupingCall(fn)) return Kind.GROUPING;
             if (select.isAggregateFunction(fn.name())) return Kind.AGGREGATE;
+            if (mode != Mode.PLACEMENT && FilterCheck.carriesRefusedFilter(select, fn)) {
+                return Kind.NOT_AGGREGATE;
+            }
             return null;
         }
-        if (!windowsOnly && node instanceof OrderedSetAggExpr) return Kind.AGGREGATE;
+        if (mode != Mode.WINDOWS_ONLY && node instanceof OrderedSetAggExpr) return Kind.AGGREGATE;
         return null;
     }
 
+    /** A nested query written where a definition is replayed against one row and nothing else. */
+    private static boolean isStoredSubquery(Object node) {
+        return node instanceof SubqueryExpr || node instanceof ExistsExpr
+                || node instanceof AnyAllExpr || node instanceof ArraySubqueryExpr;
+    }
+
     private MemgresException misplaced(Object node, String clause) {
-        Kind kind = kindOf(node, false);
+        Kind kind = kindOf(node, Mode.PLACEMENT);
         if (kind == Kind.WINDOW) {
             return new MemgresException("window functions are not allowed in " + clause, "42P20");
         }
@@ -395,7 +456,7 @@ final class PlacementCheck {
      */
     void rejectWindowCallWithoutOver(Object node) {
         if (node == null || node instanceof Statement) return;
-        Kind kind = kindOf(node, true);
+        Kind kind = kindOf(node, Mode.WINDOWS_ONLY);
         if (kind == Kind.NO_OVER || kind == Kind.WITHIN_GROUP) throw missingClause(node, kind);
         AstWalk.forEachChild(node, this::rejectWindowCallWithoutOver);
     }
