@@ -3022,6 +3022,31 @@ class ExprEvaluator {
         return dt != null && isRangeType(dt) ? dt : null;
     }
 
+    /**
+     * The shape a geometric constructor builds, or null when the name is not one.
+     *
+     * <p>{@code point(1,2)} is a point and {@code circle(p, r)} a circle, whichever spelling was
+     * used to write them. memgres holds every geometric value as the text PostgreSQL prints for
+     * it, so without this the column was described as text and a client that asked for a point
+     * got a string instead.
+     */
+    private static DataType geometricConstructorResultType(String name, FunctionCallExpr fn) {
+        if (fn.args() == null || fn.args().isEmpty()) return null;
+        switch (name) {
+            case "point": return DataType.POINT;
+            case "box": return DataType.BOX;
+            case "circle": return DataType.CIRCLE;
+            case "lseg": return DataType.LSEG;
+            case "line": return DataType.LINE;
+            case "path": return DataType.PATH;
+            case "polygon": return DataType.POLYGON;
+            case "bound_box": return DataType.BOX;
+            case "center": case "closest_point": return DataType.POINT;
+            case "pclose": case "popen": return DataType.PATH;
+            default: return null;
+        }
+    }
+
     /** The type a range is built over — what {@code lower()} and {@code upper()} answer in. */
     private static DataType rangeSubtypeOf(DataType t) {
         if (t == null) return null;
@@ -3795,6 +3820,17 @@ class ExprEvaluator {
             // happens to be spelled as.
             DataType rangeCtor = rangeConstructorResultType(name);
             if (rangeCtor != null) return rangeCtor;
+            // A geometric constructor answers in the shape it builds. Its value is held as the
+            // text PostgreSQL prints, which is why the column used to be described as text --
+            // and a client reading point(1,2) then got a string where PG hands it a point.
+            DataType geometric = geometricConstructorResultType(name, fn);
+            if (geometric != null) return geometric;
+            // A type name written like a call is a cast, and the column has the type that was
+            // written: int4('42') is an int4 column, jsonb('{}') a jsonb one.
+            if (executor != null) {
+                DataType coercion = executor.functionEvaluator.typeNameCoercionResultType(name, fn);
+                if (coercion != null) return coercion;
+            }
             // The JSON builders answer in json or jsonb by their own name.
             DataType jsonResult = jsonFunctionResultType(name);
             if (jsonResult != null) return jsonResult;
@@ -3839,6 +3875,13 @@ class ExprEvaluator {
                     }
                 }
             }
+            // Last of all, a name that is nothing but the implementation of an operator answers
+            // exactly as the operator does, so the column is typed from the same expression
+            // evaluation runs. Asked last, because a name the engine dispatches for itself has
+            // already answered above — json_extract_path is the #> operator's function and is
+            // also a function a query may call directly.
+            Expression asOperator = FunctionEvaluator.operatorFunctionExpr(name, fn);
+            if (asOperator != null) return inferTypeFromContext(asOperator, bindings);
             return DataType.TEXT;
         }
         if (expr instanceof AtTimeZoneExpr) {
@@ -3988,6 +4031,13 @@ class ExprEvaluator {
         if (expr instanceof FunctionCallExpr) {
             FunctionCallExpr fn = (FunctionCallExpr) expr;
             String name = FunctionEvaluator.stripSchemaPrefix(fn.name().toLowerCase());
+            // An enum's own name written like a call is a cast to it, so the column is that enum.
+            if (fn.args().size() == 1 && executor != null) {
+                String coerced = executor.functionEvaluator.coercibleTypeName(name);
+                if (coerced != null && executor.database.getCustomEnum(coerced) != null) {
+                    return coerced;
+                }
+            }
             if (name.equals("coalesce") || name.equals("nullif") || name.equals("greatest") || name.equals("least")
                     || name.equals("max") || name.equals("min") || name.equals("first_value")
                     || name.equals("last_value") || name.equals("nth_value") || name.equals("lag") || name.equals("lead")) {

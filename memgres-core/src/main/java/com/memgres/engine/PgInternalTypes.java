@@ -10,7 +10,17 @@ package com.memgres.engine;
  * every row of the join that reads it, so each one that is referenced is registered here.
  *
  * <p>Columns: oid, typname, typlen, typbyval, typtype, typcategory, typalign, typstorage,
- * typelem, typarray — the same values PostgreSQL 18 reports.
+ * typelem, typarray, the prefix its I/O functions are named with, and whether it has binary I/O
+ * at all — the same values PostgreSQL 18 reports.
+ *
+ * <p>The I/O prefix is recorded rather than derived because PostgreSQL does not name these
+ * functions to one rule. Most of the reg* family and the three bootstrap types with short names
+ * run the suffix straight on — {@code charin}, {@code tidin}, {@code xid8in}, {@code regrolein} —
+ * while the longer names take an underscore, {@code pg_lsn_in} and {@code jsonpath_in}; and the
+ * two BRIN summary types drop the {@code pg_} their type name carries, so
+ * {@code pg_brin_bloom_summary}'s input function is {@code brin_bloom_summary_in}. Appending
+ * {@code "_in"} to the type name gave fifty-six names PostgreSQL has nowhere, every one of them a
+ * function a client reading pg_proc would have found and could never have called.
  */
 final class PgInternalTypes {
 
@@ -18,34 +28,36 @@ final class PgInternalTypes {
     }
 
     static final Object[][] TYPES = {
-            {18, "char", 1, true, "b", "Z", "c", "p", 0, 1002},
-            {27, "tid", 6, false, "b", "U", "s", "p", 0, 1010},
-            {29, "cid", 4, true, "b", "U", "i", "p", 0, 1012},
-            {32, "pg_ddl_command", 8, true, "p", "P", "d", "p", 0, 0},
-            {194, "pg_node_tree", -1, false, "b", "Z", "i", "x", 0, 0},
-            {269, "table_am_handler", 4, true, "p", "P", "i", "p", 0, 0},
-            {325, "index_am_handler", 4, true, "p", "P", "i", "p", 0, 0},
-            {2202, "regprocedure", 4, true, "b", "N", "i", "p", 0, 2207},
-            {2203, "regoper", 4, true, "b", "N", "i", "p", 0, 2208},
-            {2204, "regoperator", 4, true, "b", "N", "i", "p", 0, 2209},
-            {2280, "language_handler", 4, true, "p", "P", "i", "p", 0, 0},
-            {2970, "txid_snapshot", -1, false, "b", "U", "d", "x", 0, 2949},
-            {3115, "fdw_handler", 4, true, "p", "P", "i", "p", 0, 0},
-            {3220, "pg_lsn", 8, true, "b", "U", "d", "p", 0, 3221},
-            {3310, "tsm_handler", 4, true, "p", "P", "i", "p", 0, 0},
-            {3361, "pg_ndistinct", -1, false, "b", "Z", "i", "x", 0, 0},
-            {3402, "pg_dependencies", -1, false, "b", "Z", "i", "x", 0, 0},
-            {4072, "jsonpath", -1, false, "b", "U", "i", "x", 0, 4073},
-            {3734, "regconfig", 4, true, "b", "N", "i", "p", 0, 3735},
-            {3769, "regdictionary", 4, true, "b", "N", "i", "p", 0, 3770},
-            {4089, "regnamespace", 4, true, "b", "N", "i", "p", 0, 4090},
-            {4096, "regrole", 4, true, "b", "N", "i", "p", 0, 4097},
-            {4191, "regcollation", 4, true, "b", "N", "i", "p", 0, 4192},
-            {4600, "pg_brin_bloom_summary", -1, false, "b", "Z", "i", "x", 0, 0},
-            {4601, "pg_brin_minmax_multi_summary", -1, false, "b", "Z", "i", "x", 0, 0},
-            {5017, "pg_mcv_list", -1, false, "b", "Z", "i", "x", 0, 0},
-            {5038, "pg_snapshot", -1, false, "b", "U", "d", "x", 0, 5039},
-            {5069, "xid8", 8, true, "b", "U", "d", "p", 0, 271},
+            {18, "char", 1, true, "b", "Z", "c", "p", 0, 1002, "char", true},
+            {27, "tid", 6, false, "b", "U", "s", "p", 0, 1010, "tid", true},
+            {29, "cid", 4, true, "b", "U", "i", "p", 0, 1012, "cid", true},
+            {32, "pg_ddl_command", 8, true, "p", "P", "d", "p", 0, 0, "pg_ddl_command_", true},
+            {194, "pg_node_tree", -1, false, "b", "Z", "i", "x", 0, 0, "pg_node_tree_", true},
+            {269, "table_am_handler", 4, true, "p", "P", "i", "p", 0, 0, "table_am_handler_", false},
+            {325, "index_am_handler", 4, true, "p", "P", "i", "p", 0, 0, "index_am_handler_", false},
+            {2202, "regprocedure", 4, true, "b", "N", "i", "p", 0, 2207, "regprocedure", true},
+            {2203, "regoper", 4, true, "b", "N", "i", "p", 0, 2208, "regoper", true},
+            {2204, "regoperator", 4, true, "b", "N", "i", "p", 0, 2209, "regoperator", true},
+            {2280, "language_handler", 4, true, "p", "P", "i", "p", 0, 0, "language_handler_", false},
+            {2970, "txid_snapshot", -1, false, "b", "U", "d", "x", 0, 2949, "txid_snapshot_", true},
+            {3115, "fdw_handler", 4, true, "p", "P", "i", "p", 0, 0, "fdw_handler_", false},
+            {3220, "pg_lsn", 8, true, "b", "U", "d", "p", 0, 3221, "pg_lsn_", true},
+            {3310, "tsm_handler", 4, true, "p", "P", "i", "p", 0, 0, "tsm_handler_", false},
+            {3361, "pg_ndistinct", -1, false, "b", "Z", "i", "x", 0, 0, "pg_ndistinct_", true},
+            {3402, "pg_dependencies", -1, false, "b", "Z", "i", "x", 0, 0, "pg_dependencies_", true},
+            {4072, "jsonpath", -1, false, "b", "U", "i", "x", 0, 4073, "jsonpath_", true},
+            {3734, "regconfig", 4, true, "b", "N", "i", "p", 0, 3735, "regconfig", true},
+            {3769, "regdictionary", 4, true, "b", "N", "i", "p", 0, 3770, "regdictionary", true},
+            {4089, "regnamespace", 4, true, "b", "N", "i", "p", 0, 4090, "regnamespace", true},
+            {4096, "regrole", 4, true, "b", "N", "i", "p", 0, 4097, "regrole", true},
+            {4191, "regcollation", 4, true, "b", "N", "i", "p", 0, 4192, "regcollation", true},
+            {4600, "pg_brin_bloom_summary", -1, false, "b", "Z", "i", "x", 0, 0,
+                    "brin_bloom_summary_", true},
+            {4601, "pg_brin_minmax_multi_summary", -1, false, "b", "Z", "i", "x", 0, 0,
+                    "brin_minmax_multi_summary_", true},
+            {5017, "pg_mcv_list", -1, false, "b", "Z", "i", "x", 0, 0, "pg_mcv_list_", true},
+            {5038, "pg_snapshot", -1, false, "b", "U", "d", "x", 0, 5039, "pg_snapshot_", true},
+            {5069, "xid8", 8, true, "b", "U", "d", "p", 0, 271, "xid8", true},
     };
 
     /**

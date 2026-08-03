@@ -38,13 +38,13 @@ public final class BuiltinFunctionNames {
             "bool_and", "bool_or", "bound_box", "box", "btrim", "bytea",
             "cardinality", "ceil", "ceiling", "center",
             "char", "char_length", "character_length", "chr", "cidr", "circle",
-            "clock_timestamp", "closest_point", "col_description", "concat",
+            "clock_timestamp", "col_description", "concat",
             "concat_ws", "convert", "count", "crc32", "crc32c",
             "current_database", "current_query",
             "current_schema", "current_schemas", "current_setting",
             "current_user", "currval", "date", "date_bin", "date_part",
             "date_trunc", "decode", "defined", "delete",
-            "delete_key", "dense_rank", "diagonal", "diameter", "div", "each",
+            "dense_rank", "diagonal", "diameter", "div", "each",
             "encode", "enum_cmp", "enum_first", "enum_last", "enum_range", "exist", "exp",
             "extract", "first_value", "float4", "float8", "floor", "format", "format_type",
             "gen_random_bytes", "generate_series", "generate_subscripts", "get_current_ts_config",
@@ -57,8 +57,7 @@ public final class BuiltinFunctionNames {
             "hstore_to_json", "hstore_to_json_loose", "hstore_to_jsonb", "hstore_to_jsonb_loose",
             "hstore_to_matrix", "icu_unicode_version", "inet_client_addr", "inet_client_port",
             "inet_server_addr", "inet_server_port", "initcap", "int2", "int4", "int8",
-            "intersects", "interval", "is_horizontal", "is_parallel", "is_perpendicular",
-            "is_vertical", "isclosed", "isdefined", "isexists", "isfinite", "isopen",
+            "interval", "isclosed", "isdefined", "isexists", "isfinite", "isopen",
             "json_agg", "json_array_elements",
             "json_array_elements_text", "json_array_length", "json_build_array",
             "json_build_object", "json_each", "json_extract_path", "json_extract_path_text",
@@ -75,12 +74,12 @@ public final class BuiltinFunctionNames {
             "lo_from_bytea", "lo_get", "lo_import", "lo_lseek", "lo_open", "lo_put", "lo_tell",
             "lo_truncate", "lo_unlink", "log", "log10", "loread", "lower",
             "lowrite", "lpad", "lseg", "ltrim", "macaddr", "macaddr8", "make_date", "make_interval",
-            "make_time", "make_timestamp", "make_timestamptz", "max", "md5", "merge_action",
+            "make_time", "make_timestamp", "make_timestamptz", "max", "md5",
             "min", "mod", "name", "nextval",
             "normalize", "now", "npoints", "nth_value", "ntile", "num_nonnulls", "num_nulls",
             "numeric", "numnode", "obj_description", "octet_length", "oid", "overlaps", "overlay",
             "path", "pclose", "pg_advisory_lock", "pg_advisory_unlock", "pg_advisory_xact_lock",
-            "pg_advisory_xact_unlock", "pg_backend_pid", "pg_blocking_pids", "pg_cancel_backend",
+            "pg_backend_pid", "pg_blocking_pids", "pg_cancel_backend",
             "pg_client_encoding", "pg_collation_is_visible", "pg_column_size", "pg_conf_load_time",
             "pg_conversion_is_visible", "pg_current_logfile", "pg_current_snapshot",
             "pg_current_wal_flush_lsn", "pg_current_wal_insert_lsn", "pg_current_wal_lsn",
@@ -117,7 +116,7 @@ public final class BuiltinFunctionNames {
             "regexp_substr", "repeat", "replace",
             "reverse", "right", "round", "row_number", "rpad", "rtrim",
             "session_user", "set_config", "setseed", "setval",
-            "setweight", "sha1", "sha224", "sha256", "sha384", "sha512", "shobj_description", "sign",
+            "setweight", "sha224", "sha256", "sha384", "sha512", "shobj_description", "sign",
             "skeys", "slice", "slope", "split_part", "sqrt", "starts_with",
             "statement_timestamp", "string_agg", "string_to_array", "strip", "strpos", "substr",
             "substring", "sum", "svals", "text", "time",
@@ -149,6 +148,15 @@ public final class BuiltinFunctionNames {
      * {@code values} is a syntax error where it stands, {@code open} and {@code close} are a type
      * and not a function at all, and each of those answers is better than 42883.
      *
+     * <p>Also here, and for the same reason read the other way round, are the names memgres adds
+     * that PostgreSQL has no row for anywhere: the geometric aliases {@code closest_point},
+     * {@code intersects}, {@code is_horizontal}, {@code is_vertical}, {@code is_parallel} and
+     * {@code is_perpendicular}, and {@code merge_action}, which PostgreSQL evaluates as a parser
+     * construct with no pg_proc row of its own. memgres keeps every one of them callable — they
+     * are its own extension and code already written against them still runs — but a name
+     * PostgreSQL has nowhere may not be advertised in {@code pg_catalog}, because a client that
+     * reads it there writes a call the real server rejects.
+     *
      * <p>This list was built by sweeping the engine's own dispatch — every case label of every
      * switch on a folded function name, every name compared against one, every name the parser
      * synthesises — and adding the aggregates, the window functions and every name the signature
@@ -157,21 +165,35 @@ public final class BuiltinFunctionNames {
      * the resolution check would refuse a working call to.
      */
     private static final String[] ALSO_CALLABLE = {
+            // The helpers information_schema's own views are written in terms of, and
+            // pg_logical_emit_message. PostgreSQL has a pg_proc row for each — the helpers in the
+            // information_schema namespace, not pg_catalog — so they belong in NAMES rather than
+            // here, but a name listed there with no row in BuiltinFunctionSignatures is
+            // registered with prorettype 0, which is a row no client can act on and one
+            // PostgreSQL's own catalog never contains. They are callable here until each has its
+            // signature recorded.
+            "_pg_char_max_length", "_pg_char_octet_length", "_pg_datetime_precision",
+            "_pg_index_position", "_pg_interval_type", "_pg_numeric_precision",
+            "_pg_numeric_precision_radix", "_pg_numeric_scale", "_pg_truetypid", "_pg_truetypmod",
+            "pg_logical_emit_message",
             "__array_assign_slice__", "__is_normalized__", "__json_table__", "__rows_from__",
             "__similar_to_escape__", "__subscript_assign__", "__tsquery_not__",
             "__xmlattributes__", "__xmltable__", "abbrev", "acos", "acosd", "acosh", "any_value",
             "array_to_json",
             "arraycontained", "arraycontains", "arrayoverlap", "asin", "asind", "asinh", "atan",
             "atan2", "atan2d", "atand", "atanh", "bigint", "bit_count", "bool", "boolean",
-            "bpchar", "broadcast", "casefold", "cbrt", "character", "close", "coalesce",
-            "convert_from",
+            "bpchar", "broadcast", "casefold", "cbrt", "character", "close", "closest_point",
+            "coalesce", "convert_from",
             "convert_to", "corr", "cos", "cosd", "cosh", "cot", "cotd", "covar_pop", "covar_samp",
-            "cube", "cube_dim", "cume_dist", "current_catalog", "current_date", "current_role",
+            "cube", "cube_dim", "cume_dist", "current_catalog", "current_date",
+            "current_role",
             "current_time", "current_timestamp", "database_to_xml", "datemultirange", "daterange",
             "decimal", "degrees", "digest", "every", "factorial", "family", "gcd",
             "gen_random_uuid", "gen_salt", "get_bit", "get_byte", "greatest", "grouping", "hmac",
             "host", "hostmask", "inet_merge", "inet_same_family", "int", "int4multirange",
-            "int4range", "int8multirange", "int8range", "integer", "isempty", "json", "json_array",
+            "int4range", "int8multirange", "int8range", "integer", "intersects",
+            "is_horizontal", "is_parallel", "is_perpendicular", "is_vertical",
+            "isempty", "json", "json_array",
             "json_array_constructor", "json_array_subquery", "json_arrayagg", "json_each_text",
             "json_exists", "json_insert", "json_object", "json_object_agg",
             "json_object_constructor", "json_path_query", "json_path_query_first", "json_set",
@@ -182,8 +204,9 @@ public final class BuiltinFunctionNames {
             "jsonb_object", "jsonb_object_agg", "jsonb_path_match", "jsonb_path_match_tz",
             "jsonb_populate_record", "jsonb_populate_recordset", "jsonb_strip_nulls",
             "jsonb_to_record", "jsonb_to_recordset", "lcm", "least", "levenshtein", "localtime",
-            "localtimestamp", "lower_inc", "lower_inf", "macaddr8_set7bit", "masklen", "min_scale",
-            "mode", "multirange", "netmask", "network", "nullif", "nummultirange", "numrange",
+            "localtimestamp", "lower_inc", "lower_inf", "macaddr8_set7bit", "masklen",
+            "merge_action", "min_scale", "mode", "multirange", "netmask", "network", "nullif",
+            "nummultirange", "numrange",
             "open", "parse_ident", "percent_rank", "percentile_cont", "percentile_disc",
             "pg_advisory_lock_shared", "pg_advisory_unlock_all", "pg_advisory_unlock_shared",
             "pg_advisory_xact_lock_shared", "pg_available_extension_versions",
