@@ -132,6 +132,157 @@ class FunctionEvaluator {
         return sb.toString();
     }
 
+    /**
+     * The names whose written argument count settles nothing at all, so no arity rule may read it.
+     *
+     * <p>Two kinds. A <b>type constructor</b> — {@code varchar(n)}, {@code numeric(p,s)},
+     * {@code point(x,y)} — is cast syntax the grammar spells like a call, and the arguments a
+     * writer gives it are a typmod rather than the parameters PostgreSQL's pg_proc row declares.
+     * A <b>syntax form</b> — {@code trim}, {@code position}, {@code extract}, {@code overlay},
+     * {@code coalesce}, {@code greatest} — is desugared into a call whose shape is memgres's own
+     * and need not match the row PostgreSQL keeps for it, where it keeps one at all.
+     * {@code x OVERLAPS y} is the plainest case: PostgreSQL declares it over four endpoints and
+     * memgres desugars it to two row constructors, so reading the count would refuse the operator.
+     *
+     * <p>The variadic names used to be here too, because a table recording only fixed argument
+     * lists could not express "and any number more". {@link BuiltinFunctionSignatures} records the
+     * variadic ones as such now, so they are judged like everything else — which is what turned
+     * {@code format()} from an internal error into the 42883 PostgreSQL answers.
+     */
+    private static final Set<String> ANY_ARITY = Cols.setOf(
+            "jsonb_delete", "tsquery_phrase", "coalesce", "greatest", "least",
+            "grouping", "normalize", "position", "extract", "overlay", "trim",
+            "overlaps",
+            "current_user", "session_user", "merge_action",
+            "varchar", "bit", "numeric", "char", "bpchar", "decimal", "timestamp", "timestamptz",
+            "time", "timetz", "interval", "box", "point", "polygon", "lseg", "circle", "path",
+            "line", "int4multirange", "int8multirange", "nummultirange", "tsmultirange",
+            "tstzmultirange", "datemultirange");
+
+    /**
+     * Refuses a call whose qualifier names no schema.
+     *
+     * <p>A qualified call is looked for in one schema and nowhere else, so the qualifier is
+     * resolved first: {@code nosuchschema.f(1)} is 3F000 "schema does not exist", not 42883. Only
+     * a single unquoted qualifier is judged, and only when nothing at all answers to it — a schema
+     * of the user's, one of the two the catalog supplies, or the session's temp schema.
+     */
+    private void rejectMissingSchemaQualifier(String name) {
+        int dot = name.indexOf('.');
+        if (dot <= 0 || name.indexOf('.', dot + 1) >= 0) return;
+        String qualifier = name.substring(0, dot);
+        if ("pg_catalog".equals(qualifier) || "information_schema".equals(qualifier)) return;
+        if (executor.database.getSchema(qualifier) != null) return;
+        if (executor.session != null
+                && qualifier.equals(executor.session.getTempSchemaName())) {
+            return;
+        }
+        throw new MemgresException("schema \"" + qualifier + "\" does not exist", "3F000");
+    }
+
+    /** Whether this name's written argument count settles nothing; see {@link #ANY_ARITY}. */
+    static boolean acceptsAnyArity(String name) {
+        return name != null && ANY_ARITY.contains(name.toLowerCase(java.util.Locale.ROOT));
+    }
+
+    /**
+     * Refuses a call to a built-in with a number of arguments no signature of that name has.
+     *
+     * <p>PostgreSQL resolves a call by name and argument list together: there is no signature that
+     * quietly ignores an argument and none that supplies one that was not written, so
+     * {@code upper('a','b')} is not upper applied to the first of them and {@code lpad('a')} is
+     * not lpad with a length of its own choosing. Both are a function that does not exist (42883).
+     * memgres read as many arguments as each implementation wanted, which turned a mistyped call
+     * into a plausible answer one way and into an internal error — an index off the end of the
+     * argument list, reported to the client as XX000 — the other.
+     *
+     * <p>The rule reads in both directions now because {@link BuiltinFunctionSignatures} is
+     * complete: every signature PostgreSQL declares for a name is recorded with the fewest
+     * arguments it takes, so "too few" is as sound a reading as "too many". It used to record
+     * several names only in the long form PostgreSQL keeps internally, which is why the rule was
+     * one-sided and a short call reached the implementation.
+     *
+     * <p>A name the table does not list is not judged at all, which is also why no aggregate is:
+     * they carry no row there. A name a user has declared a function for decides its own arity,
+     * and so do the names in {@link #ANY_ARITY}.
+     */
+    private void rejectWrongArity(String name, FunctionCallExpr fn, RowContext ctx) {
+        if (name == null || ANY_ARITY.contains(name)) return;
+        if (fn.star()) return;
+        if (executor.database.getFunction(name) != null) return;
+        // unnest names its own too-many-arguments case, and names the argument types better.
+        if ("unnest".equals(name)) return;
+        for (Expression arg : fn.args()) {
+            // A named or variadic argument binds to a parameter by name rather than by position,
+            // so counting the written arguments is not what decides whether the call resolves.
+            if (arg instanceof NamedArgExpr) return;
+            // A query written where an argument goes is not an argument list at all — PostgreSQL
+            // refuses the syntax before it counts anything.
+            if (AstWalk.anyMatch(arg, n -> n instanceof Statement)) return;
+        }
+        // A type name written like a call of one argument is a cast, not a call: numrange(NULL) is
+        // CAST(NULL AS numrange), which PostgreSQL runs and no pg_proc row of that name describes.
+        if (fn.args().size() == 1 && DataType.fromPgName(name) != null) return;
+        if (!BuiltinFunctionSignatures.recordsSignature(name)) return;
+        if (BuiltinFunctionSignatures.acceptsArity(name, fn.args().size())) return;
+        throw new MemgresException("function " + fn.name() + "(" + argTypeNames(fn, ctx)
+                + ") does not exist\n  Hint: No function matches the given name and argument"
+                + " types. You might need to add explicit type casts.", "42883");
+    }
+
+    /** The argument types of a call, named the way PostgreSQL names them in a 42883. */
+    private String argTypeNames(FunctionCallExpr fn, RowContext ctx) {
+        StringBuilder types = new StringBuilder();
+        for (int i = 0; i < fn.args().size(); i++) {
+            if (i > 0) types.append(", ");
+            Expression arg = fn.args().get(i);
+            // An unadorned string literal is PostgreSQL's "unknown": it has no type until the
+            // function it is handed to gives it one, and a call that resolves to nothing never does.
+            if (arg instanceof Literal
+                    && ((Literal) arg).literalType() == Literal.LiteralType.STRING) {
+                types.append("unknown");
+                continue;
+            }
+            // A call is named by what it returns, which is not always what its value looks like:
+            // int4range(1,5) is a range, and the string it is held as would be reported as text.
+            String declared = declaredReturnTypeName(arg);
+            if (declared != null) {
+                types.append(declared);
+                continue;
+            }
+            // The arguments are transformed before the function is resolved, so an argument that
+            // is wrong in itself is what PostgreSQL reports -- a query written where one goes is a
+            // syntax error long before anything counts them.
+            Object value = executor.evalExpr(arg, ctx);
+            types.append(value == null ? "unknown" : AstExecutor.pgTypeNameOf(value));
+        }
+        return types.toString();
+    }
+
+    /**
+     * The type a nested call returns, when every signature PostgreSQL declares for its name returns
+     * the same one, and null otherwise. A name with overloads that differ, a set-returning one and
+     * one this database has its own function for are all left to the value.
+     */
+    private String declaredReturnTypeName(Expression arg) {
+        if (!(arg instanceof FunctionCallExpr)) return null;
+        FunctionCallExpr call = (FunctionCallExpr) arg;
+        if (call.filter() != null || call.distinct || call.star()) return null;
+        String bare = stripSchemaPrefix(call.name().toLowerCase(java.util.Locale.ROOT));
+        if (executor.database != null && executor.database.getFunction(bare) != null) return null;
+        DataType found = null;
+        for (String[] signature : BuiltinFunctionSignatures.SIGNATURES) {
+            if (!signature[0].equalsIgnoreCase(bare)) continue;
+            if (signature[3] == null || signature[3].isEmpty()) return null;
+            if (signature[3].charAt(0) == 't') return null;
+            DataType returned = DataType.fromOid(Integer.parseInt(signature[1]));
+            if (returned == null) return null;
+            if (found != null && found != returned) return null;
+            found = returned;
+        }
+        return found == null ? null : CatalogHelper.pgTypeName(found);
+    }
+
     private void requireArgs(FunctionCallExpr fn, int min) {
         if (fn.args().size() < min) {
             throw new MemgresException(
@@ -265,6 +416,10 @@ class FunctionEvaluator {
         String name = foldedName(fn.name());
         // Strip a schema prefix that names the schema the function is really in
         name = stripCallableSchemaPrefix(name);
+        // A qualifier is resolved to a schema before anything is looked for inside it, so a
+        // qualifier that names no schema is reported as the missing schema rather than as a
+        // function that does not exist in it.
+        rejectMissingSchemaQualifier(name);
 
         // Reject DEFAULT as a function argument; PG gives 42601 (syntax error)
         for (Expression arg : fn.args()) {
@@ -328,6 +483,14 @@ class FunctionEvaluator {
         if (name.equals("values")) {
             throw new MemgresException("syntax error at or near \"VALUES\"", "42601");
         }
+
+        // A function is resolved by its name and its argument list together, so a call with a
+        // number of arguments no signature of that name has resolves to nothing at all. memgres
+        // read the arguments it wanted and ignored the rest, which made upper('a','b') answer 'A'
+        // and now(1) answer the time.
+        // A VARIADIC argument was one written argument before it was expanded, and an empty array
+        // expands to none at all, so the count in hand is not the count the writer gave.
+        if (!callUsedVariadic) rejectWrongArity(name, fn, ctx);
 
         // Delegate to category handlers
         Object delegated;

@@ -3437,9 +3437,7 @@ COLUMNS: tstzrange
 ROW: ["2024-01-01 00:00:00+00","2024-02-01 00:00:00+00")
 --- STMT 25 ---
 SQL: SELECT multirange(int4range(1,5), int4range(10,15))
-RESULT: 1 columns, 1 rows
-COLUMNS: multirange
-ROW: {[1,5)}
+ERROR [42883]: ERROR: function multirange(int4range, int4range) does not exist
 --- STMT 26 ---
 SQL: SELECT int4multirange(int4range(1,5), int4range(5,8))
 RESULT: 1 columns, 1 rows

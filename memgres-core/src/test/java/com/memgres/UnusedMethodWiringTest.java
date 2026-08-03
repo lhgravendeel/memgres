@@ -95,23 +95,29 @@ class UnusedMethodWiringTest {
         }
     }
 
-    // 7. is_horizontal / is_vertical with 2 points
+    // 7. is_horizontal / is_vertical take one argument, and PostgreSQL has no two-argument form:
+    // pg_proc on the reference server holds no is_horizontal at all, and
+    // is_horizontal(point '(0,0)', point '(5,0)') is 42883 there. memgres used to answer it,
+    // which is what these two cases pinned; a call with more arguments than any signature of the
+    // name is now refused, so what they pin is the refusal.
     @Test
-    void testIsHorizontalTwoPoints() throws Exception {
-        try (Statement s = conn.createStatement();
-             ResultSet rs = s.executeQuery("SELECT is_horizontal(point '(0,0)', point '(5,0)')")) {
-            assertTrue(rs.next());
-            assertTrue(rs.getBoolean(1));
-        }
+    void testIsHorizontalTwoPoints() {
+        SQLException e = assertThrows(SQLException.class, () -> {
+            try (Statement s = conn.createStatement()) {
+                s.executeQuery("SELECT is_horizontal(point '(0,0)', point '(5,0)')");
+            }
+        });
+        assertEquals("42883", e.getSQLState());
     }
 
     @Test
-    void testIsVerticalTwoPoints() throws Exception {
-        try (Statement s = conn.createStatement();
-             ResultSet rs = s.executeQuery("SELECT is_vertical(point '(0,0)', point '(0,5)')")) {
-            assertTrue(rs.next());
-            assertTrue(rs.getBoolean(1));
-        }
+    void testIsVerticalTwoPoints() {
+        SQLException e = assertThrows(SQLException.class, () -> {
+            try (Statement s = conn.createStatement()) {
+                s.executeQuery("SELECT is_vertical(point '(0,0)', point '(0,5)')");
+            }
+        });
+        assertEquals("42883", e.getSQLState());
     }
 
     // 8. ts_token_type uses real method

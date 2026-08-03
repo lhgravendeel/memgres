@@ -299,16 +299,23 @@ class DdlTableExecutor {
 
             // A DEFAULT and a generation expression are both evaluated for one row at a time, with
             // no other row in sight; PostgreSQL names each context in its own words.
-            executor.selectExecutor.placementCheck.reject(def.defaultExpr(), "DEFAULT expressions");
+            executor.selectExecutor.placementCheck.rejectStoredDefinition(
+                    def.defaultExpr(), "DEFAULT expressions", null);
             if (def.generatedExpr() != null) {
+                // A generation expression is kept as the text it was written as, so its type names
+                // are read here rather than when the statement itself was parsed.
+                List<String> generatedTypeSchemas = new ArrayList<>();
                 Expression generated = null;
                 try {
-                    generated = com.memgres.engine.parser.Parser.parseExpression(def.generatedExpr());
+                    generated = com.memgres.engine.parser.Parser.parseExpression(
+                            def.generatedExpr(), generatedTypeSchemas);
                 } catch (RuntimeException ignored) {
                     // An expression that will not parse is reported by whatever reads it next
                 }
-                executor.selectExecutor.placementCheck.reject(
-                        generated, "column generation expressions");
+                SchemaQualifier.rejectMissingTypeSchemas(
+                        executor.database, executor.session, executor.getSystemCatalog(), generatedTypeSchemas);
+                executor.selectExecutor.placementCheck.rejectStoredDefinition(
+                        generated, "column generation expressions", null);
             }
 
             // Validate generated column expression
@@ -463,10 +470,10 @@ class DdlTableExecutor {
                 }
                 if (tc.type() == TableConstraint.ConstraintType.CHECK) {
                     // A CHECK is tested against the row being written, on its own; it can see no
-                    // other row, so nothing in it may need a group or a finished result.
-                    executor.selectExecutor.placementCheck.rejectSubquery(
-                            tc.checkExpr(), "check constraint");
-                    executor.selectExecutor.placementCheck.reject(tc.checkExpr(), "check constraints");
+                    // other row, so nothing in it may need a group or a finished result — and no
+                    // call in it may carry a clause only an aggregate has a use for.
+                    executor.selectExecutor.placementCheck.rejectStoredDefinition(
+                            tc.checkExpr(), "check constraints", "check constraint");
                     DdlDefinitionChecks.requireBooleanPredicate(tc.checkExpr(), table, "CHECK");
                 }
                 StoredConstraint sc = ddl.convertTableConstraint(stmt.name(), tc, table);
@@ -786,7 +793,8 @@ class DdlTableExecutor {
             }
             String text = bound.substring(marker.length());
             Expression expr = com.memgres.engine.parser.Parser.parseExpression(text);
-            executor.selectExecutor.placementCheck.reject(expr, "partition bound");
+            executor.selectExecutor.placementCheck.rejectStoredDefinition(
+                    expr, "partition bound", null);
             // A bound is settled once, with no row to read and no query to read one from, so a
             // column reference and a sub-select are both refused for what they are rather than
             // reported as a name nothing answers for.
@@ -1770,6 +1778,7 @@ class DdlTableExecutor {
     // ---- CREATE TABLE AS / SELECT INTO ----
 
     QueryResult executeCreateTableAs(CreateTableAsStmt stmt) {
+        SchemaQualifier.requireSchema(executor.database, executor.session, stmt.schema());
         String schemaName = stmt.schema() != null ? stmt.schema() : executor.creationSchema();
         Schema schema = executor.database.getOrCreateSchema(schemaName);
 

@@ -115,46 +115,14 @@ public final class DdlDefinitionChecks {
     // ---- CHECK / POLICY predicates ----
 
     /**
-     * {@code 42804} when the expression is plainly of some non-boolean type. PostgreSQL names
-     * the context ({@code CHECK}, {@code POLICY}) and the type it found. Expressions whose type
-     * this engine cannot decide statically are left alone rather than guessed at.
+     * {@code 42804} when the expression is plainly of some non-boolean type, and {@code 22P02}
+     * when a bare string literal stands where the condition does and is not a word boolean's
+     * input function knows. PostgreSQL names the context ({@code CHECK}, {@code POLICY}) and the
+     * type it found. Expressions whose type this engine cannot decide statically are left alone
+     * rather than guessed at, and so are the conditions written inside this one.
      */
     public static void requireBooleanPredicate(Expression expr, Table table, String context) {
-        String type = staticTypeName(expr, table);
-        if (type != null && !"boolean".equals(type)) {
-            throw PgErrors.datatypeMismatch("argument of " + context
-                    + " must be type boolean, not type " + type);
-        }
-    }
-
-    /**
-     * The expression's type where it is decidable without a full type resolver: a column
-     * reference, a cast, or a literal that is not of the untyped {@code unknown} kind. Returns
-     * null when the type is not decidable here.
-     */
-    private static String staticTypeName(Expression expr, Table table) {
-        if (expr instanceof ColumnRef && table != null) {
-            int idx = table.getColumnIndex(((ColumnRef) expr).column());
-            if (idx < 0) return null;
-            Column col = table.getColumns().get(idx);
-            if (col.getEnumTypeName() != null || col.getDomainTypeName() != null) return null;
-            return col.getType() != null ? col.getType().toRegtypeDisplay() : null;
-        }
-        if (expr instanceof CastExpr) {
-            DataType dt = DataType.fromPgName(baseTypeName(((CastExpr) expr).typeName()));
-            return dt != null ? dt.toRegtypeDisplay() : null;
-        }
-        if (expr instanceof Literal) {
-            Literal lit = (Literal) expr;
-            switch (lit.literalType()) {
-                case INTEGER: return "integer";
-                case FLOAT: return "numeric";
-                case BOOLEAN: return "boolean";
-                // A bare string literal is still of type unknown and coerces to boolean.
-                default: return null;
-            }
-        }
-        return null;
+        BooleanContext.check(expr, context, BooleanContext.Types.of(table));
     }
 
     /**

@@ -151,13 +151,19 @@ class SelectExecutor {
         // is read: reading a FROM item is observable -- a WITH item that writes would be applied,
         // a fault inside a derived table would surface -- and the statement may yet be refused.
         executor.fromResolver.checkRelationNamesExist(stmt);
+        // The range table is finished before a clause is read, and two FROM items answering to one
+        // name is a fault of the range table rather than of any clause. It is decided from the
+        // written names alone, so it costs nothing and reads nothing.
+        validateFromClause(stmt.from());
 
         boolean noFromClause = stmt.from() == null || stmt.from().isEmpty();
         // A query with no FROM clause has no range table to build, so nothing can outrank its
         // clause-level faults and they are judged straight away. One that has a FROM clause is
         // judged below, after the relations have been resolved.
         if (noFromClause) {
-            FilterCheck.reject(this, stmt, null);
+            // No relations to describe, but a call still has to resolve: a literal and a cast
+            // carry a type of their own, which is what settles whether the call names a function.
+            FilterCheck.reject(this, stmt, new QueryLevelScope(this, Cols.listOf(), null, stmt));
             rejectMisplacedSrfs(stmt);
         } else {
             // A join condition is part of the FROM clause, so PostgreSQL judges it while it builds
@@ -185,6 +191,18 @@ class SelectExecutor {
             validateDistinctOn(stmt);
             windowEvaluator.validateWindowUsage(stmt, null);
             windowEvaluator.validateAfterWhere(stmt);
+            // Nothing supplies a column here, so only what the expressions write down is typed.
+            // The select list is read before WHERE, and an aggregate may not stand in WHERE at
+            // all -- which is what PostgreSQL says about SELECT 1 WHERE count(*).
+            BooleanContext.Types noColumns = BooleanContext.Types.none();
+            for (SelectStmt.SelectTarget target : stmt.targets()) {
+                BooleanContext.scan(target.expr(), noColumns);
+            }
+            if (stmt.where() != null) {
+                placementCheck.reject(stmt.where(), "WHERE");
+                BooleanContext.check(stmt.where(), "WHERE", noColumns);
+            }
+            BooleanContext.check(stmt.having(), "HAVING", noColumns);
             boolean hasAgg = hasAggregateInTargets(stmt.targets())
                     || stmt.having() != null;
             if (hasAgg) {
@@ -213,38 +231,44 @@ class SelectExecutor {
         if (hasDataModifyingCte(stmt)) {
             scope = null;
         } else {
-            scope = new QueryLevelScope(this,
-                    executor.fromResolver.resolveTableBindings(stmt.from()), null, stmt);
+            List<RowContext.TableBinding> described =
+                    executor.fromResolver.resolveTableBindings(stmt.from());
+            // Describing swallows every relation it cannot follow, so a short list is a list with
+            // a relation missing from it and the columns that relation holds would look like
+            // columns nothing holds.
+            scope = new QueryLevelScope(this, described, null, stmt,
+                    described.size() == FromResolver.relationCount(stmt.from()));
         }
+        // A join condition belongs to the FROM clause, which PostgreSQL transforms before it reads
+        // any other clause, so this is judged before the select list's calls are.
+        rejectNonBooleanJoinConditions(stmt.from(), scope);
         FilterCheck.reject(this, stmt, scope);
         rejectMisplacedSrfs(stmt);
 
         List<RowContext> contexts = executor.fromResolver.resolveFromClause(
                 stmt.from(), stmt.where(), stmt.having(), stmt);
 
-        // PostgreSQL builds the range table before it analyses the rest of the query, so a name
-        // that does not resolve is reported on its own even when the clauses are also wrong, and
-        // two FROM items answering to one name are reported before any clause is read at all.
-        validateFromClause(stmt.from());
-
         List<RowContext.TableBinding> baseBindings;
         // What the FROM clause exposes, in order: every relation's columns except where a USING
         // or NATURAL join merged two into one, which SELECT * lists first. Taken from a row when
         // there is one and worked out from the clause itself when there is not.
         List<RowContext.OutCol> baseOutput;
+        boolean everyRelation;
         if (!contexts.isEmpty()) {
             baseBindings = contexts.get(0).getBindings();
             baseOutput = contexts.get(0).outputColumnsOrDefault();
+            everyRelation = true;
         } else {
             baseBindings = executor.fromResolver.resolveTableBindings(stmt.from());
             baseOutput = executor.fromResolver.resolveClauseOutput(stmt.from(), baseBindings);
+            everyRelation = baseBindings.size() == FromResolver.relationCount(stmt.from());
         }
 
         // What the relations supply is now known, which is what the checks below consult to report
         // an unresolvable column or call before the clause it stands in is complained about. The
         // clause-level refusals themselves keep the order they had when they ran ahead of the
         // query: a call carrying a FILTER it may not have is judged first.
-        scope = new QueryLevelScope(this, baseBindings, baseOutput, stmt);
+        scope = new QueryLevelScope(this, baseBindings, baseOutput, stmt, everyRelation);
         rejectSrfInAggregates(stmt);
         validateDistinctOn(stmt);
 
@@ -358,6 +382,16 @@ class SelectExecutor {
 
         rejectAmbiguousQualifiedRefs(stmt, baseBindings, usingColumnsLower);
 
+        // Every condition is coerced to boolean as the clause holding it is transformed, and
+        // PostgreSQL transforms the FROM clause before the select list and the select list before
+        // WHERE. Nothing in a select list has to be a condition, but a CASE, a FILTER or an AND
+        // written there still holds one.
+        BooleanContext.Types columnTypes = BooleanContext.Types.of(executor, baseBindings);
+        for (SelectStmt.FromItem item : stmt.from()) checkJoinConditions(item, columnTypes);
+        for (SelectStmt.SelectTarget target : stmt.targets()) {
+            BooleanContext.scan(target.expr(), columnTypes);
+        }
+
         // Validate array subscript type errors for empty tables
         if (contexts.isEmpty() && simpleFrom && !baseBindings.isEmpty()) {
             for (SelectStmt.SelectTarget target : stmt.targets()) {
@@ -388,19 +422,13 @@ class SelectExecutor {
         // WHERE
         if (stmt.where() != null) {
             placementCheck.reject(stmt.where(), "WHERE", scope);
+            BooleanContext.check(stmt.where(), "WHERE", columnTypes);
             // Pre-flight type validation of WHERE clause (PG checks at plan time)
             // Only validate for simple single-table SELECTs (not CTEs/subqueries/joins)
             if (simpleFrom && baseBindings.size() == 1 && !hasJoins
                     && (stmt.withClauses() == null || stmt.withClauses().isEmpty())
                     && executor.cteStack.isEmpty()) {
                 executor.validateWhereTypesAgainstTable(stmt.where(), baseBindings.get(0).table());
-            }
-            if (!contexts.isEmpty()) {
-                Object testVal = executor.evalExpr(stmt.where(), contexts.get(0));
-                if (testVal instanceof Number) {
-                    throw new MemgresException("argument of WHERE must be type boolean, not type " +
-                            TypeCoercion.inferType(testVal).getPgName(), "42804");
-                }
             }
             contexts = contexts.stream()
                     .filter(ctx -> executor.isTruthy(executor.evalExpr(stmt.where(), ctx)))
@@ -421,6 +449,15 @@ class SelectExecutor {
         // definitions, ORDER BY, GROUP BY, LIMIT and OFFSET, so what it says about a query wrong
         // in two clauses is what the earlier one is wrong about.
         windowEvaluator.validateAfterWhere(stmt);
+        BooleanContext.check(stmt.having(), "HAVING", columnTypes);
+        if (stmt.orderBy() != null) {
+            for (SelectStmt.OrderByItem item : stmt.orderBy()) {
+                BooleanContext.scan(item.expr(), columnTypes);
+            }
+        }
+        if (stmt.groupBy() != null) {
+            for (Expression g : stmt.groupBy()) BooleanContext.scan(g, columnTypes);
+        }
 
         // Check if this query uses aggregation
         boolean hasGroupBy = stmt.groupBy() != null && !stmt.groupBy().isEmpty();
@@ -1700,6 +1737,15 @@ class SelectExecutor {
         return resultRows;
     }
 
+    /** Every ON condition the FROM clause writes, each of which has to be a condition. */
+    private void checkJoinConditions(SelectStmt.FromItem item, BooleanContext.Types types) {
+        if (!(item instanceof SelectStmt.JoinFrom)) return;
+        SelectStmt.JoinFrom join = (SelectStmt.JoinFrom) item;
+        checkJoinConditions(join.left(), types);
+        checkJoinConditions(join.right(), types);
+        BooleanContext.check(join.on(), "JOIN/ON", types);
+    }
+
     // ---- SELECT without FROM ----
 
     private QueryResult executeSelectExpressions(SelectStmt stmt) {
@@ -1721,10 +1767,6 @@ class SelectExecutor {
         if (stmt.offset() != null) limitOffsetValue(stmt.offset(), false);
         if (stmt.where() != null) {
             Object whereVal = executor.evalExpr(stmt.where(), null);
-            if (whereVal instanceof Number) {
-                throw new MemgresException("argument of WHERE must be type boolean, not type " +
-                        TypeCoercion.inferType(whereVal).getPgName(), "42804");
-            }
             if (!executor.isTruthy(whereVal)) {
                 List<Column> columns = new ArrayList<>();
                 for (SelectStmt.SelectTarget target : stmt.targets()) {
@@ -1815,7 +1857,15 @@ class SelectExecutor {
                         ? new Column(alias, DataType.ENUM, true, false, null, enumTypeName)
                         : new Column(alias, DataType.TEXT, true, false, null));
             } else {
-                columns.add(new Column(alias, resultType, true, false, null));
+                // A column an enclosing query level supplies — which is what a LATERAL projects —
+                // keeps the whole of its declared type. A bare DataType does not carry an array's
+                // element type, and an int[] read through a LATERAL called itself _int4.
+                Column outerCol = target.expr() instanceof ColumnRef
+                        ? executor.exprEvaluator.columnFromOuterContexts((ColumnRef) target.expr())
+                        : null;
+                columns.add(outerCol != null
+                        ? buildProjectedColumn(alias, target.expr(), Cols.listOf())
+                        : new Column(alias, resultType, true, false, null));
             }
             if (val instanceof List<?> && srfNode != null) {
                 List<?> list = (List<?>) val;
@@ -2014,6 +2064,183 @@ class SelectExecutor {
             rejectSrfsInJoinConditions(Cols.listOf(jf.left(), jf.right()));
         }
     }
+
+    /**
+     * A join condition has to be a condition.
+     *
+     * <p>{@code ON a.id} joins on nothing at all: PostgreSQL coerces the qualification to boolean
+     * while it builds the range table and refuses what will not coerce, so a text column there is
+     * 42804 and a string that is not a boolean word is 22P02 — while memgres read whatever came out
+     * as truthy and quietly answered the whole cross product.
+     *
+     * <p>Judged before the join runs, because the join running is the wrong answer, and judged
+     * innermost-first left to right, which is the order PostgreSQL reaches the qualifications in.
+     * Deliberately one-sided: only an expression whose type is certain here is refused, so a shape
+     * this cannot type is executed exactly as before.
+     */
+    private void rejectNonBooleanJoinConditions(List<SelectStmt.FromItem> fromItems,
+                                                QueryLevelScope scope) {
+        if (fromItems == null) return;
+        for (SelectStmt.FromItem item : fromItems) {
+            if (!(item instanceof SelectStmt.JoinFrom)) continue;
+            SelectStmt.JoinFrom jf = (SelectStmt.JoinFrom) item;
+            rejectNonBooleanJoinConditions(Cols.listOf(jf.left(), jf.right()), scope);
+            rejectNonBooleanCondition(jf.on(), "JOIN/ON", scope);
+        }
+    }
+
+    /**
+     * Refuses one expression standing where a condition is wanted, naming the construct that wanted
+     * it. AND, OR and NOT each want one of their own and PostgreSQL names the operator rather than
+     * the clause, so the walk descends through them carrying the name with it.
+     */
+    private void rejectNonBooleanCondition(Expression expr, String clause, QueryLevelScope scope) {
+        if (expr == null) return;
+        // An aggregate or a window call cannot stand in a join condition at all, and that refusal
+        // is PostgreSQL's answer whatever type the condition would have had.
+        if (containsAggregate(expr) || containsWindowFunction(expr)) return;
+        if (expr instanceof BinaryExpr) {
+            BinaryExpr bin = (BinaryExpr) expr;
+            if (bin.op() == BinaryExpr.BinOp.AND || bin.op() == BinaryExpr.BinOp.OR) {
+                rejectNonBooleanCondition(bin.left(), bin.op().name(), scope);
+                rejectNonBooleanCondition(bin.right(), bin.op().name(), scope);
+            }
+            // Every other operator is a comparison or an arithmetic one whose result type this
+            // does not settle, so it is left to evaluate as before.
+            return;
+        }
+        if (expr instanceof UnaryExpr && ((UnaryExpr) expr).op() == UnaryExpr.UnaryOp.NOT) {
+            rejectNonBooleanCondition(((UnaryExpr) expr).operand(), "NOT", scope);
+            return;
+        }
+        // A string written without a type is `unknown`, and a condition is what resolves it: 'x' is
+        // not a boolean word, so PostgreSQL reports the input rather than the type.
+        if (expr instanceof Literal
+                && ((Literal) expr).literalType() == Literal.LiteralType.STRING) {
+            TypeCoercion.toBoolean(((Literal) expr).value());
+            return;
+        }
+        DataType type = certainConditionType(expr, scope);
+        if (type == null || type == DataType.BOOLEAN) return;
+        throw PgErrors.datatypeMismatch("argument of " + clause
+                + " must be type boolean, not type " + type.toRegtypeDisplay());
+    }
+
+    /**
+     * The type an expression in a condition certainly has, or null when this cannot settle it.
+     *
+     * <p>Four things are certain: a numeric or boolean literal, a cast to a named built-in type, a
+     * built-in call whose every signature returns one type, and a column of a relation this query
+     * level has already resolved. Of those, only the types on the list below are certainly not a
+     * boolean — a domain or an enum could be over anything, and refusing one wrongly would refuse
+     * SQL PostgreSQL runs.
+     */
+    private DataType certainConditionType(Expression expr, QueryLevelScope scope) {
+        DataType type = null;
+        if (expr instanceof CastExpr) {
+            String name = ((CastExpr) expr).typeName().replaceAll("\\(.*\\)", "").trim();
+            type = DataType.fromPgName(name);
+        } else if (expr instanceof FunctionCallExpr) {
+            FunctionCallExpr call = (FunctionCallExpr) expr;
+            type = resolvedReturnType(call, scope);
+            if (type == null) type = soleReturnType(call);
+        } else if (scope != null) {
+            type = scope.certainTypeOf(expr);
+        }
+        if (type == DataType.BOOLEAN) return type;
+        return CERTAINLY_NOT_BOOLEAN.contains(type) ? type : null;
+    }
+
+    /**
+     * The type a built-in call produces once it has been resolved by its argument types.
+     *
+     * <p>A name every signature of which returns one type can be answered from the name alone,
+     * which is what {@link #soleReturnType} does; an overloaded one cannot. {@code upper} returns
+     * text of a text argument and the element type of a range, so nothing is settled until the
+     * argument is looked at — and that is why {@code JOIN ... ON upper('a')} used to reach
+     * evaluation and complain about the value {@code 'A'} rather than about the type text.
+     *
+     * <p>Only an exact match counts, of the whole argument list, at one signature and no other.
+     * An unadorned string literal is read as text because that is what PostgreSQL resolves an
+     * unknown literal to when a text signature is there to take it.
+     */
+    private DataType resolvedReturnType(FunctionCallExpr call, QueryLevelScope scope) {
+        if (call.filter() != null || call.distinct || call.star) return null;
+        if (call.args() == null || call.args().isEmpty()) return null;
+        String bare = FunctionEvaluator.stripSchemaPrefix(call.name().toLowerCase(Locale.ROOT));
+        if (hasUserFunction(bare) || isAggregateFunction(bare)) return null;
+        if (PlacementCheck.isWindowFunctionName(bare)) return null;
+        int[] oids = new int[call.args().size()];
+        for (int i = 0; i < oids.length; i++) {
+            Expression arg = call.args().get(i);
+            DataType argType = scope == null ? null : scope.certainTypeOf(arg);
+            if (argType == null && arg instanceof Literal
+                    && ((Literal) arg).literalType() == Literal.LiteralType.STRING) {
+                argType = DataType.TEXT;
+            }
+            if (argType == null) return null;
+            oids[i] = argType.getOid();
+        }
+        DataType found = null;
+        for (String[] signature : BuiltinFunctionSignatures.SIGNATURES) {
+            if (!signature[0].equalsIgnoreCase(bare)) continue;
+            // A row memgres wrote for itself names the types it happened to write down, so an
+            // argument list matching one settles nothing about which form was resolved to.
+            if (!BuiltinFunctionSignatures.isPostgresSignature(signature)) return null;
+            String[] params = signature[2].isEmpty() ? new String[0] : signature[2].split(" ");
+            if (params.length != oids.length) continue;
+            boolean same = true;
+            for (int i = 0; i < params.length; i++) {
+                if (!params[i].equals(String.valueOf(oids[i]))) {
+                    same = false;
+                    break;
+                }
+            }
+            if (!same) continue;
+            // A function that returns a set returns rows, not a value of a type.
+            if (signature[3] == null || signature[3].isEmpty()) return null;
+            if (signature[3].charAt(0) == 't') return null;
+            DataType returned = DataType.fromOid(Integer.parseInt(signature[1]));
+            if (returned == null) return null;
+            if (found != null && found != returned) return null;
+            found = returned;
+        }
+        return found;
+    }
+
+    /**
+     * The type a built-in call certainly produces: the one every signature of that name returns.
+     * A name whose overloads return different types, one a user has declared a function under, and
+     * one carrying a clause that changes what it is are all left unsettled.
+     */
+    private DataType soleReturnType(FunctionCallExpr call) {
+        if (call.filter() != null || call.distinct || call.star) return null;
+        String bare = FunctionEvaluator.stripSchemaPrefix(call.name().toLowerCase(Locale.ROOT));
+        if (hasUserFunction(bare) || isAggregateFunction(bare)) return null;
+        if (PlacementCheck.isWindowFunctionName(bare)) return null;
+        DataType found = null;
+        for (String[] signature : BuiltinFunctionSignatures.SIGNATURES) {
+            if (!signature[0].equalsIgnoreCase(bare)) continue;
+            // A function that returns a set returns rows, not a value of a type.
+            if (signature[3] == null || signature[3].isEmpty()) return null;
+            if (signature[3].charAt(0) == 't') return null;
+            DataType returned = DataType.fromOid(Integer.parseInt(signature[1]));
+            if (returned == null) return null;
+            if (found != null && found != returned) return null;
+            found = returned;
+        }
+        return found;
+    }
+
+    /** The types a value certainly has when it has one of them, and none of them is boolean. */
+    private static final Set<DataType> CERTAINLY_NOT_BOOLEAN =
+            new java.util.HashSet<>(Arrays.asList(
+                    DataType.SMALLINT, DataType.INTEGER, DataType.BIGINT, DataType.REAL,
+                    DataType.DOUBLE_PRECISION, DataType.NUMERIC, DataType.MONEY,
+                    DataType.VARCHAR, DataType.CHAR, DataType.TEXT, DataType.NAME,
+                    DataType.DATE, DataType.TIMESTAMP, DataType.TIMESTAMPTZ, DataType.TIME,
+                    DataType.TIMETZ, DataType.INTERVAL, DataType.BYTEA, DataType.UUID,
+                    DataType.JSON, DataType.JSONB, DataType.XML));
 
     /**
      * A join or subquery given an alias exposes everything it produces under that single name,
@@ -2273,25 +2500,76 @@ class SelectExecutor {
         throw e;
     }
 
-    /** The first qualified reference under {@code node} naming one of {@code names}, or null. */
+    /**
+     * The first qualified reference under {@code node} naming one of {@code names}, or null.
+     *
+     * <p>A query level that binds one of the names itself takes it over for everything written
+     * inside it — its own FROM entries and its own WITH items both — so the search drops that name
+     * on the way down rather than reporting a reference that reaches something else entirely.
+     * The name is dropped for that level and every level under it, and comes back for the levels
+     * beside it.
+     */
     static String firstReferenceTo(Object node, Set<String> names) {
-        Set<String> outer = new HashSet<>(names);
+        Set<String> visible = new HashSet<>();
+        for (String name : names) visible.add(name.toLowerCase());
+        return firstReferenceIn(node, visible);
+    }
+
+    /**
+     * Every name a FROM item brings into its own query level.
+     *
+     * <p>A join has no name of its own and binds the names of everything under it, so the walk goes
+     * down both sides. A table binds the name it is written under and, where an alias renamed it,
+     * its own name as well: the alias hides it for resolution, but this list decides only whether a
+     * reference reaches something else entirely, and a name that may have been meant for the entry
+     * here is not one that reaches out.
+     */
+    private static void collectBoundNames(SelectStmt.FromItem item, Set<String> bound) {
+        if (item == null) return;
+        if (item instanceof SelectStmt.JoinFrom) {
+            collectBoundNames(((SelectStmt.JoinFrom) item).left(), bound);
+            collectBoundNames(((SelectStmt.JoinFrom) item).right(), bound);
+            return;
+        }
+        String exposed = exposedNameOf(item);
+        if (exposed != null) bound.add(exposed.toLowerCase());
+        if (item instanceof SelectStmt.TableRef) {
+            String written = ((SelectStmt.TableRef) item).table();
+            if (written != null) bound.add(written.toLowerCase());
+        }
+    }
+
+    private static String firstReferenceIn(Object node, Set<String> visible) {
+        if (node == null || visible.isEmpty()) return null;
+        Set<String> here = visible;
         if (node instanceof SelectStmt) {
-            // A name the item re-uses for its own FROM entry shadows the outer one
-            Map<String, String> own = new LinkedHashMap<>();
-            List<SelectStmt.FromItem> from = ((SelectStmt) node).from();
-            if (from != null) {
-                for (SelectStmt.FromItem f : from) {
-                    String n = exposedNameOf(f);
-                    if (n != null) own.put(n.toLowerCase(), n);
+            Set<String> bound = new HashSet<>();
+            SelectStmt sel = (SelectStmt) node;
+            if (sel.from() != null) {
+                for (SelectStmt.FromItem f : sel.from()) collectBoundNames(f, bound);
+            }
+            if (sel.withClauses() != null) {
+                for (SelectStmt.CommonTableExpr cte : sel.withClauses()) {
+                    if (cte.name() != null) bound.add(cte.name().toLowerCase());
                 }
             }
-            outer.removeAll(own.keySet());
+            if (!bound.isEmpty()) {
+                here = new HashSet<>(visible);
+                here.removeAll(bound);
+                if (here.isEmpty()) return null;
+            }
         }
-        Object found = AstWalk.findFirst(node, n -> n instanceof ColumnRef
-                && ((ColumnRef) n).table() != null
-                && outer.contains(((ColumnRef) n).table().toLowerCase()));
-        return found == null ? null : ((ColumnRef) found).table();
+        if (node instanceof ColumnRef) {
+            ColumnRef ref = (ColumnRef) node;
+            return ref.table() != null && here.contains(ref.table().toLowerCase())
+                    ? ref.table() : null;
+        }
+        final Set<String> inScope = here;
+        final String[] answer = new String[1];
+        AstWalk.forEachChild(node, child -> {
+            if (answer[0] == null) answer[0] = firstReferenceIn(child, inScope);
+        });
+        return answer[0];
     }
 
     /**

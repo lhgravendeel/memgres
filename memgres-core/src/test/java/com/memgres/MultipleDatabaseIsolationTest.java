@@ -1524,6 +1524,71 @@ class MultipleDatabaseIsolationTest {
         }
     }
 
+    /**
+     * A client that has just disconnected is not gone the moment its own close() returns: the
+     * bytes are on their way, and the server takes the connection down when it reads them. So a
+     * script that closes its connection and drops the database it was using in the next breath is
+     * racing its own disconnection -- and PostgreSQL runs that script, because DROP DATABASE waits
+     * for the other backends to exit rather than reading the count once and giving up.
+     *
+     * <p>The race itself is won on an idle machine and lost on a busy one, so it makes no test.
+     * This holds the connection open for a fixed moment instead and asks the server the same
+     * question: a session that ends while DROP DATABASE is waiting does not make the database
+     * undroppable.
+     */
+    @Test
+    void dropWaitsForASessionThatIsOnItsWayOut() throws Exception {
+        try (Memgres memgres = Memgres.builder().port(0).build().start()) {
+            String base = "jdbc:postgresql://localhost:" + memgres.getPort();
+            try (Connection conn = connect(memgres);
+                 Statement s = conn.createStatement()) {
+                s.execute("CREATE DATABASE leaving_db");
+            }
+            final Connection leaving = connect(base, "leaving_db", memgres);
+            try (Statement s = leaving.createStatement()) {
+                s.execute("CREATE TABLE t (v int)");
+            }
+            Thread closer = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        Thread.sleep(300L);
+                        leaving.close();
+                    } catch (Exception e) {
+                        throw new RuntimeException(e);
+                    }
+                }
+            });
+            closer.start();
+            try (Connection conn = connect(memgres);
+                 Statement s = conn.createStatement()) {
+                s.execute("DROP DATABASE leaving_db");
+            }
+            closer.join();
+        }
+    }
+
+    /** A connection that really stays is still a connection, and the database is still in use. */
+    @Test
+    void dropStillRefusesASessionThatStays() throws Exception {
+        try (Memgres memgres = Memgres.builder().port(0).build().start()) {
+            String base = "jdbc:postgresql://localhost:" + memgres.getPort();
+            try (Connection conn = connect(memgres);
+                 Statement s = conn.createStatement()) {
+                s.execute("CREATE DATABASE staying_db");
+            }
+            try (Connection staying = connect(base, "staying_db", memgres);
+                 Connection conn = connect(memgres);
+                 Statement s = conn.createStatement()) {
+                SQLException ex = assertThrows(SQLException.class,
+                        () -> s.execute("DROP DATABASE staying_db"));
+                assertEquals("55006", ex.getSQLState());
+                assertTrue(ex.getMessage().contains("being accessed by other users"));
+            }
+        }
+    }
+
+
     // -----------------------------------------------------------
     // 31. Drop + recreate freshness
     // -----------------------------------------------------------

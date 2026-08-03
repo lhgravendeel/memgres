@@ -27,6 +27,9 @@ class DdlViewExecutor {
 
     QueryResult executeCreateView(CreateViewStmt stmt) {
         ddl.checkPgCatalogWriteProtection();
+        // A CREATE that says which schema to create in is refused outright when there is no such
+        // schema, before the query it would store is looked at.
+        SchemaQualifier.requireSchema(executor.database, executor.session, stmt.schema());
         // A view name is taken in the schema the view goes into, not in the database at large:
         // another schema may already hold a view of that name, and this one is still free.
         String createSchema = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();

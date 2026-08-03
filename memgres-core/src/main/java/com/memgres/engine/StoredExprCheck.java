@@ -1,23 +1,11 @@
 package com.memgres.engine;
 
-import com.memgres.engine.parser.ast.AnyAllArrayExpr;
-import com.memgres.engine.parser.ast.AnyAllExpr;
-import com.memgres.engine.parser.ast.BetweenExpr;
-import com.memgres.engine.parser.ast.BinaryExpr;
-import com.memgres.engine.parser.ast.CastExpr;
 import com.memgres.engine.parser.ast.ColumnRef;
 import com.memgres.engine.parser.ast.ExistsExpr;
 import com.memgres.engine.parser.ast.Expression;
 import com.memgres.engine.parser.ast.FunctionCallExpr;
-import com.memgres.engine.parser.ast.InExpr;
-import com.memgres.engine.parser.ast.IsBooleanExpr;
-import com.memgres.engine.parser.ast.IsJsonExpr;
-import com.memgres.engine.parser.ast.IsNullExpr;
-import com.memgres.engine.parser.ast.LikeExpr;
-import com.memgres.engine.parser.ast.Literal;
 import com.memgres.engine.parser.ast.SelectStmt;
 import com.memgres.engine.parser.ast.SubqueryExpr;
-import com.memgres.engine.parser.ast.UnaryExpr;
 import com.memgres.engine.parser.ast.WindowFuncExpr;
 
 import java.util.LinkedHashSet;
@@ -79,20 +67,28 @@ final class StoredExprCheck {
                 "aggregate functions are not allowed in policy expressions", false);
     }
 
-    void check(Expression expr) {
+    /** @param select the engine, which is what says whether a call is an aggregate */
+    void check(Expression expr, SelectExecutor select) {
         if (expr == null) return;
         if (subqueryError != null && AstWalk.anyMatch(expr, StoredExprCheck::isSubquery)) {
             throw PgErrors.notImplemented(subqueryError);
         }
+        // A call carrying FILTER, DISTINCT or an aggregate ORDER BY without being an aggregate is
+        // refused by the same walk that finds a misplaced aggregate, because PostgreSQL reports
+        // whichever of the two it reads first rather than one kind before the other.
+        select.placementCheck.rejectStoredDefinition(expr, aggregateClause(), null);
         if (aggregateError != null && aggregatesOutsideSubquery(expr)) {
             throw new MemgresException(aggregateError, "42803");
         }
         checkColumnRefs(expr);
-        String type = typeNameOf(expr);
-        if (type != null && !"boolean".equals(type)) {
-            throw PgErrors.datatypeMismatch(
-                    "argument of " + argumentLabel + " must be type boolean, not type " + type);
-        }
+        BooleanContext.check(expr, argumentLabel, BooleanContext.Types.of(table, rowAliases));
+    }
+
+    /** The clause name in {@link #aggregateError}, which is what a misplaced call is refused for. */
+    private String aggregateClause() {
+        String prefix = "aggregate functions are not allowed in ";
+        return aggregateError != null && aggregateError.startsWith(prefix)
+                ? aggregateError.substring(prefix.length()) : argumentLabel;
     }
 
     /**
@@ -154,68 +150,4 @@ final class StoredExprCheck {
         return SelectExecutor.AGGREGATE_FUNCTIONS.contains(name);
     }
 
-    /**
-     * The PostgreSQL type name this expression yields, or null when it cannot be known without
-     * evaluating it. A string literal is untyped in PostgreSQL and takes the type the context
-     * wants, so it reports null rather than {@code text}.
-     */
-    private String typeNameOf(Expression expr) {
-        if (expr instanceof Literal) {
-            Literal lit = (Literal) expr;
-            switch (lit.literalType()) {
-                case BOOLEAN: return "boolean";
-                case INTEGER: return "integer";
-                case FLOAT: return "numeric";
-                default: return null;
-            }
-        }
-        if (expr instanceof ColumnRef) {
-            ColumnRef ref = (ColumnRef) expr;
-            int idx = table.getColumnIndex(ref.column());
-            return idx < 0 ? null : CatalogHelper.pgTypeName(table.getColumns().get(idx).getType());
-        }
-        if (expr instanceof BinaryExpr) {
-            return isBooleanOp(((BinaryExpr) expr).op()) ? "boolean" : null;
-        }
-        if (expr instanceof UnaryExpr) {
-            return ((UnaryExpr) expr).op() == UnaryExpr.UnaryOp.NOT ? "boolean" : null;
-        }
-        if (expr instanceof CastExpr) {
-            String target = ((CastExpr) expr).typeName();
-            return target == null ? null : target.toLowerCase(Locale.ROOT);
-        }
-        if (expr instanceof IsNullExpr || expr instanceof IsBooleanExpr || expr instanceof IsJsonExpr
-                || expr instanceof LikeExpr || expr instanceof BetweenExpr || expr instanceof InExpr
-                || expr instanceof ExistsExpr || expr instanceof AnyAllExpr
-                || expr instanceof AnyAllArrayExpr) {
-            return "boolean";
-        }
-        if (expr instanceof WindowFuncExpr) return null;
-        return null;
-    }
-
-    private static boolean isBooleanOp(BinaryExpr.BinOp op) {
-        switch (op) {
-            case EQUAL:
-            case NOT_EQUAL:
-            case LESS_THAN:
-            case GREATER_THAN:
-            case LESS_EQUAL:
-            case GREATER_EQUAL:
-            case AND:
-            case OR:
-            case LIKE:
-            case ILIKE:
-            case SIMILAR_TO:
-            case IS_DISTINCT_FROM:
-            case IS_NOT_DISTINCT_FROM:
-            case REGEX_MATCH:
-            case REGEX_IMATCH:
-            case NOT_REGEX_MATCH:
-            case NOT_REGEX_IMATCH:
-                return true;
-            default:
-                return false;
-        }
-    }
 }

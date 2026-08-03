@@ -580,14 +580,17 @@ class CatalogSecurityBuilder {
     Table buildPgLocks() {
         List<Column> cols = Cols.listOf(
                 col("locktype", DataType.TEXT),
-                col("database", DataType.INTEGER),
-                col("relation", DataType.INTEGER),
+                // The object columns are oids and the transaction one is an xid, as PostgreSQL
+                // declares them: age() is declared over xid and nothing else, so a column calling
+                // itself an integer makes age(pg_locks.transactionid) a call to no function.
+                col("database", DataType.OID),
+                col("relation", DataType.OID),
                 col("page", DataType.INTEGER),
                 col("tuple", DataType.SMALLINT),
                 col("virtualxid", DataType.TEXT),
-                col("transactionid", DataType.INTEGER),
-                col("classid", DataType.INTEGER),
-                col("objid", DataType.INTEGER),
+                col("transactionid", DataType.XID),
+                col("classid", DataType.OID),
+                col("objid", DataType.OID),
                 col("objsubid", DataType.SMALLINT),
                 col("virtualtransaction", DataType.TEXT),
                 col("pid", DataType.INTEGER),

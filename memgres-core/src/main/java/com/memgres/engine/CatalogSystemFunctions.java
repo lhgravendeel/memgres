@@ -93,6 +93,10 @@ class CatalogSystemFunctions {
                     }
                     Column colDef = ctx.resolveColumnDef(colRef.table(), colRef.column());
                     if (colDef != null) {
+                        // A domain is a type of its own, and it is the type the column was
+                        // declared with — so it is the name, not the base type it is built on and
+                        // not the enum or composite that base may itself be.
+                        if (colDef.getDomainTypeName() != null) return colDef.getDomainTypeName();
                         if (colDef.getEnumTypeName() != null) return colDef.getEnumTypeName();
                         if (colDef.getCompositeTypeName() != null) return colDef.getCompositeTypeName();
                         if (colDef.getArrayElementType() != null)

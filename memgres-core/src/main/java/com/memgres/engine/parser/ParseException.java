@@ -26,7 +26,9 @@ public class ParseException extends MemgresException {
         if (token != null && token.type() == TokenType.EOF) {
             return "syntax error at end of input";
         }
-        return "syntax error at or near \"" + (token == null ? "" : token.value()) + "\"";
+        // The word as the statement spelled it. A keyword's value is folded to upper case for
+        // matching, and quoting that named a word nobody had written.
+        return "syntax error at or near \"" + (token == null ? "" : token.raw()) + "\"";
     }
 
     private ParseException(String message, Token token, boolean verbatim) {

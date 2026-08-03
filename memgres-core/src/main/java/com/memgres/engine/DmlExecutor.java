@@ -227,6 +227,9 @@ class DmlExecutor {
         // The WHERE of a DO UPDATE decides whether to overwrite the one conflicting row, so it is
         // an UPDATE's WHERE and takes no set either -- the SET list beside it already refuses one.
         executor.selectExecutor.rejectSrfIn(oc.doUpdateWhereClause(), "WHERE");
+        // Both the target row and EXCLUDED are in scope here, so an unqualified column name is
+        // ambiguous rather than a column of the target: only what the clause writes down is typed.
+        BooleanContext.check(oc.doUpdateWhereClause(), "WHERE", BooleanContext.Types.none());
         if (oc.constraint() != null) {
             StoredConstraint named = null;
             for (StoredConstraint sc : table.getConstraints()) {
@@ -318,6 +321,72 @@ class DmlExecutor {
                 }
             }
             steps.clear();
+        }
+    }
+
+    /**
+     * What PostgreSQL settles about a data-modifying statement before it judges any clause of it.
+     *
+     * <p>PostgreSQL builds the range table first — putting the relation the statement writes into
+     * it ahead of the ones it reads — and validates the written column list against that relation
+     * while it is still analysing the statement. A statement that both names something that is not
+     * there and misuses a clause therefore reports the name. A SELECT already gets this from
+     * {@link FromResolver#checkRelationNamesExist}; INSERT, UPDATE, DELETE and MERGE resolve their
+     * target inside the methods below instead, which is why a clause-level refusal used to win.
+     *
+     * <p>This is the same resolution those methods perform, by name, reading no rows: it can only
+     * report what they would have reported, one step earlier. Where it cannot settle the answer
+     * without reading — a view, a relation it cannot describe — it says nothing and leaves the
+     * later check where it was.
+     */
+    void checkTargetsResolvable(Statement stmt) {
+        executor.fromResolver.checkRelationNamesExist(stmt);
+        SelectStmt.TableRef target = FromResolver.writtenRelationOf(stmt);
+        if (target == null) return;
+        Table table = describeWrittenRelation(target);
+        if (table == null) return;
+        // The column list of an INSERT is validated against the target the moment the target is
+        // known, before the VALUES or the SELECT behind them is looked at.
+        if (stmt instanceof InsertStmt) {
+            requireTargetColumns(table, target.table, ((InsertStmt) stmt).columns());
+        }
+        // An UPDATE's FROM and a DELETE's USING bring other relations into scope; without one the
+        // target is the whole scope, and PostgreSQL resolves the WHERE against it before it
+        // reaches the assignments or anything they carry.
+        if (stmt instanceof UpdateStmt) {
+            UpdateStmt u = (UpdateStmt) stmt;
+            if (u.from() == null || u.from().isEmpty()) {
+                requireReadableColumns(table, u.where(), u.alias(), u.table());
+            }
+        }
+        if (stmt instanceof DeleteStmt) {
+            DeleteStmt d = (DeleteStmt) stmt;
+            if (d.using() == null || d.using().isEmpty()) {
+                requireReadableColumns(table, d.where(), d.alias(), d.table());
+            }
+        }
+    }
+
+    /**
+     * The stored relation a data-modifying statement writes, described rather than read.
+     *
+     * <p>A view is left alone: it has columns of its own and a rewrite behind it, and the write
+     * path resolves both and has its own words for what is wrong with them.
+     */
+    private Table describeWrittenRelation(SelectStmt.TableRef target) {
+        if (target.table == null) return null;
+        Database.ViewDef view = target.schema != null
+                ? executor.database.getView(target.schema, target.table)
+                : executor.database.getView(target.table);
+        if (view != null) return null;
+        try {
+            return executor.resolveTable(
+                    target.schema != null ? target.schema : executor.defaultSchema(),
+                    target.table, target.schema != null);
+        } catch (RuntimeException e) {
+            // Anything this cannot resolve is left to the write path, which resolves it again and
+            // reports whatever it finds in its own words.
+            return null;
         }
     }
 
@@ -735,7 +804,10 @@ class DmlExecutor {
                         // First evaluate the DO UPDATE WHERE clause if present
                         if (stmt.onConflict().doUpdateWhereClause() != null) {
                             Object whereResult = executor.evalExpr(stmt.onConflict().doUpdateWhereClause(), conflictCtx);
-                            if (!(whereResult instanceof Boolean && ((Boolean) whereResult))) {
+                            // Read as a condition, like every other WHERE: an unadorned literal is
+                            // of type unknown and boolean's input function reads it, so WHERE 't'
+                            // is the true this clause was skipping the update for.
+                            if (!executor.isTruthy(whereResult)) {
                                 // WHERE clause evaluated to false/null: skip entirely — no update, no count, no RETURNING
                                 continue;
                             }
@@ -1973,6 +2045,8 @@ class DmlExecutor {
         executor.selectExecutor.rejectSrfIn(stmt.where(), "WHERE");
         placement.rejectOuterLevelAggregate(stmt.where(), "WHERE", table,
                 stmt.alias() != null ? stmt.alias() : stmt.table());
+        BooleanContext.check(stmt.where(), "WHERE", dmlScope(table,
+                stmt.alias() != null ? stmt.alias() : stmt.table(), stmt.using()));
         // Capture view column mapping before further resolveTable calls clobber it (renamed-column views).
         this.activeViewColMap = executor.lastViewColumnMapping;
         this.activeViewColOrder = executor.lastViewColumnOrder;
@@ -2311,7 +2385,7 @@ class DmlExecutor {
         // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
         Table targetTable = executor.resolveTable(schemaName, stmt.targetTable(), stmt.schema() != null);
         String targetAlias = stmt.targetAlias() != null ? stmt.targetAlias() : stmt.targetTable();
-        checkMergePlacement(stmt);
+        checkMergePlacement(stmt, targetTable, targetAlias);
 
         // Validate: source cannot be the same unaliased table as target
         if (stmt.source() instanceof SelectStmt.TableRef) {
@@ -3549,10 +3623,15 @@ class DmlExecutor {
      * PostgreSQL names the ON clause a JOIN condition, the WHEN condition its own thing, and an
      * action by the command it is — the same names it uses for a plain join, UPDATE and INSERT.
      */
-    private void checkMergePlacement(MergeStmt stmt) {
+    private void checkMergePlacement(MergeStmt stmt, Table targetTable, String targetAlias) {
         PlacementCheck placement = executor.selectExecutor.placementCheck;
         placement.reject(stmt.onCondition(), "JOIN conditions");
         executor.selectExecutor.rejectSrfIn(stmt.onCondition(), "JOIN conditions");
+        // The ON condition is deliberately not coerced to boolean: PostgreSQL transforms a MERGE's
+        // join condition without coercing it, so MERGE ... ON (1) is accepted where the same
+        // condition written in a JOIN is not. A WHEN condition is coerced, and both relations are
+        // in scope for it.
+        BooleanContext.Types types = mergeScope(stmt, targetTable, targetAlias);
         for (MergeStmt.WhenClause clause : stmt.whenClauses()) {
             Expression when = null;
             List<InsertStmt.SetClause> sets = null;
@@ -3572,6 +3651,7 @@ class DmlExecutor {
             }
             placement.reject(when, "MERGE WHEN conditions");
             executor.selectExecutor.rejectSrfIn(when, "MERGE WHEN conditions");
+            BooleanContext.check(when, "WHEN", types);
             if (sets != null) {
                 for (InsertStmt.SetClause set : sets) {
                     placement.reject(set.value(), "UPDATE");
@@ -3625,6 +3705,48 @@ class DmlExecutor {
         placement.reject(stmt.where(), "WHERE");
         executor.selectExecutor.rejectSrfIn(stmt.where(), "WHERE");
         placement.rejectOuterLevelAggregate(stmt.where(), "WHERE", table, targetName);
+        BooleanContext.Types types = dmlScope(table, targetName, stmt.from());
+        for (InsertStmt.SetClause set : stmt.setClauses()) BooleanContext.scan(set.value(), types);
+        BooleanContext.check(stmt.where(), "WHERE", types);
+    }
+
+    /**
+     * What an UPDATE or a DELETE has in scope: its target, and the relations its FROM or USING
+     * clause adds. A clause item this cannot look up leaves the target's columns untyped too,
+     * because then there is no telling which relation a bare name belongs to.
+     */
+    private BooleanContext.Types dmlScope(Table table, String alias,
+                                          List<SelectStmt.FromItem> extra) {
+        if (table == null) return BooleanContext.Types.none();
+        if (extra == null || extra.isEmpty()) return BooleanContext.Types.of(table);
+        List<RowContext.TableBinding> bindings = new ArrayList<>();
+        bindings.add(new RowContext.TableBinding(table, alias, null));
+        for (SelectStmt.FromItem item : extra) {
+            if (!(item instanceof SelectStmt.TableRef)) return BooleanContext.Types.none();
+            SelectStmt.TableRef ref = (SelectStmt.TableRef) item;
+            Table joined = executor.selectExecutor.lookupRelationOrNull(ref.schema(), ref.table());
+            if (joined == null) return BooleanContext.Types.none();
+            bindings.add(new RowContext.TableBinding(joined,
+                    ref.alias() != null ? ref.alias() : ref.table(), null));
+        }
+        return BooleanContext.Types.of(executor, bindings);
+    }
+
+    /**
+     * What the two relations of a MERGE supply, for typing the conditions written against them.
+     * Both are described rather than read; a source this cannot look up leaves the target's
+     * columns untyped as well, because then there is no telling which of the two a bare name is.
+     */
+    private BooleanContext.Types mergeScope(MergeStmt stmt, Table targetTable, String targetAlias) {
+        if (!(stmt.source() instanceof SelectStmt.TableRef)) return BooleanContext.Types.none();
+        SelectStmt.TableRef src = (SelectStmt.TableRef) stmt.source();
+        Table source = executor.selectExecutor.lookupRelationOrNull(src.schema(), src.table());
+        if (source == null || targetTable == null) return BooleanContext.Types.none();
+        List<RowContext.TableBinding> bindings = new ArrayList<>();
+        bindings.add(new RowContext.TableBinding(targetTable, targetAlias, null));
+        bindings.add(new RowContext.TableBinding(source,
+                src.alias() != null ? src.alias() : src.table(), null));
+        return BooleanContext.Types.of(executor, bindings);
     }
 
     /**

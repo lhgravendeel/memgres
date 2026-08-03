@@ -60,6 +60,15 @@ class DdlAlterTableExecutor {
     }
 
     QueryResult executeAlterTable(AlterTableStmt stmt) {
+        // ALTER opens the relation it names, and opening one starts by finding its schema. IF
+        // EXISTS says not to mind a relation that is not there, and a relation in a schema that is
+        // not there is not there either: PostgreSQL raises a notice and does nothing, the same as
+        // for a missing relation in a schema it found.
+        if (stmt.ifExists()
+                && !SchemaQualifier.exists(executor.database, executor.session, stmt.schema())) {
+            return QueryResult.command(QueryResult.Type.CREATE_TABLE, 0);
+        }
+        SchemaQualifier.requireSchema(executor.database, executor.session, stmt.schema());
         String schemaName = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
         rejectActionsOnOtherRelationKinds(stmt);
         QueryResult indexResult = alterIndexRelation(stmt, schemaName);
@@ -615,6 +624,8 @@ class DdlAlterTableExecutor {
         }
         DdlDefinitionChecks.rejectSystemColumnName(def.name());
         DdlDefinitionChecks.validateDefaultExpression(def.defaultExpr());
+        executor.selectExecutor.placementCheck.rejectStoredDefinition(
+                def.defaultExpr(), "DEFAULT expressions", null);
         // A child that lacks one of its parent's columns cannot stand in for the parent, so PG
         // refuses to add a column to a parent alone.
         if (stmt.only() && !childRelations(table).isEmpty()) {
@@ -1658,6 +1669,8 @@ class DdlAlterTableExecutor {
         } else {
             Column col = requireColumn(table, alterCol.column(), stmt.table());
             DdlDefinitionChecks.validateDefaultExpression(setDefault.expr());
+            executor.selectExecutor.placementCheck.rejectStoredDefinition(
+                    setDefault.expr(), "DEFAULT expressions", null);
             // The default has to be a value the column can hold, or every insert that relies on
             // it fails on a statement that never mentions the column.
             if (DdlDefinitionChecks.isEvaluableAtDefinitionTime(setDefault.expr())) {
@@ -1933,10 +1946,8 @@ class DdlAlterTableExecutor {
         }
 
         if (addConstraint.constraint().type() == TableConstraint.ConstraintType.CHECK) {
-            executor.selectExecutor.placementCheck.rejectSubquery(
-                    addConstraint.constraint().checkExpr(), "check constraint");
-            executor.selectExecutor.placementCheck.reject(
-                    addConstraint.constraint().checkExpr(), "check constraints");
+            executor.selectExecutor.placementCheck.rejectStoredDefinition(
+                    addConstraint.constraint().checkExpr(), "check constraints", "check constraint");
             DdlDefinitionChecks.requireBooleanPredicate(
                     addConstraint.constraint().checkExpr(), table, "CHECK");
         }

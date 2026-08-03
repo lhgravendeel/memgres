@@ -44,6 +44,8 @@ public class AstExecutor {
      */
     final java.util.Map<String, Long> sessionSequenceValues = new java.util.HashMap<>();
     final FromResolver fromResolver = new FromResolver(this);
+    /** The types a relation's definition settles for its columns, read from the definition. */
+    final DefinedTypes definedTypes = new DefinedTypes(this);
     /** How deep a statement run from inside another statement is. */
     private int executeDepth;
     final ExprEvaluator exprEvaluator = new ExprEvaluator(this);
@@ -182,8 +184,10 @@ public class AstExecutor {
         OffsetDateTime previousInstant = TypeCoercion.rawSessionInstant();
         TypeCoercion.setSessionInstant(currentInstant());
         try {
-            Statement stmt = Parser.parse(sql);
+            List<String> typeSchemas = new ArrayList<String>();
+            Statement stmt = Parser.parse(sql, typeSchemas);
             if (stmt == null) return QueryResult.empty(); // empty input (only comments)
+            rejectQualifiedTypeSchemas(stmt, typeSchemas);
             rejectNestedDataModifyingCtes(stmt);
             // The FULL JOIN restriction is asked of the statement the client sent and of nothing
             // else; a statement run from inside one — a function body, a catalog lookup — is not
@@ -221,6 +225,32 @@ public class AstExecutor {
             TypeCoercion.setSessionZone(previousZone);
             TypeCoercion.setSessionInstant(previousInstant);
         }
+    }
+
+    /**
+     * A type name written under a schema that does not exist, which PostgreSQL refuses before it
+     * runs anything — wherever the type stands, and whether or not the expression holding it would
+     * ever have been evaluated. {@code CASE WHEN false THEN 1::nosuch.int4 END} and a WITH item
+     * nothing selects from are both refused, because the type is resolved while the statement is
+     * analysed rather than while it runs.
+     *
+     * <p>The range table is built first, though, so a relation the statement names and does not
+     * have is still what {@code SELECT 1::nosuch.int4 FROM nosuchtable} reports. That lookup is
+     * asked for here only when a qualifier has already turned out to be missing, so a statement
+     * whose type names all resolve — which is every statement that writes no qualifier at all —
+     * reaches the engine by exactly the path it did before.
+     */
+    private void rejectQualifiedTypeSchemas(Statement stmt, List<String> typeSchemas) {
+        String missing = SchemaQualifier.firstMissing(database, session, typeSchemas);
+        if (missing != null) {
+            fromResolver.checkRelationNamesExist(stmt);
+            throw SchemaQualifier.missing(missing);
+        }
+        // The schema is there; whether it holds the type is the second half of the same lookup.
+        String unknown = SchemaQualifier.firstUnknownType(database, systemCatalog, typeSchemas);
+        if (unknown == null) return;
+        fromResolver.checkRelationNamesExist(stmt);
+        throw SchemaQualifier.noSuchType(unknown);
     }
 
     /**
@@ -388,6 +418,11 @@ public class AstExecutor {
         // UPDATE -- before any of it is run. A SELECT is judged where its own relations have been
         // resolved instead (SelectExecutor.executeSelectInner), because PostgreSQL builds the
         // range table before it looks at any clause and reports a missing relation on its own.
+        // The range table comes first for a data-modifying statement too, and the relation it
+        // writes goes into it before the ones it reads, so both are resolved before the clauses
+        // are judged. Only names are resolved and the target is only described: nothing is read
+        // and nothing is written by the check itself.
+        if (isDataModifying(stmt)) dmlExecutor.checkTargetsResolvable(stmt);
         if (stmt instanceof SetOpStmt || isDataModifying(stmt)) {
             FilterCheck.reject(selectExecutor, stmt, null);
         }

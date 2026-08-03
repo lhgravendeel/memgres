@@ -517,6 +517,38 @@ public enum DataType {
             new java.util.HashSet<>(java.util.Arrays.asList("regclass", "regtype", "regproc", "citext"));
 
     /**
+     * The names memgres reads as types that PostgreSQL keeps somewhere other than pg_catalog. An
+     * extension puts its types in the schema it was installed into, which is {@code public} by
+     * default, so {@code public.citext} names a type that is really there.
+     */
+    private static final java.util.Set<String> INSTALLED_BY_AN_EXTENSION =
+            new java.util.HashSet<>(java.util.Arrays.asList("citext", "hstore"));
+
+    /**
+     * Whether PostgreSQL's own pg_catalog holds a type of this name.
+     *
+     * <p>Asked when a type is written under a schema, to tell a qualifier that names where the type
+     * really is from one that does not. The built-in types are pg_catalog's alone — {@code int4} is
+     * neither public's nor pg_toast's — while a type an extension installed, and a type memgres
+     * added an OID of its own for, are not pg_catalog's and are left to resolve as they always did.
+     */
+    /** Whether this name is one an extension installs rather than one pg_catalog ships. */
+    public static boolean installedByAnExtension(String name) {
+        return name != null
+                && INSTALLED_BY_AN_EXTENSION.contains(name.trim().toLowerCase());
+    }
+
+    public static boolean isPgCatalogTypeName(String name) {
+        if (name == null) return false;
+        String lower = name.trim().toLowerCase();
+        if (INSTALLED_BY_AN_EXTENSION.contains(lower)) return false;
+        DataType dt = fromPgName(lower);
+        // PostgreSQL hands out everything below 16384 while it builds the catalogs, so an OID at or
+        // above it belongs to something this engine minted rather than something PostgreSQL ships.
+        return dt != null && dt.getOid() > 0 && dt.getOid() < 16384;
+    }
+
+    /**
      * The name PostgreSQL uses for a type in messages and catalogs: {@code int} is reported as
      * {@code integer}, {@code float8} as {@code double precision}. Unknown names (user-defined
      * types) are returned lowercased and otherwise unchanged.

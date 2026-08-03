@@ -63,9 +63,18 @@ class FromFunctionResolver {
         checkColumnAliasCount(funcFrom, contexts);
         // TABLESAMPLE binds the real stored table; never flag persistent tables.
         if (!funcFrom.functionName().toLowerCase().startsWith("__tablesample__:")) {
+            // The columns carry whatever type the resolver read off the values it built, so what
+            // the call itself settles is recorded beside them. See DefinedTypes. The call settles
+            // the same thing for every row it produced, so it is worked out once.
+            String[] settled = null;
             for (RowContext rc : contexts) {
                 for (RowContext.TableBinding b : rc.getBindings()) {
                     b.table().setFunctionResult(true);
+                    int width = b.table().getColumns().size();
+                    if (settled == null || settled.length != width) {
+                        settled = executor.definedTypes.ofFunction(funcFrom, width);
+                    }
+                    b.table().setDefinedColumnTypes(settled);
                 }
             }
         }
@@ -1828,8 +1837,10 @@ class FromFunctionResolver {
         }
         List<Column> result = new ArrayList<>(columns);
         for (int i = 0; i < aliases.size() && i < result.size(); i++) {
-            Column orig = result.get(i);
-            result.set(i, new Column(aliases.get(i), orig.getType(), orig.isNullable(), orig.isPrimaryKey(), orig.getDefaultValue()));
+            // A rename is a rename: the column keeps the type it had, down to the parts a bare
+            // DataType does not carry — an element type, an enum's or a domain's name, a
+            // precision. Rebuilt from the DataType alone, an integer[] came back as _int4.
+            result.set(i, result.get(i).withName(aliases.get(i)));
         }
         return result;
     }

@@ -51,6 +51,8 @@ class RangeFunctions {
      * {@code tsrange(date, date)} come back as the pair of timestamps it actually holds.
      */
     private String buildRange(String rangeType, FunctionCallExpr fn, RowContext ctx) {
+        String cast = castedRange(rangeType, fn, ctx);
+        if (cast != NOT_A_CAST) return cast;
         Object loObj = executor.evalExpr(fn.args().get(0), ctx);
         Object hiObj = executor.evalExpr(fn.args().get(1), ctx);
         String bounds = fn.args().size() > 2 && executor.evalExpr(fn.args().get(2), ctx) != null
@@ -65,6 +67,22 @@ class RangeFunctions {
         String hi = hiObj == null ? "" : quoteForRange(hiObj);
         String text = bounds.charAt(0) + lo + "," + hi + bounds.charAt(1);
         return RangeOperations.parse(text, rangeType).toString();
+    }
+
+    /** Told apart from a null result, which is what a cast of NULL answers. */
+    private static final String NOT_A_CAST = new String("not a cast");
+
+    /**
+     * A range type name written like a call of one argument, which PostgreSQL reads as a cast:
+     * {@code daterange('[2020-01-01,2020-02-01)')} is CAST(… AS daterange) and
+     * {@code daterange(NULL)} is a null range. Reading a second bound off an argument list that
+     * has only one was an index off the end, and the client was told XX000.
+     */
+    private String castedRange(String rangeType, FunctionCallExpr fn, RowContext ctx) {
+        if (fn.args().size() != 1) return NOT_A_CAST;
+        Object only = executor.evalExpr(fn.args().get(0), ctx);
+        if (only == null) return null;
+        return RangeOperations.parse(only.toString(), rangeType).toString();
     }
 
     /** A bound written back into a range literal has to survive being read out of it again. */
@@ -114,6 +132,8 @@ class RangeFunctions {
     Object eval(String name, FunctionCallExpr fn, RowContext ctx) {
         switch (name) {
             case "int4range": {
+                String cast = castedRange("int4range", fn, ctx);
+                if (cast != NOT_A_CAST) return cast;
                 Object loObj = executor.evalExpr(fn.args().get(0), ctx);
                 Object hiObj = executor.evalExpr(fn.args().get(1), ctx);
                 rejectWiderBound("int4range", loObj, hiObj);
@@ -316,10 +336,8 @@ class RangeFunctions {
                 sb.append("}");
                 return sb.toString();
             }
-            case "numrange": {
-                if (fn.args().size() < 2) return null;
+            case "numrange":
                 return buildRange(name, fn, ctx);
-            }
             default: {
                 // Check for user-defined range type constructors
                 String subtype = executor.database.getRangeTypes().get(name);

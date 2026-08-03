@@ -1151,12 +1151,12 @@ public class Session {
     // Notification support
 
     /** Installed by the wire handler so a notification can reach an idle listener at once. */
-    private volatile java.util.function.Consumer<Notification> notificationSink;
+    private volatile Runnable notificationSink;
     /** True while this session is running a statement, when a push would interleave messages. */
     private volatile boolean executingStatement;
 
-    public void setNotificationSink(java.util.function.Consumer<Notification> sink) {
-        this.notificationSink = sink;
+    public void setNotificationSink(Runnable flusher) {
+        this.notificationSink = flusher;
     }
 
     public boolean isExecutingStatement() {
@@ -1166,15 +1166,14 @@ public class Session {
     public void addNotification(Notification notification) {
         pendingNotifications.add(notification);
         // PG delivers to a listener that is sitting idle on the socket, not only to one that
-        // happens to issue another statement. Push now unless a response is in flight, in
-        // which case the ReadyForQuery drain will carry it.
-        java.util.function.Consumer<Notification> sink = notificationSink;
-        if (sink != null && !executingStatement) {
-            Notification pending;
-            while ((pending = pendingNotifications.poll()) != null) {
-                sink.accept(pending);
-            }
-        }
+        // happens to issue another statement, so ask this connection to write what it has. The
+        // notification stays on the queue until something writes it: taking it off here and
+        // handing it to a write that has not happened yet left it in neither place, and a
+        // listener whose next statement drained the queue in that moment found it empty and
+        // read the notification only after its own ReadyForQuery -- which is one statement too
+        // late for a client that asked for its notifications when that statement returned.
+        Runnable flusher = notificationSink;
+        if (flusher != null && !executingStatement) flusher.run();
     }
 
     public java.util.Queue<Notification> getPendingNotifications() {

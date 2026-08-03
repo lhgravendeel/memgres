@@ -3883,12 +3883,19 @@ public class PlpgsqlExecutor {
 
     // ---- Helpers ----
 
+    /**
+     * PL/pgSQL wants a boolean, not something that can be read as one. It has the value already,
+     * so it does not raise the type system's 42804: it puts the value through boolean's input
+     * function, and a value whose text that function does not know is 22P02. The difference is
+     * visible — {@code IF i} where i is 1 runs, because "1" is boolean input, while {@code IF i+1}
+     * fails with {@code invalid input syntax for type boolean: "2"}.
+     */
     private boolean isTruthy(Object val) {
         if (val == null) return false;
         if (val instanceof Boolean) return ((Boolean) val);
-        if (val instanceof Number) return ((Number) val).intValue() != 0;
-        if (val instanceof String) return ((String) val).equalsIgnoreCase("true") || ((String) val).equals("t");
-        return true;
+        String text = val instanceof java.util.List<?>
+                ? TypeCoercion.formatPgArray((java.util.List<?>) val) : String.valueOf(val);
+        return Boolean.TRUE.equals(TypeCoercion.toBoolean(text));
     }
 
     private Object coerceParamValue(Object val, String typeName) {
