@@ -75,6 +75,15 @@ final class PgInternalTypes {
             {5039, "_pg_snapshot", 5038, "d"},
     };
 
+    /** Whether one of these bootstrap types is named that. */
+    static boolean holds(String typname) {
+        if (typname == null) return false;
+        for (Object[] t : TYPES) {
+            if (((String) t[1]).equalsIgnoreCase(typname)) return true;
+        }
+        return false;
+    }
+
     /**
      * The name PostgreSQL prints for one of these OIDs, or null when it is not one of them.
      * An array type prints as its element type followed by {@code []}, the way regtype does.

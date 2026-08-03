@@ -409,8 +409,7 @@ class DmlParser {
         if (parser.matchKeyword("AS")) {
             alias = parser.readIdentifier();
         } else if (!parser.check(TokenType.SEMICOLON) && !parser.check(TokenType.EOF) && !parser.isAtEnd()
-                && (parser.peek().type() == TokenType.IDENTIFIER || parser.peek().type() == TokenType.QUOTED_IDENTIFIER
-                    || parser.isKeywordValidAsBareAlias())) {
+                && parser.isKeywordValidAsBareAlias()) {
             alias = parser.readIdentifier();
         }
 
@@ -462,8 +461,7 @@ class DmlParser {
         String targetAlias = null;
         if (parser.matchKeyword("AS")) {
             targetAlias = parser.readIdentifier();
-        } else if (!parser.checkKeyword("USING") && (parser.check(TokenType.IDENTIFIER) || parser.check(TokenType.QUOTED_IDENTIFIER)
-                || parser.isKeywordValidAsBareAlias())) {
+        } else if (!parser.checkKeyword("USING") && parser.isKeywordValidAsBareAlias()) {
             targetAlias = parser.readIdentifier();
         }
 

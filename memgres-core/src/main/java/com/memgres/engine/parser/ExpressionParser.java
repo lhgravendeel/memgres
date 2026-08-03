@@ -280,19 +280,32 @@ public class ExpressionParser {
     protected String parseTypeName() {
         StringBuilder sb = new StringBuilder();
         boolean qualified = false;  // an interval field qualifier has already taken its precision
+        boolean schemaWritten = false;
         String name = readIdentifier();
         // A schema-qualified type is written schema.typename. The engine works with the bare name,
         // so the qualifier is recorded rather than carried: it still has to name a schema that
-        // exists, which is something only whoever runs the statement can say.
+        // exists, which is something only whoever runs the statement can say. The exception is
+        // information_schema, whose types answer to nothing else and so keep their qualifier.
         if (check(TokenType.DOT)) {
             advance();
             String qualifier = name;
             name = readIdentifier();
+            schemaWritten = true;
             // Recorded whole, because both halves are read: the schema has to be one that exists,
             // and the type has to be one that schema holds.
             typeSchemaQualifiers.add(qualifier + "." + name);
+            if (com.memgres.engine.InformationSchemaTypes.isTheSchema(qualifier)) {
+                name = qualifier.toLowerCase() + "." + name.toLowerCase();
+            }
         }
         sb.append(name);
+
+        // A multi-word type is a spelling PostgreSQL's grammar rewrites, and the grammar reads one
+        // only where no schema was written: after a qualifier it takes a single name and the next
+        // word is unexpected, which is what "pg_catalog.character varying" reports.
+        if (schemaWritten) {
+            return finishTypeName(sb, false);
+        }
 
         // Handle multi-word types: DOUBLE PRECISION, CHARACTER VARYING, TIMESTAMP WITH/WITHOUT TIME ZONE
         if (name.equalsIgnoreCase("DOUBLE") && checkKeyword("PRECISION")) {
@@ -327,6 +340,15 @@ public class ExpressionParser {
             sb.append(" ").append(advance().value());
         }
 
+        return finishTypeName(sb, qualified);
+    }
+
+    /**
+     * The precision and the array suffix, which every type name may carry however it was written.
+     *
+     * @param qualified whether an interval field list has already taken this name's precision.
+     */
+    private String finishTypeName(StringBuilder sb, boolean qualified) {
         // Handle precision: (N) or (N,M), for types not already handled above
         // PG allows negative scale in numeric(p,s), e.g. numeric(10,-2) rounds to hundreds
         if (qualified && check(TokenType.LEFT_PAREN)) {

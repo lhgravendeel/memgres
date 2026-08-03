@@ -803,7 +803,7 @@ class DdlAdminExecutor {
         } catch (RuntimeException ignored) {
             return; // a qualification this cannot read is reported when the rule fires
         }
-        SchemaQualifier.rejectMissingTypeSchemas(executor.database, executor.session, typeSchemas);
+        SchemaQualifier.rejectMissingTypeSchemas(executor.database, executor.session, executor.getSystemCatalog(), typeSchemas);
         java.util.Set<String> aliases = new java.util.LinkedHashSet<>();
         aliases.add("old");
         aliases.add("new");

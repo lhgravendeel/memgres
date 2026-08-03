@@ -359,6 +359,276 @@ SELECT count(*) AS n
   FROM pg_catalog.pg_attrdef ad
  WHERE pg_catalog.pg_get_expr(ad.adbin, ad.adrelid) IS NULL;
 
+-- ============================================================================
+-- I. A name the schema written does not hold at all
+-- ============================================================================
+-- Reported as it was written, which is what distinguishes it from the same
+-- complaint made about a bare name.
+
+-- begin-expected-error
+-- sqlstate: 42704
+-- message-like: type "pg_catalog.qs_nosuchtype" does not exist
+-- end-expected-error
+SELECT 1::pg_catalog.qs_nosuchtype;
+
+-- begin-expected-error
+-- sqlstate: 42704
+-- message-like: type "public.qs_nosuchtype" does not exist
+-- end-expected-error
+SELECT 1::public.qs_nosuchtype;
+
+-- unqualified, there is no schema to name
+-- begin-expected-error
+-- sqlstate: 42704
+-- message-like: type "qs_nosuchtype" does not exist
+-- end-expected-error
+SELECT 1::qs_nosuchtype;
+
+-- begin-expected-error
+-- sqlstate: 42704
+-- message-like: type "pg_catalog.qs_nosuchtype" does not exist
+-- end-expected-error
+CREATE TABLE qs_q2 (i pg_catalog.qs_nosuchtype);
+
+-- a relation's type belongs to the schema the relation is in
+-- begin-expected-error
+-- sqlstate: 42704
+-- message-like: type "public.pg_class" does not exist
+-- end-expected-error
+SELECT NULL::public.pg_class;
+
+-- begin-expected-error
+-- sqlstate: 42704
+-- message-like: type "public.pg_tables" does not exist
+-- end-expected-error
+SELECT NULL::public.pg_tables;
+
+-- ============================================================================
+-- J. The domains information_schema is written in terms of
+-- ============================================================================
+-- The standard describes its own catalog in five named domains, and they answer
+-- under that schema and nowhere else.
+
+-- begin-expected
+-- columns: c
+-- row: 1
+-- end-expected
+SELECT 1::information_schema.cardinal_number AS c;
+
+-- begin-expected
+-- columns: c
+-- row: x
+-- end-expected
+SELECT 'x'::information_schema.character_data AS c;
+
+-- begin-expected
+-- columns: c
+-- row: x
+-- end-expected
+SELECT 'x'::information_schema.sql_identifier AS c;
+
+-- begin-expected
+-- columns: c
+-- row: YES
+-- end-expected
+SELECT 'YES'::information_schema.yes_or_no AS c;
+
+-- begin-expected
+-- columns: c
+-- row: t
+-- end-expected
+SELECT now()::information_schema.time_stamp IS NOT NULL AS c;
+
+-- named as the qualified type it is
+-- begin-expected
+-- columns: c
+-- row: information_schema.cardinal_number
+-- end-expected
+SELECT pg_typeof(1::information_schema.cardinal_number)::text AS c;
+
+-- the value is the type underneath, and is read as one
+-- begin-expected-error
+-- sqlstate: 22P02
+-- message-like: invalid input syntax for type integer: "x"
+-- end-expected-error
+SELECT 'x'::information_schema.cardinal_number;
+
+-- and then judged by the domain's own constraint
+-- begin-expected-error
+-- sqlstate: 23514
+-- message-like: value for domain information_schema.yes_or_no violates check constraint "yes_or_no_check"
+-- end-expected-error
+SELECT 'MAYBE'::information_schema.yes_or_no;
+
+-- they answer to nothing else
+-- begin-expected-error
+-- sqlstate: 42704
+-- message-like: type "cardinal_number" does not exist
+-- end-expected-error
+SELECT 1::cardinal_number;
+
+-- begin-expected-error
+-- sqlstate: 42704
+-- message-like: type "public.cardinal_number" does not exist
+-- end-expected-error
+SELECT 1::public.cardinal_number;
+
+-- begin-expected-error
+-- sqlstate: 42704
+-- message-like: type "pg_catalog.cardinal_number" does not exist
+-- end-expected-error
+SELECT 1::pg_catalog.cardinal_number;
+
+-- ============================================================================
+-- K. A multi-word type name written under a schema
+-- ============================================================================
+-- The grammar reads a multi-word spelling only where no schema was written:
+-- after a qualifier it takes a single name, and the next word is unexpected.
+
+-- begin-expected-error
+-- sqlstate: 42601
+-- message-like: syntax error at or near "varying"
+-- end-expected-error
+SELECT NULL::pg_catalog.character varying;
+
+-- begin-expected-error
+-- sqlstate: 42601
+-- message-like: syntax error at or near "precision"
+-- end-expected-error
+SELECT NULL::pg_catalog.double precision;
+
+-- begin-expected-error
+-- sqlstate: 42601
+-- message-like: syntax error at or near "with"
+-- end-expected-error
+SELECT NULL::pg_catalog.timestamp with time zone;
+
+-- begin-expected-error
+-- sqlstate: 42601
+-- message-like: syntax error at or near "without"
+-- end-expected-error
+SELECT NULL::pg_catalog.time without time zone;
+
+-- begin-expected-error
+-- sqlstate: 42601
+-- message-like: syntax error at or near "varying"
+-- end-expected-error
+CREATE TABLE qs_q3 (i pg_catalog.character varying);
+
+-- half of a multi-word spelling is no type of its own
+-- begin-expected-error
+-- sqlstate: 42704
+-- message-like: type "pg_catalog.character" does not exist
+-- end-expected-error
+SELECT NULL::pg_catalog.character;
+
+-- begin-expected-error
+-- sqlstate: 42704
+-- message-like: type "pg_catalog.varying" does not exist
+-- end-expected-error
+SELECT NULL::pg_catalog.varying;
+
+-- a precision and an array suffix are carried however the name was written
+-- begin-expected
+-- columns: c
+-- row: ab
+-- end-expected
+SELECT 'abc'::pg_catalog.varchar(2) AS c;
+
+-- begin-expected
+-- columns: c
+-- row: 1.20
+-- end-expected
+SELECT 1.2::pg_catalog.numeric(10,2) AS c;
+
+-- ============================================================================
+-- L. Which words may stand as a label, and which as a relation's alias
+-- ============================================================================
+-- A label written without AS may not be a word the grammar is still expecting
+-- to continue the expression before it. A relation's alias is a plain name, and
+-- takes any word the grammar does not keep for itself.
+
+-- begin-expected-error
+-- sqlstate: 42601
+-- message-like: syntax error at or near "varying"
+-- end-expected-error
+SELECT 1 varying;
+
+-- begin-expected-error
+-- sqlstate: 42601
+-- message-like: syntax error at or near "day"
+-- end-expected-error
+SELECT 1 day;
+
+-- begin-expected-error
+-- sqlstate: 42601
+-- message-like: syntax error at or near "character"
+-- end-expected-error
+SELECT 1 character;
+
+-- written with AS, every one of them is a label
+-- begin-expected
+-- columns: varying
+-- row: 1
+-- end-expected
+SELECT 1 AS varying;
+
+-- begin-expected
+-- columns: day
+-- row: 1
+-- end-expected
+SELECT 1 AS day;
+
+-- and a word the grammar does not keep is a label without AS
+-- begin-expected
+-- columns: value
+-- row: 1
+-- end-expected
+SELECT 1 value;
+
+-- begin-expected
+-- columns: name
+-- row: 1
+-- end-expected
+SELECT 1 name;
+
+-- a relation takes the wider set
+-- begin-expected
+-- columns: id
+-- row: 1
+-- row: 2
+-- end-expected
+SELECT varying.id FROM qs_t varying ORDER BY 1;
+
+-- begin-expected
+-- columns: id
+-- row: 1
+-- row: 2
+-- end-expected
+SELECT "day".id FROM qs_t day ORDER BY 1;
+
+-- but not a word it keeps for itself
+-- begin-expected-error
+-- sqlstate: 42601
+-- message-like: syntax error at or near "overlaps"
+-- end-expected-error
+SELECT * FROM qs_t overlaps;
+
+-- begin-expected-error
+-- sqlstate: 42601
+-- message-like: syntax error at or near "isnull"
+-- end-expected-error
+SELECT * FROM qs_t isnull;
+
+-- FOR opens a locking clause and nothing else
+-- begin-expected-error
+-- sqlstate: 42601
+-- message-like: syntax error at end of input
+-- end-expected-error
+SELECT * FROM qs_t for;
+
+DROP TABLE IF EXISTS qs_q2 CASCADE;
+DROP TABLE IF EXISTS qs_q3 CASCADE;
 DROP TABLE IF EXISTS qs_q1 CASCADE;
 DROP TABLE IF EXISTS qs_u CASCADE;
 DROP TABLE IF EXISTS qs_t CASCADE;

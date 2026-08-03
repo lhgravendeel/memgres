@@ -602,6 +602,11 @@ class SelectParser {
                 lockMode = "UPDATE";
             } else if (parser.matchKeyword("SHARE")) {
                 lockMode = "SHARE";
+            } else {
+                // FOR opens a locking clause and nothing else here, so a word that names no lock
+                // strength is the word PostgreSQL stops on -- swallowing the FOR accepted a
+                // statement that trailed off into nothing.
+                throw ParseException.at(parser.peek());
             }
             // Optional: OF table_name [, ...]
             if (parser.matchKeyword("OF")) {
@@ -1238,8 +1243,7 @@ class SelectParser {
         String alias = null;
         if (parser.matchKeyword("AS")) {
             alias = parser.readIdentifier();
-        } else if (parser.peek().type() == TokenType.IDENTIFIER || parser.peek().type() == TokenType.QUOTED_IDENTIFIER
-                || isKeywordValidAsBareAlias()) {
+        } else if (isValidBareTargetLabel()) {
             alias = parser.readIdentifier();
         }
 
@@ -1440,9 +1444,7 @@ class SelectParser {
         String alias = null;
         if (parser.matchKeyword("AS")) {
             alias = parser.readIdentifier();
-        } else if (parser.peek().type() == TokenType.IDENTIFIER
-                || parser.peek().type() == TokenType.QUOTED_IDENTIFIER
-                || isKeywordValidAsBareAlias()) {
+        } else if (isKeywordValidAsBareAlias()) {
             alias = parser.readIdentifier();
         }
         List<String> colAliases = null;
@@ -1526,8 +1528,7 @@ class SelectParser {
                 parser.matchKeyword("AS");
                 // Try to read optional alias
                 String alias = null;
-                if (parser.peek().type() == TokenType.IDENTIFIER || parser.peek().type() == TokenType.QUOTED_IDENTIFIER
-                        || isKeywordValidAsBareAlias()) {
+                if (isKeywordValidAsBareAlias()) {
                     alias = parser.readIdentifier();
                 }
                 // Parse optional column aliases: alias(col1, col2, ...)
@@ -1562,8 +1563,7 @@ class SelectParser {
                 // Pattern: (SELECT ... JOIN ...) alias or (SELECT ... JOIN ...) alias(col1, col2, ...)
                 String parenAlias = null;
                 parser.matchKeyword("AS");
-                if (parser.peek().type() == TokenType.IDENTIFIER || parser.peek().type() == TokenType.QUOTED_IDENTIFIER
-                        || isKeywordValidAsBareAlias()) {
+                if (isKeywordValidAsBareAlias()) {
                     parenAlias = parser.readIdentifier();
                 }
                 if (parenAlias != null) {
@@ -1632,8 +1632,7 @@ class SelectParser {
             String alias = null;
             if (parser.matchKeyword("AS")) {
                 alias = parser.readIdentifier();
-            } else if (parser.peek().type() == TokenType.IDENTIFIER || parser.peek().type() == TokenType.QUOTED_IDENTIFIER
-                    || isKeywordValidAsBareAlias()) {
+            } else if (isKeywordValidAsBareAlias()) {
                 alias = parser.readIdentifier();
             }
             // Optional column definition list: alias(col [type], col [type], ...)
@@ -1676,8 +1675,7 @@ class SelectParser {
                 String funcAlias = null;
                 if (parser.matchKeyword("AS")) {
                     funcAlias = parser.readIdentifier();
-                } else if (parser.peek().type() == TokenType.IDENTIFIER || parser.peek().type() == TokenType.QUOTED_IDENTIFIER
-                        || isKeywordValidAsBareAlias()) {
+                } else if (isKeywordValidAsBareAlias()) {
                     funcAlias = parser.readIdentifier();
                 }
                 List<String> colAliases = null;
@@ -1701,8 +1699,7 @@ class SelectParser {
         String alias = null;
         if (parser.matchKeyword("AS")) {
             alias = parser.readIdentifier();
-        } else if (parser.peek().type() == TokenType.IDENTIFIER || parser.peek().type() == TokenType.QUOTED_IDENTIFIER
-                || isKeywordValidAsBareAlias()) {
+        } else if (isKeywordValidAsBareAlias()) {
             alias = parser.readIdentifier();
         }
 
@@ -1826,20 +1823,84 @@ class SelectParser {
     }
 
     /**
-     * Check if the current token is a keyword that can be used as a bare alias.
-     * In PostgreSQL, most keywords are non-reserved and can be used as identifiers.
-     * Only clause-starting and join-related keywords are excluded.
+     * The words PostgreSQL will not read as an alias written without AS.
+     *
+     * <p>Most keywords are non-reserved and name a column perfectly well, but a handful cannot
+     * stand there because the grammar is still expecting them to continue what came before: after
+     * an expression, {@code varying} may be the second half of {@code character varying} and
+     * {@code day} the field of an interval, so neither can be a label. PostgreSQL keeps the list
+     * itself and reports it through {@code pg_get_keywords().barelabel}; this is that list, read
+     * from PostgreSQL 18. It is what makes {@code pg_catalog.character varying} a syntax error
+     * pointing at {@code varying} rather than a cast with a column called varying after it.
+     */
+    private static final java.util.Set<String> NOT_A_BARE_LABEL = new java.util.HashSet<String>(
+            java.util.Arrays.asList(
+                    "ARRAY", "AS", "CHAR", "CHARACTER", "CREATE", "DAY", "EXCEPT", "FETCH",
+                    "FILTER", "FOR", "FROM", "GRANT", "GROUP", "HAVING", "HOUR", "INTERSECT",
+                    "INTO", "ISNULL", "LIMIT", "MINUTE", "MONTH", "NOTNULL", "OFFSET", "ON",
+                    "ORDER", "OVER", "OVERLAPS", "PRECISION", "RETURNING", "SECOND", "TO",
+                    "UNION", "VARYING", "WHERE", "WINDOW", "WITH", "WITHIN", "WITHOUT", "YEAR"));
+
+    /**
+     * The words PostgreSQL keeps for itself, which is what an alias may not be.
+     *
+     * <p>A relation's alias is a plain name, and PostgreSQL takes any keyword for one except the
+     * reserved words and the few it reads as a type or function name where a name may stand. It
+     * keeps the classification itself and reports it through {@code pg_get_keywords().catcode};
+     * this is the R and T rows, read from PostgreSQL 18.
+     */
+    private static final java.util.Set<String> KEPT_BY_THE_GRAMMAR = new java.util.HashSet<String>(
+            java.util.Arrays.asList(
+                    "ALL", "ANALYSE", "ANALYZE", "AND", "ANY", "ARRAY", "AS", "ASC", "ASYMMETRIC",
+                    "AUTHORIZATION", "BINARY", "BOTH", "CASE", "CAST", "CHECK", "COLLATE",
+                    "COLLATION", "COLUMN", "CONCURRENTLY", "CONSTRAINT", "CREATE", "CROSS",
+                    "CURRENT_CATALOG", "CURRENT_DATE", "CURRENT_ROLE", "CURRENT_SCHEMA",
+                    "CURRENT_TIME", "CURRENT_TIMESTAMP", "CURRENT_USER", "DEFAULT", "DEFERRABLE",
+                    "DESC", "DISTINCT", "DO", "ELSE", "END", "EXCEPT", "FALSE", "FETCH", "FOR",
+                    "FOREIGN", "FREEZE", "FROM", "FULL", "GRANT", "GROUP", "HAVING", "ILIKE", "IN",
+                    "INITIALLY", "INNER", "INTERSECT", "INTO", "IS", "ISNULL", "JOIN", "LATERAL",
+                    "LEADING", "LEFT", "LIKE", "LIMIT", "LOCALTIME", "LOCALTIMESTAMP", "NATURAL",
+                    "NOT", "NOTNULL", "NULL", "OFFSET", "ON", "ONLY", "OR", "ORDER", "OUTER",
+                    "OVERLAPS", "PLACING", "PRIMARY", "REFERENCES", "RETURNING", "RIGHT", "SELECT",
+                    "SESSION_USER", "SIMILAR", "SOME", "SYMMETRIC", "SYSTEM_USER", "TABLE",
+                    "TABLESAMPLE", "THEN", "TO", "TRAILING", "TRUE", "UNION", "UNIQUE", "USER",
+                    "USING", "VARIADIC", "VERBOSE", "WHEN", "WHERE", "WINDOW", "WITH"));
+
+    /**
+     * Whether the word here may be a relation's alias written without AS.
+     *
+     * <p>This is the name a FROM item, an UPDATE target and a DELETE target take, which PostgreSQL
+     * reads as a plain name rather than as a label. A label is judged by a different and narrower
+     * rule -- see {@link #isValidBareTargetLabel()}.
      */
     boolean isKeywordValidAsBareAlias() {
-        if (parser.peek().type() != TokenType.KEYWORD) return false;
+        TokenType type = parser.peek().type();
+        if (type == TokenType.QUOTED_IDENTIFIER) return true;
+        // A word memgres lexes as an identifier is judged the same way, because PostgreSQL judges
+        // the word and not how it was recognised: isnull and overlaps are its own either way.
+        if (type != TokenType.IDENTIFIER && type != TokenType.KEYWORD) return false;
         String word = parser.peek().value().toUpperCase();
-        if (isClauseKeyword(word)) return false;
-        // FILTER cannot be a bare alias: it would swallow the aggregate filter clause that
-        // follows, leaving the expression before it silently unresolved.
-        return !word.equals("USING") && !word.equals("TABLESAMPLE")
-                && !word.equals("WITH") && !word.equals("WINDOW")
-                && !word.equals("OVER") && !word.equals("LATERAL")
-                && !word.equals("FILTER");
+        if (type == TokenType.KEYWORD && isClauseKeyword(word)) return false;
+        return !KEPT_BY_THE_GRAMMAR.contains(word);
+    }
+
+    /**
+     * Whether the word here may be a select target's label written without AS.
+     *
+     * <p>Narrower than an alias, and not because a label is more precious: after an expression the
+     * grammar may still be expecting the word to continue it, so {@code varying} could be the
+     * second half of {@code character varying} and {@code day} the field of an interval. Which
+     * words those are is not something to reason out -- it is the list the reference server
+     * reports, and a word memgres happens to lex as an identifier rather than as a keyword is
+     * judged by it too, because PostgreSQL judges the word and not how it was recognised.
+     */
+    boolean isValidBareTargetLabel() {
+        TokenType type = parser.peek().type();
+        if (type == TokenType.QUOTED_IDENTIFIER) return true;
+        if (type != TokenType.IDENTIFIER && type != TokenType.KEYWORD) return false;
+        String word = parser.peek().value().toUpperCase();
+        if (type == TokenType.KEYWORD && isClauseKeyword(word)) return false;
+        return !NOT_A_BARE_LABEL.contains(word);
     }
 
     /**

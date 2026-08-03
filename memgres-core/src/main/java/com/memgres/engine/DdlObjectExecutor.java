@@ -3097,7 +3097,7 @@ class DdlObjectExecutor {
                 }
                 if (expr instanceof ColumnRef) continue;
                 SchemaQualifier.rejectMissingTypeSchemas(
-                        executor.database, executor.session, typeSchemas);
+                        executor.database, executor.session, executor.getSystemCatalog(), typeSchemas);
                 executor.selectExecutor.placementCheck.rejectStoredDefinition(
                         expr, "index expressions", "index expression");
             }
@@ -3111,7 +3111,7 @@ class DdlObjectExecutor {
                 return;
             }
             SchemaQualifier.rejectMissingTypeSchemas(
-                    executor.database, executor.session, typeSchemas);
+                    executor.database, executor.session, executor.getSystemCatalog(), typeSchemas);
             executor.selectExecutor.placementCheck.rejectStoredDefinition(
                     pred, "index predicates", "index predicate");
         }

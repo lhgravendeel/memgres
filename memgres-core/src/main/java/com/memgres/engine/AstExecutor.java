@@ -247,7 +247,7 @@ public class AstExecutor {
             throw SchemaQualifier.missing(missing);
         }
         // The schema is there; whether it holds the type is the second half of the same lookup.
-        String unknown = SchemaQualifier.firstUnknownType(database, typeSchemas);
+        String unknown = SchemaQualifier.firstUnknownType(database, systemCatalog, typeSchemas);
         if (unknown == null) return;
         fromResolver.checkRelationNamesExist(stmt);
         throw SchemaQualifier.noSuchType(unknown);

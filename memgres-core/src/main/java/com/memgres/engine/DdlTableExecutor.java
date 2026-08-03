@@ -313,7 +313,7 @@ class DdlTableExecutor {
                     // An expression that will not parse is reported by whatever reads it next
                 }
                 SchemaQualifier.rejectMissingTypeSchemas(
-                        executor.database, executor.session, generatedTypeSchemas);
+                        executor.database, executor.session, executor.getSystemCatalog(), generatedTypeSchemas);
                 executor.selectExecutor.placementCheck.rejectStoredDefinition(
                         generated, "column generation expressions", null);
             }

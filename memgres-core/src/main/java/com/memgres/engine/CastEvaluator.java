@@ -331,6 +331,14 @@ class CastEvaluator {
         // concrete type the caller passed in.
         if (PolymorphicTypes.isPolymorphic(lowerSpec)) return val;
 
+        // One of information_schema's own domains, which keeps its qualifier because it answers to
+        // nothing else. The value becomes the type underneath and is then judged by the domain.
+        if (InformationSchemaTypes.isOne(lowerSpec)) {
+            DataType base = InformationSchemaTypes.baseTypeOf(lowerSpec);
+            return InformationSchemaTypes.check(lowerSpec,
+                    applyCast(val, base.getPgName(), fromUnknownLiteral));
+        }
+
         // Reject impossible casts (PG raises 42846 "cannot cast type X to Y")
         if (lowerSpec.equals("uuid")) {
             if (val instanceof Number || val instanceof Boolean) {

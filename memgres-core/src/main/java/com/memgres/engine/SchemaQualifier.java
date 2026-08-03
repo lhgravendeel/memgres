@@ -39,11 +39,12 @@ final class SchemaQualifier {
      * and a function that does not resolve — but not the range table, which is built first of all,
      * and that is what the caller runs ahead of this.
      */
-    static void rejectMissingTypeSchemas(Database database, Session session, List<String> written) {
+    static void rejectMissingTypeSchemas(Database database, Session session,
+                                         SystemCatalog catalog, List<String> written) {
         if (written == null || written.isEmpty()) return;
         String missingSchema = firstMissing(database, session, written);
         if (missingSchema != null) throw missing(missingSchema);
-        String unknownType = firstUnknownType(database, written);
+        String unknownType = firstUnknownType(database, catalog, written);
         if (unknownType != null) throw noSuchType(unknownType);
     }
 
@@ -63,55 +64,83 @@ final class SchemaQualifier {
      *
      * <p>A qualified type name says which schema to find the type in, and PostgreSQL looks only
      * there: {@code public.int4} and {@code pg_toast.int4} are both {@code 42704} even though
-     * {@code int4} is a type, because neither schema holds it. The built-in types are pg_catalog's
-     * and nothing else's, and a type this database was told about answers wherever it was made —
-     * memgres keeps those by bare name, so any schema that exists may name one, which errs towards
-     * accepting rather than refusing a type the user really did create.
-     *
-     * <p>Only what can be shown to be in the wrong schema is refused here. A name nothing in this
-     * engine answers to is left to the cast itself, which reports it as the type it could not find:
-     * the list of names {@link DataType} knows is not the list of names a cast accepts —
-     * {@code record} and {@code anyelement} are two it takes and that one has no entry for — and
-     * reading it as though it were refused both.
+     * {@code int4} is a type, because neither schema holds it, and so is {@code public.pg_class},
+     * whose relation is pg_catalog's. The name is reported as it was written, which is what
+     * distinguishes this complaint from the same one made later about a bare name.
      */
-    static String firstUnknownType(Database database, List<String> written) {
+    static String firstUnknownType(Database database, SystemCatalog catalog, List<String> written) {
         if (written == null || database == null) return null;
         for (String name : written) {
             String qualifier = qualifierOf(name);
             if (qualifier == null) continue;
             String bare = name.substring(qualifier.length() + 1);
-            boolean ours = declaredHere(database, bare) || namesARelation(database, bare);
-            if ("pg_catalog".equalsIgnoreCase(qualifier)) {
-                // pg_catalog holds the built-in types and nothing this database was told about.
-                if (ours || GRAMMAR_SPELLINGS.contains(bare.toLowerCase(Locale.ROOT))) return name;
-                continue;
-            }
-            // Anywhere else, a built-in type name is one that schema does not hold.
-            if (!ours && DataType.isPgCatalogTypeName(bare)) return name;
+            if (!heldBy(database, catalog, qualifier, bare)) return name;
         }
         return null;
+    }
+
+    /**
+     * Whether the schema written holds a type of that name.
+     *
+     * <p>pg_catalog holds the types PostgreSQL ships and the catalog relations, and nothing this
+     * database was told about; every other schema holds what was made in it, and
+     * information_schema holds the five domains the standard describes itself in. A type memgres
+     * implements where PostgreSQL has none — citext and hstore, which an extension would install
+     * into whichever schema it was added to — answers wherever it is written, because there is no
+     * schema this engine could call the wrong one for it.
+     */
+    private static boolean heldBy(Database database, SystemCatalog catalog,
+                                  String qualifier, String bare) {
+        String lower = bare.toLowerCase(Locale.ROOT);
+        if (DataType.installedByAnExtension(lower)) return true;
+        if ("pg_catalog".equalsIgnoreCase(qualifier)) {
+            if (GRAMMAR_SPELLINGS.contains(lower)) return false;
+            if (declaredHere(database, bare)) return false;
+            return DataType.isPgCatalogTypeName(lower)
+                    || PolymorphicTypes.names().contains(lower)
+                    || PSEUDO_TYPES.contains(lower)
+                    || PgInternalTypes.holds(lower)
+                    || namesARelation(database, catalog, qualifier, bare);
+        }
+        if (InformationSchemaTypes.holds(qualifier, lower)) return true;
+        return declaredHere(database, bare) || namesARelation(database, catalog, qualifier, bare);
     }
 
     /**
      * The spellings PostgreSQL's grammar reads as types without pg_catalog holding one of that
      * name. {@code integer} is the SQL word for {@code int4} and {@code serial} is shorthand for a
      * column definition, so neither answers to {@code pg_catalog.} anything — which is how
-     * PostgreSQL tells a real type name from a word its parser rewrites.
+     * PostgreSQL tells a real type name from a word its parser rewrites. The words that only ever
+     * stand as half of a multi-word spelling are here for the same reason.
      */
     private static final java.util.Set<String> GRAMMAR_SPELLINGS = new java.util.HashSet<String>(
             java.util.Arrays.asList("int", "integer", "smallint", "bigint", "real", "boolean",
                     "decimal", "dec", "float", "serial", "serial2", "serial4", "serial8",
-                    "smallserial", "bigserial"));
+                    "smallserial", "bigserial", "character", "varying", "precision", "national",
+                    "double"));
 
-    /** Whether some relation of that name is there; every relation mints a type of its own name. */
-    private static boolean namesARelation(Database database, String bare) {
-        if (database.getTable(bare) != null || database.hasView(bare)) return true;
-        for (Schema schema : database.getSchemas().values()) {
-            if (schema != null && schema.getTables().containsKey(bare.toLowerCase(Locale.ROOT))) {
-                return true;
+    /** The pseudo-types: no values of their own, and still names pg_catalog holds. */
+    private static final java.util.Set<String> PSEUDO_TYPES = new java.util.HashSet<String>(
+            java.util.Arrays.asList("any", "record", "trigger", "event_trigger", "void",
+                    "internal", "cstring", "unknown", "aclitem"));
+
+    /**
+     * Whether that schema holds a relation of that name; every relation mints a type of its own.
+     * A catalog relation is derived rather than kept, so the catalog is asked for it by name.
+     */
+    private static boolean namesARelation(Database database, SystemCatalog catalog,
+                                          String qualifier, String bare) {
+        if (SystemCatalog.isSystemCatalog(qualifier, bare)) {
+            try {
+                return catalog != null && catalog.resolve(qualifier, bare) != null;
+            } catch (RuntimeException e) {
+                return false;
             }
         }
-        return false;
+        Schema schema = database.getSchema(qualifier);
+        if (schema == null) return false;
+        return schema.getTables().containsKey(bare.toLowerCase(Locale.ROOT))
+                || database.hasView(qualifier, bare);
     }
 
     /** Whether this database has been told about a type of that name, in whatever schema. */

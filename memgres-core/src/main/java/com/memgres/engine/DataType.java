@@ -532,6 +532,12 @@ public enum DataType {
      * neither public's nor pg_toast's — while a type an extension installed, and a type memgres
      * added an OID of its own for, are not pg_catalog's and are left to resolve as they always did.
      */
+    /** Whether this name is one an extension installs rather than one pg_catalog ships. */
+    public static boolean installedByAnExtension(String name) {
+        return name != null
+                && INSTALLED_BY_AN_EXTENSION.contains(name.trim().toLowerCase());
+    }
+
     public static boolean isPgCatalogTypeName(String name) {
         if (name == null) return false;
         String lower = name.trim().toLowerCase();

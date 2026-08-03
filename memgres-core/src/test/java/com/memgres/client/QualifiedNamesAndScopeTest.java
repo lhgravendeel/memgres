@@ -240,4 +240,130 @@ class QualifiedNamesAndScopeTest {
         assertEquals("0", scalar("SELECT count(*) FROM pg_catalog.pg_attrdef ad"
                 + " WHERE pg_catalog.pg_get_expr(ad.adbin, ad.adrelid) IS NULL"));
     }
+
+    /**
+     * A name the schema written does not hold at all is reported as it was written, which is what
+     * distinguishes it from the same complaint about a bare name.
+     */
+    @Test
+    void aTypeNothingHoldsIsReportedAsItWasWritten() {
+        assertEquals("type \"pg_catalog.qst_nosuchtype\" does not exist",
+                messageOf("SELECT 1::pg_catalog.qst_nosuchtype"));
+        assertEquals("type \"public.qst_nosuchtype\" does not exist",
+                messageOf("SELECT 1::public.qst_nosuchtype"));
+        assertEquals("type \"qst_nosuchtype\" does not exist",
+                messageOf("SELECT 1::qst_nosuchtype"),
+                "unqualified, there is no schema to name");
+        assertEquals("type \"pg_catalog.qst_nosuchtype\" does not exist",
+                messageOf("CREATE TABLE qst_q2 (i pg_catalog.qst_nosuchtype)"));
+    }
+
+    /** A relation's type belongs to the schema the relation is in, catalog relations included. */
+    @Test
+    void aCatalogRelationsTypeIsPgCatalogs() {
+        assertEquals("type \"public.pg_class\" does not exist",
+                messageOf("SELECT NULL::public.pg_class"));
+        assertEquals("type \"public.pg_tables\" does not exist",
+                messageOf("SELECT NULL::public.pg_tables"));
+    }
+
+    /** The five domains the standard describes its own catalog in. */
+    @Test
+    void informationSchemaHasItsOwnDomains() throws Exception {
+        assertEquals("1", scalar("SELECT 1::information_schema.cardinal_number"));
+        assertEquals("x", scalar("SELECT 'x'::information_schema.character_data"));
+        assertEquals("x", scalar("SELECT 'x'::information_schema.sql_identifier"));
+        assertEquals("YES", scalar("SELECT 'YES'::information_schema.yes_or_no"));
+        assertEquals("t", scalar("SELECT now()::information_schema.time_stamp IS NOT NULL"));
+        assertEquals("information_schema.cardinal_number",
+                scalar("SELECT pg_typeof(1::information_schema.cardinal_number)::text"));
+    }
+
+    /** The value is the type underneath, and is then judged by the domain's own constraint. */
+    @Test
+    void anInformationSchemaDomainJudgesItsValue() {
+        assertEquals("invalid input syntax for type integer: \"x\"",
+                messageOf("SELECT 'x'::information_schema.cardinal_number"));
+        assertEquals("value for domain information_schema.yes_or_no"
+                        + " violates check constraint \"yes_or_no_check\"",
+                messageOf("SELECT 'MAYBE'::information_schema.yes_or_no"));
+    }
+
+    /** They answer under that schema and nowhere else. */
+    @Test
+    void anInformationSchemaDomainAnswersToNothingElse() {
+        assertEquals("type \"cardinal_number\" does not exist",
+                messageOf("SELECT 1::cardinal_number"));
+        assertEquals("type \"public.cardinal_number\" does not exist",
+                messageOf("SELECT 1::public.cardinal_number"));
+        assertEquals("type \"pg_catalog.cardinal_number\" does not exist",
+                messageOf("SELECT 1::pg_catalog.cardinal_number"));
+    }
+
+    /**
+     * The grammar reads a multi-word spelling only where no schema was written: after a qualifier
+     * it takes a single name, and the next word is unexpected.
+     */
+    @Test
+    void aQualifiedTypeNameTakesASingleWord() {
+        assertEquals("syntax error at or near \"varying\"",
+                messageOf("SELECT NULL::pg_catalog.character varying"));
+        assertEquals("syntax error at or near \"precision\"",
+                messageOf("SELECT NULL::pg_catalog.double precision"));
+        assertEquals("syntax error at or near \"with\"",
+                messageOf("SELECT NULL::pg_catalog.timestamp with time zone"));
+        assertEquals("syntax error at or near \"without\"",
+                messageOf("SELECT NULL::pg_catalog.time without time zone"));
+        assertEquals("syntax error at or near \"varying\"",
+                messageOf("CREATE TABLE qst_q3 (i pg_catalog.character varying)"));
+        assertEquals("type \"pg_catalog.character\" does not exist",
+                messageOf("SELECT NULL::pg_catalog.character"),
+                "half of a multi-word spelling is no type of its own");
+        assertEquals("type \"pg_catalog.varying\" does not exist",
+                messageOf("SELECT NULL::pg_catalog.varying"));
+    }
+
+    /** A precision and an array suffix are carried however the name was written. */
+    @Test
+    void aQualifiedTypeNameStillTakesItsPrecision() throws Exception {
+        assertEquals("ab", scalar("SELECT 'abc'::pg_catalog.varchar(2)"));
+        assertEquals("1.20", scalar("SELECT 1.2::pg_catalog.numeric(10,2)"));
+    }
+
+    /**
+     * A label written without AS may not be a word the grammar is still expecting to continue the
+     * expression before it.
+     */
+    @Test
+    void aLabelWrittenWithoutAsIsTheNarrowerSet() throws Exception {
+        assertEquals("syntax error at or near \"varying\"", messageOf("SELECT 1 varying"));
+        assertEquals("syntax error at or near \"day\"", messageOf("SELECT 1 day"));
+        assertEquals("syntax error at or near \"character\"", messageOf("SELECT 1 character"));
+        assertEquals("1", scalar("SELECT 1 AS varying"), "written with AS, every one is a label");
+        assertEquals("1", scalar("SELECT 1 AS day"));
+        assertEquals("1", scalar("SELECT 1 value"), "a word the grammar does not keep needs no AS");
+        assertEquals("1", scalar("SELECT 1 name"));
+    }
+
+    /** A relation's alias is a plain name, and takes any word the grammar does not keep. */
+    @Test
+    void aRelationsAliasIsTheWiderSet() throws Exception {
+        assertEquals("1", scalar("SELECT varying.id FROM qst_t varying ORDER BY 1"));
+        assertEquals("1", scalar("SELECT \"day\".id FROM qst_t day ORDER BY 1"));
+        assertEquals("syntax error at or near \"overlaps\"",
+                messageOf("SELECT * FROM qst_t overlaps"));
+        assertEquals("syntax error at or near \"isnull\"", messageOf("SELECT * FROM qst_t isnull"));
+    }
+
+    /** FOR opens a locking clause and nothing else, so a word that names no strength is the fault. */
+    @Test
+    void forOpensALockingClauseAndNothingElse() {
+        assertEquals("syntax error at end of input", messageOf("SELECT * FROM qst_t for"));
+        assertEquals("syntax error at or near \"qst_nosuch\"",
+                messageOf("SELECT * FROM qst_t for qst_nosuch"));
+        assertEquals("OK", stateOf("SELECT * FROM qst_t FOR UPDATE"));
+        assertEquals("OK", stateOf("SELECT * FROM qst_t FOR NO KEY UPDATE"));
+        assertEquals("OK", stateOf("SELECT * FROM qst_t FOR KEY SHARE"));
+        assertEquals("OK", stateOf("SELECT * FROM qst_t FOR SHARE"));
+    }
 }
