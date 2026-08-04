@@ -270,15 +270,20 @@ public class GucSettings {
     /**
      * The compiled-in default PostgreSQL reports in {@code pg_settings.boot_val} for parameters
      * whose running value memgres derives from its own environment instead. {@code boot_val} is
-     * what the server would use with no configuration at all, so it does not vary with the
-     * machine — and a client comparing two servers' configurations reads it precisely because it
-     * does not. The running value stays in the definition above; only the reported boot value is
-     * corrected here.
+     * what the server would use with no configuration at all — the value compiled in, not the one
+     * this machine arrived at — and a client comparing two servers' configurations reads it for
+     * exactly that reason. The running value stays in the definition above; only the reported boot
+     * value is corrected here.
+     *
+     * <p>Not everything PostgreSQL compiles in is the same everywhere: the flush-after parameters
+     * are 0 where the platform has no way to ask for a flush and a real page count where it has,
+     * so PostgreSQL on Windows boots them at 0 and on Linux at 64 and 32. memgres runs them at 64
+     * and 32, so overriding the reported boot value to 0 made the row contradict itself — the
+     * setting said one thing and the value it was said to have booted from said another. They are
+     * left out of this table and report what memgres actually boots with.
      */
     private static final String[][] BOOT_VAL_OVERRIDES = {
             {"application_name", ""},
-            {"bgwriter_flush_after", "0"},
-            {"checkpoint_flush_after", "0"},
             {"client_encoding", "SQL_ASCII"},
             {"lc_messages", ""},
             {"lc_monetary", "C"},

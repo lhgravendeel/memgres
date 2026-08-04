@@ -538,13 +538,19 @@ SELECT p.parameter_name, p.ordinal_position, p.parameter_mode, p.data_type,
 -- end-expected
 SELECT schema_owner FROM information_schema.schemata WHERE schema_name = 'public';
 
--- The database encoding is one anonymous character set with no default collation.
+-- The database encoding is one anonymous character set: no catalog, no schema, no name of its
+-- own beyond the encoding. The two default_collate columns are deliberately not asserted here.
+-- PostgreSQL names the database's default collation there only when the locale it was created
+-- with is also a collation pg_collation holds -- en_US.utf8 on a Linux server is, and
+-- English_Netherlands.1252 on a Windows one is not, so the same PostgreSQL answers pg_catalog and
+-- en_US.utf8 on one machine and NULL on another. That is a property of the server's locale rather
+-- than of either engine.
 -- begin-expected
--- columns: character_set_catalog,character_set_schema,character_set_name,character_repertoire,form_of_use,default_collate_schema,default_collate_name
--- row: NULL | NULL | UTF8 | UCS | UTF8 | NULL | NULL
+-- columns: character_set_catalog,character_set_schema,character_set_name,character_repertoire,form_of_use
+-- row: NULL | NULL | UTF8 | UCS | UTF8
 -- end-expected
 SELECT character_set_catalog, character_set_schema, character_set_name,
-       character_repertoire, form_of_use, default_collate_schema, default_collate_name
+       character_repertoire, form_of_use
   FROM information_schema.character_sets;
 
 -- begin-expected

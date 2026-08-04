@@ -362,7 +362,14 @@ class ViewUpdatabilityAndSettingsMetadataTest {
         assertNull(setting("enable_bitmapscan", "extra_desc"));
     }
 
-    /** boot_val is the compiled-in default, which does not vary with the machine. */
+    /**
+     * boot_val is the compiled-in default rather than the value this server arrived at.
+     *
+     * <p>The flush-after parameters are asserted against what memgres runs, not against 0: what
+     * PostgreSQL compiles in for those depends on whether the platform can ask for a flush, so it
+     * boots them at 0 on Windows and at 64 and 32 on Linux. Reporting 0 while running 64 made the
+     * row contradict itself.
+     */
     @Test
     void bootValIsPostgresCompiledInDefault() throws Exception {
         assertEquals("SQL_ASCII", setting("client_encoding", "boot_val"));
@@ -372,8 +379,10 @@ class ViewUpdatabilityAndSettingsMetadataTest {
         assertEquals("C", setting("lc_monetary", "boot_val"));
         assertEquals("C", setting("lc_numeric", "boot_val"));
         assertEquals("C", setting("lc_time", "boot_val"));
-        assertEquals("0", setting("bgwriter_flush_after", "boot_val"));
-        assertEquals("0", setting("checkpoint_flush_after", "boot_val"));
+        assertEquals(setting("bgwriter_flush_after", "setting"),
+                setting("bgwriter_flush_after", "boot_val"));
+        assertEquals(setting("checkpoint_flush_after", "setting"),
+                setting("checkpoint_flush_after", "boot_val"));
         assertEquals("100", setting("max_stack_depth", "boot_val"));
         assertEquals("-1", setting("wal_buffers", "boot_val"));
         // reset_val stays the value this server would actually go back to.

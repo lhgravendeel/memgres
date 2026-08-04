@@ -374,12 +374,12 @@ SELECT name, (extra_desc IS NOT NULL) AS has_extra FROM pg_settings
  WHERE name IN ('block_size','enable_bitmapscan') ORDER BY name;
 
 -- boot_val is the compiled-in default: it does not vary with the machine, which is precisely
--- why a client comparing two servers reads it.
+-- why a client comparing two servers reads it. The flush-after parameters are left out: what
+-- PostgreSQL compiles in for those depends on whether the platform can ask for a flush at all, so
+-- it boots them at 0 on Windows and at 64 and 32 on Linux, and neither answer is the wrong one.
 -- begin-expected
 -- columns: name,boot_val
 -- row: application_name|
--- row: bgwriter_flush_after|0
--- row: checkpoint_flush_after|0
 -- row: client_encoding|SQL_ASCII
 -- row: lc_monetary|C
 -- row: lc_numeric|C
@@ -390,8 +390,7 @@ SELECT name, (extra_desc IS NOT NULL) AS has_extra FROM pg_settings
 -- end-expected
 SELECT name, boot_val FROM pg_settings
  WHERE name IN ('application_name','client_encoding','server_encoding','lc_monetary',
-                'lc_numeric','lc_time','bgwriter_flush_after','checkpoint_flush_after',
-                'max_stack_depth','wal_buffers')
+                'lc_numeric','lc_time','max_stack_depth','wal_buffers')
  ORDER BY name;
 
 -- begin-expected
