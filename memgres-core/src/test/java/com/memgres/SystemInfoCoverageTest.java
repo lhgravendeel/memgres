@@ -470,37 +470,43 @@ class SystemInfoCoverageTest {
 
     @Test
     void testPgGetViewdef() throws SQLException {
+        // Measured on PostgreSQL 18: pg_get_viewdef(0) IS NULL -> true. The whole pg_get_*def
+        // family answers NULL for an OID with nothing behind it; an empty definition would tell a
+        // client the object exists and has no body.
         String result = query1("SELECT pg_get_viewdef(0)");
-        // Stub returns empty string
-        assertNotNull(result);
+        assertNull(result);
     }
 
     // --- pg_get_constraintdef(constraint_oid) ---
 
     @Test
     void testPgGetConstraintdef() throws SQLException {
+        // Measured on PostgreSQL 18: pg_get_constraintdef(0) IS NULL -> true.
         String result = query1("SELECT pg_get_constraintdef(0)");
-        assertNotNull(result);
+        assertNull(result);
     }
 
     @Test
     void testPgGetConstraintdefNonExistent() throws SQLException {
+        // Measured on PostgreSQL 18: pg_get_constraintdef(99999) IS NULL -> true.
         String result = query1("SELECT pg_get_constraintdef(99999)");
-        assertNotNull(result);
+        assertNull(result);
     }
 
     // --- pg_get_indexdef(index_oid) ---
 
     @Test
     void testPgGetIndexdef() throws SQLException {
+        // Measured on PostgreSQL 18: pg_get_indexdef(0) IS NULL -> true.
         String result = query1("SELECT pg_get_indexdef(0)");
-        assertNotNull(result);
+        assertNull(result);
     }
 
     @Test
     void testPgGetIndexdefNonExistent() throws SQLException {
+        // Measured on PostgreSQL 18: pg_get_indexdef(99999) IS NULL -> true.
         String result = query1("SELECT pg_get_indexdef(99999)");
-        assertNotNull(result);
+        assertNull(result);
     }
 
     // --- pg_get_serial_sequence('table', 'column') ---
@@ -728,28 +734,34 @@ class SystemInfoCoverageTest {
 
     @Test
     void testPgGetFunctionArguments() throws SQLException {
+        // Measured on PostgreSQL 18: pg_get_function_arguments(0) IS NULL -> true. An OID no
+        // pg_proc row carries names no function, and the answer is NULL, not an empty list that
+        // reads like a function of no arguments.
         String result = query1("SELECT pg_get_function_arguments(0)");
-        assertNotNull(result);
+        assertNull(result);
     }
 
     @Test
     void testPgGetFunctionArgumentsNonExistent() throws SQLException {
+        // Measured on PostgreSQL 18: pg_get_function_arguments(99999) IS NULL -> true.
         String result = query1("SELECT pg_get_function_arguments(99999)");
-        assertNotNull(result);
+        assertNull(result);
     }
 
     // --- pg_get_function_result(func_oid) ---
 
     @Test
     void testPgGetFunctionResult() throws SQLException {
+        // Measured on PostgreSQL 18: pg_get_function_result(0) IS NULL -> true.
         String result = query1("SELECT pg_get_function_result(0)");
-        assertNotNull(result);
+        assertNull(result);
     }
 
     @Test
     void testPgGetFunctionResultNonExistent() throws SQLException {
+        // Measured on PostgreSQL 18: pg_get_function_result(99999) IS NULL -> true.
         String result = query1("SELECT pg_get_function_result(99999)");
-        assertNotNull(result);
+        assertNull(result);
     }
 
     // ========================================================================

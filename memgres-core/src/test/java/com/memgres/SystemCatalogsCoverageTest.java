@@ -975,17 +975,19 @@ class SystemCatalogsCoverageTest {
 
     @Test
     void testPgGetConstraintdefReturnsString() throws SQLException {
-        // Just ensure it doesn't throw
+        // Measured on PostgreSQL 18: pg_get_constraintdef(0) IS NULL -> true. An OID that names no
+        // constraint has no definition, and an empty string would read as a constraint with one.
         String result = query1("SELECT pg_get_constraintdef(0)");
-        assertNotNull(result);
+        assertNull(result);
     }
 
     // ---- pg_get_indexdef ----
 
     @Test
     void testPgGetIndexdefReturnsString() throws SQLException {
+        // Measured on PostgreSQL 18: pg_get_indexdef(0) IS NULL -> true.
         String result = query1("SELECT pg_get_indexdef(0)");
-        assertNotNull(result);
+        assertNull(result);
     }
 
     // ---- pg_get_serial_sequence ----
@@ -1001,8 +1003,11 @@ class SystemCatalogsCoverageTest {
 
     @Test
     void testPgGetFunctiondef() throws SQLException {
+        // Measured on PostgreSQL 18: SELECT pg_get_functiondef(0) IS NULL -> true. An OID with no
+        // pg_proc row behind it has no definition to deparse, and the answer is NULL rather than
+        // an empty definition a client could mistake for one.
         String result = query1("SELECT pg_get_functiondef(0)");
-        assertNotNull(result);
+        assertNull(result);
     }
 
     // ---- pg_table_is_visible ----
@@ -1137,14 +1142,16 @@ class SystemCatalogsCoverageTest {
 
     @Test
     void testPgGetFunctionArguments() throws SQLException {
+        // Measured on PostgreSQL 18: pg_get_function_arguments(0) IS NULL -> true.
         String result = query1("SELECT pg_get_function_arguments(0)");
-        assertNotNull(result);
+        assertNull(result);
     }
 
     @Test
     void testPgGetFunctionResult() throws SQLException {
+        // Measured on PostgreSQL 18: pg_get_function_result(0) IS NULL -> true.
         String result = query1("SELECT pg_get_function_result(0)");
-        assertNotNull(result);
+        assertNull(result);
     }
 
     // ---- shobj_description ----

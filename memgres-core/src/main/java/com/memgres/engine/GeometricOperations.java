@@ -471,6 +471,9 @@ public final class GeometricOperations {
     }
 
     public static String formatPoint(PgPoint p) {
+        // No point at all is written as no value at all: the closest-point operator has shapes
+        // for which PostgreSQL answers NULL rather than naming a point.
+        if (p == null) return null;
         return "(" + fmtD(p.x) + "," + fmtD(p.y) + ")";
     }
 
@@ -1416,45 +1419,346 @@ public final class GeometricOperations {
         return new PgPoint(cx, cy);
     }
 
+    /**
+     * The closest point on {@code on} to the segment {@code to}, and the distance to it, following
+     * the order PostgreSQL's own lseg_closept_lseg tests its four candidates in. The order decides
+     * the answer whenever two candidates are the same distance away, which is why it is kept: a box
+     * edge that ties with a later one has to win, or {@code lseg ## box} names a different corner
+     * than PostgreSQL does.
+     */
+    private static double closestOnLsegToLseg(PgLseg on, PgLseg to, PgPoint[] result) {
+        PgPoint ip = lsegIntersectionPoint(on, to);
+        if (ip != null) {
+            result[0] = ip;
+            return 0.0;
+        }
+        PgPoint best = closestPointOnLseg(to.p1, on);
+        double dist = distancePointPoint(to.p1, best);
+        PgPoint cand = closestPointOnLseg(to.p2, on);
+        double d = distancePointPoint(to.p2, cand);
+        if (d < dist) { dist = d; best = cand; }
+        d = distancePointLseg(on.p1, to);
+        if (d < dist) { dist = d; best = on.p1; }
+        d = distancePointLseg(on.p2, to);
+        if (d < dist) { dist = d; best = on.p2; }
+        result[0] = best;
+        return dist;
+    }
+
+    /** Whether two segments run in the same direction, which is what makes {@code ##} answer NULL. */
+    private static boolean lsegsParallel(PgLseg a, PgLseg b) {
+        double cross = (a.p2.x - a.p1.x) * (b.p2.y - b.p1.y)
+                - (a.p2.y - a.p1.y) * (b.p2.x - b.p1.x);
+        return Math.abs(cross) < EPSILON;
+    }
+
+    /**
+     * {@code lseg ## lseg} — close_lseg. PostgreSQL has no answer for two segments that run
+     * parallel, whether they are apart, touching or lying on top of each other, and says NULL;
+     * otherwise it answers with the point of {@code on} nearest {@code to}.
+     */
+    private static PgPoint closestOnLsegFromLseg(PgLseg on, PgLseg to) {
+        if (lsegsParallel(on, to)) return null;
+        PgPoint[] result = new PgPoint[1];
+        closestOnLsegToLseg(on, to, result);
+        return result[0];
+    }
+
+    /**
+     * {@code lseg ## box} — close_sb. A segment that meets the box at all is answered with the
+     * point of the segment nearest the box's centre, which is what PostgreSQL does once it has
+     * decided the distance is zero; a segment clear of the box is answered with a point on the box,
+     * found by walking its four edges in PostgreSQL's order and keeping the first strict minimum.
+     */
+    private static PgPoint closestOnBoxFromLseg(PgBox box, PgLseg seg) {
+        if (lsegIntersectsBox(seg, box)) {
+            PgPoint centre = new PgPoint((box.low.x + box.high.x) / 2, (box.low.y + box.high.y) / 2);
+            return closestPointOnLseg(centre, seg);
+        }
+        PgLseg[] edges = new PgLseg[]{
+                new PgLseg(box.low, new PgPoint(box.low.x, box.high.y)),
+                new PgLseg(box.low, new PgPoint(box.high.x, box.low.y)),
+                new PgLseg(box.high, new PgPoint(box.low.x, box.high.y)),
+                new PgLseg(box.high, new PgPoint(box.high.x, box.low.y))
+        };
+        PgPoint best = null;
+        double bestDist = Double.MAX_VALUE;
+        PgPoint[] result = new PgPoint[1];
+        for (PgLseg edge : edges) {
+            double d = closestOnLsegToLseg(edge, seg, result);
+            if (d < bestDist) { bestDist = d; best = result[0]; }
+        }
+        return best;
+    }
+
+    /**
+     * {@code line ## lseg} — close_ls. A line parallel to the segment has no nearest point on it in
+     * PostgreSQL and answers NULL; a line that crosses the segment answers with the crossing, and
+     * one that does not answers with the segment endpoint nearer the line.
+     */
+    private static PgPoint closestOnLsegFromLine(PgLseg seg, PgLine line) {
+        double dx = seg.p2.x - seg.p1.x;
+        double dy = seg.p2.y - seg.p1.y;
+        if (Math.abs(line.a * dx + line.b * dy) < EPSILON) return null;
+        double v1 = line.a * seg.p1.x + line.b * seg.p1.y + line.c;
+        double v2 = line.a * seg.p2.x + line.b * seg.p2.y + line.c;
+        if ((v1 <= 0 && v2 >= 0) || (v1 >= 0 && v2 <= 0)) {
+            double t = v1 / (v1 - v2);
+            return new PgPoint(seg.p1.x + t * dx, seg.p1.y + t * dy);
+        }
+        return Math.abs(v1) < Math.abs(v2) ? seg.p1 : seg.p2;
+    }
+
     public static PgPoint closestPoint(Object a, Object b) {
         // PG's ## operator never accepts a point as the second operand: the
-        // result is the closest point that lies ON the second object.
+        // result is the closest point that lies ON the second object. It has no
+        // reversed spellings either -- box ## lseg is no operator at all.
         if (a instanceof PgPoint && b instanceof PgLseg) return closestPointOnLseg(((PgPoint) a), ((PgLseg) b));
         if (a instanceof PgPoint && b instanceof PgLine) return closestPointOnLine(((PgPoint) a), ((PgLine) b));
         if (a instanceof PgPoint && b instanceof PgBox) return closestPointOnBox(((PgPoint) a), ((PgBox) b));
-        if (a instanceof PgLseg && b instanceof PgLseg) {
-            PgLseg lb = (PgLseg) b;
-            PgLseg la = (PgLseg) a;
-            PgPoint ip = lsegIntersectionPoint(la, lb);
-            if (ip != null) return ip;
-            double d1 = distancePointLseg(la.p1, lb);
-            double d2 = distancePointLseg(la.p2, lb);
-            double d3 = distancePointLseg(lb.p1, la);
-            double d4 = distancePointLseg(lb.p2, la);
-            double min = Math.min(Math.min(d1, d2), Math.min(d3, d4));
-            if (min == d1) return closestPointOnLseg(la.p1, lb);
-            if (min == d2) return closestPointOnLseg(la.p2, lb);
-            if (min == d3) return closestPointOnLseg(lb.p1, la);
-            return closestPointOnLseg(lb.p2, la);
-        }
-        if (a instanceof PgLseg && b instanceof PgBox) {
-            PgLseg seg = (PgLseg) a;
-            PgBox box = (PgBox) b;
-            PgPoint best = null; double bestDist = Double.MAX_VALUE;
-            for (PgLseg edge : boxEdges(box)) {
-                PgPoint ip = lsegIntersectionPoint(seg, edge);
-                if (ip != null) return ip;
-                PgPoint cp = closestPointOnLseg(seg.p1, edge);
-                double d = distancePointPoint(seg.p1, cp);
-                if (d < bestDist) { bestDist = d; best = cp; }
-                cp = closestPointOnLseg(seg.p2, edge);
-                d = distancePointPoint(seg.p2, cp);
-                if (d < bestDist) { bestDist = d; best = cp; }
-            }
-            return best;
-        }
-        if (a instanceof PgBox && b instanceof PgLseg) return closestPoint(b, a);
+        if (a instanceof PgLseg && b instanceof PgLseg) return closeLseg((PgLseg) a, (PgLseg) b);
+        if (a instanceof PgLseg && b instanceof PgBox) return closeSb((PgLseg) a, (PgBox) b);
+        if (a instanceof PgLine && b instanceof PgLseg) return closeLs((PgLine) a, (PgLseg) b);
         throw new MemgresException("operator does not exist: " + pgTypeName(a) + " ## " + pgTypeName(b), "42883");
+    }
+
+    // ========================================================================
+    // PostgreSQL's own closest-point arithmetic
+    //
+    // The two-segment and segment-box cases are not "the nearest point of the
+    // shapes" in the way geometry would define it, and the way PostgreSQL
+    // arrives at its answer decides both which point it names when several are
+    // equally near and the last bits of the coordinates it prints. So these
+    // follow geo_ops.c step for step: the same epsilon comparisons, the same
+    // line coefficients, and the same order over the sides of a box.
+    // ========================================================================
+
+    /** The tolerance PostgreSQL's geometric types compare with (EPSILON in geo_decls.h). */
+    private static final double PG_EPSILON = 1.0E-06;
+
+    private static boolean fpZero(double a) { return Math.abs(a) <= PG_EPSILON; }
+
+    private static boolean fpEq(double a, double b) { return Math.abs(a - b) <= PG_EPSILON; }
+
+    /** A point together with how far it was from whatever was measured to it. */
+    private static final class PointDist {
+        final PgPoint point;
+        final double dist;
+        PointDist(PgPoint point, double dist) { this.point = point; this.dist = dist; }
+    }
+
+    /** PostgreSQL's pg_hypot: the distance between two points. */
+    private static double pgHypot(double x, double y) {
+        double yx;
+        x = Math.abs(x);
+        y = Math.abs(y);
+        if (x < y) { double swap = x; x = y; y = swap; }
+        if (Double.isInfinite(x) || Double.isInfinite(y)) return Double.POSITIVE_INFINITY;
+        if (Double.isNaN(x) || Double.isNaN(y)) return Double.NaN;
+        if (x == 0) return 0;
+        yx = y / x;
+        return x * Math.sqrt(1.0 + (yx * yx));
+    }
+
+    private static double pointDt(PgPoint a, PgPoint b) { return pgHypot(a.x - b.x, a.y - b.y); }
+
+    /** The slope of the line through two points; a vertical line is DBL_MAX. */
+    private static double pointSl(PgPoint p1, PgPoint p2) {
+        if (fpEq(p1.x, p2.x)) return Double.MAX_VALUE;
+        if (fpEq(p1.y, p2.y)) return 0.0;
+        return (p1.y - p2.y) / (p1.x - p2.x);
+    }
+
+    /** The slope of the perpendicular to the line through two points. */
+    private static double pointInvsl(PgPoint p1, PgPoint p2) {
+        if (fpEq(p1.x, p2.x)) return 0.0;
+        if (fpEq(p1.y, p2.y)) return Double.MAX_VALUE;
+        return (p1.x - p2.x) / (p2.y - p1.y);
+    }
+
+    private static double lsegSl(PgLseg l) { return pointSl(l.p1, l.p2); }
+
+    /** The line through a point with a given slope, as PostgreSQL writes its coefficients. */
+    private static PgLine lineConstruct(PgPoint pt, double m) {
+        if (m == Double.MAX_VALUE) return new PgLine(-1.0, 0.0, pt.x);
+        if (m == 0) return new PgLine(0.0, -1.0, pt.y);
+        double c = pt.y - m * pt.x;
+        if (c == 0.0) c = 0.0;
+        return new PgLine(m, -1.0, c);
+    }
+
+    /** Where two lines meet, or null when they are parallel. */
+    private static PgPoint lineInterptLine(PgLine l1, PgLine l2) {
+        double x;
+        double y;
+        if (!fpZero(l1.b)) {
+            if (fpEq(l2.a, l1.a / l1.b * l2.b)) return null;
+            x = (l1.b * l2.c - l2.b * l1.c) / (l1.a * l2.b - l2.a * l1.b);
+            y = -(l1.a * x + l1.c) / l1.b;
+        } else if (!fpZero(l2.b)) {
+            if (fpEq(l1.a, l2.a / l2.b * l1.b)) return null;
+            x = (l2.b * l1.c - l1.b * l2.c) / (l2.a * l1.b - l1.a * l2.b);
+            y = -(l2.a * x + l2.c) / l2.b;
+        } else {
+            return null;
+        }
+        // The arithmetic above tends to produce a negative zero, which PostgreSQL writes back
+        // as a plain zero before it hands the point out.
+        if (x == 0.0) x = 0.0;
+        if (y == 0.0) y = 0.0;
+        return new PgPoint(x, y);
+    }
+
+    /** Whether a point lies on a segment: the two part lengths add up to the whole. */
+    private static boolean lsegContainPoint(PgLseg lseg, PgPoint pt) {
+        return fpEq(pointDt(lseg.p1, pt) + pointDt(lseg.p2, pt), pointDt(lseg.p1, lseg.p2));
+    }
+
+    private static boolean pointEqPoint(PgPoint a, PgPoint b) {
+        return fpEq(a.x, b.x) && fpEq(a.y, b.y);
+    }
+
+    /** Where a line crosses a segment, or null when it misses it. */
+    private static PgPoint lsegInterptLine(PgLseg lseg, PgLine line) {
+        PgPoint interpt = lineInterptLine(lineConstruct(lseg.p1, lsegSl(lseg)), line);
+        if (interpt == null) return null;
+        if (!lsegContainPoint(lseg, interpt)) return null;
+        // An endpoint that is only an epsilon away is the endpoint itself, not the
+        // rounding residue the arithmetic produced.
+        if (pointEqPoint(lseg.p1, interpt)) return lseg.p1;
+        if (pointEqPoint(lseg.p2, interpt)) return lseg.p2;
+        return interpt;
+    }
+
+    /** Where two segments cross, as a point on the first, or null when they do not. */
+    private static PgPoint lsegInterptLseg(PgLseg l1, PgLseg l2) {
+        PgPoint interpt = lsegInterptLine(l1, lineConstruct(l2.p1, lsegSl(l2)));
+        if (interpt == null) return null;
+        if (!lsegContainPoint(l2, interpt)) return null;
+        return interpt;
+    }
+
+    /** The point of a segment nearest a given point, with the distance to it. */
+    private static PointDist lsegCloseptPoint(PgLseg lseg, PgPoint pt) {
+        PgPoint closept = lsegInterptLine(lseg, lineConstruct(pt, pointInvsl(lseg.p1, lseg.p2)));
+        if (closept == null) {
+            // The perpendicular misses the segment, so an endpoint is nearest.
+            closept = pointDt(lseg.p1, pt) < pointDt(lseg.p2, pt) ? lseg.p1 : lseg.p2;
+        }
+        return new PointDist(closept, pointDt(pt, closept));
+    }
+
+    /** The point of {@code on} nearest the segment {@code to}, with the distance to it. */
+    private static PointDist lsegCloseptLseg(PgLseg on, PgLseg to) {
+        PgPoint crossing = lsegInterptLseg(on, to);
+        if (crossing != null) return new PointDist(crossing, 0.0);
+
+        PointDist best = lsegCloseptPoint(on, to.p1);
+        PointDist other = lsegCloseptPoint(on, to.p2);
+        if (other.dist < best.dist) best = other;
+
+        // The nearest point can still be an endpoint of the segment we are on.
+        double d = lsegCloseptPoint(to, on.p1).dist;
+        if (d < best.dist) best = new PointDist(on.p1, d);
+        d = lsegCloseptPoint(to, on.p2).dist;
+        if (d < best.dist) best = new PointDist(on.p2, d);
+        return best;
+    }
+
+    /**
+     * {@code lseg ## lseg}: the point of the second segment nearest the first. Two segments of
+     * the same slope have no answer at all in PostgreSQL, which counts a segment whose endpoints
+     * coincide as vertical, so two of those are parallel to each other and to any vertical.
+     */
+    private static PgPoint closeLseg(PgLseg l1, PgLseg l2) {
+        if (lsegSl(l1) == lsegSl(l2)) return null;
+        return lsegCloseptLseg(l2, l1).point;
+    }
+
+    /**
+     * The four sides of a box as close_sb walks them: round the perimeter from the low corner,
+     * left first. Both the order of the sides and the order of the two ends of each side decide
+     * which point is named when two of them are equally near.
+     */
+    private static PgLseg[] pgBoxSides(PgBox box) {
+        PgPoint topLeft = new PgPoint(box.low.x, box.high.y);
+        PgPoint bottomRight = new PgPoint(box.high.x, box.low.y);
+        return new PgLseg[]{
+                new PgLseg(box.low, topLeft),        // left
+                new PgLseg(topLeft, box.high),       // top
+                new PgLseg(box.high, bottomRight),   // right
+                new PgLseg(bottomRight, box.low)     // bottom
+        };
+    }
+
+    /** The slope of a line written as its coefficients; a vertical line is DBL_MAX. */
+    private static double lineSl(PgLine line) {
+        if (fpZero(line.a)) return 0.0;
+        if (fpZero(line.b)) return Double.MAX_VALUE;
+        return line.a / -line.b;
+    }
+
+    /** The slope of the perpendicular to a line. */
+    private static double lineInvsl(PgLine line) {
+        if (fpZero(line.a)) return Double.MAX_VALUE;
+        if (fpZero(line.b)) return 0.0;
+        return line.b / line.a;
+    }
+
+    /** How far a point is from a line, the perpendicular never being parallel to it. */
+    private static double lineCloseptDist(PgLine line, PgPoint point) {
+        PgPoint closept = lineInterptLine(lineConstruct(point, lineInvsl(line)), line);
+        if (closept == null) return pointDt(point, point);
+        return pointDt(point, closept);
+    }
+
+    /**
+     * {@code line ## lseg}: the point of the segment nearest the line, or no point at all when
+     * the two run at the same slope. PostgreSQL has no operator the other way round.
+     */
+    private static PgPoint closeLs(PgLine line, PgLseg lseg) {
+        if (lsegSl(lseg) == lineSl(line)) return null;
+        PgPoint crossing = lsegInterptLine(lseg, line);
+        if (crossing != null) return crossing;
+        return lineCloseptDist(line, lseg.p1) < lineCloseptDist(line, lseg.p2) ? lseg.p1 : lseg.p2;
+    }
+
+    /** Whether a segment meets a box at all: PostgreSQL's inter_sb. */
+    private static boolean lsegInterBox(PgLseg lseg, PgBox box) {
+        double lowX = Math.min(lseg.p1.x, lseg.p2.x);
+        double lowY = Math.min(lseg.p1.y, lseg.p2.y);
+        double highX = Math.max(lseg.p1.x, lseg.p2.x);
+        double highY = Math.max(lseg.p1.y, lseg.p2.y);
+        if (lowX > box.high.x || highX < box.low.x || lowY > box.high.y || highY < box.low.y) {
+            return false;
+        }
+        if (boxContainsPoint(box, lseg.p1) || boxContainsPoint(box, lseg.p2)) return true;
+        for (PgLseg side : pgBoxSides(box)) {
+            if (lsegInterptLseg(side, lseg) != null) return true;
+        }
+        return false;
+    }
+
+    /**
+     * {@code lseg ## box}: a segment that meets the box is answered with its own point nearest
+     * the centre of the box -- a point inside the box, not on it -- and one that misses with the
+     * point of the nearest side. Sides at the same distance are settled by the order above.
+     */
+    private static PgPoint closeSb(PgLseg lseg, PgBox box) {
+        if (lsegInterBox(lseg, box)) {
+            PgPoint centre = new PgPoint((box.high.x + box.low.x) / 2.0, (box.high.y + box.low.y) / 2.0);
+            return lsegCloseptPoint(lseg, centre).point;
+        }
+        PgPoint result = null;
+        double dist = -1;
+        for (PgLseg side : pgBoxSides(box)) {
+            PointDist candidate = lsegCloseptLseg(side, lseg);
+            if (dist < 0 || candidate.dist < dist) {
+                dist = candidate.dist;
+                result = candidate.point;
+            }
+        }
+        return result;
     }
 
     // ========================================================================

@@ -828,7 +828,11 @@ public class Database {
         pgSleepUntilFunc.setVolatility("VOLATILE");
         pgSleepUntilFunc.setStrict(true);
         addFunction(pgSleepUntilFunc);
-        // Register built-in comparison functions so CREATE OPERATOR PROCEDURE = int4eq etc. works
+        // Register the built-in comparison functions so CREATE OPERATOR ... PROCEDURE = int4eq
+        // resolves. They are functions and not procedures: PostgreSQL marks these prokind='f',
+        // and calling one that had been marked 'p' was refused with "int4eq is a procedure" -- a
+        // row that also broke PostgreSQL's own rule that a procedure returns void, since these
+        // return boolean.
         String[][] builtinCompFuncs = {
                 {"int4eq", "boolean", "integer,integer"},
                 {"int4ne", "boolean", "integer,integer"},
@@ -842,8 +846,10 @@ public class Database {
             for (String pType : f[2].split(",")) {
                 params.add(new PgFunction.Param(null, pType.trim(), "IN", null));
             }
-            PgFunction fn = new PgFunction(f[0], f[1], "-- built-in: " + f[0], "internal", params, true);
+            PgFunction fn = new PgFunction(f[0], f[1], "-- built-in: " + f[0], "internal", params, false);
             fn.setSchemaName("pg_catalog");
+            fn.setVolatility("IMMUTABLE");
+            fn.setStrict(true);
             addFunction(fn);
         }
     }

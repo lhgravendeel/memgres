@@ -395,6 +395,200 @@ class InformationSchemaTest {
         }
     }
 
+    // ---- view_column_usage ----------------------------------------------------------------
+
+    @Test
+    void view_column_usage_lists_the_columns_a_views_query_refers_to_and_no_others() throws SQLException {
+        try (Statement s = conn.createStatement()) {
+            s.execute("CREATE SCHEMA isvcu");
+            s.execute("CREATE TABLE isvcu.p (id int primary key, code text, extra int)");
+            s.execute("CREATE TABLE isvcu.c (id int primary key, pid int, nm text)");
+            s.execute("CREATE VIEW isvcu.vjoin AS SELECT p.id, p.code, c.nm "
+                    + "FROM isvcu.p p JOIN isvcu.c c ON c.pid = p.id");
+            // PG 18: c.id and p.extra are columns of relations the view reads but never names,
+            // and they are not listed. The four that the query does name are.
+            assertEquals(List.of("c=nm", "c=pid", "p=code", "p=id"),
+                    pairs(s, "SELECT table_name, column_name FROM information_schema.view_column_usage "
+                            + "WHERE view_schema = 'isvcu' ORDER BY 1, 2"));
+            assertEquals(List.of("c", "p"),
+                    column(s, "SELECT table_name FROM information_schema.view_table_usage "
+                            + "WHERE view_schema = 'isvcu' ORDER BY 1"));
+            s.execute("DROP VIEW isvcu.vjoin");
+            s.execute("DROP TABLE isvcu.c");
+            s.execute("DROP TABLE isvcu.p");
+            s.execute("DROP SCHEMA isvcu");
+        }
+    }
+
+    @Test
+    void view_column_usage_expands_a_star_into_every_column_it_stands_for() throws SQLException {
+        try (Statement s = conn.createStatement()) {
+            s.execute("CREATE TABLE isvcu_t (a int, b text, c date)");
+            s.execute("CREATE VIEW isvcu_v AS SELECT * FROM isvcu_t");
+            assertEquals(List.of("isvcu_t=a", "isvcu_t=b", "isvcu_t=c"),
+                    pairs(s, "SELECT table_name, column_name FROM information_schema.view_column_usage "
+                            + "WHERE view_name = 'isvcu_v' ORDER BY 2"));
+            s.execute("DROP VIEW isvcu_v");
+            s.execute("DROP TABLE isvcu_t");
+        }
+    }
+
+    // ---- the helper views information_schema is built on ------------------------------------
+
+    @Test
+    void the_helper_views_option_lists_are_text_arrays_not_names() throws SQLException {
+        try (Statement s = conn.createStatement()) {
+            // PG 18: ftoptions is text[], so information_schema.columns calls it ARRAY of _text.
+            assertRow(s, "SELECT data_type, udt_name FROM information_schema.columns "
+                            + "WHERE table_schema = 'information_schema' "
+                            + "AND table_name = '_pg_foreign_tables' AND column_name = 'ftoptions'",
+                    "ARRAY", "_text");
+            assertEquals(List.of("_pg_foreign_data_wrappers=fdwoptions/ARRAY/_text",
+                            "_pg_foreign_servers=srvoptions/ARRAY/_text",
+                            "_pg_foreign_table_columns=attfdwoptions/ARRAY/_text",
+                            "_pg_foreign_tables=ftoptions/ARRAY/_text",
+                            "_pg_user_mappings=umoptions/ARRAY/_text"),
+                    quads(s, "SELECT table_name, column_name, data_type, udt_name "
+                            + "FROM information_schema.columns "
+                            + "WHERE table_schema = 'information_schema' AND data_type = 'ARRAY' "
+                            + "ORDER BY table_name, column_name"));
+        }
+    }
+
+    @Test
+    void the_helper_views_are_listed_alongside_the_standard_ones() throws SQLException {
+        try (Statement s = conn.createStatement()) {
+            assertEquals(List.of("_pg_foreign_data_wrappers=VIEW", "_pg_foreign_servers=VIEW",
+                            "_pg_foreign_table_columns=VIEW", "_pg_foreign_tables=VIEW",
+                            "_pg_user_mappings=VIEW"),
+                    pairs(s, "SELECT table_name, table_type FROM information_schema.tables "
+                            + "WHERE table_schema = 'information_schema' "
+                            + "AND table_name LIKE '\\_pg\\_%' ORDER BY 1"));
+        }
+    }
+
+    // ---- schemata -------------------------------------------------------------------------
+
+    @Test
+    void the_public_schema_is_owned_by_pg_database_owner() throws SQLException {
+        try (Statement s = conn.createStatement()) {
+            // PG 15 and later: public follows the database rather than a named user.
+            assertRow(s, "SELECT schema_owner FROM information_schema.schemata "
+                    + "WHERE schema_name = 'public'", "pg_database_owner");
+        }
+    }
+
+    // ---- attributes, user_defined_types, udt_privileges, data_type_privileges --------------
+
+    @Test
+    void attributes_describes_every_attribute_of_a_composite_type() throws SQLException {
+        try (Statement s = conn.createStatement()) {
+            s.execute("CREATE SCHEMA isatt");
+            s.execute("SET search_path TO isatt");
+            s.execute("CREATE TYPE ct AS (a int, b text, c date)");
+            try {
+                assertEquals(List.of("a=1/integer/int4/1", "b=2/text/text/2", "c=3/date/date/3"),
+                        quads(s, "SELECT attribute_name, ordinal_position || '/' || data_type, "
+                                + "attribute_udt_name, dtd_identifier "
+                                + "FROM information_schema.attributes "
+                                + "WHERE udt_schema = 'isatt' AND udt_name = 'ct' "
+                                + "ORDER BY ordinal_position"));
+                assertRow(s, "SELECT is_nullable, attribute_default, attribute_udt_schema, "
+                                + "numeric_precision, numeric_precision_radix, numeric_scale, "
+                                + "is_derived_reference_attribute FROM information_schema.attributes "
+                                + "WHERE udt_schema = 'isatt' AND udt_name = 'ct' AND attribute_name = 'a'",
+                        "YES", null, "pg_catalog", "32", "2", "0", "NO");
+                // text reports the octet length it can hold; date reports a datetime precision of 0
+                assertRow(s, "SELECT character_octet_length, character_maximum_length "
+                                + "FROM information_schema.attributes WHERE udt_schema = 'isatt' "
+                                + "AND udt_name = 'ct' AND attribute_name = 'b'", "1073741824", null);
+                assertRow(s, "SELECT datetime_precision FROM information_schema.attributes "
+                                + "WHERE udt_schema = 'isatt' AND udt_name = 'ct' AND attribute_name = 'c'",
+                        "0");
+                assertRow(s, "SELECT user_defined_type_category, is_instantiable, is_final, data_type "
+                                + "FROM information_schema.user_defined_types "
+                                + "WHERE user_defined_type_schema = 'isatt'",
+                        "STRUCTURED", "YES", null, null);
+                // A composite type's attributes are data type descriptors like a column's
+                assertEquals(List.of("ct=USER-DEFINED TYPE/1", "ct=USER-DEFINED TYPE/2",
+                                "ct=USER-DEFINED TYPE/3"),
+                        triples(s, "SELECT object_name, object_type, dtd_identifier "
+                                + "FROM information_schema.data_type_privileges "
+                                + "WHERE object_schema = 'isatt' ORDER BY dtd_identifier"));
+                // USAGE on a type goes to PUBLIC, and to its owner with the right to grant it on
+                assertEquals(List.of("PUBLIC=TYPE USAGE/NO", "memgres=TYPE USAGE/YES"),
+                        triples(s, "SELECT grantee, privilege_type, is_grantable "
+                                + "FROM information_schema.udt_privileges "
+                                + "WHERE udt_schema = 'isatt' AND udt_name = 'ct' ORDER BY grantee"));
+                assertEquals(List.of("PUBLIC=TYPE USAGE/NO", "memgres=TYPE USAGE/YES"),
+                        triples(s, "SELECT grantee, privilege_type, is_grantable "
+                                + "FROM information_schema.role_udt_grants "
+                                + "WHERE udt_schema = 'isatt' AND udt_name = 'ct' ORDER BY grantee"));
+            } finally {
+                s.execute("DROP TYPE ct");
+                s.execute("SET search_path TO public");
+                s.execute("DROP SCHEMA isatt");
+            }
+        }
+    }
+
+    @Test
+    void a_relations_row_type_carries_the_same_usage_grant_as_a_composite_type() throws SQLException {
+        try (Statement s = conn.createStatement()) {
+            s.execute("CREATE SCHEMA isudt");
+            s.execute("CREATE TABLE isudt.t (a int)");
+            s.execute("CREATE VIEW isudt.v AS SELECT a FROM isudt.t");
+            assertEquals(List.of("t=PUBLIC/NO", "t=memgres/YES", "v=PUBLIC/NO", "v=memgres/YES"),
+                    triples(s, "SELECT udt_name, grantee, is_grantable "
+                            + "FROM information_schema.udt_privileges "
+                            + "WHERE udt_schema = 'isudt' ORDER BY udt_name, grantee"));
+            s.execute("DROP VIEW isudt.v");
+            s.execute("DROP TABLE isudt.t");
+            s.execute("DROP SCHEMA isudt");
+        }
+    }
+
+    // ---- element_types --------------------------------------------------------------------
+
+    @Test
+    void element_types_describes_every_array_typed_descriptor_by_the_collection_it_belongs_to()
+            throws SQLException {
+        try (Statement s = conn.createStatement()) {
+            s.execute("CREATE SCHEMA isel");
+            s.execute("CREATE TABLE isel.tarr (a1 text[], b1 int, c1 int[])");
+            s.execute("CREATE DOMAIN isel.darr AS text[]");
+            s.execute("CREATE DOMAIN isel.dplain AS text");
+            s.execute("CREATE TABLE isel.tdom (d1 isel.darr, e1 text)");
+            s.execute("CREATE VIEW isel.varr AS SELECT a1 FROM isel.tarr");
+            // PG 18: the domain over text[] is listed, the column typed by that domain is not —
+            // the column's type is the domain, and the domain is what carries the array.
+            assertEquals(List.of("darr=DOMAIN/1/text/a1", "tarr=TABLE/1/text/a1",
+                            "tarr=TABLE/3/integer/a3", "varr=TABLE/1/text/a1"),
+                    quads(s, "SELECT object_name, object_type || '/' || collection_type_identifier, "
+                            + "data_type, dtd_identifier FROM information_schema.element_types "
+                            + "WHERE object_schema = 'isel' ORDER BY object_type, object_name, "
+                            + "collection_type_identifier"));
+            assertRow(s, "SELECT udt_schema, udt_name, character_maximum_length, "
+                            + "character_octet_length, numeric_precision, maximum_cardinality "
+                            + "FROM information_schema.element_types "
+                            + "WHERE object_schema = 'isel' AND object_name = 'darr'",
+                    "pg_catalog", "text", null, null, null, null);
+            // Every column of every relation is a descriptor, array-typed or not
+            assertEquals(List.of("darr=DOMAIN/1", "dplain=DOMAIN/1", "tarr=TABLE/1", "tarr=TABLE/2",
+                            "tarr=TABLE/3", "tdom=TABLE/1", "tdom=TABLE/2", "varr=TABLE/1"),
+                    pairs(s, "SELECT object_name, object_type || '/' || dtd_identifier "
+                            + "FROM information_schema.data_type_privileges "
+                            + "WHERE object_schema = 'isel' ORDER BY object_type, object_name, "
+                            + "dtd_identifier"));
+            s.execute("DROP VIEW isel.varr");
+            s.execute("DROP TABLE isel.tdom");
+            s.execute("DROP TABLE isel.tarr");
+            s.execute("DROP DOMAIN isel.darr");
+            s.execute("DROP DOMAIN isel.dplain");
+            s.execute("DROP SCHEMA isel");
+        }
+    }
+
     // ---- helpers --------------------------------------------------------------------------
 
     private static void assertRow(Statement s, String sql, String... expected) throws SQLException {

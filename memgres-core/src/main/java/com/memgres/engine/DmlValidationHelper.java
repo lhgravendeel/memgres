@@ -112,14 +112,29 @@ class DmlValidationHelper {
      * Collect all WITH CHECK OPTION expressions for a view and its base views (CASCADED).
      * Returns empty list if the target is a table or has no check option.
      */
-    List<Expression> collectViewCheckExprs(String targetName) {
-        List<Expression> exprs = new ArrayList<>();
+    List<ViewCheck> collectViewCheckExprs(String targetName) {
+        List<ViewCheck> exprs = new ArrayList<>();
         collectViewCheckExprsRecursive(targetName, false, exprs, new HashSet<>());
         return exprs;
     }
 
+    /**
+     * One view's WITH CHECK OPTION condition, kept with the name of the view that declared it.
+     * A write through a chain of views can fail any of their conditions, and PostgreSQL names
+     * the one that failed — without it a caller only learns that some view rejected the row.
+     */
+    static final class ViewCheck {
+        final String viewName;
+        final Expression expr;
+
+        ViewCheck(String viewName, Expression expr) {
+            this.viewName = viewName;
+            this.expr = expr;
+        }
+    }
+
     private void collectViewCheckExprsRecursive(String viewName, boolean cascading,
-                                                  List<Expression> exprs,
+                                                  List<ViewCheck> exprs,
                                                   Set<String> visited) {
         if (!visited.add(viewName.toLowerCase())) return;
         Database.ViewDef view = executor.database.getView(viewName);
@@ -128,7 +143,7 @@ class DmlValidationHelper {
         boolean hasCheck = view.checkOption() != null;
         if ((hasCheck || cascading) && view.query() instanceof SelectStmt && ((SelectStmt) view.query()).where() != null) {
             SelectStmt sel = (SelectStmt) view.query();
-            exprs.add(sel.where());
+            exprs.add(new ViewCheck(view.name(), sel.where()));
         }
         // Always descend: a base view's own WITH CHECK OPTION applies to rows written
         // through an outer view, whatever the outer view declares. The cascading flag only
@@ -149,20 +164,36 @@ class DmlValidationHelper {
     }
 
     /** Validate a row against collected WITH CHECK OPTION expressions. Throws 44000 if violated. */
-    void enforceViewCheckOption(List<Expression> checkExprs, Table table, Object[] row) {
+    void enforceViewCheckOption(List<ViewCheck> checkExprs, Table table, Object[] row) {
         if (checkExprs.isEmpty()) return;
         RowContext ctx = new RowContext(table, table.getName(), row);
-        for (Expression checkExpr : checkExprs) {
+        for (ViewCheck check : checkExprs) {
             try {
-                Object result = executor.evalExpr(checkExpr, ctx);
+                Object result = executor.evalExpr(check.expr, ctx);
                 if (!executor.isTruthy(result)) {
-                    throw new MemgresException("new row violates check option for view", "44000");
+                    throw checkOptionViolation(check.viewName, row);
                 }
             } catch (MemgresException me) {
                 if ("44000".equals(me.getSqlState())) throw me;
                 // Other eval errors, treat as violation
-                throw new MemgresException("new row violates check option for view", "44000");
+                throw checkOptionViolation(check.viewName, row);
             }
         }
+    }
+
+    /**
+     * PostgreSQL names the view whose check option the row failed and prints the row itself, so
+     * a caller writing many rows at once can tell which one was rejected and why.
+     */
+    private MemgresException checkOptionViolation(String viewName, Object[] row) {
+        StringBuilder failing = new StringBuilder();
+        for (int i = 0; i < row.length; i++) {
+            if (i > 0) failing.append(", ");
+            failing.append(row[i] == null ? "null" : row[i].toString());
+        }
+        MemgresException ex = new MemgresException(
+                "new row violates check option for view \"" + viewName + "\"", "44000");
+        ex.setDetail("Failing row contains (" + failing + ").");
+        return ex;
     }
 }

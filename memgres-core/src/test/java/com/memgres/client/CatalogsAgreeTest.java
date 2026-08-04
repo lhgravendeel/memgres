@@ -118,6 +118,82 @@ class CatalogsAgreeTest {
         }
     }
 
+    /**
+     * format_type has to name the pseudo-types too. A routine's signature is declared over them
+     * far more often than a column is — an input function reads a cstring, a receive function is
+     * handed internal, a trigger function answers trigger — so a renderer that only knows the
+     * types a column can have prints "unknown" over most of pg_proc. Values from PostgreSQL 18.
+     */
+    @Test
+    void format_type_names_the_pseudo_types_and_the_bootstrap_types() throws SQLException {
+        try (Statement s = conn.createStatement()) {
+            assertRow(s, "SELECT format_type(2275, NULL)", "cstring");
+            assertRow(s, "SELECT format_type(1263, NULL)", "cstring[]");
+            assertRow(s, "SELECT format_type(2281, NULL)", "internal");
+            assertRow(s, "SELECT format_type(2279, NULL)", "trigger");
+            assertRow(s, "SELECT format_type(3838, NULL)", "event_trigger");
+            assertRow(s, "SELECT format_type(2280, NULL)", "language_handler");
+            assertRow(s, "SELECT format_type(3115, NULL)", "fdw_handler");
+            assertRow(s, "SELECT format_type(325, NULL)", "index_am_handler");
+            assertRow(s, "SELECT format_type(269, NULL)", "table_am_handler");
+            assertRow(s, "SELECT format_type(3310, NULL)", "tsm_handler");
+            assertRow(s, "SELECT format_type(2249, NULL)", "record");
+            assertRow(s, "SELECT format_type(2278, NULL)", "void");
+            assertRow(s, "SELECT format_type(2283, NULL)", "anyelement");
+            assertRow(s, "SELECT format_type(2277, NULL)", "anyarray");
+            assertRow(s, "SELECT format_type(5077, NULL)", "anycompatible");
+            assertRow(s, "SELECT format_type(5078, NULL)", "anycompatiblearray");
+            // "any" is a reserved word, so PG's format_type quotes what it prints.
+            assertRow(s, "SELECT format_type(2276, NULL)", "\"any\"");
+            // The bootstrap types: unknown is what an unadorned literal still is, refcursor what
+            // a cursor variable holds, gtsvector what tsvector's GiST opclass stores.
+            assertRow(s, "SELECT format_type(705, NULL)", "unknown");
+            assertRow(s, "SELECT format_type(1790, NULL)", "refcursor");
+            assertRow(s, "SELECT format_type(2201, NULL)", "refcursor[]");
+            assertRow(s, "SELECT format_type(3642, NULL)", "gtsvector");
+            assertRow(s, "SELECT format_type(3644, NULL)", "gtsvector[]");
+            // An unmodified bpchar is named "character": format_type prints the spelling a
+            // client could write back, which is why PG's identity form of length(bpchar) reads
+            // length(character).
+            assertRow(s, "SELECT format_type(1042, NULL)", "character");
+            assertRow(s, "SELECT format_type(1042, 9)", "character(5)");
+            // No type at all is a dash; an OID with no type behind it is deliberately not a name.
+            assertRow(s, "SELECT format_type(0, NULL)", "-");
+            assertRow(s, "SELECT format_type(999999, NULL)", "???");
+        }
+    }
+
+    /**
+     * Every type memgres registers has to name itself. A type that reached pg_type without
+     * reaching format_type's own table used to print as the word "unknown" wherever a client
+     * asked what it was — including through pg_get_function_arguments, which is how a driver
+     * lists what the server can do.
+     */
+    @Test
+    void every_registered_type_names_itself() throws SQLException {
+        try (Statement s = conn.createStatement()) {
+            List<String> nameless = new ArrayList<>();
+            try (ResultSet rs = s.executeQuery(
+                    "SELECT typname, format_type(oid, NULL) FROM pg_type "
+                    + "WHERE typname <> 'unknown' AND format_type(oid, NULL) = 'unknown' "
+                    + "ORDER BY typname")) {
+                while (rs.next()) nameless.add(rs.getString(1));
+            }
+            assertEquals(List.of(), nameless, "pg_type rows format_type cannot name");
+            // ... and no rendered signature in pg_proc falls back to it either. The type actually
+            // named unknown is excluded the same way the query above excludes it: its own four I/O
+            // functions are declared over it, so their signatures say "unknown" because that is
+            // the type's name and not because the renderer ran out of names. PostgreSQL 18 answers
+            // the same four rows for the unfiltered query (unknownin, unknownout, unknownrecv,
+            // unknownsend, at OIDs 109, 110, 2416 and 2417) and zero for this one.
+            assertRow(s, "SELECT count(*)::text FROM pg_proc "
+                    + "WHERE (pg_get_function_arguments(oid) LIKE '%unknown%' "
+                    + "OR pg_get_function_result(oid) LIKE '%unknown%') "
+                    + "AND proname NOT IN "
+                    + "('unknownin', 'unknownout', 'unknownrecv', 'unknownsend')", "0");
+        }
+    }
+
     // ---- domains ---------------------------------------------------------------------------
 
     @Test

@@ -52,7 +52,11 @@ class CatalogSecurityBuilder {
             if (settingValue == null) settingValue = entry.getValue();
             String resetValue = def != null ? guc.getResetValue(name) : settingValue;
             if (resetValue == null) resetValue = settingValue;
-            String source = guc.hasSessionOverride(name) ? "session" : "default";
+            // A transaction's own settings are not chosen by the session at all: the transaction
+            // machinery assigns them when it starts, and PostgreSQL reports that as "override"
+            // so a client can tell a value it set from a value the server imposed.
+            String source = guc.hasSessionOverride(name) ? "session"
+                    : (SessionExecutor.isTransactionScopedGuc(name) ? "override" : "default");
             // L12: PG exposes mixed-case canonical names (e.g. TimeZone, DateStyle)
             // in pg_settings.name.
             String displayName = guc.getCanonicalName(name);
@@ -60,7 +64,7 @@ class CatalogSecurityBuilder {
                     def != null ? def.unit : null,
                     def != null ? def.category : "Customized Options",
                     def != null ? def.shortDesc : null,
-                    null,
+                    def != null ? def.extraDesc : null,
                     def != null ? def.context : "user",
                     def != null ? def.vartype : "string",
                     source,

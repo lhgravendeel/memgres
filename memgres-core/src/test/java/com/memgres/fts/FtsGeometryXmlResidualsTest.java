@@ -231,4 +231,74 @@ class FtsGeometryXmlResidualsTest {
             s.execute("DROP FUNCTION zz_exec_norm()");
         }
     }
+
+    // ---- The closest-point operator over a segment and a box, and over two segments ----
+    //
+    // Every expectation below was read from the reference server. A segment that meets a box is
+    // answered with a point inside the box -- its own point nearest the box's centre -- and one
+    // that misses with a point of the nearest side, the sides being walked left, top, right,
+    // bottom so that the ties fall the way PostgreSQL's do.
+
+    @Test
+    void closest_point_on_a_box_is_the_point_of_the_nearest_side() throws SQLException {
+        assertEquals("(2,4)", scalar("SELECT lseg '[(4,0),(4,4)]' ## box '(-2,1),(2,4)'"));
+        assertEquals("(3,3)", scalar("SELECT lseg '[(4,0),(4,4)]' ## box '(0,0),(3,3)'"));
+        assertEquals("(0,0)", scalar("SELECT lseg '[(-2,0),(-2,3)]' ## box '(0,0),(3,3)'"));
+        assertEquals("(0,3)", scalar("SELECT lseg '[(-10,10),(10,10)]' ## box '(0,0),(3,3)'"));
+        assertEquals("(-5,-1)", scalar("SELECT lseg '[(-10,10),(10,10)]' ## box '(-5,-5),(-1,-1)'"));
+    }
+
+    @Test
+    void closest_point_on_a_box_the_segment_meets_is_inside_it() throws SQLException {
+        assertEquals("(0.24999999999999997,1.75)",
+                scalar("SELECT lseg '[(1,2),(-2,1)]' ## box '(-2,1),(2,4)'"));
+        assertEquals("(1.25,1.25)", scalar("SELECT lseg '[(0,0),(6,6)]' ## box '(-2,1),(2,4)'"));
+        assertEquals("(1,2)", scalar("SELECT lseg '[(1,2),(-2,1)]' ## box '(0,0),(3,3)'"));
+        assertEquals("(-3,-3)", scalar("SELECT lseg '[(-3,-3),(-3,-3)]' ## box '(-5,-5),(-1,-1)'"));
+    }
+
+    @Test
+    void closest_point_on_the_second_segment_of_two() throws SQLException {
+        assertEquals("(-2,1)", scalar("SELECT lseg '[(-3,-3),(-3,-3)]' ## lseg '[(1,2),(-2,1)]'"));
+        assertEquals("(1,2)", scalar("SELECT lseg '[(5,0),(0,5)]' ## lseg '[(1,2),(-2,1)]'"));
+        assertEquals("(1.4285714285714286,3.571428571428571)",
+                scalar("SELECT lseg '[(-2,1),(2,4)]' ## lseg '[(5,0),(0,5)]'"));
+        assertEquals("(4,4)", scalar("SELECT lseg '[(2,4),(6,8)]' ## lseg '[(4,0),(4,4)]'"));
+    }
+
+    @Test
+    void two_segments_of_the_same_slope_have_no_closest_point() throws SQLException {
+        assertNull(scalar("SELECT lseg '[(2,4),(6,8)]' ## lseg '[(0,0),(6,6)]'"));
+        assertNull(scalar("SELECT lseg '[(-10,10),(10,10)]' ## lseg '[(-10,10),(10,10)]'"));
+        // A segment whose endpoints coincide counts as vertical, and so does a vertical one.
+        assertNull(scalar("SELECT lseg '[(1,1),(1,1)]' ## lseg '[(4,0),(4,4)]'"));
+        assertNull(scalar("SELECT lseg '[(1,1),(1,1)]' ## lseg '[(3,3),(3,3)]'"));
+    }
+
+    @Test
+    void closest_point_of_a_line_and_a_segment_runs_that_way_round_only() throws SQLException {
+        assertEquals("(0,1.6666666666666667)", scalar("SELECT line '{1,0,0}' ## lseg '[(1,2),(-2,1)]'"));
+        assertEquals("(0,2)", scalar("SELECT line '{1,0,0}' ## lseg '[(-5,2),(5,2)]'"));
+        assertNull(scalar("SELECT line '{1,-1,3}' ## lseg '[(0,0),(4,4)]'"));
+
+        for (String sql : new String[]{
+                "SELECT lseg '[(0,0),(4,4)]' ## line '{1,-1,3}'",
+                "SELECT box '(-2,1),(2,4)' ## lseg '[(4,0),(4,4)]'"}) {
+            String err = expectError(sql);
+            assertNotNull(err, sql);
+            assertTrue(err.startsWith("42883"), sql + " => " + err);
+            assertTrue(err.contains("operator does not exist"), sql + " => " + err);
+        }
+    }
+
+    @Test
+    void the_functions_the_closest_point_operator_is_recorded_as_are_callable() throws SQLException {
+        assertEquals("(1,2)",
+                scalar("SELECT close_lseg(lseg '[(4,0),(4,4)]', lseg '[(1,2),(-2,1)]')::text"));
+        assertEquals("(2,4)",
+                scalar("SELECT close_sb(lseg '[(4,0),(4,4)]', box '(-2,1),(2,4)')::text"));
+        assertEquals("(0,0)",
+                scalar("SELECT close_ls(line '{1,0,0}', lseg '[(0,0),(4,4)]')::text"));
+        assertEquals("(1,0)", scalar("SELECT close_ps(point '(1,1)', lseg '[(0,0),(4,0)]')::text"));
+    }
 }

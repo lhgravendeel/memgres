@@ -528,10 +528,12 @@ class CatalogSystemFunctions {
             case "set_config": {
                 if (fn.args().size() >= 2) {
                     String settingName = String.valueOf(executor.evalExpr(fn.args().get(0), ctx));
-                    if (settingName.equalsIgnoreCase("max_connections")) {
-                        throw new MemgresException("parameter \"max_connections\" cannot be changed without restarting the server");
-                    }
+                    // set_config is SET written as a function call, so it is judged by the same
+                    // rules: an unrecognized parameter is refused rather than invented, and one
+                    // that cannot be changed at run time says so with the same SQLSTATE.
+                    GucSettings.requireKnown(settingName);
                     String settingValue = String.valueOf(executor.evalExpr(fn.args().get(1), ctx));
+                    GucSettings.checkAssignable(settingName, settingValue);
                     boolean isLocal = fn.args().size() >= 3 && executor.isTruthy(executor.evalExpr(fn.args().get(2), ctx));
                     // set_config runs inside a query, so a transaction-scoped setting is subject
                     // to the same rules the SET statement is: the isolation level can no longer
