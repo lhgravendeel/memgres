@@ -283,6 +283,465 @@ class FunctionEvaluator {
         return found == null ? null : CatalogHelper.pgTypeName(found);
     }
 
+    // ---- A type name written like a call ----
+
+    /**
+     * The type names PostgreSQL's own grammar reads as a type rather than as a function name.
+     *
+     * <p>{@code SELECT numeric(42)} is a syntax error there (42601), not a call and not a
+     * coercion, because the parser has already decided the word starts a type before it reaches
+     * the parenthesis. Every one of these is a col_name_keyword; a spelling that is not —
+     * {@code int4}, {@code bpchar}, {@code timestamptz}, {@code varbit} — is an ordinary
+     * identifier and does resolve as a coercion. Enabling these here would make memgres accept
+     * SQL PostgreSQL rejects, so the coercion path refuses to look at them.
+     */
+    private static final Set<String> TYPE_NAME_KEYWORDS = Cols.setOf(
+            "numeric", "decimal", "dec", "varchar", "character varying", "boolean", "integer",
+            "int", "bigint", "smallint", "real", "float", "double precision", "double",
+            "char", "character", "nchar", "bit", "bit varying", "time", "timestamp",
+            "interval", "serial", "bigserial", "smallserial", "setof", "national character",
+            "citext", "hstore");
+
+    /**
+     * Type names PostgreSQL keeps that memgres reads through a cast without carrying a
+     * {@link DataType} for them, so {@link DataType#fromPgName} cannot be what recognises them.
+     */
+    private static final Set<String> EXTRA_COERCIBLE_TYPE_NAMES = Cols.setOf(
+            "regnamespace", "regconfig", "regdictionary", "regoperator", "regoper", "regrole",
+            "regprocedure", "regcollation", "pg_lsn", "tid", "jsonpath", "xid", "cid",
+            "aclitem", "pg_snapshot", "txid_snapshot", "cstring", "unknown");
+
+    /**
+     * The pseudo-types whose name is not a coercion PostgreSQL will perform. A polymorphic
+     * placeholder stands for a type rather than being one, and an anonymous composite has no
+     * input function, so PostgreSQL answers 42883 or 0A000 rather than converting anything.
+     */
+    private static final Set<String> UNCOERCIBLE_TYPE_NAMES = Cols.setOf(
+            "record", "anyarray", "anyelement", "anynonarray", "anyenum", "anyrange",
+            "anymultirange", "anycompatible", "anycompatiblearray", "anycompatiblenonarray",
+            "anycompatiblerange", "anycompatiblemultirange", "any", "internal", "trigger",
+            "event_trigger", "language_handler", "fdw_handler", "index_am_handler",
+            "tsm_handler", "table_am_handler", "gtsvector", "opaque", "pg_ddl_command",
+            "enum", "refcursor");
+
+    /**
+     * Whether this name can stand for a type in a call written like a function.
+     *
+     * <p>Answered for the bare name, with any {@code pg_catalog.} qualifier already stripped: a
+     * built-in type, one of the names memgres only casts to, a domain the user declared or an
+     * enum the user declared. A schema qualifier that is not pg_catalog's leaves the name alone,
+     * because {@code public.int4(1)} names nothing in either engine.
+     */
+    String coercibleTypeName(String name) {
+        if (name == null) return null;
+        String bare = name;
+        if (bare.indexOf('.') >= 0) {
+            // A schema qualifier is part of the call. pg_catalog's is stripped before this point,
+            // so what is left names a schema of the user's, and only a type really in it answers.
+            if (!bare.startsWith("public.") || bare.indexOf('.', 7) >= 0) return null;
+            bare = bare.substring(7);
+            if (executor.database == null) return null;
+            if (executor.database.getDomain(bare) == null
+                    && executor.database.getCustomEnum(bare) == null) {
+                return null;
+            }
+            return bare;
+        }
+        if (TYPE_NAME_KEYWORDS.contains(bare) || UNCOERCIBLE_TYPE_NAMES.contains(bare)) return null;
+        if (bare.endsWith("[]") || bare.startsWith("_")) return null;
+        // A type this database was told about answers first: the name is then its own, whatever
+        // PostgreSQL happens to keep under the same spelling.
+        if (executor.database != null
+                && (executor.database.getDomain(bare) != null
+                    || executor.database.getCustomEnum(bare) != null)) {
+            return bare;
+        }
+        if (EXTRA_COERCIBLE_TYPE_NAMES.contains(bare)) return bare;
+        return DataType.fromPgName(bare) != null ? bare : null;
+    }
+
+    /**
+     * The type whose conversions decide whether the call resolves. A domain is its base type for
+     * that purpose — {@code adomain(1)} converts an integer exactly as the integer it is built on
+     * does — while every other name decides for itself.
+     */
+    private String coercionTargetOf(String typeName) {
+        if (executor.database == null) return typeName;
+        DomainType domain = executor.database.getDomain(typeName);
+        if (domain == null || domain.getBaseType() == null) return typeName;
+        return domain.getBaseType().getPgName();
+    }
+
+    /** The types whose values PostgreSQL reads with the target type's input function. */
+    private static boolean isStringCategory(DataType t) {
+        return t == DataType.TEXT || t == DataType.VARCHAR || t == DataType.CHAR
+                || t == DataType.NAME;
+    }
+
+    private static boolean isNumberType(DataType t) {
+        return t == DataType.SMALLINT || t == DataType.INTEGER || t == DataType.BIGINT
+                || t == DataType.REAL || t == DataType.DOUBLE_PRECISION || t == DataType.NUMERIC
+                || t == DataType.SERIAL || t == DataType.BIGSERIAL || t == DataType.SMALLSERIAL;
+    }
+
+    private static boolean isOidType(DataType t) {
+        return t == DataType.OID || t == DataType.REGCLASS || t == DataType.REGTYPE
+                || t == DataType.REGPROC;
+    }
+
+    /**
+     * Whether PostgreSQL has a conversion from the argument's type to the named one, measured
+     * against PG 18 rather than derived. A source with no type of its own — an unadorned literal
+     * or a NULL — is read by the target's input function and so always converts; a source in the
+     * string category likewise. Everything else needs a cast PostgreSQL actually declares, which
+     * is why {@code date(42)}, {@code uuid(42)} and {@code int4(point '(1,2)')} are a function
+     * that does not exist rather than a conversion that fails.
+     *
+     * <p>Where the conversion PostgreSQL performs is not the one memgres's cast would perform —
+     * {@code bytea(42)} writes the integer's bytes, {@code int4(jsonb)} reads a JSON number — the
+     * pair is left out, so the call is refused rather than answered wrongly.
+     */
+    private static boolean coercionAdmitted(String target, DataType src) {
+        if (src == null || isStringCategory(src)) return true;
+        DataType targetType = DataType.fromPgName(target);
+        if (targetType != null && targetType == src) return true;
+        switch (target) {
+            case "int2": case "int4": case "int8": case "float4": case "float8":
+                if (isNumberType(src)) return true;
+                if (isOidType(src)) return target.equals("int4") || target.equals("int8");
+                return src == DataType.BOOLEAN && target.equals("int4");
+            case "bool":
+                return src == DataType.SMALLINT || src == DataType.INTEGER;
+            case "oid":
+                return src == DataType.SMALLINT || src == DataType.INTEGER
+                        || src == DataType.BIGINT || isOidType(src);
+            case "money":
+                return isNumberType(src);
+            case "date": case "timestamptz":
+                return src == DataType.DATE || src == DataType.TIMESTAMP
+                        || src == DataType.TIMESTAMPTZ;
+            case "timetz":
+                return src == DataType.TIME || src == DataType.TIMETZ
+                        || src == DataType.TIMESTAMP || src == DataType.TIMESTAMPTZ;
+            case "inet": case "cidr":
+                return src == DataType.INET || src == DataType.CIDR;
+            case "macaddr": case "macaddr8":
+                return src == DataType.MACADDR || src == DataType.MACADDR8;
+            case "json": case "jsonb":
+                return src == DataType.JSON || src == DataType.JSONB;
+            case "name":
+                return true;
+            case "bpchar":
+                return src != DataType.INET && src != DataType.CIDR;
+            case "regclass": case "regtype": case "regproc": case "regnamespace":
+            case "regconfig": case "regdictionary": case "regoperator": case "regoper":
+            case "regprocedure": case "regcollation": case "regrole":
+                return src == DataType.INTEGER || isOidType(src);
+            default:
+                return false;
+        }
+    }
+
+    /** The type an argument expression carries, or null when it is an unadorned literal. */
+    private DataType staticArgType(Expression arg, RowContext ctx) {
+        if (arg instanceof Literal) {
+            Literal.LiteralType lt = ((Literal) arg).literalType();
+            if (lt == Literal.LiteralType.STRING || lt == Literal.LiteralType.NULL) return null;
+        }
+        List<RowContext.TableBinding> bindings = ctx == null
+                ? java.util.Collections.<RowContext.TableBinding>emptyList() : ctx.getBindings();
+        try {
+            return executor.exprEvaluator.inferTypeFromContext(arg, bindings);
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    /** The way PostgreSQL names an argument type in a 42883 raised by a coercion that has none. */
+    private String coercionArgTypeName(Expression arg, RowContext ctx) {
+        DataType t = staticArgType(arg, ctx);
+        if (t == null) return "unknown";
+        if (t == DataType.ENUM) {
+            List<RowContext.TableBinding> bindings = ctx == null
+                    ? java.util.Collections.<RowContext.TableBinding>emptyList() : ctx.getBindings();
+            String enumName = executor.exprEvaluator.resolveEnumTypeName(arg, bindings);
+            if (enumName != null) return enumName;
+        }
+        return CatalogHelper.pgTypeName(t);
+    }
+
+    /**
+     * The value a type name written like a call produces, or {@link #NOT_HANDLED} when the name
+     * is not a type or the call is not one PostgreSQL reads as a coercion.
+     *
+     * <p>One written argument is a coercion of it. Two or three are the typmod-applying rows
+     * PostgreSQL keeps in pg_proc, and those are reachable only through the {@code pg_catalog.}
+     * spelling, because the bare name of every type that has one is a keyword.
+     */
+    private Object typeNameCoercion(String name, FunctionCallExpr fn, RowContext ctx) {
+        if (fn.star() || fn.distinct()) return NOT_HANDLED;
+        for (Expression a : fn.args()) {
+            if (a instanceof NamedArgExpr) return NOT_HANDLED;
+        }
+        boolean qualified = fn.name() != null
+                && fn.name().toLowerCase(java.util.Locale.ROOT).startsWith("pg_catalog.");
+        if (qualified && fn.args().size() >= 2 && fn.args().size() <= 3) {
+            return typmodCoercion(name, fn, ctx);
+        }
+        if (fn.args().size() != 1) return NOT_HANDLED;
+        String typeName = coercibleTypeName(name);
+        if (typeName == null) return NOT_HANDLED;
+        Expression arg = fn.args().get(0);
+        if (!coercionAdmitted(coercionTargetOf(typeName), staticArgType(arg, ctx))) {
+            throw new MemgresException("function " + fn.name() + "("
+                    + coercionArgTypeName(arg, ctx) + ") does not exist\n"
+                    + "  Hint: No function matches the given name and argument types."
+                    + " You might need to add explicit type casts.", "42883");
+        }
+        Object value = executor.evalExpr(arg, ctx);
+        // void carries no value at all: whatever is handed to it, PostgreSQL prints nothing.
+        if (typeName.equals("void")) return value == null ? null : "";
+        return executor.castEvaluator.applyCast(value, typeName,
+                arg instanceof Literal
+                        && ((Literal) arg).literalType() == Literal.LiteralType.STRING);
+    }
+
+    /**
+     * {@code pg_catalog.varchar(v, typmod, isExplicit)} and its relatives, which apply a stored
+     * type modifier to a value that already has the type. The modifier is the packed one the
+     * catalogs hold, so a length carries four bytes of header with it and anything below that is
+     * "no modifier at all" — which is why {@code pg_catalog.varchar('abcdef', 3, true)} answers
+     * abcdef and {@code pg_catalog.varchar('abcdef', 7, true)} answers abc.
+     */
+    private Object typmodCoercion(String name, FunctionCallExpr fn, RowContext ctx) {
+        boolean lengthTyped = name.equals("varchar") || name.equals("bpchar");
+        if (!lengthTyped && !name.equals("numeric")) return NOT_HANDLED;
+        if (lengthTyped && fn.args().size() != 3) return NOT_HANDLED;
+        if (!lengthTyped && fn.args().size() != 2) return NOT_HANDLED;
+        Object value = executor.evalExpr(fn.args().get(0), ctx);
+        Object typmodArg = executor.evalExpr(fn.args().get(1), ctx);
+        if (value == null || typmodArg == null) return null;
+        if (!(typmodArg instanceof Number)) return NOT_HANDLED;
+        int typmod = ((Number) typmodArg).intValue();
+        if (typmod < 4) return value;
+        if (lengthTyped) {
+            String s = value.toString();
+            int n = typmod - 4;
+            return s.length() > n ? s.substring(0, n) : s;
+        }
+        int bits = typmod - 4;
+        int precision = (bits >> 16) & 0xffff;
+        int scale = bits & 0xffff;
+        return executor.castEvaluator.applyCast(value, "numeric(" + precision + "," + scale + ")");
+    }
+
+    /**
+     * The type a call that is really a coercion answers in, for the layer that describes a column
+     * before any row is produced. Null when the call is not one.
+     */
+    DataType typeNameCoercionResultType(String name, FunctionCallExpr fn) {
+        if (fn.args().size() != 1 || fn.star() || fn.distinct()) {
+            boolean qualified = fn.name() != null
+                    && fn.name().toLowerCase(java.util.Locale.ROOT).startsWith("pg_catalog.");
+            if (!qualified || fn.args().size() < 2 || fn.args().size() > 3) return null;
+            if (!name.equals("varchar") && !name.equals("bpchar") && !name.equals("numeric")) {
+                return null;
+            }
+            return DataType.fromPgName(name);
+        }
+        String typeName = coercibleTypeName(name);
+        if (typeName == null) return null;
+        DataType dt = DataType.fromPgName(typeName);
+        if (dt != null) return dt;
+        if (executor.database != null) {
+            DomainType domain = executor.database.getDomain(typeName);
+            if (domain != null) return domain.getBaseType();
+            if (executor.database.getCustomEnum(typeName) != null) return DataType.ENUM;
+        }
+        return null;
+    }
+
+    // ---- The functions behind the operators ----
+
+    /**
+     * The operator spelling of each name pg_operator records as its implementation, or null where
+     * two operators share a name and the spelling therefore settles nothing.
+     */
+    /**
+     * Names whose operator memgres evaluates wrongly, so calling them by name would answer wrongly.
+     *
+     * <p>Measured: the closest-point operator {@code ##} disagrees with PostgreSQL for two of the
+     * shapes it is written over. Two segments that do not meet are no point at all in PostgreSQL
+     * and a point in memgres, and a segment crossing a box gives the crossing point there and a
+     * corner here. The other four spellings agree and are callable. Exposing a name that returns a
+     * wrong answer is worse than leaving it uncallable, so these two wait for {@code ##}.
+     */
+    private static final Set<String> ANSWERS_WRONGLY = new HashSet<String>(java.util.Arrays.asList(
+            "close_lseg", "close_sb"));
+
+    private static final Map<String, String[]> OPERATOR_BY_FUNCTION = buildOperatorByFunction();
+
+    private static Map<String, String[]> buildOperatorByFunction() {
+        Map<String, String[]> byFunction = new HashMap<String, String[]>();
+        Set<String> ambiguous = new HashSet<String>();
+        for (Object[] row : PgOperatorTable.OPERATORS) {
+            String symbol = (String) row[0];
+            String kind = (String) row[1];
+            String function = (String) row[5];
+            if (function == null || function.isEmpty()) continue;
+            String[] seen = byFunction.get(function);
+            if (seen == null) {
+                byFunction.put(function, new String[]{symbol, kind});
+            } else if (!seen[0].equals(symbol) || !seen[1].equals(kind)) {
+                ambiguous.add(function);
+            }
+        }
+        for (String function : ambiguous) byFunction.remove(function);
+        return byFunction;
+    }
+
+    /** The binary operator each spelling denotes, for the spellings memgres evaluates. */
+    private static final Map<String, BinaryExpr.BinOp> BINARY_BY_SYMBOL = buildBinaryBySymbol();
+
+    private static Map<String, BinaryExpr.BinOp> buildBinaryBySymbol() {
+        Map<String, BinaryExpr.BinOp> map = new HashMap<String, BinaryExpr.BinOp>();
+        map.put("+", BinaryExpr.BinOp.ADD);
+        map.put("-", BinaryExpr.BinOp.SUBTRACT);
+        map.put("*", BinaryExpr.BinOp.MULTIPLY);
+        map.put("/", BinaryExpr.BinOp.DIVIDE);
+        map.put("%", BinaryExpr.BinOp.MODULO);
+        map.put("^", BinaryExpr.BinOp.POWER);
+        map.put("=", BinaryExpr.BinOp.EQUAL);
+        map.put("<>", BinaryExpr.BinOp.NOT_EQUAL);
+        map.put("<", BinaryExpr.BinOp.LESS_THAN);
+        map.put(">", BinaryExpr.BinOp.GREATER_THAN);
+        map.put("<=", BinaryExpr.BinOp.LESS_EQUAL);
+        map.put(">=", BinaryExpr.BinOp.GREATER_EQUAL);
+        map.put("||", BinaryExpr.BinOp.CONCAT);
+        map.put("&", BinaryExpr.BinOp.BIT_AND);
+        map.put("|", BinaryExpr.BinOp.BIT_OR);
+        map.put("#", BinaryExpr.BinOp.BIT_XOR);
+        map.put("<<", BinaryExpr.BinOp.SHIFT_LEFT);
+        map.put(">>", BinaryExpr.BinOp.SHIFT_RIGHT);
+        map.put("@>", BinaryExpr.BinOp.CONTAINS);
+        map.put("<@", BinaryExpr.BinOp.CONTAINED_BY);
+        map.put("&&", BinaryExpr.BinOp.OVERLAP);
+        map.put("->", BinaryExpr.BinOp.JSON_ARROW);
+        map.put("->>", BinaryExpr.BinOp.JSON_ARROW_TEXT);
+        map.put("#>", BinaryExpr.BinOp.JSON_HASH_ARROW);
+        map.put("#>>", BinaryExpr.BinOp.JSON_HASH_ARROW_TEXT);
+        map.put("#-", BinaryExpr.BinOp.JSON_DELETE_PATH);
+        map.put("@@", BinaryExpr.BinOp.TS_MATCH);
+        map.put("?", BinaryExpr.BinOp.JSONB_EXISTS);
+        map.put("?|", BinaryExpr.BinOp.JSONB_EXISTS_ANY);
+        map.put("?&", BinaryExpr.BinOp.JSONB_EXISTS_ALL);
+        map.put("@?", BinaryExpr.BinOp.JSONB_PATH_EXISTS_OP);
+        map.put("~", BinaryExpr.BinOp.REGEX_MATCH);
+        map.put("~*", BinaryExpr.BinOp.REGEX_IMATCH);
+        map.put("!~", BinaryExpr.BinOp.NOT_REGEX_MATCH);
+        map.put("!~*", BinaryExpr.BinOp.NOT_REGEX_IMATCH);
+        map.put("~~", BinaryExpr.BinOp.LIKE);
+        map.put("~~*", BinaryExpr.BinOp.ILIKE);
+        map.put("<->", BinaryExpr.BinOp.DISTANCE);
+        map.put("~=", BinaryExpr.BinOp.APPROX_EQUAL);
+        map.put("<<|", BinaryExpr.BinOp.GEO_BELOW);
+        map.put("|>>", BinaryExpr.BinOp.GEO_ABOVE);
+        map.put("&<", BinaryExpr.BinOp.GEO_NOT_EXTEND_RIGHT);
+        map.put("&>", BinaryExpr.BinOp.GEO_NOT_EXTEND_LEFT);
+        map.put("&<|", BinaryExpr.BinOp.GEO_NOT_EXTEND_ABOVE);
+        map.put("|&>", BinaryExpr.BinOp.GEO_NOT_EXTEND_BELOW);
+        map.put("?#", BinaryExpr.BinOp.GEO_INTERSECTS);
+        map.put("##", BinaryExpr.BinOp.GEO_CLOSEST_POINT);
+        map.put("?||", BinaryExpr.BinOp.GEO_PARALLEL);
+        map.put("?-|", BinaryExpr.BinOp.GEO_PERPENDICULAR);
+        map.put("?-", BinaryExpr.BinOp.GEO_HORIZONTAL);
+        map.put("-|-", BinaryExpr.BinOp.RANGE_ADJACENT);
+        map.put(">>=", BinaryExpr.BinOp.INET_CONTAINS_EQUALS);
+        map.put("<<=", BinaryExpr.BinOp.INET_CONTAINED_BY_EQUALS);
+        return map;
+    }
+
+    /** The prefix operator each spelling denotes, for the spellings memgres evaluates. */
+    private static final Map<String, UnaryExpr.UnaryOp> UNARY_BY_SYMBOL = buildUnaryBySymbol();
+
+    private static Map<String, UnaryExpr.UnaryOp> buildUnaryBySymbol() {
+        Map<String, UnaryExpr.UnaryOp> map = new HashMap<String, UnaryExpr.UnaryOp>();
+        map.put("-", UnaryExpr.UnaryOp.NEGATE);
+        map.put("+", UnaryExpr.UnaryOp.POSITIVE);
+        map.put("~", UnaryExpr.UnaryOp.BIT_NOT);
+        map.put("@", UnaryExpr.UnaryOp.ABS);
+        map.put("|/", UnaryExpr.UnaryOp.SQRT);
+        map.put("||/", UnaryExpr.UnaryOp.CBRT);
+        map.put("@@", UnaryExpr.UnaryOp.GEO_CENTER);
+        map.put("@-@", UnaryExpr.UnaryOp.GEO_LENGTH);
+        map.put("#", UnaryExpr.UnaryOp.GEO_NPOINTS);
+        map.put("?-", UnaryExpr.UnaryOp.GEO_IS_HORIZONTAL);
+        map.put("?|", UnaryExpr.UnaryOp.GEO_IS_VERTICAL);
+        return map;
+    }
+
+    /**
+     * Whether this name is one PostgreSQL keeps as the implementation of an operator, and memgres
+     * can therefore call by evaluating the operator. Read by the placement checks, which refuse a
+     * name the engine cannot dispatch before they look at anything else about the call.
+     */
+    static boolean isOperatorFunction(String name) {
+        if (name == null) return false;
+        if (ANSWERS_WRONGLY.contains(name.toLowerCase(java.util.Locale.ROOT))) return false;
+        String[] operator = OPERATOR_BY_FUNCTION.get(name.toLowerCase(java.util.Locale.ROOT));
+        if (operator == null) return false;
+        return "b".equals(operator[1]) ? BINARY_BY_SYMBOL.containsKey(operator[0])
+                : UNARY_BY_SYMBOL.containsKey(operator[0]);
+    }
+
+    /**
+     * The value the operator behind this name produces, or {@link #NOT_HANDLED} when the name
+     * backs no operator memgres evaluates or the call was not written with the arguments the
+     * operator takes.
+     */
+    private Object operatorFunctionCall(String name, FunctionCallExpr fn, RowContext ctx) {
+        Expression rewritten = operatorFunctionExpr(name, fn);
+        if (rewritten == null) return NOT_HANDLED;
+        try {
+            return executor.evalExpr(rewritten, ctx);
+        } catch (MemgresException e) {
+            // The query wrote a function, so an argument the operator cannot take is that function
+            // resolving to nothing -- naming the operator would name something nobody wrote.
+            if ("42883".equals(e.getSqlState()) && e.getMessage() != null
+                    && e.getMessage().startsWith("operator does not exist")) {
+                throw new MemgresException("function " + fn.name() + "("
+                        + argTypeNames(fn, ctx) + ") does not exist"
+                        + "\n  Hint: No function matches the given name and argument types."
+                        + " You might need to add explicit type casts.", "42883");
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * The call written as the operator it implements, or null when it is not one. Both evaluation
+     * and the layer that describes the column read it, so the two cannot disagree about what the
+     * call answers.
+     */
+    static Expression operatorFunctionExpr(String name, FunctionCallExpr fn) {
+        if (fn.star() || fn.distinct()) return null;
+        for (Expression a : fn.args()) {
+            if (a instanceof NamedArgExpr) return null;
+        }
+        String[] operator = OPERATOR_BY_FUNCTION.get(name);
+        if (operator == null) return null;
+        if ("b".equals(operator[1]) && fn.args().size() == 2) {
+            BinaryExpr.BinOp op = BINARY_BY_SYMBOL.get(operator[0]);
+            return op == null ? null
+                    : new BinaryExpr(fn.args().get(0), op, fn.args().get(1));
+        }
+        if ("l".equals(operator[1]) && fn.args().size() == 1) {
+            UnaryExpr.UnaryOp op = UNARY_BY_SYMBOL.get(operator[0]);
+            return op == null ? null : new UnaryExpr(op, fn.args().get(0));
+        }
+        return null;
+    }
+
     private void requireArgs(FunctionCallExpr fn, int min) {
         if (fn.args().size() < min) {
             throw new MemgresException(
@@ -2969,6 +3428,18 @@ class FunctionEvaluator {
                 if (name.equals("open") || name.equals("close")) {
                     throw new MemgresException("type \"" + name + "\" does not exist", "42704");
                 }
+                // A type name written like a call is a cast, not a call. No pg_proc row answers
+                // to it and none needs to: PostgreSQL resolves the call as a coercion, so
+                // int4('42'), bool('t'), uuid(...) and a user's own domain or enum name all run.
+                Object coerced = typeNameCoercion(name, fn, ctx);
+                if (coerced != NOT_HANDLED) return coerced;
+                // A name the catalog advertises as the implementation of an operator is callable
+                // in PostgreSQL exactly as the operator is: int4pl(1,2) is 1 + 2 and texteq('a',
+                // 'a') is 'a' = 'a'. memgres listed every one of them in pg_proc and could
+                // dispatch none, so a tool that resolved a name through the catalog wrote a call
+                // the server then refused.
+                Object viaOperator = operatorFunctionCall(name, fn, ctx);
+                if (viaOperator != NOT_HANDLED) return viaOperator;
                 // Unknown function; build argument type list for error message
                 StringBuilder argTypes = new StringBuilder();
                 for (int ai = 0; ai < fn.args().size(); ai++) {

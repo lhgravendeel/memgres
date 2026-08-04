@@ -793,11 +793,16 @@ class DdlObjectExecutor {
                     .map(PgFunction.Param::typeName)
                     .collect(Collectors.toList());
             if (existingTypes.size() == newParamTypes.size()) {
+                // What identifies a function is the argument types themselves, not the words they
+                // were written with: int, int4 and integer are one type, and a length or a
+                // precision is not part of the type at all. Comparing the spellings would let
+                // f(int) and f(int4) both exist, and then no call could choose between them.
                 boolean sameTypes = true;
                 for (int i = 0; i < existingTypes.size(); i++) {
-                    String et = existingTypes.get(i) != null ? existingTypes.get(i).toLowerCase() : "";
-                    String nt = newParamTypes.get(i) != null ? newParamTypes.get(i).toLowerCase() : "";
-                    if (!et.equals(nt)) { sameTypes = false; break; }
+                    if (!sameTypeName(existingTypes.get(i), newParamTypes.get(i))) {
+                        sameTypes = false;
+                        break;
+                    }
                 }
                 if (sameTypes) {
                     if (stmt.orReplace()) {
@@ -841,25 +846,46 @@ class DdlObjectExecutor {
             Cols.setOf("sql", "plpgsql", "c", "internal");
 
     /**
-     * CREATE OR REPLACE keeps the identity of the existing function, so callers compiled against
-     * its result type and parameter names stay valid; changing either is a new function, and PG
-     * makes you drop the old one first.
+     * CREATE OR REPLACE keeps the identity of the existing routine, so callers compiled against
+     * its kind, its result type, its parameter names and the arguments they were allowed to omit
+     * stay valid; changing any of those is a different routine, and PostgreSQL makes you drop the
+     * old one first. The checks run in PostgreSQL's own order, because a definition wrong in two
+     * ways is reported by the first thing wrong with it.
      */
     private void checkReplaceKeepsSignature(PgFunction existing, CreateFunctionStmt stmt,
                                             List<PgFunction.Param> params) {
+        // A function is SELECTed and a procedure is CALLed, so one never silently becomes the
+        // other. PostgreSQL calls this the wrong kind of object rather than a bad definition.
+        if (existing.isProcedure() != stmt.isProcedure()) {
+            MemgresException e = new MemgresException("cannot change routine kind", "42809");
+            e.setDetail("\"" + stmt.name() + "\" is a "
+                    + (existing.isProcedure() ? "procedure" : "function") + ".");
+            throw e;
+        }
+
         List<PgFunction.Param> oldOut = outParams(existing.getParams());
         List<PgFunction.Param> newOut = outParams(params);
-        boolean outChanged = oldOut.size() != newOut.size();
-        for (int i = 0; !outChanged && i < oldOut.size(); i++) {
-            outChanged = !sameParamName(oldOut.get(i).name(), newOut.get(i).name())
-                    || !DataType.canonicalName(oldOut.get(i).typeName())
-                            .equals(DataType.canonicalName(newOut.get(i).typeName()));
+        if (existing.isProcedure()) {
+            // A procedure yields no value, so all a caller sees is whether it hands anything back
+            // through parameters — and if it does, what that row looks like, one column or many.
+            if (oldOut.isEmpty() != newOut.isEmpty()) {
+                throw new MemgresException(
+                        "cannot change whether a procedure has output parameters", "42P13");
+            }
+            if (!oldOut.isEmpty()) rejectChangedOutputRow(oldOut, newOut);
+        } else {
+            // What a call yields is not always what RETURNS says: a lone output parameter carries
+            // the result itself, so IN a int RETURNS int and INOUT a int are the same function
+            // seen from outside, while several output parameters make a row type whose column
+            // names are part of it.
+            String oldRet = effectiveReturnType(existing.getParams(), existing.getReturnType());
+            String newRet = effectiveReturnType(params, stmt.returnType());
+            if (!oldRet.equals(newRet)) {
+                throw new MemgresException("cannot change return type of existing function", "42P13");
+            }
+            if (oldOut.size() > 1 || newOut.size() > 1) rejectChangedOutputRow(oldOut, newOut);
         }
-        String oldRet = existing.getReturnType() == null ? "" : DataType.canonicalName(existing.getReturnType());
-        String newRet = stmt.returnType() == null ? "" : DataType.canonicalName(stmt.returnType());
-        if (outChanged || !oldRet.equals(newRet)) {
-            throw new MemgresException("cannot change return type of existing function", "42P13");
-        }
+
         List<PgFunction.Param> oldIn = inParams(existing.getParams());
         List<PgFunction.Param> newIn = inParams(params);
         for (int i = 0; i < oldIn.size() && i < newIn.size(); i++) {
@@ -870,6 +896,102 @@ class DdlObjectExecutor {
                         "cannot change name of input parameter \"" + oldName + "\"", "42P13");
             }
         }
+
+        // A default is part of the call signature: a caller that omitted the argument would stop
+        // resolving if the replacement took the default away. Adding defaults is safe and allowed,
+        // so it is only a shrinking count that PostgreSQL refuses.
+        if (countDefaults(params) < countDefaults(existing.getParams())) {
+            throw new MemgresException(
+                    "cannot remove parameter defaults from existing function", "42P13");
+        }
+    }
+
+    /**
+     * The row a set of output parameters defines is its columns in order, names included, so a
+     * renamed or retyped output column is a different result type even where the count agrees.
+     */
+    private static void rejectChangedOutputRow(List<PgFunction.Param> oldOut,
+                                               List<PgFunction.Param> newOut) {
+        boolean changed = oldOut.size() != newOut.size();
+        for (int i = 0; !changed && i < oldOut.size(); i++) {
+            changed = !sameParamName(oldOut.get(i).name(), newOut.get(i).name())
+                    || !sameTypeName(oldOut.get(i).typeName(), newOut.get(i).typeName());
+        }
+        if (changed) {
+            MemgresException e = new MemgresException(
+                    "cannot change return type of existing function", "42P13");
+            e.setDetail("Row type defined by OUT parameters is different.");
+            throw e;
+        }
+    }
+
+    /**
+     * The type a call of this routine yields, as a caller sees it. Output parameters, which the
+     * RETURNS TABLE columns also are, override the declared return type: exactly one of them is
+     * the result, several of them make an anonymous row.
+     */
+    private static String effectiveReturnType(List<PgFunction.Param> params, String declared) {
+        String decl = declared == null ? "" : declared.trim();
+        boolean table = decl.equalsIgnoreCase("TABLE");
+        boolean setOf = table || decl.regionMatches(true, 0, "SETOF ", 0, 6);
+        List<PgFunction.Param> outs = outParams(params);
+        String base;
+        if (outs.size() == 1) {
+            base = DataType.canonicalName(outs.get(0).typeName());
+        } else if (outs.size() > 1) {
+            base = "record";
+        } else {
+            String bare = table ? "" : (setOf ? decl.substring(6).trim() : decl);
+            base = bare.isEmpty() ? "void" : DataType.canonicalName(bare);
+        }
+        return (setOf ? "setof " : "") + base;
+    }
+
+    /** How many parameters may be left out of a call, which is how many carry a default. */
+    /**
+     * How many of these parameters carry a default.
+     *
+     * <p>The parser records no default as null and a written one as its text, so a default whose
+     * text is empty -- {@code DEFAULT $q$$q$}, {@code DEFAULT B''}, {@code DEFAULT X''} -- is still
+     * a default. Reading an empty text as an absent default made replacing a function with one of
+     * those look like taking a default away.
+     */
+    private static int countDefaults(List<PgFunction.Param> params) {
+        int n = 0;
+        for (PgFunction.Param p : params) {
+            if (p.defaultExpr() != null) n++;
+        }
+        return n;
+    }
+
+    private static boolean sameTypeName(String a, String b) {
+        String ca = a == null ? "" : DataType.canonicalName(withoutModifier(a));
+        String cb = b == null ? "" : DataType.canonicalName(withoutModifier(b));
+        return ca == null ? cb == null : ca.equals(cb);
+    }
+
+    /**
+     * A type name with the length or precision taken off it.
+     *
+     * <p>PostgreSQL records a parameter's type and not its modifier, so {@code timestamp(6) with
+     * time zone} and {@code timestamptz} are one type and a function declared over both is declared
+     * twice. Canonicalising the written name whole did not see that: the modifier sits in the
+     * middle of the multi-word spellings, so everything after it was dropped and
+     * {@code timestamp(6) with time zone} was read as a bare timestamp.
+     *
+     * <p>{@code float(n)} is the exception PostgreSQL's grammar makes: it is not a modifier at all
+     * but a choice of type, real up to 24 and double precision beyond, so it is resolved rather
+     * than removed.
+     */
+    private static String withoutModifier(String typeName) {
+        String lower = typeName.trim().toLowerCase(java.util.Locale.ROOT);
+        java.util.regex.Matcher f =
+                java.util.regex.Pattern.compile("^float\\s*\\(\\s*(\\d+)\\s*\\)(.*)$").matcher(lower);
+        if (f.matches()) {
+            int bits = Integer.parseInt(f.group(1));
+            return (bits <= 24 ? "real" : "double precision") + f.group(2);
+        }
+        return lower.replaceAll("\\(\\s*[^()]*\\)", "").replaceAll("\\s+", " ").trim();
     }
 
     private static boolean sameParamName(String a, String b) {

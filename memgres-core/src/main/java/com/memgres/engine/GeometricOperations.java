@@ -295,7 +295,11 @@ public final class GeometricOperations {
      */
     private static List<Double> extractDoubles(String s) {
         List<Double> result = new ArrayList<>();
-        Matcher m = Pattern.compile("-?(?:NaN|Infinity|\\d+(?:\\.\\d*)?(?:[eE][+-]?\\d+)?)").matcher(s);
+        // A number may open with its decimal point, and may be written with a leading plus:
+        // PostgreSQL reads "+.5" and ".5" as one half, where requiring a leading digit read the
+        // dot as a separator and the value as five.
+        Matcher m = Pattern.compile(
+                "[-+]?(?:NaN|Infinity|(?:\\d+(?:\\.\\d*)?|\\.\\d+)(?:[eE][+-]?\\d+)?)").matcher(s);
         while (m.find()) {
             result.add(Double.parseDouble(m.group()));
         }

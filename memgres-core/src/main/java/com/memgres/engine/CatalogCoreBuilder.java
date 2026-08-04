@@ -1424,14 +1424,18 @@ class CatalogCoreBuilder {
         for (Object[] it : PgInternalTypes.TYPES) {
             String itName = (String) it[1];
             short itLen = (short) (int) (Integer) it[2];
-            boolean itPseudo = "p".equals(it[4]);
+            // The I/O prefix is recorded with the type, not built from its name: PostgreSQL
+            // spells these charin and pg_lsn_in and brin_bloom_summary_in, and a name derived
+            // from the type is a function nothing can call.
+            String itIo = (String) it[10];
+            boolean itBinary = Boolean.TRUE.equals(it[11]);
             table.insertRow(new Object[]{
                     it[0], itName, pgCatalogOid, 10,
                     itLen, it[3], it[4], it[5], false, true, ",",
                     0, regproc(null), it[8], it[9],
-                    regproc(itName + "_in"), regproc(itName + "_out"),
-                    itPseudo ? regproc(null) : regproc(itName + "_recv"),
-                    itPseudo ? regproc(null) : regproc(itName + "_send"),
+                    regproc(itIo + "in"), regproc(itIo + "out"),
+                    itBinary ? regproc(itIo + "recv") : regproc(null),
+                    itBinary ? regproc(itIo + "send") : regproc(null),
                     regproc(null), regproc(null), regproc(null), it[6], it[7],
                     false, 0, -1, 0, 0, null, null, null, 1
             });
@@ -1785,15 +1789,19 @@ class CatalogCoreBuilder {
         int internalLangOid = oids.oid("lang:internal");
 
         int amHandlerType = 325;   // index_am_handler
-        // Built-in handler functions for pg_am (access methods)
+        int tableAmHandlerType = 269;
+        // Built-in handler functions for pg_am (access methods). A table access method's handler
+        // answers table_am_handler, not the index_am_handler the six index methods answer, and a
+        // client reading the return type to tell the two kinds apart needs the difference.
         String[] amHandlers = {"heap_tableam_handler", "bthandler", "hashhandler",
                 "gisthandler", "ginhandler", "spghandler", "brinhandler"};
         for (String h : amHandlers) {
-            int hLang = h.equals("heap_tableam_handler") ? cLangOid : internalLangOid;
+            boolean isTableAm = h.equals("heap_tableam_handler");
+            int hLang = isTableAm ? cLangOid : internalLangOid;
             table.insertRow(new Object[]{
                     oids.oid("proc:" + h), h, pgCatalogNs, 10, hLang, 1.0, 0.0,
                     0, "-", "f", false, false, true, false, "v", "u",
-                    (short) 1, (short) 0, amHandlerType,
+                    (short) 1, (short) 0, isTableAm ? tableAmHandlerType : amHandlerType,
                     oidvector("2281"), null, null, null, null, null,
                     h, null, null, null, null, 1
             });
@@ -1842,6 +1850,12 @@ class CatalogCoreBuilder {
         // Built-in aggregates (prokind='a'), one row per overload with the type that overload
         // returns. Reporting anyelement for all of them says nothing a caller can use:
         // sum(int8) returns numeric, and a client deciding how to read the result needs that.
+        // any_value, mode, the two percentile_* and the nine regr_* are evaluated correctly and
+        // are listed nowhere, so a tool asking the catalog what this server aggregates over is
+        // told less than the engine can do. They are not added here: every prokind='a' row needs
+        // a pg_aggregate row behind it — PostgreSQL has no aggregate without one, and
+        // pg-catalog-consistency.sql checks exactly that — and pg_aggregate is built from
+        // BuiltinAggregateSignatures.AGGREGATES, which is where the thirteen have to go.
         Map<String, Integer> aggIndex = new HashMap<>();
         for (String[] agg : BuiltinAggregateSignatures.AGGREGATES) {
             String aggName = agg[0];
@@ -2011,30 +2025,18 @@ class CatalogCoreBuilder {
             });
         }
 
-        // Event trigger helper functions (built-in)
-        String[] eventTriggerHelpers = {
-                "pg_event_trigger_ddl_commands",
-                "pg_event_trigger_dropped_objects",
-                "pg_event_trigger_table_rewrite_oid",
-                "pg_event_trigger_table_rewrite_reason"
-        };
-        for (String etHelper : eventTriggerHelpers) {
-            table.insertRow(new Object[]{
-                    oids.oid("proc:" + etHelper), etHelper, pgCatalogNs, 10,
-                    internalLangOid, 1.0, 0.0, 0, "-", "f",
-                    false, false, false, false, "v", "u",
-                    (short) 0, (short) 0, voidType,
-                    oidvector(""), null, null, null, null, null,
-                    etHelper, null, null, null, null, 1
-            });
-        }
+        // The event trigger helpers are registered from their recorded signatures further down,
+        // like every other built-in. A row written here first won every one of those four names,
+        // and the row written here said void: pg_event_trigger_ddl_commands returns SETOF record
+        // and pg_event_trigger_table_rewrite_oid returns an oid, so anything reading the catalog
+        // to decide how to call them read a function that returns nothing.
 
-        // Built-in extension functions (uuid-ossp, pgcrypto, pg_trgm, fuzzystrmatch, unaccent, json)
+        // Built-in extension functions (pgcrypto, fuzzystrmatch, unaccent, json). The uuid-ossp
+        // and pg_trgm names are deliberately absent: PostgreSQL puts an extension's functions in
+        // the schema the extension was installed into and nowhere until then, so those are
+        // registered below only once CREATE EXTENSION has run.
         String[] extensionFunctions = {
-                "uuid_generate_v1", "uuid_generate_v3", "uuid_generate_v4", "uuid_generate_v5",
-                "uuid_nil", "uuid_ns_dns", "uuid_ns_url",
                 "digest", "hmac", "gen_salt", "gen_random_uuid",
-                "show_trgm", "similarity",
                 "levenshtein", "soundex",
                 "unaccent",
                 "json_strip_nulls", "jsonb_strip_nulls",
@@ -2154,25 +2156,9 @@ class CatalogCoreBuilder {
                 "lo_truncate64", null, null, null, null, 1
         });
 
-        // UUID functions
-        // uuid_extract_timestamp(uuid) → timestamptz
-        table.insertRow(new Object[]{
-                oids.oid("proc:uuid_extract_timestamp"), "uuid_extract_timestamp", pgCatalogNs, 10,
-                internalLangOid, 1.0, 0.0, 0, "-", "f",
-                false, false, true, false, "i", "s",
-                (short) 1, (short) 0, 1184, // returns timestamptz (OID 1184)
-                oidvector("2950"), null, null, null, null, null,
-                "uuid_extract_timestamp", null, null, null, null, 1
-        });
-        // uuid_extract_version(uuid) → int4
-        table.insertRow(new Object[]{
-                oids.oid("proc:uuid_extract_version"), "uuid_extract_version", pgCatalogNs, 10,
-                internalLangOid, 1.0, 0.0, 0, "-", "f",
-                false, false, true, false, "i", "s",
-                (short) 1, (short) 0, 23, // returns int4 (OID 23)
-                oidvector("2950"), null, null, null, null, null,
-                "uuid_extract_version", null, null, null, null, 1
-        });
+        // uuid_extract_timestamp and uuid_extract_version are registered from their recorded
+        // signatures further down. The rows written here won both names and said
+        // uuid_extract_version returns integer; PostgreSQL returns smallint.
 
         // pg_control_* functions (return record)
         String[] pgControlFunctions = {
@@ -2180,10 +2166,13 @@ class CatalogCoreBuilder {
                 "pg_control_recovery", "pg_control_system"
         };
         for (String ctlFn : pgControlFunctions) {
+            // One record, not a set of them: each of these reads the control file once and
+            // answers a single row, and PG records proretset false and provolatile 'v' for all
+            // four. Reporting a set makes a client expect to iterate what it cannot.
             table.insertRow(new Object[]{
                     oids.oid("proc:" + ctlFn), ctlFn, pgCatalogNs, 10,
                     internalLangOid, 1.0, 0.0, 0, "-", "f",
-                    false, false, true, true, "s", "u",
+                    false, false, true, false, "v", "u",
                     (short) 0, (short) 0, 2249, // returns record (OID 2249)
                     oidvector(""), null, null, null, null, null,
                     ctlFn, null, null, null, null, 1
@@ -2227,6 +2216,11 @@ class CatalogCoreBuilder {
         Set<String> operatorFuncs = existingProcNames(table);
         for (Object[] op : PgOperatorTable.OPERATORS) {
             String fname = (String) op[5];
+            // As with the cast functions: a name PostgreSQL declares signatures for is registered
+            // from those, whole. Deriving a row from the one operator that names it recorded a
+            // single overload of a name that has several — tsquery_phrase lost the form that
+            // takes a distance, because <-> names only the two-argument one.
+            if (SIGNED_BUILTINS.contains(fname)) continue;
             if (!operatorFuncs.add(fname.toLowerCase())) continue;
             int left = (Integer) op[2];
             int right = (Integer) op[3];
@@ -2258,6 +2252,11 @@ class CatalogCoreBuilder {
         Set<String> castFuncs = existingProcNames(table);
         for (Object[] c : PgCastTable.CASTS) {
             String fname = (String) c[2];
+            // A name PostgreSQL declares a signature for is registered from that signature
+            // below, whole. Minting a row here from the first cast that happens to name it
+            // read the target type off that cast: oid(bigint) returns oid, and the first row
+            // naming it is the int8 -> regproc cast, so pg_proc said it returned regproc.
+            if (SIGNED_BUILTINS.contains(fname)) continue;
             if (fname.isEmpty() || !castFuncs.add(fname.toLowerCase())) continue;
             table.insertRow(new Object[]{
                     oids.oid("proc:" + fname), fname, pgCatalogNs, 10,
@@ -2288,6 +2287,17 @@ class CatalogCoreBuilder {
         for (String[] sig : BuiltinFunctionSignatures.SIGNATURES) {
             String name = sig[0];
             if (alreadyListed.contains(name.toLowerCase())) continue;
+            // An extension's functions live in the schema the extension was installed into, and
+            // nowhere at all before CREATE EXTENSION runs. Listing them in pg_catalog on a fresh
+            // database advertised nine names PostgreSQL has nowhere, every one of them a call
+            // memgres itself refuses until the extension exists.
+            String owningExtension = BuiltinFunctionSignatures.owningExtension(name);
+            int fnNs = pgCatalogNs;
+            if (owningExtension != null) {
+                if (!database.hasExtension(owningExtension)) continue;
+                String extSchema = database.getExtensionSchema(owningExtension);
+                fnNs = extSchema == null ? publicNs : oids.oid("ns:" + extSchema);
+            }
             signed.add(name.toLowerCase());
             String[] args = sig[2].isEmpty() ? new String[0] : sig[2].split(" ");
             int idx = signatureIndex.merge(name, 0, (a, b) -> a + 1);
@@ -2297,13 +2307,24 @@ class CatalogCoreBuilder {
             // it is parallel restricted. Reporting false/'u' for every one of them left two
             // columns of a pg_proc row saying nothing a planner or a client could use.
             char volatility = sig[3].charAt(1);
+            // The parameters this signature does not insist on are the ones carrying a default,
+            // which is what pronargdefaults counts; and a variadic signature collects its tail
+            // into the last declared type, which is what provariadic names. Both were reported
+            // as zero for every row, so a client could not tell format(text, VARIADIC "any")
+            // from a two-argument function or see that jsonb_set's fourth argument may be left
+            // out — the arity table has known this all along and pg_proc did not say it.
+            int fewest = BuiltinFunctionSignatures.fewestArguments(sig);
+            short nargdefaults = (short) Math.max(0, args.length - fewest);
+            int variadic = BuiltinFunctionSignatures.isVariadic(sig) && args.length > 0
+                    ? Integer.parseInt(args[args.length - 1]) : 0;
             table.insertRow(new Object[]{
-                    oids.oid(oidKey), name, pgCatalogNs, 10,
+                    oids.oid(oidKey), name, fnNs, 10,
                     internalLangOid, 1.0, sig[3].charAt(0) == 't' ? 1000.0 : 0.0,
-                    0, "-", "f",
-                    false, false, true, sig[3].charAt(0) == 't',
+                    variadic, "-", "f",
+                    false, false, BuiltinFunctionSignatures.isStrict(name, sig[2]),
+                    sig[3].charAt(0) == 't',
                     String.valueOf(volatility), volatility == 'v' ? "r" : "s",
-                    (short) args.length, (short) 0, Integer.parseInt(sig[1]),
+                    (short) args.length, nargdefaults, Integer.parseInt(sig[1]),
                     oidvector(sig[2]), null, null, null, null, null,
                     name, null, null, null, null, 1
             });
@@ -2324,6 +2345,89 @@ class CatalogCoreBuilder {
         }
 
         return table;
+    }
+
+    /**
+     * The I/O functions PostgreSQL declares over something other than the type that names them.
+     *
+     * <p>Two groups. The polymorphic ones — array, record, range, multirange, domain, enum — are
+     * one function serving every type of their kind, so PostgreSQL declares them over anyarray,
+     * record, anyrange, anymultirange, "any" and anyenum rather than over the type whose pg_type
+     * row points at them. The rest are the types that carry a typmod: their input and receive
+     * functions take the type OID and the typmod beside the value, three arguments where the
+     * others take one.
+     *
+     * <p>Columns: proname, prorettype, proargtypes. Read from the reference server.
+     */
+    private static final String[][] DECLARED_IO = {
+            {"array_in", "2277", "2275 26 23"},
+            {"array_out", "2275", "2277"},
+            {"array_recv", "2277", "2281 26 23"},
+            {"array_send", "17", "2277"},
+            {"record_in", "2249", "2275 26 23"},
+            {"record_out", "2275", "2249"},
+            {"record_recv", "2249", "2281 26 23"},
+            {"record_send", "17", "2249"},
+            {"range_in", "3831", "2275 26 23"},
+            {"range_out", "2275", "3831"},
+            {"range_recv", "3831", "2281 26 23"},
+            {"range_send", "17", "3831"},
+            {"multirange_in", "4537", "2275 26 23"},
+            {"multirange_out", "2275", "4537"},
+            {"multirange_recv", "4537", "2281 26 23"},
+            {"multirange_send", "17", "4537"},
+            {"domain_in", "2276", "2275 26 23"},
+            {"domain_out", "2275", "2276"},
+            {"domain_recv", "2276", "2281 26 23"},
+            {"domain_send", "17", "2276"},
+            {"enum_in", "3500", "2275 26"},
+            {"enum_out", "2275", "3500"},
+            {"enum_recv", "3500", "2281 26"},
+            {"enum_send", "17", "3500"},
+            {"bit_in", "1560", "2275 26 23"},
+            {"bit_recv", "1560", "2281 26 23"},
+            {"bpcharin", "1042", "2275 26 23"},
+            {"bpcharrecv", "1042", "2281 26 23"},
+            {"interval_in", "1186", "2275 26 23"},
+            {"interval_recv", "1186", "2281 26 23"},
+            {"numeric_in", "1700", "2275 26 23"},
+            {"numeric_recv", "1700", "2281 26 23"},
+            {"time_in", "1083", "2275 26 23"},
+            {"time_recv", "1083", "2281 26 23"},
+            {"timestamp_in", "1114", "2275 26 23"},
+            {"timestamp_recv", "1114", "2281 26 23"},
+            {"timestamptz_in", "1184", "2275 26 23"},
+            {"timestamptz_recv", "1184", "2281 26 23"},
+            {"timetz_in", "1266", "2275 26 23"},
+            {"timetz_recv", "1266", "2281 26 23"},
+            {"varbit_in", "1562", "2275 26 23"},
+            {"varbit_recv", "1562", "2281 26 23"},
+            {"varcharin", "1043", "2275 26 23"},
+            {"varcharrecv", "1043", "2281 26 23"},
+    };
+
+    /**
+     * I/O functions that take the type OID and the typmod beside the value but return the type
+     * whose pg_type row named them, so only their argument list is recorded here.
+     */
+    private static final String[] IO_WITH_TYPMOD_ARGS = {
+            "anyrange_in", "anymultirange_in", "anycompatiblerange_in", "anycompatiblemultirange_in",
+    };
+
+    /** Whether this input function reads a type OID and a typmod beside the value. */
+    private static boolean takesTypmodArgs(String name) {
+        for (String io : IO_WITH_TYPMOD_ARGS) {
+            if (io.equalsIgnoreCase(name)) return true;
+        }
+        return false;
+    }
+
+    /** The signature PostgreSQL declares for this I/O function, or null when it declares none. */
+    private static String[] declaredIoSignature(String name) {
+        for (String[] io : DECLARED_IO) {
+            if (io[0].equalsIgnoreCase(name)) return new String[]{io[1], io[2]};
+        }
+        return null;
     }
 
     /** cstring, the type PostgreSQL's I/O functions read from and write to. */
@@ -2365,22 +2469,40 @@ class CatalogCoreBuilder {
                 RegprocValue fn = (RegprocValue) row[at];
                 if (fn.oid() == 0 || fn.name() == null) continue;
                 if (!listed.add(fn.name().toLowerCase())) continue;
-                int argType;
+                String argTypes;
                 int retType;
-                if ("typinput".equals(col)) { argType = CSTRING; retType = typeOid; }
-                else if ("typoutput".equals(col)) { argType = typeOid; retType = CSTRING; }
-                else if ("typreceive".equals(col)) { argType = INTERNAL; retType = typeOid; }
-                else if ("typsend".equals(col)) { argType = typeOid; retType = 17; }
-                else if ("typmodin".equals(col)) { argType = 1263; retType = 23; }
-                else if ("typmodout".equals(col)) { argType = 23; retType = CSTRING; }
-                else if ("typanalyze".equals(col)) { argType = INTERNAL; retType = 16; }
-                else { argType = INTERNAL; retType = INTERNAL; }
+                // A handful of I/O functions serve more than the one type that names them, and
+                // PostgreSQL declares those polymorphically rather than over the type at hand:
+                // array_in answers anyarray, not the particular array type whose pg_type row
+                // reached it, and it reads a type OID and a typmod beside the cstring. Recorded
+                // here from the reference server so proargtypes and prorettype are the ones a
+                // caller resolves against.
+                String[] declared = declaredIoSignature(fn.name());
+                if (declared != null) {
+                    retType = Integer.parseInt(declared[0]);
+                    argTypes = declared[1];
+                } else if (takesTypmodArgs(fn.name())) {
+                    retType = typeOid;
+                    argTypes = CSTRING + " 26 23";
+                } else {
+                    int argType;
+                    if ("typinput".equals(col)) { argType = CSTRING; retType = typeOid; }
+                    else if ("typoutput".equals(col)) { argType = typeOid; retType = CSTRING; }
+                    else if ("typreceive".equals(col)) { argType = INTERNAL; retType = typeOid; }
+                    else if ("typsend".equals(col)) { argType = typeOid; retType = 17; }
+                    else if ("typmodin".equals(col)) { argType = 1263; retType = 23; }
+                    else if ("typmodout".equals(col)) { argType = 23; retType = CSTRING; }
+                    else if ("typanalyze".equals(col)) { argType = INTERNAL; retType = 16; }
+                    else { argType = INTERNAL; retType = INTERNAL; }
+                    argTypes = String.valueOf(argType);
+                }
+                int nargs = argTypes.trim().isEmpty() ? 0 : argTypes.trim().split("\\s+").length;
                 table.insertRow(new Object[]{
                         oids.oid("proc:" + fn.name()), fn.name(), pgCatalogNs, 10,
                         internalLangOid, 1.0, 0.0, 0, "-", "f",
                         false, false, true, false, "i", "s",
-                        (short) 1, (short) 0, retType,
-                        oidvector(String.valueOf(argType)), null, null, null, null, null,
+                        (short) nargs, (short) 0, retType,
+                        oidvector(argTypes), null, null, null, null, null,
                         fn.name(), null, null, null, null, 1
                 });
             }

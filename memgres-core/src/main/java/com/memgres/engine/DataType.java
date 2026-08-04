@@ -216,6 +216,13 @@ public enum DataType {
             case "regtype":
             case "regproc":
                 return INTEGER;
+            // Two types the engine already carries an OID for but had no name for, so a value
+            // written as one was described to the client as text. Naming them is what lets
+            // xid('100') and pg_lsn('0/16B3748') resolve at all.
+            case "xid":
+                return XID;
+            case "pg_lsn":
+                return PG_LSN;
             case "bool":
             case "boolean":
                 return BOOLEAN;

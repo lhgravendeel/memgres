@@ -402,6 +402,17 @@ class CatalogMetadataFunctions {
                 }
                 return result.isEmpty() ? null : result;
             }
+            case "_pg_char_max_length":
+            case "_pg_char_octet_length":
+            case "_pg_numeric_precision":
+            case "_pg_numeric_precision_radix":
+            case "_pg_numeric_scale":
+            case "_pg_datetime_precision":
+            case "_pg_interval_type":
+            case "_pg_truetypid":
+            case "_pg_truetypmod":
+            case "_pg_index_position":
+                return evalInformationSchemaHelper(name, fn, ctx);
             case "to_regclass":
                 return evalToRegclass(fn, ctx);
             case "to_regtype":
@@ -817,6 +828,284 @@ class CatalogMetadataFunctions {
             if (e.getValue() != null && e.getValue() == oid) return e.getKey();
         }
         return null;
+    }
+
+    // ------------------------------------------------------------------
+    // information_schema's own helper functions
+    // ------------------------------------------------------------------
+
+    /**
+     * The functions {@code information_schema}'s views are written in terms of.
+     *
+     * <p>They are ordinary SQL functions in PostgreSQL, declared in the {@code information_schema}
+     * namespace and readable in {@code information_schema.sql}. memgres computes the same view
+     * columns natively rather than by composing these, so the views agreed already — but the
+     * helpers are also called directly, by ORMs and by anything that reads a column's declared
+     * width or precision out of {@code pg_attribute} the way the views do, and every one of those
+     * calls was a 42883.
+     *
+     * <p>Each answer below follows the reference server's own definition rather than memgres's
+     * idea of the type, because the typmod arithmetic is what a caller is really asking about: a
+     * varchar's typmod is its length plus four, a numeric's packs precision and scale into one
+     * integer, and an interval's packs a field mask above its precision.
+     */
+    private Object evalInformationSchemaHelper(String name, FunctionCallExpr fn, RowContext ctx) {
+        requireInformationSchemaVisible(fn, ctx);
+        if (fn.args().size() != 2) {
+            throw new MemgresException("function " + fn.name() + "(" + helperArgTypes(fn, ctx)
+                    + ") does not exist\n  Hint: No function matches the given name and argument"
+                    + " types. You might need to add explicit type casts.", "42883");
+        }
+        if ("_pg_truetypid".equals(name) || "_pg_truetypmod".equals(name)) {
+            return evalTrueType(name, fn, ctx);
+        }
+        if ("_pg_index_position".equals(name)) {
+            return evalIndexPosition(fn, ctx);
+        }
+        // Every remaining helper is declared RETURNS NULL ON NULL INPUT, so a NULL argument is
+        // answered without the body running.
+        Object typidVal = executor.evalExpr(fn.args().get(0), ctx);
+        Object typmodVal = executor.evalExpr(fn.args().get(1), ctx);
+        if (typidVal == null || typmodVal == null) return null;
+        int typid = typeOidOf(typidVal);
+        int typmod = executor.toInt(typmodVal);
+        switch (name) {
+            case "_pg_char_max_length":
+                return pgCharMaxLength(typid, typmod);
+            case "_pg_char_octet_length": {
+                if (typid != TEXT_OID && typid != BPCHAR_OID && typid != VARCHAR_OID) return null;
+                if (typmod == -1) return 1 << 30;
+                Integer maxLength = pgCharMaxLength(typid, typmod);
+                // The multiplier is pg_encoding_max_length of the database encoding; memgres
+                // stores and serves text as UTF8, whose longest character is four bytes.
+                return maxLength == null ? null : (Object) (maxLength * 4);
+            }
+            case "_pg_numeric_precision":
+                switch (typid) {
+                    case INT2_OID: return 16;
+                    case INT4_OID: return 32;
+                    case INT8_OID: return 64;
+                    case FLOAT4_OID: return 24;
+                    case FLOAT8_OID: return 53;
+                    case NUMERIC_OID:
+                        return typmod == -1 ? null : (Object) (((typmod - 4) >> 16) & 0xFFFF);
+                    default: return null;
+                }
+            case "_pg_numeric_precision_radix":
+                switch (typid) {
+                    case INT2_OID: case INT4_OID: case INT8_OID:
+                    case FLOAT4_OID: case FLOAT8_OID:
+                        return 2;
+                    case NUMERIC_OID:
+                        return 10;
+                    default: return null;
+                }
+            case "_pg_numeric_scale":
+                switch (typid) {
+                    case INT2_OID: case INT4_OID: case INT8_OID:
+                        return 0;
+                    case NUMERIC_OID:
+                        return typmod == -1 ? null : (Object) ((typmod - 4) & 0xFFFF);
+                    default: return null;
+                }
+            case "_pg_datetime_precision":
+                if (typid == DATE_OID) return 0;
+                if (typid == TIME_OID || typid == TIMETZ_OID
+                        || typid == TIMESTAMP_OID || typid == TIMESTAMPTZ_OID) {
+                    return typmod < 0 ? 6 : typmod;
+                }
+                if (typid == INTERVAL_OID) {
+                    // An interval's typmod carries the field mask above its precision, and a
+                    // precision of 0xFFFF means none was written.
+                    return (typmod < 0 || (typmod & 0xFFFF) == 0xFFFF) ? 6 : (typmod & 0xFFFF);
+                }
+                return null;
+            case "_pg_interval_type":
+                return pgIntervalType(typid, typmod);
+            default:
+                return NOT_HANDLED;
+        }
+    }
+
+    private static final int INT8_OID = 20;
+    private static final int INT2_OID = 21;
+    private static final int INT4_OID = 23;
+    private static final int TEXT_OID = 25;
+    private static final int FLOAT4_OID = 700;
+    private static final int FLOAT8_OID = 701;
+    private static final int BPCHAR_OID = 1042;
+    private static final int VARCHAR_OID = 1043;
+    private static final int DATE_OID = 1082;
+    private static final int TIME_OID = 1083;
+    private static final int TIMESTAMP_OID = 1114;
+    private static final int TIMESTAMPTZ_OID = 1184;
+    private static final int INTERVAL_OID = 1186;
+    private static final int TIMETZ_OID = 1266;
+    private static final int NUMERIC_OID = 1700;
+    private static final int BIT_OID = 1560;
+    private static final int VARBIT_OID = 1562;
+
+    private static Integer pgCharMaxLength(int typid, int typmod) {
+        if (typmod == -1) return null;
+        if (typid == BPCHAR_OID || typid == VARCHAR_OID) return typmod - 4;
+        if (typid == BIT_OID || typid == VARBIT_OID) return typmod;
+        return null;
+    }
+
+    /**
+     * The qualifier list of an interval type, upper-cased: {@code YEAR}, {@code DAY TO SECOND(3)}.
+     *
+     * <p>PostgreSQL reads it back out of {@code format_type}'s own rendering, keeping whatever
+     * follows the type name and the space after it — which is why a plain {@code interval},
+     * having no space and no qualifier, answers NULL rather than an empty string.
+     */
+    private Object pgIntervalType(int typid, int typmod) {
+        if (typid != INTERVAL_OID) return null;
+        String formatted = formatTypeByOid(INTERVAL_OID, typmod);
+        if (formatted == null || !formatted.startsWith("interval")) return null;
+        int at = "interval".length();
+        while (at < formatted.length()) {
+            char c = formatted.charAt(at);
+            if (c == '(' || c == ')' || (c >= '0' && c <= '9')) at++;
+            else break;
+        }
+        if (at >= formatted.length() || formatted.charAt(at) != ' ') return null;
+        return formatted.substring(at + 1).toUpperCase(java.util.Locale.ROOT);
+    }
+
+    /**
+     * {@code _pg_truetypid} and {@code _pg_truetypmod}, which see through a domain.
+     *
+     * <p>Both are declared over whole rows of {@code pg_attribute} and {@code pg_type} and are
+     * called as {@code _pg_truetypid(a.*, t.*)}. memgres has no composite value carrying its
+     * field names, so the fields are read off the row the star stands for rather than off the
+     * value it produced.
+     */
+    private Object evalTrueType(String name, FunctionCallExpr fn, RowContext ctx) {
+        Expression attArg = fn.args().get(0);
+        Expression typArg = fn.args().get(1);
+        Object typtype = rowField(typArg, ctx, "typtype");
+        boolean domain = typtype != null && "d".equals(String.valueOf(typtype).trim());
+        if (domain) {
+            return "_pg_truetypid".equals(name)
+                    ? rowField(typArg, ctx, "typbasetype")
+                    : rowField(typArg, ctx, "typtypmod");
+        }
+        return "_pg_truetypid".equals(name)
+                ? rowField(attArg, ctx, "atttypid")
+                : rowField(attArg, ctx, "atttypmod");
+    }
+
+    /** One field of the row a whole-row reference stands for, or null when it is not one. */
+    private Object rowField(Expression expr, RowContext ctx, String field) {
+        if (ctx == null) return null;
+        String qualifier = null;
+        if (expr instanceof WildcardExpr) {
+            qualifier = ((WildcardExpr) expr).table;
+        } else if (expr instanceof ColumnRef) {
+            ColumnRef ref = (ColumnRef) expr;
+            // A bare name that matches a FROM entry is that row, not a column of it.
+            if (ref.table() == null) qualifier = ref.column();
+        }
+        if (qualifier == null || ctx.getBinding(qualifier) == null) return null;
+        try {
+            return ctx.resolveColumn(qualifier, field);
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    /**
+     * Where an attribute sits in an index's key list, counting from one, or NULL when it is not
+     * in it at all.
+     */
+    private Object evalIndexPosition(FunctionCallExpr fn, RowContext ctx) {
+        Object indexArg = executor.evalExpr(fn.args().get(0), ctx);
+        Object attArg = executor.evalExpr(fn.args().get(1), ctx);
+        if (indexArg == null || attArg == null) return null;
+        int indexOid;
+        if (indexArg instanceof RegclassValue) indexOid = ((RegclassValue) indexArg).oid;
+        else if (indexArg instanceof Number) indexOid = ((Number) indexArg).intValue();
+        else {
+            try {
+                indexOid = Integer.parseInt(String.valueOf(indexArg).trim());
+            } catch (NumberFormatException e) {
+                return null;
+            }
+        }
+        int attnum = executor.toInt(attArg);
+        Table pgIndex = executor.systemCatalog.resolve("pg_catalog", "pg_index");
+        if (pgIndex == null) return null;
+        int oidAt = pgIndex.getColumnIndex("indexrelid");
+        int keyAt = pgIndex.getColumnIndex("indkey");
+        if (oidAt < 0 || keyAt < 0) return null;
+        for (Object[] row : pgIndex.getRows()) {
+            if (oidAt >= row.length || keyAt >= row.length) continue;
+            Object relid = row[oidAt];
+            if (!(relid instanceof Number) || ((Number) relid).intValue() != indexOid) continue;
+            List<Object> keys = FromFunctionResolver.toElementList(row[keyAt]);
+            if (keys == null) return null;
+            for (int i = 0; i < keys.size(); i++) {
+                Object key = keys.get(i);
+                if (key instanceof Number && ((Number) key).intValue() == attnum) return i + 1;
+                if (key != null && String.valueOf(key).trim().equals(String.valueOf(attnum))) {
+                    return i + 1;
+                }
+            }
+            return null;
+        }
+        return null;
+    }
+
+    /**
+     * Refuses a call that names a schema these helpers are not in.
+     *
+     * <p>They are declared in {@code information_schema}, so {@code pg_catalog._pg_truetypid(...)}
+     * names a schema that does not hold them and the reference server refuses it. memgres strips
+     * a {@code pg_catalog.} qualifier from every built-in call before dispatch, which would have
+     * answered it.
+     *
+     * <p>An <em>unqualified</em> call is deliberately not refused, even though the reference
+     * server refuses one under the default search path — {@code information_schema} is never
+     * implicitly on it. PostgreSQL resolves a name once, when the statement carrying it is
+     * written, and a view or a routine body created while the schema was on the path keeps
+     * working after it comes off. memgres re-resolves stored definitions against the session's
+     * current path, so refusing here refused a view that had been created legitimately (measured:
+     * {@code SET search_path = public, information_schema; CREATE VIEW v AS SELECT
+     * _pg_char_max_length(...); RESET search_path; SELECT * FROM v} answers 10 on the reference
+     * server and 42883 with the check in place). Refusing SQL that works is the worse of the two
+     * errors, so the unqualified spelling is answered and the divergence left where it is.
+     */
+    private void requireInformationSchemaVisible(FunctionCallExpr fn, RowContext ctx) {
+        int dot = fn.name().lastIndexOf('.');
+        if (dot < 0) return;
+        String qualifier = fn.name().substring(0, dot);
+        if ("information_schema".equalsIgnoreCase(qualifier)) return;
+        throw new MemgresException("function " + fn.name() + "(" + helperArgTypes(fn, ctx)
+                + ") does not exist\n  Hint: No function matches the given name and argument"
+                + " types. You might need to add explicit type casts.", "42883");
+    }
+
+    /** The written arguments named the way PostgreSQL names them in a 42883. */
+    private String helperArgTypes(FunctionCallExpr fn, RowContext ctx) {
+        StringBuilder types = new StringBuilder();
+        for (int i = 0; i < fn.args().size(); i++) {
+            if (i > 0) types.append(", ");
+            Expression arg = fn.args().get(i);
+            if (arg instanceof Literal
+                    && ((Literal) arg).literalType() == Literal.LiteralType.STRING) {
+                types.append("unknown");
+                continue;
+            }
+            Object value;
+            try {
+                value = executor.evalExpr(arg, ctx);
+            } catch (RuntimeException e) {
+                value = null;
+            }
+            types.append(value == null ? "unknown" : AstExecutor.pgTypeNameOf(value));
+        }
+        return types.toString();
     }
 
     private Object evalToRegclass(FunctionCallExpr fn, RowContext ctx) {

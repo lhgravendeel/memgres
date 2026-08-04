@@ -303,6 +303,20 @@ class CastEvaluator {
         }
     }
 
+    /** The types whose value memgres keeps exactly as it was written; see {@link #applyCast}. */
+    private static final java.util.Set<String> KEPT_AS_WRITTEN =
+            new java.util.HashSet<>(java.util.Arrays.asList(
+                    "regcollation", "aclitem", "pg_snapshot", "txid_snapshot", "cid",
+                    "cstring", "unknown"));
+
+    /** Whether a type of this name was declared here, in which case it is not PostgreSQL's. */
+    private boolean isDeclaredByThisDatabase(String typeName) {
+        if (executor.database == null) return false;
+        return executor.database.getDomain(typeName) != null
+                || executor.database.getCustomEnum(typeName) != null
+                || executor.database.getRowType(typeName) != null;
+    }
+
     Object applyCast(Object val, String typeSpec) {
         return applyCast(val, typeSpec, false);
     }
@@ -458,6 +472,13 @@ class CastEvaluator {
                 }
                 return castList;
             }
+        }
+        // Types PostgreSQL ships that memgres holds no value class for. A cast to one is legal SQL
+        // there, so refusing it as a type that does not exist refused a statement PostgreSQL runs;
+        // the text is kept as written, which is what every one of them prints. A type this
+        // database has been told about under the same name is its own and answers first.
+        if (KEPT_AS_WRITTEN.contains(typeName) && !isDeclaredByThisDatabase(typeName)) {
+            return val.toString();
         }
         switch (typeName) {
             case "integer":

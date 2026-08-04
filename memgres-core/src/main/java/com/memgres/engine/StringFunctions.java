@@ -59,6 +59,9 @@ class StringFunctions {
      * overload, so a wider count is a function that does not exist rather than a value to narrow.
      * Narrowing it silently turned a count of four billion into an empty string.
      *
+     * <p>This is the backstop for the paths {@link #requireIntegerCounts} cannot type statically
+     * -- a value that arrives wider than int4 came from somewhere wider than int4.
+     *
      * @param index which argument carries the count
      * @return the count once it is known to fit, or null when the argument itself is null
      */
@@ -75,26 +78,168 @@ class StringFunctions {
         }
         if (value < Integer.MIN_VALUE || value > Integer.MAX_VALUE) {
             throw new MemgresException("function " + name + "("
-                    + argumentTypeList(fn, ctx, index) + ") does not exist", "42883");
+                    + argumentTypeList(fn, ctx) + ") does not exist", "42883");
         }
         return (int) value;
+    }
+
+    /**
+     * Reject the call before any of it runs when a count argument is declared wider than the
+     * {@code integer} parameter PostgreSQL gives these routines.
+     *
+     * <p>PostgreSQL picks an overload from the argument's <em>type</em> and never looks at the
+     * value, and it declares no int8, numeric, real or float8 form of {@code left}, {@code right},
+     * {@code repeat}, {@code lpad}, {@code rpad}, {@code substr}, {@code substring},
+     * {@code split_part}, {@code overlay} or {@code chr}. Since none of those types has an
+     * implicit cast down to int4, a bigint column holding 4 is just as much a missing function as
+     * a literal four billion is -- which is why a rule written on the value could never get
+     * {@code left(s, n)} over a bigint column right. int2 does cast up to int4 implicitly and
+     * keeps working. Resolution also happens before execution, so a NULL argument does not get to
+     * answer NULL ahead of the error; hence this runs at the top of the case rather than where
+     * the count is read.
+     */
+    private void requireIntegerCounts(FunctionCallExpr fn, RowContext ctx, String displayName,
+                                      int... indexes) {
+        for (int i = 0; i < indexes.length; i++) {
+            int index = indexes[i];
+            if (index >= fn.args().size()) continue;
+            if (wideCountType(fn.args().get(index), ctx) != null) {
+                throw new MemgresException("function " + displayName + "("
+                        + argumentTypeList(fn, ctx) + ") does not exist", "42883");
+            }
+        }
+    }
+
+    /**
+     * The name PostgreSQL would print for an argument too wide to be an {@code integer} count, or
+     * null when the argument is something an integer parameter accepts. Unknown is null too: an
+     * expression memgres cannot type statically must not be refused on a guess, so everything not
+     * recognised here is let through and left to {@link #countArgument}'s value check.
+     */
+    private String wideCountType(Expression e, RowContext ctx) {
+        if (e == null) return null;
+        if (e instanceof Literal) {
+            Literal lit = (Literal) e;
+            if (lit.literalType() == Literal.LiteralType.INTEGER) {
+                return integerLiteralType(lit.value(), false);
+            }
+            // A written constant with a point or an exponent is numeric; a bare string literal,
+            // NULL and the rest are unknown and take the parameter's own type.
+            return lit.literalType() == Literal.LiteralType.FLOAT ? "numeric" : null;
+        }
+        if (e instanceof UnaryExpr) {
+            UnaryExpr un = (UnaryExpr) e;
+            if (un.op() == UnaryExpr.UnaryOp.NEGATE || un.op() == UnaryExpr.UnaryOp.POSITIVE) {
+                Expression inner = un.operand();
+                // PostgreSQL folds a leading sign into the constant it precedes, and that fold is
+                // the whole reason -2147483648 is an integer while 2147483648 is a bigint.
+                if (inner instanceof Literal
+                        && ((Literal) inner).literalType() == Literal.LiteralType.INTEGER) {
+                    return integerLiteralType(((Literal) inner).value(),
+                            un.op() == UnaryExpr.UnaryOp.NEGATE);
+                }
+                return wideCountType(inner, ctx);
+            }
+        }
+        if (e instanceof BinaryExpr) {
+            BinaryExpr bin = (BinaryExpr) e;
+            switch (bin.op()) {
+                case ADD:
+                case SUBTRACT:
+                case MULTIPLY:
+                case DIVIDE:
+                case MODULO:
+                    // Arithmetic answers in the wider of its operands, so 4294967296 - 4294967292
+                    // is a bigint 4 and not an integer one.
+                    return widerType(wideCountType(bin.left(), ctx),
+                            wideCountType(bin.right(), ctx));
+                default:
+                    break;
+            }
+        }
+        if (e instanceof CastExpr) {
+            String typeName = ((CastExpr) e).typeName().replaceAll("\\(.*\\)", "").trim();
+            return wideTypeName(DataType.fromPgName(typeName));
+        }
+        if (e instanceof FunctionCallExpr) {
+            // The sequence functions are declared over bigint and nothing narrower; the general
+            // inference below has no return type for them and would let them through.
+            String fname = FunctionEvaluator.stripSchemaPrefix(
+                    ((FunctionCallExpr) e).name().toLowerCase(java.util.Locale.ROOT));
+            if (fname.equals("nextval") || fname.equals("currval") || fname.equals("lastval")
+                    || fname.equals("setval")) {
+                return "bigint";
+            }
+        }
+        return wideTypeName(executor.exprEvaluator.inferTypeFromContext(e,
+                ctx != null ? ctx.getBindings() : new ArrayList<RowContext.TableBinding>()));
+    }
+
+    /** How wide PostgreSQL's lexer makes a written integer constant: int4, then int8, then numeric. */
+    private static String integerLiteralType(String text, boolean negated) {
+        if (text == null) return null;
+        java.math.BigInteger v;
+        try {
+            v = new java.math.BigInteger(text.trim());
+        } catch (NumberFormatException e) {
+            return null; // not a plain decimal constant; nothing may be concluded
+        }
+        if (negated) v = v.negate();
+        if (v.bitLength() <= 31) return null;
+        return v.bitLength() <= 63 ? "bigint" : "numeric";
+    }
+
+    private static String wideTypeName(DataType t) {
+        if (t == null) return null;
+        switch (t) {
+            case BIGINT:
+            case BIGSERIAL:
+                return "bigint";
+            case NUMERIC:
+                return "numeric";
+            case REAL:
+                return "real";
+            case DOUBLE_PRECISION:
+                return "double precision";
+            case MONEY:
+                return "money";
+            default:
+                return null;
+        }
+    }
+
+    private static int typeWidthRank(String name) {
+        if (name == null) return 0;
+        if (name.equals("bigint")) return 1;
+        if (name.equals("money")) return 2;
+        if (name.equals("numeric")) return 3;
+        if (name.equals("real")) return 4;
+        return 5; // double precision
+    }
+
+    private static String widerType(String a, String b) {
+        return typeWidthRank(a) >= typeWidthRank(b) ? a : b;
     }
 
     /**
      * Render the argument types the way PostgreSQL reports them when no overload matches. An
      * unadorned literal is still {@code unknown} at that point, which is what it calls it.
      */
-    private String argumentTypeList(FunctionCallExpr fn, RowContext ctx, int wideIndex) {
+    private String argumentTypeList(FunctionCallExpr fn, RowContext ctx) {
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < fn.args().size(); i++) {
             if (i > 0) sb.append(", ");
-            if (i == wideIndex) {
-                sb.append("bigint");
+            Expression arg = fn.args().get(i);
+            String wide = wideCountType(arg, ctx);
+            if (wide != null) {
+                sb.append(wide);
                 continue;
             }
-            Expression arg = fn.args().get(i);
+            // A bare literal has no type of its own yet -- a written string and a written NULL
+            // are both still "unknown" when PostgreSQL gives up on the overload and names them.
             if (arg instanceof Literal
-                    && ((Literal) arg).literalType() == Literal.LiteralType.STRING) {
+                    && (((Literal) arg).literalType() == Literal.LiteralType.STRING
+                        || ((Literal) arg).literalType() == Literal.LiteralType.NULL)) {
                 sb.append("unknown");
                 continue;
             }
@@ -409,6 +554,7 @@ class StringFunctions {
             }
             case "substring":
             case "substr": {
+                requireIntegerCounts(fn, ctx, name, 1, 2);
                 if (fn.args().size() < 2) {
                     throw new MemgresException("function substring(text) does not exist\n  Hint: No function matches the given name and argument types.", "42883");
                 }
@@ -520,6 +666,7 @@ class StringFunctions {
                 return s.substring(0, i2 + 1);
             }
             case "lpad": {
+                requireIntegerCounts(fn, ctx, "lpad", 1);
                 Object str = executor.evalExpr(fn.args().get(0), ctx);
                 if (str == null) return null;
                 Integer lenBox = countArgument(fn, ctx, 1, "lpad");
@@ -545,6 +692,7 @@ class StringFunctions {
                 return sb.substring(0, len - s.length()) + s;
             }
             case "rpad": {
+                requireIntegerCounts(fn, ctx, "rpad", 1);
                 Object str = executor.evalExpr(fn.args().get(0), ctx);
                 if (str == null) return null;
                 Integer lenBox = countArgument(fn, ctx, 1, "rpad");
@@ -591,6 +739,7 @@ class StringFunctions {
                 return arg1.toString().indexOf(arg2.toString()) + 1;
             }
             case "left": {
+                requireIntegerCounts(fn, ctx, "left", 1);
                 Object str = executor.evalExpr(fn.args().get(0), ctx);
                 if (str == null) return null;
                 Integer nBox = countArgument(fn, ctx, 1, "left");
@@ -601,6 +750,7 @@ class StringFunctions {
                 return n + s.length() > 0 ? s.substring(0, s.length() + n) : "";
             }
             case "right": {
+                requireIntegerCounts(fn, ctx, "right", 1);
                 Object str = executor.evalExpr(fn.args().get(0), ctx);
                 if (str == null) return null;
                 Integer nBox = countArgument(fn, ctx, 1, "right");
@@ -611,6 +761,7 @@ class StringFunctions {
                 return -n < s.length() ? s.substring(-n) : "";
             }
             case "repeat": {
+                requireIntegerCounts(fn, ctx, "repeat", 1);
                 Object str = executor.evalExpr(fn.args().get(0), ctx);
                 if (str == null) return null;
                 Integer nBox = countArgument(fn, ctx, 1, "repeat");
@@ -627,6 +778,7 @@ class StringFunctions {
                 return str == null ? null : new StringBuilder(str.toString()).reverse().toString();
             }
             case "split_part": {
+                requireIntegerCounts(fn, ctx, "split_part", 2);
                 Object str = executor.evalExpr(fn.args().get(0), ctx);
                 Object delim = executor.evalExpr(fn.args().get(1), ctx);
                 Object fieldVal = executor.evalExpr(fn.args().get(2), ctx);
@@ -651,6 +803,7 @@ class StringFunctions {
                 return (field >= 1 && field <= parts.length) ? parts[field - 1] : "";
             }
             case "regexp_replace": {
+                requireIntegerCounts(fn, ctx, "regexp_replace", 3, 4);
                 // Two forms:
                 // Old: regexp_replace(string, pattern, replacement [, flags])
                 // PG15+: regexp_replace(string, pattern, replacement, start, N [, flags])
@@ -758,6 +911,7 @@ class StringFunctions {
                 return null;
             }
             case "regexp_count": {
+                requireIntegerCounts(fn, ctx, "regexp_count", 2);
                 // regexp_count(string, pattern [, start [, flags]])
                 // start is 1-based position to begin searching from
                 Object str = executor.evalExpr(fn.args().get(0), ctx);
@@ -794,6 +948,7 @@ class StringFunctions {
                         .matcher(str.toString()).find();
             }
             case "regexp_substr": {
+                requireIntegerCounts(fn, ctx, "regexp_substr", 2, 3, 5);
                 // regexp_substr(string, pattern [, start [, N [, flags [, subexpr]]]])
                 Object str = executor.evalExpr(fn.args().get(0), ctx);
                 Object patternVal = executor.evalExpr(fn.args().get(1), ctx);
@@ -832,6 +987,7 @@ class StringFunctions {
                 return null;
             }
             case "regexp_instr": {
+                requireIntegerCounts(fn, ctx, "regexp_instr", 2, 3, 4, 6);
                 // regexp_instr(string, pattern [, start [, N [, endoption [, flags [, subexpr]]]]])
                 // start: 1-based position to begin searching
                 // N: which match to return (1 = first)
@@ -1002,11 +1158,14 @@ class StringFunctions {
                 return result.toString();
             }
             case "chr": {
+                requireIntegerCounts(fn, ctx, "chr", 0);
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
                 int codepoint = executor.toInt(arg);
                 if (codepoint == 0) throw new MemgresException("null character not permitted", "54000");
-                if (codepoint < 0) throw new MemgresException("requested character too large for encoding: " + codepoint, "22023");
+                // A negative code point is not an oversized one: PostgreSQL reads the argument as
+                // an unsigned code point and says so.
+                if (codepoint < 0) throw new MemgresException("character number must be positive", "22023");
                 if (codepoint > 1114111) throw new MemgresException("requested character too large for encoding: " + codepoint, "54000");
                 return new String(Character.toChars(codepoint));
             }
@@ -1183,6 +1342,9 @@ class StringFunctions {
                 }
             }
             case "overlay": {
+                // memgres only parses the SQL syntax form, which PostgreSQL reports schema-
+                // qualified; the plain overlay(a, b, n, m) call form it names without a prefix.
+                requireIntegerCounts(fn, ctx, "pg_catalog.overlay", 2, 3);
                 // overlay(string PLACING replacement FROM start FOR count)
                 // PG: overlay(s, r, p, n) = left(s, p-1) || r || substr(s, p+n)
                 Object str = executor.evalExpr(fn.args().get(0), ctx);

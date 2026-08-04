@@ -214,7 +214,7 @@ public class PgInterval implements Comparable<PgInterval> {
             PgInterval ranged;
             try {
                 ranged = parseRanged(input, typmod);
-            } catch (NumberFormatException | ArithmeticException e) {
+            } catch (NumberFormatException | ArithmeticException | IsoFieldOverflow e) {
                 throw PgErrors.intervalFieldOutOfRange(input == null ? "" : input.trim());
             }
             if (ranged != null) return typmod.apply(ranged);
@@ -228,57 +228,27 @@ public class PgInterval implements Comparable<PgInterval> {
     public static PgInterval parse(String input) {
         try {
             return parseInternal(input);
-        } catch (NumberFormatException | ArithmeticException e) {
+        } catch (NumberFormatException | ArithmeticException | IsoFieldOverflow e) {
             // A field wider than its Java type is a value-range problem, not an engine defect.
             throw PgErrors.intervalFieldOutOfRange(input == null ? "" : input.trim());
         }
     }
 
     private static PgInterval parseInternal(String input) {
-        if (input == null || Strs.isBlank(input)) {
+        if (input == null) {
             return new PgInterval(0, 0, 0);
         }
         String s = input.trim();
+        // PG has no spelling of the empty interval: text with nothing in it is a syntax error,
+        // not a zero. Callers that want zero build it directly.
+        if (s.isEmpty()) throw invalidIntervalSyntax(input);
         if (s.equalsIgnoreCase("infinity") || s.equalsIgnoreCase("+infinity")) return INFINITY;
         if (s.equalsIgnoreCase("-infinity")) return NEG_INFINITY;
 
-        // Try ISO 8601 duration format: P[nY][nM][nD][T[nH][nM][nS]]
-        if (s.startsWith("P") || s.startsWith("p")) {
-            Matcher iso = java.util.regex.Pattern.compile(
-                    "^[Pp](?:(-?\\d+)[Yy])?(?:(-?\\d+)[Mm])?(?:(-?\\d+)[Ww])?(?:(-?\\d+)[Dd])?" +
-                    "(?:[Tt](?:(-?\\d+)[Hh])?(?:(-?\\d+)[Mm])?(?:(-?\\d+(?:\\.\\d+)?)[Ss])?)?$"
-            ).matcher(s);
-            if (iso.matches()) {
-                int years = iso.group(1) != null ? Integer.parseInt(iso.group(1)) : 0;
-                int mons = iso.group(2) != null ? Integer.parseInt(iso.group(2)) : 0;
-                int weeks = iso.group(3) != null ? Integer.parseInt(iso.group(3)) : 0;
-                int days = iso.group(4) != null ? Integer.parseInt(iso.group(4)) : 0;
-                int hours = iso.group(5) != null ? Integer.parseInt(iso.group(5)) : 0;
-                int minutes = iso.group(6) != null ? Integer.parseInt(iso.group(6)) : 0;
-                double seconds = iso.group(7) != null ? Double.parseDouble(iso.group(7)) : 0;
-                days += weeks * 7;
-                long totalMonths = (long) years * 12 + mons;
-                long totalMicros = (hours * 3600L + minutes * 60L) * 1_000_000L + Math.round(seconds * 1_000_000L);
-                return checked(totalMonths, days, totalMicros);
-            }
-            // ISO 8601's alternative form, PYYYY-MM-DDThh:mm:ss: the same fields written
-            // positionally rather than each with its own designator letter
-            Matcher alt = java.util.regex.Pattern.compile(
-                    "^[Pp](-?\\d+)-(\\d+)-(\\d+)(?:[Tt](-?\\d+):(\\d+):(\\d+(?:\\.\\d+)?))?$"
-            ).matcher(s);
-            if (alt.matches()) {
-                int years = Integer.parseInt(alt.group(1));
-                int mons = Integer.parseInt(alt.group(2));
-                int days = Integer.parseInt(alt.group(3));
-                int hours = alt.group(4) != null ? Integer.parseInt(alt.group(4)) : 0;
-                int minutes = alt.group(5) != null ? Integer.parseInt(alt.group(5)) : 0;
-                double seconds = alt.group(6) != null ? Double.parseDouble(alt.group(6)) : 0;
-                long totalMonths = (long) years * 12 + mons;
-                long totalMicros = (hours * 3600L + minutes * 60L) * 1_000_000L
-                        + Math.round(seconds * 1_000_000L);
-                return checked(totalMonths, days, totalMicros);
-            }
-        }
+        // ISO 8601 durations are read from the untrimmed text: PG only takes this branch when the
+        // string itself opens with an upper-case 'P', so ' P1Y' and 'p1Y' are not durations at all.
+        PgInterval iso = parseIso8601(input);
+        if (iso != null) return iso;
 
         // Try verbose format first: '1 year 2 months 3 weeks 3 days 4 hours 5 minutes 6 seconds'
         Matcher vm = VERBOSE_INTERVAL.matcher(s);
@@ -289,14 +259,14 @@ public class PgInterval implements Comparable<PgInterval> {
             int days = vm.group(4) != null ? Integer.parseInt(vm.group(4)) : 0;
             int hours = vm.group(5) != null ? Integer.parseInt(vm.group(5)) : 0;
             int minutes = vm.group(6) != null ? Integer.parseInt(vm.group(6)) : 0;
-            double seconds = vm.group(7) != null ? Double.parseDouble(vm.group(7)) : 0;
+            long secondMicros = secondsToMicros(vm.group(7));
 
             days += weeks * 7;
             long totalMonths = (long) years * 12 + mons;
-            long totalMicros = (hours * 3600L + minutes * 60L) * 1_000_000L + Math.round(seconds * 1_000_000L);
+            long totalMicros = (hours * 3600L + minutes * 60L) * 1_000_000L + secondMicros;
 
             // Return if we actually matched something, or if any group was present (even if zero)
-            if (years != 0 || mons != 0 || weeks != 0 || days != 0 || hours != 0 || minutes != 0 || seconds != 0
+            if (years != 0 || mons != 0 || weeks != 0 || days != 0 || hours != 0 || minutes != 0 || secondMicros != 0
                     || vm.group(1) != null || vm.group(2) != null || vm.group(3) != null
                     || vm.group(4) != null || vm.group(5) != null || vm.group(6) != null || vm.group(7) != null) {
                 return checked(totalMonths, days, totalMicros);
@@ -345,8 +315,8 @@ public class PgInterval implements Comparable<PgInterval> {
                     int tsign = "-".equals(sqm.group(5)) ? -1 : 1;
                     int hours = Integer.parseInt(sqm.group(6));
                     int minutes = Integer.parseInt(sqm.group(7));
-                    double secs = sqm.group(8) != null ? Double.parseDouble(sqm.group(8)) : 0;
-                    totalMicros = tsign * ((hours * 3600L + minutes * 60L) * 1_000_000L + Math.round(secs * 1_000_000L));
+                    totalMicros = tsign * ((hours * 3600L + minutes * 60L) * 1_000_000L
+                            + secondsToMicros(sqm.group(8)));
                 }
                 return new PgInterval(totalMonths, days, totalMicros);
             }
@@ -363,24 +333,23 @@ public class PgInterval implements Comparable<PgInterval> {
                 int tsign = "-".equals(dtm.group(3)) ? -1 : 1;
                 int hours = Integer.parseInt(dtm.group(4));
                 int minutes = Integer.parseInt(dtm.group(5));
-                double secs = dtm.group(6) != null ? Double.parseDouble(dtm.group(6)) : 0;
-                long totalMicros = tsign * ((hours * 3600L + minutes * 60L) * 1_000_000L + Math.round(secs * 1_000_000L));
+                long totalMicros = tsign * ((hours * 3600L + minutes * 60L) * 1_000_000L
+                        + secondsToMicros(dtm.group(6)));
                 return new PgInterval(0, days, totalMicros);
             }
         }
 
-        // Try simple number (treated as seconds)
-        try {
-            double secs = Double.parseDouble(s);
-            return new PgInterval(0, 0, Math.round(secs * 1_000_000));
-        } catch (NumberFormatException e) {
-            // ignore
+        // A bare number is a count of seconds. Only plain decimal digits qualify: Java would also
+        // read '1d' and '1f' as numbers, but to PG the trailing letter is a unit word, so '1d' is
+        // a day. Anything else falls through to the unit list, which knows what the letters mean.
+        if (PLAIN_NUMBER.matcher(s).matches()) {
+            return new PgInterval(0, 0, secondsToMicros(s));
         }
 
         PgInterval units = parseUnitList(s);
         if (units != null) return units;
 
-        throw new MemgresException("invalid input syntax for type interval: \"" + input + "\"", "22007");
+        throw invalidIntervalSyntax(input);
     }
 
     /**
@@ -411,8 +380,7 @@ public class PgInterval implements Comparable<PgInterval> {
                 boolean neg = tok.group(1).startsWith("-");
                 long h = Math.abs(Long.parseLong(tok.group(1)));
                 long m = Long.parseLong(tok.group(2));
-                double sec = tok.group(3) != null ? Double.parseDouble(tok.group(3)) : 0;
-                long field = (h * 3600L + m * 60L) * 1_000_000L + Math.round(sec * 1_000_000L);
+                long field = (h * 3600L + m * 60L) * 1_000_000L + secondsToMicros(tok.group(3));
                 micros += neg ? -field : field;
                 matchedAny = true;
                 continue;
@@ -422,7 +390,7 @@ public class PgInterval implements Comparable<PgInterval> {
                 ago = true;
                 continue;
             }
-            double value = Double.parseDouble(tok.group(4));
+            Quantity value = quantity(tok.group(4));
             String unit = tok.group(5) == null ? "second" : normalizeUnit(tok.group(5));
             if (unit == null) return null;
             Accum one = new Accum();
@@ -444,44 +412,342 @@ public class PgInterval implements Comparable<PgInterval> {
         long micros;
     }
 
+    /** A number in an ISO 8601 duration, and where reading it stopped. */
+    private static final class IsoNumber {
+        final int whole;
+        final double frac;
+        final int end;
+        IsoNumber(int whole, double frac, int end) { this.whole = whole; this.frac = frac; this.end = end; }
+    }
+
+    /** A bare seconds count: decimal digits and nothing else, no exponent and no type suffix. */
+    private static final Pattern PLAIN_NUMBER = Pattern.compile("[+-]?(?:\\d+(?:\\.\\d*)?|\\.\\d+)");
+
+    /** What an ISO 8601 duration may hold where a number is expected — strtod's own grammar. */
+    private static final Pattern ISO_NUMBER =
+            Pattern.compile("-?(?:\\d+(?:\\.\\d*)?|\\.\\d+)(?:[eE][-+]?\\d+)?");
+
     /**
-     * Add {@code value} of {@code unit} to the running totals, spilling a fractional quantity
-     * into the next smaller field the way PG does.
+     * Read an ISO 8601 duration the way PG's DecodeISO8601Interval does.
+     *
+     * <p>Three shapes share the grammar. The usual one names each field with a designator letter
+     * ({@code P1Y2M3DT4H5M6S}), and PG simply loops over number-and-letter pairs, so a designator
+     * may repeat and a quantity may be fractional. The alternative extended form writes the fields
+     * positionally instead ({@code P0001-02-03T04:05:06}), and the alternative basic form runs
+     * them together ({@code P00010203T040506}) — both are recognised by the shape of the very
+     * first number, and neither may follow a designator field.
+     *
+     * <p>The text is read exactly as given: the duration must start at the first character and
+     * end at the last, and every letter is upper case. That is why {@code ' P1Y'}, {@code 'P1Y '}
+     * and {@code 'p1Y'} are not durations, and why a bare {@code 'P'} is nothing at all.
+     *
+     * @return the decoded interval, or null when the text is not an ISO 8601 duration
+     */
+    private static PgInterval parseIso8601(String str) {
+        if (str.length() < 2 || str.charAt(0) != 'P') return null;
+        Accum acc = new Accum();
+        boolean datepart = true;
+        boolean havefield = false;
+        int n = str.length();
+        int i = 1;
+        while (i < n) {
+            if (str.charAt(i) == 'T') {
+                datepart = false;
+                havefield = false;
+                i++;
+                continue;
+            }
+            int fieldStart = i;
+            IsoNumber num = isoNumber(str, i);
+            if (num == null) return null;
+            i = num.end;
+            char unit = i < n ? str.charAt(i) : '\0';
+            i++;
+            if (datepart) {
+                switch (unit) {
+                    case 'Y':
+                        addYears(acc, num.whole, num.frac * 12.0);
+                        break;
+                    case 'M':
+                        acc.months += num.whole;
+                        adjustFractDays(acc, num.frac, 30);
+                        break;
+                    case 'W':
+                        acc.days += num.whole * 7L;
+                        adjustFractDays(acc, num.frac, 7);
+                        break;
+                    case 'D':
+                        acc.days += num.whole;
+                        adjustFractSeconds(acc, num.frac, 86_400);
+                        break;
+                    case 'T':
+                    case '\0':
+                        if (isoDigitWidth(str, fieldStart) == 8 && !havefield) {
+                            // Alternative basic form: PYYYYMMDD, the whole date in one number
+                            acc.months += (num.whole / 10000) * 12L + (num.whole / 100) % 100;
+                            acc.days += num.whole % 100;
+                            adjustFractSeconds(acc, num.frac, 86_400);
+                            if (unit == '\0') return checked(acc.months, acc.days, acc.micros);
+                            datepart = false;
+                            havefield = false;
+                            continue;
+                        }
+                        // falls through to the extended form, which reads the same first number
+                    case '-': {
+                        // Alternative extended form: PYYYY-MM-DD, only ever the first field
+                        if (havefield) return null;
+                        addYears(acc, num.whole, num.frac * 12.0);
+                        if (unit == '\0') return checked(acc.months, acc.days, acc.micros);
+                        if (unit == 'T') {
+                            datepart = false;
+                            havefield = false;
+                            continue;
+                        }
+                        IsoNumber mon = isoNumber(str, i);
+                        if (mon == null) return null;
+                        i = mon.end;
+                        acc.months += mon.whole;
+                        adjustFractDays(acc, mon.frac, 30);
+                        if (i >= n) return checked(acc.months, acc.days, acc.micros);
+                        if (str.charAt(i) == 'T') {
+                            datepart = false;
+                            havefield = false;
+                            i++;
+                            continue;
+                        }
+                        if (str.charAt(i) != '-') return null;
+                        i++;
+                        IsoNumber day = isoNumber(str, i);
+                        if (day == null) return null;
+                        i = day.end;
+                        acc.days += day.whole;
+                        adjustFractSeconds(acc, day.frac, 86_400);
+                        if (i >= n) return checked(acc.months, acc.days, acc.micros);
+                        if (str.charAt(i) != 'T') return null;
+                        datepart = false;
+                        havefield = false;
+                        i++;
+                        continue;
+                    }
+                    default:
+                        return null;
+                }
+            } else {
+                switch (unit) {
+                    case 'H':
+                        acc.micros += num.whole * 3_600_000_000L;
+                        adjustFractSeconds(acc, num.frac, 3_600);
+                        break;
+                    case 'M':
+                        acc.micros += num.whole * 60_000_000L;
+                        adjustFractSeconds(acc, num.frac, 60);
+                        break;
+                    case 'S':
+                        acc.micros += num.whole * 1_000_000L;
+                        adjustFractSeconds(acc, num.frac, 1);
+                        break;
+                    case '\0':
+                        if (isoDigitWidth(str, fieldStart) == 6 && !havefield) {
+                            // Alternative basic form: Thhmmss. PG reads what trails the six digits
+                            // as microseconds outright, not as a fraction of a second.
+                            acc.micros += (num.whole / 10000) * 3_600_000_000L
+                                    + ((num.whole / 100) % 100) * 60_000_000L
+                                    + (num.whole % 100) * 1_000_000L
+                                    + roundToMicrosecond(num.frac);
+                            return checked(acc.months, acc.days, acc.micros);
+                        }
+                        // falls through to the extended form, which reads the same first number
+                    case ':': {
+                        // Alternative extended form: Thh:mm:ss, only ever the first field
+                        if (havefield) return null;
+                        acc.micros += num.whole * 3_600_000_000L;
+                        adjustFractSeconds(acc, num.frac, 3_600);
+                        if (unit == '\0') return checked(acc.months, acc.days, acc.micros);
+                        IsoNumber min = isoNumber(str, i);
+                        if (min == null) return null;
+                        i = min.end;
+                        acc.micros += min.whole * 60_000_000L;
+                        adjustFractSeconds(acc, min.frac, 60);
+                        if (i >= n) return checked(acc.months, acc.days, acc.micros);
+                        if (str.charAt(i) != ':') return null;
+                        i++;
+                        IsoNumber sec = isoNumber(str, i);
+                        if (sec == null) return null;
+                        i = sec.end;
+                        acc.micros += sec.whole * 1_000_000L;
+                        adjustFractSeconds(acc, sec.frac, 1);
+                        if (i >= n) return checked(acc.months, acc.days, acc.micros);
+                        return null;
+                    }
+                    default:
+                        return null;
+                }
+            }
+            havefield = true;
+        }
+        return checked(acc.months, acc.days, acc.micros);
+    }
+
+    /** Read one number of an ISO 8601 duration; null when nothing there looks like a number. */
+    private static IsoNumber isoNumber(String str, int from) {
+        if (from >= str.length()) return null;
+        Matcher m = ISO_NUMBER.matcher(str);
+        m.region(from, str.length());
+        if (!m.lookingAt()) return null;
+        double v = Double.parseDouble(m.group());
+        // An unrepresentable magnitude is a malformed duration to PG, an oversized one a bad value
+        if (Double.isInfinite(v) || Double.isNaN(v)) return null;
+        if (v < Integer.MIN_VALUE || v > Integer.MAX_VALUE) throw new IsoFieldOverflow();
+        int whole = (int) v;
+        return new IsoNumber(whole, v - whole, m.end());
+    }
+
+    /** A field of an ISO 8601 duration that will not fit the int PG decodes it into. */
+    private static final class IsoFieldOverflow extends RuntimeException {
+        private static final long serialVersionUID = 1L;
+    }
+
+    /** How many digits open the field at {@code from}; the alternative forms are 8 and 6 wide. */
+    private static int isoDigitWidth(String str, int from) {
+        int i = from;
+        if (i < str.length() && str.charAt(i) == '-') i++;
+        int start = i;
+        while (i < str.length() && str.charAt(i) >= '0' && str.charAt(i) <= '9') i++;
+        return i - start;
+    }
+
+    /**
+     * A quantity as PG reads one: the integer digits and the fraction are decoded separately,
+     * because every unit spills its fractional part into a different smaller field.
+     */
+    private static final class Quantity {
+        final long whole;
+        final double frac;
+        Quantity(long whole, double frac) { this.whole = whole; this.frac = frac; }
+    }
+
+    /** Split a signed decimal into its integer digits and its fraction, as PG's decoder does. */
+    private static Quantity quantity(String text) {
+        String t = stripPlus(text.trim());
+        int dot = t.indexOf('.');
+        if (dot < 0) return new Quantity(Long.parseLong(t), 0);
+        String ip = t.substring(0, dot);
+        long whole = (ip.isEmpty() || "-".equals(ip)) ? 0 : Long.parseLong(ip);
+        String fp = t.substring(dot);
+        double frac = fp.length() > 1 ? Double.parseDouble("0" + fp) : 0;
+        if (t.startsWith("-")) frac = -frac;
+        return new Quantity(whole, frac);
+    }
+
+    /**
+     * Add a quantity of {@code unit} to the running totals, spilling a fractional quantity into
+     * the next smaller field the way PG does: a fraction of a year becomes whole months, a
+     * fraction of a month or a week becomes whole days and then part of a day, and a fraction of
+     * anything smaller becomes microseconds.
      *
      * @return false when the unit is not one this type can hold
      */
-    private static boolean addUnit(Accum acc, double value, String unit) {
-        // Scale the larger units down to years first, so one fractional rule covers them all
-        if ("millennium".equals(unit)) { value *= 1000; unit = "year"; }
-        else if ("century".equals(unit)) { value *= 100; unit = "year"; }
-        else if ("decade".equals(unit)) { value *= 10; unit = "year"; }
-        long whole = (long) value;
-        double frac = value - whole;
+    private static boolean addUnit(Accum acc, Quantity q, String unit) {
+        long val = q.whole;
+        double fval = q.frac;
+        if ("millennium".equals(unit)) return addYears(acc, val * 1000L, fval * 12_000.0);
+        if ("century".equals(unit))    return addYears(acc, val * 100L, fval * 1_200.0);
+        if ("decade".equals(unit))     return addYears(acc, val * 10L, fval * 120.0);
         switch (unit) {
             case "year":
-                // A fractional year spills into whole months, as PG does
-                acc.months += whole * 12 + Math.round(frac * 12);
-                break;
+                return addYears(acc, val, fval * 12.0);
             case "month":
-                acc.months += whole;
-                acc.days += Math.round(frac * 30);
-                break;
+                acc.months += val;
+                adjustFractDays(acc, fval, 30);
+                return true;
             case "week":
-                acc.days += whole * 7;
-                acc.micros += Math.round(frac * 7 * 86_400_000_000L);
-                break;
+                acc.days += Math.multiplyExact(val, 7L);
+                adjustFractDays(acc, fval, 7);
+                return true;
             case "day":
-                acc.days += whole;
-                acc.micros += Math.round(frac * 86_400_000_000L);
-                break;
-            case "hour":        acc.micros += Math.round(value * 3_600_000_000L); break;
-            case "minute":      acc.micros += Math.round(value * 60_000_000L); break;
-            case "second":      acc.micros += Math.round(value * 1_000_000L); break;
-            case "millisecond": acc.micros += Math.round(value * 1_000L); break;
-            case "microsecond": acc.micros += Math.round(value); break;
+                acc.days += val;
+                adjustFractSeconds(acc, fval, 86_400);
+                return true;
+            case "hour":
+                acc.micros += Math.multiplyExact(val, 3_600_000_000L);
+                adjustFractSeconds(acc, fval, 3_600);
+                return true;
+            case "minute":
+                acc.micros += Math.multiplyExact(val, 60_000_000L);
+                adjustFractSeconds(acc, fval, 60);
+                return true;
+            case "second":
+                acc.micros += Math.multiplyExact(val, 1_000_000L);
+                adjustFractSeconds(acc, fval, 1);
+                return true;
+            case "millisecond":
+                acc.micros += Math.multiplyExact(val, 1_000L) + roundToMicrosecond(fval * 1_000.0);
+                return true;
+            case "microsecond":
+                acc.micros += val + roundToMicrosecond(fval);
+                return true;
             default: return false;
         }
+    }
+
+    /** Years plus a fraction already scaled to months; PG rounds that fraction to a whole month. */
+    private static boolean addYears(Accum acc, long years, double fractionalMonths) {
+        acc.months += Math.multiplyExact(years, 12L);
+        if (fractionalMonths != 0) acc.months += (long) Math.rint(fractionalMonths);
         return true;
+    }
+
+    /**
+     * PG's AdjustFractSeconds: the fraction is scaled to seconds, the whole seconds are taken as
+     * they stand, and only what is left is rounded to microseconds.
+     */
+    private static void adjustFractSeconds(Accum acc, double frac, int scale) {
+        if (frac == 0) return;
+        double f = frac * scale;
+        long sec = (long) f;
+        acc.micros += sec * 1_000_000L;
+        f -= sec;
+        acc.micros += roundToMicrosecond(f * 1_000_000.0);
+    }
+
+    /**
+     * Round a count of microseconds to a whole one. PG rounds to the nearer, and a quantity that
+     * lands exactly half way keeps the smaller magnitude — 1.5us is 1us and 3.5us is 3us, where
+     * ordinary IEEE rounding would send both to the even neighbour instead. The fraction of a
+     * year is the one place that does round to even, and it is rounded on its own.
+     */
+    private static long roundToMicrosecond(double micros) {
+        double magnitude = Math.abs(micros);
+        double whole = Math.floor(magnitude);
+        if (magnitude - whole > 0.5) whole += 1.0;
+        return (long) (micros < 0 ? -whole : whole);
+    }
+
+    /**
+     * PG's AdjustFractDays: the fraction is scaled to days, the whole days are taken as they
+     * stand, and the remainder becomes a fraction of one day.
+     */
+    private static void adjustFractDays(Accum acc, double frac, int scale) {
+        if (frac == 0) return;
+        double f = frac * scale;
+        long extraDays = (long) f;
+        acc.days += extraDays;
+        f -= extraDays;
+        adjustFractSeconds(acc, f, 86_400);
+    }
+
+    /**
+     * Seconds to microseconds the way PG does it: whole seconds exactly, the rest rounded. The
+     * text is split before it is converted, because reading '1.0000005' as one double and
+     * subtracting the 1 afterwards does not leave the same fraction as reading '.0000005' alone.
+     */
+    private static long secondsToMicros(String text) {
+        if (text == null) return 0;
+        Quantity q = quantity(text);
+        Accum acc = new Accum();
+        acc.micros = Math.multiplyExact(q.whole, 1_000_000L);
+        adjustFractSeconds(acc, q.frac, 1);
+        return acc.micros;
     }
 
     /**
@@ -572,9 +838,9 @@ public class PgInterval implements Comparable<PgInterval> {
             int bit = fieldBitOf(unit);
             if ((filled & bit) != 0) throw invalidIntervalSyntax(input);
             filled |= bit;
-            double value;
+            Quantity value;
             try {
-                value = Double.parseDouble(stripPlus(f[1]));
+                value = quantity(f[1]);
             } catch (NumberFormatException e) {
                 return null;
             }
@@ -595,14 +861,14 @@ public class PgInterval implements Comparable<PgInterval> {
         boolean negative = hh.startsWith("-");
         long hours = Math.abs(Long.parseLong(stripPlus(hh)));
         long minutes = Long.parseLong(mm);
-        double seconds = ss != null ? Double.parseDouble(ss) : 0;
+        long secondMicros = secondsToMicros(ss);
         // Under MINUTE TO SECOND the SQL standard reads a two-part time field as MM:SS
         if (ss == null && range == (IntervalTypmod.MINUTE | IntervalTypmod.SECOND)) {
-            seconds = minutes;
+            secondMicros = Math.multiplyExact(minutes, 1_000_000L);
             minutes = hours;
             hours = 0;
         }
-        long field = (hours * 3600L + minutes * 60L) * 1_000_000L + Math.round(seconds * 1_000_000L);
+        long field = (hours * 3600L + minutes * 60L) * 1_000_000L + secondMicros;
         return negative ? -field : field;
     }
 
@@ -622,23 +888,45 @@ public class PgInterval implements Comparable<PgInterval> {
                 "invalid input syntax for type interval: \"" + input + "\"", "22007");
     }
 
+    /**
+     * PG holds each interval unit in a keyword table under at most ten characters, and truncates
+     * the word it is given before looking it up. That single rule decides the whole accepted set:
+     * 'microseconds' and 'microsecon' name the same field because both shorten to the same key,
+     * while 'cents' and 'millenium' name nothing at all because neither is a key.
+     */
+    private static final int UNIT_TOKEN_MAX_LEN = 10;
+
     /** Map a PG interval unit word (any accepted abbreviation or plural) to its canonical name. */
     private static String normalizeUnit(String raw) {
-        String u = raw.toLowerCase();
-        if (u.length() > 1 && u.endsWith("s")) u = u.substring(0, u.length() - 1);
+        String u = raw.toLowerCase(java.util.Locale.ROOT);
+        if (u.length() > UNIT_TOKEN_MAX_LEN) u = u.substring(0, UNIT_TOKEN_MAX_LEN);
         switch (u) {
-            case "microsecond": case "usec": case "us": return "microsecond";
-            case "millisecond": case "msec": case "ms": return "millisecond";
-            case "second": case "sec": case "s": return "second";
-            case "minute": case "min": case "m": return "minute";
-            case "hour": case "hr": case "h": return "hour";
-            case "day": case "d": return "day";
-            case "week": case "w": return "week";
-            case "month": case "mon": return "month";
-            case "year": case "yr": case "y": return "year";
-            case "decade": case "dec": return "decade";
-            case "century": case "centurie": case "cent": return "century";
-            case "millennium": case "millennia": case "millenium": return "millennium";
+            case "us": case "usec": case "usecond": case "useconds": case "usecs":
+            case "microsecon":
+                return "microsecond";
+            case "ms": case "msec": case "msecond": case "mseconds": case "msecs":
+            case "millisecon":
+                return "millisecond";
+            case "s": case "sec": case "second": case "seconds": case "secs":
+                return "second";
+            case "m": case "min": case "mins": case "minute": case "minutes":
+                return "minute";
+            case "h": case "hr": case "hrs": case "hour": case "hours":
+                return "hour";
+            case "d": case "day": case "days":
+                return "day";
+            case "w": case "week": case "weeks":
+                return "week";
+            case "mon": case "mons": case "month": case "months":
+                return "month";
+            case "y": case "yr": case "yrs": case "year": case "years":
+                return "year";
+            case "dec": case "decs": case "decade": case "decades":
+                return "decade";
+            case "c": case "cent": case "century": case "centuries":
+                return "century";
+            case "mil": case "mils": case "millennia": case "millennium":
+                return "millennium";
             default: return null;
         }
     }

@@ -41,6 +41,32 @@ class CatalogSystemFunctions {
         return false;
     }
 
+    /**
+     * The written arguments of a call named the way PostgreSQL names them in a 42883. An
+     * unadorned string literal is "unknown": it has no type until the function it is handed to
+     * gives it one, and a call that resolves to nothing never does.
+     */
+    private String writtenArgTypes(FunctionCallExpr fn, RowContext ctx) {
+        StringBuilder types = new StringBuilder();
+        for (int i = 0; i < fn.args().size(); i++) {
+            if (i > 0) types.append(", ");
+            Expression arg = fn.args().get(i);
+            if (arg instanceof Literal
+                    && ((Literal) arg).literalType() == Literal.LiteralType.STRING) {
+                types.append("unknown");
+                continue;
+            }
+            Object value;
+            try {
+                value = executor.evalExpr(arg, ctx);
+            } catch (RuntimeException e) {
+                value = null;
+            }
+            types.append(value == null ? "unknown" : AstExecutor.pgTypeNameOf(value));
+        }
+        return types.toString();
+    }
+
     private void requireArgs(FunctionCallExpr fn, int min) {
         if (fn.args().size() < min) {
             throw new MemgresException(
@@ -79,6 +105,15 @@ class CatalogSystemFunctions {
                             && (pre.value() == null || agreesWithValue(declared, pre.value()))) {
                         return pgTypeDisplayName(declared);
                     }
+                }
+
+                // An LSN is carried as its own text -- "0/0" says nothing about the type that
+                // produced it -- so the call's declared result type is the only witness.
+                if (rawExpr instanceof FunctionCallExpr
+                        && "pg_logical_emit_message".equals(FunctionEvaluator.stripSchemaPrefix(
+                                ((FunctionCallExpr) rawExpr).name()
+                                        .toLowerCase(java.util.Locale.ROOT)))) {
+                    return "pg_lsn";
                 }
 
                 // Check if this is a system column reference (ctid, xmin, xmax, cmin, cmax, tableoid)
@@ -607,6 +642,25 @@ class CatalogSystemFunctions {
             case "pg_current_wal_insert_lsn":
             case "pg_current_wal_flush_lsn":
                 return "0/0";
+            case "pg_logical_emit_message": {
+                // Writes a logical-decoding message into the WAL and answers with the LSN it was
+                // written at. memgres keeps no WAL, so the call is accepted, its arguments are
+                // evaluated for their own errors, and the answer is the same zero LSN
+                // pg_current_wal_lsn gives. Both overloads -- a text payload and a bytea one --
+                // and the optional trailing flush flag are the same call here.
+                if (fn.args().size() < 3 || fn.args().size() > 4) {
+                    throw new MemgresException("function " + fn.name()
+                            + "(" + writtenArgTypes(fn, ctx) + ") does not exist"
+                            + "\n  Hint: No function matches the given name and argument types."
+                            + " You might need to add explicit type casts.", "42883");
+                }
+                boolean anyNull = false;
+                for (Expression emitArg : fn.args()) {
+                    if (executor.evalExpr(emitArg, ctx) == null) anyNull = true;
+                }
+                // Declared strict, so a NULL anywhere in the call answers NULL.
+                return anyNull ? null : "0/0";
+            }
             case "pg_last_wal_receive_lsn":
             case "pg_last_wal_replay_lsn":
                 return null;

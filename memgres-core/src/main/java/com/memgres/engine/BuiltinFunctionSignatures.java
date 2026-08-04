@@ -97,6 +97,75 @@ public final class BuiltinFunctionSignatures {
         return known;
     }
 
+    /**
+     * The extension each of these names belongs to, for the names PostgreSQL keeps in no schema
+     * at all until its extension is created.
+     *
+     * <p>PostgreSQL never puts an extension's functions in {@code pg_catalog}: they are created in
+     * whatever schema {@code CREATE EXTENSION} installed the extension into, and before that they
+     * do not exist. memgres implements these natively and gates the call itself — every one of
+     * them answers 42883 until its extension is there — but listed them all in pg_catalog on a
+     * fresh database, so the catalog advertised nine functions the engine would refuse.
+     */
+    private static final String[][] EXTENSION_OWNED = {
+            {"uuid_generate_v1", "uuid-ossp"},
+            {"uuid_generate_v3", "uuid-ossp"},
+            {"uuid_generate_v4", "uuid-ossp"},
+            {"uuid_generate_v5", "uuid-ossp"},
+            {"uuid_nil", "uuid-ossp"},
+            {"uuid_ns_dns", "uuid-ossp"},
+            {"uuid_ns_url", "uuid-ossp"},
+            {"show_trgm", "pg_trgm"},
+            {"similarity", "pg_trgm"},
+    };
+
+    /** The extension this name belongs to, or null when it belongs to none. */
+    static String owningExtension(String name) {
+        if (name == null) return null;
+        for (String[] owned : EXTENSION_OWNED) {
+            if (owned[0].equalsIgnoreCase(name)) return owned[1];
+        }
+        return null;
+    }
+
+    /** The fewest arguments this signature accepts — pronargs less its defaulted parameters. */
+    static int fewestArguments(String[] signature) {
+        int params = signature[2].isEmpty() ? 0 : signature[2].split(" ").length;
+        String fewest = signature.length > 4 ? signature[4] : String.valueOf(params);
+        if (fewest.endsWith("*")) fewest = fewest.substring(0, fewest.length() - 1);
+        if (fewest.endsWith("+")) fewest = fewest.substring(0, fewest.length() - 1);
+        try {
+            return Integer.parseInt(fewest);
+        } catch (NumberFormatException e) {
+            return params;
+        }
+    }
+
+    /** Whether this signature collects a tail of arguments into its last declared type. */
+    static boolean isVariadic(String[] signature) {
+        if (signature.length <= 4) return false;
+        String fewest = signature[4];
+        if (fewest.endsWith("*")) fewest = fewest.substring(0, fewest.length() - 1);
+        return fewest.endsWith("+");
+    }
+
+    /**
+     * Whether PostgreSQL declares this signature strict.
+     *
+     * <p>Strict is the rule and this is the list of exceptions, read off the reference server one
+     * signature at a time: a strict function is never entered with a NULL argument, so a client or
+     * a planner reading the column is reading whether the body can see a NULL at all. It is keyed
+     * by argument types as well as by name because the two are not decided together —
+     * {@code array_to_string(anyarray, text)} is strict and the three-argument form that takes a
+     * null-substitute is not.
+     */
+    static boolean isStrict(String name, String argTypes) {
+        for (String[] lax : NOT_STRICT) {
+            if (lax[0].equalsIgnoreCase(name) && lax[1].equals(argTypes)) return false;
+        }
+        return true;
+    }
+
     /** Names PostgreSQL declares both prokind='w' and prokind='a'. */
     private static final java.util.Set<String> DUAL_KIND =
             new java.util.HashSet<String>(java.util.Arrays.asList(
@@ -293,7 +362,6 @@ public final class BuiltinFunctionSignatures {
             {"circle", "718", "604", "fi", "1"},
             {"circle", "718", "600 701", "fi", "2"},
             {"clock_timestamp", "1184", "", "fv", "0"},
-            {"closest_point", "600", "601 601", "fi", "2*"},
             {"col_description", "25", "26 23", "fs", "2"},
             {"concat", "25", "2276", "fs", "1+"},
             {"concat_ws", "25", "25 2276", "fs", "2+"},
@@ -341,7 +409,6 @@ public final class BuiltinFunctionSignatures {
             {"delete", "90001", "90001 25", "fi", "2*"},
             {"delete", "90001", "90001 1009", "fi", "2*"},
             {"delete", "90001", "90001 90001", "fi", "2*"},
-            {"delete_key", "90001", "90001 25", "fi", "2*"},
             {"diagonal", "601", "603", "fi", "1"},
             {"diameter", "701", "718", "fi", "1"},
             {"digest", "17", "25 25", "fi", "2*"},
@@ -544,13 +611,8 @@ public final class BuiltinFunctionSignatures {
             {"int8multirange", "4536", "3927", "fi", "1+"},
             {"int8range", "3926", "20 20", "fi", "2"},
             {"int8range", "3926", "20 20 25", "fi", "3"},
-            {"intersects", "16", "601 601", "fi", "2*"},
             {"interval", "1186", "1083", "fi", "1"},
             {"interval", "1186", "1186 23", "fi", "2"},
-            {"is_horizontal", "16", "601", "fi", "1*"},
-            {"is_parallel", "16", "601 601", "fi", "2*"},
-            {"is_perpendicular", "16", "601 601", "fi", "2*"},
-            {"is_vertical", "16", "601", "fi", "1*"},
             {"isclosed", "16", "602", "fi", "1"},
             {"isdefined", "16", "90001 25", "fi", "2*"},
             {"isempty", "16", "3831", "fi", "1"},
@@ -578,6 +640,8 @@ public final class BuiltinFunctionSignatures {
             {"json_populate_record", "2283", "2283 114 16", "fs", "2"},
             {"json_populate_recordset", "2283", "2283 114 16", "ts", "2"},
             {"json_strip_nulls", "114", "114 16", "fs", "1"},
+            {"json_to_record", "2249", "114", "fs", "1"},
+            {"json_to_recordset", "2249", "114", "ts", "1"},
             {"json_typeof", "25", "114", "fi", "1"},
             {"jsonb_array_elements", "3802", "3802", "ti", "1"},
             {"jsonb_array_elements_text", "25", "3802", "ti", "1"},
@@ -613,6 +677,8 @@ public final class BuiltinFunctionSignatures {
             {"jsonb_set", "3802", "3802 1009 3802 16", "fi", "3"},
             {"jsonb_set_lax", "3802", "3802 1009 3802 16 25", "fi", "3"},
             {"jsonb_strip_nulls", "3802", "3802 16", "fs", "1"},
+            {"jsonb_to_record", "2249", "3802", "fs", "1"},
+            {"jsonb_to_recordset", "2249", "3802", "ts", "1"},
             {"jsonb_typeof", "25", "3802", "fi", "1"},
             {"justify_days", "1186", "1186", "fi", "1"},
             {"justify_hours", "1186", "1186", "fi", "1"},
@@ -685,7 +751,6 @@ public final class BuiltinFunctionSignatures {
             {"masklen", "23", "869", "fi", "1"},
             {"md5", "25", "17", "fi", "1"},
             {"md5", "25", "25", "fi", "1"},
-            {"merge_action", "25", "", "fv", "0*"},
             {"min_scale", "23", "1700", "fi", "1"},
             {"mod", "1700", "1700 1700", "fi", "2"},
             {"mod", "20", "20 20", "fi", "2"},
@@ -760,7 +825,7 @@ public final class BuiltinFunctionSignatures {
             {"pg_advisory_xact_lock", "2278", "23 23", "fv", "2"},
             {"pg_advisory_xact_lock_shared", "2278", "20", "fv", "1"},
             {"pg_advisory_xact_lock_shared", "2278", "23 23", "fv", "2"},
-            {"pg_advisory_xact_unlock", "2278", "20", "fv", "1*"},
+            {"pg_available_extension_versions", "2249", "", "ts", "0"},
             {"pg_backend_pid", "23", "", "fs", "0"},
             {"pg_backup_start", "3220", "25 16", "fv", "1"},
             {"pg_backup_stop", "2249", "16", "fv", "0"},
@@ -848,6 +913,7 @@ public final class BuiltinFunctionSignatures {
             {"pg_notify", "2278", "25 25", "fv", "2"},
             {"pg_opclass_is_visible", "16", "26", "fs", "1"},
             {"pg_operator_is_visible", "16", "26", "fs", "1"},
+            {"pg_options_to_table", "2249", "1009", "ts", "1"},
             {"pg_partition_ancestors", "2205", "2205", "tv", "1"},
             {"pg_partition_root", "2205", "2205", "fi", "1"},
             {"pg_partition_tree", "2249", "2205", "tv", "1"},
@@ -869,6 +935,7 @@ public final class BuiltinFunctionSignatures {
             {"pg_rotate_logfile", "16", "", "fv", "0"},
             {"pg_safe_snapshot_blocking_pids", "1007", "23", "fv", "1"},
             {"pg_sequence_last_value", "20", "2205", "fv", "1"},
+            {"pg_show_all_settings", "2249", "", "ts", "0"},
             {"pg_size_bytes", "20", "25", "fi", "1"},
             {"pg_size_pretty", "25", "1700", "fi", "1"},
             {"pg_size_pretty", "25", "20", "fi", "1"},
@@ -1013,7 +1080,6 @@ public final class BuiltinFunctionSignatures {
             {"setval", "20", "2205 20 16", "fv", "3"},
             {"setweight", "3614", "3614 18", "fi", "2"},
             {"setweight", "3614", "3614 18 1009", "fi", "3"},
-            {"sha1", "17", "17", "fi", "1*"},
             {"sha224", "17", "17", "fi", "1"},
             {"sha256", "17", "17", "fi", "1"},
             {"sha384", "17", "17", "fi", "1"},
@@ -1230,6 +1296,96 @@ public final class BuiltinFunctionSignatures {
             {"xpath", "143", "25 142 1009", "fi", "3"},
             {"xpath_exists", "16", "25 142", "fi", "2"},
             {"xpath_exists", "16", "25 142 1009", "fi", "3"},
+    };
+
+    /**
+     * The signatures PostgreSQL does <em>not</em> declare strict, by proname and proargtypes.
+     * Read from the reference server, one row per signature memgres records.
+     */
+    private static final String[][] NOT_STRICT = {
+            {"array_append", "5078 5077"},
+            {"array_cat", "5078 5078"},
+            {"array_fill", "2283 1007"},
+            {"array_fill", "2283 1007 1007"},
+            {"array_position", "5078 5077"},
+            {"array_position", "5078 5077 23"},
+            {"array_positions", "5078 5077"},
+            {"array_prepend", "5077 5078"},
+            {"array_remove", "5078 5077"},
+            {"array_replace", "5078 5077 5077"},
+            {"array_to_string", "2277 25 25"},
+            {"concat", "2276"},
+            {"concat_ws", "25 2276"},
+            {"current_query", ""},
+            {"daterange", "1082 1082"},
+            {"daterange", "1082 1082 25"},
+            {"enum_first", "3500"},
+            {"enum_last", "3500"},
+            {"enum_range", "3500"},
+            {"enum_range", "3500 3500"},
+            {"format", "25"},
+            {"format", "25 2276"},
+            {"format_type", "26 23"},
+            {"inet_client_addr", ""},
+            {"inet_client_port", ""},
+            {"inet_server_addr", ""},
+            {"inet_server_port", ""},
+            {"int4range", "23 23"},
+            {"int4range", "23 23 25"},
+            {"int8range", "20 20"},
+            {"int8range", "20 20 25"},
+            {"json_build_array", ""},
+            {"json_build_array", "2276"},
+            {"json_build_object", ""},
+            {"json_build_object", "2276"},
+            {"json_populate_record", "2283 114 16"},
+            {"json_populate_recordset", "2283 114 16"},
+            {"json_to_recordset", "114"},
+            {"jsonb_build_array", ""},
+            {"jsonb_build_array", "2276"},
+            {"jsonb_build_object", ""},
+            {"jsonb_build_object", "2276"},
+            {"jsonb_populate_record", "2283 3802"},
+            {"jsonb_populate_recordset", "2283 3802"},
+            {"jsonb_set_lax", "3802 1009 3802 16 25"},
+            {"jsonb_to_recordset", "3802"},
+            {"num_nonnulls", "2276"},
+            {"num_nulls", "2276"},
+            {"numrange", "1700 1700"},
+            {"numrange", "1700 1700 25"},
+            {"overlaps", "1083 1083 1083 1083"},
+            {"overlaps", "1083 1083 1083 1186"},
+            {"overlaps", "1083 1186 1083 1083"},
+            {"overlaps", "1083 1186 1083 1186"},
+            {"overlaps", "1114 1114 1114 1114"},
+            {"overlaps", "1114 1114 1114 1186"},
+            {"overlaps", "1114 1186 1114 1114"},
+            {"overlaps", "1114 1186 1114 1186"},
+            {"overlaps", "1184 1184 1184 1184"},
+            {"overlaps", "1184 1184 1184 1186"},
+            {"overlaps", "1184 1186 1184 1184"},
+            {"overlaps", "1184 1186 1184 1186"},
+            {"overlaps", "1266 1266 1266 1266"},
+            {"pg_current_logfile", ""},
+            {"pg_current_logfile", "25"},
+            {"pg_logical_slot_get_changes", "19 3220 23 1009"},
+            {"pg_logical_slot_peek_changes", "19 3220 23 1009"},
+            {"pg_notify", "25 25"},
+            {"pg_stat_clear_snapshot", ""},
+            {"pg_stat_reset", ""},
+            {"pg_stat_reset_shared", "25"},
+            {"pg_typeof", "2276"},
+            {"quote_nullable", "2283"},
+            {"quote_nullable", "25"},
+            {"set_config", "25 25 16"},
+            {"string_to_array", "25 25"},
+            {"string_to_array", "25 25 25"},
+            {"string_to_table", "25 25"},
+            {"string_to_table", "25 25 25"},
+            {"tsrange", "1114 1114"},
+            {"tsrange", "1114 1114 25"},
+            {"tstzrange", "1184 1184"},
+            {"tstzrange", "1184 1184 25"},
     };
 
     /**

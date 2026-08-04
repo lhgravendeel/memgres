@@ -288,7 +288,12 @@ final class QueryLevelScope {
         // settled before the arguments are looked at -- as PostgreSQL settles it.
         if (!BuiltinFunctionNames.isCallable(bareName)
                 && !select.isAggregateFunction(bareName)
-                && !PlacementCheck.isWindowFunctionName(bareName)) {
+                && !PlacementCheck.isWindowFunctionName(bareName)
+                // PostgreSQL keeps the implementation of an operator as an ordinary function, and
+                // the catalog lists it. memgres dispatches those by evaluating the operator behind
+                // the name, which is a name the register does not carry -- so a check that read the
+                // register alone refused calls the engine can answer.
+                && !FunctionEvaluator.isOperatorFunction(bareName)) {
             throw noSuchFunction(call, args);
         }
         if (!FunctionEvaluator.acceptsAnyArity(bareName)) {

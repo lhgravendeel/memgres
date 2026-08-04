@@ -65,6 +65,26 @@ class GeometricFunctions {
     }
 
     /** The given type name when it names a geometric type, else null. */
+    /**
+     * Refuses a call whose argument count no signature of the name takes.
+     *
+     * <p>A name PostgreSQL does not have carries no row in the signature table, so the arity rule
+     * that judges every other call says nothing about it. These are memgres's own, and they still
+     * take what they take.
+     */
+    private static void requireArity(FunctionCallExpr fn, int arity) {
+        if (fn.args().size() == arity) return;
+        StringBuilder types = new StringBuilder();
+        for (int i = 0; i < fn.args().size(); i++) {
+            types.append(i > 0 ? ", " : "").append("point");
+        }
+        MemgresException e = new MemgresException(
+                "function " + fn.name() + "(" + types + ") does not exist", "42883");
+        e.setHint("No function matches the given name and argument types."
+                + " You might need to add explicit type casts.");
+        throw e;
+    }
+
     private static String geometricTypeName(String name) {
         switch (name) {
             case "point": case "line": case "lseg":
@@ -114,7 +134,47 @@ class GeometricFunctions {
         }
     }
 
+    /** The names PostgreSQL declares as a constructor of a shape. */
+    private static final java.util.Set<String> SHAPE_CONSTRUCTORS =
+            new java.util.HashSet<>(java.util.Arrays.asList(
+                    "point", "box", "circle", "lseg", "line", "path", "polygon"));
+
+    /**
+     * Refuses a constructor call PostgreSQL has no signature for.
+     *
+     * <p>Every one of these needs an argument: {@code point()} resolves to nothing, and memgres
+     * read the first argument of an empty list and reported the resulting internal error to the
+     * client. A single argument has to be something a shape can be read out of — a number is not,
+     * which is why {@code point(42)} is a function that does not exist rather than a point at
+     * (NaN,NaN), and a piece of text that is not a shape is bad input for the type.
+     */
+    private void requireConstructorArgs(String name, FunctionCallExpr fn, RowContext ctx) {
+        if (!SHAPE_CONSTRUCTORS.contains(name)) return;
+        if (fn.args().isEmpty()) {
+            throw new MemgresException("function " + name + "() does not exist"
+                    + "\n  Hint: No function matches the given name and argument types.", "42883");
+        }
+        if (fn.args().size() != 1) return;
+        Object arg = executor.evalExpr(fn.args().get(0), ctx);
+        if (arg == null) return;
+        if (arg instanceof Number || arg instanceof Boolean) {
+            throw new MemgresException("function " + name + "(" + AstExecutor.pgTypeNameOf(arg)
+                    + ") does not exist"
+                    + "\n  Hint: No function matches the given name and argument types.", "42883");
+        }
+        if (arg instanceof String && !GeometricOperations.isGeometricString(((String) arg).trim())) {
+            // Not written as a shape, so it is either the plain list of numbers PostgreSQL also
+            // reads -- "1,2" for a point, "0,0,5" for a circle -- or it is not input for this type
+            // at all. Let the cast decide, so the constructor and the cast beside it agree: a test
+            // of its own for what a shape looks like refused text the very same value could be
+            // cast to. A value that IS written as a shape is left alone, because these constructors
+            // also build one shape from another and that is not text this type can read.
+            executor.castEvaluator.applyCast(arg, name, true);
+        }
+    }
+
     Object eval(String name, FunctionCallExpr fn, RowContext ctx) {
+        requireConstructorArgs(name, fn, ctx);
         switch (name) {
             case "area": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
@@ -325,27 +385,21 @@ class GeometricFunctions {
                 return pt != null ? GeometricOperations.format(pt) : null;
             }
             case "is_horizontal": {
-                if (fn.args().size() == 2) {
-                    Object a = executor.evalExpr(fn.args().get(0), ctx);
-                    Object b = executor.evalExpr(fn.args().get(1), ctx);
-                    if (a == null || b == null) return null;
-                    return GeometricOperations.isHorizontal(
-                            GeometricOperations.parsePoint(a.toString()),
-                            GeometricOperations.parsePoint(b.toString()));
-                }
+                // One segment, and nothing else. PostgreSQL has no function of this name at all --
+                // its own spellings are lseg_horizontal and ishorizontal -- so the one-argument
+                // form is memgres's own, and the two-argument form was an invention on top of an
+                // invention. It answered only because the catalog carried a row for the name.
+                requireArity(fn, 1);
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 return arg == null ? null : GeometricOperations.isHorizontal(
                         GeometricOperations.parseLseg(arg.toString()));
             }
             case "is_vertical": {
-                if (fn.args().size() == 2) {
-                    Object a = executor.evalExpr(fn.args().get(0), ctx);
-                    Object b = executor.evalExpr(fn.args().get(1), ctx);
-                    if (a == null || b == null) return null;
-                    return GeometricOperations.isVertical(
-                            GeometricOperations.parsePoint(a.toString()),
-                            GeometricOperations.parsePoint(b.toString()));
-                }
+                // One segment, and nothing else. PostgreSQL has no function of this name at all --
+                // its own spellings are lseg_horizontal and ishorizontal -- so the one-argument
+                // form is memgres's own, and the two-argument form was an invention on top of an
+                // invention. It answered only because the catalog carried a row for the name.
+                requireArity(fn, 1);
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 return arg == null ? null : GeometricOperations.isVertical(
                         GeometricOperations.parseLseg(arg.toString()));
