@@ -191,6 +191,60 @@ SELECT format_type(1185, 3);
 -- end-expected
 SELECT format_type('int4'::regtype, -1);
 
+-- format_type has to name the pseudo-types too. A routine's signature is declared over them far
+-- more often than a column is -- an input function reads a cstring, a receive function is handed
+-- internal, a trigger function answers trigger -- so a renderer that only knows the types a
+-- column can have prints the word "unknown" over most of pg_proc.
+-- begin-expected
+-- columns: a | b | c | d | e
+-- row: cstring, cstring[], internal, trigger, event_trigger
+-- end-expected
+SELECT format_type(2275, NULL) AS a, format_type(1263, NULL) AS b,
+       format_type(2281, NULL) AS c, format_type(2279, NULL) AS d,
+       format_type(3838, NULL) AS e;
+
+-- begin-expected
+-- columns: a | b | c | d | e
+-- row: language_handler, fdw_handler, index_am_handler, table_am_handler, tsm_handler
+-- end-expected
+SELECT format_type(2280, NULL) AS a, format_type(3115, NULL) AS b,
+       format_type(325, NULL) AS c, format_type(269, NULL) AS d,
+       format_type(3310, NULL) AS e;
+
+-- "any" is a reserved word, so format_type quotes what it prints.
+-- begin-expected
+-- columns: a | b | c | d | e | f
+-- row: record, void, anyelement, anyarray, anycompatiblearray, "any"
+-- end-expected
+SELECT format_type(2249, NULL) AS a, format_type(2278, NULL) AS b,
+       format_type(2283, NULL) AS c, format_type(2277, NULL) AS d,
+       format_type(5078, NULL) AS e, format_type(2276, NULL) AS f;
+
+-- The bootstrap types: unknown is what an unadorned literal still is, refcursor what a cursor
+-- variable holds, gtsvector what tsvector's GiST opclass stores.
+-- begin-expected
+-- columns: a | b | c | d | e
+-- row: unknown, refcursor, refcursor[], gtsvector, gtsvector[]
+-- end-expected
+SELECT format_type(705, NULL) AS a, format_type(1790, NULL) AS b,
+       format_type(2201, NULL) AS c, format_type(3642, NULL) AS d,
+       format_type(3644, NULL) AS e;
+
+-- An unmodified bpchar is named "character": format_type prints the spelling a client could
+-- write back, which is why PG's identity form of length(bpchar) reads length(character).
+-- begin-expected
+-- columns: a | b
+-- row: character, character(5)
+-- end-expected
+SELECT format_type(1042, NULL) AS a, format_type(1042, 9) AS b;
+
+-- No type at all is a dash; an OID with no type behind it is deliberately not a name.
+-- begin-expected
+-- columns: a | b
+-- row: -, ???
+-- end-expected
+SELECT format_type(0, NULL) AS a, format_type(999999, NULL) AS b;
+
 -- ============================================================================
 -- SECTION D: a domain carries its base type's declaration into a column
 -- ============================================================================

@@ -375,10 +375,25 @@ class PgCatalogConsistencyTest {
                 + " WHERE proname = 'random'")));
     }
 
+    /**
+     * The locale is spelt the way PostgreSQL spells it — en-US, with a hyphen — and the row that
+     * carries that spelling is the ICU one.
+     *
+     * <p>This used to read the spelling off a row named {@code en_US}, and memgres carried one:
+     * an ICU collation at encoding 6. Measured against PostgreSQL 18, that row does not exist in
+     * that shape anywhere. What PostgreSQL has, and only on a host whose locale list offers it,
+     * is a *libc* en_US at that locale's own encoding — 24 (WIN1252) on the reference server,
+     * never 6 — so the row memgres offered was one no PostgreSQL server would match, and
+     * COLLATE "en_US" failed on both engines anyway. The name has been dropped from
+     * pg_collation; the spelling it was there to demonstrate is asserted here on en-US-x-icu,
+     * which PostgreSQL does register wherever ICU is available.
+     */
     @Test
-    void enUsIsSpeltTheWayPostgresSpellsIt() throws SQLException {
-        assertEquals("en-US,en-US", one("SELECT collcollate || ',' || collctype"
-                + " FROM pg_collation WHERE collname = 'en_US'"));
+    void anIcuLocaleIsSpeltTheWayPostgresSpellsIt() throws SQLException {
+        assertEquals("i,-1,en-US", one("SELECT collprovider || ',' || collencoding || ',' || colllocale"
+                + " FROM pg_collation WHERE collname = 'en-US-x-icu'"));
+        assertEquals("0", one("SELECT count(*) FROM pg_collation"
+                + " WHERE collname = 'en_US' AND collencoding = 6"));
     }
 
     @Test

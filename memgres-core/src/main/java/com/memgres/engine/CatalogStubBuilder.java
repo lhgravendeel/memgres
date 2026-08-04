@@ -1177,6 +1177,13 @@ class CatalogStubBuilder {
                 col("xmin", DataType.INTEGER)
         );
         Table table = new Table("pg_am", cols);
+        // The access-method OIDs are PostgreSQL's own. amhandler is not: it has to be the OID
+        // pg_proc gave the handler function, and pg_proc mints those from the user-object
+        // counter, so the number here is above 16384 where PostgreSQL's is 330 for bthandler.
+        // It resolves — amhandler::regproc reads back "bthandler", and a join to pg_proc lands
+        // on a row — which is what a client follows the column for; only a comparison of the
+        // raw number against PostgreSQL's would notice. Fixing it means giving the handler
+        // functions their real OIDs in pg_proc, which is CatalogCoreBuilder's to do.
         table.insertRow(new Object[]{2, "heap", "t", oids.oid("proc:heap_tableam_handler"), 1});
         table.insertRow(new Object[]{403, "btree", "i", oids.oid("proc:bthandler"), 1});
         table.insertRow(new Object[]{405, "hash", "i", oids.oid("proc:hashhandler"), 1});

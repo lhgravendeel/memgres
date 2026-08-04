@@ -436,3 +436,117 @@ SELECT count(*)::text AS a FROM pg_proc WHERE proname = 'tsquery_phrase';
 -- end-expected
 SELECT bool_and(pronargs = array_length(proargtypes, 1))::text AS a FROM pg_proc
   WHERE pronargs > 0;
+
+-- ============================================================================
+-- What a name written for a reg* type resolves to
+--
+-- regprocedure is a signature and regproc a bare name, and the two differ in
+-- more than spelling: a bare name several functions carry names none of them,
+-- while a signature names exactly one. A schema written in front of the name
+-- is part of what is being named -- a function of that name in another schema
+-- is not the one asked for -- and the name comes back qualified only where the
+-- schema it lives in is off the search path.
+-- ============================================================================
+
+-- A signature resolves whichever spelling its argument types were written in.
+-- begin-expected
+-- columns: a
+-- row: upper(text)
+-- end-expected
+SELECT 'upper(text)'::regprocedure::text AS a;
+
+-- begin-expected
+-- columns: a
+-- row: upper(text)
+-- end-expected
+SELECT 'pg_catalog.upper(text)'::regprocedure::text AS a;
+
+-- begin-expected
+-- columns: a
+-- row: sum(integer)
+-- end-expected
+SELECT to_regprocedure('sum(int4)')::text AS a;
+
+-- begin-expected
+-- columns: a
+-- row: pg_sleep(double precision)
+-- end-expected
+SELECT to_regprocedure('pg_sleep(float8)')::text AS a;
+
+-- begin-expected
+-- columns: a
+-- row: now()
+-- end-expected
+SELECT to_regprocedure('now()')::text AS a;
+
+-- public holds none of the built-ins, so naming it names nothing. to_regproc
+-- and to_regprocedure answer with nothing where the cast raises.
+-- begin-expected
+-- columns: a
+-- row: NULL
+-- end-expected
+SELECT to_regprocedure('public.upper(text)')::text AS a;
+
+-- begin-expected-error
+-- sqlstate: 42883
+-- message-like: function "public.upper(text)" does not exist
+-- end-expected-error
+SELECT 'public.upper(text)'::regprocedure;
+
+-- begin-expected-error
+-- sqlstate: 42883
+-- message-like: does not exist
+-- end-expected-error
+SELECT 'nosuchschema.upper(text)'::regprocedure;
+
+-- upper is declared over text, over a range and over a multirange, so its bare
+-- name names no one function.
+-- begin-expected
+-- columns: a
+-- row: NULL
+-- end-expected
+SELECT to_regproc('upper')::text AS a;
+
+-- begin-expected
+-- columns: a
+-- row: NULL
+-- end-expected
+SELECT to_regproc('sum')::text AS a;
+
+-- ... while these are declared once each.
+-- begin-expected
+-- columns: a
+-- row: now
+-- end-expected
+SELECT to_regproc('now')::text AS a;
+
+-- begin-expected
+-- columns: a
+-- row: pg_sleep
+-- end-expected
+SELECT to_regproc('pg_sleep')::text AS a;
+
+-- A reference is held as its name and its OID together, so only the call says
+-- which of the two types it is.
+-- begin-expected
+-- columns: a | b
+-- row: regproc | regprocedure
+-- end-expected
+SELECT pg_typeof(to_regproc('now'))::text AS a,
+       pg_typeof(to_regprocedure('now()'))::text AS b;
+
+-- A write-ahead log position is a pg_lsn, whichever call produced it. Only the
+-- reading calls are here: pg_switch_wal writes, and this file is run against a
+-- live server. Its type is asserted in CatalogFunctionNamesTest instead.
+-- begin-expected
+-- columns: a | b
+-- row: pg_lsn | pg_lsn
+-- end-expected
+SELECT pg_typeof(pg_current_wal_lsn())::text AS a,
+       pg_typeof(pg_current_wal_insert_lsn())::text AS b;
+
+-- begin-expected
+-- columns: a
+-- row: true
+-- end-expected
+SELECT (pg_current_wal_lsn() >= '0/0'::pg_lsn)::text AS a;

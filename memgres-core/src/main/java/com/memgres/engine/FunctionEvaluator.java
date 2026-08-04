@@ -566,18 +566,15 @@ class FunctionEvaluator {
     /**
      * The operator spelling of each name pg_operator records as its implementation, or null where
      * two operators share a name and the spelling therefore settles nothing.
-     */
-    /**
-     * Names whose operator memgres evaluates wrongly, so calling them by name would answer wrongly.
      *
-     * <p>Measured: the closest-point operator {@code ##} disagrees with PostgreSQL for two of the
-     * shapes it is written over. Two segments that do not meet are no point at all in PostgreSQL
-     * and a point in memgres, and a segment crossing a box gives the crossing point there and a
-     * corner here. The other four spellings agree and are callable. Exposing a name that returns a
-     * wrong answer is worse than leaving it uncallable, so these two wait for {@code ##}.
+     * <p>Empty now that {@code ##} agrees with PostgreSQL for every shape it is written over.
+     * close_lseg and close_sb sat here because two segments that do not meet were no point at all
+     * in PostgreSQL and a point in memgres, and a segment crossing a box gave the crossing point
+     * there and a corner here; both were measured against the live server and fixed, so the two
+     * names are callable again. Exposing a name that returns a wrong answer is worse than leaving
+     * it uncallable, which is what this list is for when the next one turns up.
      */
-    private static final Set<String> ANSWERS_WRONGLY = new HashSet<String>(java.util.Arrays.asList(
-            "close_lseg", "close_sb"));
+    private static final Set<String> ANSWERS_WRONGLY = new HashSet<String>();
 
     private static final Map<String, String[]> OPERATOR_BY_FUNCTION = buildOperatorByFunction();
 
@@ -687,7 +684,6 @@ class FunctionEvaluator {
      */
     static boolean isOperatorFunction(String name) {
         if (name == null) return false;
-        if (ANSWERS_WRONGLY.contains(name.toLowerCase(java.util.Locale.ROOT))) return false;
         String[] operator = OPERATOR_BY_FUNCTION.get(name.toLowerCase(java.util.Locale.ROOT));
         if (operator == null) return false;
         return "b".equals(operator[1]) ? BINARY_BY_SYMBOL.containsKey(operator[0])
@@ -2776,6 +2772,26 @@ class FunctionEvaluator {
             case "pg_promote": {
                 // pg_promote(boolean, integer) → boolean — only valid on a standby server
                 throw new MemgresException("recovery is not in progress", "55000");
+            }
+            case "pg_wal_replay_pause":
+            case "pg_wal_replay_resume": {
+                // Recovery control, and this server is not recovering — the same 55000 PostgreSQL
+                // gives on a primary. The name was listed in pg_proc and answered 42883, which told
+                // a monitoring tool the function was missing rather than that it did not apply.
+                throw new MemgresException("recovery is not in progress", "55000");
+            }
+            case "pg_switch_wal": {
+                // Forces a WAL segment switch and answers with the LSN it ended at. memgres keeps
+                // no WAL, so nothing moves and the answer is the same zero LSN pg_current_wal_lsn
+                // gives.
+                return "0/0";
+            }
+            case "pg_create_restore_point": {
+                // Names a point in the WAL to recover to, and answers with its LSN. The name is
+                // required and NULL propagates, because the function is declared strict.
+                requireArgs(fn, 1);
+                Object pointName = executor.evalExpr(fn.args().get(0), ctx);
+                return pointName == null ? null : "0/0";
             }
             case "pg_safe_snapshot_blocking_pids": {
                 // pg_safe_snapshot_blocking_pids(int) → int[] — stub, returns empty int array

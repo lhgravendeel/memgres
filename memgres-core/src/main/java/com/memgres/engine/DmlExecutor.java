@@ -34,6 +34,9 @@ class DmlExecutor {
     private Map<String, String> activeViewColMap;
     // Ordered base-column names, one per view-column position, for positional INSERT remapping.
     private List<String> activeViewColOrder;
+    // View columns computed from an expression: named by a write, they are refused rather than
+    // reported missing, because the column exists and only the place to write it does not.
+    private Set<String> activeViewExprCols;
 
     /** Translate a view column name to the base table column name using the active mapping. */
     private String mapViewColumn(String colName) {
@@ -401,7 +404,7 @@ class DmlExecutor {
         rejectMaterializedViewWrite(stmt.table());
         String schemaName = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
         // Collect WITH CHECK OPTION constraints from views we're inserting through
-        List<Expression> viewCheckExprs = validationHelper.collectViewCheckExprs(stmt.table());
+        List<DmlValidationHelper.ViewCheck> viewCheckExprs = validationHelper.collectViewCheckExprs(stmt.table());
         // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
         executor.viewDmlVerb = "insert into";
         Table table = executor.resolveTable(schemaName, stmt.table(), stmt.schema() != null);
@@ -428,6 +431,7 @@ class DmlExecutor {
         // Capture view column mapping/order before any further resolveTable calls clobber them.
         this.activeViewColMap = executor.lastViewColumnMapping;
         this.activeViewColOrder = executor.lastViewColumnOrder;
+        this.activeViewExprCols = executor.lastViewExpressionColumns;
         // C6: Enforce INSERT privilege
         executor.checkTablePrivilege("INSERT", schemaName, stmt.table());
         // Check table-level locks (blocks if ACCESS EXCLUSIVE held by another session)
@@ -461,6 +465,19 @@ class DmlExecutor {
             return QueryResult.command(QueryResult.Type.INSERT, ruleCount);
         }
 
+        // A view column computed from an expression is a real column of the view — it is returned
+        // by SELECT — but there is nothing behind it to write to. PG says so in those words, and
+        // saying "column does not exist" instead would send a caller looking for a typo.
+        if (activeViewExprCols != null && stmt.columns() != null) {
+            for (String col : stmt.columns()) {
+                if (activeViewExprCols.contains(col.toLowerCase())) {
+                    MemgresException ex = new MemgresException("cannot insert into column \"" + col
+                            + "\" of view \"" + stmt.table() + "\"", "0A000");
+                    ex.setDetail(ViewUpdatability.DETAIL_NOT_COLUMN);
+                    throw ex;
+                }
+            }
+        }
         // Every name the statement writes to is resolved against the relation before any row is
         // looked at, so an INSERT into a column that is not there is refused the same way whether
         // the VALUES list is empty, the SELECT behind it returns nothing, or the table is empty.
@@ -1316,7 +1333,7 @@ class DmlExecutor {
                 stmt.alias(), stmt.from());
         String schemaName = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
         // Collect WITH CHECK OPTION constraints from views we're updating through
-        List<Expression> viewCheckExprs = validationHelper.collectViewCheckExprs(stmt.table());
+        List<DmlValidationHelper.ViewCheck> viewCheckExprs = validationHelper.collectViewCheckExprs(stmt.table());
         // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
         executor.viewDmlVerb = "update";
         Table table = executor.resolveTable(schemaName, stmt.table(), stmt.schema() != null);
@@ -1331,8 +1348,10 @@ class DmlExecutor {
         if (viewExprCols != null) {
             for (InsertStmt.SetClause set : stmt.setClauses()) {
                 if (viewExprCols.contains(set.column().toLowerCase())) {
-                    throw new MemgresException("cannot update column \"" + set.column()
+                    MemgresException ex = new MemgresException("cannot update column \"" + set.column()
                             + "\" of view \"" + stmt.table() + "\"", "0A000");
+                    ex.setDetail(ViewUpdatability.DETAIL_NOT_COLUMN);
+                    throw ex;
                 }
             }
         }

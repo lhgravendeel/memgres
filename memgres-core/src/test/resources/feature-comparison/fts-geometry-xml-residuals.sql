@@ -209,5 +209,139 @@ END; $$ LANGUAGE plpgsql;
 -- end-expected
 SELECT fgx_exec_rev() AS r;
 
+-- ============================================================================
+-- The closest-point operator over two segments, and over a segment and a box
+--
+-- Neither is "the nearest point of the two shapes" the way geometry would put
+-- it. Two segments of the same slope have no answer at all, and a segment that
+-- meets a box is answered with a point inside the box rather than on it: the
+-- point of the segment nearest the box's centre. Which point is named when
+-- several are equally near follows from the order the sides of a box are
+-- walked, so the ties are here too.
+-- ============================================================================
+
+-- A segment beside a box: the point of the nearest side, the top winning the
+-- tie with the right side.
+-- begin-expected
+-- columns: p
+-- row: (2,4)
+-- end-expected
+SELECT lseg '[(4,0),(4,4)]' ## box '(-2,1),(2,4)' AS p;
+
+-- ... and the left side winning the tie with the top.
+-- begin-expected
+-- columns: p
+-- row: (0,0)
+-- end-expected
+SELECT lseg '[(-2,0),(-2,3)]' ## box '(0,0),(3,3)' AS p;
+
+-- begin-expected
+-- columns: p
+-- row: (0,3)
+-- end-expected
+SELECT lseg '[(-10,10),(10,10)]' ## box '(0,0),(3,3)' AS p;
+
+-- A segment lying inside the box is answered with its own point nearest the
+-- centre of the box, which is not on the box at all.
+-- begin-expected
+-- columns: p
+-- row: (0.24999999999999997,1.75)
+-- end-expected
+SELECT lseg '[(1,2),(-2,1)]' ## box '(-2,1),(2,4)' AS p;
+
+-- ... and so is one that crosses it.
+-- begin-expected
+-- columns: p
+-- row: (1.25,1.25)
+-- end-expected
+SELECT lseg '[(0,0),(6,6)]' ## box '(-2,1),(2,4)' AS p;
+
+-- A segment whose endpoints coincide is still a point, and this one is inside
+-- the box.
+-- begin-expected
+-- columns: p
+-- row: (-3,-3)
+-- end-expected
+SELECT lseg '[(-3,-3),(-3,-3)]' ## box '(-5,-5),(-1,-1)' AS p;
+
+-- Two segments: the answer lies on the second one.
+-- begin-expected
+-- columns: p
+-- row: (-2,1)
+-- end-expected
+SELECT lseg '[(-3,-3),(-3,-3)]' ## lseg '[(1,2),(-2,1)]' AS p;
+
+-- begin-expected
+-- columns: p
+-- row: (1,2)
+-- end-expected
+SELECT lseg '[(5,0),(0,5)]' ## lseg '[(1,2),(-2,1)]' AS p;
+
+-- Where they cross, the crossing point.
+-- begin-expected
+-- columns: p
+-- row: (1.4285714285714286,3.571428571428571)
+-- end-expected
+SELECT lseg '[(-2,1),(2,4)]' ## lseg '[(5,0),(0,5)]' AS p;
+
+-- Two segments of the same slope have no closest point, and a segment whose
+-- endpoints coincide counts as vertical -- so it is parallel to any vertical.
+-- begin-expected
+-- columns: p
+-- row: NULL
+-- end-expected
+SELECT lseg '[(2,4),(6,8)]' ## lseg '[(0,0),(6,6)]' AS p;
+
+-- begin-expected
+-- columns: p
+-- row: NULL
+-- end-expected
+SELECT lseg '[(1,1),(1,1)]' ## lseg '[(4,0),(4,4)]' AS p;
+
+-- A line and a segment, which PostgreSQL has in that order only.
+-- begin-expected
+-- columns: p
+-- row: (0,1.6666666666666667)
+-- end-expected
+SELECT line '{1,0,0}' ## lseg '[(1,2),(-2,1)]' AS p;
+
+-- begin-expected
+-- columns: p
+-- row: NULL
+-- end-expected
+SELECT line '{1,-1,3}' ## lseg '[(0,0),(4,4)]' AS p;
+
+-- begin-expected-error
+-- sqlstate: 42883
+-- message-like: operator does not exist: lseg ## line
+-- end-expected-error
+SELECT lseg '[(0,0),(4,4)]' ## line '{1,-1,3}';
+
+-- There is no reversed spelling for a box either.
+-- begin-expected-error
+-- sqlstate: 42883
+-- message-like: operator does not exist: box ## lseg
+-- end-expected-error
+SELECT box '(-2,1),(2,4)' ## lseg '[(4,0),(4,4)]';
+
+-- The functions the operator is recorded as, called by name.
+-- begin-expected
+-- columns: p
+-- row: (1,2)
+-- end-expected
+SELECT close_lseg(lseg '[(4,0),(4,4)]', lseg '[(1,2),(-2,1)]')::text AS p;
+
+-- begin-expected
+-- columns: p
+-- row: (2,4)
+-- end-expected
+SELECT close_sb(lseg '[(4,0),(4,4)]', box '(-2,1),(2,4)')::text AS p;
+
+-- begin-expected
+-- columns: p
+-- row: (0,0)
+-- end-expected
+SELECT close_ls(line '{1,0,0}', lseg '[(0,0),(4,4)]')::text AS p;
+
 -- Cleanup
 DROP SCHEMA IF EXISTS fgx_test CASCADE;

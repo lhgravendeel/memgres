@@ -41,6 +41,14 @@ class CastEvaluator {
 
     private final AstExecutor executor;
 
+    /** Reads pg_proc for the regprocedure cast; built once because it holds only the executor. */
+    private CatalogMetadataFunctions procCatalog;
+
+    private CatalogMetadataFunctions procCatalog() {
+        if (procCatalog == null) procCatalog = new CatalogMetadataFunctions(executor);
+        return procCatalog;
+    }
+
     /**
      * The name PostgreSQL prints for a type OID, or null when nothing here carries that OID.
      *
@@ -1112,49 +1120,23 @@ class CastEvaluator {
                     String known = procNameForOid(procOidIn);
                     return known != null ? new RegprocValue(procOidIn, known) : val;
                 }
-                String procName = val.toString();
-                // Strip schema prefix for comparison
-                if (procName.contains(".")) {
-                    procName = procName.substring(procName.lastIndexOf('.') + 1);
+                // A schema written in front of the name is part of what is being named: a
+                // function of that name in another schema is not the one asked for, and no
+                // schema of that name at all means no function either. What comes back is
+                // written the way PostgreSQL writes it -- qualified only where the schema is
+                // off the search path -- rather than the way the query happened to spell it.
+                String written = val.toString();
+                CatalogMetadataFunctions.ProcLookup lookup = CatalogMetadataFunctions.lookupProc(
+                        executor, written, "regprocedure".equals(typeName));
+                if (lookup == null) {
+                    throw new MemgresException(
+                            "function \"" + written.trim() + "\" does not exist", "42883");
                 }
-                // For regproc (no signature), check for ambiguous built-in aggregates
-                if ("regproc".equals(typeName)) {
-                    String lowerProc = procName.toLowerCase();
-                    // Built-in aggregates that exist for multiple types (ambiguous via regproc)
-                    // M15: these built-ins have several type variants in PG, so a
-                    // bare-name ::regproc reference is ambiguous (42725).
-                    java.util.Set<String> ambiguousBuiltins = Cols.setOf(
-                            "min", "max", "sum", "avg", "count",
-                            "array_agg", "string_agg", "every", "bool_and", "bool_or",
-                            "lower", "upper", "abs", "round");
-                    if (ambiguousBuiltins.contains(lowerProc)) {
-                        throw new MemgresException("more than one function named \"" + procName + "\"", "42725");
-                    }
+                if (lookup.ambiguous) {
+                    throw new MemgresException(
+                            "more than one function named \"" + written.trim() + "\"", "42725");
                 }
-                // For regprocedure (explicit signature lookup like 'fname(int)'::regprocedure),
-                // validate that the function exists. regproc is used for system function references
-                // (like typinput in pg_type) which may reference built-in PG functions we don't track.
-                if ("regprocedure".equals(typeName)) {
-                    String lookupName = procName;
-                    if (lookupName.contains("(")) {
-                        lookupName = lookupName.substring(0, lookupName.indexOf('(')).trim();
-                    }
-                    if (executor.database.getFunction(lookupName) == null && executor.database.getFunction(lookupName.toLowerCase()) == null) {
-                        throw new MemgresException("function \"" + procName + "\" does not exist", "42883");
-                    }
-                }
-                // Try to resolve to an OID for comparison with pg_proc/pg_aggregate
-                // Strip argument list if present (e.g. "cfmt_fn(int)" -> "cfmt_fn")
-                String oidLookupName = procName;
-                if (oidLookupName.contains("(")) {
-                    oidLookupName = oidLookupName.substring(0, oidLookupName.indexOf('(')).trim();
-                }
-                int procOid = executor.systemCatalog.getOid("proc:" + oidLookupName);
-                if (procOid == 0) {
-                    procOid = executor.systemCatalog.getOid("proc:" + oidLookupName.toLowerCase());
-                }
-                if (procOid != 0) return new RegprocValue(procOid, procName);
-                return new RegprocValue(0, procName);
+                return new RegprocValue(lookup.oid, lookup.display);
             }
             case "regtype": {
                 // ::regtype converts a type name to its OID or name

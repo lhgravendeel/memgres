@@ -144,6 +144,36 @@ public final class TypeCoercion {
             case ENUM:
             case HSTORE:
                 return TypeCategory.UNKNOWN;
+            // The object-identifier aliases are numbers in PostgreSQL's own type system: regclass
+            // is category N and comparing one to an integer is what a catalog join does. They were
+            // missing here, and the exception below is why DataType.fromPgName could not answer
+            // with them -- a value written ::regclass had to be described to the client as an
+            // integer, which is not what it holds.
+            case REGPROC:
+            case REGCLASS:
+            case REGTYPE:
+            case XID:
+                return TypeCategory.NUMERIC;
+            // A vector, a node tree, a composite and the statistics types have no category any
+            // assignment rule reads; naming them keeps categoryOf total, which is what its callers
+            // assume when they ask about a column type they did not choose.
+            case INT2VECTOR:
+            case OIDVECTOR:
+            case PG_NODE_TREE:
+            case PG_LSN:
+            case PG_NDISTINCT:
+            case PG_DEPENDENCIES:
+            case PG_MCV_LIST:
+            case ANYARRAY:
+            case RECORD:
+            case VOID:
+            case MACADDR8:
+            case OID_ARRAY:
+            case RECORD_ARRAY:
+            case INTERNAL_CHAR_ARRAY:
+                return TypeCategory.UNKNOWN;
+            case INTERNAL_CHAR:
+                return TypeCategory.STRING;
             default:
                 throw new IllegalStateException("Unknown data type: " + type);
         }

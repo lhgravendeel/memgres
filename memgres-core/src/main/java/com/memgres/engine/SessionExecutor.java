@@ -213,7 +213,11 @@ class SessionExecutor {
         }
 
         if (name.equals("max_connections")) {
-            throw new MemgresException("parameter \"max_connections\" cannot be changed without restarting the server");
+            // A parameter fixed at server start is refused with the class PostgreSQL uses for
+            // exactly that, the same one wal_level and block_size already answer with here.
+            throw new MemgresException(
+                    "parameter \"max_connections\" cannot be changed without restarting the server",
+                    "55P02");
         }
 
         if (name.equals("max_prepared_transactions")) {

@@ -15,6 +15,17 @@ class CatalogMetadataFunctions {
 
     static final Object NOT_HANDLED = FunctionEvaluator.NOT_HANDLED;
 
+    /** The write-ahead log position memgres reports: it keeps no log, so nothing has moved. */
+    private static final String ZERO_LSN = "0/0";
+
+    /**
+     * The functions that answer with a write-ahead log position. Their value is carried as the
+     * text it prints as, so pg_typeof has nothing but the name to read the type off.
+     */
+    private static final Set<String> LSN_FUNCTIONS = Cols.setOf(
+            "pg_switch_wal", "pg_current_wal_lsn", "pg_current_wal_insert_lsn",
+            "pg_current_wal_flush_lsn", "pg_last_wal_receive_lsn", "pg_last_wal_replay_lsn");
+
     /**
      * Names of tables that are genuinely known to exist in pg_catalog or information_schema.
      * Used by to_regclass to avoid treating every arbitrary name as a valid catalog table,
@@ -134,7 +145,11 @@ class CatalogMetadataFunctions {
                         }
                     }
                 }
-                return "";
+                // Measured on PostgreSQL 18: an OID that names no constraint answers NULL, and so
+                // does a NULL argument. The whole pg_get_*def family does. An empty string reads
+                // like a constraint with no definition, which is a thing that cannot exist, and a
+                // client concatenating the answer into DDL writes a broken statement out of it.
+                return null;
             }
             case "pg_get_indexdef":
                 return evalPgGetIndexdef(fn, ctx);
@@ -149,10 +164,10 @@ class CatalogMetadataFunctions {
             case "pg_get_triggerdef":
                 return evalPgGetTriggerdef(fn, ctx);
             case "pg_get_ruledef": {
-                if (fn.args().isEmpty()) return "";
+                if (fn.args().isEmpty()) return null;
                 Object ruleOidVal = executor.evalExpr(fn.args().get(0), ctx);
                 if (fn.args().size() > 1) executor.evalExpr(fn.args().get(1), ctx);
-                if (ruleOidVal == null) return "";
+                if (ruleOidVal == null) return null;
                 int ruleOid = executor.toInt(ruleOidVal);
                 // M19: a view's implicit "_RETURN" rule reproduces the view query.
                 for (Database.ViewDef vd : executor.database.getViews().values()) {
@@ -173,7 +188,7 @@ class CatalogMetadataFunctions {
                             "rule:" + entry.getKey() + "_" + entry.getValue()[0]);
                     if (rOid == ruleOid) return entry.getValue()[1];
                 }
-                return "";
+                return null;
             }
             case "pg_get_function_sqlbody": {
                 if (!fn.args().isEmpty()) executor.evalExpr(fn.args().get(0), ctx);
@@ -203,40 +218,76 @@ class CatalogMetadataFunctions {
             }
             case "pg_get_viewdef":
                 return evalPgGetViewdef(fn, ctx);
+            case "pg_relation_is_updatable": {
+                String[] rel = relationOfArg(fn.args().get(0), ctx);
+                if (rel == null) return 0;
+                boolean includeTriggers = fn.args().size() > 1
+                        && executor.isTruthy(executor.evalExpr(fn.args().get(1), ctx));
+                return ViewUpdatability.relationEvents(executor.database, rel[0], rel[1], includeTriggers);
+            }
+            case "pg_column_is_updatable": {
+                String[] rel = relationOfArg(fn.args().get(0), ctx);
+                if (rel == null) return Boolean.FALSE;
+                Object attArg = executor.evalExpr(fn.args().get(1), ctx);
+                if (attArg == null) return null;
+                int attnum = executor.toInt(attArg);
+                boolean includeTriggers = fn.args().size() > 2
+                        && executor.isTruthy(executor.evalExpr(fn.args().get(2), ctx));
+                String column = columnNameAt(rel[0], rel[1], attnum);
+                if (column == null) return Boolean.FALSE;
+                return ViewUpdatability.columnIsUpdatable(executor.database, rel[0], rel[1],
+                        column, includeTriggers) ? Boolean.TRUE : Boolean.FALSE;
+            }
             case "pg_get_functiondef": {
                 if (!fn.args().isEmpty()) {
-                    PgFunction func = resolveFunction(fn.args().get(0), ctx);
+                    Object arg = executor.evalExpr(fn.args().get(0), ctx);
+                    Object[] row = builtinProcRow(arg);
+                    if (row != null) return buildProcFunctionDef(row);
+                    PgFunction func = resolveFunctionValue(arg);
                     if (func != null) {
                         return buildFunctionDef(func);
                     }
+                    row = procRowOf(arg);
+                    if (row != null) return buildProcFunctionDef(row);
                 }
-                return "";
+                // An OID with no pg_proc row behind it is an object PostgreSQL has nothing to
+                // deparse, and it answers NULL rather than an empty definition.
+                return null;
             }
             case "pg_get_function_arguments": {
                 if (!fn.args().isEmpty()) {
-                    PgFunction func = resolveFunction(fn.args().get(0), ctx);
+                    Object arg = executor.evalExpr(fn.args().get(0), ctx);
+                    Object[] row = builtinProcRow(arg);
+                    if (row != null) return renderProcArguments(row, true);
+                    PgFunction func = resolveFunctionValue(arg);
                     if (func != null) {
                         return buildFunctionArguments(func);
                     }
-                    Object[] row = procRow(fn.args().get(0), ctx);
+                    row = procRowOf(arg);
                     if (row != null) return renderProcArguments(row, true);
                 }
-                return "";
+                return null;
             }
             case "pg_get_function_identity_arguments": {
                 if (!fn.args().isEmpty()) {
-                    PgFunction func = resolveFunction(fn.args().get(0), ctx);
+                    Object arg = executor.evalExpr(fn.args().get(0), ctx);
+                    Object[] row = builtinProcRow(arg);
+                    if (row != null) return renderProcArguments(row, false);
+                    PgFunction func = resolveFunctionValue(arg);
                     if (func != null) {
                         return buildFunctionIdentityArguments(func);
                     }
-                    Object[] row = procRow(fn.args().get(0), ctx);
+                    row = procRowOf(arg);
                     if (row != null) return renderProcArguments(row, false);
                 }
-                return "";
+                return null;
             }
             case "pg_get_function_result": {
                 if (!fn.args().isEmpty()) {
-                    PgFunction func = resolveFunction(fn.args().get(0), ctx);
+                    Object resultArg = executor.evalExpr(fn.args().get(0), ctx);
+                    Object[] builtinRow = builtinProcRow(resultArg);
+                    if (builtinRow != null) return renderProcResult(builtinRow);
+                    PgFunction func = resolveFunctionValue(resultArg);
                     if (func != null) {
                         String rt = func.getReturnType();
                         if (rt == null || rt.isEmpty()) {
@@ -251,10 +302,10 @@ class CatalogMetadataFunctions {
                         }
                         return normalizePgTypeName(rt);
                     }
-                    Object[] row = procRow(fn.args().get(0), ctx);
+                    Object[] row = procRowOf(resultArg);
                     if (row != null) return renderProcResult(row);
                 }
-                return "";
+                return null;
             }
             case "pg_get_serial_sequence":
                 return evalPgGetSerialSequence(fn, ctx);
@@ -417,28 +468,40 @@ class CatalogMetadataFunctions {
                 return evalToRegclass(fn, ctx);
             case "to_regtype":
                 return evalToRegtype(fn, ctx);
-            case "to_regprocedure": {
+            case "pg_switch_wal": {
+                // Switches to a new write-ahead log file and answers with the position it wrote
+                // up to. memgres keeps no log, so there is nothing to switch and the position is
+                // the same one pg_current_wal_lsn gives -- but it is a pg_lsn, not the text it
+                // is carried as, which is what a caller comparing two positions depends on.
+                if (!fn.args().isEmpty()) return NOT_HANDLED;
+                return ZERO_LSN;
+            }
+            case "pg_typeof": {
+                // A write-ahead log position is carried as its own text, so the value says
+                // nothing about the type that produced it and only the declaration can.
+                Expression typeofArg = fn.args().isEmpty() ? null : fn.args().get(0);
+                if (typeofArg instanceof FunctionCallExpr) {
+                    String called = FunctionEvaluator.stripSchemaPrefix(
+                            ((FunctionCallExpr) typeofArg).name().toLowerCase(Locale.ROOT));
+                    if (LSN_FUNCTIONS.contains(called)) return "pg_lsn";
+                    // A function reference is held as its name and its OID together, which is
+                    // the same value for both of these; only the call says which type it is.
+                    if ("to_regproc".equals(called)) return "regproc";
+                    if ("to_regprocedure".equals(called)) return "regprocedure";
+                }
+                return NOT_HANDLED;
+            }
+            case "to_regprocedure":
+            case "to_regproc": {
+                // Neither raises: a name nothing answers to, a name several answer to and a name
+                // in a schema that holds no such function are all no function at all.
                 if (fn.args().isEmpty()) return null;
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
-                String procSig = arg.toString().trim();
-                String procName = procSig;
-                int parenIdx = procSig.indexOf('(');
-                if (parenIdx >= 0) procName = procSig.substring(0, parenIdx).trim();
-                if (resolveFunctionByName(procName) != null) return procSig;
-                return null;
-            }
-            case "to_regproc": {
-                if (fn.args().isEmpty()) return null;
-                Object argRp = executor.evalExpr(fn.args().get(0), ctx);
-                if (argRp == null) return null;
-                String rpName = argRp.toString().trim();
-                String rpFuncName = rpName.contains(".")
-                        ? rpName.substring(rpName.indexOf('.') + 1).toLowerCase()
-                        : rpName.toLowerCase();
-                if (resolveFunctionByName(rpName) != null) return rpFuncName;
-                if (isBuiltinFunction(rpFuncName)) return rpFuncName;
-                return null;
+                ProcLookup lookup = lookupProc(executor, arg.toString(),
+                        "to_regprocedure".equals(name));
+                if (lookup == null || lookup.ambiguous) return null;
+                return new RegprocValue(lookup.oid, lookup.display);
             }
             case "pg_partition_root": {
                 // pg_partition_root(regclass) → returns root partition table
@@ -471,7 +534,7 @@ class CatalogMetadataFunctions {
     // ---- Complex case methods ----
 
     private Object evalPgGetIndexdef(FunctionCallExpr fn, RowContext ctx) {
-        if (fn.args().isEmpty()) return "";
+        if (fn.args().isEmpty()) return null;
         Object arg = executor.evalExpr(fn.args().get(0), ctx);
         int colNo = 0;
         if (fn.args().size() >= 2) {
@@ -479,7 +542,7 @@ class CatalogMetadataFunctions {
             colNo = colNoArg != null ? ((Number) colNoArg).intValue() : 0;
             if (fn.args().size() >= 3) executor.evalExpr(fn.args().get(2), ctx);
         }
-        if (arg == null) return "";
+        if (arg == null) return null;
         String indexName = null;
         if (arg instanceof RegclassValue) {
             RegclassValue rc = (RegclassValue) arg;
@@ -495,7 +558,7 @@ class CatalogMetadataFunctions {
         } else {
             indexName = arg.toString();
         }
-        if (indexName == null) return "";
+        if (indexName == null) return null;
         if (indexName.contains(".")) {
             indexName = indexName.substring(indexName.lastIndexOf('.') + 1);
         }
@@ -519,7 +582,9 @@ class CatalogMetadataFunctions {
         if (colNo > 0 && cols != null) {
             return colNo <= cols.size() ? cols.get(colNo - 1) : "";
         }
-        if (cols == null) return "";
+        // A relation that is not an index has no index definition, and PostgreSQL answers NULL
+        // rather than the empty string a client would read as an index with no columns.
+        if (cols == null) return null;
         // H16: constraint-backed indexes (PK/UNIQUE) are always unique
         boolean unique = constraintTableName != null || executor.database.isUniqueIndex(indexName);
         String tableName = constraintTableName != null
@@ -557,7 +622,7 @@ class CatalogMetadataFunctions {
     private Object evalPgGetTriggerdef(FunctionCallExpr fn, RowContext ctx) {
         Object trigOidVal = fn.args().isEmpty() ? null : executor.evalExpr(fn.args().get(0), ctx);
         if (fn.args().size() > 1) executor.evalExpr(fn.args().get(1), ctx);
-        if (trigOidVal == null) return "";
+        if (trigOidVal == null) return null;
         int trigOid = executor.toInt(trigOidVal);
         for (Map.Entry<String, List<PgTrigger>> trigEntry : executor.database.getAllTriggers().entrySet()) {
             Map<String, java.util.List<PgTrigger>> grouped = new java.util.LinkedHashMap<>();
@@ -578,7 +643,7 @@ class CatalogMetadataFunctions {
                 }
             }
         }
-        return "";
+        return null;
     }
 
     /** The events a trigger may fire on, in the order PostgreSQL prints them. */
@@ -619,8 +684,63 @@ class CatalogMetadataFunctions {
         return sb.toString();
     }
 
+    /**
+     * The schema and name a regclass argument stands for, or null when it stands for nothing.
+     *
+     * <p>PostgreSQL's updatability functions take a regclass and answer 0 / false for an oid that
+     * reaches no relation rather than raising, so a caller sweeping pg_class while another
+     * session drops a relation gets an answer instead of a failed statement.</p>
+     */
+    private String[] relationOfArg(Expression arg, RowContext ctx) {
+        Object value = executor.evalExpr(arg, ctx);
+        if (value == null) return null;
+        String name = null;
+        if (value instanceof RegclassValue) {
+            name = ((RegclassValue) value).name();
+        } else if (value instanceof Number) {
+            int targetOid = ((Number) value).intValue();
+            for (Map.Entry<String, Integer> entry : executor.systemCatalog.getOidMap().entrySet()) {
+                if (entry.getValue() == targetOid && entry.getKey().startsWith("rel:")) {
+                    name = entry.getKey().substring("rel:".length());
+                    break;
+                }
+            }
+            if (name == null) return null;
+        } else {
+            name = value.toString();
+        }
+        if (name == null || name.isEmpty()) return null;
+        int dot = name.lastIndexOf('.');
+        if (dot >= 0) {
+            return new String[]{name.substring(0, dot), name.substring(dot + 1)};
+        }
+        return new String[]{executor.defaultSchema(), name};
+    }
+
+    /** The name of the column at this attnum, or null when the relation has no such column. */
+    private String columnNameAt(String schemaName, String relationName, int attnum) {
+        if (attnum < 1) return null;
+        Database.ViewDef vd = executor.database.getView(schemaName, relationName);
+        List<Column> cols = null;
+        if (vd != null) {
+            cols = vd.cachedColumns();
+        } else {
+            Schema schema = executor.database.getSchema(schemaName);
+            Table t = schema != null ? schema.getTable(relationName) : null;
+            if (t == null) {
+                for (Schema s : executor.database.getSchemas().values()) {
+                    t = s.getTable(relationName);
+                    if (t != null) break;
+                }
+            }
+            if (t != null) cols = t.getColumns();
+        }
+        if (cols == null || attnum > cols.size()) return null;
+        return cols.get(attnum - 1).getName();
+    }
+
     private Object evalPgGetViewdef(FunctionCallExpr fn, RowContext ctx) {
-        if (fn.args().isEmpty()) return "";
+        if (fn.args().isEmpty()) return null;
         Object arg = executor.evalExpr(fn.args().get(0), ctx);
         String viewName = null;
         if (arg instanceof RegclassValue) {
@@ -673,7 +793,9 @@ class CatalogMetadataFunctions {
                 return SqlUnparser.prettyViewDef(sql, wrapColumn) + ";";
             }
         }
-        return "";
+        // An OID that names no view, or names a relation that is not one, has no definition:
+        // PostgreSQL answers NULL, not an empty query text.
+        return null;
     }
 
     private Object evalPgGetSerialSequence(FunctionCallExpr fn, RowContext ctx) {
@@ -1365,26 +1487,337 @@ class CatalogMetadataFunctions {
         return canonical;
     }
 
-    // ---- Shared helper for to_regproc / to_regprocedure ----
+    // ========================================================================
+    // Names written for the reg* types
+    //
+    // to_regproc, to_regprocedure and the two casts all read the same name and
+    // differ only in what they do with the outcome: the casts raise where the
+    // functions answer with nothing. So the reading is done once, here.
+    // ========================================================================
 
+    /** The function a bare or qualified name names, for the callers that want the definition. */
     private PgFunction resolveFunctionByName(String name) {
-        String schema = null;
-        String funcName = name;
-        if (name.contains(".")) {
-            int dotIdx = name.indexOf('.');
-            schema = name.substring(0, dotIdx).toLowerCase();
-            funcName = name.substring(dotIdx + 1).toLowerCase();
-        } else {
-            funcName = name.toLowerCase();
+        int dot = name.indexOf('.');
+        if (dot < 0) return executor.database.getFunction(name.toLowerCase(Locale.ROOT));
+        String schema = name.substring(0, dot).toLowerCase(Locale.ROOT);
+        String bare = name.substring(dot + 1).toLowerCase(Locale.ROOT);
+        PgFunction found = executor.database.getFunction(schema, bare);
+        return found != null ? found : executor.database.getFunction(bare);
+    }
+
+    /** A function name as a reg* type reads it: a schema, a name, and the signature if written. */
+    private static final class ProcSpec {
+        final String schema;
+        final String name;
+        /** Null where no parenthesis was written, so the name stands for every signature. */
+        final List<String> argTypes;
+
+        ProcSpec(String schema, String name, List<String> argTypes) {
+            this.schema = schema;
+            this.name = name;
+            this.argTypes = argTypes;
         }
-        PgFunction found = null;
-        if (schema != null) {
-            found = executor.database.getFunction(schema, funcName);
-            if (found == null) found = executor.database.getFunction(funcName);
-        } else {
-            found = executor.database.getFunction(funcName);
+    }
+
+    /** What a reg* name resolved to, or that several functions answer to it. */
+    static final class ProcLookup {
+        final int oid;
+        final String display;
+        final boolean ambiguous;
+
+        private ProcLookup(int oid, String display, boolean ambiguous) {
+            this.oid = oid;
+            this.display = display;
+            this.ambiguous = ambiguous;
+        }
+
+        static ProcLookup found(int oid, String display) { return new ProcLookup(oid, display, false); }
+
+        static ProcLookup ambiguous() { return new ProcLookup(0, null, true); }
+    }
+
+    /** One function the catalog holds, whatever it was declared by. */
+    private static final class ProcCandidate {
+        final String schema;
+        final String name;
+        final List<String> argTypes;
+        final int oid;
+
+        ProcCandidate(String schema, String name, List<String> argTypes, int oid) {
+            this.schema = schema;
+            this.name = name;
+            this.argTypes = argTypes;
+            this.oid = oid;
+        }
+    }
+
+    /**
+     * The function a reg* name names, null when nothing does, or an ambiguous lookup when a bare
+     * name is answered by more than one function in the first schema of the path that has it.
+     *
+     * @param requireSignature true for regprocedure, which is a signature and not a bare name
+     */
+    static ProcLookup lookupProc(AstExecutor executor, String written, boolean requireSignature) {
+        ProcSpec spec = parseProcSpec(written);
+        if (spec == null) return null;
+        if (requireSignature && spec.argTypes == null) return null;
+        if (!requireSignature && spec.argTypes != null) return null;
+
+        for (String schema : candidateSchemas(executor, spec)) {
+            List<ProcCandidate> matches = new ArrayList<ProcCandidate>();
+            for (ProcCandidate candidate : proceduresIn(executor, schema, spec.name)) {
+                if (spec.argTypes == null || spec.argTypes.equals(candidate.argTypes)) {
+                    matches.add(candidate);
+                }
+            }
+            if (matches.isEmpty()) continue;
+            if (matches.size() > 1 && spec.argTypes == null) return ProcLookup.ambiguous();
+            ProcCandidate match = matches.get(0);
+            StringBuilder display = new StringBuilder();
+            if (!schemaVisibleOnPath(executor, match.schema)) display.append(match.schema).append('.');
+            display.append(match.name);
+            if (requireSignature) {
+                display.append('(');
+                for (int i = 0; i < match.argTypes.size(); i++) {
+                    if (i > 0) display.append(',');
+                    display.append(match.argTypes.get(i));
+                }
+                display.append(')');
+            }
+            return ProcLookup.found(match.oid, display.toString());
+        }
+        return spec.argTypes == null ? lookupInPgProc(executor, spec) : null;
+    }
+
+    /**
+     * The catalog's own row for a name nothing here carries a signature for -- the type input and
+     * output functions, and an aggregate a query defined -- found by the name pg_proc holds.
+     *
+     * <p>Only a name the search path did not answer reaches this, and only where the database
+     * holds no function of that name at all: a function it does hold has a schema of its own, so
+     * one in a schema off the path has to stay unfound rather than be picked up here. A schema
+     * written in front of the name still has to be the one the row is in.
+     */
+    private static ProcLookup lookupInPgProc(AstExecutor executor, ProcSpec spec) {
+        if (!executor.database.getFunctionOverloads(spec.name).isEmpty()) return null;
+        int wantedNamespace = 0;
+        if (spec.schema != null) {
+            wantedNamespace = namespaceOid(executor, spec.schema);
+            if (wantedNamespace == 0) return null;
+        }
+        Table procs = executor.systemCatalog.resolve("pg_catalog", "pg_proc", executor.session);
+        if (procs == null) return null;
+        int oidIdx = procs.getColumnIndex("oid");
+        int nameIdx = procs.getColumnIndex("proname");
+        int nsIdx = procs.getColumnIndex("pronamespace");
+        if (oidIdx < 0 || nameIdx < 0) return null;
+        int oid = 0;
+        int seen = 0;
+        for (Object[] row : procs.getRows()) {
+            Object rowName = nameIdx < row.length ? row[nameIdx] : null;
+            if (rowName == null || !spec.name.equalsIgnoreCase(rowName.toString())) continue;
+            if (wantedNamespace != 0) {
+                Object ns = nsIdx >= 0 && nsIdx < row.length ? row[nsIdx] : null;
+                if (!(ns instanceof Number) || ((Number) ns).intValue() != wantedNamespace) continue;
+            }
+            seen++;
+            if (seen == 1 && oidIdx < row.length && row[oidIdx] instanceof Number) {
+                oid = ((Number) row[oidIdx]).intValue();
+            }
+        }
+        if (seen == 0) return null;
+        String display = spec.schema != null && !schemaVisibleOnPath(executor, spec.schema)
+                ? spec.schema + "." + spec.name : spec.name;
+        return seen > 1 ? ProcLookup.ambiguous() : ProcLookup.found(oid, display);
+    }
+
+    /** The OID of a schema by name, or 0 when the database has no schema of that name. */
+    private static int namespaceOid(AstExecutor executor, String schema) {
+        Table namespaces = executor.systemCatalog.resolve("pg_catalog", "pg_namespace", executor.session);
+        if (namespaces == null) return 0;
+        int oidIdx = namespaces.getColumnIndex("oid");
+        int nameIdx = namespaces.getColumnIndex("nspname");
+        if (oidIdx < 0 || nameIdx < 0) return 0;
+        for (Object[] row : namespaces.getRows()) {
+            Object rowName = nameIdx < row.length ? row[nameIdx] : null;
+            if (rowName == null || !schema.equalsIgnoreCase(rowName.toString())) continue;
+            Object oid = oidIdx < row.length ? row[oidIdx] : null;
+            if (oid instanceof Number) return ((Number) oid).intValue();
+        }
+        return 0;
+    }
+
+    /** Splits a written name into its schema, its name and the argument types it carries. */
+    private static ProcSpec parseProcSpec(String written) {
+        if (written == null) return null;
+        String text = written.trim();
+        if (text.isEmpty()) return null;
+        List<String> args = null;
+        int open = text.indexOf('(');
+        if (open >= 0) {
+            if (!text.endsWith(")")) return null;
+            String inside = text.substring(open + 1, text.length() - 1).trim();
+            args = new ArrayList<String>();
+            if (!inside.isEmpty()) {
+                for (String piece : inside.split(",")) {
+                    String typeName = procTypeDisplay(piece);
+                    if (typeName.isEmpty()) return null;
+                    args.add(typeName);
+                }
+            }
+            text = text.substring(0, open).trim();
+        }
+        int dot = lastDotOutsideQuotes(text);
+        String schema = dot < 0 ? null : unquoteIdent(text.substring(0, dot));
+        String name = unquoteIdent(dot < 0 ? text : text.substring(dot + 1));
+        if (name.isEmpty()) return null;
+        return new ProcSpec(schema, name, args);
+    }
+
+    private static int lastDotOutsideQuotes(String text) {
+        boolean quoted = false;
+        int found = -1;
+        for (int i = 0; i < text.length(); i++) {
+            char ch = text.charAt(i);
+            if (ch == '"') quoted = !quoted;
+            else if (ch == '.' && !quoted) found = i;
         }
         return found;
+    }
+
+    private static String unquoteIdent(String written) {
+        String text = written.trim();
+        if (text.length() >= 2 && text.startsWith("\"") && text.endsWith("\"")) {
+            return text.substring(1, text.length() - 1).replace("\"\"", "\"");
+        }
+        return text.toLowerCase(Locale.ROOT);
+    }
+
+    /** The name PostgreSQL prints for a type, whichever of its spellings was written. */
+    private static String procTypeDisplay(String written) {
+        String text = written.trim();
+        if (text.isEmpty()) return "";
+        boolean array = text.endsWith("[]");
+        String base = array ? text.substring(0, text.length() - 2).trim() : text;
+        DataType type = DataType.fromPgName(base);
+        String name = type != null ? CatalogHelper.pgTypeName(type) : base.toLowerCase(Locale.ROOT);
+        return array ? name + "[]" : name;
+    }
+
+    private static String procTypeDisplayForOid(String oid) {
+        DataType type = DataType.fromOid(Integer.parseInt(oid.trim()));
+        return type == null ? "" : CatalogHelper.pgTypeName(type);
+    }
+
+    /** The schemas a name is looked for in: the one written, or the whole search path. */
+    private static List<String> candidateSchemas(AstExecutor executor, ProcSpec spec) {
+        if (spec.schema != null) return Cols.listOf(spec.schema);
+        if (executor.session != null) return executor.session.getEffectiveSearchPath(true);
+        return Cols.listOf("pg_catalog", "public");
+    }
+
+    private static boolean schemaVisibleOnPath(AstExecutor executor, String schema) {
+        if (executor.session == null) return "pg_catalog".equals(schema) || "public".equals(schema);
+        for (String onPath : executor.session.getEffectiveSearchPath(true)) {
+            if (onPath.equalsIgnoreCase(schema)) return true;
+        }
+        return false;
+    }
+
+    /** Every function of this name in one schema: the database's own, and the built-in ones. */
+    private static List<ProcCandidate> proceduresIn(AstExecutor executor, String schema, String name) {
+        List<ProcCandidate> found = new ArrayList<ProcCandidate>();
+        List<PgFunction> overloads = executor.database.getFunctionOverloads(name);
+        for (int i = 0; i < overloads.size(); i++) {
+            PgFunction fn = overloads.get(i);
+            String fnSchema = fn.getSchemaName() == null ? "public" : fn.getSchemaName();
+            if (!fnSchema.equalsIgnoreCase(schema)) continue;
+            List<String> argTypes = new ArrayList<String>();
+            if (fn.getParams() != null) {
+                for (PgFunction.Param p : fn.getParams()) {
+                    String mode = p.mode() == null ? "IN" : p.mode().toUpperCase(Locale.ROOT);
+                    if (mode.equals("OUT") || mode.equals("TABLE")) continue;
+                    argTypes.add(procTypeDisplay(p.typeName()));
+                }
+            }
+            String key = i == 0 ? "proc:" + fn.getName() : "proc:" + fn.getName() + "#" + i;
+            found.add(new ProcCandidate(fnSchema, fn.getName(), argTypes,
+                    executor.systemCatalog.getOid(key)));
+        }
+        if (!"pg_catalog".equalsIgnoreCase(schema)) return found;
+
+        // A few built-ins are registered as functions of their own as well, so that ALTER
+        // FUNCTION reaches them; the signature table describes those same functions and must not
+        // count them a second time -- one function twice over is not two functions.
+        for (String[] signature : BuiltinFunctionSignatures.SIGNATURES) {
+            if (!signature[0].equalsIgnoreCase(name)) continue;
+            addUnlessPresent(found, builtinCandidate(executor, signature[0], signature[2]));
+        }
+        for (String[] aggregate : BuiltinAggregateSignatures.AGGREGATES) {
+            if (!aggregate[0].equalsIgnoreCase(name)) continue;
+            addUnlessPresent(found, builtinCandidate(executor, aggregate[0], aggregate[2]));
+        }
+        return found;
+    }
+
+    private static void addUnlessPresent(List<ProcCandidate> found, ProcCandidate candidate) {
+        for (ProcCandidate seen : found) {
+            if (seen.name.equalsIgnoreCase(candidate.name) && seen.argTypes.equals(candidate.argTypes)) {
+                return;
+            }
+        }
+        found.add(candidate);
+    }
+
+    private static ProcCandidate builtinCandidate(AstExecutor executor, String name, String argOids) {
+        List<String> argTypes = new ArrayList<String>();
+        String trimmed = argOids == null ? "" : argOids.trim();
+        if (!trimmed.isEmpty()) {
+            for (String oid : trimmed.split(" ")) argTypes.add(procTypeDisplayForOid(oid));
+        }
+        String bare = name.toLowerCase(Locale.ROOT);
+        return new ProcCandidate("pg_catalog", bare, argTypes,
+                builtinProcOid(executor, bare, trimmed));
+    }
+
+    /**
+     * The OID pg_proc actually carries for one overload of a built-in.
+     *
+     * <p>An OID minted from the name alone is the same number for every overload of that name, so
+     * a signature that names one of them resolved to whichever overload was registered first:
+     * {@code lpad(text,integer,text)} came back as the two-argument lpad and
+     * {@code generate_series(integer,integer)} as the numeric one, because pg_proc mints
+     * {@code proc:lpad} and {@code proc:generate_series} for the first row of each name and a
+     * distinct key for every row after it. The catalog is where the overloads are told apart, so
+     * the row is found there — by the name and the argument types together, which is exactly what
+     * a regprocedure signature names — and the minted OID is left as the answer only for a name
+     * pg_proc has no row of that shape for.
+     */
+    private static int builtinProcOid(AstExecutor executor, String name, String argOids) {
+        Table procs = executor.systemCatalog.resolve("pg_catalog", "pg_proc", executor.session);
+        if (procs != null) {
+            int oidIdx = procs.getColumnIndex("oid");
+            int nameIdx = procs.getColumnIndex("proname");
+            int argsIdx = procs.getColumnIndex("proargtypes");
+            int nsIdx = procs.getColumnIndex("pronamespace");
+            int pgCatalog = namespaceOid(executor, "pg_catalog");
+            if (oidIdx >= 0 && nameIdx >= 0 && argsIdx >= 0) {
+                for (Object[] row : procs.getRows()) {
+                    Object rowName = nameIdx < row.length ? row[nameIdx] : null;
+                    if (rowName == null || !name.equalsIgnoreCase(rowName.toString())) continue;
+                    if (pgCatalog != 0 && nsIdx >= 0 && nsIdx < row.length) {
+                        Object ns = row[nsIdx];
+                        if (!(ns instanceof Number) || ((Number) ns).intValue() != pgCatalog) continue;
+                    }
+                    Object args = argsIdx < row.length ? row[argsIdx] : null;
+                    String have = args == null ? "" : args.toString().trim();
+                    if (!have.equals(argOids)) continue;
+                    Object oid = oidIdx < row.length ? row[oidIdx] : null;
+                    if (oid instanceof Number) return ((Number) oid).intValue();
+                }
+            }
+        }
+        return executor.systemCatalog.getOid("proc:" + name);
     }
 
     // ---- Helper methods ----
@@ -1526,6 +1959,33 @@ class CatalogMetadataFunctions {
         m.put(30, "oidvector");
         m.put(18, "\"char\"");
         m.put(1002, "\"char\"[]");
+        // The pseudo-types a routine's signature is declared over. A catalog function's argument
+        // or result is one of these far more often than it is a table column's type — an input
+        // function reads a cstring, a receive function is handed internal, a trigger function
+        // answers trigger — so a renderer that does not know them prints "unknown" over most of
+        // pg_proc. They carry no modifier, so each is simply its own name.
+        m.put(2275, "cstring");
+        m.put(2276, "\"any\"");        // reserved word: PG's format_type quotes it
+        m.put(2279, "trigger");
+        m.put(2281, "internal");
+        m.put(3838, "event_trigger");
+        m.put(2280, "language_handler");
+        m.put(3115, "fdw_handler");
+        m.put(325, "index_am_handler");
+        m.put(269, "table_am_handler");
+        m.put(3310, "tsm_handler");
+        m.put(32, "pg_ddl_command");
+        // The bootstrap types the catalogs are built out of, and their arrays. unknown is the
+        // type an unadorned literal still has; refcursor is what a PL/pgSQL cursor variable is;
+        // gtsvector is the GiST index representation tsvector's opclass stores.
+        m.put(705, "unknown");
+        m.put(1790, "refcursor");
+        m.put(2201, "refcursor[]");
+        m.put(3642, "gtsvector");
+        m.put(3644, "gtsvector[]");
+        // A typmod input function is handed the modifier's words as cstring[], so every
+        // xxxtypmodin row in pg_proc names this type and nothing else does.
+        m.put(1263, "cstring[]");
         EXTRA_TYPE_NAMES = java.util.Collections.unmodifiableMap(m);
     }
 
@@ -1559,6 +2019,8 @@ class CatalogMetadataFunctions {
     }
 
     private String formatTypeByOid(int oid, int typmod) {
+        // No type at all: PG prints a dash rather than naming whatever sits at OID zero.
+        if (oid == 0) return "-";
         // PG quotes "char" so it is not read as the SQL type char; format_type is where a client
         // learns a catalog flag column is the single-byte type and not a bpchar.
         if (oid == 18) return "\"char\"";
@@ -1682,7 +2144,69 @@ class CatalogMetadataFunctions {
         }
         String extra = EXTRA_TYPE_NAMES.get(oid);
         if (extra != null) return extra;
-        return "unknown";
+        String bootstrap = PgInternalTypes.nameForOid(oid);
+        if (bootstrap != null) return bootstrap;
+        String cataloged = catalogTypeName(oid, new java.util.HashSet<Integer>());
+        if (cataloged != null) return cataloged;
+        // An OID with no type behind it. PG prints "???" — deliberately not a name, so a caller
+        // cannot mistake it for one. "unknown" was a real type's name and read as an answer.
+        return "???";
+    }
+
+    /**
+     * The name pg_type itself records for an OID, for the types no {@link DataType} models.
+     *
+     * <p>Every type memgres registers has a pg_type row, so the row is the one description that
+     * cannot fall behind: a bootstrap type added to the catalog, a relation's composite row type
+     * and the array beside it all name themselves there. Reading it is what keeps format_type
+     * answering for types this class was never told about, instead of calling them "unknown".
+     *
+     * <p>An array is named after its element with the brackets added, the way PostgreSQL's own
+     * format_type does it — and by the same test it uses: a type is an array when it points at an
+     * element type and is not stored plain, which is why oidvector and int2vector, which do point
+     * at an element, still print under their own names.
+     *
+     * @param seen the array types already followed, so a typelem cycle cannot recurse forever
+     */
+    private String catalogTypeName(int oid, Set<Integer> seen) {
+        if (oid == 0) return null;
+        Table types = executor.systemCatalog.resolve("pg_catalog", "pg_type", executor.session);
+        if (types == null) return null;
+        int oidAt = types.getColumnIndex("oid");
+        int nameAt = types.getColumnIndex("typname");
+        if (oidAt < 0 || nameAt < 0) return null;
+        int elemAt = types.getColumnIndex("typelem");
+        int storageAt = types.getColumnIndex("typstorage");
+        for (Object[] row : types.getRows()) {
+            Object o = oidAt < row.length ? row[oidAt] : null;
+            if (!(o instanceof Number) || ((Number) o).intValue() != oid) continue;
+            Object nm = nameAt < row.length ? row[nameAt] : null;
+            if (nm == null) return null;
+            Object elem = elemAt >= 0 && elemAt < row.length ? row[elemAt] : null;
+            Object storage = storageAt >= 0 && storageAt < row.length ? row[storageAt] : null;
+            int elemOid = elem instanceof Number ? ((Number) elem).intValue() : 0;
+            boolean plain = storage != null && "p".equals(storage.toString());
+            if (elemOid != 0 && !plain && seen.add(oid)) {
+                String element = EXTRA_TYPE_NAMES.get(elemOid);
+                if (element == null) element = PgInternalTypes.nameForOid(elemOid);
+                if (element == null) {
+                    DataType dt = dataTypeOf(elemOid);
+                    if (dt != null) element = CatalogHelper.formatType(dt, null, -1);
+                }
+                if (element == null) element = catalogTypeName(elemOid, seen);
+                if (element != null) return element + "[]";
+            }
+            return nm.toString();
+        }
+        return null;
+    }
+
+    /** The {@link DataType} an OID names, or null when no enum constant carries it. */
+    private static DataType dataTypeOf(int oid) {
+        for (DataType dt : DataType.values()) {
+            if (dt.getOid() == oid && !dt.getPgName().startsWith("_")) return dt;
+        }
+        return null;
     }
 
     private static String buildFunctionDef(PgFunction func) {
@@ -1751,7 +2275,10 @@ class CatalogMetadataFunctions {
     }
 
     private PgFunction resolveFunction(Expression argExpr, RowContext ctx) {
-        Object arg = executor.evalExpr(argExpr, ctx);
+        return resolveFunctionValue(executor.evalExpr(argExpr, ctx));
+    }
+
+    private PgFunction resolveFunctionValue(Object arg) {
         if (arg == null) return null;
         if (arg instanceof Number) {
             Number oid = (Number) arg;
@@ -1803,10 +2330,11 @@ class CatalogMetadataFunctions {
      * rendered; pg_proc is built once per statement and cached, so the lookup does not rebuild it
      * per row.
      */
-    private Object[] procRow(Expression argExpr, RowContext ctx) {
-        Object arg = executor.evalExpr(argExpr, ctx);
-        if (!(arg instanceof Number)) return null;
-        int wanted = ((Number) arg).intValue();
+    private Object[] procRowOf(Object arg) {
+        int wanted;
+        if (arg instanceof Number) wanted = ((Number) arg).intValue();
+        else if (arg instanceof RegprocValue) wanted = ((RegprocValue) arg).oid();
+        else return null;
         Table procs = executor.systemCatalog.resolve("pg_catalog", "pg_proc", executor.session);
         if (procs == null) return null;
         int oidIdx = procs.getColumnIndex("oid");
@@ -1816,6 +2344,20 @@ class CatalogMetadataFunctions {
             if (o instanceof Number && ((Number) o).intValue() == wanted) return row;
         }
         return null;
+    }
+
+    /**
+     * The pg_proc row of a built-in, which is to say one whose namespace is pg_catalog.
+     *
+     * <p>A handful of built-ins are also carried as {@link PgFunction} stubs so that ALTER FUNCTION
+     * can name them, and the stub knows less than the catalog row does: it invents an argument name
+     * PostgreSQL does not record and its body is a comment rather than the C symbol. So for
+     * anything in pg_catalog the row wins, and the stub is left to answer for what a user created.
+     */
+    private Object[] builtinProcRow(Object arg) {
+        Object[] row = procRowOf(arg);
+        if (row == null) return null;
+        return "pg_catalog".equals(procNamespaceName(procCol(row, "pronamespace"))) ? row : null;
     }
 
     /** A pg_proc column by name, or null when the row is shorter than the catalog. */
@@ -1869,6 +2411,124 @@ class CatalogMetadataFunctions {
             }
         }
         return sb.toString();
+    }
+
+    /**
+     * The {@code CREATE OR REPLACE FUNCTION} text PostgreSQL deparses a pg_proc row into.
+     *
+     * <p>Every part of it is read off the row rather than guessed, because the row is what a client
+     * asking this question has already seen: the schema from pronamespace, the language from
+     * prolang, the body from prosrc, and the attribute line from prokind, provolatile, proparallel,
+     * proisstrict, prosecdef, proleakproof, procost and prorows in the order PostgreSQL prints
+     * them. The defaults PostgreSQL leaves off are left off here too — VOLATILE, PARALLEL UNSAFE,
+     * and a cost that is the language's own — so the text compares equal to PostgreSQL's for a
+     * builtin whose row matches.
+     *
+     * <p>An aggregate has no function definition at all: PostgreSQL refuses with 42809 rather than
+     * printing something a client could execute.
+     */
+    private String buildProcFunctionDef(Object[] row) {
+        Object kind = procCol(row, "prokind");
+        String prokind = kind == null ? "f" : kind.toString();
+        String name = String.valueOf(procCol(row, "proname"));
+        if ("a".equals(prokind)) {
+            throw new MemgresException("\"" + name + "\" is an aggregate function", "42809");
+        }
+        boolean procedure = "p".equals(prokind);
+        StringBuilder sb = new StringBuilder();
+        sb.append("CREATE OR REPLACE ").append(procedure ? "PROCEDURE " : "FUNCTION ");
+        String schema = procNamespaceName(procCol(row, "pronamespace"));
+        if (schema != null) sb.append(quoteProcIdent(schema)).append('.');
+        sb.append(quoteProcIdent(name)).append('(');
+        sb.append(renderProcArguments(row, true)).append(")\n");
+        if (!procedure) {
+            sb.append(" RETURNS ").append(renderProcResult(row)).append("\n");
+        }
+        String language = procLanguageName(procCol(row, "prolang"));
+        sb.append(" LANGUAGE ").append(language == null ? "internal" : language).append("\n");
+        StringBuilder attrs = new StringBuilder();
+        if ("w".equals(prokind)) attrs.append(" WINDOW");
+        Object volatility = procCol(row, "provolatile");
+        if (volatility != null && "i".equals(volatility.toString())) attrs.append(" IMMUTABLE");
+        else if (volatility != null && "s".equals(volatility.toString())) attrs.append(" STABLE");
+        Object parallel = procCol(row, "proparallel");
+        if (parallel != null && "s".equals(parallel.toString())) attrs.append(" PARALLEL SAFE");
+        else if (parallel != null && "r".equals(parallel.toString())) attrs.append(" PARALLEL RESTRICTED");
+        if (Boolean.TRUE.equals(procCol(row, "proisstrict"))) attrs.append(" STRICT");
+        if (Boolean.TRUE.equals(procCol(row, "prosecdef"))) attrs.append(" SECURITY DEFINER");
+        if (Boolean.TRUE.equals(procCol(row, "proleakproof"))) attrs.append(" LEAKPROOF");
+        // A cost that is the language's own default is not printed, and neither is a row estimate
+        // that is not a set-returning function's own.
+        Object cost = procCol(row, "procost");
+        if (cost instanceof Number) {
+            double defaultCost = "internal".equals(language) || "c".equals(language) ? 1 : 100;
+            double actual = ((Number) cost).doubleValue();
+            if (actual > 0 && actual != defaultCost) attrs.append(" COST ").append(trimNumber(actual));
+        }
+        Object rows = procCol(row, "prorows");
+        if (Boolean.TRUE.equals(procCol(row, "proretset")) && rows instanceof Number) {
+            double actual = ((Number) rows).doubleValue();
+            if (actual > 0 && actual != 1000) attrs.append(" ROWS ").append(trimNumber(actual));
+        }
+        if (attrs.length() > 0) sb.append(attrs).append("\n");
+        Object src = procCol(row, "prosrc");
+        sb.append("AS $function$").append(src == null ? "" : src).append("$function$\n");
+        return sb.toString();
+    }
+
+    /** An identifier written the way a CREATE statement would have to write it to name it again. */
+    private static String quoteProcIdent(String ident) {
+        if (ident == null || ident.isEmpty()) return "\"\"";
+        boolean plain = Character.isLowerCase(ident.charAt(0)) || ident.charAt(0) == '_';
+        for (int i = 0; plain && i < ident.length(); i++) {
+            char c = ident.charAt(i);
+            plain = Character.isLowerCase(c) || Character.isDigit(c) || c == '_';
+        }
+        return plain ? ident : "\"" + ident.replace("\"", "\"\"") + "\"";
+    }
+
+    /** A cost or row estimate written the way PostgreSQL's %g writes it: 1 rather than 1.0. */
+    private static String trimNumber(double value) {
+        if (value == Math.rint(value) && !Double.isInfinite(value)) {
+            return String.valueOf((long) value);
+        }
+        return String.valueOf(value);
+    }
+
+    /** The schema name behind a pronamespace OID, read from pg_namespace. */
+    private String procNamespaceName(Object oidValue) {
+        if (!(oidValue instanceof Number)) return null;
+        int wanted = ((Number) oidValue).intValue();
+        Table namespaces = executor.systemCatalog.resolve("pg_catalog", "pg_namespace", executor.session);
+        if (namespaces == null) return null;
+        int oidIdx = namespaces.getColumnIndex("oid");
+        int nameIdx = namespaces.getColumnIndex("nspname");
+        if (oidIdx < 0 || nameIdx < 0) return null;
+        for (Object[] row : namespaces.getRows()) {
+            Object o = row[oidIdx];
+            if (o instanceof Number && ((Number) o).intValue() == wanted) {
+                return row[nameIdx] == null ? null : row[nameIdx].toString();
+            }
+        }
+        return null;
+    }
+
+    /** The language name behind a prolang OID, read from pg_language. */
+    private String procLanguageName(Object oidValue) {
+        if (!(oidValue instanceof Number)) return null;
+        int wanted = ((Number) oidValue).intValue();
+        Table languages = executor.systemCatalog.resolve("pg_catalog", "pg_language", executor.session);
+        if (languages == null) return null;
+        int oidIdx = languages.getColumnIndex("oid");
+        int nameIdx = languages.getColumnIndex("lanname");
+        if (oidIdx < 0 || nameIdx < 0) return null;
+        for (Object[] row : languages.getRows()) {
+            Object o = row[oidIdx];
+            if (o instanceof Number && ((Number) o).intValue() == wanted) {
+                return row[nameIdx] == null ? null : row[nameIdx].toString();
+            }
+        }
+        return null;
     }
 
     /** The return type PostgreSQL prints for a pg_proc row, SETOF included. */

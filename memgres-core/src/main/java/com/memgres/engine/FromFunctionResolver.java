@@ -750,9 +750,13 @@ class FromFunctionResolver {
             row[2] = def != null ? def.unit : null;
             row[3] = def != null ? def.category : "Customized Options";
             row[4] = def != null ? def.shortDesc : null;
+            row[5] = def != null ? def.extraDesc : null;
             row[6] = def != null ? def.context : "user";
             row[7] = def != null ? def.vartype : "string";
-            row[8] = guc.hasSessionOverride(name) ? "session" : "default";
+            // The same three answers pg_settings gives, from the same facts: a transaction's own
+            // settings are imposed by the transaction rather than chosen by the session.
+            row[8] = guc.hasSessionOverride(name) ? "session"
+                    : (SessionExecutor.isTransactionScopedGuc(name) ? "override" : "default");
             row[9] = def != null ? def.minVal : null;
             row[10] = def != null ? def.maxVal : null;
             row[11] = def != null ? def.enumVals : null;

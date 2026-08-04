@@ -339,7 +339,10 @@ public final class CatalogHelper {
             case VARCHAR:
                 return typmod >= 4 ? "character varying(" + (typmod - 4) + ")" : "character varying";
             case CHAR:
-                return typmod >= 4 ? "character(" + (typmod - 4) + ")" : "bpchar";
+                // Unmodified bpchar is "character", the SQL name, not the catalog's typname:
+                // format_type prints the spelling a client could write back, and PG's identity
+                // form of length(bpchar) is length(character) for exactly that reason.
+                return typmod >= 4 ? "character(" + (typmod - 4) + ")" : "character";
             case NUMERIC:
                 if (typmod >= 4) {
                     int raw = typmod - 4;

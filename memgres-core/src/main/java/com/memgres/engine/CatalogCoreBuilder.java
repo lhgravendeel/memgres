@@ -321,7 +321,7 @@ class CatalogCoreBuilder {
             if (attrs.containsKey(name)) continue;
             attrs.put(name, new String[]{name, String.valueOf(it[2]),
                     Boolean.TRUE.equals(it[3]) ? "t" : "f", (String) it[4], (String) it[5],
-                    "f", ",", (String) it[6], (String) it[7], "0"});
+                    "f", ",", (String) it[6], (String) it[7], String.valueOf(it[12])});
         }
         for (Object[] a : PgInternalTypes.ARRAYS) {
             String name = (String) a[1];
@@ -374,31 +374,59 @@ class CatalogCoreBuilder {
     }
 
     /**
+     * The types PostgreSQL builds out of a fixed number of another type, and records that in
+     * typelem even though they are not array types.
+     *
+     * <p>{@code name} is 64 chars, a point is two float8s, a segment and a box are two points, a
+     * line is three float8s. PostgreSQL fills typelem for all five — its subscripting operator
+     * reads it, which is why {@code ('(1,2)'::point)[0]} answers 1 — and memgres reported 0, so
+     * anything asking the catalog what a point is made of was told nothing.
+     */
+    private static final Map<String, Integer> FIXED_ELEMENT_OF;
+
+    static {
+        Map<String, Integer> elems = new HashMap<>();
+        elems.put("name", 18);    // "char"
+        elems.put("point", 701);  // float8
+        elems.put("lseg", 600);   // point
+        elems.put("box", 600);    // point
+        elems.put("line", 701);   // float8
+        FIXED_ELEMENT_OF = Collections.unmodifiableMap(elems);
+    }
+
+    /**
      * Pseudo-types: trigger, event_trigger, void, record, the polymorphic family, and the two
-     * types only an internal function deals in. Columns: name, oid — how each is laid out is
-     * recorded once, in {@link #TYPE_ATTRIBUTES}, because a pseudo-type's width is not the one
-     * its name suggests: cstring is a pointer of length -2 and record is a varlena, so neither
-     * is passed by value.
+     * types only an internal function deals in. Columns: name, oid, typarray, and whether
+     * PostgreSQL gives it binary I/O — how each is laid out is recorded once, in
+     * {@link #TYPE_ATTRIBUTES}, because a pseudo-type's width is not the one its name suggests:
+     * cstring is a pointer of length -2 and record is a varlena, so neither is passed by value.
+     *
+     * <p>Two of them do have an array type. {@code record}'s is {@code _record} and
+     * {@code cstring}'s is {@code _cstring}, and both were reported as 0 — so a client following
+     * typarray to find out how an array of the type is described reached nothing, on a type
+     * memgres does carry the array row for. Five of them have binary I/O: record, anyarray,
+     * anycompatiblearray, void and cstring, and reporting '-' for those said no binary
+     * representation exists.
      */
     private static final String[][] PSEUDO_TYPES = {
-            {"trigger", "2279"},
-            {"event_trigger", "3838"},
-            {"void", "2278"},
-            {"record", "2249"},
-            {"any", "2276"},
-            {"anyelement", "2283"},
-            {"anyarray", "2277"},
-            {"anynonarray", "2776"},
-            {"anyenum", "3500"},
-            {"anyrange", "3831"},
-            {"anymultirange", "4537"},
-            {"anycompatible", "5077"},
-            {"anycompatiblearray", "5078"},
-            {"anycompatiblenonarray", "5079"},
-            {"anycompatiblerange", "5080"},
-            {"anycompatiblemultirange", "4538"},
-            {"internal", "2281"},
-            {"cstring", "2275"},
+            {"trigger", "2279", "0", "f"},
+            {"event_trigger", "3838", "0", "f"},
+            {"void", "2278", "0", "t"},
+            {"record", "2249", "2287", "t"},
+            {"any", "2276", "0", "f"},
+            {"anyelement", "2283", "0", "f"},
+            {"anyarray", "2277", "0", "t"},
+            {"anynonarray", "2776", "0", "f"},
+            {"anyenum", "3500", "0", "f"},
+            {"anyrange", "3831", "0", "f"},
+            {"anymultirange", "4537", "0", "f"},
+            {"anycompatible", "5077", "0", "f"},
+            {"anycompatiblearray", "5078", "0", "t"},
+            {"anycompatiblenonarray", "5079", "0", "f"},
+            {"anycompatiblerange", "5080", "0", "f"},
+            {"anycompatiblemultirange", "4538", "0", "f"},
+            {"internal", "2281", "0", "f"},
+            {"cstring", "2275", "1263", "t"},
     };
 
     /** The pg_type row for a relation's composite row type. */
@@ -1395,7 +1423,8 @@ class CatalogCoreBuilder {
             // A vector holds elements, and PG records which: 0-based int2vector/oidvector carry
             // typelem the same way an array type does.
             int typelem = dt == DataType.INT2VECTOR ? DataType.SMALLINT.getOid()
-                    : dt == DataType.OIDVECTOR ? DataType.OID.getOid() : 0;
+                    : dt == DataType.OIDVECTOR ? DataType.OID.getOid()
+                    : FIXED_ELEMENT_OF.containsKey(pgName) ? FIXED_ELEMENT_OF.get(pgName) : 0;
             Object subscript = (dt == DataType.INT2VECTOR || dt == DataType.OIDVECTOR)
                     ? regproc("array_subscript_handler") : regproc(null);
             String io = ioBaseName(pgName);
@@ -1437,7 +1466,7 @@ class CatalogCoreBuilder {
                     itBinary ? regproc(itIo + "recv") : regproc(null),
                     itBinary ? regproc(itIo + "send") : regproc(null),
                     regproc(null), regproc(null), regproc(null), it[6], it[7],
-                    false, 0, -1, 0, 0, null, null, null, 1
+                    false, 0, -1, 0, it[12], null, null, null, 1
             });
         }
 
@@ -1496,11 +1525,14 @@ class CatalogCoreBuilder {
             String ptName = pt[0];
             int ptOid = Integer.parseInt(pt[1]);
             String[] ptAttrs = typeAttrs(ptName);
+            boolean ptBinary = "t".equals(pt[3]);
             table.insertRow(new Object[]{
                     ptOid, ptName, pgCatalogOid, 10,
                     Short.parseShort(ptAttrs[1]), "t".equals(ptAttrs[2]), "p", "P", false, true, ",",
-                    0, regproc(null), 0, 0,
-                    regproc(ptName + "_in"), regproc(ptName + "_out"), regproc(null), regproc(null),
+                    0, regproc(null), 0, Integer.parseInt(pt[2]),
+                    regproc(ptName + "_in"), regproc(ptName + "_out"),
+                    ptBinary ? regproc(ptName + "_recv") : regproc(null),
+                    ptBinary ? regproc(ptName + "_send") : regproc(null),
                     regproc(null), regproc(null), regproc(null), ptAttrs[7], ptAttrs[8],
                     false, 0, -1, 0, 0, null, null, null, 1
             });
@@ -1862,9 +1894,13 @@ class CatalogCoreBuilder {
             int idx = aggIndex.merge(aggName, 0, (a, b) -> a + 1);
             String oidKey = idx == 0 ? "proc:" + aggName : "proc:" + aggName + "#agg" + idx;
             String[] args = agg[2].isEmpty() ? new String[0] : agg[2].split(" ");
+            // Every one of PostgreSQL's 161 built-in aggregates is parallel safe. Reporting them
+            // unsafe told a planner reading the column that count(), sum() and min() cannot be
+            // computed in a parallel plan — a claim about the server that is simply not true of
+            // the aggregates memgres implements.
             table.insertRow(new Object[]{
                     oids.oid(oidKey), aggName, pgCatalogNs, 10, internalLangOid, 1.0, 0.0,
-                    0, "-", "a", false, false, false, false, "i", "u",
+                    0, "-", "a", false, false, false, false, "i", "s",
                     (short) args.length, (short) 0, Integer.parseInt(agg[1]),
                     oidvector(agg[2]), null, null, null, null, null,
                     aggName, null, null, null, null, 1
@@ -1879,9 +1915,14 @@ class CatalogCoreBuilder {
             int idx = winIndex.merge(winName, 0, (a, b) -> a + 1);
             String oidKey = idx == 0 ? "proc:" + winName : "proc:" + winName + "#win" + idx;
             String[] args = win[2].isEmpty() ? new String[0] : win[2].split(" ");
+            // Parallel safe, like the aggregates; and strict exactly when the window function
+            // takes an argument — lag, lead, first_value, last_value, nth_value and ntile all
+            // return NULL for a NULL input without their body running, while the six that take
+            // none (row_number, rank, dense_rank, percent_rank, cume_dist) cannot be strict at
+            // all. memgres reported every one of them not strict.
             table.insertRow(new Object[]{
                     oids.oid(oidKey), winName, pgCatalogNs, 10, internalLangOid, 1.0, 0.0,
-                    0, "-", "w", false, false, false, false, "i", "u",
+                    0, "-", "w", false, false, args.length > 0, false, "i", "s",
                     (short) args.length, (short) 0, Integer.parseInt(win[1]),
                     oidvector(win[2]), null, null, null, null, null,
                     winName, null, null, null, null, 1
@@ -2315,8 +2356,12 @@ class CatalogCoreBuilder {
             // out — the arity table has known this all along and pg_proc did not say it.
             int fewest = BuiltinFunctionSignatures.fewestArguments(sig);
             short nargdefaults = (short) Math.max(0, args.length - fewest);
+            // provariadic names the type the tail collects INTO, which for an array parameter is
+            // its element type rather than the array itself.
             int variadic = BuiltinFunctionSignatures.isVariadic(sig) && args.length > 0
-                    ? Integer.parseInt(args[args.length - 1]) : 0;
+                    ? BuiltinFunctionSignatures.variadicElementType(
+                            Integer.parseInt(args[args.length - 1]))
+                    : 0;
             table.insertRow(new Object[]{
                     oids.oid(oidKey), name, fnNs, 10,
                     internalLangOid, 1.0, sig[3].charAt(0) == 't' ? 1000.0 : 0.0,
@@ -2344,7 +2389,75 @@ class CatalogCoreBuilder {
             });
         }
 
+        applyRecordedProcRows(table, pgCatalogNs);
         return table;
+    }
+
+    /**
+     * Give every pg_catalog function the columns PostgreSQL records for it.
+     *
+     * <p>Run over the finished table rather than at each of the dozen places a row is written,
+     * because the rows come from a dozen places: a signature, an operator's function, a type's I/O
+     * function, a cast's conversion function, an aggregate, a window function, and — for
+     * {@code pg_sleep} and its two relatives — a {@link PgFunction} the database registers at
+     * startup. The last of those is why the sweep is over the table: those three rows carried
+     * argument names PostgreSQL does not give them, and no amount of care at the signature loop
+     * would have reached a row that loop never writes.
+     *
+     * <p>Only pg_catalog rows are touched. A user function named {@code concat(any)} is that
+     * user's function and PostgreSQL's numbers say nothing about it.
+     */
+    private void applyRecordedProcRows(Table table, int pgCatalogNs) {
+        int nameAt = table.getColumnIndex("proname");
+        int nsAt = table.getColumnIndex("pronamespace");
+        int argsAt = table.getColumnIndex("proargtypes");
+        int costAt = table.getColumnIndex("procost");
+        int rowsAt = table.getColumnIndex("prorows");
+        int variadicAt = table.getColumnIndex("provariadic");
+        int strictAt = table.getColumnIndex("proisstrict");
+        int volatileAt = table.getColumnIndex("provolatile");
+        int parallelAt = table.getColumnIndex("proparallel");
+        int allArgsAt = table.getColumnIndex("proallargtypes");
+        int modesAt = table.getColumnIndex("proargmodes");
+        int namesAt = table.getColumnIndex("proargnames");
+        int defaultsAt = table.getColumnIndex("proargdefaults");
+        for (Object[] row : table.getRows()) {
+            if (!(row[nsAt] instanceof Number)
+                    || ((Number) row[nsAt]).intValue() != pgCatalogNs) continue;
+            if (row[nameAt] == null) continue;
+            String argTypes = row[argsAt] == null ? "" : row[argsAt].toString();
+            String[] rec = BuiltinFunctionSignatures.recordedProcRow(
+                    row[nameAt].toString(), argTypes);
+            if (rec == null) continue;
+            row[allArgsAt] = oidListOrNull(rec[2]);
+            row[modesAt] = textListOrNull(rec[3]);
+            row[namesAt] = textListOrNull(rec[4]);
+            // proargdefaults is one expression per defaulted argument, and the reader splits it
+            // on '|'; the table separates them with '~' because '|' separates its own fields.
+            row[defaultsAt] = rec[5].isEmpty() ? null : rec[5].replace('~', '|');
+            row[variadicAt] = Integer.valueOf(Integer.parseInt(rec[6]));
+            row[costAt] = Double.valueOf(rec[7]);
+            row[rowsAt] = Double.valueOf(rec[8]);
+            row[volatileAt] = rec[9];
+            row[parallelAt] = rec[10];
+            row[strictAt] = Boolean.valueOf("t".equals(rec[11]));
+        }
+    }
+
+    /** A comma-separated list of OIDs as the array column holds it, or null when it is empty. */
+    private static List<Object> oidListOrNull(String commaSeparated) {
+        if (commaSeparated == null || commaSeparated.isEmpty()) return null;
+        List<Object> out = new ArrayList<>();
+        for (String part : commaSeparated.split(",")) out.add(Integer.valueOf(part.trim()));
+        return out;
+    }
+
+    /** A comma-separated list of strings as the array column holds it, or null when it is empty. */
+    private static List<Object> textListOrNull(String commaSeparated) {
+        if (commaSeparated == null || commaSeparated.isEmpty()) return null;
+        List<Object> out = new ArrayList<>();
+        for (String part : commaSeparated.split(",", -1)) out.add(part);
+        return out;
     }
 
     /**

@@ -833,6 +833,7 @@ public final class BuiltinFunctionSignatures {
             {"pg_cancel_backend", "16", "23", "fv", "1"},
             {"pg_client_encoding", "19", "", "fs", "0"},
             {"pg_collation_is_visible", "16", "26", "fs", "1"},
+            {"pg_column_is_updatable", "16", "2205 21 16", "fs", "3"},
             {"pg_column_size", "23", "2276", "fs", "1"},
             {"pg_conf_load_time", "1184", "", "fs", "0"},
             {"pg_conversion_is_visible", "16", "26", "fs", "1"},
@@ -928,6 +929,7 @@ public final class BuiltinFunctionSignatures {
             {"pg_read_file", "25", "25 20 20", "fv", "3"},
             {"pg_read_file", "25", "25 20 20 16", "fv", "4"},
             {"pg_relation_filepath", "25", "2205", "fs", "1"},
+            {"pg_relation_is_updatable", "23", "2205 16", "fs", "2"},
             {"pg_relation_size", "20", "2205", "fv", "1"},
             {"pg_relation_size", "20", "2205 25", "fv", "2"},
             {"pg_reload_conf", "16", "", "fv", "0"},
@@ -1414,4 +1416,610 @@ public final class BuiltinFunctionSignatures {
             {"rank", "20", ""},
             {"row_number", "20", ""},
     };
+
+    /**
+     * What PostgreSQL records about a built-in beyond the types in its signature.
+     *
+     * <p>A signature says what a call may pass and what comes back. The rest of a pg_proc row says
+     * how the call behaves and what its parameters are called, and those columns were left at
+     * whatever memgres could derive: proallargtypes, proargmodes, proargnames and proargdefaults
+     * were NULL on all 2338 rows, so {@code json_each} had no OUT columns, {@code concat} was not
+     * marked VARIADIC, {@code jsonb_set}'s fourth argument claimed a default it did not carry, and
+     * {@code pg_sleep} carried an argument name PostgreSQL does not give it. procost was 100 where
+     * PostgreSQL says 1 and 1 where it says 10 or 100 or 1000; proparallel was derived from
+     * volatility, which is not the rule PostgreSQL follows; proisstrict and provolatile were
+     * guessed for the whole type-I/O family.
+     *
+     * <p>Each row here is one signature's answer read whole off the reference server, for every
+     * signature memgres carries whose answer differs from what it derives. Keyed by name and
+     * proargtypes together, because none of these columns is decided by the name alone —
+     * {@code array_to_string(anyarray, text)} is strict and the three-argument form is not,
+     * {@code ts_stat(text)} costs 10 and {@code ts_debug(text)} costs 100.
+     *
+     * <p>One row per string so the whole table is one array of constants rather than four hundred
+     * nested ones — a nested-array initialiser this size does not fit in a class initialiser
+     * beside {@link #SIGNATURES}. Fields, in order, separated by {@code |}: proname, proargtypes,
+     * proallargtypes, proargmodes, proargnames, proargdefaults, provariadic, procost, prorows,
+     * provolatile, proparallel, proisstrict. The three array columns are comma-separated and empty
+     * where PostgreSQL has NULL; proargdefaults is separated by {@code ~} because {@code |} is
+     * already spoken for, and is turned back into PostgreSQL's one-per-defaulted-argument list
+     * when the row is written.
+     */
+    private static final class Recorded {
+
+        static final String[] ROWS = {
+            "aclexplode|1034|1034,26,26,25,16|i,o,o,o,o|acl,grantor,grantee,"
+                    + "privilege_type,is_grantable||0|1|10|s|s|t",
+            "aclitemin|2275|||||0|1|0|s|s|t",
+            "aclitemout|1033|||||0|1|0|s|s|t",
+            "age|28|||||0|1|0|s|r|t",
+            "anyarray_out|2277|||||0|1|0|s|s|t",
+            "anycompatiblearray_out|5078|||||0|1|0|s|s|t",
+            "anyarray_recv|2281|||||0|1|0|s|s|t",
+            "anyarray_send|2277|||||0|1|0|s|s|t",
+            "anycompatiblearray_recv|2281|||||0|1|0|s|s|t",
+            "anycompatiblearray_send|5078|||||0|1|0|s|s|t",
+            "anycompatiblemultirange_in|2275 26 23|||||0|1|0|s|s|t",
+            "anycompatiblemultirange_out|4538|||||0|1|0|s|s|t",
+            "anycompatiblerange_in|2275 26 23|||||0|1|0|s|s|t",
+            "anycompatiblerange_out|5080|||||0|1|0|s|s|t",
+            "anyenum_out|3500|||||0|1|0|s|s|t",
+            "anymultirange_in|2275 26 23|||||0|1|0|s|s|t",
+            "anymultirange_out|4537|||||0|1|0|s|s|t",
+            "anyrange_in|2275 26 23|||||0|1|0|s|s|t",
+            "anyrange_out|3831|||||0|1|0|s|s|t",
+            "anytextcat|2776 25|||||0|1|0|s|s|t",
+            "array_in|2275 26 23|||||0|1|0|s|s|t",
+            "array_out|2277|||||0|1|0|s|s|t",
+            "array_recv|2281 26 23|||||0|1|0|s|s|t",
+            "array_sample|2277 23|||||0|1|0|v|s|t",
+            "array_send|2277|||||0|1|0|s|s|t",
+            "array_shuffle|2277|||||0|1|0|v|s|t",
+            "array_sort|2277 16|||array,descending||0|1|0|i|s|t",
+            "array_sort|2277 16 16|||array,descending,nulls_first||0|1|0|i|s|t",
+            "array_typanalyze|2281|||||0|1|0|s|s|t",
+            "bpcharrecv|2281 26 23|||||0|1|0|s|s|t",
+            "bpcharsend|1042|||||0|1|0|s|s|t",
+            "brin_bloom_summary_recv|2281|||||0|1|0|s|s|t",
+            "brin_bloom_summary_send|4600|||||0|1|0|s|s|t",
+            "brin_minmax_multi_summary_recv|2281|||||0|1|0|s|s|t",
+            "brin_minmax_multi_summary_send|4601|||||0|1|0|s|s|t",
+            "brinhandler|2281|||||0|1|0|v|s|t",
+            "bthandler|2281|||||0|1|0|v|s|t",
+            "cash_in|2275|||||0|1|0|s|s|t",
+            "cash_out|790|||||0|1|0|s|s|t",
+            "clock_timestamp||||||0|1|0|v|s|t",
+            "col_description|26 23|||||0|100|0|s|s|t",
+            "concat|2276|2276|v|||2276|1|0|s|s|f",
+            "concat_ws|25 2276|25,2276|i,v|||2276|1|0|s|s|f",
+            "current_schema||||||0|1|0|s|u|t",
+            "current_schemas|16|||||0|1|0|s|u|t",
+            "currval|2205|||||0|1|0|v|u|t",
+            "cstring_recv|2281|||||0|1|0|s|s|t",
+            "cstring_send|2275|||||0|1|0|s|s|t",
+            "database_to_xml|16 16 25|||nulls,tableforest,targetns||0|100|0|s|r|t",
+            "date_eq_timestamptz|1082 1184|||||0|1|0|s|s|t",
+            "date_ge_timestamptz|1082 1184|||||0|1|0|s|s|t",
+            "date_gt_timestamptz|1082 1184|||||0|1|0|s|s|t",
+            "date_in|2275|||||0|1|0|s|s|t",
+            "date_le_timestamptz|1082 1184|||||0|1|0|s|s|t",
+            "date_lt_timestamptz|1082 1184|||||0|1|0|s|s|t",
+            "date_ne_timestamptz|1082 1184|||||0|1|0|s|s|t",
+            "date_out|1082|||||0|1|0|s|s|t",
+            "datemultirange|3913|3913|v|||3912|1|0|i|s|t",
+            "event_trigger_in|2275|||||0|1|0|i|s|f",
+            "fdw_handler_in|2275|||||0|1|0|i|s|f",
+            "fmgr_c_validator|26|||||0|1|0|s|s|t",
+            "fmgr_internal_validator|26|||||0|1|0|s|s|t",
+            "fmgr_sql_validator|26|||||0|1|0|s|s|t",
+            "format|25 2276|25,2276|i,v|||2276|1|0|s|s|f",
+            "gen_random_uuid||||||0|1|0|v|s|t",
+            "ginhandler|2281|||||0|1|0|v|s|t",
+            "gisthandler|2281|||||0|1|0|v|s|t",
+            "has_any_column_privilege|19 25 25|||||0|10|0|s|s|t",
+            "has_any_column_privilege|19 26 25|||||0|10|0|s|s|t",
+            "has_any_column_privilege|25 25|||||0|10|0|s|s|t",
+            "has_any_column_privilege|26 25|||||0|10|0|s|s|t",
+            "has_any_column_privilege|26 25 25|||||0|10|0|s|s|t",
+            "has_any_column_privilege|26 26 25|||||0|10|0|s|s|t",
+            "has_largeobject_privilege|19 26 25|||||0|10|0|s|s|t",
+            "has_largeobject_privilege|26 25|||||0|10|0|s|s|t",
+            "has_largeobject_privilege|26 26 25|||||0|10|0|s|s|t",
+            "hashhandler|2281|||||0|1|0|v|s|t",
+            "heap_tableam_handler|2281|||||0|1|0|v|s|t",
+            "index_am_handler_in|2275|||||0|1|0|i|s|f",
+            "inet_client_addr||||||0|1|0|s|r|f",
+            "inet_client_port||||||0|1|0|s|r|f",
+            "inet_server_addr||||||0|1|0|s|r|f",
+            "inet_server_port||||||0|1|0|s|r|f",
+            "int4multirange|3905|3905|v|||3904|1|0|i|s|t",
+            "int8multirange|3927|3927|v|||3926|1|0|i|s|t",
+            "internal_in|2275|||||0|1|0|i|s|f",
+            "interval_in|2275 26 23|||||0|1|0|s|s|t",
+            "interval_out|1186|||||0|1|0|s|s|t",
+            "interval_pl_timestamptz|1186 1184|||||0|1|0|s|s|t",
+            "json_agg|2283|||||0|1|0|s|s|f",
+            "json_array_element|114 23|||from_json,element_index||0|1|0|i|s|t",
+            "json_array_element_text|114 23|||from_json,element_index||0|1|0|i|s|t",
+            "json_array_elements|114|114,114|i,o|from_json,value||0|1|100|i|s|t",
+            "json_array_elements_text|114|114,25|i,o|from_json,value||0|1|100|i|s|t",
+            "json_build_array|2276|2276|v|||2276|1|0|s|s|f",
+            "json_build_object|2276|2276|v|||2276|1|0|s|s|f",
+            "json_each|114|114,25,114|i,o,o|from_json,key,value||0|1|100|i|s|t",
+            "json_each_text|114|114,25,25|i,o,o|from_json,key,value||0|1|100|i|s|t",
+            "json_extract_path|114 1009|114,1009|i,v|from_json,path_elems||25|1|0|i|s|t",
+            "json_extract_path_text|114 1009|114,1009|i,v|from_json,path_elems||25|1|0|i|s|t",
+            "json_object_agg|2276 2276|||key,value||0|1|0|s|s|f",
+            "json_object_field|114 25|||from_json,field_name||0|1|0|i|s|t",
+            "json_object_field_text|114 25|||from_json,field_name||0|1|0|i|s|t",
+            "json_object_keys|114|||||0|1|100|i|s|t",
+            "json_populate_record|2283 114 16|||base,from_json,use_json_as_text|false|0|1|0|s|s|f",
+            "json_populate_recordset|2283 114 16|||base,from_json,"
+                    + "use_json_as_text|false|0|1|100|s|s|f",
+            "json_strip_nulls|114 16|||target,strip_in_arrays|false|0|1|0|s|s|t",
+            "json_to_recordset|114|||||0|1|100|s|s|f",
+            "jsonb_agg|2283|||||0|1|0|s|s|f",
+            "jsonb_array_element|3802 23|||from_json,element_index||0|1|0|i|s|t",
+            "jsonb_array_element_text|3802 23|||from_json,element_index||0|1|0|i|s|t",
+            "jsonb_array_elements|3802|3802,3802|i,o|from_json,value||0|1|100|i|s|t",
+            "jsonb_array_elements_text|3802|3802,25|i,o|from_json,value||0|1|100|i|s|t",
+            "jsonb_build_array|2276|2276|v|||2276|1|0|s|s|f",
+            "jsonb_build_object|2276|2276|v|||2276|1|0|s|s|f",
+            "jsonb_each|3802|3802,25,3802|i,o,o|from_json,key,value||0|1|100|i|s|t",
+            "jsonb_each_text|3802|3802,25,25|i,o,o|from_json,key,value||0|1|100|i|s|t",
+            "jsonb_extract_path|3802 1009|3802,1009|i,v|from_json,path_elems||25|1|0|i|s|t",
+            "jsonb_extract_path_text|3802 1009|3802,1009|i,v|from_json,path_elems||25|1|0|i|s|t",
+            "jsonb_insert|3802 1009 3802 16|||jsonb_in,path,replacement,"
+                    + "insert_after|false|0|1|0|i|s|t",
+            "jsonb_object_agg|2276 2276|||key,value||0|1|0|i|s|f",
+            "jsonb_object_field|3802 25|||from_json,field_name||0|1|0|i|s|t",
+            "jsonb_object_field_text|3802 25|||from_json,field_name||0|1|0|i|s|t",
+            "jsonb_object_keys|3802|||||0|1|100|i|s|t",
+            "jsonb_path_exists|3802 4072 3802 16|||target,path,vars,"
+                    + "silent|'{}'::jsonb~false|0|1|0|i|s|t",
+            "jsonb_path_exists_tz|3802 4072 3802 16|||target,path,vars,"
+                    + "silent|'{}'::jsonb~false|0|1|0|s|s|t",
+            "jsonb_path_match|3802 4072 3802 16|||target,path,vars,"
+                    + "silent|'{}'::jsonb~false|0|1|0|i|s|t",
+            "jsonb_path_match_tz|3802 4072 3802 16|||target,path,vars,"
+                    + "silent|'{}'::jsonb~false|0|1|0|s|s|t",
+            "jsonb_path_query|3802 4072 3802 16|||target,path,vars,"
+                    + "silent|'{}'::jsonb~false|0|1|1000|i|s|t",
+            "jsonb_path_query_array|3802 4072 3802 16|||target,path,vars,"
+                    + "silent|'{}'::jsonb~false|0|1|0|i|s|t",
+            "jsonb_path_query_array_tz|3802 4072 3802 16|||target,path,vars,"
+                    + "silent|'{}'::jsonb~false|0|1|0|s|s|t",
+            "jsonb_path_query_first|3802 4072 3802 16|||target,path,vars,"
+                    + "silent|'{}'::jsonb~false|0|1|0|i|s|t",
+            "jsonb_path_query_first_tz|3802 4072 3802 16|||target,path,vars,"
+                    + "silent|'{}'::jsonb~false|0|1|0|s|s|t",
+            "jsonb_path_query_tz|3802 4072 3802 16|||target,path,vars,"
+                    + "silent|'{}'::jsonb~false|0|1|1000|s|s|t",
+            "jsonb_populate_recordset|2283 3802|||||0|1|100|s|s|f",
+            "jsonb_set|3802 1009 3802 16|||jsonb_in,path,replacement,"
+                    + "create_if_missing|true|0|1|0|i|s|t",
+            "jsonb_set_lax|3802 1009 3802 16 25|||jsonb_in,path,replacement,"
+                    + "create_if_missing,"
+                    + "null_value_treatment|true~'use_json_null'::text|0|1|0|i|s|f",
+            "jsonb_strip_nulls|3802 16|||target,strip_in_arrays|false|0|1|0|s|s|t",
+            "jsonb_to_recordset|3802|||||0|1|100|s|s|f",
+            "language_handler_in|2275|||||0|1|0|i|s|f",
+            "lastval||||||0|1|0|v|u|t",
+            "lo_close|23|||||0|1|0|v|u|t",
+            "lo_creat|23|||||0|1|0|v|u|t",
+            "lo_create|26|||||0|1|0|v|u|t",
+            "lo_export|26 25|||||0|1|0|v|u|t",
+            "lo_from_bytea|26 17|||||0|1|0|v|u|t",
+            "lo_get|26|||||0|1|0|v|u|t",
+            "lo_get|26 20 23|||||0|1|0|v|u|t",
+            "lo_import|25|||||0|1|0|v|u|t",
+            "lo_import|25 26|||||0|1|0|v|u|t",
+            "lo_lseek|23 23 23|||||0|1|0|v|u|t",
+            "lo_open|26 23|||||0|1|0|v|u|t",
+            "lo_put|26 20 17|||||0|1|0|v|u|t",
+            "lo_tell|23|||||0|1|0|v|u|t",
+            "lo_truncate|23 23|||||0|1|0|v|u|t",
+            "lo_truncate64|23 20|||||0|1|0|v|u|t",
+            "lo_unlink|26|||||0|1|0|v|u|t",
+            "loread|23 23|||||0|1|0|v|u|t",
+            "lowrite|23 17|||||0|1|0|v|u|t",
+            "make_date|23 23 23|||year,month,day||0|1|0|i|s|t",
+            "make_interval|23 23 23 23 23 23 701|||years,months,weeks,days,hours,mins,"
+                    + "secs|0~0~0~0~0~0~0.0|0|1|0|i|s|t",
+            "make_time|23 23 701|||hour,min,sec||0|1|0|i|s|t",
+            "make_timestamp|23 23 23 23 23 701|||year,month,mday,hour,min,sec||0|1|0|i|s|t",
+            "make_timestamptz|23 23 23 23 23 701|||year,month,mday,hour,min,sec||0|1|0|s|s|t",
+            "make_timestamptz|23 23 23 23 23 701 25|||year,month,mday,hour,min,sec,"
+                    + "timezone||0|1|0|s|s|t",
+            "money|20|||||0|1|0|s|s|t",
+            "multirange_in|2275 26 23|||||0|1|0|s|s|t",
+            "multirange_out|4537|||||0|1|0|s|s|t",
+            "multirange_recv|2281 26 23|||||0|1|0|s|s|t",
+            "multirange_send|4537|||||0|1|0|s|s|t",
+            "multirange_typanalyze|2281|||||0|1|0|s|s|t",
+            "namerecv|2281|||||0|1|0|s|s|t",
+            "namesend|19|||||0|1|0|s|s|t",
+            "nextval|2205|||||0|1|0|v|u|t",
+            "normalize|25 25||||'NFC'::text|0|1|0|i|s|t",
+            "num_nonnulls|2276|2276|v|||2276|1|0|i|s|f",
+            "num_nulls|2276|2276|v|||2276|1|0|i|s|f",
+            "nummultirange|3907|3907|v|||3906|1|0|i|s|t",
+            "obj_description|26|||||0|100|0|s|s|t",
+            "obj_description|26 19|||||0|100|0|s|s|t",
+            "parse_ident|25 16|||str,strict|true|0|1|0|i|s|t",
+            "pg_available_extension_versions||19,25,16,16,16,19,1003,25|o,o,o,o,o,o,o,"
+                    + "o|name,version,superuser,trusted,relocatable,schema,requires,"
+                    + "comment||0|10|100|s|s|t",
+            "pg_backend_pid||||||0|1|0|s|r|t",
+            "pg_backup_start|25 16|||label,fast|false|0|1|0|v|r|t",
+            "pg_backup_stop|16|16,3220,25,25|i,o,o,o|wait_for_archive,lsn,labelfile,"
+                    + "spcmapfile|true|0|1|0|v|r|t",
+            "pg_blocking_pids|23|||||0|1|0|v|s|t",
+            "pg_cancel_backend|23|||||0|1|0|v|s|t",
+            "pg_collation_is_visible|26|||||0|10|0|s|s|t",
+            "pg_conf_load_time||||||0|1|0|s|r|t",
+            "pg_control_checkpoint||3220,3220,25,23,23,16,25,26,28,28,28,26,28,28,26,28,"
+                    + "28,1184|o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o|checkpoint_lsn,redo_lsn,"
+                    + "redo_wal_file,timeline_id,prev_timeline_id,full_page_writes,next_xid,"
+                    + "next_oid,next_multixact_id,next_multi_offset,oldest_xid,oldest_xid_dbid,"
+                    + "oldest_active_xid,oldest_multi_xid,oldest_multi_dbid,oldest_commit_ts_xid,"
+                    + "newest_commit_ts_xid,checkpoint_time||0|1|0|v|s|t",
+            "pg_control_init||23,23,23,23,23,23,23,23,23,16,23,16|o,o,o,o,o,o,o,o,o,o,o,"
+                    + "o|max_data_alignment,database_block_size,blocks_per_segment,wal_block_size,"
+                    + "bytes_per_wal_segment,max_identifier_length,max_index_columns,"
+                    + "max_toast_chunk_size,large_object_chunk_size,float8_pass_by_value,"
+                    + "data_page_checksum_version,default_char_signedness||0|1|0|v|s|t",
+            "pg_control_recovery||3220,23,3220,3220,16|o,o,o,o,o|min_recovery_end_lsn,"
+                    + "min_recovery_end_timeline,backup_start_lsn,backup_end_lsn,"
+                    + "end_of_backup_record_required||0|1|0|v|s|t",
+            "pg_control_system||23,23,20,1184|o,o,o,o|pg_control_version,"
+                    + "catalog_version_no,system_identifier,pg_control_last_modified||0|1|0|v|s|t",
+            "pg_conversion_is_visible|26|||||0|10|0|s|s|t",
+            "pg_create_logical_replication_slot|19 19 16 16 16|19,19,16,16,16,19,3220|i,"
+                    + "i,i,i,i,o,o|slot_name,plugin,temporary,twophase,failover,slot_name,"
+                    + "lsn|false~false~false|0|1|0|v|u|t",
+            "pg_create_physical_replication_slot|19 16 16|19,16,16,19,3220|i,i,i,o,"
+                    + "o|slot_name,immediately_reserve,temporary,slot_name,"
+                    + "lsn|false~false|0|1|0|v|u|t",
+            "pg_create_restore_point|25|||||0|1|0|v|s|t",
+            "pg_current_logfile||||||0|1|0|v|s|f",
+            "pg_current_logfile|25|||||0|1|0|v|s|f",
+            "pg_current_wal_flush_lsn||||||0|1|0|v|s|t",
+            "pg_current_wal_insert_lsn||||||0|1|0|v|s|t",
+            "pg_current_wal_lsn||||||0|1|0|v|s|t",
+            "pg_current_xact_id||||||0|1|0|s|u|t",
+            "pg_current_xact_id_if_assigned||||||0|1|0|s|u|t",
+            "pg_database_size|19|||||0|1|0|v|s|t",
+            "pg_database_size|26|||||0|1|0|v|s|t",
+            "pg_dependencies_recv|2281|||||0|1|0|s|s|t",
+            "pg_dependencies_send|3402|||||0|1|0|s|s|t",
+            "pg_drop_replication_slot|19|||||0|1|0|v|u|t",
+            "pg_event_trigger_ddl_commands||26,26,23,25,25,25,25,16,32|o,o,o,o,o,o,o,o,"
+                    + "o|classid,objid,objsubid,command_tag,object_type,schema_name,"
+                    + "object_identity,in_extension,command||0|10|100|s|r|t",
+            "pg_event_trigger_dropped_objects||26,26,23,16,16,16,25,25,25,25,1009,1009|o,"
+                    + "o,o,o,o,o,o,o,o,o,o,o|classid,objid,objsubid,original,normal,is_temporary,"
+                    + "object_type,schema_name,object_name,object_identity,address_names,"
+                    + "address_args||0|10|100|s|r|t",
+            "pg_event_trigger_table_rewrite_oid||26|o|oid||0|1|0|s|r|t",
+            "pg_event_trigger_table_rewrite_reason||||||0|1|0|s|r|t",
+            "pg_export_snapshot||||||0|1|0|v|u|t",
+            "pg_function_is_visible|26|||||0|10|0|s|s|t",
+            "pg_get_acl|26 26 23|||classid,objid,objsubid||0|1|0|s|s|t",
+            "pg_get_keywords||25,18,16,25,25|o,o,o,o,o|word,catcode,barelabel,catdesc,"
+                    + "baredesc||0|10|500|s|s|t",
+            "pg_get_viewdef|25|||||0|1|0|s|r|t",
+            "pg_get_viewdef|25 16|||||0|1|0|s|r|t",
+            "pg_get_viewdef|26|||||0|1|0|s|r|t",
+            "pg_get_viewdef|26 16|||||0|1|0|s|r|t",
+            "pg_get_viewdef|26 23|||||0|1|0|s|r|t",
+            "pg_indexes_size|2205|||||0|1|0|v|s|t",
+            "pg_is_in_recovery||||||0|1|0|v|s|t",
+            "pg_is_wal_replay_paused||||||0|1|0|v|s|t",
+            "pg_last_wal_receive_lsn||||||0|1|0|v|s|t",
+            "pg_last_wal_replay_lsn||||||0|1|0|v|s|t",
+            "pg_last_xact_replay_timestamp||||||0|1|0|v|s|t",
+            "pg_listening_channels||||||0|1|10|s|r|t",
+            "pg_log_backend_memory_contexts|23|||||0|1|0|v|s|t",
+            "pg_logical_slot_get_changes|19 3220 23 1009|19,3220,23,1009,3220,28,25|i,i,"
+                    + "i,v,o,o,o|slot_name,upto_lsn,upto_nchanges,options,lsn,xid,"
+                    + "data|'{}'::text[]|25|1000|1000|v|u|f",
+            "pg_logical_slot_peek_changes|19 3220 23 1009|19,3220,23,1009,3220,28,25|i,i,"
+                    + "i,v,o,o,o|slot_name,upto_lsn,upto_nchanges,options,lsn,xid,"
+                    + "data|'{}'::text[]|25|1000|1000|v|u|f",
+            "pg_ls_archive_statusdir||25,20,1184|o,o,o|name,size,modification||0|10|20|v|s|t",
+            "pg_ls_dir|25|||||0|1|1000|v|s|t",
+            "pg_ls_dir|25 16 16|||||0|1|1000|v|s|t",
+            "pg_ls_logdir||25,20,1184|o,o,o|name,size,modification||0|10|20|v|s|t",
+            "pg_ls_tmpdir||25,20,1184|o,o,o|name,size,modification||0|10|20|v|s|t",
+            "pg_ls_tmpdir|26|26,25,20,1184|i,o,o,o|tablespace,name,size,"
+                    + "modification||0|10|20|v|s|t",
+            "pg_ls_waldir||25,20,1184|o,o,o|name,size,modification||0|10|20|v|s|t",
+            "pg_mcv_list_recv|2281|||||0|1|0|s|s|t",
+            "pg_mcv_list_send|5017|||||0|1|0|s|s|t",
+            "pg_my_temp_schema||||||0|1|0|s|r|t",
+            "pg_ndistinct_recv|2281|||||0|1|0|s|s|t",
+            "pg_ndistinct_send|3361|||||0|1|0|s|s|t",
+            "pg_node_tree_recv|2281|||||0|1|0|s|s|t",
+            "pg_node_tree_send|194|||||0|1|0|s|s|t",
+            "pg_opclass_is_visible|26|||||0|10|0|s|s|t",
+            "pg_operator_is_visible|26|||||0|10|0|s|s|t",
+            "pg_options_to_table|1009|1009,25,25|i,o,o|options_array,option_name,"
+                    + "option_value||0|1|3|s|s|t",
+            "pg_partition_ancestors|2205|2205,2205|i,o|partitionid,relid||0|1|10|v|s|t",
+            "pg_partition_tree|2205|2205,2205,2205,16,23|i,o,o,o,o|rootrelid,relid,"
+                    + "parentrelid,isleaf,level||0|1|1000|v|s|t",
+            "pg_promote|16 23|||wait,wait_seconds|true~60|0|1|0|v|s|t",
+            "pg_read_binary_file|25|||||0|1|0|v|s|t",
+            "pg_read_binary_file|25 16|||||0|1|0|v|s|t",
+            "pg_read_binary_file|25 20 20|||||0|1|0|v|s|t",
+            "pg_read_binary_file|25 20 20 16|||||0|1|0|v|s|t",
+            "pg_read_file|25|||||0|1|0|v|s|t",
+            "pg_read_file|25 16|||||0|1|0|v|s|t",
+            "pg_read_file|25 20 20|||||0|1|0|v|s|t",
+            "pg_read_file|25 20 20 16|||||0|1|0|v|s|t",
+            "pg_relation_size|2205|||||0|1|0|v|s|t",
+            "pg_relation_size|2205 25|||||0|1|0|v|s|t",
+            "pg_reload_conf||||||0|1|0|v|s|t",
+            "pg_replication_slot_advance|19 3220|19,3220,19,3220|i,i,o,o|slot_name,"
+                    + "upto_lsn,slot_name,end_lsn||0|1|0|v|u|t",
+            "pg_rotate_logfile||||||0|1|0|v|s|t",
+            "pg_safe_snapshot_blocking_pids|23|||||0|1|0|v|s|t",
+            "pg_sequence_last_value|2205|||||0|1|0|v|u|t",
+            "pg_show_all_settings||25,25,25,25,25,25,25,25,25,25,25,1009,25,25,25,23,"
+                    + "16|o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o|name,setting,unit,category,short_desc,"
+                    + "extra_desc,context,vartype,source,min_val,max_val,enumvals,boot_val,"
+                    + "reset_val,sourcefile,sourceline,pending_restart||0|1|1000|s|s|t",
+            "pg_sleep|701|||||0|1|0|i|s|t",
+            "pg_sleep_for|1186|||||0|1|0|v|s|t",
+            "pg_sleep_until|1184|||||0|1|0|v|s|t",
+            "pg_snapshot_xip|5038|||||0|1|50|i|s|t",
+            "pg_stat_file|25|25,20,1184,1184,1184,1184,16|i,o,o,o,o,o,o|filename,size,"
+                    + "access,modification,change,creation,isdir||0|1|0|v|s|t",
+            "pg_stat_file|25 16|25,16,20,1184,1184,1184,1184,16|i,i,o,o,o,o,o,o|filename,"
+                    + "missing_ok,size,access,modification,change,creation,isdir||0|1|0|v|s|t",
+            "pg_stat_reset||||||0|1|0|v|s|f",
+            "pg_stat_reset_shared|25|||target|NULL::text|0|1|0|v|s|f",
+            "pg_stat_reset_single_function_counters|26|||||0|1|0|v|s|t",
+            "pg_stat_reset_single_table_counters|26|||||0|1|0|v|s|t",
+            "pg_switch_wal||||||0|1|0|v|s|t",
+            "pg_table_is_visible|26|||||0|10|0|s|s|t",
+            "pg_table_size|2205|||||0|1|0|v|s|t",
+            "pg_tablespace_size|19|||||0|1|0|v|s|t",
+            "pg_tablespace_size|26|||||0|1|0|v|s|t",
+            "pg_terminate_backend|23 20|||pid,timeout|0|0|1|0|v|s|t",
+            "pg_total_relation_size|2205|||||0|1|0|v|s|t",
+            "pg_ts_config_is_visible|26|||||0|10|0|s|s|t",
+            "pg_ts_dict_is_visible|26|||||0|10|0|s|s|t",
+            "pg_ts_parser_is_visible|26|||||0|10|0|s|s|t",
+            "pg_ts_template_is_visible|26|||||0|10|0|s|s|t",
+            "pg_type_is_visible|26|||||0|10|0|s|s|t",
+            "pg_wal_replay_pause||||||0|1|0|v|s|t",
+            "pg_wal_replay_resume||||||0|1|0|v|s|t",
+            "pg_xact_status|5069|||||0|1|0|v|s|t",
+            "phraseto_tsquery|25|||||0|100|0|s|s|t",
+            "phraseto_tsquery|3734 25|||||0|100|0|i|s|t",
+            "plainto_tsquery|25|||||0|100|0|s|s|t",
+            "plainto_tsquery|3734 25|||||0|100|0|i|s|t",
+            "query_to_xml|25 16 16 25|||query,nulls,tableforest,targetns||0|100|0|v|u|t",
+            "random|1700 1700|||min,max||0|1|0|v|r|t",
+            "random|20 20|||min,max||0|1|0|v|r|t",
+            "random|23 23|||min,max||0|1|0|v|r|t",
+            "random_normal|701 701|||mean,stddev|0~1|0|1|0|v|r|t",
+            "range_in|2275 26 23|||||0|1|0|s|s|t",
+            "range_out|3831|||||0|1|0|s|s|t",
+            "range_recv|2281 26 23|||||0|1|0|s|s|t",
+            "range_send|3831|||||0|1|0|s|s|t",
+            "range_typanalyze|2281|||||0|1|0|s|s|t",
+            "record_in|2275 26 23|||||0|1|0|s|s|t",
+            "record_out|2249|||||0|1|0|s|s|t",
+            "record_recv|2281 26 23|||||0|1|0|s|s|t",
+            "record_send|2249|||||0|1|0|s|s|t",
+            "regclassin|2275|||||0|1|0|s|s|t",
+            "regclassout|2205|||||0|1|0|s|s|t",
+            "regcollationin|2275|||||0|1|0|s|s|t",
+            "regcollationout|4191|||||0|1|0|s|s|t",
+            "regconfigin|2275|||||0|1|0|s|s|t",
+            "regconfigout|3734|||||0|1|0|s|s|t",
+            "regdictionaryin|2275|||||0|1|0|s|s|t",
+            "regdictionaryout|3769|||||0|1|0|s|s|t",
+            "regexp_count|25 25|||string,pattern||0|1|0|i|s|t",
+            "regexp_count|25 25 23|||string,pattern,start||0|1|0|i|s|t",
+            "regexp_count|25 25 23 25|||string,pattern,start,flags||0|1|0|i|s|t",
+            "regexp_instr|25 25|||string,pattern||0|1|0|i|s|t",
+            "regexp_instr|25 25 23|||string,pattern,start||0|1|0|i|s|t",
+            "regexp_instr|25 25 23 23|||string,pattern,start,N||0|1|0|i|s|t",
+            "regexp_instr|25 25 23 23 23|||string,pattern,start,N,endoption||0|1|0|i|s|t",
+            "regexp_instr|25 25 23 23 23 25|||string,pattern,start,N,endoption,flags||0|1|0|i|s|t",
+            "regexp_instr|25 25 23 23 23 25 23|||string,pattern,start,N,endoption,flags,"
+                    + "subexpr||0|1|0|i|s|t",
+            "regexp_like|25 25|||string,pattern||0|1|0|i|s|t",
+            "regexp_like|25 25 25|||string,pattern,flags||0|1|0|i|s|t",
+            "regexp_match|25 25|||string,pattern||0|1|0|i|s|t",
+            "regexp_match|25 25 25|||string,pattern,flags||0|1|0|i|s|t",
+            "regexp_matches|25 25|||string,pattern||0|1|1|i|s|t",
+            "regexp_matches|25 25 25|||string,pattern,flags||0|1|10|i|s|t",
+            "regexp_replace|25 25 25|||string,pattern,replacement||0|1|0|i|s|t",
+            "regexp_replace|25 25 25 23|||string,pattern,replacement,start||0|1|0|i|s|t",
+            "regexp_replace|25 25 25 23 23|||string,pattern,replacement,start,N||0|1|0|i|s|t",
+            "regexp_replace|25 25 25 23 23 25|||string,pattern,replacement,start,N,"
+                    + "flags||0|1|0|i|s|t",
+            "regexp_replace|25 25 25 25|||string,pattern,replacement,flags||0|1|0|i|s|t",
+            "regexp_split_to_array|25 25|||string,pattern||0|1|0|i|s|t",
+            "regexp_split_to_array|25 25 25|||string,pattern,flags||0|1|0|i|s|t",
+            "regexp_split_to_table|25 25|||string,pattern||0|1|1000|i|s|t",
+            "regexp_split_to_table|25 25 25|||string,pattern,flags||0|1|1000|i|s|t",
+            "regexp_substr|25 25|||string,pattern||0|1|0|i|s|t",
+            "regexp_substr|25 25 23|||string,pattern,start||0|1|0|i|s|t",
+            "regexp_substr|25 25 23 23|||string,pattern,start,N||0|1|0|i|s|t",
+            "regexp_substr|25 25 23 23 25|||string,pattern,start,N,flags||0|1|0|i|s|t",
+            "regexp_substr|25 25 23 23 25 23|||string,pattern,start,N,flags,subexpr||0|1|0|i|s|t",
+            "regnamespacein|2275|||||0|1|0|s|s|t",
+            "regnamespaceout|4089|||||0|1|0|s|s|t",
+            "regoperatorin|2275|||||0|1|0|s|s|t",
+            "regoperatorout|2204|||||0|1|0|s|s|t",
+            "regoperin|2275|||||0|1|0|s|s|t",
+            "regoperout|2203|||||0|1|0|s|s|t",
+            "regprocedurein|2275|||||0|1|0|s|s|t",
+            "regprocedureout|2202|||||0|1|0|s|s|t",
+            "regprocin|2275|||||0|1|0|s|s|t",
+            "regprocout|24|||||0|1|0|s|s|t",
+            "regrolein|2275|||||0|1|0|s|s|t",
+            "regroleout|4096|||||0|1|0|s|s|t",
+            "regtypein|2275|||||0|1|0|s|s|t",
+            "regtypeout|2206|||||0|1|0|s|s|t",
+            "schema_to_xml|19 16 16 25|||schema,nulls,tableforest,targetns||0|100|0|s|r|t",
+            "set_config|25 25 16|||||0|1|0|v|u|f",
+            "setval|2205 20|||||0|1|0|v|u|t",
+            "setval|2205 20 16|||||0|1|0|v|u|t",
+            "shobj_description|26 19|||||0|100|0|s|s|t",
+            "spghandler|2281|||||0|1|0|v|s|t",
+            "string_agg|17 17|||value,delimiter||0|1|0|i|s|f",
+            "string_agg|25 25|||value,delimiter||0|1|0|i|s|f",
+            "suppress_redundant_updates_trigger||||||0|1|0|v|s|t",
+            "table_am_handler_in|2275|||||0|1|0|i|s|f",
+            "table_to_xml|2205 16 16 25|||tbl,nulls,tableforest,targetns||0|100|0|s|r|t",
+            "textanycat|25 2776|||||0|1|0|s|s|t",
+            "textrecv|2281|||||0|1|0|s|s|t",
+            "textsend|25|||||0|1|0|s|s|t",
+            "time_in|2275 26 23|||||0|1|0|s|s|t",
+            "timeofday||||||0|1|0|v|s|t",
+            "timestamp_eq_timestamptz|1114 1184|||||0|1|0|s|s|t",
+            "timestamp_ge_timestamptz|1114 1184|||||0|1|0|s|s|t",
+            "timestamp_gt_timestamptz|1114 1184|||||0|1|0|s|s|t",
+            "timestamp_in|2275 26 23|||||0|1|0|s|s|t",
+            "timestamp_le_timestamptz|1114 1184|||||0|1|0|s|s|t",
+            "timestamp_lt_timestamptz|1114 1184|||||0|1|0|s|s|t",
+            "timestamp_ne_timestamptz|1114 1184|||||0|1|0|s|s|t",
+            "timestamp_out|1114|||||0|1|0|s|s|t",
+            "timestamptz_eq_date|1184 1082|||||0|1|0|s|s|t",
+            "timestamptz_eq_timestamp|1184 1114|||||0|1|0|s|s|t",
+            "timestamptz_ge_date|1184 1082|||||0|1|0|s|s|t",
+            "timestamptz_ge_timestamp|1184 1114|||||0|1|0|s|s|t",
+            "timestamptz_gt_date|1184 1082|||||0|1|0|s|s|t",
+            "timestamptz_gt_timestamp|1184 1114|||||0|1|0|s|s|t",
+            "timestamptz_in|2275 26 23|||||0|1|0|s|s|t",
+            "timestamptz_le_date|1184 1082|||||0|1|0|s|s|t",
+            "timestamptz_le_timestamp|1184 1114|||||0|1|0|s|s|t",
+            "timestamptz_lt_date|1184 1082|||||0|1|0|s|s|t",
+            "timestamptz_lt_timestamp|1184 1114|||||0|1|0|s|s|t",
+            "timestamptz_mi_interval|1184 1186|||||0|1|0|s|s|t",
+            "timestamptz_ne_date|1184 1082|||||0|1|0|s|s|t",
+            "timestamptz_ne_timestamp|1184 1114|||||0|1|0|s|s|t",
+            "timestamptz_out|1184|||||0|1|0|s|s|t",
+            "timestamptz_pl_interval|1184 1186|||||0|1|0|s|s|t",
+            "timetz_in|2275 26 23|||||0|1|0|s|s|t",
+            "to_tsquery|25|||||0|100|0|s|s|t",
+            "to_tsquery|3734 25|||||0|100|0|i|s|t",
+            "to_tsvector|114|||||0|100|0|s|s|t",
+            "to_tsvector|25|||||0|100|0|s|s|t",
+            "to_tsvector|3734 114|||||0|100|0|i|s|t",
+            "to_tsvector|3734 25|||||0|100|0|i|s|t",
+            "to_tsvector|3734 3802|||||0|100|0|i|s|t",
+            "to_tsvector|3802|||||0|100|0|s|s|t",
+            "trigger_in|2275|||||0|1|0|i|s|f",
+            "ts_debug|25|25,25,25,25,3770,3769,1009|i,o,o,o,o,o,o|document,alias,"
+                    + "description,token,dictionaries,dictionary,lexemes||0|100|1000|s|s|t",
+            "ts_debug|3734 25|3734,25,25,25,25,3770,3769,1009|i,i,o,o,o,o,o,o|config,"
+                    + "document,alias,description,token,dictionaries,dictionary,"
+                    + "lexemes||0|100|1000|s|s|t",
+            "ts_headline|114 3615|||||0|100|0|s|s|t",
+            "ts_headline|114 3615 25|||||0|100|0|s|s|t",
+            "ts_headline|25 3615|||||0|100|0|s|s|t",
+            "ts_headline|25 3615 25|||||0|100|0|s|s|t",
+            "ts_headline|3734 114 3615|||||0|100|0|i|s|t",
+            "ts_headline|3734 114 3615 25|||||0|100|0|i|s|t",
+            "ts_headline|3734 25 3615|||||0|100|0|i|s|t",
+            "ts_headline|3734 25 3615 25|||||0|100|0|i|s|t",
+            "ts_headline|3734 3802 3615|||||0|100|0|i|s|t",
+            "ts_headline|3734 3802 3615 25|||||0|100|0|i|s|t",
+            "ts_headline|3802 3615|||||0|100|0|s|s|t",
+            "ts_headline|3802 3615 25|||||0|100|0|s|s|t",
+            "ts_match_tq|25 3615|||||0|100|0|s|s|t",
+            "ts_match_tt|25 25|||||0|100|0|s|s|t",
+            "ts_parse|25 25|25,25,23,25|i,i,o,o|parser_name,txt,tokid,token||0|1|1000|s|s|t",
+            "ts_parse|26 25|26,25,23,25|i,i,o,o|parser_oid,txt,tokid,token||0|1|1000|i|s|t",
+            "ts_rewrite|3615 25|||||0|100|0|v|u|t",
+            "ts_stat|25|25,25,23,23|i,o,o,o|query,word,ndoc,nentry||0|10|10000|v|u|t",
+            "ts_stat|25 25|25,25,25,23,23|i,i,o,o,o|query,weights,word,ndoc,"
+                    + "nentry||0|10|10000|v|u|t",
+            "ts_token_type|25|25,23,25,25|i,o,o,o|parser_name,tokid,alias,"
+                    + "description||0|1|16|s|s|t",
+            "ts_token_type|26|26,23,25,25|i,o,o,o|parser_oid,tokid,alias,description||0|1|16|i|s|t",
+            "ts_typanalyze|2281|||||0|1|0|s|s|t",
+            "tsm_handler_in|2275|||||0|1|0|i|s|f",
+            "tsmultirange|3909|3909|v|||3908|1|0|i|s|t",
+            "tstzmultirange|3911|3911|v|||3910|1|0|i|s|t",
+            "txid_current||||||0|1|0|s|u|t",
+            "txid_current_if_assigned||||||0|1|0|s|u|t",
+            "txid_snapshot_xip|2970|||||0|1|50|i|s|t",
+            "txid_status|20|||||0|1|0|v|s|t",
+            "unnest|2277|||||0|1|100|i|s|t",
+            "unnest|3614|3614,25,1005,1009|i,o,o,o|tsvector,lexeme,positions,weights||0|1|10|i|s|t",
+            "unnest|4537|||||0|1|100|i|s|t",
+            "uuidv4||||||0|1|0|v|s|t",
+            "uuidv7||||||0|1|0|v|s|t",
+            "uuidv7|1186|||shift||0|1|0|v|s|t",
+            "varcharrecv|2281 26 23|||||0|1|0|s|s|t",
+            "varcharsend|1043|||||0|1|0|s|s|t",
+            "websearch_to_tsquery|25|||||0|100|0|s|s|t",
+            "websearch_to_tsquery|3734 25|||||0|100|0|i|s|t",
+            "xml_in|2275|||||0|1|0|s|s|t",
+            "xml_recv|2281|||||0|1|0|s|s|t",
+            "xml_send|142|||||0|1|0|s|s|t",
+        };
+
+        /** Declared after the rows: a field initialiser runs in source order and would read null. */
+        static final java.util.Map<String, String[]> BY_SIGNATURE = build();
+
+        private static java.util.Map<String, String[]> build() {
+            java.util.Map<String, String[]> map =
+                    new java.util.HashMap<String, String[]>(ROWS.length * 2);
+            for (String row : ROWS) {
+                String[] f = row.split("\\|", -1);
+                map.put(signatureKey(f[0], f[1]), f);
+            }
+            return java.util.Collections.unmodifiableMap(map);
+        }
+    }
+
+    private static String signatureKey(String name, String argTypes) {
+        return name.toLowerCase(java.util.Locale.ROOT) + "(" + argTypes.trim() + ")";
+    }
+
+    /**
+     * PostgreSQL's own pg_proc row for this exact signature, or null where PostgreSQL's answer is
+     * the one memgres already derives.
+     *
+     * <p>Fields as documented on {@link Recorded}. Read only for functions in pg_catalog: a user
+     * function that happens to share a built-in's name and argument list is that user's function,
+     * and describing it with PostgreSQL's numbers would be a lie about their code.
+     */
+    static String[] recordedProcRow(String name, String argTypes) {
+        if (name == null || argTypes == null) return null;
+        return Recorded.BY_SIGNATURE.get(signatureKey(name, argTypes));
+    }
+
+    /**
+     * The type a variadic parameter's tail collects into, which is what provariadic names.
+     *
+     * <p>PostgreSQL records the ELEMENT type, not the array the parameter is declared as:
+     * {@code json_extract_path(json, VARIADIC text[])} has provariadic 25, not 1009, and
+     * {@code datemultirange(VARIADIC daterange[])} has 3912, not 3913. memgres recorded the
+     * declared type on all twelve of its variadic signatures, so a client working out how many
+     * arguments the tail may take read one level of array too many. {@code "any"} is its own
+     * element type and is returned unchanged.
+     */
+    static int variadicElementType(int declaredType) {
+        switch (declaredType) {
+            case 1009: return 25;     // text[]     -> text
+            case 3905: return 3904;   // int4range[]  -> int4range
+            case 3907: return 3906;   // numrange[]   -> numrange
+            case 3909: return 3908;   // tsrange[]    -> tsrange
+            case 3911: return 3910;   // tstzrange[]  -> tstzrange
+            case 3913: return 3912;   // daterange[]  -> daterange
+            case 3927: return 3926;   // int8range[]  -> int8range
+            default: return declaredType;
+        }
+    }
 }

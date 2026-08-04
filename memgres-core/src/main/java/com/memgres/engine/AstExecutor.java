@@ -1142,16 +1142,26 @@ public class AstExecutor {
         Database.ViewDef view = userQualified && schemaName != null
                 ? database.getView(schemaName, tableName) : database.getView(tableName);
         if (view != null) {
-            Table underlying = resolveViewToBaseTable(view);
-            if (underlying != null) return underlying;
-            // Check for INSTEAD OF triggers — if present, the view is DML-capable
-            List<PgTrigger> viewTriggers = database.getTriggersForTable(tableName);
-            if (viewTriggers != null && viewTriggers.stream().anyMatch(
-                    t -> t.getTiming() == PgTrigger.Timing.INSTEAD_OF)) {
+            // Whether the write may be rewritten onto the base table is PostgreSQL's exact rule,
+            // and it is the same rule the catalogs report — a caller that asked
+            // information_schema.views or pg_relation_is_updatable first was told the truth.
+            ViewUpdatability.Reason reason = ViewUpdatability.notAutoUpdatable(database, view);
+            if (reason == null) {
+                Table underlying = resolveViewToBaseTable(view);
+                if (underlying != null) return underlying;
+            }
+            // An INSTEAD OF trigger takes the write in place of the rewrite — but only the write
+            // it was declared for. A view with an INSTEAD OF UPDATE trigger and nothing else is
+            // still not deletable, and PG refuses the DELETE.
+            if ((ViewUpdatability.insteadOfEvents(database, tableName) & verbEvent(viewDmlVerb)) != 0) {
                 // Create a virtual table from the view's column definitions
                 return buildVirtualTableForView(view, tableName);
             }
-            throw new MemgresException("cannot " + viewDmlVerb + " view \"" + tableName + "\"", "55000");
+            // PG blames the view that broke the rule, which for a view over a view is the inner
+            // one — the caller has to be told which definition to change.
+            String blamed = reason != null && reason.relation != null ? reason.relation : tableName;
+            throw ViewUpdatability.cannotWrite(viewDmlVerb, blamed,
+                    reason != null ? reason.detail : ViewUpdatability.DETAIL_NOT_SINGLE_RELATION);
         }
         // Sequences are queryable as relations in PG (columns: last_value, log_cnt, is_called)
         Table seqTable = resolveSequenceAsRelation(schemaName, tableName);
@@ -1166,6 +1176,13 @@ public class AstExecutor {
                 new MemgresException("relation \"" + tableName + "\" does not exist", "42P01");
         selectExecutor.noteHiddenWithItem(notThere, tableName);
         throw notThere;
+    }
+
+    /** The event bit the statement now being resolved writes with. */
+    private int verbEvent(String verb) {
+        if ("update".equals(verb)) return ViewUpdatability.UPDATE;
+        if ("delete from".equals(verb)) return ViewUpdatability.DELETE;
+        return ViewUpdatability.INSERT;
     }
 
     /**
