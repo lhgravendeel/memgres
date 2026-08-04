@@ -20,6 +20,11 @@ class DmlValidationHelper {
         this.executor = executor;
     }
 
+    /** A column's recorded domain named the way PostgreSQL names it in an error about it. */
+    private String domainDisplay(String stored) {
+        return TypeNamespace.display(executor.database, executor.session, stored);
+    }
+
     void applyCitextFolding(Table table, Object[] row) {
         for (int i = 0; i < table.getColumns().size() && i < row.length; i++) {
             if (row[i] instanceof String) {
@@ -50,9 +55,9 @@ class DmlValidationHelper {
                 if (enumTypeName != null) {
                     CustomEnum customEnum = executor.database.getCustomEnum(enumTypeName);
                     if (customEnum != null && !customEnum.isValidLabel(row[i].toString())) {
-                        throw new MemgresException(
-                                "invalid input value for enum " + enumTypeName + ": \"" + row[i] + "\"",
-                                "22P02");
+                        throw new MemgresException("invalid input value for enum "
+                                + TypeNamespace.display(executor.database, executor.session, enumTypeName)
+                                + ": \"" + row[i] + "\"", "22P02");
                     }
                 }
             }
@@ -75,8 +80,8 @@ class DmlValidationHelper {
                 }
                 for (DomainType domain : chain) {
                     if (row[i] == null && domain.isNotNull()) {
-                        throw new MemgresException(
-                                "domain " + domain.getName() + " does not allow null values", "23502");
+                        throw new MemgresException("domain " + domainDisplay(domain.getName())
+                                + " does not allow null values", "23502");
                     }
                     // A domain CHECK still runs for NULL: CHECK (VALUE IS NOT NULL) rejects it
                     Table tempTable = new Table("_domain_check",
@@ -88,7 +93,8 @@ class DmlValidationHelper {
                         Object result = executor.evalExpr(domain.getParsedCheck(), tempCtx);
                         if (result != null && !executor.isTruthy(result)) {
                             throw new MemgresException(
-                                    "value for domain " + domainName + " violates check constraint \"" + domain.getName() + "_check\"",
+                                    "value for domain " + domainDisplay(domainName)
+                                            + " violates check constraint \"" + domain.getName() + "_check\"",
                                     "23514");
                         }
                     }
@@ -98,7 +104,8 @@ class DmlValidationHelper {
                             Object result = executor.evalExpr(nc.parsedCheck(), tempCtx);
                             if (result != null && !executor.isTruthy(result)) {
                                 throw new MemgresException(
-                                        "value for domain " + domainName + " violates check constraint \"" + nc.name() + "\"",
+                                        "value for domain " + domainDisplay(domainName)
+                                                + " violates check constraint \"" + nc.name() + "\"",
                                         "23514");
                             }
                         }

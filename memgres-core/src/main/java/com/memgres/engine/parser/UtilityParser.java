@@ -1352,9 +1352,10 @@ class UtilityParser {
         }
         if (onIdx == 2 && tokenValues.size() == 4) {
             objectType = tokenValues.get(0);
-            String relation = tokenValues.get(3);
-            if (relation.contains(".")) relation = relation.substring(relation.lastIndexOf('.') + 1);
-            objectName = relation + "." + tokenValues.get(1);
+            // The relation keeps whatever qualifier it was written with: COMMENT ON CONSTRAINT c
+            // ON a.t names a's t, and dropping the "a" filed the comment under whichever t the
+            // search path happened to reach.
+            objectName = tokenValues.get(3) + "." + tokenValues.get(1);
         } else {
             objectType = tokenValues.size() > 1
                     ? String.join(" ", tokenValues.subList(0, tokenValues.size() - 1))

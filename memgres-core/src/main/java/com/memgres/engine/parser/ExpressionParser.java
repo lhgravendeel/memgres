@@ -282,10 +282,10 @@ public class ExpressionParser {
         boolean qualified = false;  // an interval field qualifier has already taken its precision
         boolean schemaWritten = false;
         String name = readIdentifier();
-        // A schema-qualified type is written schema.typename. The engine works with the bare name,
-        // so the qualifier is recorded rather than carried: it still has to name a schema that
-        // exists, which is something only whoever runs the statement can say. The exception is
-        // information_schema, whose types answer to nothing else and so keep their qualifier.
+        // A schema-qualified type is written schema.typename, and the qualifier is carried: two
+        // schemas may each hold a type of the same name, so a column declared a.e has to record
+        // which e it was declared with. pg_catalog is the exception — it holds the types this
+        // engine ships and nothing a schema map knows about, so pg_catalog.int4 is just int4.
         if (check(TokenType.DOT)) {
             advance();
             String qualifier = name;
@@ -294,7 +294,7 @@ public class ExpressionParser {
             // Recorded whole, because both halves are read: the schema has to be one that exists,
             // and the type has to be one that schema holds.
             typeSchemaQualifiers.add(qualifier + "." + name);
-            if (com.memgres.engine.InformationSchemaTypes.isTheSchema(qualifier)) {
+            if (!"pg_catalog".equalsIgnoreCase(qualifier)) {
                 name = qualifier.toLowerCase() + "." + name.toLowerCase();
             }
         }

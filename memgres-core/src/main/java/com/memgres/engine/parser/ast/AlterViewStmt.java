@@ -12,17 +12,29 @@ public final class AlterViewStmt implements Statement {
     public final boolean ifExists;
     public final Action action;
     public final Map<String, String> setOptions;
+    /**
+     * True when the statement wrote MATERIALIZED VIEW. The two are different kinds of relation,
+     * so a statement that names the wrong one has to say which kind it expected — PostgreSQL
+     * answers {@code "x" is not a materialized view}, never {@code is not a view}.
+     */
+    public final boolean materialized;
 
     public AlterViewStmt(String name, String newName, boolean ifExists, Action action) {
-        this(name, newName, ifExists, action, null);
+        this(name, newName, ifExists, action, null, false);
     }
 
     public AlterViewStmt(String name, String newName, boolean ifExists, Action action, Map<String, String> setOptions) {
+        this(name, newName, ifExists, action, setOptions, false);
+    }
+
+    public AlterViewStmt(String name, String newName, boolean ifExists, Action action,
+                         Map<String, String> setOptions, boolean materialized) {
         this.name = name;
         this.newName = newName;
         this.ifExists = ifExists;
         this.action = action;
         this.setOptions = setOptions;
+        this.materialized = materialized;
     }
 
     public enum Action {
@@ -42,6 +54,7 @@ public final class AlterViewStmt implements Statement {
     public boolean ifExists() { return ifExists; }
     public Action action() { return action; }
     public Map<String, String> setOptions() { return setOptions; }
+    public boolean materialized() { return materialized; }
 
     @Override
     public boolean equals(Object o) {

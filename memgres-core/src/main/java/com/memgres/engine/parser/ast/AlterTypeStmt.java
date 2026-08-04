@@ -10,6 +10,11 @@ public final class AlterTypeStmt implements Statement {
     public final String neighbor;
     /** DROP ATTRIBUTE IF EXISTS: a missing attribute is a notice, not an error. */
     public final boolean ifExists;
+    /** ALTER TYPE schema.name — null when the name was written bare. */
+    private String schemaName;
+
+    public String schemaName() { return schemaName; }
+    public void setSchemaName(String schemaName) { this.schemaName = schemaName; }
 
     public AlterTypeStmt(
             String typeName,

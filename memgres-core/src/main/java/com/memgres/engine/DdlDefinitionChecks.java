@@ -266,8 +266,8 @@ public final class DdlDefinitionChecks {
 
     /** The column's type as PostgreSQL spells it in an error about that type. */
     private static String typeDisplay(Column col) {
-        if (col.getEnumTypeName() != null) return col.getEnumTypeName();
-        if (col.getDomainTypeName() != null) return col.getDomainTypeName();
+        if (col.getEnumTypeName() != null) return TypeNamespace.nameOfKey(col.getEnumTypeName());
+        if (col.getDomainTypeName() != null) return TypeNamespace.nameOfKey(col.getDomainTypeName());
         DataType dt = col.getType();
         if (dt == null) return "unknown";
         String base = dt.toRegtypeDisplay();

@@ -110,9 +110,8 @@ class CatalogTypeSystemBuilder {
 
         // User-defined range types
         for (Map.Entry<String, String> entry : database.getRangeTypes().entrySet()) {
-            String rangeName = entry.getKey();
             String subtypeName = entry.getValue();
-            int rangeTypeOid = oids.oid("type:" + rangeName);
+            int rangeTypeOid = oids.oid("type:" + entry.getKey());
             int subtypeOid = resolveTypeOid(subtypeName);
             table.insertRow(new Object[]{rangeTypeOid, subtypeOid, 0, 0, 0, 0, 0});
         }
@@ -341,7 +340,8 @@ class CatalogTypeSystemBuilder {
             DataType dt = DataType.fromPgName(typeName);
             if (dt != null) return dt.getOid();
         } catch (Exception ignored) {}
-        return oids.oid("type:" + typeName.toLowerCase());
+        String key = TypeNamespace.oidKeyFor(database, typeName);
+        return oids.oid(key != null ? key : TypeNamespace.oidKey(null, typeName));
     }
 
     private int resolveAccessMethodOid(String method) {

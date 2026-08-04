@@ -73,10 +73,18 @@ class CastEvaluator {
         if (builtin != null) return builtin;
         String other = CatalogCoreBuilder.otherTypeName(oid);
         if (other != null) return other;
-        // A user type (enum, domain, composite) is named in the catalog's OID map.
+        // A user type (enum, domain, composite) is named in the catalog's OID map. PostgreSQL
+        // renders it qualified only where the search path would not find it by its bare name.
         String key = executor.systemCatalog.keyForOid(oid);
-        if (key != null && key.startsWith("type:")) return key.substring(5);
+        if (key != null && key.startsWith("type:")) return userTypeDisplay(key.substring(5));
         return null;
+    }
+
+    /** A user type's key written the way regtype prints it for this session. */
+    private String userTypeDisplay(String typeKey) {
+        String bare = TypeNamespace.nameOfKey(typeKey);
+        String resolved = TypeNamespace.resolve(executor.database, executor.session, bare);
+        return typeKey.equals(resolved) ? bare : typeKey;
     }
 
     /** PostgreSQL spells its single-byte flag type with the quotes; everything else as itself. */
@@ -330,18 +338,45 @@ class CastEvaluator {
     }
 
     /**
+     * A written type name rewritten as {@code schema.name} once the search path says which type it
+     * denotes. Anything that is not a user-defined type — every built-in, and every name that
+     * denotes nothing — is handed back exactly as written, so only the ambiguity this resolves is
+     * changed. The precision and array suffixes travel with it.
+     */
+    String qualifyUserType(String typeSpec) {
+        if (typeSpec == null || typeSpec.indexOf('.') >= 0) return typeSpec;
+        String trimmed = typeSpec.trim();
+        int paren = trimmed.indexOf('(');
+        String suffix = "";
+        String base = trimmed;
+        if (paren > 0) {
+            base = trimmed.substring(0, paren).trim();
+            suffix = trimmed.substring(paren);
+        }
+        while (base.endsWith("[]")) {
+            base = base.substring(0, base.length() - 2);
+            suffix = "[]" + suffix;
+        }
+        String key = TypeNamespace.resolve(executor.database, executor.session, base);
+        return key == null ? typeSpec : key + suffix;
+    }
+
+    /**
      * @param fromUnknownLiteral the value was written as a bare quoted literal, so PG reads it with
      *        the target type's input function rather than converting a value of a known type.
      */
     Object applyCast(Object val, String typeSpec, boolean fromUnknownLiteral) {
+        // Which type a bare name denotes is the search path's answer, and it is settled once here
+        // so everything downstream reads the same one: with search_path = b, ::e is b's e.
+        typeSpec = qualifyUserType(typeSpec);
         if (val == null) {
             // A NOT NULL domain rejects null even through a cast, and the constraint is
             // inherited from every domain it is built on
             DomainType nullDomain = executor.database.getDomain(
                     typeSpec.toLowerCase().replaceAll("\\(.*\\)", "").trim());
             if (nullDomain != null && domainChainRejectsNull(nullDomain)) {
-                throw new MemgresException(
-                        "domain " + nullDomain.getName() + " does not allow null values", "23502");
+                throw new MemgresException("domain " + typeDisplayName(nullDomain.getName())
+                        + " does not allow null values", "23502");
             }
             return null;
         }
@@ -1202,11 +1237,11 @@ class CastEvaluator {
                             break;
                     }
                 }
-                // A composite or range type created by the user is as much a type as an enum is.
-                if (dt == null && executor.database.getDomain(rtName) == null
-                        && !executor.database.isCustomEnum(rtName)
-                        && !executor.database.isCompositeType(rtName)
-                        && !executor.database.getRangeTypes().containsKey(rtName)) {
+                // A composite or range type created by the user is as much a type as an enum is,
+                // and which schema's is settled by the qualifier written or by the search path.
+                String userTypeKey =
+                        TypeNamespace.resolve(executor.database, executor.session, rtName);
+                if (dt == null && userTypeKey == null) {
                     throw new MemgresException("type \"" + val + "\" does not exist", "42704");
                 }
                 // Return RegtypeValue with canonical type name and OID
@@ -1278,8 +1313,8 @@ class CastEvaluator {
                     return new RegtypeValue(dt.getOid(), canonical);
                 }
                 // Custom enum or domain — resolve OID from catalog
-                int customOid = executor.systemCatalog.getOid("type:" + rtName);
-                return new RegtypeValue(customOid, val.toString());
+                int customOid = executor.systemCatalog.getOid("type:" + userTypeKey);
+                return new RegtypeValue(customOid, userTypeDisplay(userTypeKey));
             }
             case "oid": {
                 if (val instanceof RegclassValue) return ((RegclassValue) val).oid();
@@ -1336,7 +1371,9 @@ class CastEvaluator {
                 if (customEnum != null) {
                     String label = val instanceof AstExecutor.PgEnum ? ((AstExecutor.PgEnum) val).label() : val.toString();
                     if (!customEnum.isValidLabel(label)) {
-                        throw new MemgresException("invalid input value for enum " + typeName + ": \"" + label + "\"", "22P02");
+                        throw new MemgresException("invalid input value for enum "
+                                + TypeNamespace.display(executor.database, executor.session, typeName)
+                                + ": \"" + label + "\"", "22P02");
                     }
                     return new AstExecutor.PgEnum(label, typeName, customEnum.ordinal(label));
                 }
@@ -1392,9 +1429,20 @@ class CastEvaluator {
     private void failIfViolated(Expression check, RowContext ctx, String domainName, String constraintName) {
         Object result = executor.evalExpr(check, ctx);
         if (result != null && !executor.isTruthy(result)) {
-            throw new MemgresException("value for domain " + domainName
+            throw new MemgresException("value for domain "
+                    + TypeNamespace.display(executor.database, executor.session, domainName)
                     + " violates check constraint \"" + constraintName + "\"", "23514");
         }
+    }
+
+    /**
+     * How a message names a user-defined type: bare when the search path reaches the schema it
+     * lives in, and schema-qualified when it does not. PostgreSQL decides this by what the reader
+     * could have written unqualified, not by what this statement did write — so a cast spelled
+     * {@code a.e} still says {@code e} once {@code a} is on the path.
+     */
+    private String typeDisplayName(String name) {
+        return TypeNamespace.displayName(executor.database, executor.searchPathSchemas(), name);
     }
 
     /**

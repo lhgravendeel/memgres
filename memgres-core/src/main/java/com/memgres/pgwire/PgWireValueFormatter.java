@@ -447,7 +447,8 @@ class PgWireValueFormatter {
      */
     static int columnTypeOid(DataType colType, Column col, Session session) {
         if (colType == DataType.ENUM && session != null && col.getEnumTypeName() != null) {
-            String key = "type:" + col.getEnumTypeName();
+            // The column recorded which schema's enum it was declared with; the OID follows it.
+            String key = session.typeOidKey(col.getEnumTypeName());
             if (col.getArrayElementType() == DataType.ENUM) {
                 key = key + "[]";
             }

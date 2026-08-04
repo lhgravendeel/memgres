@@ -279,65 +279,23 @@ public class PgInterval implements Comparable<PgInterval> {
             int years = pm.group(1) != null ? Integer.parseInt(pm.group(1)) : 0;
             int mons = pm.group(2) != null ? Integer.parseInt(pm.group(2)) : 0;
             int days = pm.group(3) != null ? Integer.parseInt(pm.group(3)) : 0;
-            String sign = pm.group(4);
-            int hours = pm.group(5) != null ? Integer.parseInt(pm.group(5)) : 0;
-            int minutes = pm.group(6) != null ? Integer.parseInt(pm.group(6)) : 0;
-            int secs = pm.group(7) != null ? Integer.parseInt(pm.group(7)) : 0;
-            int fracMicros = 0;
-            if (pm.group(8) != null) {
-                String frac = pm.group(8);
-                // Pad to 6 digits
-                frac = (frac + "000000").substring(0, 6);
-                fracMicros = Integer.parseInt(frac);
-            }
-
             int totalMonths = years * 12 + mons;
-            long totalMicros = (hours * 3600L + minutes * 60L + secs) * 1_000_000L + fracMicros;
-            if ("-".equals(sign)) totalMicros = -totalMicros;
-
-            return new PgInterval(totalMonths, days, totalMicros);
-        }
-
-        // Try sql_standard year-month format: 'Y-M' (e.g. '1-2' = 1 year 2 months)
-        // Also handles optional sign and optional day/time parts: [+|-]Y-M [D] [H:M:S]
-        {
-            java.util.regex.Matcher sqm = java.util.regex.Pattern.compile(
-                    "^(-?)(\\d+)-(\\d+)(?:\\s+(-?\\d+))?(?:\\s+(-?)(\\d+):(\\d+)(?::(\\d+(?:\\.\\d+)?))?)?$"
-            ).matcher(s);
-            if (sqm.matches()) {
-                int sign = "-".equals(sqm.group(1)) ? -1 : 1;
-                int years = Integer.parseInt(sqm.group(2));
-                int mons = Integer.parseInt(sqm.group(3));
-                int totalMonths = sign * (years * 12 + mons);
-                int days = sqm.group(4) != null ? Integer.parseInt(sqm.group(4)) : 0;
-                long totalMicros = 0;
-                if (sqm.group(6) != null) {
-                    int tsign = "-".equals(sqm.group(5)) ? -1 : 1;
-                    int hours = Integer.parseInt(sqm.group(6));
-                    int minutes = Integer.parseInt(sqm.group(7));
-                    totalMicros = tsign * ((hours * 3600L + minutes * 60L) * 1_000_000L
-                            + secondsToMicros(sqm.group(8)));
-                }
-                return new PgInterval(totalMonths, days, totalMicros);
+            long totalMicros = 0;
+            if (pm.group(5) != null) {
+                // The time of day is read by the one decoder that knows PG's rules for it, so
+                // '04:70:00' is as much out of range here as it is anywhere else.
+                String ss = pm.group(7) + (pm.group(8) == null ? "" : "." + pm.group(8));
+                totalMicros = timeFieldMicros(
+                        ("-".equals(pm.group(4)) ? "-" : "") + pm.group(5),
+                        pm.group(6), ss, IntervalTypmod.FULL_RANGE);
             }
+            if (totalMicros != NOT_A_TIME_FIELD) return new PgInterval(totalMonths, days, totalMicros);
         }
 
-        // Try sql_standard day-time format: 'D HH:MM:SS' (e.g. '2 04:05:06' = 2 days 04:05:06)
-        {
-            java.util.regex.Matcher dtm = java.util.regex.Pattern.compile(
-                    "^(-?)(\\d+)\\s+(-?)(\\d+):(\\d+)(?::(\\d+(?:\\.\\d+)?))?$"
-            ).matcher(s);
-            if (dtm.matches()) {
-                int dsign = "-".equals(dtm.group(1)) ? -1 : 1;
-                int days = dsign * Integer.parseInt(dtm.group(2));
-                int tsign = "-".equals(dtm.group(3)) ? -1 : 1;
-                int hours = Integer.parseInt(dtm.group(4));
-                int minutes = Integer.parseInt(dtm.group(5));
-                long totalMicros = tsign * ((hours * 3600L + minutes * 60L) * 1_000_000L
-                        + secondsToMicros(dtm.group(6)));
-                return new PgInterval(0, days, totalMicros);
-            }
-        }
+        // The sql_standard shapes 'Y-M [D] [H:M:S]' and 'D H:M:S' are left to the general reader
+        // below: a bare number between a year-month field and a time of day is a day count, but
+        // the same number with no time of day after it is a count of seconds, and only a reader
+        // that looks at what follows can tell the two apart.
 
         // A bare number is a count of seconds. Only plain decimal digits qualify: Java would also
         // read '1d' and '1f' as numbers, but to PG the trailing letter is a unit word, so '1d' is
@@ -345,6 +303,14 @@ public class PgInterval implements Comparable<PgInterval> {
         if (PLAIN_NUMBER.matcher(s).matches()) {
             return new PgInterval(0, 0, secondsToMicros(s));
         }
+
+        // An unqualified literal is decoded by the same reader a qualified one uses, with nothing
+        // restricted: PG has one DecodeInterval, and the qualifier only supplies the unit for an
+        // unlabelled number. Reading both through it is what makes '1-2 3 4:05.678' a year, two
+        // months, three days and four minutes rather than a heap of seconds, and what makes
+        // '1 hour 2 hour' the syntax error PG says it is.
+        PgInterval ranged = parseRanged(s, IntervalTypmod.PLAIN);
+        if (ranged != null) return ranged;
 
         PgInterval units = parseUnitList(s);
         if (units != null) return units;
@@ -361,6 +327,7 @@ public class PgInterval implements Comparable<PgInterval> {
      * @return the parsed interval, or null when the text is not a unit list at all
      */
     private static PgInterval parseUnitList(String s) {
+        String written = s;
         // PG's traditional output opened with '@'; it carries no meaning of its own
         if (s.startsWith("@")) s = s.substring(1).trim();
         Matcher tok = java.util.regex.Pattern.compile(
@@ -372,10 +339,12 @@ public class PgInterval implements Comparable<PgInterval> {
         long micros = 0;
         boolean matchedAny = false;
         boolean ago = false;
+        boolean lastWasUnitless = false;
         int end = 0;
         while (tok.find()) {
             end = tok.end();
             if (tok.group(1) != null) {
+                if (ago) throw invalidIntervalSyntax(written);
                 // A bare time field: the sign on the hours carries across the whole field
                 boolean neg = tok.group(1).startsWith("-");
                 long h = Math.abs(Long.parseLong(tok.group(1)));
@@ -383,14 +352,21 @@ public class PgInterval implements Comparable<PgInterval> {
                 long field = (h * 3600L + m * 60L) * 1_000_000L + secondsToMicros(tok.group(3));
                 micros += neg ? -field : field;
                 matchedAny = true;
+                lastWasUnitless = false;
                 continue;
             }
             if (tok.group(6) != null) {
                 if (!"ago".equalsIgnoreCase(tok.group(6))) return null;
+                // 'ago' stands where the unit for the number to its left would have been, so a
+                // number that had no unit of its own has none at all: '1 ago' is a syntax error.
+                if (lastWasUnitless || ago) throw invalidIntervalSyntax(written);
                 ago = true;
                 continue;
             }
+            // 'ago' is the last word of a literal; anything after it is a syntax error
+            if (ago) throw invalidIntervalSyntax(written);
             Quantity value = quantity(tok.group(4));
+            lastWasUnitless = tok.group(5) == null;
             String unit = tok.group(5) == null ? "second" : normalizeUnit(tok.group(5));
             if (unit == null) return null;
             Accum one = new Accum();
@@ -757,7 +733,7 @@ public class PgInterval implements Comparable<PgInterval> {
      */
     private static final Pattern QUALIFIED_FIELD = Pattern.compile(
             "\\G\\s*(?:"
-          + "([+-]?\\d+):(\\d+)(?::(\\d+(?:\\.\\d+)?))?"      // 1,2,3 time-of-day HH:MM[:SS]
+          + "([+-]?\\d+):(\\d+(?:\\.\\d*)?)(?::(\\d+(?:\\.\\d*)?))?"  // 1,2,3 time HH:MM[:SS]
           + "|([+-]?\\d+)-(\\d+)"                              // 4,5   sql_standard years-months
           + "|([+-]?(?:\\d+(?:\\.\\d+)?|\\.\\d+))"             // 6     bare quantity
           + "|([A-Za-z]+)"                                     // 7     unit word, or "ago"
@@ -803,27 +779,50 @@ public class PgInterval implements Comparable<PgInterval> {
         int filled = 0;
         String pendingUnit = null;
         boolean ago = false;
+        boolean agoIsTheUnit = false;
+        boolean sawField = false;
         for (int i = fields.size() - 1; i >= 0; i--) {
             String[] f = fields.get(i);
+            // '@' is PG's traditional lead-in and carries nothing, wherever it stands
             if ("at".equals(f[0])) continue;
             if ("word".equals(f[0])) {
-                if ("ago".equalsIgnoreCase(f[1])) { ago = true; continue; }
+                if ("ago".equalsIgnoreCase(f[1])) {
+                    // 'ago' turns the whole interval around and PG only takes it as the last word
+                    // of the literal: 'ago 1 day' and '1 day ago 2 hours' are syntax errors, and
+                    // so is a second 'ago' with nothing left to turn.
+                    if (sawField) throw invalidIntervalSyntax(input);
+                    // PG reads the fields right to left and lets a unit word name the number to
+                    // its left. 'ago' is not a unit, and PG leaves it standing where the unit
+                    // would have been, so a number with nothing but 'ago' to its right has no
+                    // unit at all — which is why '1 ago' is a syntax error and '1 day ago' is not.
+                    ago = true;
+                    sawField = true;
+                    agoIsTheUnit = true;
+                    pendingUnit = null;
+                    continue;
+                }
                 String unit = normalizeUnit(f[1]);
                 if (unit == null) return null;
                 pendingUnit = unit;
+                sawField = true;
+                agoIsTheUnit = false;
                 continue;
             }
+            sawField = true;
             if ("time".equals(f[0])) {
-                int timeFields = IntervalTypmod.HOUR | IntervalTypmod.MINUTE | IntervalTypmod.SECOND;
+                int timeFields = U_HOUR | U_MINUTE | U_SECOND;
                 if ((filled & timeFields) != 0) throw invalidIntervalSyntax(input);
+                long micros = timeFieldMicros(f[1], f[2], f[3], typmod.range());
+                if (micros == NOT_A_TIME_FIELD) return null;
                 filled |= timeFields;
-                acc.micros += timeFieldMicros(f[1], f[2], f[3], typmod.range());
+                acc.micros += micros;
                 // PG reads whatever stands to the left of a time-of-day as a day count
                 pendingUnit = "day";
+                agoIsTheUnit = false;
                 continue;
             }
             if ("ym".equals(f[0])) {
-                int ymFields = IntervalTypmod.YEAR | IntervalTypmod.MONTH;
+                int ymFields = U_YEAR | U_MONTH;
                 if ((filled & ymFields) != 0) throw invalidIntervalSyntax(input);
                 filled |= ymFields;
                 long sign = f[1].startsWith("-") ? -1 : 1;
@@ -831,8 +830,10 @@ public class PgInterval implements Comparable<PgInterval> {
                 long mons = Long.parseLong(f[2]);
                 acc.months += sign * (years * 12 + mons);
                 pendingUnit = null;
+                agoIsTheUnit = false;
                 continue;
             }
+            if (agoIsTheUnit) throw invalidIntervalSyntax(input);
             String unit = pendingUnit != null
                     ? pendingUnit : IntervalTypmod.unitName(typmod.defaultUnit());
             int bit = fieldBitOf(unit);
@@ -845,9 +846,16 @@ public class PgInterval implements Comparable<PgInterval> {
                 return null;
             }
             if (!addUnit(acc, value, unit)) return null;
-            // 'D H' is the SQL standard spelling of DAY TO HOUR, so an hour hands DAY leftwards
-            pendingUnit = "hour".equals(unit) ? "day" : null;
+            // A unit keeps naming the numbers further left until another unit word replaces it,
+            // which is what makes '1 2 days' the duplicate-field error PG reports rather than a
+            // day and a stray second. The one exception is PG's own: an hour hands DAY leftwards,
+            // because 'D H' is the SQL standard spelling of DAY TO HOUR.
+            pendingUnit = "hour".equals(unit) ? "day" : unit;
         }
+        // A literal that filled no field at all is not an interval of zero: PG has no spelling for
+        // the empty interval, so 'day', 'ago', '@' and '@ ago' are all syntax errors rather than
+        // 00:00:00. Handing them back as a zero let a column store a quantity nobody wrote.
+        if (filled == 0) return null;
         if (ago) return checked(-acc.months, -acc.days, -acc.micros);
         return checked(acc.months, acc.days, acc.micros);
     }
@@ -856,31 +864,85 @@ public class PgInterval implements Comparable<PgInterval> {
         return s.startsWith("+") ? s.substring(1) : s;
     }
 
-    /** Microseconds held by one HH:MM[:SS] field; the sign on the hours covers the whole field. */
+    /**
+     * Microseconds held by one HH:MM[:SS] field; the sign on the hours covers the whole field.
+     *
+     * <p>Two parts are not always hours and minutes. PG reads {@code a:b} as MINUTE:SECOND when
+     * the qualifier is MINUTE TO SECOND, and — whatever the qualifier — whenever the second part
+     * carries a fraction, because a fraction can only belong to the seconds field. That is why
+     * {@code '3:04'} is three hours and four minutes but {@code '3:04.5'} is three minutes and
+     * four and a half seconds.
+     *
+     * <p>The minutes may not exceed 59 and the seconds may not exceed 60, exactly as PG's
+     * DecodeTimeForInterval requires; the hours are unbounded because an interval is a duration
+     * rather than a time of day.
+     */
     private static long timeFieldMicros(String hh, String mm, String ss, int range) {
         boolean negative = hh.startsWith("-");
         long hours = Math.abs(Long.parseLong(stripPlus(hh)));
-        long minutes = Long.parseLong(mm);
-        long secondMicros = secondsToMicros(ss);
-        // Under MINUTE TO SECOND the SQL standard reads a two-part time field as MM:SS
-        if (ss == null && range == (IntervalTypmod.MINUTE | IntervalTypmod.SECOND)) {
-            secondMicros = Math.multiplyExact(minutes, 1_000_000L);
+        long minutes;
+        String secondsText;
+        if (mm.indexOf('.') >= 0) {
+            if (ss != null) return NOT_A_TIME_FIELD;   // 'a:b.c:d' is no shape PG accepts
+            secondsText = mm;
             minutes = hours;
             hours = 0;
+        } else if (ss != null) {
+            minutes = Long.parseLong(mm);
+            secondsText = ss;
+        } else if (range == (IntervalTypmod.MINUTE | IntervalTypmod.SECOND)) {
+            secondsText = mm;
+            minutes = hours;
+            hours = 0;
+        } else {
+            minutes = Long.parseLong(mm);
+            secondsText = null;
         }
-        long field = (hours * 3600L + minutes * 60L) * 1_000_000L + secondMicros;
+        // PG counts the whole seconds and the fraction separately, and bounds each on its own:
+        // 60 whole seconds is allowed (it is what makes '3:60.5' four minutes) and so is a
+        // fraction that rounds to a whole second, but 61 is out of range.
+        Quantity sec = secondsText == null ? new Quantity(0, 0) : quantity(secondsText);
+        long fracMicros = (long) Math.rint(sec.frac * 1_000_000.0);
+        if (minutes > 59 || sec.whole > 60 || Math.abs(fracMicros) > 1_000_000L) {
+            throw new IsoFieldOverflow();
+        }
+        long field = (hours * 3600L + minutes * 60L + sec.whole) * 1_000_000L + fracMicros;
         return negative ? -field : field;
     }
 
-    /** The interval field a unit word fills, for detecting a literal that fills one twice. */
+    /** Sentinel for a time field whose shape PG's decoder would refuse outright. */
+    private static final long NOT_A_TIME_FIELD = Long.MIN_VALUE;
+
+    // One bit per unit word, for detecting a literal that fills the same field twice. PG keeps a
+    // separate mask bit for every unit it knows rather than one per interval field, so
+    // '1 week 2 days' and '1 second 500 milliseconds' are both fine while '1 day 1 day' is not.
+    private static final int U_MILLENNIUM = 1 << 0;
+    private static final int U_CENTURY = 1 << 1;
+    private static final int U_DECADE = 1 << 2;
+    private static final int U_YEAR = 1 << 3;
+    private static final int U_MONTH = 1 << 4;
+    private static final int U_WEEK = 1 << 5;
+    private static final int U_DAY = 1 << 6;
+    private static final int U_HOUR = 1 << 7;
+    private static final int U_MINUTE = 1 << 8;
+    private static final int U_SECOND = 1 << 9;
+    private static final int U_MILLISECOND = 1 << 10;
+    private static final int U_MICROSECOND = 1 << 11;
+
+    /** The mask bit a unit word fills, for detecting a literal that fills one twice. */
     private static int fieldBitOf(String unit) {
-        if ("year".equals(unit) || "decade".equals(unit)
-                || "century".equals(unit) || "millennium".equals(unit)) return IntervalTypmod.YEAR;
-        if ("month".equals(unit)) return IntervalTypmod.MONTH;
-        if ("day".equals(unit) || "week".equals(unit)) return IntervalTypmod.DAY;
-        if ("hour".equals(unit)) return IntervalTypmod.HOUR;
-        if ("minute".equals(unit)) return IntervalTypmod.MINUTE;
-        return IntervalTypmod.SECOND;
+        if ("millennium".equals(unit)) return U_MILLENNIUM;
+        if ("century".equals(unit)) return U_CENTURY;
+        if ("decade".equals(unit)) return U_DECADE;
+        if ("year".equals(unit)) return U_YEAR;
+        if ("month".equals(unit)) return U_MONTH;
+        if ("week".equals(unit)) return U_WEEK;
+        if ("day".equals(unit)) return U_DAY;
+        if ("hour".equals(unit)) return U_HOUR;
+        if ("minute".equals(unit)) return U_MINUTE;
+        if ("millisecond".equals(unit)) return U_MILLISECOND;
+        if ("microsecond".equals(unit)) return U_MICROSECOND;
+        return U_SECOND;
     }
 
     private static MemgresException invalidIntervalSyntax(String input) {

@@ -37,6 +37,37 @@ class CatalogStubBuilder {
         return formatted;
     }
 
+    /**
+     * The text-search objects PostgreSQL pins an OID for, named once so the rows that point at
+     * each other cannot drift apart.
+     *
+     * <p>All but two are written into PostgreSQL's own .dat files and are the same number on
+     * every server: the default parser is 3722, the simple dictionary 3765 and the simple
+     * template 3727, and the simple configuration 3748. snowball and english_stem are created at
+     * initdb instead, so their numbers are not fixed anywhere and memgres only has to keep its
+     * own two rows agreeing with each other.
+     */
+    private static final int PARSER_DEFAULT = 3722;
+    private static final int DICT_SIMPLE = 3765;
+    private static final int DICT_ENGLISH_STEM = 12676;
+    private static final int TMPL_SIMPLE = 3727;
+    private static final int TMPL_SNOWBALL = 14801;
+    private static final int CFG_SIMPLE = 3748;
+    private static final int CFG_ENGLISH = 3764;
+
+    /**
+     * An array column that also records what it is an array of.
+     *
+     * <p>{@link CatalogHelper#col} leaves the element type unset, and a column with an array type
+     * but no element type is described by its internal typname: {@code pg_typeof} answered
+     * {@code _text} where PostgreSQL answers {@code text[]}. Recording the element is what lets
+     * the column be named the way a client could write it back in SQL.
+     */
+    private static Column arrayCol(String name, DataType arrayType, DataType elementType) {
+        return new Column(name, arrayType, true, false, null, null, null, null, null, null, null,
+                elementType);
+    }
+
     final Database database;
     final OidSupplier oids;
 
@@ -51,10 +82,10 @@ class CatalogStubBuilder {
 
     Table buildPgTables() {
         List<Column> cols = Cols.listOf(
-                colNN("schemaname", DataType.TEXT),
-                colNN("tablename", DataType.TEXT),
-                colNN("tableowner", DataType.TEXT),
-                col("tablespace", DataType.TEXT),
+                colNN("schemaname", DataType.NAME),
+                colNN("tablename", DataType.NAME),
+                colNN("tableowner", DataType.NAME),
+                col("tablespace", DataType.NAME),
                 col("hasindexes", DataType.BOOLEAN),
                 col("hasrules", DataType.BOOLEAN),
                 col("hastriggers", DataType.BOOLEAN),
@@ -77,8 +108,9 @@ class CatalogStubBuilder {
                 String tableName = tableEntry.getKey();
                 Table t = tableEntry.getValue();
                 // M22: compute hasindexes/hastriggers from actual state
+                final String tblSchema = schemaEntry.getKey();
                 boolean hasIdx = !t.getConstraints().isEmpty() || database.getIndexColumns().keySet().stream()
-                        .anyMatch(idx -> { String ti = database.getIndexTable(idx); return ti != null && ti.endsWith("." + tableName); });
+                        .anyMatch(idx -> { String ti = database.getIndexTable(idx); return ti != null && ti.equalsIgnoreCase(tblSchema + "." + tableName); });
                 boolean hasFk = false;
                 for (StoredConstraint sc : t.getConstraints()) {
                     if (sc.getType() == StoredConstraint.Type.FOREIGN_KEY) { hasFk = true; break; }
@@ -96,9 +128,9 @@ class CatalogStubBuilder {
 
     Table buildPgViews() {
         List<Column> cols = Cols.listOf(
-                colNN("schemaname", DataType.TEXT),
-                colNN("viewname", DataType.TEXT),
-                colNN("viewowner", DataType.TEXT),
+                colNN("schemaname", DataType.NAME),
+                colNN("viewname", DataType.NAME),
+                colNN("viewowner", DataType.NAME),
                 col("definition", DataType.TEXT)
         );
         Table table = new Table("pg_views", cols);
@@ -117,10 +149,10 @@ class CatalogStubBuilder {
 
     Table buildPgIndexes() {
         List<Column> cols = Cols.listOf(
-                colNN("schemaname", DataType.TEXT),
-                colNN("tablename", DataType.TEXT),
-                colNN("indexname", DataType.TEXT),
-                col("tablespace", DataType.TEXT),
+                colNN("schemaname", DataType.NAME),
+                colNN("tablename", DataType.NAME),
+                colNN("indexname", DataType.NAME),
+                col("tablespace", DataType.NAME),
                 col("indexdef", DataType.TEXT)
         );
         Table table = new Table("pg_indexes", cols);
@@ -129,9 +161,10 @@ class CatalogStubBuilder {
 
         // 1. Explicit indexes (CREATE INDEX)
         for (Map.Entry<String, List<String>> idx : database.getIndexColumns().entrySet()) {
-            String indexName = idx.getKey();
+            String indexKey = idx.getKey();
+            String indexName = Database.idxName(indexKey);
             List<String> indexCols = idx.getValue();
-            String storedTableQualified = database.getIndexTable(indexName);
+            String storedTableQualified = database.getIndexTable(indexKey);
             String schemaName = "public";
             String tableName = storedTableQualified;
             if (storedTableQualified != null && storedTableQualified.contains(".")) {
@@ -139,17 +172,17 @@ class CatalogStubBuilder {
                 schemaName = parts[0];
                 tableName = parts[1];
             }
-            boolean isUnique = database.isUniqueIndex(indexName);
-            String method = database.getIndexMethod(indexName);
+            boolean isUnique = database.isUniqueIndex(indexKey);
+            String method = database.getIndexMethod(indexKey);
             String indexDef = buildIndexDef(indexName, storedTableQualified, isUnique, method,
                     CatalogHelper.deparseIndexColumns(database, storedTableQualified, indexCols),
-                    database.getIndexColumnOptions(indexName),
-                    database.getIndexIncludeColumns(indexName),
-                    database.isIndexNullsNotDistinct(indexName),
+                    database.getIndexColumnOptions(indexKey),
+                    database.getIndexIncludeColumns(indexKey),
+                    database.isIndexNullsNotDistinct(indexKey),
                     CatalogHelper.deparseIndexPredicate(database, storedTableQualified,
-                            database.getIndexWhereClause(indexName)));
+                            database.getIndexWhereClause(indexKey)));
             table.insertRow(new Object[]{schemaName, tableName, indexName, null, indexDef});
-            addedIndexes.add(indexName.toLowerCase());
+            addedIndexes.add(Database.idxKey(schemaName, indexName).toLowerCase());
         }
 
         // 2. Implicit indexes from PRIMARY KEY and UNIQUE constraints
@@ -161,7 +194,8 @@ class CatalogStubBuilder {
                     if (sc.getType() == StoredConstraint.Type.PRIMARY_KEY
                             || sc.getType() == StoredConstraint.Type.UNIQUE) {
                         String indexName = sc.getName();
-                        if (addedIndexes.contains(indexName.toLowerCase())) continue;
+                        if (addedIndexes.contains(
+                                Database.idxKey(schemaName, indexName).toLowerCase())) continue;
                         String indexDef = "CREATE UNIQUE INDEX " + indexName
                                 + " ON " + schemaName + "." + t.getName()
                                 + " USING btree (" + String.join(", ", sc.getColumns()) + ")"
@@ -229,8 +263,8 @@ class CatalogStubBuilder {
     Table buildPgSequence() {
         // pg_sequence: the catalog table (not the pg_sequences view)
         List<Column> cols = Cols.listOf(
-                colNN("seqrelid", DataType.INTEGER),
-                colNN("seqtypid", DataType.INTEGER),
+                colNN("seqrelid", DataType.OID),
+                colNN("seqtypid", DataType.OID),
                 colNN("seqstart", DataType.BIGINT),
                 colNN("seqincrement", DataType.BIGINT),
                 colNN("seqmax", DataType.BIGINT),
@@ -239,12 +273,11 @@ class CatalogStubBuilder {
                 colNN("seqcycle", DataType.BOOLEAN)
         );
         Table table = new Table("pg_sequence", cols);
-        for (String seqName : getSequenceNames(database)) {
-            Sequence seq = database.getSequence(seqName);
-            String seqSchemaName = resolveSequenceSchema(database, seqName);
-            int seqOid = oids.oid("rel:" + seqSchemaName + "." + seqName);
+        for (String qualified : getSequenceNames(database)) {
+            Sequence seq = database.getSequence(qualified);
+            int seqOid = oids.oid("rel:" + qualified);
             // Determine sequence type from the source column type
-            DataType seqDataType = getSequenceDataType(database, seqName);
+            DataType seqDataType = getSequenceDataType(database, qualified);
             int typOid = seqDataType.getOid();
             long startWith = seq != null ? seq.getStartWith() : 1L;
             long incrementBy = seq != null ? seq.getIncrementBy() : 1L;
@@ -263,10 +296,10 @@ class CatalogStubBuilder {
 
     Table buildPgSequences() {
         List<Column> cols = Cols.listOf(
-                colNN("schemaname", DataType.TEXT),
-                colNN("sequencename", DataType.TEXT),
-                colNN("sequenceowner", DataType.TEXT),
-                col("data_type", DataType.TEXT),
+                colNN("schemaname", DataType.NAME),
+                colNN("sequencename", DataType.NAME),
+                colNN("sequenceowner", DataType.NAME),
+                col("data_type", DataType.REGTYPE),
                 col("start_value", DataType.BIGINT),
                 col("min_value", DataType.BIGINT),
                 col("max_value", DataType.BIGINT),
@@ -276,9 +309,11 @@ class CatalogStubBuilder {
                 col("last_value", DataType.BIGINT)
         );
         Table table = new Table("pg_sequences", cols);
-        for (String seqName : getSequenceNames(database)) {
-            Sequence seq = database.getSequence(seqName);
-            DataType seqDataType = getSequenceDataType(database, seqName);
+        for (String qualified : getSequenceNames(database)) {
+            String seqName = CatalogHelper.nameOf(qualified);
+            String seqSchema = CatalogHelper.schemaOf(qualified);
+            Sequence seq = database.getSequence(qualified);
+            DataType seqDataType = getSequenceDataType(database, qualified);
             String typeName;
             switch (seqDataType) {
                 case SMALLINT:
@@ -300,7 +335,6 @@ class CatalogStubBuilder {
             boolean cycle = seq != null && seq.isCycle();
             long cacheSize = seq != null ? (long) seq.getCache() : 1L;
             Long lastValue = (seq != null && seq.isCalled()) ? seq.currValRaw() : null;
-            String seqSchema = resolveSequenceSchema(database, seqName);
             table.insertRow(new Object[]{
                     seqSchema, seqName, "memgres", typeName,
                     startWith, minValue, maxValue,
@@ -310,26 +344,15 @@ class CatalogStubBuilder {
         return table;
     }
 
-    /** Resolve the schema that owns a given sequence by checking the schemaObjectRegistry. */
-    private static String resolveSequenceSchema(Database database, String seqName) {
-        for (java.util.Map.Entry<String, Schema> entry : database.getSchemas().entrySet()) {
-            java.util.Set<String> objects = database.getSchemaObjects(entry.getKey());
-            if (objects.contains("sequence:" + seqName.toLowerCase())) {
-                return entry.getKey();
-            }
-        }
-        return "public";
-    }
-
     // ---------------------------------------------------------------
     //  Stats stubs (and some with data)
     // ---------------------------------------------------------------
 
     Table buildPgStatUserTables() {
         List<Column> cols = Cols.listOf(
-                col("relid", DataType.INTEGER),
-                col("schemaname", DataType.TEXT),
-                col("relname", DataType.TEXT),
+                col("relid", DataType.OID),
+                col("schemaname", DataType.NAME),
+                col("relname", DataType.NAME),
                 col("seq_scan", DataType.BIGINT),
                 col("last_seq_scan", DataType.TIMESTAMPTZ),
                 col("seq_tup_read", DataType.BIGINT),
@@ -403,9 +426,9 @@ class CatalogStubBuilder {
      */
     Table buildPgStatXactTables(String name) {
         List<Column> cols = Cols.listOf(
-                col("relid", DataType.INTEGER),
-                col("schemaname", DataType.TEXT),
-                col("relname", DataType.TEXT),
+                col("relid", DataType.OID),
+                col("schemaname", DataType.NAME),
+                col("relname", DataType.NAME),
                 col("seq_scan", DataType.BIGINT),
                 col("seq_tup_read", DataType.BIGINT),
                 col("idx_scan", DataType.BIGINT),
@@ -434,11 +457,11 @@ class CatalogStubBuilder {
     /** Block-level index counters; a different view from pg_stat_*_indexes, with its own columns. */
     Table buildPgStatioIndexes(String name) {
         List<Column> cols = Cols.listOf(
-                col("relid", DataType.INTEGER),
-                col("indexrelid", DataType.INTEGER),
-                col("schemaname", DataType.TEXT),
-                col("relname", DataType.TEXT),
-                col("indexrelname", DataType.TEXT),
+                col("relid", DataType.OID),
+                col("indexrelid", DataType.OID),
+                col("schemaname", DataType.NAME),
+                col("relname", DataType.NAME),
+                col("indexrelname", DataType.NAME),
                 col("idx_blks_read", DataType.BIGINT),
                 col("idx_blks_hit", DataType.BIGINT)
         );
@@ -448,9 +471,9 @@ class CatalogStubBuilder {
     /** Block-level sequence counters. */
     Table buildPgStatioSequences(String name) {
         List<Column> cols = Cols.listOf(
-                col("relid", DataType.INTEGER),
-                col("schemaname", DataType.TEXT),
-                col("relname", DataType.TEXT),
+                col("relid", DataType.OID),
+                col("schemaname", DataType.NAME),
+                col("relname", DataType.NAME),
                 col("blks_read", DataType.BIGINT),
                 col("blks_hit", DataType.BIGINT)
         );
@@ -459,11 +482,11 @@ class CatalogStubBuilder {
 
     Table buildPgStatUserIndexes() {
         List<Column> cols = Cols.listOf(
-                col("relid", DataType.INTEGER),
-                col("indexrelid", DataType.INTEGER),
-                col("schemaname", DataType.TEXT),
-                col("relname", DataType.TEXT),
-                col("indexrelname", DataType.TEXT),
+                col("relid", DataType.OID),
+                col("indexrelid", DataType.OID),
+                col("schemaname", DataType.NAME),
+                col("relname", DataType.NAME),
+                col("indexrelname", DataType.NAME),
                 col("idx_scan", DataType.BIGINT),
                 col("last_idx_scan", DataType.TIMESTAMPTZ),
                 col("idx_tup_read", DataType.BIGINT),
@@ -474,8 +497,9 @@ class CatalogStubBuilder {
         Set<String> addedIndexes = new java.util.HashSet<>();
         // Populate with explicit indexes (zero stats)
         for (Map.Entry<String, List<String>> idx : database.getIndexColumns().entrySet()) {
-            String indexName = idx.getKey();
-            String storedTable = database.getIndexTable(indexName);
+            String indexKey = idx.getKey();
+            String indexName = Database.idxName(indexKey);
+            String storedTable = database.getIndexTable(indexKey);
             String indexSchema = "public";
             String tableName = null;
             if (storedTable != null) {
@@ -484,7 +508,7 @@ class CatalogStubBuilder {
                 else tableName = parts[0];
             }
             if (tableName != null) {
-                addedIndexes.add(indexName.toLowerCase());
+                addedIndexes.add(Database.idxKey(indexSchema, indexName).toLowerCase());
                 long idxScan = 0L;
                 Schema sch = database.getSchemas().get(indexSchema);
                 if (sch != null) {
@@ -507,8 +531,9 @@ class CatalogStubBuilder {
                 Table t = tableEntry.getValue();
                 for (Map.Entry<String, TableIndex> idxEntry : t.getIndexes().entrySet()) {
                     String constraintName = idxEntry.getKey();
-                    if (!addedIndexes.contains(constraintName.toLowerCase())) {
-                        addedIndexes.add(constraintName.toLowerCase());
+                    String ciKey = Database.idxKey(schemaName, constraintName).toLowerCase();
+                    if (!addedIndexes.contains(ciKey)) {
+                        addedIndexes.add(ciKey);
                         table.insertRow(new Object[]{
                                 oids.oid("rel:" + schemaName + "." + t.getName()),
                                 oids.oid("rel:" + schemaName + "." + constraintName),
@@ -525,8 +550,8 @@ class CatalogStubBuilder {
 
     Table buildPgStatDatabase() {
         List<Column> cols = Cols.listOf(
-                col("datid", DataType.INTEGER),
-                col("datname", DataType.TEXT),
+                col("datid", DataType.OID),
+                col("datname", DataType.NAME),
                 col("numbackends", DataType.INTEGER),
                 col("xact_commit", DataType.BIGINT),
                 col("xact_rollback", DataType.BIGINT),
@@ -575,7 +600,7 @@ class CatalogStubBuilder {
         // PostgreSQL keeps five numbered slots per column; a query that reads a histogram or a
         // most-common-value list names them, so a pg_statistic without them describes nothing.
         List<Column> cols = new java.util.ArrayList<>(Cols.listOf(
-                col("starelid", DataType.INTEGER),
+                col("starelid", DataType.OID),
                 col("staattnum", DataType.SMALLINT),
                 col("stainherit", DataType.BOOLEAN),
                 col("stanullfrac", DataType.REAL),
@@ -670,22 +695,22 @@ class CatalogStubBuilder {
     Table buildPgStatReplication() {
         List<Column> cols = Cols.listOf(
                 col("pid", DataType.INTEGER),
-                col("usesysid", DataType.INTEGER),
-                col("usename", DataType.TEXT),
+                col("usesysid", DataType.OID),
+                col("usename", DataType.NAME),
                 col("application_name", DataType.TEXT),
-                col("client_addr", DataType.TEXT),
+                col("client_addr", DataType.INET),
                 col("client_hostname", DataType.TEXT),
                 col("client_port", DataType.INTEGER),
                 col("backend_start", DataType.TIMESTAMPTZ),
-                col("backend_xmin", DataType.INTEGER),
+                col("backend_xmin", DataType.XID),
                 col("state", DataType.TEXT),
-                col("sent_lsn", DataType.TEXT),
-                col("write_lsn", DataType.TEXT),
-                col("flush_lsn", DataType.TEXT),
-                col("replay_lsn", DataType.TEXT),
-                col("write_lag", DataType.TEXT),
-                col("flush_lag", DataType.TEXT),
-                col("replay_lag", DataType.TEXT),
+                col("sent_lsn", DataType.PG_LSN),
+                col("write_lsn", DataType.PG_LSN),
+                col("flush_lsn", DataType.PG_LSN),
+                col("replay_lsn", DataType.PG_LSN),
+                col("write_lag", DataType.INTERVAL),
+                col("flush_lag", DataType.INTERVAL),
+                col("replay_lag", DataType.INTERVAL),
                 col("sync_priority", DataType.INTEGER),
                 col("sync_state", DataType.TEXT),
                 col("reply_time", DataType.TIMESTAMPTZ)
@@ -695,12 +720,12 @@ class CatalogStubBuilder {
 
     Table buildPgStatSubscription() {
         List<Column> cols = Cols.listOf(
-                col("subid", DataType.INTEGER),
-                col("subname", DataType.TEXT),
+                col("subid", DataType.OID),
+                col("subname", DataType.NAME),
                 col("worker_type", DataType.TEXT),
                 col("pid", DataType.INTEGER),
                 col("leader_pid", DataType.INTEGER),
-                col("relid", DataType.INTEGER),
+                col("relid", DataType.OID),
                 col("received_lsn", DataType.PG_LSN),
                 col("last_msg_send_time", DataType.TIMESTAMPTZ),
                 col("last_msg_receipt_time", DataType.TIMESTAMPTZ),
@@ -714,9 +739,9 @@ class CatalogStubBuilder {
         // PG 17 replaced the dead-tuple counts with byte-based ones and added index progress.
         List<Column> cols = Cols.listOf(
                 col("pid", DataType.INTEGER),
-                col("datid", DataType.INTEGER),
-                col("datname", DataType.TEXT),
-                col("relid", DataType.INTEGER),
+                col("datid", DataType.OID),
+                col("datname", DataType.NAME),
+                col("relid", DataType.OID),
                 col("phase", DataType.TEXT),
                 col("heap_blks_total", DataType.BIGINT),
                 col("heap_blks_scanned", DataType.BIGINT),
@@ -737,9 +762,9 @@ class CatalogStubBuilder {
     Table buildPgStatProgressAnalyze() {
         return new Table("pg_stat_progress_analyze", Cols.listOf(
                 col("pid", DataType.INTEGER),
-                col("datid", DataType.INTEGER),
-                col("datname", DataType.TEXT),
-                col("relid", DataType.INTEGER),
+                col("datid", DataType.OID),
+                col("datname", DataType.NAME),
+                col("relid", DataType.OID),
                 col("phase", DataType.TEXT),
                 col("sample_blks_total", DataType.BIGINT),
                 col("sample_blks_scanned", DataType.BIGINT),
@@ -754,9 +779,9 @@ class CatalogStubBuilder {
     Table buildPgStatProgressCluster() {
         return new Table("pg_stat_progress_cluster", Cols.listOf(
                 col("pid", DataType.INTEGER),
-                col("datid", DataType.INTEGER),
-                col("datname", DataType.TEXT),
-                col("relid", DataType.INTEGER),
+                col("datid", DataType.OID),
+                col("datname", DataType.NAME),
+                col("relid", DataType.OID),
                 col("command", DataType.TEXT),
                 col("phase", DataType.TEXT),
                 col("cluster_index_relid", DataType.OID),
@@ -780,9 +805,9 @@ class CatalogStubBuilder {
     Table buildPgStatProgressCopy() {
         return new Table("pg_stat_progress_copy", Cols.listOf(
                 col("pid", DataType.INTEGER),
-                col("datid", DataType.INTEGER),
-                col("datname", DataType.TEXT),
-                col("relid", DataType.INTEGER),
+                col("datid", DataType.OID),
+                col("datname", DataType.NAME),
+                col("relid", DataType.OID),
                 col("command", DataType.TEXT),
                 col("type", DataType.TEXT),
                 col("bytes_processed", DataType.BIGINT),
@@ -810,10 +835,10 @@ class CatalogStubBuilder {
     Table buildPgStatProgressCreateIndex() {
         List<Column> cols = Cols.listOf(
                 col("pid", DataType.INTEGER),
-                col("datid", DataType.INTEGER),
-                col("datname", DataType.TEXT),
-                col("relid", DataType.INTEGER),
-                col("index_relid", DataType.INTEGER),
+                col("datid", DataType.OID),
+                col("datname", DataType.NAME),
+                col("relid", DataType.OID),
+                col("index_relid", DataType.OID),
                 col("command", DataType.TEXT),
                 col("phase", DataType.TEXT),
                 col("lockers_total", DataType.BIGINT),
@@ -842,6 +867,8 @@ class CatalogStubBuilder {
                 col("last_msg_receipt_time", DataType.TIMESTAMPTZ),
                 col("latest_end_lsn", DataType.PG_LSN),
                 col("latest_end_time", DataType.TIMESTAMPTZ),
+                // text here, unlike pg_replication_slots.slot_name, which is a name: the receiver
+                // reports the slot it was configured with, not one this server holds a row for.
                 col("slot_name", DataType.TEXT),
                 col("sender_host", DataType.TEXT),
                 col("sender_port", DataType.INTEGER),
@@ -880,9 +907,9 @@ class CatalogStubBuilder {
 
     Table buildPgStatioUserTables() {
         List<Column> cols = Cols.listOf(
-                col("relid", DataType.INTEGER),
-                col("schemaname", DataType.TEXT),
-                col("relname", DataType.TEXT),
+                col("relid", DataType.OID),
+                col("schemaname", DataType.NAME),
+                col("relname", DataType.NAME),
                 col("heap_blks_read", DataType.BIGINT),
                 col("heap_blks_hit", DataType.BIGINT),
                 col("idx_blks_read", DataType.BIGINT),
@@ -1029,42 +1056,51 @@ class CatalogStubBuilder {
     //  Text search
     // ---------------------------------------------------------------
 
+    /**
+     * pg_ts_parser. The five prs* columns are regprocs in PostgreSQL, naming the C functions that
+     * drive the parser. memgres's parser is not reachable as a function, so each is reported as
+     * InvalidOid — which is what PostgreSQL itself writes when there is no function — and prints
+     * as '-' rather than as a function name memgres could not have called.
+     */
     Table buildPgTsParser() {
         List<Column> cols = Cols.listOf(
-                colNN("oid", DataType.INTEGER),
-                colNN("prsname", DataType.TEXT),
-                colNN("prsnamespace", DataType.INTEGER),
-                col("prsstart", DataType.INTEGER),
-                col("prstoken", DataType.INTEGER),
-                col("prsend", DataType.INTEGER),
-                col("prsheadline", DataType.INTEGER),
-                col("prslextype", DataType.INTEGER)
+                colNN("oid", DataType.OID),
+                colNN("prsname", DataType.NAME),
+                colNN("prsnamespace", DataType.OID),
+                col("prsstart", DataType.REGPROC),
+                col("prstoken", DataType.REGPROC),
+                col("prsend", DataType.REGPROC),
+                col("prsheadline", DataType.REGPROC),
+                col("prslextype", DataType.REGPROC)
         );
         Table table = new Table("pg_ts_parser", cols);
         // default parser
-        table.insertRow(new Object[]{3722, "default", oids.oid("ns:pg_catalog"), 0, 0, 0, 0, 0});
+        RegprocValue none = new RegprocValue(0, "-");
+        table.insertRow(new Object[]{3722, "default", oids.oid("ns:pg_catalog"),
+                none, none, none, none, none});
         return table;
     }
 
     Table buildPgTsDict() {
         List<Column> cols = Cols.listOf(
-                colNN("oid", DataType.INTEGER),
-                colNN("dictname", DataType.TEXT),
-                colNN("dictnamespace", DataType.INTEGER),
-                col("dictowner", DataType.INTEGER),
-                col("dicttemplate", DataType.INTEGER),
+                colNN("oid", DataType.OID),
+                colNN("dictname", DataType.NAME),
+                colNN("dictnamespace", DataType.OID),
+                col("dictowner", DataType.OID),
+                col("dicttemplate", DataType.OID),
                 col("dictinitoption", DataType.TEXT)
         );
         Table table = new Table("pg_ts_dict", cols);
         int pgCatNs = oids.oid("ns:pg_catalog");
-        table.insertRow(new Object[]{3765, "simple", pgCatNs, 10, 3727, null});
-        table.insertRow(new Object[]{12676, "english_stem", pgCatNs, 10, 3726, "language = 'english'"});
+        table.insertRow(new Object[]{3765, "simple", pgCatNs, 10, TMPL_SIMPLE, null});
+        table.insertRow(new Object[]{DICT_ENGLISH_STEM, "english_stem", pgCatNs, 10, TMPL_SNOWBALL,
+                "language = 'english'"});
         // User-created text search dictionaries
         int oidCounter = 91000;
         int publicNs = oids.oid("ns:public");
         for (Map.Entry<String, Database.TsDictDef> entry : database.getTsDicts().entrySet()) {
             Database.TsDictDef dict = entry.getValue();
-            int tmplOid = "simple".equalsIgnoreCase(dict.template) ? 3727 : 3726;
+            int tmplOid = "simple".equalsIgnoreCase(dict.template) ? TMPL_SIMPLE : TMPL_SNOWBALL;
             table.insertRow(new Object[]{oidCounter++, dict.name.toLowerCase(), publicNs, 10, tmplOid, dict.options});
         }
         return table;
@@ -1072,54 +1108,121 @@ class CatalogStubBuilder {
 
     Table buildPgTsTemplate() {
         List<Column> cols = Cols.listOf(
-                colNN("oid", DataType.INTEGER),
-                colNN("tmplname", DataType.TEXT),
-                colNN("tmplnamespace", DataType.INTEGER),
-                col("tmplinit", DataType.INTEGER),
-                col("tmpllexize", DataType.INTEGER)
+                colNN("oid", DataType.OID),
+                colNN("tmplname", DataType.NAME),
+                colNN("tmplnamespace", DataType.OID),
+                col("tmplinit", DataType.REGPROC),
+                col("tmpllexize", DataType.REGPROC)
         );
         Table table = new Table("pg_ts_template", cols);
         int pgCatNs = oids.oid("ns:pg_catalog");
-        table.insertRow(new Object[]{3727, "simple", pgCatNs, 0, 0});
-        table.insertRow(new Object[]{3726, "snowball", pgCatNs, 0, 0});
-        table.insertRow(new Object[]{3730, "synonym", pgCatNs, 0, 0});
+        RegprocValue none = new RegprocValue(0, "-");
+        table.insertRow(new Object[]{TMPL_SIMPLE, "simple", pgCatNs, none, none});
+        // snowball is created at initdb rather than pinned in a .dat file, so PostgreSQL's OID
+        // for it is not a fixed number and memgres cannot match it. 3726 was worse than
+        // arbitrary: PostgreSQL hands that OID to the function dsimple_lexize, so a client that
+        // resolved it against a real server landed on something else entirely. Numbered out of
+        // the way instead.
+        table.insertRow(new Object[]{TMPL_SNOWBALL, "snowball", pgCatNs, none, none});
+        table.insertRow(new Object[]{3730, "synonym", pgCatNs, none, none});
         return table;
     }
 
     Table buildPgTsConfig() {
         List<Column> cols = Cols.listOf(
-                colNN("oid", DataType.INTEGER),
-                colNN("cfgname", DataType.TEXT),
-                colNN("cfgnamespace", DataType.INTEGER),
-                col("cfgowner", DataType.INTEGER),
-                col("cfgparser", DataType.INTEGER)
+                colNN("oid", DataType.OID),
+                colNN("cfgname", DataType.NAME),
+                colNN("cfgnamespace", DataType.OID),
+                col("cfgowner", DataType.OID),
+                col("cfgparser", DataType.OID)
         );
         Table table = new Table("pg_ts_config", cols);
         int pgCatNs = oids.oid("ns:pg_catalog");
-        table.insertRow(new Object[]{3748, "simple", pgCatNs, 10, 3722});
-        table.insertRow(new Object[]{3764, "english", pgCatNs, 10, 3722});
+        table.insertRow(new Object[]{CFG_SIMPLE, "simple", pgCatNs, 10, PARSER_DEFAULT});
+        table.insertRow(new Object[]{CFG_ENGLISH, "english", pgCatNs, 10, PARSER_DEFAULT});
         // User-created text search configurations
         int oidCounter = 90000;
         for (Map.Entry<String, Database.TsConfigDef> entry : database.getTsConfigs().entrySet()) {
             Database.TsConfigDef cfg = entry.getValue();
             int publicNs = oids.oid("ns:public");
-            table.insertRow(new Object[]{oidCounter++, cfg.name.toLowerCase(), publicNs, 10, 3722});
+            table.insertRow(new Object[]{oidCounter++, cfg.name.toLowerCase(), publicNs, 10,
+                    PARSER_DEFAULT});
         }
         return table;
     }
 
+    /**
+     * The token types a shipped configuration has a dictionary for.
+     *
+     * <p>PostgreSQL maps nineteen of the parser's twenty-three: everything the default parser can
+     * emit except blank, tag, protocol and entity, which carry no lexeme. memgres listed two —
+     * asciiword and word — and lexized all nineteen anyway, so the catalog said the server would
+     * drop an email address or a URL from a tsvector that it in fact indexes, and a tool that
+     * read the mapping to decide what a configuration covers was told the wrong answer nineteen
+     * times over. See {@link #buildPgTsConfigMap()}.
+     */
+    private static final int[] MAPPED_TOKEN_TYPES = {
+            1,  // asciiword
+            2,  // word
+            3,  // numword
+            4,  // email
+            5,  // url
+            6,  // host
+            7,  // sfloat
+            8,  // version
+            9,  // hword_numpart
+            10, // hword_part
+            11, // hword_asciipart
+            15, // numhword
+            16, // asciihword
+            17, // hword
+            18, // url_path
+            19, // file
+            20, // float
+            21, // int
+            22, // uint
+    };
+
+    /**
+     * The token types the {@code english} configuration runs through {@code english_stem}.
+     *
+     * <p>A snowball stemmer is for words. PostgreSQL sends the six word-shaped token types through
+     * it and every other one — an email address, a URL, a host name, a version string, a number —
+     * through {@code simple}, because stemming those would change a value that has to come back
+     * out as it went in. memgres's own text search already agrees: {@code to_tsvector('english',
+     * 'running user@example.com 12345')} keeps the address and the number whole and stems only the
+     * word. Naming english_stem for all nineteen said the opposite of what the engine does.
+     */
+    private static final java.util.Set<Integer> ENGLISH_STEMMED_TOKEN_TYPES =
+            new java.util.HashSet<Integer>(Arrays.asList(
+                    1,  // asciiword
+                    2,  // word
+                    10, // hword_part
+                    11, // hword_asciipart
+                    16, // asciihword
+                    17  // hword
+            ));
+
     Table buildPgTsConfigMap() {
         List<Column> cols = Cols.listOf(
-                colNN("mapcfg", DataType.INTEGER),
+                colNN("mapcfg", DataType.OID),
                 colNN("maptokentype", DataType.INTEGER),
                 colNN("mapseqno", DataType.INTEGER),
-                colNN("mapdict", DataType.INTEGER)
+                colNN("mapdict", DataType.OID)
         );
         Table table = new Table("pg_ts_config_map", cols);
-        // Default mappings for 'english' config (OID 3764)
-        // Map common token types to english_stem dictionary (OID 12676)
-        table.insertRow(new Object[]{3764, 1, 1, 12676}); // asciiword
-        table.insertRow(new Object[]{3764, 2, 1, 12676}); // word
+        // The two shipped configurations, each mapping every token type that carries a lexeme:
+        // 'simple' through the simple dictionary, 'english' through english_stem for the word
+        // shapes and simple for everything else. Both are backed — to_tsvector('simple', ...) and
+        // to_tsvector('english', ...) lexize all of them, and by these dictionaries.
+        for (int tokenType : MAPPED_TOKEN_TYPES) {
+            table.insertRow(new Object[]{CFG_SIMPLE, tokenType, 1, DICT_SIMPLE});
+        }
+        for (int tokenType : MAPPED_TOKEN_TYPES) {
+            table.insertRow(new Object[]{CFG_ENGLISH, tokenType, 1,
+                    ENGLISH_STEMMED_TOKEN_TYPES.contains(tokenType)
+                            ? DICT_ENGLISH_STEM : DICT_SIMPLE});
+        }
         // User-created config mappings
         int oidCounter = 90000;
         for (Map.Entry<String, String> entry : database.getTsConfigMaps().entrySet()) {
@@ -1130,14 +1233,17 @@ class CatalogStubBuilder {
             int cfgOid = findTsConfigOid(cfgName, oidCounter);
             // Map token type name to an integer
             int tokenTypeId = mapTokenTypeName(tokenType);
-            table.insertRow(new Object[]{cfgOid, tokenTypeId, 1, 3765});
+            // A name the parser does not emit is not a mapping: writing it down as asciiword
+            // claimed a rule the configuration never had.
+            if (tokenTypeId < 0) continue;
+            table.insertRow(new Object[]{cfgOid, tokenTypeId, 1, DICT_SIMPLE});
         }
         return table;
     }
 
     private int findTsConfigOid(String cfgName, int startOid) {
-        if ("simple".equalsIgnoreCase(cfgName)) return 3748;
-        if ("english".equalsIgnoreCase(cfgName)) return 3764;
+        if ("simple".equalsIgnoreCase(cfgName)) return CFG_SIMPLE;
+        if ("english".equalsIgnoreCase(cfgName)) return CFG_ENGLISH;
         int oid = 90000;
         for (String key : database.getTsConfigs().keySet()) {
             if (key.equalsIgnoreCase(cfgName)) return oid;
@@ -1146,6 +1252,15 @@ class CatalogStubBuilder {
         return startOid;
     }
 
+    /**
+     * The token-type number the default parser gives an alias, or -1 for a name it never emits.
+     *
+     * <p>These have to be the numbers {@code ts_token_type('default')} answers with, because that
+     * is what a {@code pg_ts_config_map JOIN ts_token_type} — the only way to read the mapping as
+     * names — joins on. Three were wrong: hword_numpart, hword_part and hword_asciipart are 9, 10
+     * and 11, and numhword, asciihword and hword are 15, 16 and 17, so a configuration mapped on
+     * numhword was recorded as mapping hword_part instead.
+     */
     private int mapTokenTypeName(String name) {
         switch (name.toLowerCase()) {
             case "asciiword": return 1;
@@ -1156,11 +1271,22 @@ class CatalogStubBuilder {
             case "host": return 6;
             case "sfloat": return 7;
             case "version": return 8;
-            case "hyphword": return 9;
-            case "numhword": return 10;
-            case "asciihword": return 11;
+            case "hword_numpart": return 9;
+            case "hword_part": return 10;
+            case "hword_asciipart": return 11;
             case "blank": return 12;
-            default: return 1;
+            case "tag": return 13;
+            case "protocol": return 14;
+            case "numhword": return 15;
+            case "asciihword": return 16;
+            case "hword": return 17;
+            case "url_path": return 18;
+            case "file": return 19;
+            case "float": return 20;
+            case "int": return 21;
+            case "uint": return 22;
+            case "entity": return 23;
+            default: return -1;
         }
     }
 
@@ -1168,6 +1294,13 @@ class CatalogStubBuilder {
     //  Infrastructure stubs
     // ---------------------------------------------------------------
 
+    /**
+     * pg_am. amhandler is a regproc, and a regproc prints the function's name: PostgreSQL answers
+     * {@code bthandler} for {@code amhandler::text}, and memgres answered the raw OID because the
+     * column held a bare Integer rather than the name-and-OID pair {@link CatalogHelper#regproc}
+     * makes. The join to pg_proc landed either way, so only a client that read the column as
+     * text — which is how psql's \dA and every "what handles this index" query print it — saw it.
+     */
     Table buildPgAm() {
         List<Column> cols = Cols.listOf(
                 colNN("oid", DataType.OID),
@@ -1184,23 +1317,41 @@ class CatalogStubBuilder {
         // on a row — which is what a client follows the column for; only a comparison of the
         // raw number against PostgreSQL's would notice. Fixing it means giving the handler
         // functions their real OIDs in pg_proc, which is CatalogCoreBuilder's to do.
-        table.insertRow(new Object[]{2, "heap", "t", oids.oid("proc:heap_tableam_handler"), 1});
-        table.insertRow(new Object[]{403, "btree", "i", oids.oid("proc:bthandler"), 1});
-        table.insertRow(new Object[]{405, "hash", "i", oids.oid("proc:hashhandler"), 1});
-        table.insertRow(new Object[]{783, "gist", "i", oids.oid("proc:gisthandler"), 1});
-        table.insertRow(new Object[]{2742, "gin", "i", oids.oid("proc:ginhandler"), 1});
-        table.insertRow(new Object[]{4000, "spgist", "i", oids.oid("proc:spghandler"), 1});
-        table.insertRow(new Object[]{3580, "brin", "i", oids.oid("proc:brinhandler"), 1});
+        table.insertRow(new Object[]{2, "heap", "t", handler("heap_tableam_handler"), 1});
+        table.insertRow(new Object[]{403, "btree", "i", handler("bthandler"), 1});
+        table.insertRow(new Object[]{405, "hash", "i", handler("hashhandler"), 1});
+        table.insertRow(new Object[]{783, "gist", "i", handler("gisthandler"), 1});
+        table.insertRow(new Object[]{2742, "gin", "i", handler("ginhandler"), 1});
+        table.insertRow(new Object[]{4000, "spgist", "i", handler("spghandler"), 1});
+        table.insertRow(new Object[]{3580, "brin", "i", handler("brinhandler"), 1});
         return table;
     }
 
+    /** A regproc value: the OID pg_proc gave the function, printing as the function's name. */
+    private RegprocValue handler(String procName) {
+        return new RegprocValue(oids.oid("proc:" + procName), procName);
+    }
+
+    /**
+     * The two tablespaces every PostgreSQL cluster has.
+     *
+     * <p>spcoptions is {@code text[]}, not text: it is the same {@code {key=value}} option array
+     * every other catalog carries one of, and a client that read the column as an array — the
+     * value already answers to unnest and to subscripting — was told by pg_attribute that it was
+     * a scalar, so a typed read of it failed on the advertised OID alone.
+     *
+     * <p>The two OIDs are still minted from the user-object counter. PostgreSQL pins them at 1663
+     * and 1664 in {@code pg_tablespace.dat}, the same number on every server ever initdb'd, and a
+     * query that joins on the literal finds nothing here. Correcting it means moving
+     * pg_database.dattablespace in the same step, which is CatalogSecurityBuilder's to do.
+     */
     Table buildPgTablespace() {
         List<Column> cols = Cols.listOf(
-                colNN("oid", DataType.INTEGER),
-                colNN("spcname", DataType.TEXT),
-                colNN("spcowner", DataType.INTEGER),
+                colNN("oid", DataType.OID),
+                colNN("spcname", DataType.NAME),
+                colNN("spcowner", DataType.OID),
                 col("spcacl", DataType.ACLITEM_ARRAY),
-                col("spcoptions", DataType.TEXT),
+                arrayCol("spcoptions", DataType.TEXT_ARRAY, DataType.TEXT),
                 col("xmin", DataType.INTEGER)
         );
         Table table = new Table("pg_tablespace", cols);
@@ -1211,8 +1362,8 @@ class CatalogStubBuilder {
 
     Table buildPgShdescription() {
         List<Column> cols = Cols.listOf(
-                colNN("objoid", DataType.INTEGER),
-                colNN("classoid", DataType.INTEGER),
+                colNN("objoid", DataType.OID),
+                colNN("classoid", DataType.OID),
                 col("description", DataType.TEXT)
         );
         return new Table("pg_shdescription", cols); // empty, no shared descriptions
@@ -1220,13 +1371,13 @@ class CatalogStubBuilder {
 
     Table buildPgConversion() {
         List<Column> cols = Cols.listOf(
-                colNN("oid", DataType.INTEGER),
-                colNN("conname", DataType.TEXT),
-                colNN("connamespace", DataType.INTEGER),
-                col("conowner", DataType.INTEGER),
+                colNN("oid", DataType.OID),
+                colNN("conname", DataType.NAME),
+                colNN("connamespace", DataType.OID),
+                col("conowner", DataType.OID),
                 col("conforencoding", DataType.INTEGER),
                 col("contoencoding", DataType.INTEGER),
-                col("conproc", DataType.INTEGER),
+                col("conproc", DataType.REGPROC),
                 col("condefault", DataType.BOOLEAN)
         );
         return new Table("pg_conversion", cols);
@@ -1234,8 +1385,8 @@ class CatalogStubBuilder {
 
     Table buildPgLargeobjectMetadata() {
         List<Column> cols = Cols.listOf(
-                colNN("oid", DataType.INTEGER),
-                col("lomowner", DataType.INTEGER),
+                colNN("oid", DataType.OID),
+                col("lomowner", DataType.OID),
                 col("lomacl", DataType.ACLITEM_ARRAY)
         );
         Table t = new Table("pg_largeobject_metadata", cols);
@@ -1247,13 +1398,13 @@ class CatalogStubBuilder {
 
     Table buildPgShdepend() {
         List<Column> cols = Cols.listOf(
-                colNN("dbid", DataType.INTEGER),
-                colNN("classid", DataType.INTEGER),
-                colNN("objid", DataType.INTEGER),
+                colNN("dbid", DataType.OID),
+                colNN("classid", DataType.OID),
+                colNN("objid", DataType.OID),
                 colNN("objsubid", DataType.INTEGER),
-                colNN("refclassid", DataType.INTEGER),
-                colNN("refobjid", DataType.INTEGER),
-                colNN("deptype", DataType.CHAR)
+                colNN("refclassid", DataType.OID),
+                colNN("refobjid", DataType.OID),
+                colNN("deptype", DataType.INTERNAL_CHAR)
         );
         return new Table("pg_shdepend", cols);
     }
@@ -1278,25 +1429,31 @@ class CatalogStubBuilder {
 
     Table buildPgTransform() {
         List<Column> cols = Cols.listOf(
-                colNN("oid", DataType.INTEGER),
-                colNN("trftype", DataType.INTEGER),
-                colNN("trflang", DataType.INTEGER),
-                col("trffromsql", DataType.INTEGER),
-                col("trftosql", DataType.INTEGER)
+                colNN("oid", DataType.OID),
+                colNN("trftype", DataType.OID),
+                colNN("trflang", DataType.OID),
+                col("trffromsql", DataType.REGPROC),
+                col("trftosql", DataType.REGPROC)
         );
         return new Table("pg_transform", cols);
     }
 
+    /**
+     * pg_statistic_ext. stxkeys is an {@code int2vector} of attribute numbers, not text: the
+     * space-separated form memgres already writes is exactly int2vector's, so only the declared
+     * type was wrong — and a client that subscripted the column to read the third key was told
+     * it was reading a string. PostgreSQL also orders stxstattarget before stxkind.
+     */
     Table buildPgStatisticExt() {
         List<Column> cols = Cols.listOf(
-                colNN("oid", DataType.INTEGER),
-                colNN("stxrelid", DataType.INTEGER),
-                colNN("stxname", DataType.TEXT),
-                colNN("stxnamespace", DataType.INTEGER),
-                col("stxowner", DataType.INTEGER),
-                col("stxkeys", DataType.TEXT),
-                col("stxkind", DataType.INTERNAL_CHAR_ARRAY),
+                colNN("oid", DataType.OID),
+                colNN("stxrelid", DataType.OID),
+                colNN("stxname", DataType.NAME),
+                colNN("stxnamespace", DataType.OID),
+                col("stxowner", DataType.OID),
+                col("stxkeys", DataType.INT2VECTOR),
                 col("stxstattarget", DataType.SMALLINT),
+                col("stxkind", DataType.INTERNAL_CHAR_ARRAY),
                 col("stxexprs", DataType.PG_NODE_TREE)
         );
         Table table = new Table("pg_statistic_ext", cols);
@@ -1342,8 +1499,8 @@ class CatalogStubBuilder {
                     statOid, relOid, es.getName(), pgCatalogNs,
                     10, // stxowner (superuser)
                     keys.toString(),
-                    kindStr.toString(),
                     (short) es.getStattarget(),
+                    kindStr.toString(),
                     null // stxexprs: no expression statistics
             });
         }
@@ -1373,9 +1530,9 @@ class CatalogStubBuilder {
 
     Table buildPgStats() {
         List<Column> cols = Cols.listOf(
-                col("schemaname", DataType.TEXT),
-                col("tablename", DataType.TEXT),
-                col("attname", DataType.TEXT),
+                col("schemaname", DataType.NAME),
+                col("tablename", DataType.NAME),
+                col("attname", DataType.NAME),
                 col("inherited", DataType.BOOLEAN),
                 col("null_frac", DataType.REAL),
                 col("avg_width", DataType.INTEGER),
@@ -1491,13 +1648,17 @@ class CatalogStubBuilder {
         return table;
     }
 
+    /**
+     * pg_publication_rel. prattrs is the {@code int2vector} of the column list a publication was
+     * given, and prqual the row filter's parsed form; both were declared text.
+     */
     Table buildPgPublicationRel() {
         List<Column> cols = Cols.listOf(
-                colNN("oid", DataType.INTEGER),
-                colNN("prpubid", DataType.INTEGER),
-                colNN("prrelid", DataType.INTEGER),
-                col("prqual", DataType.TEXT),
-                col("prattrs", DataType.TEXT)
+                colNN("oid", DataType.OID),
+                colNN("prpubid", DataType.OID),
+                colNN("prrelid", DataType.OID),
+                col("prqual", DataType.PG_NODE_TREE),
+                col("prattrs", DataType.INT2VECTOR)
         );
         Table table = new Table("pg_publication_rel", cols);
         int seq = 60000;
@@ -1513,33 +1674,41 @@ class CatalogStubBuilder {
 
     Table buildPgPublicationNamespace() {
         List<Column> cols = Cols.listOf(
-                colNN("oid", DataType.INTEGER),
-                colNN("pnpubid", DataType.INTEGER),
-                colNN("pnnspid", DataType.INTEGER)
+                colNN("oid", DataType.OID),
+                colNN("pnpubid", DataType.OID),
+                colNN("pnnspid", DataType.OID)
         );
         return new Table("pg_publication_namespace", cols);
     }
 
     Table buildPgSubscriptionRel() {
         List<Column> cols = Cols.listOf(
-                colNN("srsubid", DataType.INTEGER),
-                colNN("srrelid", DataType.INTEGER),
-                col("srsubstate", DataType.CHAR),
-                col("srsublsn", DataType.TEXT)
+                colNN("srsubid", DataType.OID),
+                colNN("srrelid", DataType.OID),
+                col("srsubstate", DataType.INTERNAL_CHAR),
+                col("srsublsn", DataType.PG_LSN)
         );
         return new Table("pg_subscription_rel", cols);
     }
 
+    /**
+     * pg_partitioned_table. partattrs is an {@code int2vector} and partclass and partcollation are
+     * {@code oidvector}s, each with one entry per partition key column — PostgreSQL's own
+     * {@code pg_get_partkeydef} walks them in step with partnatts. memgres declared all three
+     * text and wrote a single {@code 0} into the two oidvectors however many key columns there
+     * were, so a two-column partition key described one operator class and a reader stepping
+     * through the vector ran off the end.
+     */
     Table buildPgPartitionedTable() {
         List<Column> cols = Cols.listOf(
-                colNN("partrelid", DataType.INTEGER),
-                colNN("partstrat", DataType.CHAR),
+                colNN("partrelid", DataType.OID),
+                colNN("partstrat", DataType.INTERNAL_CHAR),
                 colNN("partnatts", DataType.SMALLINT),
-                col("partdefid", DataType.INTEGER),
-                col("partattrs", DataType.TEXT),
-                col("partclass", DataType.TEXT),
-                col("partcollation", DataType.TEXT),
-                col("partexprs", DataType.TEXT)
+                col("partdefid", DataType.OID),
+                col("partattrs", DataType.INT2VECTOR),
+                col("partclass", DataType.OIDVECTOR),
+                col("partcollation", DataType.OIDVECTOR),
+                col("partexprs", DataType.PG_NODE_TREE)
         );
         Table table = new Table("pg_partitioned_table", cols);
         // Populate from all partitioned tables (those with a partition strategy)
@@ -1574,9 +1743,18 @@ class CatalogStubBuilder {
                     }
                     partattrs = attrsBuf.toString();
                 }
+                // One entry per key column, the way PostgreSQL writes them. The operator class
+                // is still reported as 0 — memgres does not record which one a partition key was
+                // resolved through — but the vector is now the length the rest of the row says
+                // it is.
+                StringBuilder zeros = new StringBuilder();
+                for (int ci = 0; ci < partnatts; ci++) {
+                    if (ci > 0) zeros.append(' ');
+                    zeros.append('0');
+                }
                 table.insertRow(new Object[]{
                         tblOid, strategy, partnatts, defOid,
-                        partattrs, "0", "0", null
+                        partattrs, zeros.toString(), zeros.toString(), null
                 });
             }
         }
@@ -1585,8 +1763,8 @@ class CatalogStubBuilder {
 
     Table buildPgInherits() {
         List<Column> cols = Cols.listOf(
-                colNN("inhrelid", DataType.INTEGER),
-                colNN("inhparent", DataType.INTEGER),
+                colNN("inhrelid", DataType.OID),
+                colNN("inhparent", DataType.OID),
                 colNN("inhseqno", DataType.INTEGER),
                 col("inhdetachpending", DataType.BOOLEAN)
         );
@@ -1626,8 +1804,8 @@ class CatalogStubBuilder {
             // Resolve schema from stored index metadata (must match pg_class OID keys)
             String childSchema = resolveIndexSchema(childIdx);
             String parentSchema = resolveIndexSchema(parentIdx);
-            int childOid = oids.oid("rel:" + childSchema + "." + childIdx);
-            int parentOid = oids.oid("rel:" + parentSchema + "." + parentIdx);
+            int childOid = oids.oid("rel:" + childSchema + "." + Database.idxName(childIdx));
+            int parentOid = oids.oid("rel:" + parentSchema + "." + Database.idxName(parentIdx));
             table.insertRow(new Object[]{ childOid, parentOid, 1, false });
         }
         return table;
@@ -1653,12 +1831,18 @@ class CatalogStubBuilder {
         return null;
     }
 
+    /**
+     * pg_event_trigger. evttags is the list of command tags the trigger is restricted to, and
+     * PostgreSQL types it {@code text[]} — the value memgres writes is already an array literal
+     * that answers to array_length and unnest, so only the column's declared type was wrong, and
+     * a client reading it as an array was told it was a scalar.
+     */
     Table buildPgEventTrigger() {
         List<Column> cols = Cols.listOf(
-                colNN("oid", DataType.INTEGER), colNN("evtname", DataType.TEXT),
-                col("evtevent", DataType.TEXT), col("evtowner", DataType.INTEGER),
-                col("evtfoid", DataType.INTEGER), col("evtenabled", DataType.CHAR),
-                col("evttags", DataType.TEXT), col("xmin", DataType.INTEGER));
+                colNN("oid", DataType.OID), colNN("evtname", DataType.NAME),
+                col("evtevent", DataType.NAME), col("evtowner", DataType.OID),
+                col("evtfoid", DataType.OID), col("evtenabled", DataType.INTERNAL_CHAR),
+                arrayCol("evttags", DataType.TEXT_ARRAY, DataType.TEXT), col("xmin", DataType.INTEGER));
         return new Table("pg_event_trigger", cols);
     }
 
@@ -1688,12 +1872,19 @@ class CatalogStubBuilder {
         return table;
     }
 
+    /**
+     * pg_foreign_data_wrapper. The four option columns of the foreign-data catalogs — fdwoptions,
+     * srvoptions, umoptions, ftoptions — are all {@code text[]} in PostgreSQL, holding the
+     * {@code {key=value}} pairs the OPTIONS clause wrote. memgres declared each of them text
+     * while storing exactly that array literal, so {@code unnest(fdwoptions)} worked and
+     * {@code getArray} on the column did not.
+     */
     Table buildPgForeignDataWrapper() {
         List<Column> cols = Cols.listOf(
-                colNN("oid", DataType.INTEGER), colNN("fdwname", DataType.TEXT),
-                col("fdwowner", DataType.INTEGER), col("fdwhandler", DataType.INTEGER),
-                col("fdwvalidator", DataType.INTEGER), col("fdwacl", DataType.ACLITEM_ARRAY),
-                col("fdwoptions", DataType.TEXT), col("xmin", DataType.INTEGER));
+                colNN("oid", DataType.OID), colNN("fdwname", DataType.NAME),
+                col("fdwowner", DataType.OID), col("fdwhandler", DataType.OID),
+                col("fdwvalidator", DataType.OID), col("fdwacl", DataType.ACLITEM_ARRAY),
+                arrayCol("fdwoptions", DataType.TEXT_ARRAY, DataType.TEXT), col("xmin", DataType.INTEGER));
         Table table = new Table("pg_foreign_data_wrapper", cols);
         for (Database.FdwWrapper w : database.getForeignDataWrappers().values()) {
             table.insertRow(new Object[]{
@@ -1703,18 +1894,23 @@ class CatalogStubBuilder {
         return table;
     }
 
+    /**
+     * pg_foreign_server. PostgreSQL orders the columns srvacl then srvoptions; memgres had them
+     * the other way round, so attnum, ordinal_position and {@code SELECT *} all disagreed with
+     * PostgreSQL and anything reading the row positionally read the ACL out of the options.
+     */
     Table buildPgForeignServer() {
         List<Column> cols = Cols.listOf(
-                colNN("oid", DataType.INTEGER), colNN("srvname", DataType.TEXT),
-                col("srvowner", DataType.INTEGER), col("srvfdw", DataType.INTEGER),
+                colNN("oid", DataType.OID), colNN("srvname", DataType.NAME),
+                col("srvowner", DataType.OID), col("srvfdw", DataType.OID),
                 col("srvtype", DataType.TEXT), col("srvversion", DataType.TEXT),
-                col("srvoptions", DataType.TEXT), col("srvacl", DataType.ACLITEM_ARRAY),
+                col("srvacl", DataType.ACLITEM_ARRAY), arrayCol("srvoptions", DataType.TEXT_ARRAY, DataType.TEXT),
                 col("xmin", DataType.INTEGER));
         Table table = new Table("pg_foreign_server", cols);
         for (Database.FdwServer s : database.getForeignServers().values()) {
             int fdwOid = oids.oid("fdw:" + s.fdwName);
             table.insertRow(new Object[]{
-                    oids.oid("srv:" + s.name), s.name, 10, fdwOid, null, null, s.options, null, 1
+                    oids.oid("srv:" + s.name), s.name, 10, fdwOid, null, null, null, s.options, 1
             });
         }
         return table;
@@ -1722,8 +1918,8 @@ class CatalogStubBuilder {
 
     Table buildPgUserMapping() {
         List<Column> cols = Cols.listOf(
-                colNN("oid", DataType.INTEGER), col("umuser", DataType.INTEGER),
-                col("umserver", DataType.INTEGER), col("umoptions", DataType.TEXT),
+                colNN("oid", DataType.OID), col("umuser", DataType.OID),
+                col("umserver", DataType.OID), arrayCol("umoptions", DataType.TEXT_ARRAY, DataType.TEXT),
                 col("xmin", DataType.INTEGER));
         Table table = new Table("pg_user_mapping", cols);
         for (Database.FdwUserMapping m : database.getForeignUserMappings().values()) {
@@ -1738,12 +1934,12 @@ class CatalogStubBuilder {
 
     Table buildPgUserMappings() {
         List<Column> cols = Cols.listOf(
-                colNN("umid", DataType.INTEGER),
-                col("srvid", DataType.INTEGER),
-                col("srvname", DataType.TEXT),
-                col("umuser", DataType.INTEGER),
-                col("usename", DataType.TEXT),
-                col("umoptions", DataType.TEXT)
+                colNN("umid", DataType.OID),
+                col("srvid", DataType.OID),
+                col("srvname", DataType.NAME),
+                col("umuser", DataType.OID),
+                col("usename", DataType.NAME),
+                arrayCol("umoptions", DataType.TEXT_ARRAY, DataType.TEXT)
         );
         Table table = new Table("pg_user_mappings", cols);
         for (Database.FdwUserMapping m : database.getForeignUserMappings().values()) {
@@ -1760,8 +1956,8 @@ class CatalogStubBuilder {
 
     Table buildPgForeignTable() {
         List<Column> cols = Cols.listOf(
-                colNN("ftrelid", DataType.INTEGER), col("ftserver", DataType.INTEGER),
-                col("ftoptions", DataType.TEXT), col("xmin", DataType.INTEGER));
+                colNN("ftrelid", DataType.OID), col("ftserver", DataType.OID),
+                arrayCol("ftoptions", DataType.TEXT_ARRAY, DataType.TEXT), col("xmin", DataType.INTEGER));
         Table table = new Table("pg_foreign_table", cols);
         for (Database.FdwForeignTable ft : database.getForeignTables().values()) {
             int relOid = oids.oid("rel:public." + ft.tableName);
@@ -1774,11 +1970,11 @@ class CatalogStubBuilder {
     /** pg_seclabels: security labels view. Empty but needs correct columns for catalog queries. */
     Table buildPgSeclabels() {
         List<Column> cols = Cols.listOf(
-                colNN("objoid", DataType.INTEGER),
-                colNN("classoid", DataType.INTEGER),
+                colNN("objoid", DataType.OID),
+                colNN("classoid", DataType.OID),
                 colNN("objsubid", DataType.INTEGER),
                 col("objtype", DataType.TEXT),
-                col("objnamespace", DataType.INTEGER),
+                col("objnamespace", DataType.OID),
                 col("objname", DataType.TEXT),
                 col("provider", DataType.TEXT),
                 col("label", DataType.TEXT)
@@ -1788,10 +1984,10 @@ class CatalogStubBuilder {
 
     Table buildPgInitPrivs() {
         List<Column> cols = Cols.listOf(
-                colNN("objoid", DataType.INTEGER),
-                colNN("classoid", DataType.INTEGER),
+                colNN("objoid", DataType.OID),
+                colNN("classoid", DataType.OID),
                 colNN("objsubid", DataType.INTEGER),
-                col("privtype", DataType.CHAR),
+                col("privtype", DataType.INTERNAL_CHAR),
                 col("initprivs", DataType.ACLITEM_ARRAY)
         );
         return new Table("pg_init_privs", cols); // empty, no initial privileges to track
@@ -1799,11 +1995,11 @@ class CatalogStubBuilder {
 
     Table buildPgPreparedXacts() {
         List<Column> cols = Cols.listOf(
-                col("transaction", DataType.INTEGER),
+                col("transaction", DataType.XID),
                 col("gid", DataType.TEXT),
                 col("prepared", DataType.TIMESTAMPTZ),
-                col("owner", DataType.TEXT),
-                col("database", DataType.TEXT)
+                col("owner", DataType.NAME),
+                col("database", DataType.NAME)
         );
         Table table = new Table("pg_prepared_xacts", cols);
         for (Database.PreparedTransaction pt : database.getPreparedTransactions().values()) {
@@ -1908,7 +2104,7 @@ class CatalogStubBuilder {
 
     Table buildPgAvailableExtensions() {
         List<Column> cols = Cols.listOf(
-                col("name", DataType.TEXT),
+                col("name", DataType.NAME),
                 col("default_version", DataType.TEXT),
                 col("installed_version", DataType.TEXT),
                 col("comment", DataType.TEXT)
@@ -1918,16 +2114,20 @@ class CatalogStubBuilder {
         return table;
     }
 
+    /**
+     * pg_available_extension_versions. {@code requires} lists the extensions a version depends
+     * on, one identifier per element, and PostgreSQL types it {@code name[]}.
+     */
     Table buildPgAvailableExtensionVersions() {
         List<Column> cols = Cols.listOf(
-                col("name", DataType.TEXT),
+                col("name", DataType.NAME),
                 col("version", DataType.TEXT),
                 col("installed", DataType.BOOLEAN),
                 col("superuser", DataType.BOOLEAN),
                 col("trusted", DataType.BOOLEAN),
                 col("relocatable", DataType.BOOLEAN),
-                col("schema", DataType.TEXT),
-                col("requires", DataType.TEXT),
+                col("schema", DataType.NAME),
+                arrayCol("requires", DataType.NAME_ARRAY, DataType.NAME),
                 col("comment", DataType.TEXT)
         );
         Table table = new Table("pg_available_extension_versions", cols);
@@ -1956,22 +2156,31 @@ class CatalogStubBuilder {
         return new Table("pg_file_settings", cols); // empty, no file-based config
     }
 
+    /**
+     * pg_hba_file_rules. A host-based-authentication line names a list of databases and a list of
+     * roles, so PostgreSQL types database, user_name and options {@code text[]} and writes
+     * {@code {all}} rather than {@code all} — a rule for two databases is two array elements and
+     * cannot be told from one database named "a,b" once it is flattened to a string. memgres
+     * declared all three text and wrote the bare word, so a client that read the column as an
+     * array got nothing to unnest.
+     */
     Table buildPgHbaFileRules() {
         List<Column> cols = Cols.listOf(
                 col("rule_number", DataType.INTEGER),
                 col("file_name", DataType.TEXT),
                 col("line_number", DataType.INTEGER),
                 col("type", DataType.TEXT),
-                col("database", DataType.TEXT),
-                col("user_name", DataType.TEXT),
+                arrayCol("database", DataType.TEXT_ARRAY, DataType.TEXT),
+                arrayCol("user_name", DataType.TEXT_ARRAY, DataType.TEXT),
                 col("address", DataType.TEXT),
                 col("netmask", DataType.TEXT),
                 col("auth_method", DataType.TEXT),
-                col("options", DataType.TEXT),
+                arrayCol("options", DataType.TEXT_ARRAY, DataType.TEXT),
                 col("error", DataType.TEXT)
         );
         Table table = new Table("pg_hba_file_rules", cols);
-        table.insertRow(new Object[]{1, null, 1, "host", "all", "all", "0.0.0.0/0", null, "trust", null, null});
+        table.insertRow(new Object[]{1, null, 1, "host", "{all}", "{all}", "0.0.0.0/0", null,
+                "trust", null, null});
         return table;
     }
 
@@ -1987,16 +2196,16 @@ class CatalogStubBuilder {
 
     Table buildPgPublication() {
         List<Column> cols = Cols.listOf(
-                colNN("oid", DataType.INTEGER),
-                col("pubname", DataType.TEXT),
-                col("pubowner", DataType.INTEGER),
+                colNN("oid", DataType.OID),
+                col("pubname", DataType.NAME),
+                col("pubowner", DataType.OID),
                 col("puballtables", DataType.BOOLEAN),
                 col("pubinsert", DataType.BOOLEAN),
                 col("pubupdate", DataType.BOOLEAN),
                 col("pubdelete", DataType.BOOLEAN),
                 col("pubtruncate", DataType.BOOLEAN),
                 col("pubviaroot", DataType.BOOLEAN),
-                col("pubgencols", DataType.TEXT)
+                col("pubgencols", DataType.INTERNAL_CHAR)
         );
         Table table = new Table("pg_publication", cols);
         for (Database.PubDef pub : database.getPublications().values()) {
@@ -2011,23 +2220,25 @@ class CatalogStubBuilder {
     Table buildPgSubscription() {
         // PG18 pg_subscription: 18 columns (see system_views.sql GRANT on pg_subscription)
         List<Column> cols = Cols.listOf(
-                colNN("oid", DataType.INTEGER),
-                col("subdbid", DataType.INTEGER),
-                col("subskiplsn", DataType.TEXT),
-                col("subname", DataType.TEXT),
-                col("subowner", DataType.INTEGER),
+                colNN("oid", DataType.OID),
+                col("subdbid", DataType.OID),
+                col("subskiplsn", DataType.PG_LSN),
+                col("subname", DataType.NAME),
+                col("subowner", DataType.OID),
                 col("subenabled", DataType.BOOLEAN),
                 col("subbinary", DataType.BOOLEAN),
-                col("substream", DataType.CHAR),
-                col("subtwophasestate", DataType.CHAR),
+                col("substream", DataType.INTERNAL_CHAR),
+                col("subtwophasestate", DataType.INTERNAL_CHAR),
                 col("subdisableonerr", DataType.BOOLEAN),
                 col("subpasswordrequired", DataType.BOOLEAN),
                 col("subrunasowner", DataType.BOOLEAN),
                 col("subfailover", DataType.BOOLEAN),
                 col("subconninfo", DataType.TEXT),
-                col("subslotname", DataType.TEXT),
+                col("subslotname", DataType.NAME),
                 col("subsynccommit", DataType.TEXT),
-                col("subpublications", DataType.TEXT),
+                // The publications a subscription follows are a text[], and the value written
+                // here has always been the array literal for them.
+                arrayCol("subpublications", DataType.TEXT_ARRAY, DataType.TEXT),
                 col("suborigin", DataType.TEXT)
         );
         Table table = new Table("pg_subscription", cols);
@@ -2086,11 +2297,11 @@ class CatalogStubBuilder {
 
     Table buildPgReplicationSlots() {
         List<Column> cols = Cols.listOf(
-                col("slot_name", DataType.TEXT),
-                col("plugin", DataType.TEXT),
+                col("slot_name", DataType.NAME),
+                col("plugin", DataType.NAME),
                 col("slot_type", DataType.TEXT),
-                col("datoid", DataType.INTEGER),
-                col("database", DataType.TEXT),
+                col("datoid", DataType.OID),
+                col("database", DataType.NAME),
                 col("temporary", DataType.BOOLEAN),
                 col("active", DataType.BOOLEAN),
                 col("active_pid", DataType.INTEGER),
@@ -2123,7 +2334,7 @@ class CatalogStubBuilder {
 
     Table buildPgReplicationOrigin() {
         List<Column> cols = Cols.listOf(
-                colNN("roident", DataType.INTEGER),
+                colNN("roident", DataType.OID),
                 col("roname", DataType.TEXT)
         );
         return new Table("pg_replication_origin", cols);
@@ -2131,18 +2342,18 @@ class CatalogStubBuilder {
 
     Table buildPgReplicationOriginStatus() {
         List<Column> cols = Cols.listOf(
-                col("local_id", DataType.INTEGER),
+                col("local_id", DataType.OID),
                 col("external_id", DataType.TEXT),
-                col("remote_lsn", DataType.TEXT),
-                col("local_lsn", DataType.TEXT)
+                col("remote_lsn", DataType.PG_LSN),
+                col("local_lsn", DataType.PG_LSN)
         );
         return new Table("pg_replication_origin_status", cols);
     }
 
     Table buildPgStatSubscriptionStats() {
         List<Column> cols = Cols.listOf(
-                col("subid", DataType.INTEGER),
-                col("subname", DataType.TEXT),
+                col("subid", DataType.OID),
+                col("subname", DataType.NAME),
                 col("apply_error_count", DataType.BIGINT),
                 col("sync_error_count", DataType.BIGINT),
                 // PG 18 counts each kind of apply conflict separately.
@@ -2160,10 +2371,10 @@ class CatalogStubBuilder {
 
     Table buildPgMatviews() {
         List<Column> cols = Cols.listOf(
-                col("schemaname", DataType.TEXT),
-                col("matviewname", DataType.TEXT),
-                col("matviewowner", DataType.TEXT),
-                col("tablespace", DataType.TEXT),
+                col("schemaname", DataType.NAME),
+                col("matviewname", DataType.NAME),
+                col("matviewowner", DataType.NAME),
+                col("tablespace", DataType.NAME),
                 col("hasindexes", DataType.BOOLEAN),
                 col("ispopulated", DataType.BOOLEAN),
                 col("definition", DataType.TEXT)
@@ -2188,9 +2399,9 @@ class CatalogStubBuilder {
 
     Table buildPgRulesView() {
         List<Column> cols = Cols.listOf(
-                col("schemaname", DataType.TEXT),
-                col("tablename", DataType.TEXT),
-                col("rulename", DataType.TEXT),
+                col("schemaname", DataType.NAME),
+                col("tablename", DataType.NAME),
+                col("rulename", DataType.NAME),
                 col("definition", DataType.TEXT)
         );
         Table table = new Table("pg_rules", cols);
@@ -2206,7 +2417,7 @@ class CatalogStubBuilder {
     Table buildPgStatStatements() {
         List<Column> cols = Cols.listOf(
                 col("userid", DataType.INTEGER),
-                col("dbid", DataType.INTEGER),
+                col("dbid", DataType.OID),
                 col("toplevel", DataType.BOOLEAN),
                 col("queryid", DataType.BIGINT),
                 col("query", DataType.TEXT),
@@ -2302,7 +2513,7 @@ class CatalogStubBuilder {
     Table buildPgStatUserFunctions() {
         List<Column> cols = Cols.listOf(
                 col("funcid", DataType.INTEGER),
-                col("schemaname", DataType.TEXT),
+                col("schemaname", DataType.NAME),
                 col("funcname", DataType.TEXT),
                 col("calls", DataType.BIGINT),
                 col("total_time", DataType.DOUBLE_PRECISION),
@@ -2344,7 +2555,7 @@ class CatalogStubBuilder {
 
     Table buildPgParameterAcl() {
         List<Column> cols = Cols.listOf(
-                col("oid", DataType.INTEGER),
+                col("oid", DataType.OID),
                 col("parname", DataType.TEXT),
                 col("paracl", DataType.TEXT_ARRAY)
         );
@@ -2370,13 +2581,13 @@ class CatalogStubBuilder {
         List<Column> cols = Cols.listOf(
                 col("pid", DataType.INTEGER),
                 col("state", DataType.TEXT),
-                col("sent_lsn", DataType.TEXT),
-                col("write_lsn", DataType.TEXT),
-                col("flush_lsn", DataType.TEXT),
-                col("replay_lsn", DataType.TEXT),
-                col("write_lag", DataType.TEXT),
-                col("flush_lag", DataType.TEXT),
-                col("replay_lag", DataType.TEXT),
+                col("sent_lsn", DataType.PG_LSN),
+                col("write_lsn", DataType.PG_LSN),
+                col("flush_lsn", DataType.PG_LSN),
+                col("replay_lsn", DataType.PG_LSN),
+                col("write_lag", DataType.INTERVAL),
+                col("flush_lag", DataType.INTERVAL),
+                col("replay_lag", DataType.INTERVAL),
                 col("sync_priority", DataType.INTEGER),
                 col("sync_state", DataType.TEXT),
                 col("reply_time", DataType.TIMESTAMPTZ)

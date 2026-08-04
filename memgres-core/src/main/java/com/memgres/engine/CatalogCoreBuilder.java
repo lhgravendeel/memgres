@@ -460,17 +460,19 @@ class CatalogCoreBuilder {
         };
     }
 
+    /** The OID of the user-defined type a written name denotes, or {@code fallback}. */
+    private int userTypeOid(String written, int fallback) {
+        String key = TypeNamespace.oidKeyFor(database, written);
+        return key == null ? fallback : oids.oid(key);
+    }
+
     private int rowTypeArrayOid(String schemaName, String relName) {
-        if (database.getCompositeTypes().containsKey(relName)) {
-            return oids.oid("type:" + relName + "[]");
-        }
-        return oids.oid("type:" + schemaName + "." + relName + "[]");
+        return oids.oid(TypeNamespace.oidKey(schemaName, relName) + "[]");
     }
 
     /** The OID of a relation's row type, which pg_class.reltype names. */
     private int rowTypeOid(String schemaName, String relName) {
-        if (database.getCompositeTypes().containsKey(relName)) return oids.oid("type:" + relName);
-        return oids.oid("type:" + schemaName + "." + relName);
+        return oids.oid(TypeNamespace.oidKey(schemaName, relName));
     }
 
     /**
@@ -530,16 +532,6 @@ class CatalogCoreBuilder {
     }
 
     /** Resolve the schema that owns a given sequence via the schemaObjectRegistry. */
-    private static String resolveSequenceSchema(Database database, String seqName) {
-        for (Map.Entry<String, Schema> entry : database.getSchemas().entrySet()) {
-            java.util.Set<String> objects = database.getSchemaObjects(entry.getKey());
-            if (objects.contains("sequence:" + seqName.toLowerCase())) {
-                return entry.getKey();
-            }
-        }
-        return "public";
-    }
-
     Table buildPgClass() {
         List<Column> cols = Cols.listOf(
                 colNN("oid", DataType.OID),
@@ -671,7 +663,7 @@ class CatalogCoreBuilder {
                 // M22: FK endpoints have internal RI triggers
                 if (hasForeignKey || fkReferencedTables.contains(t.getName().toLowerCase())) hasTriggers = true;
                 boolean hasIdx = !t.getConstraints().isEmpty() || database.getIndexColumns().keySet().stream()
-                        .anyMatch(idx -> { String ti = database.getIndexTable(idx); return ti != null && ti.endsWith("." + t.getName()); });
+                        .anyMatch(idx -> { String ti = database.getIndexTable(idx); return ti != null && ti.equalsIgnoreCase(schemaEntry.getKey() + "." + t.getName()); });
                 // Partition metadata for pg_class
                 String relkind = t.getPartitionStrategy() != null ? "p" : "r";
                 boolean relispartition = t.getPartitionParent() != null;
@@ -728,9 +720,10 @@ class CatalogCoreBuilder {
             });
         }
 
-        // Sequences - explicit sequences (resolve actual schema)
-        for (String seqName : database.getSequences().keySet()) {
-            String explSeqSchema = resolveSequenceSchema(database, seqName);
+        // Sequences - explicit sequences (each lives in the schema it was created in)
+        for (Sequence explSeq : database.getSequences().values()) {
+            String seqName = explSeq.getName();
+            String explSeqSchema = explSeq.getSchemaName();
             int seqOwnerOid = resolveOwnerOid(database, oids, "sequence:" + seqName);
             int sOid = oids.oid("rel:" + explSeqSchema + "." + seqName);
             table.insertRow(new Object[]{
@@ -758,7 +751,7 @@ class CatalogCoreBuilder {
                     } else if (seqCol.getDefaultValue() != null && seqCol.getDefaultValue().contains("__identity__")) {
                         implicitSeqName = seqT.getName() + "_" + seqCol.getName() + "_seq";
                     }
-                    if (implicitSeqName != null && !database.getSequences().containsKey(implicitSeqName.toLowerCase())) {
+                    if (implicitSeqName != null && !database.hasSequence(seqSchemaName, implicitSeqName)) {
                         int isOid = oids.oid("rel:" + seqSchemaName + "." + implicitSeqName);
                         table.insertRow(new Object[]{
                                 isOid, implicitSeqName, seqNsOid,
@@ -779,9 +772,10 @@ class CatalogCoreBuilder {
         // Indexes (from explicit CREATE INDEX)
         Set<String> addedIndexNames = new HashSet<>();
         for (Map.Entry<String, List<String>> idx : database.getIndexColumns().entrySet()) {
-            String indexName = idx.getKey();
-            addedIndexNames.add(indexName.toLowerCase());
-            String storedTableQualified = database.getIndexTable(indexName);
+            String indexKey = idx.getKey();
+            String indexName = Database.idxName(indexKey);
+            addedIndexNames.add(indexKey.toLowerCase());
+            String storedTableQualified = database.getIndexTable(indexKey);
             String indexSchema = "public";
             if (storedTableQualified != null) {
                 String[] parts = storedTableQualified.split("\\.", 2);
@@ -805,7 +799,7 @@ class CatalogCoreBuilder {
             int idxOid = oids.oid("rel:" + indexSchema + "." + indexName);
             short idxNatts = (short) idx.getValue().size();
             // Build reloptions array from index storage parameters
-            Map<String, String> idxOpts = database.getIndexReloptions(indexName);
+            Map<String, String> idxOpts = database.getIndexReloptions(indexKey);
             Object reloptionsVal = null;
             if (idxOpts != null && !idxOpts.isEmpty()) {
                 List<String> optList = new ArrayList<>();
@@ -814,7 +808,7 @@ class CatalogCoreBuilder {
                 }
                 reloptionsVal = optList;
             }
-            String idxMethod = database.getIndexMethod(indexName);
+            String idxMethod = database.getIndexMethod(indexKey);
             int relamOid = resolveAccessMethodOid(idxMethod);
             // Determine if this is a partitioned index (index on a partitioned table)
             String idxRelkind = "i";
@@ -848,7 +842,8 @@ class CatalogCoreBuilder {
             for (Map.Entry<String, Table> tableEntry : schemaEntry.getValue().getTables().entrySet()) {
                 for (StoredConstraint sc : tableEntry.getValue().getConstraints()) {
                     if ((sc.getType() == StoredConstraint.Type.PRIMARY_KEY || sc.getType() == StoredConstraint.Type.UNIQUE)
-                            && !addedIndexNames.contains(sc.getName().toLowerCase())) {
+                            && !addedIndexNames.contains(
+                                    Database.idxKey(schemaEntry.getKey(), sc.getName()).toLowerCase())) {
                         int ciOid = oids.oid("rel:" + schemaEntry.getKey() + "." + sc.getName());
                         short ciNatts = (short) (sc.getColumns() != null ? sc.getColumns().size() : 0);
                         String ciRelkind = tableEntry.getValue().getPartitionStrategy() != null ? "I" : "i";
@@ -870,15 +865,16 @@ class CatalogCoreBuilder {
 
         // Composite types (relkind='c'). pg_type.typrelid and the composite's pg_attribute
         // rows already point at "rel:<schema>.<name>", so the same key links them up.
-        int compositeNsOid = oids.oid("ns:public");
         for (Map.Entry<String, java.util.List<com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField>> ctEntry
                 : database.getCompositeTypes().entrySet()) {
-            String ctName = ctEntry.getKey();
-            int ctOid = oids.oid("rel:public." + ctName);
+            String ctKey = ctEntry.getKey();
+            String ctName = TypeNamespace.nameOfKey(ctKey);
+            int compositeNsOid = oids.oid("ns:" + TypeNamespace.schemaOfKey(ctKey));
+            int ctOid = oids.oid("rel:" + TypeNamespace.schemaOfKey(ctKey) + "." + ctName);
             short ctNatts = (short) (ctEntry.getValue() != null ? ctEntry.getValue().size() : 0);
             table.insertRow(new Object[]{
                     ctOid, ctName, compositeNsOid,
-                    oids.oid("type:" + ctName), 0, resolveOwnerOid(database, oids, "type:" + ctName), 0, 0, 0,
+                    oids.oid("type:" + ctKey), 0, resolveOwnerOid(database, oids, "type:" + ctKey), 0, 0, 0,
                     0, 0.0, 0, 0, 0,
                     false, false, "p", "c",
                     ctNatts, (short) 0,
@@ -889,13 +885,18 @@ class CatalogCoreBuilder {
             });
         }
 
-        // Foreign tables (relkind='f')
-        int publicNsOid = oids.oid("ns:public");
-        for (Database.FdwForeignTable ft : database.getForeignTables().values()) {
+        // Foreign tables (relkind='f'), each in the schema it was created in. One whose schema
+        // has been dropped is not listed: DROP SCHEMA ... CASCADE takes its foreign tables with
+        // it, and ForeignTables.live leaves out the ones that lost their schema.
+        for (Object[] entry : ForeignTables.live(database)) {
+            String ftSchema = (String) entry[0];
+            Database.FdwForeignTable ft = (Database.FdwForeignTable) entry[1];
+            // The oid key stays the bare-name one: pg_foreign_table pairs its ftrelid on the
+            // same key, and a foreign table's identity has to be one number in both catalogs.
             int ftOid = oids.oid("rel:public." + ft.tableName);
             short ftNatts = (short) (ft.columns != null ? ft.columns.size() : 0);
             table.insertRow(new Object[]{
-                    ftOid, ft.tableName, publicNsOid,
+                    ftOid, ft.tableName, oids.oid("ns:" + ftSchema),
                     0, 0, 10, 0, ftOid, 0,
                     0, 0.0, 0, 0, 0,
                     false, false, "p", "f",
@@ -1055,10 +1056,12 @@ class CatalogCoreBuilder {
                     int typmod = CatalogHelper.attTypmod(c);
                     // Resolve atttypid: use custom type OID for enums/domains
                     int atttypid = c.getType().getOid();
+                    // The column records the type it was declared with, schema and all, so a
+                    // column of a.e points at a.e's OID and not at some other schema's e.
                     if (colType == DataType.ENUM && c.getEnumTypeName() != null) {
-                        atttypid = oids.oid("type:" + c.getEnumTypeName());
+                        atttypid = userTypeOid(c.getEnumTypeName(), atttypid);
                     } else if (c.getDomainTypeName() != null) {
-                        atttypid = oids.oid("type:" + c.getDomainTypeName());
+                        atttypid = userTypeOid(c.getDomainTypeName(), atttypid);
                     }
                     // Use column-level overrides if set
                     String effectiveStorage = c.getAttStorageOverride() != null ? c.getAttStorageOverride() : storage;
@@ -1099,9 +1102,9 @@ class CatalogCoreBuilder {
     private void addSequenceAttributes(Table table) {
         String[] names = {"last_value", "log_cnt", "is_called"};
         DataType[] types = {DataType.BIGINT, DataType.BIGINT, DataType.BOOLEAN};
-        for (String seqName : CatalogHelper.getSequenceNames(database)) {
-            String seqSchema = sequenceSchema(seqName);
-            int seqOid = oids.oid("rel:" + seqSchema + "." + seqName);
+        for (String qualified : CatalogHelper.getSequenceNames(database)) {
+            String seqName = CatalogHelper.nameOf(qualified);
+            int seqOid = oids.oid("rel:" + CatalogHelper.schemaOf(qualified) + "." + seqName);
             for (int i = 0; i < names.length; i++) {
                 DataType dt = types[i];
                 table.insertRow(new Object[]{
@@ -1113,6 +1116,33 @@ class CatalogCoreBuilder {
                 });
             }
         }
+    }
+
+    /**
+     * The schema a user-defined type lives in, read from the schema object registry the same way
+     * a sequence's is. A type registered nowhere counts as public, which is where the paths that
+     * do not register put it.
+     */
+    private String typeSchema(String kind, String typeName) {
+        for (Map.Entry<String, Schema> entry : database.getSchemas().entrySet()) {
+            if (database.getSchemaObjects(entry.getKey())
+                    .contains(kind + ":" + typeName.toLowerCase())) {
+                return entry.getKey();
+            }
+        }
+        return "public";
+    }
+
+    /** True when a composite type of this name lives in this very schema. */
+    private boolean compositeLivesIn(String schemaName, String name) {
+        return database.getCompositeTypes().containsKey(name.toLowerCase())
+                && typeSchema("composite", name)
+                        .equalsIgnoreCase(schemaName == null ? "public" : schemaName);
+    }
+
+    /** The pg_class key of a composite type's row-type relation, in the schema it lives in. */
+    private String compositeRelKey(String ctName) {
+        return "rel:" + typeSchema("composite", ctName) + "." + ctName;
     }
 
     private String sequenceSchema(String seqName) {
@@ -1137,8 +1167,9 @@ class CatalogCoreBuilder {
                 for (Map.Entry<String, java.util.List<String>> idx : database.getIndexColumns().entrySet()) {
                     String qualified = database.getIndexTable(idx.getKey());
                     if (qualified == null || !qualified.equalsIgnoreCase(schemaName + "." + t.getName())) continue;
-                    addIndexAttributeRows(table, schemaName, idx.getKey(), t, idx.getValue());
-                    done.add(idx.getKey().toLowerCase());
+                    String bare = Database.idxName(idx.getKey());
+                    addIndexAttributeRows(table, schemaName, bare, t, idx.getValue());
+                    done.add(bare.toLowerCase());
                 }
                 for (StoredConstraint sc : t.getConstraints()) {
                     if (sc.getType() != StoredConstraint.Type.PRIMARY_KEY
@@ -1241,8 +1272,10 @@ class CatalogCoreBuilder {
     private void addPgAttributeExtras(Table table) {
         addSequenceAttributes(table);
         addIndexAttributes(table);
-        // Foreign table columns
-        for (Database.FdwForeignTable ft : database.getForeignTables().values()) {
+        // Foreign table columns. A foreign table whose schema was dropped is gone from pg_class,
+        // so its columns go with it -- an attribute row pointing at no relation is worse than none.
+        for (Object[] entry : ForeignTables.live(database)) {
+            Database.FdwForeignTable ft = (Database.FdwForeignTable) entry[1];
             int ftRelOid = oids.oid("rel:public." + ft.tableName);
             if (ft.columns != null) {
                 for (int i = 0; i < ft.columns.size(); i++) {
@@ -1265,8 +1298,9 @@ class CatalogCoreBuilder {
         // Composite type attributes
         for (Map.Entry<String, java.util.List<com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField>> ctEntry
                 : database.getCompositeTypes().entrySet()) {
-            String ctName = ctEntry.getKey();
-            int ctRelOid = oids.oid("rel:public." + ctName);
+            String ctKey = ctEntry.getKey();
+            int ctRelOid = oids.oid("rel:" + TypeNamespace.schemaOfKey(ctKey) + "."
+                    + TypeNamespace.nameOfKey(ctKey));
             java.util.List<com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField> fields = ctEntry.getValue();
             for (int i = 0; i < fields.size(); i++) {
                 com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField f = fields.get(i);
@@ -1551,25 +1585,19 @@ class CatalogCoreBuilder {
                 false, 0, -1, 0, 0, null, null, null, 1
         });
 
-        // Add custom enum types
-        for (CustomEnum ce : database.getCustomEnums().values()) {
-            // Determine the schema this enum belongs to via the schema object registry
-            int enumNsOid = oids.oid("ns:public"); // default to public
-            for (Map.Entry<String, Schema> se : database.getSchemas().entrySet()) {
-                java.util.Set<String> objs = database.getSchemaObjects(se.getKey());
-                if (objs != null && objs.contains("enum:" + ce.getName().toLowerCase())) {
-                    enumNsOid = oids.oid("ns:" + se.getKey());
-                    break;
-                }
-            }
-            int enumOid = oids.oid("type:" + ce.getName());
+        // Add custom enum types. Each is in the schema it was created in, and two schemas each
+        // holding an "e" are two rows with two OIDs rather than one row that answers for both.
+        for (Map.Entry<String, CustomEnum> ceEntry : database.getCustomEnums().entrySet()) {
+            CustomEnum ce = ceEntry.getValue();
+            int enumNsOid = oids.oid("ns:" + TypeNamespace.schemaOfKey(ceEntry.getKey()));
+            int enumOid = oids.oid("type:" + ceEntry.getKey());
             // Every PG enum type also gets an array-type pg_type row (typname "_<name>"); mint
             // its OID eagerly and link both rows (element.typarray -> array oid,
             // array.typelem -> element oid) so pgjdbc's TypeInfoCache queries for an
             // enum-ARRAY column (getArrayDelimiter, getPGArrayElement, ...) resolve instead of
             // finding zero rows. See PgWireValueFormatter.columnTypeOid, which advertises this
             // same "type:<name>[]" OID for "<name>[]"-typed columns.
-            int enumArrayOid = oids.oid("type:" + ce.getName() + "[]");
+            int enumArrayOid = oids.oid("type:" + ceEntry.getKey() + "[]");
             table.insertRow(new Object[]{
                     enumOid, ce.getName(), enumNsOid, 10,
                     (short) 4, true, "e", "E", false, true, ",",
@@ -1591,21 +1619,23 @@ class CatalogCoreBuilder {
         // Add composite types
         for (Map.Entry<String, java.util.List<com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField>> ctEntry
                 : database.getCompositeTypes().entrySet()) {
-            String ctName = ctEntry.getKey();
-            int ctNsOid = oids.oid("ns:public");
-            int ctRelOid = oids.oid("rel:public." + ctName);
+            String ctKey = ctEntry.getKey();
+            String ctName = TypeNamespace.nameOfKey(ctKey);
+            String ctSchema = TypeNamespace.schemaOfKey(ctKey);
+            int ctNsOid = oids.oid("ns:" + ctSchema);
+            int ctRelOid = oids.oid("rel:" + ctSchema + "." + ctName);
             table.insertRow(new Object[]{
-                    oids.oid("type:" + ctName), ctName, ctNsOid, 10,
+                    oids.oid("type:" + ctKey), ctName, ctNsOid, 10,
                     (short) -1, false, "c", "C", false, true, ",",
-                    ctRelOid, regproc(null), 0, oids.oid("type:" + ctName + "[]"),
+                    ctRelOid, regproc(null), 0, oids.oid("type:" + ctKey + "[]"),
                     regproc("record_in"), regproc("record_out"), regproc("record_recv"), regproc("record_send"),
                     regproc(null), regproc(null), regproc(null), "d", "x",
                     false, 0, -1, 0, 0, null, null, null, 1
             });
             table.insertRow(new Object[]{
-                    oids.oid("type:" + ctName + "[]"), "_" + ctName, ctNsOid, 10,
+                    oids.oid("type:" + ctKey + "[]"), "_" + ctName, ctNsOid, 10,
                     (short) -1, false, "b", "A", false, true, ",",
-                    0, regproc("array_subscript_handler"), oids.oid("type:" + ctName), 0,
+                    0, regproc("array_subscript_handler"), oids.oid("type:" + ctKey), 0,
                     regproc("array_in"), regproc("array_out"), regproc("array_recv"), regproc("array_send"),
                     regproc(null), regproc(null), regproc("array_typanalyze"), "d", "x",
                     false, 0, -1, 0, 0, null, null, null, 1
@@ -1613,9 +1643,10 @@ class CatalogCoreBuilder {
         }
 
         // Shell types: a name reserved but not yet defined, so typisdefined is false
-        for (String shellName : database.getShellTypes()) {
+        for (String shellKey : database.getShellTypes()) {
             table.insertRow(new Object[]{
-                    oids.oid("type:" + shellName), shellName, oids.oid("ns:public"), 10,
+                    oids.oid("type:" + shellKey), TypeNamespace.nameOfKey(shellKey),
+                    oids.oid("ns:" + TypeNamespace.schemaOfKey(shellKey)), 10,
                     (short) 4, false, "p", "P", false, false, ",",
                     0, null, 0, 0,
                     "shell_in", "shell_out", "-", "-",
@@ -1634,7 +1665,8 @@ class CatalogCoreBuilder {
             int relNsOid = oids.oid("ns:" + schemaName);
             for (Table rel : schemaEntry.getValue().getTables().values()) {
                 String relName = rel.getName();
-                if (database.getCompositeTypes().containsKey(relName)) continue;
+                if (database.getCompositeTypes().containsKey(
+                        TypeNamespace.key(schemaName, relName))) continue;
                 table.insertRow(rowType(schemaName, relName, relNsOid));
                 table.insertRow(rowTypeArray(schemaName, relName, relNsOid));
             }
@@ -1643,7 +1675,8 @@ class CatalogCoreBuilder {
         // A view has a row type too, and DatabaseMetaData.getUDTs reads it the same way.
         for (Database.ViewDef vd : database.getViews().values()) {
             String vSchema = vd.schemaName() != null ? vd.schemaName() : "public";
-            if (database.getCompositeTypes().containsKey(vd.name())) continue;
+            if (database.getCompositeTypes().containsKey(
+                    TypeNamespace.key(vSchema, vd.name()))) continue;
             table.insertRow(rowType(vSchema, vd.name(), oids.oid("ns:" + vSchema)));
             table.insertRow(rowTypeArray(vSchema, vd.name(), oids.oid("ns:" + vSchema)));
         }
@@ -1658,8 +1691,9 @@ class CatalogCoreBuilder {
         }
 
         // Add domain types
-        for (DomainType dom : database.getDomains().values()) {
-            int domNsOid = oids.oid("ns:" + dom.getSchemaName());
+        for (Map.Entry<String, DomainType> domEntry : database.getDomains().entrySet()) {
+            DomainType dom = domEntry.getValue();
+            int domNsOid = oids.oid("ns:" + TypeNamespace.schemaOfKey(domEntry.getKey()));
             // Resolve base type OID
             int baseTypeOid = 0;
             String baseTypeCat = "U";
@@ -1707,7 +1741,7 @@ class CatalogCoreBuilder {
                 baseTypeCat = "A";
             }
             table.insertRow(new Object[]{
-                    oids.oid("type:" + dom.getName()), dom.getName(), domNsOid, 10,
+                    oids.oid("type:" + domEntry.getKey()), dom.getName(), domNsOid, 10,
                     (short) -1, false, "d", baseTypeCat, false, true, ",",
                     0, regproc(null), 0, 0,
                     regproc("domain_in"), regproc("domain_out"), regproc("domain_recv"), regproc("domain_send"),
@@ -1719,10 +1753,10 @@ class CatalogCoreBuilder {
 
         // Add user-defined range types
         for (Map.Entry<String, String> rangeEntry : database.getRangeTypes().entrySet()) {
-            String rangeName = rangeEntry.getKey();
-            int rangeNsOid = oids.oid("ns:public");
+            String rangeKey = rangeEntry.getKey();
+            int rangeNsOid = oids.oid("ns:" + TypeNamespace.schemaOfKey(rangeKey));
             table.insertRow(new Object[]{
-                    oids.oid("type:" + rangeName), rangeName, rangeNsOid, 10,
+                    oids.oid("type:" + rangeKey), TypeNamespace.nameOfKey(rangeKey), rangeNsOid, 10,
                     (short) -1, false, "r", "R", false, true, ",",
                     0, regproc(null), 0, 0,
                     regproc("range_in"), regproc("range_out"), regproc("range_recv"), regproc("range_send"),
@@ -1768,12 +1802,12 @@ class CatalogCoreBuilder {
         Table table = new Table("pg_enum", cols);
         for (Map.Entry<String, CustomEnum> entry : database.getCustomEnums().entrySet()) {
             CustomEnum ce = entry.getValue();
-            int typid = oids.oid("type:" + ce.getName());
+            int typid = oids.oid("type:" + entry.getKey());
             List<String> labels = ce.getLabels();
             List<Double> sortOrders = ce.getSortOrders();
             for (int i = 0; i < labels.size(); i++) {
                 table.insertRow(new Object[]{
-                        oids.oid("enum:" + ce.getName() + ":" + labels.get(i)),
+                        oids.oid("enum:" + entry.getKey() + ":" + labels.get(i)),
                         typid, sortOrders.get(i), labels.get(i)
                 });
             }
@@ -2740,7 +2774,10 @@ class CatalogCoreBuilder {
                 return dt.getOid();
             }
         }
-        return 0;
+        // A user-defined type: a composite attribute's declared type, a function's argument or
+        // return type. It answers under the schema that holds it.
+        String userKey = TypeNamespace.oidKeyFor(database, lower);
+        return userKey == null ? 0 : oids.oid(userKey);
     }
 
     /** PG marks anything in a pg_temp namespace as temporary, ahead of unlogged. */

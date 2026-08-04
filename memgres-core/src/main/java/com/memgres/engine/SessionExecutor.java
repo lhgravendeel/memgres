@@ -21,6 +21,23 @@ class SessionExecutor {
         this.executor = executor;
     }
 
+    /**
+     * The schema a relation named by a COMMENT lives in: the one written, or the first on the
+     * search path that holds a relation of that name. A comment is keyed by where the object is,
+     * not by what the session's default schema happened to be.
+     */
+    private String relationSchema(String writtenSchema, String bareName) {
+        if (writtenSchema != null) return writtenSchema.toLowerCase();
+        if (bareName != null) {
+            for (String schema : executor.searchPathSchemas()) {
+                if (RelationNamespace.kindOf(executor.database, schema, bareName) != null) {
+                    return schema;
+                }
+            }
+        }
+        return executor.defaultSchema();
+    }
+
     // ---- SET / SHOW / RESET ----
 
     QueryResult executeSetStmt(SetStmt stmt) {
@@ -33,7 +50,7 @@ class SessionExecutor {
                 String objType = parts[1].toUpperCase();
                 String objName = parts[2];
                 // Strip schema prefix for resolution and storage (e.g., "public.customers" -> "customers")
-                String schemaName = executor.defaultSchema();
+                String writtenSchema = null;
                 String bareName = objName;
                 // CONSTRAINT/TRIGGER/RULE/POLICY names are qualified by their relation, not a
                 // schema, so the prefix must survive into the stored key
@@ -41,12 +58,16 @@ class SessionExecutor {
                         || objType.equals("RULE") || objType.equals("POLICY");
                 if (objName.contains(".") && !objType.equals("COLUMN") && !relationScoped) {
                     int dot = objName.indexOf('.');
-                    schemaName = objName.substring(0, dot);
+                    writtenSchema = objName.substring(0, dot);
                     bareName = objName.substring(dot + 1);
                     // COMMENT resolves the schema first and reports that when it is not there,
                     // rather than the object it never got as far as looking for.
-                    SchemaQualifier.requireSchema(executor.database, executor.session, schemaName);
+                    SchemaQualifier.requireSchema(executor.database, executor.session, writtenSchema);
                 }
+                // Where the object actually is, which is what its comment is keyed by: the schema
+                // written, or the first one on the search path that holds it. The kinds that are
+                // not relations settle it for themselves below.
+                String schemaName = relationSchema(writtenSchema, bareName);
                 if (objType.equals("TABLE") || objType.equals("RELATION")) {
                     try {
                         executor.resolveTable(schemaName, bareName);
@@ -105,22 +126,52 @@ class SessionExecutor {
                             if ("42703".equals(e.getSqlState())) throw e;
                             throw new MemgresException("relation \"" + tablePart + "\" does not exist", "42P01");
                         }
-                        // Store with bare table.column name for consistent lookup
+                        // Store the column under its table's own schema: two schemas may each hold
+                        // a t with an x, and what was said about one is not said about the other.
+                        schemaName = tablePart.contains(".")
+                                ? colSchema.toLowerCase() : relationSchema(null, colTable);
                         bareName = colTable + "." + colPart;
                     }
                 } else if (objType.equals("FUNCTION") || objType.equals("PROCEDURE") || objType.equals("ROUTINE")) {
                     // Normalize PROCEDURE/ROUTINE to FUNCTION for comment storage
                     objType = "FUNCTION";
-                    if (executor.database.getFunction(bareName) == null) {
+                    PgFunction fn = executor.database.getFunction(bareName);
+                    if (fn == null) {
                         throw new MemgresException("function " + bareName + " does not exist", "42883");
                     }
+                    if (writtenSchema == null) schemaName = Database.schemaOf(fn);
                 } else if (objType.equals("SCHEMA")) {
                     String schemaN = bareName;
                     if (executor.database.getSchema(schemaN) == null) {
                         throw new MemgresException("schema \"" + schemaN + "\" does not exist", "3F000");
                     }
+                } else if (objType.equals("TYPE") || objType.equals("DOMAIN")) {
+                    // A domain is a type; PostgreSQL keeps both comments in pg_type's namespace,
+                    // and which schema's type this is is the search path's to answer.
+                    String typeKey = TypeNamespace.resolve(executor.database, executor.session,
+                            writtenSchema == null ? bareName : writtenSchema + "." + bareName);
+                    if (typeKey == null) {
+                        throw new MemgresException("type \"" + objName + "\" does not exist", "42704");
+                    }
+                    objType = "TYPE";
+                    schemaName = TypeNamespace.schemaOfKey(typeKey);
+                    bareName = TypeNamespace.nameOfKey(typeKey);
+                } else if (relationScoped) {
+                    // The name is "<relation>.<object>", and the relation may carry a schema of
+                    // its own. Written, it settles which relation this is; bare, the search path
+                    // does — and either way the comment is filed under that relation's schema.
+                    String[] scoped = bareName.split("\\.", 3);
+                    if (scoped.length == 3) {
+                        SchemaQualifier.requireSchema(executor.database, executor.session, scoped[0]);
+                        schemaName = scoped[0].toLowerCase();
+                        bareName = scoped[1] + "." + scoped[2];
+                    } else if (scoped.length == 2) {
+                        schemaName = relationSchema(null, scoped[0]);
+                    }
                 }
-                executor.database.addComment(objType.toLowerCase(), bareName.toLowerCase(), stmt.value());
+                String key = Database.globalCommentType(objType)
+                        ? bareName.toLowerCase() : Database.commentKey(schemaName, bareName);
+                executor.database.addComment(objType.toLowerCase(), key, stmt.value());
             }
             return QueryResult.message(QueryResult.Type.SET, "COMMENT");
         }
@@ -552,11 +603,48 @@ class SessionExecutor {
                     columns.add(colParts);
                 }
             }
+            // A foreign table is created in the schema the statement names, or in the first
+            // schema of the search_path -- and it takes that name in that schema, so a relation
+            // of any other kind already holding it is 42P07.
+            String written = parts.length > 4 && !parts[4].isEmpty() ? parts[4] : null;
+            if (written != null) {
+                SchemaQualifier.requireSchema(executor.database, executor.session, written);
+            }
+            String ftSchema = written != null ? written : executor.defaultSchema();
+            // IF NOT EXISTS steps aside for whatever holds the name, foreign table or not: PG
+            // asks the relation namespace, not its own catalog, and leaves what is there alone.
+            boolean ifNotExists = parts.length > 5 && "true".equals(parts[5]);
+            if (ifNotExists && RelationNamespace.kindOf(executor.database, ftSchema, ftName) != null) {
+                return QueryResult.command(QueryResult.Type.SET, 0);
+            }
+            RelationNamespace.requireFree(executor.database, ftSchema, ftName, null);
+            // memgres keys foreign tables by their bare name, so a name reused in a second
+            // schema replaces the first; forgetting the old attribution keeps the catalogs
+            // from reporting one foreign table as living in two schemas at once.
+            ForeignTables.unregisterEverywhere(executor.database, ftName);
             executor.database.addForeignTable(new Database.FdwForeignTable(ftName, serverName, options, columns));
+            ForeignTables.register(executor.database, ftSchema, ftName);
             return QueryResult.command(QueryResult.Type.SET, 0);
         }
         if (name.equals("drop_foreign_table")) {
-            executor.database.removeForeignTable(stmt.value());
+            String[] parts = stmt.value().split("\0", -1);
+            String ftName = parts[0];
+            String written = parts.length > 1 && !parts[1].isEmpty() ? parts[1] : null;
+            boolean ifExists = parts.length > 2 && "true".equals(parts[2]);
+            if (written != null) {
+                SchemaQualifier.requireSchema(executor.database, executor.session, written);
+            }
+            String ftSchema = written != null ? written : executor.defaultSchema();
+            if (!ForeignTables.existsIn(executor.database, ftSchema, ftName)) {
+                if (ifExists) return QueryResult.command(QueryResult.Type.SET, 0);
+                // Something else of that name in this schema is a wrong-kind drop; nothing of
+                // that name is a foreign table that is not there.
+                RelationNamespace.requireKind(executor.database, ftSchema, ftName,
+                        RelationNamespace.FOREIGN_TABLE);
+                throw new MemgresException("foreign table \"" + ftName + "\" does not exist", "42704");
+            }
+            executor.database.removeForeignTable(ftName);
+            ForeignTables.unregister(executor.database, ftSchema, ftName);
             return QueryResult.command(QueryResult.Type.SET, 0);
         }
         if (name.equals("import_foreign_schema")) {

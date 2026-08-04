@@ -1227,6 +1227,16 @@ public class Session {
         return executor.getSystemCatalog().getOid(key);
     }
 
+    /**
+     * The catalog key of the user-defined type a written name denotes. A column records the name
+     * it was declared with, and two schemas may each hold a type of that name, so this resolves
+     * the one that column's OID belongs to.
+     */
+    public String typeOidKey(String written) {
+        String key = TypeNamespace.oidKeyFor(database, written);
+        return key != null ? key : TypeNamespace.oidKey(null, written);
+    }
+
     public GucSettings getGucSettings() {
         return gucSettings;
     }
@@ -1285,7 +1295,7 @@ public class Session {
             database.removeSchema(tempSchemaName);
         }
         // Also remove any temp sequences
-        database.removeSequencesWithPrefix(tempSchemaName + ".");
+        database.removeSequencesInSchema(tempSchemaName);
     }
 
     /**
@@ -2227,7 +2237,7 @@ public class Session {
 
         @Override
         public void undo(Database db) {
-            db.removeCustomEnum(typeName);
+            db.removeCustomEnum(schema + "." + typeName);
             db.unregisterSchemaObject(schema, "enum", typeName);
         }
     }

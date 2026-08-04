@@ -70,6 +70,7 @@ class DdlAlterTableExecutor {
         }
         SchemaQualifier.requireSchema(executor.database, executor.session, stmt.schema());
         String schemaName = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
+        rejectCompositeTypeTarget(schemaName, stmt.table());
         rejectActionsOnOtherRelationKinds(stmt);
         QueryResult indexResult = alterIndexRelation(stmt, schemaName);
         if (indexResult != null) return indexResult;
@@ -101,6 +102,23 @@ class DdlAlterTableExecutor {
         }
 
         return QueryResult.command(QueryResult.Type.CREATE_TABLE, 0);
+    }
+
+    /**
+     * A composite type owns a {@code pg_class} row, so ALTER TABLE finds it — and then refuses it,
+     * because what a composite is made of is ALTER TYPE's business. PostgreSQL names the bare
+     * relation even when the statement qualified it, and points the reader at the right statement.
+     */
+    private void rejectCompositeTypeTarget(String schemaName, String written) {
+        if (written == null) return;
+        String bare = RelationNamespace.bareName(written);
+        if (!RelationNamespace.COMPOSITE.equals(
+                RelationNamespace.kindOf(executor.database, schemaName, bare))) {
+            return;
+        }
+        MemgresException e = PgErrors.wrongObjectType("\"" + bare + "\" is a composite type");
+        e.setHint("Use ALTER TYPE instead.");
+        throw e;
     }
 
     /**
@@ -232,8 +250,12 @@ class DdlAlterTableExecutor {
                 if (executor.database.getView(newName) != null) {
                     throw new MemgresException("relation \"" + newName + "\" already exists", "42P07");
                 }
+                String viewSchema = view.schemaName() != null
+                        ? view.schemaName() : executor.defaultSchema();
                 executor.database.removeView(bare);
                 executor.database.addView(withViewName(view, newName, view.cachedColumns()));
+                executor.identity().relationRenamed(view.materialized() ? "m" : "v",
+                        viewSchema, bare, viewSchema, newName);
                 view = executor.database.getView(newName);
                 bare = newName;
             } else if (action instanceof AlterTableStmt.RenameColumn) {
@@ -255,11 +277,15 @@ class DdlAlterTableExecutor {
                 if (executor.database.getSchema(target) == null) {
                     throw new MemgresException("schema \"" + target + "\" does not exist", "3F000");
                 }
+                String viewSchema = view.schemaName() != null
+                        ? view.schemaName() : executor.defaultSchema();
                 executor.database.removeView(bare);
                 executor.database.addView(new Database.ViewDef(view.name(), target, view.query(),
                         view.orReplace(), view.materialized(), view.cachedColumns(),
                         view.cachedRows(), view.sourceSQL(), view.checkOption(),
                         view.reloptions(), view.populated()));
+                executor.identity().relationRenamed(view.materialized() ? "m" : "v",
+                        viewSchema, bare, target, bare);
                 view = executor.database.getView(bare);
             }
         }
@@ -306,12 +332,13 @@ class DdlAlterTableExecutor {
         Schema schema = executor.database.getSchema(schemaName);
         if (schema != null && schema.getTable(bare) != null) return null;
         if (executor.database.getView(bare) != null) return null;
-        if (!executor.database.hasIndex(bare)) return null;
+        if (!executor.database.hasIndex(schemaName, bare)) return null;
         for (AlterTableStmt.AlterAction action : stmt.actions()) {
             if (action instanceof AlterTableStmt.RenameTable) {
                 String newName = ((AlterTableStmt.RenameTable) action).newName();
                 RelationNamespace.requireFree(executor.database, schemaName, newName, null);
-                executor.database.renameIndex(bare, newName);
+                executor.database.renameIndex(Database.idxKey(schemaName, bare), newName);
+                executor.identity().relationRenamed("i", schemaName, bare, schemaName, newName);
             }
             // OWNER TO is accepted; memgres records no per-index owner to change.
         }
@@ -368,12 +395,12 @@ class DdlAlterTableExecutor {
         String bare = stmt.table().contains(".")
                 ? stmt.table().substring(stmt.table().lastIndexOf('.') + 1) : stmt.table();
         Database.ViewDef view = executor.database.getView(bare);
-        boolean isSequence = view == null && executor.database.hasSequence(bare);
-        Schema ownSchema = executor.database.getSchema(
-                stmt.schema() != null ? stmt.schema() : executor.defaultSchema());
+        String ownSchemaName = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
+        boolean isSequence = view == null && executor.database.hasSequence(ownSchemaName, bare);
+        Schema ownSchema = executor.database.getSchema(ownSchemaName);
         boolean isIndex = view == null && !isSequence
                 && (ownSchema == null || ownSchema.getTable(bare) == null)
-                && executor.database.hasIndex(bare);
+                && executor.database.hasIndex(ownSchemaName, bare);
         if (view == null && !isSequence && !isIndex) return;
         for (AlterTableStmt.AlterAction action : stmt.actions()) {
             // An index has no schema of its own to change: it always lives where its table does.
@@ -551,8 +578,21 @@ class DdlAlterTableExecutor {
                 throw new MemgresException("schema \"" + setSchema.newSchema()
                         + "\" does not exist", "3F000");
             }
+            // Everything that travels with the table needs a free name where it is going. The
+            // whole move is refused when one of them is taken, because a move that overwrote the
+            // destination's index or sequence destroyed an object the statement never named.
+            requireNamesFreeInTarget(table, schemaName, setSchema.newSchema(), stmt.table());
             oldSchema.removeTable(stmt.table());
             newSchema.addTable(table);
+            // The indexes are moved first: they are found by the schema-qualified name of the
+            // table they were built on, which the table's own move rewrites.
+            moveOwnedSequences(table, schemaName, setSchema.newSchema());
+            moveOwnedIndexes(table, schemaName, setSchema.newSchema(), stmt.table());
+            // Same object, new schema: the OID goes with it, and so does everything filed under
+            // the qualified name it used to answer to.
+            executor.identity().relationRenamed("r", schemaName, stmt.table(),
+                    setSchema.newSchema(), stmt.table());
+            carryComments(schemaName, stmt.table(), setSchema.newSchema(), stmt.table());
             retargetDependents(schemaName, stmt.table(), setSchema.newSchema(), stmt.table());
         } else if (action instanceof AlterTableStmt.Inherit) {
             AlterTableStmt.Inherit inherit = (AlterTableStmt.Inherit) action;
@@ -647,6 +687,7 @@ class DdlAlterTableExecutor {
             if (defaultVal == null && def.identity() == null) {
                 String seqName = stmt.table() + "_" + def.name() + "_seq";
                 Sequence seq = new Sequence(seqName, null, null, null, null);
+                seq.setSchemaName(schemaName);
                 executor.database.addSequence(seq);
                 executor.database.registerSchemaObject(schemaName, "sequence", seqName);
                 defaultVal = "nextval('" + seqName + "'::regclass)";
@@ -656,8 +697,9 @@ class DdlAlterTableExecutor {
         // GENERATED AS IDENTITY on ADD COLUMN
         if (def.identity() != null) {
             String seqName = stmt.table() + "_" + def.name() + "_seq";
-            if (!executor.database.hasSequence(seqName)) {
+            if (!executor.database.hasSequence(schemaName, seqName)) {
                 Sequence seq = new Sequence(seqName, def.identityStart(), def.identityIncrement(), null, null);
+                seq.setSchemaName(schemaName);
                 executor.database.addSequence(seq);
                 executor.database.registerSchemaObject(schemaName, "sequence", seqName);
             }
@@ -791,12 +833,27 @@ class DdlAlterTableExecutor {
                 if (defaultVal.startsWith("__identity__") && defaultVal.contains(":seq:")) {
                     identitySeqName = defaultVal.substring(defaultVal.indexOf(":seq:") + 5);
                 }
+                // A serial column's default names its sequence without a qualifier, which means
+                // the one in this table's schema. Evaluating the default text instead would look
+                // the name up through the search path and miss it whenever the table is not on it.
+                Sequence backing = null;
+                if (!defaultVal.startsWith("__identity__") && defaultVal.contains("nextval(")) {
+                    int q1 = defaultVal.indexOf('\'');
+                    int q2 = defaultVal.indexOf('\'', q1 + 1);
+                    if (q1 >= 0 && q2 > q1) {
+                        backing = executor.database.getSequenceFor(table.getSchemaName(),
+                                defaultVal.substring(q1 + 1, q2));
+                    }
+                }
                 for (Object[] row : table.getRows()) {
                     Object v;
                     if (defaultVal.startsWith("__identity__")) {
                         Sequence seq = identitySeqName != null
-                                ? executor.database.getSequence(identitySeqName) : null;
+                                ? executor.database.getSequenceFor(table.getSchemaName(), identitySeqName)
+                                : null;
                         v = seq != null ? seq.nextVal() : table.nextSerial();
+                    } else if (backing != null) {
+                        v = backing.nextVal();
                     } else {
                         v = executor.evaluateDefault(defaultVal, dt);
                     }
@@ -1172,6 +1229,10 @@ class DdlAlterTableExecutor {
         Schema schema = executor.database.getSchema(schemaName);
         // The new name has to be free of every kind of relation, not only of another table.
         RelationNamespace.requireFree(executor.database, schemaName, rename.newName(), null);
+        // ...and then free of every kind of type, because the table's row type has to be renamed
+        // with it. The relation check runs first: renaming onto another table is 42P07 and
+        // renaming onto an enum, a domain, a range or a shell is 42710, both measured.
+        TypeNamespace.requireRenameableRowType(executor.database, schemaName, rename.newName());
         if (schema.getTable(rename.newName()) != null) {
             throw new MemgresException("relation \"" + rename.newName() + "\" already exists", "42P07");
         }
@@ -1192,9 +1253,38 @@ class DdlAlterTableExecutor {
         }
         renamed.setRlsEnabled(table.isRlsEnabled());
         schema.addTable(renamed);
+        // The same table under a new name: the OID stays with it, and so do the comment, the
+        // grants and the indexes built on it. Told, not inferred -- see ObjectIdentity.
+        executor.identity().relationRenamed("r", schemaName, stmt.table(),
+                schemaName, rename.newName());
+        carryComments(schemaName, stmt.table(), schemaName, rename.newName());
         retargetDependents(schemaName, stmt.table(), schemaName, rename.newName());
         return renamed;
     }
+
+    /**
+     * A renamed or moved relation keeps what was said about it. PostgreSQL keys a comment by the
+     * object's OID, which a rename does not change; memgres keys it by schema and name, so the
+     * relation's own comment and every one of its columns' has to be carried across.
+     */
+    void carryComments(String oldSchema, String oldName, String newSchema, String newName) {
+        Database db = executor.database;
+        String from = Database.commentKey(oldSchema, oldName);
+        String to = Database.commentKey(newSchema, newName);
+        for (String kind : COMMENTED_RELATION_KINDS) {
+            db.moveComment(kind, from, to);
+        }
+        // Column, constraint, trigger, rule and policy comments are keyed under the relation.
+        for (String kind : RELATION_SCOPED_KINDS) {
+            db.moveCommentsUnder(kind, from + ".", to + ".");
+        }
+    }
+
+    private static final String[] COMMENTED_RELATION_KINDS = {
+            "table", "relation", "view", "materialized view", "index", "sequence", "foreign table"};
+
+    private static final String[] RELATION_SCOPED_KINDS = {
+            "column", "constraint", "trigger", "rule", "policy"};
 
     /**
      * Follow a renamed or moved relation from everything that names it. PG records these
@@ -1650,7 +1740,7 @@ class DdlAlterTableExecutor {
             if (!owner.equalsIgnoreCase(qualified) && !owner.equalsIgnoreCase(tableName)) continue;
             List<String> cols = e.getValue();
             if (cols != null && cols.size() == 1 && cols.get(0).equalsIgnoreCase(column)) {
-                return e.getKey();
+                return Database.idxName(e.getKey());
             }
         }
         return null;
@@ -1729,7 +1819,7 @@ class DdlAlterTableExecutor {
         int colIdx = table.getColumnIndex(column);
         Column col = colIdx >= 0 ? table.getColumns().get(colIdx) : null;
         if (col != null && col.getDefaultValue() != null && col.getDefaultValue().contains("nextval")) {
-            Sequence seq = findBackingSequence(col);
+            Sequence seq = findBackingSequence(table, col);
             if (seq != null) {
                 long inc = Long.parseLong(marker.substring(marker.indexOf(":") + 1));
                 seq.setIncrementBy(inc);
@@ -1752,7 +1842,7 @@ class DdlAlterTableExecutor {
         boolean restarted = false;
         if (col != null && col.getDefaultValue() != null
                 && (col.getDefaultValue().contains("nextval") || col.getDefaultValue().contains(":seq:"))) {
-            Sequence seq = findBackingSequence(col);
+            Sequence seq = findBackingSequence(table, col);
             if (seq != null) {
                 if (marker.contains(":")) {
                     long val = Long.parseLong(marker.substring(marker.indexOf(":") + 1));
@@ -1833,11 +1923,14 @@ class DdlAlterTableExecutor {
 
         String seqName = explicitSeqName != null ? explicitSeqName :
                 stmt.table() + "_" + column + "_seq";
-        if (!executor.database.hasSequence(seqName)) {
-            executor.database.addSequence(new Sequence(seqName, startWith, incrementBy, null, null));
-            executor.database.registerSchemaObject(executor.defaultSchema(), "sequence", seqName);
+        String identitySchema = table.getSchemaName();
+        if (!executor.database.hasSequence(identitySchema, seqName)) {
+            Sequence added = new Sequence(seqName, startWith, incrementBy, null, null);
+            added.setSchemaName(identitySchema);
+            executor.database.addSequence(added);
+            executor.database.registerSchemaObject(identitySchema, "sequence", seqName);
         } else if (startWith != null || incrementBy != null) {
-            Sequence seq = executor.database.getSequence(seqName);
+            Sequence seq = executor.database.getSequence(identitySchema, seqName);
             if (startWith != null) seq.restart(startWith);
             if (incrementBy != null) seq.setIncrementBy(incrementBy);
         }
@@ -1875,19 +1968,101 @@ class DdlAlterTableExecutor {
         }
     }
 
-    private Sequence findBackingSequence(Column col) {
+    /**
+     * A sequence a column of this table draws from belongs to the table, so it moves with it.
+     * Leaving it behind breaks every later insert: the default names the sequence without a
+     * qualifier, which means the schema the table is now in, and nothing of that name is there.
+     */
+    private void moveOwnedSequences(Table table, String fromSchema, String toSchema) {
+        if (fromSchema.equalsIgnoreCase(toSchema)) return;
+        for (String seqName : ownedSequenceNames(table, fromSchema)) {
+            Sequence seq = executor.database.getSequence(fromSchema, seqName);
+            if (seq == null) continue;
+            executor.database.removeSequence(fromSchema, seqName);
+            executor.database.unregisterSchemaObject(fromSchema, "sequence", seqName);
+            seq.setSchemaName(toSchema);
+            executor.database.addSequence(seq);
+            executor.database.registerSchemaObject(toSchema, "sequence", seqName);
+            executor.identity().relationRenamed("S", fromSchema, seqName, toSchema, seqName);
+        }
+    }
+
+    /** An index lives where its table does, so moving the table moves every index on it. */
+    private void moveOwnedIndexes(Table table, String fromSchema, String toSchema, String tableName) {
+        if (fromSchema.equalsIgnoreCase(toSchema)) return;
+        for (String key : ownedIndexKeys(fromSchema, tableName)) {
+            String bare = Database.idxName(key);
+            executor.database.moveIndex(key, toSchema, toSchema + "." + tableName);
+            executor.identity().relationRenamed("i", fromSchema, bare, toSchema, bare);
+        }
+    }
+
+    /**
+     * The sequences this table owns, by bare name. A default that names its sequence without a
+     * qualifier means the one in the table's own schema, and only that one belongs to the table.
+     */
+    private List<String> ownedSequenceNames(Table table, String fromSchema) {
+        List<String> names = new ArrayList<>();
+        for (Column col : table.getColumns()) {
+            String seqName = Sequence.nameInDefault(col.getDefaultValue());
+            if (seqName == null || seqName.indexOf('.') > 0) continue;
+            if (executor.database.getSequence(fromSchema, seqName) != null) names.add(seqName);
+        }
+        return names;
+    }
+
+    /** The keys of the indexes written on this table, which live where the table does. */
+    private List<String> ownedIndexKeys(String fromSchema, String tableName) {
+        List<String> keys = new ArrayList<>();
+        String oldOwner = fromSchema + "." + tableName;
+        for (String key : new ArrayList<>(executor.database.getIndexColumns().keySet())) {
+            String owner = executor.database.getIndexTable(key);
+            if (owner != null && owner.equalsIgnoreCase(oldOwner)) keys.add(key);
+        }
+        return keys;
+    }
+
+    /**
+     * Refuse the move when the table, or anything that travels with it, would land on a name the
+     * destination schema has already given to a relation.
+     *
+     * <p>PostgreSQL checks before it moves anything and names the object that is in the way, so
+     * the statement either moves the lot or leaves every schema as it found it. Moving first and
+     * overwriting was silent destruction: the destination's index or its sequence — counter and
+     * all — simply stopped existing.
+     */
+    private void requireNamesFreeInTarget(Table table, String fromSchema, String toSchema,
+                                          String tableName) {
+        if (fromSchema.equalsIgnoreCase(toSchema)) return;
+        requireFreeInTarget(toSchema, tableName);
+        for (String seqName : ownedSequenceNames(table, fromSchema)) {
+            requireFreeInTarget(toSchema, seqName);
+        }
+        for (String key : ownedIndexKeys(fromSchema, tableName)) {
+            requireFreeInTarget(toSchema, Database.idxName(key));
+        }
+    }
+
+    private void requireFreeInTarget(String toSchema, String name) {
+        if (RelationNamespace.kindOf(executor.database, toSchema, name) == null) return;
+        throw new MemgresException("relation \"" + name + "\" already exists in schema \""
+                + toSchema + "\"", "42P07");
+    }
+
+    private Sequence findBackingSequence(Table table, Column col) {
         String seqRef = col.getDefaultValue();
+        String schema = table.getSchemaName();
         // Check for nextval('seqname'::regclass) pattern
         int qi = seqRef.indexOf("'");
         int qi2 = seqRef.indexOf("'", qi + 1);
         if (qi >= 0 && qi2 >= 0) {
             String seqName = seqRef.substring(qi + 1, qi2);
-            return executor.database.getSequence(seqName);
+            return executor.database.getSequenceFor(schema, seqName);
         }
         // Check for __identity__:...:seq:seqname pattern
         if (seqRef.contains(":seq:")) {
             String seqName = seqRef.substring(seqRef.indexOf(":seq:") + 5);
-            return executor.database.getSequence(seqName);
+            return executor.database.getSequenceFor(schema, seqName);
         }
         return null;
     }

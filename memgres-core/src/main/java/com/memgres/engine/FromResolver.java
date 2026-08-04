@@ -736,6 +736,7 @@ class FromResolver {
 
         String schemaName = tableRef.schema() != null ? tableRef.schema() : executor.defaultSchema();
         boolean userQualified = tableRef.schema() != null;
+        refuseForeignTable(schemaName, tableRef.table());
         try {
             executor.resolveTable(schemaName, tableRef.table(), userQualified);
             return;
@@ -752,6 +753,16 @@ class FromResolver {
         // Nothing answers to the name. Raise it the way the ordinary lookup does, so the message
         // and the "there is a WITH item" hint are identical.
         executor.resolveTable(schemaName, tableRef.table(), userQualified);
+    }
+
+    /**
+     * A FROM item that names a foreign table is refused by its wrapper, not by the name lookup.
+     * The relation is there — it is in pg_class and information_schema, and a query that called
+     * it missing would send a reader looking for a name that is plainly listed.
+     */
+    private void refuseForeignTable(String schemaName, String name) {
+        Database.FdwForeignTable ft = ForeignTables.lookup(executor.database, schemaName, name);
+        if (ft != null) throw ForeignTables.noHandler(executor.database, ft);
     }
 
     private boolean implicitlySearchedSchemaHolds(String name) {
@@ -1045,6 +1056,7 @@ class FromResolver {
         String schemaName = tableRef.schema() != null ? tableRef.schema() : executor.defaultSchema();
         // H35: pass userQualified=true when user explicitly wrote schema.table
         boolean userQualified = tableRef.schema() != null;
+        refuseForeignTable(schemaName, tableRef.table());
         // An empty search_path leaves an unqualified name nowhere to be found -- except in the
         // two schemas PostgreSQL searches whether or not the path names them. pg_temp is one and
         // was already allowed for here; pg_catalog is the other, and leaving it out is why

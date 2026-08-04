@@ -95,7 +95,7 @@ final class SchemaQualifier {
         if (DataType.installedByAnExtension(lower)) return true;
         if ("pg_catalog".equalsIgnoreCase(qualifier)) {
             if (GRAMMAR_SPELLINGS.contains(lower)) return false;
-            if (declaredHere(database, bare)) return false;
+            if (declaredIn(database, qualifier, bare)) return false;
             return DataType.isPgCatalogTypeName(lower)
                     || PolymorphicTypes.names().contains(lower)
                     || PSEUDO_TYPES.contains(lower)
@@ -103,7 +103,8 @@ final class SchemaQualifier {
                     || namesARelation(database, catalog, qualifier, bare);
         }
         if (InformationSchemaTypes.holds(qualifier, lower)) return true;
-        return declaredHere(database, bare) || namesARelation(database, catalog, qualifier, bare);
+        return declaredIn(database, qualifier, bare)
+                || namesARelation(database, catalog, qualifier, bare);
     }
 
     /**
@@ -143,13 +144,13 @@ final class SchemaQualifier {
                 || database.hasView(qualifier, bare);
     }
 
-    /** Whether this database has been told about a type of that name, in whatever schema. */
-    private static boolean declaredHere(Database database, String bare) {
-        return database.isCustomEnum(bare)
-                || database.getDomain(bare) != null
-                || database.getCompositeType(bare) != null
-                || database.getRangeTypes().containsKey(bare)
-                || database.getShellTypes().contains(bare);
+    /**
+     * Whether that schema holds a type of that name. One namespace per schema holds all five
+     * kinds of user-defined type, so this is one lookup against that namespace — and it is the
+     * written schema's, because {@code a.e} is not answered by an {@code e} that lives in b.
+     */
+    private static boolean declaredIn(Database database, String qualifier, String bare) {
+        return database.typeKeys().contains(TypeNamespace.key(qualifier, bare));
     }
 
     static MemgresException noSuchType(String written) {
@@ -182,6 +183,16 @@ final class SchemaQualifier {
         if (!"pg_temp".equalsIgnoreCase(qualifier)) return false;
         String temp = session == null ? null : session.getTempSchemaName();
         return temp != null && database.getSchema(temp) != null;
+    }
+
+    /**
+     * The schema a written qualifier really names. {@code pg_temp} is not a schema of its own but
+     * an alias for this session's temporary one, and treating it as a literal name turned
+     * {@code nextval('pg_temp.s')} into a missing relation.
+     */
+    static String resolveAlias(Session session, String qualifier) {
+        if (qualifier == null || !"pg_temp".equalsIgnoreCase(qualifier)) return qualifier;
+        return session == null ? qualifier : session.getTempSchemaName();
     }
 
     /** The schema a name of the form {@code schema.object} was written under, or null. */

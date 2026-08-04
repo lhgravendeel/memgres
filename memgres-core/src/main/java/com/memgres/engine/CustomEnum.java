@@ -11,9 +11,16 @@ import java.util.List;
 public class CustomEnum {
 
     private final String name;
+    /** The schema the type was created in; two schemas may each hold an enum of this name. */
+    private String schemaName = "public";
     private final List<String> labels;
     /** PG-compatible sort orders (fractional for ADD VALUE BEFORE). */
     private final List<Double> sortOrders;
+
+    public CustomEnum(String schemaName, String name, List<String> labels) {
+        this(name, labels);
+        if (schemaName != null && !schemaName.isEmpty()) this.schemaName = schemaName.toLowerCase();
+    }
 
     public CustomEnum(String name, List<String> labels) {
         this.name = name;
@@ -28,6 +35,14 @@ public class CustomEnum {
 
     public String getName() {
         return name;
+    }
+
+    public String getSchemaName() {
+        return schemaName;
+    }
+
+    public void setSchemaName(String schemaName) {
+        if (schemaName != null && !schemaName.isEmpty()) this.schemaName = schemaName.toLowerCase();
     }
 
     public List<String> getLabels() {

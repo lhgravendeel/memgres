@@ -153,6 +153,18 @@ public class InfoSchemaBuilder {
                 return constantView("sql_sizing", SQL_SIZING);
             case "sql_implementation_info":
                 return constantView("sql_implementation_info", SQL_IMPLEMENTATION_INFO);
+            case "foreign_tables": {
+                // The standard's own list of foreign tables and the server behind each one.
+                Table t = declaredView(tableName);
+                for (Object[] entry : ForeignTables.live(database)) {
+                    Database.FdwForeignTable ft = (Database.FdwForeignTable) entry[1];
+                    t.insertRow(new Object[]{
+                            catalogName(), (String) entry[0], ft.tableName,
+                            catalogName(), ft.serverName
+                    });
+                }
+                return t;
+            }
             case "information_schema_catalog_name": {
                 Table t = declaredView(tableName);
                 t.insertRow(new Object[]{catalogName()});
@@ -434,6 +446,17 @@ public class InfoSchemaBuilder {
             }
         }
 
+        // A foreign table is listed here under a table type of its own. A tool that enumerates
+        // this view to find out what it may read saw nothing at all for one, and then could not
+        // explain the pg_class row it had already found.
+        for (Object[] entry : ForeignTables.live(database)) {
+            Database.FdwForeignTable ft = (Database.FdwForeignTable) entry[1];
+            table.insertRow(new Object[]{
+                    catalogName(), (String) entry[0], ft.tableName, "FOREIGN",
+                    null, null, null, null, null, "YES", "NO", null
+            });
+        }
+
         for (Database.ViewDef vd : database.getViews().values()) {
             // M21: PG's information_schema excludes materialized views
             if (vd.materialized()) continue;
@@ -525,6 +548,14 @@ public class InfoSchemaBuilder {
                 Table t = tableEntry.getValue();
                 addColumnsForTable(table, schemaEntry.getKey(), t, true);
             }
+        }
+
+        // A foreign table's columns are described here exactly as a base table's are: the
+        // relation is listed in information_schema.tables, and a view that names its columns
+        // nowhere would leave a reader unable to write a query against a relation it can see.
+        for (Object[] entry : ForeignTables.live(database)) {
+            Database.FdwForeignTable ft = (Database.FdwForeignTable) entry[1];
+            addColumnsForTable(table, (String) entry[0], foreignTableShape(ft), true);
         }
 
         // View columns: resolved output columns stored on the ViewDef. Materialized
@@ -675,6 +706,25 @@ public class InfoSchemaBuilder {
      * every column it has or not listed at all. A listing that stopped partway would contradict
      * pg_attribute about the same relation while still looking like an answer.
      */
+    /**
+     * A foreign table's declared columns as a relation shape, so that the views describing
+     * columns can read it with the same code they read a stored table with. Its columns are held
+     * as name/type text, and a type memgres does not know is described as text rather than
+     * dropped — a column missing from the catalog is a column no client can ask about.
+     */
+    private static Table foreignTableShape(Database.FdwForeignTable ft) {
+        List<Column> cols = new ArrayList<>();
+        if (ft.columns != null) {
+            for (String[] col : ft.columns) {
+                if (col.length == 0 || col[0] == null) continue;
+                DataType dt = null;
+                if (col.length > 1 && col[1] != null) dt = DataType.fromPgName(col[1]);
+                cols.add(new Column(col[0], dt != null ? dt : DataType.TEXT, true, false, null));
+            }
+        }
+        return new Table(ft.tableName, cols);
+    }
+
     private void addColumnsForTable(Table isTable, String schemaName, Table t, boolean isUserTable) {
         addColumnsForTable(isTable, schemaName, t.getName(), t, isUserTable);
     }
@@ -726,13 +776,15 @@ public class InfoSchemaBuilder {
                 default: udtName = col.getType().getPgName(); break;
             }
             if (isUserTable) {
+                // udt_schema and udt_name are two columns, so the type the column records is
+                // split into the schema it lives in and the name it answers to there.
                 if (dt == DataType.ENUM && col.getEnumTypeName() != null) {
-                    udtSchema = schemaName;
-                    udtName = col.getEnumTypeName();
+                    udtSchema = TypeNamespace.schemaOfKey(col.getEnumTypeName());
+                    udtName = TypeNamespace.nameOfKey(col.getEnumTypeName());
                 } else if (col.getCompositeTypeName() != null) {
                     // H14: composite column — udt_name is the composite type name
-                    udtSchema = schemaName;
-                    udtName = col.getCompositeTypeName();
+                    udtSchema = TypeNamespace.schemaOfKey(col.getCompositeTypeName());
+                    udtName = TypeNamespace.nameOfKey(col.getCompositeTypeName());
                 }
                 // H14: DOMAIN columns keep the BASE type udt_name (e.g. int4);
                 // the domain identity is carried by the domain_* fields below.
@@ -751,7 +803,9 @@ public class InfoSchemaBuilder {
                 // null made an IDENTITY column indistinguishable from an unbounded one.
                 Sequence identitySeq = null;
                 int seqAt = defaultVal.indexOf(":seq:");
-                if (seqAt >= 0) identitySeq = database.getSequence(defaultVal.substring(seqAt + 5));
+                if (seqAt >= 0) {
+                    identitySeq = database.getSequenceFor(schemaName, defaultVal.substring(seqAt + 5));
+                }
                 identityStart = identitySeq != null ? String.valueOf(identitySeq.getStartWith()) : "1";
                 identityIncrement = identitySeq != null
                         ? String.valueOf(identitySeq.getIncrementBy()) : "1";
@@ -771,8 +825,9 @@ public class InfoSchemaBuilder {
                 domainCatalog = catalogName();
                 // The domain lives where it was created, which need not be where the table is.
                 DomainType colDomain = database.getDomain(col.getDomainTypeName());
-                domainSchema = colDomain != null ? colDomain.getSchemaName() : schemaName;
-                domainName = col.getDomainTypeName();
+                domainSchema = colDomain != null ? colDomain.getSchemaName()
+                        : TypeNamespace.schemaOfKey(col.getDomainTypeName());
+                domainName = TypeNamespace.nameOfKey(col.getDomainTypeName());
             }
 
             // H14: is_nullable — view columns are always YES (PG semantics)
@@ -1257,20 +1312,24 @@ public class InfoSchemaBuilder {
                 for (Column col : tbl.getColumns()) {
                     String def = col.getDefaultValue();
                     if (def != null && def.contains(":seq:")) {
-                        identitySeqs.add(def.substring(def.indexOf(":seq:") + 5));
+                        identitySeqs.add(Database.seqKey(schema.getName(),
+                                def.substring(def.indexOf(":seq:") + 5)));
                     }
                 }
             }
         }
-        for (String seqName : CatalogHelper.getSequenceNames(database)) {
-            if (identitySeqs.contains(seqName)) continue; // M14: exclude identity sequences
-            Sequence seq = database.getSequence(seqName);
+        for (String qualified : CatalogHelper.getSequenceNames(database)) {
+            String seqName = CatalogHelper.nameOf(qualified);
+            if (identitySeqs.contains(Database.seqKey(CatalogHelper.schemaOf(qualified), seqName))) {
+                continue; // M14: exclude identity sequences
+            }
+            Sequence seq = database.getSequence(qualified);
             if (seq != null) {
                 String dataType = seq.getDataType() != null ? seq.getDataType() : "bigint";
                 int precision = "smallint".equals(dataType) ? 16 : "integer".equals(dataType) ? 32 : 64;
                 String cycleOption = seq.isCycle() ? "YES" : "NO";
                 table.insertRow(new Object[]{
-                        catalogName(), sequenceSchema(seqName), seqName, dataType, precision, 2, 0,
+                        catalogName(), CatalogHelper.schemaOf(qualified), seqName, dataType, precision, 2, 0,
                         String.valueOf(seq.getStartWith()),
                         String.valueOf(seq.getMinValue()),
                         String.valueOf(seq.getMaxValue()),
@@ -1280,16 +1339,6 @@ public class InfoSchemaBuilder {
             }
         }
         return table;
-    }
-
-    /** The schema a sequence was created in, as the schema object registry recorded it. */
-    private String sequenceSchema(String seqName) {
-        for (String schemaName : database.getSchemas().keySet()) {
-            if (database.getSchemaObjects(schemaName).contains("sequence:" + seqName.toLowerCase())) {
-                return schemaName;
-            }
-        }
-        return "public";
     }
 
     private Table buildIsViews() {
@@ -1401,7 +1450,7 @@ public class InfoSchemaBuilder {
                     ? CatalogHelper.pgTypeName(d.getArrayElementType()) + "[]"
                     : CatalogHelper.pgTypeName(base);
             table.insertRow(new Object[]{
-                    catalogName(), d.getSchemaName(), entry.getKey(),
+                    catalogName(), d.getSchemaName(), d.getName(),
                     dataType,
                     facts == null ? null : facts.charMaxLen, facts == null ? null : facts.charOctetLen,
                     null, null, null,                       // character_set_*
@@ -2003,9 +2052,9 @@ public class InfoSchemaBuilder {
         for (Relation rel : userRelations()) {
             addUdtGrant(table, catalog, rel.schema, rel.name, ownerOf(rel.ownerKey()));
         }
-        for (String ctName : database.getCompositeTypes().keySet()) {
-            addUdtGrant(table, catalog, compositeTypeSchema(ctName), ctName,
-                    ownerOf("type:" + ctName));
+        for (String ctKey : database.getCompositeTypes().keySet()) {
+            addUdtGrant(table, catalog, compositeTypeSchema(ctKey), typeNameOf(ctKey),
+                    ownerOf("type:" + ctKey));
         }
         return table;
     }
@@ -2022,9 +2071,9 @@ public class InfoSchemaBuilder {
         for (Map.Entry<String, DomainType> entry : database.getDomains().entrySet()) {
             DomainType d = entry.getValue();
             String owner = ownerOf("domain:" + entry.getKey());
-            table.insertRow(new Object[]{owner, "PUBLIC", catalog, domainSchema(d), entry.getKey(),
+            table.insertRow(new Object[]{owner, "PUBLIC", catalog, domainSchema(d), d.getName(),
                     "DOMAIN", "USAGE", "NO"});
-            table.insertRow(new Object[]{owner, owner, catalog, domainSchema(d), entry.getKey(),
+            table.insertRow(new Object[]{owner, owner, catalog, domainSchema(d), d.getName(),
                     "DOMAIN", "USAGE", "YES"});
         }
         return table;
@@ -2047,14 +2096,14 @@ public class InfoSchemaBuilder {
             }
         }
         for (Map.Entry<String, DomainType> entry : database.getDomains().entrySet()) {
-            table.insertRow(new Object[]{catalog, domainSchema(entry.getValue()), entry.getKey(),
-                    "DOMAIN", "1"});
+            table.insertRow(new Object[]{catalog, domainSchema(entry.getValue()),
+                    entry.getValue().getName(), "DOMAIN", "1"});
         }
         for (Map.Entry<String, List<com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField>> ct
                 : database.getCompositeTypes().entrySet()) {
             String schema = compositeTypeSchema(ct.getKey());
             for (int i = 0; i < ct.getValue().size(); i++) {
-                table.insertRow(new Object[]{catalog, schema, ct.getKey(),
+                table.insertRow(new Object[]{catalog, schema, typeNameOf(ct.getKey()),
                         "USER-DEFINED TYPE", String.valueOf(i + 1)});
             }
         }
@@ -2091,7 +2140,7 @@ public class InfoSchemaBuilder {
         for (Map.Entry<String, DomainType> entry : database.getDomains().entrySet()) {
             DomainType d = entry.getValue();
             if (!d.isArray()) continue;
-            addElementTypeRow(table, catalog, domainSchema(d), entry.getKey(), "DOMAIN",
+            addElementTypeRow(table, catalog, domainSchema(d), d.getName(), "DOMAIN",
                     "1", d.getArrayElementType());
         }
         for (Relation rel : userRelations()) {
@@ -2116,8 +2165,8 @@ public class InfoSchemaBuilder {
             for (int i = 0; i < fields.size(); i++) {
                 TypeSpec spec = parseTypeSpec(fields.get(i).typeName());
                 if (!spec.isArray || spec.type == null) continue;
-                addElementTypeRow(table, catalog, schema, ct.getKey(), "USER-DEFINED TYPE",
-                        String.valueOf(i + 1), spec.type);
+                addElementTypeRow(table, catalog, schema, typeNameOf(ct.getKey()),
+                        "USER-DEFINED TYPE", String.valueOf(i + 1), spec.type);
             }
         }
         return table;
@@ -2162,10 +2211,15 @@ public class InfoSchemaBuilder {
                 if (spec.isArray) dataType = "ARRAY";
                 else if (spec.type == null) dataType = "USER-DEFINED";
                 else dataType = CatalogHelper.pgTypeName(spec.type);
-                String udtName = spec.type != null ? spec.type.getPgName() : spec.baseName;
-                String udtSchema = spec.type != null ? "pg_catalog" : schema;
+                // An attribute's type has a schema of its own: a composite in b whose attribute
+                // is of a.e reports a here, not b. The two are separate columns, so the recorded
+                // type is split rather than printed whole.
+                String udtName = spec.type != null
+                        ? spec.type.getPgName() : TypeNamespace.nameOfKey(spec.baseName);
+                String udtSchema = spec.type != null
+                        ? "pg_catalog" : TypeNamespace.schemaOfKey(spec.baseName);
                 table.insertRow(new Object[]{
-                        catalog, schema, ct.getKey(), f.name(), Integer.valueOf(i + 1),
+                        catalog, schema, typeNameOf(ct.getKey()), f.name(), Integer.valueOf(i + 1),
                         null,                                   // attribute_default
                         "YES",                                  // is_nullable
                         dataType,
@@ -2194,13 +2248,13 @@ public class InfoSchemaBuilder {
     private Table buildIsUserDefinedTypes() {
         Table table = declaredView("user_defined_types");
         String catalog = catalogName();
-        for (String ctName : database.getCompositeTypes().keySet()) {
+        for (String ctKey : database.getCompositeTypes().keySet()) {
             // PG answers only the first five columns for a composite type and leaves the rest
             // null: the remaining fields describe a DISTINCT type, which PG does not have.
             Object[] row = new Object[29];
             row[0] = catalog;
-            row[1] = compositeTypeSchema(ctName);
-            row[2] = ctName;
+            row[1] = compositeTypeSchema(ctKey);
+            row[2] = typeNameOf(ctKey);
             row[3] = "STRUCTURED";
             row[4] = "YES";
             table.insertRow(row);
@@ -2215,9 +2269,13 @@ public class InfoSchemaBuilder {
         for (Relation rel : userRelations()) {
             for (Column col : rel.columns) {
                 if (col.getDomainTypeName() == null) continue;
+                // The schema and the name are two columns here, so the recorded key is split
+                // rather than printed whole.
                 DomainType d = database.getDomain(col.getDomainTypeName());
                 table.insertRow(new Object[]{catalog,
-                        d != null ? domainSchema(d) : rel.schema, col.getDomainTypeName(),
+                        d != null ? domainSchema(d)
+                                : TypeNamespace.schemaOfKey(col.getDomainTypeName()),
+                        TypeNamespace.nameOfKey(col.getDomainTypeName()),
                         catalog, rel.schema, rel.name, col.getName()});
             }
         }
@@ -2240,11 +2298,11 @@ public class InfoSchemaBuilder {
                     default: udtName = col.getType().getPgName(); break;
                 }
                 if (col.getType() == DataType.ENUM && col.getEnumTypeName() != null) {
-                    udtSchema = rel.schema;
-                    udtName = col.getEnumTypeName();
+                    udtSchema = TypeNamespace.schemaOfKey(col.getEnumTypeName());
+                    udtName = TypeNamespace.nameOfKey(col.getEnumTypeName());
                 } else if (col.getCompositeTypeName() != null) {
-                    udtSchema = compositeTypeSchema(col.getCompositeTypeName());
-                    udtName = col.getCompositeTypeName();
+                    udtSchema = TypeNamespace.schemaOfKey(col.getCompositeTypeName());
+                    udtName = TypeNamespace.nameOfKey(col.getCompositeTypeName());
                 }
                 table.insertRow(new Object[]{catalog, udtSchema, udtName,
                         catalog, rel.schema, rel.name, col.getName()});
@@ -2260,7 +2318,7 @@ public class InfoSchemaBuilder {
         for (Map.Entry<String, DomainType> entry : database.getDomains().entrySet()) {
             DomainType d = entry.getValue();
             table.insertRow(new Object[]{catalog, "pg_catalog", d.getBaseType().getPgName(),
-                    catalog, domainSchema(d), entry.getKey()});
+                    catalog, domainSchema(d), d.getName()});
         }
         return table;
     }
@@ -2499,11 +2557,11 @@ public class InfoSchemaBuilder {
             String schema = domainSchema(d);
             if (d.getParsedCheck() != null) {
                 table.insertRow(new Object[]{catalog, schema, d.getName() + "_check",
-                        catalog, schema, entry.getKey(), "NO", "NO"});
+                        catalog, schema, d.getName(), "NO", "NO"});
             }
             for (DomainType.NamedConstraint nc : d.getNamedConstraints()) {
                 table.insertRow(new Object[]{catalog, schema, nc.name(),
-                        catalog, schema, entry.getKey(), "NO", "NO"});
+                        catalog, schema, d.getName(), "NO", "NO"});
             }
         }
         return table;
@@ -2625,13 +2683,24 @@ public class InfoSchemaBuilder {
     }
 
     /** The schema a composite type was created in, as the schema object registry recorded it. */
-    private String compositeTypeSchema(String typeName) {
-        for (String schemaName : database.getSchemas().keySet()) {
-            if (database.getSchemaObjects(schemaName).contains("composite:" + typeName.toLowerCase())) {
-                return schemaName;
-            }
-        }
-        return "public";
+    private String compositeTypeSchema(String typeKey) {
+        return TypeNamespace.schemaOfKey(typeKey);
+    }
+
+    /** The bare name of the type a namespace key stands for. */
+    private static String typeNameOf(String typeKey) {
+        return TypeNamespace.nameOfKey(typeKey);
+    }
+
+    /**
+     * The schema a user-defined type lives in — which is not the schema of whatever is declared as
+     * it. {@code udt_schema} names the type, so a table in one schema whose column is of a type in
+     * another has to report the type's, and a name no type answers to falls back to the caller's.
+     */
+    private String userTypeSchema(String typeName, String fallback) {
+        if (typeName == null) return fallback;
+        String owner = TypeNamespace.schemaOf(database, typeName);
+        return owner != null ? owner : fallback;
     }
 
     /** A trigger function written the way PG writes it in triggers.action_statement. */

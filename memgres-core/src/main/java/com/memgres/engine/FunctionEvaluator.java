@@ -1449,15 +1449,15 @@ class FunctionEvaluator {
                     int targetOid = ((Number) seqArg).intValue();
                     seqName = null;
                     for (Map.Entry<String, Sequence> entry : executor.database.getSequences().entrySet()) {
-                        int seqOid = executor.systemCatalog.getOid("rel:public." + entry.getKey());
+                        int seqOid = executor.systemCatalog.getOid("rel:" + entry.getKey());
                         if (seqOid == targetOid) { seqName = entry.getKey(); break; }
                     }
                     if (seqName == null) seqName = String.valueOf(seqArg); // fallback
                 } else {
                     seqName = String.valueOf(seqArg);
                 }
-                // Strip schema prefix if present (e.g., "public.my_seq" → "my_seq")
-                if (seqName.contains(".")) seqName = seqName.substring(seqName.lastIndexOf('.') + 1);
+                // A qualifier names one schema's sequence and no other's: stripping it made
+                // nextval('other.s') advance whichever sequence of that name was found first.
                 Sequence seq = resolveSequence(seqName);
                 if (seq == null) throw new MemgresException("relation \"" + seqName + "\" does not exist", "42P01");
                 long nv;
@@ -1467,15 +1467,14 @@ class FunctionEvaluator {
                     nv = seq.nextVal();
                 }
                 executor.lastSequenceValue = nv;
-                executor.sessionSequenceValues.put(seq.getName().toLowerCase(), nv);
+                executor.sessionSequenceValues.put(seq.qualifiedName().toLowerCase(), nv);
                 return nv;
             }
             case "currval": {
                 String seqName = String.valueOf(executor.evalExpr(fn.args().get(0), ctx));
-                if (seqName.contains(".")) seqName = seqName.substring(seqName.lastIndexOf('.') + 1);
                 Sequence seq = resolveSequence(seqName);
                 if (seq == null) throw new MemgresException("relation \"" + seqName + "\" does not exist", "42P01");
-                Long drawn = executor.sessionSequenceValues.get(seq.getName().toLowerCase());
+                Long drawn = executor.sessionSequenceValues.get(seq.qualifiedName().toLowerCase());
                 if (drawn == null) {
                     throw new MemgresException("currval of sequence \"" + seq.getName()
                             + "\" is not yet defined in this session", "55000");
@@ -1499,14 +1498,13 @@ class FunctionEvaluator {
                     int targetOid = ((Number) seqArg).intValue();
                     seqName = null;
                     for (Map.Entry<String, Sequence> entry : executor.database.getSequences().entrySet()) {
-                        int seqOid = executor.systemCatalog.getOid("rel:public." + entry.getKey());
+                        int seqOid = executor.systemCatalog.getOid("rel:" + entry.getKey());
                         if (seqOid == targetOid) { seqName = entry.getKey(); break; }
                     }
                     if (seqName == null) seqName = String.valueOf(seqArg);
                 } else {
                     seqName = String.valueOf(seqArg);
                 }
-                if (seqName.contains(".")) seqName = seqName.substring(seqName.lastIndexOf('.') + 1);
                 Sequence seq = resolveSequence(seqName);
                 if (seq == null) throw new MemgresException("relation \"" + seqName + "\" does not exist", "42P01");
                 try { return seq.currVal(); }
@@ -1514,7 +1512,6 @@ class FunctionEvaluator {
             }
             case "setval": {
                 String seqName = String.valueOf(executor.evalExpr(fn.args().get(0), ctx));
-                if (seqName.contains(".")) seqName = seqName.substring(seqName.lastIndexOf('.') + 1);
                 Sequence seq = resolveSequence(seqName);
                 if (seq == null) throw new MemgresException("relation \"" + seqName + "\" does not exist", "42P01");
                 Object rawVal = executor.evalExpr(fn.args().get(1), ctx);
@@ -1532,7 +1529,7 @@ class FunctionEvaluator {
                 // setval defines currval for the session that called it, but only when the
                 // value counts as already used.
                 if (marksCurrval) {
-                    executor.sessionSequenceValues.put(seq.getName().toLowerCase(), val);
+                    executor.sessionSequenceValues.put(seq.qualifiedName().toLowerCase(), val);
                 }
                 // Also sync the table's serial counter if this sequence matches tableName_colName_seq
                 // This ensures GENERATED ALWAYS AS IDENTITY / SERIAL columns pick up the new value
@@ -3589,8 +3586,9 @@ class FunctionEvaluator {
 
     private String resolveEnumTypeFromArg(Expression arg, RowContext ctx) {
         if (arg instanceof CastExpr) {
+            // enum_range(NULL::e) reads the e the search path names, not some other schema's.
             CastExpr cast = (CastExpr) arg;
-            return cast.typeName();
+            return executor.castEvaluator.qualifyUserType(cast.typeName());
         }
         Object val = executor.evalExpr(arg, ctx);
         return val == null ? null : val.toString();
@@ -3600,33 +3598,46 @@ class FunctionEvaluator {
      * Resolve a sequence by name, checking session temp schema first, then global.
      */
     private Sequence resolveSequence(String seqName) {
-        if (executor.session != null) {
-            String tempName = executor.session.getTempSchemaName() + "." + seqName;
-            Sequence seq = executor.database.getSequence(tempName);
+        int dot = seqName.indexOf('.');
+        String writtenSchema = dot > 0 ? seqName.substring(0, dot) : null;
+        String bare = dot > 0 ? seqName.substring(dot + 1) : seqName;
+        // A name that says which schema is answered by that schema alone; a bare one walks the
+        // search path, with this session's temporary schema implicitly ahead of it. pg_temp is
+        // not a schema of its own but the alias this session's temporary one answers to.
+        List<String> path = new ArrayList<>();
+        if (writtenSchema != null) {
+            path.add(SchemaQualifier.resolveAlias(executor.session, writtenSchema));
+        } else {
+            if (executor.session != null) path.add(executor.session.getTempSchemaName());
+            path.addAll(executor.searchPathSchemas());
+        }
+        for (String schema : path) {
+            Sequence seq = executor.database.getSequence(schema, bare);
+            // A sequence another session created in a transaction that is still open may never
+            // have existed; it is not there to draw a value from yet.
             if (seq != null && executor.database.isObjectVisibleTo(seq, executor.session)) return seq;
         }
-        Sequence seq = executor.database.getSequence(seqName);
-        // A sequence another session created in a transaction that is still open may never
-        // have existed; it is not there to draw a value from yet.
-        if (seq != null && executor.database.isObjectVisibleTo(seq, executor.session)) return seq;
 
         // PG creates implicit sequences for SERIAL columns (tablename_colname_seq).
         // Memgres uses an internal counter instead, so auto-create the sequence
         // on first reference to maintain PG-compatible setval/nextval/currval behavior.
-        if (seqName.endsWith("_seq")) {
-            String prefix = seqName.substring(0, seqName.length() - 4);
+        if (bare.endsWith("_seq")) {
+            String prefix = bare.substring(0, bare.length() - 4);
             int lastUnderscore = prefix.lastIndexOf('_');
             if (lastUnderscore > 0) {
                 String tblName = prefix.substring(0, lastUnderscore);
                 String colName = prefix.substring(lastUnderscore + 1);
-                for (Schema schema : executor.database.getSchemas().values()) {
+                for (String schemaName : path) {
+                    Schema schema = executor.database.getSchema(schemaName);
+                    if (schema == null) continue;
                     Table tbl = schema.getTable(tblName);
                     if (tbl != null) {
                         int colIdx = tbl.getColumnIndex(colName);
                         if (colIdx >= 0 && (tbl.getColumns().get(colIdx).getType() == DataType.SERIAL
                                 || tbl.getColumns().get(colIdx).getType() == DataType.BIGSERIAL
                                 || tbl.getColumns().get(colIdx).getType() == DataType.SMALLSERIAL)) {
-                            Sequence implicitSeq = new Sequence(seqName, null, null, null, null);
+                            Sequence implicitSeq = new Sequence(bare, null, null, null, null);
+                            implicitSeq.setSchemaName(schema.getName());
                             long currentVal = tbl.getSerialCounter() - 1;
                             if (currentVal >= 1) implicitSeq.setVal(currentVal);
                             executor.database.addSequence(implicitSeq);

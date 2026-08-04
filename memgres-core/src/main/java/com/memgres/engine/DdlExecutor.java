@@ -176,9 +176,10 @@ class DdlExecutor {
         }
         if (cols.isEmpty()) return;
         String method = sc.getExcludeMethod() != null ? sc.getExcludeMethod() : "btree";
-        executor.database.addIndex(sc.getName(), cols);
-        executor.database.addIndexMeta(sc.getName(),
-                (schemaName != null ? schemaName : "public") + "." + tableName, false, method, null);
+        String idxSchema = schemaName != null ? schemaName : "public";
+        executor.database.addIndex(idxSchema, sc.getName(), cols);
+        executor.database.addIndexMeta(idxSchema, sc.getName(),
+                idxSchema + "." + tableName, false, method, null);
     }
 
     /** Convert a TableConstraint AST node to a StoredConstraint. */
@@ -429,7 +430,14 @@ class DdlExecutor {
         String fullTypeName = typeName.replaceAll("\\(.*\\)", "").trim();
         boolean isArray = fullTypeName.endsWith("[]");
         DataType arrayElementType = null;
-        String baseType = fullTypeName.replace("[]", "").trim();
+        // Which type a written name denotes is settled once, here, and the column records the
+        // answer: with two schemas each holding an e, a column declared a.e has to keep reading
+        // a.e's definition however the search path moves afterwards.
+        String baseType = TypeNamespace.qualify(executor.database, executor.session,
+                fullTypeName.replace("[]", "").trim());
+        if (!baseType.equals(fullTypeName.replace("[]", "").trim())) {
+            fullTypeName = isArray ? baseType + "[]" : baseType;
+        }
         if (isArray) {
             try { arrayElementType = DataType.fromPgName(baseType); } catch (Exception ignored) {}
         }
@@ -491,9 +499,27 @@ class DdlExecutor {
                 compositeTypeName = baseType;
             } else if (executor.database.isShellType(baseType)) {
                 // A shell has no representation yet, so nothing can be declared as one
-                throw new MemgresException("type \"" + baseType + "\" is only a shell", "42704");
+                throw new MemgresException("type \""
+                        + TypeNamespace.display(executor.database, executor.session, baseType)
+                        + "\" is only a shell", "42704");
             } else {
-                throw new MemgresException("type \"" + baseType + "\" does not exist", "42704");
+                // A qualifier that turned out to name no type of this engine's own is dropped and
+                // the bare name read as the built-in it spells, which is what information_schema's
+                // domains and an extension's types are written as. Whether the schema was entitled
+                // to hold that name is the statement-level check's business, not this one's.
+                DataType builtin = TypeNamespace.writtenSchema(baseType) == null ? null
+                        : DataType.fromPgName(isArray
+                                ? TypeNamespace.bare(baseType) + "[]" : TypeNamespace.bare(baseType));
+                if (builtin == null && TypeNamespace.writtenSchema(baseType) != null) {
+                    builtin = DataType.fromPgName(TypeNamespace.bare(baseType));
+                }
+                if (builtin == null) {
+                    throw new MemgresException("type \"" + baseType + "\" does not exist", "42704");
+                }
+                dataType = builtin;
+                if (isArray && arrayElementType == null) {
+                    arrayElementType = DataType.fromPgName(TypeNamespace.bare(baseType));
+                }
             }
         }
 

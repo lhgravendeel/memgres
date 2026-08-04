@@ -24,6 +24,7 @@ public class Schema {
     }
 
     public void addTable(Table table) {
+        table.setSchemaName(name);
         tables.put(table.getName(), table);
     }
 

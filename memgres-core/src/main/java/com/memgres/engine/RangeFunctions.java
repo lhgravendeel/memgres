@@ -340,7 +340,7 @@ class RangeFunctions {
                 return buildRange(name, fn, ctx);
             default: {
                 // Check for user-defined range type constructors
-                String subtype = executor.database.getRangeTypes().get(name);
+                String subtype = executor.database.getRangeSubtype(name);
                 if (subtype != null) {
                     // User-defined range type constructor: treat like int4range
                     Object loObj = executor.evalExpr(fn.args().get(0), ctx);

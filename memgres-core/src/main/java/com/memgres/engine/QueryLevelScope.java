@@ -363,8 +363,8 @@ final class QueryLevelScope {
         return database.isCustomEnum(bareName)
                 || database.getDomain(bareName) != null
                 || database.getCompositeType(bareName) != null
-                || database.getRangeTypes().containsKey(bareName)
-                || database.getShellTypes().contains(bareName);
+                || database.isRangeType(bareName)
+                || database.isShellType(bareName);
     }
 
     /**

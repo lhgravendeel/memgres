@@ -41,6 +41,56 @@ class CatalogConstraintBuilder {
         return attnums.isEmpty() ? null : attnums;
     }
 
+    /**
+     * The schema the table a foreign key references actually lives in, or null when no relation
+     * of that name can be found.
+     *
+     * <p>Every catalog column a foreign key fills in — {@code confrelid}, {@code confkey},
+     * {@code conindid} and the relation its action triggers are filed against — names the
+     * <em>referenced</em> relation, so all of them have to agree on which relation that is.
+     * Taking the child's schema as the answer names a relation that need not exist: a table in
+     * one schema referencing a table in another through the search path produced rows keyed
+     * {@code rel:<child schema>.<parent name>}, which either matched nothing at all (a dangling
+     * {@code tgrelid}) or, once a table of that name was created in the child's schema, latched
+     * onto a table the constraint has nothing to do with.
+     *
+     * <p>A qualified reference is taken at its word as long as the relation is really there. An
+     * unqualified one was resolved through the search path when the constraint was written and
+     * memgres keeps no record of which schema won, so it is resolved the only two ways that
+     * cannot name the wrong relation: the child's own schema, or the one schema in the database
+     * that holds a table of that name. When neither settles it the foreign key contributes no
+     * rows rather than rows about somebody else's table.
+     */
+    private String referencedSchema(String childSchema, StoredConstraint sc) {
+        String refName = sc.getReferencesTable();
+        if (refName == null) return null;
+        String declared = sc.getReferencesSchema();
+        if (declared != null) {
+            Schema declaredSchema = database.getSchemas().get(declared);
+            if (declaredSchema != null && declaredSchema.getTable(refName) != null) return declared;
+        }
+        Schema own = childSchema == null ? null : database.getSchemas().get(childSchema);
+        if (own != null && own.getTable(refName) != null) return childSchema;
+        String only = null;
+        for (Map.Entry<String, Schema> entry : database.getSchemas().entrySet()) {
+            if (entry.getValue().getTable(refName) == null) continue;
+            if (only != null) return null;
+            only = entry.getKey();
+        }
+        return only;
+    }
+
+    /**
+     * The key a constraint's OID is minted from. A constraint name is unique only within its
+     * table, and a table name only within its schema, so both halves belong in the key: two
+     * schemas each holding a {@code chi} table with an {@code fk_z} constraint are two
+     * constraints, and keying them alike gave them one OID between them, which doubled every
+     * row of a join from pg_trigger or pg_depend to pg_constraint.
+     */
+    static String constraintKey(String schemaName, String tableName, String constraintName) {
+        return "con:" + schemaName + "." + tableName + "." + constraintName;
+    }
+
     Table buildPgConstraint() {
         List<Column> cols = Cols.listOf(
                 colNN("oid", DataType.OID),
@@ -103,9 +153,10 @@ class CatalogConstraintBuilder {
                         default:
                             throw new IllegalStateException("Unknown constraint type: " + sc.getType());
                     }
+                    String refSchema = sc.getType() == StoredConstraint.Type.FOREIGN_KEY
+                            ? referencedSchema(schemaEntry.getKey(), sc) : null;
                     int confrelid = 0;
-                    if (sc.getType() == StoredConstraint.Type.FOREIGN_KEY && sc.getReferencesTable() != null) {
-                        String refSchema = sc.getReferencesSchema() != null ? sc.getReferencesSchema() : schemaEntry.getKey();
+                    if (refSchema != null) {
                         confrelid = oids.oid("rel:" + refSchema + "." + sc.getReferencesTable());
                     }
                     // Convert column names to attnum array string
@@ -115,27 +166,24 @@ class CatalogConstraintBuilder {
                         // ones its expression reads, and that is what conkey lists.
                         conkey = checkedColumns(t, sc);
                     }
+                    Table refTable = refSchema == null ? null
+                            : database.getSchemas().get(refSchema).getTable(sc.getReferencesTable());
                     List<Object> confkey = null;
-                    if (sc.getType() == StoredConstraint.Type.FOREIGN_KEY && sc.getReferencesTable() != null) {
-                        Table refTable = findTable(database, sc.getReferencesTable());
-                        if (refTable != null) {
-                            confkey = columnNamesToAttnums(refTable, sc.getReferencesColumns());
-                        }
+                    if (refTable != null) {
+                        confkey = columnNamesToAttnums(refTable, sc.getReferencesColumns());
                     }
                     int conindid = 0;
                     if (sc.getType() == StoredConstraint.Type.PRIMARY_KEY
                             || sc.getType() == StoredConstraint.Type.UNIQUE
                             || sc.getType() == StoredConstraint.Type.EXCLUDE) {
                         conindid = oids.oid("rel:" + schemaEntry.getKey() + "." + sc.getName());
-                    } else if (sc.getType() == StoredConstraint.Type.FOREIGN_KEY && sc.getReferencesTable() != null) {
-                        // For FK constraints, conindid should reference the PK/UNIQUE index on the referenced table
-                        Table refTable = findTable(database, sc.getReferencesTable());
-                        if (refTable != null) {
-                            for (StoredConstraint refCon : refTable.getConstraints()) {
-                                if (refCon.getType() == StoredConstraint.Type.PRIMARY_KEY) {
-                                    conindid = oids.oid("rel:" + schemaEntry.getKey() + "." + refCon.getName());
-                                    break;
-                                }
+                    } else if (refTable != null) {
+                        // conindid names the index behind the referenced table's primary key, and
+                        // that index lives in the referenced table's schema, not the child's.
+                        for (StoredConstraint refCon : refTable.getConstraints()) {
+                            if (refCon.getType() == StoredConstraint.Type.PRIMARY_KEY) {
+                                conindid = oids.oid("rel:" + refSchema + "." + refCon.getName());
+                                break;
                             }
                         }
                     }
@@ -175,7 +223,7 @@ class CatalogConstraintBuilder {
                         }
                     }
                     table.insertRow(new Object[]{
-                            oids.oid("con:" + t.getName() + "." + sc.getName()),
+                            oids.oid(constraintKey(schemaEntry.getKey(), t.getName(), sc.getName())),
                             sc.getName(),
                             nsOid,
                             contype,
@@ -230,7 +278,7 @@ class CatalogConstraintBuilder {
                             conname = owner.getName() + "_" + c.getName() + "_not_null";
                         }
                         table.insertRow(new Object[]{
-                                oids.oid("con:" + t.getName() + "." + conname),
+                                oids.oid(constraintKey(schemaEntry.getKey(), t.getName(), conname)),
                                 conname,
                                 nsOid,
                                 "n",
@@ -253,8 +301,9 @@ class CatalogConstraintBuilder {
 
         // Domain CHECK constraints (contypid points to domain type OID)
         int publicNsOid = oids.oid("ns:public");
-        for (DomainType dom : database.getDomains().values()) {
-            int domTypeOid = oids.oid("type:" + dom.getName());
+        for (Map.Entry<String, DomainType> domEntry : database.getDomains().entrySet()) {
+            DomainType dom = domEntry.getValue();
+            int domTypeOid = oids.oid("type:" + domEntry.getKey());
             // Inline CHECK (from CREATE DOMAIN ... CHECK(...))
             if (dom.getCheckExpression() != null) {
                 String conname = dom.getName() + "_check";
@@ -346,10 +395,11 @@ class CatalogConstraintBuilder {
         Table table = new Table("pg_index", cols);
         // Populate from stored index metadata
         for (Map.Entry<String, List<String>> idx : database.getIndexColumns().entrySet()) {
-            String indexName = idx.getKey();
+            String indexKey = idx.getKey();
+            String indexName = Database.idxName(indexKey);
             List<String> indexCols = idx.getValue();
             // Use stored table name to find the exact table for this index
-            String storedTableQualified = database.getIndexTable(indexName);
+            String storedTableQualified = database.getIndexTable(indexKey);
             // Find the table that this index belongs to
             for (Map.Entry<String, Schema> schemaEntry : database.getSchemas().entrySet()) {
                 for (Map.Entry<String, com.memgres.engine.Table> tableEntry : schemaEntry.getValue().getTables().entrySet()) {
@@ -381,7 +431,7 @@ class CatalogConstraintBuilder {
                         int indexOid = oids.oid("rel:" + schemaEntry.getKey() + "." + indexName);
                         int tableOid = oids.oid("rel:" + schemaEntry.getKey() + "." + t.getName());
                         // Check uniqueness from both constraint metadata and explicit index flags
-                        boolean isUnique = database.isUniqueIndex(indexName) ||
+                        boolean isUnique = database.isUniqueIndex(indexKey) ||
                                 t.getConstraints().stream()
                                 .anyMatch(sc -> sc.getName().equalsIgnoreCase(indexName) &&
                                         (sc.getType() == StoredConstraint.Type.UNIQUE || sc.getType() == StoredConstraint.Type.PRIMARY_KEY));
@@ -394,10 +444,10 @@ class CatalogConstraintBuilder {
                         }
                         PgVector indkeyVec = new PgVector(indkeyElems);
                         // Get WHERE predicate for partial indexes
-                        String whereClause = database.getIndexWhereClause(indexName);
+                        String whereClause = database.getIndexWhereClause(indexKey);
                         String indexprs = hasExprCols ? exprParts.toString() : null;
                         // Build indoption, indclass, indcollation as PgVectors
-                        List<String> columnOptions = database.getIndexColumnOptions(indexName);
+                        List<String> columnOptions = database.getIndexColumnOptions(indexKey);
                         List<Object> optionElems = new java.util.ArrayList<>();
                         List<Object> classElems = new java.util.ArrayList<>();
                         List<Object> collElems = new java.util.ArrayList<>();
@@ -421,7 +471,7 @@ class CatalogConstraintBuilder {
                             collElems.add(0);      // default collation
                         }
                         // INCLUDE columns: add to indkey but not to indoption/indclass
-                        List<String> includeColumns = database.getIndexIncludeColumns(indexName);
+                        List<String> includeColumns = database.getIndexIncludeColumns(indexKey);
                         int nKeyAtts = indkeyElems.size();
                         if (includeColumns != null && !includeColumns.isEmpty()) {
                             for (String incCol : includeColumns) {
@@ -435,8 +485,8 @@ class CatalogConstraintBuilder {
                             indkeyVec = new PgVector(indkeyElems);
                         }
                         int totalAtts = indkeyElems.size();
-                        boolean nullsNotDistinct = database.isIndexNullsNotDistinct(indexName);
-                        boolean isClustered = database.isClusteredIndex(indexName);
+                        boolean nullsNotDistinct = database.isIndexNullsNotDistinct(indexKey);
+                        boolean isClustered = database.isClusteredIndex(indexKey);
                         boolean isExclusion = t.getConstraints().stream()
                                 .anyMatch(sc -> sc.getName().equalsIgnoreCase(indexName)
                                         && sc.getType() == StoredConstraint.Type.EXCLUDE);
@@ -454,7 +504,10 @@ class CatalogConstraintBuilder {
             }
         }
         // Also add indexes from PK and UNIQUE constraints (implicit indexes)
-        Set<String> existingIndexNames = new HashSet<>(database.getIndexColumns().keySet());
+        Set<String> existingIndexNames = new HashSet<>();
+        for (String key : database.getIndexColumns().keySet()) {
+            existingIndexNames.add(key.toLowerCase());
+        }
         for (Map.Entry<String, Schema> schemaEntry : database.getSchemas().entrySet()) {
             for (Map.Entry<String, com.memgres.engine.Table> tableEntry : schemaEntry.getValue().getTables().entrySet()) {
                 com.memgres.engine.Table t = tableEntry.getValue();
@@ -462,7 +515,8 @@ class CatalogConstraintBuilder {
                 for (StoredConstraint sc : t.getConstraints()) {
                     if (sc.getType() == StoredConstraint.Type.PRIMARY_KEY || sc.getType() == StoredConstraint.Type.UNIQUE) {
                         String indexName = sc.getName();
-                        if (existingIndexNames.contains(indexName.toLowerCase())) continue;
+                        if (existingIndexNames.contains(
+                                Database.idxKey(schemaEntry.getKey(), indexName).toLowerCase())) continue;
                         List<Object> indkeyList = new java.util.ArrayList<>();
                         for (String colName : sc.getColumns()) {
                             int colIdx = t.getColumnIndex(colName);
@@ -611,7 +665,7 @@ class CatalogConstraintBuilder {
                     }
                 }
                 if (colIdx > 0) {
-                    int seqOid = oids.oid("rel:" + schemaEntry.getKey() + "." + seq.getName());
+                    int seqOid = oids.oid("rel:" + seq.getSchemaName() + "." + seq.getName());
                     int ownerTblOid = oids.oid("rel:" + schemaEntry.getKey() + "." + ownerTbl.getName());
                     table.insertRow(new Object[]{pgClassOid, seqOid, 0, pgClassOid, ownerTblOid, colIdx, "a"});
                 }
@@ -740,85 +794,124 @@ class CatalogConstraintBuilder {
         table.insertRow(new Object[]{oids.oid("proc:spghandler"), pgProcClassOid, 0, "SP-GiST index access method handler", 1});
         table.insertRow(new Object[]{oids.oid("proc:brinhandler"), pgProcClassOid, 0, "BRIN index access method handler", 1});
 
-        // User-defined comments (from COMMENT ON statements)
-        int pgClassClassOid = oids.oid("rel:pg_catalog.pg_class");
-        int pgNamespaceClassOid = oids.oid("rel:pg_catalog.pg_namespace");
+        // User-defined comments (from COMMENT ON statements). Every kind that can carry one is
+        // covered, and each row takes the OID of the object the comment is actually on: a comment
+        // key names one schema, so a.t's comment does not describe b.t.
         for (Map.Entry<String, String> entry : database.getComments().entrySet()) {
-            String key = entry.getKey(); // "type:name"
+            String key = entry.getKey(); // "<kind>:<schema>.<name>"
             String desc = entry.getValue();
             int colonIdx = key.indexOf(':');
             if (colonIdx < 0) continue;
-            String objType = key.substring(0, colonIdx);
-            String objName = key.substring(colonIdx + 1);
-
-            switch (objType) {
-                case "table":
-                case "relation": {
-                    // Find the table across schemas to get its OID
-                    for (Map.Entry<String, Schema> se : database.getSchemas().entrySet()) {
-                        Table t = se.getValue().getTable(objName);
-                        if (t != null) {
-                            int tblOid = oids.oid("rel:" + se.getKey() + "." + objName);
-                            table.insertRow(new Object[]{tblOid, pgClassClassOid, 0, desc, 1});
-                            break;
-                        }
-                    }
-                    break;
-                }
-                case "view": {
-                    for (Map.Entry<String, Schema> se : database.getSchemas().entrySet()) {
-                        // Views are stored in database.getViews() not in schema tables
-                        // but their OIDs are in rel:schema.name
-                        int vOid = oids.oid("rel:" + se.getKey() + "." + objName);
-                        if (vOid != 0 && database.hasView(objName)) {
-                            table.insertRow(new Object[]{vOid, pgClassClassOid, 0, desc, 1});
-                            break;
-                        }
-                    }
-                    break;
-                }
-                case "index": {
-                    // Find the index OID
-                    for (Map.Entry<String, Schema> se : database.getSchemas().entrySet()) {
-                        int idxOid = oids.oid("rel:" + se.getKey() + "." + objName);
-                        if (idxOid != 0) {
-                            table.insertRow(new Object[]{idxOid, pgClassClassOid, 0, desc, 1});
-                            break;
-                        }
-                    }
-                    break;
-                }
-                case "column": {
-                    // objName is "tablename.colname"
-                    int dotIdx = objName.lastIndexOf('.');
-                    if (dotIdx > 0) {
-                        String tblName = objName.substring(0, dotIdx);
-                        String colName = objName.substring(dotIdx + 1);
-                        for (Map.Entry<String, Schema> se : database.getSchemas().entrySet()) {
-                            Table t = se.getValue().getTable(tblName);
-                            if (t != null) {
-                                int tblOid = oids.oid("rel:" + se.getKey() + "." + tblName);
-                                int colIdx = t.getColumnIndex(colName);
-                                if (colIdx >= 0) {
-                                    table.insertRow(new Object[]{tblOid, pgClassClassOid, colIdx + 1, desc, 1});
-                                }
-                                break;
-                            }
-                        }
-                    }
-                    break;
-                }
-                case "schema": {
-                    if (database.getSchema(objName) != null) {
-                        int nsOid = oids.oid("ns:" + objName);
-                        table.insertRow(new Object[]{nsOid, pgNamespaceClassOid, 0, desc, 1});
-                    }
-                    break;
-                }
-            }
+            Object[] row = describeComment(key.substring(0, colonIdx),
+                    key.substring(colonIdx + 1), desc);
+            if (row != null) table.insertRow(row);
         }
 
         return table;
+    }
+
+    /**
+     * The pg_description row a stored comment makes, or null when nothing of that name is there
+     * to describe. {@code objName} is {@code schema.name} for everything a schema holds, so the
+     * OID comes from that schema and not from whichever one was reached first.
+     */
+    private Object[] describeComment(String objType, String objName, String desc) {
+        int pgClassClassOid = oids.oid("rel:pg_catalog.pg_class");
+        int pgNamespaceClassOid = oids.oid("rel:pg_catalog.pg_namespace");
+        int pgTypeClassOid = oids.oid("rel:pg_catalog.pg_type");
+        int pgProcClassOid = oids.oid("rel:pg_catalog.pg_proc");
+        int pgConstraintClassOid = oids.oid("rel:pg_catalog.pg_constraint");
+        int pgTriggerClassOid = oids.oid("rel:pg_catalog.pg_trigger");
+        int pgRewriteClassOid = oids.oid("rel:pg_catalog.pg_rewrite");
+        int pgPolicyClassOid = oids.oid("rel:pg_catalog.pg_policy");
+        String schema = TypeNamespace.schemaOfKey(objName);
+        String bare = TypeNamespace.nameOfKey(objName);
+
+        switch (objType) {
+            case "table":
+            case "relation":
+            case "view":
+            case "materialized view":
+            case "index":
+            case "sequence":
+            case "foreign table": {
+                // All six are relations, and a relation's OID is minted under its own schema.
+                if (RelationNamespace.kindOf(database, schema, bare) == null) return null;
+                return new Object[]{oids.oid("rel:" + schema + "." + bare),
+                        pgClassClassOid, 0, desc, 1};
+            }
+            case "column": {
+                // objName is "<schema>.<relation>.<column>". A view carries column comments too,
+                // and its columns are not in the schema's table map.
+                int dotIdx = bare.lastIndexOf('.');
+                if (dotIdx <= 0) return null;
+                String relName = bare.substring(0, dotIdx);
+                String colName = bare.substring(dotIdx + 1);
+                Schema s = database.getSchema(schema);
+                Table t = s == null ? null : s.getTable(relName);
+                int colIdx = -1;
+                if (t != null) {
+                    colIdx = t.getColumnIndex(colName);
+                } else {
+                    Database.ViewDef v = database.getView(schema, relName);
+                    List<Column> vcols = v == null ? null : v.cachedColumns();
+                    if (vcols != null) {
+                        for (int i = 0; i < vcols.size(); i++) {
+                            if (vcols.get(i).getName().equalsIgnoreCase(colName)) { colIdx = i; break; }
+                        }
+                    }
+                }
+                if (colIdx < 0) return null;
+                return new Object[]{oids.oid("rel:" + schema + "." + relName),
+                        pgClassClassOid, colIdx + 1, desc, 1};
+            }
+            case "type":
+            case "domain": {
+                String typeKey = TypeNamespace.key(schema, bare);
+                if (!database.typeKeys().contains(typeKey)) return null;
+                return new Object[]{oids.oid("type:" + typeKey), pgTypeClassOid, 0, desc, 1};
+            }
+            case "function":
+            case "procedure":
+            case "routine":
+            case "aggregate": {
+                PgFunction fn = database.getFunction(bare);
+                if (fn == null) return null;
+                return new Object[]{oids.oid("proc:" + bare), pgProcClassOid, 0, desc, 1};
+            }
+            case "schema": {
+                if (database.getSchema(objName) == null) return null;
+                return new Object[]{oids.oid("ns:" + objName), pgNamespaceClassOid, 0, desc, 1};
+            }
+            // The three relation-scoped kinds are keyed "<schema>.<relation>.<object>"; each
+            // catalog mints its OIDs under its own spelling of that, so each is rebuilt here.
+            case "constraint": {
+                int dotIdx = bare.lastIndexOf('.');
+                if (dotIdx <= 0) return null;
+                return new Object[]{oids.oid("con:" + schema + "." + bare),
+                        pgConstraintClassOid, 0, desc, 1};
+            }
+            case "trigger": {
+                int dotIdx = bare.lastIndexOf('.');
+                if (dotIdx <= 0) return null;
+                return new Object[]{oids.oid("trig:" + schema + "." + bare),
+                        pgTriggerClassOid, 0, desc, 1};
+            }
+            case "rule": {
+                int dotIdx = bare.lastIndexOf('.');
+                if (dotIdx <= 0) return null;
+                return new Object[]{oids.oid("rule:" + bare.substring(dotIdx + 1) + "_"
+                        + bare.substring(0, dotIdx)), pgRewriteClassOid, 0, desc, 1};
+            }
+            case "policy": {
+                int dotIdx = bare.lastIndexOf('.');
+                if (dotIdx <= 0) return null;
+                return new Object[]{oids.oid("pol:" + schema + "." + bare),
+                        pgPolicyClassOid, 0, desc, 1};
+            }
+            default:
+                return null;
+        }
     }
 
     Table buildPgTrigger() {
@@ -900,15 +993,146 @@ class CatalogConstraintBuilder {
 
             String tgenabled = first.getEnabledState();
             String whenCondition = first.getWhenClause();
+
+            // The arguments written after the function name are part of what the trigger is:
+            // TG_NARGS and TG_ARGV read them at run time, and pg_dump reads them back out of
+            // tgnargs/tgargs. PG stores them as one bytea of NUL-terminated strings.
+            List<String> trigArgs = null;
+            for (PgTrigger trig : entry.getValue()) {
+                if (trig.getArgs() != null && !trig.getArgs().isEmpty()) { trigArgs = trig.getArgs(); break; }
+            }
+            int tgnargs = trigArgs == null ? 0 : trigArgs.size();
+            byte[] tgargs = encodeTriggerArgs(trigArgs);
+
+            // tgattr holds the attnums of an UPDATE OF column list. A trigger with no column
+            // list has an empty vector rather than a null one, which is what lets a client write
+            // array_length(tgattr, 1) without a null check.
+            List<Object> attrNums = new java.util.ArrayList<>();
+            for (PgTrigger trig : entry.getValue()) {
+                if (trig.getUpdateColumns() == null || t == null) continue;
+                for (String colName : trig.getUpdateColumns()) {
+                    int idx = t.getColumnIndex(colName);
+                    if (idx >= 0 && !attrNums.contains(idx + 1)) attrNums.add(idx + 1);
+                }
+            }
+            // A CONSTRAINT TRIGGER's deferrability is part of when it runs, and a client asking
+            // whether SET CONSTRAINTS can move it reads these two columns to find out.
+            boolean trigDeferrable = false;
+            boolean trigDeferred = false;
+            for (PgTrigger trig : entry.getValue()) {
+                if (trig.isDeferrable()) trigDeferrable = true;
+                if (trig.isInitiallyDeferred()) trigDeferred = true;
+            }
             table.insertRow(new Object[]{
                     oids.oid("trig:" + trigSchema + "." + first.getTableName() + "." + first.getName()),
                     relOid, first.getName(),
-                    tgfoid, (short) tgtype, tgenabled, false, 0, 0, false, false,
-                    (short) 0, "", null, whenCondition, 0,
+                    tgfoid, (short) tgtype, tgenabled, false, 0, 0, trigDeferrable, trigDeferred,
+                    (short) tgnargs, tgargs, new PgVector(attrNums), whenCondition, 0,
                     first.getOldTransitionTable(), first.getNewTransitionTable(), 0, 1
             });
         }
+        addForeignKeyTriggers(table);
         return table;
+    }
+
+    /**
+     * The rows a foreign key puts in pg_trigger. PostgreSQL enforces a foreign key with four
+     * internal row triggers — an INSERT and an UPDATE check on the referencing table, a DELETE
+     * and an UPDATE action on the referenced one — and they are as much a part of the catalog as
+     * the constraint is: a client counting the triggers on a table, or looking for what a
+     * constraint installed, sees nothing at all without them. They are marked tgisinternal, which
+     * is how a tool that wants only the triggers a user wrote leaves them out.
+     */
+    private void addForeignKeyTriggers(Table table) {
+        for (Map.Entry<String, Schema> schemaEntry : database.getSchemas().entrySet()) {
+            String schemaName = schemaEntry.getKey();
+            for (com.memgres.engine.Table t : schemaEntry.getValue().getTables().values()) {
+                for (StoredConstraint sc : t.getConstraints()) {
+                    if (sc.getType() != StoredConstraint.Type.FOREIGN_KEY) continue;
+                    if (sc.getReferencesTable() == null) continue;
+                    // The action triggers are filed against the referenced relation, so unless
+                    // that relation can be named there is nothing to file them against and the
+                    // foreign key contributes no rows at all.
+                    String refSchema = referencedSchema(schemaName, sc);
+                    if (refSchema == null) continue;
+                    com.memgres.engine.Table refTable =
+                            database.getSchemas().get(refSchema).getTable(sc.getReferencesTable());
+                    int childOid = oids.oid("rel:" + schemaName + "." + t.getName());
+                    int parentOid = oids.oid("rel:" + refSchema + "." + sc.getReferencesTable());
+                    int conOid = oids.oid(constraintKey(schemaName, t.getName(), sc.getName()));
+                    int indOid = 0;
+                    for (StoredConstraint refCon : refTable.getConstraints()) {
+                        if (refCon.getType() == StoredConstraint.Type.PRIMARY_KEY
+                                || refCon.getType() == StoredConstraint.Type.UNIQUE) {
+                            indOid = oids.oid("rel:" + refSchema + "." + refCon.getName());
+                            break;
+                        }
+                    }
+                    String key = schemaName + "." + t.getName() + "." + sc.getName();
+                    // The check triggers sit on the referencing table and carry the constraint's
+                    // own deferrability.
+                    riTrigger(table, key, "c", 5, childOid, parentOid, conOid, indOid,
+                            "RI_FKey_check_ins", sc.isDeferrable(), sc.isInitiallyDeferred());
+                    riTrigger(table, key, "c", 17, childOid, parentOid, conOid, indOid,
+                            "RI_FKey_check_upd", sc.isDeferrable(), sc.isInitiallyDeferred());
+                    // An action trigger can only wait until the end of the transaction when
+                    // there is nothing for it to do but complain: NO ACTION defers with the
+                    // constraint, while a cascade or a set-null has to run as the row changes.
+                    boolean delDefer = isNoAction(sc.getOnDelete()) && sc.isDeferrable();
+                    boolean updDefer = isNoAction(sc.getOnUpdate()) && sc.isDeferrable();
+                    riTrigger(table, key, "a", 9, parentOid, childOid, conOid, indOid,
+                            riFunction(sc.getOnDelete(), "del"),
+                            delDefer, delDefer && sc.isInitiallyDeferred());
+                    riTrigger(table, key, "a", 17, parentOid, childOid, conOid, indOid,
+                            riFunction(sc.getOnUpdate(), "upd"),
+                            updDefer, updDefer && sc.isInitiallyDeferred());
+                }
+            }
+        }
+    }
+
+    /** True for the action that only checks, which is also the one a foreign key defaults to. */
+    private static boolean isNoAction(StoredConstraint.FkAction action) {
+        return action == null || action == StoredConstraint.FkAction.NO_ACTION;
+    }
+
+    /** The referential-integrity function a referential action is carried out by. */
+    private static String riFunction(StoredConstraint.FkAction action, String event) {
+        if (action == StoredConstraint.FkAction.CASCADE) return "RI_FKey_cascade_" + event;
+        if (action == StoredConstraint.FkAction.SET_NULL) return "RI_FKey_setnull_" + event;
+        if (action == StoredConstraint.FkAction.SET_DEFAULT) return "RI_FKey_setdefault_" + event;
+        if (action == StoredConstraint.FkAction.RESTRICT) return "RI_FKey_restrict_" + event;
+        return "RI_FKey_noaction_" + event;
+    }
+
+    /** One internal referential-integrity trigger row. */
+    private void riTrigger(Table table, String constraintKey, String side, int tgtype,
+                           int relOid, int otherOid, int conOid, int indOid,
+                           String function, boolean deferrable, boolean deferred) {
+        int trigOid = oids.oid("trig:ri:" + side + ":" + tgtype + ":" + constraintKey);
+        table.insertRow(new Object[]{
+                trigOid, relOid, "RI_ConstraintTrigger_" + side + "_" + trigOid,
+                oids.oid("proc:" + function), (short) tgtype, "O", true,
+                otherOid, indOid, deferrable, deferred,
+                (short) 0, new byte[0], new PgVector(new java.util.ArrayList<Object>()), null, conOid,
+                null, null, 0, 1
+        });
+    }
+
+    /**
+     * The trigger arguments as PostgreSQL stores them in {@code pg_trigger.tgargs}: every
+     * argument in order, each followed by a NUL byte. An argument list of {@code ('a b', '')}
+     * is nine bytes, not two strings.
+     */
+    private static byte[] encodeTriggerArgs(List<String> args) {
+        if (args == null || args.isEmpty()) return new byte[0];
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        for (String arg : args) {
+            byte[] bytes = (arg == null ? "" : arg).getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            out.write(bytes, 0, bytes.length);
+            out.write(0);
+        }
+        return out.toByteArray();
     }
 
     /** Recursively collect table references from FROM items for view dependency tracking. */

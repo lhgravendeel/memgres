@@ -24,6 +24,14 @@ class DdlTableExecutor {
         this.executor = ddl.executor;
     }
 
+    /** The first schema on the search path that holds a relation of this name. */
+    private String schemaOfRelation(String bareName) {
+        for (String schema : executor.searchPathSchemas()) {
+            if (RelationNamespace.kindOf(executor.database, schema, bareName) != null) return schema;
+        }
+        return executor.defaultSchema();
+    }
+
     // ---- CREATE TABLE ----
 
     QueryResult executeCreateTable(CreateTableStmt stmt) {
@@ -56,6 +64,9 @@ class DdlTableExecutor {
             }
             throw new MemgresException("relation \"" + stmt.name() + "\" already exists", "42P07");
         }
+        // A table carries a row type of its own name, so a name an enum, a domain or a range
+        // already answers to is taken for it even though no relation holds it.
+        TypeNamespace.requireCreatableRowType(executor.database, schemaName, stmt.name());
 
         // Handle PARTITION OF
         if (stmt.partitionOfParent() != null) {
@@ -132,6 +143,11 @@ class DdlTableExecutor {
                     likeTableName = likeEntry;
                 }
                 Table likeTable = executor.resolveTable(schemaName, likeTableName);
+                // A column comment is kept under its table's own schema, so the source's schema
+                // has to be the one INCLUDING COMMENTS reads from.
+                String likeTableSchema = likeTableName.indexOf('.') > 0
+                        ? likeTableName.substring(0, likeTableName.indexOf('.')).toLowerCase()
+                        : schemaOfRelation(likeTable.getName());
                 // LIKE copies the shape of a column and nothing more unless the option that
                 // carries the rest is written out. Adding the source column object itself gave
                 // the new table the source's defaults, its identity and its generation
@@ -149,7 +165,8 @@ class DdlTableExecutor {
                         }
                         if (wants(likeOptions, "COMMENTS")) {
                             String srcComment = executor.database.getComment("column",
-                                    likeTable.getName() + "." + col.getName());
+                                    Database.commentKey(likeTableSchema,
+                                            likeTable.getName() + "." + col.getName()));
                             if (srcComment != null) {
                                 likeColumnComments.put(col.getName().toLowerCase(), srcComment);
                             }
@@ -229,6 +246,7 @@ class DdlTableExecutor {
                 notNull = true;
                 String seqName = stmt.name() + "_" + def.name() + "_seq";
                 Sequence seq = new Sequence(seqName, def.identityStart(), def.identityIncrement(), null, null);
+                seq.setSchemaName(schemaName);
                 executor.database.addSequence(seq);
                 executor.database.registerSchemaObject(schemaName, "sequence", seqName);
                 if (def.identityStart() != null || def.identityIncrement() != null) {
@@ -258,6 +276,7 @@ class DdlTableExecutor {
                 // M14: set sequence data type to match column type
                 if (dataType == DataType.SERIAL) seq.setDataType("integer");
                 else if (dataType == DataType.SMALLSERIAL) seq.setDataType("smallint");
+                seq.setSchemaName(schemaName);
                 executor.database.addSequence(seq);
                 executor.database.registerSchemaObject(schemaName, "sequence", seqName);
                 defaultVal = "nextval('" + seqName + "'::regclass)";
@@ -528,7 +547,8 @@ class DdlTableExecutor {
         }
         for (Map.Entry<String, String> cc : likeColumnComments.entrySet()) {
             executor.database.addComment("column",
-                    (stmt.name() + "." + cc.getKey()).toLowerCase(), cc.getValue());
+                    Database.commentKey(schemaName, stmt.name() + "." + cc.getKey()),
+                    cc.getValue());
         }
 
         // Clone indexes from LIKE ... INCLUDING INDEXES
@@ -541,8 +561,9 @@ class DdlTableExecutor {
                 String newIdxName = newTableName + "_" + String.join("_", srcCols) + "_idx";
                 boolean isUnique = executor.database.isUniqueIndex(srcIdx);
                 String method = executor.database.getIndexMethod(srcIdx);
-                executor.database.addIndex(newIdxName, new ArrayList<>(srcCols));
-                executor.database.addIndexMeta(newIdxName, schemaName + "." + newTableName, isUnique, method, null);
+                executor.database.addIndex(schemaName, newIdxName, new ArrayList<>(srcCols));
+                executor.database.addIndexMeta(schemaName, newIdxName,
+                        schemaName + "." + newTableName, isUnique, method, null);
             }
         }
 
@@ -1233,7 +1254,7 @@ class DdlTableExecutor {
             if (droppedTable == null) {
                 // A view, sequence or index of this name is the wrong kind of relation, and
                 // IF EXISTS does not make DROP TABLE the right command for it.
-                RelationNamespace.requireKind(executor.database, schemaName, name,
+                RelationNamespace.requireKindForDrop(executor.database, schemaName, name,
                         RelationNamespace.TABLE);
                 if (!ifExists) {
                     throw new MemgresException("table \"" + name + "\" does not exist", "42P01");
@@ -1437,9 +1458,10 @@ class DdlTableExecutor {
                         // __identity__:...:seq:seqname — always owned
                         seqName = col.getDefaultValue().substring(col.getDefaultValue().indexOf(":seq:") + 5);
                     }
-                    if (seqName != null && executor.database.hasSequence(seqName)) {
-                        executor.database.removeSequence(seqName);
-                        executor.database.removeObjectOwner("sequence:" + seqName);
+                    Sequence owned = executor.database.getSequenceFor(schemaName, seqName);
+                    if (owned != null) {
+                        executor.database.removeSequence(owned.getSchemaName(), owned.getName());
+                        executor.database.removeObjectOwner("sequence:" + owned.getName());
                     }
                 }
             }
@@ -1737,11 +1759,12 @@ class DdlTableExecutor {
                                     seqName = def.substring(def.indexOf(":seq:") + 5);
                                 }
                                 if (seqName != null) {
-                                    Sequence seq = executor.database.getSequence(seqName);
+                                    Sequence seq = executor.database.getSequenceFor(
+                                            schemaName, seqName);
                                     if (seq != null) {
                                         // C11: Record undo so ROLLBACK restores the sequence
                                         executor.recordUndo(new Session.SequenceRestartUndo(
-                                                seqName, seq.currValRaw(), seq.isCalled()));
+                                                seq.qualifiedName(), seq.currValRaw(), seq.isCalled()));
                                         seq.restart();
                                     }
                                 }
@@ -1764,9 +1787,15 @@ class DdlTableExecutor {
             }
             if (!found) {
                 // A name that resolves to something which is not a table is a different
-                // complaint from a name that resolves to nothing, and PostgreSQL says so.
+                // complaint from a name that resolves to nothing, and PostgreSQL says so. An
+                // index and a sequence own a name in a schema exactly as a view does, and
+                // reporting either as missing sent the reader after a relation that is there.
                 if (executor.database.hasView(bareName)) {
                     throw new MemgresException("\"" + bareName + "\" is not a table", "42809");
+                }
+                for (String schemaName : searchSchemas) {
+                    RelationNamespace.requireKind(executor.database, schemaName, bareName,
+                            RelationNamespace.TABLE);
                 }
                 throw new MemgresException(
                         "relation \"" + bareName + "\" does not exist", "42P01");

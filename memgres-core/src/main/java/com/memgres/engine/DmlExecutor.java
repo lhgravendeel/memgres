@@ -649,7 +649,7 @@ class DmlExecutor {
                     row[i] = resolveIdentityNextVal(table, col);
                 } else if ((col.getType() == DataType.SERIAL || col.getType() == DataType.BIGSERIAL || col.getType() == DataType.SMALLSERIAL)
                         && col.getDefaultValue() != null && col.getDefaultValue().contains("nextval(")) {
-                    row[i] = resolveSerialNextVal(col);
+                    row[i] = resolveSerialNextVal(table, col);
                 } else if ((col.getType() == DataType.SERIAL || col.getType() == DataType.BIGSERIAL || col.getType() == DataType.SMALLSERIAL)
                         && col.getDefaultValue() == null) {
                     // Default was removed (e.g. DROP SEQUENCE CASCADE) — no auto-value
@@ -1211,7 +1211,7 @@ class DmlExecutor {
                 row[i] = resolveIdentityNextVal(table, col);
             } else if ((col.getType() == DataType.SERIAL || col.getType() == DataType.BIGSERIAL || col.getType() == DataType.SMALLSERIAL)
                     && col.getDefaultValue() != null && col.getDefaultValue().contains("nextval(")) {
-                row[i] = resolveSerialNextVal(col);
+                row[i] = resolveSerialNextVal(table, col);
             } else if ((col.getType() == DataType.SERIAL || col.getType() == DataType.BIGSERIAL || col.getType() == DataType.SMALLSERIAL)
                     && col.getDefaultValue() == null) {
                 // Default was removed (e.g. DROP SEQUENCE CASCADE) — no auto-value
@@ -1244,20 +1244,25 @@ class DmlExecutor {
         if (customEnum == null) return rawValue;
         String label = rawValue instanceof AstExecutor.PgEnum ? ((AstExecutor.PgEnum) rawValue).label() : rawValue.toString();
         if (!customEnum.isValidLabel(label)) {
-            throw new MemgresException(
-                    "invalid input value for enum " + enumTypeName + ": \"" + label + "\"", "22P02");
+            // Named the way PostgreSQL names it here: bare when the search path finds it,
+            // qualified when the type is one the reader would otherwise not know which of.
+            throw new MemgresException("invalid input value for enum "
+                    + TypeNamespace.display(executor.database, executor.session, enumTypeName)
+                    + ": \"" + label + "\"", "22P02");
         }
         return new AstExecutor.PgEnum(label, enumTypeName, customEnum.ordinal(label));
     }
 
-    private Object resolveSerialNextVal(Column col) {
+    private Object resolveSerialNextVal(Table table, Column col) {
         String def = col.getDefaultValue();
-        // Extract sequence name from nextval('seqname'::regclass)
+        // Extract sequence name from nextval('seqname'::regclass). A bare name in a default means
+        // the sequence in this table's own schema: two schemas may each hold a t_id_seq, and
+        // drawing from whichever one is found first makes the two tables share a counter.
         int q1 = def.indexOf('\'');
         int q2 = def.indexOf('\'', q1 + 1);
         if (q1 >= 0 && q2 > q1) {
             String seqName = def.substring(q1 + 1, q2);
-            Sequence seq = executor.database.getSequence(seqName);
+            Sequence seq = executor.database.getSequenceFor(table.getSchemaName(), seqName);
             if (seq != null) {
                 return drawFromSequence(seq);
             }
@@ -1272,7 +1277,7 @@ class DmlExecutor {
     private long drawFromSequence(Sequence seq) {
         long value = seq.nextVal();
         executor.lastSequenceValue = value;
-        executor.sessionSequenceValues.put(seq.getName().toLowerCase(), value);
+        executor.sessionSequenceValues.put(seq.qualifiedName().toLowerCase(), value);
         return value;
     }
 
@@ -1280,7 +1285,7 @@ class DmlExecutor {
         String def = col.getDefaultValue();
         if (def != null && def.contains(":seq:")) {
             String seqName = def.substring(def.indexOf(":seq:") + 5);
-            Sequence seq = executor.database.getSequence(seqName);
+            Sequence seq = executor.database.getSequenceFor(table.getSchemaName(), seqName);
             if (seq != null) {
                 return drawFromSequence(seq);
             }

@@ -93,6 +93,21 @@ public class Table {
         return name;
     }
 
+    /**
+     * The schema holding this table, set when it is added to one. A column default names its
+     * sequence without a qualifier, so the answer to "which sequence does {@code t_id_seq} mean"
+     * is only decidable once the table knows which schema it is in.
+     */
+    private String schemaName = "public";
+
+    public String getSchemaName() {
+        return schemaName;
+    }
+
+    public void setSchemaName(String schemaName) {
+        this.schemaName = schemaName == null ? "public" : schemaName;
+    }
+
     public List<Column> getColumns() {
         return columns;
     }

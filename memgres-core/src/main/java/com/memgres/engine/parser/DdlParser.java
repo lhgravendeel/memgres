@@ -260,10 +260,14 @@ class DdlParser {
         }
         else if (parser.matchKeywords("FOREIGN", "TABLE")) {
             boolean ftIfExists = parser.matchKeywords("IF", "EXISTS");
+            String ftSchema = null;
             String ftName = parser.readIdentifier();
-            if (parser.match(TokenType.DOT)) ftName = parser.readIdentifier();
+            if (parser.match(TokenType.DOT)) { ftSchema = ftName; ftName = parser.readIdentifier(); }
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-            return new SetStmt("drop_foreign_table", ftName);
+            // The schema and IF EXISTS both decide what the drop does: a foreign table in
+            // another schema is not this one, and only IF EXISTS makes a missing one silent.
+            return new SetStmt("drop_foreign_table",
+                    ftName + "\0" + (ftSchema != null ? ftSchema : "") + "\0" + ftIfExists);
         }
         else if (parser.matchKeyword("PUBLICATION")) {
             return parseDropObject("publication");
@@ -501,7 +505,14 @@ class DdlParser {
             parser.expectKeyword("VIEW");
             boolean viewIfExists = parser.matchKeywords("IF", "EXISTS");
             String viewName = parser.readIdentifier();
-            if (parser.match(TokenType.DOT)) viewName = parser.readIdentifier();
+            // Keep the qualifier: ALTER MATERIALIZED VIEW a.v names a's relation and no other
+            // schema's, and dropping it aimed the complaint at a name in the wrong schema.
+            String viewSchema = null;
+            if (parser.match(TokenType.DOT)) {
+                viewSchema = viewName;
+                viewName = parser.readIdentifier();
+            }
+            String writtenView = viewSchema == null ? viewName : viewSchema + "." + viewName;
             if (parser.matchKeywords("RENAME", "COLUMN")) {
                 String oldCol = parser.readIdentifier();
                 parser.expectKeyword("TO");
@@ -510,30 +521,40 @@ class DdlParser {
                 return renameRelationColumn(viewName, oldCol, newCol, viewIfExists);
             }
             if (parser.matchKeywords("RENAME", "TO")) {
-                return new AlterViewStmt(viewName, parser.readIdentifier(), viewIfExists, AlterViewStmt.Action.RENAME_TO);
+                return new AlterViewStmt(writtenView, parser.readIdentifier(), viewIfExists,
+                        AlterViewStmt.Action.RENAME_TO, null, true);
             }
             if (parser.matchKeywords("OWNER", "TO")) {
-                return new AlterViewStmt(viewName, parser.readIdentifier(), viewIfExists, AlterViewStmt.Action.OWNER_TO);
+                return new AlterViewStmt(writtenView, parser.readIdentifier(), viewIfExists,
+                        AlterViewStmt.Action.OWNER_TO, null, true);
             }
             if (parser.matchKeywords("SET", "SCHEMA")) {
                 String newSchema = parser.readIdentifier();
                 while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-                return new AlterTableStmt(null, viewName,
+                return new AlterTableStmt(viewSchema, viewName,
                         Cols.listOf((AlterTableStmt.AlterAction)
                                 new AlterTableStmt.SetSchema(newSchema)), viewIfExists);
             }
             if (parser.matchKeyword("SET") && parser.check(TokenType.LEFT_PAREN)) {
                 Map<String, String> opts = parseViewWithOptions();
-                return new AlterViewStmt(viewName, null, viewIfExists, AlterViewStmt.Action.SET_OPTIONS, opts);
+                return new AlterViewStmt(writtenView, null, viewIfExists,
+                        AlterViewStmt.Action.SET_OPTIONS, opts, true);
             }
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-            return new AlterViewStmt(viewName, null, viewIfExists, AlterViewStmt.Action.NO_OP);
+            return new AlterViewStmt(writtenView, null, viewIfExists,
+                    AlterViewStmt.Action.NO_OP, null, true);
         }
 
         if (parser.matchKeyword("VIEW")) {
             boolean viewIfExists = parser.matchKeywords("IF", "EXISTS");
             String viewName = parser.readIdentifier();
-            if (parser.match(TokenType.DOT)) viewName = parser.readIdentifier();
+            // Keep the qualifier: ALTER VIEW a.v names a's relation and no other schema's.
+            String viewSchema = null;
+            if (parser.match(TokenType.DOT)) {
+                viewSchema = viewName;
+                viewName = parser.readIdentifier();
+            }
+            String writtenView = viewSchema == null ? viewName : viewSchema + "." + viewName;
             if (parser.matchKeywords("RENAME", "COLUMN")) {
                 String oldCol = parser.readIdentifier();
                 parser.expectKeyword("TO");
@@ -544,22 +565,22 @@ class DdlParser {
             if (parser.matchKeywords("SET", "SCHEMA")) {
                 String newSchema = parser.readIdentifier();
                 while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-                return new AlterTableStmt(null, viewName,
+                return new AlterTableStmt(viewSchema, viewName,
                         Cols.listOf((AlterTableStmt.AlterAction)
                                 new AlterTableStmt.SetSchema(newSchema)), viewIfExists);
             }
             if (parser.matchKeywords("RENAME", "TO")) {
-                return new AlterViewStmt(viewName, parser.readIdentifier(), viewIfExists, AlterViewStmt.Action.RENAME_TO);
+                return new AlterViewStmt(writtenView, parser.readIdentifier(), viewIfExists, AlterViewStmt.Action.RENAME_TO);
             }
             if (parser.matchKeywords("OWNER", "TO")) {
-                return new AlterViewStmt(viewName, parser.readIdentifier(), viewIfExists, AlterViewStmt.Action.OWNER_TO);
+                return new AlterViewStmt(writtenView, parser.readIdentifier(), viewIfExists, AlterViewStmt.Action.OWNER_TO);
             }
             if (parser.matchKeyword("SET") && parser.check(TokenType.LEFT_PAREN)) {
                 Map<String, String> opts = parseViewWithOptions();
-                return new AlterViewStmt(viewName, null, viewIfExists, AlterViewStmt.Action.SET_OPTIONS, opts);
+                return new AlterViewStmt(writtenView, null, viewIfExists, AlterViewStmt.Action.SET_OPTIONS, opts);
             }
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-            return new AlterViewStmt(viewName, null, viewIfExists, AlterViewStmt.Action.NO_OP);
+            return new AlterViewStmt(writtenView, null, viewIfExists, AlterViewStmt.Action.NO_OP);
         }
 
         if (parser.matchKeyword("DOMAIN")) return parseAlterDomain();
@@ -973,12 +994,16 @@ class DdlParser {
 
     CreateTypeStmt parseCreateType() {
         String name = parser.readIdentifier();
-        if (parser.match(TokenType.DOT)) name = parser.readIdentifier();
+        // The schema is kept, not discarded: a.e and b.e are two types, and which one this is
+        // decides where it lands and which of them a later name resolves to.
+        String schema = null;
+        if (parser.match(TokenType.DOT)) { schema = name; name = parser.readIdentifier(); }
         // CREATE TYPE name; with no definition is a shell type — the documented first step of
         // defining a base type, and the name a base type's I/O functions refer to.
         if (!parser.checkKeyword("AS")) {
             CreateTypeStmt shell = new CreateTypeStmt(name, null, null);
             shell.setShell(true);
+            shell.setSchemaName(schema);
             return shell;
         }
         parser.expectKeyword("AS");
@@ -989,7 +1014,9 @@ class DdlParser {
                 do { labels.add(parser.expect(TokenType.STRING_LITERAL).value()); } while (parser.match(TokenType.COMMA));
             }
             parser.expect(TokenType.RIGHT_PAREN);
-            return new CreateTypeStmt(name, labels);
+            CreateTypeStmt e = new CreateTypeStmt(name, labels);
+            e.setSchemaName(schema);
+            return e;
         }
         if (parser.matchKeyword("RANGE")) {
             parser.expect(TokenType.LEFT_PAREN);
@@ -1007,7 +1034,9 @@ class DdlParser {
             if (rangeSubtype == null) {
                 throw PgErrors.syntax("type attribute \"subtype\" is required");
             }
-            return new CreateTypeStmt(name, null, null, rangeSubtype);
+            CreateTypeStmt r = new CreateTypeStmt(name, null, null, rangeSubtype);
+            r.setSchemaName(schema);
+            return r;
         }
         parser.expect(TokenType.LEFT_PAREN);
         List<CreateTypeStmt.CompositeField> fields = new ArrayList<>();
@@ -1019,7 +1048,9 @@ class DdlParser {
             } while (parser.match(TokenType.COMMA));
         }
         parser.expect(TokenType.RIGHT_PAREN);
-        return new CreateTypeStmt(name, null, fields);
+        CreateTypeStmt c = new CreateTypeStmt(name, null, fields);
+        c.setSchemaName(schema);
+        return c;
     }
 
     CreateExtensionStmt parseCreateExtension() {
@@ -1401,7 +1432,9 @@ class DdlParser {
     AlterSequenceStmt parseAlterSequence() {
         boolean ifExists = parser.matchKeywords("IF", "EXISTS");
         String name = parser.readIdentifier();
-        if (parser.match(TokenType.DOT)) name = parser.readIdentifier();
+        // Keep the qualifier: ALTER SEQUENCE a.s names a's sequence and no other schema's, and
+        // dropping the schema here made the statement alter — and relocate — whichever one it found.
+        if (parser.match(TokenType.DOT)) name = name + "." + parser.readIdentifier();
         if (parser.matchKeywords("RENAME", "TO")) {
             AlterSequenceStmt renamed = AlterSequenceStmt.renameTo(name, parser.readIdentifier());
             renamed.setIfExists(ifExists);
@@ -1588,7 +1621,9 @@ class DdlParser {
 
     AlterTypeStmt parseAlterType() {
         String typeName = parser.readIdentifier();
-        if (parser.match(TokenType.DOT)) typeName = parser.readIdentifier();
+        // Carried, not discarded: ALTER TYPE a.e names a.e however many other schemas hold an e,
+        // and PostgreSQL reports the name it could not find as it was written.
+        if (parser.match(TokenType.DOT)) typeName = typeName.toLowerCase() + "." + parser.readIdentifier();
         if (parser.matchKeywords("ADD", "VALUE")) {
             boolean ifNotExists = parser.matchKeywords("IF", "NOT", "EXISTS");
             Token val = parser.expect(TokenType.STRING_LITERAL);
@@ -2172,7 +2207,8 @@ class DdlParser {
         }
 
         String indexName = parser.readIdentifier();
-        if (parser.match(TokenType.DOT)) indexName = parser.readIdentifier();
+        // Keep the qualifier: ALTER INDEX a.i names a's index and no other schema's.
+        if (parser.match(TokenType.DOT)) indexName = indexName + "." + parser.readIdentifier();
 
         // RENAME TO
         if (parser.matchKeywords("RENAME", "TO")) {
@@ -2643,7 +2679,7 @@ class DdlParser {
     }
 
     private Statement parseCreateForeignTable() {
-        parser.matchKeywords("IF", "NOT", "EXISTS");
+        boolean ifNotExists = parser.matchKeywords("IF", "NOT", "EXISTS");
         String schema = null;
         String name = parser.readIdentifier();
         if (parser.match(TokenType.DOT)) { schema = name; name = parser.readIdentifier(); }
@@ -2668,9 +2704,12 @@ class DdlParser {
         }
         String options = parseOptionsClause();
         while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-        // Encode columns as col1\ttype1\ncol2\ttype2
+        // Encode columns as col1\ttype1\ncol2\ttype2. The schema the statement wrote is carried
+        // along with them: a foreign table is created in the schema it names, like any relation.
         String colStr = String.join("\n", colDefs);
-        return new SetStmt("create_foreign_table", name + "\0" + serverName + "\0" + (options != null ? options : "") + "\0" + colStr);
+        return new SetStmt("create_foreign_table", name + "\0" + serverName + "\0"
+                + (options != null ? options : "") + "\0" + colStr + "\0"
+                + (schema != null ? schema : "") + "\0" + ifNotExists);
     }
 
     private Statement parseAlterServer() {

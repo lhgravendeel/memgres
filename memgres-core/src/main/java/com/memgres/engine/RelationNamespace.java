@@ -19,6 +19,18 @@ final class RelationNamespace {
     static final String SEQUENCE = "sequence";
     static final String INDEX = "index";
 
+    /**
+     * A composite type owns a {@code pg_class} row of its own — {@code relkind 'c'} — so its row
+     * type sits in the relation namespace beside the tables. {@code CREATE TABLE} over one is
+     * {@code 42P07} and {@code DROP TABLE} over one is {@code 42809}, both measured.
+     */
+    static final String COMPOSITE = "composite type";
+
+    /** A foreign table is a relation like any other: it takes a name in its schema. */
+
+    static final String FOREIGN_TABLE = "foreign table";
+
+
     private RelationNamespace() {}
 
     /**
@@ -31,11 +43,15 @@ final class RelationNamespace {
         String schema = schemaName == null ? "public" : schemaName.toLowerCase();
         Schema s = db.getSchema(schema);
         if (s != null && s.getTable(bare) != null) return TABLE;
+        // A foreign table holds its name in the schema against every other kind, so a CREATE
+        // TABLE over one is 42P07 and a DROP TABLE on one is 42809 -- the same as for a view.
+        if (ForeignTables.existsIn(db, schema, bare)) return FOREIGN_TABLE;
         Database.ViewDef v = db.getView(schema, bare);
         if (v != null && sameSchema(v.schemaName, schema)) return v.materialized ? MATVIEW : VIEW;
-        if (db.hasSequence(bare) && attributedTo(db, schema, "sequence", bare)) return SEQUENCE;
-        if (db.hasIndex(bare) && attributedTo(db, schema, "index", bare)) return INDEX;
+        if (db.hasSequence(schema, bare)) return SEQUENCE;
+        if (db.hasIndex(schema, bare)) return INDEX;
         if (constraintIndexHere(s, bare)) return INDEX;
+        if (TypeNamespace.COMPOSITE.equals(TypeNamespace.kindOf(db, schema, bare))) return COMPOSITE;
         return null;
     }
 
@@ -70,12 +86,44 @@ final class RelationNamespace {
         throw new MemgresException("relation \"" + bareName(name) + "\" already exists", "42P07");
     }
 
-    /** Refuse a DROP that names a relation of the wrong kind: {@code "x" is not a table}. */
+    /** Refuse a statement that names a relation of the wrong kind: {@code "x" is not a table}. */
     static void requireKind(Database db, String schemaName, String name, String wantedKind) {
+        MemgresException e = wrongKind(db, schemaName, name, wantedKind);
+        if (e != null) throw e;
+    }
+
+    /**
+     * The same refusal with the hint PostgreSQL adds when it is a DROP that named the wrong kind.
+     * A DROP has a right statement to point at — the one that drops what is really there — and
+     * the reader who reached for DROP TABLE on an index needs to be told which that is.
+     */
+    static void requireKindForDrop(Database db, String schemaName, String name, String wantedKind) {
+        MemgresException e = wrongKind(db, schemaName, name, wantedKind);
+        if (e == null) return;
+        String found = kindOf(db, schemaName, name);
+        e.setHint("Use DROP " + found.toUpperCase() + " to remove " + article(found) + " " + found + ".");
+        throw e;
+    }
+
+    /** The wrong-kind refusal for this name, or null when the kind is right or the name is free. */
+    private static MemgresException wrongKind(Database db, String schemaName, String name,
+                                              String wantedKind) {
         String kind = kindOf(db, schemaName, name);
-        if (kind == null || kind.equals(wantedKind)) return;
-        throw new MemgresException("\"" + bareName(name) + "\" is not " + article(wantedKind)
+        if (kind == null || kind.equals(wantedKind)) return null;
+        return new MemgresException("\"" + bareName(name) + "\" is not " + article(wantedKind)
                 + " " + wantedKind, "42809");
+    }
+
+    /**
+     * The first schema on the path that holds a relation of this name, or null. This is where a
+     * complaint about a bare name belongs: the relation the statement would have reached.
+     */
+    static String schemaHolding(Database db, java.util.List<String> searchPath, String name) {
+        if (searchPath == null) return null;
+        for (String schema : searchPath) {
+            if (kindOf(db, schema, name) != null) return schema;
+        }
+        return null;
     }
 
     /** True when a relation of some kind other than {@code kind} owns the name. */
@@ -97,21 +145,5 @@ final class RelationNamespace {
     private static boolean sameSchema(String a, String b) {
         if (a == null) return "public".equalsIgnoreCase(b);
         return a.equalsIgnoreCase(b);
-    }
-
-    /**
-     * Sequences and indexes live in flat maps, so a name is attributed to a schema through the
-     * schema object registry. When the registry knows nothing about the name anywhere — an object
-     * created by a path that does not register — it counts as living in {@code public}, which is
-     * where every such path puts it.
-     */
-    private static boolean attributedTo(Database db, String schema, String type, String name) {
-        String key = type + ":" + name.toLowerCase();
-        Set<String> here = db.getSchemaObjects(schema);
-        if (here.contains(key)) return true;
-        for (String other : db.getSchemas().keySet()) {
-            if (db.getSchemaObjects(other).contains(key)) return false;
-        }
-        return "public".equals(schema);
     }
 }

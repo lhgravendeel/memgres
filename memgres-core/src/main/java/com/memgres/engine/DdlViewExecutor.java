@@ -469,11 +469,12 @@ class DdlViewExecutor {
     QueryResult executeAlterView(AlterViewStmt stmt) {
         if (stmt.action() == AlterViewStmt.Action.RENAME_TO) {
             Database.ViewDef existing = executor.database.getView(stmt.name());
-            if (existing == null) {
-                if (stmt.ifExists()) return QueryResult.command(QueryResult.Type.CREATE_TABLE, 0);
+            if (existing == null || existing.materialized() != stmt.materialized()) {
+                if (existing == null && stmt.ifExists()) {
+                    return QueryResult.command(QueryResult.Type.CREATE_TABLE, 0);
+                }
                 // A table or a sequence of that name is a wrong-kind complaint, not a missing one.
-                RelationNamespace.requireKind(executor.database, executor.defaultSchema(),
-                        stmt.name(), RelationNamespace.VIEW);
+                requireViewKind(stmt);
                 throw new MemgresException("relation \"" + stmt.name() + "\" does not exist", "42P01");
             }
             if (executor.database.hasView(stmt.newName())) {
@@ -483,11 +484,18 @@ class DdlViewExecutor {
             RelationNamespace.requireFree(executor.database,
                     existing.schemaName() != null ? existing.schemaName() : executor.defaultSchema(),
                     stmt.newName(), null);
+            String viewSchema = existing.schemaName() != null
+                    ? existing.schemaName() : executor.defaultSchema();
             executor.database.removeView(stmt.name());
             executor.database.addView(new Database.ViewDef(stmt.newName(), existing.schemaName(), existing.query(),
                     existing.orReplace(), existing.materialized(),
                     existing.cachedColumns(), existing.cachedRows(), existing.sourceSQL(),
                     existing.checkOption(), existing.reloptions(), existing.populated()));
+            // The view is the same object under another name, so its OID, its comment and its
+            // grants stay with it. See ObjectIdentity.
+            executor.identity().relationRenamed(existing.materialized() ? "m" : "v",
+                    viewSchema, RelationNamespace.bareName(stmt.name()),
+                    viewSchema, RelationNamespace.bareName(stmt.newName()));
         }
         if (stmt.action() == AlterViewStmt.Action.OWNER_TO) {
             String newOwner = ddl.resolveOwnerName(stmt.newName());
@@ -496,12 +504,16 @@ class DdlViewExecutor {
             }
             Database.ViewDef vd = executor.database.getView(stmt.name());
             String vSchema = (vd != null && vd.schemaName() != null) ? vd.schemaName() : executor.defaultSchema();
-            executor.database.setObjectOwner("view:" + vSchema + "." + stmt.name(), newOwner);
+            executor.database.setObjectOwner(
+                    "view:" + vSchema + "." + RelationNamespace.bareName(stmt.name()), newOwner);
         }
         if (stmt.action() == AlterViewStmt.Action.SET_OPTIONS) {
             Database.ViewDef existing = executor.database.getView(stmt.name());
-            if (existing == null) {
-                if (stmt.ifExists()) return QueryResult.command(QueryResult.Type.CREATE_TABLE, 0);
+            if (existing == null || existing.materialized() != stmt.materialized()) {
+                if (existing == null && stmt.ifExists()) {
+                    return QueryResult.command(QueryResult.Type.CREATE_TABLE, 0);
+                }
+                requireViewKind(stmt);
                 throw new MemgresException("view \"" + stmt.name() + "\" does not exist", "42P01");
             }
             // Merge new options into existing reloptions
@@ -516,12 +528,32 @@ class DdlViewExecutor {
         }
         if (stmt.action() == AlterViewStmt.Action.NO_OP) {
             Database.ViewDef existing = executor.database.getView(stmt.name());
-            if (existing == null) {
-                if (stmt.ifExists()) return QueryResult.command(QueryResult.Type.CREATE_TABLE, 0);
+            if (existing == null || existing.materialized() != stmt.materialized()) {
+                if (existing == null && stmt.ifExists()) {
+                    return QueryResult.command(QueryResult.Type.CREATE_TABLE, 0);
+                }
+                requireViewKind(stmt);
                 throw new MemgresException("view \"" + stmt.name() + "\" does not exist", "42P01");
             }
         }
         return QueryResult.command(QueryResult.Type.CREATE_TABLE, 0);
+    }
+
+    /**
+     * Refuse an ALTER VIEW that named a relation of another kind, naming the kind the statement
+     * expected. A table an ALTER VIEW names is not a missing view, it is a table — PostgreSQL
+     * answers {@code 42809 "x" is not a view}, and {@code 42P01} sent the reader looking for
+     * something that is right there under the name they wrote.
+     */
+    private void requireViewKind(AlterViewStmt stmt) {
+        String bare = RelationNamespace.bareName(stmt.name());
+        String written = SchemaQualifier.qualifierOf(stmt.name());
+        String schema = written != null ? written
+                : RelationNamespace.schemaHolding(executor.database,
+                        executor.relationSearchPath(), bare);
+        if (schema == null) schema = executor.defaultSchema();
+        RelationNamespace.requireKind(executor.database, schema, bare,
+                stmt.materialized() ? RelationNamespace.MATVIEW : RelationNamespace.VIEW);
     }
 
     // ---- REFRESH MATERIALIZED VIEW ----
