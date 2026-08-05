@@ -946,6 +946,7 @@ class FunctionEvaluator {
         // A VARIADIC argument was one written argument before it was expanded, and an empty array
         // expands to none at all, so the count in hand is not the count the writer gave.
         if (!callUsedVariadic) rejectWrongArity(name, fn, ctx);
+        if (!callUsedVariadic) rejectAmbiguousBuiltin(executor, name, fn.name(), fn.args(), ctx);
 
         // Delegate to category handlers
         Object delegated;
@@ -1856,6 +1857,18 @@ class FunctionEvaluator {
                     }
                 }
                 if (dimsList.isEmpty()) return "{}";
+                // An array has a size past which PostgreSQL will not build one, and the extents
+                // are asked for rather than accumulated: a request for four hundred million
+                // elements is refused before anything is allocated for it, instead of taking the
+                // heap with it.
+                long requested = 1;
+                for (int di = 0; di < dimsList.size(); di++) {
+                    requested *= ((Number) dimsList.get(di)).intValue();
+                    if (requested > MAX_ARRAY_ELEMENTS) {
+                        throw new MemgresException("array size exceeds the maximum allowed ("
+                                + MAX_ARRAY_ELEMENTS + ")", "54000");
+                    }
+                }
                 String filled = buildFilledArray(fillVal, dimsList, 0);
                 StringBuilder prefix = new StringBuilder();
                 boolean customBounds = false;
@@ -3732,6 +3745,92 @@ class FunctionEvaluator {
             case "bool": return "boolean";
             default: return t;
         }
+    }
+
+    /**
+     * Refuses a call whose name, for the arguments as written, means more than one thing.
+     *
+     * <p>An untyped literal is of no type until a signature says what it is, and a name declared
+     * over several types in several categories says nothing: {@code sum} is declared over numbers
+     * and over intervals, so {@code sum('1')} names neither and PostgreSQL refuses it. Reading the
+     * literal as a number regardless answered a call PostgreSQL does not have, and answered it
+     * with whichever overload memgres happened to reach first.
+     *
+     * <p>Only a call every one of whose arguments is either written with a type or written as an
+     * untyped literal is judged. An argument whose type this cannot read — a column of a
+     * subquery, a call this says nothing about — leaves the whole call alone, because a call
+     * refused on a guess is worse than a call resolved on one. A name a user has declared a
+     * function for is left alone too: their declaration is part of the answer.
+     */
+    static void rejectAmbiguousBuiltin(AstExecutor executor, String name, List<Expression> args,
+                                       RowContext ctx) {
+        rejectAmbiguousBuiltin(executor, name, name, args, ctx);
+    }
+
+    /** As above, reporting the call by the name the statement wrote rather than the one it means. */
+    static void rejectAmbiguousBuiltin(AstExecutor executor, String name, String writtenName,
+                                       List<Expression> args, RowContext ctx) {
+        if (name == null || args == null || args.isEmpty()) return;
+        if (!BuiltinCallTypes.records(name)) return;
+        if (executor.database.getFunctions().containsKey(name.toLowerCase())) return;
+        // A type name written as a call is a cast to that type, whatever else PostgreSQL happens
+        // to declare under the same spelling: bytea('x') is 'x'::bytea and takes one argument of
+        // whatever was written, so there is no overload to choose between.
+        if (args.size() == 1 && executor.functionEvaluator.coercibleTypeName(name) != null) return;
+        args = flattenRowArguments(args);
+        int[] written = new int[args.size()];
+        boolean anyUntyped = false;
+        for (int i = 0; i < args.size(); i++) {
+            Expression arg = args.get(i);
+            String declared = executor.binaryOpEvaluator.declaredTypeForResolution(arg, ctx);
+            if (declared == null) {
+                if (!isUntypedLiteral(arg)) return;   // no opinion about this call
+                anyUntyped = true;
+                written[i] = BuiltinCallTypes.UNKNOWN;
+                continue;
+            }
+            DataType type = DataType.fromPgName(canonicalTypeName(declared));
+            if (type == null) return;
+            written[i] = type.getOid();
+        }
+        BuiltinCallTypes.requireCallable(name, writtenName, written);
+        if (!anyUntyped) return;
+        BuiltinCallTypes.requireResolvable(name, writtenName, written);
+    }
+
+    /**
+     * The arguments a call really passes. {@code (a, b) OVERLAPS (c, d)} is written as two pairs
+     * and declared as four arguments, so the pairs are read apart before the signature is looked
+     * up; otherwise the call is judged against an arity nothing declares.
+     */
+    private static List<Expression> flattenRowArguments(List<Expression> args) {
+        boolean anyRow = false;
+        for (Expression arg : args) {
+            if (arg instanceof ArrayExpr && ((ArrayExpr) arg).isRow()) { anyRow = true; break; }
+        }
+        if (!anyRow) return args;
+        List<Expression> flat = new ArrayList<>();
+        for (Expression arg : args) {
+            if (arg instanceof ArrayExpr && ((ArrayExpr) arg).isRow()) {
+                flat.addAll(((ArrayExpr) arg).elements());
+            } else {
+                flat.add(arg);
+            }
+        }
+        return flat;
+    }
+
+    /**
+     * The most elements PostgreSQL will build an array of: what fits in the largest allocation it
+     * makes, one pointer per element.
+     */
+    private static final long MAX_ARRAY_ELEMENTS = 134217727L;
+
+    /** A literal of no type: a string, or a bare NULL. */
+    private static boolean isUntypedLiteral(Expression expr) {
+        if (!(expr instanceof Literal)) return false;
+        Literal.LiteralType type = ((Literal) expr).literalType();
+        return type == Literal.LiteralType.STRING || type == Literal.LiteralType.NULL;
     }
 
     /**

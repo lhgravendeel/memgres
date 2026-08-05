@@ -25,11 +25,16 @@ class AgeNullFixTest {
     }
     @AfterAll static void tearDown() throws Exception { if (conn != null) conn.close(); if (memgres != null) memgres.close(); }
 
-    @Test void age_null_returns_null() throws SQLException {
-        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery("SELECT pg_catalog.age(NULL)")) {
-            assertTrue(rs.next());
-            assertNull(rs.getObject(1));
-        }
+    /**
+     * A bare NULL has no type, and age is declared over an instant and over a transaction id, so
+     * age(NULL) names neither of them. PostgreSQL refuses the call rather than choosing one; the
+     * call the Describe path actually writes says which it means, and is the test below.
+     */
+    @Test void age_of_an_untyped_null_names_no_overload() {
+        SQLException e = assertThrows(SQLException.class, () -> {
+            try (Statement s = conn.createStatement()) { s.executeQuery("SELECT pg_catalog.age(NULL)"); }
+        });
+        assertEquals("42725", e.getSQLState());
     }
 
     @Test void age_null_xid_returns_null() throws SQLException {

@@ -533,7 +533,10 @@ class SelectExecutor {
 
         boolean hasSrf = !srfIndices.isEmpty();
 
-        if (!hasSrf) {
+        if (!hasSrf && resolvedOrderBy != null && !resolvedOrderBy.isEmpty()) {
+            // Sorting rewrites the list where it stands, so it needs one that may be rewritten.
+            // A FROM item that works its rows out as they are read hands on a list that may not.
+            contexts = new ArrayList<>(contexts);
             sortContexts(contexts, resolvedOrderBy);
         }
 
@@ -683,6 +686,7 @@ class SelectExecutor {
         }
 
         // Project
+        contexts = boundedByRowCount(stmt, contexts, hasSrf);
         List<Object[]> resultRows = projectRows(contexts, projections, srfIndices);
 
         // For SRF queries, apply ORDER BY after SRF expansion
@@ -1597,6 +1601,59 @@ class SelectExecutor {
             CastExpr cast = (CastExpr) expr;
             String tn = cast.typeName().toLowerCase().trim();
             if (executor.database.isCompositeType(tn)) return tn;
+        }
+        return null;
+    }
+
+    /**
+     * The rows the select list has to be evaluated for, where the query says how many it wants.
+     *
+     * <p>A row past the limit cannot reach the answer, so evaluating the select list for it is
+     * work done for nothing: {@code LIMIT 1} over a five-million-row series projected five
+     * million rows to return one, which took forty times as long as counting all five million.
+     * Dropping them first is the same answer with the same rows in the same order.
+     *
+     * <p>Only where every remaining row still stands for exactly one output row. DISTINCT, WITH
+     * TIES and a set-returning select list each decide how many rows come out only once the
+     * projection has run, so under any of them there is no count to cut at. And only where the
+     * count is already a number: an expression is evaluated where the query says, once.
+     */
+    private List<RowContext> boundedByRowCount(SelectStmt stmt, List<RowContext> contexts,
+                                               boolean hasSrf) {
+        if (hasSrf || stmt.limit() == null || stmt.withTies() || stmt.distinct()) return contexts;
+        if (stmt.distinctOn() != null && !stmt.distinctOn().isEmpty()) return contexts;
+        Long limit = writtenRowCount(stmt.limit());
+        if (limit == null || limit < 0) return contexts;
+        long offset = 0;
+        if (stmt.offset() != null) {
+            Long written = writtenRowCount(stmt.offset());
+            if (written == null) return contexts;
+            offset = Math.max(0L, written);
+        }
+        // A count past what a list can address is no bound at all, and adding two of them is how
+        // a bound turns negative.
+        if (offset > Integer.MAX_VALUE || limit > Integer.MAX_VALUE) return contexts;
+        long wanted = offset + limit;
+        if (wanted >= contexts.size()) return contexts;
+        return contexts.subList(0, (int) wanted);
+    }
+
+    /**
+     * A row count written as a number, or null where the query works it out for itself. A bound
+     * parameter is a number too — it was decided before the statement ran — but anything the
+     * query computes is left to the clause that computes it, so nothing is evaluated twice.
+     */
+    private Long writtenRowCount(Expression expr) {
+        if (expr instanceof Literal && ((Literal) expr).literalType() == Literal.LiteralType.INTEGER) {
+            try {
+                return Long.valueOf(((Literal) expr).value());
+            } catch (NumberFormatException e) {
+                return null;
+            }
+        }
+        if (expr instanceof ParamRef) {
+            Object value = executor.evalExpr(expr, null);
+            return value instanceof Number ? Long.valueOf(((Number) value).longValue()) : null;
         }
         return null;
     }

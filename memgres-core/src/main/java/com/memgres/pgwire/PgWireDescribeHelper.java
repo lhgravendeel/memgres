@@ -65,6 +65,37 @@ class PgWireDescribeHelper {
         return null;
     }
 
+    /**
+     * The error to report for a statement that could not be described.
+     *
+     * <p>Describing a query runs it, and a query with parameters is run with nulls standing in for
+     * them, so a statement the parser stops on is reported at whatever the null was written over.
+     * The client wrote a parameter there, and that is what PostgreSQL names: reading the statement
+     * as it was sent puts the parameter back into the message. Only a statement that fails as
+     * written is re-reported — one that parses on its own was refused for the substitution, and
+     * the substituted message is the true one.
+     */
+    private Exception failureAsWritten(String sql, Exception failure) {
+        if (!"42601".equals(sqlStateOf(failure)) || countParameters(sql) == 0) return failure;
+        try {
+            com.memgres.engine.parser.Parser.parse(sql);
+            return failure;
+        } catch (RuntimeException asWritten) {
+            return asWritten;
+        }
+    }
+
+    /**
+     * Whether a query already says how many rows it wants. Describing a SELECT runs it for its
+     * column types with a row count of zero appended, and a query that limits itself takes no
+     * second limit: {@code FETCH FIRST n ROWS ONLY} is the same clause spelled the other way, and
+     * PostgreSQL rejects a LIMIT written after it as readily as it rejects two LIMITs.
+     */
+    private static boolean alreadyBounded(String sql) {
+        String upper = sql.toUpperCase();
+        return upper.contains("LIMIT") || upper.contains("FETCH");
+    }
+
     private static String sqlStateOf(Exception e) {
         if (e instanceof MemgresException) {
             String state = ((MemgresException) e).getSqlState();
@@ -99,7 +130,7 @@ class PgWireDescribeHelper {
                 try {
                     String nullSql = replaceParamsWithNull(sql);
                     nullSql = nullSql.replaceAll(";\\s*$", "").trim();
-                    if (!nullSql.toUpperCase().contains("LIMIT")) nullSql = nullSql + " LIMIT 0";
+                    if (!alreadyBounded(nullSql)) nullSql = nullSql + " LIMIT 0";
                     QueryResult result = session.execute(nullSql, Cols.listOf());
                     if (!result.getColumns().isEmpty()) {
                         sendRowDescription(ctx, result);
@@ -146,7 +177,7 @@ class PgWireDescribeHelper {
                 String metaSql = countParameters(sql) > 0 ? replaceParamsWithNull(sql) : sql;
                 metaSql = metaSql.replaceAll(";\\s*$", "").trim();
                 metaSql = metaSql.replaceAll("--[^\\n]*$", "").trim();
-                if (!metaSql.toUpperCase().contains("LIMIT")) metaSql = metaSql + " LIMIT 0";
+                if (!alreadyBounded(metaSql)) metaSql = metaSql + " LIMIT 0";
                 QueryResult result = session.execute(metaSql, Cols.listOf());
                 if (result.getType() == QueryResult.Type.SELECT || !result.getColumns().isEmpty()) {
                     sendRowDescription(ctx, result);
@@ -181,7 +212,8 @@ class PgWireDescribeHelper {
             // surfaces downstream as a confusing client-side failure (e.g. jdbi's
             // NoResultsException) instead of the real server-side error. Surface it now.
             if (describeFailure != null) {
-                throw new DescribeExecutionFailedException(sqlStateOf(describeFailure), describeFailure.getMessage());
+                Exception reported = failureAsWritten(sql, describeFailure);
+                throw new DescribeExecutionFailedException(sqlStateOf(reported), reported.getMessage());
             }
             LOG.warn("[PROTO] Describe Stmt fell through to NoData for query: {}",
                     sql.substring(0, Math.min(120, sql.length())).replace("\n"," "));
@@ -311,7 +343,7 @@ class PgWireDescribeHelper {
                         String metaSql = sql.replaceAll(";\\s*$", "").trim()
                                 .replaceAll("--[^\\n]*$", "").trim();
                         metaSql = metaSql.replaceAll("(?i)\\bFOR\\s+(UPDATE|NO\\s+KEY\\s+UPDATE|SHARE|KEY\\s+SHARE)(\\s+(SKIP\\s+LOCKED|NOWAIT|OF\\s+\\w+))*", "").trim();
-                        if (!metaSql.toUpperCase().contains("LIMIT")) metaSql = metaSql + " LIMIT 0";
+                        if (!alreadyBounded(metaSql)) metaSql = metaSql + " LIMIT 0";
                         QueryResult metaResult = session.execute(metaSql, paramValues);
                         if (metaResult.getType() == QueryResult.Type.SELECT || !metaResult.getColumns().isEmpty()) {
                             sendRowDescription(ctx, metaResult);
@@ -871,7 +903,14 @@ class PgWireDescribeHelper {
     private void sendParameterDescription(ChannelHandlerContext ctx, String sql, int[] oids) {
         int numParams = countParameters(sql);
         int[] inferred = inferParamOidsFromCasts(sql, numParams);
-        int[] fromContext = PgWireParamTypes.infer(sql, numParams, database, session);
+        int[] fromContext;
+        try {
+            fromContext = PgWireParamTypes.infer(sql, numParams, database, session);
+        } catch (MemgresException e) {
+            // The statement names a call PostgreSQL cannot choose between. That is the answer to
+            // a Describe as much as to an Execute, and it is the answer PostgreSQL gives first.
+            throw new DescribeExecutionFailedException(sqlStateOf(e), e.getMessage());
+        }
         ByteBuf buf = ctx.alloc().buffer();
         buf.writeByte('t');
         buf.writeInt(4 + 2 + numParams * 4);

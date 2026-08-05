@@ -105,6 +105,11 @@ public class Parser extends ExpressionParser {
                         || t.type() == TokenType.STRING_LITERAL
                         || t.type() == TokenType.KEYWORD
                         || t.type() == TokenType.DOT
+                        // A parameter left standing after the statement is as much garbage as a
+                        // leftover identifier. Dropping it silently accepted "WHERE jb ? ?",
+                        // where a driver's second placeholder turns the jsonb existence operator
+                        // into a parameter and leaves the first one with nothing to do.
+                        || t.type() == TokenType.PARAM
                         || t.type() == TokenType.STAR) {
                     throw new ParseException("syntax error at or near \"" + t.value() + "\"", t);
                 }

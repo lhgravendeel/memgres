@@ -208,6 +208,23 @@ public class Table {
         return rows;
     }
 
+    /**
+     * Hand this table rows it does not own a copy of.
+     *
+     * <p>{@link #replaceAllRows} copies what it is given, which is right for a table whose rows
+     * are values someone may go on to change. The rows of a virtual relation built for one FROM
+     * item are not: they are worked out from the item itself and read as the query walks them,
+     * and copying them would build the very list the item was written not to build.
+     */
+    public void publishGeneratedRows(List<Object[]> generated) {
+        writeLock.lock();
+        try {
+            publish(generated);
+        } finally {
+            writeLock.unlock();
+        }
+    }
+
     /** Atomically replace all rows (used by snapshot restore and temp table truncation). */
     public void replaceAllRows(List<Object[]> newRows) {
         writeLock.lock();
