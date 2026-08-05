@@ -53,19 +53,33 @@ public class TsQuery {
         return new TsQuery(Op.TERM, t.toLowerCase(), prefix, weights, null, null, 0);
     }
 
+    /**
+     * Combining with an empty query drops the empty side rather than keeping a hole in the tree.
+     * A stop word makes {@code to_tsquery('a')} empty, and PostgreSQL folds it away, so
+     * {@code to_tsquery('a') && to_tsquery('b')} is simply {@code 'b'} — keeping the empty operand
+     * printed a query beginning with an operator and matched nothing.
+     */
     public static TsQuery and(TsQuery l, TsQuery r) {
+        if (l == null || l.isEmpty()) return r == null ? emptyQuery() : r;
+        if (r == null || r.isEmpty()) return l;
         return new TsQuery(Op.AND, null, false, null, l, r, 0);
     }
 
     public static TsQuery or(TsQuery l, TsQuery r) {
+        if (l == null || l.isEmpty()) return r == null ? emptyQuery() : r;
+        if (r == null || r.isEmpty()) return l;
         return new TsQuery(Op.OR, null, false, null, l, r, 0);
     }
 
+    /** Negating nothing is still nothing: there is no lexeme for the NOT to be about. */
     public static TsQuery not(TsQuery operand) {
+        if (operand == null || operand.isEmpty()) return emptyQuery();
         return new TsQuery(Op.NOT, null, false, null, operand, null, 0);
     }
 
     public static TsQuery phrase(TsQuery l, TsQuery r, int distance) {
+        if (l == null || l.isEmpty()) return r == null ? emptyQuery() : r;
+        if (r == null || r.isEmpty()) return l;
         return new TsQuery(Op.PHRASE, null, false, null, l, r, distance);
     }
 
@@ -101,13 +115,31 @@ public class TsQuery {
      * operands with no operator is a "syntax error in tsquery", and an operator
      * missing an operand is "no operand in tsquery".
      */
+    /**
+     * Read a tsquery the way a literal is read: the lexemes are taken exactly as written.
+     *
+     * <p>This is the whole difference between {@code 'Cats'::tsquery} and
+     * {@code to_tsquery('Cats')}. A literal already names the lexemes to look for, so nothing is
+     * lowercased, stemmed or dropped — {@code 'Cats'} stays {@code 'Cats'} and {@code 'a'} stays
+     * {@code 'a'} even though the English dictionary would call it a stop word. Running a literal
+     * through a dictionary turned {@code 'a & b'} into a query with a hole in it.
+     */
     public static TsQuery parse(String input) {
+        return parse(input, null);
+    }
+
+    /**
+     * Read a tsquery and normalize each lexeme through a text search configuration, which is what
+     * {@code to_tsquery} does. {@code simple} folds case and no more; every other configuration
+     * also drops stop words and stems what is left.
+     */
+    public static TsQuery parse(String input, String config) {
         if (input == null || input.trim().isEmpty()) return emptyQuery();
         List<String> tokens = tokenize(input);
         if (tokens.isEmpty()) return emptyQuery();
         try {
             int[] pos = {0};
-            TsQuery result = parseOr(tokens, pos);
+            TsQuery result = parseOr(tokens, pos, config);
             // Leftover tokens mean two operands with no operator between them.
             if (pos[0] < tokens.size()) throw new TsqParseError(false);
             return result;
@@ -119,39 +151,39 @@ public class TsQuery {
         }
     }
 
-    private static TsQuery parseOr(List<String> tokens, int[] pos) {
-        TsQuery left = parseAnd(tokens, pos);
+    private static TsQuery parseOr(List<String> tokens, int[] pos, String config) {
+        TsQuery left = parseAnd(tokens, pos, config);
         while (pos[0] < tokens.size() && tokens.get(pos[0]).equals("|")) {
             pos[0]++;
-            TsQuery right = parseAnd(tokens, pos);
+            TsQuery right = parseAnd(tokens, pos, config);
             left = or(left, right);
         }
         return left;
     }
 
-    private static TsQuery parseAnd(List<String> tokens, int[] pos) {
-        TsQuery left = parsePhrase(tokens, pos);
+    private static TsQuery parseAnd(List<String> tokens, int[] pos, String config) {
+        TsQuery left = parsePhrase(tokens, pos, config);
         while (pos[0] < tokens.size() && tokens.get(pos[0]).equals("&")) {
             pos[0]++;
-            TsQuery right = parsePhrase(tokens, pos);
+            TsQuery right = parsePhrase(tokens, pos, config);
             left = and(left, right);
         }
         return left;
     }
 
-    private static TsQuery parsePhrase(List<String> tokens, int[] pos) {
-        TsQuery left = parsePrimary(tokens, pos);
+    private static TsQuery parsePhrase(List<String> tokens, int[] pos, String config) {
+        TsQuery left = parsePrimary(tokens, pos, config);
         while (pos[0] < tokens.size()) {
             String tok = tokens.get(pos[0]);
             if (tok.equals("<->")) {
                 pos[0]++;
-                TsQuery right = parsePrimary(tokens, pos);
+                TsQuery right = parsePrimary(tokens, pos, config);
                 left = phrase(left, right, 1);
             } else if (tok.startsWith("<") && tok.endsWith(">")) {
                 try {
                     int dist = Integer.parseInt(tok.substring(1, tok.length() - 1));
                     pos[0]++;
-                    TsQuery right = parsePrimary(tokens, pos);
+                    TsQuery right = parsePrimary(tokens, pos, config);
                     left = phrase(left, right, dist);
                 } catch (NumberFormatException e) {
                     break;
@@ -163,7 +195,7 @@ public class TsQuery {
         return left;
     }
 
-    private static TsQuery parsePrimary(List<String> tokens, int[] pos) {
+    private static TsQuery parsePrimary(List<String> tokens, int[] pos, String config) {
         // A primary (operand) is required here; running out of tokens or hitting a
         // binary operator / close-paren means the preceding operator has no operand.
         if (pos[0] >= tokens.size()) throw new TsqParseError(true);
@@ -174,11 +206,11 @@ public class TsQuery {
         }
         if (t.equals("!")) {
             pos[0]++;
-            return not(parsePrimary(tokens, pos));
+            return not(parsePrimary(tokens, pos, config));
         }
         if (t.equals("(")) {
             pos[0]++;
-            TsQuery result = parseOr(tokens, pos);
+            TsQuery result = parseOr(tokens, pos, config);
             if (pos[0] < tokens.size() && tokens.get(pos[0]).equals(")")) pos[0]++;
             else throw new TsqParseError(false); // missing ')'
             return result;
@@ -207,7 +239,17 @@ public class TsQuery {
                 if (ws.isEmpty()) ws = null;
             }
         }
-        return term(t, isPrefix, ws);
+        return lexeme(t, isPrefix, ws, config);
+    }
+
+    /**
+     * The lexeme a written word stands for. With no configuration the word is the lexeme, which is
+     * how a literal is read; with one, the word goes through that configuration's dictionary.
+     */
+    private static TsQuery lexeme(String word, boolean prefix, Set<Character> weights, String config) {
+        if (config == null) return new TsQuery(Op.TERM, word, prefix, weights, null, null, 0);
+        if ("simple".equalsIgnoreCase(config)) return termSimple(word, prefix, weights);
+        return term(word, prefix, weights);
     }
 
     private static List<String> tokenize(String input) {
@@ -275,7 +317,10 @@ public class TsQuery {
     public boolean matches(TsVector vector) {
         switch (op) {
             case TERM: {
-                if (term == null || term.isEmpty()) return true;
+                // An empty query names no lexeme, so there is nothing for a document to hold.
+                // Matching everything instead made to_tsquery('a') -- a stop word, and so empty --
+                // match every row.
+                if (term == null || term.isEmpty()) return false;
                 if (prefix) {
                     boolean found = vector.getLexemes().stream()
                             .anyMatch(l -> l.startsWith(term));
@@ -304,7 +349,8 @@ public class TsQuery {
                     return left.matches(vector) && right.matches(vector);
                 }
                 if (left.term == null || left.term.isEmpty() || right.term == null || right.term.isEmpty()) {
-                    // Empty terms (from stopwords) match anything
+                    // A phrase with nothing on one side is not a phrase; whatever is left has to
+                    // be found on its own.
                     return left.matches(vector) && right.matches(vector);
                 }
                 List<Integer> leftPositions = vector.getPositions(left.term);
@@ -344,7 +390,8 @@ public class TsQuery {
     public int numNode() {
         switch (op) {
             case TERM:
-                return 1;
+                // An empty query has no nodes at all.
+                return term == null || term.isEmpty() ? 0 : 1;
             case NOT:
                 return 1 + left.numNode();
             case AND:

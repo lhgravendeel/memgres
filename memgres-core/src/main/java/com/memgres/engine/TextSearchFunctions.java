@@ -128,7 +128,9 @@ class TextSearchFunctions {
                 if (tsqStr.matches("(?s).*[&|]\\s*[&|].*")) {
                     throw new MemgresException("syntax error in tsquery: \"" + tsqStr + "\"", "42601");
                 }
-                return TsQuery.parse(tsqStr);
+                // Unlike a literal, to_tsquery runs each word through the configuration's
+                // dictionary, so 'Cats' becomes 'cat' under english and 'cats' under simple.
+                return TsQuery.parse(tsqStr, config);
             }
             case "plainto_tsquery": {
                 String config = "english";

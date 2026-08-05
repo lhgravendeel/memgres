@@ -156,11 +156,13 @@ class BinaryOpEvaluator {
                 && !other.equals("tsvector") && !other.equals("tsquery")) {
             return null;
         }
-        // @@ never takes two queries: a literal to the right of a tsquery is the document being
-        // searched, so it is read as a tsvector. Reading it as another tsquery made 'a b' -- a
-        // perfectly good document -- a syntax error.
-        if (bin.op() == BinaryExpr.BinOp.TS_MATCH && other.equals("tsquery")) {
-            return rightUntyped ? "tsvector" : null;
+        // @@ never takes two of a kind: a literal beside a tsquery is the document being searched
+        // and is read as a tsvector; a literal beside a tsvector is the query and is read as a
+        // tsquery. Reading a literal as whatever the other side was made 'a b' -- a perfectly good
+        // document -- a syntax error, and left tsvector @@ 'a' with no operator at all.
+        if (bin.op() == BinaryExpr.BinOp.TS_MATCH) {
+            if (other.equals("tsquery")) return rightUntyped ? "tsvector" : null;
+            if (other.equals("tsvector")) return null;
         }
         return LITERAL_RESOLVABLE_TYPES.contains(other) ? other : null;
     }
@@ -328,6 +330,28 @@ class BinaryOpEvaluator {
     private static boolean isUntypedStringLiteral(Expression expr) {
         return expr instanceof Literal
                 && ((Literal) expr).literalType() == Literal.LiteralType.STRING;
+    }
+
+    /** The types that make an operand of {@code @@} the document rather than the query. */
+    private static final java.util.Set<String> TEXTUAL_TYPES = Cols.setOf(
+            "text", "varchar", "character varying", "char", "character", "bpchar", "name", "citext");
+
+    /**
+     * What an operand of {@code @@} is, as far as resolution is concerned: {@code "tsvector"},
+     * {@code "tsquery"}, {@code "text"} when it was written as text, or null when it is an
+     * untyped literal that the other side has to settle.
+     *
+     * <p>Which operator was written is not something the values can answer on their own. A tsvector
+     * beside a literal reads that literal as a query; a text beside one reads it as a phrase to
+     * search for. Both arrive here as a Java string.
+     */
+    private String matchOperandType(Expression expr, RowContext ctx) {
+        if (isUntypedStringLiteral(expr)) return null;
+        String declared = declaredOperandType(expr, ctx);
+        if ("tsvector".equals(declared) || "tsquery".equals(declared)) return declared;
+        // Only a operand actually written as a string type reads its partner as a phrase; one
+        // whose type this cannot work out is left for the values to settle, as before.
+        return TEXTUAL_TYPES.contains(declared) ? "text" : null;
     }
 
     /** The type an operand is declared to have, from a cast or a column, or null. */
@@ -797,6 +821,14 @@ class BinaryOpEvaluator {
                 && isJsonbExpression(bin.left(), ctx)) {
             return executor.functionEvaluator.evaluateJsonPathMatchSilent(
                     left.toString().trim(), right.toString().trim());
+        }
+
+        // PostgreSQL declares four @@ operators and they disagree on how to read a bare string,
+        // so the answer depends on which one was written. Only here are both operands still
+        // expressions, so this is where that can be told.
+        if (bin.op() == BinaryExpr.BinOp.TS_MATCH && left != null && right != null) {
+            return TextSearchOperations.matches(left, right,
+                    matchOperandType(bin.left(), ctx), matchOperandType(bin.right(), ctx));
         }
 
         // A jsonb scalar is stored as its own text, so only the declared type tells

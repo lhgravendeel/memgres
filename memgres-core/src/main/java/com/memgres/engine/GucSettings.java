@@ -75,7 +75,7 @@ public class GucSettings {
             {"debug_assertions", "off", "bool", "internal", "Preset Options", null, null, null, null, "Shows whether the running server has assertion checks enabled."},
             {"default_table_access_method", "heap", "string", "user", "Client Connection Defaults / Statement Behavior", null, null, null, null, "Sets the default table access method for new tables."},
             {"default_tablespace", "", "string", "user", "Client Connection Defaults / Statement Behavior", null, null, null, null, "Sets the default tablespace to create tables and indexes in.", "An empty string means use the database's default tablespace."},
-            {"default_text_search_config", "pg_catalog.simple", "string", "user", "Client Connection Defaults / Locale and Formatting", null, null, null, null, "Sets default text search configuration."},
+            {"default_text_search_config", "pg_catalog.english", "string", "user", "Client Connection Defaults / Locale and Formatting", null, null, null, null, "Sets default text search configuration."},
             {"default_toast_compression", "pglz", "enum", "user", "Client Connection Defaults / Statement Behavior", null, null, null, "pglz,lz4", "Sets the default compression method for compressible values."},
             {"default_transaction_deferrable", "off", "bool", "user", "Client Connection Defaults / Statement Behavior", null, null, null, null, "Sets the default deferrable status of new transactions."},
             {"default_transaction_isolation", "read committed", "enum", "user", "Client Connection Defaults / Statement Behavior", null, null, null, "serializable,repeatable read,read committed,read uncommitted", "Sets the transaction isolation level of each new transaction."},
