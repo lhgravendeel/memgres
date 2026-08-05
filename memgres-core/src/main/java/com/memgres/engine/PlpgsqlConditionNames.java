@@ -9,11 +9,11 @@ import java.util.Set;
  * errcodes, and a name outside it is a compile error rather than a handler that quietly never
  * fires — which is the failure a misspelled condition otherwise produces.
  */
-final class PlpgsqlConditionNames {
+public final class PlpgsqlConditionNames {
 
     private PlpgsqlConditionNames() {}
 
-    static boolean isKnown(String name) {
+    public static boolean isKnown(String name) {
         return NAMES.contains(name.toLowerCase());
     }
 

@@ -356,7 +356,7 @@ public final class PlpgsqlBodyValidator {
             if (!STACKED_ITEMS.contains(name.toUpperCase())
                     && !CURRENT_ITEMS.contains(name.toUpperCase())) {
                 throw new MemgresException("unrecognized GET DIAGNOSTICS item at or near \""
-                        + name.toLowerCase() + "\"", "42601");
+                        + name + "\"", "42601");
             }
         }
         for (PlpgsqlStatement.DiagItem item : stmt.items()) {
