@@ -1006,6 +1006,13 @@ class SessionExecutor {
                         }
                     }
                 }
+                // Outside a transaction block the statement is its own transaction, so the mode
+                // it set ends with it. Letting it persist made a later transaction check a
+                // deferred constraint immediately, which is the opposite of what was asked for
+                // and had nothing to do with the statement that asked.
+                if (executor.session != null && !executor.session.isExplicitTransactionBlock()) {
+                    executor.session.clearConstraintModes();
+                }
                 return QueryResult.message(QueryResult.Type.SET, "SET CONSTRAINTS");
             }
         }

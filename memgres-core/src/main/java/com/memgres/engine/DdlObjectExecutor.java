@@ -87,6 +87,7 @@ class DdlObjectExecutor {
             executor.identity().typeCreated(TypeNamespace.key(schema, name));
             executor.database.addCompositeType(schema, name, stmt.compositeFields());
             executor.database.registerSchemaObject(schema, "composite", name);
+            executor.recordUndo(new Session.CreateCompositeTypeUndo(schema, name));
         }
         if (wasShell) executor.database.getShellTypes().remove(TypeNamespace.key(schema, name));
         return QueryResult.command(QueryResult.Type.CREATE_TYPE, 0);
@@ -3158,6 +3159,7 @@ class DdlObjectExecutor {
         executor.identity().typeCreated(TypeNamespace.key(domainSchema, stmt.name()));
         executor.database.addDomain(domain);
         executor.database.registerSchemaObject(domainSchema, "domain", stmt.name());
+        executor.recordUndo(new Session.CreateDomainUndo(domainSchema, stmt.name()));
         return QueryResult.message(QueryResult.Type.SET, "CREATE DOMAIN");
     }
 

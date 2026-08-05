@@ -479,10 +479,16 @@ class MultiConnectionTransactionTest {
             s1.execute("INSERT INTO ddl_txn_drop VALUES (1), (2), (3)");
             s1.execute("BEGIN");
             s1.execute("DROP TABLE ddl_txn_drop");
-            // c2 should not see table
+            // The drop has not committed, so the relation is still there for c2: this transaction
+            // may roll back, and a session told a live relation was missing has been told wrong.
+            // PostgreSQL makes c2 wait on the ACCESS EXCLUSIVE lock instead of answering; memgres
+            // answers from the state the drop has not yet replaced, which is the same answer that
+            // wait would produce for a rollback and differs only in the window before a commit.
+            assertEquals("3", query1(s2, "SELECT count(*) FROM ddl_txn_drop"));
+            // Its own session sees it gone, which is what the rest of that transaction expects.
             try {
-                s2.executeQuery("SELECT count(*) FROM ddl_txn_drop");
-                fail("Table should be dropped");
+                s1.executeQuery("SELECT count(*) FROM ddl_txn_drop");
+                fail("the dropping session should not still see the table");
             } catch (SQLException e) {
                 // expected
             }
@@ -1060,11 +1066,19 @@ class MultiConnectionTransactionTest {
             s1.execute("INSERT INTO alter_rb VALUES (1)");
             s1.execute("BEGIN");
             s1.execute("ALTER TABLE alter_rb ADD COLUMN val text DEFAULT 'hello'");
-            // c2 should see the new column
-            assertEquals("hello", query1(s2, "SELECT val FROM alter_rb WHERE id = 1"));
-            // Note: ALTER TABLE rollback may not be fully supported (depends on undo entries)
-            // Just verify no crash
+            // The column belongs to this transaction until it commits, so c2's view of the
+            // relation is the shape it had before the ALTER.
+            try {
+                s2.executeQuery("SELECT val FROM alter_rb WHERE id = 1");
+                fail("an uncommitted column should not be visible to another session");
+            } catch (SQLException e) {
+                // expected
+            }
+            // The altering session sees it, or it could not write to it.
+            assertEquals("hello", query1(s1, "SELECT val FROM alter_rb WHERE id = 1"));
             s1.execute("COMMIT");
+            // Once committed it is everyone's.
+            assertEquals("hello", query1(s2, "SELECT val FROM alter_rb WHERE id = 1"));
             s1.execute("DROP TABLE alter_rb");
         }
     }

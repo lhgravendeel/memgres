@@ -856,6 +856,7 @@ class DdlAdminExecutor {
             throw new MemgresException("schema \"" + s.name() + "\" already exists", "42P06");
         }
         executor.database.getOrCreateSchema(s.name());
+        executor.recordUndo(new Session.CreateSchemaUndo(s.name()));
         String owner = s.authorization() != null ? s.authorization() : executor.sessionUser();
         executor.database.setObjectOwner("schema:" + s.name(), owner);
         return QueryResult.message(QueryResult.Type.SET, "CREATE SCHEMA");

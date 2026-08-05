@@ -1097,6 +1097,10 @@ class FromResolver {
         executor.checkTablePrivilege("SELECT", schemaName, tableRef.table());
         // A reader inside an explicit transaction holds ACCESS SHARE until it ends, which is
         // what makes a concurrent TRUNCATE or ALTER wait instead of yanking the table away.
+        // An autocommit reader does not take it: PostgreSQL would, but a lock wait with no
+        // deadline turns any session that is left idle in a transaction into one that hangs
+        // every later reader, and what that lock protects here is answered by hiding the
+        // uncommitted shape instead.
         if (executor.session != null && executor.session.isInTransaction()) {
             executor.database.acquireTableLock(schemaName + "." + tableRef.table(),
                     "AccessShareLock", executor.session, false);
