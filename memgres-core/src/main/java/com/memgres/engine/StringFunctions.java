@@ -352,6 +352,37 @@ class StringFunctions {
         this.executor = executor;
     }
 
+    /** The encodings {@code to_ascii} can read from; every other one it refuses outright. */
+    private static final java.util.Set<String> TO_ASCII_SOURCES =
+            Cols.setOf("LATIN1", "LATIN2", "LATIN9", "WIN1250");
+
+    /** PostgreSQL's encoding numbers, for the {@code to_ascii(text, integer)} form. */
+    private static final String[] ENCODING_BY_CODE = {
+            "SQL_ASCII", "EUC_JP", "EUC_CN", "EUC_KR", "EUC_TW", "EUC_JIS_2004", "UTF8",
+            "MULE_INTERNAL", "LATIN1", "LATIN2", "LATIN3", "LATIN4", "LATIN5", "LATIN6",
+            "LATIN7", "LATIN8", "LATIN9", "LATIN10", "WIN1256", "WIN1258", "WIN866", "WIN874",
+            "KOI8R", "WIN1251", "WIN1252", "ISO_8859_5", "ISO_8859_6", "ISO_8859_7",
+            "ISO_8859_8", "WIN1250", "WIN1253", "WIN1254", "WIN1255", "WIN1257", "KOI8U"};
+
+    /**
+     * The encoding an argument names, whether it was written as a name or as PostgreSQL's own
+     * number for it. Neither a name nor a number that names no encoding is guessed at.
+     */
+    private static String encodingNameOf(Object arg) {
+        if (arg instanceof Number) {
+            int code = ((Number) arg).intValue();
+            if (code < 0 || code >= ENCODING_BY_CODE.length) {
+                throw new MemgresException(code + " is not a valid encoding code", "42704");
+            }
+            return ENCODING_BY_CODE[code];
+        }
+        String name = arg.toString().trim();
+        for (String known : ENCODING_BY_CODE) {
+            if (known.equalsIgnoreCase(name)) return known;
+        }
+        throw new MemgresException(name + " is not a valid encoding name", "42704");
+    }
+
     Object eval(String name, FunctionCallExpr fn, RowContext ctx) {
         switch (name) {
             case "length":
@@ -494,6 +525,32 @@ class StringFunctions {
                 }
             }
             case "trim":
+            case "to_ascii": {
+                Object arg = executor.evalExpr(fn.args().get(0), ctx);
+                if (arg == null) return null;
+                // The source encoding is the one named, or the server's when none is. PostgreSQL
+                // only converts from the single-byte Latin and Windows encodings, and says so
+                // rather than guessing at anything else — including its own UTF8.
+                String encoding = "UTF8";
+                if (fn.args().size() > 1) {
+                    Object encArg = executor.evalExpr(fn.args().get(1), ctx);
+                    if (encArg == null) return null;
+                    encoding = encodingNameOf(encArg);
+                }
+                if (!TO_ASCII_SOURCES.contains(encoding.toUpperCase())) {
+                    throw new MemgresException("encoding conversion from " + encoding
+                            + " to ASCII not supported", "0A000");
+                }
+                // Strip the accents rather than the letters: that is what the conversion is for.
+                String folded = java.text.Normalizer.normalize(
+                        arg.toString(), java.text.Normalizer.Form.NFD);
+                StringBuilder ascii = new StringBuilder(folded.length());
+                for (int i = 0; i < folded.length(); i++) {
+                    char c = folded.charAt(i);
+                    if (Character.getType(c) != Character.NON_SPACING_MARK) ascii.append(c);
+                }
+                return ascii.toString();
+            }
             case "btrim": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
@@ -504,7 +561,11 @@ class StringFunctions {
                     return byteaTrim(data, trimBytes, true, true);
                 }
                 if (fn.args().size() > 1) {
-                    String chars = String.valueOf(executor.evalExpr(fn.args().get(1), ctx));
+                    Object charsArg = executor.evalExpr(fn.args().get(1), ctx);
+                    // Strict: there is no answer to "trim these characters" when which characters
+                    // is unknown. Rendering the NULL as text trimmed the letters of the word null.
+                    if (charsArg == null) return null;
+                    String chars = charsArg.toString();
                     String s = arg.toString();
                     int start = 0;
                     while (start < s.length() && chars.indexOf(s.charAt(start)) >= 0) start++;
@@ -644,7 +705,12 @@ class StringFunctions {
                     byte[] trimBytes = fn.args().size() > 1 ? toBytea(executor.evalExpr(fn.args().get(1), ctx)) : new byte[]{0x20};
                     return byteaTrim(data, trimBytes, true, false);
                 }
-                String chars = fn.args().size() > 1 ? String.valueOf(executor.evalExpr(fn.args().get(1), ctx)) : " ";
+                String chars = " ";
+                if (fn.args().size() > 1) {
+                    Object charsArg = executor.evalExpr(fn.args().get(1), ctx);
+                    if (charsArg == null) return null;
+                    chars = charsArg.toString();
+                }
                 String s = str.toString();
                 int i = 0;
                 while (i < s.length() && chars.indexOf(s.charAt(i)) >= 0) i++;
@@ -659,7 +725,12 @@ class StringFunctions {
                     byte[] trimBytes = fn.args().size() > 1 ? toBytea(executor.evalExpr(fn.args().get(1), ctx)) : new byte[]{0x20};
                     return byteaTrim(data, trimBytes, false, true);
                 }
-                String chars = fn.args().size() > 1 ? String.valueOf(executor.evalExpr(fn.args().get(1), ctx)) : " ";
+                String chars = " ";
+                if (fn.args().size() > 1) {
+                    Object charsArg = executor.evalExpr(fn.args().get(1), ctx);
+                    if (charsArg == null) return null;
+                    chars = charsArg.toString();
+                }
                 String s = str.toString();
                 int i2 = s.length() - 1;
                 while (i2 >= 0 && chars.indexOf(s.charAt(i2)) >= 0) i2--;

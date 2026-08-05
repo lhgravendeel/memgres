@@ -521,10 +521,13 @@ class CatalogMetadataFunctions {
         if (fn.args().isEmpty()) return null;
         Object arg = executor.evalExpr(fn.args().get(0), ctx);
         int colNo = 0;
+        boolean pretty = false;
         if (fn.args().size() >= 2) {
             Object colNoArg = executor.evalExpr(fn.args().get(1), ctx);
             colNo = colNoArg != null ? ((Number) colNoArg).intValue() : 0;
-            if (fn.args().size() >= 3) executor.evalExpr(fn.args().get(2), ctx);
+            if (fn.args().size() >= 3) {
+                pretty = executor.isTruthy(executor.evalExpr(fn.args().get(2), ctx));
+            }
         }
         if (arg == null) return null;
         // Two schemas may each hold an index called i, so the OID — which names exactly one of
@@ -597,8 +600,27 @@ class CatalogMetadataFunctions {
         List<String> includeColumns = executor.database.getIndexIncludeColumns(indexKey);
         boolean nullsNotDistinct = executor.database.isIndexNullsNotDistinct(indexKey)
                 || constraintNullsNotDistinct;
-        return CatalogStubBuilder.buildIndexDef(indexName, tableName, unique, idxMethod,
+        // The pretty form drops the schema from the table name when the search path reaches it,
+        // which is the only difference between the two spellings PostgreSQL prints.
+        return CatalogStubBuilder.buildIndexDef(indexName,
+                pretty ? unqualifiedWhenOnPath(tableName) : tableName, unique, idxMethod,
                 normalizedCols, columnOptions, includeColumns, nullsNotDistinct, whereClause);
+    }
+
+    /**
+     * A {@code schema.name} written the way the pretty form writes it: bare when the search path
+     * reaches that schema, qualified when it does not, so the reader can still tell which relation
+     * is meant.
+     */
+    private String unqualifiedWhenOnPath(String qualified) {
+        if (qualified == null) return null;
+        int dot = qualified.lastIndexOf('.');
+        if (dot <= 0) return qualified;
+        String schema = qualified.substring(0, dot);
+        for (String onPath : executor.searchPathSchemas()) {
+            if (schema.equalsIgnoreCase(onPath)) return qualified.substring(dot + 1);
+        }
+        return qualified;
     }
 
     /**

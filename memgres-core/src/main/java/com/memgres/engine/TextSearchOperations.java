@@ -22,6 +22,26 @@ public class TextSearchOperations {
      * other side leaves it: a vector opposite a query, a query opposite a vector.
      */
     public static Object matches(Object left, Object right) {
+        return matches(left, right, null, null);
+    }
+
+    /**
+     * The same, told what each side was written as. PostgreSQL declares four {@code @@} operators
+     * and they do not agree on how to read a bare string, so which one was written decides the
+     * answer:
+     *
+     * <ul>
+     *   <li>{@code tsvector @@ tsquery} — both sides already lexemes.</li>
+     *   <li>{@code text @@ tsquery} — the text becomes a vector through {@code to_tsvector}.</li>
+     *   <li>{@code text @@ text} — and the right becomes a query through
+     *       {@code plainto_tsquery}, so {@code 'cat dog'} is two words to find rather than a
+     *       tsquery with a syntax error in it.</li>
+     *   <li>{@code tsquery @@ tsvector} — the commuted form of the first.</li>
+     * </ul>
+     *
+     * <p>{@code operandType} is null for an untyped literal, which the other side settles.
+     */
+    public static Object matches(Object left, Object right, String leftType, String rightType) {
         if (left == null || right == null) return null;
         // One of each is the only pairing PG declares; two of a kind matches nothing
         if (left instanceof TsQuery && right instanceof TsQuery) {
@@ -30,21 +50,49 @@ public class TextSearchOperations {
         if (left instanceof TsVector && right instanceof TsVector) {
             throw new MemgresException("operator does not exist: tsvector @@ tsvector", "42883");
         }
+        // A query on the left is the commuted form; there is no tsquery @@ text at all.
+        if (left instanceof TsQuery && "text".equals(rightType)) {
+            throw new MemgresException("operator does not exist: tsquery @@ text", "42883");
+        }
         boolean queryOnLeft = left instanceof TsQuery
                 || (right instanceof TsVector && !(left instanceof TsVector));
         Object documentSide = queryOnLeft ? right : left;
         Object querySide = queryOnLeft ? left : right;
+        String documentType = queryOnLeft ? rightType : leftType;
+
         TsVector vector;
         if (documentSide instanceof TsVector) {
             vector = (TsVector) documentSide;
+        } else if (queryOnLeft && querySide instanceof TsQuery && documentType == null) {
+            // An untyped literal to the right of a query is the document, and PostgreSQL reads it
+            // as a vector written out: there is no tsquery @@ text to prefer instead. To the left
+            // of one it is text, because @@(text, tsquery) exists and text is the preferred type
+            // of its category -- which is why 'a b' @@ 'a'::tsquery is false and the commuted form
+            // is true.
+            TsVector parsed = TsVector.parseLiteral(documentSide.toString());
+            vector = parsed != null ? parsed : TsVector.fromText(documentSide.toString());
         } else {
-            String text = documentSide.toString();
-            TsVector parsed = TsVector.parseLiteral(text);
-            vector = parsed != null ? parsed : TsVector.fromText(text);
+            // Written as text: the words go through the default configuration rather than being
+            // read as a vector already written out.
+            vector = TsVector.fromText(documentSide.toString());
         }
-        TsQuery query = querySide instanceof TsQuery
-                ? (TsQuery) querySide : TsQuery.parse(querySide.toString());
+
+        TsQuery query;
+        if (querySide instanceof TsQuery) {
+            query = (TsQuery) querySide;
+        } else if (documentSide instanceof TsVector || "tsvector".equals(documentType)) {
+            // Opposite a vector, a bare string is a tsquery as written.
+            query = TsQuery.parse(querySide.toString());
+        } else {
+            // text @@ text: the right side is a phrase to look for, not a query to parse.
+            query = phraseWordsToQuery(querySide.toString());
+        }
         return vector.matches(query);
+    }
+
+    /** {@code plainto_tsquery} over the default configuration, which is what text @@ text uses. */
+    private static TsQuery phraseWordsToQuery(String text) {
+        return plainToTsQuery(text, "english");
     }
 
     /** phraseto_tsquery: treats input as a phrase (words connected by <N> where N accounts for stopwords).

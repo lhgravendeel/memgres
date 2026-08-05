@@ -50,13 +50,27 @@ class RangeFunctions {
      * {@code rangeType}'s element type. Going through the range's own text form is what makes
      * {@code tsrange(date, date)} come back as the pair of timestamps it actually holds.
      */
+    /**
+     * The bound flags a range constructor was given, or {@code "[)"} when it was given none.
+     * A NULL is not a default: PostgreSQL refuses it, because which bounds were meant is exactly
+     * what the argument was there to say.
+     */
+    private String boundFlags(FunctionCallExpr fn, RowContext ctx) {
+        if (fn.args().size() <= 2) return "[)";
+        Object flags = executor.evalExpr(fn.args().get(2), ctx);
+        if (flags == null) {
+            throw new MemgresException(
+                    "range constructor flags argument must not be null", "22000");
+        }
+        return flags.toString();
+    }
+
     private String buildRange(String rangeType, FunctionCallExpr fn, RowContext ctx) {
         String cast = castedRange(rangeType, fn, ctx);
         if (cast != NOT_A_CAST) return cast;
         Object loObj = executor.evalExpr(fn.args().get(0), ctx);
         Object hiObj = executor.evalExpr(fn.args().get(1), ctx);
-        String bounds = fn.args().size() > 2 && executor.evalExpr(fn.args().get(2), ctx) != null
-                ? executor.evalExpr(fn.args().get(2), ctx).toString() : "[)";
+        String bounds = boundFlags(fn, ctx);
         if (bounds.length() != 2
                 || (bounds.charAt(0) != '[' && bounds.charAt(0) != '(')
                 || (bounds.charAt(1) != ']' && bounds.charAt(1) != ')')) {
@@ -137,7 +151,7 @@ class RangeFunctions {
                 Object loObj = executor.evalExpr(fn.args().get(0), ctx);
                 Object hiObj = executor.evalExpr(fn.args().get(1), ctx);
                 rejectWiderBound("int4range", loObj, hiObj);
-                String bounds = fn.args().size() > 2 ? executor.evalExpr(fn.args().get(2), ctx).toString() : "[)";
+                String bounds = boundFlags(fn, ctx);
                 Integer lo = loObj == null ? null : executor.toInt(loObj);
                 Integer hi = hiObj == null ? null : executor.toInt(hiObj);
                 return RangeOperations.int4rangeNullable(lo, hi, bounds).toString();
@@ -345,7 +359,7 @@ class RangeFunctions {
                     // User-defined range type constructor: treat like int4range
                     Object loObj = executor.evalExpr(fn.args().get(0), ctx);
                     Object hiObj = executor.evalExpr(fn.args().get(1), ctx);
-                    String bounds = fn.args().size() > 2 ? executor.evalExpr(fn.args().get(2), ctx).toString() : "[)";
+                    String bounds = boundFlags(fn, ctx);
                     // For integer subtypes, use canonical form
                     String st = subtype.toLowerCase();
                     if (st.equals("int4") || st.equals("integer") || st.equals("int") || st.equals("int8") || st.equals("bigint") || st.equals("smallint") || st.equals("int2")) {

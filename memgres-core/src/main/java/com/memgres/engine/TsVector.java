@@ -213,12 +213,14 @@ public class TsVector {
         return query.matches(this);
     }
 
-    /** Check if lexeme exists. For tsvector produced via parseLiteral, exact match; for stemmed, stem first. */
+    /**
+     * Whether this vector holds the lexeme. A tsvector holds lexemes and a tsquery holds lexemes,
+     * so the comparison is exact: whatever normalization either side needed was done when it was
+     * built. Stemming here instead made {@code 'cats'::tsquery} match a vector holding
+     * {@code 'cat'}, which PostgreSQL does not.
+     */
     public boolean containsLexeme(String lexeme) {
-        // Try exact match first (for literal tsvectors)
-        if (lexemes.containsKey(lexeme)) return true;
-        // Then try stemmed match
-        return lexemes.containsKey(simpleStem(lexeme.toLowerCase()));
+        return lexemes.containsKey(lexeme);
     }
 
     /** Check if lexeme exists (exact match only, no stemming). */
@@ -234,12 +236,9 @@ public class TsVector {
         return lexemes;
     }
 
-    /** Get all positions for a lexeme. */
+    /** Get all positions for a lexeme, matched exactly as {@link #containsLexeme} does. */
     public List<Integer> getPositions(String lexeme) {
         List<PosEntry> entries = lexemes.get(lexeme);
-        if (entries == null) {
-            entries = lexemes.get(simpleStem(lexeme.toLowerCase()));
-        }
         if (entries == null) return Cols.listOf();
         return entries.stream().map(PosEntry::position).collect(Collectors.toList());
     }
