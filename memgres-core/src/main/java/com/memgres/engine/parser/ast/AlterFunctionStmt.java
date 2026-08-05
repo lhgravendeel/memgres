@@ -67,7 +67,15 @@ public final class AlterFunctionStmt implements Statement {
         RENAME_TO,
         SET_SCHEMA,
         OWNER_TO,
-        SET_ATTRIBUTES   // volatility, strict, security, cost, rows, parallel, leakproof, SET/RESET
+        SET_ATTRIBUTES,  // volatility, strict, security, cost, rows, parallel, leakproof, SET/RESET
+        DEPENDS_ON_EXTENSION   // records nothing, but the extension still has to exist
+    }
+
+    /** Convenience factory for DEPENDS ON EXTENSION, whose target is carried in targetValue. */
+    public static AlterFunctionStmt dependsOnExtension(String name, String schema, boolean isProcedure,
+                                                       String extension, java.util.List<String> paramTypes) {
+        return new AlterFunctionStmt(name, schema, isProcedure, false, Action.DEPENDS_ON_EXTENSION,
+                extension, null, null, null, null, null, null, null, null, null, paramTypes);
     }
 
     /** Convenience factory for RENAME TO. */

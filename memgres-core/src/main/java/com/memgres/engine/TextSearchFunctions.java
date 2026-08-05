@@ -63,32 +63,62 @@ class TextSearchFunctions {
                 "text search configuration \"" + rawName + "\" does not exist", "42704");
     }
 
+    /**
+     * The names this class answers to. Checked before anything is evaluated, so a call this class
+     * does not handle is handed on untouched rather than having its arguments run twice.
+     */
+    private static final Set<String> HANDLED = Cols.setOf(
+            "__tsquery_not__", "array_to_tsvector", "get_current_ts_config", "numnode",
+            "phraseto_tsquery", "plainto_tsquery", "querytree", "setweight", "strip",
+            "to_tsquery", "to_tsvector", "ts_debug", "ts_delete", "ts_filter", "ts_headline",
+            "ts_lexize", "ts_parse", "ts_rank", "ts_rank_cd", "ts_rewrite", "ts_stat",
+            "ts_token_type", "tsquery_phrase", "tsvector_to_array", "websearch_to_tsquery");
+
+    /**
+     * Every text-search function PostgreSQL exposes is declared strict, so a NULL argument makes
+     * the call NULL without the body ever running. {@code get_current_ts_config} takes no
+     * argument and {@code __tsquery_not__} is memgres's own spelling of the {@code !!} operator,
+     * which is strict as well; the exceptions in pg_proc are all internal support functions that
+     * are not reachable from SQL.
+     */
     Object eval(String name, FunctionCallExpr fn, RowContext ctx) {
+        if (!HANDLED.contains(name)) return NOT_HANDLED;
+        // Evaluated once, here: reading an argument twice would run a volatile expression twice,
+        // and nextval() in an argument would burn two values.
+        List<Object> argv = new ArrayList<Object>(fn.args().size());
+        for (Expression arg : fn.args()) argv.add(executor.evalExpr(arg, ctx));
+        for (Object v : argv) {
+            if (v == null) return null;
+        }
+        return eval(name, argv, ctx);
+    }
+
+    private Object eval(String name, List<Object> argv, RowContext ctx) {
         switch (name) {
             case "__tsquery_not__": {
-                Object operand = executor.evalExpr(fn.args().get(0), ctx);
+                Object operand = argv.get(0);
                 if (operand == null) return null;
                 TsQuery q = operand instanceof TsQuery ? (TsQuery) operand : TsQuery.parse(operand.toString());
                 return TsQuery.not(q);
             }
             case "to_tsvector": {
-                if (fn.args().size() == 2) {
+                if (argv.size() == 2) {
                     String configName = resolveTsConfig(
-                            String.valueOf(executor.evalExpr(fn.args().get(0), ctx)));
-                    Object text = executor.evalExpr(fn.args().get(1), ctx);
+                            String.valueOf(argv.get(0)));
+                    Object text = argv.get(1);
                     return text == null ? null : TsVector.fromText(text.toString(), configName);
                 }
-                Object text = executor.evalExpr(fn.args().get(0), ctx);
+                Object text = argv.get(0);
                 return text == null ? null : TsVector.fromText(text.toString());
             }
             case "to_tsquery": {
                 String config = "english";
                 Object tsqText;
-                if (fn.args().size() == 2) {
-                    config = resolveTsConfig(String.valueOf(executor.evalExpr(fn.args().get(0), ctx)));
-                    tsqText = executor.evalExpr(fn.args().get(1), ctx);
+                if (argv.size() == 2) {
+                    config = resolveTsConfig(String.valueOf(argv.get(0)));
+                    tsqText = argv.get(1);
                 } else {
-                    tsqText = executor.evalExpr(fn.args().get(0), ctx);
+                    tsqText = argv.get(0);
                 }
                 if (tsqText == null) return null;
                 String tsqStr = tsqText.toString().trim();
@@ -103,33 +133,33 @@ class TextSearchFunctions {
             case "plainto_tsquery": {
                 String config = "english";
                 String input;
-                if (fn.args().size() == 2) {
-                    config = String.valueOf(executor.evalExpr(fn.args().get(0), ctx)).toLowerCase();
-                    input = String.valueOf(executor.evalExpr(fn.args().get(1), ctx));
+                if (argv.size() == 2) {
+                    config = String.valueOf(argv.get(0)).toLowerCase();
+                    input = String.valueOf(argv.get(1));
                 } else {
-                    input = String.valueOf(executor.evalExpr(fn.args().get(0), ctx));
+                    input = String.valueOf(argv.get(0));
                 }
                 return TextSearchOperations.plainToTsQuery(input, config);
             }
             case "phraseto_tsquery": {
                 String config = "english";
                 String input;
-                if (fn.args().size() == 2) {
-                    config = String.valueOf(executor.evalExpr(fn.args().get(0), ctx)).toLowerCase();
-                    input = String.valueOf(executor.evalExpr(fn.args().get(1), ctx));
+                if (argv.size() == 2) {
+                    config = String.valueOf(argv.get(0)).toLowerCase();
+                    input = String.valueOf(argv.get(1));
                 } else {
-                    input = String.valueOf(executor.evalExpr(fn.args().get(0), ctx));
+                    input = String.valueOf(argv.get(0));
                 }
                 return TextSearchOperations.phraseToTsQuery(input, config);
             }
             case "websearch_to_tsquery": {
                 String config = "english";
                 String input;
-                if (fn.args().size() == 2) {
-                    config = String.valueOf(executor.evalExpr(fn.args().get(0), ctx)).toLowerCase();
-                    input = String.valueOf(executor.evalExpr(fn.args().get(1), ctx));
+                if (argv.size() == 2) {
+                    config = String.valueOf(argv.get(0)).toLowerCase();
+                    input = String.valueOf(argv.get(1));
                 } else {
-                    input = String.valueOf(executor.evalExpr(fn.args().get(0), ctx));
+                    input = String.valueOf(argv.get(0));
                 }
                 return TextSearchOperations.websearchToTsQuery(input, config);
             }
@@ -138,8 +168,8 @@ class TextSearchFunctions {
                 int argIdx = 0;
                 float[] weights = null;
                 // Check if first arg is a weights array
-                if (fn.args().size() >= 3) {
-                    Object first = executor.evalExpr(fn.args().get(0), ctx);
+                if (argv.size() >= 3) {
+                    Object first = argv.get(0);
                     if (first != null) {
                         float[] parsed = parseWeightsArray(first);
                         if (parsed != null) {
@@ -148,16 +178,16 @@ class TextSearchFunctions {
                         }
                     }
                 }
-                Object vecObj = executor.evalExpr(fn.args().get(argIdx), ctx);
-                Object queryObj = executor.evalExpr(fn.args().get(argIdx + 1), ctx);
+                Object vecObj = argv.get(argIdx);
+                Object queryObj = argv.get(argIdx + 1);
                 // A rank over a null document or a null query is unknown, not zero: zero is a real
                 // answer meaning "no match", and a caller ordering by rank cannot tell them apart.
                 if (vecObj == null || queryObj == null) return null;
                 TsVector vec = vecObj instanceof TsVector ? ((TsVector) vecObj) : toTsVector(vecObj.toString());
                 TsQuery query = queryObj instanceof TsQuery ? ((TsQuery) queryObj) : TsQuery.parse(queryObj.toString());
                 int norm = 0;
-                if (argIdx + 2 < fn.args().size()) {
-                    Object normObj = executor.evalExpr(fn.args().get(argIdx + 2), ctx);
+                if (argIdx + 2 < argv.size()) {
+                    Object normObj = argv.get(argIdx + 2);
                     if (normObj != null) norm = executor.toInt(normObj);
                 }
                 // PG returns the raw float4; rounding here would lose a significant digit.
@@ -166,8 +196,8 @@ class TextSearchFunctions {
             case "ts_rank_cd": {
                 int argIdx = 0;
                 float[] weights = null;
-                if (fn.args().size() >= 3) {
-                    Object first = executor.evalExpr(fn.args().get(0), ctx);
+                if (argv.size() >= 3) {
+                    Object first = argv.get(0);
                     if (first != null) {
                         float[] parsed = parseWeightsArray(first);
                         if (parsed != null) {
@@ -176,16 +206,16 @@ class TextSearchFunctions {
                         }
                     }
                 }
-                Object vecObj = executor.evalExpr(fn.args().get(argIdx), ctx);
-                Object queryObj = executor.evalExpr(fn.args().get(argIdx + 1), ctx);
+                Object vecObj = argv.get(argIdx);
+                Object queryObj = argv.get(argIdx + 1);
                 // A rank over a null document or a null query is unknown, not zero: zero is a real
                 // answer meaning "no match", and a caller ordering by rank cannot tell them apart.
                 if (vecObj == null || queryObj == null) return null;
                 TsVector vec = vecObj instanceof TsVector ? ((TsVector) vecObj) : toTsVector(vecObj.toString());
                 TsQuery query = queryObj instanceof TsQuery ? ((TsQuery) queryObj) : TsQuery.parse(queryObj.toString());
                 int norm = 0;
-                if (argIdx + 2 < fn.args().size()) {
-                    Object normObj = executor.evalExpr(fn.args().get(argIdx + 2), ctx);
+                if (argIdx + 2 < argv.size()) {
+                    Object normObj = argv.get(argIdx + 2);
                     if (normObj != null) norm = executor.toInt(normObj);
                 }
                 return (float) vec.rankCd(query, weights, norm);
@@ -198,20 +228,20 @@ class TextSearchFunctions {
                 String document;
                 TsQuery query;
                 String options = null;
-                if (fn.args().size() >= 4) {
-                    Object cfg = executor.evalExpr(fn.args().get(0), ctx);
-                    Object doc = executor.evalExpr(fn.args().get(1), ctx);
-                    Object q = executor.evalExpr(fn.args().get(2), ctx);
-                    Object opt = executor.evalExpr(fn.args().get(3), ctx);
+                if (argv.size() >= 4) {
+                    Object cfg = argv.get(0);
+                    Object doc = argv.get(1);
+                    Object q = argv.get(2);
+                    Object opt = argv.get(3);
                     if (cfg == null || doc == null || q == null || opt == null) return null;
                     config = cfg.toString();
                     document = doc.toString();
                     query = q instanceof TsQuery ? ((TsQuery) q) : TsQuery.parse(q.toString());
                     options = opt.toString();
-                } else if (fn.args().size() == 3) {
-                    Object first = executor.evalExpr(fn.args().get(0), ctx);
-                    Object second = executor.evalExpr(fn.args().get(1), ctx);
-                    Object third = executor.evalExpr(fn.args().get(2), ctx);
+                } else if (argv.size() == 3) {
+                    Object first = argv.get(0);
+                    Object second = argv.get(1);
+                    Object third = argv.get(2);
                     if (first == null || second == null || third == null) return null;
                     if (third instanceof TsQuery) {
                         config = first.toString();
@@ -223,8 +253,8 @@ class TextSearchFunctions {
                         options = third.toString();
                     }
                 } else {
-                    Object doc = executor.evalExpr(fn.args().get(0), ctx);
-                    Object q = executor.evalExpr(fn.args().get(1), ctx);
+                    Object doc = argv.get(0);
+                    Object q = argv.get(1);
                     if (doc == null || q == null) return null;
                     document = doc.toString();
                     query = q instanceof TsQuery ? ((TsQuery) q) : TsQuery.parse(q.toString());
@@ -232,9 +262,9 @@ class TextSearchFunctions {
                 return TextSearchOperations.tsHeadline(document, query, options);
             }
             case "ts_rewrite": {
-                Object queryObj = executor.evalExpr(fn.args().get(0), ctx);
-                Object targetObj = executor.evalExpr(fn.args().get(1), ctx);
-                Object subObj = executor.evalExpr(fn.args().get(2), ctx);
+                Object queryObj = argv.get(0);
+                Object targetObj = argv.get(1);
+                Object subObj = argv.get(2);
                 if (queryObj == null || targetObj == null || subObj == null) return null;
                 TsQuery query = queryObj instanceof TsQuery ? ((TsQuery) queryObj) : TsQuery.parse(queryObj.toString());
                 TsQuery target = targetObj instanceof TsQuery ? ((TsQuery) targetObj) : TsQuery.parse(targetObj.toString());
@@ -242,17 +272,17 @@ class TextSearchFunctions {
                 return TextSearchOperations.tsRewrite(query, target, sub);
             }
             case "strip": {
-                Object arg = executor.evalExpr(fn.args().get(0), ctx);
+                Object arg = argv.get(0);
                 if (arg instanceof TsVector) return ((TsVector) arg).strip();
                 return arg != null ? arg.toString() : null;
             }
             case "setweight": {
-                Object vecObj = executor.evalExpr(fn.args().get(0), ctx);
-                Object weightObj = executor.evalExpr(fn.args().get(1), ctx);
+                Object vecObj = argv.get(0);
+                Object weightObj = argv.get(1);
                 TsVector vec = vecObj instanceof TsVector ? ((TsVector) vecObj) : toTsVector(vecObj.toString());
                 char weight = weightObj.toString().charAt(0);
-                if (fn.args().size() >= 3) {
-                    Object lexArr = executor.evalExpr(fn.args().get(2), ctx);
+                if (argv.size() >= 3) {
+                    Object lexArr = argv.get(2);
                     List<String> filterLexemes = new ArrayList<>();
                     if (lexArr instanceof List<?>) {
                         for (Object o : (List<?>) lexArr) filterLexemes.add(o.toString());
@@ -269,8 +299,8 @@ class TextSearchFunctions {
                 return vec.setWeight(weight);
             }
             case "ts_delete": {
-                Object vecObj = executor.evalExpr(fn.args().get(0), ctx);
-                Object toDelete = executor.evalExpr(fn.args().get(1), ctx);
+                Object vecObj = argv.get(0);
+                Object toDelete = argv.get(1);
                 TsVector vec = vecObj instanceof TsVector ? ((TsVector) vecObj) : toTsVector(vecObj.toString());
                 List<String> deleteList = new ArrayList<>();
                 if (toDelete instanceof List<?>) {
@@ -288,8 +318,8 @@ class TextSearchFunctions {
                 return vec.delete(deleteList);
             }
             case "ts_filter": {
-                Object vecObj = executor.evalExpr(fn.args().get(0), ctx);
-                Object weightsObj = executor.evalExpr(fn.args().get(1), ctx);
+                Object vecObj = argv.get(0);
+                Object weightsObj = argv.get(1);
                 TsVector vec = vecObj instanceof TsVector ? ((TsVector) vecObj) : toTsVector(vecObj.toString());
                 Set<Character> filterWeights = new HashSet<>();
                 if (weightsObj instanceof List<?>) {
@@ -308,31 +338,31 @@ class TextSearchFunctions {
                 return vec.filter(filterWeights);
             }
             case "tsquery_phrase": {
-                Object leftObj = executor.evalExpr(fn.args().get(0), ctx);
-                Object rightObj = executor.evalExpr(fn.args().get(1), ctx);
+                Object leftObj = argv.get(0);
+                Object rightObj = argv.get(1);
                 TsQuery left = leftObj instanceof TsQuery ? ((TsQuery) leftObj) : TsQuery.parse(leftObj.toString());
                 TsQuery right = rightObj instanceof TsQuery ? ((TsQuery) rightObj) : TsQuery.parse(rightObj.toString());
-                int dist = fn.args().size() >= 3 ? executor.toInt(executor.evalExpr(fn.args().get(2), ctx)) : 1;
+                int dist = argv.size() >= 3 ? executor.toInt(argv.get(2)) : 1;
                 return TextSearchOperations.tsqueryPhrase(left, right, dist);
             }
             case "numnode": {
-                Object queryObj = executor.evalExpr(fn.args().get(0), ctx);
+                Object queryObj = argv.get(0);
                 TsQuery query = queryObj instanceof TsQuery ? ((TsQuery) queryObj) : TsQuery.parse(queryObj.toString());
                 return query.numNode();
             }
             case "querytree": {
-                Object queryObj = executor.evalExpr(fn.args().get(0), ctx);
+                Object queryObj = argv.get(0);
                 TsQuery query = queryObj instanceof TsQuery ? ((TsQuery) queryObj) : TsQuery.parse(queryObj.toString());
                 return query.queryTree();
             }
             case "ts_debug": {
                 String config = "english";
                 String input;
-                if (fn.args().size() == 2) {
-                    config = String.valueOf(executor.evalExpr(fn.args().get(0), ctx));
-                    input = String.valueOf(executor.evalExpr(fn.args().get(1), ctx));
+                if (argv.size() == 2) {
+                    config = String.valueOf(argv.get(0));
+                    input = String.valueOf(argv.get(1));
                 } else {
-                    input = String.valueOf(executor.evalExpr(fn.args().get(0), ctx));
+                    input = String.valueOf(argv.get(0));
                 }
                 List<Object[]> debug = TextSearchOperations.tsDebug(input);
                 if (debug.isEmpty()) return "";
@@ -340,13 +370,13 @@ class TextSearchFunctions {
                 return "(" + first[0] + ",\"" + first[1] + "\"," + first[2] + "," + first[3] + ",{" + first[5] + "})";
             }
             case "ts_lexize": {
-                String dict = String.valueOf(executor.evalExpr(fn.args().get(0), ctx));
-                String token = String.valueOf(executor.evalExpr(fn.args().get(1), ctx));
+                String dict = String.valueOf(argv.get(0));
+                String token = String.valueOf(argv.get(1));
                 List<String> result = TextSearchOperations.tsLexize(dict, token);
                 return "{" + String.join(",", result) + "}";
             }
             case "ts_token_type": {
-                String parser = fn.args().isEmpty() ? "default" : String.valueOf(executor.evalExpr(fn.args().get(0), ctx));
+                String parser = argv.isEmpty() ? "default" : String.valueOf(argv.get(0));
                 List<Object[]> types = TextSearchOperations.tsTokenType(parser);
                 StringBuilder sb = new StringBuilder();
                 for (Object[] t : types) {
@@ -356,8 +386,8 @@ class TextSearchFunctions {
                 return "(" + sb + ")";
             }
             case "ts_parse": {
-                String tsParser = String.valueOf(executor.evalExpr(fn.args().get(0), ctx));
-                String text = String.valueOf(executor.evalExpr(fn.args().get(1), ctx));
+                String tsParser = String.valueOf(argv.get(0));
+                String text = String.valueOf(argv.get(1));
                 List<Object[]> tokens = TextSearchOperations.tsParse(tsParser, text);
                 StringBuilder sb = new StringBuilder();
                 for (Object[] t : tokens) {
@@ -373,7 +403,7 @@ class TextSearchFunctions {
                 return TextSearchOperations.getCurrentTsConfig();
             }
             case "array_to_tsvector": {
-                Object arrObj = executor.evalExpr(fn.args().get(0), ctx);
+                Object arrObj = argv.get(0);
                 List<String> words = new ArrayList<>();
                 if (arrObj instanceof List<?>) {
                     List<?> list = (List<?>) arrObj;
@@ -392,7 +422,7 @@ class TextSearchFunctions {
                 return TsVector.fromArray(words);
             }
             case "tsvector_to_array": {
-                Object vecObj = executor.evalExpr(fn.args().get(0), ctx);
+                Object vecObj = argv.get(0);
                 TsVector vec = vecObj instanceof TsVector ? ((TsVector) vecObj) : toTsVector(vecObj.toString());
                 List<String> arr = vec.toArray();
                 return "{" + String.join(",", arr) + "}";

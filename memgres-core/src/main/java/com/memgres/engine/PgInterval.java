@@ -107,6 +107,14 @@ public class PgInterval implements Comparable<PgInterval> {
             boolean positive = isPositiveInfinity() == (factor > 0);
             return positive ? INFINITY : NEG_INFINITY;
         }
+        // A finite span stretched by an infinite factor is infinite, and which infinity it is
+        // follows the two signs. A zero span is the indeterminate case, as 0 * infinity always is,
+        // and NaN names no factor at all.
+        if (Double.isInfinite(factor)) {
+            if (months == 0 && days == 0 && microseconds == 0) throw intervalOutOfRange();
+            return isNegative() == (factor < 0) ? INFINITY : NEG_INFINITY;
+        }
+        if (Double.isNaN(factor)) throw intervalOutOfRange();
         // PG cascades fractional parts: fractional months → days, fractional days → microseconds
         double totalMonths = months * factor;
         int newMonths = (int) totalMonths;
@@ -159,11 +167,17 @@ public class PgInterval implements Comparable<PgInterval> {
             return isPositiveInfinity()
                     ? TypeCoercion.TIMESTAMP_INFINITY : TypeCoercion.TIMESTAMP_NEG_INFINITY;
         }
-        LocalDateTime result = dateTime;
-        if (months != 0) result = result.plusMonths(months);
-        if (days != 0) result = result.plusDays(days);
-        if (microseconds != 0) result = result.plusNanos(microseconds * 1000);
-        return result;
+        LocalDateTime result;
+        try {
+            result = dateTime;
+            if (months != 0) result = result.plusMonths(months);
+            if (days != 0) result = result.plusDays(days);
+            if (microseconds != 0) result = result.plusNanos(microseconds * 1000);
+        } catch (RuntimeException e) {
+            // java.time runs out of year long before the type does; either way there is no answer.
+            throw new MemgresException("timestamp out of range", "22008");
+        }
+        return TypeCoercion.requireTimestampInRange(result);
     }
 
     /**
@@ -175,10 +189,19 @@ public class PgInterval implements Comparable<PgInterval> {
                     ? TypeCoercion.TIMESTAMP_INFINITY : TypeCoercion.TIMESTAMP_NEG_INFINITY;
             return bound.atOffset(dateTime.getOffset());
         }
-        OffsetDateTime result = dateTime;
-        if (months != 0) result = result.plusMonths(months);
-        if (days != 0) result = result.plusDays(days);
-        if (microseconds != 0) result = result.plusNanos(microseconds * 1000);
+        OffsetDateTime result;
+        try {
+            result = dateTime;
+            if (months != 0) result = result.plusMonths(months);
+            if (days != 0) result = result.plusDays(days);
+            if (microseconds != 0) result = result.plusNanos(microseconds * 1000);
+        } catch (RuntimeException e) {
+            throw new MemgresException("timestamp out of range", "22008");
+        }
+        // The instant is what has to be representable, so the check is made in UTC rather than in
+        // whatever offset this value carries.
+        TypeCoercion.requireTimestampInRange(
+                result.withOffsetSameInstant(java.time.ZoneOffset.UTC).toLocalDateTime());
         return result;
     }
 

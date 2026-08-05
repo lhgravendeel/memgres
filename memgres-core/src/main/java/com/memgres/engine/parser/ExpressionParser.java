@@ -1120,7 +1120,15 @@ public class ExpressionParser {
      * tighter than any binary operator.
      */
     private Expression parsePrimaryWithCasts() {
+        // A JSON subscript may be negative — jsonb -> -1 is the last element — so the sign binds
+        // to the subscript here rather than being left for a binary minus that has no left side.
+        boolean negated = false;
+        if (check(TokenType.MINUS)) {
+            advance();
+            negated = true;
+        }
         Expression expr = parsePrimary();
+        if (negated) expr = new UnaryExpr(UnaryExpr.UnaryOp.NEGATE, expr);
         while (match(TokenType.CAST)) {
             String typeName = parseTypeName();
             expr = new CastExpr(expr, typeName);

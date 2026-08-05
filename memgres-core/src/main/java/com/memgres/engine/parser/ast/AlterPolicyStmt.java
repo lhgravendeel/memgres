@@ -10,6 +10,8 @@ public final class AlterPolicyStmt implements Statement {
     public final String renameTo;
     public final Expression usingExpr;
     public final Expression withCheckExpr;
+    /** The roles a TO clause named; empty when it wrote none. Each has to be a role that exists. */
+    public final java.util.List<String> roles;
 
     public AlterPolicyStmt(
             String name,
@@ -18,11 +20,23 @@ public final class AlterPolicyStmt implements Statement {
             Expression usingExpr,
             Expression withCheckExpr
     ) {
+        this(name, table, renameTo, usingExpr, withCheckExpr, java.util.Collections.<String>emptyList());
+    }
+
+    public AlterPolicyStmt(
+            String name,
+            String table,
+            String renameTo,
+            Expression usingExpr,
+            Expression withCheckExpr,
+            java.util.List<String> roles
+    ) {
         this.name = name;
         this.table = table;
         this.renameTo = renameTo;
         this.usingExpr = usingExpr;
         this.withCheckExpr = withCheckExpr;
+        this.roles = roles == null ? java.util.Collections.<String>emptyList() : roles;
     }
 
     public String name() { return name; }
@@ -30,6 +44,7 @@ public final class AlterPolicyStmt implements Statement {
     public String renameTo() { return renameTo; }
     public Expression usingExpr() { return usingExpr; }
     public Expression withCheckExpr() { return withCheckExpr; }
+    public java.util.List<String> roles() { return roles; }
 
     @Override
     public boolean equals(Object o) {

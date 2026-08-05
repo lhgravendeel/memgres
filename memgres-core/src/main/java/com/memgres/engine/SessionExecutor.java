@@ -695,6 +695,16 @@ class SessionExecutor {
             String pubName = parts[0];
             String[] newTables = parts.length > 1 ? parts[1].split(",") : new String[0];
             Database.PubDef pub = requirePublication(pubName);
+            // A publication lists relations, so a name that is not one cannot join it, and one
+            // already listed would be listed twice.
+            for (String t : newTables) {
+                if (t.isEmpty()) continue;
+                requirePublishableRelation(t);
+                if (pub != null && containsIgnoreCase(pub.tables, t)) {
+                    throw new MemgresException("relation \"" + t
+                            + "\" is already member of publication \"" + pubName + "\"", "42710");
+                }
+            }
             if (pub != null) {
                 for (String t : newTables) {
                     if (!t.isEmpty()) pub.tables.add(t);
@@ -707,6 +717,9 @@ class SessionExecutor {
             String pubName = parts[0];
             String[] newTables = parts.length > 1 ? parts[1].split(",") : new String[0];
             Database.PubDef pub = requirePublication(pubName);
+            for (String t : newTables) {
+                if (!t.isEmpty()) requirePublishableRelation(t);
+            }
             if (pub != null) {
                 pub.tables.clear();
                 for (String t : newTables) {
@@ -720,8 +733,35 @@ class SessionExecutor {
             String pubName = parts[0];
             String[] dropTables = parts.length > 1 ? parts[1].split(",") : new String[0];
             Database.PubDef pub = requirePublication(pubName);
+            for (String t : dropTables) {
+                if (t.isEmpty()) continue;
+                requirePublishableRelation(t);
+                if (pub != null && !containsIgnoreCase(pub.tables, t)) {
+                    throw new MemgresException("relation \"" + t
+                            + "\" is not part of the publication", "42704");
+                }
+            }
             if (pub != null) {
                 for (String t : dropTables) pub.tables.remove(t);
+            }
+            return QueryResult.command(QueryResult.Type.SET, 0);
+        }
+        if (name.equals("alter_publication_owner")) {
+            String[] parts = stmt.value().split("\0", 2);
+            requirePublication(parts[0]);
+            requireRoleForAlter(parts.length > 1 ? parts[1] : "");
+            return QueryResult.command(QueryResult.Type.SET, 0);
+        }
+        if (name.equals("alter_publication_options")) {
+            String[] parts = stmt.value().split("\0", 2);
+            requirePublication(parts[0]);
+            String keys = parts.length > 1 ? parts[1] : "";
+            for (String key : keys.split(",")) {
+                if (key.isEmpty()) continue;
+                if (!PUBLICATION_PARAMETERS.contains(key.toLowerCase())) {
+                    throw new MemgresException(
+                            "unrecognized publication parameter: \"" + key + "\"", "42601");
+                }
             }
             return QueryResult.command(QueryResult.Type.SET, 0);
         }
@@ -753,6 +793,10 @@ class SessionExecutor {
                 throw new MemgresException("aggregate " + parts[0] + "("
                         + DdlObjectExecutor.canonicalTypeList(argTypes) + ") does not exist", "42883");
             }
+            // Neither a move nor a change of owner is recorded for an aggregate, but the schema
+            // and the role still have to exist for PostgreSQL to accept the statement.
+            if (parts.length > 4 && !parts[4].isEmpty()) requireSchemaForAlter(parts[4]);
+            if (parts.length > 5 && !parts[5].isEmpty()) requireRoleForAlter(parts[5]);
             if ("rename".equals(parts[2])) {
                 executor.database.removeAggregate(parts[0]);
                 PgAggregate renamed = new PgAggregate(parts[3], agg.getSfunc(), agg.getStype(),
@@ -798,6 +842,13 @@ class SessionExecutor {
             executor.database.removeExtendedStatistic(parts[0]);
             stat.setName(parts[1]);
             executor.database.addExtendedStatistic(stat);
+            return QueryResult.command(QueryResult.Type.SET, 0);
+        }
+        if (name.equals("alter_statistics_move")) {
+            String[] parts = stmt.value().split("\0", -1);
+            requireStatistic(parts[0]);
+            if (parts.length > 1 && !parts[1].isEmpty()) requireSchemaForAlter(parts[1]);
+            if (parts.length > 2 && !parts[2].isEmpty()) requireRoleForAlter(parts[2]);
             return QueryResult.command(QueryResult.Type.SET, 0);
         }
         if (name.equals("alter_statistics_target")) {
@@ -999,12 +1050,14 @@ class SessionExecutor {
 
         Set<String> internalNames = Cols.setOf("constraints", "transaction",
                 "create_noop", "alter_noop", "drop_noop",
-                "create_statistics", "alter_statistics_rename", "alter_statistics_target", "drop_statistics",
+                "create_statistics", "alter_statistics_rename", "alter_statistics_target",
+                "alter_statistics_move", "drop_statistics",
                 "create_fdw", "drop_fdw", "create_server", "drop_server", "alter_server_options",
                 "create_user_mapping", "drop_user_mapping",
                 "create_foreign_table", "drop_foreign_table", "import_foreign_schema",
                 "create_publication", "alter_publication_add_table", "alter_publication_set_table",
                 "alter_publication_drop_table", "alter_publication_rename",
+                "alter_publication_owner", "alter_publication_options",
                 "alter_publication_noop", "drop_publication",
                 "create_subscription", "drop_subscription",
                 "create_ts_config", "create_ts_dict", "drop_ts_configuration", "drop_ts_dictionary",
@@ -2763,6 +2816,49 @@ class SessionExecutor {
     /** Separator inside a stub statement's encoded payload; SQL text cannot contain it. */
     private static final String STUB_SEP = "\u0001";
 
+    /** The options {@code ALTER PUBLICATION ... SET (...)} takes; anything else is a 42601. */
+    private static final Set<String> PUBLICATION_PARAMETERS =
+            Cols.setOf("publish", "publish_via_partition_root");
+
+    /** Whether a list already names this relation, whatever case it was written in. */
+    private static boolean containsIgnoreCase(java.util.Collection<String> names, String name) {
+        for (String n : names) {
+            if (n != null && n.equalsIgnoreCase(name)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * A publication lists relations, so a name it is given has to be one. PostgreSQL reports a
+     * name that is not a relation as a missing relation rather than accepting it into the list.
+     */
+    private void requirePublishableRelation(String tableName) {
+        if (executor.ddlExecutor.resolveTableOrNull(tableName) == null) {
+            throw new MemgresException(
+                    "relation \"" + tableName + "\" does not exist", "42P01");
+        }
+    }
+
+    /** The schema a SET SCHEMA names has to exist, whatever the statement then does with it. */
+    private void requireSchemaForAlter(String schemaName) {
+        if (executor.database.getSchema(schemaName) == null) {
+            throw new MemgresException("schema " + quoted(schemaName) + " does not exist", "3F000");
+        }
+    }
+
+    /** The same for the role an OWNER TO names. */
+    private void requireRoleForAlter(String roleName) {
+        String resolved = executor.ddlExecutor.resolveOwnerName(roleName);
+        if (!executor.database.hasRole(resolved)) {
+            throw new MemgresException("role " + quoted(resolved) + " does not exist", "42704");
+        }
+    }
+
+    /** A name as PostgreSQL prints it in a message: wrapped in double quotes. */
+    private static String quoted(String name) {
+        return (char) 34 + name + (char) 34;
+    }
+
     /** Collations PostgreSQL ships with, which exist without ever being created. */
     private static final Set<String> BUILTIN_COLLATIONS = Cols.setOf(
             "default", "c", "posix", "c.utf-8", "c.utf8", "en_us", "en_us.utf-8", "en_us.utf8",
@@ -2779,6 +2875,8 @@ class SessionExecutor {
         String first = parts.length > 0 ? parts[0] : "";
         String second = parts.length > 1 ? parts[1] : "";
         String third = parts.length > 2 ? parts[2] : "";
+        String intoSchema = parts.length > 3 ? parts[3] : "";
+        String newOwner = parts.length > 4 ? parts[4] : "";
         if (kind.equals("create_stub")) {
             executor.database.addStubObject(first, second);
             return QueryResult.message(QueryResult.Type.SET, "CREATE");
@@ -2833,6 +2931,11 @@ class SessionExecutor {
                     ? "collation \"" + second + "\" for encoding \"UTF8\" does not exist"
                     : first + " \"" + second + "\" does not exist", "42704");
         }
+        // The object is there; now the thing the statement points at has to be too. PostgreSQL
+        // checks the target of a SET SCHEMA or an OWNER TO whether or not it goes on to record
+        // anything, and a script told the move happened will believe it did.
+        if (!intoSchema.isEmpty()) requireSchemaForAlter(intoSchema);
+        if (!newOwner.isEmpty()) requireRoleForAlter(newOwner);
         if (!third.isEmpty()) {
             if (isCollation) {
                 Database.CollationDef coll = executor.database.getCollation(second);

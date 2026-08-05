@@ -1514,8 +1514,16 @@ class DdlParser {
         String name = parser.readIdentifierOrString();
         String newName = "";
         if (parser.matchKeywords("RENAME", "TO")) newName = parser.readIdentifierOrString();
+        // SET SCHEMA and OWNER TO change nothing memgres records for these kinds, but PostgreSQL
+        // still refuses a schema or a role that is not there, so both names are carried through
+        // to be checked rather than discarded with the rest of the statement.
+        String schema = "";
+        String owner = "";
+        if (parser.matchKeywords("SET", "SCHEMA")) schema = parser.readIdentifierOrString();
+        else if (parser.matchKeywords("OWNER", "TO")) owner = parser.readIdentifierOrString();
         while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-        return new SetStmt("alter_stub", kind + STUB_SEP + name + STUB_SEP + newName);
+        return new SetStmt("alter_stub", kind + STUB_SEP + name + STUB_SEP + newName
+                + STUB_SEP + schema + STUB_SEP + owner);
     }
 
     /** {@code ALTER RULE name ON relation ...}: the rule is looked up on its relation. */
@@ -1559,8 +1567,23 @@ class DdlParser {
         if (parser.match(TokenType.DOT)) name = parser.readIdentifierOrString();
         String newName = "";
         if (parser.matchKeywords("RENAME", "TO")) newName = parser.readIdentifierOrString();
+        return new SetStmt("alter_object",
+                kind + STUB_SEP + name + STUB_SEP + newName + STUB_SEP + "" + parseMoveOrReown());
+    }
+
+    /**
+     * The tail of an ALTER that memgres records nothing for: a {@code SET SCHEMA} or an
+     * {@code OWNER TO}. PostgreSQL still refuses a schema or a role that does not exist, so both
+     * names are carried through to be checked rather than discarded with the rest of the
+     * statement. Returns the two trailing payload fields, empty when neither clause was written.
+     */
+    private String parseMoveOrReown() {
+        String schema = "";
+        String owner = "";
+        if (parser.matchKeywords("SET", "SCHEMA")) schema = parser.readIdentifierOrString();
+        else if (parser.matchKeywords("OWNER", "TO")) owner = parser.readIdentifierOrString();
         while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-        return new SetStmt("alter_object", kind + STUB_SEP + name + STUB_SEP + newName);
+        return STUB_SEP + schema + STUB_SEP + owner;
     }
 
     AlterDomainStmt parseAlterDomain() {
@@ -1614,6 +1637,11 @@ class DdlParser {
         if (parser.matchKeywords("SET", "SCHEMA")) {
             return new AlterDomainStmt(domainName, "SET_SCHEMA", null, null, null, null, false,
                     parser.readIdentifier());
+        }
+        // Nothing is recorded for a change of owner, but the role still has to be one that exists.
+        if (parser.matchKeywords("OWNER", "TO")) {
+            return new AlterDomainStmt(domainName, "OWNER_TO", null, null, null, null, false,
+                    parser.readIdentifierOrString());
         }
         while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
         return new AlterDomainStmt(domainName, "NO_OP", null, null, null, null);
@@ -2110,6 +2138,19 @@ class DdlParser {
             String newOwner = parser.readIdentifier();
             return AlterFunctionStmt.ownerTo(funcName, schema, isProcedure, ifExists, newOwner, paramTypes);
         }
+        // DEPENDS ON EXTENSION / NO DEPENDS ON EXTENSION: memgres records no such dependency, but
+        // PostgreSQL still refuses an extension that was never installed.
+        int beforeDepends = parser.pos;
+        boolean noDepends = matchIdentCI("NO");
+        if (matchIdentCI("DEPENDS")) {
+            parser.matchKeyword("ON");
+            parser.matchKeyword("EXTENSION");
+            String ext = parser.readIdentifierOrString();
+            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+            return AlterFunctionStmt.dependsOnExtension(funcName, schema, isProcedure, ext, paramTypes);
+        }
+        // Not this form after all; a bare NO belongs to whatever attribute follows.
+        if (noDepends) parser.pos = beforeDepends;
 
         // Attribute changes: VOLATILE, STABLE, IMMUTABLE, STRICT, CALLED ON NULL INPUT,
         // RETURNS NULL ON NULL INPUT, SECURITY DEFINER/INVOKER, LEAKPROOF, NOT LEAKPROOF,
@@ -2560,9 +2601,15 @@ class DdlParser {
             action = "rename";
             newName = parser.readIdentifier();
         }
+        // SET SCHEMA and OWNER TO record nothing, but the schema and the role still have to exist.
+        String schema = "";
+        String owner = "";
+        if (parser.matchKeywords("SET", "SCHEMA")) schema = parser.readIdentifierOrString();
+        else if (parser.matchKeywords("OWNER", "TO")) owner = parser.readIdentifierOrString();
         while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
         return new SetStmt("alter_aggregate",
-                name + "\0" + String.join("\1", argTypes) + "\0" + action + "\0" + newName);
+                name + "\0" + String.join("\1", argTypes) + "\0" + action + "\0" + newName
+                        + "\0" + schema + "\0" + owner);
     }
 
     // ---- ALTER STATISTICS ----
@@ -2579,16 +2626,18 @@ class DdlParser {
             String target = parser.advance().value();
             return new SetStmt("alter_statistics_target", name + "\0" + target);
         }
+        // Neither records anything, but the statistics object, the role and the schema all still
+        // have to exist for PostgreSQL to accept the statement.
         if (parser.matchKeywords("OWNER", "TO")) {
-            parser.readIdentifier();
-            return new SetStmt("alter_noop", "ok");
+            return new SetStmt("alter_statistics_move", name + "\0" + "" + "\0"
+                    + parser.readIdentifierOrString());
         }
         if (parser.matchKeywords("SET", "SCHEMA")) {
-            parser.readIdentifier();
-            return new SetStmt("alter_noop", "ok");
+            return new SetStmt("alter_statistics_move", name + "\0"
+                    + parser.readIdentifierOrString() + "\0" + "");
         }
         while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-        return new SetStmt("alter_noop", "ok");
+        return new SetStmt("alter_statistics_move", name + "\0" + "" + "\0" + "");
     }
 
     // ---- FDW DDL parsing ----
@@ -2795,6 +2844,27 @@ class DdlParser {
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
             return new SetStmt("alter_publication_rename", name + "\0" + newName);
         }
+        if (parser.matchKeywords("OWNER", "TO")) {
+            String owner = parser.readIdentifierOrString();
+            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+            return new SetStmt("alter_publication_owner", name + "\0" + owner);
+        }
+        // SET (option = value): nothing here is recorded, but PostgreSQL names an option it does
+        // not know rather than accepting it, so the keys are carried through to be checked.
+        if (parser.matchKeyword("SET") && parser.check(TokenType.LEFT_PAREN)) {
+            List<String> keys = new ArrayList<>();
+            parser.expect(TokenType.LEFT_PAREN);
+            while (!parser.isAtEnd() && !parser.check(TokenType.RIGHT_PAREN)) {
+                keys.add(parser.readIdentifierOrString());
+                while (!parser.isAtEnd() && !parser.check(TokenType.COMMA)
+                        && !parser.check(TokenType.RIGHT_PAREN)) {
+                    parser.advance();
+                }
+                if (!parser.match(TokenType.COMMA)) break;
+            }
+            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+            return new SetStmt("alter_publication_options", name + "\0" + String.join(",", keys));
+        }
         while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
         return new SetStmt("alter_publication_noop", name);
     }
@@ -2958,9 +3028,8 @@ class DdlParser {
         // to be one that exists — and a RENAME has to move the name it is registered under.
         String newName = "";
         if (parser.matchKeywords("RENAME", "TO")) newName = parser.readIdentifierOrString();
-        while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-        return new SetStmt("alter_object",
-                "text search configuration" + STUB_SEP + name + STUB_SEP + newName);
+        return new SetStmt("alter_object", "text search configuration" + STUB_SEP + name
+                + STUB_SEP + newName + STUB_SEP + "" + parseMoveOrReown());
     }
 
     // ---- CREATE COLLATION ----

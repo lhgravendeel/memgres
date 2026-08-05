@@ -1781,7 +1781,14 @@ public class AstExecutor {
                                 }
                             }
                             if (match) {
-                                throw new MemgresException(kind + " " + stmt.targetValue() + " already exists", "42723");
+                                // Named the way PostgreSQL names it: the signature that clashes and
+                                // the schema it clashes in, since only an overload of the same
+                                // argument types in the same schema is a collision at all.
+                                String where = existing.getSchemaName() != null
+                                        ? existing.getSchemaName() : "public";
+                                throw new MemgresException(kind + " " + stmt.targetValue() + "("
+                                        + DdlObjectExecutor.canonicalTypeList(existingParamTypes)
+                                        + ") already exists in schema \"" + where + "\"", "42723");
                             }
                         }
                     }
@@ -1820,6 +1827,19 @@ public class AstExecutor {
                 }
                 database.setObjectOwner("function:" + stmt.name(), newOwner);
                 func.setOwner(newOwner);
+                return QueryResult.message(QueryResult.Type.SET, tag);
+            }
+            case DEPENDS_ON_EXTENSION: {
+                PgFunction dependent = resolveAlterFunction(stmt);
+                if (dependent == null) {
+                    throw new MemgresException(kind + " " + alterFunctionSignature(stmt)
+                            + " does not exist", "42883");
+                }
+                // memgres keeps no extension dependencies, but an extension that was never
+                // installed is still not something a function can be made to depend on. The ones
+                // PostgreSQL ships with count as installed, which is why this asks the same
+                // question every other statement naming an extension asks.
+                ddlExecutor.requireObjectExists("extension", stmt.targetValue());
                 return QueryResult.message(QueryResult.Type.SET, tag);
             }
             case SET_ATTRIBUTES: {

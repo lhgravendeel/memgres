@@ -1455,6 +1455,9 @@ class BinaryOpEvaluator {
                                 } else if (inner.charAt(ci) == '{' || inner.charAt(ci) == '[') depth++;
                                 else if (inner.charAt(ci) == '}' || inner.charAt(ci) == ']') depth--;
                             }
+                            // A negative subscript counts back from the end, so -1 is the last
+                            // element; one that reaches past the front is simply not there.
+                            if (idx < 0) idx += elements.size();
                             if (idx >= 0 && idx < elements.size()) return elements.get(idx);
                         }
                         return null;
