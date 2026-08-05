@@ -136,6 +136,11 @@ public class PlpgsqlExecutor {
             variables.put(key, value);
         }
 
+        /** A cursor's own value is a portal, not something to read as the declared type. */
+        private boolean isCursorValue(Object value) {
+            return value instanceof BoundCursor || value instanceof CursorState;
+        }
+
         /**
          * A declaration's NOT NULL and a domain's constraints have to hold on every write, not
          * only on the initialiser — otherwise a value the declared type cannot represent moves
@@ -149,7 +154,18 @@ public class PlpgsqlExecutor {
             }
             String domain = domainVars.get(key);
             Object coerced = domain != null ? astExecutor.castValue(value, domain) : value;
+            // A variable holds values of its declared type, and PostgreSQL coerces on every
+            // assignment rather than storing whatever it was handed: an int takes 2 from 1.7, a
+            // boolean takes true from 'yes', and neither takes 'abc' at all. Storing the value
+            // unconverted let a variable hold something its own type could never represent, and
+            // the wrong answer then travelled wherever the variable did.
             String constrained = constrainedTypes.get(key);
+            if (coerced != null && domain == null && constrained == null) {
+                String declared = coercionType(declaredType(key));
+                if (declared != null && !isCursorValue(coerced)) {
+                    coerced = astExecutor.castValue(coerced, declared);
+                }
+            }
             if (coerced != null && isTemporalTypmodType(constrained)) {
                 // A declared fractional-seconds precision is applied by reading the value as the
                 // declared type, which is where the rounding lives
@@ -379,7 +395,9 @@ public class PlpgsqlExecutor {
                 }
             }
             val = coerceParamValue(val, p.typeName());
-            scope.declare(pName, val);
+            // A parameter has a declared type as much as a DECLARE does, and what reads that type
+            // — a row constructor being returned, a char(n) being unpadded — has to see it.
+            scope.declareTyped(pName, val, p.typeName());
             if (p.name() != null) {
                 // Every parameter answers to its position as well as its name, so
                 // ALIAS FOR $1 reaches the same storage that the name reaches
@@ -435,6 +453,7 @@ public class PlpgsqlExecutor {
             // Explicit RETURN; if we also have OUT params, prefer the OUT param values
             if (outParams.isEmpty()) {
                 checkReturnedRecord(rs.value, returnType);
+                checkTriggerReturnIsRow(rs.value, returnType);
                 return voidReturning ? VOID_VALUE : rs.value;
             }
         }
@@ -469,6 +488,21 @@ public class PlpgsqlExecutor {
 
     /** The text of the single value of type {@code void}, which is empty and is not NULL. */
     private static final String VOID_VALUE = "";
+
+    /**
+     * A trigger returns the row it wants written, so a scalar is not something it can return at
+     * all. Accepting one left the trigger looking as if it had returned a row and the write going
+     * ahead with whatever the scalar was.
+     */
+    private void checkTriggerReturnIsRow(Object value, String returnType) {
+        if (value == null || returnType == null) return;
+        if (!"trigger".equalsIgnoreCase(returnType.trim())) return;
+        if (value instanceof Map || value instanceof AstExecutor.PgRow || value instanceof Object[]) {
+            return;
+        }
+        throw new MemgresException(
+                "cannot return non-composite value from function returning composite type", "42804");
+    }
 
     /**
      * A record returned where a composite type is declared has to have that type's fields. A row
@@ -746,6 +780,12 @@ public class PlpgsqlExecutor {
                     copyMapToRow(retMap, newRow, table);
                 }
                 return newRow;
+            }
+            // A trigger returns the row it wants written. A scalar is not one, and taking it for
+            // the row let the write go ahead as though the trigger had approved it.
+            if (!(retVal instanceof AstExecutor.PgRow) && !(retVal instanceof Object[])) {
+                throw new MemgresException("cannot return non-composite value from function"
+                        + " returning composite type", "42804");
             }
         }
 
@@ -1642,8 +1682,125 @@ public class PlpgsqlExecutor {
         if (trimmed.equalsIgnoreCase("OLD")) throw new ReturnSignal(scope.get("old"));
         if (trimmed.equalsIgnoreCase("NULL")) throw new ReturnSignal(null);
         Object value = evalExpr(stmt.valueExpr(), scope);
+        checkReturnedRowTypes(stmt.valueExpr(), (String) scope.get("__return_type__"), scope);
         throw new ReturnSignal(unpadBpchar(stmt.valueExpr(), value,
                 (String) scope.get("__return_type__"), scope));
+    }
+
+    /**
+     * A row constructor returned where a composite type is declared has to be built from
+     * expressions of that type's own attribute types. PostgreSQL coerces nothing here: a
+     * {@code RETURN ROW(x, x)} whose {@code x} is an {@code integer} does not fit a
+     * {@code (bigint, bigint)}, and a bare {@code 'a'} is {@code unknown} rather than
+     * {@code text}, so it fits no attribute at all. The record would otherwise be handed back
+     * under a name it does not fit, and read at the wrong field offsets.
+     *
+     * <p>Only elements whose type is certain are judged — a cast, a declared variable, or a
+     * literal. Anything this cannot place is left alone, because refusing a row PostgreSQL
+     * accepts would break working code to catch a rarer mistake.
+     */
+    private void checkReturnedRowTypes(String valueExpr, String returnType, Scope scope) {
+        if (valueExpr == null || returnType == null) return;
+        List<com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField> fields =
+                database.getRowType(returnType.trim());
+        if (fields == null) return;
+        List<String> elements = rowConstructorElements(valueExpr);
+        if (elements == null || elements.size() != fields.size()) return;
+        for (int i = 0; i < elements.size(); i++) {
+            String had = staticTypeOfElement(elements.get(i), scope);
+            if (had == null) continue;
+            String want = canonicalAttributeType(fields.get(i).typeName());
+            if (want == null) continue;
+            if (!had.equals(want)) {
+                throw new MemgresException(
+                        "returned record type does not match expected record type", "42804");
+            }
+        }
+    }
+
+    /**
+     * The element expressions of a row constructor, or null when this is not one. Both spellings
+     * count: {@code ROW(a, b)} and the bare {@code (a, b)}. A single parenthesised expression is
+     * not a row, so it is not one of them.
+     */
+    private static List<String> rowConstructorElements(String expr) {
+        String s = expr.trim();
+        if (s.regionMatches(true, 0, "ROW", 0, 3)) s = s.substring(3).trim();
+        if (s.length() < 2 || s.charAt(0) != '(' || s.charAt(s.length() - 1) != ')') return null;
+        String inner = s.substring(1, s.length() - 1);
+        List<String> parts = new ArrayList<String>();
+        int depth = 0;
+        boolean inString = false;
+        StringBuilder cur = new StringBuilder();
+        for (int i = 0; i < inner.length(); i++) {
+            char c = inner.charAt(i);
+            if (inString) {
+                cur.append(c);
+                if (c == '\'') inString = false;
+                continue;
+            }
+            if (c == '\'') { inString = true; cur.append(c); continue; }
+            if (c == '(' || c == '[') depth++;
+            if (c == ')' || c == ']') depth--;
+            if (c == ',' && depth == 0) { parts.add(cur.toString().trim()); cur.setLength(0); continue; }
+            cur.append(c);
+        }
+        parts.add(cur.toString().trim());
+        // One element and no comma is a parenthesised expression rather than a row.
+        return parts.size() < 2 && !expr.trim().regionMatches(true, 0, "ROW", 0, 3) ? null : parts;
+    }
+
+    /**
+     * The type an element of a row constructor is, when that can be told for certain, in the
+     * spelling {@link #canonicalAttributeType} uses. {@code "unknown"} is a type of its own: it is
+     * what a bare string literal is, and it fits no attribute.
+     */
+    private String staticTypeOfElement(String element, Scope scope) {
+        String e = element.trim();
+        if (e.isEmpty()) return null;
+        // An explicit cast says the type outright; the last one written is the one that lands.
+        int cast = e.lastIndexOf("::");
+        if (cast >= 0) return canonicalAttributeType(e.substring(cast + 2));
+        if (isSimpleIdentifier(e) && scope.has(e)) {
+            String declared = coercionType(scope.declaredType(e));
+            return declared == null ? null : canonicalAttributeType(declared);
+        }
+        if (e.length() >= 2 && e.charAt(0) == '\'' && e.charAt(e.length() - 1) == '\'') {
+            return "unknown";
+        }
+        if (e.matches("[+-]?\\d+")) {
+            try {
+                long v = Long.parseLong(e);
+                return v >= Integer.MIN_VALUE && v <= Integer.MAX_VALUE ? "integer" : "bigint";
+            } catch (NumberFormatException ex) {
+                return "numeric";
+            }
+        }
+        if (e.matches("[+-]?(\\d+\\.\\d*|\\.\\d+)([eE][+-]?\\d+)?")) return "numeric";
+        return null;
+    }
+
+    /** A declared type reduced to the name two types are the same when they share. */
+    private static String canonicalAttributeType(String typeName) {
+        if (typeName == null) return null;
+        String t = typeName.trim().toLowerCase();
+        int paren = t.indexOf('(');
+        if (paren > 0) t = t.substring(0, paren).trim();
+        if (t.isEmpty()) return null;
+        switch (t) {
+            case "int2": case "smallint": return "smallint";
+            case "int4": case "int": case "integer": return "integer";
+            case "int8": case "bigint": return "bigint";
+            case "numeric": case "decimal": return "numeric";
+            case "float4": case "real": return "real";
+            case "float8": case "double precision": return "double precision";
+            case "bool": case "boolean": return "boolean";
+            case "varchar": case "character varying": return "varchar";
+            case "char": case "character": case "bpchar": return "bpchar";
+            case "text": return "text";
+            case "unknown": return "unknown";
+            default: return t;
+        }
     }
 
     /**
@@ -1999,6 +2156,64 @@ public class PlpgsqlExecutor {
 
     // ---- EXECUTE dynamic SQL ----
 
+    /**
+     * The statements a dynamic command string holds. Semicolons inside a string literal, a quoted
+     * identifier, a dollar-quoted body or a comment are text rather than separators, so splitting
+     * on the character alone would cut a statement in half.
+     */
+    private static List<String> splitDynamicStatements(String sql) {
+        List<String> out = new ArrayList<String>();
+        StringBuilder cur = new StringBuilder();
+        int i = 0;
+        while (i < sql.length()) {
+            char c = sql.charAt(i);
+            if (c == '\'' || c == '"') {
+                int end = i + 1;
+                while (end < sql.length()) {
+                    if (sql.charAt(end) == c) {
+                        // A doubled quote is one quote of content, not the end of the literal.
+                        if (end + 1 < sql.length() && sql.charAt(end + 1) == c) end += 2;
+                        else break;
+                    } else {
+                        end++;
+                    }
+                }
+                cur.append(sql, i, Math.min(end + 1, sql.length()));
+                i = end + 1;
+                continue;
+            }
+            if (c == '$') {
+                int tagEnd = sql.indexOf('$', i + 1);
+                if (tagEnd > 0 && sql.substring(i + 1, tagEnd).matches("[A-Za-z_0-9]*")) {
+                    String tag = sql.substring(i, tagEnd + 1);
+                    int close = sql.indexOf(tag, tagEnd + 1);
+                    int end = close < 0 ? sql.length() : close + tag.length();
+                    cur.append(sql, i, end);
+                    i = end;
+                    continue;
+                }
+            }
+            if (c == '-' && i + 1 < sql.length() && sql.charAt(i + 1) == '-') {
+                int nl = sql.indexOf('\n', i);
+                int end = nl < 0 ? sql.length() : nl;
+                cur.append(sql, i, end);
+                i = end;
+                continue;
+            }
+            if (c == ';') {
+                if (cur.toString().trim().length() > 0) out.add(cur.toString().trim());
+                cur.setLength(0);
+                i++;
+                continue;
+            }
+            cur.append(c);
+            i++;
+        }
+        if (cur.toString().trim().length() > 0) out.add(cur.toString().trim());
+        if (out.isEmpty()) out.add(sql);
+        return out;
+    }
+
     private void executeExecute(PlpgsqlStatement.ExecuteStmt stmt, Scope scope) {
         Object sqlVal = evalExpr(stmt.sqlExpr(), scope);
         if (sqlVal == null) {
@@ -2010,7 +2225,14 @@ public class PlpgsqlExecutor {
         boolean prev = astExecutor.isStrictColumnRefs();
         astExecutor.setStrictColumnRefs(true);
         try {
-            QueryResult result = astExecutor.execute(sql);
+            // EXECUTE runs whatever the string holds, and a string may hold several statements.
+            // All of them run, in order; an INTO takes its row from the last one, which is what
+            // PostgreSQL's SPI does with a multi-statement command.
+            QueryResult result = null;
+            for (String one : splitDynamicStatements(sql)) {
+                result = astExecutor.execute(one);
+            }
+            if (result == null) return;
             scope.lastRowCount = result.getAffectedRows();
 
             // Note: PG's EXECUTE never changes FOUND (it does update GET DIAGNOSTICS ROW_COUNT)
@@ -2880,9 +3102,11 @@ public class PlpgsqlExecutor {
                     "cursor \"" + stmt.cursorName() + "\" has no arguments", "42601");
         }
         if (sql != null) {
-            // A refcursor variable holds its portal name; PG generates one when it has none
+            // A refcursor variable holds its portal name; PG generates one when it has none, and
+            // it is that generated name — not the variable's — that the caller FETCHes from.
             String portal = bound instanceof String && !((String) bound).trim().isEmpty()
-                    ? ((String) bound).trim() : stmt.cursorName();
+                    ? ((String) bound).trim()
+                    : (session != null ? session.nextUnnamedPortal() : stmt.cursorName());
             // Two variables naming the same portal are two names for one cursor, and the second
             // OPEN would silently discard the first one's rows
             if (bound instanceof String && session != null && session.getCursor(portal) != null) {
@@ -3936,7 +4160,10 @@ public class PlpgsqlExecutor {
                 }
                 case "boolean":
                 case "bool":
-                    return Boolean.parseBoolean(s);
+                    // PostgreSQL's own boolean input, which takes yes/on/t/1 and any unambiguous
+                    // prefix of them, and refuses everything else. Java's parseBoolean answers
+                    // false to all of those, so 'yes' arrived as false and 'abc' as false too.
+                    return astExecutor.castValue(s, "boolean");
                 case "numeric":
                 case "decimal": {
                     try { return new java.math.BigDecimal(s); } catch (Exception e) { return val; } 
@@ -3967,8 +4194,26 @@ public class PlpgsqlExecutor {
         return false;
     }
 
+    /** A five-character SQLSTATE: digits and upper-case letters, which is all PostgreSQL asks. */
+    private static boolean isSqlStateLiteral(String code) {
+        if (code.length() != 5) return false;
+        for (int i = 0; i < 5; i++) {
+            char c = code.charAt(i);
+            if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z'))) return false;
+        }
+        return true;
+    }
+
     private String conditionToSqlState(String condition) {
-        switch (condition.toLowerCase().replace("'", "").trim()) {
+        // ERRCODE takes either a five-character SQLSTATE or the name of a condition. Anything
+        // else names no condition at all, and PostgreSQL says so rather than raising the message
+        // under a code it invented.
+        String written = condition.replace("'", "").trim();
+        if (!isSqlStateLiteral(written) && !PlpgsqlConditionNames.isKnown(written)) {
+            throw new MemgresException(
+                    "unrecognized exception condition \"" + written.toLowerCase() + "\"", "42704");
+        }
+        switch (written.toLowerCase()) {
             case "division_by_zero":
                 return "22012";
             case "unique_violation":

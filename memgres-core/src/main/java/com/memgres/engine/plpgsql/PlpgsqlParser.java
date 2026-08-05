@@ -96,6 +96,18 @@ public class PlpgsqlParser {
     }
 
     /**
+     * The same, but the spelling as the author wrote it. The lexer folds an unquoted word, and a
+     * message about a word PostgreSQL did not recognise quotes it back the way it was typed — so
+     * the reader can find it in their own source.
+     */
+    private String readIdentAsWritten() {
+        Token t = peek();
+        String raw = t.raw();
+        readIdent();
+        return raw;
+    }
+
+    /**
      * A body that does not parse is the writer's mistake, not the engine's. PostgreSQL reports it
      * as a syntax error naming the token it stopped at; reporting it as an internal error instead
      * tells the caller nothing they can act on and hides a plain typo behind a fault report.
@@ -835,7 +847,7 @@ public class PlpgsqlParser {
             // A format string is itself the message, so USING MESSAGE would be a second one
             if (format != null) seen.add("MESSAGE");
             while (!check(TokenType.SEMICOLON) && !isAtEnd()) {
-                String key = readIdent();
+                String key = readIdentAsWritten();
                 if (match(TokenType.EQUALS) || match(TokenType.COLON_EQUALS)) {
                     // The value is an ordinary expression, so it is kept as text and evaluated
                     // when the RAISE runs rather than being read as a bare literal.
@@ -856,8 +868,10 @@ public class PlpgsqlParser {
                         case "TABLE": table = val; break;
                         case "SCHEMA": schema = val; break;
                         default:
+                            // PostgreSQL echoes the word as it was written, which is what a
+                            // reader is looking for in their own source.
                             throw new MemgresException("unrecognized RAISE statement option at or"
-                                    + " near \"" + key.toLowerCase() + "\"", "42601");
+                                    + " near \"" + key + "\"", "42601");
                     }
                 }
                 match(TokenType.COMMA);
@@ -1095,21 +1109,23 @@ public class PlpgsqlParser {
         do {
             String varName = readIdent();
             if (!match(TokenType.EQUALS)) match(TokenType.COLON_EQUALS);
-            String itemName = readIdent();
+            String itemName = readIdentAsWritten();
             if (peek().type() == TokenType.IDENTIFIER || peek().type() == TokenType.KEYWORD) {
                 // Handle multi-word like ROW_COUNT, PG_EXCEPTION_DETAIL, etc.
                 if (!check(TokenType.COMMA) && !check(TokenType.SEMICOLON) && !isAtEnd()) {
-                    itemName += "_" + readIdent();
+                    itemName += "_" + readIdentAsWritten();
                     // Handle triple-word items like PG_EXCEPTION_DETAIL -> already two-word after underscore join
                     // But PG_EXCEPTION_CONTEXT is also possible via PG + EXCEPTION + CONTEXT
                     if (peek().type() == TokenType.IDENTIFIER || peek().type() == TokenType.KEYWORD) {
                         if (!check(TokenType.COMMA) && !check(TokenType.SEMICOLON) && !isAtEnd()) {
-                            itemName += "_" + readIdent();
+                            itemName += "_" + readIdentAsWritten();
                         }
                     }
                 }
             }
-            items.add(new PlpgsqlStatement.DiagItem(varName, itemName.toUpperCase()));
+            // Kept as written: PostgreSQL echoes the word back in the message about it, and a
+            // reader is looking for what they typed rather than for a normalised spelling.
+            items.add(new PlpgsqlStatement.DiagItem(varName, itemName));
         } while (match(TokenType.COMMA));
         match(TokenType.SEMICOLON);
         return new PlpgsqlStatement.GetDiagnosticsStmt(items, stacked);

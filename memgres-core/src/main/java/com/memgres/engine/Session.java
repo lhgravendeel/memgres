@@ -1390,6 +1390,19 @@ public class Session {
 
     // ---- Cursors ----
 
+    /** How many portals this session has had to name for itself. */
+    private final java.util.concurrent.atomic.AtomicInteger unnamedPortals =
+            new java.util.concurrent.atomic.AtomicInteger(0);
+
+    /**
+     * The name PostgreSQL gives a cursor that was opened without one. It is not the variable's
+     * name: two functions each declaring a cursor called {@code c} open two different portals, and
+     * the name is what a caller handed the refcursor back has to FETCH from.
+     */
+    public String nextUnnamedPortal() {
+        return "<unnamed portal " + unnamedPortals.incrementAndGet() + ">";
+    }
+
     public void addCursor(String name, CursorState cursor) {
         cursors.put(name.toLowerCase(), cursor);
     }
