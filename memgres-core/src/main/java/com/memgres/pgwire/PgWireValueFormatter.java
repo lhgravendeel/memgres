@@ -57,6 +57,9 @@ class PgWireValueFormatter {
             return b ? "t" : "f";
         } else if (val instanceof LocalTime) {
             LocalTime t = (LocalTime) val;
+            // The end of the day is a time PostgreSQL prints as 24:00:00; java.time holds it one
+            // nanosecond short, so it would otherwise read back as 23:59:59.999999.
+            if (com.memgres.engine.TypeCoercion.isEndOfDay(t)) return "24:00:00";
             return t.getNano() != 0
                     ? stripTrailingFracZeros(t.format(DateTimeFormatter.ofPattern("HH:mm:ss.SSSSSS")))
                     : t.format(DateTimeFormatter.ofPattern("HH:mm:ss"));

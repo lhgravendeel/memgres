@@ -152,6 +152,12 @@ class DateTimeFunctions {
                 double sec = executor.toDouble(executor.evalExpr(fn.args().get(2), ctx));
                 int secs = (int) sec;
                 int nanos = (int) Math.round((sec - secs) * 1_000_000_000);
+                // A field outside its range is the caller's mistake, reported as one rather than
+                // as the internal fault java.time raises for it.
+                if (hour < 0 || hour > 23 || minute < 0 || minute > 59 || sec < 0 || sec >= 60) {
+                    throw new MemgresException("time field value out of range: " + hour + ":"
+                            + twoDigits(minute) + ":" + twoDigits(secs), "22008");
+                }
                 return java.time.LocalTime.of(hour, minute, secs, nanos);
             }
             case "isfinite": {
@@ -602,15 +608,19 @@ class DateTimeFunctions {
         if (RESERVED_UNITS.contains(canonical) && !canonical.equals("epoch")) {
             throw notRecognized(unit, typeName);
         }
-        long dayMicros = time.toNanoOfDay() / 1000;
+        // The end-of-day value counts as a full day, so its hour is 24 rather than the 23 the
+        // clock underneath it reads.
+        long dayMicros = TypeCoercion.timeMicros(time);
         long secondMicros = dayMicros % 60_000_000L;
+        long hourOfDay = dayMicros / 3_600_000_000L;
+        long minuteOfHour = (dayMicros % 3_600_000_000L) / 60_000_000L;
         int offsetSeconds = offset == null ? 0 : offset.getTotalSeconds();
         switch (canonical) {
             case "microsecond": return whole(secondMicros, extractForm);
             case "millisecond": return scaled(secondMicros, 3, extractForm);
             case "second": return scaled(secondMicros, 6, extractForm);
-            case "minute": return whole(time.getMinute(), extractForm);
-            case "hour": return whole(time.getHour(), extractForm);
+            case "minute": return whole(minuteOfHour, extractForm);
+            case "hour": return whole(hourOfDay, extractForm);
             // A timetz's epoch is its time of day taken back to UTC
             case "epoch": return scaled(dayMicros - offsetSeconds * 1_000_000L, 6, extractForm);
             case "timezone":
@@ -851,6 +861,12 @@ class DateTimeFunctions {
             throw new MemgresException("invalid input syntax for type numeric: \"" + input + "\"", "22P02");
         }
         return negative ? value.negate() : value;
+    }
+
+
+    /** A clock field padded the way PostgreSQL writes it back in a range complaint. */
+    private static String twoDigits(int value) {
+        return value < 10 && value >= 0 ? "0" + value : String.valueOf(value);
     }
 
 }

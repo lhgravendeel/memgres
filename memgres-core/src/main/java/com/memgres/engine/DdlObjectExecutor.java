@@ -195,6 +195,7 @@ class DdlObjectExecutor {
                 break;
             }
             case OWNER_TO: {
+                requireOwnerExists(stmt.value());
                 break;
             }
         }
@@ -376,6 +377,15 @@ class DdlObjectExecutor {
         if (schemaName == null) return;
         if (executor.database.getSchema(schemaName) == null) {
             throw new MemgresException("schema \"" + schemaName + "\" does not exist", "3F000");
+        }
+    }
+
+    /** A role that does not exist cannot be given anything to own. */
+    void requireOwnerExists(String roleName) {
+        if (roleName == null) return;
+        String resolved = ddl.resolveOwnerName(roleName);
+        if (!executor.database.hasRole(resolved)) {
+            throw new MemgresException("role \"" + resolved + "\" does not exist", "42704");
         }
     }
 
@@ -637,9 +647,11 @@ class DdlObjectExecutor {
 
         switch (stmt.action()) {
             case OWNER_TO:
+                requireOwnerExists(stmt.value());
                 op.setOwner(stmt.value());
                 break;
             case SET_SCHEMA:
+                requireSchemaExists(stmt.value());
                 op.setSchemaName(stmt.value());
                 break;
             case SET_PROPERTIES:
@@ -3438,6 +3450,10 @@ class DdlObjectExecutor {
                 executor.identity().typeRenamed("d", oldKey, newKey);
                 break;
             }
+            case "OWNER_TO": {
+                requireOwnerExists(stmt.newConstraintName());
+                break;
+            }
             case "NO_OP": {
                 break;
             }
@@ -4344,7 +4360,14 @@ class DdlObjectExecutor {
         String name = parts.length > 1 ? parts[1] : "";
         String newName = parts.length > 2 ? parts[2] : "";
         String extra = parts.length > 3 ? parts[3] : "";
+        String intoSchema = parts.length > 4 ? parts[4] : "";
+        String newOwner = parts.length > 5 ? parts[5] : "";
         requireObjectExists(kind, name);
+        // The object is there; the schema or role the statement points at has to be there too.
+        // PostgreSQL checks it whether or not anything is then recorded, and a script told the
+        // move happened will believe it did.
+        if (!intoSchema.isEmpty()) requireSchemaExists(intoSchema);
+        if (!newOwner.isEmpty()) requireOwnerExists(newOwner);
         if (!newName.isEmpty()) renameRegisteredObject(kind, name, newName);
         // ALTER EXTENSION ... UPDATE with nothing to update to says so. Only an extension whose
         // version memgres actually knows can be named honestly here; the ones it accepts without

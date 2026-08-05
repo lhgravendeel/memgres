@@ -1446,6 +1446,11 @@ class StringFunctions {
             case "to_hex": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
+                // Two's complement, and how wide it is decides the answer: to_hex(-1) is
+                // ffffffff for an integer and ffffffffffffffff for a bigint.
+                if (arg instanceof Integer || arg instanceof Short || arg instanceof Byte) {
+                    return Integer.toHexString(((Number) arg).intValue());
+                }
                 return Long.toHexString(executor.toLong(arg));
             }
             case "normalize": {

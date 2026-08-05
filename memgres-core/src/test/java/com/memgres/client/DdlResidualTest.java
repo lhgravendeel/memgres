@@ -439,8 +439,14 @@ class DdlResidualTest {
         // Both survive the refused rename, and the ordinary alterations still work.
         assertEquals(List.of("dr_pub2", "dr_pub3"), column(
                 "SELECT pubname FROM pg_publication WHERE pubname LIKE 'dr_pub%' ORDER BY pubname"));
-        assertAccepted("ALTER PUBLICATION dr_pub3 ADD TABLE dr_pt");
+        // dr_pub3 was created FOR TABLE dr_pt, so adding it again would list it twice.
+        assertRejected("42710", "relation \"dr_pt\" is already member of publication \"dr_pub3\"",
+                "ALTER PUBLICATION dr_pub3 ADD TABLE dr_pt");
         assertAccepted("ALTER PUBLICATION dr_pub3 DROP TABLE dr_pt");
+        // ...and once it is out, dropping it again names a relation the publication does not have.
+        assertRejected("42704", "relation \"dr_pt\" is not part of the publication",
+                "ALTER PUBLICATION dr_pub3 DROP TABLE dr_pt");
+        assertAccepted("ALTER PUBLICATION dr_pub3 ADD TABLE dr_pt");
         assertAccepted("ALTER PUBLICATION dr_pub3 OWNER TO CURRENT_USER");
     }
 

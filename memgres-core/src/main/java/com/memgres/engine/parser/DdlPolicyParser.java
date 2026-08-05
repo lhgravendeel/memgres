@@ -97,13 +97,15 @@ class DdlPolicyParser {
             throw new ParseException("policy command cannot be altered", parser.peek());
         }
 
-        // Skip TO role clause
+        // The roles a TO clause names are kept rather than skipped: PostgreSQL refuses one that
+        // does not exist, and accepting it silently leaves the policy applying to nobody.
+        java.util.List<String> roles = new java.util.ArrayList<String>();
         if (parser.matchKeyword("TO")) {
-            do { parser.readIdentifier(); } while (parser.match(TokenType.COMMA));
+            do { roles.add(parser.readIdentifier()); } while (parser.match(TokenType.COMMA));
         }
 
         Expression[] exprs = parseUsingWithCheck();
-        return new AlterPolicyStmt(name, table, null, exprs[0], exprs[1]);
+        return new AlterPolicyStmt(name, table, null, exprs[0], exprs[1], roles);
     }
 
     /** Shared parsing for USING (expr) and WITH CHECK (expr) clauses. */

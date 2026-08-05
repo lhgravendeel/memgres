@@ -468,6 +468,11 @@ class MathFunctions {
                             "operand, lower bound, and upper bound cannot be NaN", "2201G");
                 }
                 int count = executor.toInt(countArg);
+                // There is no bucket to fall into when none were asked for, and dividing by the
+                // count would be a division by zero besides.
+                if (count <= 0) {
+                    throw new MemgresException("count must be greater than zero", "2201G");
+                }
                 if (val < lo) return 0;
                 if (val >= hi) return count + 1;
                 return (int) ((val - lo) / (hi - lo) * count) + 1;

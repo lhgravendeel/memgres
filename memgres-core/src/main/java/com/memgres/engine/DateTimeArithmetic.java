@@ -69,13 +69,10 @@ class DateTimeArithmetic {
         if (left instanceof LocalTime && right instanceof PgInterval) {
             PgInterval iv = (PgInterval) right;
             LocalTime lt = (LocalTime) left;
-            LocalTime result = lt;
-            long totalMicros = iv.getMicroseconds();
-            long totalSeconds = totalMicros / 1_000_000;
-            result = result.plusHours(totalSeconds / 3600);
-            result = result.plusMinutes((totalSeconds % 3600) / 60);
-            result = result.plusSeconds(totalSeconds % 60);
-            return result;
+            // Counted in microseconds since midnight, so the end-of-day value takes part as the
+            // full day it stands for: 24:00:00 + 1 second is 00:00:01, not a nanosecond short.
+            return TypeCoercion.timeOfMicros(
+                    TypeCoercion.timeMicros(lt) + iv.getMicroseconds());
         }
         // interval + time (commutative)
         if (left instanceof PgInterval && right instanceof LocalTime) {
@@ -272,6 +269,12 @@ class DateTimeArithmetic {
             PgInterval iv = (PgInterval) right;
             LocalTime lt = (LocalTime) left;
             return dateTimeAdd(lt, iv.negate());
+        }
+
+        // time - time → interval, which may be negative: PG does not wrap it into a day
+        if (left instanceof LocalTime && right instanceof LocalTime) {
+            long micros = ChronoUnit.MICROS.between((LocalTime) right, (LocalTime) left);
+            return new PgInterval(0, 0, micros);
         }
 
         // date - date → integer (days between)

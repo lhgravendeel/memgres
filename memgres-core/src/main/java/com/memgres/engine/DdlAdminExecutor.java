@@ -447,6 +447,9 @@ class DdlAdminExecutor {
 
     // ---- ALTER POLICY ----
 
+    /** PUBLIC names every role at once rather than one that has to be found in the catalog. */
+    private static final String PUBLIC_ROLE = "public";
+
     QueryResult executeAlterPolicy(AlterPolicyStmt stmt) {
         Table table = executor.resolveTable("public", stmt.table());
         RlsPolicy found = null;
@@ -467,7 +470,25 @@ class DdlAdminExecutor {
         if (stmt.usingExpr() != null && "INSERT".equals(policyCommand)) {
             throw PgErrors.syntax("only WITH CHECK expression allowed for INSERT");
         }
+        // Every role a TO clause names has to exist. PostgreSQL checks them before it changes
+        // anything, so a policy is never left applying to a role that is not there.
+        for (String role : stmt.roles()) {
+            if (PUBLIC_ROLE.equalsIgnoreCase(role)) continue;
+            String resolved = executor.ddlExecutor.resolveOwnerName(role);
+            if (!executor.database.hasRole(resolved)) {
+                throw new MemgresException("role \"" + resolved + "\" does not exist", "42704");
+            }
+        }
         if (stmt.renameTo() != null) {
+            // Renaming onto a name another policy on this table already answers to would leave
+            // two of them with one name.
+            for (RlsPolicy p : table.getRlsPolicies()) {
+                if (p.getName().equalsIgnoreCase(stmt.renameTo())
+                        && !p.getName().equalsIgnoreCase(stmt.name())) {
+                    throw new MemgresException("policy \"" + stmt.renameTo() + "\" for table \""
+                            + stmt.table() + "\" already exists", "42710");
+                }
+            }
             for (int i = 0; i < table.getRlsPolicies().size(); i++) {
                 RlsPolicy p = table.getRlsPolicies().get(i);
                 if (p.getName().equalsIgnoreCase(stmt.name())) {

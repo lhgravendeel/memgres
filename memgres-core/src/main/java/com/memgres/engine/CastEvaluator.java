@@ -639,6 +639,7 @@ class CastEvaluator {
                 // digits the value has, so 01:02:03.99 stays two digits wide
                 if (val instanceof java.time.LocalTime) {
                     java.time.LocalTime lt = (java.time.LocalTime) val;
+                    if (TypeCoercion.isEndOfDay(lt)) return "24:00:00";
                     return lt.getNano() == 0
                             ? lt.format(java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss"))
                             : stripTrailingFracZeros(lt.format(

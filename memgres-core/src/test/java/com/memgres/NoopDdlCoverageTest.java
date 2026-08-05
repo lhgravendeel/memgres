@@ -32,6 +32,13 @@ class NoopDdlCoverageTest {
         stmt.execute("CREATE FOREIGN TABLE ft1 (id int, name text) SERVER myserver");
         stmt.execute("CREATE PUBLICATION mypub FOR ALL TABLES");
         stmt.execute("CREATE SUBSCRIPTION mysub CONNECTION 'host=localhost' PUBLICATION mypub");
+        // OWNER TO names a role, and a publication's table list names relations. PostgreSQL
+        // refuses one that does not exist, so they are created here for the same reason the
+        // objects above are: the statement under test is meant to be a no-op, not an error.
+        stmt.execute("CREATE ROLE newowner");
+        stmt.execute("CREATE TABLE t1 (id int)");
+        stmt.execute("CREATE TABLE t2 (id int)");
+        stmt.execute("CREATE TABLE t4 (id int)");
     }
 
     @AfterAll

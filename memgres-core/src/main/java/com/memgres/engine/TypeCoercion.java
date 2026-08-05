@@ -970,6 +970,7 @@ public final class TypeCoercion {
         if (val instanceof OffsetDateTime) return ((OffsetDateTime) val).toString();
         if (val instanceof LocalTime) {
             LocalTime lt = (LocalTime) val;
+            if (isEndOfDay(lt)) return "24:00:00";
             if (lt.getNano() == 0) return lt.format(DateTimeFormatter.ofPattern("HH:mm:ss"));
             // Java pads the fraction to a multiple of three digits; PostgreSQL writes only the
             // digits the value has, so 01:02:03.99 stays two digits wide
@@ -1578,7 +1579,10 @@ public final class TypeCoercion {
         // Handle special keywords
         if (s.equalsIgnoreCase("allballs")) return LocalTime.MIDNIGHT;
         if (s.equalsIgnoreCase("now")) return nowHere().toLocalTime();
-        try { return LocalTime.parse(s); } catch (DateTimeParseException e) {
+        // 24:00:00 is the end of the day, and the only hour-24 time the type takes: 24:00:00.000001
+        // is out of range. java.time stops a nanosecond short of it, so it is held as that.
+        if (s.matches("24:00(:00(\\.0+)?)?")) return TIME_END_OF_DAY;
+        try { return roundedToMicros(LocalTime.parse(s)); } catch (DateTimeParseException e) {
             // Try parsing as time with timezone offset (e.g., "10:30:00+02")
             try {
                 return java.time.OffsetTime.parse(s, java.time.format.DateTimeFormatter.ISO_OFFSET_TIME).toLocalTime();
@@ -1684,6 +1688,9 @@ public final class TypeCoercion {
                 } catch (DateTimeParseException e3) { /* fall through */ }
             }
         }
+
+        // The end of the day is a timetz as much as it is a time.
+        if (s.matches("24:00(:00(\\.0+)?)?")) return "24:00:00+00";
 
         // Plain time without offset, default to +00 (UTC)
         try {
@@ -1829,12 +1836,75 @@ public final class TypeCoercion {
         }
     }
 
+    /**
+     * PostgreSQL's {@code time} runs to 24:00:00 inclusive — one value past the last instant of
+     * the day, which it uses to mean the end of it. {@code java.time.LocalTime} stops one
+     * nanosecond short of that, so {@link LocalTime#MAX} stands in for it here. Nothing else can
+     * reach that value: a time is stored to microsecond precision, so 23:59:59.999999999 is not a
+     * value any input produces — PostgreSQL rounds it up to 24:00:00, which is exactly what this
+     * represents.
+     */
+    public static final LocalTime TIME_END_OF_DAY = LocalTime.MAX;
+
+    /**
+     * A time held to the microsecond, which is the resolution the type has. PostgreSQL rounds
+     * rather than truncates, so 23:59:59.9999999 becomes 24:00:00 — the end-of-day value, and the
+     * reason it is reachable at all.
+     */
+    public static LocalTime roundedToMicros(LocalTime time) {
+        long nanos = time.toNanoOfDay();
+        long micros = (nanos + 500L) / 1000L;
+        return micros >= 86_400_000_000L ? TIME_END_OF_DAY : LocalTime.ofNanoOfDay(micros * 1000L);
+    }
+
+    /** True when this is the end-of-day time, which prints as 24:00:00 rather than as a clock. */
+    public static boolean isEndOfDay(Object value) {
+        return TIME_END_OF_DAY.equals(value);
+    }
+
+    /** Microseconds since midnight, counting the end-of-day value as a full day. */
+    public static long timeMicros(LocalTime time) {
+        return isEndOfDay(time) ? 86_400_000_000L : time.toNanoOfDay() / 1000L;
+    }
+
+    /** The time a microsecond count names, wrapping into the day as PostgreSQL does. */
+    public static LocalTime timeOfMicros(long micros) {
+        long day = 86_400_000_000L;
+        long m = ((micros % day) + day) % day;
+        return LocalTime.ofNanoOfDay(m * 1000L);
+    }
+
     // Sentinel values for PG 'infinity' / '-infinity' timestamps
     public static final LocalDateTime TIMESTAMP_INFINITY = LocalDateTime.of(9999, 12, 31, 23, 59, 59);
     public static final LocalDateTime TIMESTAMP_NEG_INFINITY = LocalDateTime.of(-4713, 1, 1, 0, 0, 0);
     /** date also has infinities, sharing the timestamp sentinels' day so comparisons agree. */
     public static final LocalDate DATE_INFINITY = TIMESTAMP_INFINITY.toLocalDate();
     public static final LocalDate DATE_NEG_INFINITY = TIMESTAMP_NEG_INFINITY.toLocalDate();
+
+    /**
+     * The span a PostgreSQL timestamp can hold: 4714-11-24 BC to 294276-12-31, which is narrower at
+     * the top than {@code date}'s (5874897-12-31) because a timestamp spends its bits on the time
+     * of day. Arithmetic that lands outside it has no representable answer, so PostgreSQL raises
+     * 22008 rather than returning a value no server could store or send back.
+     */
+    private static final LocalDateTime TIMESTAMP_RANGE_MAX =
+            LocalDateTime.of((int) TIMESTAMP_MAX_YEAR, 12, 31, 23, 59, 59, 999_999_000);
+    private static final LocalDateTime TIMESTAMP_RANGE_MIN = LocalDateTime.of(-4713, 11, 24, 0, 0);
+
+    /**
+     * Refuse a timestamp outside the type's range. The two infinity sentinels are let through: they
+     * stand for infinity rather than for the instant they happen to be spelled as, and
+     * {@code -infinity} is deliberately stored below the true lower bound.
+     */
+    public static LocalDateTime requireTimestampInRange(LocalDateTime value) {
+        if (value == null || value.equals(TIMESTAMP_INFINITY) || value.equals(TIMESTAMP_NEG_INFINITY)) {
+            return value;
+        }
+        if (value.isAfter(TIMESTAMP_RANGE_MAX) || value.isBefore(TIMESTAMP_RANGE_MIN)) {
+            throw new MemgresException("timestamp out of range", "22008");
+        }
+        return value;
+    }
 
     public static Object toLocalDateTimeOrInfinity(Object val) {
         if (val instanceof String) {

@@ -469,9 +469,11 @@ public final class JsonOperations {
      */
     public static String jsonbSet(String json, List<String> path, String newValue, boolean createMissing) {
         json = json.trim();
-        if (path.isEmpty()) return json;
+        // The answer is a jsonb whatever happens to it, so it is spelled the way jsonb is spelled
+        // — including when the path reached nothing and the target comes back as it went in.
+        if (path.isEmpty()) return normalizeJsonb(json);
         requirePathTarget(json);
-        return jsonbSetAt(json, path, 0, newValue, createMissing);
+        return normalizeJsonb(jsonbSetAt(json, path, 0, newValue, createMissing));
     }
 
     private static String jsonbSetAt(String json, List<String> path, int at, String newValue, boolean createMissing) {
@@ -820,7 +822,27 @@ public final class JsonOperations {
             sb.append("]");
             return sb.toString();
         }
-        return json;
+        return normalizeJsonbNumber(json);
+    }
+
+    /**
+     * A jsonb number is stored as {@code numeric}, so the exponent it was written with is not part
+     * of it: 1e2 reads back as 100 and 1e-3 as 0.001. {@code json} keeps the text as written,
+     * which is why this belongs to the jsonb path alone.
+     */
+    private static String normalizeJsonbNumber(String scalar) {
+        String s = scalar.trim();
+        if (s.isEmpty()) return scalar;
+        int e = s.indexOf('e');
+        if (e < 0) e = s.indexOf('E');
+        if (e < 0) return scalar;
+        // Only a bare number carries an exponent; a quoted string keeps whatever it holds.
+        if (s.charAt(0) == '"') return scalar;
+        try {
+            return new java.math.BigDecimal(s).toPlainString();
+        } catch (NumberFormatException ex) {
+            return scalar;
+        }
     }
 
     private static String elemsToJsonArray(List<String> elems) {
