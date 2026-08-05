@@ -109,7 +109,10 @@ public class Table {
     }
 
     public List<Column> getColumns() {
-        return columns;
+        // A column an open transaction added is not part of the relation for anyone else yet, so
+        // it is left out of their view — which keeps it out of pg_attribute, information_schema
+        // and every listing built from the table's own columns.
+        return Database.visibleColumns(columns);
     }
 
     /**

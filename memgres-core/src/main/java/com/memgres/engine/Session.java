@@ -1657,6 +1657,14 @@ public class Session {
         deferredTriggers.add(trigger);
     }
 
+    /** Forget every SET CONSTRAINTS override, as the end of a transaction does. */
+    public void clearConstraintModes() {
+        allConstraintsDeferred = false;
+        allConstraintsImmediate = false;
+        deferredConstraintNames.clear();
+        immediateConstraintNames.clear();
+    }
+
     public void setAllConstraintsDeferred(boolean deferred) {
         if (deferred) {
             this.allConstraintsDeferred = true;
@@ -2255,6 +2263,70 @@ public class Session {
         }
     }
 
+    /**
+     * Undo a CREATE TYPE ... AS (...). A composite owns a pg_class row as well as a pg_type row,
+     * so both go when the transaction that made them does.
+     */
+    public static final class CreateCompositeTypeUndo implements UndoEntry {
+        public final String schema;
+        public final String typeName;
+
+        public CreateCompositeTypeUndo(String schema, String typeName) {
+            this.schema = schema;
+            this.typeName = typeName;
+        }
+
+        @Override
+        public void undo(Database db) {
+            db.getCompositeTypes().remove(TypeNamespace.key(schema, typeName));
+            db.unregisterSchemaObject(schema, "composite", typeName);
+        }
+    }
+
+    /** Undo a CREATE DOMAIN. */
+    public static final class CreateDomainUndo implements UndoEntry {
+        public final String schema;
+        public final String typeName;
+
+        public CreateDomainUndo(String schema, String typeName) {
+            this.schema = schema;
+            this.typeName = typeName;
+        }
+
+        @Override
+        public void undo(Database db) {
+            db.getDomains().remove(TypeNamespace.key(schema, typeName));
+            db.unregisterSchemaObject(schema, "domain", typeName);
+        }
+    }
+
+    /**
+     * Undo an ALTER TABLE ... RENAME. A rename is a name appearing and a name going away, and a
+     * rolled-back transaction has done neither — leaving the new name behind meant the relation
+     * answered to a name no committed statement ever gave it.
+     */
+    public static final class RenameTableUndo implements UndoEntry {
+        public final String schemaName;
+        public final String oldName;
+        public final String newName;
+        public final Table original;
+
+        public RenameTableUndo(String schemaName, String oldName, String newName, Table original) {
+            this.schemaName = schemaName;
+            this.oldName = oldName;
+            this.newName = newName;
+            this.original = original;
+        }
+
+        @Override
+        public void undo(Database db) {
+            Schema schema = db.getSchema(schemaName);
+            if (schema == null) return;
+            schema.removeTable(newName);
+            if (original != null) schema.addTable(original);
+        }
+    }
+
     /** Undo an INSERT by removing the row. */
         public static final class InsertUndo implements UndoEntry {
         public final String schema;
@@ -2656,6 +2728,31 @@ public class Session {
     }
 
     /** Undo a CREATE VIEW. */
+    /**
+     * Undo a CREATE SCHEMA. DDL is transactional, so a schema a rolled-back transaction created
+     * has to go with it — leaving it behind made the next CREATE SCHEMA of that name fail with
+     * 42P06 for a schema nobody had successfully created.
+     */
+    public static final class CreateSchemaUndo implements UndoEntry {
+        public final String schemaName;
+
+        public CreateSchemaUndo(String schemaName) {
+            this.schemaName = schemaName;
+        }
+
+        @Override
+        public void undo(Database db) {
+            db.removeSchema(schemaName);
+        }
+
+        public String schemaName() { return schemaName; }
+
+        @Override
+        public String toString() {
+            return "CreateSchemaUndo[schemaName=" + schemaName + "]";
+        }
+    }
+
         public static final class CreateViewUndo implements UndoEntry {
         public final String viewName;
 

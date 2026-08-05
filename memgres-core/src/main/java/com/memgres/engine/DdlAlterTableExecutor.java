@@ -821,6 +821,9 @@ class DdlAlterTableExecutor {
             col.setAttHasMissing(true);
         }
         table.addColumn(col, evaluatedDefault);
+        // The column belongs to this transaction until it commits: another session's view of the
+        // relation is the shape it had before the ALTER.
+        executor.database.markUncommittedObject(col, executor.session);
         executor.recordUndo(new Session.AddColumnUndo(schemaName, stmt.table(), def.name()));
 
         // Backfill existing rows for sequence-backed (serial/identity/nextval) and volatile
@@ -1253,6 +1256,12 @@ class DdlAlterTableExecutor {
         }
         renamed.setRlsEnabled(table.isRlsEnabled());
         schema.addTable(renamed);
+        // A rename is a name appearing and a name going away, and neither has happened for
+        // anyone else until this transaction commits: the new name is hidden the way any
+        // uncommitted relation is, and the old one is held the way any uncommitted drop is.
+        executor.database.markUncommittedObject(renamed, executor.session);
+        executor.recordUndo(new Session.RenameTableUndo(
+                schemaName, stmt.table(), rename.newName(), table));
         // The same table under a new name: the OID stays with it, and so do the comment, the
         // grants and the indexes built on it. Told, not inferred -- see ObjectIdentity.
         executor.identity().relationRenamed("r", schemaName, stmt.table(),

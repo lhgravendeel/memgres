@@ -948,7 +948,10 @@ public class Database {
     }
 
     public Schema getOrCreateSchema(String name) {
-        return schemas.computeIfAbsent(name, Schema::new);
+        boolean existed = schemas.containsKey(name);
+        Schema schema = schemas.computeIfAbsent(name, Schema::new);
+        if (!existed) markUncommittedObject(schema, CURRENT_VIEWER.get());
+        return schema;
     }
 
     /**
@@ -983,7 +986,7 @@ public class Database {
     }
 
     public Map<String, Schema> getSchemas() {
-        return schemas;
+        return visible(schemas);
     }
 
     /** The register that says which OID belongs to which object. @see ObjectIdentity */
@@ -1058,6 +1061,7 @@ public class Database {
     // Custom ENUM types
     public void addCustomEnum(CustomEnum customEnum) {
         customEnums.put(TypeNamespace.key(customEnum.getSchemaName(), customEnum.getName()), customEnum);
+        markUncommittedObject(customEnum, CURRENT_VIEWER.get());
     }
 
     public CustomEnum getCustomEnum(String name) {
@@ -1084,7 +1088,7 @@ public class Database {
     }
 
     public Map<String, CustomEnum> getCustomEnums() {
-        return customEnums;
+        return visible(customEnums);
     }
 
     // Composite types
@@ -1094,6 +1098,7 @@ public class Database {
 
     public void addCompositeType(String schema, String name, List<CreateTypeStmt.CompositeField> fields) {
         compositeTypes.put(TypeNamespace.key(schema, name), fields);
+        markUncommittedObject(fields, CURRENT_VIEWER.get());
     }
 
     public boolean isCompositeType(String name) {
@@ -1128,7 +1133,7 @@ public class Database {
     }
 
     public Map<String, List<CreateTypeStmt.CompositeField>> getCompositeTypes() {
-        return compositeTypes;
+        return visible(compositeTypes);
     }
 
     // User-defined range types
@@ -1298,6 +1303,7 @@ public class Database {
         List<PgFunction> overloads = functionOverloads.computeIfAbsent(key, k -> new ArrayList<>());
         overloads.add(function);
         functions.put(key, function); // last-added wins for simple name lookup
+        markUncommittedObject(function, CURRENT_VIEWER.get());
     }
 
     /** Returns the single function with this name, or the first overload if multiple exist. */
@@ -1605,7 +1611,7 @@ public class Database {
     }
 
     public Map<String, PgFunction> getFunctions() {
-        return functions;
+        return visible(functions);
     }
 
     // Triggers
@@ -1735,6 +1741,7 @@ public class Database {
     /** Everything this session created is now permanent (or gone); stop hiding it. */
     public void clearUncommittedObjects(Session creator) {
         if (creator == null) return;
+        for (Schema schema : schemas.values()) schema.forgetDroppedBy(creator);
         synchronized (uncommittedObjects) {
             uncommittedObjects.values().removeIf(s -> s == creator);
         }
@@ -1758,6 +1765,11 @@ public class Database {
     private static final ThreadLocal<Session> CURRENT_VIEWER = new ThreadLocal<Session>();
 
     /** Bind the session running this thread's statement; returns the one it replaced. */
+    /** The session whose statement is running on this thread, or null outside one. */
+    static Session currentViewer() {
+        return CURRENT_VIEWER.get();
+    }
+
     public static Session bindViewer(Session viewer) {
         Session previous = CURRENT_VIEWER.get();
         if (viewer == null) CURRENT_VIEWER.remove(); else CURRENT_VIEWER.set(viewer);
@@ -1771,17 +1783,61 @@ public class Database {
      * neither a copy nor a wrapper is made for a statement no uncommitted DDL is running beside.
      */
     static Map<String, Table> visibleTables(Map<String, Table> tables) {
+        return visible(tables);
+    }
+
+    /**
+     * The same for any map of objects a statement can create: views, sequences, indexes, schemas,
+     * types, functions. DDL is transactional whatever it creates, so every kind is hidden from
+     * other sessions by the same rule and through the same one place.
+     *
+     * <p>Returns the map itself when there is nothing to hide, which is the ordinary case, so
+     * neither a copy nor a wrapper is made for a statement no uncommitted DDL is running beside.
+     */
+    static <V> Map<String, V> visible(Map<String, V> objects) {
         Session viewer = CURRENT_VIEWER.get();
-        if (viewer == null) return tables;
+        if (viewer == null) return objects;
         Database db = viewer.getDatabase();
-        if (db == null || db.uncommittedObjects.isEmpty()) return tables;
-        Map<String, Table> visible = null;
-        for (Map.Entry<String, Table> e : tables.entrySet()) {
+        if (db == null || db.uncommittedObjects.isEmpty()) return objects;
+        Map<String, V> shown = null;
+        for (Map.Entry<String, V> e : objects.entrySet()) {
             if (db.isObjectVisibleTo(e.getValue(), viewer)) continue;
-            if (visible == null) visible = new java.util.LinkedHashMap<String, Table>(tables);
-            visible.remove(e.getKey());
+            if (shown == null) shown = new java.util.LinkedHashMap<String, V>(objects);
+            shown.remove(e.getKey());
         }
-        return visible == null ? tables : visible;
+        return shown == null ? objects : shown;
+    }
+
+    /** A relation's columns without those an open transaction of another session added. */
+    static List<Column> visibleColumns(List<Column> columns) {
+        Session viewer = CURRENT_VIEWER.get();
+        if (viewer == null) return columns;
+        Database db = viewer.getDatabase();
+        if (db == null || db.uncommittedObjects.isEmpty()) return columns;
+        List<Column> shown = null;
+        for (int i = 0; i < columns.size(); i++) {
+            if (db.isObjectVisibleTo(columns.get(i), viewer)) continue;
+            if (shown == null) shown = new ArrayList<Column>(columns);
+            shown.remove(columns.get(i));
+        }
+        return shown == null ? columns : shown;
+    }
+
+    /** The same for a set of names an object kind is tracked by rather than a map. */
+    static java.util.Set<String> visibleNames(java.util.Set<String> names,
+                                              Map<String, ?> byName) {
+        Session viewer = CURRENT_VIEWER.get();
+        if (viewer == null) return names;
+        Database db = viewer.getDatabase();
+        if (db == null || db.uncommittedObjects.isEmpty()) return names;
+        java.util.Set<String> shown = null;
+        for (String name : names) {
+            Object o = byName == null ? null : byName.get(name);
+            if (o == null || db.isObjectVisibleTo(o, viewer)) continue;
+            if (shown == null) shown = new java.util.LinkedHashSet<String>(names);
+            shown.remove(name);
+        }
+        return shown == null ? names : shown;
     }
 
     // Sequences
@@ -1800,6 +1856,7 @@ public class Database {
 
     public void addSequence(Sequence sequence) {
         sequences.put(seqKey(sequence.getSchemaName(), sequence.getName()), sequence);
+        markUncommittedObject(sequence, CURRENT_VIEWER.get());
     }
 
     /** The sequence of this name in this schema, and in no other. */
@@ -2296,6 +2353,8 @@ public class Database {
     // Index metadata (for USING INDEX lookups)
     public void addIndex(String schemaName, String name, List<String> columns) {
         indexColumns.put(idxKey(schemaName, name), columns);
+        // The column list is what every index listing is built from, so hiding it hides the index.
+        markUncommittedObject(columns, CURRENT_VIEWER.get());
     }
 
     public void addIndexMeta(String schemaName, String name, String tableName, boolean isUnique) {
@@ -2475,7 +2534,7 @@ public class Database {
     }
 
     public Map<String, List<String>> getIndexColumns() {
-        return indexColumns;
+        return visible(indexColumns);
     }
 
     // Views
@@ -2485,6 +2544,7 @@ public class Database {
     // name still finds the only view that answers to it.
     public void addView(ViewDef view) {
         views.put(viewKey(view.schemaName(), view.name()), view);
+        markUncommittedObject(view, CURRENT_VIEWER.get());
     }
 
     /** The key a view is stored under: its schema and its name. */
@@ -2542,16 +2602,17 @@ public class Database {
     }
 
     public Map<String, ViewDef> getViews() {
-        return views;
+        return visible(views);
     }
 
     public Map<String, Sequence> getSequences() {
-        return sequences;
+        return visible(sequences);
     }
 
     // Domain types
     public void addDomain(DomainType domain) {
         domains.put(TypeNamespace.key(domain.getSchemaName(), domain.getName()), domain);
+        markUncommittedObject(domain, CURRENT_VIEWER.get());
     }
 
     public DomainType getDomain(String name) {
@@ -2574,7 +2635,7 @@ public class Database {
     }
 
     public Map<String, DomainType> getDomains() {
-        return domains;
+        return visible(domains);
     }
 
     // ==================== Advisory locks ====================
