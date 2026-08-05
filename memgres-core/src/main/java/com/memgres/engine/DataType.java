@@ -120,6 +120,12 @@ public enum DataType {
     RECORD_ARRAY(2287, "_record"),
     OID_ARRAY(1028, "_oid"),
     INTERNAL_CHAR_ARRAY(1002, "_char"),
+    // Array types PG ships that had no name here, so 'bit[]'::regtype and 'point[]'::regtype
+    // resolved to nothing at all and format_type could not be asked about them.
+    CIDR_ARRAY(651, "_cidr"),
+    POINT_ARRAY(1017, "_point"),
+    BIT_ARRAY(1561, "_bit"),
+    VARBIT_ARRAY(1563, "_varbit"),
 
     // Types the system catalogs declare columns of. A catalog column typed text where PG types
     // it pg_node_tree tells a client the value can be read as text, which it cannot; and a
@@ -404,6 +410,12 @@ public enum DataType {
             case JSONB: return JSONB_ARRAY;
             case INET: return INET_ARRAY;
             case RECORD: return RECORD_ARRAY;
+            case CIDR: return CIDR_ARRAY;
+            case POINT: return POINT_ARRAY;
+            case BIT: return BIT_ARRAY;
+            case VARBIT: return VARBIT_ARRAY;
+            case OID: return OID_ARRAY;
+            case INTERNAL_CHAR: return INTERNAL_CHAR_ARRAY;
             default: return null;
         }
     }
@@ -437,6 +449,10 @@ public enum DataType {
             case RECORD_ARRAY: return RECORD;
             case OID_ARRAY: return OID;
             case INTERNAL_CHAR_ARRAY: return INTERNAL_CHAR;
+            case CIDR_ARRAY: return CIDR;
+            case POINT_ARRAY: return POINT;
+            case BIT_ARRAY: return BIT;
+            case VARBIT_ARRAY: return VARBIT;
             case ACLITEM_ARRAY: return null; // aclitem has no DataType of its own
             default: return null;
         }

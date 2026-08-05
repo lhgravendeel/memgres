@@ -211,13 +211,15 @@ class NoopDdlCoverageTest {
         exec("DROP USER MAPPING IF EXISTS FOR current_user SERVER myserver");
     }
 
-    // CREATE FOREIGN TABLE
+    // CREATE FOREIGN TABLE. Each of these creates a name of its own: a foreign table holds its
+    // name in its schema like any relation, so creating one over the shared ft1 is 42P07 in
+    // PostgreSQL and asserting that it succeeds would be asserting the wrong thing.
     @Test void testCreateForeignTable() throws SQLException {
-        exec("CREATE FOREIGN TABLE ft1 (id int, name text) SERVER myserver");
+        exec("CREATE FOREIGN TABLE ft_plain (id int, name text) SERVER myserver");
     }
 
     @Test void testCreateForeignTableWithOptions() throws SQLException {
-        exec("CREATE FOREIGN TABLE ft1 (id int OPTIONS (column_name 'ID'), name text) SERVER myserver OPTIONS (table_name 'remote_t')");
+        exec("CREATE FOREIGN TABLE ft_opts (id int OPTIONS (column_name 'ID'), name text) SERVER myserver OPTIONS (table_name 'remote_t')");
     }
 
     @Test void testCreateForeignTableIfNotExists() throws SQLException {

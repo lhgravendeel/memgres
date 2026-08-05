@@ -1,7 +1,6 @@
 package com.memgres.engine;
 
 import java.util.*;
-import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Virtual system catalog tables (pg_catalog.* and information_schema.*).
@@ -11,15 +10,23 @@ public class SystemCatalog implements OidSupplier {
 
     private final Database database;
 
-    // OID counters, stable within a session but generated on the fly
-    private final Map<String, Integer> oidMap = new HashMap<>();
-    private final AtomicInteger oidCounter = new AtomicInteger(16384); // start above built-in OIDs
-
     private final PgCatalogBuilder pgCatalogBuilder;
     private final InfoSchemaBuilder infoSchemaBuilder;
 
+    /**
+     * Where OIDs come from and where they stay. The register belongs to the database rather than
+     * to this catalog: an OID is the same number on every connection, and a rename run on one
+     * connection has to move the OID everybody reads. See {@link ObjectIdentity}.
+     */
+    private final ObjectIdentity identity;
+
+    /** The register's map. The OIDs PostgreSQL fixes by convention are seeded into it below. */
+    private final Map<String, Integer> oidMap;
+
     public SystemCatalog(Database database) {
         this.database = database;
+        this.identity = database.objectIdentity();
+        this.oidMap = identity.oidMap();
         // Pre-seed the bootstrap superuser role OID to 10 (PG convention).
         // pg_dump expects this when looking up namespace/table owners.
         oidMap.put("role:memgres", 10);
@@ -129,6 +136,11 @@ public class SystemCatalog implements OidSupplier {
         if (statementCache != null) statementCache.clear();
     }
 
+    /** The register the OIDs come from, for the statements that have to tell it what they did. */
+    ObjectIdentity identity() {
+        return identity;
+    }
+
     /**
      * Resolve a system catalog table, returning a virtual Table with rows.
      * Returns null if this is not a recognized catalog table.
@@ -165,7 +177,7 @@ public class SystemCatalog implements OidSupplier {
 
     @Override
     public int oid(String key) {
-        return oidMap.computeIfAbsent(key, k -> oidCounter.getAndIncrement());
+        return identity.oid(key);
     }
 
     /** Public accessor for looking up OIDs by key (used by ::regclass cast). */
@@ -173,31 +185,18 @@ public class SystemCatalog implements OidSupplier {
         return oid(key);
     }
 
-    /** Reverse of the OID map, rebuilt whenever the map has grown. */
-    private Map<Integer, String> keysByOid;
-    private int keysByOidBuiltAt = -1;
-
     /**
      * The object key an OID was handed out for, or null. This is what lets ::regproc and
      * ::regtype print a name for an OID read out of a catalog column instead of the number
-     * back again — a scan of the map per value would be quadratic over a catalog query, so the
-     * reverse is kept and rebuilt only when a new OID has been allocated.
+     * back again.
      */
-    public synchronized String keyForOid(int oid) {
-        if (keysByOid == null || keysByOidBuiltAt != oidMap.size()) {
-            Map<Integer, String> reverse = new HashMap<>();
-            for (Map.Entry<String, Integer> e : oidMap.entrySet()) {
-                if (!reverse.containsKey(e.getValue())) reverse.put(e.getValue(), e.getKey());
-            }
-            keysByOid = reverse;
-            keysByOidBuiltAt = oidMap.size();
-        }
-        return keysByOid.get(oid);
+    public String keyForOid(int oid) {
+        return identity.keyForOid(oid);
     }
 
     /** Allocate and return the next available OID. */
     public int nextOid() {
-        return oidCounter.getAndIncrement();
+        return identity.nextOid();
     }
 
     /** Public accessor for the full OID map (used by pg_get_indexdef etc.). */

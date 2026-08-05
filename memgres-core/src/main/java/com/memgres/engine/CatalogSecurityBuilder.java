@@ -401,7 +401,6 @@ class CatalogSecurityBuilder {
                 col("xmin", DataType.INTEGER)
         );
         Table table = new Table("pg_policy", cols);
-        int rowOid = oids.oid("pg_policy:base");
         for (Map.Entry<String, Schema> schemaEntry : database.getSchemas().entrySet()) {
             String schemaName = schemaEntry.getKey();
             for (Map.Entry<String, com.memgres.engine.Table> tableEntry
@@ -428,8 +427,11 @@ class CatalogSecurityBuilder {
                             ? SqlUnparser.exprToSql(policy.getUsingExpr()) : null;
                     String withCheckText = policy.getWithCheckExpr() != null
                             ? SqlUnparser.exprToSql(policy.getWithCheckExpr()) : null;
+                    // A policy's OID is minted under its own name, not handed out in row order,
+                    // so it stays the same across rebuilds and pg_description can point at it.
                     table.insertRow(new Object[]{
-                            rowOid++, policy.getName(), relOid, cmdChar,
+                            oids.oid("pol:" + schemaName + "." + t.getName() + "." + policy.getName()),
+                            policy.getName(), relOid, cmdChar,
                             permissive, rolesText, qualText, withCheckText, 1
                     });
                 }

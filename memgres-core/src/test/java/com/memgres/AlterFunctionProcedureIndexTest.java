@@ -628,11 +628,21 @@ class AlterFunctionProcedureIndexTest {
     // ALTER INDEX — Schema-qualified name
     // =========================================================================
 
+    /**
+     * An index lives in the schema of the table it indexes, and ALTER INDEX finds it there and
+     * only there. Measured against PostgreSQL 18: with search_path at its default, the
+     * unqualified form is {@code 42P01 relation "ai_sch_idx" does not exist} because
+     * {@code ai_sch_test} is not on the path, and the qualified form succeeds. This test used to
+     * assert the unqualified form succeeded, which PostgreSQL does not do.
+     */
     @Test
     void testAlterIndexSchemaQualified() throws SQLException {
         exec("CREATE SCHEMA ai_sch_test");
         exec("CREATE TABLE ai_sch_test.ai_sch_tbl (id serial, name text)");
         exec("CREATE INDEX ai_sch_idx ON ai_sch_test.ai_sch_tbl (name)");
-        exec("ALTER INDEX ai_sch_idx RENAME TO ai_sch_idx_new");
+        SQLException offPath = assertThrows(SQLException.class,
+                () -> exec("ALTER INDEX ai_sch_idx RENAME TO ai_sch_idx_new"));
+        assertEquals("42P01", offPath.getSQLState());
+        exec("ALTER INDEX ai_sch_test.ai_sch_idx RENAME TO ai_sch_idx_new");
     }
 }

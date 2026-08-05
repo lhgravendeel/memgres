@@ -411,6 +411,49 @@ public class AstExecutor {
         scalarSubqueries.clear();
     }
 
+    /** The register that has to be told when an object is created, renamed, moved or dropped. */
+    ObjectIdentity identity() {
+        return systemCatalog.identity();
+    }
+
+    /**
+     * What has to be done before a statement creates a relation, and the schemas that already hold
+     * one of that name. Asked again once the statement has run, the one schema that has gained a
+     * relation of the name is the schema the statement created it in — which is the identity the
+     * OID register is told about, without this having to work out for itself where each kind of
+     * CREATE puts a relation.
+     *
+     * @see ObjectIdentity#relationCreated
+     */
+    private Set<String> beforeCreatingRelation(String name) {
+        if (name == null) return java.util.Collections.emptySet();
+        String bare = RelationNamespace.bareName(name);
+        Set<String> held = new HashSet<>();
+        for (String schema : database.getSchemas().keySet()) {
+            if (RelationNamespace.kindOf(database, schema, bare) != null) held.add(schema);
+        }
+        // Nothing anywhere answers to the name, so a comment still filed under it was said about
+        // an object that has been dropped. Cleared here, before the CREATE runs, because the
+        // CREATE may file comments of its own -- LIKE ... INCLUDING COMMENTS does.
+        if (held.isEmpty()) identity().forgetOrphanedComments(bare);
+        return held;
+    }
+
+    /**
+     * Tell the OID register about a relation this statement has just created, so the number the
+     * name used to answer with — the one belonging to whatever was dropped from under it — is not
+     * handed to the new object. PostgreSQL never reuses an OID.
+     */
+    private void noteRelationCreated(String name, Set<String> heldBefore) {
+        if (name == null) return;
+        String bare = RelationNamespace.bareName(name);
+        for (String schema : database.getSchemas().keySet()) {
+            if (heldBefore.contains(schema)) continue;
+            if (RelationNamespace.kindOf(database, schema, bare) == null) continue;
+            identity().relationCreated(schema, bare);
+        }
+    }
+
     private QueryResult executeReadOrWrite(Statement stmt) {
         checkReadOnlyTransaction(stmt);
         // FILTER belongs to a call that accumulates rows, so a statement is refused for one
@@ -434,11 +477,17 @@ public class AstExecutor {
         if (stmt instanceof CreateTableStmt) {
             String tag = getDdlTag(stmt);
             fireEventTriggers("ddl_command_start", tag);
+            Set<String> held = beforeCreatingRelation(((CreateTableStmt) stmt).name());
             QueryResult result = ddlExecutor.executeCreateTable(((CreateTableStmt) stmt));
+            noteRelationCreated(((CreateTableStmt) stmt).name(), held);
             fireEventTriggers("ddl_command_end", tag);
             return result;
         }
-        if (stmt instanceof DropTableStmt) return ddlExecutor.executeDropTable(((DropTableStmt) stmt));
+        if (stmt instanceof DropTableStmt) {
+            QueryResult result = ddlExecutor.executeDropTable(((DropTableStmt) stmt));
+            identity().sweepDead();
+            return result;
+        }
         if (stmt instanceof CreateTypeStmt) return ddlExecutor.executeCreateType(((CreateTypeStmt) stmt));
         if (stmt instanceof CreateFunctionStmt) return ddlExecutor.executeCreateFunction(((CreateFunctionStmt) stmt));
         if (stmt instanceof CreateAggregateStmt) return ddlExecutor.executeCreateAggregate(((CreateAggregateStmt) stmt));
@@ -462,15 +511,42 @@ public class AstExecutor {
         if (stmt instanceof CreateCollationStmt) return ddlExecutor.executeCreateCollation(((CreateCollationStmt) stmt));
         if (stmt instanceof CreateCastStmt) return ddlExecutor.executeCreateCast(((CreateCastStmt) stmt));
         if (stmt instanceof CreateRuleStmt) return ddlExecutor.executeCreateRule(((CreateRuleStmt) stmt));
-        if (stmt instanceof DropStmt) return ddlExecutor.executeDropStmt(((DropStmt) stmt));
-        if (stmt instanceof AlterTableStmt) return ddlExecutor.executeAlterTable(((AlterTableStmt) stmt));
+        if (stmt instanceof DropStmt) {
+            QueryResult result = ddlExecutor.executeDropStmt(((DropStmt) stmt));
+            identity().sweepDead();
+            return result;
+        }
+        if (stmt instanceof AlterTableStmt) {
+            QueryResult result = ddlExecutor.executeAlterTable(((AlterTableStmt) stmt));
+            // DROP CONSTRAINT and DROP COLUMN take an index down without naming it.
+            identity().sweepDead();
+            return result;
+        }
         if (stmt instanceof TruncateStmt) return ddlExecutor.executeTruncate(((TruncateStmt) stmt));
         if (stmt instanceof SetStmt) return sessionExecutor.executeSetStmt(((SetStmt) stmt));
         if (stmt instanceof DiscardStmt) return sessionExecutor.executeDiscard(((DiscardStmt) stmt));
         if (stmt instanceof TransactionStmt) return ddlExecutor.executeTransaction(((TransactionStmt) stmt));
-        if (stmt instanceof CreateIndexStmt) return ddlExecutor.executeCreateIndex(((CreateIndexStmt) stmt));
-        if (stmt instanceof CreateViewStmt) return ddlExecutor.executeCreateView(((CreateViewStmt) stmt));
-        if (stmt instanceof CreateSequenceStmt) return ddlExecutor.executeCreateSequence(((CreateSequenceStmt) stmt));
+        if (stmt instanceof CreateIndexStmt) {
+            String created = ((CreateIndexStmt) stmt).name();
+            Set<String> held = beforeCreatingRelation(created);
+            QueryResult result = ddlExecutor.executeCreateIndex(((CreateIndexStmt) stmt));
+            noteRelationCreated(created, held);
+            return result;
+        }
+        if (stmt instanceof CreateViewStmt) {
+            String created = ((CreateViewStmt) stmt).name();
+            Set<String> held = beforeCreatingRelation(created);
+            QueryResult result = ddlExecutor.executeCreateView(((CreateViewStmt) stmt));
+            noteRelationCreated(created, held);
+            return result;
+        }
+        if (stmt instanceof CreateSequenceStmt) {
+            String created = ((CreateSequenceStmt) stmt).name();
+            Set<String> held = beforeCreatingRelation(created);
+            QueryResult result = ddlExecutor.executeCreateSequence(((CreateSequenceStmt) stmt));
+            noteRelationCreated(created, held);
+            return result;
+        }
         if (stmt instanceof ExplainStmt) return ddlExecutor.executeExplain(((ExplainStmt) stmt));
         if (stmt instanceof CreateDomainStmt) return ddlExecutor.executeCreateDomain(((CreateDomainStmt) stmt));
         if (stmt instanceof CopyStmt) return dmlExecutor.executeCopy(((CopyStmt) stmt));
@@ -481,7 +557,13 @@ public class AstExecutor {
         if (stmt instanceof CreatePolicyStmt) return ddlExecutor.executeCreatePolicy(((CreatePolicyStmt) stmt));
         if (stmt instanceof RefreshMaterializedViewStmt) return ddlExecutor.executeRefreshMaterializedView(((RefreshMaterializedViewStmt) stmt));
         if (stmt instanceof MergeStmt) return dmlExecutor.executeMerge(((MergeStmt) stmt));
-        if (stmt instanceof CreateTableAsStmt) return ddlExecutor.executeCreateTableAs(((CreateTableAsStmt) stmt));
+        if (stmt instanceof CreateTableAsStmt) {
+            String created = ((CreateTableAsStmt) stmt).name();
+            Set<String> held = beforeCreatingRelation(created);
+            QueryResult result = ddlExecutor.executeCreateTableAs(((CreateTableAsStmt) stmt));
+            noteRelationCreated(created, held);
+            return result;
+        }
         if (stmt instanceof AlterTypeStmt) return ddlExecutor.executeAlterType(((AlterTypeStmt) stmt));
         if (stmt instanceof AlterSequenceStmt) return ddlExecutor.executeAlterSequence(((AlterSequenceStmt) stmt));
         if (stmt instanceof CreateSchemaStmt) return ddlExecutor.executeCreateSchema(((CreateSchemaStmt) stmt));
@@ -573,6 +655,7 @@ public class AstExecutor {
                 throw new MemgresException("role \"" + s.role() + "\" does not exist", "42704");
             }
             ddlExecutor.executeDropOwned(role);
+            identity().sweepDead();
             return QueryResult.message(QueryResult.Type.SET, "DROP OWNED");
         }
         throw new MemgresException("unsupported statement type: " + stmt.getClass().getSimpleName(), "0A000");
@@ -687,8 +770,13 @@ public class AstExecutor {
         int idx = table.getColumnIndex(column);
         if (idx < 0) return null;
         Column col = table.getColumns().get(idx);
-        if (col.getDomainTypeName() != null) return col.getDomainTypeName();
-        if (col.getEnumTypeName() != null) return col.getEnumTypeName();
+        // %TYPE names the column's own type as this session would write it.
+        if (col.getDomainTypeName() != null) {
+            return TypeNamespace.display(database, session, col.getDomainTypeName());
+        }
+        if (col.getEnumTypeName() != null) {
+            return TypeNamespace.display(database, session, col.getEnumTypeName());
+        }
         if (col.getCompositeTypeName() != null) return null;
         if (col.getArrayElementType() != null) return col.getArrayElementType().getPgName() + "[]";
         if (col.getType() == null) return null;
@@ -904,6 +992,18 @@ public class AstExecutor {
      * Schemas an unqualified name is looked up in, in precedence order. pg_catalog is implicitly
      * first, which is what makes a built-in win over a same-named function in a user schema.
      */
+    /**
+     * Schemas a relation name is looked up in, with this session's temporary schema ahead of the
+     * rest. PostgreSQL puts pg_temp implicitly first for relations, which is what makes a
+     * temporary sequence answer to its bare name.
+     */
+    java.util.List<String> relationSearchPath() {
+        java.util.LinkedHashSet<String> path = new java.util.LinkedHashSet<>();
+        if (session != null) path.add(session.getTempSchemaName().toLowerCase());
+        path.addAll(searchPathSchemas());
+        return new ArrayList<>(path);
+    }
+
     java.util.List<String> searchPathSchemas() {
         java.util.LinkedHashSet<String> path = new java.util.LinkedHashSet<>();
         path.add("pg_catalog");
@@ -1164,8 +1264,11 @@ public class AstExecutor {
                     reason != null ? reason.detail : ViewUpdatability.DETAIL_NOT_SINGLE_RELATION);
         }
         // Sequences are queryable as relations in PG (columns: last_value, log_cnt, is_called)
-        Table seqTable = resolveSequenceAsRelation(schemaName, tableName);
+        Table seqTable = resolveSequenceAsRelation(schemaName, tableName, userQualified);
         if (seqTable != null) return seqTable;
+        // An index is a relation the name reaches, so PostgreSQL opens it and then refuses it for
+        // what it is. Reporting it missing sent the reader looking for a relation that is there.
+        rejectRelationKindInFrom(schemaName, tableName, userQualified);
         // PG names the relation the way the query did: a qualified reference that found nothing
         // reports the qualified name, and only an unqualified one can have meant a WITH item.
         if (userQualified && schemaName != null) {
@@ -1189,8 +1292,13 @@ public class AstExecutor {
      * Resolve a sequence name to a virtual single-row table with columns
      * last_value, log_cnt, is_called — matching PG's sequence relation layout.
      */
-    private Table resolveSequenceAsRelation(String schemaName, String seqName) {
-        Sequence seq = database.getSequence(seqName);
+    private Table resolveSequenceAsRelation(String schemaName, String seqName, boolean userQualified) {
+        // A written qualifier names one schema's sequence and no other's. Asking for the sequence
+        // of that name anywhere returned public's counter for a read of another schema's, and
+        // invented a row for a sequence the named schema does not hold at all.
+        Sequence seq = userQualified && schemaName != null
+                ? database.getSequence(SchemaQualifier.resolveAlias(session, schemaName), seqName)
+                : database.resolveSequence(relationSearchPath(), seqName);
         if (seq == null) return null;
         List<Column> cols = new java.util.ArrayList<>();
         cols.add(new Column("last_value", DataType.BIGINT, false, false, null));
@@ -1199,6 +1307,36 @@ public class AstExecutor {
         Table table = new Table(seqName, cols);
         table.insertRow(new Object[]{seq.currValRaw(), 0L, seq.isCalled()});
         return table;
+    }
+
+    /**
+     * Refuse a read or a write against a relation whose kind cannot carry one.
+     *
+     * <p>PostgreSQL resolves the name first and opens the relation second, so naming an index in
+     * a FROM or an INSERT is {@code 42809 cannot open relation} with a detail line saying which
+     * kind is in the way — not {@code 42P01}, which says the name reaches nothing and sends the
+     * reader looking for a relation that is sitting right there.
+     */
+    private void rejectRelationKindInFrom(String schemaName, String tableName, boolean userQualified) {
+        List<String> path = userQualified && schemaName != null
+                ? Collections.singletonList(SchemaQualifier.resolveAlias(session, schemaName))
+                : relationSearchPath();
+        for (String schema : path) {
+            String kind = RelationNamespace.kindOf(database, schema, tableName);
+            // A composite type owns a pg_class row too, so a query reaches it and is refused for
+            // what it is rather than told the relation is missing — the same complaint an index
+            // gets, worded for the kind that was found.
+            String detail = RelationNamespace.INDEX.equals(kind)
+                    ? "This operation is not supported for indexes."
+                    : RelationNamespace.COMPOSITE.equals(kind)
+                            ? "This operation is not supported for composite types." : null;
+            if (detail == null) continue;
+            MemgresException e = new MemgresException(
+                    "cannot open relation \"" + tableName + "\"", "42809");
+            e.setDetail(detail);
+            e.setPositionToken(tableName);
+            throw e;
+        }
     }
 
     Table resolveTableSafe(String tableName) {
@@ -1756,15 +1894,36 @@ public class AstExecutor {
         }
     }
 
-    /** Rename a PK/UNIQUE constraint-backed index. Returns true if found and renamed. */
+    /**
+     * Rename a PK/UNIQUE constraint-backed index. Returns true if found and renamed.
+     *
+     * <p>The written name is resolved the way every other relation name is: a qualifier names one
+     * schema and no other, a bare name walks the search path. Comparing the whole written name
+     * against bare constraint names refused {@code ALTER INDEX a.t_pkey RENAME TO ...} outright,
+     * because no constraint is ever called {@code a.t_pkey}.
+     */
     private boolean renameConstraintIndex(String oldName, String newName) {
-        String oldLower = oldName.toLowerCase();
-        for (java.util.Map.Entry<String, Schema> se : database.getSchemas().entrySet()) {
-            for (java.util.Map.Entry<String, Table> te : se.getValue().getTables().entrySet()) {
-                for (StoredConstraint sc : te.getValue().getConstraints()) {
-                    if ((sc.getType() == StoredConstraint.Type.PRIMARY_KEY || sc.getType() == StoredConstraint.Type.UNIQUE)
-                            && sc.getName().toLowerCase().equals(oldLower)) {
+        int dot = oldName.lastIndexOf('.');
+        String bare = dot > 0 ? oldName.substring(dot + 1) : oldName;
+        List<String> path = dot > 0
+                ? Collections.singletonList(oldName.substring(0, dot))
+                : relationSearchPath();
+        for (String schemaName : path) {
+            Schema s = database.getSchema(schemaName);
+            if (s == null) continue;
+            for (Table t : s.getTables().values()) {
+                for (StoredConstraint sc : t.getConstraints()) {
+                    if ((sc.getType() == StoredConstraint.Type.PRIMARY_KEY
+                            || sc.getType() == StoredConstraint.Type.UNIQUE)
+                            && sc.getName().equalsIgnoreCase(bare)) {
+                        // A rename never moves the index, so the new name has to be free right
+                        // here — including of the tables and sequences the schema already holds.
+                        RelationNamespace.requireFree(database, schemaName, newName, null);
+                        String was = sc.getName();
                         sc.setName(newName);
+                        // The index a constraint is backed by owns a pg_class row and an OID of
+                        // its own, and both stay with it across the rename.
+                        identity().relationRenamed("i", schemaName, was, schemaName, newName);
                         return true;
                     }
                 }
@@ -1773,26 +1932,48 @@ public class AstExecutor {
         return false;
     }
 
+    /**
+     * Refuse an ALTER INDEX action that is not the generic relation rename against a relation
+     * that is not an index. Only the rename is kind-blind in PostgreSQL; everything else opens
+     * the index and says what the name really holds instead of reporting it missing.
+     */
+    private void requireIndexKind(String schemaName, String bareName) {
+        RelationNamespace.requireKind(database, schemaName, bareName, RelationNamespace.INDEX);
+    }
+
     // ---- ALTER INDEX ----
 
     private QueryResult executeAlterIndex(AlterIndexStmt stmt) {
+        // A qualified name reaches the index in the schema it names; a bare one walks the search
+        // path. Reaching whichever index of that name existed anywhere let ALTER INDEX other.i
+        // rename an index the statement never named.
+        String idxKey = database.resolveIndexName(relationSearchPath(), stmt.name());
+        String bareIdx = RelationNamespace.bareName(stmt.name());
+        // Where a complaint about this name belongs. With no index of the name, that is still the
+        // schema the statement wrote, or the first on the path holding any relation of the name —
+        // using the default schema said "does not exist" about a relation sitting elsewhere.
+        String idxSchema = idxKey != null ? Database.idxSchema(idxKey)
+                : SchemaQualifier.qualifierOf(stmt.name());
+        if (idxSchema == null) {
+            idxSchema = RelationNamespace.schemaHolding(database, relationSearchPath(), bareIdx);
+        }
+        if (idxSchema == null) idxSchema = defaultSchema();
         switch (stmt.action()) {
             case RENAME_TO: {
-                boolean found = database.hasIndex(stmt.name());
+                boolean found = idxKey != null;
                 if (!found) {
                     // Also check PK/UNIQUE constraint-backed indexes
                     found = renameConstraintIndex(stmt.name(), stmt.targetValue());
-                }
-                if (!found) {
-                    if (database.hasIndex(stmt.name())) found = true;
                 }
                 if (!found) {
                     // PostgreSQL renames whatever relation the name owns here: ALTER INDEX's
                     // rename runs the generic relation rename and never checks the kind, so
                     // ALTER INDEX naming a table renames the table. Refusing it turned SQL
                     // PostgreSQL accepts into a missing-relation error.
-                    if (RelationNamespace.kindOf(database, defaultSchema(), stmt.name()) != null) {
-                        return ddlExecutor.executeAlterTable(new AlterTableStmt(null, stmt.name(),
+                    if (RelationNamespace.kindOf(database, idxSchema, bareIdx) != null) {
+                        // The relation is in idxSchema; handing the rename the written name with
+                        // its qualifier still attached made it look for a table called "a.t".
+                        return ddlExecutor.executeAlterTable(new AlterTableStmt(idxSchema, bareIdx,
                                 java.util.Collections.<AlterTableStmt.AlterAction>singletonList(
                                         new AlterTableStmt.RenameTable(stmt.targetValue())),
                                 stmt.ifExists()));
@@ -1800,50 +1981,56 @@ public class AstExecutor {
                     if (stmt.ifExists()) return QueryResult.message(QueryResult.Type.SET, "ALTER INDEX");
                     throw new MemgresException("relation \"" + stmt.name() + "\" does not exist", "42P01");
                 }
-                if (database.hasIndex(stmt.name())) {
+                if (idxKey != null) {
                     // The new name has to be free of every kind of relation, not only of another
                     // index: renaming an index onto a table left two relations answering to one
-                    // name and the index unreachable under either.
-                    RelationNamespace.requireFree(database, defaultSchema(), stmt.targetValue(), null);
-                    if (database.hasIndex(stmt.targetValue())) {
+                    // name and the index unreachable under either. A rename never moves the index
+                    // out of the schema it is in, so it is that schema the name has to be free in.
+                    RelationNamespace.requireFree(database, idxSchema, stmt.targetValue(), null);
+                    if (database.hasIndex(idxSchema, stmt.targetValue())) {
                         throw new MemgresException("relation \"" + stmt.targetValue() + "\" already exists", "42P07");
                     }
-                    database.renameIndex(stmt.name(), stmt.targetValue());
+                    database.renameIndex(idxKey, stmt.targetValue());
+                    // The same index under a new name: its OID and its comment stay with it.
+                    identity().relationRenamed("i", idxSchema, Database.idxName(idxKey),
+                            idxSchema, stmt.targetValue());
                 }
                 return QueryResult.message(QueryResult.Type.SET, "ALTER INDEX");
             }
             case SET_PARAMS: {
-                if (!database.hasIndex(stmt.name())) {
+                if (idxKey == null) {
                     if (stmt.ifExists()) return QueryResult.message(QueryResult.Type.SET, "ALTER INDEX");
+                    requireIndexKind(idxSchema, bareIdx);
                     throw new MemgresException("relation \"" + stmt.name() + "\" does not exist", "42P01");
                 }
                 if (stmt.params != null && !stmt.params.isEmpty()) {
                     // A parameter the access method does not have, or a value outside its range,
                     // is refused here rather than stored as written.
-                    DdlIndexValidator.checkRelOptions(database.getIndexMethod(stmt.name()), stmt.params);
-                    java.util.Map<String, String> existing = database.getIndexReloptions(stmt.name());
+                    DdlIndexValidator.checkRelOptions(database.getIndexMethod(idxKey), stmt.params);
+                    java.util.Map<String, String> existing = database.getIndexReloptions(idxKey);
                     java.util.Map<String, String> merged = existing != null ? new java.util.LinkedHashMap<>(existing) : new java.util.LinkedHashMap<>();
                     merged.putAll(stmt.params);
-                    database.setIndexReloptions(stmt.name(), merged);
+                    database.setIndexReloptions(idxKey, merged);
                 }
                 return QueryResult.message(QueryResult.Type.SET, "ALTER INDEX");
             }
             case RESET_PARAMS: {
-                if (!database.hasIndex(stmt.name())) {
+                if (idxKey == null) {
                     if (stmt.ifExists()) return QueryResult.message(QueryResult.Type.SET, "ALTER INDEX");
+                    requireIndexKind(idxSchema, bareIdx);
                     throw new MemgresException("relation \"" + stmt.name() + "\" does not exist", "42P01");
                 }
                 if (stmt.params != null && !stmt.params.isEmpty()) {
-                    java.util.Map<String, String> existing = database.getIndexReloptions(stmt.name());
+                    java.util.Map<String, String> existing = database.getIndexReloptions(idxKey);
                     if (existing != null) {
                         java.util.Map<String, String> updated = new java.util.LinkedHashMap<>(existing);
                         for (String key : stmt.params.keySet()) {
                             updated.remove(key);
                         }
                         if (updated.isEmpty()) {
-                            database.removeIndexReloptions(stmt.name());
+                            database.removeIndexReloptions(idxKey);
                         } else {
-                            database.setIndexReloptions(stmt.name(), updated);
+                            database.setIndexReloptions(idxKey, updated);
                         }
                     }
                 }
@@ -1852,12 +2039,16 @@ public class AstExecutor {
             case ATTACH_PARTITION: {
                 String childIdx = stmt.targetValue();
                 String parentIdx = stmt.name();
+                // The parent map is keyed by schema and name, so the written names have to be
+                // resolved to those keys before they can be compared with what it holds.
+                String parentKey = database.resolveIndexName(relationSearchPath(), parentIdx);
+                if (parentKey == null) parentKey = Database.idxKey(idxSchema, parentIdx);
                 if (childIdx != null) {
                     // Validate: reject if parent already has a child index for the same partition table
                     String childTable = database.getIndexTable(childIdx);
                     if (childTable != null) {
                         for (Map.Entry<String, String> entry : database.getIndexParentMap().entrySet()) {
-                            if (entry.getValue().equalsIgnoreCase(parentIdx)) {
+                            if (entry.getValue().equalsIgnoreCase(parentKey)) {
                                 String existingChildTable = database.getIndexTable(entry.getKey());
                                 if (childTable.equalsIgnoreCase(existingChildTable != null ? existingChildTable : "")) {
                                     throw new MemgresException(
@@ -1875,7 +2066,8 @@ public class AstExecutor {
             default:
                 // All other actions (SET TABLESPACE, etc.) are accepted no-ops
                 if (stmt.action() != AlterIndexStmt.Action.NO_OP
-                        && !database.hasIndex(stmt.name()) && !stmt.ifExists()) {
+                        && idxKey == null && !stmt.ifExists()) {
+                    requireIndexKind(idxSchema, bareIdx);
                     throw new MemgresException("relation \"" + stmt.name() + "\" does not exist", "42P01");
                 }
                 return QueryResult.message(QueryResult.Type.SET, "ALTER INDEX");

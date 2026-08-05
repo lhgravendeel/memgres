@@ -26,14 +26,25 @@ class DdlObjectExecutor {
     QueryResult executeCreateType(CreateTypeStmt stmt) {
         ddl.checkPgCatalogWriteProtection();
         String name = stmt.name();
-        boolean wasShell = executor.database.isShellType(name);
-        if (typeNameTaken(name)) {
-            throw PgErrors.duplicateObject("type", name);
+        // A type lands in the schema written before its name, or in the one a CREATE lands in.
+        // Only that schema's own namespace decides whether the name is free, so a.e and b.e are
+        // two types rather than one refusal.
+        SchemaQualifier.requireSchema(executor.database, executor.session, stmt.schemaName());
+        String schema = stmt.schemaName() != null
+                ? stmt.schemaName().toLowerCase() : executor.creationSchema();
+        boolean wasShell = executor.database.getShellTypes().contains(TypeNamespace.key(schema, name));
+        if (wasShell) {
+            // CREATE TYPE x; twice reserves a name already reserved; any other form fills it in.
+            if (stmt.shell()) throw PgErrors.duplicateObject("type", name);
+        } else {
+            // A composite type owns a pg_class row as well as a pg_type row, so it also has to
+            // find the relation name free; an enum, a range, a domain and a shell do not.
+            TypeNamespace.requireCreatableType(executor.database, schema, name,
+                    stmt.compositeFields() != null);
         }
         if (stmt.shell()) {
-            if (wasShell) throw PgErrors.duplicateObject("type", name);
-            executor.database.addShellType(name);
-            executor.database.registerSchemaObject(executor.defaultSchema(), "shell", name);
+            executor.database.addShellType(schema, name);
+            executor.database.registerSchemaObject(schema, "shell", name);
             return QueryResult.command(QueryResult.Type.CREATE_TYPE, 0);
         }
         if (stmt.enumLabels() != null) {
@@ -45,17 +56,20 @@ class DdlObjectExecutor {
                             + "\"pg_enum_typid_label_index\"", "23505");
                 }
             }
-            CustomEnum created = new CustomEnum(name, stmt.enumLabels());
+            // A type created under a name a dropped type used to answer to is a new type, and
+            // takes a new OID -- PostgreSQL never reuses one.
+            executor.identity().typeCreated(TypeNamespace.key(schema, name));
+            CustomEnum created = new CustomEnum(schema, name, stmt.enumLabels());
             executor.database.addCustomEnum(created);
             executor.database.markUncommittedObject(created, executor.session);
-            executor.database.registerSchemaObject(executor.defaultSchema(), "enum", name);
+            executor.database.registerSchemaObject(schema, "enum", name);
             // CREATE TYPE is undone by ROLLBACK like any other DDL; without this the type
             // outlives the transaction that never committed it.
-            executor.recordUndo(new Session.CreateEnumTypeUndo(executor.defaultSchema(), name));
+            executor.recordUndo(new Session.CreateEnumTypeUndo(schema, name));
         } else if (stmt.rangeSubtype() != null) {
             ddl.resolveColumnType(stmt.rangeSubtype(), null);
-            executor.database.addRangeType(name, stmt.rangeSubtype());
-            executor.database.registerSchemaObject(executor.defaultSchema(), "range", name);
+            executor.database.addRangeType(schema, name, stmt.rangeSubtype());
+            executor.database.registerSchemaObject(schema, "range", name);
         } else if (stmt.compositeFields() != null) {
             // Attribute names are checked before their types, as PostgreSQL does: a duplicate name
             // is reported even when the second attribute also names a type that does not exist.
@@ -70,44 +84,56 @@ class DdlObjectExecutor {
             for (CreateTypeStmt.CompositeField f : stmt.compositeFields()) {
                 ddl.resolveColumnType(f.typeName(), null);
             }
-            executor.database.addCompositeType(name, stmt.compositeFields());
-            executor.database.registerSchemaObject(executor.defaultSchema(), "composite", name);
+            executor.identity().typeCreated(TypeNamespace.key(schema, name));
+            executor.database.addCompositeType(schema, name, stmt.compositeFields());
+            executor.database.registerSchemaObject(schema, "composite", name);
         }
-        if (wasShell) executor.database.removeShellType(name);
+        if (wasShell) executor.database.getShellTypes().remove(TypeNamespace.key(schema, name));
         return QueryResult.command(QueryResult.Type.CREATE_TYPE, 0);
-    }
-
-    /**
-     * True when the name already denotes a type of any kind. A shell does not count: filling in a
-     * shell is exactly what the second half of a base-type definition does.
-     */
-    private boolean typeNameTaken(String name) {
-        return executor.database.getCustomEnum(name) != null
-                || executor.database.isCompositeType(name)
-                || executor.database.getRangeTypes().containsKey(name.toLowerCase())
-                || executor.database.getDomain(name) != null;
     }
 
     // ---- ALTER TYPE ----
 
     QueryResult executeAlterType(AlterTypeStmt stmt) {
-        // Check if this is a composite type operation first
-        if (stmt.action() == AlterTypeStmt.Action.ADD_ATTRIBUTE
+        boolean onAttribute = stmt.action() == AlterTypeStmt.Action.ADD_ATTRIBUTE
                 || stmt.action() == AlterTypeStmt.Action.DROP_ATTRIBUTE
                 || stmt.action() == AlterTypeStmt.Action.ALTER_ATTRIBUTE_TYPE
-                || stmt.action() == AlterTypeStmt.Action.RENAME_ATTRIBUTE) {
+                || stmt.action() == AlterTypeStmt.Action.RENAME_ATTRIBUTE;
+        // A qualifier names the schema the type has to be in, and resolution honours it: ALTER
+        // TYPE a.e reaches a's e or nothing, so a type somewhere else is left alone.
+        // Check if this is a composite type operation first
+        if (onAttribute) {
             return executeAlterCompositeType(stmt);
         }
         // RENAME TO and SET SCHEMA apply to any type; only an enum is looked up below, so a
         // composite has to be handled here or it would be reported as a type that does not exist.
+        String named = TypeNamespace.resolve(executor.database, executor.session, stmt.typeName());
         if ((stmt.action() == AlterTypeStmt.Action.RENAME_TO
                 || stmt.action() == AlterTypeStmt.Action.SET_SCHEMA)
-                && executor.database.isCompositeType(stmt.typeName())) {
+                && named != null
+                && executor.database.getCompositeTypes().containsKey(named)) {
             return executeAlterCompositeType(stmt);
         }
 
-        CustomEnum existing = executor.database.getCustomEnum(stmt.typeName());
-        if (existing == null) throw new MemgresException("type \"" + stmt.typeName() + "\" does not exist", "42704");
+        // Which e this is is settled once, by the schema written or by the search path, and the
+        // rest of the statement works on that one.
+        String typeKey = TypeNamespace.resolve(executor.database, executor.session, stmt.typeName());
+        CustomEnum existing = typeKey == null ? null : executor.database.getCustomEnums().get(typeKey);
+        if (existing == null) {
+            // A label belongs to an enum and to nothing else, so a type of another kind — or a
+            // relation, whose row type is a type of that name too — is the wrong kind of object
+            // here rather than a missing one.
+            boolean onLabel = stmt.action() == AlterTypeStmt.Action.ADD_VALUE
+                    || stmt.action() == AlterTypeStmt.Action.RENAME_VALUE;
+            String lookIn = TypeNamespace.writtenSchema(stmt.typeName()) != null
+                    ? TypeNamespace.writtenSchema(stmt.typeName()) : executor.defaultSchema();
+            String lookFor = TypeNamespace.bare(stmt.typeName());
+            if (onLabel && (TypeNamespace.kindOf(executor.database, lookIn, lookFor) != null
+                    || TypeNamespace.rowTypeOwner(executor.database, lookIn, lookFor) != null)) {
+                throw PgErrors.wrongObjectType(stmt.typeName() + " is not an enum");
+            }
+            throw new MemgresException("type \"" + stmt.typeName() + "\" does not exist", "42704");
+        }
 
         switch (stmt.action()) {
             case ADD_VALUE: {
@@ -138,14 +164,34 @@ class DdlObjectExecutor {
                 break;
             }
             case RENAME_TO: {
-                requireTypeNameFree(stmt.value());
-                executor.database.removeCustomEnum(stmt.typeName());
-                executor.database.addCustomEnum(new CustomEnum(stmt.value(), existing.getLabels()));
+                // The type stays where it is; only its name changes, and it keeps its identity —
+                // its labels, and whatever was said about it in a comment.
+                String schema = TypeNamespace.schemaOfKey(typeKey);
+                requireTypeNameFree(typeRef(schema, stmt.value()));
+                executor.database.getCustomEnums().remove(typeKey);
+                CustomEnum renamed = new CustomEnum(schema, stmt.value(), existing.getLabels());
+                executor.database.addCustomEnum(renamed);
+                executor.database.unregisterSchemaObject(schema, "enum", TypeNamespace.nameOfKey(typeKey));
+                executor.database.registerSchemaObject(schema, "enum", stmt.value());
+                executor.database.moveComment("type", typeKey, TypeNamespace.key(schema, stmt.value()));
+                retargetTypeColumns(typeKey, TypeNamespace.key(schema, stmt.value()));
+                // A column declared with the old word is not rewritten, so the old word goes on
+                // answering with this type's OID.
+                executor.identity().typeRenamed("e", typeKey, TypeNamespace.key(schema, stmt.value()));
                 break;
             }
             case SET_SCHEMA: {
                 requireSchemaExists(stmt.value());
-                executor.database.registerSchemaObject(stmt.value(), "enum", stmt.typeName());
+                String from = TypeNamespace.schemaOfKey(typeKey);
+                String bare = TypeNamespace.nameOfKey(typeKey);
+                TypeNamespace.requireFree(executor.database, stmt.value(), bare);
+                executor.database.getCustomEnums().remove(typeKey);
+                existing.setSchemaName(stmt.value());
+                executor.database.addCustomEnum(existing);
+                executor.database.unregisterSchemaObject(from, "enum", bare);
+                executor.database.registerSchemaObject(stmt.value(), "enum", bare);
+                executor.database.moveComment("type", typeKey, TypeNamespace.key(stmt.value(), bare));
+                retargetTypeColumns(typeKey, TypeNamespace.key(stmt.value(), bare));
                 break;
             }
             case OWNER_TO: {
@@ -156,7 +202,9 @@ class DdlObjectExecutor {
     }
 
     private QueryResult executeAlterCompositeType(AlterTypeStmt stmt) {
-        List<CreateTypeStmt.CompositeField> fields = executor.database.getCompositeType(stmt.typeName());
+        String typeKey = TypeNamespace.resolve(executor.database, executor.session, stmt.typeName());
+        List<CreateTypeStmt.CompositeField> fields =
+                typeKey == null ? null : executor.database.getCompositeTypes().get(typeKey);
         if (fields == null) {
             // An attribute lives on the relation a composite type owns, so this is a relation
             // lookup: PostgreSQL reports a name that owns no relation as a missing relation, and a
@@ -167,25 +215,30 @@ class DdlObjectExecutor {
                 throw new MemgresException(
                         "type \"" + stmt.typeName() + "\" does not exist", "42704");
             }
-            if (RelationNamespace.kindOf(executor.database, executor.defaultSchema(),
-                    stmt.typeName()) != null) {
+            String lookIn = TypeNamespace.writtenSchema(stmt.typeName()) != null
+                    ? TypeNamespace.writtenSchema(stmt.typeName()) : executor.defaultSchema();
+            String lookFor = TypeNamespace.bare(stmt.typeName());
+            if (RelationNamespace.kindOf(executor.database, lookIn, lookFor) != null) {
                 throw new MemgresException(
-                        "\"" + stmt.typeName() + "\" is not a composite type", "42809");
+                        "\"" + lookFor + "\" is not a composite type", "42809");
             }
             throw new MemgresException(
                     "relation \"" + stmt.typeName() + "\" does not exist", "42P01");
         }
+        // An attribute error names the relation the composite owns, which is the type's own bare
+        // name however the statement wrote it.
+        String typeName = TypeNamespace.nameOfKey(typeKey);
 
         switch (stmt.action()) {
             case ADD_ATTRIBUTE: {
                 if (hasAttribute(fields, stmt.value())) {
                     throw new MemgresException("column \"" + stmt.value() + "\" of relation \""
-                            + stmt.typeName() + "\" already exists", "42701");
+                            + typeName + "\" already exists", "42701");
                 }
                 ddl.resolveColumnType(stmt.newValue(), null);
                 List<CreateTypeStmt.CompositeField> newFields = new ArrayList<>(fields);
                 newFields.add(new CreateTypeStmt.CompositeField(stmt.value(), stmt.newValue()));
-                executor.database.addCompositeType(stmt.typeName(), newFields);
+                executor.database.getCompositeTypes().put(typeKey, newFields);
                 break;
             }
             case DROP_ATTRIBUTE: {
@@ -193,13 +246,13 @@ class DdlObjectExecutor {
                     if (stmt.ifExists()) {
                         if (executor.session != null) {
                             executor.session.addNotice("NOTICE", "00000", "column \"" + stmt.value()
-                                    + "\" of relation \"" + stmt.typeName()
+                                    + "\" of relation \"" + typeName
                                     + "\" does not exist, skipping", null);
                         }
                         break;
                     }
                     throw new MemgresException("column \"" + stmt.value() + "\" of relation \""
-                            + stmt.typeName() + "\" does not exist", "42703");
+                            + typeName + "\" does not exist", "42703");
                 }
                 List<CreateTypeStmt.CompositeField> newFields = new ArrayList<>();
                 for (CreateTypeStmt.CompositeField f : fields) {
@@ -207,13 +260,13 @@ class DdlObjectExecutor {
                         newFields.add(f);
                     }
                 }
-                executor.database.addCompositeType(stmt.typeName(), newFields);
+                executor.database.getCompositeTypes().put(typeKey, newFields);
                 break;
             }
             case ALTER_ATTRIBUTE_TYPE: {
                 if (!hasAttribute(fields, stmt.value())) {
                     throw new MemgresException("column \"" + stmt.value() + "\" of relation \""
-                            + stmt.typeName() + "\" does not exist", "42703");
+                            + typeName + "\" does not exist", "42703");
                 }
                 List<CreateTypeStmt.CompositeField> newFields = new ArrayList<>();
                 for (CreateTypeStmt.CompositeField f : fields) {
@@ -223,7 +276,7 @@ class DdlObjectExecutor {
                         newFields.add(f);
                     }
                 }
-                executor.database.addCompositeType(stmt.typeName(), newFields);
+                executor.database.getCompositeTypes().put(typeKey, newFields);
                 break;
             }
             case RENAME_ATTRIBUTE: {
@@ -232,7 +285,7 @@ class DdlObjectExecutor {
                 }
                 if (hasAttribute(fields, stmt.newValue())) {
                     throw new MemgresException("column \"" + stmt.newValue() + "\" of relation \""
-                            + stmt.typeName() + "\" already exists", "42701");
+                            + typeName + "\" already exists", "42701");
                 }
                 List<CreateTypeStmt.CompositeField> newFields = new ArrayList<>();
                 for (CreateTypeStmt.CompositeField f : fields) {
@@ -242,20 +295,39 @@ class DdlObjectExecutor {
                         newFields.add(f);
                     }
                 }
-                executor.database.addCompositeType(stmt.typeName(), newFields);
+                executor.database.getCompositeTypes().put(typeKey, newFields);
                 break;
             }
             case RENAME_TO: {
-                requireCompositeRenameTargetFree(stmt.value());
-                executor.database.removeCompositeType(stmt.typeName());
-                executor.database.addCompositeType(stmt.value(), fields);
-                executor.database.registerSchemaObject(
-                        executor.defaultSchema(), "composite", stmt.value());
+                String schema = TypeNamespace.schemaOfKey(typeKey);
+                requireCompositeRenameTargetFree(typeRef(schema, stmt.value()));
+                executor.database.getCompositeTypes().remove(typeKey);
+                executor.database.addCompositeType(schema, stmt.value(), fields);
+                executor.database.unregisterSchemaObject(
+                        schema, "composite", TypeNamespace.nameOfKey(typeKey));
+                executor.database.registerSchemaObject(schema, "composite", stmt.value());
+                executor.database.moveComment("type", typeKey, TypeNamespace.key(schema, stmt.value()));
+                retargetTypeColumns(typeKey, TypeNamespace.key(schema, stmt.value()));
+                executor.identity().typeRenamed("c", typeKey, TypeNamespace.key(schema, stmt.value()));
+                // A composite type owns a pg_class row of its own, which is the same relation
+                // under the new name.
+                executor.identity().relationRenamed("c", schema, TypeNamespace.nameOfKey(typeKey),
+                        schema, stmt.value());
                 break;
             }
             case SET_SCHEMA: {
                 requireSchemaExists(stmt.value());
-                executor.database.registerSchemaObject(stmt.value(), "composite", stmt.typeName());
+                String from = TypeNamespace.schemaOfKey(typeKey);
+                String bare = TypeNamespace.nameOfKey(typeKey);
+                TypeNamespace.requireFree(executor.database, stmt.value(), bare);
+                executor.database.getCompositeTypes().remove(typeKey);
+                executor.database.addCompositeType(stmt.value(), bare, fields);
+                executor.database.unregisterSchemaObject(from, "composite", bare);
+                executor.database.registerSchemaObject(stmt.value(), "composite", bare);
+                executor.database.moveComment("type", typeKey, TypeNamespace.key(stmt.value(), bare));
+                retargetTypeColumns(typeKey, TypeNamespace.key(stmt.value(), bare));
+                // Same object, new schema: the pg_class row it owns goes with it.
+                executor.identity().relationRenamed("c", from, bare, stmt.value(), bare);
                 break;
             }
             default:
@@ -270,15 +342,15 @@ class DdlObjectExecutor {
      */
     private void requireTypeNameFree(String name) {
         if (name == null) return;
-        Schema schema = executor.database.getSchema(executor.defaultSchema());
+        String schemaName = TypeNamespace.writtenSchema(name) != null
+                ? TypeNamespace.writtenSchema(name) : executor.defaultSchema();
+        String bare = TypeNamespace.bare(name);
+        Schema schema = executor.database.getSchema(schemaName);
         // A table carries a composite type of its own name, so it takes the name for types too.
-        boolean tableTakesIt = schema != null && schema.getTable(name) != null;
-        if (executor.database.isCompositeType(name)
-                || executor.database.getCustomEnum(name) != null
-                || executor.database.isDomain(name)
-                || tableTakesIt) {
-            throw new MemgresException("type \"" + name + "\" already exists", "42710");
+        if (schema != null && schema.getTable(bare) != null) {
+            throw new MemgresException("type \"" + bare + "\" already exists", "42710");
         }
+        TypeNamespace.requireFree(executor.database, schemaName, bare);
     }
 
     /**
@@ -289,9 +361,12 @@ class DdlObjectExecutor {
      */
     private void requireCompositeRenameTargetFree(String name) {
         if (name == null) return;
-        if (executor.database.isCompositeType(name)
-                || RelationNamespace.kindOf(executor.database, executor.defaultSchema(), name) != null) {
-            throw new MemgresException("relation \"" + name + "\" already exists", "42P07");
+        String schemaName = TypeNamespace.writtenSchema(name) != null
+                ? TypeNamespace.writtenSchema(name) : executor.defaultSchema();
+        String bare = TypeNamespace.bare(name);
+        if (executor.database.getCompositeTypes().containsKey(TypeNamespace.key(schemaName, bare))
+                || RelationNamespace.kindOf(executor.database, schemaName, bare) != null) {
+            throw new MemgresException("relation \"" + bare + "\" already exists", "42P07");
         }
         requireTypeNameFree(name);
     }
@@ -2082,14 +2157,31 @@ class DdlObjectExecutor {
                 dropSchema(stmt);
                 break;
             case DOMAIN: {
-                if (!executor.database.isDomain(stmt.name())) {
+                // DROP DOMAIN b.d drops b's and leaves a's; a bare name is the search path's.
+                String written = typeRef(stmt.schema(), stmt.name());
+                String key = TypeNamespace.resolveParts(executor.database, executor.session,
+                        stmt.schema(), stmt.name());
+                if (key == null || !executor.database.getDomains().containsKey(key)) {
+                    // A type of this name that is not a domain is the wrong kind of object for
+                    // DROP DOMAIN, not a missing one, and IF EXISTS does not make it right.
+                    if (key != null) {
+                        throw PgErrors.wrongObjectType("\"" + written + "\" is not a domain");
+                    }
                     if (!stmt.ifExists()) {
                         throw new MemgresException(
-                                "type \"" + stmt.name() + "\" does not exist", "42704");
+                                "type \"" + written + "\" does not exist", "42704");
                     }
-                    noticeSkipped("type \"" + stmt.name() + "\"");
+                    noticeSkipped("type \"" + written + "\"");
+                    break;
                 }
-                executor.database.removeDomain(stmt.name());
+                // A column declared as the domain depends on it exactly as one declared as an
+                // enum depends on that, and blocks the drop the same way.
+                refuseOrCascadeTypeDependents(stmt, key);
+                executor.database.getDomains().remove(key);
+                executor.database.unregisterSchemaObject(TypeNamespace.schemaOfKey(key),
+                        "domain", TypeNamespace.nameOfKey(key));
+                executor.database.addComment("type", key, null);
+                executor.identity().typeDropped("d", key);
                 break;
             }
             case POLICY:
@@ -2207,18 +2299,39 @@ class DdlObjectExecutor {
         return QueryResult.command(QueryResult.Type.DROP_TABLE, 0);
     }
 
+    /**
+     * The schema a DROP VIEW complaint is about: the one holding the view when there is one, the
+     * one the statement wrote, or the first on the search path that holds a relation of the name.
+     */
+    private String dropTargetSchema(DropStmt stmt, Database.ViewDef existing) {
+        if (existing != null && existing.schemaName() != null) return existing.schemaName();
+        if (stmt.schema() != null) return stmt.schema();
+        String written = SchemaQualifier.qualifierOf(stmt.name());
+        if (written != null) return written;
+        String holder = RelationNamespace.schemaHolding(executor.database,
+                executor.relationSearchPath(), stmt.name());
+        return holder != null ? holder : executor.defaultSchema();
+    }
+
     private void dropView(DropStmt stmt) {
         // A materialized view is a different kind of object from a view, and dropping one by the
         // wrong name would destroy stored data on what is usually a typo.
         Database.ViewDef existing = executor.database.getView(stmt.name());
         boolean wantMaterialized = stmt.objectType() == DropStmt.ObjectType.MATERIALIZED_VIEW;
+        // A sequence or an index of this name is the wrong kind of relation too, and IF EXISTS
+        // does not turn the wrong kind into "nothing to do". The complaint has to be made about
+        // the schema the name really reaches, or a qualified DROP is told nothing is amiss.
+        RelationNamespace.requireKindForDrop(executor.database, dropTargetSchema(stmt, existing),
+                RelationNamespace.bareName(stmt.name()),
+                wantMaterialized ? RelationNamespace.MATVIEW : RelationNamespace.VIEW);
         if (existing != null && existing.materialized() != wantMaterialized) {
             throw new MemgresException("\"" + stmt.name() + "\" is not a "
                     + (wantMaterialized ? "materialized view" : "view"), "42809");
         }
-        // A sequence or an index of this name is the wrong kind of relation too, and IF EXISTS
-        // does not turn the wrong kind into "nothing to do".
-        RelationNamespace.requireKind(executor.database, executor.defaultSchema(), stmt.name(),
+        // A sequence, an index or a composite type of this name is the wrong kind of relation
+        // too, and IF EXISTS does not turn the wrong kind into "nothing to do". A written
+        // qualifier names the one schema to look in.
+        RelationNamespace.requireKind(executor.database, dropLookupSchema(stmt), stmt.name(),
                 wantMaterialized ? RelationNamespace.MATVIEW : RelationNamespace.VIEW);
         if (existing == null) {
             if (!stmt.ifExists()) {
@@ -2262,11 +2375,23 @@ class DdlObjectExecutor {
 
     private void dropSequence(DropStmt stmt) {
         String seqName = stmt.name();
-        // Strip schema prefix for lookup
-        String bareSeqName = seqName.contains(".") ? seqName.substring(seqName.lastIndexOf('.') + 1) : seqName;
-        RelationNamespace.requireKind(executor.database, executor.defaultSchema(), bareSeqName,
+        // A written qualifier names the one schema to look in. Dropping the sequence some other
+        // schema happens to hold under that name destroys an object the statement never named.
+        // The qualifier reaches here either parsed off into stmt.schema() or still on the name.
+        int dot = seqName.lastIndexOf('.');
+        String writtenSchema = stmt.schema() != null ? stmt.schema()
+                : (dot > 0 ? seqName.substring(0, dot) : null);
+        String bareSeqName = dot > 0 ? seqName.substring(dot + 1) : seqName;
+        SchemaQualifier.requireSchema(executor.database, executor.session, writtenSchema);
+        // pg_temp is the alias this session's temporary schema answers to, not a schema name.
+        writtenSchema = SchemaQualifier.resolveAlias(executor.session, writtenSchema);
+        Sequence found = executor.database.resolveSequence(executor.relationSearchPath(),
+                writtenSchema != null ? writtenSchema + "." + bareSeqName : bareSeqName);
+        String seqSchema = found != null ? found.getSchemaName()
+                : (writtenSchema != null ? writtenSchema : executor.defaultSchema());
+        RelationNamespace.requireKindForDrop(executor.database, seqSchema, bareSeqName,
                 RelationNamespace.SEQUENCE);
-        if (!executor.database.hasSequence(bareSeqName)) {
+        if (found == null) {
             if (!stmt.ifExists()) {
                 if (ddl.resolveTableOrNull(bareSeqName) != null || executor.database.hasView(bareSeqName)) {
                     throw new MemgresException("\"" + bareSeqName + "\" is not a sequence", "42809");
@@ -2277,52 +2402,81 @@ class DdlObjectExecutor {
             return;
         }
         // Check for dependent columns
-        List<String[]> dependents = findSequenceDependents(bareSeqName);
+        List<SequenceDependent> dependents = findSequenceDependents(found);
+        List<String> visibleSchemas = executor.searchPathSchemas();
         if (!dependents.isEmpty() && !stmt.cascade()) {
-            throw new MemgresException("cannot drop sequence " + bareSeqName
+            // PostgreSQL names an object the search path does not reach by its schema too, so the
+            // reader can tell which of two same-named sequences the complaint is about.
+            boolean visible = visibleSchemas.contains(seqSchema.toLowerCase());
+            String shown = visible ? bareSeqName : seqSchema + "." + bareSeqName;
+            MemgresException e = new MemgresException("cannot drop sequence " + shown
                     + " because other objects depend on it", "2BP01");
+            List<String> lines = new ArrayList<>();
+            for (SequenceDependent dep : dependents) {
+                lines.add("default value for column " + dep.columnName() + " of table "
+                        + dep.tableRef(visibleSchemas) + " depends on sequence " + shown);
+            }
+            e.setDetail(String.join("\n", lines));
+            e.setHint("Use DROP ... CASCADE to drop the dependent objects too.");
+            throw e;
         }
         // CASCADE: remove the default from dependent columns
         if (stmt.cascade()) {
             List<String> cascaded = new ArrayList<>();
-            for (String[] dep : dependents) {
-                cascaded.add("default value for column " + dep[1] + " of table " + dep[0]);
+            for (SequenceDependent dep : dependents) {
+                cascaded.add("default value for column " + dep.columnName() + " of table "
+                        + dep.tableRef(visibleSchemas));
             }
             noticeDropCascades(executor, cascaded);
-            for (String[] dep : dependents) {
-                String tblName = dep[0];
-                String colName = dep[1];
-                for (Schema schema : executor.database.getSchemas().values()) {
-                    Table tbl = schema.getTable(tblName);
-                    if (tbl != null) {
-                        for (Column col : tbl.getColumns()) {
-                            if (col.getName().equalsIgnoreCase(colName)) {
-                                col.setDefaultValue(null);
-                            }
-                        }
-                    }
-                }
+            for (SequenceDependent dep : dependents) {
+                dep.column.setDefaultValue(null);
             }
         }
-        Sequence oldSeq = executor.database.getSequence(bareSeqName);
-        if (oldSeq != null) {
-            executor.recordUndo(new Session.DropSequenceUndo(bareSeqName, oldSeq));
-        }
-        executor.database.removeSequence(bareSeqName);
+        executor.recordUndo(new Session.DropSequenceUndo(found.qualifiedName(), found));
+        executor.database.removeSequence(seqSchema, bareSeqName);
         executor.database.removeObjectOwner("sequence:" + bareSeqName);
     }
 
-    /** Find all table columns whose default references the given sequence name. */
-    private List<String[]> findSequenceDependents(String seqName) {
-        List<String[]> result = new java.util.ArrayList<>();
-        for (Schema schema : executor.database.getSchemas().values()) {
-            for (java.util.Map.Entry<String, Table> entry : schema.getTables().entrySet()) {
-                Table tbl = entry.getValue();
+    /** A column whose default draws from a particular sequence, and the table that holds it. */
+    private static final class SequenceDependent {
+        final String schemaName;
+        final Table table;
+        final Column column;
+        SequenceDependent(String schemaName, Table table, Column column) {
+            this.schemaName = schemaName;
+            this.table = table;
+            this.column = column;
+        }
+        String columnName() { return column.getName(); }
+
+        /**
+         * The table named the way PostgreSQL names it in a dependency message: by its bare name
+         * when the search path reaches it, and schema-qualified when it does not, so the reader
+         * can tell which of two same-named tables the message is about.
+         */
+        String tableRef(java.util.List<String> searchPath) {
+            return searchPath.contains(schemaName.toLowerCase())
+                    ? table.getName() : schemaName + "." + table.getName();
+        }
+    }
+
+    /**
+     * The columns whose default draws from this sequence, in whatever schema they live.
+     *
+     * <p>A default written without a qualifier resolved through the search path when the column
+     * was created, so a table in one schema can perfectly well depend on a sequence in another —
+     * which is exactly the case PostgreSQL refuses to drop out from under. Looking only in the
+     * sequence's own schema let the drop succeed and left the default pointing at nothing.
+     */
+    private List<SequenceDependent> findSequenceDependents(Sequence seq) {
+        List<SequenceDependent> result = new ArrayList<>();
+        for (java.util.Map.Entry<String, Schema> se : executor.database.getSchemas().entrySet()) {
+            for (Table tbl : se.getValue().getTables().values()) {
                 for (Column col : tbl.getColumns()) {
-                    String def = col.getDefaultValue();
-                    if (def == null) continue;
-                    if (def.contains("nextval('" + seqName + "'") || def.contains(":seq:" + seqName)) {
-                        result.add(new String[]{tbl.getName(), col.getName()});
+                    String written = Sequence.nameInDefault(col.getDefaultValue());
+                    if (written == null) continue;
+                    if (executor.database.getSequenceFor(se.getKey(), written) == seq) {
+                        result.add(new SequenceDependent(se.getKey(), tbl, col));
                     }
                 }
             }
@@ -2330,20 +2484,46 @@ class DdlObjectExecutor {
         return result;
     }
 
+    /**
+     * Point every column that draws from this sequence at the name it now answers to.
+     *
+     * <p>A default holds the sequence's name as text, so a sequence that is renamed or moved to
+     * another schema leaves every default that named it pointing at nothing, and the next INSERT
+     * fails on the default's own text. PostgreSQL's defaults reference the sequence itself and
+     * follow it wherever it goes; rewriting the text is how the same thing is said here.
+     */
+    private void retargetSequenceDefaults(List<SequenceDependent> dependents, Sequence seq) {
+        for (SequenceDependent dep : dependents) {
+            String written = dep.schemaName.equalsIgnoreCase(seq.getSchemaName())
+                    ? seq.getName() : seq.qualifiedName();
+            String def = dep.column.getDefaultValue();
+            String old = Sequence.nameInDefault(def);
+            if (old == null) continue;
+            dep.column.setDefaultValue(def.contains(":seq:")
+                    ? def.substring(0, def.indexOf(":seq:") + 5) + written
+                    : "nextval('" + written + "'::regclass)");
+        }
+    }
+
     private void dropIndex(DropStmt stmt) {
         String bareIndexName = RelationNamespace.bareName(stmt.name());
-        String indexSchema = stmt.schema() != null ? stmt.schema()
-                : stmt.name().contains(".")
-                    ? stmt.name().substring(0, stmt.name().lastIndexOf('.'))
-                    : executor.defaultSchema();
-        RelationNamespace.requireKind(executor.database, indexSchema,
+        String written = stmt.schema() != null ? stmt.schema() + "." + bareIndexName : stmt.name();
+        // The index this statement names, in the schema it wrote or the first on the search path
+        // that holds one. Everything below works on that one index and no other of the name.
+        String indexKey = executor.database.resolveIndexName(executor.relationSearchPath(), written);
+        String indexSchema = indexKey != null ? Database.idxSchema(indexKey)
+                : (stmt.schema() != null ? stmt.schema()
+                    : stmt.name().contains(".")
+                        ? stmt.name().substring(0, stmt.name().lastIndexOf('.'))
+                        : executor.defaultSchema());
+        RelationNamespace.requireKindForDrop(executor.database, indexSchema,
                 bareIndexName, RelationNamespace.INDEX);
         // The index behind a PRIMARY KEY or UNIQUE constraint belongs to the constraint, which
         // needs it: it goes when the constraint does, and not before. Only the index the
         // constraint made for itself is protected — an index somebody wrote a CREATE INDEX for
         // is theirs to drop, even when a constraint of the same name was recorded beside it.
         Schema indexHome = executor.database.getSchema(indexSchema);
-        if (indexHome != null && !executor.database.hasIndex(bareIndexName)) {
+        if (indexHome != null && indexKey == null) {
             for (Table owner : indexHome.getTables().values()) {
                 for (StoredConstraint sc : owner.getConstraints()) {
                     if (sc.getType() != StoredConstraint.Type.PRIMARY_KEY
@@ -2357,8 +2537,7 @@ class DdlObjectExecutor {
         }
         // An unqualified name is looked for through the search path, so an index in a schema
         // that is not on it is not found — dropping it needs the schema written out.
-        boolean visible = executor.database.hasIndex(bareIndexName)
-                && RelationNamespace.kindOf(executor.database, indexSchema, bareIndexName) != null;
+        boolean visible = indexKey != null;
         if (!visible) {
             if (!stmt.ifExists()) {
                 throw new MemgresException("index \"" + bareIndexName + "\" does not exist", "42704");
@@ -2366,7 +2545,7 @@ class DdlObjectExecutor {
             noticeSkipped("index \"" + bareIndexName + "\"");
             return;
         }
-        String storedTable = executor.database.getIndexTable(bareIndexName);
+        String storedTable = executor.database.getIndexTable(indexKey);
         if (storedTable != null) {
             try {
                 int dotIdx = storedTable.indexOf('.');
@@ -2376,7 +2555,7 @@ class DdlObjectExecutor {
                 t.getConstraints().removeIf(sc -> sc.getName().equalsIgnoreCase(bareIndexName));
             } catch (MemgresException ignored) {}
         }
-        executor.database.removeIndex(bareIndexName);
+        executor.database.removeIndex(indexSchema, bareIndexName);
     }
 
     private void dropFunction(DropStmt stmt) {
@@ -2485,57 +2664,125 @@ class DdlObjectExecutor {
         }
     }
 
-    private void dropType(DropStmt stmt) {
-        CustomEnum existing = executor.database.getCustomEnum(stmt.name());
-        boolean isComposite = executor.database.isCompositeType(stmt.name());
-        boolean isRange = executor.database.getRangeTypes().containsKey(stmt.name().toLowerCase());
-        boolean isShell = executor.database.isShellType(stmt.name());
-        if (existing == null && !isComposite && !isRange && !isShell) {
-            if (!stmt.ifExists()) {
-                throw new MemgresException("type \"" + stmt.name() + "\" does not exist", "42704");
-            }
-            noticeSkipped("type \"" + stmt.name() + "\"");
-            return;
-        }
-        // Dropping a type a column is declared as would leave that column pointing at nothing
-        List<String> dependents = columnsDeclaredAsType(stmt.name());
+    /**
+     * Dropping a type a column is declared as would leave that column pointing at nothing, so
+     * without CASCADE the columns block the drop and with it they are taken along.
+     */
+    private void refuseOrCascadeTypeDependents(DropStmt stmt, String key) {
+        List<String> dependents = columnsDeclaredAsType(key);
+        if (dependents.isEmpty()) return;
+        String display = TypeNamespace.display(executor.database, executor.session, key);
         if (!stmt.cascade()) {
-            if (!dependents.isEmpty()) {
-                StringBuilder detail = new StringBuilder();
-                for (String d : dependents) {
-                    detail.append("\n  Detail: column ").append(d).append(" depends on type ").append(stmt.name());
-                }
-                throw new MemgresException("cannot drop type " + stmt.name()
-                        + " because other objects depend on it" + detail, "2BP01");
-            }
-        } else {
-            List<String> cascaded = new ArrayList<>();
+            StringBuilder detail = new StringBuilder();
             for (String d : dependents) {
-                int dot = d.indexOf('.');
-                cascaded.add("column " + d.substring(dot + 1) + " of table " + d.substring(0, dot));
+                detail.append("\n  Detail: column ").append(d)
+                        .append(" depends on type ").append(display);
             }
-            noticeDropCascades(executor, cascaded);
+            throw new MemgresException("cannot drop type " + display
+                    + " because other objects depend on it" + detail, "2BP01");
         }
-        if (existing != null) executor.database.removeCustomEnum(stmt.name());
-        if (isComposite) executor.database.removeCompositeType(stmt.name());
-        if (isRange) executor.database.getRangeTypes().remove(stmt.name().toLowerCase());
-        if (isShell) executor.database.removeShellType(stmt.name());
+        List<String> cascaded = new ArrayList<>();
+        for (String d : dependents) {
+            int dot = d.indexOf('.');
+            cascaded.add("column " + d.substring(dot + 1) + " of table " + d.substring(0, dot));
+        }
+        noticeDropCascades(executor, cascaded);
     }
 
-    /** Every table column whose declared type is {@code typeName}, as "table.column". */
-    private List<String> columnsDeclaredAsType(String typeName) {
+    /** The schema a DROP looks in: the one it named, or the session's own. */
+    private String dropLookupSchema(DropStmt stmt) {
+        return stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
+    }
+
+    private void dropType(DropStmt stmt) {
+        // Which schema's type this is settles first: DROP TYPE b.e drops b's and leaves a's,
+        // and a bare name is the search path's to answer.
+        String written = typeRef(stmt.schema(), stmt.name());
+        // The schema and the name stay apart: an unqualified name is the search path's to answer,
+        // and reaching past it would drop a type this session cannot even see.
+        String key = TypeNamespace.resolveParts(executor.database, executor.session,
+                stmt.schema(), stmt.name());
+        boolean isEnum = key != null && executor.database.getCustomEnums().containsKey(key);
+        boolean isComposite = key != null && executor.database.getCompositeTypes().containsKey(key);
+        boolean isRange = key != null && executor.database.getRangeTypes().containsKey(key);
+        boolean isShell = key != null && executor.database.getShellTypes().contains(key);
+        // DROP TYPE takes a domain too: PostgreSQL has one type namespace and DROP TYPE names it.
+        boolean isDomain = key != null && executor.database.getDomains().containsKey(key);
+        if (!isEnum && !isComposite && !isRange && !isShell && !isDomain) {
+            // A table, a view and a materialized view each own a row type of their own name, and
+            // that row type is not something DROP TYPE may take away on its own. IF EXISTS does
+            // not soften it: the type is there, it is just not one this statement may drop.
+            String lookIn = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
+            String owner = TypeNamespace.rowTypeOwner(executor.database, lookIn, stmt.name());
+            if (owner != null) {
+                throw new MemgresException("cannot drop type " + written + " because " + owner
+                        + " " + written + " requires it", "2BP01");
+            }
+            if (!stmt.ifExists()) {
+                throw new MemgresException("type \"" + written + "\" does not exist", "42704");
+            }
+            noticeSkipped("type \"" + written + "\"");
+            return;
+        }
+        refuseOrCascadeTypeDependents(stmt, key);
+        String schema = TypeNamespace.schemaOfKey(key);
+        String bare = TypeNamespace.nameOfKey(key);
+        // The OIDs go with the type: PostgreSQL never hands a dropped one to a type created later
+        // under the same name.
+        if (isEnum) {
+            executor.database.getCustomEnums().remove(key);
+            executor.identity().typeDropped("e", key);
+        }
+        if (isComposite) {
+            executor.database.getCompositeTypes().remove(key);
+            executor.identity().typeDropped("c", key);
+        }
+        if (isRange) executor.database.getRangeTypes().remove(key);
+        if (isShell) executor.database.getShellTypes().remove(key);
+        if (isDomain) {
+            executor.database.getDomains().remove(key);
+            executor.identity().typeDropped("d", key);
+        }
+        executor.database.unregisterSchemaObject(schema,
+                isEnum ? "enum" : isComposite ? "composite" : isRange ? "range"
+                        : isDomain ? "domain" : "shell", bare);
+        executor.database.addComment("type", key, null);
+    }
+
+    /** A written type name: the schema the statement gave, when it gave one, and the name. */
+    static String typeRef(String schema, String name) {
+        if (name == null) return null;
+        if (schema == null || TypeNamespace.writtenSchema(name) != null) return name;
+        return schema.toLowerCase() + "." + name;
+    }
+
+    /**
+     * Every table column whose declared type is the type stored under {@code key}, as
+     * "table.column". A column records the type it was declared with under the same key, so a
+     * column of a.e is not found by dropping b.e.
+     */
+    private List<String> columnsDeclaredAsType(String key) {
         List<String> found = new ArrayList<>();
         for (Schema schema : executor.database.getSchemas().values()) {
             for (Table t : schema.getTables().values()) {
                 for (Column c : t.getColumns()) {
-                    if (typeName.equalsIgnoreCase(c.getEnumTypeName())
-                            || typeName.equalsIgnoreCase(c.getCompositeTypeName())) {
+                    // A domain is a type like any other, and a column declared as one depends on
+                    // it exactly as a column declared as an enum depends on that.
+                    if (sameType(key, c.getEnumTypeName()) || sameType(key, c.getCompositeTypeName())
+                            || sameType(key, c.getDomainTypeName())) {
                         found.add(t.getName() + "." + c.getName());
                     }
                 }
             }
         }
         return found;
+    }
+
+    /** Whether a column's recorded type name denotes the type stored under {@code key}. */
+    private boolean sameType(String key, String declared) {
+        if (declared == null) return false;
+        String resolved = TypeNamespace.find(executor.database.typeKeys(), declared);
+        return key.equals(resolved);
     }
 
     private void dropSchema(DropStmt stmt) {
@@ -2595,27 +2842,40 @@ class DdlObjectExecutor {
                     String objType = entry.substring(0, colonIdx);
                     String objName = entry.substring(colonIdx + 1);
                     switch (objType) {
+                        // Only this schema's type goes: the same name may be another schema's.
                         case "enum":
-                            executor.database.removeCustomEnum(objName);
+                            executor.database.getCustomEnums()
+                                    .remove(TypeNamespace.key(schemaName, objName));
                             break;
                         case "composite":
-                            executor.database.removeCompositeType(objName);
+                            executor.database.getCompositeTypes()
+                                    .remove(TypeNamespace.key(schemaName, objName));
+                            break;
+                        case "range":
+                            executor.database.getRangeTypes()
+                                    .remove(TypeNamespace.key(schemaName, objName));
+                            break;
+                        case "shell":
+                            executor.database.getShellTypes()
+                                    .remove(TypeNamespace.key(schemaName, objName));
                             break;
                         case "sequence":
-                            executor.database.removeSequence(objName);
+                            // This schema's sequence of that name, not another schema's.
+                            executor.database.removeSequence(schemaName, objName);
                             break;
                         case "domain":
-                            executor.database.removeDomain(objName);
+                            executor.database.getDomains()
+                                    .remove(TypeNamespace.key(schemaName, objName));
                             break;
                         case "index":
-                            executor.database.removeIndex(objName);
+                            executor.database.removeIndex(schemaName, objName);
                             break;
                         case "function":
                             // Only this schema's copy goes; the same name may exist elsewhere.
                             executor.database.removeFunction(schemaName, objName);
                             break;
                         case "view":
-                            executor.database.removeView(objName);
+                            executor.database.removeView(schemaName, objName);
                             break;
                     }
                 }
@@ -2677,13 +2937,17 @@ class DdlObjectExecutor {
     QueryResult executeCreateSequence(CreateSequenceStmt stmt) {
         SchemaQualifier.requireSchema(executor.database, executor.session, stmt.schema());
         String seqName = stmt.name();
-        if (stmt.temporary() && executor.session != null) {
-            seqName = executor.session.getTempSchemaName() + "." + seqName;
-        }
         // A qualified name puts the sequence in the schema it names, and it is that schema's
-        // relations the name has to be free of.
+        // relations the name has to be free of. A temporary sequence lands in this session's
+        // temporary schema, which is a schema like any other.
         String seqSchema = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
-        boolean nameOwned = executor.database.hasSequence(seqName)
+        if (stmt.temporary() && executor.session != null) {
+            seqSchema = executor.session.getTempSchemaName();
+            // The temporary schema has to be a schema the engine really holds, or a later
+            // statement that writes pg_temp is told there is no such schema to write.
+            executor.database.getOrCreateSchema(seqSchema);
+        }
+        boolean nameOwned = executor.database.hasSequence(seqSchema, seqName)
                 || RelationNamespace.kindOf(executor.database, seqSchema, seqName) != null;
         if (nameOwned) {
             if (stmt.ifNotExists()) return QueryResult.message(QueryResult.Type.SET, "CREATE SEQUENCE");
@@ -2693,13 +2957,14 @@ class DdlObjectExecutor {
         DdlSequenceValidator.Params p = DdlSequenceValidator.forCreate(stmt.getAsType(),
                 stmt.incrementBy(), stmt.minValue(), stmt.maxValue(), stmt.startWith(), stmt.getCache());
         Sequence seq = new Sequence(seqName, p.startWith, p.incrementBy, p.minValue, p.maxValue);
+        seq.setSchemaName(seqSchema);
         DdlSequenceValidator.apply(seq, p);
         if (stmt.cycle() != null) seq.setCycle(stmt.cycle());
         if (stmt.ownedByTable() != null) applySequenceOwnedBy(seq, stmt.ownedByTable(), stmt.ownedByColumn());
         executor.database.addSequence(seq);
         executor.database.markUncommittedObject(seq, executor.session);
         executor.database.registerSchemaObject(seqSchema, "sequence", seqName);
-        executor.recordUndo(new Session.CreateSequenceUndo(seqName));
+        executor.recordUndo(new Session.CreateSequenceUndo(seq.qualifiedName()));
         executor.database.setObjectOwner("sequence:" + seqName, executor.sessionUser());
         return QueryResult.message(QueryResult.Type.SET, "CREATE SEQUENCE");
     }
@@ -2707,30 +2972,65 @@ class DdlObjectExecutor {
     // ---- ALTER SEQUENCE ----
 
     QueryResult executeAlterSequence(AlterSequenceStmt stmt) {
-        Sequence seq = executor.database.getSequence(stmt.name());
+        int dot = stmt.name().lastIndexOf('.');
+        String writtenSchema = dot > 0 ? stmt.name().substring(0, dot) : null;
+        String bareName = dot > 0 ? stmt.name().substring(dot + 1) : stmt.name();
+        SchemaQualifier.requireSchema(executor.database, executor.session, writtenSchema);
+        // pg_temp is the alias this session's temporary schema answers to, not a schema name.
+        writtenSchema = SchemaQualifier.resolveAlias(executor.session, writtenSchema);
+        // A qualifier names one schema's sequence and no other's; without that, an ALTER aimed at
+        // a schema that holds nothing of the name silently altered — and relocated — someone else's.
+        Sequence seq = executor.database.resolveSequence(executor.relationSearchPath(),
+                writtenSchema != null ? writtenSchema + "." + bareName : bareName);
         if (seq == null) {
             if (stmt.ifExists()) return QueryResult.message(QueryResult.Type.SET, "ALTER SEQUENCE");
             // A relation of that name that is not a sequence is a different complaint: the name
             // resolves, the kind is wrong, and reporting it as missing sends the reader looking
             // for an object that is right there.
-            RelationNamespace.requireKind(executor.database, executor.defaultSchema(),
-                    stmt.name(), RelationNamespace.SEQUENCE);
+            RelationNamespace.requireKind(executor.database,
+                    writtenSchema != null ? writtenSchema : executor.defaultSchema(),
+                    bareName, RelationNamespace.SEQUENCE);
             throw new MemgresException("relation \"" + stmt.name() + "\" does not exist", "42P01");
         }
+        String seqSchema = seq.getSchemaName();
         if (stmt.setSchema() != null) {
             requireSchemaExists(stmt.setSchema());
-            executor.database.registerSchemaObject(stmt.setSchema(), "sequence", stmt.name());
+            if (!seqSchema.equalsIgnoreCase(stmt.setSchema())) {
+                if (RelationNamespace.kindOf(executor.database, stmt.setSchema(), seq.getName()) != null) {
+                    throw new MemgresException("relation \"" + seq.getName()
+                            + "\" already exists in schema \"" + stmt.setSchema() + "\"", "42P07");
+                }
+                // The columns that draw from it have to be told where it went, before it goes.
+                List<SequenceDependent> moved = findSequenceDependents(seq);
+                executor.database.removeSequence(seqSchema, seq.getName());
+                executor.database.unregisterSchemaObject(seqSchema, "sequence", seq.getName());
+                seq.setSchemaName(stmt.setSchema());
+                executor.database.addSequence(seq);
+                executor.identity().relationRenamed("S", seqSchema, seq.getName(),
+                        stmt.setSchema(), seq.getName());
+                retargetSequenceDefaults(moved, seq);
+            }
+            executor.database.registerSchemaObject(stmt.setSchema(), "sequence", seq.getName());
             return QueryResult.message(QueryResult.Type.SET, "ALTER SEQUENCE");
         }
         if (stmt.renameTo() != null) {
-            if (executor.database.hasSequence(stmt.renameTo())) {
+            // The new name is the old one's schema plus a new bare name: a rename never moves an
+            // object between schemas.
+            RelationNamespace.requireFree(executor.database, seqSchema, stmt.renameTo(), null);
+            if (executor.database.hasSequence(seqSchema, stmt.renameTo())) {
                 throw new MemgresException("relation \"" + stmt.renameTo() + "\" already exists", "42P07");
             }
-            RelationNamespace.requireFree(executor.database, executor.defaultSchema(),
-                    stmt.renameTo(), null);
-            executor.database.removeSequence(stmt.name());
+            List<SequenceDependent> renamed = findSequenceDependents(seq);
+            String wasCalled = seq.getName();
+            executor.database.removeSequence(seqSchema, seq.getName());
+            executor.database.unregisterSchemaObject(seqSchema, "sequence", seq.getName());
             seq.setName(stmt.renameTo());
             executor.database.addSequence(seq);
+            executor.database.registerSchemaObject(seqSchema, "sequence", stmt.renameTo());
+            // The same sequence under a new name keeps its OID, its comment and its owner.
+            executor.identity().relationRenamed("S", seqSchema, wasCalled,
+                    seqSchema, stmt.renameTo());
+            retargetSequenceDefaults(renamed, seq);
             return QueryResult.message(QueryResult.Type.SET, "ALTER SEQUENCE");
         }
         DdlSequenceValidator.Params p = DdlSequenceValidator.forAlter(seq, stmt.getAsType(),
@@ -2743,7 +3043,7 @@ class DdlObjectExecutor {
             if (!executor.database.hasRole(newOwner)) {
                 throw new MemgresException("role \"" + newOwner + "\" does not exist", "42704");
             }
-            executor.database.setObjectOwner("sequence:" + stmt.name(), newOwner);
+            executor.database.setObjectOwner("sequence:" + seq.getName(), newOwner);
         }
         // M20: OWNED BY table.column
         if (stmt.ownedByTable() != null) {
@@ -2777,18 +3077,27 @@ class DdlObjectExecutor {
 
     QueryResult executeCreateDomain(CreateDomainStmt stmt) {
         SchemaQualifier.requireSchema(executor.database, executor.session, stmt.schemaName());
-        if (executor.database.getDomain(stmt.name()) != null) {
-            throw new MemgresException("type \"" + stmt.name() + "\" already exists", "42710");
-        }
+        String domainSchema = stmt.schemaName() != null
+                ? stmt.schemaName().toLowerCase() : executor.creationSchema();
+        // A domain shares one namespace per schema with every other kind of type, and only that
+        // schema's: a.d and b.d are two domains. A relation's row type is in that namespace too,
+        // so a table's name is taken for a domain as much as an enum's is.
+        TypeNamespace.requireCreatableType(executor.database, domainSchema, stmt.name(), false);
         // The base type's modifier is resolved after the name collision and before anything is
         // written, so a domain over a width the type could never carry is never created.
         TypeCoercion.checkDeclaredTypeLimits(stmt.baseType());
         boolean baseIsArray = stmt.baseType().replaceAll("\\(.*\\)", "").trim().endsWith("[]");
-        String baseTypeName = stmt.baseType().replaceAll("\\(.*\\)", "").trim().replace("[]", "").trim();
+        String baseTypeName = TypeNamespace.qualify(executor.database, executor.session,
+                stmt.baseType().replaceAll("\\(.*\\)", "").trim().replace("[]", "").trim());
         DataType baseType = DataType.fromPgName(baseTypeName);
         if (baseType == null) {
             DomainType parent = executor.database.getDomain(baseTypeName);
             if (parent != null) baseType = parent.getBaseType();
+            else if (executor.database.isCustomEnum(baseTypeName)) baseType = DataType.ENUM;
+            else if (TypeNamespace.writtenSchema(baseTypeName) != null
+                    && DataType.fromPgName(TypeNamespace.bare(baseTypeName)) != null) {
+                baseType = DataType.fromPgName(TypeNamespace.bare(baseTypeName));
+            }
             else throw PgErrors.undefinedObject("type", baseTypeName);
         }
         // A domain over an array is a domain over the array type, not over its element: the
@@ -2833,8 +3142,8 @@ class DdlObjectExecutor {
         domain.setBaseTypeFacts(DataType.intervalQualifier(stmt.baseType()), elementType);
         // The default is read with the base type's input function here, not at the first insert.
         domain.setDefaultValue(requireDefaultReadableAsDomain(domain, domain.getDefaultValue()));
-        String domainSchema = stmt.schemaName() != null ? stmt.schemaName() : executor.defaultSchema();
         domain.setSchemaName(domainSchema);
+        executor.identity().typeCreated(TypeNamespace.key(domainSchema, stmt.name()));
         executor.database.addDomain(domain);
         executor.database.registerSchemaObject(domainSchema, "domain", stmt.name());
         return QueryResult.message(QueryResult.Type.SET, "CREATE DOMAIN");
@@ -3085,7 +3394,11 @@ class DdlObjectExecutor {
             }
             case "RENAME_TO": {
                 String newName = stmt.newConstraintName();
-                requireTypeNameFree(newName);
+                // The domain stays in its own schema and keeps its identity: every column
+                // declared with it, and whatever a comment said about it.
+                String domSchema = domain.getSchemaName();
+                String oldKey = TypeNamespace.key(domSchema, domain.getName());
+                requireTypeNameFree(typeRef(domSchema, newName));
                 DomainType renamed = new DomainType(newName, domain.getBaseType(),
                         domain.getBaseTypeName(), domain.isNotNull(), domain.getCheckExpression(),
                         domain.getParsedCheck(), domain.getDefaultValue());
@@ -3096,25 +3409,33 @@ class DdlObjectExecutor {
                     renamed.addConstraint(nc.name(), nc.rawCheckExpr(), nc.parsedCheck(),
                             nc.isValidated());
                 }
-                executor.database.removeDomain(stmt.domainName());
+                String newKey = TypeNamespace.key(domSchema, newName);
+                executor.database.getDomains().remove(oldKey);
                 executor.database.addDomain(renamed);
-                executor.database.registerSchemaObject(executor.defaultSchema(), "domain", newName);
-                // Every column declared with the domain names it, and the name just changed.
-                for (Schema s : executor.database.getSchemas().values()) {
-                    for (Table t : s.getTables().values()) {
-                        for (Column c : t.getColumns()) {
-                            if (stmt.domainName().equalsIgnoreCase(c.getDomainTypeName())) {
-                                c.setDomainTypeName(newName);
-                            }
-                        }
-                    }
-                }
+                executor.database.unregisterSchemaObject(domSchema, "domain", domain.getName());
+                executor.database.registerSchemaObject(domSchema, "domain", newName);
+                executor.database.moveComment("type", oldKey, newKey);
+                retargetDomainColumns(oldKey, newKey);
+                // The same domain under a new name: a column declared with the old word goes on
+                // reading this domain, so the OID stays with it.
+                executor.identity().typeRenamed("d", oldKey, newKey);
                 break;
             }
             case "SET_SCHEMA": {
                 requireSchemaExists(stmt.newConstraintName());
-                executor.database.registerSchemaObject(stmt.newConstraintName(), "domain",
-                        stmt.domainName());
+                String from = domain.getSchemaName();
+                String oldKey = TypeNamespace.key(from, domain.getName());
+                String to = stmt.newConstraintName().toLowerCase();
+                TypeNamespace.requireFree(executor.database, to, domain.getName());
+                executor.database.getDomains().remove(oldKey);
+                domain.setSchemaName(to);
+                executor.database.addDomain(domain);
+                executor.database.unregisterSchemaObject(from, "domain", domain.getName());
+                executor.database.registerSchemaObject(to, "domain", domain.getName());
+                String newKey = TypeNamespace.key(to, domain.getName());
+                executor.database.moveComment("type", oldKey, newKey);
+                retargetDomainColumns(oldKey, newKey);
+                executor.identity().typeRenamed("d", oldKey, newKey);
                 break;
             }
             case "NO_OP": {
@@ -3124,6 +3445,41 @@ class DdlObjectExecutor {
         return QueryResult.message(QueryResult.Type.SET, "ALTER DOMAIN");
     }
 
+    /**
+     * Follow a renamed or moved domain from every column declared with it. A column records the
+     * type it was declared with by name; PostgreSQL records an OID, which a rename does not
+     * change, so the recorded name has to be rewritten here for the column to keep its type.
+     */
+    private void retargetDomainColumns(String oldKey, String newKey) {
+        for (Schema s : executor.database.getSchemas().values()) {
+            for (Table t : s.getTables().values()) {
+                for (Column c : t.getColumns()) {
+                    if (oldKey.equalsIgnoreCase(c.getDomainTypeName())) {
+                        c.setDomainTypeName(newKey);
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Follow a renamed or moved enum or composite from every column declared with it. A column of
+     * a type keeps reading that type through the rename, which is what PostgreSQL's OIDs give it
+     * for nothing and memgres, which records names, has to do here.
+     */
+    private void retargetTypeColumns(String oldKey, String newKey) {
+        for (Schema s : executor.database.getSchemas().values()) {
+            for (Table t : s.getTables().values()) {
+                for (Column c : t.getColumns()) {
+                    if (oldKey.equalsIgnoreCase(c.getEnumTypeName())) c.setEnumTypeName(newKey);
+                    if (oldKey.equalsIgnoreCase(c.getCompositeTypeName())) {
+                        c.setCompositeTypeName(newKey);
+                    }
+                }
+            }
+        }
+    }
+
     /** What to do with one stored value of a domain: the table and column it sits in, and it. */
     private interface DomainValueVisitor {
         void accept(String tableName, String columnName, Object value);
@@ -3131,11 +3487,17 @@ class DdlObjectExecutor {
 
     /** Visit every stored value in every column declared with this domain. */
     private void forEachDomainValue(String domainName, DomainValueVisitor visitor) {
+        // A column records the schema its domain lives in, so the written name is resolved to the
+        // one domain it names before the columns are compared against it.
+        String key = TypeNamespace.resolve(executor.database, executor.session, domainName);
+        if (key == null) return;
         for (Schema schema : executor.database.getSchemas().values()) {
             for (Table table : schema.getTables().values()) {
                 for (int ci = 0; ci < table.getColumns().size(); ci++) {
                     Column col = table.getColumns().get(ci);
-                    if (!domainName.equalsIgnoreCase(col.getDomainTypeName())) continue;
+                    if (col.getDomainTypeName() == null) continue;
+                    if (!key.equals(TypeNamespace.find(executor.database.typeKeys(),
+                            col.getDomainTypeName()))) continue;
                     for (Object[] row : table.getRows()) {
                         visitor.accept(table.getName(), col.getName(), row[ci]);
                     }
@@ -3301,8 +3663,10 @@ class DdlObjectExecutor {
         // finding the schema it was written under.
         SchemaQualifier.requireSchema(executor.database, executor.session, s.schema());
         String indexSchema = s.schema() != null ? s.schema() : executor.defaultSchema();
+        // Only this schema's relations can take the name: two schemas may each hold an index
+        // called i, and refusing the second one turned valid SQL away.
         boolean nameTaken = s.name() != null
-                && (executor.database.hasIndex(s.name())
+                && (executor.database.hasIndex(indexSchema, s.name())
                     || RelationNamespace.kindOf(executor.database, indexSchema, s.name()) != null);
         if (nameTaken && s.ifNotExists()) return QueryResult.message(QueryResult.Type.SET, "CREATE INDEX");
         // PostgreSQL analyses the statement before it opens anything, so an aggregate or a
@@ -3568,16 +3932,19 @@ class DdlObjectExecutor {
             throw new MemgresException("relation \"" + s.name() + "\" already exists", "42P07");
         }
         if (s.name() != null && s.columns() != null) {
-            executor.database.addIndex(s.name(), s.columns());
-            // Store index metadata (table name, uniqueness, method, WHERE clause)
+            // An index lives in the schema of the table it indexes, and it is that schema's
+            // relations its name has to be free of -- not every schema's at once.
             String idxSchemaForMeta = s.schema() != null ? s.schema() : executor.defaultSchema();
-            executor.database.addIndexMeta(s.name(), idxSchemaForMeta + "." + s.table(), s.unique(),
-                    s.method(), s.whereClause());
-            executor.database.setIndexColumnOptions(s.name(), s.columnOptions());
-            executor.database.setIndexIncludeColumns(s.name(), s.includeColumns());
-            executor.database.setIndexNullsNotDistinct(s.name(), s.nullsNotDistinct());
+            executor.database.addIndex(idxSchemaForMeta, s.name(), s.columns());
+            // Store index metadata (table name, uniqueness, method, WHERE clause)
+            executor.database.addIndexMeta(idxSchemaForMeta, s.name(),
+                    idxSchemaForMeta + "." + s.table(), s.unique(), s.method(), s.whereClause());
+            executor.database.setIndexColumnOptions(idxSchemaForMeta, s.name(), s.columnOptions());
+            executor.database.setIndexIncludeColumns(idxSchemaForMeta, s.name(), s.includeColumns());
+            executor.database.setIndexNullsNotDistinct(idxSchemaForMeta, s.name(), s.nullsNotDistinct());
             executor.database.registerSchemaObject(idxSchemaForMeta, "index", s.name());
-            executor.recordUndo(new Session.CreateIndexUndo(s.name()));
+            executor.recordUndo(new Session.CreateIndexUndo(
+                    Database.idxKey(idxSchemaForMeta, s.name())));
             // Build a real TableIndex for simple column indexes (non-expression, non-partial)
             // so they can be used for index scans in SELECT queries
             if (s.table() != null && s.whereClause() == null) {
@@ -3618,13 +3985,15 @@ class DdlObjectExecutor {
                     if (parentTable.getPartitionStrategy() != null && !parentTable.getPartitions().isEmpty()) {
                         for (Table partition : parentTable.getPartitions()) {
                             String childIdxName = s.name() + "_" + partition.getName();
-                            if (!executor.database.hasIndex(childIdxName)) {
-                                executor.database.addIndex(childIdxName, s.columns());
-                                executor.database.addIndexMeta(childIdxName,
+                            if (!executor.database.hasIndex(idxSchemaForMeta, childIdxName)) {
+                                executor.database.addIndex(idxSchemaForMeta, childIdxName, s.columns());
+                                executor.database.addIndexMeta(idxSchemaForMeta, childIdxName,
                                         idxSchemaForMeta + "." + partition.getName(),
                                         s.unique(), s.method(), s.whereClause());
                                 executor.database.registerSchemaObject(idxSchemaForMeta, "index", childIdxName);
-                                executor.database.setIndexParent(childIdxName, s.name());
+                                executor.database.setIndexParent(
+                                        Database.idxKey(idxSchemaForMeta, childIdxName),
+                                        Database.idxKey(idxSchemaForMeta, s.name()));
                                 // Build TableIndex on partition for query optimization
                                 boolean hasExprColsP = s.columns().stream().anyMatch(c ->
                                         c.contains("(") || c.contains(" ") || c.contains("+") || c.contains("-")
@@ -4141,13 +4510,8 @@ class DdlObjectExecutor {
     private int resolveTypeOid(String typeName) {
         DataType dt = DataType.fromPgName(typeName);
         if (dt != null) return dt.getOid();
-        // Check domain types
-        DomainType dom = executor.database.getDomain(typeName.toLowerCase());
-        if (dom != null) return executor.systemCatalog.getOid("type:" + typeName.toLowerCase());
-        // Check enum types
-        if (executor.database.getCustomEnums().containsKey(typeName.toLowerCase()))
-            return executor.systemCatalog.getOid("type:" + typeName.toLowerCase());
-        // Fallback
-        return executor.systemCatalog.getOid("type:" + typeName.toLowerCase());
+        String key = TypeNamespace.oidKeyFor(executor.database, typeName);
+        return executor.systemCatalog.getOid(
+                key != null ? key : TypeNamespace.oidKey(null, typeName));
     }
 }

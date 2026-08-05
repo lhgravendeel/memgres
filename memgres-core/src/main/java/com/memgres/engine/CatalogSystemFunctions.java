@@ -30,6 +30,11 @@ class CatalogSystemFunctions {
         this.privilegeFunctions = new CatalogPrivilegeFunctions(executor);
     }
 
+    /** A column's recorded type name as PostgreSQL spells it for this session. */
+    private String typeDisplay(String stored) {
+        return TypeNamespace.display(executor.database, executor.session, stored);
+    }
+
     /** True when the call names a user function whose declared result type is polymorphic. */
     private boolean isPolymorphicUserFunction(FunctionCallExpr fn) {
         String name = fn.name();
@@ -131,9 +136,9 @@ class CatalogSystemFunctions {
                         // A domain is a type of its own, and it is the type the column was
                         // declared with — so it is the name, not the base type it is built on and
                         // not the enum or composite that base may itself be.
-                        if (colDef.getDomainTypeName() != null) return colDef.getDomainTypeName();
-                        if (colDef.getEnumTypeName() != null) return colDef.getEnumTypeName();
-                        if (colDef.getCompositeTypeName() != null) return colDef.getCompositeTypeName();
+                        if (colDef.getDomainTypeName() != null) return typeDisplay(colDef.getDomainTypeName());
+                        if (colDef.getEnumTypeName() != null) return typeDisplay(colDef.getEnumTypeName());
+                        if (colDef.getCompositeTypeName() != null) return typeDisplay(colDef.getCompositeTypeName());
                         if (colDef.getArrayElementType() != null)
                             return pgTypeDisplayName(colDef.getArrayElementType()) + "[]";
                         if (colDef.getType() == DataType.JSONB) return "jsonb";

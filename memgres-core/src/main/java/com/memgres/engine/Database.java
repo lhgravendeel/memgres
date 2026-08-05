@@ -33,9 +33,12 @@ public class Database {
     private final Map<String, List<PgTrigger>> triggers = new ConcurrentHashMap<>();
     private final Map<String, Sequence> sequences = new ConcurrentHashMap<>();
     private final Map<String, ViewDef> views = new ConcurrentHashMap<>();
+    // The five kinds of user-defined type all live in one namespace per schema, so each is keyed
+    // by TypeNamespace.key(schema, name) rather than by the bare name: two schemas may each hold
+    // a type called e, and a column declared with one has to keep reading that one's definition.
     private final Map<String, DomainType> domains = new ConcurrentHashMap<>();
     private final Map<String, List<CreateTypeStmt.CompositeField>> compositeTypes = new ConcurrentHashMap<>();
-    private final Map<String, String> rangeTypes = new ConcurrentHashMap<>(); // range type name → subtype name
+    private final Map<String, String> rangeTypes = new ConcurrentHashMap<>(); // range type key → subtype name
     private final Set<String> shellTypes = ConcurrentHashMap.newKeySet(); // CREATE TYPE name; with no definition
     private final Map<String, PgAggregate> userAggregates = new ConcurrentHashMap<>();
     private final Map<String, PgOperator> userOperators = new ConcurrentHashMap<>();
@@ -53,6 +56,13 @@ public class Database {
     private final Map<String, String> indexParentIndex = new ConcurrentHashMap<>(); // child index name → parent index name (ALTER INDEX ATTACH PARTITION)
     private final Map<String, PgEventTrigger> eventTriggers = new ConcurrentHashMap<>(); // event trigger name → definition
     private final Map<String, ExtendedStatistic> extendedStatistics = new ConcurrentHashMap<>();
+
+    /**
+     * Which OID was handed out for which object. It belongs to the database and not to a
+     * connection's catalog: PostgreSQL's OIDs are a property of the object, so a table has the
+     * same number on every connection and a rename run on one moves the number for all of them.
+     */
+    private final ObjectIdentity objectIdentity = new ObjectIdentity(this);
 
     // User-defined casts: each entry is [sourceOid(int), targetOid(int), castFunc(int), castContext(String), castMethod(String)]
     private final java.util.List<Object[]> userDefinedCasts = new java.util.concurrent.CopyOnWriteArrayList<>();
@@ -911,8 +921,8 @@ public class Database {
     public Set<String> getAnalyzedTables() { return analyzedTables; }
 
     // Clustered index tracking
-    public void setClusteredIndex(String indexName) { clusteredIndexes.add(indexName.toLowerCase()); }
-    public boolean isClusteredIndex(String indexName) { return clusteredIndexes.contains(indexName.toLowerCase()); }
+    public void setClusteredIndex(String indexName) { clusteredIndexes.add(idxName(indexName).toLowerCase()); }
+    public boolean isClusteredIndex(String indexName) { return clusteredIndexes.contains(idxName(indexName).toLowerCase()); }
 
     /** Snapshot of all advisory lock holds (for pg_locks). One row per (session, lock, mode). */
     public List<AdvisoryLockRow> getAdvisoryLockRows() {
@@ -976,6 +986,11 @@ public class Database {
         return schemas;
     }
 
+    /** The register that says which OID belongs to which object. @see ObjectIdentity */
+    ObjectIdentity objectIdentity() {
+        return objectIdentity;
+    }
+
     /**
      * Lookup a table by unqualified name, searching pg_catalog first, then public.
      */
@@ -1025,25 +1040,47 @@ public class Database {
         this.databaseRegistry = databaseRegistry;
     }
 
+    /**
+     * Every key under which some user-defined type of any kind is stored. One namespace per
+     * schema holds all five kinds, so this is what decides whether a name is taken and which
+     * schema a bare one resolves to.
+     */
+    Set<String> typeKeys() {
+        Set<String> keys = new java.util.LinkedHashSet<>();
+        keys.addAll(customEnums.keySet());
+        keys.addAll(compositeTypes.keySet());
+        keys.addAll(rangeTypes.keySet());
+        keys.addAll(domains.keySet());
+        keys.addAll(shellTypes);
+        return keys;
+    }
+
     // Custom ENUM types
     public void addCustomEnum(CustomEnum customEnum) {
-        customEnums.put(customEnum.getName().toLowerCase(), customEnum);
+        customEnums.put(TypeNamespace.key(customEnum.getSchemaName(), customEnum.getName()), customEnum);
     }
 
     public CustomEnum getCustomEnum(String name) {
-        return customEnums.get(name.toLowerCase());
+        String key = TypeNamespace.find(customEnums.keySet(), name);
+        return key == null ? null : customEnums.get(key);
+    }
+
+    /** The enum of that name in that schema, and only that one. */
+    public CustomEnum getCustomEnum(String schema, String name) {
+        return customEnums.get(TypeNamespace.key(schema, name));
     }
 
     public boolean isCustomEnum(String typeName) {
-        return customEnums.containsKey(typeName.toLowerCase());
+        return TypeNamespace.find(customEnums.keySet(), typeName) != null;
     }
 
     public void replaceCustomEnum(CustomEnum e) {
-        customEnums.put(e.getName().toLowerCase(), e);
+        addCustomEnum(e);
     }
 
     public void removeCustomEnum(String name) {
-        customEnums.remove(name.toLowerCase());
+        String key = TypeNamespace.find(customEnums.keySet(), name);
+        if (key != null) customEnums.remove(key);
     }
 
     public Map<String, CustomEnum> getCustomEnums() {
@@ -1052,15 +1089,20 @@ public class Database {
 
     // Composite types
     public void addCompositeType(String name, List<CreateTypeStmt.CompositeField> fields) {
-        compositeTypes.put(name.toLowerCase(), fields);
+        addCompositeType(TypeNamespace.writtenSchema(name), name, fields);
+    }
+
+    public void addCompositeType(String schema, String name, List<CreateTypeStmt.CompositeField> fields) {
+        compositeTypes.put(TypeNamespace.key(schema, name), fields);
     }
 
     public boolean isCompositeType(String name) {
-        return compositeTypes.containsKey(name.toLowerCase());
+        return TypeNamespace.find(compositeTypes.keySet(), name) != null;
     }
 
     public List<CreateTypeStmt.CompositeField> getCompositeType(String name) {
-        return compositeTypes.get(name.toLowerCase());
+        String key = TypeNamespace.find(compositeTypes.keySet(), name);
+        return key == null ? null : compositeTypes.get(key);
     }
 
     /**
@@ -1081,7 +1123,8 @@ public class Database {
     }
 
     public void removeCompositeType(String name) {
-        compositeTypes.remove(name.toLowerCase());
+        String key = TypeNamespace.find(compositeTypes.keySet(), name);
+        if (key != null) compositeTypes.remove(key);
     }
 
     public Map<String, List<CreateTypeStmt.CompositeField>> getCompositeTypes() {
@@ -1090,7 +1133,26 @@ public class Database {
 
     // User-defined range types
     public void addRangeType(String name, String subtype) {
-        rangeTypes.put(name.toLowerCase(), subtype);
+        addRangeType(TypeNamespace.writtenSchema(name), name, subtype);
+    }
+
+    public void addRangeType(String schema, String name, String subtype) {
+        rangeTypes.put(TypeNamespace.key(schema, name), subtype);
+    }
+
+    /** The subtype of the range type a written name denotes, or null. */
+    public String getRangeSubtype(String name) {
+        String key = TypeNamespace.find(rangeTypes.keySet(), name);
+        return key == null ? null : rangeTypes.get(key);
+    }
+
+    public boolean isRangeType(String name) {
+        return TypeNamespace.find(rangeTypes.keySet(), name) != null;
+    }
+
+    public void removeRangeType(String name) {
+        String key = TypeNamespace.find(rangeTypes.keySet(), name);
+        if (key != null) rangeTypes.remove(key);
     }
 
     public Map<String, String> getRangeTypes() {
@@ -1099,15 +1161,20 @@ public class Database {
 
     // Shell types: a name reserved by CREATE TYPE name; with no definition yet
     public void addShellType(String name) {
-        shellTypes.add(name.toLowerCase());
+        addShellType(TypeNamespace.writtenSchema(name), name);
+    }
+
+    public void addShellType(String schema, String name) {
+        shellTypes.add(TypeNamespace.key(schema, name));
     }
 
     public boolean isShellType(String name) {
-        return shellTypes.contains(name.toLowerCase());
+        return TypeNamespace.find(shellTypes, name) != null;
     }
 
     public void removeShellType(String name) {
-        shellTypes.remove(name.toLowerCase());
+        String key = TypeNamespace.find(shellTypes, name);
+        if (key != null) shellTypes.remove(key);
     }
 
     public Set<String> getShellTypes() {
@@ -1717,26 +1784,104 @@ public class Database {
         return visible == null ? tables : visible;
     }
 
-    public void addSequence(Sequence sequence) {
-        sequences.put(sequence.getName().toLowerCase(), sequence);
+    // Sequences
+    //
+    // A sequence is a relation, so it belongs to one schema and two schemas may each hold one of
+    // the same name. The map is keyed by both. Keying it by the bare name alone made
+    // `DROP SEQUENCE other.s` destroy the sequence in the schema that really held it, made
+    // `nextval('other.s')` advance it, and gave two tables in different schemas with a `serial`
+    // column of the same name one shared counter.
+
+    /** The key a sequence is stored under: its schema and its name, both folded. */
+    static String seqKey(String schemaName, String name) {
+        String schema = schemaName == null || schemaName.isEmpty() ? "public" : schemaName;
+        return schema.toLowerCase() + "." + name.toLowerCase();
     }
 
+    public void addSequence(Sequence sequence) {
+        sequences.put(seqKey(sequence.getSchemaName(), sequence.getName()), sequence);
+    }
+
+    /** The sequence of this name in this schema, and in no other. */
+    public Sequence getSequence(String schemaName, String name) {
+        if (name == null) return null;
+        return sequences.get(seqKey(schemaName, name));
+    }
+
+    /**
+     * The sequence a written name refers to. A qualified name reaches the sequence in the schema it
+     * names and nowhere else; a bare one, written by a caller that has no schema to offer, finds
+     * one of that name preferring public.
+     */
     public Sequence getSequence(String name) {
-        return sequences.get(name.toLowerCase());
+        if (name == null) return null;
+        int dot = name.indexOf('.');
+        if (dot > 0) return getSequence(name.substring(0, dot), name.substring(dot + 1));
+        Sequence pub = sequences.get(seqKey("public", name));
+        if (pub != null) return pub;
+        for (Map.Entry<String, Sequence> e : sequences.entrySet()) {
+            if (e.getValue().getName().equalsIgnoreCase(name)) return e.getValue();
+        }
+        return null;
+    }
+
+    /**
+     * The sequence a name written in a statement refers to: the schema it names if it names one,
+     * otherwise the first schema on the search path that holds a sequence of that name.
+     */
+    public Sequence resolveSequence(List<String> searchPath, String written) {
+        if (written == null) return null;
+        int dot = written.indexOf('.');
+        if (dot > 0) return getSequence(written.substring(0, dot), written.substring(dot + 1));
+        if (searchPath != null) {
+            for (String schema : searchPath) {
+                Sequence seq = getSequence(schema, written);
+                if (seq != null) return seq;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * The sequence a column default draws from. The default writes the name the way it was written
+     * at CREATE time — bare for a {@code serial} column, which means the sequence in the table's
+     * own schema, and qualified when it names another's.
+     *
+     * <p>A bare name that the table's own schema cannot answer still means something: it was
+     * resolved through the search path when the column was created, so it can name a sequence
+     * anywhere. Stopping at the table's schema made a table depending on another schema's
+     * sequence insert nothing but a 22P02 on the default's own text.
+     */
+    public Sequence getSequenceFor(String tableSchema, String written) {
+        if (written == null) return null;
+        if (written.indexOf('.') > 0) return getSequence(written);
+        Sequence own = getSequence(tableSchema, written);
+        return own != null ? own : getSequence(written);
     }
 
     public void removeSequence(String name) {
-        sequences.remove(name.toLowerCase());
+        Sequence seq = getSequence(name);
+        if (seq != null) sequences.remove(seqKey(seq.getSchemaName(), seq.getName()));
     }
 
-    /** Remove all sequences whose name starts with the given prefix. */
-    public void removeSequencesWithPrefix(String prefix) {
-        String lowerPrefix = prefix.toLowerCase();
-        sequences.keySet().removeIf(k -> k.startsWith(lowerPrefix));
+    /** Drop the sequence of this name in this schema. */
+    public void removeSequence(String schemaName, String name) {
+        sequences.remove(seqKey(schemaName, name));
+    }
+
+    /** Remove every sequence belonging to the named schema (a temporary schema going away). */
+    public void removeSequencesInSchema(String schemaName) {
+        String prefix = schemaName.toLowerCase() + ".";
+        sequences.keySet().removeIf(k -> k.startsWith(prefix));
     }
 
     public boolean hasSequence(String name) {
-        return sequences.containsKey(name.toLowerCase());
+        return getSequence(name) != null;
+    }
+
+    /** Whether this schema holds a sequence of this name. */
+    public boolean hasSequence(String schemaName, String name) {
+        return getSequence(schemaName, name) != null;
     }
 
     // Rules
@@ -1886,6 +2031,74 @@ public class Database {
     }
 
     /**
+     * A renamed relation takes its rules with it. PostgreSQL records the relation a rule is on as
+     * an OID, so a rename changes nothing about the rule; memgres keys every part of a rule by
+     * the relation's bare name, so all of them are rewritten here or the rule stops firing, drops
+     * out of {@code pg_rules}, and cannot be dropped by name any more.
+     *
+     * @see ObjectIdentity#relationRenamed
+     */
+    void retargetRules(String oldTable, String newTable) {
+        String from = oldTable.toLowerCase();
+        String to = newTable.toLowerCase();
+        if (from.equals(to)) return;
+        Map<String, String> moved = new LinkedHashMap<>();
+        for (Map.Entry<String, String> e : new LinkedHashMap<>(rules).entrySet()) {
+            String k = e.getKey();
+            String rekeyed = null;
+            if (k.equals("everhad:" + from)) {
+                rekeyed = "everhad:" + to;
+            } else if (k.startsWith("name:") && k.endsWith(":" + from)) {
+                rekeyed = k.substring(0, k.length() - from.length()) + to;
+            } else if (k.startsWith("state:") && k.endsWith(":" + from)) {
+                rekeyed = k.substring(0, k.length() - from.length()) + to;
+            } else if (k.startsWith("qual:" + from + ":") || k.startsWith("off:" + from + ":")) {
+                int colon = k.indexOf(':');
+                rekeyed = k.substring(0, colon + 1) + to + k.substring(colon + 1 + from.length());
+            } else if (k.startsWith(from + ":")) {
+                rekeyed = to + k.substring(from.length());
+            } else if (k.startsWith("def:") && e.getValue().startsWith(from + "|")) {
+                // The definition records the relation it is on in its first field.
+                moved.put(k, to + e.getValue().substring(from.length()));
+                continue;
+            }
+            if (rekeyed == null) continue;
+            rules.remove(k);
+            moved.put(rekeyed, e.getValue());
+        }
+        rules.putAll(moved);
+    }
+
+    /**
+     * A renamed relation takes its triggers with it. They are registered under the relation's bare
+     * name and each one records the name it fires for, so a rename leaves them firing for a
+     * relation that is gone and reporting a relation OID of zero in {@code pg_trigger}.
+     *
+     * @see ObjectIdentity#relationRenamed
+     */
+    void retargetTriggers(String oldTable, String newTable, String newSchema) {
+        String from = oldTable.toLowerCase();
+        String to = newTable.toLowerCase();
+        List<PgTrigger> list = triggers.remove(from);
+        if (list == null || list.isEmpty()) return;
+        List<PgTrigger> rebuilt = new ArrayList<>();
+        for (PgTrigger t : list) {
+            // The table name is fixed at construction, so the trigger is rebuilt around the name
+            // it now fires for; everything else about it is carried over unchanged.
+            PgTrigger moved = new PgTrigger(t.getName(), t.getTiming(), t.getEvent(), newTable,
+                    t.getFunctionName(), t.getUpdateColumns(), t.getNewTransitionTable(),
+                    t.getOldTransitionTable(), t.isForEachStatement(), t.getWhenClause(),
+                    t.isDeferrable(), t.isInitiallyDeferred(), t.getArgs());
+            moved.setSchemaName(newSchema != null ? newSchema : t.getSchemaName());
+            moved.setEnabledState(t.getEnabledState());
+            rebuilt.add(moved);
+        }
+        List<PgTrigger> atTarget = triggers.get(to);
+        if (atTarget != null) rebuilt.addAll(0, atTarget);
+        triggers.put(to, rebuilt);
+    }
+
+    /**
      * Forget every rule a name carried, for a relation newly created under it. Dropping a relation
      * takes its rules with it in PostgreSQL, so a table created under the same name afterwards
      * starts with none and with relhasrules false.
@@ -1926,7 +2139,8 @@ public class Database {
         return rules.get("qual:" + table.toLowerCase() + ":" + event.toUpperCase());
     }
 
-    // Comments
+    // Comments. The name half of a key is schema-qualified for everything a schema holds, so
+    // COMMENT ON TABLE a.t and COMMENT ON TABLE b.t are two comments rather than one.
     public void addComment(String objectType, String objectName, String comment) {
         if (comment == null) {
             comments.remove(objectType + ":" + objectName);
@@ -1939,63 +2153,194 @@ public class Database {
         return comments.get(objectType + ":" + objectName);
     }
 
+    /**
+     * The key a comment on an object called {@code name} in {@code schema} is stored under.
+     * Schemas, roles, databases and extensions are not held by a schema, so they key by name
+     * alone; {@link #globalCommentType} says which those are.
+     */
+    public static String commentKey(String schema, String name) {
+        if (name == null) return null;
+        String s = schema == null || schema.isEmpty() ? "public" : schema.toLowerCase();
+        return s + "." + name.toLowerCase();
+    }
+
+    /** Whether an object of this kind lives outside every schema, so its comment keys by name. */
+    public static boolean globalCommentType(String objectType) {
+        if (objectType == null) return false;
+        String t = objectType.toLowerCase();
+        return t.equals("schema") || t.equals("database") || t.equals("role") || t.equals("user")
+                || t.equals("extension") || t.equals("tablespace") || t.equals("language")
+                || t.equals("procedural language") || t.equals("foreign data wrapper")
+                || t.equals("server") || t.equals("publication") || t.equals("subscription")
+                || t.equals("event trigger") || t.equals("access method")
+                || t.equals("large object") || t.equals("cast") || t.equals("transform");
+    }
+
+    /**
+     * Carry a comment from one key to another. A rename or a SET SCHEMA leaves the same object
+     * with a different key, and what was said about it is said about it still.
+     */
+    public void moveComment(String objectType, String fromKey, String toKey) {
+        if (fromKey == null || toKey == null || fromKey.equals(toKey)) return;
+        String text = comments.remove(objectType + ":" + fromKey);
+        if (text != null) comments.put(objectType + ":" + toKey, text);
+    }
+
+    /** Carry every comment whose key starts with {@code fromPrefix} over to {@code toPrefix}. */
+    public void moveCommentsUnder(String objectType, String fromPrefix, String toPrefix) {
+        if (fromPrefix == null || toPrefix == null || fromPrefix.equals(toPrefix)) return;
+        String from = objectType + ":" + fromPrefix;
+        List<String> keys = new ArrayList<>(comments.keySet());
+        for (String k : keys) {
+            if (k.startsWith(from)) {
+                String text = comments.remove(k);
+                if (text != null) {
+                    comments.put(objectType + ":" + toPrefix + k.substring(from.length()), text);
+                }
+            }
+        }
+    }
+
     public Map<String, String> getComments() {
         return comments;
     }
 
+    // Indexes
+    //
+    // An index is a relation, so it lives in a schema — the schema of the table it indexes — and
+    // two schemas may each hold one of the same name. Every index map is keyed by
+    // {@code schema.name}: keyed by the bare name alone, a second CREATE INDEX of a name already
+    // used in another schema was refused, and ALTER INDEX other.i renamed whichever one it found.
+
     /**
-     * The key an index of this name is stored under. PostgreSQL folds an unquoted identifier and
-     * keeps a quoted one, so {@code "MixedCase"} and {@code mixedcase} are two indexes and the
-     * name is stored exactly as it was written. Names that reach here from somewhere that folded
-     * them already still resolve, case-insensitively, to the one index that answers to them.
+     * The key an index of this name in this schema is stored under. PostgreSQL folds an unquoted
+     * identifier and keeps a quoted one, so {@code "MixedCase"} and {@code mixedcase} are two
+     * indexes and the name is stored exactly as it was written; the schema half is folded because
+     * a schema name always is by the time it reaches here.
+     */
+    static String idxKey(String schemaName, String name) {
+        String schema = schemaName == null || schemaName.isEmpty() ? "public" : schemaName;
+        return schema.toLowerCase() + "." + name;
+    }
+
+    /** The name half of an index key. */
+    static String idxName(String key) {
+        int dot = key.indexOf('.');
+        return dot > 0 ? key.substring(dot + 1) : key;
+    }
+
+    /** The schema half of an index key. */
+    static String idxSchema(String key) {
+        int dot = key.indexOf('.');
+        return dot > 0 ? key.substring(0, dot) : "public";
+    }
+
+    /**
+     * The key a written index name resolves to. A qualified name reaches the index in the schema
+     * it names; a bare one, from a caller with no schema to offer, finds the one index of that
+     * name wherever it lives. Names that reach here already folded still resolve.
      */
     private String ixKey(String name) {
         if (name == null) return null;
-        if (indexColumns.containsKey(name) || indexTableNames.containsKey(name)) return name;
+        int dot = name.indexOf('.');
+        if (dot > 0) {
+            String exact = idxKey(name.substring(0, dot), name.substring(dot + 1));
+            if (indexColumns.containsKey(exact) || indexTableNames.containsKey(exact)) return exact;
+            String ci = matchKey(exact, true);
+            return ci != null ? ci : exact;
+        }
+        String bare = matchKey(name, false);
+        if (bare != null) return bare;
+        String folded = matchKey(name, true);
+        return folded != null ? folded : idxKey("public", name);
+    }
+
+    /**
+     * The stored key whose name half matches, exactly or after folding. A qualified {@code want}
+     * has to agree on the schema too; a bare one answers from whichever schema holds it.
+     */
+    private String matchKey(String want, boolean fold) {
+        boolean qualified = want.indexOf('.') > 0;
         for (String key : indexColumns.keySet()) {
-            if (key.equalsIgnoreCase(name)) return key;
+            String candidate = qualified ? key : idxName(key);
+            if (fold ? candidate.equalsIgnoreCase(want) : candidate.equals(want)) return key;
         }
         for (String key : indexTableNames.keySet()) {
-            if (key.equalsIgnoreCase(name)) return key;
+            String candidate = qualified ? key : idxName(key);
+            if (fold ? candidate.equalsIgnoreCase(want) : candidate.equals(want)) return key;
         }
-        return name;
+        return null;
+    }
+
+    /**
+     * The index a name written in a statement refers to, as {@code schema.name}, or null. A
+     * qualified name is answered by the schema it names and by no other; a bare one by the first
+     * schema on the search path that holds an index of that name.
+     */
+    public String resolveIndexName(List<String> searchPath, String written) {
+        if (written == null) return null;
+        int dot = written.indexOf('.');
+        if (dot > 0) {
+            String key = idxKey(written.substring(0, dot), written.substring(dot + 1));
+            return indexColumns.containsKey(key) ? key : null;
+        }
+        if (searchPath != null) {
+            for (String schema : searchPath) {
+                String key = idxKey(schema, written);
+                if (indexColumns.containsKey(key)) return key;
+            }
+        }
+        return null;
     }
 
     // Index metadata (for USING INDEX lookups)
-    public void addIndex(String name, List<String> columns) {
-        indexColumns.put(name, columns);
+    public void addIndex(String schemaName, String name, List<String> columns) {
+        indexColumns.put(idxKey(schemaName, name), columns);
     }
 
-    public void addIndexMeta(String name, String tableName, boolean isUnique) {
-        indexTableNames.put(name, tableName);
-        indexUniqueFlags.put(name, isUnique);
+    public void addIndexMeta(String schemaName, String name, String tableName, boolean isUnique) {
+        String key = idxKey(schemaName, name);
+        indexTableNames.put(key, tableName);
+        indexUniqueFlags.put(key, isUnique);
     }
 
-    public void addIndexMeta(String name, String tableName, boolean isUnique, String method, String whereClause) {
-        indexTableNames.put(name, tableName);
-        indexUniqueFlags.put(name, isUnique);
-        if (method != null) indexMethods.put(name, method);
-        if (whereClause != null) indexWhereClauses.put(name, whereClause);
+    /** Whether this schema holds an index of exactly this name. */
+    public boolean hasIndex(String schemaName, String name) {
+        return name != null && indexColumns.containsKey(idxKey(schemaName, name));
     }
 
-    public void setIndexColumnOptions(String name, List<String> options) {
-        if (options != null) indexColumnOptions.put(name, options);
+    /** Drop the index of this name in this schema. */
+    public void removeIndex(String schemaName, String name) {
+        removeIndexKey(idxKey(schemaName, name));
+    }
+
+    public void addIndexMeta(String schemaName, String name, String tableName, boolean isUnique,
+                             String method, String whereClause) {
+        String key = idxKey(schemaName, name);
+        indexTableNames.put(key, tableName);
+        indexUniqueFlags.put(key, isUnique);
+        if (method != null) indexMethods.put(key, method);
+        if (whereClause != null) indexWhereClauses.put(key, whereClause);
+    }
+
+    public void setIndexColumnOptions(String schemaName, String name, List<String> options) {
+        if (options != null) indexColumnOptions.put(idxKey(schemaName, name), options);
     }
 
     public List<String> getIndexColumnOptions(String name) {
         return indexColumnOptions.get(ixKey(name));
     }
 
-    public void setIndexIncludeColumns(String name, List<String> cols) {
-        if (cols != null && !cols.isEmpty()) indexIncludeColumns.put(name, cols);
+    public void setIndexIncludeColumns(String schemaName, String name, List<String> cols) {
+        if (cols != null && !cols.isEmpty()) indexIncludeColumns.put(idxKey(schemaName, name), cols);
     }
 
     public List<String> getIndexIncludeColumns(String name) {
         return indexIncludeColumns.get(ixKey(name));
     }
 
-    public void setIndexNullsNotDistinct(String name, boolean value) {
-        if (value) indexNullsNotDistinct.put(name, true);
+    public void setIndexNullsNotDistinct(String schemaName, String name, boolean value) {
+        if (value) indexNullsNotDistinct.put(idxKey(schemaName, name), true);
     }
 
     public boolean isIndexNullsNotDistinct(String name) {
@@ -2040,7 +2385,7 @@ public class Database {
     }
 
     public void setIndexReloptions(String name, Map<String, String> opts) {
-        indexReloptions.put(name, opts);
+        indexReloptions.put(ixKey(name), opts);
     }
 
     public void removeIndexReloptions(String name) {
@@ -2048,16 +2393,24 @@ public class Database {
     }
 
     /**
-     * True when an index answers to exactly this name. The match is exact because the name is
-     * what decides whether another index may be created under it, and PostgreSQL has already
-     * folded an unquoted identifier by the time it gets here.
+     * True when an index anywhere answers to exactly this name. Kept for callers that have no
+     * schema to offer — asking "is this name a relation at all". A CREATE that has to decide
+     * whether a name is free asks {@link #hasIndex(String, String)} about one schema instead.
      */
     public boolean hasIndex(String name) {
-        return name != null && indexColumns.containsKey(name);
+        if (name == null) return false;
+        if (name.indexOf('.') > 0) return indexColumns.containsKey(ixKey(name));
+        for (String key : indexColumns.keySet()) {
+            if (idxName(key).equals(name)) return true;
+        }
+        return false;
     }
 
     public void removeIndex(String name) {
-        String key = ixKey(name);
+        removeIndexKey(ixKey(name));
+    }
+
+    private void removeIndexKey(String key) {
         indexColumns.remove(key);
         indexTableNames.remove(key);
         indexUniqueFlags.remove(key);
@@ -2069,10 +2422,29 @@ public class Database {
         indexNullsNotDistinct.remove(key);
     }
 
-    /** Rename an index: re-key across all index maps and update schema registry. */
+    /**
+     * Move an index into another schema, keeping its name. An index lives where its table does,
+     * so this happens when the table is moved and never on its own.
+     */
+    public void moveIndex(String oldKey, String newSchema, String newOwnerTable) {
+        String newKey = idxKey(newSchema, idxName(oldKey));
+        rekeyIndex(oldKey, newKey);
+        if (newOwnerTable != null) indexTableNames.put(newKey, newOwnerTable);
+    }
+
+    /**
+     * Rename an index: re-key across all index maps and update the schema registry. A rename
+     * never moves the index out of its schema, so the new key keeps the old key's schema.
+     */
     public void renameIndex(String oldName, String newName) {
         String oldKey = ixKey(oldName);
-        String newKey = newName;
+        String newKey = idxKey(idxSchema(oldKey), idxName(newName));
+        rekeyIndex(oldKey, newKey);
+    }
+
+    /** Move every index map's entry from one key to another. */
+    private void rekeyIndex(String oldKey, String newKey) {
+        if (oldKey.equals(newKey)) return;
         List<String> cols = indexColumns.remove(oldKey);
         if (cols != null) indexColumns.put(newKey, cols);
         String tbl = indexTableNames.remove(oldKey);
@@ -2091,15 +2463,15 @@ public class Database {
         if (inclCols != null) indexIncludeColumns.put(newKey, inclCols);
         Boolean nnd = indexNullsNotDistinct.remove(oldKey);
         if (nnd != null) indexNullsNotDistinct.put(newKey, nnd);
-        // Update schema registry
-        for (Map.Entry<String, Set<String>> entry : schemaObjectRegistry.entrySet()) {
-            if (entry.getValue().remove("index:" + oldKey.toLowerCase())) {
-                entry.getValue().add("index:" + newKey.toLowerCase());
-            }
-        }
+        // Update schema registry, which records the bare name under the schema that holds it.
+        String oldBare = idxName(oldKey).toLowerCase();
+        String newBare = idxName(newKey).toLowerCase();
+        Set<String> from = schemaObjectRegistry.get(idxSchema(oldKey));
+        if (from != null) from.remove("index:" + oldBare);
+        registerSchemaObject(idxSchema(newKey), "index", newBare);
         // Update object ownership key
-        String oldOwner = objectOwners.remove("index:" + oldKey);
-        if (oldOwner != null) objectOwners.put("index:" + newKey, oldOwner);
+        String oldOwner = objectOwners.remove("index:" + idxName(oldKey));
+        if (oldOwner != null) objectOwners.put("index:" + idxName(newKey), oldOwner);
     }
 
     public Map<String, List<String>> getIndexColumns() {
@@ -2179,19 +2551,26 @@ public class Database {
 
     // Domain types
     public void addDomain(DomainType domain) {
-        domains.put(domain.getName().toLowerCase(), domain);
+        domains.put(TypeNamespace.key(domain.getSchemaName(), domain.getName()), domain);
     }
 
     public DomainType getDomain(String name) {
-        return domains.get(name.toLowerCase());
+        String key = TypeNamespace.find(domains.keySet(), name);
+        return key == null ? null : domains.get(key);
+    }
+
+    /** The domain of that name in that schema, and only that one. */
+    public DomainType getDomain(String schema, String name) {
+        return domains.get(TypeNamespace.key(schema, name));
     }
 
     public void removeDomain(String name) {
-        domains.remove(name.toLowerCase());
+        String key = TypeNamespace.find(domains.keySet(), name);
+        if (key != null) domains.remove(key);
     }
 
     public boolean isDomain(String name) {
-        return domains.containsKey(name.toLowerCase());
+        return TypeNamespace.find(domains.keySet(), name) != null;
     }
 
     public Map<String, DomainType> getDomains() {

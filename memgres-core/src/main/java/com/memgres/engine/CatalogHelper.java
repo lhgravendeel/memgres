@@ -2,7 +2,9 @@ package com.memgres.engine;
 
 import com.memgres.engine.util.Cols;
 
+import java.util.EnumSet;
 import java.util.List;
+import java.util.Set;
 
 /**
  * Static utility methods shared by PgCatalogBuilder and InfoSchemaBuilder.
@@ -361,7 +363,15 @@ public final class CatalogHelper {
                 return typmod >= 0 ? "time(" + typmod + ") with time zone" : "time with time zone";
             case INTERVAL: {
                 if (typmod < 0) return "interval";
-                String qualifier = intervalQualifierOf((typmod >> 16) & 0x7FFF);
+                int mask = (typmod >> 16) & 0x7FFF;
+                // The high half is a field mask, not a number: an interval typmod that does not
+                // name a qualifier PG can write is not a narrower interval, it is not a typmod at
+                // all, and PG refuses to print one rather than inventing 'interval(3)'.
+                if (mask != INTERVAL_FULL_RANGE && intervalQualifierOf(mask) == null) {
+                    throw new MemgresException(
+                            "invalid INTERVAL typmod: 0x" + Integer.toHexString(typmod), "XX000");
+                }
+                String qualifier = intervalQualifierOf(mask);
                 int prec = typmod & 0xFFFF;
                 StringBuilder sb = new StringBuilder("interval");
                 if (qualifier != null) sb.append(' ').append(qualifier);
@@ -373,9 +383,36 @@ public final class CatalogHelper {
             case VARBIT:
                 return typmod >= 0 ? "bit varying(" + typmod + ")" : "bit varying";
             default:
-                return pgTypeName(dt);
+                return withPlainTypmod(dt, pgTypeName(dt), typmod);
         }
     }
+
+    /**
+     * PostgreSQL's {@code printTypmod} for a type that has no typmod output function of its own:
+     * the modifier is shown as the plain number it is. {@code format_type(1082, 3)} is
+     * {@code date(3)} and {@code format_type('_date'::regtype, 3)} is {@code date(3)[]}. Dropping
+     * it made format_type disagree with itself, answering one name for two different typmods.
+     *
+     * <p>The names PostgreSQL writes out by hand never carry one — measured on PG 18, every
+     * built-in whose {@code format_type(oid, 5)} shows no {@code (5)} is one of bool, float4,
+     * float8, int2, int4, int8 and json, plus the three that fold the modifier into their own
+     * spelling (bpchar, varchar, numeric) and are handled above.
+     */
+    public static String withPlainTypmod(DataType dt, String name, int typmod) {
+        if (typmod < 0 || dt == null || name == null) return name;
+        if (TYPMOD_IGNORED.contains(dt)) return name;
+        // A name that already carries a modifier, or that is an array spelled with brackets, has
+        // had the modifier applied where it belongs.
+        if (name.indexOf('(') >= 0 || name.endsWith("]")) return name;
+        return name + "(" + typmod + ")";
+    }
+
+    /** The types {@code format_type} names without ever showing a modifier. */
+    private static final Set<DataType> TYPMOD_IGNORED = java.util.Collections.unmodifiableSet(
+            EnumSet.of(DataType.BOOLEAN, DataType.REAL, DataType.DOUBLE_PRECISION,
+                    DataType.SMALLINT, DataType.INTEGER, DataType.BIGINT,
+                    DataType.SERIAL, DataType.BIGSERIAL, DataType.SMALLSERIAL,
+                    DataType.JSON));
 
     /** Return numeric precision for information_schema.columns, or null if not numeric. */
     public static Integer numericPrecision(DataType dt) {
@@ -425,9 +462,14 @@ public final class CatalogHelper {
         if (def.equalsIgnoreCase("current_date") || def.equalsIgnoreCase("current_date()")) return "CURRENT_DATE";
         if (def.toLowerCase().startsWith("nextval(")) return def;
         if (def.startsWith("'") && def.endsWith("'")) {
+            // The type a default is labelled with is named as the reader would write it, which
+            // for a type in a schema of its own is its bare name.
             String typeName = pgTypeName(col.getType());
-            if (col.getDomainTypeName() != null) typeName = col.getDomainTypeName();
-            else if (col.getEnumTypeName() != null) typeName = col.getEnumTypeName();
+            if (col.getDomainTypeName() != null) {
+                typeName = TypeNamespace.nameOfKey(col.getDomainTypeName());
+            } else if (col.getEnumTypeName() != null) {
+                typeName = TypeNamespace.nameOfKey(col.getEnumTypeName());
+            }
             return def + "::" + typeName;
         }
         String folded = foldCastOfLiteral(def);
@@ -592,7 +634,11 @@ public final class CatalogHelper {
         return null;
     }
 
-    /** Collect all sequence names (explicit + implicit from SERIAL/identity columns). */
+    /**
+     * Every sequence in the database (explicit + implicit from SERIAL/identity columns), named
+     * {@code schema.name}. A sequence is a relation, so two schemas may each hold one of the same
+     * name and only the pair identifies it.
+     */
     public static java.util.List<String> getSequenceNames(Database database) {
         java.util.Set<String> names = new java.util.LinkedHashSet<>(database.getSequences().keySet());
         for (java.util.Map.Entry<String, Schema> schemaEntry : database.getSchemas().entrySet()) {
@@ -600,9 +646,9 @@ public final class CatalogHelper {
                 Table t = tableEntry.getValue();
                 for (Column col : t.getColumns()) {
                     if (col.getType() == DataType.SERIAL || col.getType() == DataType.BIGSERIAL || col.getType() == DataType.SMALLSERIAL) {
-                        names.add(t.getName() + "_" + col.getName() + "_seq");
+                        names.add(Database.seqKey(schemaEntry.getKey(), t.getName() + "_" + col.getName() + "_seq"));
                     } else if (col.getDefaultValue() != null && col.getDefaultValue().contains("__identity__")) {
-                        names.add(t.getName() + "_" + col.getName() + "_seq");
+                        names.add(Database.seqKey(schemaEntry.getKey(), t.getName() + "_" + col.getName() + "_seq"));
                     }
                 }
             }
@@ -610,9 +656,26 @@ public final class CatalogHelper {
         return new java.util.ArrayList<>(names);
     }
 
-    /** Determine the data type for a sequence based on the source SERIAL column type. */
-    public static DataType getSequenceDataType(Database database, String seqName) {
-        for (Schema schema : database.getSchemas().values()) {
+    /** The schema half of a {@code schema.name} pair from {@link #getSequenceNames}. */
+    public static String schemaOf(String qualified) {
+        int dot = qualified.indexOf('.');
+        return dot > 0 ? qualified.substring(0, dot) : "public";
+    }
+
+    /** The name half of a {@code schema.name} pair from {@link #getSequenceNames}. */
+    public static String nameOf(String qualified) {
+        int dot = qualified.indexOf('.');
+        return dot > 0 ? qualified.substring(dot + 1) : qualified;
+    }
+
+    /**
+     * Determine the data type for a sequence based on the source SERIAL column type. The sequence
+     * is named {@code schema.name}, and only that schema's tables can be the ones that made it.
+     */
+    public static DataType getSequenceDataType(Database database, String qualifiedSeqName) {
+        Schema schema = database.getSchema(schemaOf(qualifiedSeqName));
+        String seqName = nameOf(qualifiedSeqName);
+        if (schema != null) {
             for (Table t : schema.getTables().values()) {
                 for (Column col : t.getColumns()) {
                     String expected = t.getName() + "_" + col.getName() + "_seq";

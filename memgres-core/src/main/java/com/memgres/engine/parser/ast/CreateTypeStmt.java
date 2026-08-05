@@ -12,9 +12,14 @@ public final class CreateTypeStmt implements Statement {
     public final List<CompositeField> compositeFields;
     public final String rangeSubtype;  // For CREATE TYPE ... AS RANGE (SUBTYPE = ...)
     private boolean shell;             // CREATE TYPE name; — a placeholder with no definition yet
+    private String schemaName;         // CREATE TYPE schema.name — null when none was written
 
     public boolean shell() { return shell; }
     public void setShell(boolean shell) { this.shell = shell; }
+
+    /** The schema written before the name, or null when the name was written bare. */
+    public String schemaName() { return schemaName; }
+    public void setSchemaName(String schemaName) { this.schemaName = schemaName; }
 
     public CreateTypeStmt(String name, List<String> enumLabels, List<CompositeField> compositeFields) {
         this(name, enumLabels, compositeFields, null);

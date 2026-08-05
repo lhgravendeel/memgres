@@ -13,13 +13,13 @@ public class Column {
     private boolean primaryKey;
     private String defaultValue;       // String representation (for display/catalog)
     private Expression parsedDefaultExpr;     // Parsed AST (for evaluation; avoids re-parsing)
-    private final String enumTypeName;
+    private String enumTypeName;
     private final Integer precision;
     private final Integer scale;
     private final String generatedExpr;
     private final boolean virtual;          // PG 18: VIRTUAL generated column (computed on read)
     private String domainTypeName;
-    private final String compositeTypeName;  // For composite type columns (e.g., "pair")
+    private String compositeTypeName;  // For composite type columns (e.g., "pair")
     private final DataType arrayElementType; // For array columns, the element type (e.g., INTEGER for integer[])
     private int tableOid;    // PgWire RowDescription: source table OID (0 if not from a real table)
     private short attNum;    // PgWire RowDescription: column attribute number (0 if not from a real table)
@@ -171,6 +171,8 @@ public class Column {
     public Expression getParsedDefaultExpr() { return parsedDefaultExpr; }
     public void setParsedDefaultExpr(Expression expr) { this.parsedDefaultExpr = expr; }
     public String getEnumTypeName() { return enumTypeName; }
+    /** ALTER TYPE ... RENAME TO: the column keeps its enum, which now answers to another name. */
+    public void setEnumTypeName(String enumTypeName) { this.enumTypeName = enumTypeName; }
     public Integer getPrecision() { return precision; }
     public Integer getScale() { return scale; }
     public String getGeneratedExpr() { return generatedExpr; }
@@ -180,6 +182,8 @@ public class Column {
     /** ALTER DOMAIN ... RENAME TO: the column keeps its domain, which now answers to another name. */
     public void setDomainTypeName(String domainTypeName) { this.domainTypeName = domainTypeName; }
     public String getCompositeTypeName() { return compositeTypeName; }
+    /** ALTER TYPE ... RENAME TO: the column keeps its composite under its new name. */
+    public void setCompositeTypeName(String compositeTypeName) { this.compositeTypeName = compositeTypeName; }
     public DataType getArrayElementType() { return arrayElementType; }
     public int getTableOid() { return tableOid; }
     public void setTableOid(int tableOid) { this.tableOid = tableOid; }

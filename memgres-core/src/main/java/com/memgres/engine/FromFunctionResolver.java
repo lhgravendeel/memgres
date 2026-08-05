@@ -1276,17 +1276,17 @@ class FromFunctionResolver {
         List<RowContext> contexts = new ArrayList<>();
         Database db = executor.database;
         Map<String, Integer> oidMap = executor.systemCatalog.getOidMap();
-        for (String seqName : CatalogHelper.getSequenceNames(db)) {
+        for (String qualified : CatalogHelper.getSequenceNames(db)) {
             for (Map.Entry<String, Integer> entry : oidMap.entrySet()) {
-                if (entry.getValue() == seqOid && entry.getKey().startsWith("rel:") && entry.getKey().endsWith("." + seqName)) {
-                    Sequence seq = db.getSequence(seqName);
+                if (entry.getValue() == seqOid && entry.getKey().equals("rel:" + qualified)) {
+                    Sequence seq = db.getSequence(qualified);
                     long lastVal;
                     boolean isCalled;
                     if (seq != null) {
                         lastVal = seq.currValRaw();
                         isCalled = seq.isCalled();
                     } else {
-                        long[] resolved = resolveImplicitSerial(db, seqName);
+                        long[] resolved = resolveImplicitSerial(db, qualified);
                         lastVal = resolved[0];
                         isCalled = resolved[1] != 0;
                     }
@@ -1767,13 +1767,15 @@ class FromFunctionResolver {
     /**
      * Resolve an implicit SERIAL sequence's current value from the table's serial counter.
      */
-    private long[] resolveImplicitSerial(Database db, String seqName) {
+    private long[] resolveImplicitSerial(Database db, String qualifiedSeqName) {
+        String seqName = CatalogHelper.nameOf(qualifiedSeqName);
         if (seqName.endsWith("_seq")) {
             String prefix = seqName.substring(0, seqName.length() - 4);
             int lastUnderscore = prefix.lastIndexOf('_');
             if (lastUnderscore > 0) {
                 String tblName = prefix.substring(0, lastUnderscore);
-                for (Schema schema : db.getSchemas().values()) {
+                Schema schema = db.getSchema(CatalogHelper.schemaOf(qualifiedSeqName));
+                if (schema != null) {
                     Table tbl = schema.getTable(tblName);
                     if (tbl != null) {
                         long counter = tbl.getSerialCounter();

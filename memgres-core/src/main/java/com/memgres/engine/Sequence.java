@@ -8,6 +8,12 @@ import java.util.concurrent.atomic.AtomicLong;
 public class Sequence {
 
     private String name;
+    /**
+     * The schema this sequence lives in. A sequence is a relation, so it belongs to exactly one
+     * schema and two schemas may each hold one of the same name; without this the engine keeps a
+     * single global counter and two tables with a {@code serial} column of the same name share it.
+     */
+    private String schemaName = "public";
     private long startWith;
     private long incrementBy;
     private long minValue;
@@ -19,6 +25,25 @@ public class Sequence {
     private volatile boolean called = false;
     private String ownedByTable;
     private String ownedByColumn;
+
+    /**
+     * The sequence name a column default draws from, or null when the default draws from none.
+     *
+     * <p>A default is stored as the text it was written as — {@code nextval('s'::regclass)} for a
+     * serial column, {@code __identity__:...:seq:s} for an identity one — and every caller that
+     * has to know which sequence a column belongs to was picking the name out of that text again,
+     * each with its own idea of where the quotes are.
+     */
+    public static String nameInDefault(String defaultValue) {
+        if (defaultValue == null) return null;
+        if (defaultValue.contains(":seq:")) {
+            return defaultValue.substring(defaultValue.indexOf(":seq:") + 5);
+        }
+        if (!defaultValue.contains("nextval(")) return null;
+        int q1 = defaultValue.indexOf('\'');
+        int q2 = q1 < 0 ? -1 : defaultValue.indexOf('\'', q1 + 1);
+        return q2 > q1 ? defaultValue.substring(q1 + 1, q2) : null;
+    }
 
     public Sequence(String name, Long startWith, Long incrementBy, Long minValue, Long maxValue) {
         this.name = name;
@@ -36,6 +61,19 @@ public class Sequence {
 
     public void setName(String name) {
         this.name = name;
+    }
+
+    public String getSchemaName() {
+        return schemaName;
+    }
+
+    public void setSchemaName(String schemaName) {
+        this.schemaName = schemaName == null ? "public" : schemaName;
+    }
+
+    /** {@code schema.name}, the name that identifies this sequence among all of them. */
+    public String qualifiedName() {
+        return schemaName + "." + name;
     }
 
     public synchronized long nextVal() {

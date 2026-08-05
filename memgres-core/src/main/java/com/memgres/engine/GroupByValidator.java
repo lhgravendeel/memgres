@@ -384,17 +384,35 @@ final class GroupByValidator {
         return expr;
     }
 
+    /**
+     * Whether a type name written in a query denotes the type a column recorded. A column records
+     * the schema its type lives in; a query usually writes only the name, and a bare name written
+     * against a column of that name is the same type.
+     */
+    private static boolean namesSameType(String written, String stored) {
+        if (written == null || stored == null) return false;
+        if (written.equalsIgnoreCase(stored)) return true;
+        if (!TypeNamespace.bare(written).equalsIgnoreCase(TypeNamespace.nameOfKey(stored))) {
+            return false;
+        }
+        String writtenSchema = TypeNamespace.writtenSchema(written);
+        return writtenSchema == null
+                || writtenSchema.equalsIgnoreCase(TypeNamespace.schemaOfKey(stored));
+    }
+
     /** True when the cast names the column's own declared type, length or precision and all. */
     private static boolean castsToOwnType(String typeName, Column column) {
         if (typeName == null || column == null) return false;
         String written = typeName.trim();
         // A domain and an enum are named types of their own: naming a column's own domain or
         // enum is the no-op cast, and naming the type underneath it is a conversion out of it.
+        // A written name and a column's recorded one both denote a type, and the cast is the
+        // no-op one when they denote the same one — a.e written bare as e still is.
         if (column.getDomainTypeName() != null) {
-            return written.equalsIgnoreCase(column.getDomainTypeName());
+            return namesSameType(written, column.getDomainTypeName());
         }
         if (column.getEnumTypeName() != null) {
-            return written.equalsIgnoreCase(column.getEnumTypeName());
+            return namesSameType(written, column.getEnumTypeName());
         }
         if (column.getCompositeTypeName() != null || column.getArrayElementType() != null) {
             return false;

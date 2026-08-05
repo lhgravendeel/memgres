@@ -101,7 +101,9 @@ class CatalogMetadataFunctions {
                             String schemaName = schemaEntry.getKey();
                             for (Table tbl : schemaEntry.getValue().getTables().values()) {
                                 for (StoredConstraint sc : tbl.getConstraints()) {
-                                    int scOid = executor.systemCatalog.getOid("con:" + tbl.getName() + "." + sc.getName());
+                                    int scOid = executor.systemCatalog.getOid(
+                                            CatalogConstraintBuilder.constraintKey(
+                                                    schemaName, tbl.getName(), sc.getName()));
                                     if (scOid == coid) {
                                         return formatConstraintDef(sc, schemaName, tbl);
                                     }
@@ -110,7 +112,9 @@ class CatalogMetadataFunctions {
                                 for (Column c : tbl.getColumns()) {
                                     if (c.isNullable()) continue;
                                     String conname = notNullConstraintName(tbl, c);
-                                    int nnOid = executor.systemCatalog.getOid("con:" + tbl.getName() + "." + conname);
+                                    int nnOid = executor.systemCatalog.getOid(
+                                            CatalogConstraintBuilder.constraintKey(
+                                                    schemaName, tbl.getName(), conname));
                                     if (nnOid == coid) {
                                         return "NOT NULL " + c.getName();
                                     }
@@ -312,49 +316,13 @@ class CatalogMetadataFunctions {
             case "obj_description":
                 return evalObjDescription(fn, ctx);
             case "col_description": {
-                if (fn.args().size() >= 2) {
-                    Object tableArg = executor.evalExpr(fn.args().get(0), ctx);
-                    Object colNumArg = executor.evalExpr(fn.args().get(1), ctx);
-                    if (tableArg != null && colNumArg != null) {
-                        int colNum = executor.toInt(colNumArg);
-                        int targetOid = -1;
-                        if (tableArg instanceof RegclassValue) {
-                            RegclassValue rc = (RegclassValue) tableArg;
-                            targetOid = rc.oid();
-                        } else if (tableArg instanceof Number) {
-                            Number n = (Number) tableArg;
-                            targetOid = n.intValue();
-                        }
-                        if (targetOid >= 0) {
-                            for (Schema schema : executor.database.getSchemas().values()) {
-                                for (Table tbl : schema.getTables().values()) {
-                                    int tblOid = executor.systemCatalog.getOid("rel:" + schema.getName() + "." + tbl.getName());
-                                    if (tblOid == targetOid) {
-                                        if (colNum >= 1 && colNum <= tbl.getColumns().size()) {
-                                            String colName = tbl.getColumns().get(colNum - 1).getName();
-                                            return executor.database.getComment("column", tbl.getName().toLowerCase() + "." + colName.toLowerCase());
-                                        }
-                                        return null;
-                                    }
-                                }
-                            }
-                            // Views carry column comments too, and are not in getTables()
-                            for (Database.ViewDef view : executor.database.getViews().values()) {
-                                int viewOid = executor.systemCatalog.getOid(
-                                        "rel:" + view.schemaName() + "." + view.name());
-                                if (viewOid != targetOid) continue;
-                                List<Column> vcols = view.cachedColumns();
-                                if (vcols != null && colNum >= 1 && colNum <= vcols.size()) {
-                                    String colName = vcols.get(colNum - 1).getName();
-                                    return executor.database.getComment("column",
-                                            view.name().toLowerCase() + "." + colName.toLowerCase());
-                                }
-                                return null;
-                            }
-                        }
-                    }
-                }
-                return null;
+                if (fn.args().size() < 2) return null;
+                Object tableArg = executor.evalExpr(fn.args().get(0), ctx);
+                Object colNumArg = executor.evalExpr(fn.args().get(1), ctx);
+                if (tableArg == null || colNumArg == null) return null;
+                int targetOid = oidOf(tableArg);
+                if (targetOid < 0) return null;
+                return describedBy(targetOid, executor.toInt(colNumArg), null);
             }
             case "pg_get_userbyid":
                 return "memgres";
@@ -368,8 +336,24 @@ class CatalogMetadataFunctions {
             }
             case "pg_encoding_to_char":
                 return "UTF8";
-            case "shobj_description":
-                return null;
+            case "shobj_description": {
+                // The shared catalogs — databases, roles, tablespaces. Their comments are kept by
+                // name rather than by schema, because nothing holds them.
+                if (fn.args().size() < 2) {
+                    for (Expression a : fn.args()) executor.evalExpr(a, ctx);
+                    return null;
+                }
+                Object oidArg = executor.evalExpr(fn.args().get(0), ctx);
+                Object catArg = executor.evalExpr(fn.args().get(1), ctx);
+                if (oidArg == null || catArg == null) return null;
+                String cat = String.valueOf(catArg).toLowerCase();
+                String kind = cat.contains("database") ? "database"
+                        : cat.contains("authid") || cat.contains("roles") ? "role"
+                        : cat.contains("tablespace") ? "tablespace" : null;
+                if (kind == null) return null;
+                String named = nameForSharedOid(kind, oidOf(oidArg));
+                return named == null ? null : executor.database.getComment(kind, named);
+            }
             case "pg_describe_object": {
                 if (fn.args().size() < 3) {
                     for (Expression a : fn.args()) executor.evalExpr(a, ctx);
@@ -543,30 +527,28 @@ class CatalogMetadataFunctions {
             if (fn.args().size() >= 3) executor.evalExpr(fn.args().get(2), ctx);
         }
         if (arg == null) return null;
-        String indexName = null;
+        // Two schemas may each hold an index called i, so the OID — which names exactly one of
+        // them — decides which definition to print. Reducing the argument to a bare name made
+        // pg_get_indexdef answer with the other schema's index.
+        String indexKey = null;
         if (arg instanceof RegclassValue) {
-            RegclassValue rc = (RegclassValue) arg;
-            indexName = rc.name();
+            indexKey = relationKeyForOid(((RegclassValue) arg).oid());
+            if (indexKey == null) indexKey = ((RegclassValue) arg).name();
         } else if (arg instanceof Number) {
-            int targetOid = ((Number) arg).intValue();
-            for (Map.Entry<String, Integer> entry : executor.systemCatalog.getOidMap().entrySet()) {
-                if (entry.getValue() == targetOid && entry.getKey().startsWith("rel:")) {
-                    indexName = entry.getKey().substring(entry.getKey().lastIndexOf('.') + 1);
-                    break;
-                }
-            }
+            indexKey = relationKeyForOid(((Number) arg).intValue());
         } else {
-            indexName = arg.toString();
+            indexKey = arg.toString();
         }
-        if (indexName == null) return null;
-        if (indexName.contains(".")) {
-            indexName = indexName.substring(indexName.lastIndexOf('.') + 1);
-        }
-        List<String> cols = executor.database.getIndexColumns(indexName);
+        if (indexKey == null) return null;
+        String indexName = RelationNamespace.bareName(indexKey);
+        int keyDot = indexKey.lastIndexOf('.');
+        String indexSchema = keyDot > 0 ? indexKey.substring(0, keyDot) : null;
+        List<String> cols = executor.database.getIndexColumns(indexKey);
         String constraintTableName = null;
         boolean constraintNullsNotDistinct = false;
         if (cols == null) {
             for (Map.Entry<String, Schema> schemaEntry : executor.database.getSchemas().entrySet()) {
+                if (indexSchema != null && !indexSchema.equalsIgnoreCase(schemaEntry.getKey())) continue;
                 for (Map.Entry<String, Table> tblEntry : schemaEntry.getValue().getTables().entrySet()) {
                     for (StoredConstraint sc : tblEntry.getValue().getConstraints()) {
                         if (sc.getName().equalsIgnoreCase(indexName) &&
@@ -586,10 +568,10 @@ class CatalogMetadataFunctions {
         // rather than the empty string a client would read as an index with no columns.
         if (cols == null) return null;
         // H16: constraint-backed indexes (PK/UNIQUE) are always unique
-        boolean unique = constraintTableName != null || executor.database.isUniqueIndex(indexName);
+        boolean unique = constraintTableName != null || executor.database.isUniqueIndex(indexKey);
         String tableName = constraintTableName != null
                 ? constraintTableName
-                : executor.database.getIndexTable(indexName);
+                : executor.database.getIndexTable(indexKey);
         if (tableName == null) {
             for (Map.Entry<String, Schema> schemaEntry : executor.database.getSchemas().entrySet()) {
                 for (Map.Entry<String, Table> tblEntry : schemaEntry.getValue().getTables().entrySet()) {
@@ -606,17 +588,30 @@ class CatalogMetadataFunctions {
             }
         }
         if (tableName == null) return "";
-        String idxMethod = executor.database.getIndexMethod(indexName);
+        String idxMethod = executor.database.getIndexMethod(indexKey);
         if (idxMethod == null || idxMethod.isEmpty()) idxMethod = "btree";
         String whereClause = CatalogHelper.deparseIndexPredicate(executor.database, tableName,
-                executor.database.getIndexWhereClause(indexName));
+                executor.database.getIndexWhereClause(indexKey));
         List<String> normalizedCols = CatalogHelper.deparseIndexColumns(executor.database, tableName, cols);
-        List<String> columnOptions = executor.database.getIndexColumnOptions(indexName);
-        List<String> includeColumns = executor.database.getIndexIncludeColumns(indexName);
-        boolean nullsNotDistinct = executor.database.isIndexNullsNotDistinct(indexName)
+        List<String> columnOptions = executor.database.getIndexColumnOptions(indexKey);
+        List<String> includeColumns = executor.database.getIndexIncludeColumns(indexKey);
+        boolean nullsNotDistinct = executor.database.isIndexNullsNotDistinct(indexKey)
                 || constraintNullsNotDistinct;
         return CatalogStubBuilder.buildIndexDef(indexName, tableName, unique, idxMethod,
                 normalizedCols, columnOptions, includeColumns, nullsNotDistinct, whereClause);
+    }
+
+    /**
+     * The {@code schema.name} an OID belongs to, or null when it names no relation. The OID is
+     * what tells two same-named relations in different schemas apart.
+     */
+    private String relationKeyForOid(int targetOid) {
+        for (Map.Entry<String, Integer> entry : executor.systemCatalog.getOidMap().entrySet()) {
+            if (entry.getValue() == targetOid && entry.getKey().startsWith("rel:")) {
+                return entry.getKey().substring(4);
+            }
+        }
+        return null;
     }
 
     private Object evalPgGetTriggerdef(FunctionCallExpr fn, RowContext ctx) {
@@ -676,12 +671,92 @@ class CatalogMetadataFunctions {
         }
         sb.append(String.join(" OR ", events));
         sb.append(" ON ").append(schema).append('.').append(first.getTableName());
+        // The transition tables are what the trigger function reads its rows from; a definition
+        // that leaves them out restores a trigger whose body cannot see the statement's work.
+        String oldTable = first.getOldTransitionTable();
+        String newTable = first.getNewTransitionTable();
+        if (oldTable != null || newTable != null) {
+            sb.append(" REFERENCING");
+            if (oldTable != null) sb.append(" OLD TABLE AS ").append(oldTable);
+            if (newTable != null) sb.append(" NEW TABLE AS ").append(newTable);
+        }
         sb.append(" FOR EACH ").append(first.isForEachStatement() ? "STATEMENT" : "ROW");
         if (first.getWhenClause() != null && !first.getWhenClause().isEmpty()) {
-            sb.append(" WHEN (").append(first.getWhenClause()).append(')');
+            sb.append(" WHEN (").append(deparseTriggerWhen(first.getWhenClause())).append(')');
         }
-        sb.append(" EXECUTE FUNCTION ").append(first.getFunctionName()).append("()");
+        sb.append(" EXECUTE FUNCTION ").append(first.getFunctionName()).append('(');
+        // The arguments belong in the definition: a dump that leaves them out restores a trigger
+        // whose function sees TG_NARGS = 0.
+        List<String> trigArgs = null;
+        for (PgTrigger t : triggers) {
+            if (t.getArgs() != null && !t.getArgs().isEmpty()) { trigArgs = t.getArgs(); break; }
+        }
+        if (trigArgs != null) {
+            for (int i = 0; i < trigArgs.size(); i++) {
+                if (i > 0) sb.append(", ");
+                String arg = trigArgs.get(i) == null ? "" : trigArgs.get(i);
+                sb.append('\'').append(arg.replace("'", "''")).append('\'');
+            }
+        }
+        sb.append(')');
         return sb.toString();
+    }
+
+    /** {@code OLD} or {@code NEW} followed by a dot, however the statement spaced it. */
+    private static final java.util.regex.Pattern TRIGGER_ROW_REF =
+            java.util.regex.Pattern.compile("(?i)\\b(old|new)\\s*\\.\\s*");
+
+    /**
+     * A trigger's WHEN condition as pg_get_triggerdef prints it. PostgreSQL keeps the condition
+     * as a parsed tree and prints it back from there, so what comes out is its own spelling and
+     * not the statement's: the row references are lower case, a qualified name carries no spaces
+     * around its dot, and the whole condition is parenthesised inside the WHEN's own parentheses.
+     *
+     * <p>What is stored here is the text as written, so only those three are corrected. A
+     * condition whose operators PostgreSQL would re-bracket, or whose literals it would print
+     * with an explicit cast, still comes back in the spelling it was written in.
+     *
+     * <p>The correction stops at a quote. {@code WHEN (NEW.v = 'Old. Faithful')} is a comparison
+     * against a value, and a value is not a row reference however much it looks like one: lower
+     * casing it and closing up the space after its dot produced a definition that restores a
+     * trigger firing on a string nobody stored.
+     */
+    private static String deparseTriggerWhen(String condition) {
+        String text = condition.trim();
+        StringBuilder out = new StringBuilder("(");
+        int i = 0;
+        int plainFrom = 0;
+        while (i < text.length()) {
+            char c = text.charAt(i);
+            if (c != '\'' && c != '"') { i++; continue; }
+            appendRowRefsLowered(out, text.substring(plainFrom, i));
+            int j = i + 1;
+            while (j < text.length()) {
+                if (text.charAt(j) == c) {
+                    if (j + 1 < text.length() && text.charAt(j + 1) == c) { j += 2; continue; }
+                    break;
+                }
+                j++;
+            }
+            // An unterminated quote runs to the end of the condition; copy what is there.
+            int end = Math.min(j + 1, text.length());
+            out.append(text, i, end);
+            i = end;
+            plainFrom = end;
+        }
+        appendRowRefsLowered(out, text.substring(plainFrom));
+        return out.append(')').toString();
+    }
+
+    /** Copy a stretch of condition text with {@code OLD.}/{@code NEW.} in PostgreSQL's spelling. */
+    private static void appendRowRefsLowered(StringBuilder out, String plain) {
+        java.util.regex.Matcher m = TRIGGER_ROW_REF.matcher(plain);
+        StringBuffer buf = new StringBuffer();
+        while (m.find()) {
+            m.appendReplacement(buf, m.group(1).toLowerCase(Locale.ROOT) + ".");
+        }
+        m.appendTail(buf);
+        out.append(buf);
     }
 
     /**
@@ -834,8 +909,9 @@ class CatalogMetadataFunctions {
                                 || col.getType() == DataType.SMALLSERIAL
                                 || (def != null && def.contains("__identity__"))) {
                             String seqName = tblName + "_" + colName + "_seq";
-                            if (executor.database.getSequence(seqName) == null) {
+                            if (executor.database.getSequence(schemaName, seqName) == null) {
                                 Sequence seq = new Sequence(seqName, tbl.getSerialCounter(), 1L, null, null);
+                                seq.setSchemaName(schemaName);
                                 executor.database.addSequence(seq);
                             }
                             return schemaName + "." + seqName;
@@ -858,96 +934,77 @@ class CatalogMetadataFunctions {
             Sequence seq = seqEntry.getValue();
             if (seq.getOwnedByTable() != null && seq.getOwnedByTable().equalsIgnoreCase(tblName)
                     && seq.getOwnedByColumn() != null && seq.getOwnedByColumn().equalsIgnoreCase(colName)) {
-                String seqSchema = explicitSchema != null ? explicitSchema : "public";
-                return seqSchema + "." + seq.getName();
+                return seq.getSchemaName() + "." + seq.getName();
             }
         }
         return null;
     }
 
+    /**
+     * {@code obj_description(oid[, catalog])}, which PostgreSQL defines as a read of
+     * pg_description: the row whose objoid is the object, whose objsubid is 0, and whose classoid
+     * is the catalog the object lives in. Reading the same table the catalog builds is what keeps
+     * the answer and {@code \d+} in agreement whatever kind of object was commented on.
+     */
     private Object evalObjDescription(FunctionCallExpr fn, RowContext ctx) {
         Object oidArg = executor.evalExpr(fn.args().get(0), ctx);
-        String catalog = fn.args().size() > 1 ? String.valueOf(executor.evalExpr(fn.args().get(1), ctx)) : "pg_class";
+        String catalog = fn.args().size() > 1
+                ? String.valueOf(executor.evalExpr(fn.args().get(1), ctx)) : null;
         if (oidArg == null) return null;
-        String comment = null;
-        int targetOid = -1;
-        if (oidArg instanceof RegclassValue) {
-            RegclassValue rc = (RegclassValue) oidArg;
-            targetOid = rc.oid();
-        } else if (oidArg instanceof Number) {
-            Number n = (Number) oidArg;
-            targetOid = n.intValue();
-        }
-        // A non-pg_class catalog argument selects a different comment namespace; resolve the
-        // OID back to the object it names instead of assuming it is a relation.
-        if (targetOid >= 0 && catalog != null && !catalog.equalsIgnoreCase("pg_class")) {
-            String key = oidKeyFor(targetOid);
-            if (key != null) {
-                String bare = key.substring(key.indexOf(':') + 1);
-                if (catalog.equalsIgnoreCase("pg_constraint") && key.startsWith("con:")) {
-                    String c = executor.database.getComment("constraint", bare.toLowerCase());
-                    if (c == null && bare.contains(".")) {
-                        c = executor.database.getComment("constraint",
-                                bare.substring(bare.lastIndexOf('.') + 1).toLowerCase());
-                    }
-                    return c;
-                }
-                if (catalog.equalsIgnoreCase("pg_proc") && key.startsWith("proc:")) {
-                    String fname = bare;
-                    int lp = fname.indexOf('(');
-                    if (lp > 0) fname = fname.substring(0, lp);
-                    return executor.database.getComment("function", fname.toLowerCase());
-                }
-                if (catalog.equalsIgnoreCase("pg_type") && key.startsWith("type:")) {
-                    String c = executor.database.getComment("type", bare.toLowerCase());
-                    if (c == null) c = executor.database.getComment("domain", bare.toLowerCase());
-                    return c;
-                }
-            }
-            return null;
-        }
-        if (targetOid >= 0) {
-            for (Schema schema : executor.database.getSchemas().values()) {
-                for (Table tbl : schema.getTables().values()) {
-                    int tblOid = executor.systemCatalog.getOid("rel:" + schema.getName() + "." + tbl.getName());
-                    if (tblOid == targetOid) {
-                        comment = executor.database.getComment("table", tbl.getName().toLowerCase());
-                        break;
-                    }
-                }
-                if (comment != null) break;
-            }
-        }
-        if (comment == null && targetOid >= 0) {
-            for (Map.Entry<String, Integer> entry : executor.systemCatalog.getOidMap().entrySet()) {
-                if (entry.getValue() == targetOid && entry.getKey().startsWith("rel:")) {
-                    String indexName = entry.getKey().substring(entry.getKey().lastIndexOf('.') + 1);
-                    comment = executor.database.getComment("index", indexName.toLowerCase());
-                    if (comment != null) break;
-                }
-            }
-        }
-        if (comment == null) {
-            String objName = oidArg.toString().toLowerCase();
-            comment = executor.database.getComment("table", objName);
-            if (comment == null) {
-                comment = executor.database.getComment("index", objName);
-            }
-            if (comment == null && objName.contains(".")) {
-                String bareName = objName.substring(objName.lastIndexOf('.') + 1);
-                comment = executor.database.getComment("table", bareName);
-                if (comment == null) {
-                    comment = executor.database.getComment("index", bareName);
-                }
-            }
-        }
-        return comment;
+        int targetOid = oidOf(oidArg);
+        if (targetOid < 0) return null;
+        return describedBy(targetOid, 0, catalog);
     }
 
-    /** Reverse-lookup: the catalog key that was assigned this OID, or null. */
-    private String oidKeyFor(int oid) {
+    /** The OID an argument to a description function carries, or -1. */
+    private int oidOf(Object arg) {
+        if (arg instanceof RegclassValue) return ((RegclassValue) arg).oid();
+        if (arg instanceof RegtypeValue) return ((RegtypeValue) arg).oid();
+        if (arg instanceof RegprocValue) return ((RegprocValue) arg).oid();
+        if (arg instanceof RegnamespaceValue) return ((RegnamespaceValue) arg).oid();
+        if (arg instanceof Number) return ((Number) arg).intValue();
+        try {
+            return Integer.parseInt(String.valueOf(arg).trim());
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+    }
+
+    /**
+     * The pg_description row for this object, or null. A null {@code catalog} takes any classoid,
+     * which is the one-argument form's behaviour.
+     */
+    private Object describedBy(int objOid, int objSubId, String catalog) {
+        Table descr;
+        try {
+            descr = executor.systemCatalog.resolve("pg_catalog", "pg_description");
+        } catch (RuntimeException e) {
+            return null;
+        }
+        if (descr == null) return null;
+        int wantClass = -1;
+        if (catalog != null && !catalog.trim().isEmpty()) {
+            String bare = catalog.trim().toLowerCase();
+            if (bare.startsWith("pg_catalog.")) bare = bare.substring("pg_catalog.".length());
+            wantClass = executor.systemCatalog.getOid("rel:pg_catalog." + bare);
+        }
+        for (Object[] row : descr.getRows()) {
+            if (executor.toInt(row[0]) != objOid) continue;
+            if (executor.toInt(row[2]) != objSubId) continue;
+            if (wantClass >= 0 && executor.toInt(row[1]) != wantClass) continue;
+            return row[3];
+        }
+        return null;
+    }
+
+    /** The name of a database, role or tablespace of this OID, or null. */
+    private String nameForSharedOid(String kind, int oid) {
+        if (oid < 0) return null;
+        String prefix = kind.equals("database") ? "db:" : kind.equals("role") ? "role:" : "ts:";
         for (Map.Entry<String, Integer> e : executor.systemCatalog.getOidMap().entrySet()) {
-            if (e.getValue() != null && e.getValue() == oid) return e.getKey();
+            if (e.getValue() != null && e.getValue() == oid && e.getKey().startsWith(prefix)) {
+                return e.getKey().substring(prefix.length()).toLowerCase();
+            }
         }
         return null;
     }
@@ -1254,7 +1311,15 @@ class CatalogMetadataFunctions {
                     if (sysCat != null) foundRc = sysCat;
                 }
             }
-            if (foundRc == null && executor.database.hasIndex(tblNameRc)) {
+            // A sequence and a view are relations too, and to_regclass names them the same way.
+            if (foundRc == null && executor.database.getSequence(schemaNameRc, tblNameRc) != null) {
+                foundIndexRc = true;
+            }
+            if (foundRc == null && !foundIndexRc
+                    && executor.database.getView(schemaNameRc, tblNameRc) != null) {
+                foundIndexRc = true;
+            }
+            if (foundRc == null && !foundIndexRc && executor.database.hasIndex(tblNameRc)) {
                 String idxTable = executor.database.getIndexTable(tblNameRc);
                 if (idxTable != null) {
                     String idxTableSchema = null;
@@ -1277,7 +1342,18 @@ class CatalogMetadataFunctions {
                 foundRc = entry.getValue().getTable(regclassName);
                 if (foundRc != null) { resolvedSchemaRc = entry.getKey(); break; }
             }
-            if (foundRc == null && executor.database.hasIndex(regclassName.toLowerCase())) {
+            if (foundRc == null) {
+                for (String pathSchema : executor.relationSearchPath()) {
+                    if (executor.database.getSequence(pathSchema, regclassName) != null
+                            || executor.database.getView(pathSchema, regclassName) != null) {
+                        foundIndexRc = true;
+                        resolvedSchemaRc = pathSchema;
+                        break;
+                    }
+                }
+            }
+            if (foundRc == null && !foundIndexRc
+                    && executor.database.hasIndex(regclassName.toLowerCase())) {
                 foundIndexRc = true;
                 resolvedSchemaRc = effectiveSchemaRc;
             }
@@ -1319,7 +1395,26 @@ class CatalogMetadataFunctions {
         if (fn.args().isEmpty()) return null;
         Object arg = executor.evalExpr(fn.args().get(0), ctx);
         if (arg == null) return null;
-        return canonicalTypeName(executor.database, arg.toString().trim().toLowerCase());
+        String written = arg.toString().trim().toLowerCase();
+        String canonical = canonicalTypeName(executor.database, written);
+        if (canonical == null) return null;
+        // to_regtype answers a regtype, not the name of one: a caller writing
+        // to_regtype('text[]')::oid is asking the value for its OID, and text cannot answer.
+        return new RegtypeValue(typeOidOfName(written), canonical);
+    }
+
+    /** The OID of a type named as written, or 0 when nothing here carries one. */
+    private int typeOidOfName(String typeName) {
+        String bare = typeName;
+        boolean array = bare.endsWith("[]");
+        if (array) bare = bare.substring(0, bare.length() - 2).trim();
+        DataType dt = DataType.fromPgName(bare);
+        if (dt != null) {
+            DataType resolved = array ? DataType.arrayOf(dt) : dt;
+            if (resolved != null) return resolved.getOid();
+        }
+        int custom = executor.systemCatalog.getOid("type:" + bare);
+        return array ? 0 : custom;
     }
 
     /**
@@ -1328,6 +1423,13 @@ class CatalogMetadataFunctions {
      */
     static String canonicalTypeName(Database database, String typeName) {
         String canonical;
+        // An array type is named after its element type, so it is the element that has to be
+        // recognised: without this 'text[]' and 'bit[]' were no types at all.
+        if (typeName.endsWith("[]")) {
+            String element = canonicalTypeName(database,
+                    typeName.substring(0, typeName.length() - 2).trim());
+            return element == null ? null : element + "[]";
+        }
         switch (typeName) {
             case "int4":
             case "integer":
@@ -1874,16 +1976,26 @@ class CatalogMetadataFunctions {
         return t;
     }
 
-    /** True if the referenced schema should be omitted (same schema or on search_path). */
-    private boolean schemaVisibleForRef(String refSchema, String ownSchema) {
+    /**
+     * True when the referenced table can be written without its schema — that is, when looking
+     * the bare name up along the current search path finds that very table.
+     *
+     * <p>Being in the same schema as the constraint is not enough. PostgreSQL's deparser asks
+     * only what the reader's search path would resolve the name to, so a foreign key inside a
+     * schema nobody has on their path prints {@code REFERENCES q.par(id)} even though the
+     * constraint and the table it names sit side by side. Treating a shared schema as visible
+     * printed a definition that, pasted back in, would build the constraint against a different
+     * table or fail outright.
+     */
+    private boolean schemaVisibleForRef(String refSchema, String refTable) {
         if (refSchema == null) return true;
-        if (refSchema.equalsIgnoreCase(ownSchema)) return true;
-        if (executor.session != null) {
-            for (String p : executor.session.getEffectiveSearchPath(false)) {
-                if (refSchema.equalsIgnoreCase(p)) return true;
-            }
-        } else if ("public".equalsIgnoreCase(refSchema)) {
-            return true;
+        if (executor.session == null) return "public".equalsIgnoreCase(refSchema);
+        for (String p : executor.session.getEffectiveSearchPath(false)) {
+            Schema onPath = executor.database.getSchema(p);
+            if (onPath == null) continue;
+            // A schema earlier on the path that holds no table of this name hides nothing
+            if (refTable != null && onPath.getTable(refTable) == null) continue;
+            return refSchema.equalsIgnoreCase(p);
         }
         return false;
     }
@@ -1906,7 +2018,7 @@ class CatalogMetadataFunctions {
                 if (sc.getReferencesTable() != null) {
                     // H16: only schema-qualify the referenced table when its schema is
                     // NOT visible via the current search_path (matching PG).
-                    if (!schemaVisibleForRef(sc.getReferencesSchema(), ownSchema)) {
+                    if (!schemaVisibleForRef(sc.getReferencesSchema(), sc.getReferencesTable())) {
                         sb.append(sc.getReferencesSchema()).append(".");
                     }
                     sb.append(sc.getReferencesTable());
@@ -2009,12 +2121,8 @@ class CatalogMetadataFunctions {
             DataType resolved = array ? DataType.arrayOf(dt) : dt;
             if (resolved != null) return resolved.getOid();
         }
-        for (CustomEnum ce : executor.database.getCustomEnums().values()) {
-            if (ce.getName().equalsIgnoreCase(bare)) return executor.systemCatalog.getOid("type:" + ce.getName());
-        }
-        for (DomainType domain : executor.database.getDomains().values()) {
-            if (domain.getName().equalsIgnoreCase(bare)) return executor.systemCatalog.getOid("type:" + domain.getName());
-        }
+        String userKey = TypeNamespace.resolve(executor.database, executor.session, bare);
+        if (userKey != null) return executor.systemCatalog.getOid("type:" + userKey);
         return 0;
     }
 
@@ -2131,16 +2239,15 @@ class CatalogMetadataFunctions {
                                 : dt.getPgName();
                         break;
                 }
-                return base;
+                return CatalogHelper.withPlainTypmod(dt, base, typmod);
             }
         }
-        for (CustomEnum ce : executor.database.getCustomEnums().values()) {
-            int enumOid = executor.systemCatalog.getOid("type:" + ce.getName());
-            if (enumOid == oid) return ce.getName();
-        }
-        for (DomainType domain : executor.database.getDomains().values()) {
-            int domainOid = executor.systemCatalog.getOid("type:" + domain.getName());
-            if (domainOid == oid) return domain.getName();
+        // A user-defined type prints under the name this session would write for it: bare where
+        // the search path finds it, qualified where it would not.
+        for (String typeKey : executor.database.typeKeys()) {
+            if (executor.systemCatalog.getOid("type:" + typeKey) == oid) {
+                return TypeNamespace.display(executor.database, executor.session, typeKey);
+            }
         }
         String extra = EXTRA_TYPE_NAMES.get(oid);
         if (extra != null) return extra;
@@ -2245,8 +2352,32 @@ class CatalogMetadataFunctions {
         return sb.toString();
     }
 
+    /**
+     * A written type name with its modifier removed: {@code varchar(10)} is {@code varchar},
+     * {@code numeric(5,2)} is {@code numeric}, {@code interval day to second(2)} is
+     * {@code interval}.
+     *
+     * <p>PostgreSQL records only a type OID for a function's arguments and result — pg_proc has
+     * nowhere to put a typmod — so the qualifier a declaration wrote is genuinely gone by the
+     * time pg_get_function_arguments is asked, and a client reading the signature back must see
+     * the same bare type PostgreSQL shows it.
+     */
+    static String stripTypeModifier(String typeName) {
+        if (typeName == null) return null;
+        String s = typeName.trim();
+        int open = s.indexOf('(');
+        if (open >= 0) {
+            int close = s.indexOf(')', open);
+            s = close >= 0 ? (s.substring(0, open) + s.substring(close + 1)).trim()
+                    : s.substring(0, open).trim();
+        }
+        if (DataType.intervalQualifier(s) != null) return "interval";
+        return s;
+    }
+
     static String normalizePgTypeName(String typeName) {
         if (typeName == null) return "void";
+        typeName = stripTypeModifier(typeName);
         switch (typeName.toLowerCase().trim()) {
             case "int":
             case "int4":

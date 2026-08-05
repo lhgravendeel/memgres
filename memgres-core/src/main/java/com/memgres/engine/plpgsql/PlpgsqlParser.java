@@ -313,7 +313,22 @@ public class PlpgsqlParser {
 
     private String readTypeName() {
         StringBuilder sb = new StringBuilder();
-        sb.append(readIdent());
+        String first = readIdent();
+        sb.append(first);
+        // A declared interval may carry a field qualifier, exactly as one in a column definition,
+        // a cast, a domain or a parameter list may. Stopping at the field word left the qualifier
+        // standing where the parser expected a semicolon, so DECLARE v interval day to second(2)
+        // was a syntax error in the one place the type could not be written.
+        if ("interval".equalsIgnoreCase(first) && checkIntervalFieldWord()) {
+            readIntervalQualifier(sb);
+            // A qualifier takes the whole modifier, so nothing but an array suffix may follow.
+            while (check(TokenType.LEFT_BRACKET)) {
+                advance();
+                match(TokenType.RIGHT_BRACKET);
+                sb.append("[]");
+            }
+            return sb.toString();
+        }
         while (!isAtEnd()) {
             if (checkKw("VARYING")) { sb.append(" ").append(advance().value()); continue; }
             if (check(TokenType.LEFT_PAREN)) {
@@ -334,6 +349,54 @@ public class PlpgsqlParser {
             break;
         }
         return sb.toString();
+    }
+
+    /** True when the next word names an interval field, so it belongs to the type and not after it. */
+    private boolean checkIntervalFieldWord() {
+        Token t = peek();
+        if (t.type() != TokenType.KEYWORD && t.type() != TokenType.IDENTIFIER) return false;
+        String v = t.value().toUpperCase(java.util.Locale.ROOT);
+        return "YEAR".equals(v) || "MONTH".equals(v) || "DAY".equals(v)
+                || "HOUR".equals(v) || "MINUTE".equals(v) || "SECOND".equals(v);
+    }
+
+    /**
+     * The field qualifier written after {@code interval}, in the one spelling the rest of the
+     * engine reads it back in — {@code interval day to second(2)}, lower case, with the precision
+     * SECOND alone may carry.
+     */
+    private void readIntervalQualifier(StringBuilder sb) {
+        String first = advance().value().toLowerCase(java.util.Locale.ROOT);
+        sb.append(' ').append(first);
+        if ("second".equals(first)) { readIntervalPrecision(sb); return; }
+        if (!checkKw("TO")) return;
+        String[] allowed;
+        if ("year".equals(first)) allowed = new String[]{"month"};
+        else if ("day".equals(first)) allowed = new String[]{"hour", "minute", "second"};
+        else if ("hour".equals(first)) allowed = new String[]{"minute", "second"};
+        else if ("minute".equals(first)) allowed = new String[]{"second"};
+        else allowed = new String[0];
+        if (allowed.length == 0) throw syntaxError(peek());
+        advance();  // TO
+        Token endTok = peek();
+        String end = checkIntervalFieldWord() ? endTok.value().toLowerCase(java.util.Locale.ROOT) : null;
+        boolean ok = false;
+        for (int i = 0; i < allowed.length; i++) {
+            if (allowed[i].equals(end)) ok = true;
+        }
+        if (!ok) throw syntaxError(endTok);
+        advance();
+        sb.append(" to ").append(end);
+        if ("second".equals(end)) readIntervalPrecision(sb);
+    }
+
+    /** The optional precision SECOND takes. */
+    private void readIntervalPrecision(StringBuilder sb) {
+        if (!check(TokenType.LEFT_PAREN)) return;
+        advance();
+        sb.append('(').append(advance().value());
+        if (!match(TokenType.RIGHT_PAREN)) throw syntaxError(peek());
+        sb.append(')');
     }
 
     // ---- Statement parsing ----
