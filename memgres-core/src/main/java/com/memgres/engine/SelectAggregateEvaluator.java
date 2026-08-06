@@ -1083,6 +1083,12 @@ class SelectAggregateEvaluator {
     Object evalAggregate(FunctionCallExpr fn, List<RowContext> group) {
         String name = FunctionEvaluator.stripSchemaPrefix(fn.name().toLowerCase());
 
+        // An aggregate is resolved from the types of its arguments like any other call, and a
+        // name declared over several categories -- sum over numbers and over intervals -- is not
+        // resolved by an untyped literal at all.
+        FunctionEvaluator.rejectAmbiguousBuiltin(executor, name, fn.args(),
+                group.isEmpty() ? null : group.get(0));
+
         // A nested aggregate is refused while the statement is analysed, in
         // SelectWindowEvaluator.validateCallPlacement, so that the shape is rejected whether or
         // not the query reaches a row and so that the one legal nesting -- an aggregate under a

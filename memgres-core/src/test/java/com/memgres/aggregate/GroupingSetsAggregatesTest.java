@@ -357,8 +357,18 @@ class GroupingSetsAggregatesTest {
         try (Statement s = conn.createStatement()) {
             s.execute("CREATE TABLE d2 (x numeric)");
             s.execute("INSERT INTO d2 VALUES (1.0), (1.00), (2)");
+            // string_agg is declared over text and over bytea, and a numeric column is neither:
+            // PostgreSQL refuses the call rather than reading the number as a string for it.
+            SQLException e = assertThrows(SQLException.class, () -> s.executeQuery(
+                    "SELECT string_agg(DISTINCT x, ',' ORDER BY x) AS sa FROM d2"));
+            assertEquals("42883", e.getSQLState());
+            // DISTINCT still has to apply to the numbers -- 1.0 and 1.00 are one value, and it
+            // is the first spelling that survives -- so the values are made distinct as numbers
+            // and rendered as text after, which is what this test is about.
             ResultSet rs = s.executeQuery(
-                    "SELECT array_agg(DISTINCT x) AS aa, string_agg(DISTINCT x, ',' ORDER BY x) AS sa "
+                    "SELECT array_agg(DISTINCT x) AS aa,"
+                    + " (SELECT string_agg(d.x::text, ',' ORDER BY d.x)"
+                    + "    FROM (SELECT DISTINCT x FROM d2) d) AS sa "
                     + "FROM d2");
             assertTrue(rs.next());
             assertEquals("{1.0,2}", rs.getString(1));

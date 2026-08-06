@@ -22,9 +22,15 @@ import static org.junit.jupiter.api.Assertions.*;
  */
 class StatementTimeoutTest {
 
-    /** Large enough that neither engine can finish it inside the tight limits used below. */
+    /**
+     * Large enough that neither engine can finish it inside the tight limits used below.
+     *
+     * <p>It has to be a statement that reads the rows: counting a series on its own is arithmetic
+     * on its ends now, and two hundred million of them are counted as fast as three are. A
+     * predicate is evaluated per row, which is the work the limit is there to interrupt.
+     */
     private static final String RUNAWAY =
-            "SELECT count(*) FROM generate_series(1, 200000000)";
+            "SELECT count(*) FROM generate_series(1, 200000000) g WHERE g > 0";
 
     static Memgres memgres;
 

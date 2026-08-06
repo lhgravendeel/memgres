@@ -59,6 +59,11 @@ class FromFunctionResolver {
             }
         }
         rejectOrdinalityWithColumnDefinitionList(funcFrom);
+        // A set-returning call is resolved from its written arguments like any other, and
+        // generate_series is declared over three numeric types: two untyped literals name none
+        // of them.
+        FunctionEvaluator.rejectAmbiguousBuiltin(executor, funcFrom.functionName().toLowerCase(),
+                funcFrom.args(), null);
         List<RowContext> contexts = appendOrdinality(funcFrom, doResolveFunctionFrom(funcFrom));
         checkColumnAliasCount(funcFrom, contexts);
         // TABLESAMPLE binds the real stored table; never flag persistent tables.
@@ -67,8 +72,11 @@ class FromFunctionResolver {
             // the call itself settles is recorded beside them. See DefinedTypes. The call settles
             // the same thing for every row it produced, so it is worked out once.
             String[] settled = null;
-            for (RowContext rc : contexts) {
-                for (RowContext.TableBinding b : rc.getBindings()) {
+            if (!contexts.isEmpty()) {
+                // Every row of one FROM item is bound to the same relations, so the first row
+                // names all of them; walking the rest set the same two properties again, once per
+                // row, which for a long series is the only reason the rows had to exist.
+                for (RowContext.TableBinding b : contexts.get(0).getBindings()) {
                     b.table().setFunctionResult(true);
                     int width = b.table().getColumns().size();
                     if (settled == null || settled.length != width) {
@@ -404,6 +412,11 @@ class FromFunctionResolver {
             List<Column> cols = new ArrayList<>();
             cols.add(new Column(colName, DataType.TIMESTAMPTZ, true, false, null));
             Table virtualTable = new Table(alias, cols);
+            long tzStepMicros = SeriesRows.fixedStepMicros(ivStep);
+            if (tzStepMicros != 0) {
+                return publishSeries(virtualTable, alias,
+                        SeriesRows.ofTimestampTzs(tzStart, tzStop, tzStepMicros));
+            }
             List<Object[]> rows = new ArrayList<>();
             List<RowContext> contexts = new ArrayList<>();
             java.time.OffsetDateTime cur = tzStart;
@@ -434,6 +447,11 @@ class FromFunctionResolver {
             List<Column> cols = new ArrayList<>();
             cols.add(new Column(colName, dateInput ? DataType.TIMESTAMPTZ : DataType.TIMESTAMP, true, false, null));
             Table virtualTable = new Table(alias, cols);
+            long stepMicros = SeriesRows.fixedStepMicros(ivStep);
+            if (stepMicros != 0) {
+                return publishSeries(virtualTable, alias,
+                        SeriesRows.ofTimestamps(dtStart, dtStop, stepMicros, dateInput));
+            }
             List<Object[]> rows = new ArrayList<>();
             List<RowContext> contexts = new ArrayList<>();
             java.time.LocalDateTime cur = dtStart;
@@ -464,22 +482,9 @@ class FromFunctionResolver {
             List<Column> numCols = new ArrayList<>();
             numCols.add(new Column(numColName, DataType.NUMERIC, true, false, null));
             Table numTable = new Table(alias, numCols);
-            List<Object[]> numRows = new ArrayList<>();
-            List<RowContext> numContexts = new ArrayList<>();
-            boolean up = nStep.signum() > 0;
-            long numProduced = 0;
-            // Accumulate with add() so each value keeps PG's growing scale (1.0, 1.25, 1.50, ...)
-            for (java.math.BigDecimal v = nStart;
-                 up ? v.compareTo(nStop) <= 0 : v.compareTo(nStop) >= 0;
-                 v = v.add(nStep)) {
-                if ((numProduced++ & CANCEL_POLL_MASK) == 0) StatementCancel.check();
-                if (numRows.size() >= MAX_SERIES_ROWS) throw seriesTooLarge();
-                Object[] row = new Object[]{v};
-                numRows.add(row);
-                numContexts.add(new RowContext(numTable, alias, row));
-            }
-            numTable.replaceAllRows(numRows);
-            return numContexts;
+            // Each value is the start plus so many steps, which carries the scale that adding the
+            // step that many times carries: 1.0, 1.25, 1.50, ... as PostgreSQL prints them.
+            return publishSeries(numTable, alias, SeriesRows.ofNumerics(nStart, nStop, nStep));
         }
         try {
             executor.toLong(evalArgs.get(0));
@@ -504,32 +509,23 @@ class FromFunctionResolver {
         List<Column> cols = new ArrayList<>();
         cols.add(new Column(colName, seriesType, true, false, null));
         Table virtualTable = new Table(alias, cols);
-        List<Object[]> rows = new ArrayList<>();
-        List<RowContext> contexts = new ArrayList<>();
-        long produced = 0;
-        if (step != 0) {
-            boolean ascending = step > 0;
-            long v = start;
-            while (ascending ? v <= stop : v >= stop) {
-                if ((produced++ & CANCEL_POLL_MASK) == 0) StatementCancel.check();
-                if (rows.size() >= MAX_SERIES_ROWS) throw seriesTooLarge();
-                Object val = seriesType == DataType.BIGINT ? (Object) Long.valueOf(v)
-                        : (v >= Integer.MIN_VALUE && v <= Integer.MAX_VALUE)
-                                ? (Object) Integer.valueOf((int) v) : (Object) Long.valueOf(v);
-                Object[] row = new Object[]{val};
-                rows.add(row);
-                contexts.add(new RowContext(virtualTable, alias, row));
-                long next = v + step;
-                // A series that runs to the edge of bigint wraps on its last step; the loop
-                // condition would then hold again and never end.
-                if (((v ^ next) & (step ^ next)) < 0) break;
-                v = next;
-            }
-        }
-        // Publish the rows in one go: Table.insertRow copies the whole row list on every call, so
-        // filling a large series through it is quadratic and five million rows never finished.
-        virtualTable.replaceAllRows(rows);
-        return contexts;
+        if (step == 0) return publishSeries(virtualTable, alias, new ArrayList<Object[]>());
+        return publishSeries(virtualTable, alias,
+                SeriesRows.ofIntegers(start, stop, step, seriesType == DataType.BIGINT));
+    }
+
+    /**
+     * The rows of a series, handed on as the FROM item's contexts and left on the virtual table
+     * for anything that reads it there.
+     *
+     * <p>Neither list holds the rows: they are worked out as they are read, so a series costs what
+     * the query reads of it rather than what it spans. That is what lets a series be longer than
+     * memgres would have held -- PostgreSQL has no size past which it refuses one -- and what
+     * makes a LIMIT over a long series cost the rows it asked for.
+     */
+    private List<RowContext> publishSeries(Table virtualTable, String alias, List<Object[]> rows) {
+        virtualTable.publishGeneratedRows(rows);
+        return SeriesRows.contextsOver(virtualTable, alias, rows);
     }
 
     // ---- generate_subscripts ----

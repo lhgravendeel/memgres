@@ -152,9 +152,11 @@ SELECT name, setting, unit FROM pg_settings WHERE name = 'statement_timeout';
 -- The timeout fires
 -- ---------------------------------------------------------------------------
 
--- 12. A runaway SELECT is cancelled: 57014 canceling statement due to statement timeout
+-- 12. A runaway SELECT is cancelled: 57014 canceling statement due to statement timeout.
+-- It reads the rows rather than counting the series: counting one is arithmetic on its ends,
+-- so two hundred million rows are counted as quickly as three and there is nothing to cancel.
 SET statement_timeout = '50ms';
-SELECT count(*) FROM generate_series(1, 200000000);
+SELECT count(*) FROM generate_series(1, 200000000) g WHERE g > 0;
 
 -- 13. The session is usable straight away afterwards (autocommit, nothing to roll back)
 -- begin-expected
@@ -163,7 +165,7 @@ SELECT count(*) FROM generate_series(1, 200000000);
 -- end-expected
 SELECT 1 AS after_select;
 
--- 14. A row filter does not save it either
+-- 14. Nor does a filter that keeps only a few of the rows
 SELECT count(*) FROM generate_series(1, 200000000) g WHERE g % 7 = 0;
 
 -- 15. A runaway recursive CTE is cancelled the same way
@@ -219,7 +221,7 @@ SET statement_timeout = '50ms';
 BEGIN;
 
 -- 20. The statement is cancelled...
-SELECT count(*) FROM generate_series(1, 200000000);
+SELECT count(*) FROM generate_series(1, 200000000) g WHERE g > 0;
 
 -- 21. ...and the transaction is left aborted: 25P02 until it ends
 SELECT 1;
@@ -249,7 +251,7 @@ SET LOCAL statement_timeout = '50ms';
 SHOW statement_timeout;
 
 -- 23. In force inside the transaction
-SELECT count(*) FROM generate_series(1, 200000000);
+SELECT count(*) FROM generate_series(1, 200000000) g WHERE g > 0;
 
 ROLLBACK;
 

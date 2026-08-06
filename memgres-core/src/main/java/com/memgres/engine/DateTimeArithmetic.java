@@ -284,6 +284,21 @@ class DateTimeArithmetic {
             return (int) ChronoUnit.DAYS.between(rd, ld);
         }
 
+        // One moment taken from another, where at least one of them carries a zone.
+        if (left instanceof OffsetDateTime && right instanceof OffsetDateTime) {
+            return between(((OffsetDateTime) right).toInstant(), ((OffsetDateTime) left).toInstant());
+        }
+        // A moment written with a zone and one written without are still two moments; PostgreSQL
+        // reads the one without as being in the session's zone and subtracts them as instants.
+        if (left instanceof OffsetDateTime && right instanceof LocalDateTime) {
+            return between(TypeCoercion.toOffsetDateTime(right).toInstant(),
+                    ((OffsetDateTime) left).toInstant());
+        }
+        if (left instanceof LocalDateTime && right instanceof OffsetDateTime) {
+            return between(((OffsetDateTime) right).toInstant(),
+                    TypeCoercion.toOffsetDateTime(left).toInstant());
+        }
+
         // timestamp - timestamp → interval
         if (left instanceof LocalDateTime && right instanceof LocalDateTime) {
             LocalDateTime rdt = (LocalDateTime) right;
@@ -418,6 +433,24 @@ class DateTimeArithmetic {
     private static boolean isTimestampInfinity(String s) {
         String t = s.trim().toLowerCase();
         return t.equals("infinity") || t.equals("-infinity");
+    }
+
+    /**
+     * The interval between two instants, in the days-and-time form PostgreSQL prints one in.
+     *
+     * <p>The timestamp type spans further than a count of microseconds does, so a pair at its two
+     * ends has no interval between them that can be counted either.
+     */
+    private static PgInterval between(java.time.Instant from, java.time.Instant to) {
+        long micros;
+        try {
+            micros = ChronoUnit.MICROS.between(from, to);
+        } catch (ArithmeticException e) {
+            throw new MemgresException("interval out of range", "22008");
+        }
+        long days = micros / (24L * 3600 * 1_000_000);
+        long remainingMicros = micros % (24L * 3600 * 1_000_000);
+        return new PgInterval(0, (int) days, remainingMicros);
     }
 
     /**

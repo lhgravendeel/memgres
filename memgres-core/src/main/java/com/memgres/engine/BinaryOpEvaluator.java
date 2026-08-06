@@ -506,6 +506,22 @@ class BinaryOpEvaluator {
                 default: return null;
             }
         }
+        if (expr instanceof FunctionCallExpr) {
+            // What a built-in answers with is part of what the query says, the same as a cast is:
+            // now() is a timestamptz wherever it stands, so a literal beside it is read as one
+            // rather than as a number. Only a call that settles on a single declared signature
+            // says anything; the rest are left unresolved as before.
+            FunctionCallExpr fn = (FunctionCallExpr) expr;
+            List<Expression> args = fn.args() == null ? new ArrayList<Expression>() : fn.args();
+            int[] written = new int[args.size()];
+            for (int i = 0; i < args.size(); i++) {
+                String declared = declaredTypeForResolution(args.get(i), ctx);
+                DataType t = declared == null ? null : DataType.fromPgName(declared);
+                written[i] = t == null ? 0 : t.getOid();
+            }
+            DataType result = DataType.fromOid(BuiltinCallTypes.resultType(fn.name(), written));
+            return result == null ? null : result.getPgName();
+        }
         if (expr instanceof ColumnRef && ctx != null) {
             ColumnRef ref = (ColumnRef) expr;
             for (RowContext.TableBinding b : ctx.getBindings()) {
