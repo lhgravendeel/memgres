@@ -65,6 +65,7 @@ public class PgFunction {
     private double cost = 100;       // default COST for PL/pgSQL; SQL functions default to 1 in PG
     private double rows;             // estimated rows for set-returning functions
     private String parallel;         // "UNSAFE" (default), "RESTRICTED", or "SAFE"
+    private boolean windowFunction;  // declared WINDOW, which PG records as prokind='w'
 
     public PgFunction(String name, String returnType, String body, String language) {
         this(name, returnType, body, language, Cols.listOf(), false);
@@ -116,6 +117,8 @@ public class PgFunction {
     }
 
     public boolean isProcedure() { return procedure; }
+    public boolean isWindowFunction() { return windowFunction; }
+    public void setWindowFunction(boolean windowFunction) { this.windowFunction = windowFunction; }
     public String getSchemaName() { return schemaName; }
     public void setSchemaName(String schema) { this.schemaName = schema; }
     public boolean isSecurityDefiner() { return securityDefiner; }

@@ -2165,36 +2165,50 @@ class DdlParser {
         java.util.Map<String, String> setClauses = null;
         java.util.List<String> resetParams = null;
 
+        // The same option list CREATE reads, so the same two refusals apply to it.
+        RoutineOptions opts = new RoutineOptions(isProcedure);
+
         while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
-            if (parser.matchKeyword("VOLATILE")) {
-                volatility = "VOLATILE";
-            } else if (parser.matchKeyword("STABLE")) {
-                volatility = "STABLE";
-            } else if (parser.matchKeyword("IMMUTABLE")) {
-                volatility = "IMMUTABLE";
+            Token at = parser.peek();
+            if (parser.checkKeyword("VOLATILE") || parser.checkKeyword("STABLE")
+                    || parser.checkKeyword("IMMUTABLE")) {
+                opts.take(RoutineOptions.VOLATILITY, at);
+                volatility = parser.advance().value();
             } else if (parser.matchKeyword("STRICT")) {
+                opts.take(RoutineOptions.STRICT, at);
                 strict = true;
             } else if (parser.matchKeywords("CALLED", "ON", "NULL", "INPUT")) {
+                opts.take(RoutineOptions.STRICT, at);
                 strict = false;
             } else if (parser.matchKeywords("RETURNS", "NULL", "ON", "NULL", "INPUT")) {
+                opts.take(RoutineOptions.STRICT, at);
                 strict = true;
             } else if (parser.matchKeywords("SECURITY", "DEFINER")) {
+                opts.take(RoutineOptions.SECURITY, at);
                 securityDefiner = true;
             } else if (parser.matchKeywords("SECURITY", "INVOKER")) {
+                opts.take(RoutineOptions.SECURITY, at);
                 securityDefiner = false;
             } else if (parser.matchKeywords("NOT", "LEAKPROOF")) {
+                opts.take(RoutineOptions.LEAKPROOF, at);
                 leakproof = false;
             } else if (parser.matchKeyword("LEAKPROOF")) {
+                opts.take(RoutineOptions.LEAKPROOF, at);
                 leakproof = true;
             } else if (parser.matchKeyword("COST")) {
+                opts.take(RoutineOptions.COST, at);
                 cost = Double.parseDouble(parser.advance().value());
             } else if (parser.matchKeyword("ROWS")) {
+                opts.take(RoutineOptions.ROWS, at);
                 rows = Double.parseDouble(parser.advance().value());
             } else if (parser.matchKeywords("PARALLEL", "SAFE")) {
+                opts.take(RoutineOptions.PARALLEL, at);
                 parallel = "SAFE";
             } else if (parser.matchKeywords("PARALLEL", "RESTRICTED")) {
+                opts.take(RoutineOptions.PARALLEL, at);
                 parallel = "RESTRICTED";
             } else if (parser.matchKeywords("PARALLEL", "UNSAFE")) {
+                opts.take(RoutineOptions.PARALLEL, at);
                 parallel = "UNSAFE";
             } else if (parser.matchKeyword("RESET")) {
                 if (parser.matchKeyword("ALL")) {

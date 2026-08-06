@@ -2001,7 +2001,7 @@ class CatalogCoreBuilder {
                     langOid = oids.oid("lang:plpgsql");
                     break;
             }
-            String kind = fn.isProcedure() ? "p" : "f";
+            String kind = fn.isProcedure() ? "p" : fn.isWindowFunction() ? "w" : "f";
             // Count arguments and build proargnames, proargmodes, proallargtypes
             short nargs = 0;
             StringBuilder argTypesBuilder = new StringBuilder();

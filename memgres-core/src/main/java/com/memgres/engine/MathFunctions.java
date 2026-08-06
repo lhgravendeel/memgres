@@ -100,7 +100,10 @@ class MathFunctions {
                 return mean + stddev * new java.util.Random().nextGaussian();
             }
             case "setseed": {
-                executor.evalExpr(fn.args().get(0), ctx);
+                // The seed is not kept, but it is a double precision, and something that cannot
+                // be read as one is not a seed that was ignored — it is not a seed.
+                Object seed = executor.evalExpr(fn.args().get(0), ctx);
+                if (seed != null) executor.exprEvaluator.toDouble(seed);
                 return "";
             }
             case "trunc": {

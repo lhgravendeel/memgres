@@ -325,6 +325,11 @@ class CatalogMetadataFunctions {
                 return describedBy(targetOid, executor.toInt(colNumArg), null);
             }
             case "pg_get_userbyid":
+                // Every role OID names the one role memgres has, but it is still an OID: naming
+                // that role for an argument that is not one answered a question nobody could ask.
+                if (!fn.args().isEmpty()) {
+                    executor.castEvaluator.applyCast(executor.evalExpr(fn.args().get(0), ctx), "oid");
+                }
                 return "memgres";
             case "pg_get_acl": {
                 // PG 18 reads the object's ACL column and answers NULL when it is unset, which is
@@ -2357,20 +2362,59 @@ class CatalogMetadataFunctions {
         return null;
     }
 
+    /**
+     * The {@code CREATE OR REPLACE} text for a routine held as a {@link PgFunction}.
+     *
+     * <p>The attribute line is part of the definition, not decoration: a definition deparsed
+     * without it does not create what was asked about. Every attribute a routine was declared
+     * with is printed, in the order PostgreSQL prints them, and the defaults PostgreSQL leaves
+     * off — VOLATILE, PARALLEL UNSAFE, a cost that is the language's own — are left off here too.
+     */
     private static String buildFunctionDef(PgFunction func) {
         StringBuilder sb = new StringBuilder();
+        boolean procedure = func.isProcedure();
         sb.append("CREATE OR REPLACE ");
-        sb.append(func.isProcedure() ? "PROCEDURE " : "FUNCTION ");
+        sb.append(procedure ? "PROCEDURE " : "FUNCTION ");
         String funcSchema = func.getSchemaName() != null ? func.getSchemaName() : "public";
         sb.append(funcSchema).append(".").append(func.getName()).append("(");
         sb.append(buildFunctionArguments(func));
         sb.append(")\n");
-        if (!func.isProcedure()) {
-            sb.append(" RETURNS ").append(normalizePgTypeName(func.getReturnType())).append("\n");
+        if (!procedure) {
+            sb.append(" RETURNS ").append(renderDeclaredResult(func.getReturnType())).append("\n");
         }
         sb.append(" LANGUAGE ").append(func.getLanguage()).append("\n");
-        sb.append("AS $function$").append(func.getBody()).append("$function$\n");
+        StringBuilder attrs = new StringBuilder();
+        if (func.isWindowFunction()) attrs.append(" WINDOW");
+        String volatility = func.getVolatility();
+        if ("IMMUTABLE".equalsIgnoreCase(volatility)) attrs.append(" IMMUTABLE");
+        else if ("STABLE".equalsIgnoreCase(volatility)) attrs.append(" STABLE");
+        String parallel = func.getParallel();
+        if ("SAFE".equalsIgnoreCase(parallel)) attrs.append(" PARALLEL SAFE");
+        else if ("RESTRICTED".equalsIgnoreCase(parallel)) attrs.append(" PARALLEL RESTRICTED");
+        if (func.isStrict()) attrs.append(" STRICT");
+        if (func.isSecurityDefiner()) attrs.append(" SECURITY DEFINER");
+        if (func.isLeakproof()) attrs.append(" LEAKPROOF");
+        double defaultCost = DdlObjectExecutor.defaultCostForLanguage(func.getLanguage());
+        double cost = func.getCost();
+        if (cost > 0 && cost != defaultCost) attrs.append(" COST ").append(trimNumber(cost));
+        double rows = func.getRows();
+        if (func.isSetReturning() && rows > 0 && rows != 1000) {
+            attrs.append(" ROWS ").append(trimNumber(rows));
+        }
+        if (attrs.length() > 0) sb.append(attrs).append("\n");
+        String tag = procedure ? "$procedure$" : "$function$";
+        sb.append("AS ").append(tag).append(func.getBody()).append(tag).append("\n");
         return sb.toString();
+    }
+
+    /** A declared result written as PostgreSQL prints it: {@code SETOF} uppercase, type canonical. */
+    private static String renderDeclaredResult(String returnType) {
+        if (returnType == null) return "void";
+        String bare = returnType.trim();
+        if (bare.length() > 6 && bare.substring(0, 6).equalsIgnoreCase("SETOF ")) {
+            return "SETOF " + normalizePgTypeName(bare.substring(6).trim());
+        }
+        return normalizePgTypeName(bare);
     }
 
     private static String buildFunctionArguments(PgFunction func) {
@@ -2379,7 +2423,9 @@ class CatalogMetadataFunctions {
         for (int i = 0; i < func.getParams().size(); i++) {
             if (i > 0) sb.append(", ");
             PgFunction.Param p = func.getParams().get(i);
-            if (p.mode() != null && !p.mode().equalsIgnoreCase("IN")) {
+            // A function's arguments are inputs unless said otherwise, so IN goes unwritten there.
+            // A procedure's are written out, because a procedure's may also be OUT or INOUT.
+            if (p.mode() != null && (func.isProcedure() || !p.mode().equalsIgnoreCase("IN"))) {
                 sb.append(p.mode().toUpperCase()).append(" ");
             }
             if (p.name() != null && !p.name().isEmpty()) {
@@ -2644,7 +2690,9 @@ class CatalogMetadataFunctions {
         }
         if (attrs.length() > 0) sb.append(attrs).append("\n");
         Object src = procCol(row, "prosrc");
-        sb.append("AS $function$").append(src == null ? "" : src).append("$function$\n");
+        // The tag names what is being defined, so a procedure's body is quoted $procedure$.
+        String tag = procedure ? "$procedure$" : "$function$";
+        sb.append("AS ").append(tag).append(src == null ? "" : src).append(tag).append("\n");
         return sb.toString();
     }
 

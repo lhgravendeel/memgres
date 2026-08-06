@@ -71,8 +71,10 @@ class StringFunctions {
         long value;
         try {
             value = executor.toLong(raw);
-        } catch (NumberFormatException e) {
-            // A count that is not a number at all is bad input, not a missing overload.
+        } catch (MemgresException e) {
+            // A count that is not a number at all is bad input, not a missing overload — and the
+            // parameter it was given for is an integer, whatever width read it on the way here.
+            if (!"22P02".equals(e.getSqlState())) throw e;
             throw new MemgresException(
                     "invalid input syntax for type integer: \"" + raw + "\"", "22P02");
         }
@@ -640,7 +642,7 @@ class StringFunctions {
                 // SQL-standard substring(text FROM similar_pattern FOR escape_char): three args
                 // where the pattern is a (non-numeric) string, e.g.
                 //   substring('foobar' from '%#"o_b#"%' for '#') -> 'oob'.
-                if (fn.args().size() == 3) {
+                if (fn.args().size() == 3 && "substring".equals(name)) {
                     Object patArg = executor.evalExpr(fn.args().get(1), ctx);
                     if (patArg instanceof String && !((String) patArg).matches("\\s*[+-]?\\d+\\s*")) {
                         Object escArg = executor.evalExpr(fn.args().get(2), ctx);
@@ -650,8 +652,10 @@ class StringFunctions {
                 }
                 Object arg1 = executor.evalExpr(fn.args().get(1), ctx);
                 if (arg1 == null) return null;
-                // If the second arg is a string (not a number), treat as regex substring
-                if (arg1 instanceof String && fn.args().size() == 2) {
+                // If the second arg is a string (not a number), treat as regex substring.
+                // Only substring has a (text, text) form; substr takes a position, so a second
+                // argument that is not one is bad input rather than a pattern to match with.
+                if (arg1 instanceof String && fn.args().size() == 2 && "substring".equals(name)) {
                     String pattern = (String) arg1;
                     try {
                         executor.toInt(arg1); // try as int first

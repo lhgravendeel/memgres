@@ -444,7 +444,10 @@ class CatalogSystemFunctions {
                 return false;
             case "pg_cancel_backend":
             case "pg_terminate_backend": {
-                if (!fn.args().isEmpty()) executor.evalExpr(fn.args().get(0), ctx);
+                // memgres has no other backend to signal, so the answer is false whatever the
+                // argument says — but a process ID is still an integer, and one that is not gets
+                // the same refusal here as it would anywhere else.
+                if (!fn.args().isEmpty()) executor.toInt(executor.evalExpr(fn.args().get(0), ctx));
                 return false;
             }
             case "pg_drop_replication_slot": {
@@ -461,9 +464,10 @@ class CatalogSystemFunctions {
             case "pg_sleep": {
                 if (!fn.args().isEmpty()) {
                     Object arg = executor.evalExpr(fn.args().get(0), ctx);
-                    if (arg instanceof Number) {
-                        Number n = (Number) arg;
-                        long millis = (long) (n.doubleValue() * 1000);
+                    if (arg != null) {
+                        // How long to sleep for is a number of seconds. Sleeping for no time at
+                        // all when it was not one accepted an argument the parameter cannot take.
+                        long millis = (long) (executor.exprEvaluator.toDouble(arg) * 1000);
                         if (millis > 0) {
                             try {
                                 Thread.sleep(millis);
@@ -478,15 +482,21 @@ class CatalogSystemFunctions {
                 return VOID_RESULT;
             }
             case "pg_sleep_for": {
-                if (!fn.args().isEmpty()) executor.evalExpr(fn.args().get(0), ctx);
+                if (!fn.args().isEmpty()) {
+                    Object arg = executor.evalExpr(fn.args().get(0), ctx);
+                    if (arg != null && !(arg instanceof PgInterval)) PgInterval.parse(arg.toString());
+                }
                 return VOID_RESULT;
             }
             case "pg_sleep_until": {
-                if (!fn.args().isEmpty()) executor.evalExpr(fn.args().get(0), ctx);
+                if (!fn.args().isEmpty()) {
+                    Object arg = executor.evalExpr(fn.args().get(0), ctx);
+                    if (arg != null) executor.castEvaluator.applyCast(arg, "timestamptz");
+                }
                 return VOID_RESULT;
             }
             case "pg_blocking_pids": {
-                if (!fn.args().isEmpty()) executor.evalExpr(fn.args().get(0), ctx);
+                if (!fn.args().isEmpty()) executor.toInt(executor.evalExpr(fn.args().get(0), ctx));
                 return Cols.listOf();
             }
             case "pg_export_snapshot":

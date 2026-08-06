@@ -536,7 +536,7 @@ class CastEvaluator {
             case "smallint":
             case "int2": {
                 if (val instanceof byte[]) return (short) bytesToInteger((byte[]) val, 2, "smallint");
-                int iv = TypeCoercion.toInteger(val).intValue();
+                int iv = readIntegerFor(val, "smallint");
                 if (iv < Short.MIN_VALUE || iv > Short.MAX_VALUE) {
                     throw new MemgresException("smallint out of range", "22003");
                 }
@@ -544,7 +544,7 @@ class CastEvaluator {
             }
             case "real":
             case "float4": {
-                double dv = TypeCoercion.toDouble(val).doubleValue();
+                double dv = readDoubleFor(val, "real");
                 float fv = (float) dv;
                 boolean broughtInfinity = Double.isInfinite(dv)
                         || (val instanceof String && isInfinityLiteral(((String) val).trim()));
@@ -1049,7 +1049,14 @@ class CastEvaluator {
                 // xid is a transaction ID, essentially an unsigned 32-bit integer
                 if (val instanceof Number) return ((Number) val).longValue();
                 String s = val.toString().trim();
-                try { return Long.parseLong(s); } catch (NumberFormatException e) { return 0L; }
+                try {
+                    return Long.parseLong(s);
+                } catch (NumberFormatException e) {
+                    // Reading a value the type cannot hold as transaction zero handed back a
+                    // number nobody wrote, and the caller had no way to tell it apart from one
+                    // that had been written.
+                    throw new MemgresException("invalid input syntax for type xid: \"" + s + "\"", "22P02");
+                }
             }
             case "regclass": {
                 // Return OID internally but tag for display as name
@@ -1330,7 +1337,7 @@ class CastEvaluator {
                 if (val instanceof RegclassValue) return ((RegclassValue) val).oid();
                 if (val instanceof RegprocValue) return ((RegprocValue) val).oid();
                 if (val instanceof RegtypeValue) return ((RegtypeValue) val).oid();
-                return TypeCoercion.toInteger(val);
+                return readOid(val);
             }
             case "regnamespace": {
                 // ::regnamespace wraps the schema name so it renders as the name
@@ -1492,6 +1499,70 @@ class CastEvaluator {
             if (!(Character.isLowerCase(c) || Character.isDigit(c) || c == '_')) needsQuote = true;
         }
         return needsQuote ? "\"" + ident.replace("\"", "\"\"") + "\"" : ident;
+    }
+
+    /**
+     * A value read as {@code typeName}'s integer input function would read it.
+     *
+     * <p>Every narrow integer type borrowed {@code integer}'s reader, so a value none of them could
+     * hold was reported against integer whatever had been written — a client told its smallint was
+     * bad integer input has to work out for itself which type the server meant.
+     */
+    private static int readIntegerFor(Object val, String typeName) {
+        try {
+            return TypeCoercion.toInteger(val).intValue();
+        } catch (MemgresException e) {
+            if ("22P02".equals(e.getSqlState())) {
+                throw new MemgresException("invalid input syntax for type " + typeName
+                        + ": \"" + val + "\"", "22P02");
+            }
+            throw e;
+        }
+    }
+
+    /** The same, for the types read as a floating-point number. */
+    private static double readDoubleFor(Object val, String typeName) {
+        try {
+            return TypeCoercion.toDouble(val).doubleValue();
+        } catch (NumberFormatException e) {
+            throw new MemgresException("invalid input syntax for type " + typeName
+                    + ": \"" + val + "\"", "22P02");
+        }
+    }
+
+    /**
+     * A value read as an OID.
+     *
+     * <p>An OID is an unsigned 32-bit number, so it reaches 4294967295 and reads a negative as the
+     * value that far below zero wraps to. Reading one as a signed integer refused every OID above
+     * two billion as out of range and kept a negative one negative, neither of which an OID can be.
+     */
+    private static Object readOid(Object val) {
+        long ov;
+        if (val instanceof Number) {
+            ov = ((Number) val).longValue();
+        } else {
+            String s = val.toString().trim();
+            try {
+                ov = Long.parseLong(s);
+            } catch (NumberFormatException e) {
+                // Too wide for a long is still a number, and the complaint about it is that the
+                // type cannot hold it rather than that it could not be read.
+                if (s.matches("[+-]?\\d+")) {
+                    throw new MemgresException("value \"" + s + "\" is out of range for type oid", "22003");
+                }
+                throw new MemgresException("invalid input syntax for type oid: \"" + s + "\"", "22P02");
+            }
+        }
+        // Only the top of the range is a bound. Below zero the value is the one it wraps to, which
+        // is how an OID written as a negative reads back as the far end of the range.
+        if (ov > 4294967295L) {
+            throw new MemgresException("value \"" + val + "\" is out of range for type oid", "22003");
+        }
+        ov &= 0xFFFFFFFFL;
+        // An OID that fits a signed int stays one, which is the shape every OID the catalogs hand
+        // out already has; only the top half of the range needs the wider number.
+        return ov <= Integer.MAX_VALUE ? (Object) Integer.valueOf((int) ov) : (Object) Long.valueOf(ov);
     }
 
     /**

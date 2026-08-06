@@ -2661,7 +2661,15 @@ class ExprEvaluator {
         if (val == null) return 0;
         if (val instanceof PgMoney) return ((PgMoney) val).getValue().longValue();
         if (val instanceof Number) return ((Number) val).longValue();
-        return Long.parseLong(val.toString());
+        String s = val.toString();
+        try {
+            return Long.parseLong(s.trim());
+        } catch (NumberFormatException e) {
+            // A value the type cannot read is what the client got wrong, not what the server did:
+            // letting the parse failure out unhandled reported it as an internal error, which
+            // says nothing about the value and nothing a client can act on.
+            throw new MemgresException("invalid input syntax for type bigint: \"" + s + "\"", "22P02");
+        }
     }
 
     // ---- Bit string operations ----
