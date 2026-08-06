@@ -180,6 +180,28 @@ class CatalogSystemFunctions {
                     }
                 }
 
+                // A call that answered nothing has no value to read a type off, and its
+                // signature is then the only witness there is: pg_column_toast_chunk_id answers
+                // an oid whether or not the value it was asked about has one.
+                if (rawExpr instanceof FunctionCallExpr) {
+                    FunctionCallExpr call = (FunctionCallExpr) rawExpr;
+                    String called = FunctionEvaluator.stripSchemaPrefix(
+                            call.name().toLowerCase(java.util.Locale.ROOT));
+                    if (BuiltinCallTypes.records(called) && executor.evalExpr(rawExpr, ctx) == null) {
+                        java.util.List<Expression> args = call.args() == null
+                                ? java.util.Collections.<Expression>emptyList() : call.args();
+                        int[] written = new int[args.size()];
+                        for (int i = 0; i < args.size(); i++) {
+                            // What the call answers with depends on what it was passed: abs of a
+                            // bigint is a bigint, and abs of nothing in particular is a float8.
+                            DataType argType = executor.exprEvaluator.inferExprType(args.get(i));
+                            written[i] = argType == null ? 0 : argType.getOid();
+                        }
+                        DataType declared = DataType.fromOid(BuiltinCallTypes.resultType(called, written));
+                        if (declared != null) return pgTypeDisplayName(declared);
+                    }
+                }
+
                 if (rawExpr instanceof CastExpr) {
                     CastExpr cast = (CastExpr) rawExpr;
                     String tn = cast.typeName().toLowerCase().replaceAll("\\(.*\\)", "").trim();
@@ -597,6 +619,14 @@ class CatalogSystemFunctions {
             case "pg_indexes_size": {
                 if (!fn.args().isEmpty()) executor.evalExpr(fn.args().get(0), ctx);
                 return 8192L;
+            }
+            case "pg_column_toast_chunk_id": {
+                // The chunk id of a value stored out of line, and null for one that is not.
+                // memgres holds every value with its row, so no value has one -- which is also
+                // PostgreSQL's answer for anything short enough not to have been moved out.
+                requireArgs(fn, 1);
+                executor.evalExpr(fn.args().get(0), ctx);
+                return null;
             }
             case "pg_column_size": {
                 if (!fn.args().isEmpty()) {

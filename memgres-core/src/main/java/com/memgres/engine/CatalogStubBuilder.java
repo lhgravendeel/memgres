@@ -2507,7 +2507,146 @@ class CatalogStubBuilder {
                 col("fsync_time", DataType.DOUBLE_PRECISION),
                 col("stats_reset", DataType.TIMESTAMPTZ)
         );
-        return new Table("pg_stat_io", cols); // empty, no I/O stats
+        Table table = new Table("pg_stat_io", cols);
+        // The view is one row per way a backend can read or write, whether or not it has: a
+        // monitoring query reads the counters off the rows it expects to find, and finding none
+        // at all is not the same as finding them at zero. The combinations are PostgreSQL's own,
+        // read off the reference server; memgres does none of this I/O, so every counter is 0.
+        List<Object[]> rows = new ArrayList<>();
+        for (String combination : IO_COMBINATIONS) {
+            String[] parts = combination.split("\\|");
+            Object[] row = new Object[cols.size()];
+            row[0] = parts[0];
+            row[1] = parts[1];
+            row[2] = parts[2];
+            for (int i = 3; i < cols.size() - 1; i++) {
+                DataType type = cols.get(i).getType();
+                if (type == DataType.NUMERIC) row[i] = java.math.BigDecimal.ZERO;
+                else if (type == DataType.DOUBLE_PRECISION) row[i] = Double.valueOf(0);
+                else row[i] = Long.valueOf(0);
+            }
+            row[cols.size() - 1] = null;   // stats_reset: never reset, because never counted
+            rows.add(row);
+        }
+        table.replaceAllRows(rows);
+        return table;
+    }
+
+    /**
+     * Every backend type, object and context PostgreSQL 18 reports I/O for, as it reports them.
+     *
+     * <p>Not every combination exists — a walwriter only touches the WAL, and only the backends
+     * that can run one report a vacuum context — so the list is the reference server's own rather
+     * than the product of the three columns.
+     */
+    private static final String[] IO_COMBINATIONS = {
+        "autovacuum launcher|relation|bulkread",
+        "autovacuum launcher|relation|init",
+        "autovacuum launcher|relation|normal",
+        "autovacuum launcher|wal|init",
+        "autovacuum launcher|wal|normal",
+        "autovacuum worker|relation|bulkread",
+        "autovacuum worker|relation|init",
+        "autovacuum worker|relation|normal",
+        "autovacuum worker|relation|vacuum",
+        "autovacuum worker|wal|init",
+        "autovacuum worker|wal|normal",
+        "background worker|relation|bulkread",
+        "background worker|relation|bulkwrite",
+        "background worker|relation|init",
+        "background worker|relation|normal",
+        "background worker|relation|vacuum",
+        "background worker|temp relation|normal",
+        "background worker|wal|init",
+        "background worker|wal|normal",
+        "background writer|relation|init",
+        "background writer|relation|normal",
+        "background writer|wal|init",
+        "background writer|wal|normal",
+        "checkpointer|relation|init",
+        "checkpointer|relation|normal",
+        "checkpointer|wal|init",
+        "checkpointer|wal|normal",
+        "client backend|relation|bulkread",
+        "client backend|relation|bulkwrite",
+        "client backend|relation|init",
+        "client backend|relation|normal",
+        "client backend|relation|vacuum",
+        "client backend|temp relation|normal",
+        "client backend|wal|init",
+        "client backend|wal|normal",
+        "io worker|relation|bulkread",
+        "io worker|relation|bulkwrite",
+        "io worker|relation|init",
+        "io worker|relation|normal",
+        "io worker|relation|vacuum",
+        "io worker|temp relation|normal",
+        "io worker|wal|init",
+        "io worker|wal|normal",
+        "slotsync worker|relation|bulkread",
+        "slotsync worker|relation|bulkwrite",
+        "slotsync worker|relation|init",
+        "slotsync worker|relation|normal",
+        "slotsync worker|relation|vacuum",
+        "slotsync worker|temp relation|normal",
+        "slotsync worker|wal|init",
+        "slotsync worker|wal|normal",
+        "standalone backend|relation|bulkread",
+        "standalone backend|relation|bulkwrite",
+        "standalone backend|relation|init",
+        "standalone backend|relation|normal",
+        "standalone backend|relation|vacuum",
+        "standalone backend|wal|init",
+        "standalone backend|wal|normal",
+        "startup|relation|bulkread",
+        "startup|relation|bulkwrite",
+        "startup|relation|init",
+        "startup|relation|normal",
+        "startup|relation|vacuum",
+        "startup|wal|init",
+        "startup|wal|normal",
+        "walreceiver|wal|init",
+        "walreceiver|wal|normal",
+        "walsender|relation|bulkread",
+        "walsender|relation|bulkwrite",
+        "walsender|relation|init",
+        "walsender|relation|normal",
+        "walsender|relation|vacuum",
+        "walsender|temp relation|normal",
+        "walsender|wal|init",
+        "walsender|wal|normal",
+        "walsummarizer|wal|init",
+        "walsummarizer|wal|normal",
+        "walwriter|wal|init",
+        "walwriter|wal|normal",
+    };
+
+    /**
+     * {@code pg_aios}, PostgreSQL 18's view of the asynchronous I/O in flight.
+     *
+     * <p>It is empty on a server that has none outstanding, which is almost always and is always
+     * true of memgres. What matters is that it is there to be selected from: a query against a
+     * view that does not exist fails, where one against an empty view answers nothing.
+     */
+    Table buildPgAios() {
+        List<Column> cols = Cols.listOf(
+                col("pid", DataType.INTEGER),
+                col("io_id", DataType.INTEGER),
+                col("io_generation", DataType.BIGINT),
+                col("state", DataType.TEXT),
+                col("operation", DataType.TEXT),
+                col("off", DataType.BIGINT),
+                col("length", DataType.BIGINT),
+                col("target", DataType.TEXT),
+                col("handle_data_len", DataType.SMALLINT),
+                col("raw_result", DataType.INTEGER),
+                col("result", DataType.TEXT),
+                col("target_desc", DataType.TEXT),
+                col("f_sync", DataType.BOOLEAN),
+                col("f_localmem", DataType.BOOLEAN),
+                col("f_buffered", DataType.BOOLEAN)
+        );
+        return new Table("pg_aios", cols);   // nothing is ever in flight
     }
 
     Table buildPgStatUserFunctions() {

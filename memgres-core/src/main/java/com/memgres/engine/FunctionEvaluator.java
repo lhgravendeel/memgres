@@ -1097,7 +1097,7 @@ class FunctionEvaluator {
                 if (arg == null) return null;
                 if (arg instanceof Number) throw new MemgresException("function crc32(integer) does not exist", "42883");
                 java.util.zip.CRC32 crc = new java.util.zip.CRC32();
-                crc.update(arg.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                crc.update(byteaOf(arg));
                 return crc.getValue();
             }
             case "crc32c": {
@@ -1105,7 +1105,7 @@ class FunctionEvaluator {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
                 if (arg instanceof Number) throw new MemgresException("function crc32c(integer) does not exist", "42883");
-                return crc32c(arg.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                return crc32c(byteaOf(arg));
             }
             case "gen_random_bytes": {
                 requireArgs(fn, 1);
@@ -1931,7 +1931,25 @@ class FunctionEvaluator {
                 if (arr instanceof List<?>) list = new ArrayList<>((List<?>) arr);
                 else if (arr instanceof String && ((String) arr).startsWith("{")) list = new ArrayList<>(parseSimplePgArray(((String) arr)));
                 else return arr;
-                list.sort((a, b) -> TypeCoercion.compare(a, b));
+                // array_sort(a, descending, nulls_first): the second argument says which way
+                // round, and the third where the nulls go -- by default the way ORDER BY puts
+                // them, last when ascending and first when descending. Reading neither sorted
+                // every call ascending, whatever it was asked for.
+                final boolean descending = fn.args().size() > 1
+                        && executor.isTruthy(executor.evalExpr(fn.args().get(1), ctx));
+                final boolean nullsFirst = fn.args().size() > 2
+                        ? executor.isTruthy(executor.evalExpr(fn.args().get(2), ctx)) : descending;
+                list.sort(new java.util.Comparator<Object>() {
+                    @Override
+                    public int compare(Object a, Object b) {
+                        if (a == null || b == null) {
+                            if (a == null && b == null) return 0;
+                            return (a == null) == nullsFirst ? -1 : 1;
+                        }
+                        int cmp = TypeCoercion.compare(a, b);
+                        return descending ? -cmp : cmp;
+                    }
+                });
                 return TypeCoercion.formatPgArray(list);
             }
             case "array_reverse": {
@@ -3826,7 +3844,20 @@ class FunctionEvaluator {
      */
     private static final long MAX_ARRAY_ELEMENTS = 134217727L;
 
-    /** A literal of no type: a string, or a bare NULL. */
+    /**
+     * The bytes a bytea value carries.
+     *
+     * <p>memgres holds one as a {@code byte[]}, and reading it through {@code toString} handed the
+     * hash and the reverse of a Java array identity -- {@code [B@54c26376} -- which is neither the
+     * value nor anything the user wrote. A value that arrived as text is read as its own bytes,
+     * which is what the cast from text to bytea does with it.
+     */
+    static byte[] byteaOf(Object value) {
+        if (value instanceof byte[]) return (byte[]) value;
+        return value.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    }
+
+    /** A literal of no type: a string, or a bare NULL. */    /** A literal of no type: a string, or a bare NULL. */
     private static boolean isUntypedLiteral(Expression expr) {
         if (!(expr instanceof Literal)) return false;
         Literal.LiteralType type = ((Literal) expr).literalType();

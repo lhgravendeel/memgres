@@ -830,6 +830,9 @@ class DateTimeFunctions {
      * would drop — turning '123-' into 123 instead of -123.
      */
     private java.math.BigDecimal parseNumberWithFormat(String input, String fmt) {
+        if (fmt != null && fmt.toUpperCase(java.util.Locale.ROOT).contains("RN")) {
+            return romanValue(input);
+        }
         String s = input.trim();
         boolean negative = false;
         if (s.startsWith("(") && s.endsWith(")")) {
@@ -864,7 +867,52 @@ class DateTimeFunctions {
     }
 
 
-    /** A clock field padded the way PostgreSQL writes it back in a range complaint. */
+    /** The letters a Roman numeral is written with, and what each is worth. */
+    private static int romanDigit(char c) {
+        switch (Character.toUpperCase(c)) {
+            case 'I': return 1;
+            case 'V': return 5;
+            case 'X': return 10;
+            case 'L': return 50;
+            case 'C': return 100;
+            case 'D': return 500;
+            case 'M': return 1000;
+            default: return 0;
+        }
+    }
+
+    /**
+     * A Roman numeral read as the number it spells, which is what {@code to_number(…, 'RN')} does.
+     *
+     * <p>PostgreSQL reads the letters that begin the value and stops at the first one that is not
+     * a Roman letter — {@code 'XYZ'} is ten — and then holds what it read to the rules: I, X, C
+     * and M repeat at most three times, V, L and D not at all, and only IV, IX, XL, XC, CD and CM
+     * may be written the subtractive way. Anything else is not a numeral, and it says so.
+     */
+    private java.math.BigDecimal romanValue(String input) {
+        String s = input == null ? "" : input.trim();
+        int end = 0;
+        while (end < s.length() && romanDigit(s.charAt(end)) != 0) end++;
+        String numeral = s.substring(0, end).toUpperCase(java.util.Locale.ROOT);
+        if (numeral.isEmpty() || !isWellFormedRoman(numeral)) {
+            throw new MemgresException("invalid Roman numeral", "22P02");
+        }
+        int total = 0;
+        for (int i = 0; i < numeral.length(); i++) {
+            int here = romanDigit(numeral.charAt(i));
+            int next = i + 1 < numeral.length() ? romanDigit(numeral.charAt(i + 1)) : 0;
+            total += here < next ? -here : here;
+        }
+        return java.math.BigDecimal.valueOf(total);
+    }
+
+    /** Whether a string of Roman letters is a numeral rather than merely letters. */
+    private static boolean isWellFormedRoman(String numeral) {
+        return numeral.matches("M{0,3}(CM|CD|D?C{0,3})(XC|XL|L?X{0,3})(IX|IV|V?I{0,3})")
+                && !numeral.isEmpty();
+    }
+
+    /** A clock field padded the way PostgreSQL writes it back in a range complaint. */    /** A clock field padded the way PostgreSQL writes it back in a range complaint. */
     private static String twoDigits(int value) {
         return value < 10 && value >= 0 ? "0" + value : String.valueOf(value);
     }

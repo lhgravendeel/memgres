@@ -64,6 +64,8 @@ public class StoredConstraint {
     private boolean deferrable;
     private boolean initiallyDeferred;
     private boolean notEnforced; // PG 18: NOT ENFORCED constraints are stored but not validated
+    /** pg_constraint.conperiod: a temporal foreign key, whose last column is a span to cover. */
+    private boolean period;
     private boolean noInherit; // CHECK ... NO INHERIT: constraint not inherited by child tables
     private boolean convalidated = true; // pg_constraint.convalidated: false when added with NOT VALID
     private boolean fromIndex; // true if this constraint was created via CREATE UNIQUE INDEX (not ADD CONSTRAINT)
@@ -105,6 +107,10 @@ public class StoredConstraint {
                                               FkAction onDelete, FkAction onUpdate) {
         return new StoredConstraint(name, Type.FOREIGN_KEY, columns, null, refTable, refColumns, onDelete, onUpdate);
     }
+
+    public boolean isPeriod() { return period; }
+
+    public void setPeriod(boolean period) { this.period = period; }
 
     public String getName() { return name; }
     public void setName(String name) { this.name = name; }

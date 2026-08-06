@@ -719,6 +719,13 @@ class ConstraintValidator {
             searchTables.add(refTable);
         }
 
+        if (sc.isPeriod()) {
+            if (periodKeyCovered(searchTables, refColNames, sc, table, row, fkColIndices, vanishing)) {
+                return;
+            }
+            throw childSideViolation(table, sc, fkColIndices, fkVals);
+        }
+
         // Try O(1) index lookup on referenced table's PK/UNIQUE index
         boolean found = false;
         // A row may satisfy a self-referencing key by itself: PostgreSQL checks the constraint
@@ -775,28 +782,117 @@ class ConstraintValidator {
         }
 
         if (!found) {
-            MemgresException ex = new MemgresException(
-                    "insert or update on table \"" + table.getName() +
-                            "\" violates foreign key constraint \"" + sc.getName() + "\"",
-                    "23503");
-            ex.setConstraint(sc.getName());
-            ex.setTable(table.getName());
-            String schema = findSchemaName(table);
-            if (schema != null) ex.setSchema(schema);
-            StringBuilder detailSb = new StringBuilder("Key (");
-            for (int i = 0; i < sc.getColumns().size(); i++) {
-                if (i > 0) detailSb.append(", ");
-                detailSb.append(sc.getColumns().get(i));
-            }
-            detailSb.append(")=(");
-            for (int i = 0; i < fkColIndices.length; i++) {
-                if (i > 0) detailSb.append(", ");
-                detailSb.append(fkVals[i]);
-            }
-            detailSb.append(") is not present in table \"").append(sc.getReferencesTable()).append("\".");
-            ex.setDetail(detailSb.toString());
-            throw ex;
+            throw childSideViolation(table, sc, fkColIndices, fkVals);
         }
+    }
+
+    /** PostgreSQL's child-side wording for a key the referenced table does not hold. */
+    private MemgresException childSideViolation(Table table, StoredConstraint sc,
+                                                int[] fkColIndices, Object[] fkVals) {
+        MemgresException ex = new MemgresException(
+                "insert or update on table \"" + table.getName() +
+                        "\" violates foreign key constraint \"" + sc.getName() + "\"",
+                "23503");
+        ex.setConstraint(sc.getName());
+        ex.setTable(table.getName());
+        String schema = findSchemaName(table);
+        if (schema != null) ex.setSchema(schema);
+        StringBuilder detailSb = new StringBuilder("Key (");
+        for (int i = 0; i < sc.getColumns().size(); i++) {
+            if (i > 0) detailSb.append(", ");
+            detailSb.append(sc.getColumns().get(i));
+        }
+        detailSb.append(")=(");
+        for (int i = 0; i < fkColIndices.length; i++) {
+            if (i > 0) detailSb.append(", ");
+            detailSb.append(fkVals[i]);
+        }
+        detailSb.append(") is not present in table \"").append(sc.getReferencesTable()).append("\".");
+        ex.setDetail(detailSb.toString());
+        return ex;
+    }
+
+    /**
+     * Whether a temporal foreign key's row is covered by the rows it references.
+     *
+     * <p>A {@code PERIOD} key names a span rather than a value: the referencing row is satisfied
+     * when the rows sharing its other key columns cover its whole period between them. Two
+     * referenced rows meeting end to end cover a period that crosses the join, which is the point
+     * of the feature — a period is not required to sit inside any one referenced row.
+     *
+     * <p>An empty period is covered by nothing. PostgreSQL refuses it rather than treating it as
+     * a period with nothing to satisfy, and the containment test alone would have let it through.
+     */
+    private boolean periodKeyCovered(List<Table> searchTables, List<String> refColNames,
+                                     StoredConstraint sc, Table table, Object[] row,
+                                     int[] fkColIndices, java.util.Set<Object[]> vanishing) {
+        int last = fkColIndices.length - 1;
+        RangeOperations.PgRange wanted = asRange(row[fkColIndices[last]]);
+        if (wanted == null || wanted.isEmpty()) return false;
+
+        List<RangeOperations.PgRange> covering = new java.util.ArrayList<>();
+        for (Table searchTable : searchTables) {
+            int[] refIdx = new int[refColNames.size()];
+            boolean colsOk = true;
+            for (int i = 0; i < refColNames.size(); i++) {
+                refIdx[i] = searchTable.getColumnIndex(refColNames.get(i));
+                if (refIdx[i] < 0) { colsOk = false; break; }
+            }
+            if (!colsOk) continue;
+            for (Object[] refRow : searchTable.getRows()) {
+                if (vanishing != null && vanishing.contains(refRow)) continue;
+                boolean sameKey = true;
+                for (int i = 0; i < last; i++) {
+                    if (!valuesEqual(row[fkColIndices[i]], refRow[refIdx[i]])) { sameKey = false; break; }
+                }
+                if (!sameKey) continue;
+                RangeOperations.PgRange has = asRange(refRow[refIdx[last]]);
+                if (has != null && !has.isEmpty()) covering.add(has);
+            }
+        }
+        return coveredByUnion(wanted, covering);
+    }
+
+    /** A stored value read as a range, or null when it is not one. */
+    private static RangeOperations.PgRange asRange(Object value) {
+        if (value instanceof RangeOperations.PgRange) return (RangeOperations.PgRange) value;
+        if (value == null) return null;
+        try {
+            return RangeOperations.parse(value.toString());
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    /**
+     * Whether one range is covered by a set of others taken together. The pieces are joined where
+     * they meet or overlap, and the answer is whether any one joined piece holds the whole range.
+     */
+    private static boolean coveredByUnion(RangeOperations.PgRange wanted,
+                                          List<RangeOperations.PgRange> pieces) {
+        List<RangeOperations.PgRange> merged = new java.util.ArrayList<>();
+        List<RangeOperations.PgRange> pending = new java.util.ArrayList<>(pieces);
+        while (!pending.isEmpty()) {
+            RangeOperations.PgRange current = pending.remove(0);
+            boolean grew = true;
+            while (grew) {
+                grew = false;
+                for (int i = 0; i < pending.size(); i++) {
+                    RangeOperations.PgRange other = pending.get(i);
+                    if (current.overlaps(other) || RangeOperations.areAdjacent(current, other)) {
+                        current = RangeOperations.union(current, other);
+                        pending.remove(i);
+                        grew = true;
+                        break;
+                    }
+                }
+            }
+            merged.add(current);
+        }
+        for (RangeOperations.PgRange piece : merged) {
+            if (piece.containsRange(wanted)) return true;
+        }
+        return false;
     }
 
     private void validateExclude(Table table, Object[] newRow, StoredConstraint sc, Object[] excludeRow) {
@@ -876,7 +972,59 @@ class ConstraintValidator {
 
     // ---- Definition-time validation of a FOREIGN KEY ----
 
-    /** Names PostgreSQL reserves for system columns; a key may not be built on any of them. */
+    /**
+     * Whether the referenced table has a {@code WITHOUT OVERLAPS} key over these columns.
+     *
+     * <p>That is the key a temporal foreign key references, and it is not an ordinary unique one:
+     * the scalar columns are unique per period rather than outright, so the same id may appear on
+     * as many rows as have periods that do not overlap. memgres stores it as the exclusion
+     * constraint it is — equality on the scalar columns, overlap on the last — which is the shape
+     * looked for here.
+     */
+    private static boolean hasWithoutOverlapsKeyOn(Table refTable, List<String> refCols) {
+        for (StoredConstraint sc : refTable.getConstraints()) {
+            if (sc.getType() != StoredConstraint.Type.EXCLUDE) continue;
+            List<StoredConstraint.ExcludeElement> elems = sc.getExcludeElements();
+            if (elems == null || elems.size() != refCols.size()) continue;
+            boolean matches = true;
+            for (int i = 0; i < elems.size(); i++) {
+                String wantOp = i == elems.size() - 1 ? "&&" : "=";
+                if (!wantOp.equals(elems.get(i).operator())
+                        || !refCols.get(i).equalsIgnoreCase(elems.get(i).column())) {
+                    matches = false;
+                    break;
+                }
+            }
+            if (matches) return true;
+        }
+        return false;
+    }
+
+    /**
+     * The column a {@code PERIOD} names has to be a span on both sides. A key written over a
+     * number cannot be covered by anything, and PostgreSQL says the constraint cannot be built
+     * rather than building one that never passes.
+     */
+    private static void requirePeriodColumnsAreRanges(Table table, Table refTable,
+                                                      StoredConstraint fk, List<String> refCols) {
+        List<String> fkCols = fk.getColumns();
+        Column referencing = columnOf(table, fkCols.get(fkCols.size() - 1));
+        Column referenced = columnOf(refTable, refCols.get(refCols.size() - 1));
+        if (isRangeColumn(referencing) && isRangeColumn(referenced)) return;
+        MemgresException ex = new MemgresException("foreign key constraint \"" + fk.getName()
+                + "\" cannot be implemented", "42804");
+        ex.setDetail("Key column \"" + fkCols.get(fkCols.size() - 1)
+                + "\" of a PERIOD foreign key must be of a range type.");
+        throw ex;
+    }
+
+    private static boolean isRangeColumn(Column column) {
+        if (column == null || column.getType() == null) return false;
+        String name = column.getType().getPgName();
+        return name != null && name.toLowerCase(java.util.Locale.ROOT).endsWith("range");
+    }
+
+    /** Names PostgreSQL reserves for system columns; a key may not be built on any of them. */    /** Names PostgreSQL reserves for system columns; a key may not be built on any of them. */
     private static final Set<String> SYSTEM_COLUMNS = new HashSet<>(Arrays.asList(
             "tableoid", "ctid", "xmin", "cmin", "xmax", "cmax"));
 
@@ -928,10 +1076,14 @@ class ConstraintValidator {
                     }
                 }
             }
-            if (!hasUniqueConstraintOn(refTable, refCols)) {
+            boolean keyed = fk.isPeriod()
+                    ? hasWithoutOverlapsKeyOn(refTable, refCols)
+                    : hasUniqueConstraintOn(refTable, refCols);
+            if (!keyed) {
                 throw new MemgresException("there is no unique constraint matching given keys for referenced table \""
                         + refTableName + "\"", "42830");
             }
+            if (fk.isPeriod()) requirePeriodColumnsAreRanges(table, refTable, fk, refCols);
         }
         if (fkCols.size() != refCols.size()) {
             throw new MemgresException(
@@ -1263,14 +1415,10 @@ class ConstraintValidator {
                             for (Object[] childRow : childTable.getRows()) {
                                 // Skip rows that are also being deleted in the same statement
                                 if (alsoDeleting != null && alsoDeleting.contains(childRow)) continue;
-                                boolean matches = true;
-                                for (int i = 0; i < childColIndices.length; i++) {
-                                    if (!valuesEqual(parentVals[i], childRow[childColIndices[i]])) {
-                                        matches = false;
-                                        break;
-                                    }
+                                if (!childRowNeedsParent(sc, childTable, childRow, childColIndices,
+                                        parentVals, deletedRow, alsoDeleting)) {
+                                    continue;
                                 }
-                                if (!matches) continue;
                                 if (postpone) {
                                     executor.session.addDeferredReferencedCheck(
                                             childTable, childRow, sc, parentTable);
@@ -1444,14 +1592,10 @@ class ConstraintValidator {
                             boolean postpone = sc.getOnUpdate() == StoredConstraint.FkAction.NO_ACTION
                                     && checkIsCurrentlyDeferred(sc);
                             for (Object[] childRow : childTable.getRows()) {
-                                boolean matches = true;
-                                for (int i = 0; i < childColIndices.length; i++) {
-                                    if (!valuesEqual(oldParentVals[i], childRow[childColIndices[i]])) {
-                                        matches = false;
-                                        break;
-                                    }
+                                if (!childRowNeedsParent(sc, childTable, childRow, childColIndices,
+                                        oldParentVals, oldRow, null)) {
+                                    continue;
                                 }
-                                if (!matches) continue;
                                 if (postpone) {
                                     executor.session.addDeferredReferencedCheck(
                                             childTable, childRow, sc, parentTable);
@@ -1469,7 +1613,36 @@ class ConstraintValidator {
         }
     }
 
-    /** Find an index on the given table whose columns match the provided column names (in order). */
+    /**
+     * Whether a child row is left without what it references once a parent row goes.
+     *
+     * <p>For an ordinary key that is the same question as whether the two keys are equal: the
+     * child names one parent row, and taking that row away leaves it naming nothing. A temporal
+     * key names as many parent rows as its period runs across, so taking one away only matters
+     * when what is left no longer covers the period — which is why the periods themselves are
+     * never compared for equality here.
+     */
+    private boolean childRowNeedsParent(StoredConstraint sc, Table childTable, Object[] childRow,
+                                        int[] childColIndices, Object[] parentVals,
+                                        Object[] parentRow, java.util.Set<Object[]> alsoGoing) {
+        int scalarColumns = sc.isPeriod() ? childColIndices.length - 1 : childColIndices.length;
+        for (int i = 0; i < scalarColumns; i++) {
+            if (!valuesEqual(parentVals[i], childRow[childColIndices[i]])) return false;
+        }
+        if (!sc.isPeriod()) return true;
+        java.util.Set<Object[]> without =
+                Collections.newSetFromMap(new java.util.IdentityHashMap<Object[], Boolean>());
+        if (alsoGoing != null) without.addAll(alsoGoing);
+        if (parentRow != null) without.add(parentRow);
+        try {
+            validateForeignKey(childTable, childRow, sc, without);
+            return false;
+        } catch (MemgresException stillShort) {
+            return true;
+        }
+    }
+
+    /** Find an index on the given table whose columns match the provided column names (in order). */    /** Find an index on the given table whose columns match the provided column names (in order). */
     private TableIndex findIndexForColumns(Table table, List<String> columnNames) {
         int[] targetIndices = new int[columnNames.size()];
         for (int i = 0; i < columnNames.size(); i++) {

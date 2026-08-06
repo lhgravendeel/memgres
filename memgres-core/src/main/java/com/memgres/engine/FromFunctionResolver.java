@@ -188,6 +188,8 @@ class FromFunctionResolver {
         if (fname.equals("pg_indexam_has_property")) return resolvePgIndexamHasProperty(alias, evalArgs);
         if (fname.equals("pg_available_extension_versions")) return resolvePgAvailableExtensionVersions(alias);
         if (fname.equals("pg_show_all_settings")) return resolvePgShowAllSettings(alias);
+        if (fname.equals("pg_get_loaded_modules")) return resolvePgGetLoadedModules(alias);
+        if (fname.equals("pg_stat_get_backend_io")) return resolvePgStatGetBackendIo(alias, evalArgs);
         if (fname.equals("unnest")) return resolveUnnest(alias, colAliases, evalArgs, funcFrom.args());
         if (fname.equals("_pg_expandarray")) return resolveExpandArray(alias, colAliases, evalArgs);
         if (fname.equals("jsonb_each") || fname.equals("jsonb_each_text") || fname.equals("json_each") || fname.equals("json_each_text"))
@@ -690,6 +692,63 @@ class FromFunctionResolver {
     }
 
     // ---- pg_available_extension_versions ----
+
+    /**
+     * {@code pg_get_loaded_modules()}, PostgreSQL 18's list of the shared libraries a backend has
+     * loaded.
+     *
+     * <p>memgres loads none — everything it implements is its own — so the answer is no rows.
+     * PostgreSQL's own answer is no rows too until something loads a module, which is why what
+     * matters here is that the call resolves rather than what it counts.
+     */
+    private List<RowContext> resolvePgGetLoadedModules(String alias) {
+        List<Column> cols = Cols.listOf(
+                new Column("module_name", DataType.TEXT, true, false, null),
+                new Column("version", DataType.TEXT, true, false, null),
+                new Column("file_name", DataType.TEXT, true, false, null)
+        );
+        Table virtualTable = new Table(alias, cols);
+        return SeriesRows.contextsOver(virtualTable, alias, new ArrayList<Object[]>());
+    }
+
+    /**
+     * {@code pg_stat_get_backend_io(pid)}, the I/O one backend has done, as {@code pg_stat_io}
+     * reports it for all of them together.
+     *
+     * <p>A pid that is nobody's answers nothing, which is how PostgreSQL says it does not know the
+     * backend. A pid that is a backend's answers the rows that backend could have done I/O in,
+     * with the counters memgres has for them, which is none.
+     */
+    private List<RowContext> resolvePgStatGetBackendIo(String alias, List<Object> evalArgs) {
+        Table source = executor.getSystemCatalog().resolve("pg_catalog", "pg_stat_io");
+        List<Column> cols = new ArrayList<>();
+        for (Column c : source.getColumns()) {
+            if (!c.getName().equals("backend_type")) cols.add(c);
+        }
+        Table virtualTable = new Table(alias, cols);
+        List<Object[]> rows = new ArrayList<>();
+        Object pidArg = evalArgs.isEmpty() ? null : evalArgs.get(0);
+        boolean known = false;
+        if (pidArg != null) {
+            int pid = TypeCoercion.toInteger(pidArg).intValue();
+            for (Session other : executor.database.getActiveSessions()) {
+                if (other.getPid() == pid) { known = true; break; }
+            }
+        }
+        if (known) {
+            List<Column> sourceCols = source.getColumns();
+            for (Object[] ioRow : source.getRows()) {
+                if (!"client backend".equals(ioRow[0])) continue;
+                Object[] row = new Object[cols.size()];
+                for (int i = 1; i < sourceCols.size(); i++) row[i - 1] = ioRow[i];
+                rows.add(row);
+            }
+        }
+        virtualTable.replaceAllRows(rows);
+        List<RowContext> contexts = new ArrayList<>();
+        for (Object[] row : rows) contexts.add(new RowContext(virtualTable, alias, row));
+        return contexts;
+    }
 
     private List<RowContext> resolvePgAvailableExtensionVersions(String alias) {
         List<Column> cols = Cols.listOf(
