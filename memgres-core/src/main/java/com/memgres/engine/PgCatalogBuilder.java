@@ -425,6 +425,8 @@ public class PgCatalogBuilder {
                 return stubs.buildPgStatArchiver();
             case "pg_stat_io":
                 return stubs.buildPgStatIo();
+            case "pg_aios":
+                return stubs.buildPgAios();
             case "pg_stat_user_functions":
             case "pg_stat_xact_user_functions":
                 return stubs.buildPgStatUserFunctions();

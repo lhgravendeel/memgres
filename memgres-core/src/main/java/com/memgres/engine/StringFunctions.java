@@ -846,7 +846,16 @@ class StringFunctions {
             }
             case "reverse": {
                 Object str = executor.evalExpr(fn.args().get(0), ctx);
-                return str == null ? null : new StringBuilder(str.toString()).reverse().toString();
+                if (str == null) return null;
+                // reverse is declared over text and over bytea, and a bytea is reversed byte by
+                // byte: reading it as text reversed the characters of a Java array's identity.
+                if (str instanceof byte[]) {
+                    byte[] src = (byte[]) str;
+                    byte[] out = new byte[src.length];
+                    for (int i = 0; i < src.length; i++) out[i] = src[src.length - 1 - i];
+                    return out;
+                }
+                return new StringBuilder(str.toString()).reverse().toString();
             }
             case "split_part": {
                 requireIntegerCounts(fn, ctx, "split_part", 2);

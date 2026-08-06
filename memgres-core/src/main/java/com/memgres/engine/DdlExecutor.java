@@ -283,6 +283,7 @@ class DdlExecutor {
                     fk.setInitiallyDeferred(tc.initiallyDeferred());
                 }
                 if (tc.notEnforced()) fk.setNotEnforced(true);
+                if (tc.period()) fk.setPeriod(true);
                 if (tc.matchType() != null) fk.setMatchType(tc.matchType());
                 fk.setOnDeleteSetNullColumns(StoredConstraint.parseSetNullColumns(tc.onDelete()));
                 fk.setOnUpdateSetNullColumns(StoredConstraint.parseSetNullColumns(tc.onUpdate()));

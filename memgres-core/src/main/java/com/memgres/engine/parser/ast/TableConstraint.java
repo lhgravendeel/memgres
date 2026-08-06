@@ -23,6 +23,16 @@ public final class TableConstraint {
     public final List<ExcludeElement> excludeElements;
     /** Index access method backing an EXCLUDE constraint; PG defaults to btree. */
     private String excludeMethod;
+    /**
+     * Whether the last column of each list was written {@code PERIOD}: a temporal foreign key,
+     * where the referencing row's period has to be covered by the referenced rows' periods rather
+     * than equal to one of them.
+     */
+    private boolean period;
+
+    public boolean period() { return period; }
+
+    public void setPeriod(boolean period) { this.period = period; }
 
     public String excludeMethod() { return excludeMethod; }
 

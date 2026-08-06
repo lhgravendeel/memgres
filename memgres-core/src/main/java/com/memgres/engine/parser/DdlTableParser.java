@@ -497,6 +497,41 @@ class DdlTableParser {
     }
 
     /**
+     * A foreign key's column list, where the last of them may be written {@code PERIOD}.
+     *
+     * <p>{@code FOREIGN KEY (id, PERIOD v) REFERENCES p (id, PERIOD v)} names the same columns an
+     * ordinary key would; what {@code PERIOD} says is that the last one is a span rather than a
+     * value, and is to be covered rather than matched. Reading the list without it stopped at the
+     * word and reported a syntax error on the column after it.
+     */
+    private List<String> parseKeyColumnsWithPeriod(boolean[] sawPeriod) {
+        List<String> cols = new ArrayList<String>();
+        do {
+            if (periodPrefixAhead()) {
+                parser.advance();
+                sawPeriod[0] = true;
+            }
+            cols.add(parser.readIdentifier());
+        } while (parser.match(TokenType.COMMA));
+        return cols;
+    }
+
+    /**
+     * Whether the word here is {@code PERIOD} introducing a column rather than naming one.
+     *
+     * <p>PERIOD is not a reserved word, so a column may be called it, and {@code FOREIGN KEY
+     * (period)} names that column. What tells them apart is what follows: the marker is written
+     * in front of a column name, and a column name is followed by a comma or the closing paren.
+     */
+    private boolean periodPrefixAhead() {
+        if (!"PERIOD".equalsIgnoreCase(parser.peek().value())) return false;
+        int next = parser.pos + 1;
+        if (next >= parser.tokens.size()) return false;
+        TokenType type = parser.tokens.get(next).type();
+        return type == TokenType.IDENTIFIER || type == TokenType.KEYWORD;
+    }
+
+    /**
      * Match {@code WITHOUT OVERLAPS}. OVERLAPS is not a reserved word, so it arrives as a plain
      * identifier and has to be matched on the word rather than on the token's kind.
      */
@@ -686,16 +721,24 @@ class DdlTableParser {
 
         if (parser.matchKeywords("FOREIGN", "KEY")) {
             parser.expect(TokenType.LEFT_PAREN);
-            List<String> cols = parser.parseIdentifierList();
+            boolean[] referencingPeriod = new boolean[1];
+            List<String> cols = parseKeyColumnsWithPeriod(referencingPeriod);
             parser.expect(TokenType.RIGHT_PAREN);
             parser.expectKeyword("REFERENCES");
             String refTable = parser.readIdentifier();
             if (parser.match(TokenType.DOT)) refTable = refTable + "." + parser.readIdentifier();
             List<String> refCols = null;
+            boolean[] referencedPeriod = new boolean[1];
             if (parser.check(TokenType.LEFT_PAREN)) {
                 parser.expect(TokenType.LEFT_PAREN);
-                refCols = parser.parseIdentifierList();
+                refCols = parseKeyColumnsWithPeriod(referencedPeriod);
                 parser.expect(TokenType.RIGHT_PAREN);
+            }
+            if (referencingPeriod[0] != referencedPeriod[0]) {
+                throw new MemgresException(referencingPeriod[0]
+                        ? "foreign key uses PERIOD on the referencing table but not the referenced table"
+                        : "foreign key uses PERIOD on the referenced table but not the referencing table",
+                        "42830");
             }
             // MATCH FULL | MATCH PARTIAL | MATCH SIMPLE
             String fkMatchType = null;
@@ -713,8 +756,10 @@ class DdlTableParser {
             boolean fkDeferrable = fkDef.deferrable;
             boolean fkInitiallyDeferred = fkDef.initiallyDeferred;
             boolean fkNotEnforced = parseNotEnforced();
-            return new TableConstraint(constraintName, TableConstraint.ConstraintType.FOREIGN_KEY,
+            TableConstraint fk = new TableConstraint(constraintName, TableConstraint.ConstraintType.FOREIGN_KEY,
                     cols, null, refTable, refCols, onDelete, onUpdate, false, fkDeferrable, fkInitiallyDeferred, fkNotEnforced, fkMatchType, null);
+            fk.setPeriod(referencingPeriod[0]);
+            return fk;
         }
 
         if (parser.matchKeyword("EXCLUDE")) {

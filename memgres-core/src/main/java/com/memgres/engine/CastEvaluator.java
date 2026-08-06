@@ -527,12 +527,15 @@ class CastEvaluator {
             case "integer":
             case "int":
             case "int4":
+                if (val instanceof byte[]) return (int) bytesToInteger((byte[]) val, 4, "integer");
                 return TypeCoercion.toInteger(val);
             case "bigint":
             case "int8":
+                if (val instanceof byte[]) return bytesToInteger((byte[]) val, 8, "bigint");
                 return TypeCoercion.toLong(val);
             case "smallint":
             case "int2": {
+                if (val instanceof byte[]) return (short) bytesToInteger((byte[]) val, 2, "smallint");
                 int iv = TypeCoercion.toInteger(val).intValue();
                 if (iv < Short.MIN_VALUE || iv > Short.MAX_VALUE) {
                     throw new MemgresException("smallint out of range", "22003");
@@ -786,6 +789,12 @@ class CastEvaluator {
                 return TypeCoercion.toMoney(val);
             case "bytea": {
                 if (val instanceof byte[]) return val;
+                // PostgreSQL 18 casts the integer types to bytea and back: the bytes are the
+                // value's own, big-endian and as wide as the type. Reading the number's decimal
+                // spelling instead made 256::bytea the three characters "256".
+                if (val instanceof Short) return integerToBytes(((Short) val).longValue(), 2);
+                if (val instanceof Integer) return integerToBytes(((Integer) val).longValue(), 4);
+                if (val instanceof Long) return integerToBytes(((Long) val).longValue(), 8);
                 String s = val.toString();
                 if (s.startsWith("\\x") || s.startsWith("\\X")) {
                     return ByteaOperations.parseHexFormat(s);
@@ -1483,6 +1492,41 @@ class CastEvaluator {
             if (!(Character.isLowerCase(c) || Character.isDigit(c) || c == '_')) needsQuote = true;
         }
         return needsQuote ? "\"" + ident.replace("\"", "\"\"") + "\"" : ident;
+    }
+
+    /**
+     * A bytea read as the integer type it is being cast to.
+     *
+     * <p>PostgreSQL 18 reads the bytes big-endian as a two's-complement number of the target
+     * type's width. Fewer bytes than the width is not an error — they are the low-order ones, so
+     * {@code '\x000001'::bytea::int} is 1 — but more than the width is a value the type cannot
+     * hold, and is reported as one.
+     */
+    private static long bytesToInteger(byte[] bytes, int width, String typeName) {
+        if (bytes.length > width) {
+            throw new MemgresException(typeName + " out of range", "22003");
+        }
+        long result = 0;
+        for (int i = 0; i < bytes.length; i++) {
+            result = (result << 8) | (bytes[i] & 0xFFL);
+        }
+        // A value written across the type's whole width is signed; one written in fewer bytes has
+        // no sign bit of its own and is the number those bytes spell.
+        if (bytes.length == width && width < 8) {
+            long signBit = 1L << (width * 8 - 1);
+            if ((result & signBit) != 0) result -= (signBit << 1);
+        }
+        return result;
+    }
+
+    /** An integer written as the bytes of its type: big-endian, and as wide as the type is. */
+    private static byte[] integerToBytes(long value, int width) {
+        byte[] out = new byte[width];
+        for (int i = width - 1; i >= 0; i--) {
+            out[i] = (byte) (value & 0xFF);
+            value >>= 8;
+        }
+        return out;
     }
 
     /** Check if a trimmed string is an infinity literal accepted by PostgreSQL. */

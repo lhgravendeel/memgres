@@ -184,6 +184,13 @@ class MathFunctions {
             }
             case "cbrt":
                 return mathUnary(fn, ctx, Math::cbrt);
+            case "gamma":
+            case "lgamma": {
+                Object arg = executor.evalExpr(fn.args().get(0), ctx);
+                if (arg == null) return null;
+                double x = executor.toDouble(arg);
+                return name.equals("gamma") ? Gamma.gamma(x) : Gamma.lgamma(x);
+            }
             case "log10":
             case "log": {
                 // log(base, x) or log(x) [base 10]

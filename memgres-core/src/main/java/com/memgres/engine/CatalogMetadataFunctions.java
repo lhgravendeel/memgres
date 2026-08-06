@@ -1946,6 +1946,20 @@ class CatalogMetadataFunctions {
 
     // ---- Helper methods ----
 
+    /** A key's columns as a definition spells them, with PERIOD in front of the last of a temporal one. */
+    private static String keyColumnList(java.util.List<String> columns, boolean period) {
+        if (!period || columns == null || columns.isEmpty()) {
+            return String.join(", ", columns == null ? java.util.Collections.<String>emptyList() : columns);
+        }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < columns.size(); i++) {
+            if (i > 0) sb.append(", ");
+            if (i == columns.size() - 1) sb.append("PERIOD ");
+            sb.append(columns.get(i));
+        }
+        return sb.toString();
+    }
+
     private static String fkActionToSql(StoredConstraint.FkAction action) {
         switch (action) {
             case CASCADE:
@@ -2035,7 +2049,10 @@ class CatalogMetadataFunctions {
                 return "CHECK (" + RuleDeparser.deparse(sc.getCheckExpr(), RuleDeparser.forTable(owner)) + ")";
             case FOREIGN_KEY: {
                 StringBuilder sb = new StringBuilder("FOREIGN KEY (");
-                sb.append(String.join(", ", sc.getColumns()));
+                // A temporal key writes PERIOD in front of its last column, on both sides: that
+                // word is what says the column is a span to be covered rather than matched, so a
+                // definition printed without it does not spell the constraint that was declared.
+                sb.append(keyColumnList(sc.getColumns(), sc.isPeriod()));
                 sb.append(") REFERENCES ");
                 if (sc.getReferencesTable() != null) {
                     // H16: only schema-qualify the referenced table when its schema is
@@ -2046,7 +2063,9 @@ class CatalogMetadataFunctions {
                     sb.append(sc.getReferencesTable());
                 }
                 if (sc.getReferencesColumns() != null && !sc.getReferencesColumns().isEmpty()) {
-                    sb.append("(").append(String.join(", ", sc.getReferencesColumns())).append(")");
+                    sb.append("(")
+                            .append(keyColumnList(sc.getReferencesColumns(), sc.isPeriod()))
+                            .append(")");
                 }
                 if (sc.getOnUpdate() != null && sc.getOnUpdate() != StoredConstraint.FkAction.NO_ACTION) {
                     sb.append(" ON UPDATE ").append(fkActionToSql(sc.getOnUpdate()));

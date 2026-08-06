@@ -1,5 +1,6 @@
 package com.memgres.engine.parser;
 
+import com.memgres.engine.MemgresException;
 import com.memgres.engine.util.Cols;
 
 import com.memgres.engine.parser.ast.*;
@@ -132,6 +133,7 @@ class UtilityParser {
         boolean freeze = false;
         String encoding = null;
         String onError = null;
+        String rejectLimit = null;
         String defaultString = null;
 
         if (parser.matchKeyword("WITH") || parser.check(TokenType.LEFT_PAREN)) {
@@ -183,6 +185,9 @@ class UtilityParser {
                     case "ON_ERROR":
                         onError = parser.readIdentifier().toLowerCase();
                         break;
+                    case "REJECT_LIMIT":
+                        rejectLimit = parser.advance().value();
+                        break;
                     case "LOG_VERBOSITY":
                         parser.readIdentifier();
                         break;
@@ -203,6 +208,13 @@ class UtilityParser {
                 parser.match(TokenType.COMMA);
             }
             parser.match(TokenType.RIGHT_PAREN);
+        }
+
+        // A limit on how many rows may be rejected only means something where rows are allowed
+        // to be rejected at all, so PostgreSQL refuses the one written without the other.
+        if (rejectLimit != null && !"ignore".equalsIgnoreCase(onError)) {
+            throw new MemgresException("COPY REJECT_LIMIT requires ON_ERROR to be set to IGNORE",
+                    "22023");
         }
 
         // Handle CSV keyword without WITH (old-style syntax)

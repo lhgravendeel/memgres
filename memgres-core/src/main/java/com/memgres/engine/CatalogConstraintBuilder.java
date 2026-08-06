@@ -240,7 +240,7 @@ class CatalogConstraintBuilder {
                             !sc.isNotEnforced(), // conenforced: true = enforced (default), false = not enforced
                             sc.getType() == StoredConstraint.Type.CHECK && sc.getCheckExpr() != null
                                     ? "{OPEXPR " + sc.getCheckExpr().toString() + "}" : null, // conbin
-                            null, false, 0, 0, 1 // conexclop, conperiod, conparentid, contypid, xmin
+                            null, sc.isPeriod(), 0, 0, 1 // conexclop, conperiod, conparentid, contypid, xmin
                     });
                 }
                 // PG 18: NOT NULL constraints are tracked in pg_constraint with contype='n'

@@ -71,7 +71,7 @@ final class PgCatalogRelations {
                 "pg_settings", "pg_shadow", "pg_shmem_allocations", "pg_stat_activity",
                 "pg_stat_all_indexes", "pg_stat_all_tables", "pg_stat_archiver",
                 "pg_stat_bgwriter", "pg_stat_checkpointer", "pg_stat_database",
-                "pg_stat_gssapi", "pg_stat_io", "pg_stat_progress_analyze",
+                "pg_aios", "pg_stat_gssapi", "pg_stat_io", "pg_stat_progress_analyze",
                 "pg_stat_progress_basebackup", "pg_stat_progress_cluster",
                 "pg_stat_progress_copy", "pg_stat_progress_create_index",
                 "pg_stat_progress_vacuum", "pg_stat_replication", "pg_stat_ssl",
