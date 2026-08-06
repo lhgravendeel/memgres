@@ -204,8 +204,13 @@ class Pg18AdditionsTest {
         assertEquals("100000000", scalar("SELECT current_setting('autovacuum_vacuum_max_threshold')"));
         assertEquals("0", scalar("SELECT current_setting('num_os_semaphores')"));
         assertEquals("enum", scalar("SELECT vartype FROM pg_settings WHERE name = 'io_method'"));
+        // PostgreSQL lists io_uring here as well, but only where it was built with liburing —
+        // the set of methods is a property of the build rather than of the version. memgres
+        // performs none of them and lists the two every build has.
         assertEquals("{sync,worker}",
                 scalar("SELECT enumvals::text FROM pg_settings WHERE name = 'io_method'"));
+        assertEquals("true", scalar("SELECT (enumvals @> ARRAY['sync','worker'])::text"
+                + " FROM pg_settings WHERE name = 'io_method'"));
     }
 
     /** A rejection limit means nothing without permission to reject anything. */

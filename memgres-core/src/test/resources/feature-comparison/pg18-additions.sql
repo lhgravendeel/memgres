@@ -531,11 +531,14 @@ SELECT current_setting('autovacuum_vacuum_max_threshold') AS r;
 -- end-expected
 SELECT vartype AS r FROM pg_settings WHERE name = 'io_method';
 
+-- io_uring is listed only where PostgreSQL was built with liburing, so the set
+-- of methods is a property of the build rather than of the version. Every build
+-- has the two below, and that is what can be asked of any of them.
 -- begin-expected
 -- columns: r
--- row: {sync,worker}
+-- row: true
 -- end-expected
-SELECT enumvals::text AS r FROM pg_settings WHERE name = 'io_method';
+SELECT (enumvals @> ARRAY['sync','worker'])::text AS r FROM pg_settings WHERE name = 'io_method';
 
 -- begin-expected
 -- columns: r
