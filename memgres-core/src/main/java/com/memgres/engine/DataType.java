@@ -56,6 +56,9 @@ public enum DataType {
 
     // Extension types
     HSTORE(90001, "hstore"),
+    // hstore is an extension type, so PostgreSQL mints its OID and its array's at install
+    // time and they differ between installations; memgres fixes both.
+    HSTORE_ARRAY(90002, "_hstore"),
 
     // Full-text search
     TSVECTOR(3614, "tsvector"),
@@ -407,6 +410,7 @@ public enum DataType {
             case UUID: return UUID_ARRAY;
             case BYTEA: return BYTEA_ARRAY;
             case JSON: return JSON_ARRAY;
+            case HSTORE: return HSTORE_ARRAY;
             case JSONB: return JSONB_ARRAY;
             case INET: return INET_ARRAY;
             case RECORD: return RECORD_ARRAY;
@@ -444,6 +448,7 @@ public enum DataType {
             case UUID_ARRAY: return UUID;
             case BYTEA_ARRAY: return BYTEA;
             case JSON_ARRAY: return JSON;
+            case HSTORE_ARRAY: return HSTORE;
             case JSONB_ARRAY: return JSONB;
             case INET_ARRAY: return INET;
             case RECORD_ARRAY: return RECORD;

@@ -554,7 +554,9 @@ class CatalogPrivilegeFunctions {
                 || "sequence".equals(kind) || "database".equals(kind) || "type".equals(kind)) {
             return kind + ":" + objectName.toLowerCase();
         }
-        return " none:" + objectName;
+        // A kind this method does not know cannot be allowed to key the same as one it does,
+        // so it is marked. The marker is not an object type and cannot be written as one.
+        return "?none:" + objectName;
     }
 
     private boolean checkPrivilegeDirectOrInherited(String roleName, String privilege,

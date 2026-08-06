@@ -1603,16 +1603,20 @@ class CastEvaluator {
             } else if (elem instanceof java.util.List<?>) {
                 java.util.List<?> nested = (java.util.List<?>) elem;
                 sb.append(formatListAsPgArray(nested));
-            } else if (elem instanceof String || elem instanceof AstExecutor.PgRow
-                    || elem instanceof java.util.Map<?, ?>) {
-                // A composite element renders as (f1,f2), whose commas make it need quoting
+            } else {
+                // A composite element renders as (f1,f2), whose commas make it need quoting, and
+                // so does every other value whose text carries a space, a brace or a quote of its
+                // own. Appending the object instead wrote an hstore, an interval and a tsvector
+                // into the literal bare, where nothing could read them back out.
                 String s;
                 if (elem instanceof AstExecutor.PgRow) {
                     s = ((AstExecutor.PgRow) elem).toPgText();
                 } else if (elem instanceof java.util.Map<?, ?>) {
                     s = AstExecutor.PgRow.fromFieldMap((java.util.Map<?, ?>) elem).toPgText();
-                } else {
+                } else if (elem instanceof String) {
                     s = (String) elem;
+                } else {
+                    s = TypeCoercion.toString(elem);
                 }
                 // Quote strings that contain special chars
                 if (s.contains(",") || s.contains("{") || s.contains("}") || s.contains("\"") || s.contains(" ") || s.isEmpty()) {
@@ -1620,8 +1624,6 @@ class CastEvaluator {
                 } else {
                     sb.append(s);
                 }
-            } else {
-                sb.append(elem);
             }
         }
         sb.append("}");

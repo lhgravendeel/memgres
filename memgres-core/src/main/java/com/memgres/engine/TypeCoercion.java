@@ -951,7 +951,11 @@ public final class TypeCoercion {
         return prolepticYear > 0 ? prolepticYear : 1 - prolepticYear;
     }
 
-    private static String toString(Object val) {
+    /**
+     * A value written the way PostgreSQL writes it, for the places that build a literal out of
+     * several values — an array, a composite — rather than casting one on its own.
+     */
+    static String toString(Object val) {
         if (val instanceof Double) return PgFloatFormat.float8out((Double) val);
         if (val instanceof Float) return PgFloatFormat.float4out((Float) val);
         if (val instanceof LocalDate) return formatIsoDate((LocalDate) val);
@@ -1034,16 +1038,19 @@ public final class TypeCoercion {
                 AstExecutor.PgRow row = (AstExecutor.PgRow) elem;
                 String rowStr = toString(row);
                 sb.append("\"").append(rowStr.replace("\\", "\\\\").replace("\"", "\\\"")).append("\"");
-            } else if (elem instanceof String) {
-                String s = (String) elem;
+            } else {
+                // Every other element is written the way the value itself is written, and quoted
+                // when its text could not be read back otherwise. Appending the object instead
+                // gave an array of hstore the element's Java identity of quoting -- none -- so
+                // {"a"=>"1"} read back as the single word a, and an interval or a tsvector inside
+                // an array lost the quotes that hold it together.
+                String s = elem instanceof String ? (String) elem : toString(elem);
                 // The literal string "NULL" must be quoted to distinguish it from SQL NULL
                 if (s.startsWith("(") || s.contains(",") || s.contains("{") || s.contains("}") || s.contains("\"") || s.contains("\\") || s.contains(" ") || s.isEmpty() || s.equalsIgnoreCase("NULL")) {
                     sb.append("\"").append(s.replace("\\", "\\\\").replace("\"", "\\\"")).append("\"");
                 } else {
                     sb.append(s);
                 }
-            } else {
-                sb.append(elem);
             }
         }
         sb.append("}");
