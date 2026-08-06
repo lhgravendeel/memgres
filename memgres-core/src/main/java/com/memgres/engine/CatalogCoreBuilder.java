@@ -87,6 +87,11 @@ class CatalogCoreBuilder {
             {6153, 4534, "_tstzmultirange", "d"},
             {6155, 4535, "_datemultirange", "i"},
             {6157, 4536, "_int8multirange", "d"},
+            // hstore is an extension type, so PostgreSQL's OID for it and for its array differ
+            // from installation to installation; memgres gives both a fixed one of its own. What
+            // has to be true either way is that following hstore's typarray reaches a type, and
+            // that an array of hstore can be named at all.
+            {90002, 90001, "_hstore", "i"},
     };
 
     /** element type OID -> its array type OID, for pg_type.typarray. */

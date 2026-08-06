@@ -488,6 +488,7 @@ class PgWireValueFormatter {
             case BYTEA: return DataType.BYTEA_ARRAY;
             case INTERVAL: return DataType.INTERVAL_ARRAY;
             case JSON: return DataType.JSON_ARRAY;
+            case HSTORE: return DataType.HSTORE_ARRAY;
             case JSONB: return DataType.JSONB_ARRAY;
             case INET: return DataType.INET_ARRAY;
             default: return null;
