@@ -590,6 +590,17 @@ class CastEvaluator {
                 if (val instanceof CitextValue) return val;
                 return new CitextValue(val.toString());
             }
+            case "\"char\"": {
+                // PostgreSQL's own single byte. A longer string keeps its first character, and a
+                // number is the character that code stands for -- which is how the catalogs read
+                // 'i' out of provolatile and how 65 is written A.
+                if (val instanceof Number) {
+                    int code = ((Number) val).intValue() & 0xFF;
+                    return code == 0 ? "" : String.valueOf((char) code);
+                }
+                String written = TypeCoercion.toString(val);
+                return written.isEmpty() ? written : written.substring(0, 1);
+            }
             case "text":
             case "varchar":
             case "character varying":

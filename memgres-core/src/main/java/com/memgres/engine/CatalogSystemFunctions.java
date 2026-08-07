@@ -1102,6 +1102,10 @@ class CatalogSystemFunctions {
                 return "numeric";
             case TEXT:
                 return "text";
+            case INTERNAL_CHAR:
+                // The one type PostgreSQL names with quotes, because char without them is the
+                // blank-padded string type. Printing it bare named the wrong type.
+                return "\"char\"";
             case VARCHAR:
                 return "character varying";
             case CHAR:

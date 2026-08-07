@@ -433,6 +433,129 @@ class BinaryOpEvaluator {
      * <p>Only operands whose type is actually declared take part: a bare literal is {@code unknown}
      * and PostgreSQL resolves it against the other side, so {@code '5' = 5} stays legal.
      */
+    /**
+     * Refuses a {@code ||} that names no operator, or more than one.
+     *
+     * <p>PostgreSQL declares eleven concatenations and no more, so a pair of types none of them
+     * takes is a pair with nothing to run: neither {@code 1 || now()} nor {@code uuid || inet} is
+     * a concatenation, however readily two values can be written one after the other. Reading the
+     * values and running them together as strings answered for 772 pairs PostgreSQL has none for.
+     *
+     * <p>Only a pair whose types the statement settles is judged, which is the same benefit of the
+     * doubt every other resolution rule here gives.
+     */
+    private void rejectUnresolvableConcat(BinaryExpr bin, RowContext ctx) {
+        concatOutcome(bin, ctx);
+    }
+
+    /**
+     * Which concatenation this {@code ||} means, refusing the pairs PostgreSQL refuses. Answers
+     * UNDECIDED where the statement has not settled both types, which leaves the reading of the
+     * two values to the rules that came before this one.
+     */
+    private ConcatResolution concatOutcome(BinaryExpr bin, RowContext ctx) {
+        if (bin.op() != BinaryExpr.BinOp.CONCAT) return ConcatResolution.UNDECIDED;
+        String lName = declaredTypeForResolution(bin.left(), ctx);
+        String rName = declaredTypeForResolution(bin.right(), ctx);
+        int lOid = operandOid(lName);
+        int rOid = operandOid(rName);
+        if (lOid < 0 || rOid < 0) return ConcatResolution.UNDECIDED;
+        ConcatOperator.Resolution resolution = ConcatOperator.resolve(lOid, rOid);
+        if (resolution.outcome == ConcatOperator.Outcome.NONE) {
+            throw missingOperator(operandName(lName), BinaryExpr.BinOp.CONCAT, operandName(rName));
+        }
+        if (resolution.outcome == ConcatOperator.Outcome.AMBIGUOUS) {
+            throw new MemgresException("operator is not unique: "
+                    + operandName(lName) + " || " + operandName(rName)
+                    + "\n  Hint: Could not choose a best candidate operator."
+                    + " You might need to add explicit type casts.", "42725");
+        }
+        return new ConcatResolution(resolution, lOid, rOid);
+    }
+
+    /** A resolved concatenation, with the types its two operands were written as. */
+    private static final class ConcatResolution {
+        static final ConcatResolution UNDECIDED = new ConcatResolution(null, 0, 0);
+
+        final ConcatOperator.Resolution resolution;
+        final int leftOid;
+        final int rightOid;
+
+        ConcatResolution(ConcatOperator.Resolution resolution, int leftOid, int rightOid) {
+            this.resolution = resolution;
+            this.leftOid = leftOid;
+            this.rightOid = rightOid;
+        }
+
+        boolean is(ConcatOperator.Outcome outcome) {
+            return resolution != null && resolution.outcome == outcome;
+        }
+    }
+
+    /**
+     * An operand read as text for a concatenation. A blank-padded string loses its padding on the
+     * way — PostgreSQL stores a bpchar padded and reads it back trimmed, which is why
+     * {@code 'a'::char(3) || 'b'} is {@code ab} and not {@code a  b}.
+     */
+    private String concatOperandAsText(Object value, int oid) {
+        String written = String.valueOf(executor.castValue(value, "text"));
+        if (oid != DataType.CHAR.getOid()) return written;
+        int end = written.length();
+        while (end > 0 && written.charAt(end - 1) == ' ') end--;
+        return written.substring(0, end);
+    }
+
+    /** The name PostgreSQL prints for an operand type, or "unknown" where none was written. */
+    private static String operandName(String typeName) {
+        if (typeName == null) return "unknown";
+        String bare = canonicalOperandType(typeName);
+        if (wasQuoted(typeName) && "char".equals(bare)) return "\"char\"";
+        return pgName(bare);
+    }
+
+    /** The OID of a written operand type: 0 where the statement said nothing, -1 where this rule cannot tell. */
+    private int operandOid(String typeName) {
+        if (typeName == null) return 0;
+        String t = canonicalOperandType(typeName);
+        // Written with quotes it is PostgreSQL's own single byte; written without, char is the
+        // blank-padded string type. They are different types and only one of them is category Z.
+        if (wasQuoted(typeName)) return "char".equals(t) ? DataType.INTERNAL_CHAR.getOid() : -1;
+        if (t.equals("char") || t.equals("character") || t.equals("bpchar")) {
+            return DataType.CHAR.getOid();
+        }
+        if (t.endsWith("[]")) {
+            DataType element = DataType.fromPgName(t.substring(0, t.length() - 2).trim());
+            DataType array = element == null ? null : DataType.arrayOf(element);
+            return array == null ? -1 : array.getOid();
+        }
+        DataType type = DataType.fromPgName(t);
+        return type == null ? -1 : type.getOid();
+    }
+
+    /**
+     * A written type name reduced to the type itself: without its modifier, and without the quotes
+     * {@code "char"} has to be written with. Leaving those on found no type at all, so the one
+     * pair PostgreSQL most often refuses went unjudged.
+     */
+    private static String canonicalOperandType(String typeName) {
+        String t = typeName.toLowerCase().trim();
+        int paren = t.indexOf('(');
+        if (paren > 0) {
+            int close = t.lastIndexOf(')');
+            String tail = close >= 0 && close + 1 < t.length() ? t.substring(close + 1) : "";
+            t = (t.substring(0, paren) + tail).trim();
+        }
+        if (t.length() > 1 && t.charAt(0) == '"' && t.charAt(t.length() - 1) == '"') {
+            t = t.substring(1, t.length() - 1);
+        }
+        return t;
+    }
+
+    private static boolean wasQuoted(String typeName) {
+        String t = typeName.trim();
+        return t.length() > 1 && t.charAt(0) == '"';
+    }
+
     void rejectCrossCategoryOperator(BinaryExpr bin, RowContext ctx) {
         BinaryExpr.BinOp op = bin.op();
         boolean comparison = isComparison(op) || resolvesThroughEquality(op);
@@ -481,6 +604,7 @@ class BinaryOpEvaluator {
     void rejectUnresolvableOperator(BinaryExpr bin, RowContext ctx) {
         rejectMissingEqualityOperator(bin, ctx);
         rejectCrossCategoryOperator(bin, ctx);
+        rejectUnresolvableConcat(bin, ctx);
     }
 
     /**
@@ -503,6 +627,7 @@ class BinaryOpEvaluator {
                 case INTEGER: return "integer";
                 case FLOAT: return "numeric";
                 case BOOLEAN: return "boolean";
+                case BIT_STRING: return "bit";
                 default: return null;
             }
         }
@@ -538,9 +663,17 @@ class BinaryOpEvaluator {
             List<Expression> elements = ((ArrayExpr) expr).elements;
             if (elements == null || elements.isEmpty()) return null;
             String element = declaredTypeForResolution(elements.get(0), ctx);
-            if (element == null) return null;
             for (int i = 1; i < elements.size(); i++) {
-                if (!element.equals(declaredTypeForResolution(elements.get(i), ctx))) return null;
+                String other = declaredTypeForResolution(elements.get(i), ctx);
+                if (element == null ? other != null : !element.equals(other)) return null;
+            }
+            // Elements that say nothing about themselves are read as text, the preferred type of
+            // the category PostgreSQL settles an untyped literal to: ARRAY['a','b'] is a text[].
+            if (element == null) {
+                for (int i = 0; i < elements.size(); i++) {
+                    if (!isUntypedStringLiteral(elements.get(i))) return null;
+                }
+                element = "text";
             }
             return element + "[]";
         }
@@ -560,6 +693,7 @@ class BinaryOpEvaluator {
                 if (idx < 0) continue;
                 if (!columnTypeIsDeclared(b.table(), idx)) return null;
                 DataType t = b.table().getColumns().get(idx).getType();
+                if (t == DataType.INTERNAL_CHAR) return "\"char\"";
                 return t == null ? null : t.getPgName();
             }
         }
@@ -711,6 +845,9 @@ class BinaryOpEvaluator {
             case "timestamptz": return "timestamp with time zone";
             case "time": return "time without time zone";
             case "timetz": return "time with time zone";
+            case "\"char\"": return "\"char\"";
+            case "varbit": return "bit varying";
+            case "citext": return "citext";
             default: return t;
         }
     }
@@ -843,9 +980,35 @@ class BinaryOpEvaluator {
         // the type could never have parsed.
         rejectMissingEqualityOperator(bin, ctx);
         rejectCrossCategoryOperator(bin, ctx);
+        ConcatResolution concat = concatOutcome(bin, ctx);
 
         Object left = executor.evalExpr(bin.left(), ctx);
         Object right = executor.evalExpr(bin.right(), ctx);
+
+        // The two concatenations that take a text on one side read the other as text too, and
+        // read it with that type's own output function. Running the stored values together
+        // instead printed whatever Java made of them — a timestamp as 2020-01-01T00:00, a real as
+        // 1.0 — and a bytea beside a text came back a bytea rather than the text it prints as.
+        if (concat.is(ConcatOperator.Outcome.TEXT_CONCAT)) {
+            if (left == null || right == null) return null;
+            return concatOperandAsText(left, concat.leftOid)
+                    + concatOperandAsText(right, concat.rightOid);
+        }
+        // An operator declared over one type reads both operands as it, so an operand the
+        // statement left untyped is that type's input to parse — and 'a' is no more a jsonb than
+        // it is a binary digit. Running the two values together accepted both.
+        if (concat.is(ConcatOperator.Outcome.SAME_TYPE) && concat.resolution.sameType != null) {
+            if (concat.leftOid == 0) left = executor.castValue(left, concat.resolution.sameType);
+            if (concat.rightOid == 0) right = executor.castValue(right, concat.resolution.sameType);
+        }
+        // An array concatenation takes its element type from the left operand, so an element
+        // joined on the right is read as that type — and a blank-padded string loses its padding
+        // going in. Written on the left it is the element type, and keeps it.
+        if (concat.is(ConcatOperator.Outcome.ARRAY) && right != null
+                && concat.rightOid == DataType.CHAR.getOid()
+                && concat.leftOid != DataType.CHAR.getOid()) {
+            right = concatOperandAsText(right, concat.rightOid);
+        }
 
         // A bare string literal has no type of its own. PostgreSQL resolves it against the other
         // operand; guessing from its shape instead picks a type the query never mentioned, which

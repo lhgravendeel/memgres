@@ -260,7 +260,9 @@ class PgCatalogCompletenessTest {
     void theCollationCatalogOffersNothingPgWouldReject() throws SQLException {
         assertEquals(0, count("SELECT count(*) FROM pg_collation WHERE collname IN"
                 + " ('C.UTF-8', 'C.utf8', 'en_US.UTF-8', 'en_US.utf8')"));
-        assertEquals("b,true,6", one("SELECT collprovider || ',' || collisdeterministic || ','"
+        // collprovider is a "char", and PostgreSQL will not choose between text || text and
+        // text || anynonarray for one, so a client has to say which it means.
+        assertEquals("b,true,6", one("SELECT collprovider::text || ',' || collisdeterministic || ','"
                 + " || collencoding FROM pg_collation WHERE collname = 'ucs_basic'"));
         assertEquals("en-US", one("SELECT colllocale FROM pg_collation"
                 + " WHERE collname = 'en-US-x-icu'"));
@@ -363,7 +365,7 @@ class PgCatalogCompletenessTest {
                         + " AND a.attname IN ('indexprs','indpred','indcheckxmin')"
                         + " ORDER BY a.attname")));
         assertEquals("pg_node_tree,-1,b,Z", one(
-                "SELECT typname || ',' || typlen || ',' || typtype || ',' || typcategory"
+                "SELECT typname || ',' || typlen || ',' || typtype::text || ',' || typcategory::text"
                 + " FROM pg_type WHERE typname = 'pg_node_tree'"));
     }
 
