@@ -287,22 +287,25 @@ class RoutineDefinitionTest {
     }
 
     /**
-     * A cost nobody wrote is the language's own — 1 where the call is compiled in, 100 where it is
-     * interpreted. Taking 100 for every language made each SQL function claim to be a hundred
-     * times the work it is, and printed a COST clause the definition never carried.
+     * A cost nobody wrote is the language's own. PostgreSQL charges 100 for a routine it has to
+     * interpret, SQL and PL/pgSQL alike, and 1 only where the call is compiled in — and it leaves
+     * the clause off the deparsed definition when the cost is that default.
      */
     @Test
     void anUnwrittenCostIsTheLanguagesOwn() throws Exception {
-        exec("CREATE FUNCTION rd_f() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$");
-        assertEquals("1", scalar("SELECT procost::text FROM pg_proc WHERE proname = 'rd_f'"));
-        assertFalse(scalar("SELECT pg_get_functiondef(oid) FROM pg_proc WHERE proname = 'rd_f'")
-                .contains("COST"));
-        exec("DROP FUNCTION rd_f()");
-        exec("CREATE FUNCTION rd_f() RETURNS int LANGUAGE plpgsql AS $$ BEGIN RETURN 1; END $$");
-        assertEquals("100", scalar("SELECT procost::text FROM pg_proc WHERE proname = 'rd_f'"));
-        // One that was written is kept whatever the language.
+        for (String lang : new String[]{"sql", "plpgsql"}) {
+            exec("DROP FUNCTION IF EXISTS rd_f()");
+            exec("CREATE FUNCTION rd_f() RETURNS int LANGUAGE " + lang
+                    + (lang.equals("sql") ? " AS $$ SELECT 1 $$" : " AS $$ BEGIN RETURN 1; END $$"));
+            assertEquals("100", scalar("SELECT procost::text FROM pg_proc WHERE proname = 'rd_f'"), lang);
+            assertFalse(scalar("SELECT pg_get_functiondef(oid) FROM pg_proc WHERE proname = 'rd_f'")
+                    .contains("COST"), lang);
+        }
+        // One that was written is kept, and is printed because it is not the default.
         exec("DROP FUNCTION rd_f()");
         exec("CREATE FUNCTION rd_f() RETURNS int LANGUAGE sql COST 7 AS $$ SELECT 1 $$");
         assertEquals("7", scalar("SELECT procost::text FROM pg_proc WHERE proname = 'rd_f'"));
+        assertTrue(scalar("SELECT pg_get_functiondef(oid) FROM pg_proc WHERE proname = 'rd_f'")
+                .contains("COST 7"));
     }
 }

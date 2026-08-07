@@ -439,6 +439,22 @@ class DdlParser {
     }
 
     /**
+     * The words of one signature parameter with its name removed, if it had one.
+     *
+     * <p>A signature may name its parameters — the identity arguments memgres itself deparses do,
+     * which is what a dump writes — and the name is no part of the type. It is the first word,
+     * unless that word begins a type whose own name is two words or is about to take a modifier
+     * or a pair of brackets.
+     */
+    private static java.util.List<String> withoutParameterName(java.util.List<String> words) {
+        if (words.size() < 2) return words;
+        String first = words.get(0);
+        String second = words.get(1);
+        if (isMultiWordTypeStart(first) || "(".equals(second) || "[".equals(second)) return words;
+        return words.subList(1, words.size());
+    }
+
+    /**
      * Parse parameter types from DROP FUNCTION name(type1, type2, ...).
      * Supports optional parameter modes (IN, OUT, INOUT, VARIADIC) and parameter names.
      * Returns a list of type names (excluding OUT parameters).
@@ -453,22 +469,26 @@ class DdlParser {
         while (!parser.isAtEnd() && !parser.check(TokenType.RIGHT_PAREN)) {
             // Skip optional mode keywords
             String mode = "IN";
-            if (parser.checkKeyword("IN") || parser.checkKeyword("OUT")
-                    || parser.checkKeyword("INOUT") || parser.checkKeyword("VARIADIC")) {
+            if (parser.checkKeyword("IN") || parser.checkKeyword("INOUT")
+                    || parser.checkKeyword("VARIADIC") || parser.checkIdentifier("OUT")
+                    || parser.checkIdentifier("INOUT") || parser.checkIdentifier("VARIADIC")) {
                 mode = parser.advance().value().toUpperCase();
+                if ("IN".equals(mode) && (parser.checkIdentifier("OUT") || parser.checkKeyword("OUT"))) {
+                    parser.advance();
+                    mode = "INOUT";
+                }
             }
-            // Collect type tokens until comma or right paren
-            StringBuilder typeBuf = new StringBuilder();
+            // Collect the parameter's words until comma or right paren
+            java.util.List<String> words = new java.util.ArrayList<>();
             int depth = 0;
             while (!parser.isAtEnd()) {
                 if (depth == 0 && (parser.check(TokenType.COMMA) || parser.check(TokenType.RIGHT_PAREN))) break;
                 if (parser.check(TokenType.LEFT_PAREN)) depth++;
                 if (parser.check(TokenType.RIGHT_PAREN)) depth--;
-                if (typeBuf.length() > 0) typeBuf.append(" ");
-                typeBuf.append(parser.advance().value());
+                words.add(parser.advance().value());
             }
             if (!"OUT".equals(mode)) {
-                types.add(typeBuf.toString().trim());
+                types.add(String.join(" ", withoutParameterName(words)));
             }
             parser.match(TokenType.COMMA);
         }
@@ -2058,6 +2078,7 @@ class DdlParser {
             case "timestamp":     // timestamp with/without time zone
             case "time":          // time with/without time zone
             case "bit":           // bit varying
+            case "interval":      // interval day to second
                 return true;
             default:
                 return false;
@@ -2083,10 +2104,24 @@ class DdlParser {
             if (!parser.check(TokenType.RIGHT_PAREN)) {
                 // Parse parameter types, skipping optional IN/OUT/INOUT/VARIADIC mode and optional param name
                 while (true) {
-                    // Skip parameter mode keywords if present
-                    if (parser.checkKeyword("IN") || parser.checkKeyword("OUT")
-                            || parser.checkKeyword("INOUT") || parser.checkKeyword("VARIADIC")) {
-                        parser.advance();
+                    // A routine is identified by what a call passes it, so an OUT parameter may be
+                    // written in the signature and is not part of what the signature matches.
+                    // Matching on it too meant a signature memgres itself deparses — which names
+                    // the OUT parameters, as PostgreSQL's does — named no routine memgres could
+                    // find, and a dump of a function with OUT parameters would not restore.
+                    // OUT is no keyword to the lexer, so it has to be recognised as the
+                    // identifier it arrives as; checking only for a keyword never matched it and
+                    // the word was read as the first half of the parameter's type.
+                    String paramMode = "IN";
+                    if (parser.checkKeyword("IN") || parser.checkKeyword("INOUT")
+                            || parser.checkKeyword("VARIADIC") || parser.checkIdentifier("OUT")
+                            || parser.checkIdentifier("INOUT") || parser.checkIdentifier("VARIADIC")) {
+                        paramMode = parser.advance().value().toUpperCase();
+                        if ("IN".equals(paramMode) && (parser.checkIdentifier("OUT")
+                                || parser.checkKeyword("OUT"))) {
+                            parser.advance();
+                            paramMode = "INOUT";
+                        }
                     }
                     // Read the type name; could be multi-word (e.g., "double precision", "character varying")
                     // But first, check if next token is a name followed by a type (e.g., "x integer")
@@ -2112,7 +2147,7 @@ class DdlParser {
                         // first IS the type (no param name)
                         typeName.append(first);
                     }
-                    paramTypes.add(typeName.toString().trim());
+                    if (!"OUT".equals(paramMode)) paramTypes.add(typeName.toString().trim());
                     if (parser.check(TokenType.COMMA)) {
                         parser.advance(); // consume ','
                     } else {

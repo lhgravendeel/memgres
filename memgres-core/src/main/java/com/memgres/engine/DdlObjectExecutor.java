@@ -940,10 +940,12 @@ class DdlObjectExecutor {
         return QueryResult.command(QueryResult.Type.CREATE_FUNCTION, 0);
     }
 
-    /** What a routine costs when its definition did not say, which depends on its language. */
+    /**
+     * What a routine costs when its definition did not say. PostgreSQL charges 1 for the languages
+     * whose calls are compiled in and 100 for every other, SQL included.
+     */
     static double defaultCostForLanguage(String language) {
-        return "sql".equalsIgnoreCase(language) || "internal".equalsIgnoreCase(language)
-                || "c".equalsIgnoreCase(language) ? 1 : 100;
+        return "internal".equalsIgnoreCase(language) || "c".equalsIgnoreCase(language) ? 1 : 100;
     }
 
     /** The languages a stock PostgreSQL has; memgres runs sql and plpgsql bodies itself. */

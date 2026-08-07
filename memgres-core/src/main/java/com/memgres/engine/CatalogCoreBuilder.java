@@ -2002,60 +2002,48 @@ class CatalogCoreBuilder {
                     break;
             }
             String kind = fn.isProcedure() ? "p" : fn.isWindowFunction() ? "w" : "f";
-            // Count arguments and build proargnames, proargmodes, proallargtypes
-            short nargs = 0;
+            // The parameters, split the way PostgreSQL splits them. A RETURNS TABLE column is
+            // recorded as mode 't' rather than 'o': it is a column of the result, not a parameter,
+            // which is why it is neither counted nor printed among the arguments.
+            List<PgFunction.Param> params = fn.getParams() != null ? fn.getParams() : Cols.listOf();
+            boolean tableResult = "TABLE".equalsIgnoreCase(fn.getReturnType());
+            List<Object> modes = new ArrayList<>();
+            List<Object> allTypes = new ArrayList<>();
+            List<Object> names = new ArrayList<>();
             StringBuilder argTypesBuilder = new StringBuilder();
-            String proargnames = null;
-            String proargmodes = null;
-            String proallargtypes = null;
-            if (fn.getParams() != null && !fn.getParams().isEmpty()) {
-                nargs = (short) fn.getParams().size();
-                // proargtypes lists the IN arguments; an OUT-only parameter is carried by
-                // proallargtypes instead, exactly as PG splits them.
-                for (PgFunction.Param p : fn.getParams()) {
-                    String mode = p.mode() == null ? "in" : p.mode().toLowerCase();
-                    if (mode.equals("out")) continue;
+            short nargs = 0;
+            short ndefaults = 0;
+            int variadicElem = 0;
+            int outCount = 0;
+            int lastOutType = 0;
+            for (PgFunction.Param p : params) {
+                String mode = paramModeLetter(p.mode());
+                if (tableResult && "o".equals(mode)) mode = "t";
+                int typeOid = resolveTypeOidByName(p.typeName());
+                modes.add(mode);
+                allTypes.add(typeOid);
+                names.add(p.name() != null ? p.name() : "");
+                // proargtypes names what a call passes: everything but the OUT and TABLE entries.
+                if (!"o".equals(mode) && !"t".equals(mode)) {
                     if (argTypesBuilder.length() > 0) argTypesBuilder.append(' ');
-                    argTypesBuilder.append(resolveTypeOidByName(p.typeName()));
+                    argTypesBuilder.append(typeOid);
+                    nargs++;
                 }
-                // Build proargnames: {name1,name2,...} — populated when any param has a name
-                boolean hasNames = fn.getParams().stream().anyMatch(p -> p.name() != null && !p.name().isEmpty());
-                if (hasNames) {
-                    StringBuilder namesBuilder = new StringBuilder("{");
-                    for (int pi = 0; pi < fn.getParams().size(); pi++) {
-                        if (pi > 0) namesBuilder.append(",");
-                        PgFunction.Param p = fn.getParams().get(pi);
-                        namesBuilder.append(p.name() != null ? p.name() : "");
-                    }
-                    namesBuilder.append("}");
-                    proargnames = namesBuilder.toString();
+                if ("o".equals(mode) || "b".equals(mode)) {
+                    outCount++;
+                    lastOutType = typeOid;
                 }
-                // Build proargmodes: {i,o,...} — populated when any param is not IN
-                boolean hasNonIn = fn.getParams().stream().anyMatch(p -> p.mode() != null
-                        && !p.mode().equalsIgnoreCase("IN") && !p.mode().isEmpty());
-                if (hasNonIn) {
-                    StringBuilder modesBuilder = new StringBuilder("{");
-                    StringBuilder allTypesBuilder = new StringBuilder("{");
-                    for (int pi = 0; pi < fn.getParams().size(); pi++) {
-                        if (pi > 0) { modesBuilder.append(","); allTypesBuilder.append(","); }
-                        PgFunction.Param p = fn.getParams().get(pi);
-                        String mode = p.mode() != null ? p.mode().toLowerCase() : "i";
-                        switch (mode) {
-                            case "in": mode = "i"; break;
-                            case "out": mode = "o"; break;
-                            case "inout": mode = "b"; break;
-                            case "variadic": mode = "v"; break;
-                            default: break; // already single-char
-                        }
-                        modesBuilder.append(mode);
-                        allTypesBuilder.append(resolveTypeOidByName(p.typeName()));
-                    }
-                    modesBuilder.append("}");
-                    allTypesBuilder.append("}");
-                    proargmodes = modesBuilder.toString();
-                    proallargtypes = allTypesBuilder.toString();
-                }
+                if ("v".equals(mode)) variadicElem = elementTypeOid(p.typeName(), typeOid);
+                if (p.defaultExpr() != null && !p.defaultExpr().isEmpty()) ndefaults++;
             }
+            // The three array columns are NULL where they would say nothing: no mode but IN, and
+            // no name at all. proallargtypes goes with proargmodes, since it is what the modes
+            // are modes of.
+            boolean anyNonIn = modes.stream().anyMatch(m -> !"i".equals(m));
+            boolean anyNamed = names.stream().anyMatch(n -> !n.toString().isEmpty());
+            List<Object> proargmodes = anyNonIn ? modes : null;
+            List<Object> proallargtypes = anyNonIn ? allTypes : null;
+            List<Object> proargnames = anyNamed ? names : null;
             String fnOwner = fn.getOwner();
             int fnOwnerOid = (fnOwner != null && !fnOwner.isEmpty()) ? oids.oid("role:" + fnOwner) : 10;
             // Build proconfig from function-level SET clauses (e.g., "work_mem=256MB")
@@ -2071,34 +2059,59 @@ class CatalogCoreBuilder {
                 sb.append("}");
                 proconfig = sb.toString();
             }
-            // Build proargdefaults: populate when any param has a default expression
+            // proargdefaults is one expression per defaulted argument, and the reader splits it on
+            // '|', the same as for a built-in. Joining them with a space and wrapping each in
+            // node-tree punctuation meant the reader saw one default for the first of them and
+            // printed the punctuation as though it were the expression.
             String proargdefaults = null;
-            if (fn.getParams() != null) {
-                StringBuilder defs = new StringBuilder();
-                for (PgFunction.Param p : fn.getParams()) {
-                    if (p.defaultExpr() != null && !p.defaultExpr().isEmpty()) {
-                        if (defs.length() > 0) defs.append(" ");
-                        defs.append("({CONST :constvalue ").append(p.defaultExpr()).append("})");
-                    }
+            StringBuilder defs = new StringBuilder();
+            for (PgFunction.Param p : params) {
+                if (p.defaultExpr() != null && !p.defaultExpr().isEmpty()) {
+                    if (defs.length() > 0) defs.append("|");
+                    defs.append(p.defaultExpr());
                 }
-                if (defs.length() > 0) proargdefaults = defs.toString();
             }
+            if (defs.length() > 0) proargdefaults = defs.toString();
             // prosqlbody: populated for BEGIN ATOMIC functions
             String prosqlbody = fn.isAtomicBody() ? fn.getBody() : null;
-            // A procedure returns void in PG's catalog; a function without a declared return
-            // type is deriving one from its OUT parameters, which makes it a record.
-            int retType = fn.getReturnType() != null ? resolveTypeOidByName(fn.getReturnType())
-                    : (fn.isProcedure() ? 2278 : 2249);
+            // What comes back, and whether it comes back a row at a time. SETOF is not part of the
+            // type — it is the proretset flag beside it — so recording "SETOF int" as the type
+            // named no type at all, and a client reading prorettype got 0 for every set-returning
+            // function it asked about.
+            String declared = fn.getReturnType();
+            boolean retset = false;
+            int retType;
+            if (fn.isProcedure()) {
+                // A procedure returns nothing, unless it has an OUT or INOUT parameter to hand
+                // back through, which makes its result a record however many there are.
+                retType = outCount > 0 ? 2249 : 2278;
+            } else if (tableResult) {
+                retType = 2249;
+                retset = true;
+            } else if (declared != null && declared.length() > 6
+                    && declared.regionMatches(true, 0, "SETOF ", 0, 6)) {
+                retType = resolveTypeOidByName(declared.substring(6).trim());
+                retset = true;
+            } else if (declared != null && !declared.isEmpty()) {
+                retType = resolveTypeOidByName(declared);
+            } else {
+                // No declared result: it is the OUT parameters, one of which is its own type and
+                // several of which together are a record.
+                retType = outCount == 1 ? lastOutType : (outCount > 1 ? 2249 : 2278);
+            }
+            // A set-returning function is estimated at a thousand rows unless it said otherwise;
+            // one that returns a single value has no row estimate at all.
+            double prorows = fn.getRows() > 0 ? fn.getRows() : (retset ? 1000 : 0);
             // Use unique OID key for overloaded functions (append param count)
             int idx = overloadIndex.merge(fn.getName(), 0, (a, b) -> a + 1);
             String oidKey = idx == 0 ? "proc:" + fn.getName() : "proc:" + fn.getName() + "#" + idx;
             table.insertRow(new Object[]{
                     oids.oid(oidKey), fn.getName(), funcNs, fnOwnerOid,
-                    langOid, fn.getCost(), fn.getRows(), 0, "-", kind,
-                    fn.isSecurityDefiner(), fn.isLeakproof(), fn.isStrict(), false,
+                    langOid, fn.getCost(), prorows, variadicElem, "-", kind,
+                    fn.isSecurityDefiner(), fn.isLeakproof(), fn.isStrict(), retset,
                     fn.getVolatility() != null ? fn.getVolatility().substring(0, 1).toLowerCase() : "v",
                     fn.getParallel() != null ? fn.getParallel().substring(0, 1).toLowerCase() : "u",
-                    nargs, (short) 0, retType,
+                    nargs, ndefaults, retType,
                     oidvector(argTypesBuilder.toString()), proallargtypes, proargmodes, proargnames,
                     proargdefaults, null,
                     fn.getBody(), null, prosqlbody, proconfig, null, 1
@@ -2744,9 +2757,57 @@ class CatalogCoreBuilder {
     }
 
     /** Resolve a type name (e.g., "int", "text", "integer") to its PG OID. */
+    /** The single letter pg_proc records a parameter's mode as. */
+    private static String paramModeLetter(String mode) {
+        String m = mode == null ? "in" : mode.toLowerCase().trim();
+        switch (m) {
+            case "": case "in": return "i";
+            case "out": return "o";
+            case "inout": return "b";
+            case "variadic": return "v";
+            default: return m;   // already a letter
+        }
+    }
+
+    /**
+     * What a VARIADIC parameter's tail collects into, which is what provariadic names.
+     *
+     * <p>PostgreSQL records the ELEMENT type, not the array the parameter was declared as: a
+     * {@code VARIADIC c int[]} has provariadic 23, not 1007. {@code "any"} is its own element type.
+     */
+    private int elementTypeOid(String declaredTypeName, int declaredOid) {
+        if (declaredTypeName != null) {
+            String t = declaredTypeName.trim();
+            if (t.endsWith("[]")) return resolveTypeOidByName(t.substring(0, t.length() - 2));
+        }
+        DataType arr = DataType.fromOid(declaredOid);
+        DataType elem = arr == null ? null : DataType.elementOf(arr);
+        return elem != null ? elem.getOid() : declaredOid;
+    }
+
     private int resolveTypeOidByName(String typeName) {
         if (typeName == null) return 0;
         String lower = typeName.toLowerCase().trim();
+        // pg_proc records a type OID and has nowhere to put a modifier, so numeric(10,2) is the
+        // numeric type. Resolving the written name whole found nothing for any of them.
+        int paren = lower.indexOf('(');
+        if (paren > 0) {
+            int close = lower.lastIndexOf(')');
+            String tail = close >= 0 && close + 1 < lower.length() ? lower.substring(close + 1) : "";
+            lower = (lower.substring(0, paren) + tail).trim();
+        }
+        // The fields an interval was narrowed to are a qualifier the same way a precision is:
+        // "interval day to second" is the interval type, and pg_proc has nowhere to say more.
+        if (lower.startsWith("interval ")) lower = "interval";
+        // An array of a type is a type of its own, with its own OID. Resolving the whole written
+        // name found nothing, so every array-typed parameter and result was recorded as OID 0 —
+        // a type a client cannot look up and cannot name.
+        if (lower.endsWith("[]")) {
+            int elem = resolveTypeOidByName(lower.substring(0, lower.length() - 2));
+            DataType elemType = elem == 0 ? null : DataType.fromOid(elem);
+            DataType arrayType = elemType == null ? null : DataType.arrayOf(elemType);
+            return arrayType != null ? arrayType.getOid() : 0;
+        }
         // Handle common aliases
         switch (lower) {
             case "int": case "integer": case "int4": return 23;

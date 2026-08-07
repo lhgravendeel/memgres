@@ -1195,6 +1195,10 @@ class CastEvaluator {
                 if (val instanceof RegtypeValue) return val;
                 if (val instanceof Number) {
                     int oid = ((Number) val).intValue();
+                    // Zero is no type at all. PostgreSQL prints it as a dash, which is what a
+                    // column that means "none of them" — provariadic on a routine with no
+                    // VARIADIC parameter — reads as; printing "0" named a type nobody has.
+                    if (oid == 0) return new RegtypeValue(0, "-");
                     String name = typeNameForOid(oid);
                     return new RegtypeValue(oid, name != null ? name : String.valueOf(oid));
                 }

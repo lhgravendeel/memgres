@@ -245,14 +245,15 @@ class CatalogMetadataFunctions {
             case "pg_get_functiondef": {
                 if (!fn.args().isEmpty()) {
                     Object arg = executor.evalExpr(fn.args().get(0), ctx);
-                    Object[] row = builtinProcRow(arg);
+                    // The row is what PostgreSQL deparses, and it is the only thing that knows
+                    // the whole of a routine. Answering a user-created one from its stub instead
+                    // printed a definition with every attribute dropped.
+                    Object[] row = procRowOf(arg);
                     if (row != null) return buildProcFunctionDef(row);
                     PgFunction func = resolveFunctionValue(arg);
                     if (func != null) {
                         return buildFunctionDef(func);
                     }
-                    row = procRowOf(arg);
-                    if (row != null) return buildProcFunctionDef(row);
                 }
                 // An OID with no pg_proc row behind it is an object PostgreSQL has nothing to
                 // deparse, and it answers NULL rather than an empty definition.
@@ -261,36 +262,32 @@ class CatalogMetadataFunctions {
             case "pg_get_function_arguments": {
                 if (!fn.args().isEmpty()) {
                     Object arg = executor.evalExpr(fn.args().get(0), ctx);
-                    Object[] row = builtinProcRow(arg);
+                    Object[] row = procRowOf(arg);
                     if (row != null) return renderProcArguments(row, true);
                     PgFunction func = resolveFunctionValue(arg);
                     if (func != null) {
                         return buildFunctionArguments(func);
                     }
-                    row = procRowOf(arg);
-                    if (row != null) return renderProcArguments(row, true);
                 }
                 return null;
             }
             case "pg_get_function_identity_arguments": {
                 if (!fn.args().isEmpty()) {
                     Object arg = executor.evalExpr(fn.args().get(0), ctx);
-                    Object[] row = builtinProcRow(arg);
+                    Object[] row = procRowOf(arg);
                     if (row != null) return renderProcArguments(row, false);
                     PgFunction func = resolveFunctionValue(arg);
                     if (func != null) {
                         return buildFunctionIdentityArguments(func);
                     }
-                    row = procRowOf(arg);
-                    if (row != null) return renderProcArguments(row, false);
                 }
                 return null;
             }
             case "pg_get_function_result": {
                 if (!fn.args().isEmpty()) {
                     Object resultArg = executor.evalExpr(fn.args().get(0), ctx);
-                    Object[] builtinRow = builtinProcRow(resultArg);
-                    if (builtinRow != null) return renderProcResult(builtinRow);
+                    Object[] resultRow = procRowOf(resultArg);
+                    if (resultRow != null) return renderProcResult(resultRow);
                     PgFunction func = resolveFunctionValue(resultArg);
                     if (func != null) {
                         String rt = func.getReturnType();
@@ -2602,18 +2599,22 @@ class CatalogMetadataFunctions {
         Object ndefObj = procCol(row, "pronargdefaults");
         int ndefaults = ndefObj instanceof Number ? ((Number) ndefObj).intValue() : 0;
         List<String> defaults = splitProcDefaults(procCol(row, "proargdefaults"));
+        boolean procedure = "p".equals(String.valueOf(procCol(row, "prokind")));
         StringBuilder sb = new StringBuilder();
         int inputCount = 0;
         for (int i = 0; i < types.size(); i++) {
             String mode = i < modes.size() && modes.get(i) != null ? modes.get(i).toString() : "i";
+            // A RETURNS TABLE column is a column of the result, not an argument, so it is named
+            // by the result and nowhere here.
+            if ("t".equals(mode)) continue;
             boolean isOut = "o".equals(mode);
-            // The identity form names only the arguments a call passes, so OUT drops out of it.
-            if (!withDefaults && isOut) continue;
             if (sb.length() > 0) sb.append(", ");
             if ("o".equals(mode)) sb.append("OUT ");
             else if ("b".equals(mode)) sb.append("INOUT ");
             else if ("v".equals(mode)) sb.append("VARIADIC ");
             else if (variadic != 0 && i == types.size() - 1) sb.append("VARIADIC ");
+            // A procedure's inputs are written IN, because a procedure's may also be OUT.
+            else if (procedure) sb.append("IN ");
             if (i < names.size() && names.get(i) != null && !names.get(i).toString().isEmpty()) {
                 sb.append(names.get(i));
                 sb.append(' ');
@@ -2621,6 +2622,8 @@ class CatalogMetadataFunctions {
             Object t = types.get(i);
             sb.append(formatTypeByOid(t instanceof Number ? ((Number) t).intValue() : 0, -1));
             if (!isOut) {
+                // The identity form is the one that names a routine, and a default is no part of
+                // what a routine is called — it is the only thing the two forms differ over.
                 int defaultIdx = inputCount - (countInputArgs(types, modes) - ndefaults);
                 if (withDefaults && defaultIdx >= 0 && defaultIdx < defaults.size()) {
                     sb.append(" DEFAULT ").append(defaults.get(defaultIdx));
@@ -2690,6 +2693,16 @@ class CatalogMetadataFunctions {
         }
         if (attrs.length() > 0) sb.append(attrs).append("\n");
         Object src = procCol(row, "prosrc");
+        // A SQL-standard body is not quoted at all — it is written out as the BEGIN ATOMIC block
+        // it was declared as, and a definition deparsed with it inside dollar quotes would not
+        // re-create the routine. PostgreSQL prints the parsed statements back rather than the
+        // text they were written as, so the block's contents are what memgres was given.
+        Object sqlBody = procCol(row, "prosqlbody");
+        if (sqlBody != null) {
+            String statements = sqlBody.toString().trim().replaceAll("\\s+;", ";");
+            if (!statements.endsWith(";")) statements = statements + ";";
+            return sb.append("BEGIN ATOMIC\n ").append(statements).append("\nEND\n").toString();
+        }
         // The tag names what is being defined, so a procedure's body is quoted $procedure$.
         String tag = procedure ? "$procedure$" : "$function$";
         sb.append("AS ").append(tag).append(src == null ? "" : src).append(tag).append("\n");
@@ -2753,8 +2766,26 @@ class CatalogMetadataFunctions {
 
     /** The return type PostgreSQL prints for a pg_proc row, SETOF included. */
     private String renderProcResult(Object[] row) {
+        // A procedure has no result at all, which PostgreSQL answers NULL for rather than naming
+        // the void its catalog row records.
+        if ("p".equals(String.valueOf(procCol(row, "prokind")))) return null;
         Object rt = procCol(row, "prorettype");
         if (!(rt instanceof Number)) return "";
+        // A RETURNS TABLE result names its columns, and they are the parameters marked 't'.
+        List<Object> modes = asList(procCol(row, "proargmodes"));
+        List<Object> allTypes = asList(procCol(row, "proallargtypes"));
+        List<Object> names = asList(procCol(row, "proargnames"));
+        StringBuilder table = new StringBuilder();
+        for (int i = 0; i < modes.size(); i++) {
+            if (!"t".equals(String.valueOf(modes.get(i)))) continue;
+            if (table.length() > 0) table.append(", ");
+            if (i < names.size() && names.get(i) != null && !names.get(i).toString().isEmpty()) {
+                table.append(names.get(i)).append(' ');
+            }
+            Object t = i < allTypes.size() ? allTypes.get(i) : null;
+            table.append(formatTypeByOid(t instanceof Number ? ((Number) t).intValue() : 0, -1));
+        }
+        if (table.length() > 0) return "TABLE(" + table + ")";
         Object retset = procCol(row, "proretset");
         String name = formatTypeByOid(((Number) rt).intValue(), -1);
         return Boolean.TRUE.equals(retset) ? "SETOF " + name : name;
@@ -2764,7 +2795,7 @@ class CatalogMetadataFunctions {
         int n = 0;
         for (int i = 0; i < types.size(); i++) {
             String mode = i < modes.size() && modes.get(i) != null ? modes.get(i).toString() : "i";
-            if (!"o".equals(mode)) n++;
+            if (!"o".equals(mode) && !"t".equals(mode)) n++;
         }
         return n;
     }
