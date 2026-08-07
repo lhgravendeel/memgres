@@ -532,6 +532,22 @@ class BinaryOpEvaluator {
             DataType result = DataType.fromOid(BuiltinCallTypes.resultType(fn.name(), written));
             return result == null ? null : result.getPgName();
         }
+        if (expr instanceof ArrayExpr && !((ArrayExpr) expr).isRow) {
+            // ARRAY[2.5] is a numeric[], and a call taking an int[] does not take one. Reading the
+            // constructor as saying nothing left every array argument unjudged.
+            List<Expression> elements = ((ArrayExpr) expr).elements;
+            if (elements == null || elements.isEmpty()) return null;
+            String element = declaredTypeForResolution(elements.get(0), ctx);
+            if (element == null) return null;
+            for (int i = 1; i < elements.size(); i++) {
+                if (!element.equals(declaredTypeForResolution(elements.get(i), ctx))) return null;
+            }
+            return element + "[]";
+        }
+        if (expr instanceof SubqueryExpr) {
+            // A scalar subquery is of the type of the one column it answers with.
+            return declaredTypeOfSingleTarget(((SubqueryExpr) expr).subquery(), ctx);
+        }
         if (expr instanceof ColumnRef && ctx != null) {
             ColumnRef ref = (ColumnRef) expr;
             for (RowContext.TableBinding b : ctx.getBindings()) {
@@ -539,9 +555,10 @@ class BinaryOpEvaluator {
                 // binding is a base table costs a walk of the schemas.
                 if (ref.table() != null && !ref.table().equalsIgnoreCase(b.alias())
                         && (b.table() == null || !ref.table().equalsIgnoreCase(b.table().getName()))) continue;
-                if (!isBaseTable(b.table())) continue;
+                if (!readsItsColumnTypes(b.table())) continue;
                 int idx = b.table().getColumnIndex(ref.column());
                 if (idx < 0) continue;
+                if (!columnTypeIsDeclared(b.table(), idx)) return null;
                 DataType t = b.table().getColumns().get(idx).getType();
                 return t == null ? null : t.getPgName();
             }
@@ -556,6 +573,73 @@ class BinaryOpEvaluator {
     private boolean isBaseTable(Table table) {
         if (table == null || table.isFunctionResult() || table.isViewProjection()) return false;
         return executor.baseTableNamed(table.getName()) == table;
+    }
+
+    /**
+     * True when a binding's columns carry a type worth resolving on. A base table's are the ones
+     * the user declared; a derived table's — a subquery in FROM, a CTE — are the ones its own
+     * projection settled, which is as much a part of what the statement says. Only a set-returning
+     * call's columns are left out: those are made up while the result is built.
+     *
+     * <p>Reading a derived column as saying nothing meant the same call was judged one way written
+     * against a table and another written against a subquery over it.
+     */
+    private boolean readsItsColumnTypes(Table table) {
+        return isBaseTable(table) || isDerivedProjection(table);
+    }
+
+    /**
+     * True when a binding is a result the statement itself built — a subquery in FROM, a CTE —
+     * whose columns were typed from its own projection.
+     *
+     * <p>Those types are as much a part of what the statement says as a declared column's are, but
+     * only where the engine worked one out: a column it could not type is text, which is also the
+     * type of every column that really is one. Reading that fallback as a declaration said a
+     * number was a string, and the call or operator over it was resolved against the wrong type
+     * — so text is the one answer this leaves alone, as it was left alone before.
+     */
+    private boolean isDerivedProjection(Table table) {
+        if (table == null || table.isFunctionResult() || table.isViewProjection()) return false;
+        return executor.baseTableNamed(table.getName()) != table;
+    }
+
+    /** Whether the column at {@code index} of {@code table} is one whose type may be read. */
+    private boolean columnTypeIsDeclared(Table table, int index) {
+        if (isBaseTable(table)) return true;
+        DataType t = table.getColumns().get(index).getType();
+        return t != null && t != DataType.TEXT;
+    }
+
+    /**
+     * The type of the one column a subquery answers with, or null when it answers with more than
+     * one or with something this rule cannot type.
+     */
+    private String declaredTypeOfSingleTarget(Statement stmt, RowContext ctx) {
+        if (!(stmt instanceof SelectStmt)) return null;
+        SelectStmt select = (SelectStmt) stmt;
+        List<SelectStmt.SelectTarget> targets = select.targets;
+        if (targets == null || targets.size() != 1) return null;
+        Expression target = targets.get(0).expr();
+        if (target instanceof ColumnRef && select.from != null && select.from.size() == 1) {
+            // The column of a single named table, which is the only FROM this rule reads.
+            ColumnRef ref = (ColumnRef) target;
+            SelectStmt.FromItem source = select.from.get(0);
+            if (!(source instanceof SelectStmt.TableRef)) return null;
+            Table table = executor.baseTableNamed(((SelectStmt.TableRef) source).table);
+            if (table == null) return null;
+            int idx = table.getColumnIndex(ref.column());
+            if (idx < 0) return null;
+            DataType t = table.getColumns().get(idx).getType();
+            return t == null ? null : t.getPgName();
+        }
+        // Anything else is read only where it says what it is on its own. Reading it against the
+        // context outside the subquery types its columns as nothing in particular, and a call
+        // resolved on that guesses -- max(k) over an unknown k reads as the preferred type of the
+        // one category any candidate takes, which is text, for a column that is an integer.
+        if (target instanceof CastExpr || target instanceof Literal) {
+            return declaredTypeForResolution(target, null);
+        }
+        return null;
     }
 
     private static boolean isArithmetic(BinaryExpr.BinOp op) {

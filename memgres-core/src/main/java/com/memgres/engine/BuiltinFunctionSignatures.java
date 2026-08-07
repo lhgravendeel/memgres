@@ -150,6 +150,69 @@ public final class BuiltinFunctionSignatures {
     }
 
     /**
+     * The routines memgres answers without reading their arguments, or by reading a NULL as some
+     * value of its own.
+     *
+     * <p>Every one of them is strict, so PostgreSQL never enters the body with a NULL argument and
+     * the call is NULL. memgres has no other backend to signal, no file to read, no lock keyspace
+     * worth entering — so the implementations answer whatever they were going to answer whatever
+     * they were given, and a NULL argument came back as {@code false}, as the empty array, as the
+     * one role, as the empty string a void function prints. None of those is a value the client
+     * asked about.
+     *
+     * <p>Read off the reference server: every strict pg_catalog function of one to three arguments
+     * was called with NULLs on both, and these are the names where PostgreSQL answered NULL and
+     * memgres answered something. The others already answer NULL of their own accord, which is why
+     * this is a list rather than a rule applied to every call — a rule would have to read every
+     * argument of every built-in call to find the few that need it.
+     */
+    private static final java.util.Set<String> NULL_IN_NULL_OUT =
+            new java.util.HashSet<String>(java.util.Arrays.asList(
+                    "current_schemas", "database_to_xml", "datemultirange", "int4multirange",
+                    "int8multirange", "lo_creat", "lo_create", "lo_export", "lo_import",
+                    "make_time", "nummultirange",
+                    "pg_advisory_lock", "pg_advisory_lock_shared", "pg_advisory_unlock",
+                    "pg_advisory_unlock_shared", "pg_advisory_xact_lock",
+                    "pg_advisory_xact_lock_shared", "pg_blocking_pids", "pg_cancel_backend",
+                    "pg_collation_is_visible", "pg_column_is_updatable", "pg_column_size",
+                    "pg_conversion_is_visible", "pg_database_size", "pg_describe_object",
+                    "pg_encoding_to_char", "pg_function_is_visible", "pg_get_userbyid",
+                    "pg_indexam_has_property", "pg_indexes_size",
+                    "pg_log_backend_memory_contexts", "pg_opclass_is_visible",
+                    "pg_operator_is_visible", "pg_read_binary_file", "pg_read_file",
+                    "pg_relation_filepath", "pg_relation_is_updatable", "pg_relation_size",
+                    "pg_safe_snapshot_blocking_pids", "pg_sleep", "pg_sleep_for",
+                    "pg_sleep_until", "pg_stat_file",
+                    "pg_stat_reset_single_function_counters",
+                    "pg_stat_reset_single_table_counters", "pg_table_is_visible", "pg_table_size",
+                    "pg_tablespace_location", "pg_tablespace_size", "pg_terminate_backend",
+                    "pg_total_relation_size", "pg_try_advisory_lock",
+                    "pg_try_advisory_lock_shared", "pg_try_advisory_xact_lock",
+                    "pg_try_advisory_xact_lock_shared", "pg_ts_config_is_visible",
+                    "pg_ts_dict_is_visible", "pg_ts_parser_is_visible",
+                    "pg_ts_template_is_visible", "pg_type_is_visible", "pg_wal_lsn_diff",
+                    "random_normal", "setseed", "tsmultirange", "tstzmultirange",
+                    "txid_snapshot_xmax", "txid_snapshot_xmin", "xpath", "xpath_exists"));
+
+    /**
+     * The multirange constructors, which collect a tail of ranges. Given one NULL that tail is
+     * itself NULL and the call is NULL; given a NULL beside other ranges the tail is a real array
+     * with a NULL in it, which is a value a multirange cannot hold and is reported as one.
+     */
+    private static final java.util.Set<String> RANGE_COLLECTORS =
+            new java.util.HashSet<String>(java.util.Arrays.asList(
+                    "datemultirange", "int4multirange", "int8multirange", "nummultirange",
+                    "tsmultirange", "tstzmultirange"));
+
+    /** Whether a NULL argument to {@code name} makes the whole call NULL without running it. */
+    static boolean nullArgumentMakesTheCallNull(String name, int arity) {
+        if (name == null) return false;
+        String lower = name.toLowerCase(java.util.Locale.ROOT);
+        if (arity != 1 && RANGE_COLLECTORS.contains(lower)) return false;
+        return NULL_IN_NULL_OUT.contains(lower);
+    }
+
+    /**
      * Whether PostgreSQL declares this signature strict.
      *
      * <p>Strict is the rule and this is the list of exceptions, read off the reference server one

@@ -1157,12 +1157,24 @@ class MultirangeTypesTest {
 
     // ===== GAP AUDIT: Constructor with NULL args =====
 
+    /**
+     * A multirange holds ranges, and NULL is not one. A lone NULL is the variadic tail itself
+     * being NULL, which makes the call NULL; a NULL beside other ranges is a member the value
+     * cannot hold. Dropping it built a multirange out of the rest, so the NULL disappeared.
+     */
     @Test
     void constructorWithNullArgs() throws Exception {
+        try (Statement st = conn.createStatement()) {
+            SQLException e = assertThrows(SQLException.class,
+                    () -> st.executeQuery("SELECT int4multirange(NULL, int4range(1,5))"));
+            assertEquals("22004", e.getSQLState());
+            assertTrue(e.getMessage().contains("multirange values cannot contain null members"),
+                    e.getMessage());
+        }
         try (Statement st = conn.createStatement();
-             ResultSet rs = st.executeQuery("SELECT int4multirange(NULL, int4range(1,5))")) {
+             ResultSet rs = st.executeQuery("SELECT int4multirange(NULL)")) {
             assertTrue(rs.next());
-            assertEquals("{[1,5)}", rs.getString(1));
+            assertNull(rs.getString(1));
         }
     }
 
