@@ -105,79 +105,58 @@ class JsonFunctions {
                                 ? new MemgresException("argument " + (i + 1) + ": key must not be null", "22023")
                                 : new MemgresException("null value not allowed for object key", "22004");
                     }
-                    Object val = executor.evalExpr(fn.args().get(i + 1), ctx);
+                    Object val = wholeRowOrValue(fn.args().get(i + 1), ctx);
                     sb.append("\"").append(key).append("\"").append(jsonb ? ": " : " : ");
                     appendJsonValue(sb, val);
                 }
                 sb.append("}");
-                return sb.toString();
+                // jsonb orders its keys and keeps the last of any repeated one; json keeps what
+                // it was written, repeats and all.
+                return jsonb ? normalizedIfStructured(sb.toString()) : sb.toString();
             }
             case "jsonb_build_array":
             case "json_build_array": {
                 StringBuilder sb = new StringBuilder("[");
                 for (int i = 0; i < fn.args().size(); i++) {
                     if (i > 0) sb.append(", ");
-                    Object val = executor.evalExpr(fn.args().get(i), ctx);
-                    appendJsonValue(sb, val);
+                    appendJsonValue(sb, wholeRowOrValue(fn.args().get(i), ctx));
                 }
                 sb.append("]");
-                return sb.toString();
+                return name.startsWith("jsonb")
+                        ? normalizedIfStructured(sb.toString()) : sb.toString();
             }
             case "to_json":
             case "to_jsonb": {
-                Object arg = executor.evalExpr(fn.args().get(0), ctx);
-                if (arg == null) return "null";
-                if (arg instanceof Number || arg instanceof Boolean) return arg.toString();
-                String s = arg.toString();
-                if ((s.startsWith("{") && s.endsWith("}")) || (s.startsWith("[") && s.endsWith("]"))) return s;
-                return JsonOperations.quote(s);
+                // A row is an object here too. Writing the composite's own text and quoting it
+                // handed a client one string with every field run together inside it.
+                Object arg = wholeRowOrValue(fn.args().get(0), ctx);
+                if (arg == null) return null; // both are strict: nothing in, nothing out
+                StringBuilder sb = new StringBuilder();
+                appendJsonValue(sb, arg);
+                String written = sb.toString();
+                // jsonb is not the text it was handed: it orders its keys and spaces them out.
+                return name.equals("to_jsonb") ? normalizedIfStructured(written) : written;
             }
             case "row_to_json": {
-                // Try whole-row resolution first for ColumnRef args (e.g., row_to_json(x) where x is a table alias)
-                Object arg = null;
-                Expression firstArg = fn.args().get(0);
-                if (firstArg instanceof ColumnRef && ctx != null) {
-                    ColumnRef cref = (ColumnRef) firstArg;
-                    if (cref.table() == null) {
-                        RowContext.TableBinding b = ctx.getBinding(cref.column());
-                        if (b != null && b.table().getColumns().size() >= 1) {
-                            java.util.Map<String, Object> record = new java.util.LinkedHashMap<>();
-                            for (int i = 0; i < b.table().getColumns().size(); i++) {
-                                record.put(b.table().getColumns().get(i).getName(), b.row()[i]);
-                            }
-                            arg = record;
-                        }
-                    }
-                }
-                if (arg == null) arg = executor.evalExpr(firstArg, ctx);
-                if (arg == null) return "null";
+                Object arg = wholeRowOrValue(fn.args().get(0), ctx);
+                if (arg == null) return null; // strict, like the rest of the family
                 boolean pretty = false;
                 if (fn.args().size() >= 2) {
                     Object prettyArg = executor.evalExpr(fn.args().get(1), ctx);
                     if (prettyArg instanceof Boolean) pretty = (Boolean) prettyArg;
                     else if (prettyArg != null) pretty = executor.isTruthy(prettyArg);
                 }
-                if (arg instanceof java.util.Map<?, ?>) {
-                    java.util.Map<?, ?> map = (java.util.Map<?, ?>) arg;
-                    return rowMapToJson(map, pretty, pretty ? 1 : 0);
-                }
+                // A row built by ROW(...) is as much a row as one taken from a table: it names
+                // its fields f1, f2 and so on rather than after any column, and it is still an
+                // object. Reading only the one that came from a table left the other printing
+                // the composite's own text, so row_to_json(row(1)) answered (1) and not {"f1":1}.
+                Map<String, Object> fields = rowFields(arg);
+                if (fields != null) return rowMapToJson(fields, pretty, pretty ? 1 : 0);
                 if (arg instanceof java.util.List<?>) {
                     java.util.List<?> list = (java.util.List<?>) arg;
-                    // ROW(...) value, convert to JSON
-                    String sep = pretty ? ",\n " : ",";
-                    StringBuilder sb = new StringBuilder("{");
-                    if (pretty) sb.append("\n ");
-                    for (int i = 0; i < list.size(); i++) {
-                        if (i > 0) sb.append(sep);
-                        sb.append("\"f").append(i + 1).append("\":");
-                        Object v = list.get(i);
-                        if (v == null) sb.append("null");
-                        else if (v instanceof Number || v instanceof Boolean) sb.append(v);
-                        else sb.append("\"").append(v.toString().replace("\\", "\\\\").replace("\"", "\\\"")).append("\"");
-                    }
-                    if (pretty) sb.append("\n");
-                    sb.append("}");
-                    return sb.toString();
+                    Map<String, Object> named = new java.util.LinkedHashMap<>();
+                    for (int i = 0; i < list.size(); i++) named.put("f" + (i + 1), list.get(i));
+                    return rowMapToJson(named, pretty, pretty ? 1 : 0);
                 }
                 return arg.toString();
             }
@@ -579,16 +558,222 @@ class JsonFunctions {
         }
     }
 
+    /**
+     * The fields of a row value, named as the row names them.
+     *
+     * <p>A row built by {@code ROW(...)} has no names of its own, so PostgreSQL calls its fields
+     * f1, f2 and so on. A row taken from a table or a subquery is named by the columns it came
+     * from, and arrives here already carrying them.
+     */
+    static Map<String, Object> rowFields(Object value) {
+        if (value instanceof Map<?, ?>) {
+            Map<String, Object> named = new java.util.LinkedHashMap<>();
+            for (Map.Entry<?, ?> e : ((Map<?, ?>) value).entrySet()) {
+                named.put(String.valueOf(e.getKey()), e.getValue());
+            }
+            return named;
+        }
+        if (value instanceof AstExecutor.PgRow) {
+            List<Object> values = ((AstExecutor.PgRow) value).values();
+            Map<String, Object> named = new java.util.LinkedHashMap<>();
+            for (int i = 0; i < values.size(); i++) named.put("f" + (i + 1), values.get(i));
+            return named;
+        }
+        return null;
+    }
+
+    /**
+     * jsonb text under the ordering and spacing jsonb keeps. A scalar has neither keys to order
+     * nor members to space, and running one through the normalizer only risked changing it.
+     */
+    static String normalizedIfStructured(String json) {
+        if (json == null) return null;
+        String trimmed = json.trim();
+        return trimmed.startsWith("{") || trimmed.startsWith("[")
+                ? JsonOperations.normalizeJsonb(json) : json;
+    }
+
+    /** An already-shaped value written out as the JSON text it stands for. */
+    String jsonTextOf(Object shaped) {
+        StringBuilder sb = new StringBuilder();
+        appendJsonValue(sb, shaped);
+        return sb.toString();
+    }
+
+    /**
+     * The value of an argument seen as the JSON it stands for. A bare alias names every column of
+     * the relation it is bound to rather than a column of that name, an array is a JSON array and
+     * a composite is a JSON object -- none of the three is the text they print as.
+     */
+    Object wholeRowOrValue(Expression arg, RowContext ctx) {
+        String relation = wholeRowRelation(arg);
+        if (relation != null && ctx != null) {
+            RowContext.TableBinding b = ctx.getBinding(relation);
+            if (b != null && b.table() != null && !b.table().getColumns().isEmpty()) {
+                Map<String, Object> record = new java.util.LinkedHashMap<>();
+                for (int i = 0; i < b.table().getColumns().size(); i++) {
+                    Column column = b.table().getColumns().get(i);
+                    record.put(column.getName(), columnValueAsJson(b.row()[i], column));
+                }
+                return record;
+            }
+        }
+        if (arg instanceof ColumnRef && ctx != null) {
+            ColumnRef ref = (ColumnRef) arg;
+            Column column = ctx.resolveColumnDef(ref.table(), ref.column());
+            if (column != null) return columnValueAsJson(executor.evalExpr(arg, ctx), column);
+        }
+        if (arg instanceof ArrayExpr && ((ArrayExpr) arg).isRow()) {
+            List<Expression> elements = ((ArrayExpr) arg).elements();
+            Map<String, Object> record = new java.util.LinkedHashMap<>();
+            for (int i = 0; i < elements.size(); i++) {
+                record.put("f" + (i + 1), wholeRowOrValue(elements.get(i), ctx));
+            }
+            return record;
+        }
+        Object value = executor.evalExpr(arg, ctx);
+        Map<String, Object> declared = fieldsOfDeclaredComposite(arg, value, ctx);
+        if (declared != null) return declared;
+        return shapedByType(value, executor.binaryOpEvaluator.declaredTypeForResolution(arg, ctx));
+    }
+
+    /** What a column of a table holds, seen as the JSON its declared type stands for. */
+    private Object columnValueAsJson(Object value, Column column) {
+        if (value == null) return null;
+        boolean json = column.getType() == DataType.JSON || column.getType() == DataType.JSONB;
+        if (column.getArrayElementType() != null) {
+            return arrayElements(asArray(value), column.getCompositeTypeName(), json);
+        }
+        if (column.getCompositeTypeName() != null) {
+            Map<String, Object> named = namedComposite(value, column.getCompositeTypeName());
+            if (named != null) return named;
+        }
+        return json ? value : plainIfText(value);
+    }
+
+    /**
+     * The members of an array, each seen as what its own element type stands for: an array of a
+     * composite holds objects rather than the text each of its elements prints as.
+     */
+    private Object arrayElements(Object array, String compositeType, boolean json) {
+        if (!(array instanceof List<?>)) return array;
+        List<Object> converted = new ArrayList<Object>();
+        for (Object element : (List<?>) array) {
+            Map<String, Object> named =
+                    compositeType == null ? null : namedComposite(element, compositeType);
+            if (named != null) converted.add(named);
+            else if (element instanceof List<?>) converted.add(arrayElements(element, compositeType, json));
+            else converted.add(json ? element : plainIfText(element));
+        }
+        return converted;
+    }
+
+    /**
+     * A value seen as the JSON its declared type stands for: an array as an array, and anything
+     * else that is not itself JSON as the text it is. Guessing from the value alone read a text
+     * of braces as an object, so a column holding {@code {1,2}} was written out unquoted.
+     */
+    private static Object shapedByType(Object value, String declaredType) {
+        if (declaredType == null) return value;
+        if (declaredType.endsWith("[]")) return asArray(value);
+        return declaredType.equals("json") || declaredType.equals("jsonb")
+                ? value : plainIfText(value);
+    }
+
+    private static Object plainIfText(Object value) {
+        return value instanceof String ? new PlainText((String) value) : value;
+    }
+
+    private static Object asArray(Object value) {
+        if (!(value instanceof String)) return value;
+        String text = ((String) value).trim();
+        return text.startsWith("{") ? FunctionEvaluator.parseSimplePgArray(text) : value;
+    }
+
+    /** Text that is text whatever it looks like: a string of braces is not an object. */
+    static final class PlainText {
+        final String text;
+
+        PlainText(String text) {
+            this.text = text;
+        }
+
+        @Override
+        public String toString() {
+            return text;
+        }
+    }
+
+    /**
+     * The relation a whole-row argument names, or null when the argument is an ordinary value.
+     * {@code t} and {@code t.*} both stand for every column of the relation t is bound to.
+     */
+    private static String wholeRowRelation(Expression arg) {
+        if (arg instanceof CompositeStarExpr) {
+            return wholeRowRelation(((CompositeStarExpr) arg).expr());
+        }
+        if (arg instanceof WildcardExpr) {
+            WildcardExpr w = (WildcardExpr) arg;
+            return w.catalog() == null && w.schema() == null ? w.table() : null;
+        }
+        if (arg instanceof ColumnRef) {
+            ColumnRef ref = (ColumnRef) arg;
+            if (ref.table() == null) return ref.column();
+            return "*".equals(ref.column()) ? ref.table() : null;
+        }
+        return null;
+    }
+
+    /**
+     * A composite the statement named gives its fields the names it declared them with, so
+     * {@code ROW(1, 'a')::rj_comp} is an object of a and b and not one of f1 and f2.
+     */
+    private Map<String, Object> fieldsOfDeclaredComposite(Expression arg, Object value, RowContext ctx) {
+        String typeName = executor.resolveCompositeTypeName(arg, ctx);
+        return typeName == null ? null : namedComposite(value, typeName);
+    }
+
+    /** A composite value under the names its type declared, whether it is held as a row or as text. */
+    private Map<String, Object> namedComposite(Object value, String typeName) {
+        List<CreateTypeStmt.CompositeField> declared = executor.database.getRowType(typeName);
+        if (declared == null || declared.isEmpty()) return null;
+        List<Object> values;
+        if (value instanceof AstExecutor.PgRow) values = ((AstExecutor.PgRow) value).values();
+        else if (value instanceof List<?>) values = new ArrayList<Object>((List<?>) value);
+        else if (value instanceof String && ((String) value).trim().startsWith("(")) {
+            values = executor.compositeTypeHandler
+                    .parseCompositeToRow(((String) value).trim(), typeName).values();
+        } else return null;
+        if (values.size() != declared.size()) return null;
+        Map<String, Object> named = new LinkedHashMap<>();
+        for (int i = 0; i < declared.size(); i++) named.put(declared.get(i).name(), values.get(i));
+        return named;
+    }
+
     private void appendJsonValue(StringBuilder sb, Object val) {
+        if (val instanceof PlainText) {
+            String text = ((PlainText) val).text;
+            sb.append("\"").append(text.replace("\\", "\\\\").replace("\"", "\\\"")).append("\"");
+            return;
+        }
+        Map<String, Object> fields = rowFields(val);
+        if (fields != null) {
+            // A row inside a row is an object inside an object, not the text a composite prints as.
+            sb.append(rowMapToJson(fields, false, 0));
+            return;
+        }
         if (val == null) {
             sb.append("null");
+        } else if (val instanceof byte[]) {
+            // A bytea is the hex text PG writes it as; Java's own toString named the array object.
+            sb.append("\"\\\\x").append(ByteaOperations.bytesToHex((byte[]) val)).append("\"");
         } else if (val instanceof Number || val instanceof Boolean) {
             sb.append(val);
         } else if (val instanceof List<?>) {
             List<?> list = (List<?>) val;
             sb.append("[");
             for (int j = 0; j < list.size(); j++) {
-                if (j > 0) sb.append(", ");
+                if (j > 0) sb.append(",");
                 appendJsonValue(sb, list.get(j));
             }
             sb.append("]");
@@ -613,28 +798,16 @@ class JsonFunctions {
 
     private String rowMapToJson(java.util.Map<?, ?> map, boolean pretty, int indent) {
         StringBuilder sb = new StringBuilder("{");
-        String sep = pretty ? ",\n" + repeat(" ",indent) : ",";
-        if (pretty) sb.append("\n").append(repeat(" ", indent));
+        // Asked for it pretty, PostgreSQL breaks the line between one field and the next and
+        // nowhere else — so a row of a single field is written on one line whatever was asked.
+        String sep = pretty ? ",\n" + repeat(" ", Math.max(indent, 1)) : ",";
         boolean first = true;
         for (Map.Entry<?, ?> entry : map.entrySet()) {
             if (!first) sb.append(sep);
             first = false;
             sb.append("\"").append(entry.getKey()).append("\":");
-            Object v = entry.getValue();
-            if (v == null) {
-                sb.append("null");
-            } else if (v instanceof Number || v instanceof Boolean) {
-                sb.append(v);
-            } else {
-                String s = v.toString();
-                if ((s.startsWith("{") && s.endsWith("}")) || (s.startsWith("[") && s.endsWith("]"))) {
-                    sb.append(s);
-                } else {
-                    sb.append("\"").append(s.replace("\\", "\\\\").replace("\"", "\\\"")).append("\"");
-                }
-            }
+            appendJsonValue(sb, entry.getValue());
         }
-        if (pretty) sb.append("\n");
         sb.append("}");
         return sb.toString();
     }

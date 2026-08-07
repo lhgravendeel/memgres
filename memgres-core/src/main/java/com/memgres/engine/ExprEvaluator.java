@@ -1126,6 +1126,11 @@ class ExprEvaluator {
 
     private Object evalCast(CastExpr cast, RowContext ctx) {
         Object val = evalExpr(cast.expr(), ctx);
+        // A blank-padded string is stored padded and read back trimmed: PostgreSQL's conversion
+        // from bpchar to any other string type drops the blanks the declaration added, which is
+        // why 'ab'::char(5)::text is two characters and not five.
+        val = BlankPadding.readAsOtherString(val, cast.typeName(),
+                executor.binaryOpEvaluator.declaredTypeForResolution(cast.expr(), ctx));
         // If the inner expression is a set-returning function and produced a List,
         // cast each element individually to preserve the List for SRF expansion.
         if (val instanceof java.util.List<?> && cast.expr() instanceof FunctionCallExpr

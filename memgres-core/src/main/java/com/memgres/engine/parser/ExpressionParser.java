@@ -281,7 +281,12 @@ public class ExpressionParser {
         StringBuilder sb = new StringBuilder();
         boolean qualified = false;  // an interval field qualifier has already taken its precision
         boolean schemaWritten = false;
+        // "char" is the one type PostgreSQL names with quotes, and the quotes are what tell it
+        // apart from char, which is the blank-padded string type. Reading the name without them
+        // made ::"char" a bpchar, so a type the catalogs are written in could not be written at all.
+        boolean quotedName = peek().type() == TokenType.QUOTED_IDENTIFIER;
         String name = readIdentifier();
+        if (quotedName && "char".equals(name)) name = "\"char\"";
         // A schema-qualified type is written schema.typename, and the qualifier is carried: two
         // schemas may each hold a type of the same name, so a column declared a.e has to record
         // which e it was declared with. pg_catalog is the exception — it holds the types this

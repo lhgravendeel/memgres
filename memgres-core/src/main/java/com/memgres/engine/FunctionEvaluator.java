@@ -48,7 +48,7 @@ class FunctionEvaluator {
     private final MathFunctions mathFunctions;
     private final StringFunctions stringFunctions;
     private final CatalogSystemFunctions catalogSystemFunctions;
-    private final JsonFunctions jsonFunctions;
+    final JsonFunctions jsonFunctions;
     private final TextSearchFunctions textSearchFunctions;
     private final DateTimeFunctions dateTimeFunctions;
     private final XmlFunctions xmlFunctions;
@@ -965,6 +965,12 @@ class FunctionEvaluator {
             rejectAmbiguousBuiltin(executor, name,
                     fn.spelledInGrammar ? "pg_catalog." + fn.name() : fn.name(), fn.args(), ctx);
         }
+
+        // A routine declared over text takes a bpchar argument through the conversion that drops
+        // the blanks its declaration added, so upper('ab'::char(5)) is AB and not "AB   ". The
+        // argument is read once here and handed on already trimmed; only the ones whose type it
+        // was written with are touched, so nothing else about the call is read differently.
+        fn = withBlanksDropped(fn, ctx, name);
 
         // Delegate to category handlers
         Object delegated;
@@ -2027,7 +2033,10 @@ class FunctionEvaluator {
                     for (Object elem : list) {
                         String rendered;
                         if (elem != null) {
-                            rendered = elem.toString().trim();
+                            // An element is written out as it is held. Trimming it dropped the
+                            // spaces a text element really has, and the blanks a bpchar element
+                            // is declared with — neither of which the array stopped holding.
+                            rendered = elem.toString();
                         } else if (nullStr != null) {
                             rendered = nullStr.toString();
                         } else {
@@ -3857,6 +3866,34 @@ class FunctionEvaluator {
         // neither, so it is not a call at all. Asking only where an argument was untyped let
         // every such call through and picked one of the two.
         BuiltinCallTypes.requireResolvable(name, writtenName, written);
+    }
+
+    /**
+     * The call with every bpchar argument replaced by the text it is read as.
+     *
+     * <p>Only an argument the statement wrote a bpchar type for is touched, and only for the
+     * routines that read one as a text — so an argument judged on the shape it was written with,
+     * a count or a pattern, still arrives as the expression it was.
+     */
+    private FunctionCallExpr withBlanksDropped(FunctionCallExpr fn, RowContext ctx, String name) {
+        if (fn.args() == null || fn.args().isEmpty()) return fn;
+        if (!BlankPadding.readsItAsText(name)) return fn;
+        List<Expression> replaced = null;
+        for (int i = 0; i < fn.args().size(); i++) {
+            Expression arg = fn.args().get(i);
+            if (!BlankPadding.isBlankPadded(
+                    executor.binaryOpEvaluator.declaredTypeForResolution(arg, ctx))) {
+                continue;
+            }
+            Object trimmed = BlankPadding.trimmed(executor.evalExpr(arg, ctx));
+            if (replaced == null) replaced = new ArrayList<>(fn.args());
+            replaced.set(i, new ExprEvaluator.PrecomputedValueExpr(trimmed, DataType.TEXT));
+        }
+        if (replaced == null) return fn;
+        FunctionCallExpr rebuilt = new FunctionCallExpr(fn.name(), replaced, fn.distinct(),
+                fn.star(), fn.orderBy(), fn.filter());
+        rebuilt.spelledInGrammar = fn.spelledInGrammar;
+        return rebuilt;
     }
 
     /**

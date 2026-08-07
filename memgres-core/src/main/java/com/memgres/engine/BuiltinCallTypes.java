@@ -50,6 +50,10 @@ public final class BuiltinCallTypes {
     private static final char ARRAY = 'A';
     private static final char PSEUDO = 'P';
     private static final char USER = 'U';
+    /** PostgreSQL's Z: a type it keeps for its own use, and which no preferred type stands for. */
+    private static final char INTERNAL = 'Z';
+    /** PostgreSQL's R: the ranges and the multiranges, which have no preferred type either. */
+    private static final char RANGE = 'R';
 
     private static final Map<Integer, Character> CATEGORY = buildCategories();
     /** The type a category resolves an otherwise undecided argument to. */
@@ -61,8 +65,13 @@ public final class BuiltinCallTypes {
         Map<Integer, Character> m = new HashMap<Integer, Character>();
         int[] numeric = {20, 21, 23, 26, 700, 701, 790, 1700, 2202, 2203, 2204, 2205, 2206, 3734, 3769, 4096, 4089};
         for (int i = 0; i < numeric.length; i++) m.put(Integer.valueOf(numeric[i]), Character.valueOf(NUMERIC));
-        int[] string = {18, 19, 25, 1042, 1043};
+        int[] string = {19, 25, 1042, 1043};
         for (int i = 0; i < string.length; i++) m.put(Integer.valueOf(string[i]), Character.valueOf(STRING));
+        // "char" is a single byte PostgreSQL keeps for its own catalogs, and it puts it in the
+        // internal category rather than among the string types. That is what makes text || "char"
+        // a call PostgreSQL cannot choose: no candidate holds the preferred type of a category
+        // that has none, so nothing settles the choice between text || text and text || anynonarray.
+        m.put(Integer.valueOf(18), Character.valueOf(INTERNAL));
         int[] datetime = {702, 1082, 1083, 1114, 1184, 1266};
         for (int i = 0; i < datetime.length; i++) m.put(Integer.valueOf(datetime[i]), Character.valueOf(DATETIME));
         int[] timespan = {703, 1186};
@@ -74,8 +83,13 @@ public final class BuiltinCallTypes {
         for (int i = 0; i < bits.length; i++) m.put(Integer.valueOf(bits[i]), Character.valueOf(BITSTRING));
         int[] geometric = {600, 601, 602, 603, 604, 628, 718};
         for (int i = 0; i < geometric.length; i++) m.put(Integer.valueOf(geometric[i]), Character.valueOf(GEOMETRIC));
-        int[] user = {17, 114, 142, 774, 829, 2950, 3220, 3614, 3615, 3802, 3904, 3906, 3908, 3910, 3912, 3926};
+        int[] user = {17, 114, 142, 774, 829, 2950, 3220, 3614, 3615, 3802};
         for (int i = 0; i < user.length; i++) m.put(Integer.valueOf(user[i]), Character.valueOf(USER));
+        // The ranges and the multiranges are one category of PostgreSQL's own, and a multirange
+        // is as much a member of it as the range it collects. Recording only the ranges left the
+        // multiranges as types nothing here accounts for.
+        int[] range = {3904, 3906, 3908, 3910, 3912, 3926, 4451, 4532, 4533, 4534, 4535, 4536};
+        for (int i = 0; i < range.length; i++) m.put(Integer.valueOf(range[i]), Character.valueOf(RANGE));
         int[] pseudo = {705, 2249, 2276, 2277, 2278, 2283, 2776, 5077, 5078, 5079, 5086};
         for (int i = 0; i < pseudo.length; i++) m.put(Integer.valueOf(pseudo[i]), Character.valueOf(PSEUDO));
         return m;
@@ -526,6 +540,22 @@ public final class BuiltinCallTypes {
         return (((long) from) << 32) | (to & 0xFFFFFFFFL);
     }
 
+    /** Whether {@code from} reaches {@code to} without being asked, as a parameter position does. */
+    static boolean reaches(int from, int to) {
+        return convertible(from, to);
+    }
+
+    /** Whether PostgreSQL's own categories account for this type, rather than a memgres one. */
+    static boolean recordsCategoryFor(int oid) {
+        return CATEGORY.get(Integer.valueOf(oid)) != null;
+    }
+
+    /** The type a category resolves an otherwise undecided argument to, or 0 when it has none. */
+    static int preferredOf(char category) {
+        Integer p = PREFERRED.get(Character.valueOf(category));
+        return p == null ? 0 : p.intValue();
+    }
+
     /** An argument reaches a parameter of its own type, or of one it casts to on its own. */
     private static boolean convertible(int from, int to) {
         if (from == to) return true;
@@ -533,10 +563,18 @@ public final class BuiltinCallTypes {
         Character fc = CATEGORY.get(Integer.valueOf(from));
         Character tc = CATEGORY.get(Integer.valueOf(to));
         if (fc == null || tc == null || fc.charValue() != tc.charValue()) return false;
-        if (fc.charValue() == NUMERIC) return numericRank(from) <= numericRank(to);
+        if (fc.charValue() == NUMERIC) {
+            // Only the six that widen into one another are a ladder. money, oid and the reg*
+            // types are of the numeric category and climb nothing: an integer reaches an oid
+            // because PostgreSQL says so above, and reaches a money not at all.
+            int fr = numericRank(from);
+            int tr = numericRank(to);
+            return fr > 0 && tr > 0 && fr <= tr;
+        }
         return fc.charValue() == STRING;   // the string types all reach each other
     }
 
+    /** Where a numeric type stands among the six that widen into one another, or 0 for the rest. */
     private static int numericRank(int oid) {
         switch (oid) {
             case 21: return 1;    // int2
@@ -545,7 +583,7 @@ public final class BuiltinCallTypes {
             case 1700: return 4;  // numeric
             case 700: return 5;   // float4
             case 701: return 6;   // float8
-            default: return 7;
+            default: return 0;
         }
     }
 

@@ -53,7 +53,11 @@ class CompositeTypeHandler {
             FunctionCallExpr fn = (FunctionCallExpr) expr;
             // populate_record / json_populate_record return the type of their first argument
             String fname = fn.name().toLowerCase();
-            if ((fname.equals("populate_record") || fname.equals("json_populate_record"))
+            // Both families fill the same record from the same base argument, so both take their
+            // shape from it -- reading only the json one left (jsonb_populate_record(...)).*
+            // with no columns to expand to and so no row at all.
+            if ((fname.equals("populate_record") || fname.equals("json_populate_record")
+                    || fname.equals("jsonb_populate_record"))
                     && fn.args() != null && !fn.args().isEmpty()) {
                 return resolveCompositeTypeName(fn.args().get(0), ctx);
             }

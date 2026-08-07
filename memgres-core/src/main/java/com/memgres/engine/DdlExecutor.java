@@ -498,6 +498,11 @@ class DdlExecutor {
             } else if (executor.database.isCompositeType(baseType)) {
                 dataType = DataType.TEXT;
                 compositeTypeName = baseType;
+                // As for an enum above, a composite's name never matches a built-in, so an array
+                // of one was left indistinguishable from a single one of it.
+                if (isArray) {
+                    arrayElementType = DataType.TEXT;
+                }
             } else if (executor.database.isShellType(baseType)) {
                 // A shell has no representation yet, so nothing can be declared as one
                 throw new MemgresException("type \""

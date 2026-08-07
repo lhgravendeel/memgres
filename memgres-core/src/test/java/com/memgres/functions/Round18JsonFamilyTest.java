@@ -117,10 +117,11 @@ class Round18JsonFamilyTest {
 
     @Test
     void row_to_json_two_arg_pretty() throws SQLException {
-        String v = str("SELECT row_to_json(x, true) FROM (SELECT 1 AS a) x");
-        // Pretty must include newlines.
-        assertTrue(v != null && v.contains("\n"),
-                "row_to_json(rec, true) must pretty-print with newlines; got '" + v + "'");
+        // Pretty breaks the line between one field and the next and nowhere else, so a row of a
+        // single field is written on one line however it was asked for.
+        assertEquals("{\"a\":1,\n \"b\":2}",
+                str("SELECT row_to_json(x, true) FROM (SELECT 1 AS a, 2 AS b) x"));
+        assertEquals("{\"a\":1}", str("SELECT row_to_json(x, true) FROM (SELECT 1 AS a) x"));
     }
 
     // =========================================================================

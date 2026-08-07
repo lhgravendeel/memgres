@@ -390,7 +390,9 @@ class PgCatalogConsistencyTest {
      */
     @Test
     void anIcuLocaleIsSpeltTheWayPostgresSpellsIt() throws SQLException {
-        assertEquals("i,-1,en-US", one("SELECT collprovider || ',' || collencoding || ',' || colllocale"
+        // collprovider is a "char", which PostgreSQL will not concatenate without being told
+        // which of its two text concatenations was meant.
+        assertEquals("i,-1,en-US", one("SELECT collprovider::text || ',' || collencoding || ',' || colllocale"
                 + " FROM pg_collation WHERE collname = 'en-US-x-icu'"));
         assertEquals("0", one("SELECT count(*) FROM pg_collation"
                 + " WHERE collname = 'en_US' AND collencoding = 6"));
