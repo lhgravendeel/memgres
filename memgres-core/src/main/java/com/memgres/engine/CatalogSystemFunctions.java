@@ -160,6 +160,19 @@ class CatalogSystemFunctions {
                         return pgTypeDisplayName(baseDef.getArrayElementType());
                     }
                 }
+                // The same for an array the statement built rather than a column of one: only a
+                // column was read, so every other subscript answered jsonb whatever it was of.
+                if (rawExpr instanceof BinaryExpr
+                        && ((BinaryExpr) rawExpr).op() == BinaryExpr.BinOp.JSON_SUBSCRIPT) {
+                    String arrayType = executor.binaryOpEvaluator
+                            .declaredTypeForResolution(((BinaryExpr) rawExpr).left(), ctx);
+                    if (arrayType != null && arrayType.endsWith("[]")) {
+                        DataType element = DataType.fromPgName(arrayType
+                                .substring(0, arrayType.length() - 2)
+                                .toLowerCase().replaceAll("\\(.*\\)", "").trim());
+                        if (element != null) return pgTypeDisplayName(element);
+                    }
+                }
                 if (rawExpr instanceof BinaryExpr
                         && (((BinaryExpr) rawExpr).op() == BinaryExpr.BinOp.JSON_ARROW
                             || ((BinaryExpr) rawExpr).op() == BinaryExpr.BinOp.JSON_SUBSCRIPT)) {
@@ -238,6 +251,21 @@ class CatalogSystemFunctions {
                         }
                         if (executor.database.isCustomEnum(elemTypeName)) {
                             return elemTypeName + "[]";
+                        }
+                    }
+                    // An array is of whatever its elements are, where they agree on what that is.
+                    // Reading only the composites and the enums left every other written element
+                    // type answering text[]: an array of character was not one of character.
+                    // Elements that disagree are left to the widening the values themselves show.
+                    String arrayType = executor.binaryOpEvaluator
+                            .declaredTypeForResolution(rawExpr, ctx);
+                    if (arrayType != null && arrayType.endsWith("[]")) {
+                        String elementName = arrayType.substring(0, arrayType.length() - 2)
+                                .toLowerCase().replaceAll("\\(.*\\)", "").trim();
+                        DataType element = elementName.endsWith("[]") ? null
+                                : DataType.fromPgName(elementName);
+                        if (element != null && DataType.elementOf(element) == null) {
+                            return pgTypeDisplayName(element) + "[]";
                         }
                     }
                 }

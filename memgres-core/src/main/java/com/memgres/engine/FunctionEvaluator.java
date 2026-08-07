@@ -2033,7 +2033,10 @@ class FunctionEvaluator {
                     for (Object elem : list) {
                         String rendered;
                         if (elem != null) {
-                            rendered = elem.toString().trim();
+                            // An element is written out as it is held. Trimming it dropped the
+                            // spaces a text element really has, and the blanks a bpchar element
+                            // is declared with — neither of which the array stopped holding.
+                            rendered = elem.toString();
                         } else if (nullStr != null) {
                             rendered = nullStr.toString();
                         } else {

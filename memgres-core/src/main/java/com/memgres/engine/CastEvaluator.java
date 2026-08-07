@@ -450,15 +450,19 @@ class CastEvaluator {
             TypeCoercion.checkNumericTypmod(rounded, precision, scale);
             return rounded;
         }
-        // Handle varchar(n) by truncating to length
-        if (lowerSpec.startsWith("varchar(") || lowerSpec.startsWith("character varying(")) {
+        // Handle varchar(n) by truncating to length. An array of them is not one of them: the
+        // width belongs to each element, and reading char(5)[] as a char(5) padded the whole
+        // literal and never took it through the array's own input function at all.
+        if (!lowerSpec.endsWith("[]")
+                && (lowerSpec.startsWith("varchar(") || lowerSpec.startsWith("character varying("))) {
             String nStr = lowerSpec.replaceAll(".*\\((\\d+)\\).*", "$1");
             int n = Integer.parseInt(nStr);
             String s = val.toString();
             return s.length() > n ? s.substring(0, n) : s;
         }
         // Handle char(n) by truncating or padding with spaces
-        if ((lowerSpec.startsWith("char(") || lowerSpec.startsWith("character(") || lowerSpec.startsWith("bpchar("))
+        if (!lowerSpec.endsWith("[]")
+                && (lowerSpec.startsWith("char(") || lowerSpec.startsWith("character(") || lowerSpec.startsWith("bpchar("))
                 && !lowerSpec.startsWith("character varying")) {
             String nStr = lowerSpec.replaceAll(".*\\((\\d+)\\).*", "$1");
             int n = Integer.parseInt(nStr);
@@ -509,7 +513,10 @@ class CastEvaluator {
                 // The literal parser hands back nested lists for nested braces, so a String element
                 // is only ever an element -- a quoted "{1,2}" stays that text rather than becoming
                 // a sub-array. A List arriving from elsewhere still needs the older reading.
-                List<Object> castList = castArrayElements(list, typeName, literal == null);
+                // The width belongs to each element, so the element is cast with it: '{c}' as a
+                // char(5)[] holds one element padded to five, not the bare text it was written as.
+                List<Object> castList = castArrayElements(list, elementSpecOf(typeSpec, typeName),
+                        literal == null);
                 if (literal != null && literal.hasCustomLowerBounds()) {
                     return literal.boundsPrefix() + TypeCoercion.formatPgArray(castList);
                 }
@@ -1630,6 +1637,17 @@ class CastEvaluator {
      *        a nested array. Only values that reached here already parsed need that: the literal
      *        parser has already told nesting apart from a quoted element that happens to look it.
      */
+    /**
+     * The written spec of an array's elements: the array's own spec without the brackets, so
+     * whatever modifier it carries goes with it. Falls back to the bare name where the spec has
+     * none to give.
+     */
+    private static String elementSpecOf(String typeSpec, String bareElementName) {
+        String spec = typeSpec == null ? "" : typeSpec.toLowerCase().trim();
+        while (spec.endsWith("[]")) spec = spec.substring(0, spec.length() - 2).trim();
+        return spec.indexOf('(') > 0 ? spec : bareElementName;
+    }
+
     private List<Object> castArrayElements(List<?> list, String elemType,
                                            boolean braceTextIsSubArray) {
         List<Object> castList = new ArrayList<>();

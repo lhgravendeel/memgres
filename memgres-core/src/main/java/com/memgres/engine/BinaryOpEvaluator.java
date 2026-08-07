@@ -497,6 +497,14 @@ class BinaryOpEvaluator {
      * way — PostgreSQL stores a bpchar padded and reads it back trimmed, which is why
      * {@code 'a'::char(3) || 'b'} is {@code ab} and not {@code a  b}.
      */
+    /** Whether a type is the blank-padded character type, or an array whose elements are. */
+    private static boolean isBlankPaddedOrItsArray(int oid) {
+        if (oid == DataType.CHAR.getOid()) return true;
+        DataType type = DataType.fromOid(oid);
+        DataType element = type == null ? null : DataType.elementOf(type);
+        return element == DataType.CHAR;
+    }
+
     private String concatOperandAsText(Object value, int oid) {
         String written = String.valueOf(executor.castValue(value, "text"));
         if (oid != DataType.CHAR.getOid()) return written;
@@ -676,6 +684,20 @@ class BinaryOpEvaluator {
                 element = "text";
             }
             return element + "[]";
+        }
+        // Subscripting an array gives one element of it, which is of the array's element type.
+        if (expr instanceof BinaryExpr
+                && ((BinaryExpr) expr).op() == BinaryExpr.BinOp.JSON_SUBSCRIPT) {
+            if (ctx != null && ((BinaryExpr) expr).left() instanceof ColumnRef) {
+                ColumnRef base = (ColumnRef) ((BinaryExpr) expr).left();
+                Column baseDef = ctx.resolveColumnDef(base.table(), base.column());
+                if (baseDef != null && baseDef.getArrayElementType() != null) {
+                    return baseDef.getArrayElementType().getPgName();
+                }
+            }
+            String arrayType = declaredTypeForResolution(((BinaryExpr) expr).left(), ctx);
+            return arrayType != null && arrayType.endsWith("[]")
+                    ? arrayType.substring(0, arrayType.length() - 2) : null;
         }
         if (expr instanceof SubqueryExpr) {
             // A scalar subquery is of the type of the one column it answers with.
@@ -1006,7 +1028,7 @@ class BinaryOpEvaluator {
         // going in. Written on the left it is the element type, and keeps it.
         if (concat.is(ConcatOperator.Outcome.ARRAY) && right != null
                 && concat.rightOid == DataType.CHAR.getOid()
-                && concat.leftOid != DataType.CHAR.getOid()) {
+                && !isBlankPaddedOrItsArray(concat.leftOid)) {
             right = concatOperandAsText(right, concat.rightOid);
         }
 
