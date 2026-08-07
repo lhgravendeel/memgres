@@ -72,7 +72,7 @@ public final class BuiltinFunctionNames {
             "jsonb_pretty", "jsonb_set", "jsonb_set_lax", "jsonb_typeof", "justify_days",
             "justify_hours", "justify_interval", "lag", "last_value", "lastval", "lead",
             "left", "lgamma", "length", "line", "ln", "lo_close", "lo_creat", "lo_create", "lo_export",
-            "lo_from_bytea", "lo_get", "lo_import", "lo_lseek", "lo_open", "lo_put", "lo_tell",
+            "lo_from_bytea", "lo_get", "lo_import", "lo_lseek", "lo_lseek64", "lo_open", "lo_put", "lo_tell", "lo_tell64",
             "lo_truncate", "lo_unlink", "log", "log10", "loread", "lower",
             "lowrite", "lpad", "lseg", "ltrim", "macaddr", "macaddr8", "make_date", "make_interval",
             "make_time", "make_timestamp", "make_timestamptz", "max", "md5",

@@ -22,7 +22,11 @@ public class PgWireMessage {
         FLUSH,
         COPY_DATA,
         COPY_DONE,
-        COPY_FAIL
+        COPY_FAIL,
+        GSSENC_REQUEST,
+        NEGOTIATE_PROTOCOL,
+        FUNCTION_CALL,
+        PROTOCOL_ERROR
     }
 
     private final Type type;
@@ -39,6 +43,14 @@ public class PgWireMessage {
     private final byte closeType;   // 'S' for statement, 'P' for portal
     private final int maxRows;
     private final byte[] copyData;  // raw bytes for CopyData/CopyFail messages
+    // A message the decoder could not read inside its own declared length
+    private String sqlState;
+    private byte offendingType;
+    private boolean fatal;
+    private java.util.List<String> unsupportedOptions;
+    private int functionOid;
+    private short resultFormat;
+    private int protocolMinor;
 
     private PgWireMessage(Type type, String query, Map<String, String> parameters,
                           String statementName, String portalName,
@@ -70,9 +82,11 @@ public class PgWireMessage {
              parameterFormatCodes, resultFormatCodes, describeType, closeType, maxRows, null);
     }
 
-    public static PgWireMessage startup(Map<String, String> parameters) {
-        return new PgWireMessage(Type.STARTUP, null, parameters, null, null,
+    public static PgWireMessage startup(Map<String, String> parameters, int protocolMinor) {
+        PgWireMessage m = new PgWireMessage(Type.STARTUP, null, parameters, null, null,
                 null, null, null, null, (byte) 0, (byte) 0, 0);
+        m.protocolMinor = protocolMinor;
+        return m;
     }
 
     public static PgWireMessage sslRequest() {
@@ -143,6 +157,45 @@ public class PgWireMessage {
                 null, null, null, null, (byte) 0, (byte) 0, 0);
     }
 
+    public static PgWireMessage gssEncRequest() {
+        return new PgWireMessage(Type.GSSENC_REQUEST, null, null, null, null,
+                null, null, null, null, (byte) 0, (byte) 0, 0);
+    }
+
+    /** The newest protocol this server has, and the named options it does not implement. */
+    public static PgWireMessage negotiateProtocolVersion(int protocolMinor,
+                                                         java.util.List<String> unsupportedOptions) {
+        PgWireMessage m = new PgWireMessage(Type.NEGOTIATE_PROTOCOL, null, null, null, null,
+                null, null, null, null, (byte) 0, (byte) 0, 0);
+        m.protocolMinor = protocolMinor;
+        m.unsupportedOptions = unsupportedOptions;
+        return m;
+    }
+
+    public static PgWireMessage functionCall(int functionOid, short[] argumentFormatCodes,
+                                             byte[][] argumentValues, short resultFormat,
+                                             String protocolViolation) {
+        PgWireMessage m = new PgWireMessage(Type.FUNCTION_CALL, protocolViolation, null, null, null,
+                null, argumentValues, argumentFormatCodes, null, (byte) 0, (byte) 0, 0);
+        m.functionOid = functionOid;
+        m.resultFormat = resultFormat;
+        return m;
+    }
+
+    /**
+     * A message whose bytes did not match the length above them. A null sqlState means the header
+     * itself was unreadable, which PG reports only in its own log before dropping the connection.
+     */
+    public static PgWireMessage protocolError(String sqlState, String message, byte offendingType,
+                                              boolean fatal) {
+        PgWireMessage m = new PgWireMessage(Type.PROTOCOL_ERROR, message, null, null, null,
+                null, null, null, null, (byte) 0, (byte) 0, 0);
+        m.sqlState = sqlState;
+        m.offendingType = offendingType;
+        m.fatal = fatal;
+        return m;
+    }
+
     public static PgWireMessage copyFail(String errorMessage) {
         return new PgWireMessage(Type.COPY_FAIL, errorMessage, null, null, null,
                 null, null, null, null, (byte) 0, (byte) 0, 0);
@@ -161,4 +214,11 @@ public class PgWireMessage {
     public byte getCloseType() { return closeType; }
     public int getMaxRows() { return maxRows; }
     public byte[] getCopyData() { return copyData; }
+    public String getSqlState() { return sqlState; }
+    public byte getOffendingType() { return offendingType; }
+    public boolean isFatal() { return fatal; }
+    public java.util.List<String> getUnsupportedOptions() { return unsupportedOptions; }
+    public int getFunctionOid() { return functionOid; }
+    public short getResultFormat() { return resultFormat; }
+    public int getProtocolMinor() { return protocolMinor; }
 }

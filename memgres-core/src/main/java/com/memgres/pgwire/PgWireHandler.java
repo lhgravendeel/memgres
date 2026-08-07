@@ -34,7 +34,9 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
     private PgWireDescribeHelper describeHelper;
     private boolean connectionRegistered;
     private int backendPid;
-    private int backendSecretKey;
+    private byte[] backendSecretKey = new byte[0];
+    /** The minor protocol version the client and this server settled on; 2 asks for more of us. */
+    private int protocolMinor;
     private String databaseName;
 
     /** Prepared statement: stores the SQL and parameter OIDs from Parse. */
@@ -99,6 +101,8 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
     private final Map<String, Portal> portals = new HashMap<>();
     private boolean rowDescSentByDescribe;
     private boolean errorPendingUntilSync;
+    /** Set between asking for a password and being given one; nothing else may run in between. */
+    private boolean awaitingPassword;
 
     public PgWireHandler(DatabaseRegistry registry, CancelRegistry cancelRegistry) {
         this.registry = registry;
@@ -126,25 +130,27 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
     }
 
     private void dispatch(ChannelHandlerContext ctx, PgWireMessage msg) {
+        // A message the decoder could not read is answered before anything else: the connection
+        // is out of step with its peer, and nothing later in this method is true of it.
+        if (msg.getType() == PgWireMessage.Type.PROTOCOL_ERROR) {
+            handleProtocolError(ctx, msg);
+            return;
+        }
+        if (awaitingPassword && msg.getType() != PgWireMessage.Type.PASSWORD) {
+            // PG names the message it got where the password was due, and hangs up: a connection
+            // that has not authenticated does not get to run statements.
+            sendFatal(ctx, "08P01", "expected password response, got message type "
+                    + frontendTypeOf(msg));
+            closeAfterFlush(ctx);
+            return;
+        }
         if (errorPendingUntilSync) {
-            switch (msg.getType()) {
-                case QUERY: {
-                    errorPendingUntilSync = false; handleQuery(ctx, msg); 
-                    break;
-                }
-                case SYNC:
-                    handleSync(ctx);
-                    break;
-                case FLUSH:
-                    handleFlush(ctx);
-                    break;
-                case TERMINATE:
-                    ctx.close();
-                    break;
-                default: {
-                    if (Memgres.logAllStatements) LOG.info("[PROTO] Discarding {} (errorPendingUntilSync)", msg.getType());
-                    break;
-                }
+            // Sync is the only thing that ends it. Answering a Query, a Flush or a Terminate in
+            // the meantime finished statements the client had already been told were skipped.
+            if (msg.getType() == PgWireMessage.Type.SYNC) {
+                handleSync(ctx);
+            } else if (Memgres.logAllStatements) {
+                LOG.info("[PROTO] Discarding {} (errorPendingUntilSync)", msg.getType());
             }
             return;
         }
@@ -170,7 +176,14 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
         }
         switch (msg.getType()) {
             case SSL_REQUEST:
-                handleSslRequest(ctx);
+            case GSSENC_REQUEST:
+                declineEncryption(ctx);
+                break;
+            case NEGOTIATE_PROTOCOL:
+                sendNegotiateProtocolVersion(ctx, msg);
+                break;
+            case FUNCTION_CALL:
+                handleFunctionCall(ctx, msg);
                 break;
             case STARTUP:
                 handleStartup(ctx, msg);
@@ -251,13 +264,76 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
 
     // ---- Connection lifecycle ----
 
-    private void handleSslRequest(ChannelHandlerContext ctx) {
+    /**
+     * A message whose bytes did not match the length above them. PostgreSQL answers it the way it
+     * answers any other error: an ErrorResponse, and then either a ReadyForQuery or, if the
+     * message was extended-query work, silence until the client sends Sync. A header that could
+     * not be believed at all is not answered, because there is nothing to answer about.
+     */
+    private void handleProtocolError(ChannelHandlerContext ctx, PgWireMessage msg) {
+        if (msg.isFatal()) {
+            if (msg.getSqlState() != null) sendFatal(ctx, msg.getSqlState(), msg.getQuery());
+            closeAfterFlush(ctx);
+            return;
+        }
+        sendErrorSimple(ctx, msg.getSqlState(), msg.getQuery());
+        if (PgWireDecoder.isExtendedQueryMessage(msg.getOffendingType())) {
+            errorPendingUntilSync = true;
+            ctx.flush();
+        } else {
+            sendReadyForQuery(ctx, session);
+        }
+    }
+
+    private static void closeAfterFlush(ChannelHandlerContext ctx) {
+        ctx.writeAndFlush(ctx.alloc().buffer(0)).addListener(future -> ctx.close());
+    }
+
+    /** The frontend message type byte a decoded message came from, for PG's own wording. */
+    private static int frontendTypeOf(PgWireMessage msg) {
+        switch (msg.getType()) {
+            case QUERY: return 'Q';
+            case PARSE: return 'P';
+            case BIND: return 'B';
+            case DESCRIBE: return 'D';
+            case EXECUTE: return 'E';
+            case SYNC: return 'S';
+            case FLUSH: return 'H';
+            case CLOSE: return 'C';
+            case TERMINATE: return 'X';
+            case FUNCTION_CALL: return 'F';
+            case COPY_DATA: return 'd';
+            case COPY_DONE: return 'c';
+            case COPY_FAIL: return 'f';
+            default: return 0;
+        }
+    }
+
+    /** Neither SSL nor GSSAPI encryption is offered, and PG declines both with a single byte. */
+    private void declineEncryption(ChannelHandlerContext ctx) {
         ByteBuf buf = ctx.alloc().buffer(1);
         buf.writeByte('N');
         ctx.writeAndFlush(buf);
     }
 
+    /** Tell a client that asked for more than this server has what it is actually going to get. */
+    private void sendNegotiateProtocolVersion(ChannelHandlerContext ctx, PgWireMessage msg) {
+        java.util.List<String> unsupported = msg.getUnsupportedOptions();
+        ByteBuf buf = ctx.alloc().buffer();
+        buf.writeByte('v');
+        int lengthIdx = buf.writerIndex();
+        buf.writeInt(0);
+        buf.writeInt((3 << 16) | msg.getProtocolMinor());
+        buf.writeInt(unsupported.size());
+        for (String option : unsupported) {
+            PgWireValueFormatter.writeCString(buf, option);
+        }
+        buf.setInt(lengthIdx, buf.writerIndex() - lengthIdx);
+        ctx.write(buf);
+    }
+
     private void handleStartup(ChannelHandlerContext ctx, PgWireMessage msg) {
+        protocolMinor = msg.getProtocolMinor();
         Map<String, String> params = msg.getParameters();
         if (params != null) {
             // Resolve target database from startup parameters
@@ -310,9 +386,19 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
         auth.writeInt(3); // cleartext password
         ctx.write(auth);
         ctx.flush();
+        awaitingPassword = true;
     }
 
     private void handlePassword(ChannelHandlerContext ctx, PgWireMessage msg) {
+        if (!awaitingPassword) {
+            // Once a connection is up, a password message is as much a stranger as any other
+            // type PG does not expect there; re-running the greeting for one let a client
+            // reopen the session it was already inside.
+            sendFatal(ctx, "08P01", "invalid frontend message type 112");
+            closeAfterFlush(ctx);
+            return;
+        }
+        awaitingPassword = false;
         if (!database.registerConnection()) {
             sendErrorSimple(ctx, "53300", "sorry, too many clients already");
             ctx.writeAndFlush(ctx.alloc().buffer(0)).addListener(future -> ctx.close());
@@ -340,13 +426,16 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
         sendParameterStatus(ctx, "is_superuser", "on");
 
         backendPid = cancelRegistry.nextPid();
-        backendSecretKey = (int) (Math.random() * Integer.MAX_VALUE);
+        // Protocol 3.2 asks for a cancel key long enough not to be guessed; 3.0 has room for four
+        // bytes and no more, so the key is as long as the version in force allows.
+        backendSecretKey = new byte[protocolMinor >= 2 ? 32 : 4];
+        new java.security.SecureRandom().nextBytes(backendSecretKey);
         cancelRegistry.register(backendPid, backendSecretKey);
         ByteBuf keyData = ctx.alloc().buffer();
         keyData.writeByte('K');
-        keyData.writeInt(12);
+        keyData.writeInt(8 + backendSecretKey.length);
         keyData.writeInt(backendPid);
-        keyData.writeInt(backendSecretKey);
+        keyData.writeBytes(backendSecretKey);
         ctx.write(keyData);
 
         // From here on the connection may sit idle waiting on the socket; a NOTIFY has to
@@ -809,6 +898,119 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
     private void markStatementDescribed(String name) {
         rowDescSentByDescribe = true;
         if (name != null && !name.isEmpty()) stmtDescribed.put(name, true);
+    }
+
+    /**
+     * The function-call sub-protocol, which is how a JDBC client reaches the large-object
+     * functions. Treated as a message type nothing understood, it was skipped in silence and the
+     * client waited for a reply that was never going to come.
+     */
+    private void handleFunctionCall(ChannelHandlerContext ctx, PgWireMessage msg) {
+        int oid = msg.getFunctionOid();
+        try {
+            Object[] proc = lookupProcByOid(oid);
+            if (proc == null) {
+                sendErrorSimple(ctx, "42883", "function with OID " + oid + " does not exist");
+                sendReadyForQuery(ctx, session);
+                return;
+            }
+            if (msg.getParameterValues() == null) {
+                sendErrorSimple(ctx, "08P01", msg.getQuery());
+                sendReadyForQuery(ctx, session);
+                return;
+            }
+            byte[][] rawArgs = msg.getParameterValues();
+            String name = (String) proc[0];
+            int[] argTypes = (int[]) proc[1];
+            int resultType = (Integer) proc[2];
+            if (rawArgs.length != argTypes.length) {
+                sendErrorSimple(ctx, "08P01", "function call message contains " + rawArgs.length
+                        + " arguments but function requires " + argTypes.length);
+                sendReadyForQuery(ctx, session);
+                return;
+            }
+
+            List<Object> args = new ArrayList<>();
+            short[] formats = msg.getParameterFormatCodes();
+            StringBuilder call = new StringBuilder("SELECT \"")
+                    .append(name.replace("\"", "\"\"")).append("\"(");
+            for (int i = 0; i < rawArgs.length; i++) {
+                if (i > 0) call.append(", ");
+                // Each argument is read as the type the function declares for it, as PG reads
+                // them: an argument sent as text is a text until something says otherwise.
+                DataType declared = DataType.fromOid(argTypes[i]);
+                call.append("$").append(i + 1);
+                if (declared != null) call.append("::").append(declared.getPgName());
+                if (rawArgs[i] == null) {
+                    args.add(null);
+                    continue;
+                }
+                short format = 0;
+                if (formats != null && formats.length > 0) {
+                    format = formats.length == 1 ? formats[0] : formats[i];
+                }
+                args.add(format == 0
+                        ? new String(rawArgs[i], StandardCharsets.UTF_8)
+                        : PgWireBinaryCodec.decodeBinaryParam(rawArgs[i], argTypes[i]));
+            }
+            call.append(")");
+
+            QueryResult result = session.execute(call.toString(), args);
+            Object value = result.getRows() != null && !result.getRows().isEmpty()
+                    ? result.getRows().get(0)[0] : null;
+            // What goes on the wire is the type pg_proc declares, not the one the value happens
+            // to be carried as: lo_creat is declared an oid and answered eight bytes, and a
+            // driver reading four of them found a large object it could not open.
+            sendFunctionCallResponse(ctx, value, DataType.fromOid(resultType),
+                    msg.getResultFormat());
+        } catch (MemgresException e) {
+            sendErrorSimple(ctx, e.getSqlState() != null ? e.getSqlState() : "XX000", e.getMessage());
+        } catch (Exception e) {
+            sendErrorSimple(ctx, "XX000", String.valueOf(e.getMessage()));
+        }
+        sendReadyForQuery(ctx, session);
+    }
+
+    /** The name and argument types of the pg_proc row an OID names, or null when it names none. */
+    private Object[] lookupProcByOid(int oid) {
+        QueryResult found = session.execute(
+                "SELECT proname, proargtypes::text, prorettype::int FROM pg_catalog.pg_proc "
+                        + "WHERE oid = " + oid, new ArrayList<>());
+        if (found.getRows() == null || found.getRows().isEmpty()) return null;
+        Object[] row = found.getRows().get(0);
+        String written = row[1] == null ? "" : row[1].toString().trim();
+        String[] parts = written.isEmpty() ? new String[0] : written.split("\\s+");
+        int[] argTypes = new int[parts.length];
+        for (int i = 0; i < parts.length; i++) {
+            try {
+                argTypes[i] = Integer.parseInt(parts[i]);
+            } catch (NumberFormatException ignored) {
+                argTypes[i] = 0;
+            }
+        }
+        int resultType = row[2] instanceof Number ? ((Number) row[2]).intValue() : 0;
+        return new Object[]{String.valueOf(row[0]), argTypes, Integer.valueOf(resultType)};
+    }
+
+    private void sendFunctionCallResponse(ChannelHandlerContext ctx, Object value, DataType type,
+                                          short resultFormat) {
+        ByteBuf buf = ctx.alloc().buffer();
+        buf.writeByte('V');
+        int lengthIdx = buf.writerIndex();
+        buf.writeInt(0);
+        if (value == null) {
+            buf.writeInt(-1);
+        } else if (resultFormat == 1) {
+            PgWireBinaryCodec.writeBinaryValue(buf, value, type);
+        } else {
+            GucSettings guc = session != null ? session.getGucSettings() : null;
+            byte[] bytes = PgWireValueFormatter.formatValue(value, guc)
+                    .getBytes(StandardCharsets.UTF_8);
+            buf.writeInt(bytes.length);
+            buf.writeBytes(bytes);
+        }
+        buf.setInt(lengthIdx, buf.writerIndex() - lengthIdx);
+        ctx.write(buf);
     }
 
     private void handleExecute(ChannelHandlerContext ctx, PgWireMessage msg) {
