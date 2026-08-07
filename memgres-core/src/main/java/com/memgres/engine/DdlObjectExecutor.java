@@ -749,6 +749,12 @@ class DdlObjectExecutor {
                     "language \"" + stmt.language().toLowerCase() + "\" does not exist", "42704");
         }
 
+        // Only now: there is no point asking what a language is to run before knowing it is one,
+        // which is why the missing body is reported here rather than where the statement was read.
+        if (!stmt.bodyGiven) {
+            throw new MemgresException("no function body specified", "42P13");
+        }
+
         // Validate return type exists (PG validates at CREATE time)
         if (stmt.returnType() != null && !stmt.returnType().isEmpty()) {
             String retType = stmt.returnType();
@@ -915,18 +921,31 @@ class DdlObjectExecutor {
         pgFunc.setSecurityDefiner(stmt.securityDefiner());
         pgFunc.setStrict(stmt.strict());
         pgFunc.setLeakproof(stmt.leakproof());
+        pgFunc.setWindowFunction(stmt.windowFunction);
         pgFunc.setVolatility(stmt.volatility());
         pgFunc.setSetClauses(stmt.setClauses());
         pgFunc.setOwner(executor.sessionUser());
         pgFunc.setAtomicBody(stmt.atomicBody);
         if (stmt.parallel() != null) pgFunc.setParallel(stmt.parallel());
+        // A cost nobody wrote is the language's own: 1 for the languages whose calls are compiled
+        // in, 100 for an interpreted one. Taking 100 for all of them made every SQL function claim
+        // to be a hundred times the work it is, which is a number a planner reads.
         if (stmt.cost() >= 0) pgFunc.setCost(stmt.cost());
+        else pgFunc.setCost(defaultCostForLanguage(stmt.language()));
         if (stmt.rows() >= 0) pgFunc.setRows(stmt.rows());
         executor.database.addFunction(pgFunc);
         executor.database.registerSchemaObject(funcSchema, "function", stmt.name());
         executor.database.setObjectOwner("function:" + stmt.name(), executor.sessionUser());
         executor.recordUndo(new Session.CreateFunctionUndo(stmt.name()));
         return QueryResult.command(QueryResult.Type.CREATE_FUNCTION, 0);
+    }
+
+    /**
+     * What a routine costs when its definition did not say. PostgreSQL charges 1 for the languages
+     * whose calls are compiled in and 100 for every other, SQL included.
+     */
+    static double defaultCostForLanguage(String language) {
+        return "internal".equalsIgnoreCase(language) || "c".equalsIgnoreCase(language) ? 1 : 100;
     }
 
     /** The languages a stock PostgreSQL has; memgres runs sql and plpgsql bodies itself. */

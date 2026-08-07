@@ -319,7 +319,15 @@ class RangeFunctions {
                 boolean allInteger = true;
                 for (Expression arg : fn.args()) {
                     Object rv = executor.evalExpr(arg, ctx);
-                    if (rv == null) continue;
+                    // A multirange holds ranges, and NULL is not one. The single-argument form is
+                    // the variadic array itself being NULL, which makes the call NULL and is
+                    // answered before this runs; a NULL beside other ranges is a member the value
+                    // cannot hold. Skipping it built a multirange out of the rest, so a NULL
+                    // range silently disappeared from the value the caller got back.
+                    if (rv == null) {
+                        throw new MemgresException(
+                                "multirange values cannot contain null members", "22004");
+                    }
                     String rs = rv.toString().trim();
                     if (rs.equalsIgnoreCase("empty")) continue;
                     rawRanges.add(rs);

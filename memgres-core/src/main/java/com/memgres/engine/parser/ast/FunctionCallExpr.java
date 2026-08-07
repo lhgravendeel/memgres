@@ -42,6 +42,14 @@ public final class FunctionCallExpr implements Expression {
         this(name, args, distinct, star, orderBy, null);
     }
 
+    /**
+     * Whether the call was spelled out by the grammar — {@code substring(s FROM n)} rather than
+     * {@code substring(s, n)}. PostgreSQL reports a refused call the way it was written, and the
+     * grammar-spelled forms it reports schema-qualified: the same missing routine is
+     * {@code pg_catalog.substring} written one way and {@code substring} written the other.
+     */
+    public boolean spelledInGrammar;
+
     public String name() { return name; }
     public List<Expression> args() { return args; }
     public boolean distinct() { return distinct; }

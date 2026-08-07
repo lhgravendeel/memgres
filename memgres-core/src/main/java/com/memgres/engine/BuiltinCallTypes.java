@@ -108,11 +108,18 @@ public final class BuiltinCallTypes {
         final int[] args;
         final int result;
         final boolean variadic;
+        /**
+         * The fewest arguments this signature accepts, which is its parameter count less the ones
+         * carrying a default. A call passing fewer than every parameter is still this signature's
+         * call, and reading arity as an exact count left every such call unjudged.
+         */
+        final int minArgs;
 
-        Signature(int[] args, int result, boolean variadic) {
+        Signature(int[] args, int result, boolean variadic, int minArgs) {
             this.args = args;
             this.result = result;
             this.variadic = variadic;
+            this.minArgs = minArgs;
         }
     }
 
@@ -124,21 +131,23 @@ public final class BuiltinCallTypes {
             Map<String, List<Signature>> m = new HashMap<String, List<Signature>>();
             for (String[] row : BuiltinFunctionSignatures.SIGNATURES) {
                 if (!BuiltinFunctionSignatures.isPostgresSignature(row)) continue;
-                add(m, row[0], row[2], row[1], BuiltinFunctionSignatures.isVariadic(row));
+                add(m, row[0], row[2], row[1], BuiltinFunctionSignatures.isVariadic(row),
+                        BuiltinFunctionSignatures.fewestArguments(row));
             }
             for (String[] row : BuiltinFunctionSignatures.WINDOW_FUNCTIONS) {
-                add(m, row[0], row[2], row[1], false);
+                add(m, row[0], row[2], row[1], false, -1);
             }
             for (String[] row : BuiltinAggregateSignatures.AGGREGATES) {
-                add(m, row[0], row[2], row[1], false);
+                add(m, row[0], row[2], row[1], false, -1);
             }
             return m;
         }
 
         static void add(Map<String, List<Signature>> m, String name, String argOids, String resultOid,
-                        boolean variadic) {
+                        boolean variadic, int fewest) {
             int[] args = parseOids(argOids);
             if (args == null) return;
+            int minArgs = fewest >= 0 && fewest <= args.length ? fewest : args.length;
             int result = parseOid(resultOid);
             String key = name.toLowerCase(Locale.ROOT);
             List<Signature> list = m.get(key);
@@ -146,7 +155,7 @@ public final class BuiltinCallTypes {
                 list = new ArrayList<Signature>();
                 m.put(key, list);
             }
-            list.add(new Signature(args, result, variadic));
+            list.add(new Signature(args, result, variadic, minArgs));
         }
     }
 
@@ -260,6 +269,45 @@ public final class BuiltinCallTypes {
     }
 
     /**
+     * Refuses a call no declared signature can take, given what its arguments were written as.
+     *
+     * <p>{@link #requireCallable} judges the category alone, which lets a {@code numeric} through
+     * to a {@code bigint} parameter: the category is right and the type is not. PostgreSQL
+     * resolves on the type, so {@code pg_advisory_lock(1.5)} is a function that does not exist —
+     * there is a cast from numeric to bigint, but only for an assignment, and a call is not one.
+     *
+     * <p>What makes this safe to refuse on, where the category check was not, is that
+     * {@link #convertible} now carries PostgreSQL's own list of the casts it applies unasked. A
+     * call still gets the benefit of the doubt wherever there is doubt: an argument whose type the
+     * statement does not settle is skipped, and a name declaring nothing of that arity is left to
+     * whatever judges arity.
+     */
+    public static void requireReachable(String name, String writtenName, int[] argOids) {
+        if (name == null || argOids == null) return;
+        List<Signature> declared = Index.BY_NAME.get(name.toLowerCase(Locale.ROOT));
+        if (declared == null || declared.isEmpty()) return;
+        boolean anySettled = false;
+        for (int i = 0; i < argOids.length; i++) {
+            if (argOids[i] == UNKNOWN) continue;
+            // A type PostgreSQL does not have is one its signatures say nothing about. memgres
+            // declares hstore and extends jsonb_set to it, and a table of PostgreSQL's signatures
+            // is not evidence that the call has nowhere to go.
+            if (categoryOf(argOids[i]) == USER
+                    && CATEGORY.get(Integer.valueOf(argOids[i])) == null) return;
+            if (categoryOf(argOids[i]) != PSEUDO) anySettled = true;
+        }
+        if (!anySettled) return;
+        boolean anyOfThisArity = false;
+        for (int i = 0; i < declared.size(); i++) {
+            Signature sig = declared.get(i);
+            if (!acceptsArity(sig, argOids.length)) continue;
+            anyOfThisArity = true;
+            if (reachable(sig, argOids)) return;
+        }
+        if (anyOfThisArity) throw missing(writtenName, argOids);
+    }
+
+    /**
      * PostgreSQL prints the name a call was written with, except where the call was not written
      * as a call at all: {@code (a, b) OVERLAPS (c, d)} is spelled out in the grammar and reported
      * against the function the grammar means, qualified as PostgreSQL qualifies it.
@@ -331,18 +379,18 @@ public final class BuiltinCallTypes {
         candidates = keepBest(candidates, argOids, false);
         if (candidates.size() == 1) return candidates;
 
-        boolean anyUnsettled = false;
         boolean everyKindKnown = true;
         for (int i = 0; i < argOids.length; i++) {
+            // Whether a name is unchoosable is only safe to report where every candidate's kind
+            // is one this class records, whatever the argument at that position said.
+            everyKindKnown &= everyCategoryKnown(candidates, i);
             if (argOids[i] != UNKNOWN) continue;
-            anyUnsettled = true;
             // A signature written over "whatever was passed" cannot take an argument that has not
             // said what it is, so PostgreSQL drops those candidates before it looks at categories
             // — which is why quote_literal(text) answers a call quote_literal(anyelement) also
             // spells, and why dropping neither made the call look like a choice between the two.
             candidates = discardPolymorphic(candidates, i);
             if (candidates.size() == 1) return candidates;
-            everyKindKnown &= everyCategoryKnown(candidates, i);
             candidates = narrowUnsettled(candidates, i);
             if (candidates.size() == 1) return candidates;
         }
@@ -354,15 +402,41 @@ public final class BuiltinCallTypes {
         }
         // Reporting a name as unchoosable is only safe where every candidate's kind is one this
         // class records. One it does not could be the very candidate PostgreSQL chose.
-        if (candidates.size() > 1 && anyUnsettled && strict && everyKindKnown) {
+        //
+        // A call whose arguments were all written with a type is judged the same way: to_hex(int2)
+        // reaches both to_hex(int4) and to_hex(int8) and is neither of them, so it is not a call
+        // PostgreSQL can choose either. Asking only where an argument was untyped let every such
+        // call through and picked one of the candidates for it.
+        if (candidates.size() > 1 && strict && everyKindKnown
+                && noneWrittenOverAnything(candidates, argOids.length)) {
             throw ambiguous(writtenName, argOids);
         }
         return candidates;
     }
 
+    /**
+     * Whether no candidate is written over "whatever was passed" at any position.
+     *
+     * <p>A polymorphic signature takes an argument of any type, so two of them are not a choice
+     * PostgreSQL has to make between: {@code array_agg} is declared over both anyarray and
+     * anynonarray, and which one a call means follows from whether the argument is an array
+     * rather than from anything a preferred type could settle. Only where every candidate names
+     * real types is more than one of them a name that cannot be chosen.
+     */
+    private static boolean noneWrittenOverAnything(List<Signature> candidates, int arity) {
+        for (int c = 0; c < candidates.size(); c++) {
+            for (int i = 0; i < arity; i++) {
+                if (POLYMORPHIC.contains(Integer.valueOf(declaredAt(candidates.get(c), i)))) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
     private static boolean acceptsArity(Signature sig, int count) {
         if (sig.variadic) return count >= sig.args.length - 1 && sig.args.length > 0;
-        return sig.args.length == count;
+        return count >= sig.minArgs && count <= sig.args.length;
     }
 
     /** Whether every written argument can reach the type the signature declares for its position. */
@@ -393,9 +467,69 @@ public final class BuiltinCallTypes {
         return element > 0 ? element : sig.args[last];
     }
 
-    /** An argument reaches a parameter of its own type, or of a wider type in the same category. */
+    /**
+     * The casts PostgreSQL applies on its own when it resolves a call — pg_cast's implicit ones,
+     * read off the reference server. An argument reaches a parameter it casts to implicitly and
+     * no other, which is why {@code numeric} does not reach a {@code bigint} parameter: that cast
+     * exists, but only for an assignment, and a call is not one.
+     *
+     * <p>Pairs of source and target OID. The categories tell most of the same story, but not all
+     * of it: nothing about a category says a date reaches a timestamp, a cidr an inet, or a bit a
+     * bit varying, and the rank the numeric types are ordered by has no counterpart elsewhere.
+     */
+    private static final int[] IMPLICIT_CASTS = {
+        18, 25,
+        19, 25,
+        20, 24, 20, 26, 20, 700, 20, 701, 20, 1700, 20, 2202, 20, 2203, 20, 2204, 20, 2205,
+        20, 2206, 20, 3734, 20, 3769, 20, 4089, 20, 4096, 20, 4191,
+        21, 20, 21, 23, 21, 24, 21, 26, 21, 700, 21, 701, 21, 1700, 21, 2202, 21, 2203, 21, 2204,
+        21, 2205, 21, 2206, 21, 3734, 21, 3769, 21, 4089, 21, 4096, 21, 4191,
+        23, 20, 23, 24, 23, 26, 23, 700, 23, 701, 23, 1700, 23, 2202, 23, 2203, 23, 2204, 23, 2205,
+        23, 2206, 23, 3734, 23, 3769, 23, 4089, 23, 4096, 23, 4191,
+        24, 26, 24, 2202,
+        25, 19, 25, 1042, 25, 1043, 25, 2205,
+        26, 24, 26, 2202, 26, 2203, 26, 2204, 26, 2205, 26, 2206, 26, 3734, 26, 3769, 26, 4089,
+        26, 4096, 26, 4191,
+        194, 25,
+        650, 869,
+        700, 701,
+        774, 829, 829, 774,
+        1042, 19, 1042, 25, 1042, 1043,
+        1043, 19, 1043, 25, 1043, 1042, 1043, 2205,
+        1082, 1114, 1082, 1184,
+        1083, 1186, 1083, 1266,
+        1114, 1184,
+        1560, 1562, 1562, 1560,
+        1700, 700, 1700, 701,
+        2202, 24, 2202, 26,
+        2203, 26, 2203, 2204,
+        2204, 26, 2204, 2203,
+        2205, 26,
+        2206, 26,
+        3361, 17, 3361, 25,
+        3402, 17, 3402, 25,
+        3734, 26, 3769, 26, 4089, 26, 4096, 26, 4191, 26,
+        5017, 17, 5017, 25,
+    };
+
+    private static final Set<Long> IMPLICIT = buildImplicit();
+
+    private static Set<Long> buildImplicit() {
+        Set<Long> m = new HashSet<Long>();
+        for (int i = 0; i + 1 < IMPLICIT_CASTS.length; i += 2) {
+            m.add(Long.valueOf(castKey(IMPLICIT_CASTS[i], IMPLICIT_CASTS[i + 1])));
+        }
+        return m;
+    }
+
+    private static long castKey(int from, int to) {
+        return (((long) from) << 32) | (to & 0xFFFFFFFFL);
+    }
+
+    /** An argument reaches a parameter of its own type, or of one it casts to on its own. */
     private static boolean convertible(int from, int to) {
         if (from == to) return true;
+        if (IMPLICIT.contains(Long.valueOf(castKey(from, to)))) return true;
         Character fc = CATEGORY.get(Integer.valueOf(from));
         Character tc = CATEGORY.get(Integer.valueOf(to));
         if (fc == null || tc == null || fc.charValue() != tc.charValue()) return false;
@@ -539,6 +673,11 @@ public final class BuiltinCallTypes {
     public static String typeName(int oid) {
         DataType type = DataType.fromOid(oid);
         if (type == null) return "unknown";
+        // An array is named after its element: PostgreSQL writes numeric[] where its catalog
+        // holds _numeric, and a client told a function of _numeric does not exist is being told
+        // about a type it did not write.
+        DataType element = DataType.elementOf(type);
+        if (element != null && element != type) return typeName(element.getOid()) + "[]";
         String recorded = type.getPgName();
         if (recorded == null) return "unknown";
         String lower = recorded.toLowerCase(Locale.ROOT);

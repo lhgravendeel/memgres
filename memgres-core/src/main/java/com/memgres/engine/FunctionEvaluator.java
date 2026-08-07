@@ -946,7 +946,25 @@ class FunctionEvaluator {
         // A VARIADIC argument was one written argument before it was expanded, and an empty array
         // expands to none at all, so the count in hand is not the count the writer gave.
         if (!callUsedVariadic) rejectWrongArity(name, fn, ctx);
-        if (!callUsedVariadic) rejectAmbiguousBuiltin(executor, name, fn.name(), fn.args(), ctx);
+        // A routine memgres answers without reading its arguments is still strict, so a NULL
+        // argument is the whole call. Left to the implementation, the answer was whatever it was
+        // going to be anyway: false, the empty array, the one role, the empty string a void
+        // function prints -- none of which the client asked about.
+        if (!callUsedVariadic && !fn.args().isEmpty()
+                && BuiltinFunctionSignatures.nullArgumentMakesTheCallNull(name, fn.args().size())
+                && !userDeclaredFunction(executor, name)) {
+            for (Expression arg : fn.args()) {
+                if (executor.evalExpr(arg, ctx) == null) return null;
+            }
+        }
+
+        // PostgreSQL reports a refused call the way the statement wrote it, and it writes the
+        // grammar-spelled forms schema-qualified: the same missing routine is pg_catalog.substring
+        // written substring(s FROM n) and substring written substring(s, n).
+        if (!callUsedVariadic) {
+            rejectAmbiguousBuiltin(executor, name,
+                    fn.spelledInGrammar ? "pg_catalog." + fn.name() : fn.name(), fn.args(), ctx);
+        }
 
         // Delegate to category handlers
         Object delegated;
@@ -1313,6 +1331,29 @@ class FunctionEvaluator {
                 if (startObj instanceof String && !((String) startObj).isEmpty() && !Character.isDigit(((String) startObj).charAt(0)) && ((String) startObj).charAt(0) != '-') {
                     String s = (String) startObj;
                     throw new MemgresException("function generate_series(unknown, unknown) is not unique", "42725");
+                }
+                // A bound or a step with a fraction is the numeric form, and truncating it to a
+                // bigint answered a series of whole numbers for a series that has none: the same
+                // call written in FROM already answered 1.5, 2.5, 3.5.
+                if (startObj instanceof java.math.BigDecimal || stopObj instanceof java.math.BigDecimal
+                        || stepObj instanceof java.math.BigDecimal) {
+                    java.math.BigDecimal nStart = TypeCoercion.toBigDecimal(startObj);
+                    java.math.BigDecimal nStop = TypeCoercion.toBigDecimal(stopObj);
+                    java.math.BigDecimal nStep = stepObj != null
+                            ? TypeCoercion.toBigDecimal(stepObj) : java.math.BigDecimal.ONE;
+                    List<Object> numeric = new ArrayList<>();
+                    if (nStep.signum() != 0) {
+                        boolean up = nStep.signum() > 0;
+                        // Each value is the start plus so many steps, which carries the scale that
+                        // adding the step that many times carries.
+                        for (int i = 0; i < 10000; i++) {
+                            java.math.BigDecimal v = i == 0 ? nStart
+                                    : nStart.add(nStep.multiply(java.math.BigDecimal.valueOf(i)));
+                            if (up ? v.compareTo(nStop) > 0 : v.compareTo(nStop) < 0) break;
+                            numeric.add(v);
+                        }
+                    }
+                    return numeric;
                 }
                 long start = executor.toLong(startObj);
                 long stop = executor.toLong(stopObj);
@@ -3797,13 +3838,11 @@ class FunctionEvaluator {
         if (args.size() == 1 && executor.functionEvaluator.coercibleTypeName(name) != null) return;
         args = flattenRowArguments(args);
         int[] written = new int[args.size()];
-        boolean anyUntyped = false;
         for (int i = 0; i < args.size(); i++) {
             Expression arg = args.get(i);
             String declared = executor.binaryOpEvaluator.declaredTypeForResolution(arg, ctx);
             if (declared == null) {
                 if (!isUntypedLiteral(arg)) return;   // no opinion about this call
-                anyUntyped = true;
                 written[i] = BuiltinCallTypes.UNKNOWN;
                 continue;
             }
@@ -3812,8 +3851,25 @@ class FunctionEvaluator {
             written[i] = type.getOid();
         }
         BuiltinCallTypes.requireCallable(name, writtenName, written);
-        if (!anyUntyped) return;
+        BuiltinCallTypes.requireReachable(name, writtenName, written);
+        // A call PostgreSQL cannot choose between is refused whether or not an argument was
+        // written without a type: to_hex(int2) reaches both to_hex(int4) and to_hex(int8) and is
+        // neither, so it is not a call at all. Asking only where an argument was untyped let
+        // every such call through and picked one of the two.
         BuiltinCallTypes.requireResolvable(name, writtenName, written);
+    }
+
+    /**
+     * Whether a user has declared a function of this name. A few built-ins are carried as
+     * {@link PgFunction} stubs so that ALTER FUNCTION can name them, and those are memgres's own
+     * — they live in pg_catalog, and they are still the built-in.
+     */
+    private static boolean userDeclaredFunction(AstExecutor executor, String name) {
+        for (PgFunction f : executor.database.getFunctionOverloads(name.toLowerCase())) {
+            if (!"pg_catalog".equals(f.getSchemaName())) return true;
+        }
+        PgFunction single = executor.database.getFunctions().get(name.toLowerCase());
+        return single != null && !"pg_catalog".equals(single.getSchemaName());
     }
 
     /**

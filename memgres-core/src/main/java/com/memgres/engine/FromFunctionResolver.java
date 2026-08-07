@@ -491,7 +491,8 @@ class FromFunctionResolver {
         try {
             executor.toLong(evalArgs.get(0));
             executor.toLong(evalArgs.get(1));
-        } catch (NumberFormatException e) {
+        } catch (MemgresException e) {
+            if (!"22P02".equals(e.getSqlState())) throw e;
             throw new MemgresException("function generate_series(unknown, unknown) is not unique", "42725");
         }
         long start = executor.toLong(evalArgs.get(0));

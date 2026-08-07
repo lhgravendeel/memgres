@@ -36,13 +36,15 @@ class AdvisoryLockFunctions {
     }
 
     private Database.AdvisoryLockId advisoryKey(FunctionCallExpr fn, RowContext ctx) {
-        long key1 = executor.toLong(executor.evalExpr(fn.args().get(0), ctx));
+        // The two forms take different types, so a key neither can read is reported against the
+        // one that was called: two keys are integers apiece, a lone key is a bigint.
         if (fn.args().size() >= 2) {
-            long key2 = executor.toLong(executor.evalExpr(fn.args().get(1), ctx));
+            long key1 = executor.toInt(executor.evalExpr(fn.args().get(0), ctx));
+            long key2 = executor.toInt(executor.evalExpr(fn.args().get(1), ctx));
             // Two-int form: classid = first arg, objid = second arg, in its own keyspace.
             return new Database.AdvisoryLockId(((key1 & 0xFFFFFFFFL) << 32) | (key2 & 0xFFFFFFFFL), true);
         }
-        return new Database.AdvisoryLockId(key1, false);
+        return new Database.AdvisoryLockId(executor.toLong(executor.evalExpr(fn.args().get(0), ctx)), false);
     }
 
     Object eval(String name, FunctionCallExpr fn, RowContext ctx) {

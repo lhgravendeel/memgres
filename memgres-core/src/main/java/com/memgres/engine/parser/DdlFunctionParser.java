@@ -159,7 +159,7 @@ class DdlFunctionParser {
         }
 
         String body = null;
-        String language = "sql";
+        String language = null;
         boolean[] secDefRef = {false};
         boolean[] strictRef = {false};
         boolean[] leakproofRef = {false};
@@ -168,42 +168,76 @@ class DdlFunctionParser {
         double[] costRef = {-1};
         double[] rowsRef = {-1};
         String[] supportRef = {null};
+        boolean[] windowRef = {false};
         java.util.Map<String, String> setClauses = new java.util.LinkedHashMap<>();
         boolean isAtomicBody = false;
 
-        if (parser.matchKeyword("AS")) {
-            body = readFunctionBody();
-            parseFunctionAttributes(secDefRef, strictRef, volatilityRef, leakproofRef, setClauses, parallelRef, costRef, rowsRef, supportRef);
-            if (parser.matchKeyword("LANGUAGE")) {
-                language = parser.readIdentifierOrString();
-            }
-        } else if (parser.matchKeyword("LANGUAGE")) {
-            language = parser.readIdentifierOrString();
-            parseFunctionAttributes(secDefRef, strictRef, volatilityRef, leakproofRef, setClauses, parallelRef, costRef, rowsRef, supportRef);
+        // The options are one list PostgreSQL reads in whatever order they were written, not an
+        // AS clause and a LANGUAGE clause in either of two arrangements. Reading them as the
+        // latter left anything spelled a third way — WINDOW ahead of LANGUAGE, say — sitting
+        // unread after the statement, and the routine was created from what had been read so far.
+        RoutineOptions opts = new RoutineOptions(isProcedure);
+        int asItemCount = 0;
+        boolean sqlStandardBody = false;
+        Token languageToken = null;
+        Token sqlBodyToken = null;
+        while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON) && !parser.check(TokenType.EOF)) {
+            Token at = parser.peek();
             if (parser.matchKeyword("AS")) {
+                opts.take(RoutineOptions.AS, at);
+                if (sqlStandardBody) {
+                    throw ParseException.saying("duplicate function body specified", at, "42P13");
+                }
                 body = readFunctionBody();
+                asItemCount = 1;
+                // A C function names an object file and a link symbol; nothing else takes two.
+                while (parser.match(TokenType.COMMA)) {
+                    readFunctionBody();
+                    asItemCount++;
+                }
+                continue;
+            }
+            if (parser.matchKeyword("LANGUAGE")) {
+                opts.take(RoutineOptions.LANGUAGE, at);
+                languageToken = at;
+                language = parser.readIdentifierOrString();
+                continue;
+            }
+            // A SQL-standard body — RETURN expr, or BEGIN ATOMIC ... END (PG 14+). It says by
+            // itself that the language is SQL, which is why it needs no LANGUAGE clause.
+            if (parser.checkKeyword("RETURN") || (parser.checkKeyword("BEGIN") && isBeginAtomic())) {
+                if (body != null) {
+                    throw ParseException.saying("duplicate function body specified", at, "42P13");
+                }
+                sqlBodyToken = at;
+                if (parser.matchKeyword("RETURN")) {
+                    body = readSqlStandardReturn();
+                } else {
+                    body = readBeginAtomicBody();
+                    isAtomicBody = true;
+                }
+                sqlStandardBody = true;
+                continue;
+            }
+            if (!parseOneAttribute(opts, secDefRef, strictRef, volatilityRef, leakproofRef,
+                    setClauses, parallelRef, costRef, rowsRef, supportRef, windowRef)) {
+                break;
             }
         }
 
-        parseFunctionAttributes(secDefRef, strictRef, volatilityRef, leakproofRef, setClauses, parallelRef, costRef, rowsRef, supportRef);
-
-        // SQL-standard function body: RETURN expr or BEGIN ATOMIC ... END (PG 14+)
-        if (body == null && parser.checkKeyword("RETURN")) {
-            // PG: inline SQL function body only valid for language SQL
-            if (!"sql".equalsIgnoreCase(language)) {
-                throw new ParseException("inline SQL function body only valid for language SQL", parser.peek(), "42P13");
-            }
-            parser.advance();
-            body = readSqlStandardReturn();
-            language = "sql";
-        } else if (body == null && parser.checkKeyword("BEGIN") && isBeginAtomic()) {
-            // PG: inline SQL function body only valid for language SQL
-            if (!"sql".equalsIgnoreCase(language)) {
-                throw new ParseException("inline SQL function body only valid for language SQL", parser.peek(), "42P13");
-            }
-            body = readBeginAtomicBody();
-            language = "sql";
-            isAtomicBody = true;
+        // What a definition must settle before it is one, in the order PostgreSQL settles it.
+        if (language == null && !sqlStandardBody) {
+            throw ParseException.saying("no language specified", parser.peek(), "42P13");
+        }
+        if (sqlStandardBody && language != null && !"sql".equalsIgnoreCase(language)) {
+            throw ParseException.saying("inline SQL function body only valid for language SQL",
+                    sqlBodyToken, "42P13");
+        }
+        if (sqlStandardBody) language = "sql";
+        // Only the C language reads a second AS item, as the symbol inside the named object file.
+        if (asItemCount > 1 && !"c".equalsIgnoreCase(language) && !"internal".equalsIgnoreCase(language)) {
+            throw ParseException.saying("only one AS item needed for language \""
+                    + language.toLowerCase() + "\"", languageToken, "42P13");
         }
 
         CreateFunctionStmt result = new CreateFunctionStmt(name, schema, rawParams.toString().trim(), parsedParams,
@@ -212,6 +246,8 @@ class DdlFunctionParser {
                 parallelRef[0], costRef[0], rowsRef[0]);
         result.atomicBody = isAtomicBody;
         result.supportFunction = supportRef[0];
+        result.bodyGiven = body != null;
+        result.windowFunction = windowRef[0];
         return result;
     }
 
@@ -331,72 +367,127 @@ class DdlFunctionParser {
         return typeName;
     }
 
-    private void parseFunctionAttributes(boolean[] securityDefinerRef, boolean[] strictRef,
-                                          String[] volatilityRef, boolean[] leakproofRef,
-                                          java.util.Map<String, String> setClauses,
-                                          String[] parallelRef, double[] costRef, double[] rowsRef,
-                                          String[] supportRef) {
-        while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON) && !parser.check(TokenType.EOF)) {
-            Token t = parser.peek();
-            if (t.type() == TokenType.KEYWORD) {
-                String kw = t.value();
-                if (kw.equals("IMMUTABLE") || kw.equals("STABLE") || kw.equals("VOLATILE") ||
-                        kw.equals("STRICT") || kw.equals("SECURITY") || kw.equals("COST") ||
-                        kw.equals("PARALLEL") || kw.equals("CALLED") || kw.equals("RETURNS") ||
-                        kw.equals("ROWS") || kw.equals("LEAKPROOF") || kw.equals("SUPPORT")) {
-                    parser.advance();
-                    if (kw.equals("IMMUTABLE") || kw.equals("STABLE") || kw.equals("VOLATILE")) {
-                        volatilityRef[0] = kw;
-                    }
-                    if (kw.equals("STRICT")) strictRef[0] = true;
-                    if (kw.equals("SECURITY")) {
-                        String defOrInvoker = parser.readIdentifier();
-                        if ("DEFINER".equalsIgnoreCase(defOrInvoker)) securityDefinerRef[0] = true;
-                        else securityDefinerRef[0] = false;
-                    }
-                    if (kw.equals("COST")) {
-                        String costVal = parser.advance().value();
-                        try { costRef[0] = Double.parseDouble(costVal); } catch (NumberFormatException e) { /* ignore */ }
-                    }
-                    if (kw.equals("ROWS")) {
-                        String rowsVal = parser.advance().value();
-                        try { rowsRef[0] = Double.parseDouble(rowsVal); } catch (NumberFormatException e) { /* ignore */ }
-                    }
-                    if (kw.equals("PARALLEL")) {
-                        String parallelVal = parser.readIdentifier().toUpperCase();
-                        parallelRef[0] = parallelVal;
-                    }
-                    if (kw.equals("SUPPORT")) supportRef[0] = parser.readIdentifier(); // consume support function name
-                    if (kw.equals("LEAKPROOF")) { leakproofRef[0] = true; }
-                    if (kw.equals("CALLED")) { parser.matchKeyword("ON"); parser.matchKeyword("NULL"); parser.matchKeyword("INPUT"); strictRef[0] = false; }
-                    if (kw.equals("RETURNS")) { parser.matchKeyword("NULL"); parser.matchKeyword("ON"); parser.matchKeyword("NULL"); parser.matchKeyword("INPUT"); strictRef[0] = true; }
-                    continue;
-                }
-                // NOT LEAKPROOF — two keywords
-                if (kw.equals("NOT") && parser.matchKeywords("NOT", "LEAKPROOF")) {
-                    leakproofRef[0] = false;
-                    continue;
-                }
-                if (kw.equals("SET")) {
-                    parser.advance();
-                    String paramName = parser.readIdentifier();
-                    if (parser.matchKeyword("TO") || parser.match(TokenType.EQUALS)) {
-                        StringBuilder valBuf = new StringBuilder();
-                        while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON) && !parser.check(TokenType.EOF)) {
-                            Token next = parser.peek();
-                            if (next.type() == TokenType.KEYWORD && isFunctionAttributeKeyword(next.value())) break;
-                            if (next.type() == TokenType.KEYWORD && next.value().equals("AS")) break;
-                            if (valBuf.length() > 0) valBuf.append(" ");
-                            valBuf.append(next.value());
-                            parser.advance();
-                        }
-                        setClauses.put(paramName.toLowerCase(), valBuf.toString().trim());
-                    }
-                    continue;
-                }
-            }
-            break;
+    /**
+     * Reads the one attribute the statement is sitting on, or answers false when what follows is
+     * not an attribute at all. Each is recorded against {@code opts}, which is what refuses a
+     * repeat and what refuses an attribute a procedure may not carry.
+     */
+    private boolean parseOneAttribute(RoutineOptions opts,
+                                      boolean[] securityDefinerRef, boolean[] strictRef,
+                                      String[] volatilityRef, boolean[] leakproofRef,
+                                      java.util.Map<String, String> setClauses,
+                                      String[] parallelRef, double[] costRef, double[] rowsRef,
+                                      String[] supportRef, boolean[] windowRef) {
+        Token t = parser.peek();
+        if (t.type() != TokenType.KEYWORD) return false;
+        String kw = t.value();
+        if (kw.equals("IMMUTABLE") || kw.equals("STABLE") || kw.equals("VOLATILE")) {
+            opts.take(RoutineOptions.VOLATILITY, t);
+            parser.advance();
+            volatilityRef[0] = kw;
+            return true;
         }
+        if (kw.equals("STRICT")) {
+            opts.take(RoutineOptions.STRICT, t);
+            parser.advance();
+            strictRef[0] = true;
+            return true;
+        }
+        if (kw.equals("CALLED")) {
+            opts.take(RoutineOptions.STRICT, t);
+            parser.advance();
+            parser.matchKeyword("ON"); parser.matchKeyword("NULL"); parser.matchKeyword("INPUT");
+            strictRef[0] = false;
+            return true;
+        }
+        if (kw.equals("RETURNS")) {
+            opts.take(RoutineOptions.STRICT, t);
+            parser.advance();
+            parser.matchKeyword("NULL"); parser.matchKeyword("ON");
+            parser.matchKeyword("NULL"); parser.matchKeyword("INPUT");
+            strictRef[0] = true;
+            return true;
+        }
+        if (kw.equals("SECURITY")) {
+            opts.take(RoutineOptions.SECURITY, t);
+            parser.advance();
+            securityDefinerRef[0] = "DEFINER".equalsIgnoreCase(parser.readIdentifier());
+            return true;
+        }
+        if (kw.equals("LEAKPROOF")) {
+            opts.take(RoutineOptions.LEAKPROOF, t);
+            parser.advance();
+            leakproofRef[0] = true;
+            return true;
+        }
+        if (kw.equals("NOT") && parser.checkKeywordAt(1, "LEAKPROOF")) {
+            opts.take(RoutineOptions.LEAKPROOF, t);
+            parser.matchKeywords("NOT", "LEAKPROOF");
+            leakproofRef[0] = false;
+            return true;
+        }
+        if (kw.equals("COST")) {
+            opts.take(RoutineOptions.COST, t);
+            parser.advance();
+            String costVal = parser.advance().value();
+            try { costRef[0] = Double.parseDouble(costVal); } catch (NumberFormatException e) { /* ignore */ }
+            return true;
+        }
+        if (kw.equals("ROWS")) {
+            opts.take(RoutineOptions.ROWS, t);
+            parser.advance();
+            String rowsVal = parser.advance().value();
+            try { rowsRef[0] = Double.parseDouble(rowsVal); } catch (NumberFormatException e) { /* ignore */ }
+            return true;
+        }
+        if (kw.equals("PARALLEL")) {
+            opts.take(RoutineOptions.PARALLEL, t);
+            parser.advance();
+            parallelRef[0] = parser.readIdentifier().toUpperCase();
+            return true;
+        }
+        if (kw.equals("SUPPORT")) {
+            opts.take(RoutineOptions.SUPPORT, t);
+            parser.advance();
+            supportRef[0] = parser.readIdentifier();
+            return true;
+        }
+        if (kw.equals("WINDOW")) {
+            opts.take(RoutineOptions.WINDOW, t);
+            parser.advance();
+            windowRef[0] = true;
+            return true;
+        }
+        if (kw.equals("TRANSFORM")) {
+            opts.take(RoutineOptions.TRANSFORM, t);
+            parser.advance();
+            do {
+                parser.matchKeyword("FOR"); parser.matchKeyword("TYPE");
+                parser.parseTypeName();
+            } while (parser.match(TokenType.COMMA));
+            return true;
+        }
+        // SET names a parameter apiece rather than being one option, so it is the one that repeats.
+        if (kw.equals("SET")) {
+            parser.advance();
+            String paramName = parser.readIdentifier();
+            if (parser.matchKeyword("TO") || parser.match(TokenType.EQUALS)) {
+                StringBuilder valBuf = new StringBuilder();
+                while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON) && !parser.check(TokenType.EOF)) {
+                    Token next = parser.peek();
+                    if (next.type() == TokenType.KEYWORD && isFunctionAttributeKeyword(next.value())) break;
+                    if (next.type() == TokenType.KEYWORD && next.value().equals("AS")) break;
+                    if (valBuf.length() > 0) valBuf.append(" ");
+                    valBuf.append(next.value());
+                    parser.advance();
+                }
+                setClauses.put(paramName.toLowerCase(), valBuf.toString().trim());
+            } else if (parser.matchKeywords("FROM", "CURRENT")) {
+                setClauses.put(paramName.toLowerCase(), "FROM CURRENT");
+            }
+            return true;
+        }
+        return false;
     }
 
     private static boolean isFunctionAttributeKeyword(String kw) {
@@ -404,6 +495,7 @@ class DdlFunctionParser {
                 kw.equals("STRICT") || kw.equals("SECURITY") || kw.equals("COST") ||
                 kw.equals("PARALLEL") || kw.equals("CALLED") || kw.equals("RETURNS") ||
                 kw.equals("ROWS") || kw.equals("SET") || kw.equals("LANGUAGE") ||
-                kw.equals("LEAKPROOF") || kw.equals("SUPPORT") || kw.equals("NOT");
+                kw.equals("LEAKPROOF") || kw.equals("SUPPORT") || kw.equals("NOT") ||
+                kw.equals("WINDOW") || kw.equals("TRANSFORM");
     }
 }

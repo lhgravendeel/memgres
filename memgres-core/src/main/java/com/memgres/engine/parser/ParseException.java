@@ -31,9 +31,19 @@ public class ParseException extends MemgresException {
         return "syntax error at or near \"" + (token == null ? "" : token.raw()) + "\"";
     }
 
-    private ParseException(String message, Token token, boolean verbatim) {
-        super(message, "42601");
+    private ParseException(String message, Token token, String sqlState, boolean verbatim) {
+        super(message, sqlState);
         if (token != null && token.position() >= 0) setPosition(token.position() + 1); // 1-based
+    }
+
+    /**
+     * A complaint PostgreSQL words itself rather than reporting as a syntax error — "no language
+     * specified" and its kind. The constructors replace the message with "syntax error at or
+     * near ...", which is what PostgreSQL says when the grammar is what went wrong, and not what
+     * it says when the statement parses and means something it refuses.
+     */
+    public static ParseException saying(String message, Token token, String sqlState) {
+        return new ParseException(message, token, sqlState, true);
     }
 
     /**
@@ -42,8 +52,8 @@ public class ParseException extends MemgresException {
      */
     public static ParseException at(Token token) {
         if (token == null || token.type() == TokenType.EOF || token.type() == TokenType.SEMICOLON) {
-            return new ParseException("syntax error at end of input", token, true);
+            return new ParseException("syntax error at end of input", token, "42601", true);
         }
-        return new ParseException("syntax error at or near \"" + token.raw() + "\"", token, true);
+        return new ParseException("syntax error at or near \"" + token.raw() + "\"", token, "42601", true);
     }
 }

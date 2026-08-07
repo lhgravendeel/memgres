@@ -27,6 +27,15 @@ public final class CreateFunctionStmt implements Statement {
     public final double rows;                 // ROWS value (-1 means use default)
     public boolean atomicBody;                // true if body was defined via BEGIN ATOMIC
     public String supportFunction;            // SUPPORT function name (null if not specified)
+    /**
+     * Whether the definition said what to run at all. An empty body is a body — the one that runs
+     * nothing — so this is what tells that apart from a definition that named no body, which is
+     * not a definition. PostgreSQL says so only after it has looked the language up, so the
+     * statement carries the answer rather than being refused where it was read.
+     */
+    public boolean bodyGiven = true;
+    /** Whether WINDOW was written, which is what makes the routine a window function. */
+    public boolean windowFunction;
 
     public CreateFunctionStmt(
             String name,
