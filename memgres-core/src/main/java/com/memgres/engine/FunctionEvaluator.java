@@ -48,7 +48,7 @@ class FunctionEvaluator {
     private final MathFunctions mathFunctions;
     private final StringFunctions stringFunctions;
     private final CatalogSystemFunctions catalogSystemFunctions;
-    private final JsonFunctions jsonFunctions;
+    final JsonFunctions jsonFunctions;
     private final TextSearchFunctions textSearchFunctions;
     private final DateTimeFunctions dateTimeFunctions;
     private final XmlFunctions xmlFunctions;

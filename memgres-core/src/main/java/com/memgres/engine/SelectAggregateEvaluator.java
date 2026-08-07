@@ -1483,17 +1483,24 @@ class SelectAggregateEvaluator {
                 List<RowContext> orderedGroup = sortGroupForAggregate(group, fn);
                 StringBuilder sb = new StringBuilder("[");
                 boolean first = true;
+                JsonFunctions json = executor.functionEvaluator.jsonFunctions;
                 for (RowContext r : orderedGroup) {
-                    Object v = executor.evalExpr(fn.args().get(0), r);
-                    if (!first) sb.append(", ");
+                    Object v = json.wholeRowOrValue(fn.args().get(0), r);
+                    boolean structured = v instanceof Map<?, ?> || v instanceof List<?>
+                            || v instanceof AstExecutor.PgRow;
+                    if (!first) {
+                        // PG breaks the line before an element that has a shape of its own, and
+                        // writes a plain one straight after the comma.
+                        sb.append(structured ? ", \n " : ", ");
+                    }
                     first = false;
-                    if (v == null) sb.append("null");
-                    else if (v instanceof Number) sb.append(v);
-                    else if (v instanceof Boolean) sb.append(v);
-                    else sb.append("\"").append(v.toString().replace("\"", "\\\"")).append("\"");
+                    // A row collected into a JSON array is the object it is, not the text a
+                    // composite prints as: json_agg(t) gathered "(1,ab,...)" as one string.
+                    sb.append(json.jsonTextOf(v));
                 }
                 sb.append("]");
-                return sb.toString();
+                return name.equals("jsonb_agg")
+                        ? JsonFunctions.normalizedIfStructured(sb.toString()) : sb.toString();
             }
             case "json_object_agg":
             case "jsonb_object_agg": {
@@ -1504,7 +1511,8 @@ class SelectAggregateEvaluator {
                 boolean first = true;
                 for (RowContext r : group) {
                     Object k = executor.evalExpr(fn.args().get(0), r);
-                    Object v = executor.evalExpr(fn.args().get(1), r);
+                    Object v = executor.functionEvaluator.jsonFunctions
+                            .wholeRowOrValue(fn.args().get(1), r);
                     // Dropping the row would silently lose it; PG refuses a NULL key outright
                     if (k == null) {
                         throw name.equals("jsonb_object_agg")
@@ -1514,10 +1522,7 @@ class SelectAggregateEvaluator {
                     if (!first) sb.append(", ");
                     first = false;
                     sb.append("\"").append(k.toString().replace("\"", "\\\"")).append("\" : ");
-                    if (v == null) sb.append("null");
-                    else if (v instanceof Number) sb.append(v);
-                    else if (v instanceof Boolean) sb.append(v);
-                    else sb.append("\"").append(v.toString().replace("\"", "\\\"")).append("\"");
+                    sb.append(executor.functionEvaluator.jsonFunctions.jsonTextOf(v));
                 }
                 sb.append(" }");
                 String result = sb.toString();
