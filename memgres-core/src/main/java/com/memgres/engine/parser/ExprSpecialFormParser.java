@@ -261,7 +261,7 @@ class ExprSpecialFormParser {
                 args = Cols.listOf(str, from);
             }
             ep.expect(TokenType.RIGHT_PAREN);
-            return new FunctionCallExpr("substring", args);
+            return grammarCall("substring", args);
         }
         if (ep.matchKeyword("FOR")) {
             Expression len = ep.parseExpression();
@@ -273,7 +273,7 @@ class ExprSpecialFormParser {
                 args = Cols.listOf(str, Literal.ofInt("1"), len);
             }
             ep.expect(TokenType.RIGHT_PAREN);
-            return new FunctionCallExpr("substring", args);
+            return grammarCall("substring", args);
         }
         if (ep.matchKeyword("SIMILAR")) {
             Expression pattern = ep.parseExpression();
@@ -300,7 +300,7 @@ class ExprSpecialFormParser {
         ep.expectKeyword("IN");
         Expression string = ep.parseExpression();
         ep.expect(TokenType.RIGHT_PAREN);
-        return new FunctionCallExpr("position", Cols.listOf(substring, string));
+        return grammarCall("position", Cols.listOf(substring, string));
     }
 
     Expression parseOverlay() {
@@ -319,7 +319,7 @@ class ExprSpecialFormParser {
             args = Cols.listOf(str, replacement, start);
         }
         ep.expect(TokenType.RIGHT_PAREN);
-        return new FunctionCallExpr("overlay", args);
+        return grammarCall("overlay", args);
     }
 
     Expression parseExtract() {
@@ -334,7 +334,7 @@ class ExprSpecialFormParser {
         ep.expectKeyword("FROM");
         Expression source = ep.parseExpression();
         ep.expect(TokenType.RIGHT_PAREN);
-        return new FunctionCallExpr("extract", Cols.listOf(Literal.ofString(field), source));
+        return grammarCall("extract", Cols.listOf(Literal.ofString(field), source));
     }
 
     Expression parseTrim() {
@@ -374,9 +374,9 @@ class ExprSpecialFormParser {
                 break;
         }
         if (charsExpr != null) {
-            return new FunctionCallExpr(funcName, Cols.listOf(stringExpr, charsExpr));
+            return grammarCall(funcName, Cols.listOf(stringExpr, charsExpr));
         } else {
-            return new FunctionCallExpr(funcName, Cols.listOf(stringExpr));
+            return grammarCall(funcName, Cols.listOf(stringExpr));
         }
     }
 
@@ -1208,5 +1208,12 @@ class ExprSpecialFormParser {
             return cr.column();
         }
         return "?column?";
+    }
+
+    /** A call the grammar spelled out, which PostgreSQL names schema-qualified when it refuses it. */
+    private static FunctionCallExpr grammarCall(String name, List<Expression> args) {
+        FunctionCallExpr call = new FunctionCallExpr(name, args);
+        call.spelledInGrammar = true;
+        return call;
     }
 }

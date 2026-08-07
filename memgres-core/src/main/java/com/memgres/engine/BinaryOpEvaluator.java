@@ -506,6 +506,16 @@ class BinaryOpEvaluator {
                 default: return null;
             }
         }
+        if (expr instanceof UnaryExpr) {
+            // A sign says nothing about the type: -4 is the integer 4 was, and reading it as
+            // nothing in particular left the call it stood in to be resolved on a preferred type
+            // instead — so abs(-4) was a double precision where abs(4) was an integer.
+            UnaryExpr un = (UnaryExpr) expr;
+            if (un.op == UnaryExpr.UnaryOp.NEGATE || un.op == UnaryExpr.UnaryOp.POSITIVE) {
+                return declaredTypeForResolution(un.operand, ctx);
+            }
+            return null;
+        }
         if (expr instanceof FunctionCallExpr) {
             // What a built-in answers with is part of what the query says, the same as a cast is:
             // now() is a timestamptz wherever it stands, so a literal beside it is read as one

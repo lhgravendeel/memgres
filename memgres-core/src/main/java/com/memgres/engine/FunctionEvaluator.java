@@ -946,7 +946,13 @@ class FunctionEvaluator {
         // A VARIADIC argument was one written argument before it was expanded, and an empty array
         // expands to none at all, so the count in hand is not the count the writer gave.
         if (!callUsedVariadic) rejectWrongArity(name, fn, ctx);
-        if (!callUsedVariadic) rejectAmbiguousBuiltin(executor, name, fn.name(), fn.args(), ctx);
+        // PostgreSQL reports a refused call the way the statement wrote it, and it writes the
+        // grammar-spelled forms schema-qualified: the same missing routine is pg_catalog.substring
+        // written substring(s FROM n) and substring written substring(s, n).
+        if (!callUsedVariadic) {
+            rejectAmbiguousBuiltin(executor, name,
+                    fn.spelledInGrammar ? "pg_catalog." + fn.name() : fn.name(), fn.args(), ctx);
+        }
 
         // Delegate to category handlers
         Object delegated;
@@ -3812,6 +3818,7 @@ class FunctionEvaluator {
             written[i] = type.getOid();
         }
         BuiltinCallTypes.requireCallable(name, writtenName, written);
+        BuiltinCallTypes.requireReachable(name, writtenName, written);
         if (!anyUntyped) return;
         BuiltinCallTypes.requireResolvable(name, writtenName, written);
     }
