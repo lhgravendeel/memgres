@@ -2679,6 +2679,7 @@ public final class TypeCoercion {
         if (value instanceof CidrValue) return DataType.CIDR;
         if (value instanceof MacaddrValue) return DataType.MACADDR;
         if (value instanceof Macaddr8Value) return DataType.MACADDR8;
+        if (value instanceof byte[]) return DataType.BYTEA;
         if (value instanceof List) return DataType.TEXT; // arrays
         return DataType.TEXT;
     }

@@ -91,6 +91,10 @@ class CatalogSystemFunctions {
         switch (name) {
             case "pg_typeof": {
                 Expression rawExpr = fn.args().get(0);
+                // Whatever this method ends up reading the value for, it reads it once. Asking
+                // twice ran a function with an effect twice: pg_typeof(lo_unlink(x)) unlinked the
+                // object and then complained that no such object existed.
+                OnceEvaluated value = new OnceEvaluated(rawExpr, ctx);
 
                 // An expression already folded to a value -- a window call resolved over its
                 // partition, an aggregate over its group -- carries the type its own expression
@@ -193,6 +197,14 @@ class CatalogSystemFunctions {
                     }
                 }
 
+                // An oid is carried as a plain number and a registry type as a plain name, so
+                // neither value says which type produced it -- lo_creat answered a bigint and
+                // to_regclass a text. The declaration is the only witness there is.
+                if (rawExpr instanceof FunctionCallExpr) {
+                    DataType declared = declaredResultType((FunctionCallExpr) rawExpr, ctx);
+                    if (isOidCarriedType(declared)) return pgTypeDisplayName(declared);
+                }
+
                 // A call that answered nothing has no value to read a type off, and its
                 // signature is then the only witness there is: pg_column_toast_chunk_id answers
                 // an oid whether or not the value it was asked about has one.
@@ -200,17 +212,8 @@ class CatalogSystemFunctions {
                     FunctionCallExpr call = (FunctionCallExpr) rawExpr;
                     String called = FunctionEvaluator.stripSchemaPrefix(
                             call.name().toLowerCase(java.util.Locale.ROOT));
-                    if (BuiltinCallTypes.records(called) && executor.evalExpr(rawExpr, ctx) == null) {
-                        java.util.List<Expression> args = call.args() == null
-                                ? java.util.Collections.<Expression>emptyList() : call.args();
-                        int[] written = new int[args.size()];
-                        for (int i = 0; i < args.size(); i++) {
-                            // What the call answers with depends on what it was passed: abs of a
-                            // bigint is a bigint, and abs of nothing in particular is a float8.
-                            DataType argType = executor.exprEvaluator.inferExprType(args.get(i));
-                            written[i] = argType == null ? 0 : argType.getOid();
-                        }
-                        DataType declared = DataType.fromOid(BuiltinCallTypes.resultType(called, written));
+                    if (BuiltinCallTypes.records(called) && value.get() == null) {
+                        DataType declared = declaredResultType(call, ctx);
                         if (declared != null) return pgTypeDisplayName(declared);
                     }
                 }
@@ -235,7 +238,7 @@ class CatalogSystemFunctions {
                     // AT TIME ZONE / AT LOCAL swaps a value between the zoned and zoneless
                     // spelling of its type; a timetz is a formatted string, which the value-shape
                     // fallback below would otherwise report as text.
-                    Object shifted = executor.evalExpr(rawExpr, ctx);
+                    Object shifted = value.get();
                     if (shifted instanceof LocalDateTime) return "timestamp without time zone";
                     if (shifted instanceof OffsetDateTime) return "timestamp with time zone";
                     if (TypeCoercion.looksLikeTimeTz(shifted)) return "time with time zone";
@@ -303,7 +306,7 @@ class CatalogSystemFunctions {
                     }
                     if (hasInt && hasFloat) return "numeric";
                     if (hasNull && nonNullType != null) {
-                        Object caseResult = executor.evalExpr(rawExpr, ctx);
+                        Object caseResult = value.get();
                         if (caseResult == null) return nonNullType;
                     }
                 }
@@ -324,7 +327,7 @@ class CatalogSystemFunctions {
                     }
                 }
 
-                Object arg = executor.evalExpr(rawExpr, ctx);
+                Object arg = value.get();
 
                 if (arg instanceof AstExecutor.PgRow) return "record";
 
@@ -808,7 +811,8 @@ class CatalogSystemFunctions {
                     executor.database.getLargeObjectStore().loFromBytea(loid, new byte[0]);
                 }
                 executor.database.getLargeObjectStore().loPut(loid, offset, data);
-                return null;
+                // Declared RETURNS void, which PG renders as an empty value and not as a NULL.
+                return "";
             }
             case "lo_open": {
                 requireArgs(fn, 2);
@@ -847,6 +851,23 @@ class CatalogSystemFunctions {
                 Object fdArg = executor.evalExpr(fn.args().get(0), ctx);
                 int fd = ((Number) fdArg).intValue();
                 return executor.database.getLargeObjectStore().loTell(fd);
+            }
+            // The 64-bit spellings a driver reaches for on an object larger than two gigabytes.
+            // Without them a client that asked for one was told the function did not exist.
+            case "lo_tell64": {
+                requireArgs(fn, 1);
+                Object fdArg = executor.evalExpr(fn.args().get(0), ctx);
+                return (long) executor.database.getLargeObjectStore()
+                        .loTell(((Number) fdArg).intValue());
+            }
+            case "lo_lseek64": {
+                requireArgs(fn, 3);
+                Object fdArg = executor.evalExpr(fn.args().get(0), ctx);
+                Object offArg = executor.evalExpr(fn.args().get(1), ctx);
+                Object whenceArg = executor.evalExpr(fn.args().get(2), ctx);
+                return (long) executor.database.getLargeObjectStore().loLseek(
+                        ((Number) fdArg).intValue(), ((Number) offArg).intValue(),
+                        ((Number) whenceArg).intValue());
             }
             case "lo_truncate": {
                 requireArgs(fn, 2);
@@ -1072,6 +1093,59 @@ class CatalogSystemFunctions {
      * which of them produced it. For these -- and only these -- pg_typeof answers from the
      * declared type rather than from the value, which still knows a bigint from an integer.
      */
+    /** An expression whose value is computed at most once, however many readers ask for it. */
+    private final class OnceEvaluated {
+        private final Expression expr;
+        private final RowContext ctx;
+        private boolean evaluated;
+        private Object value;
+
+        OnceEvaluated(Expression expr, RowContext ctx) {
+            this.expr = expr;
+            this.ctx = ctx;
+        }
+
+        Object get() {
+            if (!evaluated) {
+                value = executor.evalExpr(expr, ctx);
+                evaluated = true;
+            }
+            return value;
+        }
+    }
+
+    /** The declared result type of a built-in call, read against the arguments it was written with. */
+    private DataType declaredResultType(FunctionCallExpr call, RowContext ctx) {
+        String called = FunctionEvaluator.stripSchemaPrefix(
+                call.name().toLowerCase(java.util.Locale.ROOT));
+        if (!BuiltinCallTypes.records(called)) return null;
+        java.util.List<Expression> args = call.args() == null
+                ? java.util.Collections.<Expression>emptyList() : call.args();
+        int[] written = new int[args.size()];
+        for (int i = 0; i < args.size(); i++) {
+            // What the call answers with depends on what it was passed: abs of a bigint is a
+            // bigint, and abs of nothing in particular is a float8.
+            DataType argType = executor.exprEvaluator.inferExprType(args.get(i));
+            written[i] = argType == null ? 0 : argType.getOid();
+        }
+        return DataType.fromOid(BuiltinCallTypes.resultType(called, written));
+    }
+
+    /**
+     * A type whose value says nothing about itself: an oid under its own name or another is a
+     * bare number, and a name is a bare string. Only the declaration tells them from an integer
+     * and a text.
+     */
+    private static boolean isOidCarriedType(DataType t) {
+        if (t == null) return false;
+        switch (t) {
+            case OID: case REGPROC: case REGCLASS: case REGTYPE: case OIDVECTOR: case NAME:
+                return true;
+            default:
+                return false;
+        }
+    }
+
     private static boolean isTextCarriedType(DataType t) {
         if (t == null) return false;
         if (DataType.isArrayType(t)) return true;

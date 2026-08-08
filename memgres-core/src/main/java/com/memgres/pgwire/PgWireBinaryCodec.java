@@ -28,6 +28,29 @@ class PgWireBinaryCodec {
      * Decode a binary parameter from Bind into a Java object (usually String).
      * Uses the parameter OID from Parse to determine the type.
      */
+    /** The types PostgreSQL carries as a four-byte unsigned oid. */
+    private static boolean isOidLike(int oid) {
+        switch (oid) {
+            case 26:   // oid
+            case 24:   // regproc
+            case 28:   // xid
+            case 29:   // cid
+            case 2202: // regprocedure
+            case 2203: // regoper
+            case 2204: // regoperator
+            case 2205: // regclass
+            case 2206: // regtype
+            case 3734: // regconfig
+            case 3769: // regdictionary
+            case 4089: // regnamespace
+            case 4096: // regrole
+            case 4191: // regcollation
+                return true;
+            default:
+                return false;
+        }
+    }
+
     static Object decodeBinaryParam(byte[] bytes, int paramOid) {
         // BYTEA (OID 17): keep as raw bytes
         if (paramOid == 17) return bytes.clone();
@@ -36,6 +59,11 @@ class PgWireBinaryCodec {
         // Int32 (OID 23) or explicit 4-byte int
         if ((paramOid == 23 || paramOid == 0) && bytes.length == 4) {
             return String.valueOf(readInt4(bytes, 0));
+        }
+        // An oid, and the registry types that are oids under another name, are four unsigned
+        // bytes. Read as text instead they arrived as whatever those four bytes spelled.
+        if (isOidLike(paramOid) && bytes.length == 4) {
+            return String.valueOf(readInt4(bytes, 0) & 0xFFFFFFFFL);
         }
         // Int64 (OID 20) or explicit 8-byte long
         if ((paramOid == 20 || paramOid == 0) && bytes.length == 8) {

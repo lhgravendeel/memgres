@@ -16,35 +16,31 @@ public class CancelRegistry {
     private static final Logger LOG = LoggerFactory.getLogger(CancelRegistry.class);
     private static final AtomicInteger PID_SEQ = new AtomicInteger(1000);
 
-        private static final class Key {
-        public final int pid;
-        public final int secretKey;
+    private static final class Key {
+        final int pid;
+        final byte[] secret;
 
-        public Key(int pid, int secretKey) {
+        Key(int pid, byte[] secret) {
             this.pid = pid;
-            this.secretKey = secretKey;
+            this.secret = secret;
         }
-
-        public int pid() { return pid; }
-        public int secretKey() { return secretKey; }
 
         @Override
         public boolean equals(Object o) {
             if (this == o) return true;
             if (o == null || getClass() != o.getClass()) return false;
             Key that = (Key) o;
-            return pid == that.pid
-                && secretKey == that.secretKey;
+            return pid == that.pid && java.util.Arrays.equals(secret, that.secret);
         }
 
         @Override
         public int hashCode() {
-            return java.util.Objects.hash(pid, secretKey);
+            return pid * 31 + java.util.Arrays.hashCode(secret);
         }
 
         @Override
         public String toString() {
-            return "Key[pid=" + pid + ", " + "secretKey=" + secretKey + "]";
+            return "Key[pid=" + pid + ", secret=" + secret.length + " bytes]";
         }
     }
 
@@ -60,19 +56,19 @@ public class CancelRegistry {
     }
 
     /** Register a connection. Called once during startup. */
-    public void register(int pid, int secretKey) {
+    public void register(int pid, byte[] secretKey) {
         registered.put(new Key(pid, secretKey), Boolean.TRUE);
     }
 
     /** Unregister a connection. Called when the connection closes. */
-    public void unregister(int pid, int secretKey) {
+    public void unregister(int pid, byte[] secretKey) {
         Key key = new Key(pid, secretKey);
         registered.remove(key);
         executing.remove(key);
     }
 
     /** Mark the thread that is currently executing a query on this connection. */
-    public void setExecutingThread(int pid, int secretKey, Thread thread) {
+    public void setExecutingThread(int pid, byte[] secretKey, Thread thread) {
         Key key = new Key(pid, secretKey);
         if (thread != null) {
             executing.put(key, thread);
@@ -84,11 +80,14 @@ public class CancelRegistry {
     /**
      * Handle a CancelRequest: interrupt the thread executing on the connection
      * identified by (pid, secretKey).  Returns true if the cancel was delivered.
+     *
+     * <p>The key is as many bytes as the connection was given: four under protocol 3.0, and the
+     * thirty-two protocol 3.2 asks for.
      */
-    public boolean cancel(int pid, int secretKey) {
+    public boolean cancel(int pid, byte[] secretKey) {
         Key key = new Key(pid, secretKey);
         if (!registered.containsKey(key)) {
-            LOG.debug("CancelRequest for unknown pid={} secretKey={}", pid, secretKey);
+            LOG.debug("CancelRequest for unknown pid={}", pid);
             return false; // unknown or stale cancel key
         }
         Thread t = executing.get(key);
