@@ -586,7 +586,10 @@ class SelectExecutor {
                     effectiveLimit = clampToSize(((Number) limVal).longValue(), Integer.MAX_VALUE);
                 }
             }
-            int needed = effectiveOffset + effectiveLimit;
+            // How many rows have to be locked before the OFFSET and LIMIT can be applied. Adding
+            // the two ints overflowed whenever there was no LIMIT, and the negative total stopped
+            // the scan before it locked anything: the query answered no rows at all.
+            int needed = clampToSize((long) effectiveOffset + (long) effectiveLimit, Integer.MAX_VALUE);
             List<RowContext> filtered = new ArrayList<>();
             final String lockMode = stmt.lockClause().mode();
             for (RowContext ctx : contexts) {

@@ -109,7 +109,9 @@ final class TypeNamespace {
             String candidate = schema + "." + lower;
             if (keys.contains(candidate)) return candidate;
         }
-        return find(keys, written);
+        // Only the search path answers an unqualified name. Falling back to any schema at all
+        // meant a type in a schema this session cannot see was still reachable by its bare name.
+        return null;
     }
 
     /**

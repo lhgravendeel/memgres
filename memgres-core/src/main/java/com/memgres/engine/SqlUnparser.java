@@ -257,7 +257,11 @@ public class SqlUnparser {
     private static String fromItemToSql(SelectStmt.FromItem item) {
         if (item instanceof SelectStmt.TableRef) {
             SelectStmt.TableRef tr = (SelectStmt.TableRef) item;
-            return tr.table() + (tr.alias() != null ? " " + tr.alias() : "");
+            // The schema is part of which relation this is, so a definition that names one keeps
+            // it: dropping it wrote a view over zz_cv2.b as though it read the b of whatever
+            // schema the reader happens to be in.
+            String relation = tr.schema() != null ? tr.schema() + "." + tr.table() : tr.table();
+            return relation + (tr.alias() != null ? " " + tr.alias() : "");
         }
         if (item instanceof SelectStmt.JoinFrom) {
             SelectStmt.JoinFrom join = (SelectStmt.JoinFrom) item;

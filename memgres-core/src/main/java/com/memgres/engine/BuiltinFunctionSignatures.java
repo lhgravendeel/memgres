@@ -1047,6 +1047,7 @@ public final class BuiltinFunctionSignatures {
             {"pg_ts_parser_is_visible", "16", "26", "fs", "1"},
             {"pg_ts_template_is_visible", "16", "26", "fs", "1"},
             {"pg_type_is_visible", "16", "26", "fs", "1"},
+            {"pg_collation_for", "25", "2276", "fs", "1"},
             {"pg_typeof", "2206", "2276", "fs", "1"},
             {"pg_visible_in_snapshot", "16", "5069 5038", "fi", "2"},
             {"pg_wal_lsn_diff", "1700", "3220 3220", "fi", "2"},

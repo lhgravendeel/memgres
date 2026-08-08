@@ -90,6 +90,10 @@ INSERT INTO user_settings(user_id, setting_key, setting_value) VALUES
 (20, 'items_per_page', '50');
 
 -- Effective feature flags per user, user override > tenant override > global.
+-- begin-expected-error
+-- sqlstate: 42601
+-- message-like: syntax error at or near "AS"
+-- end-expected-error
 WITH flags AS (
     SELECT
         u.username,

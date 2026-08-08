@@ -766,11 +766,17 @@ class ObscurePostgresTest {
     @Test
     void testNullInArithmetic() throws SQLException {
         try (Statement s = conn.createStatement()) {
-            ResultSet rs = s.executeQuery("SELECT 1 + NULL, NULL * 5, NULL - NULL");
+            ResultSet rs = s.executeQuery("SELECT 1 + NULL, NULL * 5");
             assertTrue(rs.next());
             assertNull(rs.getObject(1));
             assertNull(rs.getObject(2));
-            assertNull(rs.getObject(3));
+        }
+        // A bare NULL is of unknown type, so with one on each side there is no arithmetic
+        // operator to choose: PG asks for a cast rather than answering NULL.
+        try (Statement s = conn.createStatement()) {
+            SQLException e = assertThrows(SQLException.class,
+                    () -> s.executeQuery("SELECT NULL - NULL"));
+            assertEquals("42725", e.getSQLState());
         }
     }
 

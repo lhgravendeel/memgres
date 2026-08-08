@@ -396,7 +396,7 @@ public class RowContext {
             OutCol hit = null;
             int matches = 0;
             for (OutCol oc : outputColumns) {
-                if (oc.name.equalsIgnoreCase(columnName)) {
+                if (oc.name.equals(columnName)) {
                     matches++;
                     if (hit == null) hit = oc;
                 }

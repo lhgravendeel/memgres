@@ -91,9 +91,28 @@ class ExprSpecialFormParser {
         return new ArrayExpr(elements);
     }
 
+    /** The comma that separates argument {@code index} from the one before it. */
+    private Token commaBeforeArgument(int listStart, int index) {
+        int depth = 0;
+        int seen = 0;
+        for (int i = listStart; i < ep.tokens.size(); i++) {
+            Token t = ep.tokens.get(i);
+            if (t.type() == TokenType.LEFT_PAREN) depth++;
+            else if (t.type() == TokenType.RIGHT_PAREN) {
+                if (depth == 0) break;
+                depth--;
+            } else if (t.type() == TokenType.COMMA && depth == 0) {
+                seen++;
+                if (seen == index) return t;
+            }
+        }
+        return ep.peek();
+    }
+
     Expression parseBuiltinFunction() {
         String name = ep.advance().value().toLowerCase();
         ep.expect(TokenType.LEFT_PAREN);
+        int listStart = ep.pos;
         List<Expression> args = new ArrayList<>();
         if (!ep.check(TokenType.RIGHT_PAREN)) {
             args = ep.parseExpressionList();
@@ -101,8 +120,16 @@ class ExprSpecialFormParser {
         // These are grammar productions in PostgreSQL, not function calls, so an argument list of
         // the wrong length is a syntax error at the token that should have been a comma. Reading
         // them as ordinary calls let NULLIF(1) through to an array index that was not there.
-        int required = "nullif".equals(name) ? 2 : 1;
-        if (args.size() < required) {
+        // NULLIF takes exactly two; the variadic forms take at least one.
+        boolean tooMany = "nullif".equals(name) && args.size() > 2;
+        boolean tooFew = "nullif".equals(name) ? args.size() < 2 : args.size() < 1;
+        if (tooMany) {
+            // PostgreSQL reports the comma that begins the argument it has no room for.
+            Token comma = commaBeforeArgument(listStart, 2);
+            throw ParseException.saying("syntax error at or near \"" + comma.value() + "\"",
+                    comma, "42601");
+        }
+        if (tooFew) {
             throw ParseException.saying("syntax error at or near \"" + ep.peek().value() + "\"",
                     ep.peek(), "42601");
         }

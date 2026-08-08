@@ -81,16 +81,21 @@ public class Sequence {
             called = true;
             return currentValue.get();
         }
-        long next = currentValue.get() + incrementBy;
+        long current = currentValue.get();
+        long next = current + incrementBy;
+        // The addition itself can leave the range of a long, and it wrapped round to the far end
+        // before anything compared it with the bounds: a sequence sitting on the largest bigint
+        // handed out the smallest one instead of saying it had run out.
+        boolean wrapped = incrementBy > 0 ? next < current : next > current;
         if (incrementBy > 0) {
-            if (next > maxValue) {
+            if (wrapped || next > maxValue) {
                 if (!cycle) {
                     throw new MemgresException("nextval: reached maximum value of sequence \"" + name + "\" (" + maxValue + ")", "2200H");
                 }
                 next = minValue;
             }
         } else {
-            if (next < minValue) {
+            if (wrapped || next < minValue) {
                 if (!cycle) {
                     throw new MemgresException("nextval: reached minimum value of sequence \"" + name + "\" (" + minValue + ")", "2200H");
                 }

@@ -613,6 +613,147 @@ class BinaryOpEvaluator {
         rejectMissingEqualityOperator(bin, ctx);
         rejectCrossCategoryOperator(bin, ctx);
         rejectUnresolvableConcat(bin, ctx);
+        rejectOperatorWithNoEntry(bin, ctx);
+    }
+
+    /** The spelling PostgreSQL's pg_operator uses for each of the operators written here. */
+    private static String pgSpelling(BinaryExpr.BinOp op) {
+        switch (op) {
+            case ADD: return "+";
+            case SUBTRACT: return "-";
+            case MULTIPLY: return "*";
+            case DIVIDE: return "/";
+            case MODULO: return "%";
+            case POWER: return "^";
+            case EQUAL: return "=";
+            case NOT_EQUAL: return "<>";
+            case LESS_THAN: return "<";
+            case GREATER_THAN: return ">";
+            case LESS_EQUAL: return "<=";
+            case GREATER_EQUAL: return ">=";
+            case LIKE: return "~~";
+            case ILIKE: return "~~*";
+            case REGEX_MATCH: return "~";
+            case REGEX_IMATCH: return "~*";
+            case NOT_REGEX_MATCH: return "!~";
+            case NOT_REGEX_IMATCH: return "!~*";
+            case CONTAINS: return "@>";
+            case CONTAINED_BY: return "<@";
+            case OVERLAP: return "&&";
+            case TS_MATCH: return "@@";
+            case CONCAT: return "||";
+            default: return null;
+        }
+    }
+
+    /**
+     * Refuse an operator PostgreSQL has no pg_operator row for over these operand types. Choosing
+     * an operator from the runtime classes of the two values instead let {@code 1 || 2},
+     * {@code money + 1} and {@code date LIKE '2020%'} all run.
+     */
+    private void rejectOperatorWithNoEntry(BinaryExpr bin, RowContext ctx) {
+        String spelling = pgSpelling(bin.op());
+        if (spelling == null) return;
+        String leftName = declaredTypeForResolution(bin.left(), ctx);
+        String rightName = declaredTypeForResolution(bin.right(), ctx);
+        int left = operandTypeOid(leftName, bin.left());
+        int right = operandTypeOid(rightName, bin.right());
+        if (left < 0 || right < 0) return;
+        MemgresException refusal =
+                OperatorResolution.refusalFor(spelling, left, right, leftName, rightName);
+        if (refusal != null) throw refusal;
+    }
+
+    /**
+     * The type OID an operand carries for resolution: unknown for an untyped literal, the declared
+     * type where the query wrote one, and -1 where nothing can be said and the rule stands down.
+     */
+    private int operandTypeOid(String declared, Expression expr) {
+        if (declared == null) {
+            // Only a literal with no type of its own is PostgreSQL's "unknown"; anything else
+            // whose type this engine could not work out is left unjudged. A bare NULL is unknown
+            // too, which is why NULL + NULL has no operator to choose while NULL || NULL does.
+            boolean untyped = isUntypedStringLiteral(expr)
+                    || (expr instanceof Literal
+                        && ((Literal) expr).literalType() == Literal.LiteralType.NULL);
+            return untyped ? OperatorResolution.UNKNOWN : -1;
+        }
+        String bare = declared.toLowerCase().trim();
+        int paren = bare.indexOf('(');
+        if (paren > 0) bare = bare.substring(0, paren).trim();
+        if (executor.database != null
+                && (executor.database.getCustomEnum(bare) != null
+                    || executor.database.isCompositeType(bare)
+                    || executor.database.isDomain(bare))) {
+            return -1;
+        }
+        DataType type = DataType.fromPgName(bare);
+        return type == null ? -1 : type.getOid();
+    }
+
+    /** The numeric types arithmetic widens through, narrowest first. */
+    private static final DataType[] NUMERIC_LADDER = {DataType.SMALLINT, DataType.INTEGER,
+            DataType.BIGINT, DataType.NUMERIC, DataType.REAL, DataType.DOUBLE_PRECISION};
+
+    /**
+     * What {@code a + b} over two numbers is declared to be: the wider of the two operand types.
+     * Anything that is not plain arithmetic over two types on the ladder says nothing.
+     */
+    private String arithmeticResultType(BinaryExpr bin, RowContext ctx) {
+        switch (bin.op()) {
+            case ADD: case SUBTRACT: case MULTIPLY: case DIVIDE: case MODULO:
+                break;
+            default:
+                return null;
+        }
+        int left = ladderRank(declaredTypeForResolution(bin.left(), ctx));
+        int right = ladderRank(declaredTypeForResolution(bin.right(), ctx));
+        if (left < 0 || right < 0) return null;
+        return NUMERIC_LADDER[Math.max(left, right)].getPgName();
+    }
+
+    private static int ladderRank(String declared) {
+        if (declared == null) return -1;
+        DataType type = DataType.fromPgName(declared.toLowerCase().trim());
+        for (int i = 0; type != null && i < NUMERIC_LADDER.length; i++) {
+            if (NUMERIC_LADDER[i] == type) return i;
+        }
+        return -1;
+    }
+
+    /**
+     * A shift is done in the width of the value being shifted, and answers in that width.
+     *
+     * <p>Computing in long and widening whenever the answer did not fit an int gave results of a
+     * type PostgreSQL never produces: {@code 1::int4 << 31} answered 2147483648 where the int4
+     * result is -2147483648, and {@code 1 << 32} answered 4294967296 where the shift count is
+     * taken as the low bits of the width, making it 1 again.
+     */
+    private Object integerShift(Object left, Object right, boolean leftwards) {
+        long count = executor.toLong(right);
+        if (left instanceof Long) {
+            long value = executor.toLong(left);
+            return Long.valueOf(leftwards ? value << count : value >> count);
+        }
+        if (left instanceof Short || left instanceof Byte) {
+            int value = executor.toInt(left);
+            int shifted = leftwards ? value << (count & 15) : value >> (count & 15);
+            return Short.valueOf((short) shifted);
+        }
+        int value = executor.toInt(left);
+        return Integer.valueOf(leftwards ? value << count : value >> count);
+    }
+
+    /** The operators that order or equate two values. */
+    private static boolean isComparisonOp(BinaryExpr.BinOp op) {
+        switch (op) {
+            case EQUAL: case NOT_EQUAL: case LESS_THAN: case GREATER_THAN:
+            case LESS_EQUAL: case GREATER_EQUAL:
+            case IS_DISTINCT_FROM: case IS_NOT_DISTINCT_FROM:
+                return true;
+            default:
+                return false;
+        }
     }
 
     /**
@@ -638,6 +779,14 @@ class BinaryOpEvaluator {
                 case BIT_STRING: return "bit";
                 default: return null;
             }
+        }
+        if (expr instanceof BinaryExpr) {
+            // Arithmetic over two numbers answers with the wider of them, so the operand of an
+            // enclosing operator is a number and not something to be left unjudged: it is what
+            // makes 1 || 2 + 3 a concatenation of two integers rather than one of unknown shape.
+            // Anything else falls through to the operators below that name their own type.
+            String arithmetic = arithmeticResultType((BinaryExpr) expr, ctx);
+            if (arithmetic != null) return arithmetic;
         }
         if (expr instanceof UnaryExpr) {
             // A sign says nothing about the type: -4 is the integer 4 was, and reading it as
@@ -1002,10 +1151,21 @@ class BinaryOpEvaluator {
         // the type could never have parsed.
         rejectMissingEqualityOperator(bin, ctx);
         rejectCrossCategoryOperator(bin, ctx);
+        rejectOperatorWithNoEntry(bin, ctx);
         ConcatResolution concat = concatOutcome(bin, ctx);
 
         Object left = executor.evalExpr(bin.left(), ctx);
         Object right = executor.evalExpr(bin.right(), ctx);
+
+        // A bpchar ignores trailing blanks when it is compared, and no other string type does.
+        // Where one side is declared bpchar the pair is compared that way; everywhere else the
+        // blanks count, so 'abc ' = 'abc' is false as PostgreSQL says it is.
+        if (isComparisonOp(bin.op()) && left instanceof String && right instanceof String
+                && (BlankPadding.isBlankPadded(declaredTypeForResolution(bin.left(), ctx))
+                    || BlankPadding.isBlankPadded(declaredTypeForResolution(bin.right(), ctx)))) {
+            left = BlankPadding.trimmed(left);
+            right = BlankPadding.trimmed(right);
+        }
 
         // The two concatenations that take a text on one side read the other as text too, and
         // read it with that type's own output function. Running the stored values together
@@ -1410,9 +1570,7 @@ class BinaryOpEvaluator {
                 { Boolean rangeCmp = rangeShift(left, right, true);
                 if (rangeCmp != null) return rangeCmp; }
                 rejectRangeShiftMismatch(left, right, true);
-                { long r = executor.toLong(left) << executor.toLong(right);
-                return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE)
-                        ? (Object) Long.valueOf(r) : (Object) Integer.valueOf((int) r); }
+                return integerShift(left, right, true);
             }
             case SHIFT_RIGHT: {
                 if (left == null || right == null) return null;
@@ -1436,9 +1594,7 @@ class BinaryOpEvaluator {
                 { Boolean rangeCmp = rangeShift(left, right, false);
                 if (rangeCmp != null) return rangeCmp; }
                 rejectRangeShiftMismatch(left, right, false);
-                { long r = executor.toLong(left) >> executor.toLong(right);
-                return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE)
-                        ? (Object) Long.valueOf(r) : (Object) Integer.valueOf((int) r); }
+                return integerShift(left, right, false);
             }
             case INET_CONTAINS_EQUALS: {
                 if (left == null || right == null) return null;

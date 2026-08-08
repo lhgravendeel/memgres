@@ -168,6 +168,8 @@ class DateTimeFunctions {
                     return false;
                 }
                 if (arg instanceof PgInterval) return !((PgInterval) arg).isInfinite();
+                // A timestamptz carries the timestamp sentinels behind its offset.
+                if (TypeCoercion.isDateTimeInfinity(arg)) return false;
                 if (arg instanceof java.time.LocalDateTime) {
                     java.time.LocalDateTime dt = (java.time.LocalDateTime) arg;
                     return !dt.equals(TypeCoercion.TIMESTAMP_INFINITY) && !dt.equals(TypeCoercion.TIMESTAMP_NEG_INFINITY);

@@ -90,7 +90,9 @@ public class PlpgsqlParser {
         if (t.type() == TokenType.IDENTIFIER || t.type() == TokenType.QUOTED_IDENTIFIER
                 || t.type() == TokenType.KEYWORD) {
             advance();
-            return t.value();
+            // A keyword's token carries its upper-case form, which is not the name of anything:
+            // the column in "v t.name%TYPE" is called name, not NAME.
+            return t.type() == TokenType.KEYWORD ? t.value().toLowerCase() : t.value();
         }
         throw syntaxError(t);
     }

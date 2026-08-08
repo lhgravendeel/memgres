@@ -229,6 +229,20 @@ class ExprEvaluator {
         }
         if (expr instanceof FieldAccessExpr) {
             FieldAccessExpr fa = (FieldAccessExpr) expr;
+            // A relation's own name standing where a value is wanted is the whole row, so both
+            // (t).c and (t.*).c read column c of t. Reading the name as a column instead found
+            // nothing to take a field from and the query failed on a shape PostgreSQL accepts.
+            if (ctx != null) {
+                String relation = null;
+                if (fa.expr() instanceof ColumnRef && ((ColumnRef) fa.expr()).table() == null) {
+                    relation = ((ColumnRef) fa.expr()).column();
+                } else if (fa.expr() instanceof WildcardExpr) {
+                    relation = ((WildcardExpr) fa.expr()).table();
+                }
+                if (relation != null && ctx.getBinding(relation) != null) {
+                    return ctx.resolveColumn(relation, fa.field());
+                }
+            }
             // A function declared to return bare "record" carries no column names, so there is
             // nothing for (f()).x to match — PG says so rather than evaluating the call.
             if (fa.expr() instanceof FunctionCallExpr) {
@@ -933,22 +947,9 @@ class ExprEvaluator {
             throw new MemgresException(
                 "schema \"" + qop.schema() + "\" does not exist", "3F000");
         }
-        // Check that search_path is valid because PG requires valid schemas for type resolution
-        if (executor.session != null) {
-            String searchPath = executor.session.getGucSettings().get("search_path");
-            if (searchPath != null) {
-                for (String sp : searchPath.split(",")) {
-                    String s = sp.trim().replace("\"", "").replace("'", "");
-                    if (s.isEmpty() || s.equals("$user")) continue;
-                    if ("pg_catalog".equals(s) || "information_schema".equals(s)) continue;
-                    if (executor.database.getSchema(s) == null) {
-                        String qualifiedOp = (qop.schema() != null ? qop.schema() + "." : "") + qop.opSymbol();
-                        throw new MemgresException(
-                            "operator does not exist: " + qualifiedOp + " record", "42883");
-                    }
-                }
-            }
-        }
+        // A schema on the search path that does not exist is skipped, not complained about: it
+        // is how an application names a schema it may or may not have created yet. Refusing the
+        // operator instead made every statement fail for as long as the setting stood.
         return evalExpr(qop.inner(), ctx);
     }
 
@@ -1667,15 +1668,28 @@ class ExprEvaluator {
         if (in.values() != null && !in.values().isEmpty()) {
             Expression other = in.values().get(0);
             // "= ANY(<array>)" keeps the whole array as its single value, so the comparison is
-            // against one element of it, not against the array
+            // against one element of it, not against the array. Where the element cannot be
+            // named -- the array came out of a function, say -- there is nothing to resolve
+            // against, and resolving against the array itself would refuse the comparison for
+            // being between a type and an array of it.
+            boolean resolvable = true;
             if (in.fromAny() && in.values().size() == 1) {
                 Expression element = arrayElementOperand(other);
-                if (element != null) other = element;
+                if (element == null) element = elementByDeclaredType(other, ctx);
+                if (element != null) {
+                    other = element;
+                } else if (executor.binaryOpEvaluator.declaredTypeForResolution(other, ctx) == null) {
+                    // Nothing here says whether this is an array or a single value, so there is
+                    // no pair of types to resolve an operator between.
+                    resolvable = false;
+                }
             }
-            executor.binaryOpEvaluator.rejectUnresolvableOperator(
-                    new BinaryExpr(in.expr(),
-                            in.negated() ? BinaryExpr.BinOp.NOT_EQUAL : BinaryExpr.BinOp.EQUAL,
-                            other), ctx);
+            if (resolvable) {
+                executor.binaryOpEvaluator.rejectUnresolvableOperator(
+                        new BinaryExpr(in.expr(),
+                                in.negated() ? BinaryExpr.BinOp.NOT_EQUAL : BinaryExpr.BinOp.EQUAL,
+                                other), ctx);
+            }
         }
         Object val = evalExpr(in.expr(), ctx);
 
@@ -2347,6 +2361,30 @@ class ExprEvaluator {
      * operator can be looked up against the element type. A constructor gives its first element; a
      * cast to an array type gives a cast to that array's element type.
      */
+    /**
+     * An operand standing for one element of an array whose type the query settles elsewhere.
+     * A column names its array type as the catalogs spell it, {@code _text}, and a cast names it
+     * as it was written, {@code text[]}; both mean the same array.
+     */
+    private Expression elementByDeclaredType(Expression array, RowContext ctx) {
+        String declared = executor.binaryOpEvaluator.declaredTypeForResolution(array, ctx);
+        if (declared == null) return null;
+        declared = declared.trim();
+        if (declared.endsWith("[]")) {
+            return new CastExpr(array, declared.substring(0, declared.length() - 2).trim());
+        }
+        DataType type = DataType.fromPgName(declared.toLowerCase());
+        if (type == null) return null;
+        // oidvector and int2vector are arrays as far as a subscript or an ANY is concerned, even
+        // though they are their own types: pg_index.indkey is written "= ANY(i.indkey)" by every
+        // client that lists indexes.
+        if (type == DataType.OIDVECTOR) return new CastExpr(array, DataType.OID.getPgName());
+        if (type == DataType.INT2VECTOR) return new CastExpr(array, DataType.SMALLINT.getPgName());
+        if (!DataType.isArrayType(type)) return null;
+        DataType element = DataType.elementOf(type);
+        return element == null ? null : new CastExpr(array, element.getPgName());
+    }
+
     private static Expression arrayElementOperand(Expression array) {
         if (array instanceof ArrayExpr) {
             java.util.List<Expression> items = ((ArrayExpr) array).elements();
@@ -2419,7 +2457,9 @@ class ExprEvaluator {
             case GREATER_EQUAL:
                 return compareValues(left, right) >= 0;
             default:
-                throw new RuntimeException("Unsupported operator in ANY/ALL: " + op);
+                // Every operator that answers a boolean can stand in front of ANY or ALL, not
+                // only the six comparisons: PostgreSQL accepts LIKE ANY, ~ ANY and the rest.
+                return executor.isTruthy(executor.binaryOpEvaluator.evalBinaryValues(op, left, right));
         }
     }
 
@@ -2943,6 +2983,10 @@ class ExprEvaluator {
         }
         String base = typeName.replaceAll("\\[\\]", "").replaceAll("\\(.*\\)", "").trim();
         if (base.endsWith("[]")) base = base.substring(0, base.length() - 2).trim();
+        // A column is named after the type, not after where the type lives, so a cast
+        // written with the schema still reports the plain type name.
+        int schemaDot = base.lastIndexOf('.');
+        if (schemaDot > 0) base = base.substring(schemaDot + 1);
         String baseLower = base.toLowerCase();
         if (baseLower.equals("time with time zone") || baseLower.equals("timetz")) {
             return "timetz";

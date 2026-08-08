@@ -39,9 +39,17 @@ class DateTimeArithmetic {
     Object dateTimeAdd(Object left, Object right) {
         if (left == null || right == null) return null;
 
-        // infinity timestamp + interval = infinity (and vice versa)
-        if (left instanceof String && isTimestampInfinity((String) left) && right instanceof PgInterval) return left;
-        if (right instanceof String && isTimestampInfinity((String) right) && left instanceof PgInterval) return right;
+        // Anything added to an infinity is that infinity: a number of days as much as an
+        // interval. Only the interval was allowed for, so date 'infinity' + 1 fell through to
+        // the numeric path and the word reached a parser looking for a double.
+        boolean leftInfinite = isInfinite(left);
+        boolean rightInfinite = isInfinite(right);
+        if (leftInfinite && (rightInfinite || right instanceof PgInterval || right instanceof Number)) {
+            return left;
+        }
+        if (rightInfinite && (left instanceof PgInterval || left instanceof Number)) {
+            return right;
+        }
 
         // interval + interval
         if (left instanceof PgInterval && right instanceof PgInterval) return ((PgInterval) left).plus(((PgInterval) right));
@@ -430,6 +438,12 @@ class DateTimeArithmetic {
     }
 
     /** Check if a string represents a PG infinity timestamp. */
+    /** Whether this value stands for a date/time infinity, however it is being carried. */
+    private static boolean isInfinite(Object value) {
+        if (value instanceof String) return isTimestampInfinity((String) value);
+        return TypeCoercion.isDateTimeInfinity(value);
+    }
+
     private static boolean isTimestampInfinity(String s) {
         String t = s.trim().toLowerCase();
         return t.equals("infinity") || t.equals("-infinity");

@@ -556,6 +556,14 @@ public class Lexer {
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < val.length(); i++) {
             if (val.charAt(i) == '\\' && i + 1 < val.length()) {
+                // A doubled escape character stands for one of itself, so U&'a\\b' is
+                // three characters. Reading it as the start of a codepoint left too few digits
+                // behind it, and a string PostgreSQL accepts was refused outright.
+                if (val.charAt(i + 1) == '\\') {
+                    sb.append('\\');
+                    i++;
+                    continue;
+                }
                 // \+NNNNNN form (6-digit codepoint)
                 if (val.charAt(i + 1) == '+' && i + 7 < val.length()) {
                     String hex = val.substring(i + 2, i + 8);
@@ -565,8 +573,8 @@ public class Lexer {
                         if (Character.digit(hc, 16) < 0) { valid = false; break; }
                     }
                     if (!valid) {
-                        throw new ParseException("invalid Unicode escape value",
-                                new Token(TokenType.ERROR, val, start));
+                        throw ParseException.saying("invalid Unicode escape value",
+                                new Token(TokenType.ERROR, val, start), "42601");
                     }
                     int cp = Integer.parseInt(hex, 16);
                     sb.appendCodePoint(cp);
@@ -582,8 +590,8 @@ public class Lexer {
                         if (Character.digit(hc, 16) < 0) { valid = false; break; }
                     }
                     if (!valid) {
-                        throw new ParseException("invalid Unicode escape value",
-                                new Token(TokenType.ERROR, val, start));
+                        throw ParseException.saying("invalid Unicode escape value",
+                                new Token(TokenType.ERROR, val, start), "42601");
                     }
                     int cp = Integer.parseInt(hex, 16);
                     sb.appendCodePoint(cp);
@@ -591,8 +599,8 @@ public class Lexer {
                     continue;
                 }
                 // Invalid: not enough characters for escape
-                throw new ParseException("invalid Unicode escape value",
-                        new Token(TokenType.ERROR, val, start));
+                throw ParseException.saying("invalid Unicode escape value",
+                        new Token(TokenType.ERROR, val, start), "42601");
             }
             sb.append(val.charAt(i));
         }
@@ -615,8 +623,8 @@ public class Lexer {
                         if (Character.digit(hc, 16) < 0) { valid = false; break; }
                     }
                     if (!valid) {
-                        throw new ParseException("invalid Unicode escape value",
-                                new Token(TokenType.ERROR, val, start));
+                        throw ParseException.saying("invalid Unicode escape value",
+                                new Token(TokenType.ERROR, val, start), "42601");
                     }
                     int cp = Integer.parseInt(hex, 16);
                     sb.appendCodePoint(cp);
@@ -631,16 +639,16 @@ public class Lexer {
                         if (Character.digit(hc, 16) < 0) { valid = false; break; }
                     }
                     if (!valid) {
-                        throw new ParseException("invalid Unicode escape value",
-                                new Token(TokenType.ERROR, val, start));
+                        throw ParseException.saying("invalid Unicode escape value",
+                                new Token(TokenType.ERROR, val, start), "42601");
                     }
                     int cp = Integer.parseInt(hex, 16);
                     sb.appendCodePoint(cp);
                     i += 4; // skip \XXXX
                     continue;
                 }
-                throw new ParseException("invalid Unicode escape value",
-                        new Token(TokenType.ERROR, val, start));
+                throw ParseException.saying("invalid Unicode escape value",
+                        new Token(TokenType.ERROR, val, start), "42601");
             }
             sb.append(val.charAt(i));
         }
@@ -679,25 +687,11 @@ public class Lexer {
             pos++;
         }
 
-        // Check for bare $ ($ followed by whitespace/newline - PostgreSQL treats as $$)
-        if (pos == tagStart + 1 && pos < length && Character.isWhitespace(sql.charAt(pos))) {
-            // Bare $ delimiter
-            StringBuilder body = new StringBuilder();
-            while (pos < length) {
-                // Look for closing bare $ ($ not followed by alphanumeric/underscore/$)
-                if (sql.charAt(pos) == '$') {
-                    int next = pos + 1;
-                    if (next >= length || (!Character.isLetterOrDigit(sql.charAt(next)) && sql.charAt(next) != '_' && sql.charAt(next) != '$')) {
-                        pos++; // skip closing $
-                        return new Token(TokenType.DOLLAR_STRING_LITERAL, body.toString(), start);
-                    }
-                }
-                body.append(sql.charAt(pos));
-                pos++;
-            }
-            // No closing $ found; reset
+        // A dollar quote's tag is an identifier: PostgreSQL has no bare "$ ... $" form, so
+        // "SELECT $ 'hello' $" is a syntax error at the dollar rather than the string between.
+        if (tag.length() > 1 && Character.isDigit(tag.charAt(1))) {
             pos = tagStart;
-            return null;
+            return null;   // $1$ is the parameter $1, not a quote
         }
 
         if (pos < length && sql.charAt(pos) == '$') {
@@ -756,9 +750,38 @@ public class Lexer {
         return new Token(TokenType.ERROR, sb.toString(), start);
     }
 
+    /** The base a 0x / 0o / 0b marker introduces, or 0 when the character is not one. */
+    private static int radixOf(char marker) {
+        switch (marker) {
+            case 'x': case 'X': return 16;
+            case 'o': case 'O': return 8;
+            case 'b': case 'B': return 2;
+            default: return 0;
+        }
+    }
+
     private Token readNumber(int start) {
         StringBuilder sb = new StringBuilder();
         boolean hasDecimal = false;
+
+        // PostgreSQL 16 added non-decimal integer literals. Without them 0x10 lexed as the number
+        // 0 followed by the identifier x10, which is trailing junk.
+        if (sql.charAt(pos) == '0' && pos + 2 < length) {
+            int radix = radixOf(sql.charAt(pos + 1));
+            if (radix > 0 && Character.digit(sql.charAt(pos + 2), radix) >= 0) {
+                pos += 2;
+                StringBuilder digits = new StringBuilder();
+                while (pos < length) {
+                    char d = sql.charAt(pos);
+                    if (d == '_' && digits.length() > 0) { pos++; continue; }
+                    if (Character.digit(d, radix) < 0) break;
+                    digits.append(d);
+                    pos++;
+                }
+                java.math.BigInteger value = new java.math.BigInteger(digits.toString(), radix);
+                return new Token(TokenType.INTEGER_LITERAL, value.toString(), start);
+            }
+        }
 
         while (pos < length) {
             char c = sql.charAt(pos);

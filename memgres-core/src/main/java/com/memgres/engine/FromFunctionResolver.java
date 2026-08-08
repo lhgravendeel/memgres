@@ -2455,7 +2455,14 @@ class FromFunctionResolver {
                         String val = xp.evaluate(colPath, rowNode);
                         if (val != null && !val.isEmpty()) {
                             DataType dt = DataType.fromPgName(colTypes.get(c));
-                            if (dt == DataType.INTEGER || dt == DataType.SMALLINT || dt == DataType.BIGINT) {
+                            // Each column is read in the type it was declared. Reading every
+                            // integer column as an int threw for anything past 2147483647, and
+                            // the catch below turned a bigint the document did carry into NULL.
+                            if (dt == DataType.BIGINT) {
+                                rowVals[c] = Long.parseLong(val.trim());
+                            } else if (dt == DataType.SMALLINT) {
+                                rowVals[c] = Short.parseShort(val.trim());
+                            } else if (dt == DataType.INTEGER) {
                                 rowVals[c] = Integer.parseInt(val.trim());
                             } else {
                                 rowVals[c] = val;

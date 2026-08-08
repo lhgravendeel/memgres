@@ -267,7 +267,7 @@ class DdlTableParser {
     }
 
     ColumnDef parseColumnDef() {
-        String colName = parser.readIdentifier();
+        String colName = parser.readColumnName();
         String typeName = parser.parseTypeName();
 
         boolean notNull = false;

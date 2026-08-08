@@ -411,10 +411,18 @@ class SessionExecutor {
             java.time.OffsetDateTime now = java.time.OffsetDateTime.now();
             if (val != null && val.startsWith("table:")) {
                 String tblName = val.substring("table:".length());
-                Table resolvedTable = executor.resolveTable(executor.defaultSchema(), tblName);
+                // The name may carry its schema, which is which table this is rather than part
+                // of its name.
+                String tblSchema = executor.defaultSchema();
+                int dot = tblName.lastIndexOf('.');
+                if (dot > 0) {
+                    tblSchema = tblName.substring(0, dot);
+                    tblName = tblName.substring(dot + 1);
+                }
+                Table resolvedTable = executor.resolveTable(tblSchema, tblName);
                 // Record analyzed table for pg_statistic
                 if (name.equals("analyze") || vacuumAnalyze) {
-                    executor.database.recordAnalyzedTable(executor.defaultSchema() + "." + tblName);
+                    executor.database.recordAnalyzedTable(tblSchema + "." + tblName);
                     resolvedTable.setLastAnalyze(now);
                 }
                 if (name.equals("vacuum")) {

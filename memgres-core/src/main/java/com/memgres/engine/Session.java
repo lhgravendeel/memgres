@@ -2755,14 +2755,24 @@ public class Session {
 
         public static final class CreateViewUndo implements UndoEntry {
         public final String viewName;
+        /** The schema the view was created in: without it the undo dropped whichever view of
+         *  that name it found first, so rolling back a create in one schema removed another
+         *  schema's view of the same name and left the created one standing. */
+        public final String schemaName;
 
         public CreateViewUndo(String viewName) {
+            this(null, viewName);
+        }
+
+        public CreateViewUndo(String schemaName, String viewName) {
+            this.schemaName = schemaName;
             this.viewName = viewName;
         }
 
         @Override
         public void undo(Database db) {
-            db.removeView(viewName);
+            if (schemaName != null) db.removeView(schemaName, viewName);
+            else db.removeView(viewName);
         }
 
         public String viewName() { return viewName; }
@@ -2772,7 +2782,8 @@ public class Session {
             if (this == o) return true;
             if (o == null || getClass() != o.getClass()) return false;
             CreateViewUndo that = (CreateViewUndo) o;
-            return java.util.Objects.equals(viewName, that.viewName);
+            return java.util.Objects.equals(viewName, that.viewName)
+                    && java.util.Objects.equals(schemaName, that.schemaName);
         }
 
         @Override

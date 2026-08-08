@@ -132,12 +132,15 @@ public class Table {
             for (int i = 0; i < columns.size(); i++) {
                 String n = columns.get(i).getName();
                 if (n == null) continue;
-                String key = n.toLowerCase(java.util.Locale.ROOT);
-                if (!positions.containsKey(key)) positions.put(key, Integer.valueOf(i));
+                if (!positions.containsKey(n)) positions.put(n, Integer.valueOf(i));
             }
             columnPositions = positions;
         }
-        Integer at = positions.get(columnName.toLowerCase(java.util.Locale.ROOT));
+        // A name matches as it is written. The lexer has already folded every unquoted identifier
+        // to lower case, so what arrives here still carrying capitals was written in quotes and
+        // means that exact name: "mixed" is not the column "MiXeD", and matching the two let a
+        // query read a column it did not name and an ALTER drop one it did not name.
+        Integer at = positions.get(columnName);
         return at == null ? -1 : at.intValue();
     }
 

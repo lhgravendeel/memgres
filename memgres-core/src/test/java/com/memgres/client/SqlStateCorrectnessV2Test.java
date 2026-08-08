@@ -194,8 +194,9 @@ class SqlStateCorrectnessV2Test {
         assertSqlState("SELECT 'hello' / 2", "42883");
     }
 
-    @Test void text_multiply_text_gives_42883() {
-        assertSqlState("SELECT 'a' * 'b'", "42883");
+    @Test void text_multiply_text_is_ambiguous() {
+        // Two untyped literals reach every numeric "*" alike, so PG cannot choose one.
+        assertSqlState("SELECT 'a' * 'b'", "42725");
     }
 
     @Test void int_concat_int_gives_42883() {

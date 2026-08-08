@@ -997,10 +997,69 @@ public class AstExecutor {
      * rest. PostgreSQL puts pg_temp implicitly first for relations, which is what makes a
      * temporary sequence answer to its bare name.
      */
+    /** The first table of this name along the search path, reading pg_temp where it stands. */
+    private Table tableAlongSearchPath(String tableName, String tempSchemaName) {
+        if (session == null) return null;
+        for (String entry : session.getEffectiveSearchPath(false)) {
+            String schemaName = "pg_temp".equalsIgnoreCase(entry) ? tempSchemaName : entry;
+            Schema schema = database.getSchema(schemaName);
+            if (schema == null) continue;
+            Table table = visibleTable(schema.getTable(tableName));
+            if (table != null) return table;
+        }
+        return null;
+    }
+
+    /** Whether the search path names the temporary schema, so its position is already decided. */
+    private boolean searchPathNamesTemp() {
+        if (session == null) return false;
+        String temp = session.getTempSchemaName();
+        for (String entry : session.getEffectiveSearchPath(false)) {
+            if ("pg_temp".equalsIgnoreCase(entry) || entry.equalsIgnoreCase(temp)) return true;
+        }
+        return false;
+    }
+
+    /** Whether two functions take the same argument types, so one schema cannot hold both. */
+    private static boolean sameArgumentTypes(PgFunction a, PgFunction b) {
+        if (a.getParams().size() != b.getParams().size()) return false;
+        for (int i = 0; i < a.getParams().size(); i++) {
+            String left = a.getParams().get(i).typeName();
+            String right = b.getParams().get(i).typeName();
+            if (left == null ? right != null : !left.equalsIgnoreCase(right)) return false;
+        }
+        return true;
+    }
+
+    /** A function's argument types, written the way a message names them. */
+    private static String argumentTypeList(PgFunction fn) {
+        StringBuilder sb = new StringBuilder();
+        for (PgFunction.Param p : fn.getParams()) {
+            if (sb.length() > 0) sb.append(", ");
+            sb.append(p.typeName() == null ? "any" : p.typeName());
+        }
+        return sb.toString();
+    }
+
     java.util.List<String> relationSearchPath() {
         java.util.LinkedHashSet<String> path = new java.util.LinkedHashSet<>();
-        if (session != null) path.add(session.getTempSchemaName().toLowerCase());
-        path.addAll(searchPathSchemas());
+        String temp = session == null ? null : session.getTempSchemaName().toLowerCase();
+        // pg_temp comes first only while the search path leaves it unsaid. A path that names it
+        // puts it where it was named, so "public, pg_temp" reads the permanent table of a name
+        // in preference to the temporary one — and putting temp first regardless meant a
+        // temporary table shadowed a permanent one the session had asked to see instead.
+        boolean named = false;
+        if (session != null) {
+            for (String entry : session.getEffectiveSearchPath(false)) {
+                String lower = entry.toLowerCase();
+                if (lower.equals("pg_temp") || lower.equals(temp)) { named = true; break; }
+            }
+        }
+        if (temp != null && !named) path.add(temp);
+        for (String schema : searchPathSchemas()) {
+            path.add(temp != null && "pg_temp".equals(schema) ? temp : schema);
+        }
+        if (temp != null) path.add(temp);
         return new ArrayList<>(path);
     }
 
@@ -1198,11 +1257,21 @@ public class AstExecutor {
             }
             // Fall through to view/sequence resolution below
         } else {
-            // Check temp schema first (temp tables shadow search_path)
-            Schema pgTemp = database.getSchema(tempSchemaName);
-            if (pgTemp != null) {
-                Table tempTable = visibleTable(pgTemp.getTable(tableName));
-                if (tempTable != null) return tempTable;
+            // The temporary schema comes first only while the search path leaves it unsaid; a
+            // path that names it puts it where it was named, so "public, pg_temp" reads the
+            // permanent table in preference to the temporary one of the same name.
+            boolean tempIsNamed = searchPathNamesTemp();
+            if (!tempIsNamed) {
+                Schema pgTemp = database.getSchema(tempSchemaName);
+                if (pgTemp != null) {
+                    Table tempTable = visibleTable(pgTemp.getTable(tableName));
+                    if (tempTable != null) return tempTable;
+                }
+            } else {
+                // The path said where the temporary schema stands, so the whole path is walked
+                // in order before anything is assumed about which schema is the current one.
+                Table onPath = tableAlongSearchPath(tableName, tempSchemaName);
+                if (onPath != null) return onPath;
             }
             // Then check explicit/default schema
             Schema schema = schemaName != null ? database.getSchema(schemaName) : null;
@@ -1217,6 +1286,7 @@ public class AstExecutor {
                     for (String sp : searchPath.split(",")) {
                         String s = sp.trim().replace("\"", "").replace("'", "");
                         if (s.isEmpty() || s.equals("$user")) continue;
+                        if ("pg_temp".equalsIgnoreCase(s)) s = tempSchemaName;
                         Schema spSchema = database.getSchema(s);
                         if (spSchema != null) {
                             Table table = visibleTable(spSchema.getTable(tableName));
@@ -1807,6 +1877,16 @@ public class AstExecutor {
                 String newSchema = stmt.targetValue();
                 if (database.getSchema(newSchema) == null) {
                     throw new MemgresException("schema \"" + newSchema + "\" does not exist", "3F000");
+                }
+                // A schema holds one function of a given name and argument list. Moving on top of
+                // one that is already there replaced it silently, and the function the target
+                // schema had answered under its own name no longer existed.
+                for (PgFunction other : database.getFunctionOverloads(newSchema, func.getName())) {
+                    if (other != func && sameArgumentTypes(other, func)) {
+                        throw new MemgresException("function " + func.getName() + "("
+                                + argumentTypeList(func) + ") already exists in schema \""
+                                + newSchema + "\"", "42723");
+                    }
                 }
                 func.setSchemaName(newSchema);
                 // Update schema registry

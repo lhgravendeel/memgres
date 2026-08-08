@@ -34,7 +34,7 @@ class DmlParser {
         // INSERT INTO t AS alias: PG allows alias for RETURNING/ON CONFLICT references
         String insertAlias = null;
         if (parser.matchKeyword("AS")) {
-            insertAlias = parser.readIdentifier();
+            insertAlias = parser.readColumnName();
         }
 
         // Column list — disambiguate from parenthesized SELECT by scanning for query keywords
@@ -407,7 +407,7 @@ class DmlParser {
         // Optional alias: DELETE FROM tbl alias WHERE ... or DELETE FROM tbl AS alias WHERE ...
         String alias = null;
         if (parser.matchKeyword("AS")) {
-            alias = parser.readIdentifier();
+            alias = parser.readColumnName();
         } else if (!parser.check(TokenType.SEMICOLON) && !parser.check(TokenType.EOF) && !parser.isAtEnd()
                 && parser.isKeywordValidAsBareAlias()) {
             alias = parser.readIdentifier();
@@ -460,7 +460,7 @@ class DmlParser {
         }
         String targetAlias = null;
         if (parser.matchKeyword("AS")) {
-            targetAlias = parser.readIdentifier();
+            targetAlias = parser.readColumnName();
         } else if (!parser.checkKeyword("USING") && parser.isKeywordValidAsBareAlias()) {
             targetAlias = parser.readIdentifier();
         }

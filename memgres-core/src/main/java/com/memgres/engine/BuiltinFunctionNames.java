@@ -111,6 +111,7 @@ public final class BuiltinFunctionNames {
             "pg_tablespace_location", "pg_tablespace_size", "pg_terminate_backend",
             "pg_total_relation_size", "pg_ts_config_is_visible", "pg_ts_dict_is_visible",
             "pg_ts_parser_is_visible", "pg_ts_template_is_visible", "pg_type_is_visible", "pg_typeof",
+            "pg_collation_for",
             "pg_visible_in_snapshot", "pg_wal_lsn_diff", "pg_xact_status", "phraseto_tsquery", "pi",
             "plainto_tsquery", "point", "polygon", "popen", "populate_record", "position", "power",
             "querytree", "quote_ident", "quote_literal", "quote_nullable", "radius",

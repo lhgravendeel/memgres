@@ -407,6 +407,10 @@ public final class TypeCoercion {
         DataType type = column.getType();
         if (type == DataType.SERIAL || type == DataType.BIGSERIAL || type == DataType.SMALLSERIAL) return value; // handled separately
 
+        // A log sequence number is text of a particular shape, so being a string is not enough
+        // to be one: the check has to come before the value is taken as already stored.
+        if (type == DataType.PG_LSN) return checkedLsn(value);
+
         // If value is already the right Java type, no conversion needed
         if (isCorrectJavaType(value, type)) {
             return applyPrecision(value, type, column);
@@ -423,19 +427,23 @@ public final class TypeCoercion {
             return toString(row);
         }
 
+        // A numeric special reaches its column as text, and a declared precision has no room for
+        // one: PostgreSQL calls that an overflow of the field rather than bad input syntax.
+        if (type == DataType.NUMERIC && column.getPrecision() != null
+                && NumericLimits.specialNumericOrNull(value) != null) {
+            throw new MemgresException("numeric field overflow", "22003");
+        }
         try {
             Object coerced = coerce(value, type);
             return applyPrecision(coerced, type, column);
         } catch (MemgresException e) {
-            // If the value looks like an array literal or is a List, store as-is
-            if (value instanceof java.util.List || (value instanceof String && ((String) value).trim().startsWith("{"))) {
+            if (storesArrayText(value, type)) {
                 validateArrayElements(value, type);
                 return value;
             }
             throw e;
         } catch (Exception e) {
-            // If the value looks like an array literal or is a List, store as-is
-            if (value instanceof java.util.List || (value instanceof String && ((String) value).trim().startsWith("{"))) {
+            if (storesArrayText(value, type)) {
                 validateArrayElements(value, type);
                 return value;
             }
@@ -445,6 +453,18 @@ public final class TypeCoercion {
     }
 
     /** Validate array elements match the expected array element type. */
+    /**
+     * Whether a value the target type's input function refused should still be stored as the array
+     * text it looks like. Only an array column may: the test used to be that the text began with a
+     * brace whatever the column was, so '{foo}' was accepted into a date column and stayed there
+     * as the string it is, and the conversion error it had already raised was thrown away.
+     */
+    private static boolean storesArrayText(Object value, DataType type) {
+        if (!DataType.isArrayType(type)) return false;
+        return value instanceof java.util.List
+                || (value instanceof String && ((String) value).trim().startsWith("{"));
+    }
+
     private static void validateArrayElements(Object value, DataType type) {
         if (type == DataType.INT4_ARRAY && value instanceof String) {
             String s = ((String) value).trim();
@@ -537,6 +557,87 @@ public final class TypeCoercion {
         }
     }
 
+    /** A declared numeric(p[,s]) has no room for NaN or an infinity. */
+    private static void rejectNonFiniteNumeric(double value, int precision, Integer scale) {
+        if (Double.isNaN(value) || Double.isInfinite(value)) {
+            throw new MemgresException("numeric field overflow", "22003");
+        }
+    }
+
+    /**
+     * A date/time value rounded to the fractional-second precision its column declares, or null
+     * when the value is not one this applies to. There was no branch for it at all, so a
+     * timestamp(0) column kept every digit the value arrived with.
+     */
+    private static Object roundToPrecision(Object value, DataType type, int precision) {
+        if (precision < 0 || precision > 6) return null;
+        if (value instanceof LocalDateTime) {
+            return isDateTimeInfinity(value) ? value
+                    : ((LocalDateTime) value).truncatedTo(java.time.temporal.ChronoUnit.MICROS)
+                        .plusNanos(roundingNanos(((LocalDateTime) value).getNano(), precision))
+                        .truncatedTo(unitFor(precision));
+        }
+        if (value instanceof OffsetDateTime) {
+            return isDateTimeInfinity(value) ? value
+                    : ((OffsetDateTime) value).plusNanos(
+                        roundingNanos(((OffsetDateTime) value).getNano(), precision))
+                        .truncatedTo(unitFor(precision));
+        }
+        if (value instanceof LocalTime) {
+            return ((LocalTime) value).plusNanos(
+                    roundingNanos(((LocalTime) value).getNano(), precision)).truncatedTo(unitFor(precision));
+        }
+        return null;
+    }
+
+    /** How far to nudge a value so that truncating to this precision rounds it to nearest. */
+    private static long roundingNanos(int nano, int precision) {
+        long unit = 1L;
+        for (int i = precision; i < 9; i++) unit *= 10L;
+        long remainder = nano % unit;
+        return remainder >= unit / 2 ? unit - remainder : -remainder;
+    }
+
+    private static java.time.temporal.ChronoUnit unitFor(int precision) {
+        if (precision == 0) return java.time.temporal.ChronoUnit.SECONDS;
+        if (precision <= 3) return java.time.temporal.ChronoUnit.MILLIS;
+        return java.time.temporal.ChronoUnit.MICROS;
+    }
+
+    /**
+     * A log sequence number, checked and written the way PostgreSQL writes it: two hexadecimal
+     * numbers with one slash between them, in capitals. Storing the text unread put anything at
+     * all under the type.
+     */
+    public static String checkedLsn(Object value) {
+        String lsn = value.toString().trim();
+        int slash = lsn.indexOf('/');
+        if (slash <= 0 || slash == lsn.length() - 1 || lsn.indexOf('/', slash + 1) >= 0
+                || !isHexRun(lsn.substring(0, slash)) || !isHexRun(lsn.substring(slash + 1))) {
+            throw new MemgresException(
+                    "invalid input syntax for type pg_lsn: \"" + value + "\"", "22P02");
+        }
+        return lsn.toUpperCase();
+    }
+
+    private static boolean isHexRun(String text) {
+        if (text.isEmpty() || text.length() > 8) return false;
+        for (int i = 0; i < text.length(); i++) {
+            if (Character.digit(text.charAt(i), 16) < 0) return false;
+        }
+        return true;
+    }
+
+    /** Whether this text is a run of bits, so it can be read as the bit string it spells. */
+    private static boolean isBitText(String text) {
+        if (text.isEmpty()) return false;
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (c != '0' && c != '1') return false;
+        }
+        return true;
+    }
+
     private static Object applyPrecision(Object value, DataType type, Column column) {
         // VARCHAR(n) enforcement
         if (type == DataType.VARCHAR && column.getPrecision() != null && value instanceof String) {
@@ -555,14 +656,33 @@ public final class TypeCoercion {
             // PG pads CHAR with spaces
             return String.format("%-" + n + "s", s);
         }
-        // NUMERIC(p,s)
-        if (type == DataType.NUMERIC && column.getScale() != null && value instanceof BigDecimal) {
-            BigDecimal bd = (BigDecimal) value;
-            BigDecimal rounded = bd.setScale(column.getScale(), RoundingMode.HALF_UP);
-            if (column.getPrecision() != null) {
-                checkNumericTypmod(rounded, column.getPrecision(), column.getScale());
-            }
+        // NUMERIC(p[,s]). The scale defaults to zero when only a precision was declared, and a
+        // declared precision has no room for NaN or an infinity. Requiring a scale before looking
+        // at anything let numeric(5) hold 123456789 and numeric(5,1) hold Infinity.
+        if (type == DataType.NUMERIC && column.getPrecision() != null && value instanceof Number
+                && !(value instanceof BigDecimal)) {
+            value = toBigDecimal(value);
+        }
+        if (type == DataType.NUMERIC && column.getPrecision() != null && value instanceof Double) {
+            rejectNonFiniteNumeric((Double) value, column.getPrecision(), column.getScale());
+        }
+        if (type == DataType.NUMERIC && column.getPrecision() != null && value instanceof BigDecimal) {
+            int scale = column.getScale() != null ? column.getScale() : 0;
+            BigDecimal rounded = ((BigDecimal) value).setScale(scale, RoundingMode.HALF_UP);
+            checkNumericTypmod(rounded, column.getPrecision(), scale);
             return rounded;
+        }
+        if (type == DataType.NUMERIC && column.getScale() != null && value instanceof BigDecimal) {
+            return ((BigDecimal) value).setScale(column.getScale(), RoundingMode.HALF_UP);
+        }
+        // A name is truncated to what a name holds rather than kept whole.
+        if (type == DataType.NAME && value instanceof String && ((String) value).length() > 63) {
+            return ((String) value).substring(0, 63);
+        }
+        // timestamp(n) and time(n) keep n fractional digits, rounded as PostgreSQL rounds them.
+        if (column.getPrecision() != null) {
+            Object rounded = roundToPrecision(value, type, column.getPrecision());
+            if (rounded != null) return rounded;
         }
         // interval day to second(n): the column keeps only the fields its qualifier reaches, and
         // only n fractional digits of its seconds — the same modifier a cast to the type applies.
@@ -574,7 +694,13 @@ public final class TypeCoercion {
             IntervalTypmod typmod = IntervalTypmod.fromTypeSpec(spec.toString());
             if (typmod != null) return typmod.apply((PgInterval) value);
         }
-        // BIT(n) / VARBIT(n) length enforcement
+        // BIT(n) / VARBIT(n) length enforcement. The value may arrive as the text of the bits
+        // rather than as a bit string, and checking only the latter let a bit(4) column take
+        // '101' and '10101' alike.
+        if ((type == DataType.BIT || type == DataType.VARBIT) && value instanceof String
+                && column.getPrecision() != null && isBitText((String) value)) {
+            value = new AstExecutor.PgBitString((String) value);
+        }
         if (type == DataType.BIT && value instanceof AstExecutor.PgBitString && column.getPrecision() != null) {
             String bits = ((AstExecutor.PgBitString) value).bits();
             int n = column.getPrecision();
@@ -952,6 +1078,32 @@ public final class TypeCoercion {
     }
 
     /** The BC suffix PG appends after the time part of a pre-Christian timestamp. */
+    /**
+     * {@code "infinity"} or {@code "-infinity"} when this value is one of the sentinels, else
+     * null. A date and a timestamp both have the two, and a timestamptz carries the timestamp's.
+     */
+    public static String infinityText(Object val) {
+        if (val instanceof LocalDateTime) {
+            if (val.equals(TIMESTAMP_INFINITY)) return "infinity";
+            if (val.equals(TIMESTAMP_NEG_INFINITY)) return "-infinity";
+            return null;
+        }
+        if (val instanceof LocalDate) {
+            if (val.equals(DATE_INFINITY)) return "infinity";
+            if (val.equals(DATE_NEG_INFINITY)) return "-infinity";
+            return null;
+        }
+        if (val instanceof OffsetDateTime) {
+            return infinityText(((OffsetDateTime) val).toLocalDateTime());
+        }
+        return null;
+    }
+
+    /** Whether this value is one of the date/time infinities. */
+    public static boolean isDateTimeInfinity(Object val) {
+        return infinityText(val) != null;
+    }
+
     public static String eraSuffix(int prolepticYear) {
         return prolepticYear > 0 ? "" : " BC";
     }
@@ -966,6 +1118,9 @@ public final class TypeCoercion {
      * several values — an array, a composite — rather than casting one on its own.
      */
     static String toString(Object val) {
+        // An infinity is written as the word, not as the instant that stands for it.
+        String infinite = infinityText(val);
+        if (infinite != null) return infinite;
         if (val instanceof Double) return PgFloatFormat.float8out((Double) val);
         if (val instanceof Float) return PgFloatFormat.float4out((Float) val);
         if (val instanceof LocalDate) return formatIsoDate((LocalDate) val);
@@ -1898,12 +2053,19 @@ public final class TypeCoercion {
         return LocalTime.ofNanoOfDay(m * 1000L);
     }
 
-    // Sentinel values for PG 'infinity' / '-infinity' timestamps
-    public static final LocalDateTime TIMESTAMP_INFINITY = LocalDateTime.of(9999, 12, 31, 23, 59, 59);
-    public static final LocalDateTime TIMESTAMP_NEG_INFINITY = LocalDateTime.of(-4713, 1, 1, 0, 0, 0);
+    /**
+     * Sentinel values for PostgreSQL's {@code infinity} and {@code -infinity}.
+     *
+     * <p>They sit outside every instant a timestamp can hold, so no value a user can write is one
+     * of them. Standing them on representable instants — 9999-12-31 23:59:59 and 4713-01-01 BC —
+     * meant infinity round-tripped as a finite instant, an ordinary timestamp compared equal to
+     * it, and isfinite answered true for it.
+     */
+    public static final LocalDateTime TIMESTAMP_INFINITY = LocalDateTime.MAX;
+    public static final LocalDateTime TIMESTAMP_NEG_INFINITY = LocalDateTime.MIN;
     /** date also has infinities, sharing the timestamp sentinels' day so comparisons agree. */
-    public static final LocalDate DATE_INFINITY = TIMESTAMP_INFINITY.toLocalDate();
-    public static final LocalDate DATE_NEG_INFINITY = TIMESTAMP_NEG_INFINITY.toLocalDate();
+    public static final LocalDate DATE_INFINITY = LocalDate.MAX;
+    public static final LocalDate DATE_NEG_INFINITY = LocalDate.MIN;
 
     /**
      * The span a PostgreSQL timestamp can hold: 4714-11-24 BC to 294276-12-31, which is narrower at
@@ -2299,6 +2461,12 @@ public final class TypeCoercion {
 
         // Both numbers: promote and compare
         if (a instanceof Number && b instanceof Number) {
+            // Two whole numbers are compared as whole numbers. Promoting them to double first
+            // lost the low bits of anything past 2^53, so two distinct bigints compared equal
+            // and max() over a column of them answered the smaller one.
+            if (isIntegral((Number) a) && isIntegral((Number) b)) {
+                return toBigInteger((Number) a).compareTo(toBigInteger((Number) b));
+            }
             // Handle NaN and Infinity for numeric type: NaN sorts as greatest (PG semantics)
             double da = ((Number) a).doubleValue();
             double db = ((Number) b).doubleValue();
@@ -2320,16 +2488,18 @@ public final class TypeCoercion {
         if (a instanceof PgInterval && b instanceof PgInterval) return ((PgInterval) a).compareTo((PgInterval) b);
 
         // UUID comparisons
-        if (a instanceof java.util.UUID && b instanceof java.util.UUID) return ((java.util.UUID) a).compareTo(((java.util.UUID) b));
+        if (a instanceof java.util.UUID && b instanceof java.util.UUID) {
+            return compareUuids((java.util.UUID) a, (java.util.UUID) b);
+        }
         if (a instanceof java.util.UUID && b instanceof String) {
             String sb = (String) b;
             java.util.UUID ua = (java.util.UUID) a;
-            try { return ua.compareTo(java.util.UUID.fromString(sb)); } catch (Exception e) { /* fall through */ }
+            try { return compareUuids(ua, java.util.UUID.fromString(sb)); } catch (Exception e) { /* fall through */ }
         }
         if (b instanceof java.util.UUID && a instanceof String) {
             String sa = (String) a;
             java.util.UUID ub = (java.util.UUID) b;
-            try { return java.util.UUID.fromString(sa).compareTo(ub); } catch (Exception e) { /* fall through */ }
+            try { return compareUuids(java.util.UUID.fromString(sa), ub); } catch (Exception e) { /* fall through */ }
         }
 
         // Network type comparisons (InetValue, MacaddrValue, Macaddr8Value)
@@ -2419,9 +2589,10 @@ public final class TypeCoercion {
             }
         }
 
-        // String comparison: strip trailing spaces first (consistent with areEqual)
-        // to handle CHAR(n) values, then use codepoint ordering.
-        return pgStringCompare(stripTrailingSpaces(a.toString()), stripTrailingSpaces(b.toString()));
+        // String comparison by codepoint ordering. Trailing blanks count: ignoring them is a
+        // rule that belongs to bpchar alone, and applying it to every string made 'abc ' equal
+        // to 'abc' and '' equal to ' '. The bpchar rule is applied where a bpchar is known.
+        return pgStringCompare(a.toString(), b.toString());
     }
 
     /**
@@ -2431,6 +2602,33 @@ public final class TypeCoercion {
      */
     static int pgStringCompare(String a, String b) {
         return a.compareTo(b);
+    }
+
+    /** Whether this number holds a whole value exactly, so it can be compared as one. */
+    private static boolean isIntegral(Number n) {
+        return n instanceof Integer || n instanceof Long || n instanceof Short
+                || n instanceof Byte || n instanceof java.math.BigInteger;
+    }
+
+    private static java.math.BigInteger toBigInteger(Number n) {
+        return n instanceof java.math.BigInteger
+                ? (java.math.BigInteger) n
+                : java.math.BigInteger.valueOf(n.longValue());
+    }
+
+    /**
+     * UUIDs compare as the sixteen unsigned bytes they are. java.util.UUID compares its halves as
+     * signed longs, so every UUID from 8000... on sorted below every UUID below it and the
+     * greatest UUID of all compared less than the least.
+     */
+    private static int compareUuids(java.util.UUID a, java.util.UUID b) {
+        int high = compareUnsignedLongs(a.getMostSignificantBits(), b.getMostSignificantBits());
+        return high != 0 ? high
+                : compareUnsignedLongs(a.getLeastSignificantBits(), b.getLeastSignificantBits());
+    }
+
+    private static int compareUnsignedLongs(long a, long b) {
+        return Long.compare(a + Long.MIN_VALUE, b + Long.MIN_VALUE);
     }
 
     /** Strip trailing space characters from a string (for CHAR(n) comparison semantics). */
@@ -2541,6 +2739,11 @@ public final class TypeCoercion {
 
         // Number comparison
         if (a instanceof Number && b instanceof Number) {
+            // Two whole numbers are equal only if they are the same whole number; going through
+            // double first made every pair past 2^53 that shared a mantissa compare equal.
+            if (isIntegral((Number) a) && isIntegral((Number) b)) {
+                return toBigInteger((Number) a).equals(toBigInteger((Number) b));
+            }
             // Handle NaN/Infinity: these can't be converted to BigDecimal
             double da = ((Number) a).doubleValue();
             double db = ((Number) b).doubleValue();
@@ -2634,13 +2837,9 @@ public final class TypeCoercion {
             } catch (Exception e) { /* fall through */ }
         }
 
-        // Fall back to string comparison with trailing-space-insensitive semantics.
-        // This handles CHAR(n) values which PG pads with spaces but compares ignoring trailing spaces.
-        // Must be consistent with compare() — both strip trailing spaces so that = and < never
-        // both return true for the same pair of values.
-        String sa2 = stripTrailingSpaces(a.toString());
-        String sb2 = stripTrailingSpaces(b.toString());
-        return sa2.equals(sb2);
+        // Fall back to string comparison, blanks and all, so that = and < agree with each other
+        // and with what PostgreSQL answers for text and varchar.
+        return a.toString().equals(b.toString());
     }
 
     private static boolean isDateTime(Object val) {

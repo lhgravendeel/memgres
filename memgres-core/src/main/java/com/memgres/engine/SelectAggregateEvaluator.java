@@ -921,17 +921,28 @@ class SelectAggregateEvaluator {
             }
             case "mode": {
                 if (vals.isEmpty()) return null;
-                Map<String, Long> freq = new LinkedHashMap<>();
-                Map<String, Object> firstOccurrence = new LinkedHashMap<>();
+                // The most frequent value, counted by equality rather than by how each value
+                // happens to be written: numeric 1.0, 1.00 and 1.000 are one value three times
+                // over, and counting the spellings made the runner-up win.
+                List<Object> distinct = new ArrayList<>();
+                List<Long> counts = new ArrayList<>();
                 for (Object v : vals) {
-                    String key = v.toString();
-                    freq.merge(key, 1L, Long::sum);
-                    firstOccurrence.putIfAbsent(key, v);
+                    int at = -1;
+                    for (int i = 0; i < distinct.size(); i++) {
+                        if (TypeCoercion.areEqual(distinct.get(i), v)) { at = i; break; }
+                    }
+                    if (at < 0) {
+                        distinct.add(v);
+                        counts.add(1L);
+                    } else {
+                        counts.set(at, counts.get(at) + 1);
+                    }
                 }
-                String modeKey = freq.entrySet().stream()
-                        .max(Map.Entry.comparingByValue())
-                        .map(Map.Entry::getKey).orElse(null);
-                return modeKey != null ? firstOccurrence.get(modeKey) : null;
+                int best = 0;
+                for (int i = 1; i < counts.size(); i++) {
+                    if (counts.get(i) > counts.get(best)) best = i;
+                }
+                return distinct.get(best);
             }
             default: {
                 throw notAnOrderedSetAggregate(osa, group);
@@ -1645,6 +1656,10 @@ class SelectAggregateEvaluator {
                         .setScale(16, RoundingMode.HALF_UP));
             }
             case "grouping": {
+                // The answer is an int4 bitmask, so there is room for 31 arguments and no more.
+                if (fn.args().size() > 31) {
+                    throw new MemgresException("GROUPING must have fewer than 32 arguments", "54023");
+                }
                 GroupingScope scope = groupingScope.get();
                 if (scope == null) {
                     throw new MemgresException(

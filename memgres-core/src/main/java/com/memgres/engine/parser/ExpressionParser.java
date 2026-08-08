@@ -236,6 +236,70 @@ public class ExpressionParser {
         }
     }
 
+    /** The tokens after which a keyword can only have been a column name, not a construct. */
+    private static final java.util.Set<String> FOLLOWS_A_COLUMN = java.util.Collections
+            .unmodifiableSet(new java.util.HashSet<String>(java.util.Arrays.asList(
+                    "FROM", "AS", "WHERE", "ORDER", "GROUP", "HAVING", "LIMIT", "OFFSET", "INTO",
+                    "UNION", "INTERSECT", "EXCEPT", "ON", "AND", "OR", "WHEN", "THEN", "ELSE",
+                    "END", "IS", "RETURNING", "USING", "FOR", "WINDOW", "FETCH")));
+
+    /** Whether the token after this keyword rules out every construct the keyword could begin. */
+    private boolean keywordStandsAlone() {
+        if (pos + 1 >= tokens.size()) return true;
+        Token next = tokens.get(pos + 1);
+        switch (next.type()) {
+            case COMMA: case RIGHT_PAREN: case SEMICOLON: case EOF:
+            case EQUALS: case NOT_EQUALS: case LESS_THAN: case GREATER_THAN:
+            case LESS_EQUALS: case GREATER_EQUALS:
+                return true;
+            case KEYWORD:
+                return FOLLOWS_A_COLUMN.contains(next.value().toUpperCase());
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * A name that has to be usable as a column, a table alias or a parameter. PostgreSQL's
+     * reserved and type/function-name keywords are not, which is why {@code CREATE TABLE t (order
+     * int)} and {@code FROM t AS left} are syntax errors and were accepted here.
+     */
+    /** The type names PostgreSQL spells in two words, and the typname each one carries. */
+    private static final String[][] TWO_WORD_TYPES = {
+            {"DOUBLE", "PRECISION", "float8"},
+            {"CHARACTER", "VARYING", "varchar"},
+            {"CHAR", "VARYING", "varchar"},
+            {"BIT", "VARYING", "varbit"},
+            {"NATIONAL", "CHARACTER", "bpchar"},
+    };
+
+    /** A constant written as a two-word type name and a string, or null when this is not one. */
+    private Expression parseTwoWordTypeLiteral() {
+        if (pos + 2 >= tokens.size()) return null;
+        if (tokens.get(pos + 2).type() != TokenType.STRING_LITERAL) return null;
+        String first = tokens.get(pos).value();
+        String second = tokens.get(pos + 1).value();
+        if (first == null || second == null) return null;
+        for (String[] type : TWO_WORD_TYPES) {
+            if (type[0].equalsIgnoreCase(first) && type[1].equalsIgnoreCase(second)) {
+                advance();
+                advance();
+                String text = advance().value();
+                return new CastExpr(Literal.ofString(text), type[2]);
+            }
+        }
+        return null;
+    }
+
+    protected String readColumnName() {
+        Token t = peek();
+        if (t.type() == TokenType.KEYWORD && !PgKeywords.canBeColumnName(t.value())) {
+            throw ParseException.saying(
+                    "syntax error at or near \"" + t.value().toLowerCase() + "\"", t, "42601");
+        }
+        return readIdentifier();
+    }
+
     protected String readIdentifier() {
         Token t = peek();
         if (t.type() == TokenType.IDENTIFIER || t.type() == TokenType.QUOTED_IDENTIFIER) {
@@ -683,7 +747,7 @@ public class ExpressionParser {
      * name, and an identifier anywhere else is still free to be a column called isnull.
      */
     private Expression parseComparison() {
-        Expression left = parseComparisonOperand();
+        Expression left = parseIsPostfix(parseComparisonOperand());
         if (checkIdentifier("ISNULL")) {
             advance();
             return new IsNullExpr(left, false);
@@ -695,10 +759,13 @@ public class ExpressionParser {
         return left;
     }
 
-    private Expression parseComparisonOperand() {
-        Expression left = parseOtherOps();
-
-        // IS [NOT] NULL
+    /**
+     * The IS forms, which bind looser than a comparison operator: "1 = 1 IS NULL" asks whether the
+     * comparison came out NULL, not whether the right-hand 1 did. Reading them as part of an
+     * operand made every one of them a syntax error after a comparison.
+     */
+    private Expression parseIsPostfix(Expression left) {
+        int saved = pos;
         if (checkKeyword("IS")) {
             advance();
             boolean negated = matchKeyword("NOT");
@@ -759,6 +826,13 @@ public class ExpressionParser {
             // but in practice this won't happen with well-formed SQL
         }
 
+        pos = saved;   // an IS this does not know is not ours to consume
+        return left;
+    }
+
+    private Expression parseComparisonOperand() {
+        Expression left = parseOtherOps();
+
         // [NOT] IN (...)
         boolean negated = false;
         if (checkKeyword("NOT")) {
@@ -793,7 +867,11 @@ public class ExpressionParser {
             left = new BetweenExpr(left, low, high, negated, symmetric);
             // Fall through
         } else if (matchKeyword("LIKE")) {
-            // [NOT] LIKE / ILIKE
+            // [NOT] LIKE / ILIKE, either against one pattern or against ANY/ALL of a set
+            if (checkKeyword("ANY") || checkKeyword("SOME") || checkKeyword("ALL")) {
+                Expression any = parseComparisonRhs(left, BinaryExpr.BinOp.LIKE);
+                return negated ? new UnaryExpr(UnaryExpr.UnaryOp.NOT, any) : any;
+            }
             Expression right = parseOtherOps();
             if (matchKeyword("ESCAPE")) {
                 String esc = advance().value(); // string literal
@@ -804,6 +882,10 @@ public class ExpressionParser {
             }
             // Fall through
         } else if (matchKeyword("ILIKE")) {
+            if (checkKeyword("ANY") || checkKeyword("SOME") || checkKeyword("ALL")) {
+                Expression any = parseComparisonRhs(left, BinaryExpr.BinOp.ILIKE);
+                return negated ? new UnaryExpr(UnaryExpr.UnaryOp.NOT, any) : any;
+            }
             Expression right = parseOtherOps();
             if (matchKeyword("ESCAPE")) {
                 String esc = advance().value(); // string literal
@@ -867,13 +949,13 @@ public class ExpressionParser {
                 return new AnyAllArrayExpr(left, BinaryExpr.BinOp.EQUAL, arrayExpr, true);
             }
             checkNotBooleanConnective(); // val = AND → syntax error
-            return new BinaryExpr(left, BinaryExpr.BinOp.EQUAL, parseOtherOps());
+            return nonAssociative(new BinaryExpr(left, BinaryExpr.BinOp.EQUAL, parseOtherOps()));
         }
-        if (match(TokenType.NOT_EQUALS)) return parseComparisonRhs(left, BinaryExpr.BinOp.NOT_EQUAL);
-        if (match(TokenType.LESS_THAN)) return parseComparisonRhs(left, BinaryExpr.BinOp.LESS_THAN);
-        if (match(TokenType.GREATER_THAN)) return parseComparisonRhs(left, BinaryExpr.BinOp.GREATER_THAN);
-        if (match(TokenType.LESS_EQUALS)) return parseComparisonRhs(left, BinaryExpr.BinOp.LESS_EQUAL);
-        if (match(TokenType.GREATER_EQUALS)) return parseComparisonRhs(left, BinaryExpr.BinOp.GREATER_EQUAL);
+        if (match(TokenType.NOT_EQUALS)) return nonAssociative(parseComparisonRhs(left, BinaryExpr.BinOp.NOT_EQUAL));
+        if (match(TokenType.LESS_THAN)) return nonAssociative(parseComparisonRhs(left, BinaryExpr.BinOp.LESS_THAN));
+        if (match(TokenType.GREATER_THAN)) return nonAssociative(parseComparisonRhs(left, BinaryExpr.BinOp.GREATER_THAN));
+        if (match(TokenType.LESS_EQUALS)) return nonAssociative(parseComparisonRhs(left, BinaryExpr.BinOp.LESS_EQUAL));
+        if (match(TokenType.GREATER_EQUALS)) return nonAssociative(parseComparisonRhs(left, BinaryExpr.BinOp.GREATER_EQUAL));
 
         // Array/JSON operators
         if (match(TokenType.CONTAINS)) return new BinaryExpr(left, BinaryExpr.BinOp.CONTAINS, parseOtherOps());
@@ -888,15 +970,15 @@ public class ExpressionParser {
         if (match(TokenType.JSONB_EXISTS_ALL)) return new BinaryExpr(left, BinaryExpr.BinOp.JSONB_EXISTS_ALL, parseOtherOps());
 
         // Operator forms of LIKE/ILIKE and NOT LIKE/NOT ILIKE
-        if (match(TokenType.DOUBLE_TILDE)) return new BinaryExpr(left, BinaryExpr.BinOp.LIKE, parseOtherOps());
-        if (match(TokenType.DOUBLE_TILDE_STAR)) return new BinaryExpr(left, BinaryExpr.BinOp.ILIKE, parseOtherOps());
+        if (match(TokenType.DOUBLE_TILDE)) return parseComparisonRhs(left, BinaryExpr.BinOp.LIKE);
+        if (match(TokenType.DOUBLE_TILDE_STAR)) return parseComparisonRhs(left, BinaryExpr.BinOp.ILIKE);
         if (match(TokenType.NOT_DOUBLE_TILDE)) return new UnaryExpr(UnaryExpr.UnaryOp.NOT, new BinaryExpr(left, BinaryExpr.BinOp.LIKE, parseOtherOps()));
         if (match(TokenType.NOT_DOUBLE_TILDE_STAR)) return new UnaryExpr(UnaryExpr.UnaryOp.NOT, new BinaryExpr(left, BinaryExpr.BinOp.ILIKE, parseOtherOps()));
         // POSIX regex operators
-        if (match(TokenType.TILDE)) return new BinaryExpr(left, BinaryExpr.BinOp.REGEX_MATCH, parseOtherOps());
-        if (match(TokenType.TILDE_STAR)) return new BinaryExpr(left, BinaryExpr.BinOp.REGEX_IMATCH, parseOtherOps());
-        if (match(TokenType.EXCL_TILDE)) return new BinaryExpr(left, BinaryExpr.BinOp.NOT_REGEX_MATCH, parseOtherOps());
-        if (match(TokenType.EXCL_TILDE_STAR)) return new BinaryExpr(left, BinaryExpr.BinOp.NOT_REGEX_IMATCH, parseOtherOps());
+        if (match(TokenType.TILDE)) return parseComparisonRhs(left, BinaryExpr.BinOp.REGEX_MATCH);
+        if (match(TokenType.TILDE_STAR)) return parseComparisonRhs(left, BinaryExpr.BinOp.REGEX_IMATCH);
+        if (match(TokenType.EXCL_TILDE)) return parseComparisonRhs(left, BinaryExpr.BinOp.NOT_REGEX_MATCH);
+        if (match(TokenType.EXCL_TILDE_STAR)) return parseComparisonRhs(left, BinaryExpr.BinOp.NOT_REGEX_IMATCH);
 
         // Geometric operators (DISTANCE is handled in parseOtherOps for correct precedence)
         if (match(TokenType.APPROX_EQUAL)) return new BinaryExpr(left, BinaryExpr.BinOp.APPROX_EQUAL, parseOtherOps());
@@ -936,6 +1018,26 @@ public class ExpressionParser {
      * After consuming a comparison operator, check if the next token is ANY or ALL
      * (for subquery comparisons), otherwise parse a regular binary expression.
      */
+    /** The comparison operators, which cannot be chained. */
+    private static final java.util.Set<TokenType> COMPARISON_TOKENS = java.util.Collections
+            .unmodifiableSet(new java.util.HashSet<TokenType>(java.util.Arrays.asList(
+                    TokenType.EQUALS, TokenType.NOT_EQUALS, TokenType.LESS_THAN,
+                    TokenType.GREATER_THAN, TokenType.LESS_EQUALS, TokenType.GREATER_EQUALS)));
+
+    /**
+     * PostgreSQL's comparison operators are non-associative, so {@code 1 < 0 < 5} is a syntax
+     * error rather than a comparison of a boolean with a number. Chaining them read as a
+     * left-associative pair and answered f, which is what the same text means in Python and in
+     * nothing else: a query written that way is a mistake and has to be reported as one.
+     */
+    private Expression nonAssociative(Expression comparison) {
+        if (!isAtEnd() && COMPARISON_TOKENS.contains(peek().type())) {
+            throw ParseException.saying("syntax error at or near \"" + peek().value() + "\"",
+                    peek(), "42601");
+        }
+        return comparison;
+    }
+
     private Expression parseComparisonRhs(Expression left, BinaryExpr.BinOp op) {
         if (checkKeyword("ANY") || checkKeyword("SOME") || checkKeyword("ALL")) {
             boolean isAll = checkKeyword("ALL");
@@ -964,34 +1066,61 @@ public class ExpressionParser {
      * Package-private so ExprSpecialFormParser can call it for qualified operator RHS.
      */
     Expression parseOtherOps() {
-        Expression left = parseAddition();
+        Expression left = parseOtherOpsOperand();
         while (true) {
             if (match(TokenType.CONCAT)) {
-                left = new BinaryExpr(left, BinaryExpr.BinOp.CONCAT, parseAddition());
+                left = new BinaryExpr(left, BinaryExpr.BinOp.CONCAT, parseOtherOpsOperand());
             } else if (match(TokenType.PIPE)) {
-                left = new BinaryExpr(left, BinaryExpr.BinOp.BIT_OR, parseAddition());
+                left = new BinaryExpr(left, BinaryExpr.BinOp.BIT_OR, parseOtherOpsOperand());
             } else if (match(TokenType.HASH)) {
-                left = new BinaryExpr(left, BinaryExpr.BinOp.BIT_XOR, parseAddition());
+                left = new BinaryExpr(left, BinaryExpr.BinOp.BIT_XOR, parseOtherOpsOperand());
             } else if (match(TokenType.AMPERSAND)) {
-                left = new BinaryExpr(left, BinaryExpr.BinOp.BIT_AND, parseAddition());
+                left = new BinaryExpr(left, BinaryExpr.BinOp.BIT_AND, parseOtherOpsOperand());
             } else if (match(TokenType.SHIFT_LEFT)) {
-                left = new BinaryExpr(left, BinaryExpr.BinOp.SHIFT_LEFT, parseAddition());
+                left = new BinaryExpr(left, BinaryExpr.BinOp.SHIFT_LEFT, parseOtherOpsOperand());
             } else if (match(TokenType.SHIFT_RIGHT)) {
-                left = new BinaryExpr(left, BinaryExpr.BinOp.SHIFT_RIGHT, parseAddition());
+                left = new BinaryExpr(left, BinaryExpr.BinOp.SHIFT_RIGHT, parseOtherOpsOperand());
             } else if (match(TokenType.INET_CONTAINED_BY_EQUALS)) {
-                left = new BinaryExpr(left, BinaryExpr.BinOp.INET_CONTAINED_BY_EQUALS, parseAddition());
+                left = new BinaryExpr(left, BinaryExpr.BinOp.INET_CONTAINED_BY_EQUALS, parseOtherOpsOperand());
             } else if (match(TokenType.INET_CONTAINS_EQUALS)) {
-                left = new BinaryExpr(left, BinaryExpr.BinOp.INET_CONTAINS_EQUALS, parseAddition());
+                left = new BinaryExpr(left, BinaryExpr.BinOp.INET_CONTAINS_EQUALS, parseOtherOpsOperand());
             } else if (match(TokenType.DISTANCE)) {
-                left = new BinaryExpr(left, BinaryExpr.BinOp.DISTANCE, parseAddition());
+                left = new BinaryExpr(left, BinaryExpr.BinOp.DISTANCE, parseOtherOpsOperand());
             } else if (check(TokenType.CUSTOM_OPERATOR)) {
                 String opSymbol = advance().value();
-                left = new CustomOperatorExpr(null, opSymbol, left, parseAddition());
+                left = new CustomOperatorExpr(null, opSymbol, left, parseOtherOpsOperand());
             } else {
                 break;
             }
         }
         return left;
+    }
+
+
+    /**
+     * An operand of the "other operators" level, prefix forms included. PostgreSQL puts every
+     * symbolic prefix operator at this precedence — below {@code + -} and {@code * /} — so
+     * {@code ~ 2 + 1} complements the sum and answers -4, and {@code @ -3 + 1} is the absolute
+     * value of -2. Reading them with the unary sign bound them one level too tightly.
+     */
+    private Expression parseOtherOpsOperand() {
+        if (match(TokenType.AT_SIGN)) {
+            return new UnaryExpr(UnaryExpr.UnaryOp.ABS, parseOtherOpsOperand());
+        }
+        if (match(TokenType.TILDE)) {
+            return new UnaryExpr(UnaryExpr.UnaryOp.BIT_NOT, parseOtherOpsOperand());
+        }
+        if (check(TokenType.CONCAT) && pos + 1 < tokens.size()
+                && tokens.get(pos + 1).type() == TokenType.SLASH) {
+            advance(); advance();
+            return new UnaryExpr(UnaryExpr.UnaryOp.CBRT, parseOtherOpsOperand());
+        }
+        if (check(TokenType.PIPE) && pos + 1 < tokens.size()
+                && tokens.get(pos + 1).type() == TokenType.SLASH) {
+            advance(); advance();
+            return new UnaryExpr(UnaryExpr.UnaryOp.SQRT, parseOtherOpsOperand());
+        }
+        return parseAddition();
     }
 
     private Expression parseAddition() {
@@ -1232,7 +1361,10 @@ public class ExpressionParser {
                         collation = collation + "." + readIdentifierOrString();
                     }
                     validateCollation(collation);
-                    expr = new CollateExpr(expr, collation.toLowerCase());
+                    // A collation name is an identifier and keeps the case it was written with:
+                    // COLLATE "C" names the collation C. Everything that reads it back matches
+                    // case-insensitively, so only the name reported to the client changes.
+                    expr = new CollateExpr(expr, collation);
                 }
             } else if (check(TokenType.DOT) && expr instanceof ArrayExpr && ((ArrayExpr) expr).isRow()) {
                 ArrayExpr ae = (ArrayExpr) expr;
@@ -1383,9 +1515,37 @@ public class ExpressionParser {
             }
         }
 
+        // A keyword that names a construct of the grammar is still an ordinary column name where
+        // no construct can follow it: "SELECT trim FROM t" reads the column trim, and reading it
+        // as the start of a trim() call made a perfectly ordinary query a syntax error.
+        if (t.type() == TokenType.KEYWORD && PgKeywords.isColumnNameKeyword(t.value())
+                && keywordStandsAlone()) {
+            advance();
+            return new ColumnRef(null, null, null, t.value().toLowerCase());
+        }
+
         // Keywords that are values
         if (t.type() == TokenType.KEYWORD) {
             switch (t.value()) {
+                case "COLLATION": {
+                    // COLLATION FOR (expr) is how pg_collation_for is written.
+                    if (pos + 1 < tokens.size() && tokens.get(pos + 1).type() == TokenType.KEYWORD
+                            && "FOR".equals(tokens.get(pos + 1).value())) {
+                        advance();
+                        advance();
+                        expect(TokenType.LEFT_PAREN);
+                        Expression arg = parseExpression();
+                        expect(TokenType.RIGHT_PAREN);
+                        return new FunctionCallExpr("pg_collation_for",
+                                java.util.Collections.singletonList(arg));
+                    }
+                    break;
+                }
+                case "USER": {
+                    // PostgreSQL's USER is a value function, the same as CURRENT_USER.
+                    advance();
+                    return new FunctionCallExpr("current_user", new ArrayList<Expression>());
+                }
                 case "TRUE": {
                     advance(); return Literal.ofBoolean(true);
                 }
@@ -1566,6 +1726,12 @@ public class ExpressionParser {
                 }
             }
         }
+
+        // A type name spelt in two words introduces a constant just as a one-word name does:
+        // double precision '1.5' is a float8. Reading only the first word left the second one
+        // standing where nothing could follow it, and the whole constant was a syntax error.
+        Expression twoWordConstant = parseTwoWordTypeLiteral();
+        if (twoWordConstant != null) return twoWordConstant;
 
         // Identifier: could be column ref, function call, type-annotated literal, or qualified name
         if (t.type() == TokenType.IDENTIFIER || t.type() == TokenType.QUOTED_IDENTIFIER || t.type() == TokenType.KEYWORD) {
