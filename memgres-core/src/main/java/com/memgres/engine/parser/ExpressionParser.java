@@ -1038,7 +1038,27 @@ public class ExpressionParser {
             return new UnaryExpr(UnaryExpr.UnaryOp.ABS, parseUnary());
         }
         if (match(TokenType.MINUS)) {
-            return new UnaryExpr(UnaryExpr.UnaryOp.NEGATE, parseUnary());
+            Expression operand = parseUnary();
+            // PostgreSQL's grammar folds a sign into the numeric literal behind it, so the whole
+            // of -2147483648 is one integer literal. Negating the literal afterwards instead read
+            // 2147483648 first, which is a bigint, and the expression was one width too wide:
+            // (-2147483648) - 1 answered -2147483649 where PostgreSQL raises integer out of range.
+            if (operand instanceof Literal) {
+                Literal lit = (Literal) operand;
+                if (lit.literalType() == Literal.LiteralType.INTEGER
+                        || lit.literalType() == Literal.LiteralType.FLOAT) {
+                    String text = lit.value();
+                    if (text != null && !text.isEmpty()) {
+                        // The sign is flipped either way, as PostgreSQL's doNegate does, so
+                        // -(-2147483648) folds to the bigint 2147483648 rather than overflowing
+                        // an integer negation.
+                        String negated = text.startsWith("-") ? text.substring(1) : "-" + text;
+                        return lit.literalType() == Literal.LiteralType.INTEGER
+                                ? Literal.ofInt(negated) : Literal.ofFloat(negated);
+                    }
+                }
+            }
+            return new UnaryExpr(UnaryExpr.UnaryOp.NEGATE, operand);
         }
         if (match(TokenType.PLUS)) {
             return new UnaryExpr(UnaryExpr.UnaryOp.POSITIVE, parseUnary());
@@ -1351,8 +1371,16 @@ public class ExpressionParser {
 
         // Parameter reference
         if (check(TokenType.PARAM)) {
+            Token paramToken = peek();
             String param = advance().value();
-            return new ParamRef(Integer.parseInt(param.substring(1)));
+            // A parameter number is an int, and a client may write anything. Parsing it without a
+            // guard let the NumberFormatException out as an internal error.
+            try {
+                return new ParamRef(Integer.parseInt(param.substring(1)));
+            } catch (NumberFormatException e) {
+                throw ParseException.saying("parameter number too large at or near \"" + param
+                        + "\"", paramToken, "42601");
+            }
         }
 
         // Keywords that are values

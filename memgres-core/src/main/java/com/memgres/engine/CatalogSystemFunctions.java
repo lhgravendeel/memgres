@@ -220,6 +220,13 @@ class CatalogSystemFunctions {
 
                 if (rawExpr instanceof CastExpr) {
                     CastExpr cast = (CastExpr) rawExpr;
+                    // float(p) names two different types depending on p, so the modifier is
+                    // offered whole before it is stripped as a mere width.
+                    DataType withModifier =
+                            DataType.fromPgName(cast.typeName().toLowerCase().trim());
+                    if (withModifier != null && cast.typeName().indexOf('(') > 0) {
+                        return pgTypeDisplayName(withModifier);
+                    }
                     String tn = cast.typeName().toLowerCase().replaceAll("\\(.*\\)", "").trim();
                     if (tn.endsWith("[]")) {
                         String baseType = tn.substring(0, tn.length() - 2).trim();

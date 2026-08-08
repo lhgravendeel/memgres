@@ -103,6 +103,8 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
     private boolean errorPendingUntilSync;
     /** Set between asking for a password and being given one; nothing else may run in between. */
     private boolean awaitingPassword;
+    /** The frontend message being dispatched, so a failure can be answered the way PG answers it. */
+    private byte currentFrontendType;
 
     public PgWireHandler(DatabaseRegistry registry, CancelRegistry cancelRegistry) {
         this.registry = registry;
@@ -130,6 +132,7 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
     }
 
     private void dispatch(ChannelHandlerContext ctx, PgWireMessage msg) {
+        currentFrontendType = (byte) frontendTypeOf(msg);
         // A message the decoder could not read is answered before anything else: the connection
         // is out of step with its peer, and nothing later in this method is true of it.
         if (msg.getType() == PgWireMessage.Type.PROTOCOL_ERROR) {
@@ -774,12 +777,18 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                         continue;
                     }
                 }
-                // $N parameter placeholder
+                // $N parameter placeholder. A number too large to be one is left to the parser,
+                // which names it; reading it here without a guard threw before the parser was
+                // ever reached and the escape reported an internal error.
                 if (i + 1 < len && Character.isDigit(sql.charAt(i + 1))) {
                     int j = i + 1;
                     while (j < len && Character.isDigit(sql.charAt(j))) j++;
-                    int n = Integer.parseInt(sql.substring(i + 1, j));
-                    if (n > max) max = n;
+                    try {
+                        int n = Integer.parseInt(sql.substring(i + 1, j));
+                        if (n > max) max = n;
+                    } catch (NumberFormatException ignored) {
+                        // not a parameter number this protocol can carry
+                    }
                     i = j - 1;
                 }
             }
@@ -1943,7 +1952,16 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
             if (ctx.channel().isActive()) {
                 MemgresException translated = PgErrors.translate(cause);
                 sendErrorSimple(ctx, translated.getSqlState(), translated.getMessage());
-                sendReadyForQuery(ctx, session);
+                // A ReadyForQuery nobody asked for leaves the connection one response ahead of
+                // its client for good: every later statement hands back the previous statement's
+                // result. Inside an extended-query sequence the client's own Sync produces it, so
+                // this only answers where the client is actually waiting for one.
+                if (PgWireDecoder.isExtendedQueryMessage(currentFrontendType)) {
+                    errorPendingUntilSync = true;
+                    ctx.flush();
+                } else {
+                    sendReadyForQuery(ctx, session);
+                }
             }
         } catch (Exception e) {
             // If sending the error also fails, close the connection

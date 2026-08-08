@@ -195,12 +195,22 @@ class ParserTest {
         assertEquals(BinaryExpr.BinOp.LIKE, ((BinaryExpr) sel.where()).op());
     }
 
+    /**
+     * A sign in front of a numeric literal is part of the literal, as it is in PostgreSQL's own
+     * grammar: that is what makes {@code -2147483648} an integer rather than a negated bigint.
+     * A sign in front of anything else is still the operator.
+     */
     @Test
     void shouldParseNegation() {
         SelectStmt sel = (SelectStmt) Parser.parse("SELECT -5");
         Expression expr = sel.targets().get(0).expr();
-        assertInstanceOf(UnaryExpr.class, expr);
-        assertEquals(UnaryExpr.UnaryOp.NEGATE, ((UnaryExpr) expr).op());
+        assertInstanceOf(Literal.class, expr);
+        assertEquals("-5", ((Literal) expr).value());
+
+        SelectStmt overColumn = (SelectStmt) Parser.parse("SELECT -x FROM t");
+        Expression negated = overColumn.targets().get(0).expr();
+        assertInstanceOf(UnaryExpr.class, negated);
+        assertEquals(UnaryExpr.UnaryOp.NEGATE, ((UnaryExpr) negated).op());
     }
 
     @Test

@@ -783,14 +783,25 @@ public class Lexer {
                     break;
                 }
             } else if ((c == 'e' || c == 'E') && sb.length() > 0) {
-                // Scientific notation
-                hasDecimal = true;
-                sb.append(c);
+                // Scientific notation. An exponent marker with no digits behind it is not a
+                // number at all: taking it for one produced a token BigDecimal could not read,
+                // and the NumberFormatException reached the client as an internal error.
+                int marker = pos;
+                StringBuilder exponent = new StringBuilder();
+                exponent.append(c);
                 pos++;
                 if (pos < length && (sql.charAt(pos) == '+' || sql.charAt(pos) == '-')) {
-                    sb.append(sql.charAt(pos));
+                    exponent.append(sql.charAt(pos));
                     pos++;
                 }
+                if (pos >= length || !Character.isDigit(sql.charAt(pos))) {
+                    pos = marker;
+                    throw ParseException.saying("trailing junk after numeric literal at or near \""
+                            + sb + exponent + "\"", new Token(TokenType.ERROR, sb.toString(), start),
+                            "42601");
+                }
+                hasDecimal = true;
+                sb.append(exponent);
             } else {
                 break;
             }
@@ -798,8 +809,9 @@ public class Lexer {
 
         // PG rejects number immediately followed by letter (e.g., 123abc)
         if (pos < length && Character.isLetter(sql.charAt(pos)) && sql.charAt(pos) != 'e' && sql.charAt(pos) != 'E') {
-            throw new ParseException("trailing junk after numeric literal at or near \"" + sb + sql.charAt(pos) + "\"",
-                    new Token(TokenType.ERROR, sb.toString(), start));
+            throw ParseException.saying("trailing junk after numeric literal at or near \""
+                    + sb + sql.charAt(pos) + "\"",
+                    new Token(TokenType.ERROR, sb.toString(), start), "42601");
         }
         return new Token(hasDecimal ? TokenType.FLOAT_LITERAL : TokenType.INTEGER_LITERAL,
                 sb.toString(), start);

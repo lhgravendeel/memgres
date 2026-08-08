@@ -183,8 +183,39 @@ public enum DataType {
         return pgName;
     }
 
+    /**
+     * {@code float(p)} written with a precision: real through 24, double precision from 25 to 53,
+     * and outside that range a precision PostgreSQL refuses. Returns null when the name is not a
+     * float with a precision at all.
+     */
+    private static DataType floatPrecisionType(String normalized) {
+        if (!normalized.startsWith("float")) return null;
+        int open = normalized.indexOf('(');
+        if (open < 0 || !normalized.endsWith(")")) return null;
+        String head = normalized.substring(0, open).trim();
+        if (!head.equals("float")) return null;
+        String digits = normalized.substring(open + 1, normalized.length() - 1).trim();
+        int precision;
+        try {
+            precision = Integer.parseInt(digits);
+        } catch (NumberFormatException e) {
+            return null;
+        }
+        if (precision < 1) {
+            throw new MemgresException("precision for type float must be at least 1 bit", "22023");
+        }
+        if (precision > 53) {
+            throw new MemgresException("precision for type float must be less than 54 bits", "22023");
+        }
+        return precision <= 24 ? REAL : DOUBLE_PRECISION;
+    }
+
     public static DataType fromPgName(String name) {
         String normalized = name.toLowerCase().trim();
+        // float(p) is real up to 24 bits of mantissa and double precision above it. The width was
+        // read only where a column was declared, so a cast to float(24) answered a float8.
+        DataType floatWidth = floatPrecisionType(normalized);
+        if (floatWidth != null) return floatWidth;
         switch (normalized) {
             case "int2":
             case "smallint":

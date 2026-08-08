@@ -1712,9 +1712,7 @@ class BinaryOpEvaluator {
             }
             case SIMILAR_TO: {
                 if (left == null || right == null) return null;
-                // SIMILAR TO uses SQL regex with default backslash escape
-                String pattern = similarToRegexForBinaryOp(right.toString(), "\\");
-                return left.toString().matches("(?s)" + pattern);
+                return similarToMatches(left.toString(), right.toString(), "\\");
             }
             case JSON_ARROW:
             case JSON_SUBSCRIPT: {
@@ -3392,8 +3390,7 @@ class BinaryOpEvaluator {
             }
             case SIMILAR_TO: {
                 if (left == null || right == null) return null;
-                String simPattern = similarToRegexForBinaryOp(right.toString(), "\\");
-                return left.toString().matches("(?s)" + simPattern);
+                return similarToMatches(left.toString(), right.toString(), "\\");
             }
             case JSON_ARROW:
             case JSON_SUBSCRIPT: {
@@ -3456,6 +3453,76 @@ class BinaryOpEvaluator {
      * Handles: % -> .*, _ -> ., |, (), +, *, ?, [...] (including POSIX classes),
      * and escape character processing.
      */
+    /**
+     * Does this value match this SIMILAR TO pattern?
+     *
+     * <p>The pattern used to be handed to {@code String.matches} after translation, so a pattern
+     * java.util.regex would not compile reached the client as an internal error rather than as the
+     * invalid_regular_expression PostgreSQL raises. The two shapes PostgreSQL names in its own
+     * words are checked first; anything else the engine refuses is reported with its description.
+     */
+    static boolean similarToMatches(String value, String pattern, String escapeChar) {
+        String esc = escapeChar != null && !escapeChar.isEmpty() ? escapeChar : "\\";
+        rejectMalformedSimilarPattern(pattern, esc);
+        try {
+            return value.matches("(?s)" + similarToRegexForBinaryOp(pattern, esc));
+        } catch (java.util.regex.PatternSyntaxException e) {
+            throw new MemgresException("invalid regular expression: " + e.getDescription(), "2201B");
+        }
+    }
+
+    /** The two malformations PostgreSQL names specifically, checked on the pattern as written. */
+    private static void rejectMalformedSimilarPattern(String pattern, String esc) {
+        int depth = 0;
+        boolean operandAvailable = false;
+        for (int i = 0; i < pattern.length(); i++) {
+            char ch = pattern.charAt(i);
+            if (esc.length() == 1 && ch == esc.charAt(0)) {
+                i++;
+                operandAvailable = true;
+                continue;
+            }
+            if (ch == '(') { depth++; operandAvailable = false; continue; }
+            if (ch == ')') {
+                depth--;
+                if (depth < 0) {
+                    throw new MemgresException(
+                            "invalid regular expression: parentheses () not balanced", "2201B");
+                }
+                operandAvailable = true;
+                continue;
+            }
+            if (ch == '|') { operandAvailable = false; continue; }
+            if (ch == '*' || ch == '+' || ch == '?'
+                    || (ch == '{' && boundedQuantifierEnd(pattern, i) >= 0)) {
+                if (!operandAvailable) {
+                    throw new MemgresException(
+                            "invalid regular expression: quantifier operand invalid", "2201B");
+                }
+                if (ch == '{') i = boundedQuantifierEnd(pattern, i);
+                continue;
+            }
+            operandAvailable = true;
+        }
+        if (depth != 0) {
+            throw new MemgresException(
+                    "invalid regular expression: parentheses () not balanced", "2201B");
+        }
+    }
+
+    /** The index of the closing brace when a bounded quantifier starts here, else -1. */
+    private static int boundedQuantifierEnd(String pattern, int open) {
+        int i = open + 1;
+        int digits = 0;
+        while (i < pattern.length() && Character.isDigit(pattern.charAt(i))) { i++; digits++; }
+        if (digits == 0) return -1;
+        if (i < pattern.length() && pattern.charAt(i) == ',') {
+            i++;
+            while (i < pattern.length() && Character.isDigit(pattern.charAt(i))) i++;
+        }
+        return i < pattern.length() && pattern.charAt(i) == '}' ? i : -1;
+    }
+
     private static String similarToRegexForBinaryOp(String pattern, String escapeChar) {
         StringBuilder sb = new StringBuilder();
         String esc = escapeChar != null && !escapeChar.isEmpty() ? escapeChar : "\\";
@@ -3480,8 +3547,10 @@ class BinaryOpEvaluator {
                 sb.append(ch);
                 i++;
             } else if (ch == '{') {
-                // Pass through bounded quantifier like {2}, {1,3} as-is
-                int end = pattern.indexOf('}', i);
+                // A bounded quantifier is {n}, {n,} or {n,m} and nothing else. Passing anything
+                // between braces through left java.util.regex to reject it, where PostgreSQL
+                // reads a brace that begins no quantifier as the character it is.
+                int end = boundedQuantifierEnd(pattern, i);
                 if (end >= 0) {
                     sb.append(pattern, i, end + 1);
                     i = end + 1;

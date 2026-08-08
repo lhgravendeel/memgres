@@ -492,6 +492,12 @@ class CastEvaluator {
                 return intervalTypmod.apply(TypeCoercion.toInterval(val));
             }
         }
+        // float(p) is a name whose modifier picks the type rather than the width, so the value it
+        // produces has to be narrowed to a real when p allows only a real's mantissa.
+        DataType floatWidth = typeSpec.indexOf('(') > 0
+                ? DataType.fromPgName(typeSpec.toLowerCase().trim()) : null;
+        if (floatWidth == DataType.REAL) return TypeCoercion.toFloat(val);
+        if (floatWidth == DataType.DOUBLE_PRECISION) return TypeCoercion.toDouble(val);
         String typeName = typeSpec.toLowerCase().replaceAll("\\(.*\\)", "").trim();
         // Handle array casting: when value is a List or PG array literal string, cast each element
         boolean isArrayCast = typeName.contains("[]");

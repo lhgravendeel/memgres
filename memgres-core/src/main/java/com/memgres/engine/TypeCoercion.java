@@ -781,7 +781,17 @@ public final class TypeCoercion {
             case "NaN":
                 return Float.NaN;
             default:
-                return Float.parseFloat(s);
+                break;
+        }
+        // real reads the same spellings float8 does — inf, +inf, -inf, infinity and nan, in any
+        // case. Only the canonical three were matched here, so a real column refused input its own
+        // double-precision sibling accepted, and the parse failure escaped as an internal error.
+        Double special = NumericLimits.specialNumericOrNull(s);
+        if (special != null) return special.floatValue();
+        try {
+            return Float.parseFloat(s);
+        } catch (NumberFormatException e) {
+            throw new MemgresException("invalid input syntax for type real: \"" + s + "\"", "22P02");
         }
     }
 
@@ -1406,7 +1416,14 @@ public final class TypeCoercion {
         }
         // Julian day format: J2451545
         if (s.length() > 1 && (s.charAt(0) == 'J' || s.charAt(0) == 'j') && s.substring(1).matches("\\d+")) {
-            long jd = Long.parseLong(s.substring(1));
+            // A Julian day beyond what a long holds is a date out of range, not an internal error.
+            long jd;
+            try {
+                jd = Long.parseLong(s.substring(1));
+            } catch (NumberFormatException e) {
+                throw new MemgresException(
+                        "date/time field value out of range: \"" + val + "\"", "22008");
+            }
             return julianDayToDate(jd);
         }
         // Compact YYYYMMDD format (exactly 8 digits)

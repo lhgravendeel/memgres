@@ -2232,10 +2232,10 @@ class DdlParser {
                 leakproof = true;
             } else if (parser.matchKeyword("COST")) {
                 opts.take(RoutineOptions.COST, at);
-                cost = Double.parseDouble(parser.advance().value());
+                cost = routineCost(parser, "COST");
             } else if (parser.matchKeyword("ROWS")) {
                 opts.take(RoutineOptions.ROWS, at);
-                rows = Double.parseDouble(parser.advance().value());
+                rows = routineCost(parser, "ROWS");
             } else if (parser.matchKeywords("PARALLEL", "SAFE")) {
                 opts.take(RoutineOptions.PARALLEL, at);
                 parallel = "SAFE";
@@ -3153,4 +3153,32 @@ class DdlParser {
 
         return new CreateCastStmt(sourceType, targetType, functionName, funcArgTypes, withInout, castContext);
     }
+    /**
+     * The number written after COST or ROWS. Both must be positive, and a negative sign or a word
+     * is a syntax error where it stands — reading the token with a bare parseDouble let the
+     * NumberFormatException out as an internal error.
+     */
+    private static double routineCost(Parser parser, String option) {
+        Token token = parser.peek();
+        boolean negative = false;
+        if (token.type() == TokenType.MINUS) {
+            negative = true;
+            parser.advance();
+            token = parser.peek();
+        }
+        String text = token.value();
+        double value;
+        try {
+            value = Double.parseDouble(text);
+        } catch (NumberFormatException e) {
+            throw ParseException.saying("syntax error at or near \"" + text + "\"", token, "42601");
+        }
+        parser.advance();
+        if (negative) value = -value;
+        if (value <= 0) {
+            throw new com.memgres.engine.MemgresException(option + " must be positive", "22023");
+        }
+        return value;
+    }
+
 }

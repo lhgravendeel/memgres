@@ -1124,7 +1124,41 @@ class ExprEvaluator {
         return "text".equals(t) || "varchar".equals(t) || "character varying".equals(t) || "char".equals(t);
     }
 
+    /** A type name without the width or precision written after it. */
+    private static String stripTypeModifier(String typeName) {
+        int paren = typeName.indexOf('(');
+        return (paren > 0 ? typeName.substring(0, paren) : typeName).trim();
+    }
+
+    /**
+     * Refuse a cast PostgreSQL has no path for, before the value is read. Whether a cast exists is
+     * a question about the two types, not about whether the source's text happens to parse as the
+     * target — which is how {@code true::int8} used to answer 1.
+     */
+    private void rejectMissingCast(CastExpr cast, RowContext ctx) {
+        String target = cast.typeName();
+        if (target == null || target.contains("[]") || target.indexOf('.') >= 0) return;
+        // A declared type is the only thing worth judging; where the source has none this rule
+        // says nothing, which is what keeps an untyped literal castable to anything.
+        String sourceName = executor.binaryOpEvaluator.declaredTypeForResolution(cast.expr(), ctx);
+        if (sourceName == null) return;
+        DataType source = DataType.fromPgName(stripTypeModifier(sourceName));
+        DataType targetType = DataType.fromPgName(stripTypeModifier(target));
+        if (source == null || targetType == null) return;
+        if (executor.database != null
+                && (executor.database.getCustomEnum(sourceName.toLowerCase()) != null
+                    || executor.database.getCustomEnum(target.toLowerCase()) != null
+                    || executor.database.isCompositeType(target.toLowerCase())
+                    || executor.database.isDomain(target.toLowerCase())
+                    || executor.database.isDomain(sourceName.toLowerCase()))) {
+            return;
+        }
+        MemgresException refusal = CastLegality.refusalFor(source, targetType);
+        if (refusal != null) throw refusal;
+    }
+
     private Object evalCast(CastExpr cast, RowContext ctx) {
+        rejectMissingCast(cast, ctx);
         Object val = evalExpr(cast.expr(), ctx);
         // A blank-padded string is stored padded and read back trimmed: PostgreSQL's conversion
         // from bpchar to any other string type drops the blanks the declaration added, which is
@@ -2583,46 +2617,21 @@ class ExprEvaluator {
             if (bdOp != null) return bdOp.apply(l, r);
             return java.math.BigDecimal.valueOf(doubleOp.apply(l.doubleValue(), r.doubleValue()));
         }
-        // Smallint arithmetic, check for overflow
-        if (left instanceof Short && right instanceof Short) {
+        // Integer arithmetic is done in the wider of the two operand types and checked against
+        // that type's own bounds: int2 with int4 is an int4, either with int8 is an int8. There
+        // used to be an arm for two smallints and an arm for two integers and nothing for a mixed
+        // pair, so smallint beside a wider integer fell through to the float8 path below and
+        // 5::int2 / 2::int4 answered 2.5 where PostgreSQL answers 2.
+        if (isIntegerValue(left) && isIntegerValue(right)) {
+            DataType width = widerIntegerType(left, right);
             try {
-                long result = longOp.apply((long)(short)(Short)left, (long)(short)(Short)right);
-                if (result >= Short.MIN_VALUE && result <= Short.MAX_VALUE) return (short) result;
-                MemgresException sme = new MemgresException("smallint out of range", "22003");
-                sme.setDatatype("smallint");
-                throw sme;
+                long result = longOp.apply(toLong(left), toLong(right));
+                return narrowedInteger(result, width);
             } catch (ArithmeticException e) {
-                if (e.getMessage() != null && e.getMessage().contains("/ by zero"))
+                if (e.getMessage() != null && e.getMessage().contains("/ by zero")) {
                     throw new MemgresException("division by zero", "22012");
-                MemgresException sme = new MemgresException("smallint out of range", "22003");
-                sme.setDatatype("smallint");
-                throw sme;
-            }
-        }
-        if (left instanceof Integer && right instanceof Integer) {
-            try {
-                long result = longOp.apply((long)(int)left, (long)(int)right);
-                if (result >= Integer.MIN_VALUE && result <= Integer.MAX_VALUE) return (int) result;
-                MemgresException ime = new MemgresException("integer out of range", "22003");
-                ime.setDatatype("integer");
-                throw ime;
-            } catch (ArithmeticException e) {
-                if (e.getMessage() != null && e.getMessage().contains("/ by zero"))
-                    throw new MemgresException("division by zero", "22012");
-                MemgresException ime = new MemgresException("integer out of range", "22003");
-                ime.setDatatype("integer");
-                throw ime;
-            }
-        }
-        if ((left instanceof Integer || left instanceof Long) && (right instanceof Integer || right instanceof Long)) {
-            try {
-                return longOp.apply(toLong(left), toLong(right));
-            } catch (ArithmeticException e) {
-                if (e.getMessage() != null && e.getMessage().contains("/ by zero"))
-                    throw new MemgresException("division by zero", "22012");
-                MemgresException bme = new MemgresException("bigint out of range", "22003");
-                bme.setDatatype("bigint");
-                throw bme;
+                }
+                throw integerOutOfRange(width);
             }
         }
         // PG's float4 operators return float4. Computing in double and keeping the wide result
@@ -2823,7 +2832,14 @@ class ExprEvaluator {
         if (expr instanceof ArraySubqueryExpr) return "array";
         if (expr instanceof CastExpr) {
             CastExpr cast = (CastExpr) expr;
-            String inner = exprToAlias(cast.expr());
+            // A cast is named after whatever it is a cast *of*, however many casts deep that is:
+            // typbasetype::regtype::text is still the typbasetype column. Only when nothing
+            // underneath has a name of its own does the type supply one, and then it is the type
+            // this cast ends at — 1::int::oid is an oid column, not an int4 one. Asking the
+            // expression directly underneath instead let the innermost type's name out.
+            Expression beneath = cast.expr();
+            while (beneath instanceof CastExpr) beneath = ((CastExpr) beneath).expr();
+            String inner = exprToAlias(beneath);
             return "?column?".equals(inner) ? castTypeToColumnName(cast.typeName()) : inner;
         }
         if (expr instanceof BinaryExpr) {
@@ -2917,6 +2933,14 @@ class ExprEvaluator {
 
     /** Map a cast type name to the PG column name (e.g. "int" -> "int4", "boolean" -> "bool"). */
     private String castTypeToColumnName(String typeName) {
+        // The column a cast produces is named after the type the cast resolved to, and for
+        // float(p) the modifier is what decides that type: float(24) is a float4 column.
+        if (typeName.indexOf('(') > 0 && !typeName.contains("[]")) {
+            DataType withModifier = DataType.fromPgName(typeName.toLowerCase().trim());
+            if (withModifier == DataType.REAL || withModifier == DataType.DOUBLE_PRECISION) {
+                return withModifier.getPgName();
+            }
+        }
         String base = typeName.replaceAll("\\[\\]", "").replaceAll("\\(.*\\)", "").trim();
         if (base.endsWith("[]")) base = base.substring(0, base.length() - 2).trim();
         String baseLower = base.toLowerCase();
@@ -3462,6 +3486,11 @@ class ExprEvaluator {
         }
         if (expr instanceof CastExpr) {
             CastExpr cast = (CastExpr) expr;
+            // The modifier is part of what float(p) names — 24 is a real and 25 a double
+            // precision — so it is offered whole first, and stripped only for the types whose
+            // modifier says how wide a value may be rather than which type it is.
+            DataType declared = DataType.fromPgName(cast.typeName().trim());
+            if (declared != null) return declared;
             String typeName = cast.typeName().replaceAll("\\(.*\\)", "").trim();
             DataType dt = DataType.fromPgName(typeName);
             if (dt != null) return dt;
@@ -4360,6 +4389,39 @@ class ExprEvaluator {
                 executor.castValue(((Literal) branch).value(), ptype);
             }
         }
+    }
+
+    private static boolean isIntegerValue(Object v) {
+        return v instanceof Short || v instanceof Integer || v instanceof Long;
+    }
+
+    /** The type an integer operation answers in: the wider of its two operands. */
+    private static DataType widerIntegerType(Object left, Object right) {
+        if (left instanceof Long || right instanceof Long) return DataType.BIGINT;
+        if (left instanceof Integer || right instanceof Integer) return DataType.INTEGER;
+        return DataType.SMALLINT;
+    }
+
+    /** The result as the width says it is, or the out-of-range that width raises. */
+    private static Object narrowedInteger(long result, DataType width) {
+        switch (width) {
+            case SMALLINT:
+                if (result < Short.MIN_VALUE || result > Short.MAX_VALUE) throw integerOutOfRange(width);
+                return (short) result;
+            case INTEGER:
+                if (result < Integer.MIN_VALUE || result > Integer.MAX_VALUE) throw integerOutOfRange(width);
+                return (int) result;
+            default:
+                return result;
+        }
+    }
+
+    private static MemgresException integerOutOfRange(DataType width) {
+        String name = width == DataType.SMALLINT ? "smallint"
+                : width == DataType.INTEGER ? "integer" : "bigint";
+        MemgresException e = new MemgresException(name + " out of range", "22003");
+        e.setDatatype(name);
+        return e;
     }
 
     /** The family a declared type belongs to, or null when it is one this rule leaves alone. */

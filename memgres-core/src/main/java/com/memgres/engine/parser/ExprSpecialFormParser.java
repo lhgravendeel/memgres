@@ -98,6 +98,14 @@ class ExprSpecialFormParser {
         if (!ep.check(TokenType.RIGHT_PAREN)) {
             args = ep.parseExpressionList();
         }
+        // These are grammar productions in PostgreSQL, not function calls, so an argument list of
+        // the wrong length is a syntax error at the token that should have been a comma. Reading
+        // them as ordinary calls let NULLIF(1) through to an array index that was not there.
+        int required = "nullif".equals(name) ? 2 : 1;
+        if (args.size() < required) {
+            throw ParseException.saying("syntax error at or near \"" + ep.peek().value() + "\"",
+                    ep.peek(), "42601");
+        }
         ep.expect(TokenType.RIGHT_PAREN);
         return new FunctionCallExpr(name, args);
     }
