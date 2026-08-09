@@ -263,6 +263,10 @@ class SelectExecutor {
             baseOutput = executor.fromResolver.resolveClauseOutput(stmt.from(), baseBindings);
             everyRelation = baseBindings.size() == FromResolver.relationCount(stmt.from());
         }
+        // Reading a relation takes a lock on it, and reading it FOR UPDATE takes a stronger one.
+        // The lock is on the relation the query opened, not on the rows it found, so a scan that
+        // matched nothing holds it just the same.
+        recordReadLocks(stmt, baseBindings);
 
         // What the relations supply is now known, which is what the checks below consult to report
         // an unresolvable column or call before the clause it stands in is complained about. The
@@ -3088,6 +3092,25 @@ class SelectExecutor {
         if (val instanceof Float) return java.math.BigDecimal.valueOf(((Float) val));
         if (val instanceof Number) return java.math.BigDecimal.valueOf(((Number) val).doubleValue());
         return new java.math.BigDecimal(val.toString());
+    }
+
+    /**
+     * Note the lock a read takes on each relation it touches, so pg_locks reports what is held.
+     *
+     * <p>A plain read takes an AccessShareLock; a read written FOR UPDATE or FOR SHARE takes a
+     * RowShareLock, which is what tells a reader of pg_locks the two apart.
+     */
+    private void recordReadLocks(SelectStmt stmt, List<RowContext.TableBinding> bindings) {
+        if (executor.session == null || bindings == null) return;
+        String mode = stmt.lockClause() != null ? "RowShareLock" : "AccessShareLock";
+        for (RowContext.TableBinding b : bindings) {
+            Table t = b.sourceTable != null ? b.sourceTable : b.table();
+            if (t == null || t.getName() == null) continue;
+            String schemaName = executor.database.schemaNameOf(t);
+            if (schemaName == null) continue;
+            executor.session.recordRelationLock(
+                    schemaName.toLowerCase() + "." + t.getName().toLowerCase(), mode);
+        }
     }
 
     /**

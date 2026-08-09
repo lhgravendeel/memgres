@@ -5,7 +5,9 @@ import com.memgres.engine.util.Cols;
 import com.memgres.engine.parser.ast.CreateTypeStmt;
 import com.memgres.engine.parser.ast.Statement;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -1188,7 +1190,32 @@ public class Database {
     }
 
     public void addUserCast(int sourceOid, int targetOid, int castFunc, String castContext, String castMethod) {
-        userDefinedCasts.add(new Object[]{sourceOid, targetOid, castFunc, castContext, castMethod});
+        addUserCast(sourceOid, targetOid, castFunc, castContext, castMethod, null);
+    }
+
+    /**
+     * Record a cast, and the function that performs it.
+     *
+     * <p>The name was thrown away and only a zero kept in its place, so a cast created WITH
+     * FUNCTION was listed in pg_cast and then never used: the value went through the ordinary
+     * text conversion instead, and an enum cast to an integer was read as a number rather than
+     * passed to the function that was written for it.
+     */
+    public void addUserCast(int sourceOid, int targetOid, int castFunc, String castContext,
+                            String castMethod, String functionName) {
+        userDefinedCasts.add(new Object[]{sourceOid, targetOid, castFunc, castContext, castMethod,
+                functionName});
+    }
+
+    /** The function that casts {@code sourceOid} to {@code targetOid}, or null when none does. */
+    public String castFunctionFor(int sourceOid, int targetOid) {
+        for (Object[] cast : userDefinedCasts) {
+            if ((int) cast[0] == sourceOid && (int) cast[1] == targetOid
+                    && cast.length > 5 && cast[5] != null) {
+                return (String) cast[5];
+            }
+        }
+        return null;
     }
 
     public java.util.List<Object[]> getUserDefinedCasts() {
@@ -1357,6 +1384,15 @@ public class Database {
     }
 
     /** A function with no recorded schema is treated as living in public. */
+    /** The schema that holds this relation, or null when none does. */
+    public String schemaNameOf(Table table) {
+        if (table == null) return null;
+        for (Map.Entry<String, Schema> e : schemas.entrySet()) {
+            if (e.getValue().getTable(table.getName()) == table) return e.getKey();
+        }
+        return null;
+    }
+
     public static String schemaOf(PgFunction f) {
         return f.getSchemaName() != null ? f.getSchemaName() : "public";
     }
@@ -3357,6 +3393,28 @@ public class Database {
             members.remove(memberRole.toLowerCase());
             if (members.isEmpty()) roleMemberships.remove(grantedRole.toLowerCase());
         }
+    }
+
+    /**
+     * Whether {@code member} holds the rights of {@code role}, directly or through a role it is a
+     * member of. Membership is transitive in PostgreSQL, so reading only the direct grants
+     * answered no for a role that reaches the rights by one more step.
+     */
+    public boolean isRoleMemberOf(String member, String role) {
+        if (member == null || role == null) return false;
+        String want = role.toLowerCase();
+        Set<String> seen = ConcurrentHashMap.newKeySet();
+        Deque<String> pending = new ArrayDeque<>();
+        pending.add(member.toLowerCase());
+        while (!pending.isEmpty()) {
+            String current = pending.poll();
+            if (!seen.add(current)) continue;
+            if (current.equals(want)) return true;
+            for (Map.Entry<String, Set<String>> entry : roleMemberships.entrySet()) {
+                if (entry.getValue().contains(current)) pending.add(entry.getKey());
+            }
+        }
+        return false;
     }
 
     public boolean hasRoleMemberships(String roleName) {

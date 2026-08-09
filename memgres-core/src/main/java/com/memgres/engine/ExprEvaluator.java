@@ -895,8 +895,18 @@ class ExprEvaluator {
                 case "cmin": return rowMeta != null ? (int) rowMeta[2] : 0;
                 case "cmax": return rowMeta != null ? (int) rowMeta[3] : 0;
                 case "ctid": {
-                    long ctidNum = rowMeta != null && rowMeta.length > 4 ? rowMeta[4] : 0;
-                    return "(0," + ctidNum + ")";
+                    // Every row has a place of its own. Where no place was recorded — rows a
+                    // CREATE TABLE AS or a COPY put there — the fallback was zero for all of
+                    // them, so every row shared one ctid: DISTINCT ctid counted one row, and
+                    // DELETE WHERE ctid = ... deleted the whole table.
+                    if (rowMeta != null && rowMeta.length > 4 && rowMeta[4] != 0) {
+                        return "(0," + rowMeta[4] + ")";
+                    }
+                    java.util.List<Object[]> rows = ref.table.getRows();
+                    for (int i = 0; i < rows.size(); i++) {
+                        if (rows.get(i) == ref.row) return "(0," + (i + 1) + ")";
+                    }
+                    return "(0,0)";
                 }
                 default: return 0L;
             }
@@ -1180,6 +1190,40 @@ class ExprEvaluator {
         return "text".equals(t) || "varchar".equals(t) || "character varying".equals(t) || "char".equals(t);
     }
 
+    /** Nothing: the marker for "no user-defined cast applies", since null is a real answer. */
+    private static final Object NO_USER_CAST = new Object();
+
+    /**
+     * The value as a cast created WITH FUNCTION produces it, or {@link #NO_USER_CAST}.
+     *
+     * <p>A cast the reader created is the one that applies between those two types; going through
+     * the ordinary text conversion instead ignored the function that was written for it.
+     */
+    private Object userDefinedCast(CastExpr cast, Object val, RowContext ctx) {
+        if (val == null) return NO_USER_CAST;
+        String sourceName = executor.binaryOpEvaluator.declaredTypeForResolution(cast.expr(), ctx);
+        if (sourceName == null) return NO_USER_CAST;
+        int sourceOid = typeOidOf(stripTypeModifier(sourceName));
+        int targetOid = typeOidOf(stripTypeModifier(cast.typeName()));
+        if (sourceOid <= 0 || targetOid <= 0 || sourceOid == targetOid) return NO_USER_CAST;
+        String function = executor.database.castFunctionFor(sourceOid, targetOid);
+        if (function == null) return NO_USER_CAST;
+        PgFunction func = executor.database.getFunction(function.contains(".")
+                ? function.substring(function.lastIndexOf('.') + 1) : function);
+        if (func == null) return NO_USER_CAST;
+        PlpgsqlExecutor plExec = new PlpgsqlExecutor(executor, executor.database, executor.session);
+        return plExec.executeFunction(func, java.util.Collections.singletonList(val));
+    }
+
+    /** The OID of a type, whether it is one the engine has built in or one the reader created. */
+    private int typeOidOf(String typeName) {
+        DataType built = DataType.fromPgName(typeName.toLowerCase());
+        if (built != null) return built.getOid();
+        String key = TypeNamespace.oidKeyFor(executor.database, typeName);
+        return executor.systemCatalog.getOid(
+                key != null ? key : TypeNamespace.oidKey(null, typeName));
+    }
+
     /** A type name without the width or precision written after it. */
     private static String stripTypeModifier(String typeName) {
         int paren = typeName.indexOf('(');
@@ -1216,6 +1260,8 @@ class ExprEvaluator {
     private Object evalCast(CastExpr cast, RowContext ctx) {
         rejectMissingCast(cast, ctx);
         Object val = evalExpr(cast.expr(), ctx);
+        Object byFunction = userDefinedCast(cast, val, ctx);
+        if (byFunction != NO_USER_CAST) return byFunction;
         // A blank-padded string is stored padded and read back trimmed: PostgreSQL's conversion
         // from bpchar to any other string type drops the blanks the declaration added, which is
         // why 'ab'::char(5)::text is two characters and not five.
@@ -3949,6 +3995,10 @@ class ExprEvaluator {
                 }
                 return DataType.TEXT;
             }
+            // A backend's pid is an integer, and the calls that take one resolve on that. Read as
+            // text it was an argument no signature of pg_blocking_pids accepts, so the call
+            // settled on no declared result type at all.
+            if (name.equals("pg_backend_pid")) return DataType.INTEGER;
             if (name.equals("uuid_generate_v4") || name.equals("gen_random_uuid") || name.equals("uuidv4")) return DataType.UUID;
             if (name.equals("json_serialize")) return DataType.TEXT;
             // date_part answers in double precision and extract in numeric, whatever unit either

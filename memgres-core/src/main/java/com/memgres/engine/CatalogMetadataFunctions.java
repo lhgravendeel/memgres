@@ -606,7 +606,8 @@ class CatalogMetadataFunctions {
         // which is the only difference between the two spellings PostgreSQL prints.
         return CatalogStubBuilder.buildIndexDef(indexName,
                 pretty ? unqualifiedWhenOnPath(tableName) : tableName, unique, idxMethod,
-                normalizedCols, columnOptions, includeColumns, nullsNotDistinct, whereClause);
+                normalizedCols, columnOptions, includeColumns, nullsNotDistinct, whereClause,
+                executor.database.getIndexReloptions(indexKey));
     }
 
     /**

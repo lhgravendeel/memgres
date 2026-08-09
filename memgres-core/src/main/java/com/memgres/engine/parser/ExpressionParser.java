@@ -353,8 +353,10 @@ public class ExpressionParser {
     protected String readColumnName() {
         Token t = peek();
         if (t.type() == TokenType.KEYWORD && !PgKeywords.canBeColumnName(t.value())) {
+            // PostgreSQL names the word as it was written, not folded: SAVEPOINT ALL stops at
+            // "ALL" and SAVEPOINT select at "select".
             throw ParseException.saying(
-                    "syntax error at or near \"" + t.value().toLowerCase() + "\"", t, "42601");
+                    "syntax error at or near \"" + t.raw() + "\"", t, "42601");
         }
         return readIdentifier();
     }

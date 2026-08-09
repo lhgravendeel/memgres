@@ -605,17 +605,21 @@ class SecurityAbuseCaseTest {
     @DisplayName("20. pg_has_role returns true for a user that is a member of a role")
     void pgHasRole() throws Exception {
         exec("DROP ROLE IF EXISTS sec_parent_role");
+        exec("DROP ROLE IF EXISTS sec_member_role");
         exec("CREATE ROLE sec_parent_role");
-        exec("GRANT sec_parent_role TO test");
+        // A superuser is a member of every role whatever pg_auth_members says, so the member has
+        // to be a role that is not one for a revoke to be visible at all.
+        exec("CREATE ROLE sec_member_role");
+        exec("GRANT sec_parent_role TO sec_member_role");
 
         boolean isMember = scalarBool(
-                "SELECT pg_has_role('test', 'sec_parent_role', 'MEMBER')");
+                "SELECT pg_has_role('sec_member_role', 'sec_parent_role', 'MEMBER')");
         assertTrue(isMember, "pg_has_role must return true when the membership exists");
 
-        exec("REVOKE sec_parent_role FROM test");
+        exec("REVOKE sec_parent_role FROM sec_member_role");
 
         boolean afterRevoke = scalarBool(
-                "SELECT pg_has_role('test', 'sec_parent_role', 'MEMBER')");
+                "SELECT pg_has_role('sec_member_role', 'sec_parent_role', 'MEMBER')");
         assertFalse(afterRevoke, "pg_has_role must return false after the membership is revoked");
     }
 

@@ -1428,6 +1428,13 @@ class SessionExecutor {
         String iso = encodedMode(encoded, "iso");
         String ro = encodedMode(encoded, "ro");
         String def = encodedMode(encoded, "def");
+        // A procedural body runs inside the transaction the calling statement started, and that
+        // statement is a query the transaction has already run. Read as a session outside any
+        // block, a DO block setting the isolation level was allowed to say nothing at all.
+        if (iso != null && (session.isInFunctionContext() || session.isInRoutine())) {
+            throw new MemgresException(
+                    "SET TRANSACTION ISOLATION LEVEL must be called before any query", "25001");
+        }
         if (!session.isInTransaction()) {
             if (iso != null) warnOutsideBlock(session, "SET TRANSACTION");
             if (ro != null) warnOutsideBlock(session, "SET TRANSACTION");
@@ -1820,6 +1827,13 @@ class SessionExecutor {
             if (!grantorName.equalsIgnoreCase("current_user") && !grantorName.equalsIgnoreCase("session_user")
                     && !grantorName.equalsIgnoreCase("current_role")
                     && !grantorName.equalsIgnoreCase(currentUser)) {
+                // A grantor is a role first: naming one that is not there is a missing role, and
+                // only a role that exists can then be one the session is not allowed to act as.
+                requireGrantRole(grantorName);
+                if (s.isRoleGrant()) {
+                    throw new MemgresException(
+                            "permission denied to grant privileges as role \"" + grantorName + "\"", "42501");
+                }
                 throw new MemgresException("grantor must be current user", "0A000");
             }
         }
@@ -2119,7 +2133,8 @@ class SessionExecutor {
                 && !(stmt.body() instanceof com.memgres.engine.parser.ast.UpdateStmt)
                 && !(stmt.body() instanceof com.memgres.engine.parser.ast.DeleteStmt)
                 && !(stmt.body() instanceof com.memgres.engine.parser.ast.SetOpStmt)
-                && !(stmt.body() instanceof com.memgres.engine.parser.ast.MergeStmt)) {
+                && !(stmt.body() instanceof com.memgres.engine.parser.ast.MergeStmt)
+                && !(stmt.body() instanceof com.memgres.engine.parser.ast.CreateTableAsStmt)) {
             throw new MemgresException("utility statements cannot be prepared", "42601");
         }
         // Always infer param count from $N references in body
@@ -2328,23 +2343,74 @@ class SessionExecutor {
      */
     private List<String> inferResultTypesViaDryRun(Statement body) {
         try {
-            String sql = SqlUnparser.toSql(body);
-            if (sql == null) return null;
-            sql = sql.replaceAll("\\$\\d+", "NULL");
-            if (!sql.toUpperCase().contains("LIMIT")) {
-                sql = sql + " LIMIT 0";
-            }
-            QueryResult result = executor.execute(sql);
-            if (result.getColumns() != null && !result.getColumns().isEmpty()) {
-                List<String> types = new ArrayList<>();
-                for (Column col : result.getColumns()) {
-                    types.add(col.getType().toRegtypeDisplay());
+            SelectStmt sel = body instanceof SelectStmt ? (SelectStmt) body
+                    : body instanceof SetOpStmt ? firstSelectArm((SetOpStmt) body) : null;
+            if (sel == null || sel.targets() == null || sel.targets().isEmpty()) return null;
+            // The relations are opened for their columns, not for their rows: what a query answers
+            // is settled by what it is written as. Running it to read the shape back ran what the
+            // target list called, so preparing a query over nextval() moved the sequence and
+            // preparing one over a function wrote whatever that function writes.
+            List<RowContext.TableBinding> bindings = sel.from() == null || sel.from().isEmpty()
+                    ? null : executor.fromResolver.resolveTableBindings(sel.from());
+            RowContext shape = bindings == null || bindings.isEmpty() ? null : new RowContext(bindings);
+            List<String> types = new ArrayList<>();
+            for (SelectStmt.SelectTarget target : sel.targets()) {
+                if (target.expr() instanceof WildcardExpr) {
+                    if (bindings == null) return null;
+                    for (RowContext.TableBinding b : bindings) {
+                        Table t = b.sourceTable != null ? b.sourceTable : b.table();
+                        if (t == null) return null;
+                        for (Column col : t.getColumns()) types.add(col.getType().toRegtypeDisplay());
+                    }
+                    continue;
                 }
-                return types;
+                String declared = executor.binaryOpEvaluator.declaredTypeForResolution(
+                        target.expr(), shape);
+                if (declared == null) declared = shapeOnlyType(target.expr(), shape);
+                if (declared == null) return null;
+                types.add(declared);
             }
+            return types.isEmpty() ? null : types;
         } catch (Exception e) {
-            // Dry run failed — type inference is best-effort
+            // Reading the shape is best-effort: a query whose columns cannot be named without
+            // running it simply has none recorded.
         }
+        return null;
+    }
+
+    /**
+     * The type of an expression that can be worked out by evaluating it, because evaluating it
+     * changes nothing: a literal, and the casts and operators built over literals. A call is
+     * excluded whatever it is called — a function is free to write, and reading a prepared
+     * statement's shape is not permission to let it.
+     */
+    private String shapeOnlyType(Expression expr, RowContext shape) {
+        if (!isValueOnly(expr)) return null;
+        try {
+            Object value = executor.evalExpr(expr, shape);
+            return value == null ? null : AstExecutor.pgTypeNameOf(value);
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    /** Whether an expression is built only from literals, casts and operators over them. */
+    private static boolean isValueOnly(Expression expr) {
+        if (expr instanceof Literal) return true;
+        if (expr instanceof CastExpr) return isValueOnly(((CastExpr) expr).expr());
+        if (expr instanceof UnaryExpr) return isValueOnly(((UnaryExpr) expr).operand());
+        if (expr instanceof BinaryExpr) {
+            BinaryExpr bin = (BinaryExpr) expr;
+            return isValueOnly(bin.left()) && isValueOnly(bin.right());
+        }
+        return false;
+    }
+
+    /** The arm of a set operation whose columns the whole of it answers with. */
+    private static SelectStmt firstSelectArm(SetOpStmt setOp) {
+        Statement left = setOp.left();
+        if (left instanceof SelectStmt) return (SelectStmt) left;
+        if (left instanceof SetOpStmt) return firstSelectArm((SetOpStmt) left);
         return null;
     }
 
@@ -2591,6 +2657,13 @@ class SessionExecutor {
      * CASE WHEN (boolean context), operators providing type context.
      * @param hasTypeContext true if an ancestor provides type context (e.g., inside COALESCE, CAST, etc.)
      */
+    /** Whether this operand offers a type to the other side of an operator. */
+    private static boolean isTypedOperand(Expression expr, List<String> paramTypes) {
+        if (!(expr instanceof ParamRef)) return true;
+        int idx = ((ParamRef) expr).index() - 1;
+        return paramTypes != null && idx >= 0 && idx < paramTypes.size();
+    }
+
     private void checkForUntypedParams(Expression expr, List<String> paramTypes, boolean hasTypeContext) {
         if (expr == null) return;
         if (expr instanceof ParamRef) {
@@ -2631,9 +2704,11 @@ class SessionExecutor {
         // BinaryExpr with typed operand provides context
         if (expr instanceof BinaryExpr) {
             BinaryExpr b = (BinaryExpr) expr;
-            // If one side is typed (literal, cast, etc.), the other gets context
-            boolean leftTyped = !(b.left() instanceof ParamRef);
-            boolean rightTyped = !(b.right() instanceof ParamRef);
+            // If one side is typed (literal, cast, etc.), the other gets context. A parameter
+            // the statement declared a type for is typed too: PREPARE p (int) AS SELECT $1 + $2
+            // gives $2 the integer $1 already is, which is how PostgreSQL types it.
+            boolean leftTyped = isTypedOperand(b.left(), paramTypes);
+            boolean rightTyped = isTypedOperand(b.right(), paramTypes);
             checkForUntypedParams(b.left(), paramTypes, hasTypeContext || rightTyped);
             checkForUntypedParams(b.right(), paramTypes, hasTypeContext || leftTyped);
             return;
@@ -2825,8 +2900,10 @@ class SessionExecutor {
         int expectedParams = declaredCount > 0 ? Math.max(declaredCount, inferredFromBody) : inferredFromBody;
         int actualParams = stmt.params() != null ? stmt.params().size() : 0;
         if (actualParams != expectedParams) {
-            throw new MemgresException("wrong number of parameters for prepared statement \"" + stmt.name()
-                    + "\": expected " + expectedParams + ", got " + actualParams, "42601");
+            // How many were expected and how many arrived is the detail behind the complaint, not
+            // the complaint itself, and a client matching on the message read a different one.
+            throw new MemgresException(
+                    "wrong number of parameters for prepared statement \"" + stmt.name() + "\"", "42601");
         }
         // Bind parameters
         List<Object> savedParams = new ArrayList<>(executor.boundParameters);

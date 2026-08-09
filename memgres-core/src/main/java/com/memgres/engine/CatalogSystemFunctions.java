@@ -1200,7 +1200,10 @@ class CatalogSystemFunctions {
             DataType argType = executor.exprEvaluator.inferExprType(args.get(i));
             written[i] = argType == null ? 0 : argType.getOid();
         }
-        return DataType.fromOid(BuiltinCallTypes.resultType(called, written));
+        DataType resolved = DataType.fromOid(BuiltinCallTypes.resultType(called, written));
+        if (resolved != null) return resolved;
+        // A name with one signature answers with that signature's type, whatever it was passed.
+        return DataType.fromOid(BuiltinCallTypes.soleResultType(called));
     }
 
     /**
@@ -1253,6 +1256,20 @@ class CatalogSystemFunctions {
 
     private static boolean isStringType(DataType dt) {
         return dt == DataType.TEXT || dt == DataType.VARCHAR || dt == DataType.CHAR;
+    }
+
+    /** A type written the way a message names it: integer, not int. */
+    static String readableTypeName(String written) {
+        String bare = written.trim();
+        String suffix = "";
+        while (bare.endsWith("[]")) {
+            bare = bare.substring(0, bare.length() - 2).trim();
+            suffix = suffix + "[]";
+        }
+        int paren = bare.indexOf('(');
+        if (paren > 0) bare = bare.substring(0, paren).trim();
+        DataType type = DataType.fromPgName(bare.toLowerCase());
+        return type == null ? written : pgTypeDisplayName(type) + suffix;
     }
 
     static String pgTypeDisplayName(DataType dt) {

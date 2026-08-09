@@ -58,6 +58,30 @@ final class StatementAnalyzer {
             analyze(((DeclareCursorStmt) stmt).query(), visibleCtes);
         } else if (stmt instanceof CreateTableAsStmt) {
             analyze(((CreateTableAsStmt) stmt).query(), visibleCtes);
+        } else if (stmt instanceof ExecuteStmt) {
+            analyzeExecute((ExecuteStmt) stmt);
+        }
+    }
+
+    /**
+     * A prepared statement has to be one the session holds, and it is executed with the number of
+     * arguments it was prepared for. Both are settled before the statement runs, so EXPLAIN of an
+     * EXECUTE reports them rather than describing a plan for a statement that is not there.
+     */
+    private void analyzeExecute(ExecuteStmt exec) {
+        if (executor.session == null) return;
+        Session.PreparedStmt prepared = executor.session.getPreparedStatement(exec.name());
+        if (prepared == null) {
+            throw new MemgresException(
+                    "prepared statement \"" + exec.name() + "\" does not exist", "26000");
+        }
+        int declared = prepared.paramTypes() == null ? 0 : prepared.paramTypes().size();
+        int expected = declared > 0 ? Math.max(declared, prepared.inferredParamCount())
+                : prepared.inferredParamCount();
+        int given = exec.params() == null ? 0 : exec.params().size();
+        if (given != expected) {
+            throw new MemgresException(
+                    "wrong number of parameters for prepared statement \"" + exec.name() + "\"", "42601");
         }
     }
 

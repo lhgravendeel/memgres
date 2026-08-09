@@ -468,11 +468,15 @@ class ConstraintValidator {
         }
         detailSb.append(") is ").append(restrict ? "" : "still ")
                 .append("referenced from table \"").append(childTable.getName()).append("\".");
+        // A constraint a partition inherited belongs to the partitioned table, and that is the
+        // relation PostgreSQL names — not the partition the offending row happens to live in.
+        String constrainedTable = sc.getInheritedFrom() != null
+                ? sc.getInheritedFrom() : childTable.getName();
         MemgresException ex = new MemgresException(
                 "update or delete on table \"" + parentTable.getName() + "\" violates "
                         + (restrict ? "RESTRICT setting of " : "")
                         + "foreign key constraint \"" + sc.getName()
-                        + "\" on table \"" + childTable.getName() + "\"",
+                        + "\" on table \"" + constrainedTable + "\"",
                 restrict ? "23001" : "23503");
         ex.setDetail(detailSb.toString());
         ex.setConstraint(sc.getName());

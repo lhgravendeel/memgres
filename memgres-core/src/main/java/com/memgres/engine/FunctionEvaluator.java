@@ -32,7 +32,9 @@ class FunctionEvaluator {
      */
     private static void requireEnumHasValues(String enumType, CustomEnum ce) {
         if (ce.getLabels().isEmpty()) {
-            throw new MemgresException("enum " + enumType + " contains no values", "55000");
+            String bare = enumType.contains(".")
+                    ? enumType.substring(enumType.lastIndexOf('.') + 1) : enumType;
+            throw new MemgresException("enum " + bare + " contains no values", "55000");
         }
     }
 

@@ -244,7 +244,8 @@ class FromFunctionResolver {
                 for (PgFunction.Param p : userFunc.getParams()) {
                     if ("OUT".equalsIgnoreCase(p.mode())) continue;
                     if (types.length() > 0) types.append(", ");
-                    types.append(p.typeName() == null ? "any" : p.typeName());
+                    types.append(p.typeName() == null ? "any"
+                            : CatalogSystemFunctions.readableTypeName(p.typeName()));
                 }
                 throw new MemgresException(fname + "(" + types + ") is a procedure"
                         + "\nHint: To call a procedure, use CALL.", "42809");

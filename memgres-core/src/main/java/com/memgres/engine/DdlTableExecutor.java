@@ -367,9 +367,12 @@ class DdlTableExecutor {
 
             Integer colPrecision = def.precision() != null ? def.precision() : resolved.domainPrecision();
             Integer colScale = def.scale() != null ? def.scale() : resolved.domainScale();
+            // The collation the definition names travels with the column, so the catalogue can
+            // report it and a DROP of that collation can see that something depends on it.
             Column col = new Column(def.name(), dataType, !notNull, def.primaryKey(), defaultVal,
                     enumTypeName, colPrecision, colScale, def.generatedExpr(), def.generatedVirtual(),
                     domainTypeName, compositeTypeName, arrayElementType);
+            col.setCollation(def.collation);
             String qualifier = DataType.intervalQualifier(def.typeName());
             col.setIntervalQualifier(qualifier != null ? qualifier : resolved.domainIntervalQualifier());
             if (def.defaultExpr() != null) {
@@ -742,6 +745,15 @@ class DdlTableExecutor {
         for (StoredConstraint sc : parent.getConstraints()) {
             if (sc.getType() == StoredConstraint.Type.PRIMARY_KEY || sc.getType() == StoredConstraint.Type.UNIQUE) {
                 partition.addConstraint(sc.copyForPartition(stmt.name()));
+            } else if (sc.getType() == StoredConstraint.Type.FOREIGN_KEY
+                    || sc.getType() == StoredConstraint.Type.CHECK) {
+                // The rows live in the partition, so the constraints the parent declares have to
+                // be enforced there. Copying only the key constraints left a foreign key on a
+                // partitioned table checking nothing at all: a row could name a parent row that
+                // was never there, and deleting the referenced row left it behind.
+                StoredConstraint inherited = sc.copyForPartition(stmt.name());
+                inherited.setInheritedFrom(parent.getName());
+                partition.addConstraint(inherited);
             }
         }
 
@@ -1234,6 +1246,12 @@ class DdlTableExecutor {
                 together.add(RelationNamespace.bareName(tableName).toLowerCase());
             }
         }
+        // A table is removed by whoever owns it, and every table named here is judged before any
+        // of them goes: a DROP that refuses part way through has already taken the rest.
+        requireDropOwner(stmt.schema(), stmt.name());
+        if (stmt.additionalTables() != null) {
+            for (String tableName : stmt.additionalTables()) requireDropOwner(null, tableName);
+        }
         dropSingleTable(stmt.schema(), stmt.name(), stmt.ifExists(), stmt.cascade(), together);
         if (stmt.additionalTables() != null) {
             for (String tableName : stmt.additionalTables()) {
@@ -1241,6 +1259,14 @@ class DdlTableExecutor {
             }
         }
         return QueryResult.command(QueryResult.Type.DROP_TABLE, 0);
+    }
+
+    /** The ownership a DROP TABLE needs on one of the names it lists, if that name is a table. */
+    private void requireDropOwner(String schemaHint, String name) {
+        String schemaName = schemaHint != null ? schemaHint : executor.defaultSchema();
+        Schema schema = executor.database.getSchema(schemaName);
+        if (schema == null || schema.getTable(RelationNamespace.bareName(name)) == null) return;
+        executor.requireTableOwner(schemaName, RelationNamespace.bareName(name));
     }
 
     void dropSingleTable(String schemaHint, String name, boolean ifExists, boolean cascade) {

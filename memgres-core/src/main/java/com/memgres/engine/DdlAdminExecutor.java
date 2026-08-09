@@ -185,7 +185,12 @@ class DdlAdminExecutor {
         QueryResult actualResult = null;
         if (stmt.analyze()) {
             startTime = System.nanoTime();
-            actualResult = executor.executeStatement(stmt.statement());
+            // What ANALYZE runs is the plan, not the statement that carries it: explaining a
+            // DECLARE runs its query, and does not leave a cursor behind for the session.
+            Statement toRun = stmt.statement();
+            if (toRun instanceof DeclareCursorStmt) toRun = ((DeclareCursorStmt) toRun).query();
+            else if (toRun instanceof CreateTableAsStmt) toRun = ((CreateTableAsStmt) toRun).query();
+            actualResult = executor.executeStatement(toRun);
         }
 
         ExplainPlan plan = new ExplainPlanBuilder(executor, stmt.verbose()).build(stmt.statement());
@@ -206,7 +211,9 @@ class DdlAdminExecutor {
 
         List<String> planLines = new ArrayList<>();
         plan.renderText(planLines, 0, rootSuffix(stmt, startTime, actualResult));
-        appendExplainExtras(stmt, planLines, startTime);
+        appendExplainExtras(stmt, planLines, startTime,
+                actualResult == null || actualResult.getRows() == null
+                        ? 0 : actualResult.getRows().size());
 
         List<Object[]> rows = new ArrayList<>();
         for (String line : planLines) rows.add(new Object[]{line});
@@ -236,7 +243,8 @@ class DdlAdminExecutor {
     }
 
     /** The lines that follow the plan: buffers, WAL, memory, settings and the summary totals. */
-    private void appendExplainExtras(ExplainStmt stmt, List<String> planLines, long startTime) {
+    private void appendExplainExtras(ExplainStmt stmt, List<String> planLines, long startTime,
+                                     long serializedRows) {
         if (stmt.buffers && stmt.analyze) {
             planLines.add("Buffers: shared hit=0");
         }
@@ -252,7 +260,10 @@ class DdlAdminExecutor {
             if (shown != null) planLines.add("Settings: " + shown);
         }
         if (stmt.serialize()) {
-            planLines.add("Serialization: output=0kB  format=" + stmt.serializeMode);
+            // What SERIALIZE reports is how much was written for the client, rounded up to the
+            // kilobyte it occupies: a query that answered rows wrote something.
+            planLines.add("Serialization: output=" + (serializedRows > 0 ? 1 : 0)
+                    + "kB  format=" + stmt.serializeMode);
         }
         if (stmt.summary) {
             double elapsed = startTime == 0 ? 0.0 : (System.nanoTime() - startTime) / 1_000_000.0;

@@ -5,6 +5,14 @@ package com.memgres.engine.parser.ast;
  */
 public final class ColumnDef {
     public final String name;
+    /**
+     * The collation the column sorts by, when one was written.
+     *
+     * <p>COLLATE was read and thrown away, so the catalogue reported no collation for a column
+     * that had one, and dropping the collation left the column referring to a name nobody had.
+     */
+    public String collation;
+
     public final String typeName;
     public final Integer precision;
     public final Integer scale;

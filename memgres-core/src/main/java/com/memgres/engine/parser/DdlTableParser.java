@@ -56,6 +56,12 @@ class DdlTableParser {
 
         // CREATE TABLE ... AS query
         if (parser.matchKeyword("AS")) {
+            // What follows AS is a query. EXPLAIN carries one but is not one, and taking it
+            // anyway built a table out of the plan text.
+            if (parser.checkKeyword("EXPLAIN")) {
+                Token t = parser.peek();
+                throw ParseException.saying("syntax error at or near \"" + t.raw() + "\"", t, "42601");
+            }
             Statement query = parser.parseStatement();
             boolean withData = true;
             if (parser.matchKeyword("WITH")) {
@@ -298,6 +304,7 @@ class DdlTableParser {
         // A CONSTRAINT clause names whatever constraint follows it. PG stores that name, and it
         // is the one SET CONSTRAINTS, ALTER TABLE DROP CONSTRAINT and pg_constraint use.
         String pendingName = null;
+        String columnCollation = null;
         String pkName = null;
         String uqName = null;
         String fkName = null;
@@ -451,6 +458,7 @@ class DdlTableParser {
                     String collation = parser.readIdentifier();
                     if (parser.match(TokenType.DOT)) collation = collation + "." + parser.readIdentifier();
                     ExpressionParser.validateCollationStatic(collation, parser.peek());
+                    columnCollation = collation;
                     // A column carries one collation, so a second clause is a syntax error
                     // rather than an override.
                     if (parser.checkKeyword("COLLATE")) {
@@ -480,6 +488,7 @@ class DdlTableParser {
         ColumnDef def = new ColumnDef(colName, typeName, precision, scale, notNull, pk, unique,
                 defaultExpr, refTable, refColumn, generatedExpr, generatedVirtual, identity, refOnDelete, refOnUpdate,
                 identityStart, identityIncrement, deferrable, initiallyDeferred, colNotEnforced, colRefMatchType, columnCheckExpr);
+        def.collation = columnCollation;
         def.setPrimaryKeyName(pkName);
         def.setUniqueName(uqName);
         def.setForeignKeyName(fkName);

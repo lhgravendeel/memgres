@@ -1,5 +1,6 @@
 package com.memgres.engine.parser;
 
+import com.memgres.engine.MemgresException;
 import com.memgres.engine.util.Cols;
 
 import com.memgres.engine.parser.ast.*;
@@ -338,6 +339,11 @@ public class Parser extends ExpressionParser {
         Statement result;
         if (checkKeyword("VALUES")) {
             result = selectParser.parseValuesBody();
+            // A row lock is taken on a row of a table, and a VALUES list has none, so there is
+            // nothing here for FOR UPDATE to lock.
+            if (checkKeyword("FOR")) {
+                throw new MemgresException("FOR UPDATE cannot be applied to VALUES", "0A000");
+            }
         } else {
             result = parseSelect();
         }

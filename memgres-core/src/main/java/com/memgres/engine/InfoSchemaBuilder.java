@@ -851,7 +851,11 @@ public class InfoSchemaBuilder {
                     intervalType,                           // interval_type
                     intervalPrec,                           // interval_precision
                     null, null, null,                       // character_set_*
-                    null, null, null,                       // collation_*
+                    // A column that sorts by a collation names it here, with the catalogue and
+                    // schema that hold it. Reporting nothing said the column had none.
+                    col.getCollation() == null ? null : catalogName(),
+                    col.getCollation() == null ? null : "public",
+                    col.getCollation(),                     // collation_catalog/schema/name
                     domainCatalog, domainSchema, domainName, // domain_*
                     catalogName(),                           // udt_catalog
                     udtSchema,                              // udt_schema

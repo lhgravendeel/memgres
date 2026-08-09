@@ -1048,9 +1048,10 @@ class UtilityParser {
         List<Expression> params = new ArrayList<>();
         if (parser.check(TokenType.LEFT_PAREN)) {
             parser.advance();
-            if (!parser.check(TokenType.RIGHT_PAREN)) {
-                params = parser.parseExpressionList();
-            }
+            // An argument list is written only when there are arguments in it. Accepting an empty
+            // one made EXECUTE p() a way of saying EXECUTE p, which is not a spelling PostgreSQL
+            // has: it is the closing bracket that is out of place.
+            params = parser.parseExpressionList();
             parser.expect(TokenType.RIGHT_PAREN);
         }
         return new ExecuteStmt(name, params);
@@ -1280,7 +1281,14 @@ class UtilityParser {
                 parser.expectKeyword("OPTION");
                 withAdmin = true;
             }
-            return new GrantStmt(privileges, null, null, grantees, false, withAdmin, true, null);
+            // A membership grant carries GRANTED BY too, and dropping the clause here meant the
+            // grantor was never a name the statement had to answer for.
+            String roleGrantor = null;
+            if (parser.matchIdentifier("GRANTED")) {
+                parser.expectKeyword("BY");
+                roleGrantor = parser.readIdentifier();
+            }
+            return new GrantStmt(privileges, null, null, grantees, false, withAdmin, true, null, roleGrantor);
         }
 
         // GRANT privileges ON object TO roles

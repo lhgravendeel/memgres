@@ -303,6 +303,18 @@ public class StoredConstraint {
      *
      * @param partitionTableName the name of the partition the copy will be attached to
      */
+    /**
+     * The relation this constraint was declared on, when it was inherited by a partition.
+     *
+     * <p>A partition enforces its parent's constraints, but the constraint belongs to the parent:
+     * PostgreSQL names the partitioned table in a violation, not the partition the row landed in.
+     */
+    private String inheritedFrom;
+
+    public String getInheritedFrom() { return inheritedFrom; }
+
+    public void setInheritedFrom(String parentTableName) { this.inheritedFrom = parentTableName; }
+
     public StoredConstraint copyForPartition(String partitionTableName) {
         String newName = name;
         if (type == Type.PRIMARY_KEY) {

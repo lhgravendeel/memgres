@@ -99,6 +99,21 @@ class DmlExecutor {
         throw new MemgresException("cannot " + verb + " view \"" + bare + "\"", "55000");
     }
 
+    /**
+     * Note the lock this statement takes on the relation it writes to, so pg_locks can report it.
+     */
+    private void recordRelationLock(String schema, String tableName, String mode) {
+        if (executor.session == null || tableName == null) return;
+        String bare = tableName;
+        String schemaName = schema;
+        if (schemaName == null && bare.contains(".")) {
+            schemaName = bare.substring(0, bare.indexOf('.'));
+            bare = bare.substring(bare.indexOf('.') + 1);
+        }
+        if (schemaName == null) schemaName = executor.defaultSchema();
+        executor.session.recordRelationLock(schemaName.toLowerCase() + "." + bare.toLowerCase(), mode);
+    }
+
     private String resolveTableSchemaKey(String schema, Table table) {
         if (schema != null) return schema + "." + table.getName();
         // Find the actual schema containing this table instance
@@ -424,6 +439,7 @@ class DmlExecutor {
         List<DmlValidationHelper.ViewCheck> viewCheckExprs = validationHelper.collectViewCheckExprs(stmt.table());
         // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
         executor.viewDmlVerb = "insert into";
+        recordRelationLock(stmt.schema(), stmt.table(), "RowExclusiveLock");
         rejectCatalogViewWrite(stmt.table(), "insert into");
         Table table = executor.resolveTable(schemaName, stmt.table(), stmt.schema() != null);
         // A VALUES row is written out in full; it is not read from any relation, so there is
@@ -698,9 +714,6 @@ class DmlExecutor {
             // Apply citext lowercasing for columns with citext-based domains
             validationHelper.applyCitextFolding(table, row);
 
-            // Compute generated columns
-            computeGeneratedColumns(table, row);
-
             // INSTEAD OF INSERT triggers (on views): trigger handles the insert, skip normal path
             if (hasInsteadOfInsert) {
                 Object[] insteadRow = triggerHelper.executeTriggers(triggers, PgTrigger.Timing.INSTEAD_OF, PgTrigger.Event.INSERT, row, null, table);
@@ -723,6 +736,11 @@ class DmlExecutor {
                 // BEFORE trigger returned NULL: skip this row (not inserted, not counted, no RETURNING)
                 continue;
             }
+
+            // A generated column is computed from the row that is about to be stored, which is the
+            // row the BEFORE triggers have finished with. Computing it from the row as written
+            // stored a value derived from a column the triggers then changed.
+            computeGeneratedColumns(table, row);
 
             // Validate enum values
             validationHelper.validateEnumValues(row, table);
@@ -1359,6 +1377,7 @@ class DmlExecutor {
         List<DmlValidationHelper.ViewCheck> viewCheckExprs = validationHelper.collectViewCheckExprs(stmt.table());
         // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
         executor.viewDmlVerb = "update";
+        recordRelationLock(stmt.schema(), stmt.table(), "RowExclusiveLock");
         rejectCatalogViewWrite(stmt.table(), "update");
         Table table = executor.resolveTable(schemaName, stmt.table(), stmt.schema() != null);
         // An UPDATE names one row at a time; there is no group behind it to aggregate and no
@@ -2078,6 +2097,7 @@ class DmlExecutor {
         String schemaName = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
         // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
         executor.viewDmlVerb = "delete from";
+        recordRelationLock(stmt.schema(), stmt.table(), "RowExclusiveLock");
         rejectCatalogViewWrite(stmt.table(), "delete from");
         Table table = executor.resolveTable(schemaName, stmt.table(), stmt.schema() != null);
         // As for UPDATE: a DELETE's WHERE picks rows one at a time, so nothing in it may need a

@@ -1082,7 +1082,10 @@ class CatalogCoreBuilder {
                             hasDefault,
                             identity,  // attidentity
                             c.isVirtual() ? "v" : c.isGenerated() ? "s" : "",  // attgenerated
-                            0,         // attcollation
+                            // A column that sorts by a collation points at it; zero means none,
+                            // which is what every column said however it was declared.
+                            c.getCollation() == null ? 0
+                                    : oids.oid("collation:" + c.getCollation().toLowerCase()),
                             // attndims: PG records 1 for a column declared as an array, and a
                             // client deciding whether to read the value as an array reads it.
                             1, true, 0, null,

@@ -232,6 +232,20 @@ class CatalogStubBuilder {
     static String buildIndexDef(String indexName, String tableName, boolean isUnique,
                                 String method, List<String> indexCols, List<String> columnOptions,
                                 List<String> includeColumns, boolean nullsNotDistinct, String whereClause) {
+        return buildIndexDef(indexName, tableName, isUnique, method, indexCols, columnOptions,
+                includeColumns, nullsNotDistinct, whereClause, null);
+    }
+
+    /**
+     * The definition an index was created with, including the storage parameters it carries.
+     *
+     * <p>The parameters were left out, so a definition read back from the catalogue could not
+     * recreate the index it described: a fillfactor set at creation vanished from the text.
+     */
+    static String buildIndexDef(String indexName, String tableName, boolean isUnique,
+                                String method, List<String> indexCols, List<String> columnOptions,
+                                List<String> includeColumns, boolean nullsNotDistinct,
+                                String whereClause, java.util.Map<String, String> reloptions) {
         StringBuilder sb = new StringBuilder();
         sb.append("CREATE ").append(isUnique ? "UNIQUE " : "").append("INDEX ").append(indexName)
           .append(" ON ").append(tableName != null ? tableName : "unknown")
@@ -267,6 +281,14 @@ class CatalogStubBuilder {
         }
         if (nullsNotDistinct) {
             sb.append(" NULLS NOT DISTINCT");
+        }
+        if (reloptions != null && !reloptions.isEmpty()) {
+            StringBuilder opts = new StringBuilder();
+            for (java.util.Map.Entry<String, String> e : reloptions.entrySet()) {
+                if (opts.length() > 0) opts.append(", ");
+                opts.append(e.getKey()).append("='").append(e.getValue()).append('\'');
+            }
+            sb.append(" WITH (").append(opts).append(')');
         }
         if (whereClause != null && !whereClause.isEmpty()) {
             sb.append(" WHERE ").append(whereClause);

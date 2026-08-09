@@ -286,6 +286,13 @@ public class AstExecutor {
     /** The WITH lists that count as the statement's own, including each arm of a set operation. */
     private static void collectTopLevelCtes(Statement stmt, Set<Object> out) {
         if (stmt == null) return;
+        // EXPLAIN describes a statement; it does not put one inside another. The statement it
+        // describes is still the outermost one, and reading it as nested refused a query
+        // PostgreSQL explains happily.
+        if (stmt instanceof ExplainStmt) {
+            collectTopLevelCtes(((ExplainStmt) stmt).statement, out);
+            return;
+        }
         if (stmt instanceof SetOpStmt) {
             collectTopLevelCtes(((SetOpStmt) stmt).left, out);
             collectTopLevelCtes(((SetOpStmt) stmt).right, out);
@@ -1063,6 +1070,18 @@ public class AstExecutor {
         return sb.toString();
     }
 
+    /**
+     * Read a statement and report the first thing wrong with it, without running it.
+     *
+     * <p>PostgreSQL analyses a statement when it is parsed, so a client that names a relation
+     * that is not there hears about it at Parse — before it has bound anything. memgres left
+     * every such error until execution, so a statement carrying a parameter reported a bind
+     * mismatch where PostgreSQL reports the missing relation.
+     */
+    public void analyzeWithoutRunning(Statement stmt) {
+        new StatementAnalyzer(this).analyze(stmt);
+    }
+
     java.util.List<String> relationSearchPath() {
         java.util.LinkedHashSet<String> path = new java.util.LinkedHashSet<>();
         String temp = session == null ? null : session.getTempSchemaName().toLowerCase();
@@ -1208,6 +1227,26 @@ public class AstExecutor {
         String ownerKey = "table:" + schemaName.toLowerCase() + "." + tableName.toLowerCase();
         String owner = database.getObjectOwner(ownerKey);
         return owner != null && owner.equalsIgnoreCase(role);
+    }
+
+    /**
+     * A table is reshaped and removed by whoever owns it. Every role could do both, so a session
+     * that had only set a role to one with no rights over a table still altered and dropped it.
+     *
+     * <p>Membership counts: a role that is a member of the owning role owns what it owns. So does
+     * being a superuser. A table whose owner was never recorded is left alone — nothing is known
+     * about it to refuse on.
+     */
+    void requireTableOwner(String schemaName, String tableName) {
+        if (session == null || schemaName == null || tableName == null) return;
+        String owner = database.getObjectOwner(
+                "table:" + schemaName.toLowerCase() + "." + tableName.toLowerCase());
+        if (owner == null) return;
+        String role = currentRole();
+        if (role == null || role.equalsIgnoreCase(owner)) return;
+        if (isRoleSuperuser(role)) return;
+        if (database.isRoleMemberOf(role, owner)) return;
+        throw new MemgresException("must be owner of table " + tableName, "42501");
     }
 
     /**
@@ -1918,14 +1957,16 @@ public class AstExecutor {
                 return QueryResult.message(QueryResult.Type.SET, tag);
             }
             case OWNER_TO: {
+                // The role the ownership is being given to is resolved first, so a role that is
+                // not there is what PostgreSQL names — before it has looked for the routine.
+                String newOwner = ddlExecutor.resolveOwnerName(stmt.targetValue());
+                if (!database.hasRole(newOwner)) {
+                    throw new MemgresException("role \"" + stmt.targetValue() + "\" does not exist", "42704");
+                }
                 PgFunction func = resolveAlterFunction(stmt);
                 if (func == null) {
                     if (stmt.ifExists()) return QueryResult.message(QueryResult.Type.SET, tag);
                     throw new MemgresException(kind + " " + alterFunctionSignature(stmt) + " does not exist", "42883");
-                }
-                String newOwner = ddlExecutor.resolveOwnerName(stmt.targetValue());
-                if (!database.hasRole(newOwner)) {
-                    throw new MemgresException("role \"" + stmt.targetValue() + "\" does not exist", "42704");
                 }
                 database.setObjectOwner("function:" + stmt.name(), newOwner);
                 func.setOwner(newOwner);

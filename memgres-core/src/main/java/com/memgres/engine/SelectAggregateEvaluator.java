@@ -1770,14 +1770,85 @@ class SelectAggregateEvaluator {
         }
     }
 
+    /** The type an aggregate's argument offers, from what it was written as. */
+    private String aggregateArgumentType(Expression arg, List<RowContext> group) {
+        RowContext sample = group == null || group.isEmpty() ? null : group.get(0);
+        String declared = executor.binaryOpEvaluator.declaredTypeForResolution(arg, sample);
+        if (declared == null && sample != null) {
+            // A column whose declaration says nothing still holds a value, and what that value is
+            // is what the argument is. Reading it as unknown skipped the check the aggregate's
+            // parameters are there to make, so text took an integer and said nothing about it.
+            try {
+                Object value = executor.evalExpr(arg, sample);
+                if (value != null) declared = AstExecutor.pgTypeNameOf(value);
+            } catch (RuntimeException ignored) {
+                // Nothing readable here; the argument stays unknown and the check is skipped.
+            }
+        }
+        return declared == null ? "unknown" : declared.trim().toLowerCase();
+    }
+
+    /** Whether a value of {@code have} reaches a parameter declared {@code want}. */
+    private static boolean aggregateTypeAccepts(String want, String have) {
+        if (want.equals(have)) return true;
+        if (want.equals("anyelement") || want.equals("any") || want.equals("anynonarray")) return true;
+        boolean wantText = want.equals("text") || want.equals("varchar")
+                || want.equals("character varying") || want.equals("bpchar");
+        boolean haveText = have.equals("text") || have.equals("varchar")
+                || have.equals("character varying") || have.equals("bpchar");
+        if (wantText && haveText) return true;
+        int wantRank = numericRank(want);
+        int haveRank = numericRank(have);
+        return wantRank > 0 && haveRank > 0 && haveRank <= wantRank;
+    }
+
+    private static int numericRank(String type) {
+        switch (type) {
+            case "smallint": case "int2": return 1;
+            case "integer": case "int": case "int4": return 2;
+            case "bigint": case "int8": return 3;
+            case "numeric": case "decimal": return 4;
+            case "real": case "float4": return 5;
+            case "double precision": case "float8": return 6;
+            default: return 0;
+        }
+    }
+
     private Object evalUserDefinedAggregate(PgAggregate agg, FunctionCallExpr fn, List<RowContext> group) {
         // An aggregate declared over one argument has to be given one. Reading the first of an
         // empty argument list reached the client as an internal error about an array index; the
         // call simply names no aggregate that takes nothing.
-        if (fn.args() == null || fn.args().isEmpty()) {
-            throw new MemgresException(
-                    "function " + FunctionEvaluator.stripSchemaPrefix(fn.name())
-                            + "() does not exist", "42883");
+        String[] declared = agg.getArgTypes() == null ? new String[0] : agg.getArgTypes();
+        int given = fn.args() == null ? 0 : fn.args().size();
+        // An aggregate is its name and the arguments it declares, so a call with a different
+        // number of them names no aggregate. Reading the first of an empty list reached the
+        // client as an internal error about an array index, and an extra argument was ignored.
+        if (given != declared.length) {
+            StringBuilder types = new StringBuilder();
+            for (int i = 0; i < given; i++) {
+                if (i > 0) types.append(", ");
+                types.append(CatalogSystemFunctions.readableTypeName(
+                        aggregateArgumentType(fn.args().get(i), group)));
+            }
+            throw new MemgresException("function " + FunctionEvaluator.stripSchemaPrefix(fn.name())
+                    + "(" + types + ") does not exist", "42883");
+        }
+        // And the arguments have to be of the types it declares.
+        for (int i = 0; i < given; i++) {
+            String want = declared[i] == null ? null : declared[i].trim().toLowerCase();
+            String have = aggregateArgumentType(fn.args().get(i), group);
+            if (want == null || "unknown".equals(have) || want.equals(have)) continue;
+            if (!aggregateTypeAccepts(want, have)) {
+                StringBuilder types = new StringBuilder();
+                for (int j = 0; j < given; j++) {
+                    if (j > 0) types.append(", ");
+                    types.append(CatalogSystemFunctions.readableTypeName(
+                            aggregateArgumentType(fn.args().get(j), group)));
+                }
+                throw new MemgresException("function "
+                        + FunctionEvaluator.stripSchemaPrefix(fn.name())
+                        + "(" + types + ") does not exist", "42883");
+            }
         }
         // Initialize state from INITCOND or null
         Object state = null;
@@ -1801,8 +1872,26 @@ class SelectAggregateEvaluator {
         // For DISTINCT, track seen value tuples
         Set<String> seen = fn.distinct() ? new LinkedHashSet<>() : null;
 
+        // An ORDER BY inside the call says which order the rows reach the transition function in,
+        // and for an aggregate that concatenates them the order is the answer. Accumulating in
+        // whatever order the scan produced gave a different answer from the one that was asked for.
+        List<RowContext> ordered = group;
+        if (fn.orderBy != null && !fn.orderBy.isEmpty()) {
+            ordered = new ArrayList<>(group);
+            final List<SelectStmt.OrderByItem> keys = fn.orderBy;
+            ordered.sort((left, right) -> {
+                for (SelectStmt.OrderByItem key : keys) {
+                    Object a = executor.evalExpr(key.expr(), left);
+                    Object b = executor.evalExpr(key.expr(), right);
+                    int cmp = TypeCoercion.compare(a, b);
+                    if (cmp != 0) return key.descending() ? -cmp : cmp;
+                }
+                return 0;
+            });
+        }
+
         // For each row, call SFUNC(state, value[, ...])
-        for (RowContext ctx : group) {
+        for (RowContext ctx : ordered) {
             List<Object> argValues = new ArrayList<>();
             for (Expression arg : fn.args()) {
                 argValues.add(executor.evalExpr(arg, ctx));
@@ -1909,6 +1998,10 @@ class SelectAggregateEvaluator {
             }
             return String.valueOf(d);
         }
+        // An interval is the span it measures, so two spellings of one span are one value:
+        // '1 mon', '30 days' and '720 hours' are one interval, and counting them by the text
+        // they were written with counted three.
+        if (val instanceof PgInterval) return RowKey.valueKey(val);
         return val.toString();
     }
 

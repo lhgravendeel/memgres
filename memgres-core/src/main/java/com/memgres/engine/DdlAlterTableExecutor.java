@@ -84,6 +84,9 @@ class DdlAlterTableExecutor {
             throw e;
         }
 
+        // And it is the owner who reshapes it.
+        executor.requireTableOwner(schemaName, stmt.table());
+
         // ALTER TABLE takes ACCESS EXCLUSIVE, so it waits behind any open reader
         if (executor.session != null) {
             executor.database.acquireTableLock(schemaName + "." + stmt.table(),

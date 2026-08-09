@@ -1994,7 +1994,21 @@ class DdlObjectExecutor {
         }
         // PG allows CALL with either just IN args or all args (including OUT placeholders)
         int argCount = stmt.args().size();
-        if (argCount != totalParams && (argCount < requiredInParams || argCount > inParamCount)) {
+        // A VARIADIC parameter takes the whole tail, so a call may pass more arguments than the
+        // procedure declares parameters and still be the procedure that was declared.
+        boolean variadicTail = false;
+        for (PgFunction.Param p : function.getParams()) {
+            if ("VARIADIC".equalsIgnoreCase(p.mode())) variadicTail = true;
+        }
+        // Every parameter takes a place in a CALL's argument list, an OUT one included: it is
+        // written as a placeholder and the value it is given is thrown away. Accepting a call
+        // that named only the IN parameters made CALL p(3) reach a p(int, OUT int) that no such
+        // call in PostgreSQL ever reaches.
+        int requiredParams = 0;
+        for (PgFunction.Param p : function.getParams()) {
+            if (p.defaultExpr() == null || p.defaultExpr().isEmpty()) requiredParams++;
+        }
+        if (!variadicTail && (argCount < requiredParams || argCount > totalParams)) {
             throw new MemgresException("procedure " + stmt.name() + "("
                     + String.join(", ", argTypes) + ") does not exist", "42883");
         }
@@ -2033,6 +2047,18 @@ class DdlObjectExecutor {
             }
             if ("VARIADIC".equals(mode) && variadic != null) {
                 args.add(executor.evalExpr(variadic, null));
+                continue;
+            }
+            if ("VARIADIC".equals(mode)) {
+                // Written without the keyword, the arguments left over are the array the
+                // parameter takes: CALL p(1, 2, 3) reaches VARIADIC a int[] as {1,2,3}. They are
+                // handed over one by one, because gathering them is what binding the parameter
+                // already does — collected here as well the array held one array inside it.
+                while (argIdx < stmt.args().size()) {
+                    Expression tailArg = stmt.args().get(argIdx++);
+                    if (tailArg instanceof NamedArgExpr) continue;
+                    args.add(executor.evalExpr(tailArg, null));
+                }
                 continue;
             }
             // Skip the positions the named arguments already filled.
@@ -2119,6 +2145,12 @@ class DdlObjectExecutor {
                 break;
         }
         boolean isView = stmt.table() != null && executor.database.hasView(stmt.table());
+        // PostgreSQL opens the relation before it judges what kind it is, so a trigger named on
+        // a relation that is not there is a missing relation — not a table that cannot take an
+        // INSTEAD OF trigger, which is what "not a view" was read as.
+        if (stmt.table() != null && !isView) {
+            executor.resolveTable(triggerTableSchema, stmt.table());
+        }
         if (timing == PgTrigger.Timing.INSTEAD_OF && !isView) {
             throw PgErrors.wrongObjectType("\"" + stmt.table() + "\" is a table"
                     + "\n  Detail: Tables cannot have INSTEAD OF triggers.");
@@ -2514,8 +2546,13 @@ class DdlObjectExecutor {
                     if (stmt.ifExists()) noticeSkipped("collation \"" + stmt.name() + "\"");
                     break;
                 }
-                // Dropping nothing at all left the collation answering for a name that had been
-                // taken away, so a value could still be sorted by a collation nobody has.
+                // A column that sorts by this collation is written in terms of it, and
+                // PostgreSQL will not take away something another object depends on. Dropping
+                // nothing at all left the collation answering for a name that had been removed.
+                if (!stmt.cascade() && columnCollatedBy(stmt.name()) != null) {
+                    throw new MemgresException("cannot drop collation " + stmt.name()
+                            + " because other objects depend on it", "2BP01");
+                }
                 executor.database.removeCollation(stmt.name());
                 break;
             }
@@ -4249,6 +4286,13 @@ class DdlObjectExecutor {
             executor.database.setIndexColumnOptions(idxSchemaForMeta, s.name(), s.columnOptions());
             executor.database.setIndexIncludeColumns(idxSchemaForMeta, s.name(), s.includeColumns());
             executor.database.setIndexNullsNotDistinct(idxSchemaForMeta, s.name(), s.nullsNotDistinct());
+            // The storage parameters an index was created WITH are part of what it is: pg_class
+            // lists them and pg_get_indexdef writes them back. Only ALTER INDEX SET recorded
+            // them, so an index created with a fillfactor reported none.
+            if (s.withOptions() != null && !s.withOptions().isEmpty()) {
+                executor.database.setIndexReloptions(
+                        Database.idxKey(idxSchemaForMeta, s.name()), s.withOptions());
+            }
             executor.database.registerSchemaObject(idxSchemaForMeta, "index", s.name());
             executor.recordUndo(new Session.CreateIndexUndo(
                     Database.idxKey(idxSchemaForMeta, s.name())));
@@ -4448,6 +4492,20 @@ class DdlObjectExecutor {
         }
     }
 
+    /** The first column that sorts by this collation, or null when none does. */
+    private String columnCollatedBy(String collation) {
+        for (Schema schema : executor.database.getSchemas().values()) {
+            for (Table table : schema.getTables().values()) {
+                for (Column column : table.getColumns()) {
+                    if (collation.equalsIgnoreCase(column.getCollation())) {
+                        return table.getName() + "." + column.getName();
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
     // ---- CREATE COLLATION ----
 
     QueryResult executeCreateCollation(CreateCollationStmt stmt) {
@@ -4519,13 +4577,21 @@ class DdlObjectExecutor {
         } else if (castMethod.equals("b")) {
             validateBinaryCoercible(stmt);
         }
+        // A cast from a type to itself converts nothing, so there is no cast to create. The
+        // function is judged first, because a cast written with one that does not fit is wrong
+        // about the function before it is wrong about the types.
+        if (sourceOid == targetOid) {
+            throw new MemgresException(
+                    "source data type and target data type are the same", "42P17");
+        }
         if (executor.database.getUserDefinedCasts().stream()
                 .anyMatch(c -> (int) c[0] == sourceOid && (int) c[1] == targetOid)) {
             throw new MemgresException("cast from type " + DataType.canonicalName(stmt.sourceType)
                     + " to type " + DataType.canonicalName(stmt.targetType) + " already exists", "42710");
         }
         // Store in database for inclusion in pg_cast virtual table
-        executor.database.addUserCast(sourceOid, targetOid, castFunc, stmt.castContext, castMethod);
+        executor.database.addUserCast(sourceOid, targetOid, castFunc, stmt.castContext, castMethod,
+                castMethod.equals("f") ? stmt.functionName : null);
         return QueryResult.command(QueryResult.Type.CREATE_TYPE, 0);
     }
 

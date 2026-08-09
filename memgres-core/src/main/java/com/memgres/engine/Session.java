@@ -18,6 +18,10 @@ public class Session {
 
     private final Database database;
     private final AstExecutor executor;
+
+    /** The executor this session's statements run through. */
+    public AstExecutor executor() { return executor; }
+
     private String databaseName = "memgres";
     private DatabaseRegistry databaseRegistry;
     private volatile TransactionStatus status = TransactionStatus.IDLE;
@@ -560,6 +564,17 @@ public class Session {
         boolean allowedWhileAborted = upper.startsWith("COMMIT") || upper.startsWith("END")
                 || upper.startsWith("ABORT") || upper.startsWith("ROLLBACK");
         if (status == TransactionStatus.FAILED && !allowedWhileAborted) {
+            // The statement is read before the transaction is judged unfit to run it, so text
+            // that is not a statement at all is a syntax error even here. Refusing first told a
+            // client its transaction was aborted when what it had actually sent was nonsense.
+            try {
+                com.memgres.engine.parser.Parser.parse(sql, new ArrayList<String>());
+            } catch (MemgresException parseFailure) {
+                throw parseFailure;
+            } catch (RuntimeException ignored) {
+                // Anything the parser could not make sense of in another way is left to the
+                // aborted-transaction report below, which is the answer for a readable statement.
+            }
             throw new MemgresException(
                     "current transaction is aborted, commands ignored until end of transaction block",
                     "25P02");
@@ -1415,9 +1430,10 @@ public class Session {
                 if ("pg_catalog".equals(s) || "information_schema".equals(s)
                         || database.getSchema(s) != null) return s;
             }
-            if (hasEntries) {
-                throw new MemgresException("no schema has been selected to create in", "3F000");
-            }
+            // A path that names schemas but reaches none of them, and a path written empty,
+            // both select nothing to create in. Falling back to public created the relation
+            // somewhere the reader had excluded.
+            throw new MemgresException("no schema has been selected to create in", "3F000");
         }
         return "public";
     }
@@ -1435,20 +1451,42 @@ public class Session {
      * "public" whether or not the path asked for it reported one the reader had excluded.
      */
     public List<String> getExistingSearchPath(boolean includeImplicit) {
-        List<String> result = new ArrayList<>();
-        if (includeImplicit) result.add("pg_catalog");
+        // What the path names, in the order it names it, keeping only the schemas that are there.
+        List<String> named = new ArrayList<>();
         String searchPath = gucSettings.get("search_path");
+        String tempSchema = getTempSchemaName();
+        boolean namesTemp = false;
+        boolean namesCatalog = false;
         if (searchPath != null) {
             for (String sp : searchPath.split(",")) {
                 String s = sp.trim().replace("\"", "").replace("'", "");
                 if (s.isEmpty()) continue;
                 if (s.equals("$user")) s = getConnectingUser();
-                if (s == null || result.contains(s)) continue;
+                if (s == null) continue;
+                if (s.equals("pg_temp") || s.equals(tempSchema)) {
+                    namesTemp = true;
+                    if (database.getSchema(tempSchema) == null) continue;
+                    s = tempSchema;
+                } else if (s.equals("pg_catalog")) {
+                    namesCatalog = true;
+                }
+                if (named.contains(s)) continue;
                 if ("pg_catalog".equals(s) || "information_schema".equals(s)
                         || database.getSchema(s) != null) {
-                    result.add(s);
+                    named.add(s);
                 }
             }
+        }
+        if (!includeImplicit) return named;
+        // The implicit schemas come first — the session's temporary one, then the catalogue —
+        // but only while the path has not said where it wants them. A path that names pg_catalog
+        // puts it where it was named, and prepending it regardless reported an order the reader
+        // had deliberately changed.
+        List<String> result = new ArrayList<>();
+        if (!namesTemp && database.getSchema(tempSchema) != null) result.add(tempSchema);
+        if (!namesCatalog) result.add("pg_catalog");
+        for (String s : named) {
+            if (!result.contains(s)) result.add(s);
         }
         return result;
     }
@@ -1478,16 +1516,20 @@ public class Session {
 
     // ---- Prepared statements ----
 
+    // A prepared statement and a cursor are named by an identifier, which is folded to lower case
+    // when it is written plainly and kept as it stands when it is quoted. Folding the name again
+    // here made PREPARE "P" and EXECUTE p the same statement, which in PostgreSQL they are not.
+
     public void addPreparedStatement(String name, PreparedStmt stmt) {
-        preparedStatements.put(name.toLowerCase(), stmt);
+        preparedStatements.put(name, stmt);
     }
 
     public PreparedStmt getPreparedStatement(String name) {
-        return preparedStatements.get(name.toLowerCase());
+        return preparedStatements.get(name);
     }
 
     public void removePreparedStatement(String name) {
-        preparedStatements.remove(name.toLowerCase());
+        preparedStatements.remove(name);
     }
 
     public void removeAllPreparedStatements() {
@@ -1514,15 +1556,15 @@ public class Session {
     }
 
     public void addCursor(String name, CursorState cursor) {
-        cursors.put(name.toLowerCase(), cursor);
+        cursors.put(name, cursor);
     }
 
     public CursorState getCursor(String name) {
-        return cursors.get(name.toLowerCase());
+        return cursors.get(name);
     }
 
     public void removeCursor(String name) {
-        cursors.remove(name.toLowerCase());
+        cursors.remove(name);
     }
 
     public void removeAllCursors() {
@@ -1554,6 +1596,40 @@ public class Session {
         tableLocks.put(tableKey, mode);
     }
 
+    /**
+     * The lock a statement takes on a relation it touches, and how strong it is.
+     *
+     * <p>pg_locks used to show an AccessShareLock on every relation for every session, whether or
+     * not anything had touched it and whether or not a transaction was open. So a reader looking
+     * for what a transaction holds saw locks nobody had taken, and never saw that an UPDATE holds
+     * a stronger one than a SELECT.
+     */
+    private final Map<String, String> relationLocks = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** Rank of the lock modes a statement can take, weakest first. */
+    private static final List<String> RELATION_LOCK_STRENGTH = java.util.Arrays.asList(
+            "AccessShareLock", "RowShareLock", "RowExclusiveLock", "ShareUpdateExclusiveLock",
+            "ShareLock", "ShareRowExclusiveLock", "ExclusiveLock", "AccessExclusiveLock");
+
+    /** Record that this statement touched {@code tableKey}, keeping the strongest lock taken. */
+    public void recordRelationLock(String tableKey, String mode) {
+        if (tableKey == null || mode == null) return;
+        // Locks belong to a transaction; outside one PostgreSQL has already let them go by the
+        // time anything can look.
+        if (status != TransactionStatus.IN_TRANSACTION) return;
+        String held = relationLocks.get(tableKey);
+        if (held != null
+                && RELATION_LOCK_STRENGTH.indexOf(held) >= RELATION_LOCK_STRENGTH.indexOf(mode)) {
+            return;
+        }
+        relationLocks.put(tableKey, mode);
+    }
+
+    /** The relations this session's transaction holds a lock on, and the mode of each. */
+    public Map<String, String> getRelationLocks() {
+        return relationLocks;
+    }
+
     /** Get explicit table locks. */
     public Map<String, String> getTableLocks() {
         return tableLocks;
@@ -1561,6 +1637,8 @@ public class Session {
 
     /** Release all explicit table locks. Called on commit/rollback. */
     public void releaseTableLocks() {
+        // The locks a statement took go with the transaction that took them.
+        relationLocks.clear();
         tableLocks.clear();
         if (database != null) {
             database.releaseTableLocks(this);
@@ -2107,6 +2185,14 @@ public class Session {
 
     /** Import an exported snapshot into this session's RR snapshots. */
     public void importSnapshot(Database db, String snapshotId) {
+        // Whether the transaction may take another transaction's snapshot at all is settled
+        // before the identifier is read, so a session at READ COMMITTED is told what is wrong
+        // with the transaction rather than what is wrong with a name it was never going to use.
+        String level = getEffectiveIsolationLevel();
+        if (level != null && !level.startsWith("serializable") && !level.startsWith("repeatable")) {
+            throw new MemgresException("a snapshot-importing transaction must have isolation level "
+                    + "SERIALIZABLE or REPEATABLE READ", "0A000");
+        }
         Map<String, List<Object[]>> snap = db.importSnapshot(snapshotId);
         if (snap == null) {
             throw new MemgresException("invalid snapshot identifier: \"" + snapshotId + "\"", "22023");
