@@ -991,9 +991,12 @@ class ExprEvaluator {
             return leftVal.toString().startsWith(rightVal.toString());
         }
 
-        // Determine arg type names for operator lookup
-        String leftType = cop.left() != null ? AstExecutor.pgTypeNameOf(leftVal) : "NONE";
-        String rightType = AstExecutor.pgTypeNameOf(rightVal);
+        // Determine arg type names for operator lookup. A bare string constant has no type of
+        // its own until something gives it one, so it is offered as unknown and takes whatever
+        // the operator declares — which is how 'a' reaches an integer parameter and is refused
+        // as one rather than reported as a missing text operator.
+        String leftType = cop.left() != null ? operandTypeName(cop.left(), leftVal, ctx) : "NONE";
+        String rightType = operandTypeName(cop.right(), rightVal, ctx);
 
         // Try to find matching operator in database
         PgOperator pgOp = resolveOperator(cop.schema(), cop.opSymbol(), leftType, rightType);
@@ -1021,10 +1024,12 @@ class ExprEvaluator {
             if (rightVal == null) return null;
         }
 
-        // Build argument list and call
+        // Build argument list and call. An operand the operator declares a type for arrives as
+        // that type: a bare constant has none of its own, and handing it to the backing function
+        // unconverted asked that function to multiply a string by a number.
         java.util.List<Object> args = new java.util.ArrayList<>();
-        if (cop.left() != null) args.add(leftVal);
-        args.add(rightVal);
+        if (cop.left() != null) args.add(asDeclared(leftVal, pgOp.getLeftArg()));
+        args.add(asDeclared(rightVal, pgOp.getRightArg()));
 
         PlpgsqlExecutor plExec = new PlpgsqlExecutor(executor, executor.database, executor.session);
         return plExec.executeFunction(func, args);
@@ -1034,6 +1039,37 @@ class ExprEvaluator {
      * Resolve a PgOperator by schema, name, and argument types.
      * Tries exact match first, then fuzzy matching on arg types.
      */
+    /** An operand as the type the operator declares for it. */
+    private Object asDeclared(Object value, String declaredType) {
+        if (value == null || declaredType == null) return value;
+        String bare = declaredType.trim().toLowerCase();
+        if (bare.isEmpty() || bare.equals("any") || bare.startsWith("anyelement")
+                || bare.equals("\"any\"")) {
+            return value;
+        }
+        return executor.castEvaluator.applyCast(value, bare);
+    }
+
+    /**
+     * The type an operand offers an operator.
+     *
+     * <p>What the expression was written as decides this, not what its value happens to be held
+     * in: an integer column read as a Java long is still an integer, and offering it as a bigint
+     * put it past every operator declared for integers.
+     */
+    private String operandTypeName(Expression expr, Object value, RowContext ctx) {
+        if (isUntypedConstant(expr)) return "unknown";
+        String declared = executor.binaryOpEvaluator.declaredTypeForResolution(expr, ctx);
+        if (declared != null && !declared.isEmpty()) return declared.toLowerCase();
+        return AstExecutor.pgTypeNameOf(value);
+    }
+
+    /** Whether this operand is a string constant nothing has yet given a type to. */
+    private static boolean isUntypedConstant(Expression expr) {
+        return expr instanceof Literal
+                && ((Literal) expr).literalType() == Literal.LiteralType.STRING;
+    }
+
     PgOperator resolveOperator(String schema, String opSymbol, String leftType, String rightType) {
         // Search schemas: explicit schema, or search_path
         java.util.List<String> schemas = new java.util.ArrayList<>();
@@ -1105,13 +1141,32 @@ class ExprEvaluator {
         if ("NONE".equals(declaredType) && "NONE".equals(actualType)) return true;
         // "any" type matches anything
         if ("any".equals(declaredType) || "anyelement".equals(declaredType) || "\"any\"".equals(declaredType)) return true;
-        // "unknown" is the type of NULL — matches any declared type (PG implicit coercion)
+        // "unknown" is the type of NULL and of a literal nothing has typed yet — it takes the
+        // type the operator declares.
         if ("unknown".equals(actualType)) return true;
-        // Numeric type aliases
-        if (isNumericType(declaredType) && isNumericType(actualType)) return true;
+        // A number reaches a parameter of a wider kind and not a narrower one: an integer is a
+        // numeric without losing anything, a numeric is not an integer. Treating every numeric
+        // type as interchangeable made an operator declared for two integers answer for two
+        // numerics, which is an operator PostgreSQL says does not exist.
+        int actual = numericWidth(actualType);
+        int declared = numericWidth(declaredType);
+        if (actual > 0 && declared > 0) return actual <= declared;
         // Text type aliases
         if (isTextType(declaredType) && isTextType(actualType)) return true;
         return false;
+    }
+
+    /** How wide a number is, so a narrower one may stand where a wider is declared. */
+    private static int numericWidth(String t) {
+        switch (t) {
+            case "smallint": case "int2": return 1;
+            case "integer": case "int": case "int4": return 2;
+            case "bigint": case "int8": return 3;
+            case "numeric": case "decimal": return 4;
+            case "real": case "float4": return 5;
+            case "double precision": case "float8": case "float": case "double": return 6;
+            default: return 0;
+        }
     }
 
     private static boolean isNumericType(String t) {

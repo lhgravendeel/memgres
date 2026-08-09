@@ -1771,6 +1771,14 @@ class SelectAggregateEvaluator {
     }
 
     private Object evalUserDefinedAggregate(PgAggregate agg, FunctionCallExpr fn, List<RowContext> group) {
+        // An aggregate declared over one argument has to be given one. Reading the first of an
+        // empty argument list reached the client as an internal error about an array index; the
+        // call simply names no aggregate that takes nothing.
+        if (fn.args() == null || fn.args().isEmpty()) {
+            throw new MemgresException(
+                    "function " + FunctionEvaluator.stripSchemaPrefix(fn.name())
+                            + "() does not exist", "42883");
+        }
         // Initialize state from INITCOND or null
         Object state = null;
         if (agg.getInitcond() != null) {

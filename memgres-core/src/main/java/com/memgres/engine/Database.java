@@ -152,6 +152,7 @@ public class Database {
     public void addCollation(CollationDef coll) { userCollations.put(coll.name.toLowerCase(), coll); }
     public CollationDef getCollation(String name) { return userCollations.get(name.toLowerCase()); }
     public Map<String, CollationDef> getUserCollations() { return userCollations; }
+    public void removeCollation(String name) { userCollations.remove(name.toLowerCase()); }
 
     // ---- Text Search catalog objects ----
     private final Map<String, TsConfigDef> tsConfigs = new ConcurrentHashMap<>();

@@ -640,7 +640,7 @@ class PgWireDescribeHelper {
             }
         }
         if (upper.startsWith("EXECUTE")) {
-            String planName = extractPlanName(upper);
+            String planName = extractPlanName(sql);
             if (planName != null) {
                 Session.PreparedStmt plan = session.getPreparedStatement(planName);
                 if (plan != null && plan.body() != null) {
@@ -900,13 +900,28 @@ class PgWireDescribeHelper {
         return name.isEmpty() ? null : name.toLowerCase();
     }
 
-    private static String extractPlanName(String upperSql) {
-        String rest = upperSql.substring("EXECUTE".length()).trim();
+    /**
+     * The prepared statement a name in an EXECUTE refers to.
+     *
+     * <p>The name was read out of the upper-cased text with its quotes left on, so
+     * {@code EXECUTE "p"} looked for a statement called {@code "P"} — quotes and all — found
+     * none, and described no columns while the execution still sent rows. The client then had
+     * tuples with no shape to read them by.
+     */
+    private static String extractPlanName(String sql) {
+        String rest = sql.substring(sql.toUpperCase(java.util.Locale.ROOT)
+                .indexOf("EXECUTE") + "EXECUTE".length()).trim();
+        if (rest.startsWith("\"")) {
+            int close = rest.indexOf('"', 1);
+            if (close < 0) return null;
+            String quoted = rest.substring(1, close);
+            return quoted.isEmpty() ? null : quoted;
+        }
         int endIdx = rest.indexOf('(');
         if (endIdx < 0) endIdx = rest.indexOf(' ');
         if (endIdx < 0) endIdx = rest.indexOf(';');
         String name = endIdx > 0 ? rest.substring(0, endIdx).trim() : rest.replace(";", "").trim();
-        return name.isEmpty() ? null : name.toLowerCase();
+        return name.isEmpty() ? null : name.toLowerCase(java.util.Locale.ROOT);
     }
 
     // ---- Wire protocol helpers ----

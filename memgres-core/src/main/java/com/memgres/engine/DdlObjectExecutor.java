@@ -2510,9 +2510,13 @@ class DdlObjectExecutor {
                 // Which locale-derived collations a machine has is a property of the machine, so
                 // an unknown name is not something to refuse — but IF EXISTS still says what it
                 // skipped when memgres has no collation of that name.
-                if (stmt.ifExists() && executor.database.getCollation(stmt.name()) == null) {
-                    noticeSkipped("collation \"" + stmt.name() + "\"");
+                if (executor.database.getCollation(stmt.name()) == null) {
+                    if (stmt.ifExists()) noticeSkipped("collation \"" + stmt.name() + "\"");
+                    break;
                 }
+                // Dropping nothing at all left the collation answering for a name that had been
+                // taken away, so a value could still be sorted by a collation nobody has.
+                executor.database.removeCollation(stmt.name());
                 break;
             }
             case CONVERSION: {
@@ -4452,7 +4456,10 @@ class DdlObjectExecutor {
             if (stmt.ifNotExists) {
                 return QueryResult.message(QueryResult.Type.SET, "CREATE COLLATION");
             }
-            throw new MemgresException("collation \"" + name + "\" already exists", "42710");
+            // PostgreSQL names the encoding a collation is for, because two collations of
+            // one name may exist for two encodings.
+            throw new MemgresException(
+                    "collation \"" + name + "\" for encoding \"UTF8\" already exists", "42710");
         }
 
         String provider = "c";

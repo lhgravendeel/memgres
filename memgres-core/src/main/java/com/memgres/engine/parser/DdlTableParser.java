@@ -13,6 +13,13 @@ import java.util.List;
  * extracted from DdlParser.
  */
 class DdlTableParser {
+
+    /** Whether this expression is the null constant, written plainly. */
+    private static boolean isNullLiteral(Expression expr) {
+        return expr instanceof Literal
+                && ((Literal) expr).literalType() == Literal.LiteralType.NULL;
+    }
+
     /** The properties LIKE can copy. Anything else is a syntax error, not a silently ignored word. */
     private static final java.util.Set<String> LIKE_OPTIONS = Cols.setOf(
             "ALL", "COMMENTS", "COMPRESSION", "CONSTRAINTS", "DEFAULTS", "GENERATED",
@@ -334,7 +341,14 @@ class DdlTableParser {
                 }
                 continue;
             }
-            if (parser.matchKeyword("DEFAULT")) { defaultExpr = parser.parseExpression(); continue; }
+            if (parser.matchKeyword("DEFAULT")) {
+                Expression written = parser.parseExpression();
+                // A column with no default already answers NULL, so DEFAULT NULL adds nothing:
+                // PostgreSQL records no default for it at all, and pg_attribute says the column
+                // has none. Storing one made the catalogue describe a table nobody wrote.
+                defaultExpr = isNullLiteral(written) ? null : written;
+                continue;
+            }
             if (parser.matchKeyword("REFERENCES")) {
                 fkName = pendingName;
                 pendingName = null;

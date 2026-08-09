@@ -79,17 +79,17 @@ class CatalogSecurityBuilder {
 
     Table buildPgDatabase() {
         List<Column> cols = Cols.listOf(
-                colNN("oid", DataType.INTEGER),
-                colNN("datname", DataType.TEXT),
-                colNN("datdba", DataType.INTEGER),
+                colNN("oid", DataType.OID),
+                colNN("datname", DataType.NAME),
+                colNN("datdba", DataType.OID),
                 col("encoding", DataType.INTEGER),
-                col("datlocprovider", DataType.CHAR),
+                col("datlocprovider", DataType.INTERNAL_CHAR),
                 col("datistemplate", DataType.BOOLEAN),
                 col("datallowconn", DataType.BOOLEAN),
                 col("datconnlimit", DataType.INTEGER),
                 col("datfrozenxid", DataType.XID),
-                col("datminmxid", DataType.INTEGER),
-                col("dattablespace", DataType.INTEGER),
+                col("datminmxid", DataType.XID),
+                col("dattablespace", DataType.OID),
                 col("datcollate", DataType.TEXT),
                 col("datctype", DataType.TEXT),
                 col("datlocale", DataType.TEXT),
@@ -156,7 +156,7 @@ class CatalogSecurityBuilder {
                 col("rolconnlimit", DataType.INTEGER),
                 col("rolvaliduntil", DataType.TIMESTAMPTZ),
                 col("rolbypassrls", DataType.BOOLEAN),
-                col("rolconfig", DataType.TEXT),
+                col("rolconfig", DataType.TEXT_ARRAY),
                 col("rolpassword", DataType.TEXT)
         );
         Table table = new Table("pg_roles", cols);
@@ -644,7 +644,9 @@ class CatalogSecurityBuilder {
         for (Database.AdvisoryLockRow row : database.getAdvisoryLockRows()) {
             table.insertRow(new Object[]{
                     "advisory", dbOid, null, null, null, null, null,
-                    row.classId, row.objId, row.objSubId,
+                    // An OID is unsigned, so the high half of a key with its top bit set reads
+                    // as a large number and not as a negative one.
+                    row.classId & 0xFFFFFFFFL, row.objId & 0xFFFFFFFFL, row.objSubId,
                     String.valueOf(row.session.getPid()) + "/1", row.session.getPid(),
                     row.exclusive ? "ExclusiveLock" : "ShareLock", true, false, null
             });

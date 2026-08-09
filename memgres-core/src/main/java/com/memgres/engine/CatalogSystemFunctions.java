@@ -257,6 +257,17 @@ class CatalogSystemFunctions {
                     }
                 }
 
+                // An empty array says nothing about what it would have held, so the call's own
+                // declaration decides: pg_blocking_pids answers an integer array whether or not
+                // anything is blocking.
+                if (rawExpr instanceof FunctionCallExpr && value.get() instanceof java.util.List
+                        && ((java.util.List<?>) value.get()).isEmpty()) {
+                    DataType declared = declaredResultType((FunctionCallExpr) rawExpr, ctx);
+                    if (declared != null && DataType.elementOf(declared) != null) {
+                        return pgTypeDisplayName(declared);
+                    }
+                }
+
                 if (rawExpr instanceof CastExpr) {
                     CastExpr cast = (CastExpr) rawExpr;
                     // float(p) names two different types depending on p, so the modifier is

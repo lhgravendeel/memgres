@@ -82,6 +82,23 @@ class DmlExecutor {
 
     /** Resolve the schema-qualified key for a table's row metadata.
      *  When schema is null, find the actual schema by scanning database schemas. */
+    /**
+     * A catalogue view cannot be written to.
+     *
+     * <p>Nothing looked for one, so a statement naming pg_cursors or pg_settings was told the
+     * relation did not exist — which is not what it is. PostgreSQL says the view is not one it
+     * can write through, and names the verb that was tried.
+     */
+    private void rejectCatalogViewWrite(String tableName, String verb) {
+        if (tableName == null) return;
+        String bare = tableName.contains(".")
+                ? tableName.substring(tableName.lastIndexOf('.') + 1) : tableName;
+        if (!bare.toLowerCase().startsWith("pg_")) return;
+        if (executor.systemCatalog.resolve(null, bare, executor.session) == null) return;
+        if (!"v".equals(PgCatalogRelations.relkind(bare.toLowerCase()))) return;
+        throw new MemgresException("cannot " + verb + " view \"" + bare + "\"", "55000");
+    }
+
     private String resolveTableSchemaKey(String schema, Table table) {
         if (schema != null) return schema + "." + table.getName();
         // Find the actual schema containing this table instance
@@ -407,6 +424,7 @@ class DmlExecutor {
         List<DmlValidationHelper.ViewCheck> viewCheckExprs = validationHelper.collectViewCheckExprs(stmt.table());
         // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
         executor.viewDmlVerb = "insert into";
+        rejectCatalogViewWrite(stmt.table(), "insert into");
         Table table = executor.resolveTable(schemaName, stmt.table(), stmt.schema() != null);
         // A VALUES row is written out in full; it is not read from any relation, so there is
         // nothing for an aggregate to aggregate or for a window call to be numbered against.
@@ -1341,6 +1359,7 @@ class DmlExecutor {
         List<DmlValidationHelper.ViewCheck> viewCheckExprs = validationHelper.collectViewCheckExprs(stmt.table());
         // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
         executor.viewDmlVerb = "update";
+        rejectCatalogViewWrite(stmt.table(), "update");
         Table table = executor.resolveTable(schemaName, stmt.table(), stmt.schema() != null);
         // An UPDATE names one row at a time; there is no group behind it to aggregate and no
         // result to number a window against, in either the assignments or the WHERE.
@@ -2059,6 +2078,7 @@ class DmlExecutor {
         String schemaName = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
         // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
         executor.viewDmlVerb = "delete from";
+        rejectCatalogViewWrite(stmt.table(), "delete from");
         Table table = executor.resolveTable(schemaName, stmt.table(), stmt.schema() != null);
         // As for UPDATE: a DELETE's WHERE picks rows one at a time, so nothing in it may need a
         // group or a finished result to have a value.

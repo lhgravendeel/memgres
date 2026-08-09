@@ -1783,12 +1783,17 @@ class UtilityParser {
                             + optToken.value().toLowerCase(java.util.Locale.ROOT) + "\"",
                             optToken, "42601");
                 }
-                if (opt.equals("ANALYZE") || opt.equals("ANALYSE")) hasAnalyze = true;
-                if (opt.equals("VERBOSE")) hasVerbose = true;
                 // Some options take a value (PARALLEL n, BUFFER_USAGE_LIMIT n, INDEX_CLEANUP bool)
+                String optValue = null;
                 if (!parser.check(TokenType.COMMA) && !parser.check(TokenType.RIGHT_PAREN) && !parser.isAtEnd()) {
-                    parser.advance(); // consume value
+                    optValue = parser.advance().value();
                 }
+                // A boolean option that was given FALSE is off, not merely written: reading the
+                // name alone made VACUUM (ANALYZE FALSE) analyse.
+                boolean optOn = optValue == null || !("false".equalsIgnoreCase(optValue)
+                        || "off".equalsIgnoreCase(optValue) || "0".equals(optValue));
+                if ((opt.equals("ANALYZE") || opt.equals("ANALYSE")) && optOn) hasAnalyze = true;
+                if (opt.equals("VERBOSE") && optOn) hasVerbose = true;
             }
             parser.expect(TokenType.RIGHT_PAREN);
         } else {
@@ -1804,7 +1809,25 @@ class UtilityParser {
             matchOnlyBeforeRelation();
             vacuumTable = parser.readIdentifier();
             if (parser.match(TokenType.DOT)) vacuumTable = vacuumTable + "." + parser.readIdentifier();
-            if (parser.check(TokenType.LEFT_PAREN)) parser.consumeUntilParen();
+            if (parser.check(TokenType.LEFT_PAREN)) {
+                // A column list says which columns to gather statistics for, so it means nothing
+                // without ANALYZE — and PostgreSQL says so before it opens the relation. The list
+                // has at least one column in it.
+                parser.advance();
+                if (parser.check(TokenType.RIGHT_PAREN)) {
+                    Token t = parser.peek();
+                    throw ParseException.saying(SYNTAX_AT + t.raw() + Q, t, "42601");
+                }
+                do {
+                    parser.readColumnName();
+                } while (parser.match(TokenType.COMMA));
+                parser.expect(TokenType.RIGHT_PAREN);
+                if (!hasAnalyze) {
+                    throw new MemgresException(
+                            "ANALYZE option must be specified when a column list is provided",
+                            "0A000");
+                }
+            }
         }
         // Encode flags + table into the value string
         String value = vacuumTable != null ? "table:" + vacuumTable : "ok";
