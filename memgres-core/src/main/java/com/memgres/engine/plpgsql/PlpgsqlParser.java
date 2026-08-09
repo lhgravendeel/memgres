@@ -510,10 +510,11 @@ public class PlpgsqlParser {
                     return parseRollback();
                 case "ABORT":
                     return parseAbort();
-                case "SAVEPOINT": {
-                    // PG 18: SAVEPOINT is not valid in PL/pgSQL — reject at creation time
-                    throw new MemgresException("syntax error at or near \"" + peek().value() + "\"", "42601");
-                }
+                case "SAVEPOINT":
+                    // SAVEPOINT reads as an ordinary SQL statement and is refused when it runs,
+                    // the way every other transaction command a body cannot give is. Refusing it
+                    // at compile time named it a syntax error, which is not what it is.
+                    return parseSqlStmt();
                 case "ASSERT":
                     return parseAssert();
                 case "CALL":

@@ -102,6 +102,29 @@ public class ExpressionParser {
         return t.type() == TokenType.KEYWORD && t.value().equalsIgnoreCase(keyword);
     }
 
+    /**
+     * Match a word that is not reserved, whatever kind of token it arrived as.
+     *
+     * <p>An unreserved word may be spelled by a KEYWORD token or by an IDENTIFIER one depending on
+     * whether the lexer happens to know it, and a grammar that only matched keywords refused
+     * ASENSITIVE — which is an ordinary word PostgreSQL's cursor options accept.
+     */
+    protected boolean matchWord(String word) {
+        Token t = peek();
+        if ((t.type() == TokenType.KEYWORD || t.type() == TokenType.IDENTIFIER)
+                && t.value().equalsIgnoreCase(word)) {
+            advance();
+            return true;
+        }
+        return false;
+    }
+
+    protected boolean checkWord(String word) {
+        Token t = peek();
+        return (t.type() == TokenType.KEYWORD || t.type() == TokenType.IDENTIFIER)
+                && t.value().equalsIgnoreCase(word);
+    }
+
     protected boolean matchKeyword(String keyword) {
         if (checkKeyword(keyword)) {
             advance();
@@ -316,7 +339,13 @@ public class ExpressionParser {
         if (isAtEnd()) return;
         Token t = peek();
         if (t.type() == TokenType.SEMICOLON || t.type() == TokenType.EOF) return;
-        throw ParseException.saying("syntax error at or near \"" + t.raw() + "\"", t, "42601");
+        throw ParseException.saying("syntax error at or near \"" + tokenAsWritten(t) + "\"", t, "42601");
+    }
+
+    /** A token as the reader wrote it: a string constant keeps the quotes that made it one. */
+    protected static String tokenAsWritten(Token token) {
+        if (token.type() == TokenType.STRING_LITERAL) return "'" + token.value() + "'";
+        return token.raw();
     }
 
 

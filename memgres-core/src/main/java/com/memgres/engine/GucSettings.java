@@ -873,6 +873,12 @@ public class GucSettings {
         if (Math.abs(converted - Math.rint(converted)) < 1e-10) {
             return String.valueOf((long) Math.rint(converted));
         }
+        // A parameter counted in whole units holds a whole number of them: 2500us is two and a
+        // half milliseconds, and lock_timeout is a count of milliseconds, so it is two. Keeping
+        // the fraction reported a setting in a unit the parameter is not measured in.
+        if ("integer".equals(def.vartype)) {
+            return String.valueOf((long) Math.rint(converted));
+        }
         return String.valueOf(converted);
     }
 
@@ -1051,7 +1057,27 @@ public class GucSettings {
             String match = enumMatch(def, value);
             if (match != null) return match;
         }
+        // A parameter measured in whole units holds a whole number. Keeping the fraction that was
+        // written meant default_statistics_target read back as 100.7, which is not a count of
+        // anything; PostgreSQL rounds it to the unit the parameter is in.
+        if ("integer".equals(def.vartype)) {
+            String rounded = roundedToWholeUnits(value);
+            if (rounded != null) return rounded;
+        }
         return value;
+    }
+
+    /** A written value rounded to a whole number, or null when it is not a bare number. */
+    private static String roundedToWholeUnits(String value) {
+        String text = unquote(value);
+        if (text == null) return null;
+        text = text.trim();
+        if (text.isEmpty() || text.indexOf('.') < 0) return null;
+        try {
+            return String.valueOf(Math.round(Double.parseDouble(text)));
+        } catch (NumberFormatException e) {
+            return null;   // a number with a unit after it, which toBaseUnit reads
+        }
     }
 
     /** Take a snapshot of session overrides for transactional rollback (M13). */

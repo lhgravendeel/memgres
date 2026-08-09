@@ -1286,7 +1286,9 @@ class FunctionEvaluator {
                 if (channel == null || channel.toString().trim().isEmpty()) {
                     throw new MemgresException("channel name cannot be empty", "22023");
                 }
-                if (payload != null && payload.toString().length() >= NOTIFY_PAYLOAD_LIMIT) {
+                if (payload != null && payload.toString()
+                        .getBytes(java.nio.charset.StandardCharsets.UTF_8).length
+                        >= NOTIFY_PAYLOAD_LIMIT) {
                     throw new MemgresException("payload string too long", "22023");
                 }
                 if (channel != null) {

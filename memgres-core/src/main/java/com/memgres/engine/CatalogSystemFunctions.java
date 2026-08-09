@@ -651,6 +651,9 @@ class CatalogSystemFunctions {
                     GucSettings.requireKnown(settingName);
                     String settingValue = String.valueOf(executor.evalExpr(fn.args().get(1), ctx));
                     GucSettings.checkAssignable(settingName, settingValue);
+                    // And by the same value checks: a time zone nobody has, an encoding that is
+                    // not one and a role that does not exist are refused here as they are there.
+                    executor.sessionExecutor.validateGucValue(settingName, settingValue);
                     boolean isLocal = fn.args().size() >= 3 && executor.isTruthy(executor.evalExpr(fn.args().get(2), ctx));
                     // set_config runs inside a query, so a transaction-scoped setting is subject
                     // to the same rules the SET statement is: the isolation level can no longer

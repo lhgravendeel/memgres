@@ -1286,6 +1286,28 @@ public class PlpgsqlExecutor {
         }
     }
 
+    /**
+     * The transaction commands a body cannot give.
+     *
+     * <p>A routine runs inside the caller's transaction, so it cannot open, name or unwind one:
+     * COMMIT and ROLLBACK end the caller's and start another, and are the only two PL/pgSQL has.
+     * Passing the rest through to the engine let a DO block open a transaction that nothing then
+     * closed, and every statement after it in the session was refused as part of an aborted one.
+     */
+    private void rejectTransactionCommand(String sql) {
+        String head = sql.toUpperCase(java.util.Locale.ROOT).trim();
+        for (String command : UNSUPPORTED_IN_PLPGSQL) {
+            if (head.equals(command) || head.startsWith(command + " ") || head.startsWith(command + ";")) {
+                throw new MemgresException("unsupported transaction command in PL/pgSQL", "0A000");
+            }
+        }
+    }
+
+    private static final String[] UNSUPPORTED_IN_PLPGSQL = {
+            "START TRANSACTION", "BEGIN", "SAVEPOINT", "RELEASE SAVEPOINT", "RELEASE",
+            "ROLLBACK TO SAVEPOINT", "ROLLBACK TO", "ABORT", "END TRANSACTION",
+            "PREPARE TRANSACTION", "COMMIT PREPARED", "ROLLBACK PREPARED"};
+
     private void validateTransactionControl(String command) {
         if (!isProcedureExecution) {
             throw new MemgresException("invalid transaction termination", "2D000");
@@ -2366,6 +2388,7 @@ public class PlpgsqlExecutor {
 
     private void executeSql(PlpgsqlStatement.SqlStmt stmt, Scope scope) {
         String originalSql = stmt.sql().trim();
+        rejectTransactionCommand(originalSql);
         String sql = substituteVariables(originalSql, scope);
 
         // For CALL statements, detect OUT params and bind results back to PL/pgSQL variables

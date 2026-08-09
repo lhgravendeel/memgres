@@ -138,6 +138,14 @@ class DdlFunctionParser {
         parser.expect(TokenType.RIGHT_PAREN);
 
         String returnType = isProcedure ? "void" : null;
+        // A procedure answers with nothing, so its grammar has no RETURNS: PostgreSQL stops at
+        // the type that follows one. Accepting it let a procedure be declared to return rows it
+        // has no way of producing.
+        if (isProcedure && parser.checkKeyword("RETURNS")) {
+            Token after = parser.peekAt(1);
+            throw ParseException.saying("syntax error at or near \"" + after.raw() + "\"",
+                    after, "42601");
+        }
         if (parser.matchKeyword("RETURNS")) {
             if (parser.checkKeyword("SETOF")) {
                 parser.advance();
@@ -261,9 +269,10 @@ class DdlFunctionParser {
         parser.expect(TokenType.LEFT_PAREN);
         List<Expression> args = new ArrayList<>();
         if (!parser.check(TokenType.RIGHT_PAREN)) {
-            do {
-                args.add(parser.parseExpression());
-            } while (parser.match(TokenType.COMMA));
+            // A CALL takes its arguments the way any routine call does: by position, by name with
+            // => or :=, or as one array after VARIADIC. Reading them as plain expressions made
+            // every named argument a syntax error at the arrow.
+            args = parser.parseFunctionArgList();
         }
         parser.expect(TokenType.RIGHT_PAREN);
         // A CALL takes no clause after its arguments: no RETURNING, and nothing else either.

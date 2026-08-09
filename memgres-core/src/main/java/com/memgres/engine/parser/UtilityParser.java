@@ -653,14 +653,17 @@ class UtilityParser {
 
     TransactionStmt parseSavepoint() {
         parser.expectKeyword("SAVEPOINT");
-        String name = parser.readIdentifier();
+        // A savepoint is named the way a column is, so a reserved word is not a name for one:
+        // SAVEPOINT ALL and SAVEPOINT select are syntax errors rather than savepoints.
+        String name = parser.readColumnName();
+        parser.expectEndOfStatement();
         return new TransactionStmt(TransactionStmt.TransactionAction.SAVEPOINT, name);
     }
 
     TransactionStmt parseReleaseSavepoint() {
         parser.expectKeyword("RELEASE");
         parser.matchKeyword("SAVEPOINT");
-        String name = parser.readIdentifier();
+        String name = parser.readColumnName();
         return new TransactionStmt(TransactionStmt.TransactionAction.RELEASE_SAVEPOINT, name);
     }
 
@@ -988,7 +991,7 @@ class UtilityParser {
             // The payload is one string constant, however it is quoted; it is not an expression.
             if (payloadToken.type() != TokenType.STRING_LITERAL
                     && payloadToken.type() != TokenType.DOLLAR_STRING_LITERAL) {
-                throw new ParseException("syntax error at or near \"" + payloadToken.value() + "\"", payloadToken);
+                throw new ParseException(SYNTAX_AT + asWritten(payloadToken) + Q, payloadToken);
             }
             payload = parser.advance().value();
         }
@@ -1075,10 +1078,10 @@ class UtilityParser {
         boolean scroll = false;
         boolean explicitNoScroll = false;
         while (true) {
-            if (parser.matchKeyword("BINARY")) { binary = true; continue; }
-            if (parser.matchKeyword("INSENSITIVE")) { continue; }
-            if (parser.matchKeyword("ASENSITIVE")) { continue; }
-            if (parser.matchKeyword("SCROLL")) { scroll = true; continue; }
+            if (parser.matchWord("BINARY")) { binary = true; continue; }
+            if (parser.matchWord("INSENSITIVE")) { continue; }
+            if (parser.matchWord("ASENSITIVE")) { continue; }
+            if (parser.matchWord("SCROLL")) { scroll = true; continue; }
             if (parser.checkKeyword("NO")) {
                 parser.advance();
                 parser.expectKeyword("SCROLL");
@@ -1630,9 +1633,23 @@ class UtilityParser {
                 tokenValues.add(identifierSpelling(tok));
             }
         }
-        // A function/aggregate argument list is not part of the name: COMMENT ON FUNCTION f(int)
+        // A routine's argument list says which routine of that name this is, so it travels with
+        // the name. Dropping it meant a comment on one overload was a comment on whichever
+        // overload happened to be found, and a signature that matches none was not noticed.
         int paren = tokenValues.indexOf("(");
-        if (paren > 0) tokenValues = new ArrayList<>(tokenValues.subList(0, paren));
+        String argumentList = null;
+        if (paren > 0) {
+            StringBuilder args = new StringBuilder();
+            for (int i = paren; i < tokenValues.size(); i++) {
+                String piece = tokenValues.get(i);
+                if (piece.equals("(") || piece.equals(")")) args.append(piece);
+                else if (piece.equals(",")) args.append(", ");
+                else args.append(args.length() > 0 && args.charAt(args.length() - 1) != '('
+                        && !args.toString().endsWith(", ") ? " " : "").append(piece);
+            }
+            argumentList = args.toString();
+            tokenValues = new ArrayList<>(tokenValues.subList(0, paren));
+        }
         String objectType;
         String objectName;
         // CONSTRAINT c ON t / TRIGGER t ON r / RULE r ON t / POLICY p ON t name the object
@@ -1653,6 +1670,7 @@ class UtilityParser {
                     : "TABLE";
             objectName = !tokenValues.isEmpty()
                     ? tokenValues.get(tokenValues.size() - 1) : "";
+            if (argumentList != null) objectName = objectName + argumentList;
         }
         parser.expectKeyword("IS");
         String comment = null;
@@ -1758,7 +1776,12 @@ class UtilityParser {
                 Token optToken = parser.advance();
                 String opt = optToken.value().toUpperCase();
                 if (!VALID_VACUUM_OPTIONS.contains(opt)) {
-                    throw new ParseException("unrecognized VACUUM option \"" + optToken.value() + "\"", optToken);
+                    // ParseException(message, token) reports the token and drops the message, so
+                    // the option that was not recognised was reported as a plain syntax error.
+                    // An option name is folded like any other unquoted word.
+                    throw ParseException.saying("unrecognized VACUUM option \""
+                            + optToken.value().toLowerCase(java.util.Locale.ROOT) + "\"",
+                            optToken, "42601");
                 }
                 if (opt.equals("ANALYZE") || opt.equals("ANALYSE")) hasAnalyze = true;
                 if (opt.equals("VERBOSE")) hasVerbose = true;

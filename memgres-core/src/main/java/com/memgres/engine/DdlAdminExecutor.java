@@ -291,7 +291,10 @@ class DdlAdminExecutor {
         if (stmt.channel() == null || stmt.channel().trim().isEmpty()) {
             throw new MemgresException("channel name cannot be empty", "22023");
         }
-        if (stmt.payload() != null && stmt.payload().length() >= 8000) {
+        // The bound is on the bytes the payload takes, not on the characters it is written with:
+        // four thousand two-byte characters are eight thousand bytes and one too many.
+        if (stmt.payload() != null
+                && stmt.payload().getBytes(java.nio.charset.StandardCharsets.UTF_8).length >= 8000) {
             throw new MemgresException("payload string too long", "22023");
         }
         if (executor.session != null) {

@@ -592,6 +592,20 @@ public class AstExecutor {
             AlterDefaultPrivilegesStmt s = (AlterDefaultPrivilegesStmt) stmt;
             // The schema and role are resolved to OIDs before anything is recorded, so naming one
             // that does not exist is an error rather than a default nothing will ever match.
+            // The grantees are read first: PostgreSQL resolves the roles the privileges are for
+            // before it looks at the schema they are in, so a missing grantee is what it names.
+            if (s.grantees() != null) {
+                for (String grantee : s.grantees()) {
+                    String lower = grantee == null ? null : grantee.toLowerCase();
+                    if (lower == null || lower.equals("public") || lower.equals("current_user")
+                            || lower.equals("session_user") || lower.equals("current_role")) {
+                        continue;
+                    }
+                    if (!database.hasRole(lower) && !lower.equalsIgnoreCase(sessionUser())) {
+                        throw PgErrors.undefinedObject("role", grantee);
+                    }
+                }
+            }
             if (s.forRole() != null && !database.hasRole(s.forRole().toLowerCase())) {
                 throw PgErrors.undefinedObject("role", s.forRole());
             }

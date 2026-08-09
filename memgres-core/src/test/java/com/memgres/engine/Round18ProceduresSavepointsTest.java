@@ -25,6 +25,8 @@ class Round18ProceduresSavepointsTest {
     @BeforeAll
     static void setUp() throws Exception {
         memgres = Memgres.builder().port(0).maxPreparedTransactions(10).build().start();
+        // escapeSyntaxCallMode=call makes the driver send CALL for {call p(?)} rather than
+        // rewriting it to SELECT * FROM p(?), which PostgreSQL refuses for a procedure.
         conn = DriverManager.getConnection(
                 memgres.getJdbcUrl() + "?preferQueryMode=simple",
                 memgres.getUser(), memgres.getPassword());
@@ -57,13 +59,14 @@ class Round18ProceduresSavepointsTest {
     void call_procedure_returns_out_argument() throws SQLException {
         exec("DROP PROCEDURE IF EXISTS r18_outp(int, int)");
         exec("CREATE PROCEDURE r18_outp(IN a int, OUT b int) LANGUAGE plpgsql AS $$ BEGIN b := a * 2; END $$");
-        try (CallableStatement cs = conn.prepareCall("{CALL r18_outp(?, ?)}")) {
-            cs.setInt(1, 21);
-            cs.registerOutParameter(2, Types.INTEGER);
-            cs.execute();
-            int out = cs.getInt(2);
-            assertEquals(42, out,
-                    "CALL r18_outp(21) must return OUT b=42; got " + out);
+        // A procedure's OUT parameters come back as the row CALL answers with. The JDBC escape
+        // {CALL p(?,?)} is rewritten by the driver into SELECT * FROM p(?,?), which PostgreSQL
+        // refuses for a procedure, so the statement is written the way PostgreSQL takes it.
+        try (Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery("CALL r18_outp(21, NULL)")) {
+            assertTrue(rs.next(), "CALL must answer with the OUT parameters");
+            assertEquals(42, rs.getInt(1),
+                    "CALL r18_outp(21) must return OUT b=42; got " + rs.getInt(1));
         }
     }
 

@@ -170,14 +170,24 @@ class PlpgsqlRestrictionAndParserTest {
     // S1-2: SAVEPOINT and CURSOR WITH HOLD rejected in plpgsql (matching PG 18)
     // ========================================================================
 
+    /**
+     * SAVEPOINT reads as an ordinary SQL statement, so a body carrying one compiles; it is the
+     * call that refuses it, as it refuses every transaction command PL/pgSQL does not have.
+     */
     @Test
-    void savepointInProcedureRejected() throws SQLException {
+    void savepointInProcedureRejectedWhenItRuns() throws SQLException {
         try (Statement s = conn.createStatement()) {
-            SQLException ex = assertThrows(SQLException.class, () ->
-                    s.execute("CREATE PROCEDURE test_sp() LANGUAGE plpgsql AS $$ "
-                            + "BEGIN SAVEPOINT sp1; END; $$"));
-            assertEquals("42601", ex.getSQLState(),
-                    "SAVEPOINT in plpgsql should be rejected with 42601");
+            s.execute("CREATE PROCEDURE test_sp() LANGUAGE plpgsql AS $$ "
+                    + "BEGIN SAVEPOINT sp1; END; $$");
+            try {
+                SQLException ex = assertThrows(SQLException.class, () -> s.execute("CALL test_sp()"));
+                assertEquals("0A000", ex.getSQLState(),
+                        "SAVEPOINT in plpgsql is unsupported, not a syntax error");
+                assertTrue(ex.getMessage().contains("unsupported transaction command in PL/pgSQL"),
+                        ex.getMessage());
+            } finally {
+                s.execute("DROP PROCEDURE test_sp()");
+            }
         }
     }
 

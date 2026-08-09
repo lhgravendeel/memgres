@@ -69,8 +69,8 @@ class ExprSpecialFormParser {
         }
         Expression arr = parseArrayBracket();
         if (arr instanceof ArrayExpr && ((ArrayExpr) arr).elements().isEmpty() && !ep.check(TokenType.CAST)) {
-            ArrayExpr ae = (ArrayExpr) arr;
-            throw new ParseException("cannot determine type of empty array", ep.peek(), "42P18");
+            // ParseException(message, token, state) reports the token and drops the message.
+            throw ParseException.saying("cannot determine type of empty array", ep.peek(), "42P18");
         }
         return arr;
     }

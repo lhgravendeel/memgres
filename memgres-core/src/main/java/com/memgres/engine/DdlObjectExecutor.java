@@ -1796,7 +1796,8 @@ class DdlObjectExecutor {
     private List<String> callArgumentTypes(List<Expression> args) {
         List<String> names = new ArrayList<>();
         for (Expression arg : args) {
-            names.add(callArgumentType(arg));
+            names.add(callArgumentType(
+                    arg instanceof NamedArgExpr ? ((NamedArgExpr) arg).value() : arg));
         }
         return names;
     }
@@ -1862,6 +1863,9 @@ class DdlObjectExecutor {
      * reach a procedure, and neither did the call the reader wrote.
      */
     private static boolean acceptsArgumentTypes(PgFunction fn, List<String> argTypes) {
+        for (PgFunction.Param p : fn.getParams()) {
+            if ("VARIADIC".equalsIgnoreCase(p.mode())) return true;
+        }
         int at = 0;
         for (PgFunction.Param p : fn.getParams()) {
             String mode = p.mode() == null ? "IN" : p.mode().toUpperCase();
@@ -1917,6 +1921,17 @@ class DdlObjectExecutor {
         return false;
     }
 
+    /** A routine call written with VARIADIC passes one array where the tail would go. */
+    private static boolean writtenVariadic(CallStmt stmt) {
+        for (Expression arg : stmt.args()) {
+            if (arg instanceof NamedArgExpr
+                    && "__variadic__".equals(((NamedArgExpr) arg).name())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /** Whether this routine can be called with that many arguments. */
     private static boolean acceptsArgumentCount(PgFunction fn, int argCount) {
         int required = 0;
@@ -1928,6 +1943,11 @@ class DdlObjectExecutor {
             accepted++;
             if (p.defaultExpr() == null) required++;
         }
+        boolean variadic = false;
+        for (PgFunction.Param p : fn.getParams()) {
+            if ("VARIADIC".equalsIgnoreCase(p.mode())) variadic = true;
+        }
+        if (variadic) return argCount >= required - 1;
         return argCount == total || (argCount >= required && argCount <= accepted);
     }
 
@@ -1987,11 +2007,37 @@ class DdlObjectExecutor {
         List<Object> args = new ArrayList<>();
         int argIdx = 0;
         boolean placeholdersGiven = argCount == totalParams || hasLeadingOut(function);
+        // An argument written with a name goes to the parameter of that name wherever it sits,
+        // and one written after VARIADIC is the whole tail as an array.
+        Map<String, Expression> byName = new LinkedHashMap<>();
+        Expression variadic = null;
+        for (Expression arg : stmt.args()) {
+            if (!(arg instanceof NamedArgExpr)) continue;
+            NamedArgExpr named = (NamedArgExpr) arg;
+            if ("__variadic__".equals(named.name())) variadic = named.value();
+            else byName.put(named.name().toLowerCase(), named.value());
+        }
         for (PgFunction.Param p : function.getParams()) {
             String mode = p.mode() != null ? p.mode().toUpperCase() : "IN";
             if ("OUT".equals(mode)) {
-                if (placeholdersGiven && argIdx < stmt.args().size()) argIdx++;
+                if (placeholdersGiven && argIdx < stmt.args().size()
+                        && !(stmt.args().get(argIdx) instanceof NamedArgExpr)) {
+                    argIdx++;
+                }
                 continue;
+            }
+            Expression named = p.name() == null ? null : byName.get(p.name().toLowerCase());
+            if (named != null) {
+                args.add(executor.evalExpr(named, null));
+                continue;
+            }
+            if ("VARIADIC".equals(mode) && variadic != null) {
+                args.add(executor.evalExpr(variadic, null));
+                continue;
+            }
+            // Skip the positions the named arguments already filled.
+            while (argIdx < stmt.args().size() && stmt.args().get(argIdx) instanceof NamedArgExpr) {
+                argIdx++;
             }
             if (argIdx < stmt.args().size()) {
                 args.add(executor.evalExpr(stmt.args().get(argIdx++), null));

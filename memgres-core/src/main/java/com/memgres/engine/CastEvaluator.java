@@ -1177,6 +1177,9 @@ class CastEvaluator {
                         // A primary-key or unique index is stored as a constraint, not an index,
                         // but it is still a relation with a name
                         if (!rcExists && isConstraintBackedIndex(lowerName)) rcExists = true;
+                        // A composite type has a relation of its own holding its attributes, so
+                        // its name is a regclass and col_description can be asked about it.
+                        if (!rcExists && executor.database.isCompositeType(lowerName)) rcExists = true;
                         // pg_temp is implicitly on the search path ahead of public
                         if (!rcExists && executor.session != null) {
                             Schema tempSchema = executor.database.getSchema(executor.session.getTempSchemaName());

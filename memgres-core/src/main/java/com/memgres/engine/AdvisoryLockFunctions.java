@@ -39,12 +39,54 @@ class AdvisoryLockFunctions {
         // The two forms take different types, so a key neither can read is reported against the
         // one that was called: two keys are integers apiece, a lone key is a bigint.
         if (fn.args().size() >= 2) {
-            long key1 = executor.toInt(executor.evalExpr(fn.args().get(0), ctx));
-            long key2 = executor.toInt(executor.evalExpr(fn.args().get(1), ctx));
+            long key1 = narrowed(fn, ctx, 0, "integer");
+            long key2 = narrowed(fn, ctx, 1, "integer");
             // Two-int form: classid = first arg, objid = second arg, in its own keyspace.
             return new Database.AdvisoryLockId(((key1 & 0xFFFFFFFFL) << 32) | (key2 & 0xFFFFFFFFL), true);
         }
-        return new Database.AdvisoryLockId(executor.toLong(executor.evalExpr(fn.args().get(0), ctx)), false);
+        return new Database.AdvisoryLockId(narrowed(fn, ctx, 0, "bigint"), false);
+    }
+
+    /**
+     * One key argument, refused when it does not fit the parameter the form declares.
+     *
+     * <p>The two-key form takes two integers and the one-key form a bigint; a wider value simply
+     * has no such function. Coercing it into range instead took a lock on a different key from
+     * the one the caller named, so two callers naming different keys could block each other.
+     */
+    private long narrowed(FunctionCallExpr fn, RowContext ctx, int index, String declared) {
+        Object value = executor.evalExpr(fn.args().get(index), ctx);
+        java.math.BigInteger written;
+        if (value instanceof java.math.BigDecimal) {
+            java.math.BigDecimal decimal = (java.math.BigDecimal) value;
+            if (decimal.stripTrailingZeros().scale() > 0) refuse(fn, "numeric", declared);
+            written = decimal.toBigInteger();
+        } else if (value instanceof Number) {
+            written = java.math.BigInteger.valueOf(((Number) value).longValue());
+        } else if ("integer".equals(declared)) {
+            written = java.math.BigInteger.valueOf(executor.toInt(value));
+        } else {
+            written = java.math.BigInteger.valueOf(executor.toLong(value));
+        }
+        if ("integer".equals(declared)) {
+            if (written.bitLength() > 31) {
+                refuse(fn, written.bitLength() > 63 ? "numeric" : "bigint", declared);
+            }
+            return written.longValue();
+        }
+        if (written.bitLength() > 63) refuse(fn, "numeric", declared);
+        return written.longValue();
+    }
+
+    /** Name the function the way the arguments written would have to be declared for it. */
+    private void refuse(FunctionCallExpr fn, String actual, String declared) {
+        StringBuilder types = new StringBuilder();
+        for (int i = 0; i < fn.args().size(); i++) {
+            if (i > 0) types.append(", ");
+            types.append(i == 0 ? actual : declared);
+        }
+        throw new MemgresException("function " + FunctionEvaluator.stripSchemaPrefix(fn.name())
+                + "(" + types + ") does not exist", "42883");
     }
 
     Object eval(String name, FunctionCallExpr fn, RowContext ctx) {
