@@ -13,7 +13,7 @@ public class NotificationManager {
     private final Map<String, List<Session>> listeners = new ConcurrentHashMap<>();
 
     public void listen(Session session, String channel) {
-        List<Session> sessions = listeners.computeIfAbsent(channel.toLowerCase(), k -> new CopyOnWriteArrayList<>());
+        List<Session> sessions = listeners.computeIfAbsent(channel, k -> new CopyOnWriteArrayList<>());
         synchronized (sessions) {
             if (!sessions.contains(session)) {
                 sessions.add(session);
@@ -22,7 +22,7 @@ public class NotificationManager {
     }
 
     public void unlisten(Session session, String channel) {
-        List<Session> sessions = listeners.get(channel.toLowerCase());
+        List<Session> sessions = listeners.get(channel);
         if (sessions != null) {
             sessions.remove(session);
         }
@@ -46,7 +46,7 @@ public class NotificationManager {
     }
 
     public void notify(String channel, String payload, int senderPid) {
-        List<Session> sessions = listeners.get(channel.toLowerCase());
+        List<Session> sessions = listeners.get(channel);
         if (sessions != null) {
             Notification notification = new Notification(senderPid, channel, payload != null ? payload : "");
             for (Session s : sessions) {

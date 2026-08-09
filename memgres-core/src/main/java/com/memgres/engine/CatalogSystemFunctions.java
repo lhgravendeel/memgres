@@ -444,7 +444,9 @@ class CatalogSystemFunctions {
             case "current_catalog":
                 return executor.session != null ? executor.session.getDatabaseName() : "memgres";
             case "current_schema":
-                return executor.session != null ? executor.session.getEffectiveSchema() : "public";
+                // The schema a name would resolve in, which is nothing at all when the path
+                // names no schema that exists.
+                return executor.session != null ? executor.session.getReportedSchema() : "public";
             case "current_schemas": {
                 boolean includeImplicit = false;
                 if (!fn.args().isEmpty()) {
@@ -452,7 +454,8 @@ class CatalogSystemFunctions {
                     includeImplicit = arg instanceof Boolean ? ((Boolean) arg) : "true".equalsIgnoreCase(String.valueOf(arg));
                 }
                 if (executor.session != null) {
-                    return new java.util.ArrayList<Object>(executor.session.getEffectiveSearchPath(includeImplicit));
+                    return new java.util.ArrayList<Object>(
+                            executor.session.getExistingSearchPath(includeImplicit));
                 }
                 List<Object> schemas = new java.util.ArrayList<>();
                 if (includeImplicit) schemas.add("pg_catalog");
@@ -1239,6 +1242,10 @@ class CatalogSystemFunctions {
     }
 
     static String pgTypeDisplayName(DataType dt) {
+        // An array type is named after its element with brackets after it, not by the catalogue
+        // spelling that puts an underscore in front: pg_typeof answers regtype[], not _regtype.
+        DataType element = DataType.elementOf(dt);
+        if (element != null) return pgTypeDisplayName(element) + "[]";
         switch (dt) {
             case INTEGER:
             case SERIAL:

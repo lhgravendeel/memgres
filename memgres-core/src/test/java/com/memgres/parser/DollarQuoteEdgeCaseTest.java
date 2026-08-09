@@ -83,16 +83,21 @@ class DollarQuoteEdgeCaseTest {
     }
 
     @Test
-    void testTripleDollarDoBlock() throws SQLException {
-        exec("CREATE TABLE triple_do_test (id serial PRIMARY KEY, val text)");
-        exec("""
-            DO $$$
-            BEGIN
-                INSERT INTO triple_do_test (val) VALUES ('from_triple');
-            END;
-            $$$
+    void testTripleDollarDoBlock() {
+        // A dollar quote ends at the first repeat of its own tag, so the extra dollar
+        // behind it is left over and PostgreSQL stops there.
+        SQLException e = assertThrows(SQLException.class, () -> {
+            exec("CREATE TABLE triple_do_test (id serial PRIMARY KEY, val text)");
+                exec("""
+                DO $$$
+                BEGIN
+                    INSERT INTO triple_do_test (val) VALUES ('from_triple');
+                END;
+                $$$
         """);
         assertEquals("from_triple", query1("SELECT val FROM triple_do_test"));
+        });
+        assertEquals("42601", e.getSQLState());
     }
 
     @Test
@@ -128,32 +133,42 @@ class DollarQuoteEdgeCaseTest {
     // =========================================================================
 
     @Test
-    void testDoDollarDollarDelimiter() throws SQLException {
-        exec("""
-            DO $do$$
-            BEGIN
-                RAISE NOTICE 'do dollar dollar';
-            END;
-            $do$$
+    void testDoDollarDollarDelimiter() {
+        // A dollar quote ends at the first repeat of its own tag, so the extra dollar
+        // behind it is left over and PostgreSQL stops there.
+        SQLException e = assertThrows(SQLException.class, () -> {
+            exec("""
+                DO $do$$
+                BEGIN
+                    RAISE NOTICE 'do dollar dollar';
+                END;
+                $do$$
         """);
+        });
+        assertEquals("42601", e.getSQLState());
     }
 
     @Test
-    void testDoDollarDollarWithLogic() throws SQLException {
-        exec("CREATE TABLE ddd_test (id serial PRIMARY KEY, val text)");
-        exec("""
-            DO $do$$
-            DECLARE
-                i text;
-                arr text[] := array['alpha', 'beta', 'gamma'];
-            BEGIN
-                FOREACH i IN ARRAY arr LOOP
-                    INSERT INTO ddd_test (val) VALUES (i);
-                END LOOP;
-            END;
-            $do$$
+    void testDoDollarDollarWithLogic() {
+        // A dollar quote ends at the first repeat of its own tag, so the extra dollar
+        // behind it is left over and PostgreSQL stops there.
+        SQLException e = assertThrows(SQLException.class, () -> {
+            exec("CREATE TABLE ddd_test (id serial PRIMARY KEY, val text)");
+                exec("""
+                DO $do$$
+                DECLARE
+                    i text;
+                    arr text[] := array['alpha', 'beta', 'gamma'];
+                BEGIN
+                    FOREACH i IN ARRAY arr LOOP
+                        INSERT INTO ddd_test (val) VALUES (i);
+                    END LOOP;
+                END;
+                $do$$
         """);
         assertEquals("3", query1("SELECT COUNT(*) FROM ddd_test"));
+        });
+        assertEquals("42601", e.getSQLState());
     }
 
     // =========================================================================
@@ -272,18 +287,23 @@ class DollarQuoteEdgeCaseTest {
     }
 
     @Test
-    void testDoBlockTripleDollarWithNestedDollarFormat() throws SQLException {
-        exec("CREATE TABLE triple_nested (id serial PRIMARY KEY, val text)");
-        exec("""
-            DO $$$
-            DECLARE
-                tbl text := 'triple_nested';
-            BEGIN
-                EXECUTE FORMAT('INSERT INTO %I (val) VALUES (%L)', tbl, 'nested_value');
-            END;
-            $$$
+    void testDoBlockTripleDollarWithNestedDollarFormat() {
+        // A dollar quote ends at the first repeat of its own tag, so the extra dollar
+        // behind it is left over and PostgreSQL stops there.
+        SQLException e = assertThrows(SQLException.class, () -> {
+            exec("CREATE TABLE triple_nested (id serial PRIMARY KEY, val text)");
+                exec("""
+                DO $$$
+                DECLARE
+                    tbl text := 'triple_nested';
+                BEGIN
+                    EXECUTE FORMAT('INSERT INTO %I (val) VALUES (%L)', tbl, 'nested_value');
+                END;
+                $$$
         """);
         assertEquals("nested_value", query1("SELECT val FROM triple_nested"));
+        });
+        assertEquals("42601", e.getSQLState());
     }
 
     // =========================================================================

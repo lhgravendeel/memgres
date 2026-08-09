@@ -613,6 +613,10 @@ public class GucSettings {
             customPlaceholders.add(key);
         }
         sessionOverrides.put(key, toBaseUnit(key, canonicalValue(key, normalized)));
+        // A plain SET inside a transaction is the value for the rest of that transaction too.
+        // Leaving an earlier SET LOCAL in place meant the later, plainer instruction was read
+        // as though it had not been given.
+        transactionOverrides.remove(key);
     }
 
     /** Set a transaction-scoped (LOCAL) parameter that reverts on commit/rollback. */
@@ -627,6 +631,58 @@ public class GucSettings {
     }
 
     /** Snapshot both override layers so ROLLBACK TO SAVEPOINT can undo SET / SET LOCAL. */
+    /**
+     * The settings that can change a plan, and that this session has moved off their default.
+     * EXPLAIN (SETTINGS) names exactly these — not every parameter that happens to differ, which
+     * would list whatever the client driver set on connecting.
+     */
+    private static final java.util.Set<String> PLAN_AFFECTING = new java.util.LinkedHashSet<>(
+            java.util.Arrays.asList(
+                    "search_path", "work_mem", "hash_mem_multiplier", "maintenance_work_mem",
+                    "effective_cache_size", "random_page_cost", "seq_page_cost", "cpu_tuple_cost",
+                    "cpu_index_tuple_cost", "cpu_operator_cost", "parallel_tuple_cost",
+                    "parallel_setup_cost", "min_parallel_table_scan_size",
+                    "min_parallel_index_scan_size", "effective_io_concurrency",
+                    "enable_seqscan", "enable_indexscan", "enable_indexonlyscan", "enable_bitmapscan",
+                    "enable_tidscan", "enable_sort", "enable_incremental_sort", "enable_hashagg",
+                    "enable_material", "enable_memoize", "enable_nestloop", "enable_mergejoin",
+                    "enable_hashjoin", "enable_gathermerge", "enable_partitionwise_join",
+                    "enable_partitionwise_aggregate", "enable_parallel_append",
+                    "enable_parallel_hash", "enable_partition_pruning", "enable_presorted_aggregate",
+                    "enable_async_append", "enable_group_by_reordering",
+                    "geqo", "geqo_threshold", "from_collapse_limit", "join_collapse_limit",
+                    "constraint_exclusion", "cursor_tuple_fraction", "default_statistics_target",
+                    "jit", "plan_cache_mode", "recursive_worktable_factor",
+                    "max_parallel_workers_per_gather", "temp_buffers"));
+
+    /**
+     * The plan-affecting settings this session has moved off their built-in default, in the order
+     * PostgreSQL lists them.
+     */
+    /** Settings measured in memory or time carry their unit when they are shown to a reader. */
+    private static final java.util.Set<String> MEASURED_IN_KB = new java.util.HashSet<>(
+            java.util.Arrays.asList("work_mem", "maintenance_work_mem", "effective_cache_size",
+                    "temp_buffers", "min_parallel_table_scan_size", "min_parallel_index_scan_size"));
+
+    /** The value as EXPLAIN prints it: with the unit, for the settings that are measured in one. */
+    public String getWithUnit(String key) {
+        String value = get(key);
+        if (value == null) return null;
+        if (MEASURED_IN_KB.contains(key) && value.matches("[0-9]+")) return value + "kB";
+        return value;
+    }
+
+    public java.util.List<String> changedFromDefault() {
+        java.util.List<String> names = new java.util.ArrayList<>();
+        for (String key : PLAN_AFFECTING) {
+            String value = sessionOverrides.get(key);
+            if (value == null || value.isEmpty()) continue;
+            String base = bootDefaults.containsKey(key) ? bootDefaults.get(key) : DEFAULTS.get(key);
+            if (base == null || !base.equals(value)) names.add(key);
+        }
+        return names;
+    }
+
     public Map<String, String> snapshotTransactionOverrides() {
         return new LinkedHashMap<>(transactionOverrides);
     }
@@ -646,12 +702,22 @@ public class GucSettings {
         } else {
             sessionOverrides.remove(key);
         }
+        // RESET puts the parameter back to its default now, so a SET LOCAL still standing over it
+        // is gone as well; otherwise the reset value could not be read until the transaction ended.
+        transactionOverrides.remove(key);
     }
 
     /** Reset all session parameters. */
     public void resetAll() {
         sessionOverrides.clear();
-        customPlaceholders.clear();
+        transactionOverrides.clear();
+        // A custom parameter that has been set once exists for the rest of the session: RESET
+        // returns it to its empty default, it does not make the session forget it was ever
+        // named. Clearing the placeholders made current_setting(x, true) answer NULL where
+        // PostgreSQL answers the empty string.
+        for (String custom : customPlaceholders) {
+            sessionOverrides.put(custom, "");
+        }
     }
 
     /** Set a boot-time default that overrides the static default (e.g., for session_authorization). */

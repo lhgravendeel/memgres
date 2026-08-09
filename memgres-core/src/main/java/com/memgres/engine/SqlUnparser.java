@@ -12,6 +12,29 @@ import java.util.stream.Collectors;
 public class SqlUnparser {
 
     /**
+     * The schema an unqualified relation is written under while a definition is being deparsed.
+     *
+     * <p>PostgreSQL writes a stored definition with every relation qualified that the reader's
+     * search path would not find by its bare name — which is why a dump, whose search path is
+     * empty, carries fully qualified view bodies and restores into any path at all. Echoing the
+     * text the view was written with produced bodies that only restored under the path they were
+     * created in.
+     */
+    private static final ThreadLocal<String> qualifyingSchema = new ThreadLocal<String>();
+
+    /** Deparse a stored definition with unqualified relations written under {@code schema}. */
+    public static String toSqlQualified(com.memgres.engine.parser.ast.Statement stmt, String schema,
+                                        boolean pretty) {
+        qualifyingSchema.set(schema);
+        try {
+            return pretty ? toSqlPretty(stmt) : toSql(stmt);
+        } finally {
+            qualifyingSchema.remove();
+        }
+    }
+
+
+    /**
      * Reformat a single-line SELECT into PG's pg_get_viewdef "pretty" multi-line
      * layout: leading space before SELECT, each column indented 4 spaces, and
      * FROM/WHERE on their own indented lines. (M19)
@@ -260,7 +283,8 @@ public class SqlUnparser {
             // The schema is part of which relation this is, so a definition that names one keeps
             // it: dropping it wrote a view over zz_cv2.b as though it read the b of whatever
             // schema the reader happens to be in.
-            String relation = tr.schema() != null ? tr.schema() + "." + tr.table() : tr.table();
+            String schema = tr.schema() != null ? tr.schema() : qualifyingSchema.get();
+            String relation = schema != null ? schema + "." + tr.table() : tr.table();
             return relation + (tr.alias() != null ? " " + tr.alias() : "");
         }
         if (item instanceof SelectStmt.JoinFrom) {

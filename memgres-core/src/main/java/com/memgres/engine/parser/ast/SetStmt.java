@@ -19,6 +19,17 @@ public final class SetStmt implements Statement {
         this(name, value, false);
     }
 
+    /**
+     * A second value the statement carried, where one value is not enough to say what it was.
+     * DO uses it for the language its block was written in, so the executor can refuse one that
+     * has no inline form rather than running every block as PL/pgSQL.
+     */
+    private String auxiliary;
+
+    public void setAuxiliary(String auxiliary) { this.auxiliary = auxiliary; }
+
+    public String auxiliary() { return auxiliary; }
+
     public String name() { return name; }
     public String value() { return value; }
     public boolean isLocal() { return isLocal; }

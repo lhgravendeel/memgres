@@ -889,15 +889,13 @@ class PreparedStatementCompatTest {
         }
     }
 
-    @Test void implicit_param_count_gap() throws SQLException {
-        // Uses $1 and $3 but not $2; max is $3, so 3 params expected
-        exec("PREPARE ps_gap AS SELECT $1::int + $3::int");
-        try {
-            // Must provide 3 params even though $2 is unused
-            assertEquals("40", q1("EXECUTE ps_gap(10, 'ignored', 30)"));
-        } finally {
-            exec("DEALLOCATE ps_gap");
-        }
+    @Test void implicit_param_count_gap() {
+        // $1 and $3 are written and $2 is not, so there is nothing for $2's type to be inferred
+        // from. PostgreSQL will not prepare a statement whose parameters it cannot all type.
+        SQLException e = assertThrows(SQLException.class,
+                () -> exec("PREPARE ps_gap AS SELECT $1::int + $3::int"));
+        assertEquals("42P18", e.getSQLState());
+        assertTrue(e.getMessage().contains("could not determine data type of parameter $2"));
     }
 
     // ========================================================================

@@ -50,6 +50,12 @@ public class ExpressionParser {
         return tokens.get(pos);
     }
 
+    /** The token {@code offset} places ahead, or the last one when the input ends before that. */
+    protected Token peekAt(int offset) {
+        int index = Math.min(pos + offset, tokens.size() - 1);
+        return tokens.get(index);
+    }
+
     protected Token advance() {
         Token t = tokens.get(pos);
         pos++;
@@ -290,6 +296,30 @@ public class ExpressionParser {
         }
         return null;
     }
+
+    /**
+     * A name that has to be a plain identifier: not a string literal, and not a keyword
+     * PostgreSQL reserves. A channel, a cursor and a prepared statement are all named this way,
+     * and reading them with the general identifier reader accepted {@code LISTEN 'ch'} and
+     * {@code DECLARE select CURSOR} alike.
+     */
+    protected String readObjectName() {
+        Token t = peek();
+        if (t.type() == TokenType.STRING_LITERAL || t.type() == TokenType.DOLLAR_STRING_LITERAL) {
+            throw ParseException.saying("syntax error at or near \"'" + t.value() + "'\"", t, "42601");
+        }
+        return readColumnName();
+    }
+
+    /** Nothing may follow a statement but its semicolon. */
+    protected void expectEndOfStatement() {
+        if (isAtEnd()) return;
+        Token t = peek();
+        if (t.type() == TokenType.SEMICOLON || t.type() == TokenType.EOF) return;
+        throw ParseException.saying("syntax error at or near \"" + t.raw() + "\"", t, "42601");
+    }
+
+
 
     protected String readColumnName() {
         Token t = peek();

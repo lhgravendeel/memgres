@@ -885,15 +885,32 @@ class CatalogMetadataFunctions {
             // name up meant two schemas' views of one name answered with whichever came first.
             Database.ViewDef view = executor.database.getView(viewName);
             if (view != null && view.query() != null) {
-                String sql = view.sourceSQL() != null ? view.sourceSQL()
-                        : (minimizeParens ? SqlUnparser.toSqlPretty(view.query())
-                                          : SqlUnparser.toSql(view.query()));
+                String sql;
+                if (relationsAreVisible(view)) {
+                    sql = view.sourceSQL() != null ? view.sourceSQL()
+                            : (minimizeParens ? SqlUnparser.toSqlPretty(view.query())
+                                              : SqlUnparser.toSql(view.query()));
+                } else {
+                    // Nothing the body names would be found by its bare name from here, so the
+                    // definition is written with the relations qualified.
+                    sql = SqlUnparser.toSqlQualified(view.query(), view.schemaName(), minimizeParens);
+                }
                 return SqlUnparser.prettyViewDef(sql, wrapColumn) + ";";
             }
         }
         // An OID that names no view, or names a relation that is not one, has no definition:
         // PostgreSQL answers NULL, not an empty query text.
         return null;
+    }
+
+    /** Whether the schema a view's relations live in is on the reader's search path. */
+    private boolean relationsAreVisible(Database.ViewDef view) {
+        if (executor.session == null) return true;
+        String schema = view.schemaName() == null ? "public" : view.schemaName();
+        for (String onPath : executor.session.getExistingSearchPath(true)) {
+            if (schema.equalsIgnoreCase(onPath)) return true;
+        }
+        return false;
     }
 
     private Object evalPgGetSerialSequence(FunctionCallExpr fn, RowContext ctx) {

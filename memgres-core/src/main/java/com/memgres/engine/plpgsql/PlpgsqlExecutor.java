@@ -239,7 +239,11 @@ public class PlpgsqlExecutor {
         }
         // PG compiles a DO block before running it, so a declaration it rejects never reaches a
         // statement — nothing the block would have done takes effect.
-        PlpgsqlBodyValidator.validate(astExecutor, block, null);
+        // A DO block is compiled as a function returning void: RETURN takes no value in one,
+        // and RETURN NEXT and RETURN QUERY have no set to add to. Compiling it with no routine
+        // at all skipped every one of those checks.
+        PlpgsqlBodyValidator.validate(astExecutor, block, null,
+                new PlpgsqlBodyValidator.Routine(false, "void", false));
         // DO blocks are anonymous code blocks that support transaction control (PG 11+)
         this.isProcedureExecution = true;
         this.currentFunctionName = null;

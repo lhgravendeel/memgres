@@ -208,20 +208,34 @@ class Round16QueryFeaturesTest {
                 "Expected WAL requires ANALYZE error, got: " + ex.getMessage());
     }
 
+    /**
+     * EXPLAIN (SETTINGS) names the settings that can change a plan and that this session moved
+     * off their default. A session that has changed none of them gets no Settings line at all.
+     */
     @Test
-    void explain_settings_option_parses_and_emits_settings_block() throws SQLException {
-        boolean sawSettings = false;
-        try (Statement s = conn.createStatement();
-             ResultSet rs = s.executeQuery("EXPLAIN (SETTINGS) SELECT 1")) {
-            while (rs.next()) {
-                String line = rs.getString(1);
-                if (line != null && line.toLowerCase().contains("settings")) {
-                    sawSettings = true;
-                }
+    void explain_settings_names_only_what_was_changed() throws SQLException {
+        assertNull(settingsLine(), "nothing was changed, so nothing should be listed");
+        try (Statement s = conn.createStatement()) {
+            s.execute("SET enable_seqscan = off");
+        }
+        try {
+            assertEquals("Settings: enable_seqscan = 'off'", settingsLine());
+        } finally {
+            try (Statement s = conn.createStatement()) {
+                s.execute("RESET enable_seqscan");
             }
         }
-        assertTrue(sawSettings,
-                "EXPLAIN (SETTINGS) must emit a Settings: line when non-defaults present");
+    }
+
+    private String settingsLine() throws SQLException {
+        try (Statement s = conn.createStatement();
+             ResultSet rs = s.executeQuery("EXPLAIN (SETTINGS, COSTS OFF) SELECT 1")) {
+            while (rs.next()) {
+                String line = rs.getString(1);
+                if (line != null && line.startsWith("Settings:")) return line;
+            }
+        }
+        return null;
     }
 
     // =========================================================================

@@ -161,201 +161,82 @@ class DdlAdminExecutor {
 
     // ---- EXPLAIN ----
 
+    /**
+     * EXPLAIN: analyse the statement, build the plan tree, and print it.
+     *
+     * <p>The statement is read but not run unless ANALYZE was asked for, so a cursor is not left
+     * open and a table is not emptied by asking what the plan would be.
+     */
     QueryResult executeExplain(ExplainStmt stmt) {
         if (stmt.statement() == null) {
             throw new MemgresException("syntax error at end of input", "42601");
         }
-        List<String> planLines = new ArrayList<>();
-        long startTime = 0;
-        QueryResult actualResult = null;
 
-        if (stmt.statement() instanceof SelectStmt && ((SelectStmt) stmt.statement()).from() != null) {
-            SelectStmt sel = (SelectStmt) stmt.statement();
-            HashSet<String> cteNames = new HashSet<String>();
-            if (sel.withClauses() != null) {
-                for (SelectStmt.CommonTableExpr cte : sel.withClauses()) {
-                    cteNames.add(cte.name().toLowerCase());
-                }
-            }
-            for (SelectStmt.FromItem fromItem : sel.from()) {
-                validateFromItemExists(fromItem, cteNames);
-            }
-        }
+        // Parse analysis first: a relation or column that is not there is what a reader hears
+        // about before a misspelled option, exactly as PostgreSQL orders the two.
+        new StatementAnalyzer(executor).analyze(stmt.statement());
 
         if (stmt.deferredOptionError() != null) {
             String sqlState = stmt.deferredOptionSqlState() != null ? stmt.deferredOptionSqlState() : "22023";
             throw new MemgresException(stmt.deferredOptionError(), sqlState);
         }
 
-        // PG: EXPLAIN (WAL) requires ANALYZE
-        if (stmt.wal && !stmt.analyze) {
-            throw new MemgresException("EXPLAIN option WAL requires ANALYZE", "22023");
-        }
-
+        long startTime = 0;
+        QueryResult actualResult = null;
         if (stmt.analyze()) {
             startTime = System.nanoTime();
             actualResult = executor.executeStatement(stmt.statement());
         }
 
-        buildPlanLines(stmt.statement(), planLines, 0, stmt.analyze(), startTime, actualResult, stmt.costs(), stmt.verbose());
-        appendExplainExtras(stmt, planLines);
-
-        if (planLines.isEmpty()) {
-            planLines.add("Memgres in-memory scan");
-        }
+        ExplainPlan plan = new ExplainPlanBuilder(executor, stmt.verbose()).build(stmt.statement());
 
         List<Column> planCols = Cols.listOf(new Column("QUERY PLAN", DataType.TEXT, true, false, null));
         if (stmt.format().equals("JSON")) {
-            StringBuilder json = new StringBuilder("[\n  {\n    \"Plan\": {\n");
-            json.append("      \"Node Type\": \"").append(planLines.get(0).trim()).append("\"\n");
-            json.append("    }\n  }\n]");
-            return QueryResult.select(planCols, Collections.singletonList(new Object[]{json.toString()}));
+            return QueryResult.select(planCols,
+                    Collections.singletonList(new Object[]{plan.renderJson(stmt.costs())}));
         }
         if (stmt.format().equals("XML")) {
-            StringBuilder xml = new StringBuilder("<explain xmlns=\"http://www.postgresql.org/2009/explain\">\n");
-            xml.append("  <Query>\n    <Plan>\n      <Node-Type>").append(planLines.get(0).trim())
-                    .append("</Node-Type>\n    </Plan>\n  </Query>\n</explain>");
-            return QueryResult.select(planCols, Collections.singletonList(new Object[]{xml.toString()}));
+            return QueryResult.select(planCols,
+                    Collections.singletonList(new Object[]{plan.renderXml(stmt.costs())}));
         }
         if (stmt.format().equals("YAML")) {
-            StringBuilder yaml = new StringBuilder("- Plan:\n");
-            yaml.append("    Node Type: \"").append(planLines.get(0).trim()).append("\"\n");
-            return QueryResult.select(planCols, Collections.singletonList(new Object[]{yaml.toString()}));
+            return QueryResult.select(planCols,
+                    Collections.singletonList(new Object[]{plan.renderYaml(stmt.costs())}));
         }
 
-        List<Column> cols = Cols.listOf(new Column("QUERY PLAN", DataType.TEXT, true, false, null));
+        List<String> planLines = new ArrayList<>();
+        plan.renderText(planLines, 0, rootSuffix(stmt, startTime, actualResult));
+        appendExplainExtras(stmt, planLines, startTime);
+
         List<Object[]> rows = new ArrayList<>();
-        if (!stmt.costs() && !stmt.analyze()) {
-            rows.add(new Object[]{String.join("\n", planLines)});
-        } else {
-            for (String line : planLines) {
-                rows.add(new Object[]{line});
-            }
-        }
-        return QueryResult.select(cols, rows);
+        for (String line : planLines) rows.add(new Object[]{line});
+        return QueryResult.select(planCols, rows);
     }
 
-    private void validateFromItemExists(SelectStmt.FromItem fromItem, Set<String> cteNames) {
-        if (fromItem instanceof SelectStmt.TableRef) {
-            SelectStmt.TableRef tr = (SelectStmt.TableRef) fromItem;
-            if (tr.schema() == null && cteNames.contains(tr.table().toLowerCase())) return;
-            String schema = tr.schema() != null ? tr.schema() : executor.defaultSchema();
-            try {
-                executor.resolveTable(schema, tr.table());
-            } catch (MemgresException e) {
-                throw new MemgresException("relation \"" + tr.table() + "\" does not exist", "42P01");
-            }
-        } else if (fromItem instanceof SelectStmt.JoinFrom) {
-            SelectStmt.JoinFrom jf = (SelectStmt.JoinFrom) fromItem;
-            validateFromItemExists(jf.left(), cteNames);
-            validateFromItemExists(jf.right(), cteNames);
-        }
-    }
-
-    private void buildPlanLines(Statement stmt, List<String> lines, int indent, boolean analyze,
-                                 long startTime, QueryResult actualResult, boolean costs, boolean verbose) {
-        String prefix = Strs.repeat("  ", indent);
-        String arrow = indent > 0 ? "->  " : "";
-
-        if (stmt instanceof SelectStmt) {
-            SelectStmt sel = (SelectStmt) stmt;
-            if (sel.from() == null || sel.from().isEmpty()) {
-                String resultLine = prefix + arrow + "Result";
-                if (costs || analyze) {
-                    resultLine += "  (cost=0.00..0.01 rows=1 width=4)";
-                }
-                lines.add(resultLine);
-                if (verbose) {
-                    lines.add(prefix + "  Output: (...)");
-                }
-            } else {
-                boolean hasJoin = sel.from().stream().anyMatch(f -> f instanceof SelectStmt.JoinFrom);
-                if (hasJoin) {
-                    lines.add(prefix + arrow + "Nested Loop");
-                } else if (sel.groupBy() != null && !sel.groupBy().isEmpty()) {
-                    lines.add(prefix + arrow + "HashAggregate");
-                } else {
-                    String tableName = sel.from().get(0) instanceof SelectStmt.TableRef ? ((SelectStmt.TableRef) sel.from().get(0)).table() : "subquery";
-                    int rowCount = 0;
-                    try {
-                        Table t = executor.resolveTable("public", tableName);
-                        rowCount = t.getRows().size();
-                    } catch (Exception e) { /* ignore */ }
-                    String scanLine = prefix + arrow + "Seq Scan on " + tableName;
-                    if (analyze && actualResult != null) {
-                        double elapsed = (System.nanoTime() - startTime) / 1_000_000.0;
-                        int actualRows = actualResult.getRows().size();
-                        scanLine += String.format("  (cost=0.00..1.%02d rows=%d width=0) (actual time=%.3f..%.3f rows=%d loops=1)",
-                                rowCount, rowCount, elapsed, elapsed, actualRows);
-                    } else if (costs) {
-                        scanLine += "  (cost=0.00..1.0" + String.format("%02d", rowCount) + " rows=" + rowCount + " width=0)";
-                    }
-                    lines.add(scanLine);
-                }
-                if (verbose) {
-                    // Output columns line for EXPLAIN VERBOSE
-                    if (sel.targets != null && !sel.targets.isEmpty()) {
-                        StringBuilder outputCols = new StringBuilder(prefix + "  Output: ");
-                        for (int i = 0; i < sel.targets.size(); i++) {
-                            if (i > 0) outputCols.append(", ");
-                            SelectStmt.SelectTarget st = sel.targets.get(i);
-                            if (st.alias() != null) {
-                                outputCols.append(st.alias());
-                            } else {
-                                outputCols.append(SqlUnparser.exprToSql(st.expr()));
-                            }
-                        }
-                        lines.add(outputCols.toString());
-                    } else {
-                        lines.add(prefix + "  Output: (...)");
-                    }
-                }
-                if (sel.where() != null) {
-                    lines.add(prefix + "  Filter: (...)");
-                    if (analyze && actualResult != null) {
-                        lines.add(prefix + "  Rows Removed by Filter: 0");
-                    }
-                }
-                if (analyze && !verbose) {
-                    lines.add(prefix + "  Output: (...)");
-                }
-            }
-            if (sel.orderBy() != null && !sel.orderBy().isEmpty()) {
-                if (analyze && actualResult != null) {
-                    double elapsed = (System.nanoTime() - startTime) / 1_000_000.0;
-                    lines.add(prefix + "Sort");
-                    lines.add(prefix + "  Sort Key: (...)");
-                    lines.add(prefix + String.format("  Sort Method: quicksort  (actual time=%.3f..%.3f rows=%d loops=1)",
-                            elapsed, elapsed, actualResult.getRows().size()));
-                } else {
-                    lines.add(prefix + "  Sort Key: (...)");
-                }
-            }
-            if (sel.limit() != null) {
-                lines.add(prefix + "  Limit: (...)");
-            }
-        } else if (stmt instanceof InsertStmt) {
-            InsertStmt ins = (InsertStmt) stmt;
-            lines.add(prefix + arrow + "Insert on " + ins.table());
-        } else if (stmt instanceof UpdateStmt) {
-            UpdateStmt upd = (UpdateStmt) stmt;
-            lines.add(prefix + arrow + "Update on " + upd.table());
-        } else if (stmt instanceof DeleteStmt) {
-            DeleteStmt del = (DeleteStmt) stmt;
-            lines.add(prefix + arrow + "Delete on " + del.table());
-        } else {
-            lines.add(prefix + arrow + "Memgres in-memory operation");
-        }
-
-        if (analyze && actualResult != null) {
+    /**
+     * What follows the top node's name: its estimated cost, and under ANALYZE what it actually did.
+     * PostgreSQL prints the timings only when TIMING is on, and the row count always.
+     */
+    private String rootSuffix(ExplainStmt stmt, long startTime, QueryResult actualResult) {
+        StringBuilder sb = new StringBuilder();
+        if (stmt.costs()) sb.append("  (cost=0.00..0.01 rows=1 width=4)");
+        if (stmt.analyze()) {
+            long rows = actualResult == null || actualResult.getRows() == null
+                    ? 0 : actualResult.getRows().size();
             double elapsed = (System.nanoTime() - startTime) / 1_000_000.0;
-            lines.add(String.format("Planning Time: %.3f ms", elapsed * 0.1));
-            lines.add(String.format("Execution Time: %.3f ms", elapsed));
+            sb.append(' ');
+            if (stmt.timing) {
+                sb.append(String.format(Locale.ROOT, "(actual time=%.3f..%.3f rows=%d.00 loops=1)",
+                        elapsed, elapsed, rows));
+            } else {
+                sb.append(String.format(Locale.ROOT, "(actual rows=%d.00 loops=1)", rows));
+            }
         }
+        return sb.length() == 0 ? null : sb.toString();
     }
 
-    /** Append stub lines for PG 16+/17+ EXPLAIN options (MEMORY, SERIALIZE, BUFFERS, WAL). */
-    private void appendExplainExtras(ExplainStmt stmt, List<String> planLines) {
+    /** The lines that follow the plan: buffers, WAL, memory, settings and the summary totals. */
+    private void appendExplainExtras(ExplainStmt stmt, List<String> planLines, long startTime) {
         if (stmt.buffers && stmt.analyze) {
             planLines.add("Buffers: shared hit=0");
         }
@@ -363,14 +244,37 @@ class DdlAdminExecutor {
             planLines.add("WAL: records=0 fpi=0 bytes=0");
         }
         if (stmt.memory()) {
-            planLines.add("Memory: used=0kB  allocated=0kB");
-        }
-        if (stmt.serialize()) {
-            planLines.add("Serialization: output=0kB  format=text");
+            planLines.add("Planning:");
+            planLines.add("  Memory: used=0kB  allocated=0kB");
         }
         if (stmt.settings) {
-            planLines.add("Settings: (none)");
+            String shown = changedSettings();
+            if (shown != null) planLines.add("Settings: " + shown);
         }
+        if (stmt.serialize()) {
+            planLines.add("Serialization: output=0kB  format=" + stmt.serializeMode);
+        }
+        if (stmt.summary) {
+            double elapsed = startTime == 0 ? 0.0 : (System.nanoTime() - startTime) / 1_000_000.0;
+            planLines.add(String.format(Locale.ROOT, "Planning Time: %.3f ms", elapsed * 0.1));
+            if (stmt.analyze) {
+                planLines.add(String.format(Locale.ROOT, "Execution Time: %.3f ms", elapsed));
+            }
+        }
+    }
+
+    /**
+     * The settings this session changed from their built-in defaults, as EXPLAIN (SETTINGS) lists
+     * them. Naming none of them at all was a line PostgreSQL never prints.
+     */
+    private String changedSettings() {
+        GucSettings gucs = executor.session == null ? null : executor.session.getGucSettings();
+        if (gucs == null) return null;
+        List<String> shown = new ArrayList<>();
+        for (String name : gucs.changedFromDefault()) {
+            shown.add(name + " = '" + gucs.getWithUnit(name) + "'");
+        }
+        return shown.isEmpty() ? null : String.join(", ", shown);
     }
 
     // ---- LISTEN / NOTIFY / UNLISTEN ----

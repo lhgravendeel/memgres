@@ -489,7 +489,7 @@ public class PlpgsqlParser {
                 case "EXECUTE":
                     return parseExecute();
                 case "NULL": {
-                    advance(); match(TokenType.SEMICOLON); return new PlpgsqlStatement.NullStmt(); 
+                    advance(); expectSemicolon(); return new PlpgsqlStatement.NullStmt(); 
                 }
                 case "BEGIN":
                     return parseBlock();
@@ -1366,7 +1366,7 @@ public class PlpgsqlParser {
         // PG accepts = as a synonym for := everywhere an assignment is written
         if (match(TokenType.COLON_EQUALS) || match(TokenType.EQUALS)) {
             String value = collectUntilSemicolon();
-            match(TokenType.SEMICOLON);
+            expectSemicolon();
             if (sawSubscript) {
                 return new PlpgsqlStatement.SubscriptAssignment(baseName, steps, value);
             }
@@ -1418,6 +1418,21 @@ public class PlpgsqlParser {
     }
 
     // ---- Token collecting helpers ----
+
+    /**
+     * Every statement in a PL/pgSQL body ends with a semicolon, and the one that does not is a
+     * syntax error where it runs out — at the word that could not follow it, or at the end of the
+     * input when nothing did. Treating the terminator as optional let a block missing one compile
+     * and run, so text PostgreSQL refuses did whatever the reader guessed it meant.
+     */
+    private void expectSemicolon() {
+        if (match(TokenType.SEMICOLON)) return;
+        Token t = peek();
+        if (isAtEnd() || t.type() == TokenType.EOF) {
+            throw new MemgresException("syntax error at end of input", "42601");
+        }
+        throw new MemgresException("syntax error at or near \"" + t.raw() + "\"", "42601");
+    }
 
     private String collectUntilSemicolon() {
         StringBuilder sb = new StringBuilder();

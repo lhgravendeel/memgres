@@ -23,6 +23,12 @@ public final class ExplainStmt implements Statement {
     public final boolean buffers;
     public final boolean wal;
     public boolean settings;
+    /** Whether per-node timings are collected; defaults to whether ANALYZE was asked for. */
+    public boolean timing;
+    /** Whether the planning and execution totals are printed; defaults the same way. */
+    public boolean summary;
+    /** How the rows are serialised for the client: {@code none}, {@code text} or {@code binary}. */
+    public String serializeMode = "none";
 
     public ExplainStmt(
             Statement statement,

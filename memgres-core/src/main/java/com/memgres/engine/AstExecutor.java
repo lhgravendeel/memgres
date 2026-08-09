@@ -24,6 +24,14 @@ public class AstExecutor {
 
     final Database database;
     final Session session; // null when no session
+    /**
+     * Where a select leaves the stored rows each of its answers came from, when someone has asked
+     * for them. DECLARE CURSOR asks, because WHERE CURRENT OF names a row and not a set of values:
+     * a cursor over {@code SELECT nm FROM t ORDER BY id DESC} is on one particular row of t, and
+     * two rows with the same nm are still two rows.
+     */
+    List<List<RowContext.TableBinding>> cursorRowProvenance;
+
     final SystemCatalog systemCatalog;
     public SystemCatalog getSystemCatalog() { return systemCatalog; }
     final ArrayOperationHandler arrayOperationHandler = new ArrayOperationHandler(this);

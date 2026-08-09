@@ -266,6 +266,8 @@ class DdlFunctionParser {
             } while (parser.match(TokenType.COMMA));
         }
         parser.expect(TokenType.RIGHT_PAREN);
+        // A CALL takes no clause after its arguments: no RETURNING, and nothing else either.
+        parser.expectEndOfStatement();
         return new CallStmt(name, args);
     }
 

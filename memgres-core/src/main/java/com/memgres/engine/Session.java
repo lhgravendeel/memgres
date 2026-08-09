@@ -302,6 +302,10 @@ public class Session {
         private final boolean explicitNoScroll;
         private final java.time.OffsetDateTime creationTime;
         private boolean committed; // true after the declaring transaction commits
+        /** The stored rows each answer came from, when the query was a scan that has them. */
+        private List<List<RowContext.TableBinding>> provenance;
+        /** Whether the query was written FOR UPDATE or FOR SHARE, which changes what is refused. */
+        private boolean locking;
 
         public CursorState(String name, List<Column> columns, List<Object[]> rows,
                            String queryText, boolean holdable, boolean binary, boolean scrollable,
@@ -346,6 +350,39 @@ public class Session {
         }
 
         public void setPosition(int pos) { this.position = pos; }
+
+        public void setProvenance(List<List<RowContext.TableBinding>> rowProvenance) {
+            this.provenance = rowProvenance;
+        }
+
+        public void setLocking(boolean forUpdateOrShare) { this.locking = forUpdateOrShare; }
+
+        public boolean isLocking() { return locking; }
+
+        /**
+         * The stored row of {@code table} this cursor is on, or null when its query is not a scan
+         * that reads that table. PostgreSQL calls a cursor that reads the table directly a simply
+         * updatable scan of it, and only such a cursor can be named by WHERE CURRENT OF.
+         */
+        public Object[] currentRowOf(Table table) {
+            if (provenance == null || position < 0 || position >= provenance.size()) return null;
+            for (RowContext.TableBinding binding : provenance.get(position)) {
+                if (binding.row == null) continue;
+                if (binding.table == table || binding.sourceTable == table) return binding.row;
+            }
+            return null;
+        }
+
+        /** Whether the query behind this cursor reads {@code table} at all. */
+        public boolean scans(Table table) {
+            if (provenance == null) return false;
+            for (List<RowContext.TableBinding> bindings : provenance) {
+                for (RowContext.TableBinding binding : bindings) {
+                    if (binding.table == table || binding.sourceTable == table) return true;
+                }
+            }
+            return false;
+        }
     }
 
     // SSI: tables read and written by this serializable transaction (for write-skew detection)
@@ -656,6 +693,22 @@ public class Session {
         database.clearUncommittedObjects(this);
         // M13: snapshot session GUC overrides so plain SET can be rolled back
         gucSessionSnapshot = gucSettings.snapshotSessionOverrides();
+        // LISTEN is undone by ROLLBACK the way any other statement is: a channel subscribed to in
+        // a transaction that did not commit was never subscribed to.
+        listenSnapshot = new LinkedHashSet<>(database.getNotificationManager().getListeningChannels(this));
+    }
+
+    /** The channels this session was listening to when the transaction began. */
+    private Set<String> listenSnapshot;
+
+    /** Put back the channels the session was listening to before work that did not stand. */
+    private void restoreListens(Set<String> snapshot) {
+        if (snapshot == null) return;
+        NotificationManager manager = database.getNotificationManager();
+        for (String channel : manager.getListeningChannels(this)) {
+            if (!snapshot.contains(channel)) manager.unlisten(this, channel);
+        }
+        for (String channel : snapshot) manager.listen(this, channel);
     }
 
     /** Returns the transaction start timestamp (frozen for now()/current_timestamp stability), or null if not in a transaction. */
@@ -781,6 +834,9 @@ public class Session {
             gucSettings.restoreSessionOverrides(gucSessionSnapshot);
             gucSessionSnapshot = null;
         }
+        restoreSessionIdentity();
+        restoreListens(listenSnapshot);
+        listenSnapshot = null;
         // Reset per-transaction GUCs (transaction_read_only, transaction_isolation)
         gucSettings.reset("transaction_read_only");
         gucSettings.reset("transaction_isolation");
@@ -901,6 +957,9 @@ public class Session {
         final MvccSnapshot mvcc;
         /** The cursors that existed when the savepoint was taken; later ones die with it. */
         final Set<String> cursorNames;
+        /** The channels subscribed to, and the advisory locks held, when it was taken. */
+        Set<String> listens;
+        Map<Database.AdvisoryLockId, int[]> advisoryHolds;
 
         SavepointFrame(String name, int undoPosition, int notificationCount,
                        int deferredCheckCount, long lockMark,
@@ -966,13 +1025,25 @@ public class Session {
         internalSavepoint(name);
     }
 
+    /**
+     * Put back the user the session speaks as, after its settings have been.
+     *
+     * <p>SET SESSION AUTHORIZATION changes a setting and a field beside it. The setting was on the
+     * undo log and the field was not, so a rolled-back transaction left the session still
+     * answering current_user with the role it had given up.
+     */
+    private void restoreSessionIdentity() {
+        String authorized = gucSettings.get("session_authorization");
+        if (authorized != null && !authorized.isEmpty()) setConnectingUser(authorized);
+    }
+
     /** A savepoint the engine takes for itself, such as a PL/pgSQL exception block. */
     public void internalSavepoint(String name) {
         if (status != TransactionStatus.IN_TRANSACTION) {
             // Implicit BEGIN
             begin();
         }
-        savepoints.add(new SavepointFrame(name, undoLog.size(),
+        SavepointFrame frame = new SavepointFrame(name, undoLog.size(),
                 deferredNotifications.size(), deferredFkChecks.size(),
                 database.currentRowLockMark(),
                 getGucSettings().snapshotSessionOverrides(),
@@ -980,7 +1051,10 @@ public class Session {
                 // Snapshot current MVCC maps so we can restore on ROLLBACK TO SAVEPOINT.
                 // Deep-copy the outer maps; inner collections are identity-based.
                 MvccSnapshot.capture(uncommittedInserts, uncommittedUpdates, uncommittedDeletes),
-                new LinkedHashSet<>(cursors.keySet())));
+                new LinkedHashSet<>(cursors.keySet()));
+        frame.listens = new LinkedHashSet<>(database.getNotificationManager().getListeningChannels(this));
+        frame.advisoryHolds = database.advisoryXactHolds(this);
+        savepoints.add(frame);
     }
 
     /** Snapshot of MVCC tracking maps at savepoint creation time. */
@@ -1080,6 +1154,9 @@ public class Session {
         if (frame.localGucs != null) {
             getGucSettings().restoreTransactionOverrides(frame.localGucs);
         }
+        restoreSessionIdentity();
+        restoreListens(frame.listens);
+        database.restoreAdvisoryXactHolds(this, frame.advisoryHolds);
 
         // Truncate deferred notifications to the savepoint's count
         if (frame.notificationCount < deferredNotifications.size()) {
@@ -1349,6 +1426,39 @@ public class Session {
      * Returns the full effective search path as an ordered list of schema names.
      * Matches PG's current_schemas() behavior.
      */
+    /**
+     * The search path as {@code current_schemas} reports it: the schemas that are there.
+     *
+     * <p>A path may name a schema that does not exist — nothing stops {@code SET search_path} from
+     * naming one — and PostgreSQL simply does not look in it, so it is not part of the path either.
+     * Reporting the names as written listed a schema no name could ever resolve in, and adding
+     * "public" whether or not the path asked for it reported one the reader had excluded.
+     */
+    public List<String> getExistingSearchPath(boolean includeImplicit) {
+        List<String> result = new ArrayList<>();
+        if (includeImplicit) result.add("pg_catalog");
+        String searchPath = gucSettings.get("search_path");
+        if (searchPath != null) {
+            for (String sp : searchPath.split(",")) {
+                String s = sp.trim().replace("\"", "").replace("'", "");
+                if (s.isEmpty()) continue;
+                if (s.equals("$user")) s = getConnectingUser();
+                if (s == null || result.contains(s)) continue;
+                if ("pg_catalog".equals(s) || "information_schema".equals(s)
+                        || database.getSchema(s) != null) {
+                    result.add(s);
+                }
+            }
+        }
+        return result;
+    }
+
+    /** The first schema of the path that exists, or null when none of them does. */
+    public String getReportedSchema() {
+        List<String> path = getExistingSearchPath(false);
+        return path.isEmpty() ? null : path.get(0);
+    }
+
     public List<String> getEffectiveSearchPath(boolean includeImplicit) {
         List<String> result = new ArrayList<>();
         if (includeImplicit) result.add("pg_catalog");
@@ -1516,6 +1626,17 @@ public class Session {
 
     public void exitRoutine() {
         if (routineDepth > 0) routineDepth--;
+    }
+
+    /**
+     * Whether a function, procedure or DO block is on the call chain.
+     *
+     * <p>Several statements cannot run from one — VACUUM and DISCARD among them — and the gates
+     * that refuse them asked whether a transaction was open instead, which a DO block's implicit
+     * transaction leaves false. So they ran from inside a routine and PostgreSQL refuses them.
+     */
+    public boolean isInRoutine() {
+        return routineDepth > 0;
     }
 
     public void enterTriggerCall() {

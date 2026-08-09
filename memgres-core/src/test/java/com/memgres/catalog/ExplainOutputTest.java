@@ -398,26 +398,25 @@ class ExplainOutputTest {
 
     /**
      * diff 55a: EXPLAIN (ANALYZE maybe), a non-boolean value for ANALYZE.
-     * PG gives 22023 for a non-boolean option value.
+     * A word that is not one of the four boolean spellings is a syntax error, not a bad value.
      */
     @Test
-    void explain_analyze_non_boolean_gives_22023() throws SQLException {
+    void explain_analyze_non_boolean_is_a_syntax_error() throws SQLException {
         SQLException ex = assertThrows(SQLException.class,
                 () -> exec("EXPLAIN (ANALYZE maybe) SELECT * FROM admin_t WHERE id = 1"));
-        assertEquals("22023", ex.getSQLState(),
-                "Non-boolean ANALYZE value should give 22023, got " + ex.getSQLState());
+        assertEquals("42601", ex.getSQLState(),
+                "A non-boolean ANALYZE value is a syntax error, got " + ex.getSQLState());
     }
 
     /**
-     * diff 55b: EXPLAIN (BUFFERS 123), integer used where boolean expected.
-     * PG gives 22023 for a non-boolean BUFFERS option.
+     * diff 55b: EXPLAIN (BUFFERS 123), a number other than 0 or 1 where a boolean was expected.
      */
     @Test
-    void explain_buffers_non_boolean_gives_22023() throws SQLException {
+    void explain_buffers_non_boolean_is_a_syntax_error() throws SQLException {
         SQLException ex = assertThrows(SQLException.class,
                 () -> exec("EXPLAIN (BUFFERS 123) SELECT * FROM admin_t WHERE id = 1"));
-        assertEquals("22023", ex.getSQLState(),
-                "Non-boolean BUFFERS value should give 22023, got " + ex.getSQLState());
+        assertEquals("42601", ex.getSQLState(),
+                "A non-boolean BUFFERS value is a syntax error, got " + ex.getSQLState());
     }
 
     // ========================================================================

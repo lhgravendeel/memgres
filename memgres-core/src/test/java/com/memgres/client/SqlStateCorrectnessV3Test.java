@@ -914,11 +914,11 @@ class SqlStateCorrectnessV3Test {
         assertSqlState("22023", "EXPLAIN (FORMAT yamlish) SELECT 1");
     }
 
-    @Test void explain_analyze_maybe_gives_22023() {
-        assertSqlState("22023", "EXPLAIN (ANALYZE maybe) SELECT 1");
+    @Test void explain_analyze_maybe_is_a_syntax_error() {
+        assertSqlState("42601", "EXPLAIN (ANALYZE maybe) SELECT 1");
     }
 
-    @Test void explain_buffers_numeric_gives_22023() {
-        assertSqlState("22023", "EXPLAIN (BUFFERS 123) SELECT 1");
+    @Test void explain_buffers_numeric_is_a_syntax_error() {
+        assertSqlState("42601", "EXPLAIN (BUFFERS 123) SELECT 1");
     }
 }

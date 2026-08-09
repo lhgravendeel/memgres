@@ -177,6 +177,11 @@ class SessionExecutor {
         }
 
         if (name.equals("do_block")) {
+            // Only a language with an inline handler can carry a DO block, and only a language
+            // the catalogue has at all can be named. Discarding the word ran every block as
+            // PL/pgSQL, whatever it said it was written in.
+            String language = stmt.auxiliary() == null ? "plpgsql" : stmt.auxiliary();
+            requireInlineLanguage(language);
             String body = stmt.value();
             if (body != null && !Strs.isBlank(body)) {
                 executePlpgsqlBlock(body);
@@ -250,6 +255,9 @@ class SessionExecutor {
                     if (!param.contains(".") && !guc.isKnown(param)) {
                         throw new MemgresException("unrecognized configuration parameter \"" + param + "\"", "42704");
                     }
+                    // Putting a parameter back to its default is still changing it, so a preset
+                    // the server fixed at startup refuses RESET exactly as it refuses SET.
+                    GucSettings.checkAssignable(param, null);
                     // A transaction-scoped setting has no session value to fall back to: it is
                     // derived afresh from its default_ counterpart when a transaction starts, so
                     // there is nothing for RESET to restore and PG says so.
@@ -272,6 +280,7 @@ class SessionExecutor {
         }
 
         if (name.equals("max_prepared_transactions")) {
+            GucSettings.checkAssignable(name, stmt.value());
             try {
                 int val = Integer.parseInt(stmt.value());
                 executor.database.setMaxPreparedTransactions(val);
@@ -284,16 +293,8 @@ class SessionExecutor {
 
         if (name.equals("session_authorization")) {
             String user = stmt.value();
-            if (user != null && !user.equalsIgnoreCase("DEFAULT")) {
-                // Validate that the role/user exists (PG 22023 for nonexistent)
-                if (!executor.database.getRoles().containsKey(user.toLowerCase())
-                        && !user.equalsIgnoreCase("test") && !user.equalsIgnoreCase("postgres")
-                        && !user.equalsIgnoreCase("memgres")) {
-                    String connectingUser = executor.session != null ? executor.session.getConnectingUser() : null;
-                    if (connectingUser == null || !user.equalsIgnoreCase(connectingUser)) {
-                        throw new MemgresException("invalid value for parameter \"session_authorization\": \"" + user + "\"", "22023");
-                    }
-                }
+            if (user != null && !user.equalsIgnoreCase("DEFAULT") && !user.equalsIgnoreCase("NONE")) {
+                requireRole(user, "session_authorization");
                 if (guc != null) {
                     guc.set("session_authorization", user);
                     // SET SESSION AUTHORIZATION also resets ROLE to the new session user
@@ -323,12 +324,7 @@ class SessionExecutor {
                     && !role.equalsIgnoreCase("current_user") && !role.equalsIgnoreCase("session_user")) {
                 String sessionUser = guc != null ? guc.get("session_authorization") : "test";
                 if (sessionUser == null) sessionUser = "test";
-                // Check if role exists
-                if (!executor.database.getRoles().containsKey(role.toLowerCase())
-                        && !role.equalsIgnoreCase(sessionUser)
-                        && !role.equalsIgnoreCase("test") && !role.equalsIgnoreCase("postgres")) {
-                    throw new MemgresException("invalid value for parameter \"role\": \"" + role + "\"", "22023");
-                }
+                requireRole(role, "role");
                 // Superusers can SET ROLE to any role without membership.
                 if (!role.equalsIgnoreCase(sessionUser)
                         && !sessionUser.equalsIgnoreCase("postgres")
@@ -389,6 +385,9 @@ class SessionExecutor {
         }
 
         if (name.equals("analyze") || name.equals("vacuum")) {
+            if (name.equals("vacuum") && executor.session != null && executor.session.isInRoutine()) {
+                throw new MemgresException("VACUUM cannot be executed from a function", "25001");
+            }
             // VACUUM cannot run inside a transaction block
             if (name.equals("vacuum") && executor.session != null && executor.session.isInTransaction()) {
                 throw new MemgresException("VACUUM cannot run inside a transaction block", "25001");
@@ -1306,6 +1305,15 @@ class SessionExecutor {
             session.getGucSettings().set("transaction_deferrable", def);
         }
         if (ro != null) {
+            // A transaction may be made read-only at any point, but a read-only one cannot be
+            // made read-write again once it has run a query: that would change the mode a
+            // statement already ran under. Only isolation and deferrability were guarded, so the
+            // one direction that does matter went through silently.
+            boolean currentlyReadOnly = "on".equals(session.getGucSettings().get("transaction_read_only"));
+            if ("off".equals(ro) && currentlyReadOnly && session.hasRunQueryInTransaction()) {
+                throw new MemgresException(
+                        "transaction read-write mode must be set before any query", "25001");
+            }
             session.getGucSettings().set("transaction_read_only", ro);
         }
     }
@@ -1349,6 +1357,51 @@ class SessionExecutor {
         return style + ", " + order;
     }
 
+    /**
+     * A role named by SET ROLE or SET SESSION AUTHORIZATION has to be one that exists.
+     *
+     * <p>The complaint was that the value was invalid for the parameter, which is what PostgreSQL
+     * says for a parameter whose value is out of range; for a role it names the role that is not
+     * there. The check also waved through three names spelled into the code — test, postgres and
+     * memgres — so those were accepted whether or not the server had them.
+     */
+    private void requireRole(String role, String parameter) {
+        if (role == null) return;
+        String lower = role.toLowerCase();
+        if (executor.database.getRoles().containsKey(lower)) return;
+        String connecting = executor.session != null ? executor.session.getConnectingUser() : null;
+        if (connecting != null && role.equalsIgnoreCase(connecting)) return;
+        throw new MemgresException("role \"" + role + "\" does not exist", "22023");
+    }
+
+    /**
+     * Refuse a language that cannot carry a DO block. A language the catalogue does not have does
+     * not exist at all; one that has no inline handler — sql, c, internal — has no inline form.
+     */
+    private void requireInlineLanguage(String language) {
+        Table languages = executor.systemCatalog.resolve("pg_catalog", "pg_language", executor.session);
+        int nameIdx = languages == null ? -1 : languages.getColumnIndex("lanname");
+        int inlineIdx = languages == null ? -1 : languages.getColumnIndex("laninline");
+        Object inline = null;
+        boolean known = false;
+        if (nameIdx >= 0) {
+            for (Object[] row : languages.getRows()) {
+                if (language.equals(row[nameIdx])) {
+                    known = true;
+                    inline = inlineIdx >= 0 ? row[inlineIdx] : null;
+                    break;
+                }
+            }
+        }
+        if (!known) {
+            throw new MemgresException("language \"" + language + "\" does not exist", "42704");
+        }
+        if (!(inline instanceof Number) || ((Number) inline).intValue() == 0) {
+            throw new MemgresException(
+                    "language \"" + language + "\" does not support inline code execution", "0A000");
+        }
+    }
+
     private void executePlpgsqlBlock(String body) {
         PlpgsqlExecutor plExec = new PlpgsqlExecutor(executor, executor.database, executor.session);
         plExec.executeDoBlock(body);
@@ -1360,6 +1413,10 @@ class SessionExecutor {
         if (executor.session != null) {
             String target = stmt.target().toUpperCase();
             if (target.equals("ALL")) {
+                if (executor.session.isInRoutine()) {
+                    throw new MemgresException(
+                        "DISCARD ALL cannot be executed from a function", "25001");
+                }
                 // PG: DISCARD ALL cannot run inside a transaction block
                 if (executor.session.isInTransaction()) {
                     throw new MemgresException(
@@ -1399,8 +1456,11 @@ class SessionExecutor {
         if (stmt.lockMode() != null && !VALID_LOCK_MODES.contains(stmt.lockMode().toUpperCase())) {
             throw new MemgresException("syntax error at or near \"" + stmt.lockMode().split("\\s+")[0].toLowerCase() + "\"", "42601");
         }
-        // PG requires LOCK to be inside an explicit transaction
-        if (executor.session == null || !executor.session.isInTransaction()) {
+        // PG requires LOCK to be inside an explicit transaction. A routine body is one: a
+        // procedure or DO block runs inside a transaction whether or not the caller opened it,
+        // so a LOCK written in one is inside a transaction block and PostgreSQL takes it.
+        if (executor.session == null
+                || (!executor.session.isInTransaction() && !executor.session.isInRoutine())) {
             throw new MemgresException("LOCK TABLE can only be used in transaction blocks", "25P01");
         }
         // Convert PG mode name to pg_locks mode column format (e.g. "ACCESS EXCLUSIVE" -> "AccessExclusiveLock")
@@ -1776,8 +1836,16 @@ class SessionExecutor {
             throw new MemgresException("utility statements cannot be prepared", "42601");
         }
         // Always infer param count from $N references in body
-        List<String> paramTypes = stmt.paramTypes();
+        List<String> paramTypes = declaredParameterTypes(stmt.paramTypes());
         int inferredCount = maxParamIndex(stmt.body());
+        // The relations and columns the query names have to be there now. PREPARE is where
+        // PostgreSQL analyses the statement, so a table that is missing is reported here and the
+        // statement is not remembered — EXECUTE then says there is no such prepared statement,
+        // rather than repeating the analysis failure at every execution.
+        new StatementAnalyzer(executor).analyze(stmt.body());
+        // Every parameter the query uses has to have a type. One that was never written about —
+        // $1 where only $2 appears — has nothing to infer from, and PostgreSQL names it.
+        requireEveryParameterTyped(inferredCount, paramTypes, stmt.body());
         // Validate the body at PREPARE time (PG does full analysis/type-checking here)
         validatePreparedBody(stmt.body(), paramTypes);
         // Extract original body SQL from the raw PREPARE statement for verbatim pg_prepared_statements display.
@@ -2042,6 +2110,84 @@ class SessionExecutor {
      * Validate a prepared statement body at PREPARE time, matching PG behavior
      * which performs type analysis before storing the prepared statement.
      */
+    /**
+     * The parameter types as PREPARE records them.
+     *
+     * <p>A declared parameter type is a type, not a type with a size: PostgreSQL drops the
+     * modifier, so {@code PREPARE p (varchar(3))} takes a varchar of any length and
+     * {@code PREPARE p (numeric(2,1))} does not round what it is given. Keeping the modifier
+     * turned the declaration into a cast, which truncated and rounded the caller's values.
+     */
+    private List<String> declaredParameterTypes(List<String> declared) {
+        if (declared == null) return null;
+        List<String> plain = new ArrayList<>();
+        for (String type : declared) {
+            if (type == null) { plain.add(null); continue; }
+            String name = type.trim();
+            int paren = name.indexOf('(');
+            if (paren > 0) {
+                String tail = name.substring(name.indexOf(')') + 1);
+                name = name.substring(0, paren).trim() + tail;
+            }
+            requireTypeExists(name);
+            plain.add(name);
+        }
+        return plain;
+    }
+
+    /** A declared parameter type that names nothing is reported the way any missing type is. */
+    private void requireTypeExists(String name) {
+        String bare = name.toLowerCase().trim();
+        while (bare.endsWith("[]")) bare = bare.substring(0, bare.length() - 2).trim();
+        if (bare.isEmpty()) return;
+        if (DataType.fromPgName(bare) != null) return;
+        if (executor.database.isCompositeType(bare) || executor.database.getDomain(bare) != null
+                || executor.database.getCustomEnum(bare) != null
+                || executor.database.isRangeType(bare)) {
+            return;
+        }
+        throw new MemgresException("type \"" + name + "\" does not exist", "42704");
+    }
+
+    /**
+     * Every parameter up to the highest one written has to be one the query says something about.
+     * {@code SELECT $2} uses $2 and never mentions $1, so $1 has no type to be given.
+     */
+    private void requireEveryParameterTyped(int highest, List<String> declared, Statement body) {
+        int declaredCount = declared == null ? 0 : declared.size();
+        if (highest <= declaredCount) return;
+        Set<Integer> used = new HashSet<>();
+        collectParamIndexes(body, used);
+        for (int i = 1; i <= highest; i++) {
+            if (i <= declaredCount) continue;
+            if (!used.contains(Integer.valueOf(i))) {
+                throw new MemgresException(
+                        "could not determine data type of parameter $" + i, "42P18");
+            }
+        }
+    }
+
+    /** The parameter numbers a statement actually writes. */
+    private void collectParamIndexes(Object node, Set<Integer> found) {
+        if (node == null) return;
+        if (node instanceof ParamRef) {
+            found.add(Integer.valueOf(((ParamRef) node).index()));
+            return;
+        }
+        if (node instanceof Iterable) {
+            for (Object o : (Iterable<?>) node) collectParamIndexes(o, found);
+            return;
+        }
+        if (!isAstNodeClass(node.getClass())) return;
+        for (java.lang.reflect.Field field : node.getClass().getDeclaredFields()) {
+            if (java.lang.reflect.Modifier.isStatic(field.getModifiers())) continue;
+            try {
+                field.setAccessible(true);
+                collectParamIndexes(field.get(node), found);
+            } catch (Exception e) { /* inaccessible: treat as leaf */ }
+        }
+    }
+
     private void validatePreparedBody(Statement body, List<String> paramTypes) {
         validatePreparedQueryShape(body);
         if (body instanceof SelectStmt) {
@@ -2535,8 +2681,18 @@ class SessionExecutor {
         if (executor.session.getCursor(stmt.name()) != null) {
             throw new MemgresException("cursor \"" + stmt.name() + "\" already exists", "42P03");
         }
-        // Execute the query to get all results (may be SELECT or UNION/INTERSECT/EXCEPT)
-        QueryResult result = executor.executeStatement(stmt.query());
+        // Execute the query to get all results (may be SELECT or UNION/INTERSECT/EXCEPT), keeping
+        // the stored rows behind each answer so WHERE CURRENT OF can name a row rather than
+        // hunting for one whose columns happen to match.
+        List<List<RowContext.TableBinding>> provenance = new ArrayList<>();
+        QueryResult result;
+        List<List<RowContext.TableBinding>> outerProvenance = executor.cursorRowProvenance;
+        executor.cursorRowProvenance = provenance;
+        try {
+            result = executor.executeStatement(stmt.query());
+        } finally {
+            executor.cursorRowProvenance = outerProvenance;
+        }
         List<Object[]> rows = result.getRows() != null ? new ArrayList<>(result.getRows()) : new ArrayList<>();
         List<Column> columns = result.getColumns() != null ? result.getColumns() : Cols.listOf();
         // PG stores the full DECLARE statement in pg_cursors.statement, not just the query.
@@ -2544,9 +2700,13 @@ class SessionExecutor {
                 ("DECLARE " + stmt.name() + (stmt.scroll ? " SCROLL" : "")
                  + " CURSOR" + (stmt.withHold ? " WITH HOLD" : "")
                  + " FOR " + SqlUnparser.toSql(stmt.query()));
-        executor.session.addCursor(stmt.name(),
-                new Session.CursorState(stmt.name(), columns, rows,
-                        queryText, stmt.withHold, stmt.binary, stmt.scroll, stmt.explicitNoScroll));
+        Session.CursorState cursor = new Session.CursorState(stmt.name(), columns, rows,
+                queryText, stmt.withHold, stmt.binary, stmt.scroll, stmt.explicitNoScroll);
+        // Only a scan that answered one row per stored row can be positioned onto one of them.
+        if (provenance.size() == rows.size()) cursor.setProvenance(provenance);
+        cursor.setLocking(stmt.query() instanceof SelectStmt
+                && ((SelectStmt) stmt.query()).lockClause() != null);
+        executor.session.addCursor(stmt.name(), cursor);
         return QueryResult.message(QueryResult.Type.SET, "DECLARE CURSOR");
     }
 

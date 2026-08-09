@@ -2662,6 +2662,44 @@ public class Database {
      * requests conflict with any hold. A session never conflicts with itself (PG allows the
      * same backend to stack modes freely). Caller must hold advisoryMonitor.
      */
+    /**
+     * The transaction-level advisory locks this session holds, per lock.
+     *
+     * <p>A savepoint records them so rolling back to it can put them back as they were. They
+     * belong to the transaction, and a piece of a transaction that is undone did not take them.
+     */
+    public synchronized Map<AdvisoryLockId, int[]> advisoryXactHolds(Session session) {
+        Map<AdvisoryLockId, int[]> held = new LinkedHashMap<>();
+        for (Map.Entry<AdvisoryLockId, List<AdvisoryHold>> e : advisoryLocks.entrySet()) {
+            for (AdvisoryHold hold : e.getValue()) {
+                if (hold.session == session && (hold.xactExclusive > 0 || hold.xactShared > 0)) {
+                    held.put(e.getKey(), new int[]{hold.xactExclusive, hold.xactShared});
+                }
+            }
+        }
+        return held;
+    }
+
+    /** Put this session's transaction-level advisory locks back to a recorded state. */
+    public synchronized void restoreAdvisoryXactHolds(Session session, Map<AdvisoryLockId, int[]> held) {
+        if (held == null) return;
+        Iterator<Map.Entry<AdvisoryLockId, List<AdvisoryHold>>> it = advisoryLocks.entrySet().iterator();
+        while (it.hasNext()) {
+            Map.Entry<AdvisoryLockId, List<AdvisoryHold>> e = it.next();
+            int[] want = held.get(e.getKey());
+            Iterator<AdvisoryHold> holds = e.getValue().iterator();
+            while (holds.hasNext()) {
+                AdvisoryHold hold = holds.next();
+                if (hold.session != session) continue;
+                hold.xactExclusive = want == null ? 0 : want[0];
+                hold.xactShared = want == null ? 0 : want[1];
+                if (hold.empty()) holds.remove();
+            }
+            if (e.getValue().isEmpty()) it.remove();
+        }
+        notifyAll();
+    }
+
     private Session advisoryBlocker(AdvisoryLockId id, Session session, boolean shared) {
         List<AdvisoryHold> holds = advisoryLocks.get(id);
         if (holds == null) return null;

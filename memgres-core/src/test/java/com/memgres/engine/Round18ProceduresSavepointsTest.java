@@ -24,13 +24,12 @@ class Round18ProceduresSavepointsTest {
 
     @BeforeAll
     static void setUp() throws Exception {
-        memgres = Memgres.builder().port(0).build().start();
+        memgres = Memgres.builder().port(0).maxPreparedTransactions(10).build().start();
         conn = DriverManager.getConnection(
                 memgres.getJdbcUrl() + "?preferQueryMode=simple",
                 memgres.getUser(), memgres.getPassword());
         conn.setAutoCommit(true);
         // Enable two-phase commit (disabled by default like PG)
-        try (var s = conn.createStatement()) { s.execute("SET max_prepared_transactions = 10"); }
     }
 
     @AfterAll

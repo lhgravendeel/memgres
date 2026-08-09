@@ -103,7 +103,14 @@ class MathFunctions {
                 // The seed is not kept, but it is a double precision, and something that cannot
                 // be read as one is not a seed that was ignored — it is not a seed.
                 Object seed = executor.evalExpr(fn.args().get(0), ctx);
-                if (seed != null) executor.exprEvaluator.toDouble(seed);
+                if (seed != null) {
+                    double value = executor.exprEvaluator.toDouble(seed);
+                    // A seed is a fraction of the whole range; one outside it is not a seed.
+                    if (value < -1 || value > 1) {
+                        throw new com.memgres.engine.MemgresException("setseed parameter "
+                                + String.valueOf(seed) + " is out of allowed range [-1,1]", "22023");
+                    }
+                }
                 return "";
             }
             case "trunc": {
@@ -468,6 +475,12 @@ class MathFunctions {
                 Object lower = executor.evalExpr(fn.args().get(1), ctx);
                 Object upper = executor.evalExpr(fn.args().get(2), ctx);
                 Object countArg = executor.evalExpr(fn.args().get(3), ctx);
+                // A histogram over a range of no width has no buckets to divide it into.
+                if (lower != null && upper != null
+                        && executor.toDouble(lower) == executor.toDouble(upper)) {
+                    throw new com.memgres.engine.MemgresException(
+                            "lower bound cannot equal upper bound", "2201G");
+                }
                 if (operand == null || lower == null || upper == null || countArg == null) return null;
                 double val = executor.toDouble(operand);
                 double lo = executor.toDouble(lower);

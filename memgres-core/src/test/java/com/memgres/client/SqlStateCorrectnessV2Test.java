@@ -770,20 +770,20 @@ class SqlStateCorrectnessV2Test {
         assertSqlState("EXPLAIN (FORMAT yamlish) SELECT 1", "22023");
     }
 
-    @Test void explain_analyze_non_boolean_gives_22023() {
-        assertSqlState("EXPLAIN (ANALYZE maybe) SELECT 1", "22023");
+    @Test void explain_analyze_non_boolean_is_a_syntax_error() {
+        assertSqlState("EXPLAIN (ANALYZE maybe) SELECT 1", "42601");
     }
 
-    @Test void explain_buffers_non_boolean_gives_22023() {
-        assertSqlState("EXPLAIN (BUFFERS 123) SELECT 1", "22023");
+    @Test void explain_buffers_non_boolean_is_a_syntax_error() {
+        assertSqlState("EXPLAIN (BUFFERS 123) SELECT 1", "42601");
     }
 
-    @Test void explain_costs_non_boolean_gives_22023() {
-        assertSqlState("EXPLAIN (COSTS maybe) SELECT 1", "22023");
+    @Test void explain_costs_non_boolean_is_a_syntax_error() {
+        assertSqlState("EXPLAIN (COSTS maybe) SELECT 1", "42601");
     }
 
-    @Test void explain_verbose_non_boolean_gives_22023() {
-        assertSqlState("EXPLAIN (VERBOSE 123) SELECT 1", "22023");
+    @Test void explain_verbose_non_boolean_is_a_syntax_error() {
+        assertSqlState("EXPLAIN (VERBOSE 123) SELECT 1", "42601");
     }
 
     @Test void explain_unknown_option_gives_42601() {

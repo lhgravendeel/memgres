@@ -2895,40 +2895,44 @@ class DmlExecutor {
      * Filter table rows to the single row positioned by the named cursor.
      * Matches by comparing column values from the cursor's current row against the table row values.
      */
+    /**
+     * The one row a cursor is on, for WHERE CURRENT OF.
+     *
+     * <p>The row was found by comparing the cursor's columns against every row of the table and
+     * taking the first that matched. A cursor's select list need not carry a key — {@code SELECT nm
+     * FROM t ORDER BY id DESC} carries none — so two rows that share a value were the same row to
+     * that search, and it updated whichever came first in storage rather than the one the cursor
+     * had reached. The cursor remembers the stored rows it walked, so the row it is on is the row
+     * it is on.
+     */
     private List<Object[]> filterByCurrentOf(com.memgres.engine.parser.ast.CurrentOfExpr cof,
                                               Table table, List<Object[]> candidateRows) {
         Session.CursorState cursor = executor.session.getCursor(cof.cursorName());
-        if (cursor == null) throw new MemgresException("cursor \"" + cof.cursorName() + "\" does not exist", "34000");
-        int pos = cursor.getPosition();
+        if (cursor == null) {
+            throw new MemgresException("cursor \"" + cof.cursorName() + "\" does not exist", "34000");
+        }
         // A cursor that has not fetched yet, or has run past the end, is not on a row: PG says
         // so rather than quietly matching nothing
+        int pos = cursor.getPosition();
         if (pos < 0 || pos >= cursor.getRowCount()) {
             throw new MemgresException(
                     "cursor \"" + cof.cursorName() + "\" is not positioned on a row", "24000");
         }
-        Object[] cursorRow = cursor.getRow(pos);
-        // Map cursor columns to table column indices
-        List<Column> cursorCols = cursor.getColumns();
-        int[] tableColIdx = new int[cursorCols.size()];
-        for (int i = 0; i < cursorCols.size(); i++) {
-            tableColIdx[i] = table.getColumnIndex(cursorCols.get(i).getName());
+        Object[] current = cursor.currentRowOf(table);
+        if (current == null) {
+            // A cursor that locks its rows was written to be updated through, so the complaint is
+            // that it does not reach this table; one that does not was never updatable at all.
+            String why = cursor.isLocking()
+                    ? "\" does not have a FOR UPDATE/SHARE reference to table \""
+                    : "\" is not a simply updatable scan of table \"";
+            throw new MemgresException(
+                    "cursor \"" + cof.cursorName() + why + table.getName() + "\"", "24000");
         }
-        // Find the table row matching all cursor column values
         List<Object[]> result = new ArrayList<>();
         for (Object[] row : candidateRows) {
-            boolean match = true;
-            for (int i = 0; i < cursorCols.size(); i++) {
-                if (tableColIdx[i] < 0) continue; // cursor column not in table (e.g., computed)
-                Object tableVal = row[tableColIdx[i]];
-                Object cursorVal = cursorRow[i];
-                if (!java.util.Objects.equals(tableVal, cursorVal)) {
-                    match = false;
-                    break;
-                }
-            }
-            if (match) {
+            if (row == current) {
                 result.add(row);
-                break; // Only one row should match
+                break;
             }
         }
         return result;

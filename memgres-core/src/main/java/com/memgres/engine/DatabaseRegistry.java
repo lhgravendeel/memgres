@@ -11,6 +11,7 @@ public class DatabaseRegistry {
     private final ConcurrentHashMap<String, Database> databases = new ConcurrentHashMap<>();
     private final String defaultDbName;
     private int maxConnections = 100;
+    private int maxPreparedTransactions = 0;
     private boolean autoCreateDatabases = true;
 
     public DatabaseRegistry(String defaultDbName) {
@@ -39,6 +40,7 @@ public class DatabaseRegistry {
     public boolean createDatabase(String name) {
         Database db = new Database();
         db.setMaxConnections(maxConnections);
+        db.setMaxPreparedTransactions(maxPreparedTransactions);
         db.setDatabaseRegistry(this);
         return databases.putIfAbsent(name, db) == null;
     }
@@ -71,6 +73,17 @@ public class DatabaseRegistry {
         this.maxConnections = max;
         for (Database db : databases.values()) {
             db.setMaxConnections(max);
+        }
+    }
+
+    /**
+     * How many two-phase transactions may be prepared at once. PostgreSQL fixes this at server
+     * start, so it is set when the server is built and refused to a client that asks for it.
+     */
+    public void setMaxPreparedTransactions(int max) {
+        this.maxPreparedTransactions = max;
+        for (Database db : databases.values()) {
+            db.setMaxPreparedTransactions(max);
         }
     }
 

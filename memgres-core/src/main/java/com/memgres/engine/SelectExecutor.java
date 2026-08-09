@@ -690,6 +690,12 @@ class SelectExecutor {
 
         // Project
         contexts = boundedByRowCount(stmt, contexts, hasSrf);
+        // One entry per answer, in the order they are answered, naming the stored rows behind it.
+        if (executor.cursorRowProvenance != null) {
+            for (RowContext ctx : contexts) {
+                executor.cursorRowProvenance.add(ctx.getBindings());
+            }
+        }
         List<Object[]> resultRows = projectRows(contexts, projections, srfIndices);
 
         // For SRF queries, apply ORDER BY after SRF expansion

@@ -551,12 +551,18 @@ class TransactionControlTest {
             accepted(c, "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE");
             assertEquals("serializable", scalar(c, "SHOW transaction_isolation"));
             exec(c, "ROLLBACK");
-            // READ ONLY / READ WRITE carry no such restriction
+            // READ ONLY may be chosen at any point; going back to READ WRITE once the
+            // transaction is read-only and has run a query would change the mode a statement
+            // already ran under, and PostgreSQL refuses it.
+            exec(c, "BEGIN");
+            exec(c, "SELECT 1");
+            accepted(c, "SET TRANSACTION READ WRITE");
+            assertEquals("25001", state(c, "SET TRANSACTION DEFERRABLE"));
+            exec(c, "ROLLBACK");
             exec(c, "BEGIN");
             exec(c, "SELECT 1");
             accepted(c, "SET TRANSACTION READ ONLY");
-            accepted(c, "SET TRANSACTION READ WRITE");
-            assertEquals("25001", state(c, "SET TRANSACTION DEFERRABLE"));
+            assertEquals("25001", state(c, "SET TRANSACTION READ WRITE"));
             exec(c, "ROLLBACK");
         }
     }
