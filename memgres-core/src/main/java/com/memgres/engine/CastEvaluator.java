@@ -366,6 +366,18 @@ class CastEvaluator {
      *        the target type's input function rather than converting a value of a known type.
      */
     Object applyCast(Object val, String typeSpec, boolean fromUnknownLiteral) {
+        Object result = applyCastResolved(val, typeSpec, fromUnknownLiteral);
+        // A name holds 63 bytes and no more, so a longer string cast to one is truncated rather
+        // than kept whole: a name is what identifies an object, and the server has no room for
+        // more of it than that.
+        if (result instanceof String && ((String) result).length() > 63
+                && "name".equals(typeSpec == null ? null : typeSpec.trim().toLowerCase())) {
+            return ((String) result).substring(0, 63);
+        }
+        return result;
+    }
+
+    private Object applyCastResolved(Object val, String typeSpec, boolean fromUnknownLiteral) {
         // Which type a bare name denotes is the search path's answer, and it is settled once here
         // so everything downstream reads the same one: with search_path = b, ::e is b's e.
         typeSpec = qualifyUserType(typeSpec);
@@ -492,6 +504,12 @@ class CastEvaluator {
                 return intervalTypmod.apply(TypeCoercion.toInterval(val));
             }
         }
+        // float(p) is a name whose modifier picks the type rather than the width, so the value it
+        // produces has to be narrowed to a real when p allows only a real's mantissa.
+        DataType floatWidth = typeSpec.indexOf('(') > 0
+                ? DataType.fromPgName(typeSpec.toLowerCase().trim()) : null;
+        if (floatWidth == DataType.REAL) return TypeCoercion.toFloat(val);
+        if (floatWidth == DataType.DOUBLE_PRECISION) return TypeCoercion.toDouble(val);
         String typeName = typeSpec.toLowerCase().replaceAll("\\(.*\\)", "").trim();
         // Handle array casting: when value is a List or PG array literal string, cast each element
         boolean isArrayCast = typeName.contains("[]");
@@ -614,6 +632,9 @@ class CastEvaluator {
             case "char":
             case "character":
             case "name": {
+                // An infinity is written as the word it is, not as the instant standing for it.
+                String infinite = TypeCoercion.infinityText(val);
+                if (infinite != null) return infinite;
                 // PG inet::text uses network_show which always includes /prefix
                 if (val instanceof InetValue) {
                     return ((InetValue) val).text();
@@ -1033,9 +1054,12 @@ class CastEvaluator {
                 // reg* OID types — we don't track real OIDs for these internal objects;
                 // preserve the input name as-is so the cast round-trips to the same text.
                 return val.toString();
-            case "pg_lsn":
-                // PG log sequence number — preserve the 'X/Y' hex textual form
-                return val.toString();
+            case "pg_lsn": {
+                // A log sequence number is two hex numbers with a slash between them, and it is
+                // written with capital digits. Passing the text through unread stored anything at
+                // all under the type and handed it back exactly as it arrived.
+                return TypeCoercion.checkedLsn(val);
+            }
             case "tid":
                 // tuple identifier; preserve as-is
                 return val.toString();
@@ -1167,13 +1191,15 @@ class CastEvaluator {
                 String displayName;
                 if (schemaPrefix != null) {
                     regOid = executor.systemCatalog.getOid("rel:" + schemaPrefix.toLowerCase() + "." + lowerName);
-                    displayName = formatRegclassDisplay(schemaPrefix.toLowerCase() + "." + relName);
+                    // The name a regclass prints is the relation's own, so an unquoted ZZ_Q1 in
+                    // the text prints as the zz_q1 it resolved to rather than as it was written.
+                    displayName = formatRegclassDisplay(schemaPrefix.toLowerCase() + "." + lowerName);
                 } else if (lowerName.startsWith("pg_")) {
                     regOid = executor.systemCatalog.getOid("rel:pg_catalog." + lowerName);
-                    displayName = quoteIdentIfNeeded(relName);
+                    displayName = quoteIdentIfNeeded(lowerName);
                 } else {
                     regOid = executor.systemCatalog.getOid("rel:" + executor.defaultSchema() + "." + lowerName);
-                    displayName = quoteIdentIfNeeded(relName);
+                    displayName = quoteIdentIfNeeded(lowerName);
                 }
                 return new RegclassValue(regOid, displayName);
             }
@@ -1402,8 +1428,11 @@ class CastEvaluator {
                     return coerced;
                 }
                 // Check if it's an enum type. A type another session created in a transaction
-                // that has not committed is not one this session can cast to yet.
-                CustomEnum customEnum = executor.database.getCustomEnum(typeName);
+                // that has not committed is not one this session can cast to yet, and one in a
+                // schema the search path does not reach is not one this name can mean at all.
+                String enumKey = TypeNamespace.resolve(executor.database, executor.session, typeName);
+                CustomEnum customEnum = enumKey == null ? null
+                        : executor.database.getCustomEnum(enumKey);
                 if (customEnum != null && !executor.database.isObjectVisibleTo(customEnum, executor.session)) {
                     customEnum = null;
                 }
@@ -1485,7 +1514,7 @@ class CastEvaluator {
     }
 
     /**
-     * Format a regclass display name, omitting the schema prefix if the schema
+     * Format a regclass display name, omitting the schema prefix when the schema
      * is in the current search_path (matching PG behavior).
      * Input can be "schema.table" or just "table".
      */

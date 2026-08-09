@@ -1927,7 +1927,10 @@ class DdlAlterTableExecutor {
         if (marker.contains(":seqname=")) {
             String s = marker.substring(marker.indexOf(":seqname=") + 9);
             if (s.contains(":")) s = s.substring(0, s.indexOf(":"));
-            explicitSeqName = s;
+            // A dump writes the sequence's schema with its name; the schema is where it goes,
+            // not part of what it is called.
+            int dot = s.lastIndexOf('.');
+            explicitSeqName = dot > 0 ? s.substring(dot + 1) : s;
         }
 
         String seqName = explicitSeqName != null ? explicitSeqName :
@@ -2273,18 +2276,23 @@ class DdlAlterTableExecutor {
                 refIndices[ci] = refTable.getColumnIndex(sc.getReferencesColumns().get(ci));
             }
             for (Object[] row : table.getRows()) {
-                boolean allNull = true;
+                // MATCH SIMPLE is the default, and under it a row with a NULL anywhere in the
+                // referencing columns satisfies the constraint whatever the other columns hold.
+                // Requiring every column to be NULL rejected rows PostgreSQL accepts, so the
+                // constraint could not be added at all.
+                boolean anyNull = false;
                 for (int fi : fkIndices) {
-                    if (fi >= 0 && row[fi] != null) { allNull = false; break; }
+                    if (fi < 0 || row[fi] == null) { anyNull = true; break; }
                 }
-                if (allNull) continue;
+                if (anyNull) continue;
                 boolean found = false;
                 for (Object[] refRow : refTable.getRows()) {
                     boolean match = true;
                     for (int ci = 0; ci < fkIndices.length; ci++) {
                         Object fkVal = fkIndices[ci] >= 0 ? row[fkIndices[ci]] : null;
                         Object refVal = refIndices[ci] >= 0 ? refRow[refIndices[ci]] : null;
-                        if (!java.util.Objects.equals(String.valueOf(fkVal), String.valueOf(refVal))) { match = false; break; }
+                        // Values match as values, not as text: numeric 1.00 references 1.0.
+                        if (!TypeCoercion.areEqual(fkVal, refVal)) { match = false; break; }
                     }
                     if (match) { found = true; break; }
                 }

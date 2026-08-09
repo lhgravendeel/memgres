@@ -16,7 +16,8 @@ INSERT INTO names VALUES
 (4, 'mysql');
 
 -- begin-expected-error
--- message-like: invalid input syntax
+-- sqlstate: 42883
+-- message-like: operator does not exist: text % unknown
 -- end-expected-error
 SELECT name_id
 FROM names

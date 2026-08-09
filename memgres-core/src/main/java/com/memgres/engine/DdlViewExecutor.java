@@ -158,7 +158,7 @@ class DdlViewExecutor {
         if (oldView != null) {
             executor.recordUndo(new Session.DropViewUndo(stmt.name(), oldView));
         }
-        executor.recordUndo(new Session.CreateViewUndo(stmt.name()));
+        executor.recordUndo(new Session.CreateViewUndo(viewSchema, stmt.name()));
         executor.database.setObjectOwner("view:" + viewSchema + "." + stmt.name(), executor.sessionUser());
         if (stmt.materialized()) {
             return QueryResult.command(QueryResult.Type.SELECT_INTO, rowCount);

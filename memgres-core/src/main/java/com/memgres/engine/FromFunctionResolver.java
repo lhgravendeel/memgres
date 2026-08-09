@@ -396,6 +396,12 @@ class FromFunctionResolver {
 
     private List<RowContext> resolveGenerateSeries(String alias, List<String> colAliases, List<Object> evalArgs) {
         Object stepObj = evalArgs.size() > 2 ? evalArgs.get(2) : null;
+        // Every generate_series overload is strict: a NULL bound or step produces no rows at all.
+        // The overloads read their arguments straight, so a NULL one reached a conversion that
+        // dereferenced it and the NullPointerException escaped as an internal error.
+        for (Object arg : evalArgs) {
+            if (arg == null) return emptySeries(alias, colAliases, evalArgs);
+        }
         // A zero step can never reach the stop value, so PG rejects it rather than looping
         if (stepObj instanceof Number && ((Number) stepObj).doubleValue() == 0.0) {
             throw new MemgresException("step size cannot equal zero", "22023");
@@ -529,6 +535,24 @@ class FromFunctionResolver {
     private List<RowContext> publishSeries(Table virtualTable, String alias, List<Object[]> rows) {
         virtualTable.publishGeneratedRows(rows);
         return SeriesRows.contextsOver(virtualTable, alias, rows);
+    }
+
+    /**
+     * No rows at all, which is what a strict set-returning function answers when an argument is
+     * NULL. The column still has to be named and typed, because a caller may describe the result
+     * without ever reading a row from it.
+     */
+    private List<RowContext> emptySeries(String alias, List<String> colAliases, List<Object> evalArgs) {
+        DataType type = DataType.INTEGER;
+        for (Object arg : evalArgs) {
+            if (arg != null) {
+                type = TypeCoercion.inferType(arg);
+                break;
+            }
+        }
+        List<Column> cols = new ArrayList<>();
+        cols.add(new Column(firstColAlias(colAliases, alias), type, true, false, null));
+        return publishSeries(new Table(alias, cols), alias, new ArrayList<Object[]>());
     }
 
     // ---- generate_subscripts ----
@@ -2431,7 +2455,14 @@ class FromFunctionResolver {
                         String val = xp.evaluate(colPath, rowNode);
                         if (val != null && !val.isEmpty()) {
                             DataType dt = DataType.fromPgName(colTypes.get(c));
-                            if (dt == DataType.INTEGER || dt == DataType.SMALLINT || dt == DataType.BIGINT) {
+                            // Each column is read in the type it was declared. Reading every
+                            // integer column as an int threw for anything past 2147483647, and
+                            // the catch below turned a bigint the document did carry into NULL.
+                            if (dt == DataType.BIGINT) {
+                                rowVals[c] = Long.parseLong(val.trim());
+                            } else if (dt == DataType.SMALLINT) {
+                                rowVals[c] = Short.parseShort(val.trim());
+                            } else if (dt == DataType.INTEGER) {
                                 rowVals[c] = Integer.parseInt(val.trim());
                             } else {
                                 rowVals[c] = val;

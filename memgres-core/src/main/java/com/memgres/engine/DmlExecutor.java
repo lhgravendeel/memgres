@@ -1429,12 +1429,13 @@ class DmlExecutor {
             if (colIdx >= 0) {
                 Column genCol = table.getColumns().get(colIdx);
                 if (genCol.isGenerated() && !(set.value() instanceof Literal && ((Literal) set.value()).literalType() == Literal.LiteralType.DEFAULT)) {
-                    Literal lit = (Literal) set.value();
+                    // The cast that used to stand here read the value as a Literal purely to
+                    // discard it, so assigning an expression threw ClassCastException instead of
+                    // reaching the refusal on the very next line.
                     throw new MemgresException("column \"" + genCol.getName() + "\" can only be updated to DEFAULT\n  Detail: Column \"" + genCol.getName() + "\" is a generated column.", "428C9");
                 }
                 if (genCol.getDefaultValue() != null && genCol.getDefaultValue().contains("__identity__:always")
                         && !(set.value() instanceof Literal && ((Literal) set.value()).literalType() == Literal.LiteralType.DEFAULT)) {
-                    Literal lit2 = (Literal) set.value();
                     throw new MemgresException("column \"" + genCol.getName() + "\" can only be updated to DEFAULT\n  Detail: Column \"" + genCol.getName() + "\" is an identity column defined as GENERATED ALWAYS.", "428C9");
                 }
             }

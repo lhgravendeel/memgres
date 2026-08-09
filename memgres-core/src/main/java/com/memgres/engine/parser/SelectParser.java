@@ -44,8 +44,8 @@ class SelectParser {
                     Expression offset = sop.offset();
                     boolean changed = false;
                     if (parser.matchKeywords("ORDER", "BY")) { orderBy = parser.parseOrderByList(); changed = true; }
-                    if (parser.matchKeyword("LIMIT")) { limit = parser.matchKeyword("ALL") ? Literal.ofNull() : parser.parsePrimary(); changed = true; }
-                    if (parser.matchKeyword("OFFSET")) { offset = parser.parsePrimary(); changed = true; }
+                    if (parser.matchKeyword("LIMIT")) { limit = parser.matchKeyword("ALL") ? Literal.ofNull() : parser.parseExpression(); changed = true; }
+                    if (parser.matchKeyword("OFFSET")) { offset = parser.parseExpression(); changed = true; }
                     if (changed) {
                         left = new SetOpStmt(sop.left(), sop.op(), sop.all(), sop.right(), orderBy, limit, offset,
                         sop.withTies());
@@ -93,8 +93,8 @@ class SelectParser {
             boolean changed = false;
 
             if (parser.matchKeywords("ORDER", "BY")) { orderBy = parser.parseOrderByList(); changed = true; }
-            if (parser.matchKeyword("LIMIT")) { limit = parser.matchKeyword("ALL") ? Literal.ofNull() : parser.parsePrimary(); changed = true; }
-            if (parser.matchKeyword("OFFSET")) { offset = parser.parsePrimary(); changed = true; }
+            if (parser.matchKeyword("LIMIT")) { limit = parser.matchKeyword("ALL") ? Literal.ofNull() : parser.parseExpression(); changed = true; }
+            if (parser.matchKeyword("OFFSET")) { offset = parser.parseExpression(); changed = true; }
 
             if (changed) {
                 left = new SetOpStmt(sop.left(), sop.op(), sop.all(), sop.right(), orderBy, limit, offset,
@@ -661,10 +661,10 @@ class SelectParser {
             boolean changed = false;
             if (parser.matchKeywords("ORDER", "BY")) { orderBy = parser.parseOrderByList(); changed = true; }
             if (parser.matchKeyword("LIMIT")) {
-                limit = parser.matchKeyword("ALL") ? Literal.ofNull() : parser.parsePrimary();
+                limit = parser.matchKeyword("ALL") ? Literal.ofNull() : parser.parseExpression();
                 changed = true;
             }
-            if (parser.matchKeyword("OFFSET")) { offset = parser.parsePrimary(); changed = true; }
+            if (parser.matchKeyword("OFFSET")) { offset = parser.parseExpression(); changed = true; }
             if (changed) {
                 return new SelectStmt(sel.distinct(), sel.distinctOn(), sel.targets(), sel.from(),
                         sel.where(), sel.groupBy(), sel.having(), sel.windowDefs(), orderBy, limit,
@@ -1443,7 +1443,7 @@ class SelectParser {
         boolean withOrdinality = parser.matchKeywords("WITH", "ORDINALITY");
         String alias = null;
         if (parser.matchKeyword("AS")) {
-            alias = parser.readIdentifier();
+            alias = parser.readColumnName();
         } else if (isKeywordValidAsBareAlias()) {
             alias = parser.readIdentifier();
         }
@@ -1564,7 +1564,7 @@ class SelectParser {
                 String parenAlias = null;
                 parser.matchKeyword("AS");
                 if (isKeywordValidAsBareAlias()) {
-                    parenAlias = parser.readIdentifier();
+                    parenAlias = parser.readColumnName();
                 }
                 if (parenAlias != null) {
                     // Wrap the inner FROM item as a subquery-like structure with an alias
@@ -1631,7 +1631,7 @@ class SelectParser {
             boolean withOrdinality = parser.matchKeywords("WITH", "ORDINALITY");
             String alias = null;
             if (parser.matchKeyword("AS")) {
-                alias = parser.readIdentifier();
+                alias = parser.readColumnName();
             } else if (isKeywordValidAsBareAlias()) {
                 alias = parser.readIdentifier();
             }
@@ -1674,7 +1674,7 @@ class SelectParser {
                 boolean withOrdinality = parser.matchKeywords("WITH", "ORDINALITY");
                 String funcAlias = null;
                 if (parser.matchKeyword("AS")) {
-                    funcAlias = parser.readIdentifier();
+                    funcAlias = parser.readColumnName();
                 } else if (isKeywordValidAsBareAlias()) {
                     funcAlias = parser.readIdentifier();
                 }
@@ -1698,15 +1698,16 @@ class SelectParser {
 
         String alias = null;
         if (parser.matchKeyword("AS")) {
-            alias = parser.readIdentifier();
+            alias = parser.readColumnName();
         } else if (isKeywordValidAsBareAlias()) {
             alias = parser.readIdentifier();
         }
 
-        // Handle optional secondary alias: table bare_alias AS alias2(col1, col2, ...)
-        // PostgreSQL allows this syntax (e.g., CROSS JOIN global_flags gf AS f(flag_key, enabled))
-        if (alias != null && parser.matchKeyword("AS")) {
-            alias = parser.readIdentifier();
+        // A relation takes one alias. "FROM t x AS y" is a syntax error at the AS, and reading a
+        // second alias over the first silently answered under a name the query never wrote.
+        if (alias != null && parser.checkKeyword("AS")) {
+            throw ParseException.saying("syntax error at or near \"" + parser.peek().value() + "\"",
+                    parser.peek(), "42601");
         }
         // An alias may rename the relation's columns as well as the relation: t AS z(m) calls
         // the first column m. The list renames as far as it reaches, so a shorter one leaves
@@ -2083,7 +2084,7 @@ class SelectParser {
         // Alias
         String alias = null;
         if (parser.matchKeyword("AS")) {
-            alias = parser.readIdentifier();
+            alias = parser.readColumnName();
         } else if (parser.peek().type() == TokenType.IDENTIFIER || parser.peek().type() == TokenType.QUOTED_IDENTIFIER) {
             alias = parser.readIdentifier();
         }
@@ -2136,7 +2137,7 @@ class SelectParser {
         // Alias
         String alias = null;
         if (parser.matchKeyword("AS")) {
-            alias = parser.readIdentifier();
+            alias = parser.readColumnName();
         } else if (!parser.isAtEnd() && (parser.peek().type() == TokenType.IDENTIFIER || parser.peek().type() == TokenType.QUOTED_IDENTIFIER)) {
             alias = parser.readIdentifier();
         }

@@ -245,7 +245,15 @@ class DdlTableExecutor {
                 }
                 notNull = true;
                 String seqName = stmt.name() + "_" + def.name() + "_seq";
-                Sequence seq = new Sequence(seqName, def.identityStart(), def.identityIncrement(), null, null);
+                // An identity sequence is bounded by the column's own type, as a serial's is:
+                // without the bound an int column was handed a value outside integer and held it.
+                Long identityMax = dataType == DataType.SMALLINT ? Long.valueOf(32767L)
+                        : dataType == DataType.BIGINT ? Long.valueOf(9223372036854775807L)
+                        : Long.valueOf(2147483647L);
+                Sequence seq = new Sequence(seqName, def.identityStart(), def.identityIncrement(),
+                        null, identityMax);
+                if (dataType == DataType.SMALLINT) seq.setDataType("smallint");
+                else if (dataType != DataType.BIGINT) seq.setDataType("integer");
                 seq.setSchemaName(schemaName);
                 executor.database.addSequence(seq);
                 executor.database.registerSchemaObject(schemaName, "sequence", seqName);

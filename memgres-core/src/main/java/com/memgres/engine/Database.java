@@ -1308,6 +1308,13 @@ public class Database {
 
     /** Returns the single function with this name, or the first overload if multiple exist. */
     public PgFunction getFunction(String name) {
+        // A name that carries its schema names one schema's function and no other's, so it is
+        // answered from that schema: looking the whole "schema.fn" text up as a bare name found
+        // nothing, and a trigger written to call one was refused for a function that exists.
+        int dot = name == null ? -1 : name.lastIndexOf('.');
+        if (dot > 0) {
+            return getFunction(name.substring(0, dot), name.substring(dot + 1));
+        }
         String key = name.toLowerCase();
         List<PgFunction> overloads = functionOverloads.get(key);
         if (overloads != null && !overloads.isEmpty()) return overloads.get(0);

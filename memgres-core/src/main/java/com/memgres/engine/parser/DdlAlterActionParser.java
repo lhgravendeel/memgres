@@ -422,7 +422,7 @@ class DdlAlterActionParser {
             while (!parser.check(TokenType.RIGHT_PAREN) && !parser.isAtEnd()) {
                 if (parser.matchKeywords("SEQUENCE", "NAME")) {
                     seqName = parser.readIdentifier();
-                    if (parser.match(TokenType.DOT)) seqName = parser.readIdentifier(); // skip schema
+                    if (parser.match(TokenType.DOT)) seqName = seqName + "." + parser.readIdentifier();
                 } else if (parser.matchKeywords("START", "WITH")) {
                     startWith = Long.parseLong(parser.advance().value());
                 } else if (parser.matchKeywords("INCREMENT", "BY")) {

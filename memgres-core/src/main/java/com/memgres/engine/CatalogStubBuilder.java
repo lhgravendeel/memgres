@@ -115,7 +115,21 @@ class CatalogStubBuilder {
                 for (StoredConstraint sc : t.getConstraints()) {
                     if (sc.getType() == StoredConstraint.Type.FOREIGN_KEY) { hasFk = true; break; }
                 }
-                boolean hasTrig = database.getAllTriggers().containsKey(tableName)
+                // Triggers are held under the bare table name, so a same-named table in another
+                // schema was reported as carrying the other's triggers. Each trigger knows the
+                // schema its table lives in, and only its own table's count.
+                boolean hasOwnTrigger = false;
+                java.util.List<PgTrigger> named = database.getAllTriggers().get(tableName);
+                if (named != null) {
+                    for (PgTrigger trig : named) {
+                        String trigSchema = trig.getSchemaName();
+                        if (trigSchema == null || trigSchema.equalsIgnoreCase(tblSchema)) {
+                            hasOwnTrigger = true;
+                            break;
+                        }
+                    }
+                }
+                boolean hasTrig = hasOwnTrigger
                         || hasFk || fkReferencedTables.contains(tableName.toLowerCase());
                 table.insertRow(new Object[]{
                         schemaEntry.getKey(), tableName, "memgres", null, hasIdx, false, hasTrig,

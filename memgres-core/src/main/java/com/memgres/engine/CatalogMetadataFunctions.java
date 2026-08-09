@@ -850,7 +850,7 @@ class CatalogMetadataFunctions {
             int targetOid = numArg.intValue();
             for (Map.Entry<String, Integer> entry : executor.systemCatalog.getOidMap().entrySet()) {
                 if (entry.getValue() == targetOid && entry.getKey().startsWith("rel:")) {
-                    viewName = entry.getKey().substring(entry.getKey().lastIndexOf('.') + 1);
+                    viewName = entry.getKey().substring(4);
                     break;
                 }
             }
@@ -881,9 +881,8 @@ class CatalogMetadataFunctions {
             }
         }
         if (viewName != null) {
-            if (viewName.contains(".")) {
-                viewName = viewName.substring(viewName.lastIndexOf('.') + 1);
-            }
+            // The schema is part of which view this is. Throwing it away and looking the bare
+            // name up meant two schemas' views of one name answered with whichever came first.
             Database.ViewDef view = executor.database.getView(viewName);
             if (view != null && view.query() != null) {
                 String sql = view.sourceSQL() != null ? view.sourceSQL()
@@ -1079,9 +1078,16 @@ class CatalogMetadataFunctions {
                 if (typid != TEXT_OID && typid != BPCHAR_OID && typid != VARCHAR_OID) return null;
                 if (typmod == -1) return 1 << 30;
                 Integer maxLength = pgCharMaxLength(typid, typmod);
+                if (maxLength == null) return null;
                 // The multiplier is pg_encoding_max_length of the database encoding; memgres
-                // stores and serves text as UTF8, whose longest character is four bytes.
-                return maxLength == null ? null : (Object) (maxLength * 4);
+                // stores and serves text as UTF8, whose longest character is four bytes. The
+                // product is an integer, and a typmod large enough to overflow one is reported
+                // as the overflow it is rather than wrapped round into a negative length.
+                long octets = maxLength.longValue() * 4L;
+                if (octets > Integer.MAX_VALUE || octets < Integer.MIN_VALUE) {
+                    throw new MemgresException("integer out of range", "22003");
+                }
+                return (Object) Integer.valueOf((int) octets);
             }
             case "_pg_numeric_precision":
                 switch (typid) {

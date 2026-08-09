@@ -614,6 +614,7 @@ public class PlpgsqlExecutor {
                 }
                 val = variadicArgs;
                 scope.declare(pName, val);
+                scope.declare("$" + (argIdx + 1), val);
                 break; // VARIADIC is always the last param
             } else if (argIdx < args.size()) {
                 val = args.get(argIdx);
@@ -641,7 +642,17 @@ public class PlpgsqlExecutor {
             } else {
                 val = null;
             }
+            // A null argument still has the type the parameter declares, and the body is text:
+            // writing a bare NULL threw the type away, so a body of "state + val" over two null
+            // integers became an addition of two untyped nulls with no operator to choose.
+            if (val == null && p.typeName() != null && !p.typeName().trim().isEmpty()) {
+                val = new RawSql("NULL::" + p.typeName());
+            }
             scope.declare(pName, val);
+            // A parameter answers to its position as well as its name, so a body that writes
+            // $1 reaches the same argument the name reaches. Declaring only the name left $1
+            // standing in the SQL and the function ran against a parameter it never received.
+            scope.declare("$" + (argIdx + 1), val);
             argIdx++;
         }
         // SQL-language functions resolve parameter/column name conflicts in favor of the column

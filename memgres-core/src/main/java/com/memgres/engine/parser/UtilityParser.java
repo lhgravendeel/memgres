@@ -276,6 +276,14 @@ class UtilityParser {
 
     // ---- SET ----
 
+    /**
+     * The name a token spells. A keyword's token carries its upper-case form, which is not what
+     * an object called name is called: COMMENT ON COLUMN t.name has to reach the column name.
+     */
+    private static String identifierSpelling(Token token) {
+        return token.type() == TokenType.KEYWORD ? token.value().toLowerCase() : token.value();
+    }
+
     SetStmt parseSet() {
         parser.expectKeyword("SET");
 
@@ -386,6 +394,14 @@ class UtilityParser {
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
                 Token tok = parser.advance();
                 hasTokens = true;
+                // A setting's value is a list of names and constants, so a stray token is a
+                // syntax error rather than a word to store. "SET search_path = $user" has to be
+                // written with the quotes PostgreSQL needs; taking it verbatim stored a search
+                // path of "$ USER, public" that named no schema at all.
+                if (tok.type() == TokenType.ERROR) {
+                    throw ParseException.saying(
+                            "syntax error at or near \"" + tok.value() + "\"", tok, "42601");
+                }
                 if (tok.type() == TokenType.COMMA) {
                     if (val.length() > 0 && val.charAt(val.length() - 1) == ' ') {
                         val.setLength(val.length() - 1);
@@ -1343,12 +1359,12 @@ class UtilityParser {
                 String prev = tokenValues.remove(tokenValues.size() - 1);
                 if (!parser.isAtEnd() && !parser.checkKeyword("IS")) {
                     Token next = parser.advance();
-                    tokenValues.add(prev + "." + next.value());
+                    tokenValues.add(prev + "." + identifierSpelling(next));
                 } else {
                     tokenValues.add(prev + ".");
                 }
             } else {
-                tokenValues.add(tok.value());
+                tokenValues.add(identifierSpelling(tok));
             }
         }
         // A function/aggregate argument list is not part of the name: COMMENT ON FUNCTION f(int)
@@ -1436,7 +1452,7 @@ class UtilityParser {
         if (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
             matchOnlyBeforeRelation();
             tableName = parser.readIdentifier(); // table name
-            if (parser.match(TokenType.DOT)) tableName = parser.readIdentifier(); // schema.table
+            if (parser.match(TokenType.DOT)) tableName = tableName + "." + parser.readIdentifier();
             // Optional column list
             if (parser.check(TokenType.LEFT_PAREN)) {
                 parser.advance(); // (
@@ -1496,7 +1512,7 @@ class UtilityParser {
         if (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
             matchOnlyBeforeRelation();
             vacuumTable = parser.readIdentifier();
-            if (parser.match(TokenType.DOT)) vacuumTable = parser.readIdentifier();
+            if (parser.match(TokenType.DOT)) vacuumTable = vacuumTable + "." + parser.readIdentifier();
             if (parser.check(TokenType.LEFT_PAREN)) parser.consumeUntilParen();
         }
         // Encode flags + table into the value string
@@ -1525,7 +1541,7 @@ class UtilityParser {
             parser.matchKeyword("CONCURRENTLY");
             if (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
                 targetName = parser.readIdentifier();
-                if (parser.match(TokenType.DOT)) targetName = parser.readIdentifier(); // schema.name -> keep name
+                if (parser.match(TokenType.DOT)) targetName = targetName + "." + parser.readIdentifier();
             }
         }
         String value = targetType != null && targetName != null ? targetType + ":" + targetName : "ok";
@@ -1542,7 +1558,7 @@ class UtilityParser {
         String indexName = null;
         if (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
             tableName = parser.readIdentifier(); // table name
-            if (parser.match(TokenType.DOT)) tableName = parser.readIdentifier(); // schema.table
+            if (parser.match(TokenType.DOT)) tableName = tableName + "." + parser.readIdentifier();
             if (parser.matchKeyword("USING")) {
                 indexName = parser.readIdentifier(); // index name
             }

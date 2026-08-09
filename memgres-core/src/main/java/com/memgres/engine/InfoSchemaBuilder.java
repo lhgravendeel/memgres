@@ -1806,17 +1806,21 @@ public class InfoSchemaBuilder {
             // depends on the reader's search_path and can land on a different function.
             String actionStmt = "EXECUTE FUNCTION "
                     + qualifiedFunctionName(first.getFunctionName(), trigSchema) + "()";
-            // Emit one row per event manipulation (PG standard)
+            // Emit one row per event manipulation (PG standard). Each trigger names its own
+            // table and schema: two triggers of one name on two tables were both reported
+            // against the first one's table, so a client saw one of them twice and the other
+            // not at all.
             for (PgTrigger trig : entry.getValue()) {
                 String event = trig.getEvent().name(); // INSERT, UPDATE, DELETE, TRUNCATE
+                String ownSchema = trig.getSchemaName() != null ? trig.getSchemaName() : trigSchema;
                 table.insertRow(new Object[]{
                         catalogName(),          // trigger_catalog
-                        trigSchema,             // trigger_schema
-                        first.getName(),        // trigger_name
+                        ownSchema,              // trigger_schema
+                        trig.getName(),         // trigger_name
                         event,                  // event_manipulation
                         catalogName(),          // event_object_catalog
-                        trigSchema,             // event_object_schema
-                        first.getTableName(),   // event_object_table
+                        ownSchema,              // event_object_schema
+                        trig.getTableName(),    // event_object_table
                         1,                      // action_order
                         null,                   // action_condition
                         actionStmt,             // action_statement

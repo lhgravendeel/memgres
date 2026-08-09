@@ -327,7 +327,7 @@ class PgWireDescribeHelper {
                             result.getColumns().size(), result.getRows().size(), sqlSnip);
                     return new DescribePortalResult(true, result);
                 }
-            } catch (Exception e) {
+            } catch (Exception | StackOverflowError e) {
                 LOG.warn("[PROTO] Describe Portal FAILED: {} | {}", e.getMessage(), sqlSnip);
                 LOG.debug("Full exception:", e);
                 session.restoreStatus(savedStatusPortal);
@@ -809,12 +809,23 @@ class PgWireDescribeHelper {
             if (c == '$' && i + 1 < sql.length() && Character.isDigit(sql.charAt(i + 1))) {
                 int j = i + 1;
                 while (j < sql.length() && Character.isDigit(sql.charAt(j))) j++;
-                int paramNum = Integer.parseInt(sql.substring(i + 1, j));
+                // A parameter number a client wrote may be anything at all; reading it without a
+                // guard threw out of Describe, and the escape left the connection a response ahead.
+                int paramNum = parameterNumber(sql.substring(i + 1, j));
                 if (paramNum > max) max = paramNum;
                 i = j - 1;
             }
         }
         return max;
+    }
+
+    /** The number a {@code $N} placeholder names, or 0 when it names none this protocol can carry. */
+    private static int parameterNumber(String digits) {
+        try {
+            return Integer.parseInt(digits);
+        } catch (NumberFormatException e) {
+            return 0;
+        }
     }
 
     static String replaceParamsWithNull(String sql) {
@@ -954,7 +965,7 @@ class PgWireDescribeHelper {
             if (c == '$' && i + 1 < len && Character.isDigit(sql.charAt(i + 1))) {
                 int j = i + 1;
                 while (j < len && Character.isDigit(sql.charAt(j))) j++;
-                int paramNum = Integer.parseInt(sql.substring(i + 1, j));
+                int paramNum = parameterNumber(sql.substring(i + 1, j));
                 int k = j;
                 while (k < len && Character.isWhitespace(sql.charAt(k))) k++;
                 String typeName = null;

@@ -57,12 +57,15 @@ class CharTrailingSpaceEqualityTest {
         }
     }
 
-    @Test void both_empty_after_strip() throws Exception {
-        // ' ' = '  ' should be true (both strip to empty)
+    @Test void blanksCountBetweenTwoLiterals() throws Exception {
+        // Two untyped literals are read as text, and text counts its blanks: one space is not
+        // two spaces, and neither of them is the empty string.
         try (Connection c = newConn(); Statement s = c.createStatement()) {
-            ResultSet rs = s.executeQuery("SELECT ' ' = '  ' AS eq");
+            ResultSet rs = s.executeQuery("SELECT ' ' = '  ' AS eq, '' = ' ' AS eq2, 'abc ' = 'abc' AS eq3");
             assertTrue(rs.next());
-            assertTrue(rs.getBoolean("eq"));
+            assertFalse(rs.getBoolean("eq"));
+            assertFalse(rs.getBoolean("eq2"));
+            assertFalse(rs.getBoolean("eq3"));
         }
     }
 }

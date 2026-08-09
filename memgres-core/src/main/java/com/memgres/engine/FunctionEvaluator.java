@@ -2954,6 +2954,11 @@ class FunctionEvaluator {
                 Object a = executor.evalExpr(fn.args().get(0), ctx);
                 Object b = executor.evalExpr(fn.args().get(1), ctx);
                 if (a == null || b == null) return null;
+                // Two enum values carry their own position, so they compare by it without
+                // anything having to name the type they belong to.
+                if (a instanceof AstExecutor.PgEnum && b instanceof AstExecutor.PgEnum) {
+                    return Integer.signum(((AstExecutor.PgEnum) a).compareTo((AstExecutor.PgEnum) b));
+                }
                 // Compare by position in the enum type
                 // Try to resolve the enum type from argument casts
                 String enumType = null;
@@ -2972,8 +2977,9 @@ class FunctionEvaluator {
                         return Integer.compare(posA, posB);
                     }
                 }
-                // Fallback: lexicographic comparison
-                return a.toString().compareTo(b.toString());
+                // Fallback: lexicographic comparison. A comparison function answers with the
+                // sign of the difference, not the difference itself.
+                return Integer.signum(a.toString().compareTo(b.toString()));
             }
 
             // ---- ICU unicode version ----

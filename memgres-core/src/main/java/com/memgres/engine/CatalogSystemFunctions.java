@@ -80,6 +80,29 @@ class CatalogSystemFunctions {
         }
     }
 
+    /**
+     * The schema holding the relation this regclass names, or null when it cannot be told.
+     */
+    private String schemaOfRelation(Object regclass) {
+        String written = regclass.toString();
+        int dot = written.lastIndexOf('.');
+        if (dot > 0) return written.substring(0, dot).replace("\"", "");
+        Integer oid = null;
+        if (regclass instanceof Number) oid = Integer.valueOf(((Number) regclass).intValue());
+        else if (regclass instanceof RegclassValue) oid = Integer.valueOf(((RegclassValue) regclass).oid());
+        if (oid != null) {
+            for (java.util.Map.Entry<String, Integer> e
+                    : executor.systemCatalog.getOidMap().entrySet()) {
+                if (e.getValue().equals(oid) && e.getKey().startsWith("rel:")) {
+                    String key = e.getKey().substring(4);
+                    int at = key.lastIndexOf('.');
+                    return at > 0 ? key.substring(0, at) : null;
+                }
+            }
+        }
+        return null;
+    }
+
     Object eval(String name, FunctionCallExpr fn, RowContext ctx) {
         // Try metadata/introspection functions first
         Object metaResult = metadataFunctions.eval(name, fn, ctx);
@@ -89,6 +112,22 @@ class CatalogSystemFunctions {
         if (privResult != NOT_HANDLED) return privResult;
 
         switch (name) {
+            case "pg_collation_for": {
+                // The collation an expression carries, written the way PostgreSQL writes it. A
+                // literal with no type of its own is of type unknown, which has no collation at
+                // all and answers NULL; anything else collatable carries the default.
+                Expression arg = fn.args().isEmpty() ? null : fn.args().get(0);
+                if (arg instanceof CollateExpr) {
+                    return "\"" + ((CollateExpr) arg).collation() + "\"";
+                }
+                if (arg instanceof Literal) {
+                    Literal.LiteralType kind = ((Literal) arg).literalType();
+                    if (kind == Literal.LiteralType.STRING || kind == Literal.LiteralType.NULL) {
+                        return null;
+                    }
+                }
+                return "\"default\"";
+            }
             case "pg_typeof": {
                 Expression rawExpr = fn.args().get(0);
                 // Whatever this method ends up reading the value for, it reads it once. Asking
@@ -220,6 +259,13 @@ class CatalogSystemFunctions {
 
                 if (rawExpr instanceof CastExpr) {
                     CastExpr cast = (CastExpr) rawExpr;
+                    // float(p) names two different types depending on p, so the modifier is
+                    // offered whole before it is stripped as a mere width.
+                    DataType withModifier =
+                            DataType.fromPgName(cast.typeName().toLowerCase().trim());
+                    if (withModifier != null && cast.typeName().indexOf('(') > 0) {
+                        return pgTypeDisplayName(withModifier);
+                    }
                     String tn = cast.typeName().toLowerCase().replaceAll("\\(.*\\)", "").trim();
                     if (tn.endsWith("[]")) {
                         String baseType = tn.substring(0, tn.length() - 2).trim();
@@ -647,8 +693,17 @@ class CatalogSystemFunctions {
             case "pg_ts_template_is_visible":
                 return true;
             case "pg_table_is_visible": {
+                // Visible means reachable by its bare name, which is what the search path decides.
+                // Answering true for everything told a client that two same-named tables in two
+                // schemas were both reachable unqualified, which no search path can make true.
                 Object tableOid = executor.evalExpr(fn.args().get(0), ctx);
-                return true;
+                if (tableOid == null) return null;
+                String schema = schemaOfRelation(tableOid);
+                if (schema == null) return true;
+                for (String onPath : executor.searchPathSchemas()) {
+                    if (onPath.equalsIgnoreCase(schema)) return true;
+                }
+                return false;
             }
             case "pg_database_size": {
                 if (!fn.args().isEmpty()) executor.evalExpr(fn.args().get(0), ctx);

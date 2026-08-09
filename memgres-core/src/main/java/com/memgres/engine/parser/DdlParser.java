@@ -220,7 +220,7 @@ class DdlParser {
             List<String> additionalTables = new ArrayList<>();
             while (parser.match(TokenType.COMMA)) {
                 String extra = parser.readIdentifier();
-                if (parser.match(TokenType.DOT)) extra = parser.readIdentifier();
+                if (parser.match(TokenType.DOT)) extra = extra + "." + parser.readIdentifier();
                 additionalTables.add(extra);
             }
             boolean cascade = parser.matchKeyword("CASCADE");
@@ -324,7 +324,7 @@ class DdlParser {
         else if (parser.matchKeyword("STATISTICS")) {
             boolean dropIfExists = parser.matchKeywords("IF", "EXISTS");
             String statName = parser.readIdentifier();
-            if (parser.match(TokenType.DOT)) statName = parser.readIdentifier();
+            if (parser.match(TokenType.DOT)) statName = statName + "." + parser.readIdentifier();
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
             return new SetStmt("drop_statistics", statName + "\0" + (dropIfExists ? "1" : "0"));
         }
@@ -629,6 +629,12 @@ class DdlParser {
 
         if (parser.matchKeyword("SCHEMA")) {
             String schemaName = parser.readIdentifier();
+            // ALTER SCHEMA has no IF EXISTS form. IF is an ordinary word, so PostgreSQL takes it
+            // for the schema name and stops at the EXISTS behind it.
+            if (parser.checkKeyword("EXISTS")) {
+                throw ParseException.saying("syntax error at or near \"" + parser.peek().value()
+                        + "\"", parser.peek(), "42601");
+            }
             if (parser.matchKeywords("OWNER", "TO")) {
                 return new AlterSchemaOwnerStmt(schemaName, parser.readIdentifier());
             }
@@ -818,7 +824,7 @@ class DdlParser {
         }
 
         String funcName = parser.readIdentifier();
-        if (parser.match(TokenType.DOT)) funcName = parser.readIdentifier();
+        if (parser.match(TokenType.DOT)) funcName = funcName + "." + parser.readIdentifier();
         parser.expect(TokenType.LEFT_PAREN);
         List<String> funcArgs = new ArrayList<>();
         while (!parser.check(TokenType.RIGHT_PAREN) && !parser.isAtEnd()) {
@@ -871,7 +877,7 @@ class DdlParser {
     private CreateViewStmt parseCreateRecursiveView(boolean orReplace) {
         if (parser.matchKeywords("IF", "NOT", "EXISTS")) orReplace = true;
         String name = parser.readIdentifier();
-        if (parser.match(TokenType.DOT)) name = parser.readIdentifier();
+        if (parser.match(TokenType.DOT)) name = name + "." + parser.readIdentifier();
 
         parser.expect(TokenType.LEFT_PAREN);
         List<String> columnNames = parser.parseIdentifierList();
@@ -1001,7 +1007,7 @@ class DdlParser {
         parser.expectKeyword("VIEW");
         boolean concurrently = parser.matchKeyword("CONCURRENTLY");
         String name = parser.readIdentifier();
-        if (parser.match(TokenType.DOT)) name = parser.readIdentifier();
+        if (parser.match(TokenType.DOT)) name = name + "." + parser.readIdentifier();
         boolean withData = true;
         if (parser.matchKeyword("WITH")) {
             if (parser.matchKeyword("NO")) { parser.expectKeyword("DATA"); withData = false; }
@@ -1230,7 +1236,7 @@ class DdlParser {
         }
         parser.expectKeyword("TO");
         String table = parser.readIdentifier();
-        if (parser.match(TokenType.DOT)) table = parser.readIdentifier();
+        if (parser.match(TokenType.DOT)) table = table + "." + parser.readIdentifier();
         StringBuilder where = new StringBuilder();
         if (parser.matchKeyword("WHERE")) {
             int depth = 0;
@@ -1317,6 +1323,10 @@ class DdlParser {
     Statement parseCreateSchema() {
         boolean ifNotExists = parser.matchKeywords("IF", "NOT", "EXISTS");
         String name = parser.readIdentifier();
+        // The pg_ prefix is reserved for system schemas, so a schema cannot claim it.
+        if (name != null && name.toLowerCase().startsWith("pg_")) {
+            throw new MemgresException("unacceptable schema name \"" + name + "\"", "42939");
+        }
         String authorization = null;
         if (parser.matchKeyword("AUTHORIZATION")) authorization = parser.readIdentifier();
         return new CreateSchemaStmt(name, ifNotExists, authorization);
@@ -1552,7 +1562,7 @@ class DdlParser {
         String relation = "";
         if (parser.matchKeyword("ON")) {
             relation = parser.readIdentifier();
-            if (parser.match(TokenType.DOT)) relation = parser.readIdentifier();
+            if (parser.match(TokenType.DOT)) relation = relation + "." + parser.readIdentifier();
         }
         String newName = "";
         if (parser.matchKeywords("RENAME", "TO")) newName = parser.readIdentifierOrString();
@@ -1566,7 +1576,7 @@ class DdlParser {
         String relation = "";
         if (parser.matchKeyword("ON")) {
             relation = parser.readIdentifier();
-            if (parser.match(TokenType.DOT)) relation = parser.readIdentifier();
+            if (parser.match(TokenType.DOT)) relation = relation + "." + parser.readIdentifier();
         }
         String newName = "";
         if (parser.matchKeywords("RENAME", "TO")) newName = parser.readIdentifierOrString();
@@ -1608,7 +1618,7 @@ class DdlParser {
 
     AlterDomainStmt parseAlterDomain() {
         String domainName = parser.readIdentifier();
-        if (parser.match(TokenType.DOT)) domainName = parser.readIdentifier();
+        if (parser.match(TokenType.DOT)) domainName = domainName + "." + parser.readIdentifier();
         if (parser.matchKeywords("SET", "DEFAULT")) {
             int startPos = parser.pos;
             Expression expr = parser.parseExpression();
@@ -2232,10 +2242,10 @@ class DdlParser {
                 leakproof = true;
             } else if (parser.matchKeyword("COST")) {
                 opts.take(RoutineOptions.COST, at);
-                cost = Double.parseDouble(parser.advance().value());
+                cost = routineCost(parser, "COST");
             } else if (parser.matchKeyword("ROWS")) {
                 opts.take(RoutineOptions.ROWS, at);
-                rows = Double.parseDouble(parser.advance().value());
+                rows = routineCost(parser, "ROWS");
             } else if (parser.matchKeywords("PARALLEL", "SAFE")) {
                 opts.take(RoutineOptions.PARALLEL, at);
                 parallel = "SAFE";
@@ -2313,7 +2323,7 @@ class DdlParser {
         // ATTACH PARTITION (no-op)
         if (parser.matchKeywords("ATTACH", "PARTITION")) {
             String partIdx = parser.readIdentifier();
-            if (parser.match(TokenType.DOT)) partIdx = parser.readIdentifier();
+            if (parser.match(TokenType.DOT)) partIdx = partIdx + "." + parser.readIdentifier();
             return new AlterIndexStmt(indexName, ifExists, AlterIndexStmt.Action.ATTACH_PARTITION, partIdx);
         }
         // ALTER COLUMN n SET STATISTICS n (no-op)
@@ -2585,7 +2595,7 @@ class DdlParser {
     Statement parseCreateStatistics() {
         boolean ifNotExists = parser.matchKeywords("IF", "NOT", "EXISTS");
         String name = parser.readIdentifier();
-        if (parser.match(TokenType.DOT)) name = parser.readIdentifier(); // skip schema
+        if (parser.match(TokenType.DOT)) name = name + "." + parser.readIdentifier();
 
         // Optional (kinds): (ndistinct, dependencies, mcv)
         List<String> kinds = new ArrayList<>();
@@ -2626,7 +2636,7 @@ class DdlParser {
 
         parser.expectKeyword("FROM");
         String tableName = parser.readIdentifier();
-        if (parser.match(TokenType.DOT)) tableName = parser.readIdentifier();
+        if (parser.match(TokenType.DOT)) tableName = tableName + "." + parser.readIdentifier();
 
         // Encode: "create_statistics:name:table:col1,col2:kind1,kind2:ifNotExists"
         String kindsStr = kinds.isEmpty() ? "" : String.join(",", kinds);
@@ -2639,7 +2649,7 @@ class DdlParser {
 
     Statement parseAlterAggregate() {
         String name = parser.readIdentifier();
-        if (parser.match(TokenType.DOT)) name = parser.readIdentifier();
+        if (parser.match(TokenType.DOT)) name = name + "." + parser.readIdentifier();
         List<String> argTypes = new ArrayList<>();
         if (parser.check(TokenType.LEFT_PAREN)) {
             argTypes = parseFunctionDropParamTypes();
@@ -2665,7 +2675,7 @@ class DdlParser {
 
     Statement parseAlterStatistics() {
         String name = parser.readIdentifier();
-        if (parser.match(TokenType.DOT)) name = parser.readIdentifier();
+        if (parser.match(TokenType.DOT)) name = name + "." + parser.readIdentifier();
 
         if (parser.matchKeywords("RENAME", "TO")) {
             String newName = parser.readIdentifier();
@@ -2842,7 +2852,7 @@ class DdlParser {
                 do {
                     parser.matchKeyword("ONLY");
                     String tbl = parser.readIdentifier();
-                    if (parser.match(TokenType.DOT)) tbl = parser.readIdentifier();
+                    if (parser.match(TokenType.DOT)) tbl = tbl + "." + parser.readIdentifier();
                     tables.add(tbl);
                 } while (parser.match(TokenType.COMMA));
             }
@@ -2860,7 +2870,7 @@ class DdlParser {
             do {
                 parser.matchKeyword("ONLY");
                 String tbl = parser.readIdentifier();
-                if (parser.match(TokenType.DOT)) tbl = parser.readIdentifier();
+                if (parser.match(TokenType.DOT)) tbl = tbl + "." + parser.readIdentifier();
                 tables.add(tbl);
             } while (parser.match(TokenType.COMMA));
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
@@ -2871,7 +2881,7 @@ class DdlParser {
             do {
                 parser.matchKeyword("ONLY");
                 String tbl = parser.readIdentifier();
-                if (parser.match(TokenType.DOT)) tbl = parser.readIdentifier();
+                if (parser.match(TokenType.DOT)) tbl = tbl + "." + parser.readIdentifier();
                 tables.add(tbl);
             } while (parser.match(TokenType.COMMA));
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
@@ -2882,7 +2892,7 @@ class DdlParser {
             do {
                 parser.matchKeyword("ONLY");
                 String tbl = parser.readIdentifier();
-                if (parser.match(TokenType.DOT)) tbl = parser.readIdentifier();
+                if (parser.match(TokenType.DOT)) tbl = tbl + "." + parser.readIdentifier();
                 tables.add(tbl);
             } while (parser.match(TokenType.COMMA));
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
@@ -2960,7 +2970,7 @@ class DdlParser {
 
     private Statement parseCreateTextSearchConfiguration() {
         String name = parser.readIdentifier();
-        if (parser.match(TokenType.DOT)) name = parser.readIdentifier();
+        if (parser.match(TokenType.DOT)) name = name + "." + parser.readIdentifier();
         parser.expect(TokenType.LEFT_PAREN);
         String copyFrom = null;
         String parserName = null;
@@ -2968,11 +2978,11 @@ class DdlParser {
             if (parser.matchKeyword("COPY") || matchIdentCI("COPY")) {
                 parser.expect(TokenType.EQUALS);
                 copyFrom = parser.readIdentifier();
-                if (parser.match(TokenType.DOT)) copyFrom = parser.readIdentifier();
+                if (parser.match(TokenType.DOT)) copyFrom = copyFrom + "." + parser.readIdentifier();
             } else if (matchIdentCI("PARSER")) {
                 parser.expect(TokenType.EQUALS);
                 parserName = parser.readIdentifier();
-                if (parser.match(TokenType.DOT)) parserName = parser.readIdentifier();
+                if (parser.match(TokenType.DOT)) parserName = parserName + "." + parser.readIdentifier();
             } else {
                 parser.advance();
             }
@@ -2986,7 +2996,7 @@ class DdlParser {
 
     private Statement parseCreateTextSearchDictionary() {
         String name = parser.readIdentifier();
-        if (parser.match(TokenType.DOT)) name = parser.readIdentifier();
+        if (parser.match(TokenType.DOT)) name = name + "." + parser.readIdentifier();
         parser.expect(TokenType.LEFT_PAREN);
         String template = null;
         StringBuilder opts = new StringBuilder();
@@ -2994,7 +3004,7 @@ class DdlParser {
             if (matchIdentCI("TEMPLATE")) {
                 parser.expect(TokenType.EQUALS);
                 template = parser.readIdentifier();
-                if (parser.match(TokenType.DOT)) template = parser.readIdentifier();
+                if (parser.match(TokenType.DOT)) template = template + "." + parser.readIdentifier();
             } else {
                 // Collect remaining options (e.g. STOPWORDS = english)
                 String key = parser.advance().value();
@@ -3048,7 +3058,7 @@ class DdlParser {
 
     private Statement parseAlterTextSearchConfiguration() {
         String name = parser.readIdentifier();
-        if (parser.match(TokenType.DOT)) name = parser.readIdentifier();
+        if (parser.match(TokenType.DOT)) name = name + "." + parser.readIdentifier();
         // Look for ALTER MAPPING FOR ... WITH ...
         // or ADD MAPPING FOR ... WITH ...
         // or DROP MAPPING [IF EXISTS] FOR ...
@@ -3153,4 +3163,32 @@ class DdlParser {
 
         return new CreateCastStmt(sourceType, targetType, functionName, funcArgTypes, withInout, castContext);
     }
+    /**
+     * The number written after COST or ROWS. Both must be positive, and a negative sign or a word
+     * is a syntax error where it stands — reading the token with a bare parseDouble let the
+     * NumberFormatException out as an internal error.
+     */
+    private static double routineCost(Parser parser, String option) {
+        Token token = parser.peek();
+        boolean negative = false;
+        if (token.type() == TokenType.MINUS) {
+            negative = true;
+            parser.advance();
+            token = parser.peek();
+        }
+        String text = token.value();
+        double value;
+        try {
+            value = Double.parseDouble(text);
+        } catch (NumberFormatException e) {
+            throw ParseException.saying("syntax error at or near \"" + text + "\"", token, "42601");
+        }
+        parser.advance();
+        if (negative) value = -value;
+        if (value <= 0) {
+            throw new com.memgres.engine.MemgresException(option + " must be positive", "22023");
+        }
+        return value;
+    }
+
 }
