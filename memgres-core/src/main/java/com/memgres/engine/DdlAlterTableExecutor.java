@@ -175,8 +175,7 @@ class DdlAlterTableExecutor {
             if (idx < 0) continue;
             for (Object[] row : table.getRows()) {
                 if (row[idx] == null) {
-                    throw new MemgresException("column \"" + alterCol.column() + "\" of relation \""
-                            + stmt.table() + "\" contains null values", "23502");
+                    throw PgErrors.columnContainsNulls(alterCol.column(), "relation", stmt.table());
                 }
             }
         }
@@ -406,9 +405,13 @@ class DdlAlterTableExecutor {
                 && executor.database.hasIndex(ownSchemaName, bare);
         if (view == null && !isSequence && !isIndex) return;
         for (AlterTableStmt.AlterAction action : stmt.actions()) {
-            // An index has no schema of its own to change: it always lives where its table does.
+            // An index has no schema of its own to change: it always lives where its table does,
+            // and PostgreSQL points at the table as the thing whose schema can be changed.
             if (isIndex && action instanceof AlterTableStmt.SetSchema) {
-                throw PgErrors.wrongObjectType("cannot change schema of index \"" + bare + "\"");
+                MemgresException moved = PgErrors.wrongObjectType(
+                        "cannot change schema of index \"" + bare + "\"");
+                moved.setHint("Change the schema of the table instead.");
+                throw moved;
             }
             if (action instanceof AlterTableStmt.RenameTable
                     || action instanceof AlterTableStmt.SetSchema
@@ -421,8 +424,15 @@ class DdlAlterTableExecutor {
                     || isColumnDefaultAction(action))) {
                 continue;
             }
-            throw new MemgresException("ALTER action " + alterActionName(action)
+            MemgresException e = new MemgresException("ALTER action " + alterActionName(action)
                     + " cannot be performed on relation \"" + bare + "\"", "42809");
+            // The kind that cannot carry the action goes on the detail line, so the reader is
+            // told why the relation refuses it and not only that it did.
+            e.setDetail(isSequence ? "This operation is not supported for sequences."
+                    : isIndex ? "This operation is not supported for indexes."
+                    : view.materialized() ? "This operation is not supported for materialized views."
+                    : "This operation is not supported for views.");
+            throw e;
         }
     }
 
@@ -637,8 +647,12 @@ class DdlAlterTableExecutor {
             // A partitioned table holds no rows of its own, so there is no storage for a storage
             // parameter to describe and PostgreSQL refuses the form outright.
             if (((AlterTableStmt.SetStorageParams) action).reloptions() && isPartitioned(table)) {
-                throw new MemgresException(
+                MemgresException e = new MemgresException(
                         "cannot specify storage parameters for a partitioned table", "42809");
+                // The rows live in the leaves, so the leaves are where a storage parameter has
+                // anything to describe, and PostgreSQL sends the writer there.
+                e.setHint("Specify storage parameters for its leaf partitions instead.");
+                throw e;
             }
             // Nothing is stored, but a parameter PostgreSQL does not recognise or a value it
             // will not take stops the statement here rather than being quietly accepted.
@@ -733,8 +747,7 @@ class DdlAlterTableExecutor {
         // empty as no default at all and the new rule cannot hold over the rows already stored.
         boolean fillsExistingRows = defaultVal != null && !"null".equalsIgnoreCase(defaultVal.trim());
         if (def.notNull() && !fillsExistingRows && genExpr == null && !table.getRows().isEmpty()) {
-            throw new MemgresException("column \"" + def.name()
-                    + "\" of relation \"" + stmt.table() + "\" contains null values", "23502");
+            throw PgErrors.columnContainsNulls(def.name(), "relation", stmt.table());
         }
 
         // SERIAL and GENERATED AS IDENTITY columns are implicitly NOT NULL (same as CREATE TABLE)
@@ -909,13 +922,13 @@ class DdlAlterTableExecutor {
 
     /**
      * {@code 42P16} for a constraint the whole hierarchy has to carry, written with ONLY on a
-     * table that has children. PostgreSQL names the way out in the hint rather than in the
-     * message, because the statement is right apart from the one keyword.
+     * table that has children. PostgreSQL names the way out in the hint when a NOT NULL raised
+     * it and says nothing at all for the CHECK form, so the caller says which of the two it is.
      */
-    private static MemgresException onlyOnParent() {
+    private static MemgresException onlyOnParent(boolean nameTheKeyword) {
         MemgresException e = new MemgresException(
                 "constraint must be added to child tables too", "42P16");
-        e.setHint("Do not specify the ONLY keyword.");
+        if (nameTheKeyword) e.setHint("Do not specify the ONLY keyword.");
         return e;
     }
 
@@ -933,7 +946,7 @@ class DdlAlterTableExecutor {
         // an idempotent migration re-asserting NOT NULL is exactly the shape that writes it.
         int idx = columnName == null ? -1 : table.getColumnIndex(columnName);
         if (idx >= 0 && !table.getColumns().get(idx).isNullable()) return;
-        throw onlyOnParent();
+        throw onlyOnParent(true);
     }
 
     /**
@@ -1102,9 +1115,13 @@ class DdlAlterTableExecutor {
         // A partition holds exactly the parent's columns, so dropping one from the parent alone
         // would leave the two disagreeing about a shape they are required to share.
         if (stmt.only() && !table.getPartitions().isEmpty()) {
-            throw new MemgresException(
+            MemgresException e = new MemgresException(
                     "cannot drop column from only the partitioned table when partitions exist",
                     "42P16");
+            // Taking the one keyword out is the whole of what has to change, so PostgreSQL
+            // names it rather than leaving the statement to be rewritten by guesswork.
+            e.setHint("Do not specify the ONLY keyword.");
+            throw e;
         }
         // Check for dependent generated columns
         String colNameLower = dropCol.column().toLowerCase();
@@ -1120,9 +1137,20 @@ class DdlAlterTableExecutor {
         if (!dropCol.cascade()) {
             String colName = dropCol.column().toLowerCase();
             if (!dependentGenCols.isEmpty()) {
-                throw new MemgresException("cannot drop column " + dropCol.column()
-                        + " of relation " + stmt.table()
+                MemgresException e = new MemgresException("cannot drop column " + dropCol.column()
+                        + " of table " + stmt.table()
                         + " because other objects depend on it", "2BP01");
+                // A generated column is written in terms of this one, and PostgreSQL names both
+                // sides of that dependency with the table each column belongs to.
+                List<String> lines = new ArrayList<>();
+                for (String gen : dependentGenCols) {
+                    lines.add("column " + gen + " of table " + stmt.table()
+                            + " depends on column " + dropCol.column()
+                            + " of table " + stmt.table());
+                }
+                e.setDetail(String.join("\n", lines));
+                e.setHint("Use DROP ... CASCADE to drop the dependent objects too.");
+                throw e;
             }
             for (Map.Entry<String, Database.ViewDef> viewEntry : executor.database.getViews().entrySet()) {
                 String viewSql = viewEntry.getValue().query() != null ? viewEntry.getValue().query().toString() : "";
@@ -1141,11 +1169,19 @@ class DdlAlterTableExecutor {
                     for (StoredConstraint sc : t.getConstraints()) {
                         if (isFkReferencing(sc, stmt.table(), schemaName, dropCol.column())
                                 && !StoredConstraint.containsIgnoreCase(sc.getColumns(), dropCol.column())) {
-                            throw new MemgresException("cannot drop column " + dropCol.column()
-                                    + " of table " + stmt.table()
-                                    + " because other objects depend on it\n  Detail: constraint "
-                                    + sc.getName() + " on table " + t.getName() + " depends on column "
-                                    + dropCol.column(), "2BP01");
+                            MemgresException e = new MemgresException("cannot drop column "
+                                    + dropCol.column() + " of table " + stmt.table()
+                                    + " because other objects depend on it", "2BP01");
+                            // Both relations are named as the search path would have to name
+                            // them: a column belongs to a table, and two schemas may each hold a
+                            // table of the same name.
+                            e.setDetail("constraint " + sc.getName() + " on table "
+                                    + RelationNamespace.shownName(executor.searchPathSchemas(),
+                                            sch.getName(), t.getName())
+                                    + " depends on column " + dropCol.column()
+                                    + " of table " + stmt.table());
+                            e.setHint("Use DROP ... CASCADE to drop the dependent objects too.");
+                            throw e;
                         }
                     }
                 }
@@ -1344,10 +1380,10 @@ class DdlAlterTableExecutor {
             executeSetType(alterCol, setType, table, stmt, schemaName);
         } else if (alterCol.action() instanceof AlterTableStmt.SetDefault) {
             AlterTableStmt.SetDefault setDefault = (AlterTableStmt.SetDefault) alterCol.action();
-            rejectDefaultOnGeneratedColumn(table, alterCol.column(), stmt.table());
+            rejectDefaultOnGeneratedColumn(table, alterCol.column(), stmt.table(), "SET");
             executeSetDefault(alterCol, setDefault, table, stmt);
         } else if (alterCol.action() instanceof AlterTableStmt.DropDefault) {
-            rejectDefaultOnGeneratedColumn(table, alterCol.column(), stmt.table());
+            rejectDefaultOnGeneratedColumn(table, alterCol.column(), stmt.table(), "DROP");
             table.alterColumnDefault(alterCol.column(), null);
         } else if (alterCol.action() instanceof AlterTableStmt.SetNotNull) {
             rejectOnlyNotNullOnPartitioned(table, stmt, alterCol.column());
@@ -1355,8 +1391,7 @@ class DdlAlterTableExecutor {
             if (colIdx >= 0) {
                 for (Object[] row : table.getRows()) {
                     if (row[colIdx] == null) {
-                        throw new MemgresException("column \"" + alterCol.column() + "\" of relation \""
-                                + stmt.table() + "\" contains null values", "23502");
+                        throw PgErrors.columnContainsNulls(alterCol.column(), "relation", stmt.table());
                     }
                 }
             }
@@ -1400,13 +1435,20 @@ class DdlAlterTableExecutor {
     /**
      * A generated column's value comes from its expression on every row, so a default has
      * nothing to fill in and setting or dropping one is refused rather than stored and ignored.
+     * What the writer meant is the same statement with EXPRESSION in place of DEFAULT, and
+     * PostgreSQL names it rather than leaving them to find it.
+     *
+     * @param verb SET or DROP, the word the statement used and the one the advice repeats
      */
-    private static void rejectDefaultOnGeneratedColumn(Table table, String column, String tableName) {
+    private static void rejectDefaultOnGeneratedColumn(Table table, String column, String tableName,
+                                                       String verb) {
         int idx = table.getColumnIndex(column);
         if (idx < 0) return; // the missing column is reported by the action itself
         if (table.getColumns().get(idx).isGenerated()) {
-            throw PgErrors.syntax("column \"" + column + "\" of relation \"" + tableName
-                    + "\" is a generated column");
+            MemgresException e = PgErrors.syntax("column \"" + column + "\" of relation \""
+                    + tableName + "\" is a generated column");
+            e.setHint("Use ALTER TABLE ... ALTER COLUMN ... " + verb + " EXPRESSION instead.");
+            throw e;
         }
     }
 
@@ -1461,8 +1503,12 @@ class DdlAlterTableExecutor {
                     + stmt.table() + "\" is not a generated column", "55000");
         }
         if (col.isVirtual()) {
-            throw PgErrors.notImplemented(
+            MemgresException e = PgErrors.notImplemented(
                     "ALTER TABLE / DROP EXPRESSION is not supported for virtual generated columns");
+            // The message says which kind of column is refused; the detail says which column.
+            e.setDetail("Column \"" + column + "\" of relation \"" + stmt.table()
+                    + "\" is a virtual generated column.");
+            throw e;
         }
         int idx = table.getColumnIndex(column);
         table.getColumns().set(idx, col.withGeneratedExpr(null));
@@ -1567,7 +1613,13 @@ class DdlAlterTableExecutor {
             if (c.getGeneratedExpr() != null && !c.getName().equalsIgnoreCase(alterCol.column())) {
                 String genExpr = c.getGeneratedExpr().toLowerCase();
                 if (genExpr.contains(alterColLower)) {
-                    throw new MemgresException("cannot alter type of a column used by a generated column", "0A000");
+                    MemgresException e = new MemgresException(
+                            "cannot alter type of a column used by a generated column", "0A000");
+                    // Which generated column is in the way is the one thing the message leaves
+                    // out, and it is what has to be dropped before the retype can go through.
+                    e.setDetail("Column \"" + alterCol.column() + "\" is used by generated column \""
+                            + c.getName() + "\".");
+                    throw e;
                 }
             }
         }
@@ -1714,8 +1766,7 @@ class DdlAlterTableExecutor {
         if (!table.getColumns().get(idx).isNullable()) {
             for (Object v : newValues) {
                 if (v == null) {
-                    throw new MemgresException("column \"" + column + "\" of relation \""
-                            + tableName + "\" contains null values", "23502");
+                    throw PgErrors.columnContainsNulls(column, "relation", tableName);
                 }
             }
         }
@@ -1727,6 +1778,7 @@ class DdlAlterTableExecutor {
             if (!seen.add(String.valueOf(v))) {
                 MemgresException dup = new MemgresException("could not create unique index \""
                         + uniqueIndex + "\"", "23505");
+                dup.setConstraint(uniqueIndex);
                 dup.setDetail("Key (" + column + ")=(" + v + ") is duplicated.");
                 throw dup;
             }
@@ -1804,9 +1856,7 @@ class DdlAlterTableExecutor {
         String declared = DdlDefinitionChecks.defaultExpressionTypeName(expr, value);
         if (declared != null) {
             if (!TypeCoercion.assignableFrom(declared, target)) {
-                throw PgErrors.datatypeMismatch("column \"" + columnName + "\" is of type "
-                        + target.toRegtypeDisplay()
-                        + " but default expression is of type " + declared);
+                throw defaultTypeMismatch(columnName, target, declared);
             }
             return; // the cast exists; the value is the insert's business
         }
@@ -1818,12 +1868,23 @@ class DdlAlterTableExecutor {
         } catch (MemgresException e) {
             String exprType = DdlDefinitionChecks.runtimeTypeName(value);
             if (exprType != null && !DdlDefinitionChecks.isUntypedLiteral(expr)) {
-                throw PgErrors.datatypeMismatch("column \"" + columnName + "\" is of type "
-                        + target.toRegtypeDisplay()
-                        + " but default expression is of type " + exprType);
+                throw defaultTypeMismatch(columnName, target, exprType);
             }
             throw e;
         }
+    }
+
+    /**
+     * A default the column cannot take, worded as PostgreSQL words it. The remedy is the same
+     * whichever way the mismatch was found — write the expression as the column's type — so the
+     * advice belongs with the complaint rather than at each place that raises it.
+     */
+    private static MemgresException defaultTypeMismatch(String columnName, DataType target,
+                                                        String exprType) {
+        MemgresException e = PgErrors.datatypeMismatch("column \"" + columnName + "\" is of type "
+                + target.toRegtypeDisplay() + " but default expression is of type " + exprType);
+        e.setHint("You will need to rewrite or cast the expression.");
+        return e;
     }
 
     private void handleSetIncrement(String column, String defaultVal, Table table) {
@@ -2093,7 +2154,7 @@ class DdlAlterTableExecutor {
         if (addedType == TableConstraint.ConstraintType.CHECK
                 && !addConstraint.constraint().noInherit()
                 && stmt.only() && !childRelations(table).isEmpty()) {
-            throw onlyOnParent();
+            throw onlyOnParent(false);
         }
         if (addedType == TableConstraint.ConstraintType.NOT_NULL) {
             rejectOnlyNotNullOnPartitioned(table, stmt, null);
@@ -2117,8 +2178,7 @@ class DdlAlterTableExecutor {
                 if (colIdx >= 0) {
                     for (Object[] row : table.getRows()) {
                         if (row[colIdx] == null) {
-                            throw new MemgresException("column \"" + colName + "\" of relation \""
-                                    + stmt.table() + "\" contains null values", "23502");
+                            throw PgErrors.columnContainsNulls(colName, "relation", stmt.table());
                         }
                     }
                 }
@@ -2300,10 +2360,34 @@ class DdlAlterTableExecutor {
                     if (match) { found = true; break; }
                 }
                 if (!found) {
-                    throw new MemgresException("insert or update on table \"" + tableName + "\" violates foreign key constraint \"" + sc.getName() + "\"", "23503");
+                    MemgresException ex = new MemgresException("insert or update on table \""
+                            + tableName + "\" violates foreign key constraint \"" + sc.getName()
+                            + "\"", "23503");
+                    ex.setConstraint(sc.getName());
+                    ex.setDetail(missingKeyDetail(sc, fkIndices, row));
+                    throw ex;
                 }
             }
         }
+    }
+
+    /**
+     * The key the referenced table does not hold. A constraint is declared over a whole table at
+     * once, so without the key the reader learns only that some row among all of them is at fault.
+     */
+    private static String missingKeyDetail(StoredConstraint sc, int[] fkIndices, Object[] row) {
+        StringBuilder detail = new StringBuilder("Key (");
+        for (int ci = 0; ci < sc.getColumns().size(); ci++) {
+            if (ci > 0) detail.append(", ");
+            detail.append(sc.getColumns().get(ci));
+        }
+        detail.append(")=(");
+        for (int ci = 0; ci < fkIndices.length; ci++) {
+            if (ci > 0) detail.append(", ");
+            detail.append(fkIndices[ci] >= 0 ? row[fkIndices[ci]] : null);
+        }
+        detail.append(") is not present in table \"").append(sc.getReferencesTable()).append("\".");
+        return detail.toString();
     }
 
     private void validateCheckConstraintData(StoredConstraint sc, Table table) {
@@ -2315,7 +2399,11 @@ class DdlAlterTableExecutor {
             try {
                 Object result = executor.evalExpr(sc.getCheckExpr(), checkCtx);
                 if (result instanceof Boolean && !((Boolean) result)) {
-                    throw new MemgresException("check constraint \"" + sc.getName() + "\" of relation \"" + table.getName() + "\" is violated by some row", "23514");
+                    MemgresException ex = new MemgresException("check constraint \"" + sc.getName()
+                            + "\" of relation \"" + table.getName() + "\" is violated by some row",
+                            "23514");
+                    ex.setConstraint(sc.getName());
+                    throw ex;
                 }
             } catch (MemgresException me) {
                 if ("23514".equals(me.getSqlState())) throw me;
@@ -2515,9 +2603,14 @@ class DdlAlterTableExecutor {
                 }
             }
             if (!found) {
+                // A partition holds the parent's rows and nothing besides, so a column of its own
+                // has nowhere to be stored; PostgreSQL says what the rule is, not only that this
+                // table breaks it.
                 throw new MemgresException("table \"" + partName
                         + "\" contains column \"" + pc.getName()
-                        + "\" not found in parent \"" + parent.getName() + "\"", "42804");
+                        + "\" not found in parent \"" + parent.getName() + "\""
+                        + "\n  Detail: The new partition may contain only the columns present"
+                        + " in parent.", "42804");
             }
         }
         // Check parent columns exist in partition AND have a matching type

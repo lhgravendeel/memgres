@@ -449,7 +449,8 @@ public final class PlpgsqlBodyValidator {
         }
         if (routine.setReturning()) {
             throw new MemgresException(
-                    "RETURN cannot have a parameter in function returning set", "42804");
+                    "RETURN cannot have a parameter in function returning set"
+                            + "\n  Hint: Use RETURN NEXT or RETURN QUERY.", "42804");
         }
         if (routine.hasOutParams) {
             throw new MemgresException(
@@ -477,7 +478,9 @@ public final class PlpgsqlBodyValidator {
             return;   // a body this cannot read is left for execution to report
         }
         if (returnsRows(parsed)) {
-            throw new MemgresException("query has no destination for result data", "42601");
+            throw new MemgresException("query has no destination for result data"
+                    + "\n  Hint: If you want to discard the results of a SELECT,"
+                    + " use PERFORM instead.", "42601");
         }
     }
 

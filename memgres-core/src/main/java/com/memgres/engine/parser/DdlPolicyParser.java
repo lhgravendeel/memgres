@@ -28,7 +28,9 @@ class DdlPolicyParser {
             policyType = typeToken.value().toUpperCase();
             if (!"PERMISSIVE".equals(policyType) && !"RESTRICTIVE".equals(policyType)) {
                 throw PgErrors.syntax("unrecognized row security option \""
-                        + typeToken.value().toLowerCase() + "\"");
+                        + typeToken.value().toLowerCase() + "\""
+                        + "\n  Hint: Only PERMISSIVE or RESTRICTIVE policies are supported"
+                        + " currently.");
             }
         }
 

@@ -44,6 +44,21 @@ public final class InsertStmt implements Statement {
         this.overridingUserValue = overridingUserValue;
     }
 
+    /**
+     * The brackets written after each named column, one entry per column and null where the
+     * column was named on its own. Null altogether when no column was named with brackets.
+     */
+    private List<List<SubscriptExpr.Subscript>> columnSubscripts;
+
+    public List<List<SubscriptExpr.Subscript>> columnSubscripts() {
+        return columnSubscripts;
+    }
+
+    public InsertStmt withColumnSubscripts(List<List<SubscriptExpr.Subscript>> subscripts) {
+        this.columnSubscripts = subscripts;
+        return this;
+    }
+
     /** Backward-compatible constructor without WITH clauses or alias. */
     public InsertStmt(String schema, String table, List<String> columns,
                       List<List<Expression>> values, SelectStmt selectStmt,
@@ -179,20 +194,31 @@ public final class InsertStmt implements Statement {
         public final String column;
         public final Expression value;
         public final String subField; // for composite field updates like SET pos.x = value
+        /** The brackets written after the column, when the assignment names part of the value. */
+        public final List<SubscriptExpr.Subscript> subscripts;
 
         public SetClause(String column, Expression value) {
             this(column, value, null);
         }
 
         public SetClause(String column, Expression value, String subField) {
+            this(column, value, subField, null);
+        }
+
+        public SetClause(String column, Expression value, String subField,
+                List<SubscriptExpr.Subscript> subscripts) {
             this.column = column;
             this.value = value;
             this.subField = subField;
+            this.subscripts = subscripts;
         }
 
         public String column() { return column; }
         public Expression value() { return value; }
         public String subField() { return subField; }
+
+        /** The subscripts the assignment writes through, or null when it writes the whole value. */
+        public List<SubscriptExpr.Subscript> subscripts() { return subscripts; }
 
         @Override
         public boolean equals(Object o) {

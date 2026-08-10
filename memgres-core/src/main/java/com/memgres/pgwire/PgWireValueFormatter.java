@@ -52,6 +52,10 @@ class PgWireValueFormatter {
             for (byte b : ba) sb.append(String.format("%02x", b & 0xFF));
             return sb.toString();
         }
+        // The two ends of the timestamp range are written as the words they are, not as the
+        // instants that stand for them.
+        String infinite = com.memgres.engine.TypeCoercion.infinityText(val);
+        if (infinite != null) return infinite;
         if (val instanceof Boolean) {
             Boolean b = (Boolean) val;
             return b ? "t" : "f";
@@ -162,7 +166,7 @@ class PgWireValueFormatter {
             return vec.toString();
         } else if (val instanceof java.util.List<?>) {
             java.util.List<?> list = (java.util.List<?>) val;
-            StringBuilder sb = new StringBuilder("{");
+            StringBuilder sb = new StringBuilder(boundsPrefixOf(list)).append("{");
             for (int i = 0; i < list.size(); i++) {
                 if (i > 0) sb.append(",");
                 Object elem = list.get(i);
@@ -188,8 +192,18 @@ class PgWireValueFormatter {
                     } else {
                         sb.append(s);
                     }
-                } else {
+                } else if (elem instanceof java.util.List<?>) {
+                    // A dimension inside an array is written as its own braces, never quoted.
                     sb.append(formatValue(elem, guc));
+                } else {
+                    // Every element is quoted by the same rule, whatever its type: a timestamp's
+                    // text carries a space, and unquoted it read back as two elements.
+                    String text = formatValue(elem, guc);
+                    if (needsArrayQuote(text)) {
+                        sb.append('"').append(text.replace("\\", "\\\\").replace("\"", "\\\"")).append('"');
+                    } else {
+                        sb.append(text);
+                    }
                 }
             }
             sb.append("}");
@@ -219,7 +233,7 @@ class PgWireValueFormatter {
         } else {
             return formatValue(val, guc);
         }
-        StringBuilder sb = new StringBuilder("{");
+        StringBuilder sb = new StringBuilder(boundsPrefixOf(list)).append("{");
         for (int i = 0; i < list.size(); i++) {
             if (i > 0) sb.append(',');
             Object e = list.get(i);
@@ -277,6 +291,16 @@ class PgWireValueFormatter {
     private static boolean isTemporalArrayElem(DataType t) {
         return t == DataType.DATE || t == DataType.TIMESTAMP || t == DataType.TIMESTAMPTZ
                 || t == DataType.TIME || t == DataType.TIMETZ;
+    }
+
+    /**
+     * The {@code [lb:ub]=} an array whose dimensions do not start at 1 is written with. Without it
+     * the client is told an ordinary array, and the bounds it was written with are gone.
+     */
+    private static String boundsPrefixOf(java.util.List<?> list) {
+        if (!(list instanceof com.memgres.engine.PgArray)) return "";
+        com.memgres.engine.PgArray array = (com.memgres.engine.PgArray) list;
+        return array.hasCustomLowerBounds() ? array.boundsPrefix() : "";
     }
 
     private static boolean needsArrayQuote(String s) {

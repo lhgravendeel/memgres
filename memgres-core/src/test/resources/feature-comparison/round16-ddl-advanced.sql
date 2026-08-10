@@ -79,7 +79,7 @@ DELETE FROM fk_p WHERE a=1;
 -- 5. After parent delete, only column a nullified; b stays 2
 -- begin-expected
 -- columns: a,b
--- row: 1 | 2
+-- row: NULL|2
 -- end-expected
 SELECT a, b FROM fk_c;
 

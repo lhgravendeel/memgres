@@ -17,21 +17,30 @@ class RangeFunctions {
 
     private static String getRangeTypeName(Expression expr) {
         if (expr instanceof FunctionCallExpr) {
-            FunctionCallExpr fn = (FunctionCallExpr) expr;
-            String name = fn.name().toLowerCase();
-            switch (name) {
-                case "int4range":
-                case "int8range":
-                case "numrange":
-                case "daterange":
-                case "tsrange":
-                case "tstzrange":
-                    return name;
-                default:
-                    return null;
-            }
+            return knownRangeType(((FunctionCallExpr) expr).name());
+        }
+        // A cast names the range type as plainly as a constructor does, and reading only the
+        // constructor left '(1,5]'::numrange with no type to be read back as.
+        if (expr instanceof CastExpr) {
+            return knownRangeType(((CastExpr) expr).typeName());
         }
         return null;
+    }
+
+    private static String knownRangeType(String name) {
+        if (name == null) return null;
+        String t = name.toLowerCase().trim();
+        switch (t) {
+            case "int4range":
+            case "int8range":
+            case "numrange":
+            case "daterange":
+            case "tsrange":
+            case "tstzrange":
+                return t;
+            default:
+                return null;
+        }
     }
 
     private static boolean isDecimalRange(String s) {
@@ -74,8 +83,11 @@ class RangeFunctions {
         if (bounds.length() != 2
                 || (bounds.charAt(0) != '[' && bounds.charAt(0) != '(')
                 || (bounds.charAt(1) != ']' && bounds.charAt(1) != ')')) {
-            throw new MemgresException(
-                    "range bound flags must be one of \"[]\", \"[)\", \"(]\", or \"()\"", "22P02");
+            // Bad flags are a bad argument to the constructor rather than text that would not
+            // read, and the four spellings are advice, which PostgreSQL carries in the hint.
+            MemgresException e = new MemgresException("invalid range bound flags", "42601");
+            e.setHint("Valid values are \"[]\", \"[)\", \"(]\", and \"()\".");
+            throw e;
         }
         String lo = loObj == null ? "" : quoteForRange(loObj);
         String hi = hiObj == null ? "" : quoteForRange(hiObj);
@@ -129,8 +141,7 @@ class RangeFunctions {
         throw new MemgresException("function " + rangeType + "("
                 + (loName != null ? loName : "integer") + ", "
                 + (hiName != null ? hiName : "integer") + ") does not exist"
-                + "\n  Hint: No function matches the given name and argument types."
-                + " You might need to add explicit type casts.", "42883");
+                + "\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
     }
 
     /** The PG type name a bound value can only have come from, or null when int4 accepts it. */
@@ -233,13 +244,11 @@ class RangeFunctions {
                 }
                 // range_merge(range, range) → smallest range containing both
                 // Check for cross-type range arguments (e.g., int4range vs numrange)
-                if (fn.args().size() == 2) {
-                    String lt = getRangeTypeName(fn.args().get(0));
-                    String rt = getRangeTypeName(fn.args().get(1));
-                    if (lt != null && rt != null && !lt.equals(rt)) {
-                        throw new MemgresException(
-                            "function range_merge(" + lt + ", " + rt + ") does not exist\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
-                    }
+                String lt = getRangeTypeName(fn.args().get(0));
+                String rt = getRangeTypeName(fn.args().get(1));
+                if (lt != null && rt != null && !lt.equals(rt)) {
+                    throw new MemgresException(
+                        "function range_merge(" + lt + ", " + rt + ") does not exist\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
                 }
                 Object a = executor.evalExpr(fn.args().get(0), ctx);
                 Object b = executor.evalExpr(fn.args().get(1), ctx);
@@ -249,8 +258,10 @@ class RangeFunctions {
                     throw new MemgresException(
                         "function range_merge(text, text) does not exist\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42804");
                 }
-                RangeOperations.PgRange ra = RangeOperations.parse(a.toString());
-                RangeOperations.PgRange rb = RangeOperations.parse(b.toString());
+                // Both operands are read as the range type they were written as, so a numrange is
+                // not canonicalised as though its whole-number bounds made it an integer range.
+                RangeOperations.PgRange ra = RangeOperations.parse(a.toString(), lt);
+                RangeOperations.PgRange rb = RangeOperations.parse(b.toString(), rt != null ? rt : lt);
                 return RangeOperations.merge(ra, rb).toString();
             }
             case "isempty": {
@@ -347,16 +358,13 @@ class RangeFunctions {
                     }
                 }
                 if (rawRanges.isEmpty()) return "{}";
-                if (allInteger && !intRanges.isEmpty()) {
-                    return RangeOperations.formatMultirange(RangeOperations.mergeAndSort(intRanges));
-                }
-                StringBuilder sb = new StringBuilder("{");
-                for (int i = 0; i < rawRanges.size(); i++) {
-                    if (i > 0) sb.append(",");
-                    sb.append(rawRanges.get(i));
-                }
-                sb.append("}");
-                return sb.toString();
+                // A multirange holds ranges that neither overlap nor touch, whatever its element
+                // type: writing the members out in the order they were given left two adjacent
+                // numeric ranges side by side where PostgreSQL joins them into one.
+                String memberType = name.replace("multirange", "range");
+                List<RangeOperations.PgRange> members = new ArrayList<>();
+                for (String raw : rawRanges) members.add(RangeOperations.parse(raw, memberType));
+                return RangeOperations.formatMultirange(RangeOperations.mergeAndSort(members));
             }
             case "numrange":
                 return buildRange(name, fn, ctx);
@@ -377,8 +385,10 @@ class RangeFunctions {
                     }
                     boolean li = bounds.charAt(0) == '[';
                     boolean ui = bounds.charAt(1) == ']';
-                    String loStr = loObj == null ? "" : loObj.toString();
-                    String hiStr = hiObj == null ? "" : hiObj.toString();
+                    // A bound is quoted when its text would not read back as one bound: without
+                    // that, a bound holding a comma, a space or nothing at all was lost.
+                    String loStr = writtenBound(loObj);
+                    String hiStr = writtenBound(hiObj);
                     String lBracket = loObj == null ? "(" : (li ? "[" : "(");
                     String rBracket = hiObj == null ? ")" : (ui ? "]" : ")");
                     return lBracket + loStr + "," + hiStr + rBracket;
@@ -387,4 +397,15 @@ class RangeFunctions {
             }
         }
     }
+
+    /**
+     * A user-defined range's bound as it has to be written. An absent bound is nothing at all; a
+     * bound that is there but empty is a pair of quotes, or it reads back as absent.
+     */
+    private static String writtenBound(Object value) {
+        if (value == null) return "";
+        String text = TypeCoercion.toString(value);
+        return text.isEmpty() ? "\"\"" : RangeOperations.quotedBound(text);
+    }
+
 }

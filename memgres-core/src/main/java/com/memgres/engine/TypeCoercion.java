@@ -411,11 +411,17 @@ public final class TypeCoercion {
         // to be one: the check has to come before the value is taken as already stored.
         if (type == DataType.PG_LSN) return checkedLsn(value);
 
+        // An array column holds an array. Writing the text of one into the column instead threw
+        // away the bounds and the element type, so everything read back out of it was a string.
+        if (DataType.isArrayType(type)) {
+            PgArray array = PgArray.from(value);
+            if (array != null) return coerceArrayElements(array, DataType.elementOf(type));
+        }
+
         // If value is already the right Java type, no conversion needed
         if (isCorrectJavaType(value, type)) {
             return applyPrecision(value, type, column);
         }
-
         // Arrays (List) should be stored as PG array format strings, not Java List.toString()
         if (value instanceof java.util.List<?>) {
             return formatPgArray((java.util.List<?>) value);
@@ -428,10 +434,13 @@ public final class TypeCoercion {
         }
 
         // A numeric special reaches its column as text, and a declared precision has no room for
-        // one: PostgreSQL calls that an overflow of the field rather than bad input syntax.
-        if (type == DataType.NUMERIC && column.getPrecision() != null
-                && NumericLimits.specialNumericOrNull(value) != null) {
-            throw new MemgresException("numeric field overflow", "22003");
+        // one: PostgreSQL calls that an overflow of the field rather than bad input syntax, and
+        // names the field it would not fit in.
+        if (type == DataType.NUMERIC && column.getPrecision() != null) {
+            Double special = NumericLimits.specialNumericOrNull(value);
+            if (special != null) {
+                rejectNonFiniteNumeric(special.doubleValue(), column.getPrecision(), column.getScale());
+            }
         }
         try {
             Object coerced = coerce(value, type);
@@ -450,6 +459,26 @@ public final class TypeCoercion {
             throw new MemgresException(
                     "invalid input syntax for type " + type.getPgName() + ": \"" + value + "\"", "22P02");
         }
+    }
+
+    /**
+     * Every element of an array read as the column's element type, keeping the array's bounds.
+     * An element the element type refuses is refused here rather than stored as its own spelling.
+     */
+    static PgArray coerceArrayElements(PgArray array, DataType elementType) {
+        if (elementType == null) return array;
+        List<Object> coerced = coerceElementList(array, elementType);
+        return PgArray.of(coerced, array.lowerBounds(), elementType.getPgName());
+    }
+
+    private static List<Object> coerceElementList(List<?> elements, DataType elementType) {
+        List<Object> out = new ArrayList<Object>(elements.size());
+        for (Object element : elements) {
+            if (element == null) out.add(null);
+            else if (element instanceof List<?>) out.add(coerceElementList((List<?>) element, elementType));
+            else out.add(coerce(element, elementType));
+        }
+        return out;
     }
 
     /** Validate array elements match the expected array element type. */
@@ -560,7 +589,9 @@ public final class TypeCoercion {
     /** A declared numeric(p[,s]) has no room for NaN or an infinity. */
     private static void rejectNonFiniteNumeric(double value, int precision, Integer scale) {
         if (Double.isNaN(value) || Double.isInfinite(value)) {
-            throw new MemgresException("numeric field overflow", "22003");
+            // Refused with the same sentence a cast to numeric(p,s) is refused with, so the field
+            // is named however the value arrived at it.
+            rejectSpecialForTypmod(value, precision, scale == null ? 0 : scale.intValue());
         }
     }
 
@@ -724,21 +755,15 @@ public final class TypeCoercion {
     // ---- Out-of-range exception helpers (with datatype field for wire protocol) ----
 
     private static MemgresException smallintOutOfRange() {
-        MemgresException e = new MemgresException("smallint out of range", "22003");
-        e.setDatatype("smallint");
-        return e;
+        return new MemgresException("smallint out of range", "22003");
     }
 
     private static MemgresException integerOutOfRange() {
-        MemgresException e = new MemgresException("integer out of range", "22003");
-        e.setDatatype("integer");
-        return e;
+        return new MemgresException("integer out of range", "22003");
     }
 
     private static MemgresException bigintOutOfRange() {
-        MemgresException e = new MemgresException("bigint out of range", "22003");
-        e.setDatatype("bigint");
-        return e;
+        return new MemgresException("bigint out of range", "22003");
     }
 
     // ---- Conversion helpers ----
@@ -993,6 +1018,24 @@ public final class TypeCoercion {
         if (open < 0 || close < 0) return;
         String name = typeSpec.substring(0, open).trim().toLowerCase(java.util.Locale.ROOT);
         String[] args = typeSpec.substring(open + 1, close).split(",");
+        // numeric takes its modifier as an expression rather than as a bare integer token, so a
+        // number too wide for the int4 a modifier is held in fails as a bad integer before it is
+        // a precision or a scale at all.
+        if (name.equals("numeric") || name.equals("decimal")) {
+            for (int i = 0; i < args.length; i++) {
+                String written = args[i].trim();
+                java.math.BigInteger value;
+                try {
+                    value = new java.math.BigInteger(written);
+                } catch (NumberFormatException e) {
+                    continue; // not a whole number, so the checks below say what it is instead
+                }
+                if (value.bitLength() > 31) {
+                    throw new MemgresException("value \"" + written
+                            + "\" is out of range for type integer", "22003");
+                }
+            }
+        }
         Integer first = parseModifier(args, 0);
         if (first == null) return;
 
@@ -1121,6 +1164,12 @@ public final class TypeCoercion {
         // An infinity is written as the word, not as the instant that stands for it.
         String infinite = infinityText(val);
         if (infinite != null) return infinite;
+        // The types whose Java rendering is not PostgreSQL's. A boolean inside a container is one
+        // letter, a bytea is its hex form, and a numeric is written in full rather than in Java's
+        // exponent notation -- none of which Object.toString() gives.
+        if (val instanceof Boolean) return ((Boolean) val) ? "t" : "f";
+        if (val instanceof byte[]) return byteaToText((byte[]) val);
+        if (val instanceof java.math.BigDecimal) return ((java.math.BigDecimal) val).toPlainString();
         if (val instanceof Double) return PgFloatFormat.float8out((Double) val);
         if (val instanceof Float) return PgFloatFormat.float4out((Float) val);
         if (val instanceof LocalDate) return formatIsoDate((LocalDate) val);
@@ -1149,22 +1198,11 @@ public final class TypeCoercion {
         if (val instanceof PgInterval) return ((PgInterval) val).toString();
         if (val instanceof java.util.List<?>) return formatPgArray((java.util.List<?>) val);
         if (val instanceof AstExecutor.PgEnum) return ((AstExecutor.PgEnum) val).label();
-        if (val instanceof AstExecutor.PgRow) {
-            AstExecutor.PgRow row = (AstExecutor.PgRow) val;
-            // PG format: (val1,val2,...) with nested composites quoted
-            StringBuilder sb = new StringBuilder("(");
-            for (int i = 0; i < row.values().size(); i++) {
-                if (i > 0) sb.append(",");
-                Object v = row.values().get(i);
-                if (v == null) sb.append("");
-                else if (v instanceof AstExecutor.PgRow) {
-                    AstExecutor.PgRow nested = (AstExecutor.PgRow) v;
-                    String inner = toString(nested);
-                    sb.append("\"").append(inner.replace("\"", "\\\"")).append("\"");
-                } else sb.append(v);
-            }
-            sb.append(")");
-            return sb.toString();
+        // A composite has one writer, the one that quotes its fields; a second one here wrote a
+        // row whose fields no reader could find again.
+        if (val instanceof AstExecutor.PgRow) return ((AstExecutor.PgRow) val).toPgText();
+        if (val instanceof java.util.Map<?, ?>) {
+            return AstExecutor.PgRow.fromFieldMap((java.util.Map<?, ?>) val).toPgText();
         }
         return val.toString();
     }
@@ -1189,37 +1227,65 @@ public final class TypeCoercion {
         return sb.toString();
     }
 
+    /**
+     * An array written the way {@code array_out} writes it. This is the only array writer: the
+     * three others that grew beside it each quoted a different set of characters, so the same
+     * array had three spellings and only one of them could be read back.
+     *
+     * <p>An array whose dimensions do not start at 1 states them in front of the braces, because
+     * that is the only place its bounds can be kept.
+     */
     public static String formatPgArray(java.util.List<?> list) {
-        StringBuilder sb = new StringBuilder("{");
+        String prefix = "";
+        if (list instanceof PgArray) {
+            PgArray array = (PgArray) list;
+            if (array.hasCustomLowerBounds()) prefix = array.boundsPrefix();
+        }
+        StringBuilder sb = new StringBuilder(prefix).append("{");
         for (int i = 0; i < list.size(); i++) {
             if (i > 0) sb.append(",");
             Object elem = list.get(i);
             if (elem == null) {
                 sb.append("NULL");
             } else if (elem instanceof java.util.List<?>) {
-                java.util.List<?> sub = (java.util.List<?>) elem;
-                sb.append(formatPgArray(sub));
-            } else if (elem instanceof AstExecutor.PgRow) {
-                AstExecutor.PgRow row = (AstExecutor.PgRow) elem;
-                String rowStr = toString(row);
-                sb.append("\"").append(rowStr.replace("\\", "\\\\").replace("\"", "\\\"")).append("\"");
+                sb.append(formatPgArray((java.util.List<?>) elem));
             } else {
-                // Every other element is written the way the value itself is written, and quoted
-                // when its text could not be read back otherwise. Appending the object instead
-                // gave an array of hstore the element's Java identity of quoting -- none -- so
-                // {"a"=>"1"} read back as the single word a, and an interval or a tsvector inside
-                // an array lost the quotes that hold it together.
-                String s = elem instanceof String ? (String) elem : toString(elem);
-                // The literal string "NULL" must be quoted to distinguish it from SQL NULL
-                if (s.startsWith("(") || s.contains(",") || s.contains("{") || s.contains("}") || s.contains("\"") || s.contains("\\") || s.contains(" ") || s.isEmpty() || s.equalsIgnoreCase("NULL")) {
-                    sb.append("\"").append(s.replace("\\", "\\\\").replace("\"", "\\\"")).append("\"");
-                } else {
-                    sb.append(s);
-                }
+                appendArrayElement(sb, toString(elem));
             }
         }
         sb.append("}");
         return sb.toString();
+    }
+
+    /**
+     * One element of an array literal. PostgreSQL quotes an element that is empty, that spells
+     * NULL in any case, or that carries a brace, the delimiter, a quote, a backslash or any
+     * whitespace — and escapes the quote and the backslash inside the quotes.
+     */
+    static void appendArrayElement(StringBuilder sb, String text) {
+        if (!needsArrayQuoting(text)) {
+            sb.append(text);
+            return;
+        }
+        sb.append('"');
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (c == '"' || c == '\\') sb.append('\\');
+            sb.append(c);
+        }
+        sb.append('"');
+    }
+
+    private static boolean needsArrayQuoting(String text) {
+        if (text.isEmpty() || text.equalsIgnoreCase("NULL")) return true;
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (c == '{' || c == '}' || c == ',' || c == '"' || c == '\\'
+                    || Character.isWhitespace(c)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** The words boolean input accepts, each matchable by any prefix that names only one of them. */
@@ -1710,14 +1776,19 @@ public final class TypeCoercion {
         long nanos = m.group(7) == null ? 0
                 : new java.math.BigDecimal(m.group(7)).movePointRight(9).longValue();
         if (year > maxYear) throw outOfRange(outOfRangeNoun, original);
-        if (month < 1 || month > 12) throw fieldOutOfRange(original);
+        // A month outside 1..12 and a day outside 1..31 are the two mistakes PostgreSQL suspects
+        // of being a date written in another field order, and they are the only ones it offers the
+        // DateStyle advice for. February the 30th is a real day of some other month, so it is
+        // refused with the message alone, as is a year of zero and a clock field out of range.
+        if (month < 1 || month > 12) throw misorderedField(original);
         LocalDate date;
         try {
             date = LocalDate.of((int) year, month, 1);
         } catch (RuntimeException e) {
             throw outOfRange(outOfRangeNoun, original);
         }
-        if (day < 1 || day > date.lengthOfMonth()) throw fieldOutOfRange(original);
+        if (day < 1 || day > 31) throw misorderedField(original);
+        if (day > date.lengthOfMonth()) throw fieldOutOfRange(original);
         // PG reads 24:00:00 as the following midnight and a 60th second as the next minute, but
         // only when nothing finer is written past them.
         if (hour > 24 || (hour == 24 && (minute != 0 || second != 0 || nanos != 0))) {
@@ -1744,6 +1815,13 @@ public final class TypeCoercion {
     private static MemgresException fieldOutOfRange(String original) {
         return new MemgresException(
                 "date/time field value out of range: \"" + original + "\"", "22008");
+    }
+
+    /** The same, for a field a different field order would have read as a legal one. */
+    private static MemgresException misorderedField(String original) {
+        MemgresException ex = fieldOutOfRange(original);
+        ex.setHint("Perhaps you need a different \"DateStyle\" setting.");
+        return ex;
     }
 
     private static MemgresException outOfRange(String noun, String original) {
@@ -2402,25 +2480,40 @@ public final class TypeCoercion {
      */
     public static Object arrayForCompare(Object value) {
         if (!(value instanceof String)) return value;
-        String s = ((String) value).trim();
-        if (s.length() < 2 || s.charAt(0) != '{' || s.charAt(s.length() - 1) != '}') return value;
-        String inner = s.substring(1, s.length() - 1).trim();
-        List<Object> out = new ArrayList<>();
-        if (inner.isEmpty()) return out;
-        for (String raw : inner.split(",")) {
-            String elem = raw.trim();
-            if (elem.equalsIgnoreCase("NULL")) { out.add(null); continue; }
-            if (elem.length() > 1 && elem.charAt(0) == '"' && elem.charAt(elem.length() - 1) == '"') {
-                out.add(elem.substring(1, elem.length() - 1));
-                continue;
-            }
-            try {
-                out.add(new BigDecimal(elem));
-            } catch (NumberFormatException e) {
-                out.add(elem);
-            }
+        if (!PgArray.looksLikeArrayText((String) value)) return value;
+        try {
+            return PgArray.from(value);
+        } catch (MemgresException e) {
+            // Text that opens like an array but is not one stays the text it is.
+            return value;
         }
-        return out;
+    }
+
+    /** The bounds an ordinary array has: one per dimension, each starting at 1. */
+    private static int[] defaultBounds(List<?> array) {
+        int[] bounds = new int[PgArray.dimensionsOf(array)];
+        java.util.Arrays.fill(bounds, 1);
+        return bounds;
+    }
+
+    /**
+     * Two arrays compared as {@code array_cmp} compares them: element by element, with a null
+     * element after every value, and — when every element agrees — the shorter array first.
+     */
+    private static int compareArrays(List<?> a, List<?> b) {
+        int shared = Math.min(a.size(), b.size());
+        for (int i = 0; i < shared; i++) {
+            Object ea = a.get(i);
+            Object eb = b.get(i);
+            if (ea == null || eb == null) {
+                // PostgreSQL sorts a null element after every value, the way NULLS LAST does.
+                if (ea == null && eb == null) continue;
+                return ea == null ? 1 : -1;
+            }
+            int cmp = compare(ea, eb);
+            if (cmp != 0) return cmp;
+        }
+        return Integer.compare(a.size(), b.size());
     }
 
     public static int compare(Object a, Object b) {
@@ -2437,6 +2530,14 @@ public final class TypeCoercion {
                 if (cmp != 0) return cmp;
             }
             return Integer.compare(ba.length, bb.length);
+        }
+
+        // Arrays are compared element by element, as array_cmp does. Comparing the text of the
+        // literal instead put {1,2,3} before {1}, because a comma sorts before a brace.
+        if (a instanceof List<?> || b instanceof List<?>) {
+            List<?> la = a instanceof List<?> ? (List<?>) a : null;
+            List<?> lb = b instanceof List<?> ? (List<?>) b : null;
+            if (la != null && lb != null) return compareArrays(la, lb);
         }
 
         // PgRow (record) comparison: element-by-element
@@ -2477,7 +2578,9 @@ public final class TypeCoercion {
             if (a instanceof BigDecimal || b instanceof BigDecimal) {
                 return toBigDecimal(a).compareTo(toBigDecimal(b));
             }
-            return Double.compare(da, db);
+            // IEEE says a negative zero equals a positive one, and PostgreSQL's float operators
+            // say so too; Double.compare puts them in an order they do not have.
+            return da < db ? -1 : da > db ? 1 : 0;
         }
 
         // Date/time comparisons
@@ -2724,6 +2827,29 @@ public final class TypeCoercion {
     public static boolean areEqual(Object a, Object b) {
         if (a == null && b == null) return true;
         if (a == null || b == null) return false;
+        // Two arrays are equal when their elements are, however each element is spelled: comparing
+        // the literal text made a numeric 1.0 differ from the same value written 1.00.
+        if (a instanceof List<?> && b instanceof List<?>) {
+            List<?> la = (List<?>) a;
+            List<?> lb = (List<?>) b;
+            if (la.size() != lb.size()) return false;
+            for (int i = 0; i < la.size(); i++) {
+                Object ea = la.get(i);
+                Object eb = lb.get(i);
+                if (ea == null || eb == null) {
+                    if (ea != eb) return false;
+                } else if (!areEqual(ea, eb)) {
+                    return false;
+                }
+            }
+            // An array states where its dimensions begin, and two arrays holding the same elements
+            // at different subscripts are not the same array.
+            int[] boundsA = a instanceof PgArray ? ((PgArray) a).lowerBounds() : null;
+            int[] boundsB = b instanceof PgArray ? ((PgArray) b).lowerBounds() : null;
+            return java.util.Arrays.equals(
+                    boundsA == null ? defaultBounds(la) : boundsA,
+                    boundsB == null ? defaultBounds(lb) : boundsB);
+        }
         if (a.equals(b) || b.equals(a)) return true;
         // bytea: compare the bytes, not the array identity
         if (a instanceof byte[] && b instanceof byte[]) {
@@ -2956,7 +3082,9 @@ public final class TypeCoercion {
         if (a == null && b == null) return 0;
         if (a == null) return isLower ? -1 : 1;  // unbounded lower is smallest, unbounded upper is largest
         if (b == null) return isLower ? 1 : -1;
-        int cmp = Long.compare(a.longValue(), b.longValue());
+        // The bound is compared as the number it is. Narrowing it to a long first made every
+        // fractional numrange bound tie with its neighbours, so 1.2, 1.5 and 1.9 all sorted equal.
+        int cmp = toBigDecimal(a).compareTo(toBigDecimal(b));
         if (cmp != 0) return cmp;
         // Same value: inclusive vs exclusive matters
         // For lower: inclusive < exclusive (inclusive starts earlier)

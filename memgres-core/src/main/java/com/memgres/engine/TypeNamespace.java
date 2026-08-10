@@ -286,8 +286,9 @@ final class TypeNamespace {
      */
     static void requireRenameableRowType(Database db, String schema, String name) {
         if (kindOf(db, schema, name) != null) {
-            throw new MemgresException("type \"" + name + "\" already exists"
-                    + ROW_TYPE_HINT, "42710");
+            // No hint here. PostgreSQL offers the advice where a name is being chosen for a new
+            // relation, and gives a rename that lands on a taken name the bare refusal.
+            throw new MemgresException("type \"" + name + "\" already exists", "42710");
         }
     }
 

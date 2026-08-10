@@ -36,6 +36,8 @@ public class AstExecutor {
     public SystemCatalog getSystemCatalog() { return systemCatalog; }
     final ArrayOperationHandler arrayOperationHandler = new ArrayOperationHandler(this);
     final BinaryOpEvaluator binaryOpEvaluator = new BinaryOpEvaluator(this);
+    final SubscriptEvaluator subscriptEvaluator = new SubscriptEvaluator(this);
+    final SubscriptAssign subscriptAssign = new SubscriptAssign(this);
     final CompositeTypeHandler compositeTypeHandler = new CompositeTypeHandler(this);
     final DateTimeArithmetic dateTimeArithmetic = new DateTimeArithmetic(this);
     final FunctionEvaluator functionEvaluator = new FunctionEvaluator(this);
@@ -109,6 +111,13 @@ public class AstExecutor {
      * "update" or "delete from". Set by the DML executor before it resolves the target.
      */
     String viewDmlVerb = "insert into";
+
+    /**
+     * Whether that write is a MERGE. PostgreSQL's advice for a MERGE names an INSTEAD OF trigger
+     * and nothing else, because no rule can stand in for a MERGE the way one stands in for an
+     * INSERT or an UPDATE, so the verb alone does not say enough to word the Hint.
+     */
+    boolean viewDmlByMerge;
 
     /** Views whose body is currently being expanded, and rules currently being applied. */
     private final Set<String> expansionsInProgress = new HashSet<>();
@@ -857,16 +866,10 @@ public class AstExecutor {
                 if (i > 0) sb.append(',');
                 Object elem = values.get(i);
                 if (elem == null) continue;
-                String text;
-                if (elem instanceof PgRow) {
-                    text = ((PgRow) elem).toPgText();
-                } else if (elem instanceof java.util.Map) {
-                    text = fromFieldMap((java.util.Map<?, ?>) elem).toPgText();
-                } else if (elem instanceof Boolean) {
-                    text = ((Boolean) elem) ? "t" : "f";
-                } else {
-                    text = elem.toString();
-                }
+                // Each field is written by its own type's output function, the same one an array
+                // element goes through: reading the Java object instead put a boolean in as
+                // "true", a bytea as its identity hash and an array as a Java list.
+                String text = TypeCoercion.toString(elem);
                 if (needsCompositeQuoting(text)) {
                     sb.append('"').append(text.replace("\\", "\\\\").replace("\"", "\"\"")).append('"');
                 } else {
@@ -915,15 +918,9 @@ public class AstExecutor {
 
         @Override
         public String toString() {
-            // PG-compatible format: (val1,val2,...) where NULL is empty
-            StringBuilder sb = new StringBuilder("(");
-            for (int i = 0; i < values.size(); i++) {
-                if (i > 0) sb.append(",");
-                Object v = values.get(i);
-                if (v != null) sb.append(v);
-            }
-            sb.append(")");
-            return sb.toString();
+            // A composite has one text form, the one record_out writes. A second, quoting-free
+            // one here is what a stored composite was written with, and no reader could undo it.
+            return toPgText();
         }
     }
 
@@ -1392,7 +1389,8 @@ public class AstExecutor {
             // one — the caller has to be told which definition to change.
             String blamed = reason != null && reason.relation != null ? reason.relation : tableName;
             throw ViewUpdatability.cannotWrite(viewDmlVerb, blamed,
-                    reason != null ? reason.detail : ViewUpdatability.DETAIL_NOT_SINGLE_RELATION);
+                    reason != null ? reason.detail : ViewUpdatability.DETAIL_NOT_SINGLE_RELATION,
+                    viewDmlByMerge);
         }
         // Sequences are queryable as relations in PG (columns: last_value, log_cnt, is_called)
         Table seqTable = resolveSequenceAsRelation(schemaName, tableName, userQualified);
@@ -1888,7 +1886,8 @@ public class AstExecutor {
                 PgFunction func = resolveAlterFunction(stmt);
                 if (func == null) {
                     if (stmt.ifExists()) return QueryResult.message(QueryResult.Type.SET, tag);
-                    throw new MemgresException(kind + " " + alterFunctionSignature(stmt) + " does not exist", "42883");
+                    throw new MemgresException(kind + " " + alterFunctionSignature(stmt)
+                            + " does not exist", "42883").withoutHint();
                 }
                 // Check for name conflict: target name must not already exist with compatible signature
                 java.util.List<PgFunction> existingTarget = database.getFunctionOverloads(stmt.targetValue());
@@ -2214,10 +2213,15 @@ public class AstExecutor {
                             if (entry.getValue().equalsIgnoreCase(parentKey)) {
                                 String existingChildTable = database.getIndexTable(entry.getKey());
                                 if (childTable.equalsIgnoreCase(existingChildTable != null ? existingChildTable : "")) {
-                                    throw new MemgresException(
+                                    // PostgreSQL names the partition that is already covered,
+                                    // which is the one the reader has to go and look at.
+                                    MemgresException taken = new MemgresException(
                                             "cannot attach index \"" + childIdx
                                             + "\" as a partition of index \"" + parentIdx + "\"",
                                             "55000");
+                                    taken.setDetail("Another index is already attached for partition \""
+                                            + childTable + "\".");
+                                    throw taken;
                                 }
                             }
                         }

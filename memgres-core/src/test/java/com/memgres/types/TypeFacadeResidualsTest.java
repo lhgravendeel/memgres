@@ -168,7 +168,8 @@ class TypeFacadeResidualsTest {
         }
     }
     @Test void jsonb_array_arrow_still_works() throws SQLException { assertEquals("10", q("SELECT '[10,20]'::jsonb -> 0")); }
-    @Test void text_subscript_still_rejected() throws SQLException { expectError("SELECT ('hello'::text)[0]", "42883"); }
+    /** Subscripting a text is a complaint about the type, not about a missing operator. */
+    @Test void text_subscript_still_rejected() throws SQLException { expectError("SELECT ('hello'::text)[0]", "42804"); }
 
     // ---- L1: negative substring length on bytea ----
 

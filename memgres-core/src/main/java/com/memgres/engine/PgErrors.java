@@ -149,4 +149,20 @@ public final class PgErrors {
     public static MemgresException notImplemented(String message) {
         return new MemgresException(message, "0A000");
     }
+
+    /**
+     * {@code 23502} — a rule forbidding nulls is being declared over a column that already holds
+     * one. PostgreSQL names the column in the error's own column field as well as in the sentence,
+     * so a client reading the fields rather than the prose still learns what has to be put right.
+     *
+     * @param noun how the statement refers to what holds the column: a statement about the table
+     *     says "relation", while ALTER DOMAIN, which reaches the column through its type, says
+     *     "table"
+     */
+    public static MemgresException columnContainsNulls(String column, String noun, String relation) {
+        MemgresException e = new MemgresException("column \"" + column + "\" of " + noun
+                + " \"" + relation + "\" contains null values", "23502");
+        e.setColumn(column);
+        return e;
+    }
 }

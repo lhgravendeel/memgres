@@ -80,11 +80,23 @@ class CastEvaluator {
         return null;
     }
 
-    /** A user type's key written the way regtype prints it for this session. */
+    /**
+     * A user type's key written the way regtype prints it for this session.
+     *
+     * <p>An array type is keyed by its element's key with the brackets on the end, and it is the
+     * element that the search path finds. Reading the whole key as a name to resolve found nothing,
+     * so every array of a user type printed with a qualifier PostgreSQL leaves off.
+     */
     private String userTypeDisplay(String typeKey) {
-        String bare = TypeNamespace.nameOfKey(typeKey);
+        String key = typeKey;
+        String suffix = "";
+        while (key.endsWith("[]")) {
+            key = key.substring(0, key.length() - 2);
+            suffix = suffix + "[]";
+        }
+        String bare = TypeNamespace.nameOfKey(key);
         String resolved = TypeNamespace.resolve(executor.database, executor.session, bare);
-        return typeKey.equals(resolved) ? bare : typeKey;
+        return (key.equals(resolved) ? bare : key) + suffix;
     }
 
     /** PostgreSQL spells its single-byte flag type with the quotes; everything else as itself. */
@@ -201,7 +213,13 @@ class CastEvaluator {
             StringBuilder bits = new StringBuilder(rest.length() * 4);
             for (int i = 0; i < rest.length(); i++) {
                 int digit = Character.digit(rest.charAt(i), 16);
-                if (digit < 0) return text; // let the digit check report it
+                if (digit < 0) {
+                    // Past the x the digits are hexadecimal, so one that is not is refused as a
+                    // hexadecimal digit; handing the text back to the binary check would blame
+                    // the radix marker for a character it never read.
+                    throw new MemgresException("\"" + rest.charAt(i)
+                            + "\" is not a valid hexadecimal digit", "22P02");
+                }
                 for (int bit = 3; bit >= 0; bit--) {
                     bits.append((digit >> bit) & 1);
                 }
@@ -387,8 +405,11 @@ class CastEvaluator {
             DomainType nullDomain = executor.database.getDomain(
                     typeSpec.toLowerCase().replaceAll("\\(.*\\)", "").trim());
             if (nullDomain != null && domainChainRejectsNull(nullDomain)) {
-                throw new MemgresException("domain " + typeDisplayName(nullDomain.getName())
+                MemgresException ex = new MemgresException("domain "
+                        + typeDisplayName(nullDomain.getName())
                         + " does not allow null values", "23502");
+                ex.setDatatype(nullDomain.getName());
+                throw ex;
             }
             return null;
         }
@@ -535,10 +556,11 @@ class CastEvaluator {
                 // char(5)[] holds one element padded to five, not the bare text it was written as.
                 List<Object> castList = castArrayElements(list, elementSpecOf(typeSpec, typeName),
                         literal == null);
-                if (literal != null && literal.hasCustomLowerBounds()) {
-                    return literal.boundsPrefix() + TypeCoercion.formatPgArray(castList);
-                }
-                return castList;
+                // The bounds an array states in front of its braces belong to the value, not to
+                // its spelling: kept as text they were opaque to every function but four.
+                int[] bounds = literal != null ? literal.lowerBounds()
+                        : (val instanceof PgArray ? ((PgArray) val).lowerBounds() : null);
+                return PgArray.of(castList, bounds, typeName);
             }
         }
         // Types PostgreSQL ships that memgres holds no value class for. A cast to one is legal SQL
@@ -563,7 +585,7 @@ class CastEvaluator {
                 if (val instanceof byte[]) return (short) bytesToInteger((byte[]) val, 2, "smallint");
                 int iv = readIntegerFor(val, "smallint");
                 if (iv < Short.MIN_VALUE || iv > Short.MAX_VALUE) {
-                    throw new MemgresException("smallint out of range", "22003");
+                    throw outOfRangeFor(val, "smallint");
                 }
                 return (short) iv;
             }
@@ -620,11 +642,17 @@ class CastEvaluator {
                 // number is the character that code stands for -- which is how the catalogs read
                 // 'i' out of provolatile and how 65 is written A.
                 if (val instanceof Number) {
-                    int code = ((Number) val).intValue() & 0xFF;
+                    long written = ((Number) val).longValue();
+                    // The type is one signed byte, so a number outside that byte stands for no
+                    // character: keeping the low eight bits of it read 300 as a comma.
+                    if (written < Byte.MIN_VALUE || written > Byte.MAX_VALUE) {
+                        throw new MemgresException("\"char\" out of range", "22003");
+                    }
+                    int code = (int) written & 0xFF;
                     return code == 0 ? "" : String.valueOf((char) code);
                 }
-                String written = TypeCoercion.toString(val);
-                return written.isEmpty() ? written : written.substring(0, 1);
+                String text = TypeCoercion.toString(val);
+                return text.isEmpty() ? text : text.substring(0, 1);
             }
             case "text":
             case "varchar":
@@ -693,7 +721,7 @@ class CastEvaluator {
                 }
                 // Array (List) to text: use PostgreSQL {e1,e2,...} format
                 if (val instanceof java.util.List<?>) {
-                    return formatListAsPgArray((java.util.List<?>) val);
+                    return TypeCoercion.formatPgArray((java.util.List<?>) val);
                 }
                 // Boolean to text: PG SELECT true::text → "true"
                 if (val instanceof Boolean) {
@@ -881,11 +909,12 @@ class CastEvaluator {
                 } else {
                     bitStr = expandBitRadixPrefix(val.toString());
                 }
-                // Validate: only '0' and '1' allowed
+                // The complaint is about the character that is not a digit, not about the string
+                // it sits in: PostgreSQL quotes back the first one its reader could not take.
                 for (int i = 0; i < bitStr.length(); i++) {
                     char c = bitStr.charAt(i);
                     if (c != '0' && c != '1') {
-                        throw new MemgresException("\"" + val + "\" is not a valid binary digit", "22P02");
+                        throw new MemgresException("\"" + c + "\" is not a valid binary digit", "22P02");
                     }
                 }
                 // Handle bit(N) length enforcement
@@ -1031,8 +1060,9 @@ class CastEvaluator {
             }
             case "hstore":
                 if (!executor.database.hasExtension("hstore")) {
-                    throw new MemgresException("type \"hstore\" does not exist\n"
-                            + "  Hint: You need to install the hstore extension: CREATE EXTENSION hstore;", "42704");
+                    // Nothing has created the type, so the server has never heard of it and has
+                    // no extension to recommend -- it says only that there is no such type.
+                    throw new MemgresException("type \"hstore\" does not exist", "42704");
                 }
                 if (val instanceof HstoreValue) return val;
                 return HstoreValue.parse(val.toString());
@@ -1448,6 +1478,12 @@ class CastEvaluator {
                     }
                     return new AstExecutor.PgEnum(label, typeName, customEnum.ordinal(label));
                 }
+                // A range the reader defined is read the way a built-in range is: the text goes
+                // through the range input function and comes back written the way PostgreSQL
+                // writes a range, rather than being refused as a type nothing here knows.
+                if (executor.database.getRangeSubtype(typeName) != null) {
+                    return RangeOperations.parse(val.toString().trim()).toString();
+                }
                 // Cast to "record": ROW values are already record types, return as-is
                 if (typeName.equals("record")) {
                     return val;
@@ -1500,9 +1536,15 @@ class CastEvaluator {
     private void failIfViolated(Expression check, RowContext ctx, String domainName, String constraintName) {
         Object result = executor.evalExpr(check, ctx);
         if (result != null && !executor.isTruthy(result)) {
-            throw new MemgresException("value for domain "
+            MemgresException ex = new MemgresException("value for domain "
                     + TypeNamespace.display(executor.database, executor.session, domainName)
                     + " violates check constraint \"" + constraintName + "\"", "23514");
+            ex.setConstraint(constraintName);
+            // The field is already about one type, so the qualifier the sentence needs to stay
+            // unambiguous has no work to do in it: the bare name is what PostgreSQL sends there,
+            // however the cast happened to be written.
+            ex.setDatatype(TypeNamespace.bare(domainName));
+            throw ex;
         }
     }
 
@@ -1570,8 +1612,29 @@ class CastEvaluator {
                 throw new MemgresException("invalid input syntax for type " + typeName
                         + ": \"" + val + "\"", "22P02");
             }
+            // The borrowed reader named its own type when the value would not fit — integer, or
+            // bigint for anything that came through the float path — where the type being read
+            // into is the one with no room for it.
+            if ("22003".equals(e.getSqlState())) {
+                throw outOfRangeFor(val, typeName);
+            }
             throw e;
         }
+    }
+
+    /**
+     * The out-of-range PostgreSQL reports for a value {@code typeName} has no room for.
+     *
+     * <p>Text is being read by the type's own input function, which quotes back what it was
+     * handed. A value that arrived as a number is being narrowed from a type that already held
+     * it, and there PostgreSQL names the target type on its own.
+     */
+    private static MemgresException outOfRangeFor(Object val, String typeName) {
+        if (val instanceof String) {
+            return new MemgresException(
+                    "value \"" + val + "\" is out of range for type " + typeName, "22003");
+        }
+        return new MemgresException(typeName + " out of range", "22003");
     }
 
     /** The same, for the types read as a floating-point number. */
@@ -1725,45 +1788,6 @@ class CastEvaluator {
             return s.substring(0, dotIdx) + s.substring(fracEnd);
         }
         return s.substring(0, last) + s.substring(fracEnd);
-    }
-
-    /** Format a Java List as a PostgreSQL array literal string {e1,e2,...}. */
-    private static String formatListAsPgArray(java.util.List<?> list) {
-        if (list.isEmpty()) return "{}";
-        StringBuilder sb = new StringBuilder("{");
-        for (int i = 0; i < list.size(); i++) {
-            if (i > 0) sb.append(",");
-            Object elem = list.get(i);
-            if (elem == null) {
-                sb.append("NULL");
-            } else if (elem instanceof java.util.List<?>) {
-                java.util.List<?> nested = (java.util.List<?>) elem;
-                sb.append(formatListAsPgArray(nested));
-            } else {
-                // A composite element renders as (f1,f2), whose commas make it need quoting, and
-                // so does every other value whose text carries a space, a brace or a quote of its
-                // own. Appending the object instead wrote an hstore, an interval and a tsvector
-                // into the literal bare, where nothing could read them back out.
-                String s;
-                if (elem instanceof AstExecutor.PgRow) {
-                    s = ((AstExecutor.PgRow) elem).toPgText();
-                } else if (elem instanceof java.util.Map<?, ?>) {
-                    s = AstExecutor.PgRow.fromFieldMap((java.util.Map<?, ?>) elem).toPgText();
-                } else if (elem instanceof String) {
-                    s = (String) elem;
-                } else {
-                    s = TypeCoercion.toString(elem);
-                }
-                // Quote strings that contain special chars
-                if (s.contains(",") || s.contains("{") || s.contains("}") || s.contains("\"") || s.contains(" ") || s.isEmpty()) {
-                    sb.append("\"").append(s.replace("\"", "\\\"")).append("\"");
-                } else {
-                    sb.append(s);
-                }
-            }
-        }
-        sb.append("}");
-        return sb.toString();
     }
 
     /**

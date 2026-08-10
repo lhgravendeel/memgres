@@ -184,7 +184,19 @@ class FromFunctionResolver {
             evalArgs.add(executor.evalExpr(arg, null));
         }
         if (fname.equals("generate_series")) return resolveGenerateSeries(alias, colAliases, evalArgs);
-        if (fname.equals("generate_subscripts")) return resolveGenerateSubscripts(alias, colAliases, evalArgs);
+        if (fname.equals("generate_subscripts")) {
+            // The array is declared anyarray, so an argument with no type of its own -- a bare
+            // literal, or a bare NULL -- leaves the declaration nothing to be resolved against,
+            // and PostgreSQL will not guess one for it.
+            Expression arrayArg = funcFrom.args().isEmpty() ? null : funcFrom.args().get(0);
+            if (arrayArg instanceof Literal
+                    && (((Literal) arrayArg).literalType() == Literal.LiteralType.STRING
+                        || ((Literal) arrayArg).literalType() == Literal.LiteralType.NULL)) {
+                throw new MemgresException(
+                        "could not determine polymorphic type because input has type unknown", "42804");
+            }
+            return resolveGenerateSubscripts(alias, colAliases, evalArgs);
+        }
         if (fname.equals("pg_indexam_has_property")) return resolvePgIndexamHasProperty(alias, evalArgs);
         if (fname.equals("pg_available_extension_versions")) return resolvePgAvailableExtensionVersions(alias);
         if (fname.equals("pg_show_all_settings")) return resolvePgShowAllSettings(alias);
@@ -248,7 +260,7 @@ class FromFunctionResolver {
                             : CatalogSystemFunctions.readableTypeName(p.typeName()));
                 }
                 throw new MemgresException(fname + "(" + types + ") is a procedure"
-                        + "\nHint: To call a procedure, use CALL.", "42809");
+                        + "\n  Hint: To call a procedure, use CALL.", "42809");
             }
             checkRecordColumnDefinitionList(userFunc, funcFrom);
             // Raw, not stripped: a column definition list gives the columns their types too.
@@ -423,6 +435,11 @@ class FromFunctionResolver {
         if (stepObj instanceof PgInterval && ((PgInterval) stepObj).isZero()) {
             throw new MemgresException("step size cannot equal zero", "22023");
         }
+        // An infinite step is no more a distance between two values than a zero one is: it steps
+        // straight past the stop value, which made the series the one row it started on.
+        if (stepObj instanceof PgInterval && ((PgInterval) stepObj).isInfinite()) {
+            throw new MemgresException("step size cannot be infinite", "22023");
+        }
         // OffsetDateTime (timestamptz) overload
         if (evalArgs.get(0) instanceof java.time.OffsetDateTime) {
             java.time.OffsetDateTime tzStart = (java.time.OffsetDateTime) evalArgs.get(0);
@@ -462,6 +479,14 @@ class FromFunctionResolver {
             boolean dateInput = evalArgs.get(0) instanceof java.time.LocalDate;
             java.time.LocalDateTime dtStart = dateInput ? ((java.time.LocalDate) evalArgs.get(0)).atStartOfDay() : TypeCoercion.toLocalDateTime(evalArgs.get(0));
             java.time.LocalDateTime dtStop = evalArgs.get(1) instanceof java.time.LocalDate ? ((java.time.LocalDate) evalArgs.get(1)).atStartOfDay() : TypeCoercion.toLocalDateTime(evalArgs.get(1));
+            // PostgreSQL walks the series a step at a time and never tests for a bound it cannot
+            // reach, so an infinite stop carries the walk off the end of the timestamp range and
+            // is reported as that -- not as a series too long to hold, which is memgres's own
+            // limit and not one PostgreSQL has.
+            if (dtStop.equals(TypeCoercion.TIMESTAMP_INFINITY)
+                    || dtStop.equals(TypeCoercion.TIMESTAMP_NEG_INFINITY)) {
+                throw new MemgresException("timestamp out of range", "22008");
+            }
             PgInterval ivStep = stepObj != null ? TypeCoercion.toInterval(stepObj) : new PgInterval(0, 1, 0);
             boolean ascending = !ivStep.isNegative();
             String colName = firstColAlias(colAliases, alias);
@@ -869,7 +894,7 @@ class FromFunctionResolver {
     private List<RowContext> resolveExpandArray(String alias, List<String> colAliases, List<Object> evalArgs) {
         if (evalArgs.isEmpty()) {
             throw new MemgresException("function _pg_expandarray() does not exist"
-                    + "\n  Hint: No function matches the given name and argument types.", "42883");
+                    + "\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
         }
         String valueCol = (colAliases != null && !colAliases.isEmpty()) ? colAliases.get(0) : "x";
         String indexCol = (colAliases != null && colAliases.size() >= 2) ? colAliases.get(1) : "n";
@@ -900,7 +925,7 @@ class FromFunctionResolver {
                     + " You might need to add explicit type casts.", "42725");
         }
         if (evalArgs.isEmpty()) {
-            throw new MemgresException("function unnest() does not exist\n  Hint: No function matches the given name and argument types.", "42883");
+            throw new MemgresException("function unnest() does not exist\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
         }
         if (evalArgs.size() > 1) {
             return resolveMultiUnnest(alias, colAliases, evalArgs, argExprs);
@@ -918,6 +943,12 @@ class FromFunctionResolver {
                 }
                 arr = mrElements;
             }
+        }
+        // The tsvector spelling of unnest does not produce elements but records: a lexeme, the
+        // positions it was found at and the weight each of those carries. It builds its own
+        // relation for that reason, rather than one column of whatever the argument holds.
+        if (arr instanceof TsVector) {
+            return unnestTsVector(alias, colAliases, (TsVector) arr);
         }
         // PG unnest fully flattens multidimensional arrays into scalar elements
         List<Object> elements = FunctionEvaluator.flattenArray(toElementList(arr));
@@ -940,6 +971,40 @@ class FromFunctionResolver {
         }
         return contexts;
     }
+
+    /**
+     * The rows unnest(tsvector) produces, one per lexeme, in the order the vector holds them.
+     *
+     * <p>A lexeme stored without positions has neither positions nor weights, and PostgreSQL
+     * reports that as two nulls rather than as two arrays holding nothing.
+     */
+    private List<RowContext> unnestTsVector(String alias, List<String> colAliases, TsVector vec) {
+        String lexemeCol = (colAliases != null && colAliases.size() > 0) ? colAliases.get(0) : "lexeme";
+        String posCol = (colAliases != null && colAliases.size() > 1) ? colAliases.get(1) : "positions";
+        String weightCol = (colAliases != null && colAliases.size() > 2) ? colAliases.get(2) : "weights";
+        List<Column> cols = Cols.listOf(
+                new Column(lexemeCol, DataType.TEXT, true, false, null),
+                new Column(posCol, DataType.INT2_ARRAY, true, false, null),
+                new Column(weightCol, DataType.TEXT_ARRAY, true, false, null)
+        );
+        Table virtualTable = new Table(alias, cols);
+        List<RowContext> contexts = new ArrayList<>();
+        for (Map.Entry<String, List<TsVector.PosEntry>> e : vec.getLexemeMap().entrySet()) {
+            List<Object> positions = new ArrayList<>();
+            List<Object> weights = new ArrayList<>();
+            for (TsVector.PosEntry pe : e.getValue()) {
+                positions.add(Short.valueOf((short) pe.position()));
+                weights.add(String.valueOf(pe.weight()));
+            }
+            Object[] row = new Object[]{e.getKey(),
+                    positions.isEmpty() ? null : PgArray.of(positions),
+                    weights.isEmpty() ? null : PgArray.of(weights)};
+            virtualTable.insertRow(row);
+            contexts.add(new RowContext(virtualTable, alias, row));
+        }
+        return contexts;
+    }
+
 
     private List<RowContext> resolveMultiUnnest(String alias, List<String> colAliases, List<Object> evalArgs,
                                                 List<Expression> argExprs) {
@@ -1619,8 +1684,11 @@ class FromFunctionResolver {
                 // list written alongside only renames them, and never says how many there are.
                 boolean namedBySignature = userFunc.hasOutParams();
                 if (cols.isEmpty() && !namedBySignature && colAliases != null && !colAliases.isEmpty()) {
-                    checkRecordShape(userFunc, colAliases.size(), firstRow.length);
+                    // A column whose type does not fit is what PostgreSQL reports first, even
+                    // when the list is the wrong length as well: it walks the columns it has
+                    // before it counts them.
                     checkRecordColumnTypes(userFunc, colAliases, firstRow);
+                    checkRecordShape(userFunc, colAliases.size(), firstRow.length);
                     for (int i = 0; i < colAliases.size(); i++) {
                         cols.add(columnFromDef(colAliases.get(i), i + 1));
                     }
@@ -1764,6 +1832,8 @@ class FromFunctionResolver {
         // the query it just ran against the record type it resolved, which is a datatype
         // mismatch. Same fault, two codes, and a client that branches on SQLSTATE sees both.
         MemgresException e = recordShapeError(userFunc);
+        // Both counts are the detail: which one is larger is visible from them, and the writer of
+        // the definition list needs to know what the body actually produced.
         e.setDetail("Number of returned columns (" + produced
                 + ") does not match expected column count (" + declared + ").");
         e.setPgContext("SQL function \"" + userFunc.getName() + "\" statement 1");
@@ -1780,13 +1850,31 @@ class FromFunctionResolver {
             String def = colAliases.get(i);
             int sp = def == null ? -1 : def.indexOf(' ');
             if (sp <= 0) continue;
-            String want = valueClass(def.substring(sp + 1).trim());
+            String declared = def.substring(sp + 1).trim();
+            String want = valueClass(declared);
             String got = valueClass(firstRow[i]);
             if (want == null || got == null || want.equals(got)) continue;
             MemgresException e = recordShapeError(userFunc);
+            // PostgreSQL names both types and the column they disagree at, by name and by
+            // position, so the writer of the definition list can see which entry to change.
+            e.setDetail("Returned type " + producedTypeName(firstRow[i])
+                    + " does not match expected type " + DataType.canonicalName(declared)
+                    + " in column \"" + def.substring(0, sp).trim()
+                    + "\" (position " + (i + 1) + ").");
             e.setPgContext("SQL function \"" + userFunc.getName() + "\" statement 1");
             throw e;
         }
+    }
+
+    /** The type name PostgreSQL would print for a value the body produced. */
+    private static String producedTypeName(Object value) {
+        if (value instanceof String) return "text";
+        if (value instanceof Boolean) return "boolean";
+        if (value instanceof Integer) return "integer";
+        if (value instanceof Long) return "bigint";
+        if (value instanceof Short) return "smallint";
+        if (value instanceof Float || value instanceof Double) return "double precision";
+        return "numeric";
     }
 
     /**
@@ -1971,7 +2059,7 @@ class FromFunctionResolver {
         // Validate JSON input
         if (!ExprEvaluator.isValidJson(json)) {
             if (jt.onError == JsonExistsExpr.OnBehavior.ERROR) {
-                throw new MemgresException("invalid input syntax for type json", "22P02");
+                ExprEvaluator.requireJson(json);
             }
             return contexts; // EMPTY ON ERROR (default)
         }
@@ -2358,7 +2446,7 @@ class FromFunctionResolver {
         } else {
             input = String.valueOf(evalArgs.get(0));
         }
-        List<Object[]> debugRows = TextSearchOperations.tsDebug(input);
+        List<Object[]> debugRows = TextSearchOperations.tsDebug(config, input);
         List<Column> cols = Cols.listOf(
                 new Column("alias", DataType.TEXT, true, false, null),
                 new Column("description", DataType.TEXT, true, false, null),
@@ -2370,7 +2458,10 @@ class FromFunctionResolver {
         Table virtualTable = new Table(alias, cols);
         List<RowContext> contexts = new ArrayList<>();
         for (Object[] dr : debugRows) {
-            Object[] row = new Object[]{dr[0], dr[1], dr[2], "{" + dr[3] + "}", dr[3], "{" + dr[5] + "}"};
+            // The row already holds the six values ts_debug reports, with the two lists written
+            // as arrays: wrapping them a second time nested each inside an array of one, and the
+            // dictionary that handled the token is a name of its own, not that list.
+            Object[] row = new Object[]{dr[0], dr[1], dr[2], dr[3], dr[4], dr[5]};
             virtualTable.insertRow(row);
             contexts.add(new RowContext(virtualTable, alias, row));
         }

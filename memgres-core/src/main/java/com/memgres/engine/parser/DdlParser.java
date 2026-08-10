@@ -1047,21 +1047,39 @@ class DdlParser {
         if (parser.matchKeyword("RANGE")) {
             parser.expect(TokenType.LEFT_PAREN);
             String rangeSubtype = null;
-            while (!parser.check(TokenType.RIGHT_PAREN) && !parser.isAtEnd()) {
-                if (parser.checkIdentCI("SUBTYPE")) {
-                    parser.advance();
-                    parser.expect(TokenType.EQUALS);
+            String subtypeOpclass = null;
+            boolean canonical = false;
+            do {
+                String attribute = parser.readIdentifier().toLowerCase();
+                parser.expect(TokenType.EQUALS);
+                if (attribute.equals("subtype")) {
                     rangeSubtype = parser.parseTypeName();
-                } else {
-                    parser.advance();
+                    continue;
                 }
-            }
+                // Six attributes and no others define a range. Skipping over a word that is none
+                // of them accepted a definition PostgreSQL refuses outright, and did so silently:
+                // the attribute nobody could act on was read and then thrown away.
+                if (!attribute.equals("subtype_opclass") && !attribute.equals("canonical")
+                        && !attribute.equals("subtype_diff") && !attribute.equals("collation")
+                        && !attribute.equals("multirange_type_name")) {
+                    throw PgErrors.syntax("type attribute \"" + attribute + "\" not recognized");
+                }
+                // Each of the other five names an object rather than a type -- an operator class,
+                // a function, a collation, the multirange type to create alongside this one -- and
+                // any of those may be written under a schema.
+                String written = parser.readIdentifier();
+                if (parser.match(TokenType.DOT)) written = written + "." + parser.readIdentifier();
+                if (attribute.equals("subtype_opclass")) subtypeOpclass = written;
+                if (attribute.equals("canonical")) canonical = true;
+            } while (parser.match(TokenType.COMMA));
             parser.expect(TokenType.RIGHT_PAREN);
             if (rangeSubtype == null) {
                 throw PgErrors.syntax("type attribute \"subtype\" is required");
             }
             CreateTypeStmt r = new CreateTypeStmt(name, null, null, rangeSubtype);
             r.setSchemaName(schema);
+            r.setRangeSubtypeOpclass(subtypeOpclass);
+            r.setRangeCanonical(canonical);
             return r;
         }
         parser.expect(TokenType.LEFT_PAREN);
@@ -1325,7 +1343,8 @@ class DdlParser {
         String name = parser.readIdentifier();
         // The pg_ prefix is reserved for system schemas, so a schema cannot claim it.
         if (name != null && name.toLowerCase().startsWith("pg_")) {
-            throw new MemgresException("unacceptable schema name \"" + name + "\"", "42939");
+            throw new MemgresException("unacceptable schema name \"" + name + "\""
+                    + "\n  Detail: The prefix \"pg_\" is reserved for system schemas.", "42939");
         }
         String authorization = null;
         if (parser.matchKeyword("AUTHORIZATION")) authorization = parser.readIdentifier();
@@ -1401,8 +1420,26 @@ class DdlParser {
     long readSeqLong() {
         boolean neg = false;
         if (parser.check(TokenType.MINUS)) { parser.advance(); neg = true; }
-        long val = Long.parseLong(parser.advance().value());
-        return neg ? -val : val;
+        Token token = parser.advance();
+        // The sign belongs to the number rather than to the reading of it: the lowest bigint has
+        // no positive counterpart to negate afterwards.
+        String written = (neg ? "-" : "") + token.value();
+        try {
+            return Long.parseLong(written);
+        } catch (NumberFormatException e) {
+            // A sequence's numbers are bigints. One written too wide for a bigint is out of that
+            // type's range, one written with a fraction is not one of its values at all, and
+            // anything that is not a number is a word the grammar did not expect here.
+            if (token.type() == TokenType.INTEGER_LITERAL) {
+                throw new MemgresException(
+                        "value \"" + written + "\" is out of range for type bigint", "22003");
+            }
+            if (token.type() == TokenType.FLOAT_LITERAL) {
+                throw new MemgresException(
+                        "invalid input syntax for type bigint: \"" + written + "\"", "22P02");
+            }
+            throw ParseException.at(token);
+        }
     }
 
     private void parseSequenceOptions(Long[] startWith, Long[] incrementBy, Long[] minValue,

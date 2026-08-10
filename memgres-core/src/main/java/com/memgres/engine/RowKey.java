@@ -82,6 +82,21 @@ final class RowKey {
             }
             return true;
         }
+        // The types whose Java equality is not the type's =. A timestamptz is the instant it
+        // names, whatever offset it was written with; an interval is the span it measures,
+        // whatever fields it was spelled in; and IEEE's two zeros are one number.
+        if (a instanceof java.time.OffsetDateTime && b instanceof java.time.OffsetDateTime) {
+            return ((java.time.OffsetDateTime) a).toInstant()
+                    .equals(((java.time.OffsetDateTime) b).toInstant());
+        }
+        if (a instanceof PgInterval && b instanceof PgInterval) {
+            return TypeCoercion.areEqual(a, b);
+        }
+        if ((a instanceof Double || a instanceof Float) && (b instanceof Double || b instanceof Float)) {
+            double da = ((Number) a).doubleValue();
+            double db = ((Number) b).doubleValue();
+            return Double.isNaN(da) && Double.isNaN(db) ? true : da == db;
+        }
         return a.equals(b);
     }
 
@@ -91,6 +106,18 @@ final class RowKey {
         if (v instanceof BigDecimal) {
             // stripTrailingZeros so 1.0 and 1.00 have the same hash
             return ((BigDecimal) v).stripTrailingZeros().hashCode();
+        }
+        if (v instanceof java.time.OffsetDateTime) {
+            return ((java.time.OffsetDateTime) v).toInstant().hashCode();
+        }
+        if (v instanceof PgInterval) {
+            PgInterval interval = (PgInterval) v;
+            return interval.isInfinite() ? interval.toString().hashCode()
+                    : Long.valueOf(interval.normalizedMicroseconds()).hashCode();
+        }
+        if (v instanceof Double || v instanceof Float) {
+            double d = ((Number) v).doubleValue();
+            return Double.valueOf(d == 0.0 ? 0.0 : d).hashCode();
         }
         if (v instanceof Object[]) {
             int h = 1;
@@ -157,6 +184,20 @@ final class RowKey {
         if (val instanceof Integer || val instanceof Long || val instanceof Short
                 || val instanceof java.math.BigInteger) {
             return new BigDecimal(val.toString()).stripTrailingZeros().toPlainString();
+        }
+        // A timestamptz is the instant it names, so two spellings of one instant are one value.
+        if (val instanceof java.time.OffsetDateTime) {
+            return "\0TSZ" + ((java.time.OffsetDateTime) val).toInstant();
+        }
+        // IEEE's negative zero is the same number as its positive one, and = says so.
+        if (val instanceof Double || val instanceof Float) {
+            double d = ((Number) val).doubleValue();
+            return "\0FLT" + (d == 0.0 ? 0.0 : d);
+        }
+        // A composite is its fields, written the way record_out writes them, so a comma inside a
+        // field cannot be mistaken for the boundary between two.
+        if (val instanceof AstExecutor.PgRow) {
+            return "\0ROW" + ((AstExecutor.PgRow) val).toPgText();
         }
         // Use NUL-prefixed type tag to prevent cross-type/cross-column collisions
         return "\0V" + val.getClass().getName() + "\0" + val;

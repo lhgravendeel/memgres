@@ -281,8 +281,7 @@ class FromJoinExecutor {
     private static MemgresException noEqualityOperator(DataType l, DataType r) {
         return new MemgresException("operator does not exist: " + l.toRegtypeDisplay()
                 + " = " + r.toRegtypeDisplay()
-                + "\n  Hint: No operator matches the given name and argument types."
-                + " You might need to add explicit type casts.", "42883");
+                + "\n  Hint: No operator matches the given name and argument types. You might need to add explicit type casts.", "42883");
     }
 
     /**

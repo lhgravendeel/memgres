@@ -66,13 +66,14 @@ public class MultirangeOpsCompatTest {
 
     @Test
     @DisplayName("int4multirange + int4range union")
-    void testInt4MultirangeUnionWithRange() throws Exception {
-        try (Statement stmt = conn.createStatement();
-             ResultSet rs = stmt.executeQuery(
-                 "SELECT '{[1,4)}'::int4multirange + '[6,9)'::int4range AS result")) {
-            assertTrue(rs.next(), "Expected a result row");
-            assertEquals("{[1,4),[6,9)}", rs.getString("result"));
-        }
+    void testInt4MultirangeUnionWithRange() {
+        // PostgreSQL declares + over two multiranges or two ranges, and over nothing in between.
+        SQLException e = assertThrows(SQLException.class, () -> {
+            try (Statement stmt = conn.createStatement()) {
+                stmt.executeQuery("SELECT '{[1,4)}'::int4multirange + '[6,9)'::int4range AS result");
+            }
+        });
+        assertEquals("42883", e.getSQLState());
     }
 
     @Test

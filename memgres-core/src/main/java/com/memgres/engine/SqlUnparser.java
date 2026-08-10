@@ -399,6 +399,21 @@ public class SqlUnparser {
             // to Object.toString and a Java field dump was rendered as SQL — which then re-parsed
             // as an identifier, so a prepared statement's own body named a column nothing holds.
             return "$" + ((ParamRef) expr).index();
+        } else if (expr instanceof SubscriptExpr) {
+            // Brackets are written back as brackets. Writing them as the json arrow instead turned
+            // a one-based array reference into a zero-based json one every time a view was read.
+            SubscriptExpr sub = (SubscriptExpr) expr;
+            StringBuilder subscripted = new StringBuilder(exprToSql(sub.base()));
+            for (SubscriptExpr.Subscript one : sub.subscripts()) {
+                subscripted.append('[');
+                if (one.lower() != null) subscripted.append(exprToSql(one.lower()));
+                if (one.slice()) {
+                    subscripted.append(':');
+                    if (one.upper() != null) subscripted.append(exprToSql(one.upper()));
+                }
+                subscripted.append(']');
+            }
+            return subscripted.toString();
         } else if (expr instanceof ArrayExpr) {
             ArrayExpr arr = (ArrayExpr) expr;
             return arr.isRow() ? "ROW(" +

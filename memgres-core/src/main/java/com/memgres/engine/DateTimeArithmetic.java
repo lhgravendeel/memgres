@@ -170,9 +170,7 @@ class DateTimeArithmetic {
         // PG does NOT have a '+' operator for text. String concatenation uses '||'.
         // Only allow string + non-number when one side looks like a geometric or known type.
         if (left instanceof String && !(right instanceof Number)) {
-            throw new MemgresException("operator does not exist: text + text\n"
-                + "Hint: No operator matches the given name and argument types. "
-                + "You might need to add explicit type casts.", "42883");
+            throw new MemgresException("operator does not exist: text + text", "42883");
         }
 
         // Fall back to numeric

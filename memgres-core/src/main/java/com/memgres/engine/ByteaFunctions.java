@@ -149,7 +149,13 @@ class ByteaFunctions {
                 }
                 // For bit strings, direct character indexing
                 String s = data instanceof AstExecutor.PgBitString ? ((AstExecutor.PgBitString) data).bits() : data.toString();
-                return (p >= 0 && p < s.length()) ? Character.getNumericValue(s.charAt(p)) : 0;
+                // A bit string is exactly as long as it was written, so an index past either end
+                // names no bit at all rather than a bit that happens to be zero.
+                if (p < 0 || p >= s.length()) {
+                    throw new MemgresException("bit index " + p + " out of valid range (0.."
+                            + (s.length() - 1) + ")", "2202E");
+                }
+                return Character.getNumericValue(s.charAt(p));
             }
             case "set_bit": {
                 Object data = executor.evalExpr(fn.args().get(0), ctx);
@@ -158,6 +164,11 @@ class ByteaFunctions {
                 if (data == null) return null;
                 int p = executor.toInt(pos);
                 int nb = executor.toInt(newBit);
+                // A bit holds a 0 or a 1, so there is no third value to write into one. Reading
+                // anything else as "clear the bit" quietly did something the caller never asked for.
+                if (nb != 0 && nb != 1) {
+                    throw new MemgresException("new bit must be 0 or 1", "22023");
+                }
                 if (data instanceof byte[]) {
                     byte[] bytes = (byte[]) data;
                     // bytea set_bit: PG18 numbers bits LSB-first within each byte (bit 0 = LSB of byte 0).

@@ -330,22 +330,26 @@ class MultirangeTypesTest {
         }
     }
 
+    /** PostgreSQL declares - over two multiranges or two ranges, and over nothing in between. */
     @Test
-    void multirangeMinusRange() throws Exception {
-        try (Statement st = conn.createStatement();
-             ResultSet rs = st.executeQuery("SELECT '{[1,20)}'::int4multirange - '[5,10)'::int4range")) {
-            assertTrue(rs.next());
-            assertEquals("{[1,5),[10,20)}", rs.getString(1));
-        }
+    void multirangeMinusRange() {
+        SQLException e = assertThrows(SQLException.class, () -> {
+            try (Statement st = conn.createStatement()) {
+                st.executeQuery("SELECT '{[1,20)}'::int4multirange - '[5,10)'::int4range");
+            }
+        });
+        assertEquals("42883", e.getSQLState());
     }
 
+    /** The same for +: a multirange and a range are not a pair it adds. */
     @Test
-    void multirangePlusRange() throws Exception {
-        try (Statement st = conn.createStatement();
-             ResultSet rs = st.executeQuery("SELECT '{[1,5)}'::int4multirange + '[10,20)'::int4range")) {
-            assertTrue(rs.next());
-            assertEquals("{[1,5),[10,20)}", rs.getString(1));
-        }
+    void multirangePlusRange() {
+        SQLException e = assertThrows(SQLException.class, () -> {
+            try (Statement st = conn.createStatement()) {
+                st.executeQuery("SELECT '{[1,5)}'::int4multirange + '[10,20)'::int4range");
+            }
+        });
+        assertEquals("42883", e.getSQLState());
     }
 
     // ---- pg_range catalog ----
@@ -634,13 +638,15 @@ class MultirangeTypesTest {
     // Multirange + Range arithmetic
     // ============================================================
 
+    /** And for *, which is declared over the same two pairs and no other. */
     @Test
-    void multirangeIntersectionWithRange() throws Exception {
-        try (Statement st = conn.createStatement();
-             ResultSet rs = st.executeQuery("SELECT '{[1,10),[20,30)}'::int4multirange * '[5,25)'::int4range")) {
-            assertTrue(rs.next());
-            assertEquals("{[5,10),[20,25)}", rs.getString(1));
-        }
+    void multirangeIntersectionWithRange() {
+        SQLException e = assertThrows(SQLException.class, () -> {
+            try (Statement st = conn.createStatement()) {
+                st.executeQuery("SELECT '{[1,10),[20,30)}'::int4multirange * '[5,25)'::int4range");
+            }
+        });
+        assertEquals("42883", e.getSQLState());
     }
 
     @Test
@@ -1218,14 +1224,15 @@ class MultirangeTypesTest {
         }
     }
 
+    /** A range on the left and a multirange on the right is the same missing operator. */
     @Test
-    void rangeMinusMultirange() throws Exception {
-        // range - multirange: subtract multirange from range
-        try (Statement st = conn.createStatement();
-             ResultSet rs = st.executeQuery("SELECT '[1,20)'::int4range - '{[5,10)}'::int4multirange")) {
-            assertTrue(rs.next());
-            assertEquals("{[1,5),[10,20)}", rs.getString(1));
-        }
+    void rangeMinusMultirange() {
+        SQLException e = assertThrows(SQLException.class, () -> {
+            try (Statement st = conn.createStatement()) {
+                st.executeQuery("SELECT '[1,20)'::int4range - '{[5,10)}'::int4multirange");
+            }
+        });
+        assertEquals("42883", e.getSQLState());
     }
 
     // ===== DEEP GAP AUDIT: pg_typeof() =====

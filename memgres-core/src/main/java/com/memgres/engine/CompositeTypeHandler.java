@@ -123,20 +123,15 @@ class CompositeTypeHandler {
             if (fieldVal == null) fieldVal = map.get(fieldName);
             return fieldVal;
         }
-        if (val instanceof String && ((String) val).startsWith("(") && ((String) val).endsWith(")")) {
-            String s = (String) val;
+        if (val instanceof String && RecordLiteral.looksLikeRecord((String) val)) {
             List<CreateTypeStmt.CompositeField> fields = executor.database.getRowType(typeName);
             if (fields != null) {
-                String[] parts = splitCompositeString(s.substring(1, s.length() - 1));
+                List<RecordLiteral.Field> parts = RecordLiteral.parse((String) val);
                 for (int i = 0; i < fields.size(); i++) {
                     if (fields.get(i).name().equalsIgnoreCase(fieldName)) {
-                        if (i < parts.length) {
-                            String part = parts[i];
-                            boolean quoted = part.length() >= 2 && part.startsWith("\"") && part.endsWith("\"");
-                            if (quoted) {
-                                part = part.substring(1, part.length() - 1);
-                            }
-                            return coerceFieldValue(part, fields.get(i).typeName(), quoted);
+                        if (i < parts.size()) {
+                            RecordLiteral.Field part = parts.get(i);
+                            return coerceFieldValue(part.text, fields.get(i).typeName(), part.quoted);
                         }
                         return null;
                     }
@@ -146,56 +141,24 @@ class CompositeTypeHandler {
         return null;
     }
 
+    /** The fields of a composite literal, as the composite's own reader reads them. */
     String[] splitCompositeString(String inner) {
-        List<String> parts = new ArrayList<>();
-        int depth = 0;
-        boolean inQuote = false;
-        StringBuilder current = new StringBuilder();
-        for (int i = 0; i < inner.length(); i++) {
-            char ch = inner.charAt(i);
-            if (inQuote) {
-                current.append(ch);
-                if (ch == '"') inQuote = false;
-            } else if (ch == '"') {
-                current.append(ch);
-                inQuote = true;
-            } else if (ch == '(') {
-                depth++;
-                current.append(ch);
-            } else if (ch == ')') {
-                depth--;
-                current.append(ch);
-            } else if (ch == ',' && depth == 0) {
-                parts.add(current.toString());
-                current.setLength(0);
-            } else {
-                current.append(ch);
-            }
-        }
-        parts.add(current.toString());
-        return parts.toArray(new String[0]);
+        List<RecordLiteral.Field> fields = RecordLiteral.parse(inner);
+        String[] parts = new String[fields.size()];
+        for (int i = 0; i < fields.size(); i++) parts[i] = fields.get(i).text;
+        return parts;
     }
 
     AstExecutor.PgRow parseCompositeToRow(String s, String typeName) {
-        String inner;
-        if (s.startsWith("(") && s.endsWith(")")) {
-            inner = s.substring(1, s.length() - 1);
-        } else {
-            inner = s;
-        }
-        String[] parts = splitCompositeString(inner);
+        List<RecordLiteral.Field> parts = RecordLiteral.parse(s);
         List<CreateTypeStmt.CompositeField> fields = executor.database.getRowType(typeName);
         List<Object> values = new ArrayList<>();
-        for (int i = 0; i < parts.length; i++) {
-            String part = parts[i].trim();
-            boolean quoted = part.length() >= 2 && part.startsWith("\"") && part.endsWith("\"");
-            if (quoted) {
-                part = part.substring(1, part.length() - 1);
-            }
+        for (int i = 0; i < parts.size(); i++) {
+            RecordLiteral.Field part = parts.get(i);
             if (fields != null && i < fields.size()) {
-                values.add(coerceFieldValue(part, fields.get(i).typeName(), quoted));
+                values.add(coerceFieldValue(part.text, fields.get(i).typeName(), part.quoted));
             } else {
-                values.add(part);
+                values.add(part.quoted || !part.text.isEmpty() ? part.text : null);
             }
         }
         return new AstExecutor.PgRow(values);
@@ -290,11 +253,23 @@ class CompositeTypeHandler {
                     return new java.math.BigDecimal(val);
                 case "boolean":
                 case "bool":
-                    return Boolean.parseBoolean(val);
-                default:
+                    // The field was written by boolean's output function, which writes one letter;
+                    // Java's parser reads only the word, so every stored true read back false.
+                    return TypeCoercion.toBoolean(val);
+                case "text":
+                case "varchar":
+                case "character varying":
+                case "name":
+                case "unknown":
                     return val;
+                default:
+                    // Every other type reads its own field back with its own input function, so a
+                    // field holding an array comes back as an array rather than as its text.
+                    return executor.castEvaluator.applyCast(val, lt);
             }
         } catch (NumberFormatException e) {
+            return val;
+        } catch (MemgresException e) {
             return val;
         }
     }

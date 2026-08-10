@@ -275,8 +275,11 @@ public final class BuiltinCallTypes {
             boolean accepted = false;
             for (int c = 0; c < sameArity.size() && !accepted; c++) {
                 int at = declaredAt(sameArity.get(c), i);
+                // A category of its own does not put a type out of reach: PostgreSQL casts
+                // "char" to text unasked, so translate("char", ...) is a call it makes even
+                // though the two types are in different categories.
                 accepted = POLYMORPHIC.contains(Integer.valueOf(at)) || categoryOf(at) == 0
-                        || categoryOf(at) == written;
+                        || categoryOf(at) == written || convertible(argOids[i], at);
             }
             if (!accepted) throw missing(writtenName, argOids);
         }
@@ -331,8 +334,7 @@ public final class BuiltinCallTypes {
         if (printed.equals("overlaps")) printed = "pg_catalog." + printed;
         return new MemgresException("function " + printed
                 + "(" + written(argOids) + ") does not exist"
-                + "\n  Hint: No function matches the given name and argument types."
-                + " You might need to add explicit type casts.", "42883");
+                + "\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
     }
 
     /**

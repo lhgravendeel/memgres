@@ -218,6 +218,10 @@ public enum DataType {
         DataType floatWidth = floatPrecisionType(normalized);
         if (floatWidth != null) return floatWidth;
         switch (normalized) {
+            // PostgreSQL's own single-byte type is spelled with its quotes, and the quotes are
+            // part of the name: without them the name means the blank-padded character type.
+            case "\"char\"":
+                return INTERNAL_CHAR;
             case "int2":
             case "smallint":
                 return SMALLINT;

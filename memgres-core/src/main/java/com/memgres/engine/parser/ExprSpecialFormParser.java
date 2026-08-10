@@ -70,7 +70,10 @@ class ExprSpecialFormParser {
         Expression arr = parseArrayBracket();
         if (arr instanceof ArrayExpr && ((ArrayExpr) arr).elements().isEmpty() && !ep.check(TokenType.CAST)) {
             // ParseException(message, token, state) reports the token and drops the message.
-            throw ParseException.saying("cannot determine type of empty array", ep.peek(), "42P18");
+            // PostgreSQL shows the cast that settles the type rather than only refusing the array.
+            throw ParseException.saying("cannot determine type of empty array"
+                    + "\n  Hint: Explicitly cast to the desired type, for example"
+                    + " ARRAY[]::integer[].", ep.peek(), "42P18");
         }
         return arr;
     }

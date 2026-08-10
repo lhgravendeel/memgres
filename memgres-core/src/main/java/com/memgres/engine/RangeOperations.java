@@ -18,17 +18,31 @@ public class RangeOperations {
 
     /** Element kinds a range can be built over. */
     static final String INT = "int";
+    /** int8range's element: discrete like int4range's, but with a wider limit to overflow. */
+    static final String INT8 = "int8";
     static final String NUM = "num";
     static final String DATE = "date";
     static final String TS = "ts";
     static final String TSTZ = "tstz";
+
+    /**
+     * The name PostgreSQL gives the multirange type it creates alongside a range type: a name that
+     * already ends in "range" has that word replaced, and any other name is given the suffix. Every
+     * range type has one, so the name is derived from the range's rather than stored beside it.
+     */
+    public static String multirangeTypeName(String rangeTypeName) {
+        return rangeTypeName.endsWith("range")
+                ? rangeTypeName.substring(0, rangeTypeName.length() - "range".length()) + "multirange"
+                : rangeTypeName + "_multirange";
+    }
 
     /** The element kind of a named range type, or null when the type is not one of PG's. */
     static String elemOfRangeType(String rangeType) {
         if (rangeType == null) return null;
         String t = rangeType.toLowerCase().trim();
         if (t.endsWith("multirange")) t = t.substring(0, t.length() - "multirange".length()) + "range";
-        if (t.equals("int4range") || t.equals("int8range")) return INT;
+        if (t.equals("int4range")) return INT;
+        if (t.equals("int8range")) return INT8;
         if (t.equals("numrange")) return NUM;
         if (t.equals("daterange")) return DATE;
         if (t.equals("tsrange")) return TS;
@@ -389,7 +403,7 @@ public class RangeOperations {
     private static Bound parseBound(String raw, String elem) {
         String s = stripQuotes(raw);
         Double special = specialNumber(s);
-        if (INT.equals(elem)) {
+        if (INT.equals(elem) || INT8.equals(elem)) {
             if (special != null) {
                 throw new MemgresException(
                         "invalid input syntax for type integer: \"" + s + "\"", "22P02");
@@ -506,6 +520,10 @@ public class RangeOperations {
     }
 
     /** PG quotes a bound whose text would otherwise not read back as one token. */
+    static String quotedBound(String text) {
+        return quoteBound(text);
+    }
+
     private static String quoteBound(String text) {
         if (text == null || text.isEmpty()) return "";
         boolean needs = false;
@@ -618,8 +636,11 @@ public class RangeOperations {
         if (bounds == null || bounds.length() != 2
                 || (bounds.charAt(0) != '[' && bounds.charAt(0) != '(')
                 || (bounds.charAt(1) != ']' && bounds.charAt(1) != ')')) {
-            throw new MemgresException(
-                    "range bound flags must be one of \"[]\", \"[)\", \"(]\", or \"()\"", "42601");
+            // The four spellings belong in the hint rather than the message, which is where
+            // PostgreSQL puts the advice it offers about a value it has already refused.
+            MemgresException e = new MemgresException("invalid range bound flags", "42601");
+            e.setHint("Valid values are \"[]\", \"[)\", \"(]\", and \"()\".");
+            throw e;
         }
     }
 
@@ -650,14 +671,25 @@ public class RangeOperations {
      * points at all becomes {@code empty}.
      */
     private static PgRange build(Bound lo, Bound hi, boolean li, boolean ui, String elem) {
-        boolean discrete = INT.equals(elem) || DATE.equals(elem);
+        // The bounds are checked as they were written, before anything is canonicalised. Doing it
+        // the other way round refused (5,5) — which is the empty range — and accepted [5,4],
+        // because canonicalising had already moved the bounds past each other.
+        if (lo != null && hi != null) {
+            int written = cmpVals(lo.key, hi.key);
+            if (written > 0) {
+                throw new MemgresException(
+                        "range lower bound must be less than or equal to range upper bound", "22000");
+            }
+            if (written == 0 && !(li && ui)) return emptyLike(elem);
+        }
+        boolean discrete = INT.equals(elem) || INT8.equals(elem) || DATE.equals(elem);
         if (discrete) {
             if (lo != null && !li && !isSpecial(lo.key)) {
-                lo = successor(lo, elem);
+                lo = successor(lo, elem, false);
                 li = true;
             }
             if (hi != null && ui && !isSpecial(hi.key)) {
-                hi = successor(hi, elem);
+                hi = successor(hi, elem, true);
                 ui = false;
             }
         }
@@ -676,13 +708,23 @@ public class RangeOperations {
                 elem, lo == null ? null : lo.value, hi == null ? null : hi.value);
     }
 
-    private static Bound successor(Bound b, String elem) {
+    /**
+     * The next value of a discrete element type. There is not always one: a range whose bound is
+     * the largest value its type holds cannot be canonicalised, and PostgreSQL says the element
+     * type overflowed rather than wrapping the bound round to a negative number.
+     */
+    private static Bound successor(Bound b, String elem, boolean upper) {
         if (DATE.equals(elem)) {
             LocalDate next = ((LocalDate) b.value).plusDays(1);
             return new Bound(next, Long.valueOf(next.toEpochDay()), formatDate(next));
         }
-        long next = ((Number) b.value).longValue() + 1;
-        return longBound(next);
+        long value = ((Number) b.value).longValue();
+        long limit = INT8.equals(elem) ? Long.MAX_VALUE : Integer.MAX_VALUE;
+        if (value >= limit) {
+            throw new MemgresException(
+                    (INT8.equals(elem) ? "bigint" : "integer") + " out of range", "22003");
+        }
+        return longBound(value + 1);
     }
 
     /** Parse a range from string format: [1,10), (5,15], empty, etc. */
@@ -700,19 +742,30 @@ public class RangeOperations {
         s = s.trim();
         String elem = elemOfRangeType(rangeType);
         if (s.equalsIgnoreCase("empty")) return emptyLike(elem);
-        if (s.length() < 3) throw new MemgresException("malformed range literal: \"" + s + "\"", "22P02");
-
+        if (s.isEmpty() || (s.charAt(0) != '[' && s.charAt(0) != '(')) {
+            throw malformedRange(s, "Missing left parenthesis or bracket.");
+        }
         char first = s.charAt(0);
-        char last = s.charAt(s.length() - 1);
-        if ((first != '[' && first != '(') || (last != ']' && last != ')')) {
-            throw new MemgresException("malformed range literal: \"" + s + "\"", "22P02");
+        // A range ends at the first bracket that closes it, not at the last bracket in the text.
+        // Reading to the end instead made "[1,2)]" a range whose upper bound was "2)", and the
+        // complaint that came back was about the integer rather than about the literal.
+        int close = closingBracket(s, 0);
+        if (close < 0) throw malformedRange(s, "Unexpected end of input.");
+        if (!s.substring(close + 1).trim().isEmpty()) {
+            throw malformedRange(s, "Junk after right parenthesis or bracket.");
         }
 
+        char last = s.charAt(close);
         boolean li = first == '[';
         boolean ui = last == ']';
-        String inner = s.substring(1, s.length() - 1);
+        String inner = s.substring(1, close);
         String[] parts = splitBounds(inner);
-        if (parts == null) throw new MemgresException("malformed range literal: \"" + s + "\"", "22P02");
+        if (parts == null) {
+            // A range has exactly two bounds, so the comma between them is either missing or
+            // there is one more than there is room for.
+            throw malformedRange(s, boundSeparator(inner) < -1
+                    ? "Too many commas." : "Missing comma after lower bound.");
+        }
 
         String loRaw = parts[0].trim();
         String hiRaw = parts[1].trim();
@@ -729,6 +782,17 @@ public class RangeOperations {
      * which is also what keeps the geometric types, written with several commas, out of here.
      */
     private static String[] splitBounds(String inner) {
+        int at = boundSeparator(inner);
+        if (at < 0) return null;
+        return new String[]{inner.substring(0, at), inner.substring(at + 1)};
+    }
+
+    /**
+     * Where a range's inner text separates its bounds, ignoring commas inside a quoted bound: the
+     * comma's position, -1 when there is none, and -2 when there is more than one. Which of the
+     * two failures it was is what PostgreSQL puts in the error's detail.
+     */
+    private static int boundSeparator(String inner) {
         boolean inQuotes = false;
         int at = -1;
         for (int i = 0; i < inner.length(); i++) {
@@ -736,22 +800,28 @@ public class RangeOperations {
             if (c == '\\') { i++; continue; }
             if (c == '"') { inQuotes = !inQuotes; continue; }
             if (c == ',' && !inQuotes) {
-                if (at >= 0) return null;
+                if (at >= 0) return -2;
                 at = i;
             }
         }
-        if (at < 0) return null;
-        return new String[]{inner.substring(0, at), inner.substring(at + 1)};
+        return at;
     }
 
-    /** The two bound texts of a range literal, unquoted, or null when it has no such pair. */
+    /**
+     * The two bound texts of a range literal, unquoted, or null when it has no such pair.
+     *
+     * <p>The range ends where it closes, as it does when it is read: text with something after the
+     * closing bracket has no pair of bounds to offer, and saying so leaves the complaint to the
+     * reader, which knows the literal is malformed rather than the bound out of range.
+     */
     static String[] boundTexts(String literal) {
         String s = literal.trim();
         if (s.length() < 3) return null;
         char first = s.charAt(0);
-        char last = s.charAt(s.length() - 1);
-        if ((first != '[' && first != '(') || (last != ']' && last != ')')) return null;
-        String[] parts = splitBounds(s.substring(1, s.length() - 1));
+        if (first != '[' && first != '(') return null;
+        int close = closingBracket(s, 0);
+        if (close < 0 || !s.substring(close + 1).trim().isEmpty()) return null;
+        String[] parts = splitBounds(s.substring(1, close));
         if (parts == null) return null;
         return new String[]{stripQuotes(parts[0]), stripQuotes(parts[1])};
     }
@@ -775,10 +845,11 @@ public class RangeOperations {
     private static int rankElem(String elem) {
         if (elem == null) return -1;
         if (INT.equals(elem)) return 0;
-        if (NUM.equals(elem)) return 1;
-        if (DATE.equals(elem)) return 2;
-        if (TS.equals(elem)) return 3;
-        return 4;
+        if (INT8.equals(elem)) return 1;
+        if (NUM.equals(elem)) return 2;
+        if (DATE.equals(elem)) return 3;
+        if (TS.equals(elem)) return 4;
+        return 5;
     }
 
     private static String inferElem(String raw) {
@@ -853,6 +924,21 @@ public class RangeOperations {
         if (aParts.isEmpty() || bParts.isEmpty()) return false;
         // A multirange is stored in ascending order, so only the extreme parts matter.
         return strictlyLeftOf(aParts.get(aParts.size() - 1), bParts.get(0));
+    }
+
+    /**
+     * {@code a &< b}: whether {@code a} does not reach past the end of {@code b}. An empty range
+     * takes part in no such comparison, and PostgreSQL answers false rather than true for it.
+     */
+    public static boolean multirangeDoesNotExtendRight(java.util.List<PgRange> a,
+            java.util.List<PgRange> b) {
+        java.util.List<PgRange> aParts = nonEmptyParts(a);
+        java.util.List<PgRange> bParts = nonEmptyParts(b);
+        if (aParts.isEmpty() || bParts.isEmpty()) return false;
+        PgRange last = aParts.get(aParts.size() - 1);
+        PgRange other = bParts.get(bParts.size() - 1);
+        return cmpUpperBounds(last.upper, last.upperInclusive,
+                other.upper, other.upperInclusive) <= 0;
     }
 
     private static java.util.List<PgRange> nonEmptyParts(java.util.List<PgRange> parts) {
@@ -959,7 +1045,9 @@ public class RangeOperations {
     public static java.util.List<PgRange> parseMultirangeLiteral(String text, String rangeType) {
         java.util.List<PgRange> out = new java.util.ArrayList<PgRange>();
         int p = skipSpace(text, 0);
-        if (p >= text.length() || text.charAt(p) != '{') throw malformedMultirange(text);
+        if (p >= text.length() || text.charAt(p) != '{') {
+            throw malformedMultirange(text, "Missing left brace.");
+        }
         p++;
         p = skipSpace(text, p);
         if (p < text.length() && text.charAt(p) == '}') {
@@ -967,18 +1055,20 @@ public class RangeOperations {
         } else {
             for (;;) {
                 p = skipSpace(text, p);
-                if (p >= text.length()) throw malformedMultirange(text);
+                if (p >= text.length()) {
+                    throw malformedMultirange(text, "Unexpected end of input.");
+                }
                 char c = text.charAt(p);
                 if (c == '[' || c == '(') {
                     int end = closingBracket(text, p);
-                    if (end < 0) throw malformedMultirange(text);
+                    if (end < 0) throw malformedMultirange(text, "Unexpected end of input.");
                     out.add(parse(text.substring(p, end + 1), rangeType));
                     p = end + 1;
                 } else if (text.regionMatches(true, p, "empty", 0, 5)) {
                     out.add(emptyLike(elemOfRangeType(rangeType)));
                     p += 5;
                 } else {
-                    throw malformedMultirange(text);
+                    throw malformedMultirange(text, "Expected range start.");
                 }
                 p = skipSpace(text, p);
                 if (p < text.length() && text.charAt(p) == ',') {
@@ -989,10 +1079,13 @@ public class RangeOperations {
                     p++;
                     break;
                 }
-                throw malformedMultirange(text);
+                throw malformedMultirange(text, p >= text.length()
+                        ? "Unexpected end of input." : "Expected comma or end of multirange.");
             }
         }
-        if (skipSpace(text, p) != text.length()) throw malformedMultirange(text);
+        if (skipSpace(text, p) != text.length()) {
+            throw malformedMultirange(text, "Junk after closing right brace.");
+        }
         return out;
     }
 
@@ -1014,14 +1107,33 @@ public class RangeOperations {
         return -1;
     }
 
-    private static MemgresException malformedMultirange(String text) {
-        return new MemgresException("malformed multirange literal: \"" + text + "\"", "22P02");
+    private static MemgresException malformedRange(String text, String detail) {
+        MemgresException e =
+                new MemgresException("malformed range literal: \"" + text + "\"", "22P02");
+        e.setDetail(detail);
+        return e;
+    }
+
+    private static MemgresException malformedMultirange(String text, String detail) {
+        MemgresException e =
+                new MemgresException("malformed multirange literal: \"" + text + "\"", "22P02");
+        e.setDetail(detail);
+        return e;
     }
 
     /**
      * Parse a multirange string like '{[1,4),[10,12)}' into a list of PgRange.
      */
     public static java.util.List<PgRange> parseMultirange(String s) {
+        return parseMultirange(s, null);
+    }
+
+    /**
+     * The same, reading each member as a range of {@code rangeType}. Without the type name the
+     * members are read from their own spelling, so a nummultirange whose bounds are whole numbers
+     * came back canonicalised as if it were an integer multirange.
+     */
+    public static java.util.List<PgRange> parseMultirange(String s, String rangeType) {
         if (s == null) return java.util.Collections.emptyList();
         s = s.trim();
         if (s.isEmpty()) return java.util.Collections.emptyList();
@@ -1037,7 +1149,7 @@ public class RangeOperations {
             if (c == '[' || c == '(') {
                 int end = closingBracket(s, i);
                 if (end < 0) break;
-                ranges.add(parse(s.substring(i, end + 1)));
+                ranges.add(parse(s.substring(i, end + 1), rangeType));
                 i = end + 1;
                 // Skip comma separator
                 while (i < s.length() && (s.charAt(i) == ',' || s.charAt(i) == ' ')) i++;
@@ -1113,9 +1225,14 @@ public class RangeOperations {
 
     /** Union two multiranges, merging overlapping/adjacent ranges. */
     public static String multirangeUnion(String mr1, String mr2) {
+        return multirangeUnion(mr1, mr2, null);
+    }
+
+    /** The same, reading both operands as multiranges of the named type. */
+    public static String multirangeUnion(String mr1, String mr2, String rangeType) {
         java.util.List<PgRange> all = new java.util.ArrayList<>();
-        all.addAll(parseMultirange(mr1));
-        all.addAll(parseMultirange(mr2));
+        all.addAll(parseMultirange(mr1, rangeType));
+        all.addAll(parseMultirange(mr2, rangeType));
         return formatMultirange(mergeAndSort(all));
     }
 
@@ -1135,8 +1252,13 @@ public class RangeOperations {
 
     /** Subtract a multirange from another multirange. */
     public static String multirangeSubtract(String mr1, String mr2) {
-        java.util.List<PgRange> result = new java.util.ArrayList<>(parseMultirange(mr1));
-        for (PgRange sub : parseMultirange(mr2)) {
+        return multirangeSubtract(mr1, mr2, null);
+    }
+
+    /** The same, reading both operands as multiranges of the named type. */
+    public static String multirangeSubtract(String mr1, String mr2, String rangeType) {
+        java.util.List<PgRange> result = new java.util.ArrayList<>(parseMultirange(mr1, rangeType));
+        for (PgRange sub : parseMultirange(mr2, rangeType)) {
             java.util.List<PgRange> next = new java.util.ArrayList<>();
             for (PgRange r : result) {
                 subtractSingle(r, sub, next);

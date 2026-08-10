@@ -775,8 +775,7 @@ public class Table {
             for (Object[] row : allRows) {
                 for (int ci = 0; ci < colIndices.length; ci++) {
                     if (row[colIndices[ci]] == null) {
-                        throw new MemgresException("column \"" + sc.getColumns().get(ci)
-                                + "\" of relation \"" + name + "\" contains null values", "23502");
+                        throw PgErrors.columnContainsNulls(sc.getColumns().get(ci), "relation", name);
                     }
                 }
             }
@@ -800,8 +799,11 @@ public class Table {
                     keyDesc.append(sc.getColumns().get(ci));
                     valDesc.append(row[colIndices[ci]]);
                 }
-                throw new MemgresException("could not create unique index \"" + sc.getName()
-                        + "\"\n  Detail: Key (" + keyDesc + ")=(" + valDesc + ") is duplicated.", "23505");
+                MemgresException dup = new MemgresException("could not create unique index \""
+                        + sc.getName() + "\"", "23505");
+                dup.setConstraint(sc.getName());
+                dup.setDetail("Key (" + keyDesc + ")=(" + valDesc + ") is duplicated.");
+                throw dup;
             }
         }
     }

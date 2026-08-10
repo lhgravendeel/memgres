@@ -399,14 +399,23 @@ class SelectExecutor {
         // Validate array subscript type errors for empty tables
         if (contexts.isEmpty() && simpleFrom && !baseBindings.isEmpty()) {
             for (SelectStmt.SelectTarget target : stmt.targets()) {
+                Expression base = null;
+                Expression subscript = null;
                 if (target.expr() instanceof BinaryExpr
                         && (((BinaryExpr) target.expr()).op() == BinaryExpr.BinOp.JSON_ARROW
                             || ((BinaryExpr) target.expr()).op() == BinaryExpr.BinOp.JSON_SUBSCRIPT)) {
-                    BinaryExpr bin = (BinaryExpr) target.expr();
-                    if (bin.left() instanceof ColumnRef && bin.right() instanceof Literal
-                            && ((Literal) bin.right()).literalType() == Literal.LiteralType.STRING) {
-                        Literal lit = (Literal) bin.right();
-                        ColumnRef cr = (ColumnRef) bin.left();
+                    base = ((BinaryExpr) target.expr()).left();
+                    subscript = ((BinaryExpr) target.expr()).right();
+                } else if (target.expr() instanceof SubscriptExpr) {
+                    SubscriptExpr sub = (SubscriptExpr) target.expr();
+                    base = sub.base();
+                    subscript = sub.subscripts().get(0).lower();
+                }
+                if (base != null) {
+                    if (base instanceof ColumnRef && subscript instanceof Literal
+                            && ((Literal) subscript).literalType() == Literal.LiteralType.STRING) {
+                        Literal lit = (Literal) subscript;
+                        ColumnRef cr = (ColumnRef) base;
                         for (RowContext.TableBinding tb : baseBindings) {
                             int colIdx = tb.table().getColumnIndex(cr.column());
                             if (colIdx >= 0) {

@@ -108,14 +108,41 @@ class CatalogTypeSystemBuilder {
         table.insertRow(new Object[]{3912, 1082, 4535, 0, 0, 0, 0}); // daterange   → date,      datemultirange
         table.insertRow(new Object[]{3926, 20,   4536, 0, 0, 0, 0}); // int8range   → int8,      int8multirange
 
-        // User-defined range types
+        // User-defined range types. A range orders its bounds with the subtype's default btree
+        // class and comes with a multirange type of its own; both columns were left at zero, so a
+        // reader following either one from a user-defined range reached nothing. The two function
+        // columns are regproc values rather than plain zeroes so that they print the way PG's
+        // InvalidOid does, which is a dash and not the number.
         for (Map.Entry<String, String> entry : database.getRangeTypes().entrySet()) {
             String subtypeName = entry.getValue();
             int rangeTypeOid = oids.oid("type:" + entry.getKey());
             int subtypeOid = resolveTypeOid(subtypeName);
-            table.insertRow(new Object[]{rangeTypeOid, subtypeOid, 0, 0, 0, 0, 0});
+            String multirangeKey = TypeNamespace.key(TypeNamespace.schemaOfKey(entry.getKey()),
+                    RangeOperations.multirangeTypeName(TypeNamespace.nameOfKey(entry.getKey())));
+            table.insertRow(new Object[]{rangeTypeOid, subtypeOid,
+                    oids.oid("type:" + multirangeKey), 0, defaultBtreeOpclassOid(subtypeOid),
+                    new RegprocValue(0, "-"), new RegprocValue(0, "-")});
         }
         return table;
+    }
+
+    /** The OID of the default btree operator class over a type, or 0 when it has none. */
+    private int defaultBtreeOpclassOid(int typeOid) {
+        for (Object[] c : OPCLASSES) {
+            if ("btree".equals(c[1]) && Boolean.TRUE.equals(c[3])
+                    && ((Integer) c[2]).intValue() == typeOid) {
+                return opclassOid((String) c[0], "btree");
+            }
+        }
+        return 0;
+    }
+
+    /** Whether PostgreSQL ships a btree operator class of this name. */
+    static boolean shipsBtreeOpclass(String name) {
+        for (Object[] c : OPCLASSES) {
+            if ("btree".equals(c[1]) && ((String) c[0]).equalsIgnoreCase(name)) return true;
+        }
+        return false;
     }
 
     Table buildPgExtension() {

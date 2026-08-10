@@ -25,7 +25,7 @@ class GeometricFunctions {
         if ("circle".equals(shape) || "box".equals(shape)) return;
         String t = text.trim();
         throw new MemgresException("function " + funcName + "(" + shapeName(t) + ") does not exist"
-                + "\n  Hint: No function matches the given name and argument types.", "42883");
+                + "\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
     }
 
     /** PG has area() for box, circle and path; a polygon, lseg, line or point has none. */
@@ -33,7 +33,7 @@ class GeometricFunctions {
         String shape = declaredType != null ? declaredType : shapeName(text);
         if (shape.equals("box") || shape.equals("circle") || shape.equals("path")) return;
         throw new MemgresException("function area(" + shape + ") does not exist"
-                + "\n  Hint: No function matches the given name and argument types.", "42883");
+                + "\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
     }
 
     /**
@@ -80,8 +80,7 @@ class GeometricFunctions {
         }
         MemgresException e = new MemgresException(
                 "function " + fn.name() + "(" + types + ") does not exist", "42883");
-        e.setHint("No function matches the given name and argument types."
-                + " You might need to add explicit type casts.");
+        e.setHint("No function matches the given name and argument types. You might need to add explicit type casts.");
         throw e;
     }
 
@@ -125,7 +124,7 @@ class GeometricFunctions {
     private void requireGeometric(Object arg, String funcName) {
         if (arg instanceof Number) {
             throw new MemgresException(
-                "function " + funcName + "(integer) does not exist\n  Hint: No function matches the given name and argument types.", "42883");
+                "function " + funcName + "(integer) does not exist\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
         }
         String s = arg.toString();
         if (!s.isEmpty() && !GeometricOperations.isGeometricString(s)) {
@@ -152,7 +151,7 @@ class GeometricFunctions {
         if (!SHAPE_CONSTRUCTORS.contains(name)) return;
         if (fn.args().isEmpty()) {
             throw new MemgresException("function " + name + "() does not exist"
-                    + "\n  Hint: No function matches the given name and argument types.", "42883");
+                    + "\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
         }
         if (fn.args().size() != 1) return;
         Object arg = executor.evalExpr(fn.args().get(0), ctx);
@@ -160,7 +159,7 @@ class GeometricFunctions {
         if (arg instanceof Number || arg instanceof Boolean) {
             throw new MemgresException("function " + name + "(" + AstExecutor.pgTypeNameOf(arg)
                     + ") does not exist"
-                    + "\n  Hint: No function matches the given name and argument types.", "42883");
+                    + "\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
         }
         if (arg instanceof String && !GeometricOperations.isGeometricString(((String) arg).trim())) {
             // Not written as a shape, so it is either the plain list of numbers PostgreSQL also
@@ -188,7 +187,7 @@ class GeometricFunctions {
             }
             case "center": {
                 if (fn.args().size() != 1) {
-                    throw new MemgresException("function center() does not exist\n  Hint: No function matches the given name and argument types.", "42883");
+                    throw new MemgresException("function center() does not exist\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
                 }
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
@@ -210,7 +209,7 @@ class GeometricFunctions {
                 String rs = arg.toString().trim();
                 if (!rs.startsWith("<") || !rs.endsWith(">")) {
                     throw new MemgresException(
-                        "function radius(box) does not exist\n  Hint: No function matches the given name and argument types.", "42883");
+                        "function radius(box) does not exist\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
                 }
                 return GeometricOperations.radius(rs);
             }
@@ -363,7 +362,7 @@ class GeometricFunctions {
                 if (arg == null) return null;
                 if (arg instanceof java.util.List<?>) {
                     throw new MemgresException(
-                        "function polygon(text[]) does not exist\n  Hint: No function matches the given name and argument types.", "42883");
+                        "function polygon(text[]) does not exist\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
                 }
                 return GeometricOperations.toPolygon(arg.toString());
             }

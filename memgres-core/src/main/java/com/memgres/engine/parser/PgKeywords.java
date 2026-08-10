@@ -22,7 +22,7 @@ import java.util.Set;
  * <p>Only the words this lexer treats as keywords need to appear; anything else is already an
  * ordinary identifier.
  */
-final class PgKeywords {
+public final class PgKeywords {
 
     private PgKeywords() {
     }
@@ -83,5 +83,15 @@ final class PgKeywords {
     /** Whether this word is one PostgreSQL reserves outright. */
     static boolean isReserved(String word) {
         return word != null && RESERVED.contains(word.toUpperCase());
+    }
+
+    /**
+     * Whether this word names anything in the grammar. A name that does has to be written in
+     * quotes to be read back as a name, which is what {@code quote_ident} decides.
+     */
+    public static boolean isKeywordOrReserved(String word) {
+        if (word == null) return false;
+        String upper = word.toUpperCase();
+        return RESERVED.contains(upper) || TYPE_FUNC_NAME.contains(upper) || COL_NAME.contains(upper);
     }
 }

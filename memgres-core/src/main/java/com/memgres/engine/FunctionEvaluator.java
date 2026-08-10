@@ -525,8 +525,7 @@ class FunctionEvaluator {
         if (!coercionAdmitted(coercionTargetOf(typeName), staticArgType(arg, ctx))) {
             throw new MemgresException("function " + fn.name() + "("
                     + coercionArgTypeName(arg, ctx) + ") does not exist\n"
-                    + "  Hint: No function matches the given name and argument types."
-                    + " You might need to add explicit type casts.", "42883");
+                    + "  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
         }
         Object value = executor.evalExpr(arg, ctx);
         // void carries no value at all: whatever is handed to it, PostgreSQL prints nothing.
@@ -737,8 +736,7 @@ class FunctionEvaluator {
                     && e.getMessage().startsWith("operator does not exist")) {
                 throw new MemgresException("function " + fn.name() + "("
                         + argTypeNames(fn, ctx) + ") does not exist"
-                        + "\n  Hint: No function matches the given name and argument types."
-                        + " You might need to add explicit type casts.", "42883");
+                        + "\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
             }
             throw e;
         }
@@ -772,7 +770,7 @@ class FunctionEvaluator {
         if (fn.args().size() < min) {
             throw new MemgresException(
                 "function " + fn.name() + "() does not exist" +
-                (fn.args().isEmpty() ? "" : "\n  Hint: No function matches the given name and argument types."), "42883");
+                (fn.args().isEmpty() ? "" : "\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts."), "42883");
         }
     }
 
@@ -784,10 +782,7 @@ class FunctionEvaluator {
         if (!executor.database.hasExtension(extensionName)) {
             String sig = functionName + "(" + String.join(", ",
                     java.util.Collections.nCopies(argCount, "unknown")) + ")";
-            throw new MemgresException(
-                    "function " + sig + " does not exist\n" +
-                    "  Hint: No function matches the given name and argument types. " +
-                    "You might need to add explicit type casts.", "42883");
+            throw new MemgresException("function " + sig + " does not exist", "42883");
         }
     }
 
@@ -882,9 +877,51 @@ class FunctionEvaluator {
         if (value instanceof List<?>) return (List<?>) value;
         throw new MemgresException("function " + functionName + "("
                 + AstExecutor.pgTypeNameOf(value) + ", " + AstExecutor.pgTypeNameOf(value)
-                + ") does not exist\n"
-                + "  Hint: No function matches the given name and argument types. "
-                + "You might need to add explicit type casts.", "42883");
+                + ") does not exist", "42883");
+    }
+
+    /** A null array read as the empty one, which is what the concatenating functions do with it. */
+    private static PgArray orEmpty(PgArray array) {
+        return array == null ? PgArray.of(new ArrayList<Object>()) : array;
+    }
+
+    /** Every element equal to {@code oldVal} replaced, at whatever depth it sits. */
+    private static List<Object> replaceElements(List<?> elements, Object oldVal, Object newVal) {
+        List<Object> out = new ArrayList<Object>(elements.size());
+        for (Object element : elements) {
+            if (element instanceof List<?>) out.add(replaceElements((List<?>) element, oldVal, newVal));
+            else out.add(TypeCoercion.areEqual(element, oldVal) ? newVal : element);
+        }
+        return out;
+    }
+
+    /**
+     * The element functions work on one dimension. PostgreSQL refuses a deeper array rather than
+     * looking inside it, and names the operation it was refusing; answering NULL or leaving the
+     * array untouched told the caller the element was not there.
+     */
+    private static void requireFlatArray(PgArray array, String message, String sqlState) {
+        if (array.dims().length > 1) throw new MemgresException(message, sqlState);
+    }
+
+    /**
+     * An element on its way into an array, read as the array's element type. Without this an
+     * integer array accepted the text {@code '3.7'} and held it as the string it was written as.
+     */
+    private Object coerceToElementType(PgArray array, Object element) {
+        if (element == null) return null;
+        String typeName = array.elementType();
+        if (typeName == null) {
+            for (Object existing : PgArray.flatten(array)) {
+                if (existing != null) {
+                    typeName = AstExecutor.pgTypeNameOf(existing);
+                    break;
+                }
+            }
+        }
+        if (typeName == null) return element;
+        DataType type = DataType.fromPgName(typeName);
+        return type == null ? element : TypeCoercion.coerce(element, type);
     }
 
     /** The element type of an argument that is already a proper array, or null. */
@@ -1140,9 +1177,7 @@ class FunctionEvaluator {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
                 String text = arg.toString();
-                if (!ExprEvaluator.isValidJson(text)) {
-                    throw new MemgresException("invalid input syntax for type json", "22P02");
-                }
+                ExprEvaluator.requireJson(text);
                 return text;
             }
             case "crc32": {
@@ -1315,7 +1350,7 @@ class FunctionEvaluator {
                 return FromFunctionResolver.regexpSplitToTableValues(evaluatedArgs(fn, ctx));
             case "generate_series": {
                 if (fn.args().size() < 2) {
-                    throw new MemgresException("function generate_series() does not exist\n  Hint: No function matches the given name and argument types.", "42883");
+                    throw new MemgresException("function generate_series() does not exist\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
                 }
                 Object startObj = executor.evalExpr(fn.args().get(0), ctx);
                 Object stopObj = executor.evalExpr(fn.args().get(1), ctx);
@@ -1424,98 +1459,14 @@ class FunctionEvaluator {
                 Object arrObj = executor.evalExpr(fn.args().get(0), ctx);
                 int dim = executor.toInt(executor.evalExpr(fn.args().get(1), ctx));
                 boolean reverse = fn.args().size() > 2 && executor.isTruthy(executor.evalExpr(fn.args().get(2), ctx));
-                int lo = 1;
-                int hi;
-                // Handle custom lower-bound arrays: "[lb:ub]={...}" format
-                if (arrObj instanceof String && ((String) arrObj).matches("\\[\\d+:\\d+\\]=\\{.*\\}")) {
-                    String s = (String) arrObj;
-                    int eqIdx = s.indexOf('=');
-                    String boundsStr = s.substring(0, eqIdx);
-                    String[] parts = boundsStr.substring(1, boundsStr.length() - 1).split(":");
-                    lo = Integer.parseInt(parts[0].trim());
-                    hi = Integer.parseInt(parts[1].trim());
-                } else if (arrObj instanceof List<?>) {
-                    List<?> list = (List<?>) arrObj;
-                    if (dim == 2 && !list.isEmpty() && list.get(0) instanceof List<?>) {
-                        List<?> sub = (List<?>) list.get(0);
-                        hi = lo + sub.size() - 1;
-                    } else if (dim == 1) {
-                        hi = lo + list.size() - 1;
-                    } else {
-                        return Cols.listOf(); // dimension doesn't exist
-                    }
-                } else if (arrObj instanceof String && ((String) arrObj).startsWith("{") && ((String) arrObj).endsWith("}")) {
-                    String s = (String) arrObj;
-                    String inner = s.substring(1, s.length() - 1);
-                    if (inner.isEmpty()) return Cols.listOf();
-                    // Detect multi-dimensional arrays: inner content starts with '{'
-                    if (inner.trim().startsWith("{")) {
-                        // Multi-dimensional array like {{1,2},{3,4}}
-                        // Count top-level sub-arrays for dim calculation
-                        List<String> topLevel = splitTopLevelSubArrays(inner);
-                        if (dim == 1) {
-                            hi = lo + topLevel.size() - 1;
-                        } else if (dim == 2 && !topLevel.isEmpty()) {
-                            // Parse the first sub-array to get dimension 2 size
-                            String firstSub = topLevel.get(0).trim();
-                            if (firstSub.startsWith("{") && firstSub.endsWith("}")) {
-                                String subInner = firstSub.substring(1, firstSub.length() - 1);
-                                // Check for further nesting
-                                if (subInner.trim().startsWith("{")) {
-                                    List<String> subLevel = splitTopLevelSubArrays(subInner);
-                                    hi = lo + subLevel.size() - 1;
-                                } else {
-                                    List<Object> subElems = parseSimplePgArray(firstSub);
-                                    hi = lo + subElems.size() - 1;
-                                }
-                            } else {
-                                return Cols.listOf();
-                            }
-                        } else if (dim > 2 && !topLevel.isEmpty()) {
-                            // Navigate deeper dimensions
-                            String current = topLevel.get(0).trim();
-                            for (int d = 2; d < dim; d++) {
-                                if (current.startsWith("{") && current.endsWith("}")) {
-                                    String ci = current.substring(1, current.length() - 1);
-                                    if (ci.trim().startsWith("{")) {
-                                        List<String> sub = splitTopLevelSubArrays(ci);
-                                        if (sub.isEmpty()) { return Cols.listOf(); }
-                                        current = sub.get(0).trim();
-                                    } else {
-                                        return Cols.listOf(); // dimension doesn't exist
-                                    }
-                                } else {
-                                    return Cols.listOf();
-                                }
-                            }
-                            // current should be an array at the target dimension
-                            if (current.startsWith("{") && current.endsWith("}")) {
-                                String ci = current.substring(1, current.length() - 1);
-                                if (ci.trim().startsWith("{")) {
-                                    List<String> sub = splitTopLevelSubArrays(ci);
-                                    hi = lo + sub.size() - 1;
-                                } else {
-                                    List<Object> subElems = parseSimplePgArray(current);
-                                    hi = lo + subElems.size() - 1;
-                                }
-                            } else {
-                                return Cols.listOf();
-                            }
-                        } else {
-                            return Cols.listOf();
-                        }
-                    } else {
-                        // 1D array
-                        List<Object> elems = parseSimplePgArray(s);
-                        if (dim == 1) {
-                            hi = lo + elems.size() - 1;
-                        } else {
-                            return Cols.listOf();
-                        }
-                    }
-                } else {
-                    return Cols.listOf();
-                }
+                // The subscripts run over the array's own bounds, whatever dimension is asked
+                // for and wherever that dimension starts.
+                PgArray subscripted = PgArray.from(arrObj);
+                if (subscripted == null) return Cols.listOf();
+                int[] extents = subscripted.dims();
+                if (dim < 1 || dim > extents.length) return Cols.listOf();
+                int lo = subscripted.lowerBound(dim);
+                int hi = lo + extents[dim - 1] - 1;
                 List<Object> result = new ArrayList<>();
                 if (lo <= hi) {
                     if (reverse) {
@@ -1798,6 +1749,7 @@ class FunctionEvaluator {
                 return tsArg;
             }
             case "array_length": {
+                arrayFunctionName = name;
                 requireDeclaredArrayArg(fn.args().get(0));
                 Object arr = executor.evalExpr(fn.args().get(0), ctx);
                 if (arr == null) return null;
@@ -1811,93 +1763,48 @@ class FunctionEvaluator {
                 // an empty oidvector as [0:-1] rather than as a dimensionless empty array, so
                 // array_length answers 0 where a plain empty array answers NULL.
                 if (arr instanceof PgVector) return dim == 1 ? (Object) ((PgVector) arr).size() : null;
-                if (arr instanceof List<?>) {
-                    List<?> list = (List<?>) arr;
-                    if (dim == 1) return list.isEmpty() ? null : list.size();
-                    // Dimension 2+: check if elements are sub-arrays
-                    if (dim == 2 && !list.isEmpty() && list.get(0) instanceof List<?>) return ((List<?>) list.get(0)).size();
-                    return null; // dimension doesn't exist for this array
-                }
-                // Handle PostgreSQL array string format: {val1,val2,...}, with the optional
-                // "[lb:ub]=" prefix an array with a non-default lower bound is written with.
-                if (isPgArrayText(arr)) {
-                    String s = pgArrayBody(arr.toString());
-                    if (dim != 1) return null;
-                    String inner = s.substring(1, s.length() - 1).trim();
-                    if (inner.isEmpty()) return null; // PG returns NULL for empty arrays
-                    return countArrayElements(inner);
-                }
-                return null;
+                PgArray lengthOf = PgArray.from(arr);
+                if (lengthOf == null) return null;
+                int[] lengthDims = lengthOf.dims();
+                return dim <= lengthDims.length ? (Object) lengthDims[dim - 1] : null;
             }
             case "array_upper": {
+                arrayFunctionName = name;
                 requireDeclaredArrayArg(fn.args().get(0));
                 Object arr = executor.evalExpr(fn.args().get(0), ctx);
                 int dim2 = fn.args().size() > 1 ? executor.toInt(executor.evalExpr(fn.args().get(1), ctx)) : 1;
                 if (dim2 < 1) return null;
-                int[][] upperBounds = arr instanceof String ? ArrayLiteral.statedBounds((String) arr) : null;
-                if (upperBounds != null) {
-                    return dim2 <= upperBounds[1].length ? (Object) upperBounds[1][dim2 - 1] : null;
-                }
                 // A 0-based vector runs from 0, so its upper bound is one less than its length —
                 // and -1 when it is empty, which is the bound PG reports for an empty oidvector.
                 if (arr instanceof PgVector) return dim2 == 1 ? (Object) (((PgVector) arr).size() - 1) : null;
-                if (arr instanceof List<?>) {
-                    List<?> list = (List<?>) arr;
-                    // PG returns NULL for empty arrays (they have no dimensions)
-                    if (list.isEmpty()) return null;
-                    if (dim2 == 1) return list.size();
-                    if (dim2 == 2 && list.get(0) instanceof List<?>) return ((List<?>) list.get(0)).size();
-                    return null;
-                }
-                if (arr instanceof String && ((String) arr).startsWith("{") && ((String) arr).endsWith("}")) {
-                    String s = (String) arr;
-                    if (dim2 != 1) return null;
-                    String inner = s.substring(1, s.length() - 1).trim();
-                    if (inner.isEmpty()) return null; // PG returns NULL for empty arrays
-                    return countArrayElements(inner);
-                }
-                return null;
+                PgArray upperOf = PgArray.from(arr);
+                if (upperOf == null) return null;
+                int[] upperDims = upperOf.dims();
+                if (dim2 > upperDims.length) return null;
+                return upperOf.lowerBound(dim2) + upperDims[dim2 - 1] - 1;
             }
             case "array_lower": {
+                arrayFunctionName = name;
                 requireDeclaredArrayArg(fn.args().get(0));
                 Object arr = executor.evalExpr(fn.args().get(0), ctx);
                 int dim2 = fn.args().size() > 1 ? executor.toInt(executor.evalExpr(fn.args().get(1), ctx)) : 1;
                 if (dim2 < 1) return null;
-                int[][] lowerBounds = arr instanceof String ? ArrayLiteral.statedBounds((String) arr) : null;
-                if (lowerBounds != null) {
-                    return dim2 <= lowerBounds[0].length ? (Object) lowerBounds[0][dim2 - 1] : null;
-                }
                 // int2vector and oidvector are subscripted from 0, empty or not.
                 if (arr instanceof PgVector) return dim2 == 1 ? (Object) 0 : null;
-                if (arr instanceof List<?> && !((List<?>) arr).isEmpty()) {
-                    List<?> list = (List<?>) arr;
-                    if (dim2 == 1) return 1;
-                    if (dim2 == 2 && !list.isEmpty() && list.get(0) instanceof List<?>) return 1;
-                    return null;
-                }
-                if (arr instanceof String && ((String) arr).startsWith("{") && ((String) arr).endsWith("}")) {
-                    String s = (String) arr;
-                    if (dim2 != 1) return null;
-                    String inner = s.substring(1, s.length() - 1).trim();
-                    if (!inner.isEmpty()) return 1;
-                    return null;
-                }
-                return null;
+                PgArray lowerOf = PgArray.from(arr);
+                if (lowerOf == null) return null;
+                return dim2 <= lowerOf.dims().length ? (Object) lowerOf.lowerBound(dim2) : null;
             }
             case "array_ndims": {
+                arrayFunctionName = name;
                 requireDeclaredArrayArg(fn.args().get(0));
                 Object arr = executor.evalExpr(fn.args().get(0), ctx);
                 if (arr == null) return null;
-                int[][] ndimsBounds = arr instanceof String ? ArrayLiteral.statedBounds((String) arr) : null;
-                if (ndimsBounds != null) return ndimsBounds[0].length;
-                String s = arr instanceof String ? (String) arr : TypeCoercion.formatPgArray(arr instanceof List<?> ? (List<?>) arr : Cols.listOf(arr));
-                if (!s.startsWith("{")) return null;
-                int dims = 0;
-                for (int ci = 0; ci < s.length(); ci++) {
-                    if (s.charAt(ci) == '{') dims++;
-                    else break;
-                }
-                return dims;
+                PgArray ndimsOf = PgArray.from(arr);
+                if (ndimsOf == null) return null;
+                // An array with nothing in it has no dimensions at all, which is not zero of them.
+                int ndims = ndimsOf.dims().length;
+                return ndims == 0 ? null : (Object) ndims;
             }
             case "array_fill": {
                 // array_fill is polymorphic in its first argument, so that argument has to have a
@@ -1925,8 +1832,12 @@ class FunctionEvaluator {
                     lbList = arrayFillBounds(lbArg);
                     if (lbList == null) return null;
                     if (lbList.size() != dimsList.size()) {
-                        throw new MemgresException("wrong number of array subscripts", "2202E");
+                        MemgresException e =
+                                new MemgresException("wrong number of array subscripts", "2202E");
+                        e.setDetail("Low bound array has different size than dimensions array.");
+                        throw e;
                     }
+
                 }
                 if (dimsList.size() > 6) {
                     throw new MemgresException("number of array dimensions (" + dimsList.size()
@@ -1943,7 +1854,7 @@ class FunctionEvaluator {
                                 "array size exceeds the maximum allowed (134217727)", "54000");
                     }
                 }
-                if (dimsList.isEmpty()) return "{}";
+                if (dimsList.isEmpty()) return PgArray.of(new ArrayList<Object>());
                 // An array has a size past which PostgreSQL will not build one, and the extents
                 // are asked for rather than accumulated: a request for four hundred million
                 // elements is refused before anything is allocated for it, instead of taking the
@@ -1956,55 +1867,46 @@ class FunctionEvaluator {
                                 + MAX_ARRAY_ELEMENTS + ")", "54000");
                     }
                 }
-                String filled = buildFilledArray(fillVal, dimsList, 0);
-                StringBuilder prefix = new StringBuilder();
-                boolean customBounds = false;
+                // A dimension of no extent leaves nothing to fill, and PostgreSQL answers the
+                // dimensionless empty array rather than a nest of empty levels.
                 for (int di = 0; di < dimsList.size(); di++) {
-                    int lb = lbList == null ? 1 : ((Number) lbList.get(di)).intValue();
-                    if (lb != 1) customBounds = true;
-                    int ub = lb + ((Number) dimsList.get(di)).intValue() - 1;
-                    prefix.append("[").append(lb).append(":").append(ub).append("]");
+                    if (((Number) dimsList.get(di)).intValue() == 0) {
+                        return PgArray.of(new ArrayList<Object>());
+                    }
                 }
-                // The bounds prefix is only written when a bound is not the default 1
-                return customBounds ? prefix.append("=").append(filled).toString() : filled;
+                int[] lowerBounds = new int[dimsList.size()];
+                for (int di = 0; di < dimsList.size(); di++) {
+                    lowerBounds[di] = lbList == null ? 1 : ((Number) lbList.get(di)).intValue();
+                }
+                return PgArray.of(buildFilledArray(fillVal, dimsList, 0), lowerBounds,
+                        elementTypeNameOf(fillVal));
             }
             case "trim_array": {
                 Object arr = executor.evalExpr(fn.args().get(0), ctx);
                 Object nObj = executor.evalExpr(fn.args().get(1), ctx);
                 if (arr == null || nObj == null) return null;
                 int n = ((Number) nObj).intValue();
-                List<Object> list;
-                if (arr instanceof List<?>) list = new java.util.ArrayList<>((List<?>) arr);
-                else if (arr instanceof String && ((String) arr).startsWith("{")) list = new java.util.ArrayList<>(parseSimplePgArray((String) arr));
-                else return arr;
-                if (n < 0 || n > list.size()) throw new MemgresException("number of elements to trim must be between 0 and " + list.size(), "2202E");
-                list = list.subList(0, list.size() - n);
-                return TypeCoercion.formatPgArray(list);
+                PgArray trimmed = PgArray.from(arr);
+                if (trimmed == null) return arr;
+                if (n < 0 || n > trimmed.size()) {
+                    throw new MemgresException(
+                            "number of elements to trim must be between 0 and " + trimmed.size(), "2202E");
+                }
+                return PgArray.of(new ArrayList<Object>(trimmed.subList(0, trimmed.size() - n)));
             }
             case "array_dims": {
+                arrayFunctionName = name;
                 requireDeclaredArrayArg(fn.args().get(0));
                 Object arr = executor.evalExpr(fn.args().get(0), ctx);
                 if (arr == null) return null;
-                int[][] statedDims = arr instanceof String ? ArrayLiteral.statedBounds((String) arr) : null;
-                if (statedDims != null) {
-                    StringBuilder stated = new StringBuilder();
-                    for (int di = 0; di < statedDims[0].length; di++) {
-                        stated.append('[').append(statedDims[0][di]).append(':')
-                                .append(statedDims[1][di]).append(']');
-                    }
-                    return stated.toString();
-                }
-                List<?> list = null;
-                if (arr instanceof List<?>) list = (List<?>) arr;
-                else if (arr instanceof String && ((String) arr).startsWith("{")) {
-                    String s = (String) arr;
-                    list = parseSimplePgArray(s);
-                }
-                if (list == null || list.isEmpty()) return null;
-                StringBuilder dims = new StringBuilder("[1:" + list.size() + "]");
-                // Check for multi-dimensional
-                if (!list.isEmpty() && list.get(0) instanceof List<?>) {
-                    dims.append("[1:").append(((List<?>) list.get(0)).size()).append("]");
+                PgArray dimsOf = PgArray.from(arr);
+                if (dimsOf == null) return null;
+                int[] extents = dimsOf.dims();
+                if (extents.length == 0) return null;
+                StringBuilder dims = new StringBuilder();
+                for (int di = 0; di < extents.length; di++) {
+                    int lb = dimsOf.lowerBound(di + 1);
+                    dims.append('[').append(lb).append(':').append(lb + extents[di] - 1).append(']');
                 }
                 return dims.toString();
             }
@@ -2014,10 +1916,9 @@ class FunctionEvaluator {
                 if (arr instanceof Number || arr instanceof Boolean) {
                     throw new MemgresException("function array_sort(integer) does not exist", "42883");
                 }
-                List<Object> list;
-                if (arr instanceof List<?>) list = new ArrayList<>((List<?>) arr);
-                else if (arr instanceof String && ((String) arr).startsWith("{")) list = new ArrayList<>(parseSimplePgArray(((String) arr)));
-                else return arr;
+                PgArray source = PgArray.from(arr);
+                if (source == null) return arr;
+                List<Object> list = new ArrayList<>(source);
                 // array_sort(a, descending, nulls_first): the second argument says which way
                 // round, and the third where the nulls go -- by default the way ORDER BY puts
                 // them, last when ascending and first when descending. Reading neither sorted
@@ -2037,33 +1938,27 @@ class FunctionEvaluator {
                         return descending ? -cmp : cmp;
                     }
                 });
-                return TypeCoercion.formatPgArray(list);
+                return source.resized(list);
             }
             case "array_reverse": {
                 Object arr = executor.evalExpr(fn.args().get(0), ctx);
                 if (arr == null) return null;
-                List<Object> list;
-                if (arr instanceof List<?>) list = new ArrayList<>((List<?>) arr);
-                else if (arr instanceof String && ((String) arr).startsWith("{")) list = new ArrayList<>(parseSimplePgArray(((String) arr)));
-                else return arr;
+                PgArray source = PgArray.from(arr);
+                if (source == null) return arr;
+                List<Object> list = new ArrayList<>(source);
                 java.util.Collections.reverse(list);
-                return TypeCoercion.formatPgArray(list);
+                return source.resized(list);
             }
             case "array_to_string": {
+                arrayFunctionName = name;
                 requireDeclaredArrayArg(fn.args().get(0));
                 Object arr = executor.evalExpr(fn.args().get(0), ctx);
                 Object delim = executor.evalExpr(fn.args().get(1), ctx);
                 // PG is strict on the delimiter: a NULL there makes the whole call NULL.
                 if (delim == null) return null;
-                // Handle string-formatted arrays like {a,b,c} (quote-aware, nested arrays flattened)
-                if (arr instanceof String && ((String) arr).startsWith("{") && ((String) arr).endsWith("}")) {
-                    String s = (String) arr;
-                    String inner = s.substring(1, s.length() - 1);
-                    if (inner.isEmpty()) return "";
-                    arr = flattenArray(parseSimplePgArray(s));
-                }
-                if (arr instanceof List<?>) {
-                    List<?> list = (List<?>) arr;
+                PgArray joined = PgArray.from(arr);
+                if (joined != null) {
+                    List<?> list = PgArray.flatten(joined);
                     Object nullStr = fn.args().size() > 2
                             ? executor.evalExpr(fn.args().get(2), ctx) : null;
                     // A NULL element is skipped entirely — separator included — unless a
@@ -2073,10 +1968,10 @@ class FunctionEvaluator {
                     for (Object elem : list) {
                         String rendered;
                         if (elem != null) {
-                            // An element is written out as it is held. Trimming it dropped the
-                            // spaces a text element really has, and the blanks a bpchar element
-                            // is declared with — neither of which the array stopped holding.
-                            rendered = elem.toString();
+                            // An element is written out by its own type's output function. Reading
+                            // the Java object instead wrote a boolean as "true" and a bytea as its
+                            // identity hash — neither of which is what the element holds.
+                            rendered = TypeCoercion.toString(elem);
                         } else if (nullStr != null) {
                             rendered = nullStr.toString();
                         } else {
@@ -2091,18 +1986,11 @@ class FunctionEvaluator {
                 return null;
             }
             case "cardinality": {
+                arrayFunctionName = name;
                 requireDeclaredArrayArg(fn.args().get(0));
                 Object arr = executor.evalExpr(fn.args().get(0), ctx);
-                if (arr instanceof List<?>) return countLeafElements((List<?>) arr);
-                if (arr != null) {
-                    String s = pgArrayBody(arr.toString());
-                    if (s.equals("{}")) return 0;
-                    if (s.startsWith("{") && s.endsWith("}")) {
-                        // Quote-aware count (commas inside quoted elements are not separators)
-                        return countLeafElements(parseSimplePgArray(s));
-                    }
-                }
-                return null;
+                PgArray counted = PgArray.from(arr);
+                return counted == null ? null : (Object) PgArray.flatten(counted).size();
             }
             // The function spellings of the ?| and ?& operators. PG exposes both, and code that
             // builds SQL from a query builder tends to write the function rather than an operator
@@ -2128,7 +2016,7 @@ class FunctionEvaluator {
             }
             case "unnest": {
                 if (fn.args().isEmpty()) {
-                    throw new MemgresException("function unnest() does not exist\n  Hint: No function matches the given name and argument types.", "42883");
+                    throw new MemgresException("function unnest() does not exist\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
                 }
                 // The many-argument form of unnest exists only as a FROM item -- it produces a
                 // row of several columns, which a select-list expression has no room for, and
@@ -2136,7 +2024,13 @@ class FunctionEvaluator {
                 // answered the one-argument call to a query that did not write one.
                 if (fn.args().size() > 1) throw noMultiArgUnnest(fn, ctx);
                 // unnest returns set; expand array into individual elements as a List
-                Object arr = executor.evalExpr(fn.args().get(0), ctx);
+                arrayFunctionName = name;
+                Object firstArg = executor.evalExpr(fn.args().get(0), ctx);
+                if (!(firstArg instanceof TsVector) && !(firstArg instanceof String
+                        && RangeOperations.isMultirangeOrEmpty((String) firstArg))) {
+                    requireDeclaredArrayArg(fn.args().get(0));
+                }
+                Object arr = firstArg;
                 if (arr instanceof TsVector) {
                     TsVector tv = (TsVector) arr;
                     List<Object[]> rows = TextSearchOperations.unnestTsVector(tv);
@@ -2160,9 +2054,8 @@ class FunctionEvaluator {
                     }
                     return result;
                 }
-                if (arr instanceof String && ((String) arr).startsWith("{") && ((String) arr).endsWith("}")) {
-                    String s = (String) arr;
-                    List<Object> parsed = flattenArray(parseSimplePgArray(s));
+                if (arr instanceof String && PgArray.looksLikeArrayText((String) arr)) {
+                    List<Object> parsed = PgArray.flatten(PgArray.from(arr));
                     // If this is an enum array, wrap elements as PgEnum for ordinal-based sorting
                     String enumTypeName = resolveEnumTypeFromArrayArg(fn.args().get(0), ctx);
                     if (enumTypeName != null) {
@@ -2302,99 +2195,91 @@ class FunctionEvaluator {
             case "array_cat": {
                 Object a = executor.evalExpr(fn.args().get(0), ctx);
                 Object b = executor.evalExpr(fn.args().get(1), ctx);
-                Object aArr = readArrayOperand(a, elementTypeNameOfArray(b));
-                Object bArr = readArrayOperand(b, elementTypeNameOfArray(a));
-                List<Object> result = new ArrayList<>();
-                if (aArr instanceof List<?>) result.addAll((List<?>) aArr);
-                if (bArr instanceof List<?>) result.addAll((List<?>) bArr);
-                return result;
+                PgArray aArr = PgArray.from(readArrayOperand(a, elementTypeNameOfArray(b)));
+                PgArray bArr = PgArray.from(readArrayOperand(b, elementTypeNameOfArray(a)));
+                if (aArr == null) return bArr;
+                if (bArr == null) return aArr;
+                List<Object> result = new ArrayList<>(aArr);
+                result.addAll(bArr);
+                // The result keeps the first operand's bounds: an array joined onto one that runs
+                // from zero still runs from zero.
+                return PgArray.of(result, aArr.isEmpty() ? bArr.lowerBounds() : aArr.lowerBounds(),
+                        aArr.elementType() != null ? aArr.elementType() : bArr.elementType());
             }
             case "array_append": {
-                Object arr = readArrayOperand(executor.evalExpr(fn.args().get(0), ctx),
-                        elementTypeNameOf(executor.evalExpr(fn.args().get(1), ctx)));
                 Object elem = executor.evalExpr(fn.args().get(1), ctx);
-                // Type compatibility check: if array has numeric elements, reject text element
-                if (arr instanceof List<?> && !((List<?>) arr).isEmpty() && elem != null) {
-                    List<?> la = (List<?>) arr;
-                    Object first = la.stream().filter(java.util.Objects::nonNull).findFirst().orElse(null);
-                    if (first instanceof Number && elem instanceof String && !(elem instanceof Number)) {
-                        try { Double.parseDouble(elem.toString()); } catch (NumberFormatException e) {
-                            throw new MemgresException("invalid input syntax for type integer: \"" + elem + "\"", "22P02");
-                        }
-                    }
-                }
-                List<Object> result = new ArrayList<>();
-                if (arr instanceof List<?>) result.addAll((List<?>) arr);
-                result.add(elem);
-                return result;
+                // Appending to a null array builds the one-element array, as PostgreSQL does.
+                PgArray arr = orEmpty(PgArray.from(readArrayOperand(
+                        executor.evalExpr(fn.args().get(0), ctx), elementTypeNameOf(elem))));
+                requireFlatArray(arr, "argument must be empty or one-dimensional array", "22000");
+                List<Object> result = new ArrayList<>(arr);
+                result.add(coerceToElementType(arr, elem));
+                return arr.resized(result);
             }
             case "array_prepend": {
                 Object elem = executor.evalExpr(fn.args().get(0), ctx);
-                Object arr = readArrayOperand(executor.evalExpr(fn.args().get(1), ctx),
-                        elementTypeNameOf(elem));
+                PgArray arr = orEmpty(PgArray.from(readArrayOperand(
+                        executor.evalExpr(fn.args().get(1), ctx), elementTypeNameOf(elem))));
+                requireFlatArray(arr, "argument must be empty or one-dimensional array", "22000");
                 List<Object> result = new ArrayList<>();
-                result.add(elem);
-                if (arr instanceof List<?>) result.addAll((List<?>) arr);
-                return result;
+                result.add(coerceToElementType(arr, elem));
+                result.addAll(arr);
+                return arr.resized(result);
             }
             case "array_remove": {
                 Object elem = executor.evalExpr(fn.args().get(1), ctx);
-                Object arr = readArrayOperand(executor.evalExpr(fn.args().get(0), ctx),
-                        elementTypeNameOf(elem));
+                PgArray arr = PgArray.from(readArrayOperand(
+                        executor.evalExpr(fn.args().get(0), ctx), elementTypeNameOf(elem)));
                 if (arr == null) return null;
+                requireFlatArray(arr,
+                        "removing elements from multidimensional arrays is not supported", "0A000");
                 List<Object> result = new ArrayList<>();
-                if (arr instanceof List<?>) {
-                    for (Object o : (List<?>) arr) {
-                        if (!TypeCoercion.areEqual(o, elem)) result.add(o);
-                    }
+                for (Object o : arr) {
+                    if (!TypeCoercion.areEqual(o, elem)) result.add(o);
                 }
-                return result;
+                return arr.resized(result);
             }
             case "array_position": {
                 Object elem = executor.evalExpr(fn.args().get(1), ctx);
-                Object arr = readArrayOperand(executor.evalExpr(fn.args().get(0), ctx),
-                        elementTypeNameOf(elem));
+                PgArray arr = PgArray.from(readArrayOperand(
+                        executor.evalExpr(fn.args().get(0), ctx), elementTypeNameOf(elem)));
                 if (arr == null) return null;
-                int startPos = 1;
+                requireFlatArray(arr,
+                        "searching for elements in multidimensional arrays is not supported", "0A000");
+                int lower = arr.lowerBound(1);
+                int startPos = lower;
                 if (fn.args().size() > 2) {
                     Object startArg = executor.evalExpr(fn.args().get(2), ctx);
                     if (startArg != null) startPos = ((Number) startArg).intValue();
                 }
-                if (arr instanceof List<?>) {
-                    List<?> la = (List<?>) arr;
-                    for (int ai = Math.max(startPos - 1, 0); ai < la.size(); ai++) {
-                        if (TypeCoercion.areEqual(la.get(ai), elem)) return ai + 1; // 1-based
-                    }
+                for (int ai = Math.max(startPos - lower, 0); ai < arr.size(); ai++) {
+                    if (TypeCoercion.areEqual(arr.get(ai), elem)) return ai + lower;
                 }
                 return null;
             }
             case "array_positions": {
                 Object elem = executor.evalExpr(fn.args().get(1), ctx);
-                Object arr = readArrayOperand(executor.evalExpr(fn.args().get(0), ctx),
-                        elementTypeNameOf(elem));
+                PgArray arr = PgArray.from(readArrayOperand(
+                        executor.evalExpr(fn.args().get(0), ctx), elementTypeNameOf(elem)));
                 if (arr == null) return null;
+                requireFlatArray(arr,
+                        "searching for elements in multidimensional arrays is not supported", "0A000");
                 List<Object> positions = new ArrayList<>();
-                if (arr instanceof List<?>) {
-                    List<?> la = (List<?>) arr;
-                    for (int ai = 0; ai < la.size(); ai++) {
-                        if (TypeCoercion.areEqual(la.get(ai), elem)) positions.add(ai + 1);
-                    }
+                int lower = arr.lowerBound(1);
+                for (int ai = 0; ai < arr.size(); ai++) {
+                    if (TypeCoercion.areEqual(arr.get(ai), elem)) positions.add(ai + lower);
                 }
-                return positions;
+                return PgArray.of(positions);
             }
             case "array_replace": {
                 Object oldVal = executor.evalExpr(fn.args().get(1), ctx);
-                Object arr = readArrayOperand(executor.evalExpr(fn.args().get(0), ctx),
-                        elementTypeNameOf(oldVal));
+                PgArray arr = PgArray.from(readArrayOperand(
+                        executor.evalExpr(fn.args().get(0), ctx), elementTypeNameOf(oldVal)));
                 if (arr == null) return null;
                 Object newVal = executor.evalExpr(fn.args().get(2), ctx);
-                List<Object> result = new ArrayList<>();
-                if (arr instanceof List<?>) {
-                    for (Object o : (List<?>) arr) {
-                        result.add(TypeCoercion.areEqual(o, oldVal) ? newVal : o);
-                    }
-                }
-                return result;
+                // array_replace reaches every element whatever the array's shape, so the walk goes
+                // down the dimensions instead of stopping at the first one.
+                return arr.resized(replaceElements(arr, oldVal, newVal));
             }
             case "arraycontains":
             case "arraycontained":
@@ -2525,30 +2410,27 @@ class FunctionEvaluator {
                 Object nObj = executor.evalExpr(fn.args().get(1), ctx);
                 if (arr == null) return null;
                 int n = executor.toInt(nObj);
-                List<Object> elements;
-                if (arr instanceof List<?>) {
-                    elements = new ArrayList<>((List<?>) arr);
-                } else {
-                    elements = new ArrayList<>(parseSimplePgArray(arr.toString()));
+                PgArray sampled = PgArray.from(arr);
+                if (sampled == null) return null;
+                List<Object> elements = new ArrayList<>(sampled);
+                // A sample is drawn from what is there: asking for more elements than the array
+                // holds, or for a negative number of them, is a request PostgreSQL refuses.
+                if (n < 0 || n > elements.size()) {
+                    throw new MemgresException(
+                            "sample size must be between 0 and " + elements.size(), "22023");
                 }
-                if (n <= 0) return TypeCoercion.formatPgArray(new ArrayList<>());
-                if (n >= elements.size()) n = elements.size();
-                java.util.Random rng = new java.util.Random();
-                java.util.Collections.shuffle(elements, rng);
-                return TypeCoercion.formatPgArray(new ArrayList<>(elements.subList(0, n)));
+                java.util.Collections.shuffle(elements, new java.util.Random());
+                return sampled.resized(new ArrayList<>(elements.subList(0, n)));
             }
             case "array_shuffle": {
                 // array_shuffle(arr) - returns arr with elements in random order (PG 16+)
                 Object arr = executor.evalExpr(fn.args().get(0), ctx);
                 if (arr == null) return null;
-                List<Object> elements;
-                if (arr instanceof List<?>) {
-                    elements = new ArrayList<>((List<?>) arr);
-                } else {
-                    elements = new ArrayList<>(parseSimplePgArray(arr.toString()));
-                }
+                PgArray shuffled = PgArray.from(arr);
+                if (shuffled == null) return null;
+                List<Object> elements = new ArrayList<>(shuffled);
                 java.util.Collections.shuffle(elements, new java.util.Random());
-                return TypeCoercion.formatPgArray(elements);
+                return shuffled.resized(elements);
             }
             case "enum_first": {
                 String enumType = resolveEnumTypeFromArg(fn.args().get(0), ctx);
@@ -2583,15 +2465,19 @@ class FunctionEvaluator {
                     int endIdx = toStr == null ? labels.size() - 1 : labels.indexOf(toStr);
                     if (startIdx < 0) startIdx = 0;
                     if (endIdx < 0) endIdx = labels.size() - 1;
-                    java.util.List<String> range = labels.subList(startIdx, endIdx + 1);
-                    return "{" + String.join(",", range) + "}";
+                    // An inverted pair names no labels at all, which is an empty array rather
+                    // than a sublist whose ends are the wrong way round.
+                    if (startIdx > endIdx) return PgArray.of(new ArrayList<Object>());
+                    return PgArray.of(new ArrayList<Object>(labels.subList(startIdx, endIdx + 1)));
                 }
                 // Unbounded form: enum_range(NULL::type)
                 String enumType = resolveEnumTypeFromArg(fn.args().get(0), ctx);
                 if (enumType == null) return null;
                 CustomEnum ce = executor.database.getCustomEnum(enumType);
                 if (ce == null) return null;
-                return "{" + String.join(",", ce.getLabels()) + "}";
+                // The labels are an array, and the array writer quotes a label that needs it; the
+                // joined text did not, so a label holding a comma came back as two labels.
+                return PgArray.of(new ArrayList<Object>(ce.getLabels()));
             }
             case "json_scalar": {
                 if (fn.args().isEmpty()) throw new MemgresException("function json_scalar requires one argument", "42883");
@@ -2891,16 +2777,17 @@ class FunctionEvaluator {
                 // pg_log_backend_memory_contexts(int) → boolean — stub, returns true
                 return true;
             }
-            case "pg_promote": {
-                // pg_promote(boolean, integer) → boolean — only valid on a standby server
-                throw new MemgresException("recovery is not in progress", "55000");
-            }
+            case "pg_promote":
             case "pg_wal_replay_pause":
             case "pg_wal_replay_resume": {
                 // Recovery control, and this server is not recovering — the same 55000 PostgreSQL
                 // gives on a primary. The name was listed in pg_proc and answered 42883, which told
                 // a monitoring tool the function was missing rather than that it did not apply.
-                throw new MemgresException("recovery is not in progress", "55000");
+                // PostgreSQL adds what the whole family has in common, so a caller reading the
+                // Hint learns why the call did not apply rather than only that it did not.
+                throw new MemgresException("recovery is not in progress"
+                        + "\n  Hint: Recovery control functions can only be executed"
+                        + " during recovery.", "55000");
             }
             case "pg_switch_wal": {
                 // Forces a WAL segment switch and answers with the LSN it ended at. memgres keeps
@@ -3150,6 +3037,12 @@ class FunctionEvaluator {
                     if (keysObj instanceof List && valsObj instanceof List) {
                         List<?> keysList = (List<?>) keysObj;
                         List<?> valsList = (List<?>) valsObj;
+                        // The two arrays are paired position by position, so arrays of different
+                        // lengths have no pairing to make: PostgreSQL says so rather than filling
+                        // the keys left over with a NULL value nobody wrote.
+                        if (keysList.size() != valsList.size()) {
+                            throw new MemgresException("arrays must have same bounds", "2202E");
+                        }
                         java.util.Map<String, String> map = new java.util.LinkedHashMap<>();
                         for (int i = 0; i < keysList.size(); i++) {
                             String k = keysList.get(i) != null ? keysList.get(i).toString() : null;
@@ -3390,7 +3283,17 @@ class FunctionEvaluator {
                 if (userFunc != null) {
                     // Procedures cannot be called via SELECT; must use CALL
                     if (userFunc.isProcedure()) {
-                        throw new MemgresException(name + " is a procedure\nHint: To call a procedure, use CALL.", "42809");
+                        // PostgreSQL names the routine by its argument types, the same way it
+                        // names one written in a FROM, so two overloads are told apart.
+                        StringBuilder procTypes = new StringBuilder();
+                        for (PgFunction.Param p : userFunc.getParams()) {
+                            if ("OUT".equalsIgnoreCase(p.mode())) continue;
+                            if (procTypes.length() > 0) procTypes.append(", ");
+                            procTypes.append(p.typeName() == null ? "any"
+                                    : CatalogSystemFunctions.readableTypeName(p.typeName()));
+                        }
+                        throw new MemgresException(name + "(" + procTypes + ") is a procedure"
+                                + "\n  Hint: To call a procedure, use CALL.", "42809");
                     }
                     // Collect input params (excluding OUT)
                     List<PgFunction.Param> inputParams = new ArrayList<>();
@@ -4247,13 +4150,38 @@ class FunctionEvaluator {
      * rather than an array. Only what the query wrote is inspected, so a cast, an ARRAY
      * constructor, a column and a nested function call all carry a type and keep working.
      */
-    private static void requireDeclaredArrayArg(Expression arg) {
-        if (!(arg instanceof Literal)) return;
-        Literal.LiteralType type = ((Literal) arg).literalType();
-        if (type == Literal.LiteralType.STRING || type == Literal.LiteralType.NULL) {
-            throw new MemgresException(
-                    "could not determine polymorphic type because input has type unknown", "42804");
+    private void requireDeclaredArrayArg(Expression arg) {
+        if (arg instanceof Literal) {
+            Literal.LiteralType type = ((Literal) arg).literalType();
+            if (type == Literal.LiteralType.STRING || type == Literal.LiteralType.NULL) {
+                throw new MemgresException(
+                        "could not determine polymorphic type because input has type unknown", "42804");
+            }
+            return;
         }
+        // The array functions are declared over anyarray, so an argument the statement says is
+        // something else matches no candidate at all. Only a type the statement states counts:
+        // a column's type here is whatever the engine settled on, and refusing a call on the
+        // strength of that would reject SQL PostgreSQL runs.
+        if (!(arg instanceof CastExpr)) return;
+        String written = ((CastExpr) arg).typeName();
+        if (written != null && written.trim().endsWith("]")) return;
+        DataType declared = executor.exprEvaluator.inferExprType(arg);
+        if (declared != null && !DataType.isArrayType(declared) && declared != DataType.RECORD) {
+            throw noSuchArrayFunction(declared);
+        }
+    }
+
+    /** Told which function it was by the caller's own name, which the switch is standing in. */
+    private String arrayFunctionName;
+
+    private MemgresException noSuchArrayFunction(DataType declared) {
+        String name = arrayFunctionName == null ? "array_length" : arrayFunctionName;
+        String args = declared.getPgName()
+                + ("cardinality".equals(name) || "unnest".equals(name) || "array_dims".equals(name)
+                        || "array_ndims".equals(name) ? "" : ", integer");
+        return new MemgresException("function " + name + "(" + args + ") does not exist"
+                + "\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
     }
 
     /**
@@ -4320,27 +4248,35 @@ class FunctionEvaluator {
     }
 
     /** Build a filled multi-dimensional array string. */
-    private String buildFilledArray(Object fillVal, List<?> dims, int dimIdx) {
-        if (dimIdx >= dims.size()) {
-            return fillVal == null ? "NULL" : fillVal.toString();
-        }
+    private List<Object> buildFilledArray(Object fillVal, List<?> dims, int dimIdx) {
         int size = ((Number) dims.get(dimIdx)).intValue();
-        StringBuilder sb = new StringBuilder("{");
+        List<Object> level = new ArrayList<>(Math.max(size, 0));
         for (int i = 0; i < size; i++) {
-            if (i > 0) sb.append(",");
-            sb.append(buildFilledArray(fillVal, dims, dimIdx + 1));
+            level.add(dimIdx + 1 >= dims.size() ? fillVal : buildFilledArray(fillVal, dims, dimIdx + 1));
         }
-        sb.append("}");
-        return sb.toString();
+        return level;
     }
 
-    /** An array_fill dimension or lower-bound argument as a list, or null when it is not one. */
+    /**
+     * An array_fill dimension or lower-bound argument as a list of extents. The argument is an
+     * array of one dimension; a deeper one is refused rather than reaching a cast that cannot say
+     * what went wrong.
+     */
     private static List<?> arrayFillBounds(Object arg) {
-        if (arg instanceof List<?>) return (List<?>) arg;
-        if (arg instanceof String && ((String) arg).startsWith("{")) {
-            return parseSimplePgArray((String) arg);
+        PgArray bounds = PgArray.from(arg);
+        if (bounds == null) return null;
+        if (bounds.dims().length > 1) {
+            MemgresException e = new MemgresException("wrong number of array subscripts", "2202E");
+            e.setDetail("Dimension array must be one dimensional.");
+            throw e;
         }
-        return null;
+        // The extents are integers however the argument was written: read out of a literal they
+        // arrive as the text they were spelled with.
+        List<Object> extents = new ArrayList<>(bounds.size());
+        for (Object bound : bounds) {
+            extents.add(bound == null ? null : TypeCoercion.coerce(bound, DataType.INTEGER));
+        }
+        return extents;
     }
 
     /** Count elements in a PG array inner string, respecting quoted strings and braces. */
@@ -4608,8 +4544,7 @@ class FunctionEvaluator {
         }
         MemgresException e = new MemgresException(
                 "function unnest(" + types + ") does not exist", "42883");
-        e.setHint("No function matches the given name and argument types."
-                + " You might need to add explicit type casts.");
+        e.setHint("No function matches the given name and argument types. You might need to add explicit type casts.");
         e.setPositionToken("unnest");
         return e;
     }

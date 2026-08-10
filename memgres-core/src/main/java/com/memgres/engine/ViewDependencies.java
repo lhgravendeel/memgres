@@ -88,4 +88,32 @@ final class ViewDependencies {
         }
         return out;
     }
+
+    /**
+     * The lines a blocked drop puts under DETAIL: every view that reads the relation, then every
+     * view that reads one of those, each named beside the relation it actually reads and by the
+     * kind that relation really is. A view over a view is as much a dependent as one over the
+     * table, and naming the whole chain is what shows why the last of them is in the way.
+     */
+    static List<String> dependencyLines(Database db, String schemaName, String relName,
+                                        String relKind, List<String> searchPath) {
+        List<String> out = new ArrayList<String>();
+        List<String[]> frontier = new ArrayList<String[]>();
+        frontier.add(new String[]{schemaName, relName, relKind});
+        Set<String> seen = new HashSet<String>();
+        while (!frontier.isEmpty()) {
+            String[] cur = frontier.remove(0);
+            for (String viewName : directDependents(db, cur[0], cur[1])) {
+                if (!seen.add(viewName.toLowerCase())) continue;
+                Database.ViewDef v = db.getView(viewName);
+                String vs = v != null && v.schemaName() != null ? v.schemaName() : "public";
+                String kind = v != null && v.materialized() ? "materialized view" : "view";
+                out.add(kind + " " + RelationNamespace.shownName(searchPath, vs, viewName)
+                        + " depends on " + cur[2] + " "
+                        + RelationNamespace.shownName(searchPath, cur[0], cur[1]));
+                frontier.add(new String[]{vs, viewName, kind});
+            }
+        }
+        return out;
+    }
 }

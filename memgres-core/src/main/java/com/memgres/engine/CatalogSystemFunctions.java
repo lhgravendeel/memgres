@@ -76,7 +76,7 @@ class CatalogSystemFunctions {
         if (fn.args().size() < min) {
             throw new MemgresException(
                 "function " + fn.name() + "() does not exist" +
-                (fn.args().isEmpty() ? "" : "\n  Hint: No function matches the given name and argument types."), "42883");
+                (fn.args().isEmpty() ? "" : "\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts."), "42883");
         }
     }
 
@@ -192,6 +192,31 @@ class CatalogSystemFunctions {
                     }
                 }
 
+                // Subscripting an array yields one element of it, a range of one yields another
+                // array, and only a json container yields json.
+                if (rawExpr instanceof SubscriptExpr) {
+                    SubscriptExpr sub = (SubscriptExpr) rawExpr;
+                    if (ctx != null && sub.base() instanceof ColumnRef) {
+                        ColumnRef base = (ColumnRef) sub.base();
+                        Column baseDef = ctx.resolveColumnDef(base.table(), base.column());
+                        if (baseDef != null && baseDef.getArrayElementType() != null) {
+                            return pgTypeDisplayName(sub.isSlice()
+                                    ? baseDef.getType() : baseDef.getArrayElementType());
+                        }
+                    }
+                    String arrayType = executor.binaryOpEvaluator
+                            .declaredTypeForResolution(sub.base(), ctx);
+                    if (arrayType != null && arrayType.endsWith("[]")) {
+                        if (sub.isSlice()) return arrayType;
+                        DataType element = DataType.fromPgName(arrayType
+                                .substring(0, arrayType.length() - 2)
+                                .toLowerCase().replaceAll("\\(.*\\)", "").trim());
+                        if (element != null) return pgTypeDisplayName(element);
+                    }
+                    DataType inferred = executor.exprEvaluator.inferExprType(rawExpr);
+                    if (inferred != null) return pgTypeDisplayName(inferred);
+                }
+
                 // Subscripting an array yields one element of it, so the answer is the array's
                 // element type — jsonb only where the thing subscripted really was a jsonb.
                 if (rawExpr instanceof BinaryExpr && ctx != null
@@ -220,6 +245,15 @@ class CatalogSystemFunctions {
                         && (((BinaryExpr) rawExpr).op() == BinaryExpr.BinOp.JSON_ARROW
                             || ((BinaryExpr) rawExpr).op() == BinaryExpr.BinOp.JSON_SUBSCRIPT)) {
                     return "jsonb";
+                }
+
+                // A range the reader defined has no DataType of its own, and its constructor hands
+                // back the text the range prints as, so the call's own name is the only thing left
+                // that says which type produced the value.
+                if (rawExpr instanceof FunctionCallExpr) {
+                    String called = FunctionEvaluator.stripSchemaPrefix(
+                            ((FunctionCallExpr) rawExpr).name().toLowerCase(java.util.Locale.ROOT));
+                    if (executor.database.isRangeType(called)) return typeDisplay(called);
                 }
 
                 // A range, a shape, a document and a bit string are all carried as their own
@@ -603,9 +637,14 @@ class CatalogSystemFunctions {
                     Object arg = executor.evalExpr(fn.args().get(0), ctx);
                     String target = arg != null ? arg.toString().toLowerCase() : "";
                     java.util.Set<String> validTargets = new java.util.HashSet<>(java.util.Arrays.asList(
-                            "bgwriter", "archiver", "wal", "io", "recovery_prefetch"));
+                            "archiver", "bgwriter", "checkpointer", "io", "recovery_prefetch",
+                            "slru", "wal"));
                     if (!validTargets.contains(target)) {
-                        throw new MemgresException("unrecognized reset target: \"" + target + "\"", "22023");
+                        MemgresException e = new MemgresException(
+                                "unrecognized reset target: \"" + target + "\"", "22023");
+                        e.setHint("Target must be \"archiver\", \"bgwriter\", \"checkpointer\","
+                                + " \"io\", \"recovery_prefetch\", \"slru\", or \"wal\".");
+                        throw e;
                     }
                 }
                 return VOID_RESULT;
@@ -801,8 +840,7 @@ class CatalogSystemFunctions {
                 if (fn.args().size() < 3 || fn.args().size() > 4) {
                     throw new MemgresException("function " + fn.name()
                             + "(" + writtenArgTypes(fn, ctx) + ") does not exist"
-                            + "\n  Hint: No function matches the given name and argument types."
-                            + " You might need to add explicit type casts.", "42883");
+                            + "\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
                 }
                 boolean anyNull = false;
                 for (Expression emitArg : fn.args()) {
@@ -995,9 +1033,7 @@ class CatalogSystemFunctions {
                     String castType = ((CastExpr) arg0).typeName().toLowerCase();
                     if (castType.equals("text") || castType.equals("varchar") || castType.equals("character varying")) {
                         throw new MemgresException(
-                                "function pg_xact_status(text) does not exist\n" +
-                                "  Hint: No function matches the given name and argument types. " +
-                                "You might need to add explicit type casts.", "42883");
+                                "function pg_xact_status(text) does not exist", "42883");
                     }
                 }
                 Object xidArg = executor.evalExpr(arg0, ctx);

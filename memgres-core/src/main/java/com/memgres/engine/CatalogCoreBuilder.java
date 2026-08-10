@@ -1748,27 +1748,75 @@ class CatalogCoreBuilder {
                 baseTypeOid = dom.getBaseType().getOid();
                 baseTypeCat = "A";
             }
+            // A domain is a type, and PostgreSQL gives every type an array type. The row was
+            // written with typarray zero and no array row beside it, so following typarray from a
+            // domain reached nothing where following it from an enum or a composite reached theirs.
+            int domOid = oids.oid("type:" + domEntry.getKey());
+            int domArrayOid = oids.oid("type:" + domEntry.getKey() + "[]");
             table.insertRow(new Object[]{
-                    oids.oid("type:" + domEntry.getKey()), dom.getName(), domNsOid, 10,
+                    domOid, dom.getName(), domNsOid, 10,
                     (short) -1, false, "d", baseTypeCat, false, true, ",",
-                    0, regproc(null), 0, 0,
+                    0, regproc(null), 0, domArrayOid,
                     regproc("domain_in"), regproc("domain_out"), regproc("domain_recv"), regproc("domain_send"),
                     regproc(null), regproc(null), regproc(null), "i", "x",
                     dom.isNotNull(), baseTypeOid, -1, 0, 0, null,
                     dom.getDefaultValue(), null, 1
             });
+            table.insertRow(new Object[]{
+                    domArrayOid, "_" + dom.getName(), domNsOid, 10,
+                    (short) -1, false, "b", "A", false, true, ",",
+                    0, regproc("array_subscript_handler"), domOid, 0,
+                    regproc("array_in"), regproc("array_out"), regproc("array_recv"), regproc("array_send"),
+                    regproc(null), regproc(null), regproc("array_typanalyze"), "i", "x",
+                    false, 0, -1, 0, 0, null, null, null, 1
+            });
         }
 
-        // Add user-defined range types
+        // Add user-defined range types. PostgreSQL creates four types for every one of these: the
+        // range, the multirange that holds ranges of it, and an array type over each. Writing only
+        // the range left a reader following typarray at nothing, and a multirange type nobody
+        // could name at all.
         for (Map.Entry<String, String> rangeEntry : database.getRangeTypes().entrySet()) {
             String rangeKey = rangeEntry.getKey();
+            String rangeName = TypeNamespace.nameOfKey(rangeKey);
+            String multiName = RangeOperations.multirangeTypeName(rangeName);
+            String multiKey = TypeNamespace.key(TypeNamespace.schemaOfKey(rangeKey), multiName);
             int rangeNsOid = oids.oid("ns:" + TypeNamespace.schemaOfKey(rangeKey));
+            int rangeOid = oids.oid("type:" + rangeKey);
+            int rangeArrayOid = oids.oid("type:" + rangeKey + "[]");
+            int multiOid = oids.oid("type:" + multiKey);
+            int multiArrayOid = oids.oid("type:" + multiKey + "[]");
             table.insertRow(new Object[]{
-                    oids.oid("type:" + rangeKey), TypeNamespace.nameOfKey(rangeKey), rangeNsOid, 10,
+                    rangeOid, rangeName, rangeNsOid, 10,
                     (short) -1, false, "r", "R", false, true, ",",
-                    0, regproc(null), 0, 0,
+                    0, regproc(null), 0, rangeArrayOid,
                     regproc("range_in"), regproc("range_out"), regproc("range_recv"), regproc("range_send"),
                     regproc(null), regproc(null), regproc("range_typanalyze"), "d", "x",
+                    false, 0, -1, 0, 0, null, null, null, 1
+            });
+            table.insertRow(new Object[]{
+                    rangeArrayOid, "_" + rangeName, rangeNsOid, 10,
+                    (short) -1, false, "b", "A", false, true, ",",
+                    0, regproc("array_subscript_handler"), rangeOid, 0,
+                    regproc("array_in"), regproc("array_out"), regproc("array_recv"), regproc("array_send"),
+                    regproc(null), regproc(null), regproc("array_typanalyze"), "d", "x",
+                    false, 0, -1, 0, 0, null, null, null, 1
+            });
+            table.insertRow(new Object[]{
+                    multiOid, multiName, rangeNsOid, 10,
+                    (short) -1, false, "m", "R", false, true, ",",
+                    0, regproc(null), 0, multiArrayOid,
+                    regproc("multirange_in"), regproc("multirange_out"),
+                    regproc("multirange_recv"), regproc("multirange_send"),
+                    regproc(null), regproc(null), regproc("multirange_typanalyze"), "d", "x",
+                    false, 0, -1, 0, 0, null, null, null, 1
+            });
+            table.insertRow(new Object[]{
+                    multiArrayOid, "_" + multiName, rangeNsOid, 10,
+                    (short) -1, false, "b", "A", false, true, ",",
+                    0, regproc("array_subscript_handler"), multiOid, 0,
+                    regproc("array_in"), regproc("array_out"), regproc("array_recv"), regproc("array_send"),
+                    regproc(null), regproc(null), regproc("array_typanalyze"), "d", "x",
                     false, 0, -1, 0, 0, null, null, null, 1
             });
         }

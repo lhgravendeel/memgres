@@ -928,6 +928,16 @@ public class GucSettings {
             if (n == null) {
                 throw new MemgresException("invalid value for parameter \"" + def.name + "\": \"" + value + "\"", "22023");
             }
+            // An integer parameter is held in a machine integer, so a value too wide for one never
+            // becomes a number the parameter's own bounds could be applied to: it is refused as a
+            // value that could not be read, and the range it missed is a different complaint.
+            if ("integer".equals(def.vartype)
+                    && (n.doubleValue() > Integer.MAX_VALUE || n.doubleValue() < Integer.MIN_VALUE)) {
+                MemgresException e = new MemgresException("invalid value for parameter \""
+                        + def.name + "\": \"" + value + "\"", "22023");
+                e.setHint("Value exceeds integer range.");
+                throw e;
+            }
             checkRange(def, n, value);
         }
     }

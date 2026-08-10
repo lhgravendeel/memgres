@@ -28,8 +28,13 @@ class JsonFunctions {
         if (!(base instanceof com.memgres.engine.parser.ast.CastExpr)) return;
         String typeName = ((com.memgres.engine.parser.ast.CastExpr) base).typeName();
         if (typeName != null && "record".equalsIgnoreCase(typeName.trim())) {
-            throw new MemgresException(
+            MemgresException e = new MemgresException(
                     "could not determine row type for result of " + name, "0A000");
+            // There are two ways to say what the row looks like, and PostgreSQL names both
+            // rather than only refusing the one that was written.
+            e.setHint("Provide a non-null record argument, or call the function in the FROM"
+                    + " clause using a column definition list.");
+            throw e;
         }
     }
 
@@ -80,7 +85,7 @@ class JsonFunctions {
         if (fn.args().size() < min) {
             throw new MemgresException(
                 "function " + fn.name() + "() does not exist" +
-                (fn.args().isEmpty() ? "" : "\n  Hint: No function matches the given name and argument types."), "42883");
+                (fn.args().isEmpty() ? "" : "\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts."), "42883");
         }
     }
 
@@ -125,12 +130,38 @@ class JsonFunctions {
                 return name.startsWith("jsonb")
                         ? normalizedIfStructured(sb.toString()) : sb.toString();
             }
+            case "array_to_json": {
+                // array_to_json writes an array as a JSON array, and its second argument asks for
+                // the top-level elements to be put on lines of their own.
+                Object arg = executor.evalExpr(fn.args().get(0), ctx);
+                if (arg == null) return null;
+                PgArray array = PgArray.from(arg);
+                if (array == null) {
+                    throw new MemgresException("function array_to_json("
+                            + AstExecutor.pgTypeNameOf(arg) + ") does not exist", "42883");
+                }
+                boolean lineFeeds = fn.args().size() >= 2
+                        && executor.isTruthy(executor.evalExpr(fn.args().get(1), ctx));
+                StringBuilder sb = new StringBuilder("[");
+                for (int i = 0; i < array.size(); i++) {
+                    if (i > 0) sb.append(lineFeeds ? ",\n " : ",");
+                    appendJsonValue(sb, array.get(i));
+                }
+                return sb.append(']').toString();
+            }
             case "to_json":
             case "to_jsonb": {
                 // A row is an object here too. Writing the composite's own text and quoting it
                 // handed a client one string with every field run together inside it.
                 Object arg = wholeRowOrValue(fn.args().get(0), ctx);
                 if (arg == null) return null; // both are strict: nothing in, nothing out
+                // A value that is already a json document is that document. Reading it as a Java
+                // string instead quoted it, so to_jsonb of a jsonb wrapped it in a second layer.
+                DataType argType = executor.exprEvaluator.inferExprType(fn.args().get(0));
+                if (argType == DataType.JSON || argType == DataType.JSONB) {
+                    String document = TypeCoercion.toString(arg);
+                    return name.equals("to_jsonb") ? normalizedIfStructured(document) : document;
+                }
                 StringBuilder sb = new StringBuilder();
                 appendJsonValue(sb, arg);
                 String written = sb.toString();
@@ -415,7 +446,12 @@ class JsonFunctions {
             }
             case "jsonb_strip_nulls": {
                 Object json = executor.evalExpr(fn.args().get(0), ctx);
-                return json == null ? null : JsonOperations.stripNulls(json.toString());
+                if (json == null) return null;
+                // The second argument says whether a null element of an array goes the way a null
+                // member of an object always does.
+                boolean inArrays = fn.args().size() > 1
+                        && executor.isTruthy(executor.evalExpr(fn.args().get(1), ctx));
+                return JsonOperations.stripNulls(json.toString(), false, inArrays);
             }
             case "jsonb_insert": {
                 Object json = executor.evalExpr(fn.args().get(0), ctx);
@@ -461,7 +497,10 @@ class JsonFunctions {
             case "json_strip_nulls": {
                 // Same as jsonb_strip_nulls but for json type (compact output, no extra spaces)
                 Object json = executor.evalExpr(fn.args().get(0), ctx);
-                return json == null ? null : JsonOperations.stripNulls(json.toString(), true);
+                if (json == null) return null;
+                boolean inArrays = fn.args().size() > 1
+                        && executor.isTruthy(executor.evalExpr(fn.args().get(1), ctx));
+                return JsonOperations.stripNulls(json.toString(), true, inArrays);
             }
             case "json_object":
             case "jsonb_object": {

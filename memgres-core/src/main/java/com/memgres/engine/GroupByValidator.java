@@ -219,7 +219,7 @@ final class GroupByValidator {
                     MemgresException e = new MemgresException(
                             "function " + name + "(" + type.toRegtypeDisplay() + ") does not exist",
                             "42883");
-                    e.setHint("No function matches the given name and argument types.");
+                    e.setHint("No function matches the given name and argument types. You might need to add explicit type casts.");
                     throw e;
                 }
             }

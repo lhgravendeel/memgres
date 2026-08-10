@@ -453,8 +453,9 @@ class DdlExecutor {
 
         // Extension-gated types: hstore requires CREATE EXTENSION hstore
         if (dataType == DataType.HSTORE && !executor.database.hasExtension("hstore")) {
-            throw new MemgresException("type \"hstore\" does not exist\n"
-                    + "  Hint: You need to install the hstore extension: CREATE EXTENSION hstore;", "42704");
+            // Nothing has created the type, so the server has never heard of it and has no
+            // extension to recommend -- it says only that there is no such type.
+            throw new MemgresException("type \"hstore\" does not exist", "42704");
         }
         // FLOAT(p): p <= 24 -> REAL, p >= 25 -> DOUBLE PRECISION
         if (baseType.equalsIgnoreCase("float") && precision != null && precision <= 24) {
@@ -500,6 +501,14 @@ class DdlExecutor {
                 compositeTypeName = baseType;
                 // As for an enum above, a composite's name never matches a built-in, so an array
                 // of one was left indistinguishable from a single one of it.
+                if (isArray) {
+                    arrayElementType = DataType.TEXT;
+                }
+            } else if (executor.database.isRangeType(baseType)) {
+                // A range is carried as the text it prints as, whichever subtype it was built over:
+                // PostgreSQL's own range types are held that way here too, so a column of a range
+                // the reader defined stores exactly what a column of int4range stores.
+                dataType = DataType.TEXT;
                 if (isArray) {
                     arrayElementType = DataType.TEXT;
                 }
@@ -835,7 +844,13 @@ class DdlExecutor {
             FunctionCallExpr fn = (FunctionCallExpr) expr;
             PgFunction pgFunc = db.getFunction(fn.name());
             if (pgFunc != null) {
-                throw new MemgresException("generation expression uses user-defined function", "0A000");
+                MemgresException e = new MemgresException(
+                        "generation expression uses user-defined function", "0A000");
+                // It is the virtual form that has the restriction, and saying so is what tells a
+                // reader that STORED would take the same expression.
+                e.setDetail("Virtual generated columns that make use of user-defined functions "
+                        + "are not yet supported.");
+                throw e;
             }
             if (fn.args() != null) {
                 for (Expression arg : fn.args()) checkVirtualColumnUdfExpr(arg, db);

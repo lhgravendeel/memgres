@@ -258,19 +258,20 @@ public final class XmlOperations {
     /** xpath with namespace support. nsMap maps prefix→URI. */
     public static List<String> xpath(String xpathExpr, String xml, Map<String, String> nsMap) {
         if (xpathExpr == null || xml == null) return Cols.listOf();
+        // xpath reads what it is given as a document rather than as content, so text that is not
+        // one well-formed element is refused instead of being searched inside a root element of
+        // our own making: that wrapper turned 'not xml' into a document with nothing to find and
+        // answered no rows for something PostgreSQL never got as far as searching.
+        if (!isDocument(xml)) {
+            throw new MemgresException("could not parse XML document", "2200M");
+        }
         try {
             DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
             factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
             factory.setNamespaceAware(nsMap != null && !nsMap.isEmpty());
             DocumentBuilder builder = factory.newDocumentBuilder();
             builder.setErrorHandler(new SilentErrorHandler());
-            Document doc;
-            try {
-                doc = builder.parse(new InputSource(new StringReader(xml)));
-            } catch (Exception e) {
-                String wrapped = "<_root>" + xml + "</_root>";
-                doc = builder.parse(new InputSource(new StringReader(wrapped)));
-            }
+            Document doc = builder.parse(new InputSource(new StringReader(xml)));
 
             XPathFactory xpf = XPathFactory.newInstance();
             XPath xp = xpf.newXPath();

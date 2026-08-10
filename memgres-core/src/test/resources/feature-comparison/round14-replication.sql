@@ -215,3 +215,11 @@ SELECT count(*)::text AS c FROM pg_proc WHERE proname = 'pg_promote';
 -- row: 1
 -- end-expected
 SELECT count(*)::text AS c FROM pg_proc WHERE proname = 'pg_create_restore_point';
+
+-- A publication of every table stops any table without a replica identity being updated, so
+-- it is dropped here rather than left for whatever runs next.
+DROP PUBLICATION IF EXISTS r14_pub_all;
+
+DROP PUBLICATION IF EXISTS r14_pub_tt;
+
+DROP PUBLICATION IF EXISTS r14_pub_bysch;

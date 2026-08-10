@@ -58,6 +58,8 @@ class ExprEvaluator {
             StatementCancel.check();
         }
         if (expr instanceof Literal) return evalLiteral(((Literal) expr));
+        // A value the engine computed earlier stands for itself.
+        if (expr instanceof ComputedValue) return ((ComputedValue) expr).value();
         if (expr instanceof PrecomputedValueExpr) return ((PrecomputedValueExpr) expr).value();
         // A node whose value the caller has already settled reads that value instead of being
         // computed again: an expanded set-returning call bound to one of its elements (see
@@ -302,9 +304,26 @@ class ExprEvaluator {
                         throw new MemgresException("column \"" + fieldName + "\" not found in data type " + typeName, "42703");
                     }
                 }
-                // Untyped ROW: PG does not allow field access on untyped records
-                if (fieldName.matches("f\\d+")) {
-                    throw new MemgresException("failed to find conversion function from unknown to text", "XX000");
+                // An untyped ROW names its fields by position -- f1 is the first value, f2 the
+                // second -- so the number in the name says which value was asked for, and a name
+                // that numbers no value of this row identifies no column.
+                if (fieldName.length() > 1 && (fieldName.charAt(0) == 'f' || fieldName.charAt(0) == 'F')) {
+                    int index;
+                    try {
+                        index = Integer.parseInt(fieldName.substring(1));
+                    } catch (NumberFormatException e) {
+                        index = -1; // not a position after all, so no field of that name
+                    }
+                    if (index >= 1 && index <= row.values().size()) {
+                        // A field written as a bare string literal has no type of its own, and
+                        // PostgreSQL has no output function to write an unknown out with.
+                        if (fa.expr() instanceof ArrayExpr
+                                && isUnknownLiteral(((ArrayExpr) fa.expr()).elements().get(index - 1))) {
+                            throw new MemgresException(
+                                    "failed to find conversion function from unknown to text", "XX000");
+                        }
+                        return row.values().get(index - 1);
+                    }
                 }
                 throw new MemgresException("could not identify column \"" + fieldName + "\" in record data type", "42703");
             }
@@ -315,23 +334,20 @@ class ExprEvaluator {
                 if (typeName != null) {
                     List<CreateTypeStmt.CompositeField> fields = executor.database.getRowType(typeName);
                     if (fields != null) {
-                        String[] parts = executor.splitCompositeString(s.substring(1, s.length() - 1));
+                        // The literal is read by the composite's own reader, which is the only
+                        // thing that knows which quotes were structure and which were content.
+                        List<RecordLiteral.Field> parts = RecordLiteral.parse(s);
                         for (int i = 0; i < fields.size(); i++) {
                             if (fields.get(i).name().equalsIgnoreCase(fieldName)) {
-                                if (i < parts.length) {
-                                    String part = parts[i];
-                                    // Unquote if needed (only an UNQUOTED empty field means NULL)
-                                    boolean quoted = part.length() >= 2 && part.startsWith("\"") && part.endsWith("\"");
-                                    if (quoted) {
-                                        part = part.substring(1, part.length() - 1);
-                                    }
-                                    // Coerce to the declared field type
+                                if (i < parts.size()) {
+                                    RecordLiteral.Field part = parts.get(i);
                                     String fieldType = fields.get(i).typeName();
                                     if (executor.database.isCompositeType(fieldType)) {
                                         // Nested composite, return as PgRow for further chaining
-                                        return executor.parseCompositeToRow(part, fieldType);
+                                        return executor.parseCompositeToRow(part.text, fieldType);
                                     }
-                                    return executor.compositeTypeHandler.coerceFieldValue(part, fieldType, quoted);
+                                    return executor.compositeTypeHandler.coerceFieldValue(
+                                            part.text, fieldType, part.quoted);
                                 }
                                 return null;
                             }
@@ -363,6 +379,7 @@ class ExprEvaluator {
             return null;
         }
         if (expr instanceof ArraySliceExpr) return executor.arrayOperationHandler.evalArraySlice(((ArraySliceExpr) expr), ctx);
+        if (expr instanceof SubscriptExpr) return executor.subscriptEvaluator.eval((SubscriptExpr) expr, ctx);
         if (expr instanceof CollateExpr) {
             CollateExpr ce = (CollateExpr) expr;
             Object collated = evalExpr(ce.expr(), ctx);
@@ -397,10 +414,11 @@ class ExprEvaluator {
             case STRING:
                 return lit.value();
             case BIT_STRING: {
-                // Validate bit digits: only 0 and 1 allowed
+                // The complaint is about the character that is not a digit, not about the string
+                // it sits in: PostgreSQL quotes back the first one its reader could not take.
                 for (char c : lit.value().toCharArray()) {
                     if (c != '0' && c != '1') {
-                        throw new MemgresException("\"" + lit.value() + "\" is not a valid binary digit", "22P02");
+                        throw new MemgresException("\"" + c + "\" is not a valid binary digit", "22P02");
                     }
                 }
                 return new AstExecutor.PgBitString(lit.value());
@@ -1354,9 +1372,9 @@ class ExprEvaluator {
         String t = DataType.canonicalName(declared);
         if (!"text".equals(t) && !"character varying".equals(t) && !"character".equals(t)
                 && !"name".equals(t) && !"boolean".equals(t)) return;
-        throw new MemgresException("operator does not exist: " + symbol + " " + t
-                + "\n  Hint: No operator matches the given name and argument types."
-                + " You might need to add explicit type casts.", "42883");
+        // The advice follows from the message: an operator written in front of its one operand has
+        // one argument to cast, and PostgreSQL says so in the singular.
+        throw new MemgresException("operator does not exist: " + symbol + " " + t, "42883");
     }
 
     Object evalUnaryValue(UnaryExpr.UnaryOp op, Object val) {
@@ -1545,36 +1563,28 @@ class ExprEvaluator {
     }
 
     static boolean isValidJson(String s) {
-        if (s == null || s.isEmpty()) return false;
-        s = s.trim();
-        if (s.startsWith("{") || s.startsWith("[")) {
-            try {
-                String normalized = JsonOperations.normalizeJsonb(s);
-                // Additional validation: check for nested braces without proper key structure
-                // e.g. "{{invalid}}" would normalize to "{}" incorrectly
-                if (s.startsWith("{") && s.length() > 2) {
-                    String inner = s.substring(1, s.length() - 1).trim();
-                    if (!inner.isEmpty() && !inner.contains("\"") && !inner.contains(":")) {
-                        return false; // object must have quoted keys with colons
-                    }
-                    // Validate that keys are properly quoted (reject {key: value} syntax)
-                    if (!inner.isEmpty() && inner.contains(":") && !inner.trim().startsWith("\"")) {
-                        return false; // keys must be double-quoted in valid JSON
-                    }
-                }
-                return true;
-            } catch (Exception e) { return false; }
-        }
-        // scalar values
-        if (s.equals("true") || s.equals("false") || s.equals("null")) return true;
-        if (s.startsWith("\"") && s.endsWith("\"") && s.length() >= 2) return true;
-        // Strict numeric validation: reject NaN, Infinity, etc.
+        if (s == null) return false;
+        // IS JSON asks exactly the question json input asks, so it is answered by the same reader
+        // rather than by a second, looser one of its own. Judging a document by its opening
+        // bracket called '[1,2' and '{"a":1}{"b":2}' JSON, neither of which json input would take.
         try {
-            double d = Double.parseDouble(s);
-            if (Double.isNaN(d) || Double.isInfinite(d)) return false;
+            JsonTextValidator.validate(s.trim());
             return true;
-        } catch (NumberFormatException e) {}
-        return false;
+        } catch (MemgresException e) {
+            return false;
+        }
+    }
+
+    /**
+     * The same reading, keeping the reader's complaint. A caller that only wants a yes or no asks
+     * the question above; one that is about to refuse the text has to hand on the error the reader
+     * raised, because only that names in its detail which rule the text broke.
+     */
+    static void requireJson(String s) {
+        if (s == null) {
+            throw new MemgresException("invalid input syntax for type json", "22P02");
+        }
+        JsonTextValidator.validate(s.trim());
     }
 
     private boolean hasUniqueKeys(String s) {
@@ -1631,9 +1641,7 @@ class ExprEvaluator {
         }
         // PG: invalid JSON input always errors — the implicit cast to json/jsonb fails
         // before JSON_EXISTS runs, so ON ERROR cannot catch it
-        if (!isValidJson(json)) {
-            throw new MemgresException("invalid input syntax for type json", "22P02");
-        }
+        requireJson(json);
         try {
             // Substitute PASSING variables into path
             if (je.passing() != null && !je.passing().isEmpty()) {
@@ -1658,9 +1666,7 @@ class ExprEvaluator {
         String json = inputVal.toString();
         String path = pathVal.toString().trim();
         // PG: invalid JSON input always throws an error regardless of ON ERROR behavior
-        if (!isValidJson(json)) {
-            throw new MemgresException("invalid input syntax for type json", "22P02");
-        }
+        requireJson(json);
         try {
             // Substitute PASSING variables
             if (jv.passing != null && !jv.passing.isEmpty()) {
@@ -1717,7 +1723,7 @@ class ExprEvaluator {
         String path = pathVal.toString().trim();
         try {
             if (!isValidJson(json)) {
-                if (jq.onError == JsonExistsExpr.OnBehavior.ERROR) throw new MemgresException("invalid input syntax for type json", "22P02");
+                if (jq.onError == JsonExistsExpr.OnBehavior.ERROR) requireJson(json);
                 return handleJsonQueryOnEmpty(jq);
             }
             List<String> results = executor.functionEvaluator.evaluateJsonPathAll(json, path);
@@ -1784,6 +1790,13 @@ class ExprEvaluator {
                     // no pair of types to resolve an operator between.
                     resolvable = false;
                 }
+            } else if (in.fromAny()) {
+                // A written ARRAY[...] arrives here as its elements. Where those elements are
+                // themselves arrays the comparison is still against the innermost value, because
+                // an array type in PostgreSQL says nothing about how many dimensions it has:
+                // ARRAY[ARRAY[1],ARRAY[2]] is an integer[], and = ANY over it resolves against
+                // integer rather than against integer[].
+                other = innermostElementOperand(other);
             }
             if (resolvable) {
                 executor.binaryOpEvaluator.rejectUnresolvableOperator(
@@ -1842,7 +1855,16 @@ class ExprEvaluator {
         // reached the entry that was at fault, so 1 IN (1, (SELECT 1, 2)) answered true.
         rejectWideSubqueryElements(in.values());
         rejectRowEntryMismatch(in);
-        if (val == null) return null; // NULL IN (...) is NULL
+        if (val == null) {
+            // "= ANY(<array>)" over an array holding nothing settles the answer without comparing
+            // anything, so a null on the left leaves nothing to be unknown about: it is false, and
+            // false is what PostgreSQL answers.
+            if (in.fromAny() && in.values().size() == 1) {
+                List<?> only = PgArray.from(evalExpr(in.values().get(0), ctx));
+                if (only != null && only.isEmpty()) return in.negated();
+            }
+            return null; // NULL IN (...) is NULL
+        }
 
         // Regular IN (value list)
         boolean found = false;
@@ -1853,12 +1875,22 @@ class ExprEvaluator {
                 hasNull = true;
                 continue;
             }
-            // Type mismatch validation: numeric IN (text), but allow PG array strings
-            if (val instanceof Number && elem instanceof String && !((String) elem).isEmpty()
-                    && !((String) elem).startsWith("{") && !((String) elem).startsWith("[")) {
+            // A written entry is one value, so an untyped one is read as the type it is being
+            // compared against. It used to be spared that reading when its text was spelled the
+            // way an array is spelled, which made 1 IN ('{1,2}') true.
+            if (val instanceof Number && elem instanceof String && !((String) elem).isEmpty()) {
                 String se = (String) elem;
-                try { new java.math.BigDecimal(se); } catch (NumberFormatException e) {
-                    throw new MemgresException("operator does not exist: integer = text", "42883");
+                if (!in.fromAny() && v instanceof Literal
+                        && ((Literal) v).literalType() == Literal.LiteralType.STRING) {
+                    // A written entry is one value, read as the type it is compared against, and
+                    // text spelled the way an array is spelled is not an exception to that.
+                    elem = TypeCoercion.coerce(se, executor.exprEvaluator.inferExprType(in.expr()));
+                } else if (!PgArray.looksLikeArrayText(se)) {
+                    // An array written out beside a number is an array of text, and there is no
+                    // operator between the two.
+                    try { new java.math.BigDecimal(se); } catch (NumberFormatException e) {
+                        throw new MemgresException("operator does not exist: integer = text", "42883");
+                    }
                 }
             }
             // If both val and elem are Lists, compare as row values
@@ -1876,9 +1908,11 @@ class ExprEvaluator {
                 if (found) break;
                 continue;
             }
-            // If elem is a PG-format array string like {1,5,10} (from array parameters), parse and check
-            // But NOT multirange strings like {[1,5),[10,20)} — those should be compared directly
-            if (elem instanceof String && ((String) elem).startsWith("{") && ((String) elem).endsWith("}")
+            // An array parameter arrives as the text of its literal, and "= ANY(...)" over it is a
+            // comparison against each element. A written IN list is not that: each entry there is
+            // one value, and text spelled like an array is the text it is.
+            if (in.fromAny() && elem instanceof String
+                    && ((String) elem).startsWith("{") && ((String) elem).endsWith("}")
                     && !RangeOperations.isMultirangeOrEmpty(((String) elem).trim())) {
                 String s = (String) elem;
                 List<Object> parsed = executor.arrayOperationHandler.parsePostgresArrayLiteral(s);
@@ -1950,7 +1984,9 @@ class ExprEvaluator {
         String pat = patternVal.toString();
         String esc = like.escape();
         if (esc != null && esc.length() > 1) {
-            throw new MemgresException("invalid escape string", "22025");
+            // PostgreSQL states the rule the string broke rather than only calling it invalid.
+            throw new MemgresException("invalid escape string"
+                    + "\n  Hint: Escape string must be empty or one character.", "22025");
         }
         boolean matches = likeMatch(str, pat, esc, like.caseInsensitive());
         return like.negated() ? !matches : matches;
@@ -2486,10 +2522,25 @@ class ExprEvaluator {
         return element == null ? null : new CastExpr(array, element.getPgName());
     }
 
+    /**
+     * The value an array's elements are, however deeply the constructor nests them. PostgreSQL's
+     * array types carry no dimensionality — {@code ARRAY[ARRAY[1],ARRAY[2]]} is an
+     * {@code integer[]} — so what {@code = ANY} compares against is the innermost value.
+     */
+    private static Expression innermostElementOperand(Expression element) {
+        Expression current = element;
+        while (current instanceof ArrayExpr && !((ArrayExpr) current).isRow()) {
+            java.util.List<Expression> items = ((ArrayExpr) current).elements();
+            if (items == null || items.isEmpty()) return current;
+            current = items.get(0);
+        }
+        return current;
+    }
+
     private static Expression arrayElementOperand(Expression array) {
         if (array instanceof ArrayExpr) {
             java.util.List<Expression> items = ((ArrayExpr) array).elements();
-            return items.isEmpty() ? null : items.get(0);
+            return items.isEmpty() ? null : innermostElementOperand(items.get(0));
         }
         if (array instanceof CastExpr) {
             String type = ((CastExpr) array).typeName();
@@ -2512,18 +2563,16 @@ class ExprEvaluator {
         // no "=" cannot be compared this way either. This path never reaches BinaryOpEvaluator,
         // so the rule is consulted directly against the left side and the array's first element.
         Object leftVal = evalExpr(aaa.left(), ctx);
-        if (leftVal == null) return null;
         Object arrayVal = evalExpr(aaa.array(), ctx);
         if (arrayVal == null) return null;
-        List<?> elements;
-        if (arrayVal instanceof List<?>) elements = (List<?>) arrayVal;
-        else if (arrayVal instanceof String && ((String) arrayVal).startsWith("{") && ((String) arrayVal).endsWith("}")) {
-            String s = (String) arrayVal;
-            String inner = s.substring(1, s.length() - 1).trim();
-            elements = inner.isEmpty() ? Cols.listOf() : java.util.Arrays.asList(inner.split(","));
-        } else {
-            elements = Cols.listOf(arrayVal);
-        }
+        // The array is read by the one array reader, so a quoted element holding a comma stays
+        // one element.
+        List<?> elements = PgArray.from(arrayVal);
+        if (elements == null) elements = Cols.listOf(arrayVal);
+        // An array with nothing in it settles the answer without comparing anything, which is why
+        // it answers even for a NULL on the left: there is nothing there to be unknown about.
+        if (elements.isEmpty()) return aaa.isAll();
+        if (leftVal == null) return null;
         if (aaa.isAll()) {
             boolean hasNull = false;
             for (Object elem : elements) {
@@ -2579,16 +2628,10 @@ class ExprEvaluator {
             }
             return Integer.compare(la.size(), lb.size());
         }
-        // List (array) comparison: element-by-element, shorter list is "less" if prefix matches
+        // Two arrays are compared where every array is compared, by array_cmp's rules — including
+        // the one this walk had wrong, that a null element sorts after every value.
         if (a instanceof List<?> && b instanceof List<?>) {
-            List<?> la = (List<?>) a;
-            List<?> lb = (List<?>) b;
-            int minLen = Math.min(la.size(), lb.size());
-            for (int i = 0; i < minLen; i++) {
-                int cmp = compareValues(la.get(i), lb.get(i));
-                if (cmp != 0) return cmp;
-            }
-            return Integer.compare(la.size(), lb.size());
+            return TypeCoercion.compare(a, b);
         }
         // PgEnum values compare by ordinal position (creation order)
         if (a instanceof AstExecutor.PgEnum && b instanceof AstExecutor.PgEnum) {
@@ -3006,6 +3049,9 @@ class ExprEvaluator {
         if (expr instanceof CollateExpr) return exprToAlias(((CollateExpr) expr).expr());
         if (expr instanceof CompositeStarExpr) return "?column?";
         if (expr instanceof ArraySliceExpr) return exprToAlias(((ArraySliceExpr) expr).array());
+        // A subscript keeps the name of what it reaches into, which is why ARRAY[...][1] is
+        // labelled array rather than ?column?.
+        if (expr instanceof SubscriptExpr) return exprToAlias(((SubscriptExpr) expr).base());
         return "?column?";
     }
 
@@ -3129,6 +3175,13 @@ class ExprEvaluator {
      * value whose type the engine is unsure of is left alone. Refusing a COLLATE PostgreSQL
      * performs would break far more than accepting one it refuses.
      */
+    /** The string types, which are the ones a collation applies to. */
+    private static boolean isCollatableTypeName(String typeName) {
+        return typeName.equals("text") || typeName.equals("character varying")
+                || typeName.equals("character") || typeName.equals("name")
+                || typeName.equals("citext") || typeName.equals("unknown");
+    }
+
     private static void rejectUncollatableValue(Object value) {
         String typeName = null;
         if (value instanceof Short) typeName = "smallint";
@@ -3150,6 +3203,20 @@ class ExprEvaluator {
         else if (value instanceof java.util.UUID) typeName = "uuid";
         else if (value instanceof AstExecutor.PgRow) typeName = "record";
         else if (value instanceof InetValue) typeName = "inet";
+        else if (value instanceof java.util.List<?>) {
+            // An array is collatable only where its elements are, and PostgreSQL names the array
+            // type rather than the element type when it says so.
+            for (Object element : PgArray.flatten((java.util.List<?>) value)) {
+                if (element == null) continue;
+                typeName = AstExecutor.pgTypeNameOf(element);
+                if (typeName != null && !isCollatableTypeName(typeName)) {
+                    typeName = typeName + "[]";
+                } else {
+                    typeName = null;
+                }
+                break;
+            }
+        }
         if (typeName != null) {
             throw PgErrors.datatypeMismatch("collations are not supported by type " + typeName);
         }
@@ -3595,6 +3662,30 @@ class ExprEvaluator {
     }
 
     DataType inferTypeFromContext(Expression expr, List<RowContext.TableBinding> bindings) {
+        // A subscript of an array is one element of it, and a range of one is another array of
+        // the same type; a subscript of a json container is json. Answering jsonb for all of them
+        // told a client the wrong type for every array column it read an element of.
+        if (expr instanceof SubscriptExpr) {
+            SubscriptExpr sub = (SubscriptExpr) expr;
+            DataType base = inferTypeFromContext(sub.base(), bindings);
+            if (base == null) return null;
+            if (DataType.isArrayType(base)) {
+                return sub.isSlice() ? base : DataType.elementOf(base);
+            }
+            if (base == DataType.INT2VECTOR) return DataType.SMALLINT;
+            if (base == DataType.OIDVECTOR) return DataType.OID;
+            // A point is subscripted into its coordinates; everything built out of points is
+            // subscripted into those points.
+            if (base == DataType.POINT) return DataType.DOUBLE_PRECISION;
+            if (base == DataType.BOX || base == DataType.LSEG || base == DataType.PATH
+                    || base == DataType.POLYGON) {
+                return DataType.POINT;
+            }
+            if (base == DataType.JSON || base == DataType.JSONB || base == DataType.HSTORE) {
+                return base == DataType.HSTORE ? DataType.TEXT : base;
+            }
+            return base == DataType.NAME ? DataType.TEXT : base;
+        }
         if (expr instanceof PrecomputedValueExpr) {
             PrecomputedValueExpr pre = (PrecomputedValueExpr) expr;
             if (pre.declaredType() != null) return pre.declaredType();
@@ -4435,11 +4526,8 @@ class ExprEvaluator {
 
     /** PostgreSQL's complaint that a row and a single value have no comparison between them. */
     static MemgresException noRecordOperator(String otherType, boolean otherOnLeft) {
-        MemgresException e = new MemgresException("operator does not exist: "
+        return new MemgresException("operator does not exist: "
                 + (otherOnLeft ? otherType + " = record" : "record = " + otherType), "42883");
-        e.setHint("No operator matches the given name and argument types. "
-                + "You might need to add explicit type casts.");
-        return e;
     }
 
     /** The operators that compare two rows entry by entry. */
@@ -4566,11 +4654,11 @@ class ExprEvaluator {
     }
 
     private static MemgresException integerOutOfRange(DataType width) {
+        // PostgreSQL sends no datatype field with an integer overflow: the width is already in the
+        // message, and the field is reserved for the declared type a domain or a cast named.
         String name = width == DataType.SMALLINT ? "smallint"
                 : width == DataType.INTEGER ? "integer" : "bigint";
-        MemgresException e = new MemgresException(name + " out of range", "22003");
-        e.setDatatype(name);
-        return e;
+        return new MemgresException(name + " out of range", "22003");
     }
 
     /** The family a declared type belongs to, or null when it is one this rule leaves alone. */

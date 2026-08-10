@@ -96,7 +96,11 @@ class DmlExecutor {
         if (!bare.toLowerCase().startsWith("pg_")) return;
         if (executor.systemCatalog.resolve(null, bare, executor.session) == null) return;
         if (!"v".equals(PgCatalogRelations.relkind(bare.toLowerCase()))) return;
-        throw new MemgresException("cannot " + verb + " view \"" + bare + "\"", "55000");
+        // A catalogue view is assembled from more than one relation, which is the same reason
+        // PostgreSQL gives for refusing a write to any other view of that shape, and it names the
+        // trigger and the rule that would take the write instead.
+        throw ViewUpdatability.cannotWrite(verb, bare,
+                ViewUpdatability.DETAIL_NOT_SINGLE_RELATION, executor.viewDmlByMerge);
     }
 
     /**
@@ -331,8 +335,12 @@ class DmlExecutor {
             key.append(v.toString().length()).append(':').append(v).append(';');
         }
         if (!seenKeys.add(key.toString())) {
+            // PostgreSQL points at the rows the statement itself proposed, which is where the
+            // duplicate came from — the table had nothing to do with it.
             throw new MemgresException(
-                    "ON CONFLICT DO UPDATE command cannot affect row a second time", "21000");
+                    "ON CONFLICT DO UPDATE command cannot affect row a second time"
+                            + "\n  Hint: Ensure that no rows proposed for insertion within the"
+                            + " same command have duplicate constrained values.", "21000");
         }
     }
 
@@ -439,6 +447,7 @@ class DmlExecutor {
         List<DmlValidationHelper.ViewCheck> viewCheckExprs = validationHelper.collectViewCheckExprs(stmt.table());
         // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
         executor.viewDmlVerb = "insert into";
+        executor.viewDmlByMerge = false;
         recordRelationLock(stmt.schema(), stmt.table(), "RowExclusiveLock");
         rejectCatalogViewWrite(stmt.table(), "insert into");
         Table table = executor.resolveTable(schemaName, stmt.table(), stmt.schema() != null);
@@ -543,24 +552,10 @@ class DmlExecutor {
             for (Object[] subRow : subResult.getRows()) {
                 List<Expression> exprRow = new ArrayList<>();
                 for (Object val : subRow) {
-                    if (val == null) {
-                        exprRow.add(Literal.ofNull());
-                    } else if (val instanceof Integer || val instanceof Long) {
-                        exprRow.add(Literal.ofInt(val.toString()));
-                    } else if (val instanceof Double || val instanceof Float) {
-                        // Keep the float width: a plain numeric literal would make an overflow on
-                        // the way into a real column read as an input error rather than the
-                        // narrowing PG reports, and would leave NaN with no numeric to become.
-                        exprRow.add(new CastExpr(Literal.ofFloat(val.toString()),
-                                val instanceof Float ? "float4" : "float8"));
-                    } else if (val instanceof java.math.BigDecimal) {
-                        exprRow.add(Literal.ofFloat(val.toString()));
-                    } else if (val instanceof Boolean) {
-                        Boolean b = (Boolean) val;
-                        exprRow.add(Literal.ofBoolean(b));
-                    } else {
-                        exprRow.add(Literal.ofString(val.toString()));
-                    }
+                    // The query has already produced the value; it is carried across as it is
+                    // rather than written out and read back, which is what destroyed a bytea and
+                    // an array on the way in.
+                    exprRow.add(val == null ? Literal.ofNull() : new ComputedValue(val));
                 }
                 valueRows.add(exprRow);
             }
@@ -630,6 +625,19 @@ class DmlExecutor {
                     if (genCol.isGenerated()) {
                         throw new MemgresException("cannot insert a non-DEFAULT value into column \"" + genCol.getName() + "\"\n  Detail: Column \"" + genCol.getName() + "\" is a generated column.", "428C9");
                     }
+                    // A column named with brackets is written through them: the row starts with
+                    // nothing in that column, and the assignment builds the value around it.
+                    List<SubscriptExpr.Subscript> subscripts = stmt.columnSubscripts() == null
+                            || i >= stmt.columnSubscripts().size()
+                            ? null : stmt.columnSubscripts().get(i);
+                    if (subscripts != null) {
+                        row[colIdx] = TypeCoercion.coerceForStorage(
+                                executor.subscriptAssign.assign(row[colIdx], genCol, subscripts,
+                                        valueRow.get(i), valueCtx),
+                                table.getColumns().get(colIdx));
+                        filledCols.add(colIdx);
+                        continue;
+                    }
                     Object val = executor.evalExpr(valueRow.get(i), valueCtx);
                     row[colIdx] = TypeCoercion.coerceForStorage(val, table.getColumns().get(colIdx));
                     filledCols.add(colIdx);
@@ -665,7 +673,12 @@ class DmlExecutor {
                 for (int colIdx : filledCols) {
                     Column col = table.getColumns().get(colIdx);
                     if (col.getDefaultValue() != null && col.getDefaultValue().contains("__identity__:always")) {
-                        throw new MemgresException("cannot insert a non-DEFAULT value into column \"" + col.getName() + "\"", "428C9");
+                        // PostgreSQL says what closed the column and what would open it, the same
+                        // way it does for a generated column just above.
+                        throw new MemgresException("cannot insert a non-DEFAULT value into column \""
+                                + col.getName() + "\"\n  Detail: Column \"" + col.getName()
+                                + "\" is an identity column defined as GENERATED ALWAYS."
+                                + "\n  Hint: Use OVERRIDING SYSTEM VALUE to override.", "428C9");
                     }
                 }
             } // end overridingSystemValue check
@@ -1377,6 +1390,7 @@ class DmlExecutor {
         List<DmlValidationHelper.ViewCheck> viewCheckExprs = validationHelper.collectViewCheckExprs(stmt.table());
         // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
         executor.viewDmlVerb = "update";
+        executor.viewDmlByMerge = false;
         recordRelationLock(stmt.schema(), stmt.table(), "RowExclusiveLock");
         rejectCatalogViewWrite(stmt.table(), "update");
         Table table = executor.resolveTable(schemaName, stmt.table(), stmt.schema() != null);
@@ -1403,6 +1417,19 @@ class DmlExecutor {
         // table with no rows — or one whose WHERE matched none — quietly reported success.
         List<String> setTargets = new ArrayList<>();
         for (InsertStmt.SetClause set : stmt.setClauses()) setTargets.add(set.column());
+        // "SET t.c = ..." reads as an assignment to a field of a column named t, so what goes
+        // missing is a column of the relation's own name. Nothing in that complaint shows how it
+        // came to be asked for, which is why PostgreSQL adds what the writer actually did.
+        for (InsertStmt.SetClause set : stmt.setClauses()) {
+            if (set.subField() == null || !set.column().equalsIgnoreCase(stmt.table())
+                    || table.getColumnIndex(set.column()) >= 0) {
+                continue;
+            }
+            throw new MemgresException("column \"" + set.column() + "\" of relation \""
+                    + stmt.table() + "\" does not exist"
+                    + "\n  Hint: SET target columns cannot be qualified with the relation name.",
+                    "42703");
+        }
         requireTargetColumns(table, stmt.table(), setTargets);
         // The rest of the statement is resolved against the same relation, so a name in the
         // WHERE or on the right of an assignment is refused before the scan rather than by
@@ -1976,27 +2003,16 @@ class DmlExecutor {
                 }
                 continue;
             }
-            Object val = executor.evalExpr(set.value(), ctx);
-            // Validate array element type for subscript assignments (e.g. vals[1] = 'not_an_int')
-            // The parser transforms array subscript SET into jsonb_set calls. For non-JSONB array
-            // columns (INT[], TEXT[], etc.), validate that the assigned value matches the element type.
-            if (set.value() instanceof FunctionCallExpr
-                    && "jsonb_set".equals(((FunctionCallExpr) set.value()).name())
-                    && genCol.getType() == DataType.INT4_ARRAY) {
-                // Extract the new element value from the jsonb_set call's 3rd arg (to_jsonb(val))
-                FunctionCallExpr jsonbSetCall = (FunctionCallExpr) set.value();
-                if (jsonbSetCall.args().size() >= 3) {
-                    Expression innerValExpr = jsonbSetCall.args().get(2);
-                    Object innerVal = executor.evalExpr(innerValExpr, ctx);
-                    if (innerVal instanceof String) {
-                        String sv = innerVal.toString().replace("\"", "").trim();
-                        try { Long.parseLong(sv); } catch (NumberFormatException e) {
-                            throw new MemgresException(
-                                    "invalid input syntax for type integer: \"" + sv + "\"", "22P02");
-                        }
-                    }
-                }
+            // An assignment through brackets writes part of the value the column holds, which is
+            // not the same as computing a new whole one.
+            if (set.subscripts() != null) {
+                newRow[colIdx] = TypeCoercion.coerceForStorage(
+                        executor.subscriptAssign.assign(newRow[colIdx],
+                                table.getColumns().get(colIdx), set.subscripts(), set.value(), ctx),
+                        table.getColumns().get(colIdx));
+                continue;
             }
+            Object val = executor.evalExpr(set.value(), ctx);
             // Handle composite field update: SET col.field = value
             if (set.subField() != null) {
                 String compositeTypeName = genCol.getCompositeTypeName();
@@ -2097,6 +2113,7 @@ class DmlExecutor {
         String schemaName = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
         // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
         executor.viewDmlVerb = "delete from";
+        executor.viewDmlByMerge = false;
         recordRelationLock(stmt.schema(), stmt.table(), "RowExclusiveLock");
         rejectCatalogViewWrite(stmt.table(), "delete from");
         Table table = executor.resolveTable(schemaName, stmt.table(), stmt.schema() != null);
@@ -2445,8 +2462,10 @@ class DmlExecutor {
         String schemaName = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
         rejectMaterializedViewWrite(stmt.targetTable());
         // A MERGE onto a view that cannot take it is refused by the action it wanted to perform,
-        // not by INSERT: a MERGE whose only arm is an UPDATE reports "cannot update view".
+        // not by INSERT: a MERGE whose only arm is an UPDATE reports "cannot update view". No rule
+        // can stand in for a MERGE, so the advice it is given names a trigger and nothing else.
         executor.viewDmlVerb = mergeViewDmlVerb(stmt);
+        executor.viewDmlByMerge = true;
         // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
         Table targetTable = executor.resolveTable(schemaName, stmt.targetTable(), stmt.schema() != null);
         String targetAlias = stmt.targetAlias() != null ? stmt.targetAlias() : stmt.targetTable();
@@ -2541,8 +2560,12 @@ class DmlExecutor {
                     matchedBySourceRows.add(targetRow);
                     // PG 21000: only a second real modification of the row is an error
                     if (affectedTargetRows.contains(targetRow)) {
+                        // PostgreSQL points at the source, which is where the second match came
+                        // from, rather than at the row that was hit twice.
                         throw new MemgresException(
-                                "MERGE command cannot affect row a second time", "21000");
+                                "MERGE command cannot affect row a second time"
+                                        + "\n  Hint: Ensure that not more than one source row"
+                                        + " matches any one target row.", "21000");
                     }
                     matchedTargetRows.add(targetRow);
                 }
@@ -2599,10 +2622,14 @@ class DmlExecutor {
                                     break;
                                 }
                                 // Commit the (possibly trigger-modified) new values onto the live row.
-                                System.arraycopy(newRow, 0, targetRow, 0, targetRow.length);
-                                computeGeneratedColumns(targetTable, targetRow);
-                                executor.constraintValidator.validateConstraints(targetTable, targetRow, targetRow);
+                                // The new values are checked before they are written, and written
+                                // through the table so its indexes move with them. Copying them
+                                // straight onto the live row left every index pointing at the
+                                // values the row used to hold.
+                                computeGeneratedColumns(targetTable, newRow);
+                                executor.constraintValidator.validateConstraints(targetTable, newRow, targetRow);
                                 recordUpdateUndo(stmt.schema(), stmt.targetTable(), targetRow, oldRow);
+                                targetTable.updateRowInPlace(targetRow, oldRow, newRow);
                                 executor.constraintValidator.handleFkOnUpdate(targetTable, oldRow, targetRow);
                                 // Fire AFTER UPDATE triggers for MERGE
                                 triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.UPDATE, targetRow, oldRow, targetTable, updCols);
@@ -2678,10 +2705,14 @@ class DmlExecutor {
                                     processedTargetRows.add(targetRow);
                                     break;
                                 }
-                                System.arraycopy(newRow, 0, targetRow, 0, targetRow.length);
-                                computeGeneratedColumns(targetTable, targetRow);
-                                executor.constraintValidator.validateConstraints(targetTable, targetRow, targetRow);
+                                // The new values are checked before they are written, and written
+                                // through the table so its indexes move with them. Copying them
+                                // straight onto the live row left every index pointing at the
+                                // values the row used to hold.
+                                computeGeneratedColumns(targetTable, newRow);
+                                executor.constraintValidator.validateConstraints(targetTable, newRow, targetRow);
                                 recordUpdateUndo(stmt.schema(), stmt.targetTable(), targetRow, oldRow);
+                                targetTable.updateRowInPlace(targetRow, oldRow, newRow);
                                 executor.constraintValidator.handleFkOnUpdate(targetTable, oldRow, targetRow);
                                 triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.UPDATE, targetRow, oldRow, targetTable, updCols);
                                 if (hasReturning) {
@@ -2723,7 +2754,10 @@ class DmlExecutor {
                                     throw new MemgresException("cannot insert a non-DEFAULT value into column \"" + genCol.getName() + "\"\n  Detail: Column \"" + genCol.getName() + "\" is a generated column.", "428C9");
                                 }
                                 if (genCol.getDefaultValue() != null && genCol.getDefaultValue().contains("__identity__:always")) {
-                                    throw new MemgresException("cannot insert a non-DEFAULT value into column \"" + genCol.getName() + "\"", "428C9");
+                                    throw new MemgresException("cannot insert a non-DEFAULT value into column \""
+                                            + genCol.getName() + "\"\n  Detail: Column \"" + genCol.getName()
+                                            + "\" is an identity column defined as GENERATED ALWAYS."
+                                            + "\n  Hint: Use OVERRIDING SYSTEM VALUE to override.", "428C9");
                                 }
                                 Object val = executor.evalExpr(wnm.values().get(i), sourceCtx);
                                 newRow[colIdx] = TypeCoercion.coerceForStorage(val, targetTable.getColumns().get(colIdx));
@@ -2735,7 +2769,10 @@ class DmlExecutor {
                                     throw new MemgresException("cannot insert a non-DEFAULT value into column \"" + genCol.getName() + "\"\n  Detail: Column \"" + genCol.getName() + "\" is a generated column.", "428C9");
                                 }
                                 if (genCol.getDefaultValue() != null && genCol.getDefaultValue().contains("__identity__:always")) {
-                                    throw new MemgresException("cannot insert a non-DEFAULT value into column \"" + genCol.getName() + "\"", "428C9");
+                                    throw new MemgresException("cannot insert a non-DEFAULT value into column \""
+                                            + genCol.getName() + "\"\n  Detail: Column \"" + genCol.getName()
+                                            + "\" is an identity column defined as GENERATED ALWAYS."
+                                            + "\n  Hint: Use OVERRIDING SYSTEM VALUE to override.", "428C9");
                                 }
                                 Object val = executor.evalExpr(wnm.values().get(i), sourceCtx);
                                 newRow[i] = TypeCoercion.coerceForStorage(val, targetTable.getColumns().get(i));
@@ -3347,12 +3384,17 @@ class DmlExecutor {
             if (published) break;
         }
         if (published && !table.hasUsableReplicaIdentity()) {
-            String verb = "update".equals(dmlVerb) ? "updates" : "deletes";
+            // PostgreSQL names the write the way it names it everywhere else — a DELETE is
+            // "delete from" — and its advice speaks of the write that was refused rather than
+            // always of an update.
+            boolean updating = "update".equals(dmlVerb);
             MemgresException ex = new MemgresException(
-                    "cannot " + dmlVerb + " table \"" + tableName
-                            + "\" because it does not have a replica identity and publishes " + verb,
+                    "cannot " + (updating ? "update" : "delete from") + " table \"" + tableName
+                            + "\" because it does not have a replica identity and publishes "
+                            + (updating ? "updates" : "deletes"),
                     "55000");
-            ex.setHint("To enable updating the table, set REPLICA IDENTITY using ALTER TABLE.");
+            ex.setHint("To enable " + (updating ? "updating" : "deleting from")
+                    + " the table, set REPLICA IDENTITY using ALTER TABLE.");
             throw ex;
         }
     }

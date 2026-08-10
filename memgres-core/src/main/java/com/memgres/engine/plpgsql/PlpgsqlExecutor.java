@@ -528,8 +528,13 @@ public class PlpgsqlExecutor {
         else if (value instanceof Map) width = ((Map<?, ?>) value).size();
         else return;
         if (width != fields.size()) {
+            // The two widths are the detail behind the complaint: the message says the record does
+            // not fit, and how many fields each side has is what shows why.
             throw new MemgresException(
-                    "returned record type does not match expected record type", "42804");
+                    "returned record type does not match expected record type"
+                            + "\n  Detail: Number of returned columns (" + width
+                            + ") does not match expected column count (" + fields.size() + ").",
+                    "42804");
         }
         // A row constructor builds an anonymous record whose fields are whatever its expressions
         // were: nothing has coerced them to the declared type, so a field holding text where the
@@ -540,8 +545,16 @@ public class PlpgsqlExecutor {
                 String want = valueClass(fields.get(i).typeName());
                 String got = valueClassOf(values.get(i));
                 if (want != null && got != null && !want.equals(got)) {
+                    // Which field disagreed, and how: the record is handed back under a name it
+                    // does not fit, and the field that does not fit is the whole of the reason.
                     throw new MemgresException(
-                            "returned record type does not match expected record type", "42804");
+                            "returned record type does not match expected record type"
+                                    + "\n  Detail: Returned type "
+                                    + returnedTypeName(values.get(i))
+                                    + " does not match expected type "
+                                    + DataType.canonicalName(fields.get(i).typeName())
+                                    + " in column \"" + fields.get(i).name()
+                                    + "\" (position " + (i + 1) + ").", "42804");
                 }
             }
         }
@@ -573,6 +586,17 @@ public class PlpgsqlExecutor {
         }
     }
 
+    /** The type PostgreSQL names for a value a record handed back, as its detail spells it. */
+    private static String returnedTypeName(Object value) {
+        if (value instanceof Integer || value instanceof Short) return "integer";
+        if (value instanceof Long) return "bigint";
+        if (value instanceof java.math.BigDecimal) return "numeric";
+        if (value instanceof Double) return "double precision";
+        if (value instanceof Float) return "real";
+        if (value instanceof Boolean) return "boolean";
+        return "text";
+    }
+
     /** The same broad kind, read off a value, or null when the value does not say. */
     private static String valueClassOf(Object value) {
         if (value instanceof Number) return "number";
@@ -596,9 +620,32 @@ public class PlpgsqlExecutor {
     }
 
     private static int toInt(Object val) {
-        if (val instanceof Number) return ((Number) val).intValue();
+        if (val instanceof Number) {
+            long written = ((Number) val).longValue();
+            // An integer loop variable and the int4 operators are declared over integer, so a
+            // value too wide for one is refused rather than folded round into the range: a loop
+            // written 1..3000000000 counted up to a negative bound and never entered its body.
+            if (written < Integer.MIN_VALUE || written > Integer.MAX_VALUE) {
+                throw new MemgresException("integer out of range", "22003");
+            }
+            return (int) written;
+        }
         if (val instanceof String) return Integer.parseInt((String) val);
         throw new MemgresException("cannot convert " + val + " to integer", "22023");
+    }
+
+    /**
+     * A subscript an assignment writes through.
+     *
+     * <p>An assignment has to say which element it changes and a null names none, so PostgreSQL
+     * refuses the assignment itself rather than complaining that the null would not read as a
+     * number — which is what a general-purpose reader has to say about it.
+     */
+    private static int assignmentSubscript(Object val) {
+        if (val == null) {
+            throw new MemgresException("array subscript in assignment must not be null", "22004");
+        }
+        return toInt(val);
     }
 
     private Object executeSqlFunction(PgFunction function, List<Object> args) {
@@ -1394,7 +1441,9 @@ public class PlpgsqlExecutor {
         if (!stmt.elseBody().isEmpty()) {
             executeStatements(stmt.elseBody(), scope);
         } else {
-            throw new MemgresException("case not found", "20000");
+            // PostgreSQL says what was missing from the statement, not only that nothing matched.
+            throw new MemgresException("case not found"
+                    + "\n  Hint: CASE statement is missing ELSE part.", "20000");
         }
     }
 
@@ -1985,8 +2034,14 @@ public class PlpgsqlExecutor {
                 database.getRowType(elementType);
         if (fields == null) return;
         if (result.getColumns() != null && result.getColumns().size() != fields.size()) {
+            // The two widths are the detail behind the complaint: the message says the query does
+            // not fit the declared type, and the counts are what show why.
             throw new MemgresException(
-                    "structure of query does not match function result type", "42804");
+                    "structure of query does not match function result type"
+                            + "\n  Detail: Number of returned columns ("
+                            + result.getColumns().size()
+                            + ") does not match expected column count (" + fields.size() + ").",
+                    "42804");
         }
     }
 
@@ -2293,6 +2348,9 @@ public class PlpgsqlExecutor {
                         throw new MemgresException("query returned no rows", "P0002");
                     }
                     if (result.getRows().size() > 1) {
+                        // No advice here, where a static INTO STRICT is advised to add a LIMIT:
+                        // this query is a string the block computed, and PostgreSQL does not
+                        // suggest editing text it cannot see.
                         throw new MemgresException("query returned more than one row", "P0003");
                     }
                 }
@@ -2429,7 +2487,11 @@ public class PlpgsqlExecutor {
                     throw new MemgresException("query returned no rows", "P0002");
                 }
                 if (rowCount > 1) {
-                    throw new MemgresException("query returned more than one row", "P0003");
+                    // PostgreSQL advises on the too-many-rows case and not on the empty one, since
+                    // only the query that returned too much can be narrowed.
+                    throw new MemgresException("query returned more than one row"
+                            + "\n  Hint: Make sure the query returns a single row,"
+                            + " or use LIMIT 1.", "P0003");
                 }
             }
             if (!result.getRows().isEmpty()) {
@@ -2815,8 +2877,8 @@ public class PlpgsqlExecutor {
                 ? containerType.substring(0, containerType.length() - 2) : null;
         List<Object> list = toMutableArray(container);
         if (step.isSlice()) {
-            int lower = toInt(evalExpr(step.index, scope));
-            int upper = toInt(evalExpr(step.upper, scope));
+            int lower = assignmentSubscript(evalExpr(step.index, scope));
+            int upper = assignmentSubscript(evalExpr(step.upper, scope));
             List<Object> replacement = toMutableArray(value);
             for (int i = lower; i <= upper; i++) {
                 setArrayElement(list, i, i - lower < replacement.size() ? replacement.get(i - lower) : null);
@@ -2824,7 +2886,7 @@ public class PlpgsqlExecutor {
             return list;
         }
 
-        int index = toInt(evalExpr(step.index, scope));
+        int index = assignmentSubscript(evalExpr(step.index, scope));
         Object existing = (index >= 1 && index <= list.size()) ? list.get(index - 1) : null;
         // A multi-dimensional array subscripts into itself, so the element keeps the array type
         String childType = last ? null
@@ -3129,6 +3191,12 @@ public class PlpgsqlExecutor {
     // ---- Cursors ----
 
     private void executeOpenCursor(PlpgsqlStatement.OpenCursorStmt stmt, Scope scope) {
+        // OPEN names a cursor variable the body declared. A name that stands for nothing has no
+        // cursor behind it to open, and doing nothing at all hid the typo that put it there.
+        if (!scope.has(stmt.cursorName())) {
+            throw new MemgresException("\"" + stmt.cursorName() + "\" is not a known variable",
+                    "42601");
+        }
         String sql = stmt.sql();
         Object bound = scope.get(stmt.cursorName());
         if (bound instanceof CursorState) {
@@ -3775,8 +3843,12 @@ public class PlpgsqlExecutor {
                             // #variable_conflict names the winner; without it PG reports the
                             // ambiguity, and a SQL-language body always lets the column win.
                             if (!columnWins && "error".equals(variableConflict)) {
+                                // PostgreSQL names the two things the identifier could have meant,
+                                // which is what separates this from two tables sharing a column.
                                 throw new MemgresException(
-                                        "column reference \"" + lowerName + "\" is ambiguous", "42702");
+                                        "column reference \"" + lowerName + "\" is ambiguous"
+                                                + "\n  Detail: It could refer to either a PL/pgSQL"
+                                                + " variable or a table column.", "42702");
                             }
                             if (columnWins || "use_column".equals(variableConflict)) {
                                 appendTokenToSb(sb, t);

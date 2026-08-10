@@ -1051,10 +1051,17 @@ class SelectAggregateEvaluator {
                 types.append(argTypeName(item.expr(), sample));
             }
         }
+        String name = osa.funcName().toLowerCase();
         MemgresException e = new MemgresException(
-                "function " + osa.funcName().toLowerCase() + "(" + types + ") does not exist", "42883");
-        e.setHint("No function matches the given name and argument types. "
-                + "You might need to add explicit type casts.");
+                "function " + name + "(" + types + ") does not exist", "42883");
+        // Casting nothing would resolve a hypothetical-set call: its direct arguments are the row
+        // being ranked, so it is the count that has to change, and PostgreSQL names both counts.
+        if (HYPOTHETICAL_SET_AGGREGATES.contains(name)) {
+            int keys = osa.withinGroupOrderBy() == null ? 0 : osa.withinGroupOrderBy().size();
+            e.setHint("To use the hypothetical-set aggregate " + name
+                    + ", the number of hypothetical direct arguments (here " + osa.args().size()
+                    + ") must match the number of ordering columns (here " + keys + ").");
+        }
         return e;
     }
 
@@ -1118,7 +1125,7 @@ class SelectAggregateEvaluator {
                 }
                 Expression arg = fn.args().get(0);
                 if (fn.distinct() && fn.args().size() > 1) {
-                    throw new MemgresException("function count(text, text) does not exist\n  Hint: No function matches the given name and argument types.", "42883");
+                    throw new MemgresException("function count(text, text) does not exist\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
                 }
                 if (fn.distinct()) {
                     Set<String> seen = new HashSet<>();
@@ -1267,7 +1274,7 @@ class SelectAggregateEvaluator {
             }
             case "string_agg": {
                 if (fn.args().size() < 2) {
-                    throw new MemgresException("function string_agg(text) does not exist\n  Hint: No function matches the given name and argument types.", "42883");
+                    throw new MemgresException("function string_agg(text) does not exist\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
                 }
                 if (group.isEmpty()) return null;
                 Expression arg = fn.args().get(0);
@@ -1316,29 +1323,23 @@ class SelectAggregateEvaluator {
                     if (seen != null && val != null && !seen.add(distinctKey(val))) continue;
                     list.add(val);
                 }
-                checkAccumulatedArrays(list);
-                StringBuilder sb = new StringBuilder("{");
-                for (int ai = 0; ai < list.size(); ai++) {
-                    if (ai > 0) sb.append(",");
-                    Object v = list.get(ai);
-                    if (v == null) sb.append("NULL");
-                    else if (v instanceof List<?>) sb.append(TypeCoercion.formatPgArray((List<?>) v));
-                    else if (v instanceof String) {
-                        String sv = (String) v;
-                        if (sv.isEmpty() || sv.equalsIgnoreCase("NULL") || sv.contains(",") || sv.contains("{") || sv.contains("}") || sv.contains("\"") || sv.contains("\\") || sv.contains(" ")) {
-                            sb.append("\"").append(sv.replace("\\", "\\\\").replace("\"", "\\\"")).append("\"");
-                        } else {
-                            sb.append(sv);
+                // DISTINCT sorts what it keeps, since it has to compare the values anyway, and a
+                // null sorts after every value the way an ascending order puts it.
+                if (fn.distinct() && (fn.orderBy() == null || fn.orderBy().isEmpty())) {
+                    list.sort(new java.util.Comparator<Object>() {
+                        @Override
+                        public int compare(Object a, Object b) {
+                            if (a == null || b == null) {
+                                return a == b ? 0 : (a == null ? 1 : -1);
+                            }
+                            return executor.compareValues(a, b);
                         }
-                    }
-                    else if (v instanceof AstExecutor.PgRow) {
-                        String sv = v.toString();
-                        sb.append("\"").append(sv.replace("\\", "\\\\").replace("\"", "\\\"")).append("\"");
-                    }
-                    else sb.append(v);
+                    });
                 }
-                sb.append("}");
-                return sb.toString();
+                checkAccumulatedArrays(list);
+                // The accumulated values are an array, not the text of one: written as text here,
+                // every element went through Java's spelling rather than its own type's.
+                return PgArray.of(list);
             }
             case "any_value": {
                 if (group.isEmpty()) return null;
@@ -1381,12 +1382,22 @@ class SelectAggregateEvaluator {
                 Expression arg = fn.args().get(0);
                 List<RowContext> orderedGroup = sortGroupForAggregate(group, fn);
                 RangeOperations.PgRange result = null;
+                // The same aggregate is declared over multiranges, and two of those do not meet
+                // the way two ranges do: every sub-range of one meets every sub-range of the
+                // other, so the running value stays a multirange and is intersected as one.
+                String multirangeResult = null;
                 for (RowContext ctx : orderedGroup) {
                     Object val = executor.evalExpr(arg, ctx);
                     if (val == null) continue;
                     String s = val.toString().trim();
                     if (s.equalsIgnoreCase("empty")) {
                         return "empty"; // intersection with empty is empty
+                    }
+                    if (RangeOperations.isMultirangeOrEmpty(s)) {
+                        multirangeResult = multirangeResult == null
+                                ? RangeOperations.formatMultirange(RangeOperations.parseMultirange(s))
+                                : RangeOperations.multirangeIntersect(multirangeResult, s);
+                        continue;
                     }
                     if (RangeOperations.isRangeString(s)) {
                         RangeOperations.PgRange r = RangeOperations.parse(s);
@@ -1399,6 +1410,7 @@ class SelectAggregateEvaluator {
                         }
                     }
                 }
+                if (multirangeResult != null) return multirangeResult;
                 if (result == null) return null;
                 return result.toString();
             }
@@ -2002,6 +2014,13 @@ class SelectAggregateEvaluator {
         // '1 mon', '30 days' and '720 hours' are one interval, and counting them by the text
         // they were written with counted three.
         if (val instanceof PgInterval) return RowKey.valueKey(val);
+        // Every other type answers to the one key builder, so DISTINCT counts what = counts: a
+        // timestamptz is the instant it names whatever offset it was written with, and an array
+        // is its elements rather than the text they were printed as.
+        if (val instanceof java.time.OffsetDateTime || val instanceof java.util.List<?>
+                || val instanceof AstExecutor.PgRow) {
+            return RowKey.valueKey(val);
+        }
         return val.toString();
     }
 
@@ -2015,7 +2034,7 @@ class SelectAggregateEvaluator {
             if (val == null) continue;
             if (val instanceof PgMoney) {
                 throw new MemgresException("function " + fname + "(money) does not exist"
-                        + "\n  Hint: No function matches the given name and argument types.", "42883");
+                        + "\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
             }
             // A value that is not a number at all is the same missing function sum reports; it
             // used to escape the accumulation loop below as an internal parse failure (XX000).
@@ -2045,7 +2064,7 @@ class SelectAggregateEvaluator {
         String typeName = declared != null ? declared.toRegtypeDisplay() : argTypeName(arg, sample);
         MemgresException e = new MemgresException(
                 "function " + fname + "(" + typeName + ") does not exist", "42883");
-        e.setHint("No function matches the given name and argument types.");
+        e.setHint("No function matches the given name and argument types. You might need to add explicit type casts.");
         return e;
     }
 
@@ -2094,8 +2113,16 @@ class SelectAggregateEvaluator {
             }
             if (!(v instanceof List<?>)) continue;
             int size = ((List<?>) v).size();
-            if (width < 0) width = size;
-            else if (width != size) {
+            if (width < 0) {
+                // The shape every later row is measured against comes from the first array, and
+                // an empty one has no shape to give: PostgreSQL refuses it where it stands rather
+                // than reporting the rows after it against a shape that was never taken. An empty
+                // array further along is just a row of the wrong width.
+                if (size == 0) {
+                    throw new MemgresException("cannot accumulate empty arrays", "2202E");
+                }
+                width = size;
+            } else if (width != size) {
                 throw new MemgresException(
                         "cannot accumulate arrays of different dimensionality", "2202E");
             }
@@ -2112,11 +2139,13 @@ class SelectAggregateEvaluator {
                     Object va = executor.evalExpr(item.expr(), a);
                     Object vb = executor.evalExpr(item.expr(), b);
                     // PG's default is NULLS LAST ascending, NULLS FIRST descending: nulls sort
-                    // as the largest value, and DESC flips that along with everything else.
+                    // as the largest value, and DESC flips that along with everything else. The
+                    // clause may say otherwise, and reading only the direction ignored it.
                     if (va == null || vb == null) {
                         if (va == null && vb == null) continue;
-                        int nullCmp = va == null ? 1 : -1;
-                        return item.descending() ? -nullCmp : nullCmp;
+                        boolean nullsFirst = item.nullsFirst() != null
+                                ? item.nullsFirst().booleanValue() : item.descending();
+                        return (va == null) == nullsFirst ? -1 : 1;
                     }
                     int cmp = executor.compareValues(va, vb);
                     if (item.descending()) cmp = -cmp;
