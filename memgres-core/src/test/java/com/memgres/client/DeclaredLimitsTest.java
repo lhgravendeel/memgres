@@ -394,7 +394,9 @@ class DeclaredLimitsTest {
     void aSeventhDimensionDoesNotExistToBeCounted() {
         assertRejected("54000", "number of array dimensions (7) exceeds the maximum allowed (6)",
                 "SELECT array_ndims(ARRAY[[[[[[[1]]]]]]])");
-        assertRejected("54000", "number of array dimensions (7) exceeds the maximum allowed (6)",
+        // The literal reader counts the braces as it walks them and has no total to name, which
+        // is why PostgreSQL words this one without the count the constructor gives.
+        assertRejected("54000", "number of array dimensions exceeds the maximum allowed (6)",
                 "SELECT array_ndims('{{{{{{{1}}}}}}}'::int[])");
     }
 

@@ -576,26 +576,36 @@ public final class JsonOperations {
 
     /** Strip null values from JSON object */
     public static String stripNulls(String json) {
-        return stripNulls(json, false);
+        return stripNulls(json, false, false);
     }
 
     /** Strip null values from JSON object, optionally in compact mode (no spaces). */
     public static String stripNulls(String json, boolean compact) {
+        return stripNulls(json, compact, false);
+    }
+
+    /**
+     * The same, with the second argument PostgreSQL's strip_nulls takes. A null member of an
+     * object always goes; {@code stripInArrays} says whether a null element of an array goes with
+     * it, which is not the default because dropping one moves every element after it.
+     */
+    public static String stripNulls(String json, boolean compact, boolean stripInArrays) {
         json = json.trim();
         if (json.startsWith("{")) {
             Map<String, String> map = parseObjectKeys(json);
             map.entrySet().removeIf(e -> "null".equals(e.getValue().trim()));
             for (Map.Entry<String, String> entry : map.entrySet()) {
-                entry.setValue(stripNulls(entry.getValue(), compact));
+                entry.setValue(stripNulls(entry.getValue(), compact, stripInArrays));
             }
             return mapToJson(map, compact);
         }
         if (json.startsWith("[")) {
-            List<String> elems = parseArrayElements(json);
-            for (int i = 0; i < elems.size(); i++) {
-                elems.set(i, stripNulls(elems.get(i), compact));
+            List<String> kept = new ArrayList<>();
+            for (String elem : parseArrayElements(json)) {
+                if (stripInArrays && "null".equals(elem.trim())) continue;
+                kept.add(stripNulls(elem, compact, stripInArrays));
             }
-            return elemsToJsonArray(elems);
+            return elemsToJsonArray(kept, compact);
         }
         return json;
     }
@@ -620,7 +630,12 @@ public final class JsonOperations {
                 if (c == '{' || c == '[') {
                     sb.append(c);
                     indent += 4;
-                    sb.append('\n').append(Strs.repeat(" ", indent));
+                    // A container holding nothing puts its closing brace on the next line with
+                    // nothing indented in between, so the indented line every other container
+                    // opens with is not written for it.
+                    if (!isEmptyContainer(json, i)) {
+                        sb.append('\n').append(Strs.repeat(" ", indent));
+                    }
                 } else if (c == '}' || c == ']') {
                     indent -= 4;
                     sb.append('\n').append(Strs.repeat(" ", Math.max(0, indent))).append(c);
@@ -636,6 +651,17 @@ public final class JsonOperations {
             }
         }
         return sb.toString();
+    }
+
+    /** True when the container opening at {@code open} holds nothing but whitespace. */
+    private static boolean isEmptyContainer(String json, int open) {
+        char close = json.charAt(open) == '{' ? '}' : ']';
+        for (int i = open + 1; i < json.length(); i++) {
+            char c = json.charAt(i);
+            if (c == ' ' || c == '\n' || c == '\r' || c == '\t') continue;
+            return c == close;
+        }
+        return false;
     }
 
     // ---- JSON array element access ----
@@ -846,9 +872,15 @@ public final class JsonOperations {
     }
 
     private static String elemsToJsonArray(List<String> elems) {
+        return elemsToJsonArray(elems, false);
+    }
+
+    /** The same, written the compact way the json type's own text output is written. */
+    private static String elemsToJsonArray(List<String> elems, boolean compact) {
         StringBuilder sb = new StringBuilder("[");
+        String sep = compact ? "," : ", ";
         for (int i = 0; i < elems.size(); i++) {
-            if (i > 0) sb.append(", ");
+            if (i > 0) sb.append(sep);
             sb.append(elems.get(i));
         }
         sb.append("]");

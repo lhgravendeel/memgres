@@ -2490,6 +2490,26 @@ public class Session {
         }
     }
 
+    /**
+     * Undo a CREATE TYPE ... AS RANGE. A range is a type like any other, and a transaction that
+     * rolled back created none: the name it took has to be free again for the next statement.
+     */
+    public static final class CreateRangeTypeUndo implements UndoEntry {
+        public final String schema;
+        public final String typeName;
+
+        public CreateRangeTypeUndo(String schema, String typeName) {
+            this.schema = schema;
+            this.typeName = typeName;
+        }
+
+        @Override
+        public void undo(Database db) {
+            db.getRangeTypes().remove(TypeNamespace.key(schema, typeName));
+            db.unregisterSchemaObject(schema, "range", typeName);
+        }
+    }
+
     /** Undo a CREATE DOMAIN. */
     public static final class CreateDomainUndo implements UndoEntry {
         public final String schema;

@@ -242,14 +242,27 @@ public final class HstoreValue {
         for (Map.Entry<String, String> entry : sorted.entrySet()) {
             if (!first) sb.append(", ");
             first = false;
-            sb.append('"').append(entry.getKey()).append('"');
+            // A key or a value carrying a quote or a backslash has to be written with it escaped,
+            // or the text hstore's own reader is handed back is not the pair that went in.
+            appendQuoted(sb, entry.getKey());
             sb.append("=>");
             if (entry.getValue() == null) {
                 sb.append("NULL");
             } else {
-                sb.append('"').append(entry.getValue()).append('"');
+                appendQuoted(sb, entry.getValue());
             }
         }
         return sb.toString();
+    }
+
+    /** One key or value between quotes, with the two characters that would end it escaped. */
+    private static void appendQuoted(StringBuilder sb, String text) {
+        sb.append('"');
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (c == '"' || c == '\\') sb.append('\\');
+            sb.append(c);
+        }
+        sb.append('"');
     }
 }

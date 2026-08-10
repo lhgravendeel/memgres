@@ -110,112 +110,48 @@ class ArrayOperationHandler {
         return formatArrayForOutput(elements);
     }
 
+    /**
+     * A slice {@code a[i:j]}. A bound that is not given is the array's own; a bound that is NULL
+     * makes the whole slice NULL, because there is no range to take. A slice that falls outside
+     * the array is the empty array rather than nothing at all.
+     */
     Object evalArraySlice(ArraySliceExpr slice, RowContext ctx) {
         Object arrVal = executor.evalExpr(slice.array(), ctx);
         if (arrVal == null) return null;
-        List<?> elements;
-        int lowerBound = 1;
-        // Multi-dim slicing: when the source is itself a slice result (chained [1:2][1:1])
-        // and elements are lists, apply slice to each sub-array (column-wise)
-        boolean isMultiDim = false;
-        boolean isChainedSlice = slice.array() instanceof ArraySliceExpr;
-        if (arrVal instanceof String && ((String) arrVal).matches("\\[\\d+:\\d+\\]=\\{.*\\}")) {
-            String s = (String) arrVal;
-            // Custom lower-bound array: "[lb:ub]={...}"
-            int eqIdx = s.indexOf('=');
-            String boundsStr = s.substring(0, eqIdx);
-            String[] parts = boundsStr.substring(1, boundsStr.length() - 1).split(":");
-            lowerBound = Integer.parseInt(parts[0].trim());
-            String content = s.substring(eqIdx + 1);
-            elements = FunctionEvaluator.parseSimplePgArray(content);
-        } else if (arrVal instanceof List<?>) {
-            elements = (List<?>) arrVal;
-            isMultiDim = isChainedSlice && !elements.isEmpty() && elements.get(0) instanceof List<?>;
-        } else if (arrVal instanceof String && ((String) arrVal).startsWith("{") && ((String) arrVal).endsWith("}")) {
-            // Quote- and nesting-aware parse (commas inside quoted elements are not separators)
-            elements = FunctionEvaluator.parseSimplePgArray((String) arrVal);
-        } else {
-            return arrVal; // not an array, return as-is
-        }
+        PgArray array = PgArray.from(arrVal);
+        if (array == null) return arrVal;
 
-        int size = elements.size();
-        // PG 1-based indexing; lower is inclusive, upper is inclusive
-        int lo = slice.lower() != null ? executor.toInt(executor.evalExpr(slice.lower(), ctx)) : lowerBound;
-        int hi = slice.upper() != null ? executor.toInt(executor.evalExpr(slice.upper(), ctx)) : lowerBound + size - 1;
+        int lowerBound = array.lowerBound(1);
+        int size = array.size();
+        Integer lo = sliceBound(slice.lower(), ctx);
+        Integer hi = sliceBound(slice.upper(), ctx);
+        if (slice.lower() != null && lo == null) return null;
+        if (slice.upper() != null && hi == null) return null;
+        if (lo == null) lo = lowerBound;
+        if (hi == null) hi = lowerBound + size - 1;
 
-        // Multi-dimensional array: apply slice to each sub-array (column-wise slicing)
-        if (isMultiDim) {
-            List<Object> result = new ArrayList<>();
-            for (Object elem : elements) {
-                if (elem instanceof List<?>) {
-                    List<?> subList = (List<?>) elem;
-                    int subSize = subList.size();
-                    int loIdx = lo - lowerBound;
-                    int hiIdx = hi - lowerBound;
-                    if (loIdx > hiIdx || hiIdx < 0 || loIdx >= subSize) {
-                        result.add(new ArrayList<>());
-                    } else {
-                        int from = Math.max(0, loIdx);
-                        int to = Math.min(subSize - 1, hiIdx);
-                        result.add(new ArrayList<>(subList.subList(from, to + 1)));
-                    }
-                } else {
-                    result.add(elem);
-                }
-            }
-            return formatArrayForOutput(result);
-        }
-
-        // Convert to 0-based index
         int loIdx = lo - lowerBound;
         int hiIdx = hi - lowerBound;
-
-        if (size == 0) {
-            return null;
-        }
-        if (loIdx > hiIdx || hiIdx < 0 || loIdx >= size) {
-            return "{}";
+        if (size == 0 || loIdx > hiIdx || hiIdx < 0 || loIdx >= size) {
+            return PgArray.of(new ArrayList<Object>());
         }
         int from = Math.max(0, loIdx);
         int to = Math.min(size - 1, hiIdx);
-        List<?> sub = new java.util.ArrayList<>(elements.subList(from, to + 1));
+        // A slice is an array in its own right, and PostgreSQL gives it the ordinary bounds
+        // whatever bounds it was cut from.
+        return PgArray.ofType(new ArrayList<Object>(array.subList(from, to + 1)),
+                array.elementType());
+    }
 
-        // Multi-dimensional array: if elements are lists, return as List (not string)
-        // so that chained slices can apply to each sub-array
-        if (!sub.isEmpty() && sub.get(0) instanceof List<?>) {
-            return sub;
-        }
-        return formatArrayForOutput(sub);
+    /** One bound of a slice, or null when it is absent or evaluates to NULL. */
+    private Integer sliceBound(Expression bound, RowContext ctx) {
+        if (bound == null) return null;
+        Object value = executor.evalExpr(bound, ctx);
+        return value == null ? null : (Integer) executor.toInt(value);
     }
 
     String formatArrayForOutput(List<?> elements) {
-        if (elements.isEmpty()) return "{}";
-        StringBuilder sb = new StringBuilder("{");
-        for (int i = 0; i < elements.size(); i++) {
-            if (i > 0) sb.append(",");
-            Object e = elements.get(i);
-            if (e == null) sb.append("NULL");
-            else if (e instanceof List<?>) sb.append(formatArrayForOutput((List<?>) e));
-            else if (e instanceof String && needsArrayQuoting((String) e)) {
-                sb.append("\"").append(((String) e).replace("\\", "\\\\").replace("\"", "\\\"")).append("\"");
-            } else if (e instanceof AstExecutor.PgRow) {
-                // A composite element renders with commas, so it always needs quoting
-                String rowText = ((AstExecutor.PgRow) e).toPgText();
-                sb.append("\"").append(rowText.replace("\\", "\\\\").replace("\"", "\\\"")).append("\"");
-            } else sb.append(e);
-        }
-        sb.append("}");
-        return sb.toString();
-    }
-
-    /** True if a string element must be double-quoted in PG array output syntax. */
-    private static boolean needsArrayQuoting(String s) {
-        if (s.isEmpty() || s.equalsIgnoreCase("NULL")) return true;
-        for (int i = 0; i < s.length(); i++) {
-            char c = s.charAt(i);
-            if (c == ',' || c == '{' || c == '}' || c == '"' || c == '\\' || Character.isWhitespace(c)) return true;
-        }
-        return false;
+        return TypeCoercion.formatPgArray(elements);
     }
 
     List<Object> parsePostgresArrayLiteral(String s) {
@@ -348,7 +284,7 @@ class ArrayOperationHandler {
                 }
             }
         }
-        return list;
+        return PgArray.of(list);
     }
 
     /** PG stores an array's dimension count in a fixed-size header, capped at MAXDIM. */

@@ -1,6 +1,7 @@
 package com.memgres.engine;
 
 import com.memgres.engine.parser.ast.AnyAllArrayExpr;
+import com.memgres.engine.parser.ast.SubscriptExpr;
 import com.memgres.engine.parser.ast.ArrayExpr;
 import com.memgres.engine.parser.ast.BetweenExpr;
 import com.memgres.engine.parser.ast.BinaryExpr;
@@ -629,6 +630,22 @@ public final class RuleDeparser {
         }
         if (e instanceof FunctionCallExpr) {
             return renderFunction((FunctionCallExpr) e, cols);
+        }
+        if (e instanceof SubscriptExpr) {
+            // Brackets are written back as brackets, so a rule that reads an array element still
+            // reads that element when its definition is read back.
+            SubscriptExpr sub = (SubscriptExpr) e;
+            StringBuilder sb = new StringBuilder(deparse(sub.base(), cols));
+            for (SubscriptExpr.Subscript one : sub.subscripts()) {
+                sb.append('[');
+                if (one.lower() != null) sb.append(deparse(one.lower(), cols));
+                if (one.slice()) {
+                    sb.append(':');
+                    if (one.upper() != null) sb.append(deparse(one.upper(), cols));
+                }
+                sb.append(']');
+            }
+            return sb.toString();
         }
         if (e instanceof ArrayExpr) {
             return renderArray((ArrayExpr) e, null, cols);

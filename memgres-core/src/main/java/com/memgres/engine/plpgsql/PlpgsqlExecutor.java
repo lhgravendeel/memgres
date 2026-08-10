@@ -596,9 +596,32 @@ public class PlpgsqlExecutor {
     }
 
     private static int toInt(Object val) {
-        if (val instanceof Number) return ((Number) val).intValue();
+        if (val instanceof Number) {
+            long written = ((Number) val).longValue();
+            // An integer loop variable and the int4 operators are declared over integer, so a
+            // value too wide for one is refused rather than folded round into the range: a loop
+            // written 1..3000000000 counted up to a negative bound and never entered its body.
+            if (written < Integer.MIN_VALUE || written > Integer.MAX_VALUE) {
+                throw new MemgresException("integer out of range", "22003");
+            }
+            return (int) written;
+        }
         if (val instanceof String) return Integer.parseInt((String) val);
         throw new MemgresException("cannot convert " + val + " to integer", "22023");
+    }
+
+    /**
+     * A subscript an assignment writes through.
+     *
+     * <p>An assignment has to say which element it changes and a null names none, so PostgreSQL
+     * refuses the assignment itself rather than complaining that the null would not read as a
+     * number — which is what a general-purpose reader has to say about it.
+     */
+    private static int assignmentSubscript(Object val) {
+        if (val == null) {
+            throw new MemgresException("array subscript in assignment must not be null", "22004");
+        }
+        return toInt(val);
     }
 
     private Object executeSqlFunction(PgFunction function, List<Object> args) {
@@ -2815,8 +2838,8 @@ public class PlpgsqlExecutor {
                 ? containerType.substring(0, containerType.length() - 2) : null;
         List<Object> list = toMutableArray(container);
         if (step.isSlice()) {
-            int lower = toInt(evalExpr(step.index, scope));
-            int upper = toInt(evalExpr(step.upper, scope));
+            int lower = assignmentSubscript(evalExpr(step.index, scope));
+            int upper = assignmentSubscript(evalExpr(step.upper, scope));
             List<Object> replacement = toMutableArray(value);
             for (int i = lower; i <= upper; i++) {
                 setArrayElement(list, i, i - lower < replacement.size() ? replacement.get(i - lower) : null);
@@ -2824,7 +2847,7 @@ public class PlpgsqlExecutor {
             return list;
         }
 
-        int index = toInt(evalExpr(step.index, scope));
+        int index = assignmentSubscript(evalExpr(step.index, scope));
         Object existing = (index >= 1 && index <= list.size()) ? list.get(index - 1) : null;
         // A multi-dimensional array subscripts into itself, so the element keeps the array type
         String childType = last ? null
@@ -3129,6 +3152,12 @@ public class PlpgsqlExecutor {
     // ---- Cursors ----
 
     private void executeOpenCursor(PlpgsqlStatement.OpenCursorStmt stmt, Scope scope) {
+        // OPEN names a cursor variable the body declared. A name that stands for nothing has no
+        // cursor behind it to open, and doing nothing at all hid the typo that put it there.
+        if (!scope.has(stmt.cursorName())) {
+            throw new MemgresException("\"" + stmt.cursorName() + "\" is not a known variable",
+                    "42601");
+        }
         String sql = stmt.sql();
         Object bound = scope.get(stmt.cursorName());
         if (bound instanceof CursorState) {

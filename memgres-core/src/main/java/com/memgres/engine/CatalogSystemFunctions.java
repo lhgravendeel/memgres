@@ -192,6 +192,31 @@ class CatalogSystemFunctions {
                     }
                 }
 
+                // Subscripting an array yields one element of it, a range of one yields another
+                // array, and only a json container yields json.
+                if (rawExpr instanceof SubscriptExpr) {
+                    SubscriptExpr sub = (SubscriptExpr) rawExpr;
+                    if (ctx != null && sub.base() instanceof ColumnRef) {
+                        ColumnRef base = (ColumnRef) sub.base();
+                        Column baseDef = ctx.resolveColumnDef(base.table(), base.column());
+                        if (baseDef != null && baseDef.getArrayElementType() != null) {
+                            return pgTypeDisplayName(sub.isSlice()
+                                    ? baseDef.getType() : baseDef.getArrayElementType());
+                        }
+                    }
+                    String arrayType = executor.binaryOpEvaluator
+                            .declaredTypeForResolution(sub.base(), ctx);
+                    if (arrayType != null && arrayType.endsWith("[]")) {
+                        if (sub.isSlice()) return arrayType;
+                        DataType element = DataType.fromPgName(arrayType
+                                .substring(0, arrayType.length() - 2)
+                                .toLowerCase().replaceAll("\\(.*\\)", "").trim());
+                        if (element != null) return pgTypeDisplayName(element);
+                    }
+                    DataType inferred = executor.exprEvaluator.inferExprType(rawExpr);
+                    if (inferred != null) return pgTypeDisplayName(inferred);
+                }
+
                 // Subscripting an array yields one element of it, so the answer is the array's
                 // element type — jsonb only where the thing subscripted really was a jsonb.
                 if (rawExpr instanceof BinaryExpr && ctx != null
@@ -220,6 +245,15 @@ class CatalogSystemFunctions {
                         && (((BinaryExpr) rawExpr).op() == BinaryExpr.BinOp.JSON_ARROW
                             || ((BinaryExpr) rawExpr).op() == BinaryExpr.BinOp.JSON_SUBSCRIPT)) {
                     return "jsonb";
+                }
+
+                // A range the reader defined has no DataType of its own, and its constructor hands
+                // back the text the range prints as, so the call's own name is the only thing left
+                // that says which type produced the value.
+                if (rawExpr instanceof FunctionCallExpr) {
+                    String called = FunctionEvaluator.stripSchemaPrefix(
+                            ((FunctionCallExpr) rawExpr).name().toLowerCase(java.util.Locale.ROOT));
+                    if (executor.database.isRangeType(called)) return typeDisplay(called);
                 }
 
                 // A range, a shape, a document and a bit string are all carried as their own

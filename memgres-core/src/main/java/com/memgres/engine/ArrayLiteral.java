@@ -45,6 +45,13 @@ final class ArrayLiteral {
         return elements;
     }
 
+    /** The lower bound of each dimension, one entry per dimension. */
+    int[] lowerBounds() {
+        int[] copy = new int[lowerBounds.length];
+        System.arraycopy(lowerBounds, 0, copy, 0, lowerBounds.length);
+        return copy;
+    }
+
     /** True when the array states a lower bound other than 1, which its text form has to carry. */
     boolean hasCustomLowerBounds() {
         for (int i = 0; i < lowerBounds.length; i++) {
@@ -121,7 +128,7 @@ final class ArrayLiteral {
             while (p < text.length() && isSpace(text.charAt(p))) p++;
             if (p >= text.length() || text.charAt(p) != '[') break;
             p++;
-            if (declared.size() >= MAX_DIM) throw dimensionOverflow(declared.size() + 1);
+            if (declared.size() >= MAX_DIM) throw dimensionOverflow();
             int q = skipSignedDigits(text, p);
             if (q == p) throw malformed(text);
             int lb = 1;
@@ -210,7 +217,7 @@ final class ArrayLiteral {
                         throw malformed(str);
                     }
                     state = LEVEL_STARTED;
-                    if (nestLevel >= MAX_DIM) throw dimensionOverflow(nestLevel + 1);
+                    if (nestLevel >= MAX_DIM) throw dimensionOverflow();
                     temp[nestLevel] = 0;
                     nestLevel++;
                     if (ndim < nestLevel) ndim = nestLevel;
@@ -383,8 +390,11 @@ final class ArrayLiteral {
         return new MemgresException("malformed array literal: \"" + text + "\"", "22P02");
     }
 
-    private static MemgresException dimensionOverflow(int ndim) {
-        return new MemgresException("number of array dimensions (" + ndim
-                + ") exceeds the maximum allowed (" + MAX_DIM + ")", "54000");
+    private static MemgresException dimensionOverflow() {
+        // Array input stops at the first brace too deep to follow, so it has no total depth to
+        // report and PostgreSQL names only the maximum. The count belongs to the places handed a
+        // finished shape, such as array_fill and the ARRAY constructor, which do report it.
+        return new MemgresException(
+                "number of array dimensions exceeds the maximum allowed (" + MAX_DIM + ")", "54000");
     }
 }

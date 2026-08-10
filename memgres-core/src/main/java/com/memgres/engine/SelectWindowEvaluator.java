@@ -1703,6 +1703,12 @@ class SelectWindowEvaluator {
             if (currentVal instanceof java.time.OffsetDateTime) {
                 return signed.addTo((java.time.OffsetDateTime) currentVal);
             }
+            // A window ordered by an interval measures its offset in intervals too, and the two
+            // are added the way interval + interval is added anywhere: months to months, days to
+            // days, so a month stays a calendar month here as well.
+            if (currentVal instanceof PgInterval) {
+                return ((PgInterval) currentVal).plus(signed);
+            }
         }
         // Numeric offset — the boundary is compared against the ORDER BY values with
         // Comparable.compareTo, so it must come back as the same class as currentVal.

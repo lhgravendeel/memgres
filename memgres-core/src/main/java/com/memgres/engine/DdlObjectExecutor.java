@@ -67,9 +67,29 @@ class DdlObjectExecutor {
             // outlives the transaction that never committed it.
             executor.recordUndo(new Session.CreateEnumTypeUndo(schema, name));
         } else if (stmt.rangeSubtype() != null) {
-            ddl.resolveColumnType(stmt.rangeSubtype(), null);
+            DdlExecutor.ResolvedType subtype = ddl.resolveColumnType(stmt.rangeSubtype(), null);
+            // A canonical function takes the range being defined and answers one, so it can only be
+            // written once the name already stands for something — which is what the shell type is
+            // for, and why a definition that names one without having reserved the name first is
+            // refused rather than left to fail when the function is looked up.
+            if (stmt.rangeCanonical() && !wasShell) {
+                throw PgErrors.invalidObjectState(
+                        "cannot specify a canonical function without a pre-created shell type");
+            }
+            if (stmt.rangeSubtypeOpclass() == null) {
+                DdlDefinitionChecks.requireOrderableRangeSubtype(subtype.dataType());
+            } else {
+                requireBtreeOpclass(stmt.rangeSubtypeOpclass());
+            }
+            // A type created under a name a dropped type used to answer to is a new type, and
+            // takes a new OID -- PostgreSQL never reuses one.
+            executor.identity().typeCreated(TypeNamespace.key(schema, name));
             executor.database.addRangeType(schema, name, stmt.rangeSubtype());
             executor.database.registerSchemaObject(schema, "range", name);
+            // CREATE TYPE is undone by ROLLBACK like any other DDL; without this the type
+            // outlives the transaction that never committed it, and the name it left behind
+            // refuses the next statement that tries to create it for real.
+            executor.recordUndo(new Session.CreateRangeTypeUndo(schema, name));
         } else if (stmt.compositeFields() != null) {
             // Attribute names are checked before their types, as PostgreSQL does: a duplicate name
             // is reported even when the second attribute also names a type that does not exist.
@@ -91,6 +111,21 @@ class DdlObjectExecutor {
         }
         if (wasShell) executor.database.getShellTypes().remove(TypeNamespace.key(schema, name));
         return QueryResult.command(QueryResult.Type.CREATE_TYPE, 0);
+    }
+
+    /**
+     * Refuse a SUBTYPE_OPCLASS that names no btree class, whether one PostgreSQL ships or one this
+     * database was told about. The complaint names the access method as well as the class, because
+     * a class belongs to one method and it is btree's list that was searched.
+     */
+    private void requireBtreeOpclass(String written) {
+        String bare = TypeNamespace.bare(written).toLowerCase(Locale.ROOT);
+        if (CatalogTypeSystemBuilder.shipsBtreeOpclass(bare)
+                || executor.database.hasOperatorClass(bare + ":btree")) {
+            return;
+        }
+        throw new MemgresException("operator class \"" + bare
+                + "\" does not exist for access method \"btree\"", "42704");
     }
 
     // ---- ALTER TYPE ----

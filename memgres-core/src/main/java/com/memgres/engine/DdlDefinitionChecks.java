@@ -52,6 +52,33 @@ public final class DdlDefinitionChecks {
             DataType.TEXT, DataType.VARCHAR, DataType.CHAR, DataType.NAME,
             DataType.TEXT_ARRAY, DataType.VARCHAR_ARRAY, DataType.CHAR_ARRAY, DataType.NAME_ARRAY);
 
+    // ---- range subtypes ----
+
+    /**
+     * Types PostgreSQL can put no two values of in order: it has no default btree operator class
+     * for them and none for any type they are binary-coercible to either. Measured against
+     * PostgreSQL 18 rather than read off its opclass list, because the list is not the whole rule —
+     * a varchar borrows text's class and a regclass borrows oid's, so neither belongs here even
+     * though neither has a class of its own.
+     */
+    private static final Set<DataType> UNORDERED_TYPES = Cols.setOf(
+            DataType.JSON, DataType.XML, DataType.XID,
+            DataType.POINT, DataType.LINE, DataType.LSEG, DataType.BOX,
+            DataType.PATH, DataType.POLYGON, DataType.CIRCLE);
+
+    /**
+     * A range keeps its bounds in order, and it is the subtype's default btree operator class that
+     * puts them there — so a subtype nothing can order is one no range can be built over.
+     * PostgreSQL says so when the type is defined, not when a value of it is first written.
+     */
+    public static void requireOrderableRangeSubtype(DataType subtype) {
+        if (subtype == null || !UNORDERED_TYPES.contains(subtype)) return;
+        throw new MemgresException("data type " + CatalogHelper.pgTypeName(subtype)
+                + " has no default operator class for access method \"btree\""
+                + "\n  Hint: You must specify an operator class for the range type or define a"
+                + " default operator class for the subtype.", "42704");
+    }
+
     // ---- column names ----
 
     /**

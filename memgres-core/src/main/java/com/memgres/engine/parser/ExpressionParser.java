@@ -509,9 +509,25 @@ public class ExpressionParser {
             sb.append(")");
         }
 
-        // Handle array notation: [], [][], etc.
+        // The standard spells an array type with the word ARRAY, and lets one length follow it.
+        // PostgreSQL reads that as the same type its own brackets name -- text ARRAY and
+        // text ARRAY[4] are both text[] -- because an array column carries no length at all.
+        if (checkKeyword("ARRAY")) {
+            advance();
+            if (check(TokenType.LEFT_BRACKET)) {
+                advance();
+                expect(TokenType.INTEGER_LITERAL);
+                expect(TokenType.RIGHT_BRACKET);
+            }
+            sb.append("[]");
+            return sb.toString();
+        }
+
+        // Handle array notation: [], [3], [][], etc. A dimension length is written where the
+        // standard allows one but names no other type, so int[3] is the same int[] that int[] is.
         while (check(TokenType.LEFT_BRACKET)) {
             advance();
+            match(TokenType.INTEGER_LITERAL);
             expect(TokenType.RIGHT_BRACKET);
             sb.append("[]");
         }
@@ -1376,34 +1392,37 @@ public class ExpressionParser {
                     ArrayExpr ae = (ArrayExpr) expr;
                     throw new ParseException("syntax error at or near \"[\"", peek());
                 }
-                advance(); // consume [
-                // Check for open-ended slice: [:upper]
-                Expression lower = null;
-                Expression upper = null;
-                boolean isSlice = false;
-                if (check(TokenType.COLON)) {
-                    // [:upper], no lower bound
-                    advance(); // consume :
-                    isSlice = true;
-                    if (!check(TokenType.RIGHT_BRACKET)) {
-                        upper = parseExpression();
-                    }
-                } else {
-                    lower = parseExpression();
+                // Every pair of brackets that follows belongs to the same reference: PostgreSQL
+                // reads a[1][2] as one subscript into a two-dimensional array, not as a subscript
+                // of a subscript.
+                java.util.List<SubscriptExpr.Subscript> subscripts =
+                        new java.util.ArrayList<SubscriptExpr.Subscript>();
+                while (check(TokenType.LEFT_BRACKET)) {
+                    advance(); // consume [
+                    Expression lower = null;
+                    Expression upper = null;
+                    boolean isSlice = false;
                     if (check(TokenType.COLON)) {
+                        // [:upper], no lower bound
                         advance(); // consume :
                         isSlice = true;
                         if (!check(TokenType.RIGHT_BRACKET)) {
                             upper = parseExpression();
                         }
+                    } else {
+                        lower = parseExpression();
+                        if (check(TokenType.COLON)) {
+                            advance(); // consume :
+                            isSlice = true;
+                            if (!check(TokenType.RIGHT_BRACKET)) {
+                                upper = parseExpression();
+                            }
+                        }
                     }
+                    expect(TokenType.RIGHT_BRACKET);
+                    subscripts.add(new SubscriptExpr.Subscript(lower, upper, isSlice));
                 }
-                expect(TokenType.RIGHT_BRACKET);
-                if (isSlice) {
-                    expr = new ArraySliceExpr(expr, lower, upper);
-                } else {
-                    expr = new BinaryExpr(expr, BinaryExpr.BinOp.JSON_SUBSCRIPT, lower); // array/container subscript
-                }
+                expr = new SubscriptExpr(expr, subscripts);
             } else if (matchKeywords("AT", "TIME", "ZONE")) {
                 Expression zone = parsePrimary();
                 expr = new AtTimeZoneExpr(expr, zone);

@@ -1059,6 +1059,12 @@ class StringFunctions {
                 }
                 if (fn.args().size() > 5) {
                     subexpr = executor.toInt(executor.evalExpr(fn.args().get(5), ctx));
+                    // Which group is wanted is settled before the pattern is matched, so a number
+                    // that could name no group at all is refused whether or not anything matches.
+                    if (subexpr < 0) {
+                        throw new MemgresException(
+                                "invalid value for parameter \"subexpr\": " + subexpr, "22023");
+                    }
                 }
                 String s = str.toString();
                 int offset = Math.min(start - 1, s.length());
@@ -1069,6 +1075,9 @@ class StringFunctions {
                 while (m.find(regionStart)) {
                     found++;
                     if (found == nthMatch) {
+                        // A pattern holding fewer groups than that captured nothing, which is the
+                        // same nothing a group that took no part in the match captured.
+                        if (subexpr > m.groupCount()) return null;
                         return m.group(subexpr);
                     }
                     regionStart = m.end();
@@ -1107,6 +1116,12 @@ class StringFunctions {
                 }
                 if (fn.args().size() > 6) {
                     subexpr = executor.toInt(executor.evalExpr(fn.args().get(6), ctx));
+                    // Which group is wanted is settled before the pattern is matched, so a number
+                    // that could name no group at all is refused whether or not anything matches.
+                    if (subexpr < 0) {
+                        throw new MemgresException(
+                                "invalid value for parameter \"subexpr\": " + subexpr, "22023");
+                    }
                 }
                 String s = str.toString();
                 int offset = Math.min(start - 1, s.length());
@@ -1118,6 +1133,9 @@ class StringFunctions {
                     found++;
                     if (found == nthMatch) {
                         int grp = subexpr;
+                        // A pattern holding fewer groups than that captured nothing to give a
+                        // position for, which is the answer no match gets.
+                        if (grp > m.groupCount()) return 0;
                         if (endOption == 1) {
                             return m.end(grp) + 1; // position after the match end, 1-based
                         }
@@ -1222,13 +1240,16 @@ class StringFunctions {
                     // Format the value
                     String formatted;
                     if (spec == 'L') {
-                        if (argVal == null) formatted = "NULL";
-                        else formatted = "'" + argVal.toString().replace("'", "''") + "'";
+                        // %L is quote_nullable, not a quote of its own: writing one here left a
+                        // backslash unescaped that quote_literal would have escaped.
+                        formatted = Quoting.nullableLiteral(argVal);
                     } else if (spec == 'I') {
                         if (argVal == null) throw new MemgresException("null values cannot be formatted as an SQL identifier", "22004");
-                        formatted = formatIdentifier(argVal.toString());
+                        formatted = Quoting.identifier(TypeCoercion.toString(argVal));
                     } else {
-                        formatted = argVal == null ? "" : argVal.toString();
+                        // %s writes the value by its own type's output function, so a bytea is its
+                        // hex form and a boolean is one letter rather than Java's spelling.
+                        formatted = argVal == null ? "" : TypeCoercion.toString(argVal);
                     }
                     // Apply width padding
                     if (hasWidth && formatted.length() < width) {
@@ -1506,31 +1527,15 @@ class StringFunctions {
             case "quote_literal": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
-                String s = arg.toString();
-                String escaped = s.replace("'", "''").replace("\\", "\\\\");
-                // PG uses E'' prefix when string contains backslashes
-                if (s.contains("\\")) {
-                    return "E'" + escaped + "'";
-                }
-                return "'" + escaped + "'";
+                return Quoting.literal(TypeCoercion.toString(arg));
             }
             case "quote_ident": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
-                String ident = arg.toString();
-                // Only quote if it contains special chars, is mixed case, or is a keyword
-                if (ident.matches("[a-z_][a-z0-9_]*") && !isReservedWord(ident)) {
-                    return ident;
-                }
-                return "\"" + ident.replace("\"", "\"\"") + "\"";
+                return Quoting.identifier(TypeCoercion.toString(arg));
             }
             case "quote_nullable": {
-                Object arg = executor.evalExpr(fn.args().get(0), ctx);
-                if (arg == null) return "NULL";
-                String qs = arg.toString();
-                String qescaped = qs.replace("'", "''").replace("\\", "\\\\");
-                if (qs.contains("\\")) return "E'" + qescaped + "'";
-                return "'" + qescaped + "'";
+                return Quoting.nullableLiteral(executor.evalExpr(fn.args().get(0), ctx));
             }
             case "to_hex": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
@@ -1828,14 +1833,6 @@ class StringFunctions {
 
     private boolean isReservedWord(String word) {
         return RESERVED_WORDS.contains(word.toLowerCase());
-    }
-
-    /** Format an identifier using PG's quote_ident logic: only quote when needed. */
-    private String formatIdentifier(String ident) {
-        if (ident.matches("[a-z_][a-z0-9_]*") && !isReservedWord(ident)) {
-            return ident;
-        }
-        return "\"" + ident.replace("\"", "\"\"") + "\"";
     }
 
     private void validateEncoding(String encoding) {

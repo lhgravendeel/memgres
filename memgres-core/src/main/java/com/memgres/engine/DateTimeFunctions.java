@@ -111,10 +111,35 @@ class DateTimeFunctions {
                 return truncateDate(field, source, zone);
             }
             case "make_date": {
-                int year = executor.toInt(executor.evalExpr(fn.args().get(0), ctx));
-                int month = executor.toInt(executor.evalExpr(fn.args().get(1), ctx));
-                int day = executor.toInt(executor.evalExpr(fn.args().get(2), ctx));
-                // A negative year names a BC year, which is one lower as a proleptic year
+                Object[] fields = new Object[]{executor.evalExpr(fn.args().get(0), ctx),
+                        executor.evalExpr(fn.args().get(1), ctx),
+                        executor.evalExpr(fn.args().get(2), ctx)};
+                // make_date is declared over integers alone, so a number too wide for one is a
+                // bigint -- and there is no make_date over bigint for the call to resolve to. Cut
+                // to width instead, 4294967297 became the year 1 and the call quietly succeeded.
+                StringBuilder declared = new StringBuilder();
+                boolean tooWide = false;
+                for (int i = 0; i < fields.length; i++) {
+                    boolean wide = fields[i] instanceof Number
+                            && (((Number) fields[i]).longValue() > Integer.MAX_VALUE
+                                    || ((Number) fields[i]).longValue() < Integer.MIN_VALUE);
+                    tooWide = tooWide || wide;
+                    declared.append(i == 0 ? "" : ", ").append(wide ? "bigint" : "integer");
+                }
+                if (tooWide) {
+                    throw new MemgresException(
+                            "function make_date(" + declared + ") does not exist", "42883");
+                }
+                int year = executor.toInt(fields[0]);
+                int month = executor.toInt(fields[1]);
+                int day = executor.toInt(fields[2]);
+                // There is no year nought: a negative year names a BC year, which is one lower
+                // as a proleptic year, and a zero names nothing at all.
+                if (year == 0) {
+                    throw new MemgresException("date field value out of range: 0-"
+                            + String.format("%02d", month) + "-" + String.format("%02d", day),
+                            "22008");
+                }
                 if (year < 0) year = year + 1;
                 try {
                     return java.time.LocalDate.of(year, month, day);
@@ -131,7 +156,7 @@ class DateTimeFunctions {
                 double sec = executor.toDouble(executor.evalExpr(fn.args().get(5), ctx));
                 int secs = (int) sec;
                 int nanos = (int) Math.round((sec - secs) * 1_000_000_000);
-                return java.time.LocalDateTime.of(year, month, day, hour, minute, secs, nanos);
+                return makeTimestamp(year, month, day, hour, minute, secs, nanos);
             }
             case "make_timestamptz": {
                 int year = executor.toInt(executor.evalExpr(fn.args().get(0), ctx));
@@ -144,7 +169,8 @@ class DateTimeFunctions {
                 int nanos = (int) Math.round((sec - secs) * 1_000_000_000);
                 String tz = fn.args().size() > 6 ? executor.evalExpr(fn.args().get(6), ctx).toString() : "UTC";
                 java.time.ZoneId zone = java.time.ZoneId.of(tz);
-                return java.time.LocalDateTime.of(year, month, day, hour, minute, secs, nanos).atZone(zone).toOffsetDateTime();
+                return makeTimestamp(year, month, day, hour, minute, secs, nanos)
+                        .atZone(zone).toOffsetDateTime();
             }
             case "make_time": {
                 int hour = executor.toInt(executor.evalExpr(fn.args().get(0), ctx));
@@ -299,6 +325,19 @@ class DateTimeFunctions {
                 if (source == null) return null;
                 if (source instanceof Number) {
                     Number n = (Number) source;
+                    // The epoch seconds arrive in a float8, which carries two values no instant
+                    // answers to: an infinity is the timestamp's own infinity rather than some
+                    // instant that far out, and NaN is no point in time at all.
+                    double epoch = n.doubleValue();
+                    if (Double.isNaN(epoch)) {
+                        throw new MemgresException("timestamp cannot be NaN", "22008");
+                    }
+                    if (Double.isInfinite(epoch)) {
+                        return java.time.OffsetDateTime.of(epoch > 0
+                                        ? TypeCoercion.TIMESTAMP_INFINITY
+                                        : TypeCoercion.TIMESTAMP_NEG_INFINITY,
+                                java.time.ZoneOffset.UTC);
+                    }
                     return java.time.OffsetDateTime.ofInstant(java.time.Instant.ofEpochSecond(n.longValue()), java.time.ZoneOffset.UTC);
                 }
                 if (fn.args().size() >= 2) {
@@ -917,6 +956,22 @@ class DateTimeFunctions {
     /** A clock field padded the way PostgreSQL writes it back in a range complaint. */    /** A clock field padded the way PostgreSQL writes it back in a range complaint. */
     private static String twoDigits(int value) {
         return value < 10 && value >= 0 ? "0" + value : String.valueOf(value);
+    }
+
+
+    /**
+     * A timestamp built from its fields. A field outside its range is the caller's mistake and is
+     * reported as one, naming the date it could not make; java.time's own complaint reached the
+     * client as an internal fault instead.
+     */
+    private static java.time.LocalDateTime makeTimestamp(int year, int month, int day,
+            int hour, int minute, int secs, int nanos) {
+        try {
+            return java.time.LocalDateTime.of(year, month, day, hour, minute, secs, nanos);
+        } catch (java.time.DateTimeException e) {
+            throw new MemgresException("date field value out of range: " + year + "-"
+                    + String.format("%02d", month) + "-" + String.format("%02d", day), "22008");
+        }
     }
 
 }

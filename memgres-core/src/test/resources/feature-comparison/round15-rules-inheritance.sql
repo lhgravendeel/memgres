@@ -110,7 +110,7 @@ UPDATE ONLY r15_pu_o SET tag='TAGGED' WHERE a=1;
 
 -- begin-expected
 -- columns: parent_tagged,child_tagged
--- row: 0 | 0
+-- row: 1|0
 -- end-expected
 SELECT (SELECT count(*)::int FROM ONLY r15_pu_o WHERE tag='TAGGED') AS parent_tagged,
        (SELECT count(*)::int FROM r15_cu_o WHERE tag='TAGGED') AS child_tagged;

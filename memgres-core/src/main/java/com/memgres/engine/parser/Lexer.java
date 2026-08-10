@@ -523,6 +523,7 @@ public class Lexer {
                             sb.append((char) val);
                         } else if (next == 'u' || next == 'U') {
                             // Unicode escape: backslash-u XXXX or backslash-U XXXXXXXX
+                            int escapeStart = pos;
                             int digits = (next == 'u') ? 4 : 8;
                             pos += 2;
                             int val = 0;
@@ -532,6 +533,15 @@ public class Lexer {
                                 if (uv < 0) break;
                                 val = val * 16 + uv;
                                 pos++;
+                            }
+                            // Eight hex digits reach well past the last code point there is, so a
+                            // number naming no character is the escape's fault and PostgreSQL
+                            // quotes the escape back as the statement wrote it.
+                            if (!Character.isValidCodePoint(val)) {
+                                String written = sql.substring(escapeStart, pos);
+                                throw ParseException.saying(
+                                        "invalid Unicode escape value at or near \"" + written + "\"",
+                                        new Token(TokenType.ERROR, written, escapeStart), "42601");
                             }
                             sb.appendCodePoint(val);
                         } else {

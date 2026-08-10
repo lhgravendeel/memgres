@@ -74,6 +74,20 @@ public final class CreateTypeStmt implements Statement {
     public List<CompositeField> compositeFields() { return compositeFields; }
     public String rangeSubtype() { return rangeSubtype; }
 
+    // A range is defined by more than its subtype, and two of the other attributes decide whether
+    // the definition is accepted at all rather than what the type does, so both are carried
+    // through to the statement that has to judge them.
+    private String rangeSubtypeOpclass;
+    private boolean rangeCanonical;
+
+    /** The operator class SUBTYPE_OPCLASS named, or null when the definition wrote none. */
+    public String rangeSubtypeOpclass() { return rangeSubtypeOpclass; }
+    public void setRangeSubtypeOpclass(String opclass) { this.rangeSubtypeOpclass = opclass; }
+
+    /** Whether a canonical function was written; only a pre-created shell type may have one. */
+    public boolean rangeCanonical() { return rangeCanonical; }
+    public void setRangeCanonical(boolean canonical) { this.rangeCanonical = canonical; }
+
     @Override
     public boolean equals(Object o) {
         if (this == o) return true;

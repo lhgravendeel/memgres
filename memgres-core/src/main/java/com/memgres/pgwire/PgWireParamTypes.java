@@ -13,6 +13,7 @@ import com.memgres.engine.parser.Parser;
 import com.memgres.engine.parser.ast.AnyAllArrayExpr;
 import com.memgres.engine.parser.ast.ArrayExpr;
 import com.memgres.engine.parser.ast.ArraySliceExpr;
+import com.memgres.engine.parser.ast.SubscriptExpr;
 import com.memgres.engine.parser.ast.AtTimeZoneExpr;
 import com.memgres.engine.parser.ast.BetweenExpr;
 import com.memgres.engine.parser.ast.BinaryExpr;
@@ -294,6 +295,18 @@ final class PgWireParamTypes {
                 assignOid(slice.lower(), DataType.INTEGER.getOid());
                 assignOid(slice.upper(), DataType.INTEGER.getOid());
                 condition(slice.array());
+            } else if (expr instanceof SubscriptExpr) {
+                SubscriptExpr sub = (SubscriptExpr) expr;
+                // What a subscript is depends on what is being subscripted: a json container is
+                // reached by a text key, everything else by an integer.
+                int subscriptType = subscriptOid(typeOid(sub.base()));
+                for (SubscriptExpr.Subscript one : sub.subscripts()) {
+                    if (subscriptType != 0) {
+                        assignOid(one.lower(), subscriptType);
+                        assignOid(one.upper(), subscriptType);
+                    }
+                }
+                condition(sub.base());
             } else if (expr instanceof NamedArgExpr) {
                 condition(((NamedArgExpr) expr).value());
             } else if (expr instanceof ArrayExpr) {
@@ -652,6 +665,15 @@ final class PgWireParamTypes {
             }
             if (expr instanceof SubqueryExpr) {
                 return subqueryOutputOid(((SubqueryExpr) expr).subquery());
+            }
+            if (expr instanceof SubscriptExpr) {
+                SubscriptExpr sub = (SubscriptExpr) expr;
+                DataType base = DataType.fromOid(typeOid(sub.base()));
+                if (base == null) return 0;
+                if (!DataType.isArrayType(base)) return base.getOid();
+                if (sub.isSlice()) return base.getOid();
+                DataType element = DataType.elementOf(base);
+                return element == null ? 0 : element.getOid();
             }
             if (expr instanceof BinaryExpr) {
                 BinaryExpr b = (BinaryExpr) expr;

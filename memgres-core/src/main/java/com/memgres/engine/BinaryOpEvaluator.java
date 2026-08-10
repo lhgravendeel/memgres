@@ -146,12 +146,18 @@ class BinaryOpEvaluator {
         boolean rightUntyped = isUntypedStringLiteral(bin.right());
         // Two untyped literals resolve against each other in PG, which needs no help from here
         if (leftUntyped == rightUntyped) return null;
-        String other = declaredOperandType(leftUntyped ? bin.right() : bin.left(), ctx);
+        Expression typed = leftUntyped ? bin.right() : bin.left();
+        // A row constructor is a record, and a record carries no operator of its own for a
+        // literal to be read as: PostgreSQL falls back to anynonarray || text and leaves the
+        // literal the text it is.
+        if (typed instanceof ArrayExpr && ((ArrayExpr) typed).isRow()) return null;
+        String other = declaredOperandType(typed, ctx);
         if (other == null) return null;
+        if (other.equals("record") || other.equals("record[]")) return null;
         if (other.endsWith("[]")) return other;
         // || is resolved within a type only where that type carries one of its own. A range, an
-        // inet or a point does not, so PostgreSQL falls back to anynonarray || text and the
-        // literal stays the text it is -- reading it as a range instead refused a plain 'x'.
+        // inet, a point or a record does not, so PostgreSQL falls back to anynonarray || text and
+        // the literal stays the text it is -- reading it as a range instead refused a plain 'x'.
         if (bin.op() == BinaryExpr.BinOp.CONCAT
                 && !other.equals("tsvector") && !other.equals("tsquery")) {
             return null;
@@ -269,6 +275,7 @@ class BinaryOpEvaluator {
      * settled on, and refusing an operator on the strength of that would reject working SQL.
      */
     private void rejectRangeElementTypeMismatch(BinaryExpr bin, RowContext ctx) {
+        rejectCrossRangeFamily(bin, ctx);
         if (bin.op() != BinaryExpr.BinOp.CONTAINS && bin.op() != BinaryExpr.BinOp.CONTAINED_BY) {
             return;
         }
@@ -287,6 +294,28 @@ class BinaryOpEvaluator {
         String rName = lRange ? pgName(scalar) : rDeclared;
         throw new MemgresException("operator does not exist: " + lName + " "
                 + binOpToSymbol(bin.op()) + " " + rName
+                + "\n  Hint: No operator matches the given name and argument types."
+                + " You might need to add explicit type casts.", "42883");
+    }
+
+    /**
+     * An operator between two ranges is declared over one range type, so two different ones have
+     * no operator between them however alike their shapes are. Reading the two texts and comparing
+     * their bounds answered for pairs PostgreSQL has nothing to answer with.
+     */
+    private void rejectCrossRangeFamily(BinaryExpr bin, RowContext ctx) {
+        String lDeclared = declaredOperandType(bin.left(), ctx);
+        String rDeclared = declaredOperandType(bin.right(), ctx);
+        if (lDeclared == null || rDeclared == null) return;
+        boolean lRange = RANGE_TYPES.contains(lDeclared) || MULTIRANGE_TYPES.contains(lDeclared);
+        boolean rRange = RANGE_TYPES.contains(rDeclared) || MULTIRANGE_TYPES.contains(rDeclared);
+        if (!lRange || !rRange) return;
+        String lSubtype = rangeSubtype(lDeclared);
+        String rSubtype = rangeSubtype(rDeclared);
+        if (lSubtype != null && rSubtype != null && lSubtype.equals(rSubtype)) return;
+        if (lDeclared.equals(rDeclared)) return;
+        throw new MemgresException("operator does not exist: " + lDeclared + " "
+                + binOpToSymbol(bin.op()) + " " + rDeclared
                 + "\n  Hint: No operator matches the given name and argument types."
                 + " You might need to add explicit type casts.", "42883");
     }
@@ -767,6 +796,32 @@ class BinaryOpEvaluator {
      * failure than the permissiveness this rule removes.
      */
     String declaredTypeForResolution(Expression expr, RowContext ctx) {
+        // A subscript is declared what one element of the thing subscripted is declared, and a
+        // range of them is declared what the whole is: without that a bpchar element read as text
+        // kept the blanks its declaration padded it to.
+        if (expr instanceof SubscriptExpr) {
+            SubscriptExpr sub = (SubscriptExpr) expr;
+            String base = declaredTypeForResolution(sub.base(), ctx);
+            if (base == null) {
+                DataType inferred = executor.exprEvaluator.inferExprType(sub.base());
+                base = inferred == null ? null : inferred.getPgName();
+            }
+            if (base == null) return null;
+            if (sub.isSlice()) return base;
+            if (base.endsWith("[]")) return base.substring(0, base.length() - 2);
+            // The catalogs' two vectors are subscripted like arrays without being written like
+            // one, so what a subscript of them is has to be said rather than derived.
+            if (base.equals("int2vector")) return "smallint";
+            if (base.equals("oidvector")) return "oid";
+            if (base.equals("point")) return "double precision";
+            if (base.equals("box") || base.equals("lseg") || base.equals("path")
+                    || base.equals("polygon")) {
+                return "point";
+            }
+            DataType baseType = DataType.fromPgName(base);
+            DataType element = baseType == null ? null : DataType.elementOf(baseType);
+            return element != null && element != baseType ? element.getPgName() : base;
+        }
         if (expr instanceof CastExpr) {
             String name = ((CastExpr) expr).typeName();
             return name == null ? null : name.toLowerCase().trim();
@@ -1023,6 +1078,19 @@ class BinaryOpEvaluator {
         }
     }
 
+    /** The answer a comparison operator gives for a comparison result. */
+    private static Boolean compareOp(BinaryExpr.BinOp op, int cmp) {
+        switch (op) {
+            case LESS_THAN: return cmp < 0;
+            case LESS_EQUAL: return cmp <= 0;
+            case GREATER_THAN: return cmp > 0;
+            case GREATER_EQUAL: return cmp >= 0;
+            case EQUAL: return cmp == 0;
+            case NOT_EQUAL: return cmp != 0;
+            default: return null;
+        }
+    }
+
     private static boolean isComparison(BinaryExpr.BinOp op) {
         switch (op) {
             case EQUAL: case NOT_EQUAL: case LESS_THAN: case GREATER_THAN:
@@ -1183,6 +1251,24 @@ class BinaryOpEvaluator {
             if (concat.leftOid == 0) left = executor.castValue(left, concat.resolution.sameType);
             if (concat.rightOid == 0) right = executor.castValue(right, concat.resolution.sameType);
         }
+        // An array joined to a NULL element gains the element; joined to a NULL array it is
+        // unchanged. Which of the two was written is in the declared types, not in the values:
+        // reading only the values dropped the element and left the array a member short.
+        if (concat.is(ConcatOperator.Outcome.ARRAY) && (left == null || right == null)
+                && (left == null ? concat.leftOid : concat.rightOid) != 0) {
+            boolean nullIsArray = DataType.isArrayType(
+                    DataType.fromOid(left == null ? concat.leftOid : concat.rightOid));
+            Object present = left == null ? right : left;
+            if (nullIsArray) return present;
+            PgArray array = PgArray.from(present);
+            if (array != null) {
+                java.util.List<Object> merged = new ArrayList<>();
+                if (left == null) merged.add(null);
+                merged.addAll(array);
+                if (right == null) merged.add(null);
+                return array.resized(merged);
+            }
+        }
         // An array concatenation takes its element type from the left operand, so an element
         // joined on the right is read as that type — and a blank-padded string loses its padding
         // going in. Written on the left it is the element type, and keeps it.
@@ -1209,6 +1295,18 @@ class BinaryOpEvaluator {
 
         rejectRangeElementTypeMismatch(bin, ctx);
         rejectPhantomOperator(bin, ctx, left, right);
+
+        // Two ranges are equal when their bounds are, whatever scale each bound was written with:
+        // a numrange bound spelled 1.50 is the same bound as one spelled 1.5. Only a pair the
+        // query declares to be ranges is read that way, because a point is written with the same
+        // parentheses a range is.
+        if ((bin.op() == BinaryExpr.BinOp.EQUAL || bin.op() == BinaryExpr.BinOp.NOT_EQUAL)
+                && left instanceof String && right instanceof String
+                && declaredRangeTypeStrict(bin.left(), ctx) != null
+                && declaredRangeTypeStrict(bin.right(), ctx) != null) {
+            boolean same = TypeCoercion.compare(left, right) == 0;
+            return bin.op() == BinaryExpr.BinOp.EQUAL ? same : !same;
+        }
 
         // Two paths added are joined, not translated: the second operand is a path and not the
         // point a value-level reading took it for. Only the declared types can say which of the
@@ -1376,7 +1474,8 @@ class BinaryOpEvaluator {
         // Try built-in operator handling; if it fails due to unsupported types,
         // fall back to user-defined operator lookup
         try {
-            return evalBuiltinBinary(bin.op(), left, right);
+            return evalBuiltinBinary(bin.op(), left, right,
+                    isJsonOperand(bin.left(), ctx) || isJsonOperand(bin.right(), ctx));
         } catch (ClassCastException | NumberFormatException e) {
             // Built-in handling doesn't support these types — try user-defined operator
             String opSymbol = binOpToSymbol(bin.op());
@@ -1399,6 +1498,16 @@ class BinaryOpEvaluator {
     }
 
     private Object evalBuiltinBinary(BinaryExpr.BinOp op, Object left, Object right) {
+        return evalBuiltinBinary(op, left, right, false);
+    }
+
+    /**
+     * The same, told whether the query declared either operand to be a json document. A jsonb
+     * array is written with the brackets a range is written with, so without being told the
+     * containment operators asked a range question of a document and answered it.
+     */
+    private Object evalBuiltinBinary(BinaryExpr.BinOp op, Object left, Object right,
+            boolean jsonContainment) {
         switch (op) {
             case ADD:
                 // inet + integer arithmetic
@@ -1630,8 +1739,17 @@ class BinaryOpEvaluator {
                 // Handle ROW comparison (NULL propagates) vs ARRAY comparison (NULL=NULL is true)
                 boolean leftIsArray = left instanceof List && !(left instanceof AstExecutor.PgRow);
                 boolean rightIsArray = right instanceof List && !(right instanceof AstExecutor.PgRow);
-                List<?> lList = left instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) left).values() : left instanceof List ? (List<?>) left : null;
-                List<?> rList = right instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) right).values() : right instanceof List ? (List<?>) right : null;
+                // Two arrays are ordered by array_cmp, which puts a null element after every
+                // value; a record is ordered field by field and is unknown as soon as a field is.
+                if (left instanceof List<?> && right instanceof List<?>) {
+                    // Equality asks a stricter question than ordering: two arrays holding the same
+                    // elements at different subscripts are ordered together but are not equal.
+                    if (op == BinaryExpr.BinOp.EQUAL) return TypeCoercion.areEqual(left, right);
+                    if (op == BinaryExpr.BinOp.NOT_EQUAL) return !TypeCoercion.areEqual(left, right);
+                    return compareOp(op, TypeCoercion.compare(left, right));
+                }
+                List<?> lList = left instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) left).values() : null;
+                List<?> rList = right instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) right).values() : null;
                 if (lList != null && rList != null) {
                     if (leftIsArray && rightIsArray) return arraysEqual(lList, rList);
                     if (lList.size() != rList.size()) {
@@ -1668,8 +1786,17 @@ class BinaryOpEvaluator {
             }
             case LESS_THAN: {
                 if (left == null || right == null) return null;
-                List<?> lList = left instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) left).values() : left instanceof List ? (List<?>) left : null;
-                List<?> rList = right instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) right).values() : right instanceof List ? (List<?>) right : null;
+                // Two arrays are ordered by array_cmp, which puts a null element after every
+                // value; a record is ordered field by field and is unknown as soon as a field is.
+                if (left instanceof List<?> && right instanceof List<?>) {
+                    // Equality asks a stricter question than ordering: two arrays holding the same
+                    // elements at different subscripts are ordered together but are not equal.
+                    if (op == BinaryExpr.BinOp.EQUAL) return TypeCoercion.areEqual(left, right);
+                    if (op == BinaryExpr.BinOp.NOT_EQUAL) return !TypeCoercion.areEqual(left, right);
+                    return compareOp(op, TypeCoercion.compare(left, right));
+                }
+                List<?> lList = left instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) left).values() : null;
+                List<?> rList = right instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) right).values() : null;
                 if (lList != null && rList != null) {
                     int minLen = Math.min(lList.size(), rList.size());
                     for (int ri = 0; ri < minLen; ri++) {
@@ -1684,8 +1811,17 @@ class BinaryOpEvaluator {
             }
             case GREATER_THAN: {
                 if (left == null || right == null) return null;
-                List<?> lList = left instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) left).values() : left instanceof List ? (List<?>) left : null;
-                List<?> rList = right instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) right).values() : right instanceof List ? (List<?>) right : null;
+                // Two arrays are ordered by array_cmp, which puts a null element after every
+                // value; a record is ordered field by field and is unknown as soon as a field is.
+                if (left instanceof List<?> && right instanceof List<?>) {
+                    // Equality asks a stricter question than ordering: two arrays holding the same
+                    // elements at different subscripts are ordered together but are not equal.
+                    if (op == BinaryExpr.BinOp.EQUAL) return TypeCoercion.areEqual(left, right);
+                    if (op == BinaryExpr.BinOp.NOT_EQUAL) return !TypeCoercion.areEqual(left, right);
+                    return compareOp(op, TypeCoercion.compare(left, right));
+                }
+                List<?> lList = left instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) left).values() : null;
+                List<?> rList = right instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) right).values() : null;
                 if (lList != null && rList != null) {
                     int minLen = Math.min(lList.size(), rList.size());
                     for (int ri = 0; ri < minLen; ri++) {
@@ -1700,8 +1836,17 @@ class BinaryOpEvaluator {
             }
             case LESS_EQUAL: {
                 if (left == null || right == null) return null;
-                List<?> lList = left instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) left).values() : left instanceof List ? (List<?>) left : null;
-                List<?> rList = right instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) right).values() : right instanceof List ? (List<?>) right : null;
+                // Two arrays are ordered by array_cmp, which puts a null element after every
+                // value; a record is ordered field by field and is unknown as soon as a field is.
+                if (left instanceof List<?> && right instanceof List<?>) {
+                    // Equality asks a stricter question than ordering: two arrays holding the same
+                    // elements at different subscripts are ordered together but are not equal.
+                    if (op == BinaryExpr.BinOp.EQUAL) return TypeCoercion.areEqual(left, right);
+                    if (op == BinaryExpr.BinOp.NOT_EQUAL) return !TypeCoercion.areEqual(left, right);
+                    return compareOp(op, TypeCoercion.compare(left, right));
+                }
+                List<?> lList = left instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) left).values() : null;
+                List<?> rList = right instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) right).values() : null;
                 if (lList != null && rList != null) {
                     int minLen = Math.min(lList.size(), rList.size());
                     for (int ri = 0; ri < minLen; ri++) {
@@ -1716,8 +1861,17 @@ class BinaryOpEvaluator {
             }
             case GREATER_EQUAL: {
                 if (left == null || right == null) return null;
-                List<?> lList = left instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) left).values() : left instanceof List ? (List<?>) left : null;
-                List<?> rList = right instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) right).values() : right instanceof List ? (List<?>) right : null;
+                // Two arrays are ordered by array_cmp, which puts a null element after every
+                // value; a record is ordered field by field and is unknown as soon as a field is.
+                if (left instanceof List<?> && right instanceof List<?>) {
+                    // Equality asks a stricter question than ordering: two arrays holding the same
+                    // elements at different subscripts are ordered together but are not equal.
+                    if (op == BinaryExpr.BinOp.EQUAL) return TypeCoercion.areEqual(left, right);
+                    if (op == BinaryExpr.BinOp.NOT_EQUAL) return !TypeCoercion.areEqual(left, right);
+                    return compareOp(op, TypeCoercion.compare(left, right));
+                }
+                List<?> lList = left instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) left).values() : null;
+                List<?> rList = right instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) right).values() : null;
                 if (lList != null && rList != null) {
                     int minLen = Math.min(lList.size(), rList.size());
                     for (int ri = 0; ri < minLen; ri++) {
@@ -1752,18 +1906,7 @@ class BinaryOpEvaluator {
                 // Array concat with NULL: NULL || array = array, array || NULL = array
                 if (left == null && right instanceof List) return right;
                 if (right == null && left instanceof List) return left;
-                if (left == null || right == null) {
-                    // Check if the non-null side is an array-like string
-                    if (left == null && right != null) {
-                        String rs = right.toString().trim();
-                        if (rs.startsWith("{") && rs.endsWith("}")) return right;
-                    }
-                    if (right == null && left != null) {
-                        String ls = left.toString().trim();
-                        if (ls.startsWith("{") && ls.endsWith("}")) return left;
-                    }
-                    return null;
-                }
+                if (left == null || right == null) return null;
                 // Bytea (byte[]) concatenation
                 if (left instanceof byte[] && right instanceof byte[]) {
                     byte[] lb = (byte[]) left;
@@ -1818,33 +1961,15 @@ class BinaryOpEvaluator {
                     merged.addAll(rl);
                     return merged;
                 }
-                String ls = left.toString();
-                String rs = right.toString();
-                boolean looksLikePgArrayL = ls.trim().startsWith("{") && ls.trim().endsWith("}") && !ls.trim().startsWith("{\"");
-                boolean looksLikePgArrayR = rs.trim().startsWith("{") && rs.trim().endsWith("}") && !rs.trim().startsWith("{\"");
+                String ls = TypeCoercion.toString(left);
+                String rs = TypeCoercion.toString(right);
                 // PG does NOT support || for multirange types
                 if (RangeOperations.isMultirangeOrEmpty(ls) || RangeOperations.isMultirangeOrEmpty(rs)) {
                     throw new MemgresException("operator does not exist: multirange || multirange", "42883");
                 }
-                // PG array string || scalar = array append
-                if (looksLikePgArrayL && !looksLikePgArrayR) {
-                    List<Object> arr = new ArrayList<>(FunctionEvaluator.parseSimplePgArray(ls));
-                    arr.add(right instanceof Number ? right : rs);
-                    return TypeCoercion.formatPgArray(arr);
-                }
-                // scalar || PG array string = array prepend
-                if (looksLikePgArrayR && !looksLikePgArrayL) {
-                    List<Object> arr = new ArrayList<>();
-                    arr.add(left instanceof Number ? left : ls);
-                    arr.addAll(FunctionEvaluator.parseSimplePgArray(rs));
-                    return TypeCoercion.formatPgArray(arr);
-                }
-                // PG array string || PG array string = array concat
-                if (looksLikePgArrayL && looksLikePgArrayR) {
-                    List<Object> arr = new ArrayList<>(FunctionEvaluator.parseSimplePgArray(ls));
-                    arr.addAll(FunctionEvaluator.parseSimplePgArray(rs));
-                    return TypeCoercion.formatPgArray(arr);
-                }
+                // Text that is spelled the way an array literal is spelled is still text. Reading
+                // it as an array ran '{a,b}' || 'c' together into a three-element array, which is
+                // not what either operand held.
                 if ((ls.trim().startsWith("{") || ls.trim().startsWith("["))) {
                     // Check for JSON concatenation
                     if ((rs.trim().startsWith("{") || rs.trim().startsWith("["))) {
@@ -1860,15 +1985,15 @@ class BinaryOpEvaluator {
                             left instanceof Boolean ? "boolean" : left.getClass().getSimpleName().toLowerCase();
                     throw new MemgresException("operator does not exist: " + tn + " ~~ unknown", "42883");
                 }
-                return AstExecutor.likeMatch(left.toString(), right.toString(), false);
+                return AstExecutor.likeMatch(likeOperand(left), likeOperand(right), false);
             }
             case ILIKE: {
                 if (left == null || right == null) return null;
-                return AstExecutor.likeMatch(left.toString(), right.toString(), true);
+                return AstExecutor.likeMatch(likeOperand(left), likeOperand(right), true);
             }
             case SIMILAR_TO: {
                 if (left == null || right == null) return null;
-                return similarToMatches(left.toString(), right.toString(), "\\");
+                return similarToMatches(likeOperand(left), likeOperand(right), "\\");
             }
             case JSON_ARROW:
             case JSON_SUBSCRIPT: {
@@ -1890,8 +2015,14 @@ class BinaryOpEvaluator {
                 }
                 // Reject non-integer numeric types (e.g., jsonb -> 999999999999999999999)
                 if (right instanceof java.math.BigDecimal) {
-                    java.math.BigDecimal bd = (java.math.BigDecimal) right;
                     throw new MemgresException("operator does not exist: jsonb -> numeric", "42883");
+                }
+                // The arrow is declared over int4 and text, so a wider integer beside it names no
+                // operator at all rather than being narrowed to one.
+                if (right instanceof Long) {
+                    throw new MemgresException("operator does not exist: jsonb -> bigint"
+                            + "\n  Hint: No operator matches the given name and argument types."
+                            + " You might need to add explicit type casts.", "42883");
                 }
                 if (right instanceof Number) {
                     Number n = (Number) right;
@@ -1970,17 +2101,6 @@ class BinaryOpEvaluator {
                             }
                             int idx = n.intValue();
                             return (idx >= 0 && idx < plain.length()) ? String.valueOf(plain.charAt(idx)) : null;
-                        }
-                    }
-                }
-                // Check for array subscript with non-integer key (e.g., b['x'])
-                if (left instanceof List<?> || (left instanceof String && ((String) left).trim().startsWith("{") && !((String) left).trim().startsWith("{\"") && ((String) left).trim().endsWith("}"))) {
-                    String ls2 = (String) left;
-                    // Array subscripts must be integers
-                    if (right instanceof String) {
-                        String rs2 = (String) right;
-                        try { Integer.parseInt(rs2); } catch (NumberFormatException e) {
-                            throw new MemgresException("invalid input syntax for type integer: \"" + rs2 + "\"", "22P02");
                         }
                     }
                 }
@@ -2079,8 +2199,11 @@ class BinaryOpEvaluator {
                 boolean rIsList = right instanceof List;
                 String ls = lIsList ? TypeCoercion.formatPgArray((List<?>) left) : left.toString().trim();
                 String rs = rIsList ? TypeCoercion.formatPgArray((List<?>) right) : right.toString().trim();
-                // Range/multirange semantics only apply when neither operand is a real array
-                if (!lIsList && !rIsList) {
+                // Range/multirange semantics only apply when neither operand is a real array,
+                // and never to a json document: a jsonb array is written with the brackets a
+                // range is written with, and asking a range question of it answered for a
+                // containment PostgreSQL decides quite differently.
+                if (!lIsList && !rIsList && !jsonContainment) {
                     // Multirange containment: multirange @> value/range/multirange
                     if (RangeOperations.isMultirangeOrEmpty(ls)) {
                         if (RangeOperations.isMultirangeOrEmpty(rs)) return RangeOperations.multirangeContainsMultirange(ls, rs);
@@ -2109,8 +2232,8 @@ class BinaryOpEvaluator {
                 boolean lIsPgArray = lIsList || (ls.startsWith("{") && !ls.startsWith("{\""));
                 boolean rIsPgArray = rIsList || (rs.startsWith("{") && !rs.startsWith("{\""));
                 if (lIsPgArray && rIsPgArray) {
-                    List<Object> la = FunctionEvaluator.parseSimplePgArray(ls);
-                    List<Object> ra = FunctionEvaluator.parseSimplePgArray(rs);
+                    List<?> la = lIsList ? (List<?>) left : PgArray.from(ls);
+                    List<?> ra = rIsList ? (List<?>) right : PgArray.from(rs);
                     return arrayContainsAll(la, ra);
                 }
                 if (lIsPgArray && !rIsPgArray) {
@@ -2341,10 +2464,16 @@ class BinaryOpEvaluator {
             }
             case GEO_NOT_EXTEND_RIGHT: {
                 if (left == null || right == null) return null;
+                // The ranges spell this operator the same way the geometric types do, and mean
+                // something else by it: neither operand reaching past the other's end.
+                Boolean overlapLeft = rangeNotExtend(left, right, true);
+                if (overlapLeft != null) return overlapLeft;
                 return GeometricOperations.doesNotExtendRight(left.toString(), right.toString());
             }
             case GEO_NOT_EXTEND_LEFT: {
                 if (left == null || right == null) return null;
+                Boolean overlapRight = rangeNotExtend(left, right, false);
+                if (overlapRight != null) return overlapRight;
                 return GeometricOperations.doesNotExtendLeft(left.toString(), right.toString());
             }
             case GEO_NOT_EXTEND_ABOVE: {
@@ -2455,10 +2584,11 @@ class BinaryOpEvaluator {
         List<Object> supFlat = leafElements(sup);
         for (Object o : leafElements(sub)) {
             if (o == null) return false; // NULL never equals anything
-            String os = o.toString();
             boolean found = false;
             for (Object s : supFlat) {
-                if (s != null && s.toString().equals(os)) { found = true; break; }
+                // Elements are matched by the element type's =, not by their spelling: comparing
+                // the written text made a numeric 1.0 fail to match the same value written 1.00.
+                if (s != null && TypeCoercion.areEqual(s, o)) { found = true; break; }
             }
             if (!found) return false;
         }
@@ -2470,12 +2600,12 @@ class BinaryOpEvaluator {
      * NULL elements never match anything.
      */
     static boolean arrayOverlaps(List<?> a, List<?> b) {
-        Set<String> as = new HashSet<>();
-        for (Object o : leafElements(a)) {
-            if (o != null) as.add(o.toString());
-        }
+        List<Object> left = leafElements(a);
         for (Object o : leafElements(b)) {
-            if (o != null && as.contains(o.toString())) return true;
+            if (o == null) continue;
+            for (Object s : left) {
+                if (s != null && TypeCoercion.areEqual(s, o)) return true;
+            }
         }
         return false;
     }
@@ -2670,6 +2800,30 @@ class BinaryOpEvaluator {
         return java.util.Collections.singletonList(RangeOperations.parse(s));
     }
 
+    /**
+     * A range's {@code &<} and {@code &>}: whether one does not reach past the other's end. Empty
+     * ranges are outside every comparison and answer false, as PostgreSQL's do.
+     */
+    private static Boolean rangeNotExtend(Object left, Object right, boolean leftward) {
+        if (!(left instanceof String) || !(right instanceof String)) return null;
+        String ls = ((String) left).trim(), rs = ((String) right).trim();
+        boolean lMulti = RangeOperations.isMultirangeString(ls);
+        boolean rMulti = RangeOperations.isMultirangeString(rs);
+        boolean lRange = lMulti || RangeOperations.isRangeString(ls);
+        boolean rRange = rMulti || RangeOperations.isRangeString(rs);
+        if (!lRange || !rRange) return null;
+        java.util.List<RangeOperations.PgRange> a = rangeParts(ls, lMulti, false);
+        java.util.List<RangeOperations.PgRange> b = rangeParts(rs, rMulti, false);
+        return leftward ? RangeOperations.multirangeDoesNotExtendRight(a, b)
+                : RangeOperations.multirangeDoesNotExtendRight(b, a);
+    }
+
+    /** True when the query says this operand is a json document rather than a range. */
+    private boolean isJsonOperand(Expression expr, RowContext ctx) {
+        String declared = declaredTypeForResolution(expr, ctx);
+        return "json".equals(declared) || "jsonb".equals(declared);
+    }
+
     /** Handed back when this rule does not decide the operator, leaving the old path in charge. */
     private static final Object NOT_A_RANGE_OPERATION = new Object();
 
@@ -2685,10 +2839,13 @@ class BinaryOpEvaluator {
         String lType = declaredRangeType(bin.left(), bin.right(), ctx);
         String rType = declaredRangeType(bin.right(), bin.left(), ctx);
         if (lType == null || rType == null) return NOT_A_RANGE_OPERATION;
-        // A range meeting a multirange is a pairing this rule has nothing to say about, so it is
-        // left to the operand values as before.
+        // PostgreSQL declares these three over two ranges or over two multiranges, and over
+        // nothing in between: a range added to a multirange is a pair it has no operator for.
         if (MULTIRANGE_TYPES.contains(lType) != MULTIRANGE_TYPES.contains(rType)) {
-            return NOT_A_RANGE_OPERATION;
+            throw new MemgresException("operator does not exist: " + lType + " " + binOpToSymbol(op)
+                    + " " + rType
+                    + "\n  Hint: No operator matches the given name and argument types."
+                    + " You might need to add explicit type casts.", "42883");
         }
         if (!lType.equals(rType)) {
             throw new MemgresException("operator does not exist: " + lType + " " + binOpToSymbol(op)
@@ -2700,14 +2857,14 @@ class BinaryOpEvaluator {
         if (!(left instanceof String) || !(right instanceof String)) return NOT_A_RANGE_OPERATION;
         if (MULTIRANGE_TYPES.contains(lType)) {
             if (op == BinaryExpr.BinOp.ADD) {
-                return RangeOperations.multirangeUnion((String) left, (String) right);
+                return RangeOperations.multirangeUnion((String) left, (String) right, lType);
             }
             if (op == BinaryExpr.BinOp.SUBTRACT) {
-                return RangeOperations.multirangeSubtract((String) left, (String) right);
+                return RangeOperations.multirangeSubtract((String) left, (String) right, lType);
             }
             java.util.List<RangeOperations.PgRange> parts = new ArrayList<>();
-            for (RangeOperations.PgRange a : RangeOperations.parseMultirange((String) left)) {
-                for (RangeOperations.PgRange b : RangeOperations.parseMultirange((String) right)) {
+            for (RangeOperations.PgRange a : RangeOperations.parseMultirange((String) left, lType)) {
+                for (RangeOperations.PgRange b : RangeOperations.parseMultirange((String) right, lType)) {
                     RangeOperations.PgRange part = intersectRanges(a, b);
                     if (!part.isEmpty()) parts.add(part);
                 }
@@ -2719,8 +2876,10 @@ class BinaryOpEvaluator {
             }
             return sb.append('}').toString();
         }
-        RangeOperations.PgRange a = RangeOperations.parse((String) left);
-        RangeOperations.PgRange b = RangeOperations.parse((String) right);
+        // Both operands are read as the type the query declared them, so a numrange whose bounds
+        // happen to be whole numbers is not canonicalised as though it were an integer range.
+        RangeOperations.PgRange a = RangeOperations.parse((String) left, lType);
+        RangeOperations.PgRange b = RangeOperations.parse((String) right, lType);
         if (op == BinaryExpr.BinOp.ADD) return unionRanges(a, b).toString();
         if (op == BinaryExpr.BinOp.SUBTRACT) return differenceRanges(a, b).toString();
         return intersectRanges(a, b).toString();
@@ -3004,8 +3163,17 @@ class BinaryOpEvaluator {
             }
             case LESS_THAN: {
                 if (left == null || right == null) return null;
-                List<?> lList = left instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) left).values() : left instanceof List ? (List<?>) left : null;
-                List<?> rList = right instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) right).values() : right instanceof List ? (List<?>) right : null;
+                // Two arrays are ordered by array_cmp, which puts a null element after every
+                // value; a record is ordered field by field and is unknown as soon as a field is.
+                if (left instanceof List<?> && right instanceof List<?>) {
+                    // Equality asks a stricter question than ordering: two arrays holding the same
+                    // elements at different subscripts are ordered together but are not equal.
+                    if (op == BinaryExpr.BinOp.EQUAL) return TypeCoercion.areEqual(left, right);
+                    if (op == BinaryExpr.BinOp.NOT_EQUAL) return !TypeCoercion.areEqual(left, right);
+                    return compareOp(op, TypeCoercion.compare(left, right));
+                }
+                List<?> lList = left instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) left).values() : null;
+                List<?> rList = right instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) right).values() : null;
                 if (lList != null && rList != null) {
                     int minLen = Math.min(lList.size(), rList.size());
                     for (int ri = 0; ri < minLen; ri++) {
@@ -3020,8 +3188,17 @@ class BinaryOpEvaluator {
             }
             case GREATER_THAN: {
                 if (left == null || right == null) return null;
-                List<?> lList = left instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) left).values() : left instanceof List ? (List<?>) left : null;
-                List<?> rList = right instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) right).values() : right instanceof List ? (List<?>) right : null;
+                // Two arrays are ordered by array_cmp, which puts a null element after every
+                // value; a record is ordered field by field and is unknown as soon as a field is.
+                if (left instanceof List<?> && right instanceof List<?>) {
+                    // Equality asks a stricter question than ordering: two arrays holding the same
+                    // elements at different subscripts are ordered together but are not equal.
+                    if (op == BinaryExpr.BinOp.EQUAL) return TypeCoercion.areEqual(left, right);
+                    if (op == BinaryExpr.BinOp.NOT_EQUAL) return !TypeCoercion.areEqual(left, right);
+                    return compareOp(op, TypeCoercion.compare(left, right));
+                }
+                List<?> lList = left instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) left).values() : null;
+                List<?> rList = right instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) right).values() : null;
                 if (lList != null && rList != null) {
                     int minLen = Math.min(lList.size(), rList.size());
                     for (int ri = 0; ri < minLen; ri++) {
@@ -3036,8 +3213,17 @@ class BinaryOpEvaluator {
             }
             case LESS_EQUAL: {
                 if (left == null || right == null) return null;
-                List<?> lList = left instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) left).values() : left instanceof List ? (List<?>) left : null;
-                List<?> rList = right instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) right).values() : right instanceof List ? (List<?>) right : null;
+                // Two arrays are ordered by array_cmp, which puts a null element after every
+                // value; a record is ordered field by field and is unknown as soon as a field is.
+                if (left instanceof List<?> && right instanceof List<?>) {
+                    // Equality asks a stricter question than ordering: two arrays holding the same
+                    // elements at different subscripts are ordered together but are not equal.
+                    if (op == BinaryExpr.BinOp.EQUAL) return TypeCoercion.areEqual(left, right);
+                    if (op == BinaryExpr.BinOp.NOT_EQUAL) return !TypeCoercion.areEqual(left, right);
+                    return compareOp(op, TypeCoercion.compare(left, right));
+                }
+                List<?> lList = left instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) left).values() : null;
+                List<?> rList = right instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) right).values() : null;
                 if (lList != null && rList != null) {
                     int minLen = Math.min(lList.size(), rList.size());
                     for (int ri = 0; ri < minLen; ri++) {
@@ -3052,8 +3238,17 @@ class BinaryOpEvaluator {
             }
             case GREATER_EQUAL: {
                 if (left == null || right == null) return null;
-                List<?> lList = left instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) left).values() : left instanceof List ? (List<?>) left : null;
-                List<?> rList = right instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) right).values() : right instanceof List ? (List<?>) right : null;
+                // Two arrays are ordered by array_cmp, which puts a null element after every
+                // value; a record is ordered field by field and is unknown as soon as a field is.
+                if (left instanceof List<?> && right instanceof List<?>) {
+                    // Equality asks a stricter question than ordering: two arrays holding the same
+                    // elements at different subscripts are ordered together but are not equal.
+                    if (op == BinaryExpr.BinOp.EQUAL) return TypeCoercion.areEqual(left, right);
+                    if (op == BinaryExpr.BinOp.NOT_EQUAL) return !TypeCoercion.areEqual(left, right);
+                    return compareOp(op, TypeCoercion.compare(left, right));
+                }
+                List<?> lList = left instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) left).values() : null;
+                List<?> rList = right instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) right).values() : null;
                 if (lList != null && rList != null) {
                     int minLen = Math.min(lList.size(), rList.size());
                     for (int ri = 0; ri < minLen; ri++) {
@@ -3538,15 +3733,15 @@ class BinaryOpEvaluator {
                             left instanceof Boolean ? "boolean" : left.getClass().getSimpleName().toLowerCase();
                     throw new MemgresException("operator does not exist: " + tn + " ~~ unknown", "42883");
                 }
-                return AstExecutor.likeMatch(left.toString(), right.toString(), false);
+                return AstExecutor.likeMatch(likeOperand(left), likeOperand(right), false);
             }
             case ILIKE: {
                 if (left == null || right == null) return null;
-                return AstExecutor.likeMatch(left.toString(), right.toString(), true);
+                return AstExecutor.likeMatch(likeOperand(left), likeOperand(right), true);
             }
             case SIMILAR_TO: {
                 if (left == null || right == null) return null;
-                return similarToMatches(left.toString(), right.toString(), "\\");
+                return similarToMatches(likeOperand(left), likeOperand(right), "\\");
             }
             case JSON_ARROW:
             case JSON_SUBSCRIPT: {
@@ -3588,6 +3783,17 @@ class BinaryOpEvaluator {
      * A JSON object opens the same way, so a quoted first token followed by a colon is
      * read as an object rather than an array.
      */
+    /**
+     * One side of a pattern match, written by its own type's output function. Reading the Java
+     * object instead compared a bytea's identity hash against the pattern rather than its bytes.
+     */
+    private static String likeOperand(Object value) {
+        if (value instanceof byte[]) {
+            return new String((byte[]) value, java.nio.charset.StandardCharsets.ISO_8859_1);
+        }
+        return TypeCoercion.toString(value);
+    }
+
     private static boolean isPgArrayText(String s) {
         if (!s.startsWith("{") || !s.endsWith("}")) return false;
         int i = 1;

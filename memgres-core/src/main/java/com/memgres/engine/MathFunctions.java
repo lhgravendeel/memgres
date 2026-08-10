@@ -464,12 +464,17 @@ class MathFunctions {
                         throw new com.memgres.engine.MemgresException(
                             "width_bucket second argument must be an array", "42804");
                     }
-                    // Return 0 if below all thresholds, N+1 if above all, else 1-based bucket index
-                    for (int i = 0; i < thresholds.size(); i++) {
-                        double threshold = executor.toDouble(thresholds.get(i));
-                        if (val < threshold) return i;
+                    // PostgreSQL finds the bucket by bisection, not by walking the thresholds in
+                    // order. The two agree on a sorted array and disagree on every other one, and
+                    // the answer for an unsorted array is the one bisection gives.
+                    int left = 0;
+                    int right = thresholds.size();
+                    while (left < right) {
+                        int mid = (left + right) / 2;
+                        if (val < executor.toDouble(thresholds.get(mid))) right = mid;
+                        else left = mid + 1;
                     }
-                    return thresholds.size();
+                    return left;
                 }
                 Object operand = executor.evalExpr(fn.args().get(0), ctx);
                 Object lower = executor.evalExpr(fn.args().get(1), ctx);

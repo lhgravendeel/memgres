@@ -561,7 +561,9 @@ public class PlpgsqlParser {
         }
 
         matchKw("END");
-        matchKw("IF");
+        // An IF is closed by END IF. A bare END is the enclosing block's, and letting the IF take
+        // it left the block with no end of its own and the body after it read as part of the IF.
+        if (!matchKw("IF")) throw syntaxError(peek());
         match(TokenType.SEMICOLON);
 
         return new PlpgsqlStatement.IfStmt(condition, thenBody, elsifs, elseBody);
@@ -823,6 +825,13 @@ public class PlpgsqlParser {
             //   RAISE division_by_zero;  RAISE NOTICE unique_violation;
             if (levelGiven) condition = readIdent();
             else level = readIdent();
+        }
+
+        // A level says how loud the message is, not what it says, so a format string, a condition,
+        // an SQLSTATE or a USING clause still has to follow it. Only a bare RAISE stands alone,
+        // and that one re-raises whatever an exception handler caught.
+        if (levelGiven && condition == null && errcode == null && check(TokenType.SEMICOLON)) {
+            throw syntaxError(peek());
         }
 
         String format = null;

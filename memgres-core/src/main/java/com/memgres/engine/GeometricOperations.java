@@ -306,6 +306,31 @@ public final class GeometricOperations {
         return result;
     }
 
+    /** The geometric types PostgreSQL lets a subscript reach into. */
+    private static final java.util.Set<String> SUBSCRIPTABLE = new java.util.HashSet<String>(
+            java.util.Arrays.asList("point", "box", "lseg", "line", "path", "polygon"));
+
+    /** True when a subscript on a value of this type selects one of its parts. */
+    public static boolean isSubscriptableType(String typeName) {
+        return typeName != null && SUBSCRIPTABLE.contains(typeName);
+    }
+
+    /**
+     * One part of a geometric value, counted from zero. A point is its two coordinates; everything
+     * built out of points is those points. Anything past the end is simply not there.
+     */
+    public static Object partAt(String typeName, String text, int index) {
+        if (index < 0) return null;
+        if ("point".equals(typeName)) {
+            PgPoint p = parsePoint(text);
+            if (index == 0) return p.x();
+            if (index == 1) return p.y();
+            return null;
+        }
+        List<PgPoint> points = parsePointList(text);
+        return index < points.size() ? formatPoint(points.get(index)) : null;
+    }
+
     /**
      * Parse a list of points from a string like "(x1,y1),(x2,y2),..."
      */

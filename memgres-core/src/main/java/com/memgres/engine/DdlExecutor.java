@@ -503,6 +503,14 @@ class DdlExecutor {
                 if (isArray) {
                     arrayElementType = DataType.TEXT;
                 }
+            } else if (executor.database.isRangeType(baseType)) {
+                // A range is carried as the text it prints as, whichever subtype it was built over:
+                // PostgreSQL's own range types are held that way here too, so a column of a range
+                // the reader defined stores exactly what a column of int4range stores.
+                dataType = DataType.TEXT;
+                if (isArray) {
+                    arrayElementType = DataType.TEXT;
+                }
             } else if (executor.database.isShellType(baseType)) {
                 // A shell has no representation yet, so nothing can be declared as one
                 throw new MemgresException("type \""

@@ -17,7 +17,7 @@ INSERT INTO arr_test VALUES
 -- columns: id|second_num|slice_text|num_len|card
 -- row: 1|2|{1,2}|3|3
 -- row: 2|4|{2,4}|2|2
--- row: 3||||0
+-- row: 3||{}||0
 -- end-expected
 SELECT
     id,

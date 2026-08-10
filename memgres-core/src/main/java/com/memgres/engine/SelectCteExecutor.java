@@ -859,7 +859,12 @@ class SelectCteExecutor {
      * duplicate removal — dropping it left the query answering as if the cycle were never found.
      */
     private static String dedupKey(Object[] row, List<Object> cyclePath, boolean isCycle) {
-        String key = Arrays.deepToString(row);
+        // Each column contributes its own key, kept apart from its neighbours. Running the whole
+        // row into one string made ("a", "b, c") and ("a, b", "c") the same row, and split two
+        // rows that were the same when a value's Java spelling was not its own.
+        StringBuilder sb = new StringBuilder();
+        for (Object value : row) sb.append(RowKey.valueKey(value)).append(' ');
+        String key = sb.toString();
         return cyclePath == null ? key : key + "|" + isCycle + "|" + cyclePath;
     }
 

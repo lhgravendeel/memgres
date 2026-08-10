@@ -70,8 +70,17 @@ class XmlFunctions {
                         // XML-producing expressions: pass through without escaping (PG behavior)
                         if (val != null && isXmlExpr(argExpr)) {
                             contents.add(val.toString());
+                        } else if (val instanceof java.util.List<?>) {
+                            // An array becomes one <element> per element, which is how PG's
+                            // array-to-xml mapping writes it.
+                            for (Object element : PgArray.flatten((java.util.List<?>) val)) {
+                                contents.add("<element>" + (element == null ? ""
+                                        : XmlOperations.escapeXml(TypeCoercion.toString(element)))
+                                        + "</element>");
+                            }
                         } else {
-                            contents.add(val == null ? null : XmlOperations.escapeXml(val.toString()));
+                            contents.add(val == null ? null
+                                    : XmlOperations.escapeXml(TypeCoercion.toString(val)));
                         }
                     }
                 }

@@ -39,13 +39,22 @@ class DmlParser {
 
         // Column list — disambiguate from parenthesized SELECT by scanning for query keywords
         List<String> columns = null;
+        List<List<SubscriptExpr.Subscript>> columnSubscripts = new ArrayList<>();
         if (parser.check(TokenType.LEFT_PAREN) && parser.countLeadingParensBeforeQuery() < 0) {
             parser.expect(TokenType.LEFT_PAREN);
             columns = new ArrayList<>();
             do {
                 columns.add(parser.readIdentifier());
+                // A column may be named with brackets after it, which writes part of its value
+                // rather than the whole of it, exactly as an UPDATE's assignment does.
+                columnSubscripts.add(parseSubscripts());
             } while (parser.match(TokenType.COMMA));
             parser.expect(TokenType.RIGHT_PAREN);
+            boolean anySubscript = false;
+            for (List<SubscriptExpr.Subscript> one : columnSubscripts) {
+                if (one != null) anySubscript = true;
+            }
+            if (!anySubscript) columnSubscripts = null;
         }
 
         // OVERRIDING SYSTEM VALUE / OVERRIDING USER VALUE
@@ -107,7 +116,9 @@ class DmlParser {
             if (parser.checkKeyword("ORDER")) throw new ParseException("syntax error at or near \"ORDER\"", parser.peek());
         }
 
-        return new InsertStmt(schema, table, columns, values, selectStmt, onConflict, returning, withClauses, insertAlias, overridingSystemValue, overridingUserValue);
+        return new InsertStmt(schema, table, columns, values, selectStmt, onConflict, returning,
+                withClauses, insertAlias, overridingSystemValue, overridingUserValue)
+                .withColumnSubscripts(columnSubscripts);
     }
 
     boolean isNextKeywordSelect() {
@@ -225,6 +236,33 @@ class DmlParser {
         return new UpdateStmt(schema, table, alias, sets, from, where, returning, withClauses);
     }
 
+    /** The brackets written after a name, or null when there are none. */
+    private List<SubscriptExpr.Subscript> parseSubscripts() {
+        List<SubscriptExpr.Subscript> subscripts = null;
+        while (parser.check(TokenType.LEFT_BRACKET)) {
+            parser.advance();
+            Expression lower = null;
+            Expression upper = null;
+            boolean isSlice = false;
+            if (parser.check(TokenType.COLON)) {
+                parser.advance();
+                isSlice = true;
+                if (!parser.check(TokenType.RIGHT_BRACKET)) upper = parser.parseExpression();
+            } else {
+                lower = parser.parseExpression();
+                if (parser.check(TokenType.COLON)) {
+                    parser.advance();
+                    isSlice = true;
+                    if (!parser.check(TokenType.RIGHT_BRACKET)) upper = parser.parseExpression();
+                }
+            }
+            parser.expect(TokenType.RIGHT_BRACKET);
+            if (subscripts == null) subscripts = new ArrayList<>();
+            subscripts.add(new SubscriptExpr.Subscript(lower, upper, isSlice));
+        }
+        return subscripts;
+    }
+
     List<InsertStmt.SetClause> parseSetClauses() {
         List<InsertStmt.SetClause> clauses = new ArrayList<>();
         List<String> plainlyAssigned = new ArrayList<>();
@@ -241,69 +279,13 @@ class DmlParser {
             }
             // Subscripted update: col['key'] = value, col[2] = value, or col[1:2] = value.
             // A JSONB key and an array index look the same here; which one is meant depends on
-            // the column's declared type, which only the executor knows.
-            List<String> subscriptKeys = null;
-            Expression sliceLower = null;
-            Expression sliceUpper = null;
-            boolean sawSlice = false;
-            while (parser.check(TokenType.LEFT_BRACKET)) {
-                parser.advance(); // consume [
-                Token keyToken = parser.advance(); // consume key (string literal or integer)
-                String key = keyToken.value();
-                if (parser.check(TokenType.COLON)) {
-                    if (sawSlice) {
-                        throw new com.memgres.engine.MemgresException(
-                                "multi-dimensional slice assignment is not supported", "0A000");
-                    }
-                    parser.advance(); // consume :
-                    Token upperToken = parser.advance();
-                    sliceLower = Literal.ofInt(key);
-                    sliceUpper = Literal.ofInt(upperToken.value());
-                    sawSlice = true;
-                    parser.expect(TokenType.RIGHT_BRACKET);
-                    continue;
-                }
-                if (subscriptKeys == null) subscriptKeys = new ArrayList<>();
-                subscriptKeys.add(key);
-                parser.expect(TokenType.RIGHT_BRACKET);
-            }
+            // the column's declared type, which only the executor knows. Each subscript is a whole
+            // expression: reading one token apiece refused col[i], col[$1] and col[-1] outright.
+            List<SubscriptExpr.Subscript> subscripts = parseSubscripts();
             parser.expect(TokenType.EQUALS);
             Expression val = parser.parseExpression();
-            if (sawSlice) {
-                Expression target = new ColumnRef(null, col);
-                Expression setExpr = new FunctionCallExpr("__array_assign_slice__",
-                        Cols.listOf(target, sliceLower, sliceUpper, val));
-                clauses.add(new InsertStmt.SetClause(col, setExpr, subField));
-            } else if (subscriptKeys != null) {
-                // Transform into jsonb_set call: jsonb_set(col, '{key}', value)
-                // Build the path array
-                StringBuilder pathArray = new StringBuilder("{");
-                for (int i = 0; i < subscriptKeys.size(); i++) {
-                    if (i > 0) pathArray.append(",");
-                    pathArray.append(subscriptKeys.get(i));
-                }
-                pathArray.append("}");
-                // Wrap the value expression in a jsonb_set function call
-                Expression colRef = new ColumnRef(null, col);
-                Expression pathExpr = Literal.ofString(pathArray.toString());
-                // Use to_jsonb(value) to ensure the value is jsonb
-                Expression jsonbVal;
-                if (val instanceof CastExpr) {
-                    CastExpr cast = (CastExpr) val;
-                    if (cast.typeName().equalsIgnoreCase("jsonb") || cast.typeName().equalsIgnoreCase("json")) {
-                        jsonbVal = val; // already cast to jsonb
-                    } else {
-                        jsonbVal = new FunctionCallExpr("to_jsonb", Cols.listOf(val));
-                    }
-                } else {
-                    jsonbVal = new FunctionCallExpr("to_jsonb", Cols.listOf(val));
-                }
-                // Which of the two this means is settled at run time, where the column's declared
-                // type is known: an array index assigns an element, anything else sets a JSON key.
-                Expression setExpr = new FunctionCallExpr("__subscript_assign__",
-                        Cols.listOf(colRef, pathExpr, jsonbVal, val,
-                                Literal.ofString(subscriptKeys.get(0))));
-                clauses.add(new InsertStmt.SetClause(col, setExpr, subField));
+            if (subscripts != null) {
+                clauses.add(new InsertStmt.SetClause(col, val, subField, subscripts));
             } else {
                 // A field of a composite column writes part of it, and writing several parts is
                 // how a statement sets more than one field: "SET pos.x = 1, pos.y = 2" names pos

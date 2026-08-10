@@ -543,24 +543,10 @@ class DmlExecutor {
             for (Object[] subRow : subResult.getRows()) {
                 List<Expression> exprRow = new ArrayList<>();
                 for (Object val : subRow) {
-                    if (val == null) {
-                        exprRow.add(Literal.ofNull());
-                    } else if (val instanceof Integer || val instanceof Long) {
-                        exprRow.add(Literal.ofInt(val.toString()));
-                    } else if (val instanceof Double || val instanceof Float) {
-                        // Keep the float width: a plain numeric literal would make an overflow on
-                        // the way into a real column read as an input error rather than the
-                        // narrowing PG reports, and would leave NaN with no numeric to become.
-                        exprRow.add(new CastExpr(Literal.ofFloat(val.toString()),
-                                val instanceof Float ? "float4" : "float8"));
-                    } else if (val instanceof java.math.BigDecimal) {
-                        exprRow.add(Literal.ofFloat(val.toString()));
-                    } else if (val instanceof Boolean) {
-                        Boolean b = (Boolean) val;
-                        exprRow.add(Literal.ofBoolean(b));
-                    } else {
-                        exprRow.add(Literal.ofString(val.toString()));
-                    }
+                    // The query has already produced the value; it is carried across as it is
+                    // rather than written out and read back, which is what destroyed a bytea and
+                    // an array on the way in.
+                    exprRow.add(val == null ? Literal.ofNull() : new ComputedValue(val));
                 }
                 valueRows.add(exprRow);
             }
@@ -629,6 +615,19 @@ class DmlExecutor {
                     Column genCol = table.getColumns().get(colIdx);
                     if (genCol.isGenerated()) {
                         throw new MemgresException("cannot insert a non-DEFAULT value into column \"" + genCol.getName() + "\"\n  Detail: Column \"" + genCol.getName() + "\" is a generated column.", "428C9");
+                    }
+                    // A column named with brackets is written through them: the row starts with
+                    // nothing in that column, and the assignment builds the value around it.
+                    List<SubscriptExpr.Subscript> subscripts = stmt.columnSubscripts() == null
+                            || i >= stmt.columnSubscripts().size()
+                            ? null : stmt.columnSubscripts().get(i);
+                    if (subscripts != null) {
+                        row[colIdx] = TypeCoercion.coerceForStorage(
+                                executor.subscriptAssign.assign(row[colIdx], genCol, subscripts,
+                                        valueRow.get(i), valueCtx),
+                                table.getColumns().get(colIdx));
+                        filledCols.add(colIdx);
+                        continue;
                     }
                     Object val = executor.evalExpr(valueRow.get(i), valueCtx);
                     row[colIdx] = TypeCoercion.coerceForStorage(val, table.getColumns().get(colIdx));
@@ -1976,27 +1975,16 @@ class DmlExecutor {
                 }
                 continue;
             }
-            Object val = executor.evalExpr(set.value(), ctx);
-            // Validate array element type for subscript assignments (e.g. vals[1] = 'not_an_int')
-            // The parser transforms array subscript SET into jsonb_set calls. For non-JSONB array
-            // columns (INT[], TEXT[], etc.), validate that the assigned value matches the element type.
-            if (set.value() instanceof FunctionCallExpr
-                    && "jsonb_set".equals(((FunctionCallExpr) set.value()).name())
-                    && genCol.getType() == DataType.INT4_ARRAY) {
-                // Extract the new element value from the jsonb_set call's 3rd arg (to_jsonb(val))
-                FunctionCallExpr jsonbSetCall = (FunctionCallExpr) set.value();
-                if (jsonbSetCall.args().size() >= 3) {
-                    Expression innerValExpr = jsonbSetCall.args().get(2);
-                    Object innerVal = executor.evalExpr(innerValExpr, ctx);
-                    if (innerVal instanceof String) {
-                        String sv = innerVal.toString().replace("\"", "").trim();
-                        try { Long.parseLong(sv); } catch (NumberFormatException e) {
-                            throw new MemgresException(
-                                    "invalid input syntax for type integer: \"" + sv + "\"", "22P02");
-                        }
-                    }
-                }
+            // An assignment through brackets writes part of the value the column holds, which is
+            // not the same as computing a new whole one.
+            if (set.subscripts() != null) {
+                newRow[colIdx] = TypeCoercion.coerceForStorage(
+                        executor.subscriptAssign.assign(newRow[colIdx],
+                                table.getColumns().get(colIdx), set.subscripts(), set.value(), ctx),
+                        table.getColumns().get(colIdx));
+                continue;
             }
+            Object val = executor.evalExpr(set.value(), ctx);
             // Handle composite field update: SET col.field = value
             if (set.subField() != null) {
                 String compositeTypeName = genCol.getCompositeTypeName();
@@ -2599,10 +2587,14 @@ class DmlExecutor {
                                     break;
                                 }
                                 // Commit the (possibly trigger-modified) new values onto the live row.
-                                System.arraycopy(newRow, 0, targetRow, 0, targetRow.length);
-                                computeGeneratedColumns(targetTable, targetRow);
-                                executor.constraintValidator.validateConstraints(targetTable, targetRow, targetRow);
+                                // The new values are checked before they are written, and written
+                                // through the table so its indexes move with them. Copying them
+                                // straight onto the live row left every index pointing at the
+                                // values the row used to hold.
+                                computeGeneratedColumns(targetTable, newRow);
+                                executor.constraintValidator.validateConstraints(targetTable, newRow, targetRow);
                                 recordUpdateUndo(stmt.schema(), stmt.targetTable(), targetRow, oldRow);
+                                targetTable.updateRowInPlace(targetRow, oldRow, newRow);
                                 executor.constraintValidator.handleFkOnUpdate(targetTable, oldRow, targetRow);
                                 // Fire AFTER UPDATE triggers for MERGE
                                 triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.UPDATE, targetRow, oldRow, targetTable, updCols);
@@ -2678,10 +2670,14 @@ class DmlExecutor {
                                     processedTargetRows.add(targetRow);
                                     break;
                                 }
-                                System.arraycopy(newRow, 0, targetRow, 0, targetRow.length);
-                                computeGeneratedColumns(targetTable, targetRow);
-                                executor.constraintValidator.validateConstraints(targetTable, targetRow, targetRow);
+                                // The new values are checked before they are written, and written
+                                // through the table so its indexes move with them. Copying them
+                                // straight onto the live row left every index pointing at the
+                                // values the row used to hold.
+                                computeGeneratedColumns(targetTable, newRow);
+                                executor.constraintValidator.validateConstraints(targetTable, newRow, targetRow);
                                 recordUpdateUndo(stmt.schema(), stmt.targetTable(), targetRow, oldRow);
+                                targetTable.updateRowInPlace(targetRow, oldRow, newRow);
                                 executor.constraintValidator.handleFkOnUpdate(targetTable, oldRow, targetRow);
                                 triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.UPDATE, targetRow, oldRow, targetTable, updCols);
                                 if (hasReturning) {

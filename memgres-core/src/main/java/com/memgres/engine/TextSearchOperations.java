@@ -305,7 +305,8 @@ public class TextSearchOperations {
             for (String opt : options.split(",")) {
                 String[] kv = opt.trim().split("=", 2);
                 if (kv.length == 2) {
-                    String key = kv[0].trim().toLowerCase();
+                    String written = kv[0].trim();
+                    String key = written.toLowerCase();
                     String val = kv[1].trim();
                     switch (key) {
                         case "startsel":
@@ -315,14 +316,28 @@ public class TextSearchOperations {
                             stopSel = val;
                             break;
                         case "maxwords":
-                            maxWords = Integer.parseInt(val);
+                            // The two word counts are integers, and a value that is not one is
+                            // that type's own complaint rather than a failure of this reader.
+                            maxWords = TypeCoercion.toInteger(val);
                             break;
                         case "minwords":
-                            minWords = Integer.parseInt(val);
+                            minWords = TypeCoercion.toInteger(val);
                             break;
                         case "highlightall":
                             highlightAll = val.equalsIgnoreCase("true") || val.equals("1");
                             break;
+                        case "shortword":
+                        case "maxfragments":
+                        case "fragmentdelimiter":
+                            // Recognised names the headline this builds reads the same without
+                            break;
+                        default:
+                            // A name the parser does not know is a misspelling, and silently
+                            // dropping it left the caller with defaults they thought they had
+                            // changed. The word is quoted back as it was written, so it can be
+                            // found in the caller's own source.
+                            throw new MemgresException("unrecognized headline parameter: \""
+                                    + written + "\"", "22023");
                     }
                 }
             }
@@ -411,12 +426,25 @@ public class TextSearchOperations {
 
     /** ts_debug: one row per parser token, with the dictionary that handled it. */
     public static List<Object[]> tsDebug(String text) {
+        return tsDebug("english", text);
+    }
+
+    /**
+     * The same, read under a named configuration. A configuration is what routes a token type to
+     * a dictionary, so under {@code simple} every type that reaches a dictionary at all reaches
+     * the simple one, which lowercases the token and keeps the words the stemmer drops.
+     */
+    public static List<Object[]> tsDebug(String config, String text) {
         List<Object[]> result = new ArrayList<>();
         if (text == null) return result;
+        boolean isSimple = "simple".equalsIgnoreCase(config);
         for (com.memgres.engine.fts.TsParser.Token token
                 : com.memgres.engine.fts.TsParser.parse(text)) {
             com.memgres.engine.fts.TsParser.Dict dict =
                     com.memgres.engine.fts.TsParser.dictionaryFor(token.type());
+            if (isSimple && dict == com.memgres.engine.fts.TsParser.Dict.STEM) {
+                dict = com.memgres.engine.fts.TsParser.Dict.SIMPLE;
+            }
             String dictName;
             String lexemes;
             String lower = token.text().toLowerCase();

@@ -36,6 +36,8 @@ public class AstExecutor {
     public SystemCatalog getSystemCatalog() { return systemCatalog; }
     final ArrayOperationHandler arrayOperationHandler = new ArrayOperationHandler(this);
     final BinaryOpEvaluator binaryOpEvaluator = new BinaryOpEvaluator(this);
+    final SubscriptEvaluator subscriptEvaluator = new SubscriptEvaluator(this);
+    final SubscriptAssign subscriptAssign = new SubscriptAssign(this);
     final CompositeTypeHandler compositeTypeHandler = new CompositeTypeHandler(this);
     final DateTimeArithmetic dateTimeArithmetic = new DateTimeArithmetic(this);
     final FunctionEvaluator functionEvaluator = new FunctionEvaluator(this);
@@ -857,16 +859,10 @@ public class AstExecutor {
                 if (i > 0) sb.append(',');
                 Object elem = values.get(i);
                 if (elem == null) continue;
-                String text;
-                if (elem instanceof PgRow) {
-                    text = ((PgRow) elem).toPgText();
-                } else if (elem instanceof java.util.Map) {
-                    text = fromFieldMap((java.util.Map<?, ?>) elem).toPgText();
-                } else if (elem instanceof Boolean) {
-                    text = ((Boolean) elem) ? "t" : "f";
-                } else {
-                    text = elem.toString();
-                }
+                // Each field is written by its own type's output function, the same one an array
+                // element goes through: reading the Java object instead put a boolean in as
+                // "true", a bytea as its identity hash and an array as a Java list.
+                String text = TypeCoercion.toString(elem);
                 if (needsCompositeQuoting(text)) {
                     sb.append('"').append(text.replace("\\", "\\\\").replace("\"", "\"\"")).append('"');
                 } else {
@@ -915,15 +911,9 @@ public class AstExecutor {
 
         @Override
         public String toString() {
-            // PG-compatible format: (val1,val2,...) where NULL is empty
-            StringBuilder sb = new StringBuilder("(");
-            for (int i = 0; i < values.size(); i++) {
-                if (i > 0) sb.append(",");
-                Object v = values.get(i);
-                if (v != null) sb.append(v);
-            }
-            sb.append(")");
-            return sb.toString();
+            // A composite has one text form, the one record_out writes. A second, quoting-free
+            // one here is what a stored composite was written with, and no reader could undo it.
+            return toPgText();
         }
     }
 

@@ -938,41 +938,19 @@ class ConstraintValidator {
         }
     }
 
-    /** Check if two PostgreSQL range literals overlap. */
+    /**
+     * Whether two ranges overlap. The bounds are compared as values of the element type, which is
+     * how the {@code &&} operator compares them; comparing their written text put 9 after 10 and
+     * let two overlapping ranges into a column that excludes them.
+     */
     private boolean rangesOverlap(String r1, String r2) {
-        Object[] p1 = parseRange(r1);
-        Object[] p2 = parseRange(r2);
-        if (p1 == null || p2 == null) return false;
-        String lower1 = (String) p1[0], upper1 = (String) p1[1];
-        boolean lowerInc1 = (boolean) p1[2], upperInc1 = (boolean) p1[3];
-        String lower2 = (String) p2[0], upper2 = (String) p2[1];
-        boolean lowerInc2 = (boolean) p2[2], upperInc2 = (boolean) p2[3];
-
-        // Two ranges overlap if neither is strictly before the other
-        // r1 is before r2 if upper1 < lower2 (or <= if either bound is exclusive)
-        if (!upper1.isEmpty() && !lower2.isEmpty()) {
-            int cmp = upper1.compareTo(lower2);
-            if (cmp < 0 || (cmp == 0 && (!upperInc1 || !lowerInc2))) return false;
+        try {
+            return RangeOperations.parse(r1).overlaps(RangeOperations.parse(r2));
+        } catch (MemgresException e) {
+            return false;
         }
-        if (!upper2.isEmpty() && !lower1.isEmpty()) {
-            int cmp = upper2.compareTo(lower1);
-            if (cmp < 0 || (cmp == 0 && (!upperInc2 || !lowerInc1))) return false;
-        }
-        return true;
     }
 
-    /** Parse a range literal like '[2024-01-01,2024-01-05)' into [lower, upper, lowerInc, upperInc]. */
-    private Object[] parseRange(String range) {
-        if (range == null || range.length() < 3) return null;
-        boolean lowerInc = range.charAt(0) == '[';
-        boolean upperInc = range.charAt(range.length() - 1) == ']';
-        String inner = range.substring(1, range.length() - 1);
-        int commaIdx = inner.indexOf(',');
-        if (commaIdx < 0) return null;
-        String lower = inner.substring(0, commaIdx).trim();
-        String upper = inner.substring(commaIdx + 1).trim();
-        return new Object[]{lower, upper, lowerInc, upperInc};
-    }
 
     // ---- Definition-time validation of a FOREIGN KEY ----
 
