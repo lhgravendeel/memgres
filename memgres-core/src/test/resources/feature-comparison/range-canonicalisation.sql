@@ -180,3 +180,66 @@ DROP TABLE zz_rg_ex;
 
 DROP TYPE zz_rg_fr CASCADE;
 
+
+-- A range ends at the bracket that closes it; what comes after belongs to nothing.
+-- begin-expected-error
+-- sqlstate: 22P02
+-- message-like: ERROR: malformed range literal: "[1,2)]"
+-- end-expected-error
+SELECT '[1,2)]'::int4range;
+
+-- begin-expected-error
+-- sqlstate: 22P02
+-- message-like: ERROR: malformed range literal: "[1,2))"
+-- end-expected-error
+SELECT '[1,2))'::int4range;
+
+-- begin-expected-error
+-- sqlstate: 22P02
+-- message-like: ERROR: malformed range literal: "(1,2)x"
+-- end-expected-error
+SELECT '(1,2)x'::int4range;
+
+-- begin-expected-error
+-- sqlstate: 22P02
+-- message-like: ERROR: malformed range literal: "[)"
+-- end-expected-error
+SELECT '[)'::int4range;
+
+-- begin-expected-error
+-- sqlstate: 22P02
+-- message-like: ERROR: malformed range literal: "[1,2"
+-- end-expected-error
+SELECT '[1,2'::int4range;
+
+-- Trailing space is not junk.
+-- begin-expected
+-- columns: text
+-- row: [1,2)
+-- end-expected
+SELECT '[1,2) '::int4range::text;
+
+-- A multirange literal is read as one wherever it stands, including beside an operator.
+-- begin-expected-error
+-- sqlstate: 22P02
+-- message-like: ERROR: malformed multirange literal: "[1,2)"
+-- end-expected-error
+SELECT '[1,2)'::int4multirange;
+
+-- begin-expected-error
+-- sqlstate: 22P02
+-- message-like: ERROR: malformed multirange literal: "[1,2)"
+-- end-expected-error
+SELECT '{[1,3),[5,7)}'::int4multirange @> '[1,2)';
+
+-- begin-expected-error
+-- sqlstate: 22P02
+-- message-like: ERROR: malformed multirange literal: "{[1,2)"
+-- end-expected-error
+SELECT '{[1,3)}'::int4multirange @> '{[1,2)';
+
+-- begin-expected-error
+-- sqlstate: 22P02
+-- message-like: ERROR: malformed multirange literal: "{}x"
+-- end-expected-error
+SELECT '{[1,3)}'::int4multirange @> '{}x';

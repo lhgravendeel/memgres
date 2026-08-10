@@ -80,8 +80,12 @@ final class StatementAnalyzer {
                 : prepared.inferredParamCount();
         int given = exec.params() == null ? 0 : exec.params().size();
         if (given != expected) {
+            // The two counts are the detail behind the complaint rather than part of it, which is
+            // what keeps the message the same for every prepared statement.
             throw new MemgresException(
-                    "wrong number of parameters for prepared statement \"" + exec.name() + "\"", "42601");
+                    "wrong number of parameters for prepared statement \"" + exec.name() + "\""
+                            + "\n  Detail: Expected " + expected + " parameters but got "
+                            + given + ".", "42601");
         }
     }
 

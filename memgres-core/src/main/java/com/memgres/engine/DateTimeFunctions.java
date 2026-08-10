@@ -87,7 +87,7 @@ class DateTimeFunctions {
                 Object source = executor.evalExpr(fn.args().get(1), ctx);
                 if (fieldObj == null) return null;
                 if (source instanceof Number && !(source instanceof Double)) {
-                    throw new MemgresException("function date_part(unknown, integer) does not exist\n  Hint: No function matches the given name and argument types.", "42883");
+                    throw new MemgresException("function date_part(unknown, integer) does not exist\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
                 }
                 return extractDatePart(fieldObj.toString().toLowerCase(), source, name.equals("extract"));
             }
@@ -465,7 +465,14 @@ class DateTimeFunctions {
 
     /** The unit is a word PostgreSQL knows, but this type has no such field. */
     private static MemgresException notSupported(String unit, String typeName) {
-        return new MemgresException("unit \"" + unit + "\" not supported for type " + typeName, "0A000");
+        MemgresException e = new MemgresException(
+                "unit \"" + unit + "\" not supported for type " + typeName, "0A000");
+        // An interval counts months, and a month is not a whole number of weeks, so PostgreSQL
+        // says why a week of an interval is not a thing to ask for.
+        if ("interval".equals(typeName) && "week".equals(fieldUnit(unit))) {
+            e.setDetail("Months usually have fractional weeks.");
+        }
+        return e;
     }
 
     /** The unit is not a word PostgreSQL knows at all. */
@@ -745,8 +752,7 @@ class DateTimeFunctions {
         // PG has no date_trunc over timetz at all, and reaches the interval form for time
         if (asOffsetTime(source) != null) {
             throw new MemgresException("function date_trunc(unknown, time with time zone) does not exist"
-                    + "\n  Hint: No function matches the given name and argument types."
-                    + " You might need to add explicit type casts.", "42883");
+                    + "\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
         }
         if (source instanceof java.time.LocalTime) {
             return truncateInterval(unit,

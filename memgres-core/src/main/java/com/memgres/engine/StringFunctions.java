@@ -300,8 +300,10 @@ class StringFunctions {
                     i++;
                 }
                 if (!closed) {
-                    throw new MemgresException("string is not a valid identifier: \"" + input + "\"",
-                            "22023");
+                    MemgresException e = new MemgresException(
+                            "string is not a valid identifier: \"" + input + "\"", "22023");
+                    e.setDetail("String has unclosed double quotes.");
+                    throw e;
                 }
                 parts.add(sb.toString());
             } else {
@@ -322,7 +324,12 @@ class StringFunctions {
         }
         while (i < n && Character.isWhitespace(input.charAt(i))) i++;
         if (parts.isEmpty() || expectingPart || (strict && i < n)) {
-            throw new MemgresException("string is not a valid identifier: \"" + input + "\"", "22023");
+            MemgresException e = new MemgresException(
+                    "string is not a valid identifier: \"" + input + "\"", "22023");
+            // A dot promised another part and got none, which is the one of these PostgreSQL
+            // explains; text that was never an identifier at all it simply refuses.
+            if (expectingPart) e.setDetail("No valid identifier after \".\".");
+            throw e;
         }
         return parts;
     }
@@ -465,7 +472,7 @@ class StringFunctions {
             case "casefold": {
                 if (fn.args().isEmpty()) {
                     throw new MemgresException("function casefold() does not exist"
-                            + "\n  Hint: No function matches the given name and argument types.", "42883");
+                            + "\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
                 }
                 Object cfArg = executor.evalExpr(fn.args().get(0), ctx);
                 if (cfArg == null) return null;
@@ -475,7 +482,7 @@ class StringFunctions {
             case "parse_ident": {
                 if (fn.args().isEmpty()) {
                     throw new MemgresException("function parse_ident() does not exist"
-                            + "\n  Hint: No function matches the given name and argument types.", "42883");
+                            + "\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
                 }
                 Object piArg = executor.evalExpr(fn.args().get(0), ctx);
                 if (piArg == null) return null;
@@ -488,7 +495,7 @@ class StringFunctions {
             }
             case "lower": {
                 if (fn.args().isEmpty()) {
-                    throw new MemgresException("function lower() does not exist\n  Hint: No function matches the given name and argument types.", "42883");
+                    throw new MemgresException("function lower() does not exist\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
                 }
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
@@ -619,7 +626,7 @@ class StringFunctions {
             case "substr": {
                 requireIntegerCounts(fn, ctx, name, 1, 2);
                 if (fn.args().size() < 2) {
-                    throw new MemgresException("function substring(text) does not exist\n  Hint: No function matches the given name and argument types.", "42883");
+                    throw new MemgresException("function substring(text) does not exist\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
                 }
                 Object str = executor.evalExpr(fn.args().get(0), ctx);
                 if (str == null) return null;
@@ -1622,7 +1629,7 @@ class StringFunctions {
         if (fn.args().size() < min) {
             throw new MemgresException(
                 "function " + fn.name() + "() does not exist" +
-                (fn.args().isEmpty() ? "" : "\n  Hint: No function matches the given name and argument types."), "42883");
+                (fn.args().isEmpty() ? "" : "\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts."), "42883");
         }
     }
 

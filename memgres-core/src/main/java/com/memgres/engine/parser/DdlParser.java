@@ -1343,7 +1343,8 @@ class DdlParser {
         String name = parser.readIdentifier();
         // The pg_ prefix is reserved for system schemas, so a schema cannot claim it.
         if (name != null && name.toLowerCase().startsWith("pg_")) {
-            throw new MemgresException("unacceptable schema name \"" + name + "\"", "42939");
+            throw new MemgresException("unacceptable schema name \"" + name + "\""
+                    + "\n  Detail: The prefix \"pg_\" is reserved for system schemas.", "42939");
         }
         String authorization = null;
         if (parser.matchKeyword("AUTHORIZATION")) authorization = parser.readIdentifier();

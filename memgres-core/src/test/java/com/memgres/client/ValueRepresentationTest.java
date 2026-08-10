@@ -59,6 +59,23 @@ class ValueRepresentationTest {
         return thrown.getSQLState();
     }
 
+    /** The fields of the error a statement raises, as a client reads them off the wire. */
+    private static org.postgresql.util.ServerErrorMessage fieldsOf(String sql) {
+        SQLException thrown = assertThrows(SQLException.class, () -> exec(sql),
+                "expected an error from: " + sql);
+        assertTrue(thrown instanceof org.postgresql.util.PSQLException,
+                "expected a server error from: " + sql);
+        return ((org.postgresql.util.PSQLException) thrown).getServerErrorMessage();
+    }
+
+    private static String detailOf(String sql) {
+        return fieldsOf(sql).getDetail();
+    }
+
+    private static String hintOf(String sql) {
+        return fieldsOf(sql).getHint();
+    }
+
     // ------------------------------------------------------------ the output function
 
     /** One writer, and it is each type's own: a boolean is a letter and a bytea is its hex form. */
@@ -563,6 +580,22 @@ class ValueRepresentationTest {
         assertEquals("{5}", scalar("SELECT arr::text FROM vr_ins"));
     }
 
+    /**
+     * An array type says nothing about how many dimensions it has, so {@code = ANY} over an array
+     * of arrays compares against the innermost value.
+     */
+    @Test
+    void anyOverAnArrayOfArraysComparesTheInnermostValue() throws Exception {
+        assertEquals("42883", stateOf("SELECT ARRAY[1] = ANY (ARRAY[ARRAY[1]])"));
+        assertEquals("42883", stateOf("SELECT ARRAY[1] = ANY (ARRAY[ARRAY[1],ARRAY[2]])"));
+        assertEquals("42883", stateOf("SELECT ARRAY[1] = ALL (ARRAY[ARRAY[1],ARRAY[2]])"));
+        assertEquals("t", scalar("SELECT 1 = ANY (ARRAY[ARRAY[1],ARRAY[2]])"));
+        // The ordinary shapes are unchanged, and IN is a comparison against each written value.
+        assertEquals("t", scalar("SELECT 1 = ANY (ARRAY[1,2])"));
+        assertEquals("t", scalar("SELECT 'a' = ANY (ARRAY['a','b'])"));
+        assertEquals("t", scalar("SELECT ARRAY[1] IN (ARRAY[1], ARRAY[2])"));
+    }
+
     /** A json document is not a range, however alike the two are written. */
     @Test
     void containmentOverAJsonDocumentIsJsonContainment() throws Exception {
@@ -600,5 +633,102 @@ class ValueRepresentationTest {
         exec("CREATE TABLE vr_ch (v \"char\")");
         exec("INSERT INTO vr_ch VALUES ('a')");
         assertEquals("a", scalar("SELECT v::text FROM vr_ch"));
+    }
+
+    // ------------------------------------------------------------ what a malformed value says
+
+    /** A range ends at the bracket that closes it, and what follows belongs to nothing. */
+    @Test
+    void aRangeEndsWhereItCloses() throws Exception {
+        assertEquals("Junk after right parenthesis or bracket.",
+                detailOf("SELECT '[1,2)]'::int4range"));
+        assertEquals("Junk after right parenthesis or bracket.",
+                detailOf("SELECT '[1,2))'::int4range"));
+        assertEquals("Junk after right parenthesis or bracket.",
+                detailOf("SELECT '(1,2)x'::int4range"));
+        assertEquals("Unexpected end of input.", detailOf("SELECT '[1,2'::int4range"));
+        // Trailing space is not junk, and a range that closes at its end is read as it always was.
+        assertEquals("[1,2)", scalar("SELECT ('[1,2) '::int4range)::text"));
+    }
+
+    /** A range holds two bounds, and text between its brackets that holds none says so. */
+    @Test
+    void aRangeWithoutACommaNamesTheMissingOne() {
+        assertEquals("Missing comma after lower bound.", detailOf("SELECT '[)'::int4range"));
+        assertEquals("Missing comma after lower bound.", detailOf("SELECT '[]'::int4range"));
+        assertEquals("Missing left parenthesis or bracket.", detailOf("SELECT 'x'::int4range"));
+    }
+
+    /** A multirange literal beside a multirange operator is read as one, and faulted as one. */
+    @Test
+    void aMultirangeLiteralIsFaultedWhereverItIsRead() {
+        assertEquals("Missing left brace.", detailOf("SELECT '[1,2)'::int4multirange"));
+        assertEquals("Missing left brace.",
+                detailOf("SELECT '{[1,3),[5,7)}'::int4multirange @> '[1,2)'"));
+        assertEquals("Unexpected end of input.",
+                detailOf("SELECT '{[1,3)}'::int4multirange @> '{[1,2)'"));
+        assertEquals("Junk after closing right brace.",
+                detailOf("SELECT '{[1,3)}'::int4multirange @> '{}x'"));
+    }
+
+    /**
+     * A virtual generated column has no value in the row, so the row prints the word rather than
+     * what the column works out to. A stored one is in the row and prints like any other column.
+     */
+    @Test
+    void aFailingRowPrintsAVirtualColumnAsVirtual() throws Exception {
+        exec("DROP TABLE IF EXISTS vr_vg");
+        exec("CREATE TABLE vr_vg (id int, a int, b int,"
+                + " total int GENERATED ALWAYS AS (a + b) VIRTUAL,"
+                + " CONSTRAINT vr_vg_chk CHECK (total > 0))");
+        assertEquals("Failing row contains (2, -50, 10, virtual).",
+                detailOf("INSERT INTO vr_vg (id, a, b) VALUES (2, -50, 10)"));
+
+        exec("DROP TABLE IF EXISTS vr_vs");
+        exec("CREATE TABLE vr_vs (id int, a int, b int,"
+                + " total int GENERATED ALWAYS AS (a + b) STORED,"
+                + " CONSTRAINT vr_vs_chk CHECK (total > 0))");
+        assertEquals("Failing row contains (2, -50, 10, -40).",
+                detailOf("INSERT INTO vr_vs (id, a, b) VALUES (2, -50, 10)"));
+    }
+
+    /**
+     * A name is suggested only while it is spelled nearly the same: within three edits of what was
+     * written, and within half of it. Casing counts as spelling, so a column named one way is no
+     * suggestion for the same letters cased another.
+     */
+    @Test
+    void aSuggestedColumnIsSpelledNearlyTheSame() throws Exception {
+        exec("DROP TABLE IF EXISTS vr_near");
+        exec("CREATE TABLE vr_near (abcd int)");
+        assertEquals("Perhaps you meant to reference the column \"vr_near.abcd\".",
+                hintOf("SELECT abcdefg FROM vr_near"));
+        assertNull(hintOf("SELECT abcdefgh FROM vr_near"));
+
+        exec("DROP TABLE IF EXISTS vr_one");
+        exec("CREATE TABLE vr_one (p int)");
+        assertNull(hintOf("SELECT x FROM vr_one"));
+
+        exec("DROP TABLE IF EXISTS vr_case");
+        exec("CREATE TABLE vr_case (\"MiXeD\" int)");
+        assertNull(hintOf("SELECT \"mixed\" FROM vr_case"));
+
+        exec("DROP TABLE IF EXISTS vr_tail");
+        exec("CREATE TABLE vr_tail (read_bytes int)");
+        assertNull(hintOf("SELECT op_bytes FROM vr_tail"));
+    }
+
+    /**
+     * An operator written in front of its one operand has one argument to cast, and the advice is
+     * in the singular.
+     */
+    @Test
+    void aPrefixOperatorIsAdvisedAboutInTheSingular() {
+        assertEquals("No operator matches the given name and argument type."
+                + " You might need to add an explicit type cast.",
+                hintOf("SELECT @ '-10'::text"));
+        assertEquals("No operator matches the given name and argument types."
+                + " You might need to add explicit type casts.",
+                hintOf("SELECT '-10'::text + 1::int"));
     }
 }

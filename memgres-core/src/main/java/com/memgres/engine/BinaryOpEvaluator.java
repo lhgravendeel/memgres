@@ -63,7 +63,7 @@ class BinaryOpEvaluator {
             String rType = declaredGeometricType(bin.right(), ctx);
             throw new MemgresException("operator does not exist: lseg @> "
                     + (rType != null ? rType : "unknown")
-                    + "\n  Hint: No operator matches the given name and argument types.", "42883");
+                    + "\n  Hint: No operator matches the given name and argument types. You might need to add explicit type casts.", "42883");
         }
     }
 
@@ -107,7 +107,7 @@ class BinaryOpEvaluator {
         if (lName == null || rName == null) return;
         throw new MemgresException("operator does not exist: "
                 + lName + " " + resolvedOperatorSymbol(op) + " " + rName
-                + "\n  Hint: No operator matches the given name and argument types.", "42883");
+                + "\n  Hint: No operator matches the given name and argument types. You might need to add explicit type casts.", "42883");
     }
 
     /**
@@ -294,8 +294,7 @@ class BinaryOpEvaluator {
         String rName = lRange ? pgName(scalar) : rDeclared;
         throw new MemgresException("operator does not exist: " + lName + " "
                 + binOpToSymbol(bin.op()) + " " + rName
-                + "\n  Hint: No operator matches the given name and argument types."
-                + " You might need to add explicit type casts.", "42883");
+                + "\n  Hint: No operator matches the given name and argument types. You might need to add explicit type casts.", "42883");
     }
 
     /**
@@ -316,8 +315,7 @@ class BinaryOpEvaluator {
         if (lDeclared.equals(rDeclared)) return;
         throw new MemgresException("operator does not exist: " + lDeclared + " "
                 + binOpToSymbol(bin.op()) + " " + rDeclared
-                + "\n  Hint: No operator matches the given name and argument types."
-                + " You might need to add explicit type casts.", "42883");
+                + "\n  Hint: No operator matches the given name and argument types. You might need to add explicit type casts.", "42883");
     }
 
     /** The multirange types, whose value is a brace-wrapped list of ranges. */
@@ -336,6 +334,10 @@ class BinaryOpEvaluator {
         if (!resolvesAgainstOperandType(op)) return;
         String text = value.toString().trim();
         if (text.startsWith("{") && text.endsWith("}")) return;
+        // Reading it the way a multirange is read is what names the fault -- a literal that never
+        // opened a brace is a different complaint from one that opened and never closed -- and it
+        // names it in the same words wherever a multirange literal is read.
+        RangeOperations.parseMultirangeLiteral(text);
         throw new MemgresException("malformed multirange literal: \"" + text + "\"", "22P02");
     }
 
@@ -633,8 +635,7 @@ class BinaryOpEvaluator {
     private MemgresException missingOperator(String lName, BinaryExpr.BinOp op, String rName) {
         return new MemgresException("operator does not exist: " + lName + " "
                 + resolvedOperatorSymbol(op) + " " + rName
-                + "\n  Hint: No operator matches the given name and argument types."
-                + " You might need to add explicit type casts.", "42883");
+                + "\n  Hint: No operator matches the given name and argument types. You might need to add explicit type casts.", "42883");
     }
 
     /** Runs the declaration-only rules for an operator the parser spelled some other way. */
@@ -1326,8 +1327,7 @@ class BinaryOpEvaluator {
             String rRange = declaredRangeTypeStrict(bin.right(), ctx);
             if (lRange != null && rRange != null) {
                 throw new MemgresException("operator does not exist: " + lRange + " || " + rRange
-                        + "\n  Hint: No operator matches the given name and argument types."
-                        + " You might need to add explicit type casts.", "42883");
+                        + "\n  Hint: No operator matches the given name and argument types. You might need to add explicit type casts.", "42883");
             }
             if (lRange != null || rRange != null) {
                 if (left == null || right == null) return null;
@@ -2021,8 +2021,7 @@ class BinaryOpEvaluator {
                 // operator at all rather than being narrowed to one.
                 if (right instanceof Long) {
                     throw new MemgresException("operator does not exist: jsonb -> bigint"
-                            + "\n  Hint: No operator matches the given name and argument types."
-                            + " You might need to add explicit type casts.", "42883");
+                            + "\n  Hint: No operator matches the given name and argument types. You might need to add explicit type casts.", "42883");
                 }
                 if (right instanceof Number) {
                     Number n = (Number) right;
@@ -2753,8 +2752,7 @@ class BinaryOpEvaluator {
                                                         String rName) {
         return new MemgresException("operator does not exist: "
                 + lName + (leftward ? " << " : " >> ") + rName
-                + "\n  Hint: No operator matches the given name and argument types."
-                + " You might need to add explicit type casts.", "42883");
+                + "\n  Hint: No operator matches the given name and argument types. You might need to add explicit type casts.", "42883");
     }
 
     /** The type an operand was written as, falling back on the one its value carries. */
@@ -2844,14 +2842,12 @@ class BinaryOpEvaluator {
         if (MULTIRANGE_TYPES.contains(lType) != MULTIRANGE_TYPES.contains(rType)) {
             throw new MemgresException("operator does not exist: " + lType + " " + binOpToSymbol(op)
                     + " " + rType
-                    + "\n  Hint: No operator matches the given name and argument types."
-                    + " You might need to add explicit type casts.", "42883");
+                    + "\n  Hint: No operator matches the given name and argument types. You might need to add explicit type casts.", "42883");
         }
         if (!lType.equals(rType)) {
             throw new MemgresException("operator does not exist: " + lType + " " + binOpToSymbol(op)
                     + " " + rType
-                    + "\n  Hint: No operator matches the given name and argument types."
-                    + " You might need to add explicit type casts.", "42883");
+                    + "\n  Hint: No operator matches the given name and argument types. You might need to add explicit type casts.", "42883");
         }
         if (left == null || right == null) return null;
         if (!(left instanceof String) || !(right instanceof String)) return NOT_A_RANGE_OPERATION;

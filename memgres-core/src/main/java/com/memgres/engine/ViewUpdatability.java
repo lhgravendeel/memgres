@@ -323,27 +323,29 @@ final class ViewUpdatability {
     /**
      * PostgreSQL's Hint for a write refused on a non-updatable view: it names the trigger and the
      * rule that would make the write possible, so a caller learns what to create rather than only
-     * that it cannot write.
+     * that it cannot write. A MERGE is the one write no rule can stand in for, so its Hint offers
+     * the trigger alone and says which command it is speaking about.
      */
-    static String hintFor(String verb) {
-        if ("update".equals(verb)) {
-            return "To enable updating the view, provide an INSTEAD OF UPDATE trigger"
-                    + " or an unconditional ON UPDATE DO INSTEAD rule.";
+    static String hintFor(String verb, boolean byMerge) {
+        String doing = "update".equals(verb) ? "updating the view"
+                : "delete from".equals(verb) ? "deleting from the view" : "inserting into the view";
+        String event = "update".equals(verb) ? "UPDATE"
+                : "delete from".equals(verb) ? "DELETE" : "INSERT";
+        if (byMerge) {
+            return "To enable " + doing + " using MERGE, provide an INSTEAD OF "
+                    + event + " trigger.";
         }
-        if ("delete from".equals(verb)) {
-            return "To enable deleting from the view, provide an INSTEAD OF DELETE trigger"
-                    + " or an unconditional ON DELETE DO INSTEAD rule.";
-        }
-        return "To enable inserting into the view, provide an INSTEAD OF INSERT trigger"
-                + " or an unconditional ON INSERT DO INSTEAD rule.";
+        return "To enable " + doing + ", provide an INSTEAD OF " + event + " trigger"
+                + " or an unconditional ON " + event + " DO INSTEAD rule.";
     }
 
     /** The 55000 a write on a non-updatable view raises, with PostgreSQL's Detail and Hint. */
-    static MemgresException cannotWrite(String verb, String viewName, String detail) {
+    static MemgresException cannotWrite(String verb, String viewName, String detail,
+                                        boolean byMerge) {
         MemgresException ex = new MemgresException(
                 "cannot " + verb + " view \"" + viewName + "\"", "55000");
         ex.setDetail(detail);
-        ex.setHint(hintFor(verb));
+        ex.setHint(hintFor(verb, byMerge));
         return ex;
     }
 }

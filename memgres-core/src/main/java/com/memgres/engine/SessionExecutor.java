@@ -169,7 +169,7 @@ class SessionExecutor {
                     PgFunction fn = routineWithSignature(routine, writtenArgs);
                     if (fn == null) {
                         throw new MemgresException("function " + commentRoutineSignature(routine, writtenArgs)
-                                + " does not exist", "42883");
+                                + " does not exist", "42883").withoutHint();
                     }
                     // FUNCTION and PROCEDURE each name one kind of routine, and ROUTINE either.
                     if (wanted.equals("FUNCTION") && fn.isProcedure()) {
@@ -753,8 +753,9 @@ class SessionExecutor {
             if (!ForeignTables.existsIn(executor.database, ftSchema, ftName)) {
                 if (ifExists) return QueryResult.command(QueryResult.Type.SET, 0);
                 // Something else of that name in this schema is a wrong-kind drop; nothing of
-                // that name is a foreign table that is not there.
-                RelationNamespace.requireKind(executor.database, ftSchema, ftName,
+                // that name is a foreign table that is not there. A DROP has a right statement
+                // to point at, so the refusal names the one that drops what is really there.
+                RelationNamespace.requireKindForDrop(executor.database, ftSchema, ftName,
                         RelationNamespace.FOREIGN_TABLE);
                 throw new MemgresException("foreign table \"" + ftName + "\" does not exist", "42704");
             }
@@ -1330,7 +1331,10 @@ class SessionExecutor {
                         || p.equals("euro") || p.equals("us")) {
                     validOrder = true;
                 } else {
-                    throw new MemgresException("invalid value for parameter \"DateStyle\": \"" + value + "\"", "22023");
+                    MemgresException e = new MemgresException(
+                            "invalid value for parameter \"DateStyle\": \"" + value + "\"", "22023");
+                    e.setDetail("Unrecognized key word: \"" + p + "\".");
+                    throw e;
                 }
             }
             if (!validStyle && !validOrder) {
@@ -1831,8 +1835,12 @@ class SessionExecutor {
                 // only a role that exists can then be one the session is not allowed to act as.
                 requireGrantRole(grantorName);
                 if (s.isRoleGrant()) {
+                    // PostgreSQL names the privilege that was missing, so the caller knows what to
+                    // be granted rather than only that it was refused.
                     throw new MemgresException(
-                            "permission denied to grant privileges as role \"" + grantorName + "\"", "42501");
+                            "permission denied to grant privileges as role \"" + grantorName + "\""
+                                    + "\n  Detail: The grantor must have the ADMIN option on role \""
+                                    + grantorName + "\".", "42501");
                 }
                 throw new MemgresException("grantor must be current user", "0A000");
             }
@@ -2903,7 +2911,9 @@ class SessionExecutor {
             // How many were expected and how many arrived is the detail behind the complaint, not
             // the complaint itself, and a client matching on the message read a different one.
             throw new MemgresException(
-                    "wrong number of parameters for prepared statement \"" + stmt.name() + "\"", "42601");
+                    "wrong number of parameters for prepared statement \"" + stmt.name() + "\""
+                            + "\n  Detail: Expected " + expectedParams + " parameters but got "
+                            + actualParams + ".", "42601");
         }
         // Bind parameters
         List<Object> savedParams = new ArrayList<>(executor.boundParameters);
@@ -3082,20 +3092,25 @@ class SessionExecutor {
         // PG: only explicitly declared NO SCROLL cursors reject backward movement.
         // Default cursors (no SCROLL/NO SCROLL keyword) are effectively scrollable in PG 18.
         if (cursor.isExplicitNoScroll()) {
+            // Every backward direction is refused the same way, and PostgreSQL names the option
+            // that would have allowed it rather than only saying the cursor cannot go back.
+            MemgresException backwardRefused =
+                    new MemgresException("cursor can only scan forward", "55000");
+            backwardRefused.setHint("Declare it with SCROLL option to enable backward scan.");
             switch (stmt.direction()) {
                 case PRIOR:
                 case FIRST:
                 case LAST:
                 case ABSOLUTE:
-                    throw new MemgresException("cursor can only scan forward", "55000");
+                    throw backwardRefused;
                 case RELATIVE:
                     if (stmt.count() < 0) {
-                        throw new MemgresException("cursor can only scan forward", "55000");
+                        throw backwardRefused;
                     }
                     break;
                 case BACKWARD:
                 case BACKWARD_ALL:
-                    throw new MemgresException("cursor can only scan forward", "55000");
+                    throw backwardRefused;
                 default:
                     break;
             }
@@ -3316,8 +3331,10 @@ class SessionExecutor {
             }
         }
         if (executor.database.getView(tableName) != null) {
-            throw new MemgresException(
+            MemgresException e = new MemgresException(
                     "cannot define statistics for relation \"" + tableName + "\"", "42809");
+            e.setDetail("This operation is not supported for views.");
+            throw e;
         }
         Table table = executor.resolveTable(executor.defaultSchema(), tableName);
         if (executor.database.getExtendedStatistic(statName) != null) {

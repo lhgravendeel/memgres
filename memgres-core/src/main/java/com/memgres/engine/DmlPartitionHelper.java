@@ -107,13 +107,48 @@ class DmlPartitionHelper {
             }
         }
         if (matched == null) {
-            throw new MemgresException("no partition of relation \"" + table.getName() + "\" found for row", "23514");
+            MemgresException ex = new MemgresException("no partition of relation \""
+                    + table.getName() + "\" found for row", "23514");
+            ex.setDetail(partitionKeyDetail(partCol, value));
+            throw ex;
         }
         // Recurse for multi-level partitioning (sub-partitions)
         if (matched.getPartitionStrategy() != null && !matched.getPartitions().isEmpty()) {
             return routeToPartition(matched, row);
         }
         return matched;
+    }
+
+    /**
+     * The key that found no home. The row may be wide and only its key decides where it goes, so
+     * PostgreSQL prints the key rather than the row: the reader sees at once which value sits
+     * outside every partition. An expression key is printed as the expression it was declared as.
+     */
+    private static String partitionKeyDetail(String partCol, Object value) {
+        StringBuilder names = new StringBuilder();
+        if (partCol.startsWith("(")) {
+            names.append(partCol);
+        } else {
+            names.append('(');
+            String[] parts = partCol.split(",");
+            for (int i = 0; i < parts.length; i++) {
+                if (i > 0) names.append(", ");
+                names.append(parts[i].trim());
+            }
+            names.append(')');
+        }
+        StringBuilder vals = new StringBuilder("(");
+        if (value instanceof List) {
+            List<?> tuple = (List<?>) value;
+            for (int i = 0; i < tuple.size(); i++) {
+                if (i > 0) vals.append(", ");
+                vals.append(tuple.get(i) == null ? "null" : tuple.get(i));
+            }
+        } else {
+            vals.append(value == null ? "null" : value);
+        }
+        vals.append(')');
+        return "Partition key of the failing row contains " + names + " = " + vals + ".";
     }
 
     /** Whether a routing key value is (or, for tuples, contains) SQL NULL. */

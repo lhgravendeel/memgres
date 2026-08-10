@@ -343,6 +343,36 @@ SELECT 1 IN ('{1,2}');
 -- end-expected
 SELECT ('(1,2)'::point)[1], pg_typeof(('(1,2)'::point)[1])::text;
 
+-- begin-expected-error
+-- sqlstate: 42883
+-- message-like: ERROR: operator does not exist: integer[] = integer
+-- end-expected-error
+SELECT ARRAY[1] = ANY (ARRAY[ARRAY[1]]);
+
+-- begin-expected-error
+-- sqlstate: 42883
+-- message-like: ERROR: operator does not exist: integer[] = integer
+-- end-expected-error
+SELECT ARRAY[1] = ANY (ARRAY[ARRAY[1],ARRAY[2]]);
+
+-- begin-expected-error
+-- sqlstate: 42883
+-- message-like: ERROR: operator does not exist: integer[] = integer
+-- end-expected-error
+SELECT ARRAY[1] = ALL (ARRAY[ARRAY[1],ARRAY[2]]);
+
+-- begin-expected
+-- columns: ?column?
+-- row: t
+-- end-expected
+SELECT 1 = ANY (ARRAY[ARRAY[1],ARRAY[2]]);
+
+-- begin-expected
+-- columns: ?column?
+-- row: t
+-- end-expected
+SELECT ARRAY[1] IN (ARRAY[1], ARRAY[2]);
+
 DROP TABLE zz_sb_ins;
 
 DROP TABLE zz_sb_sel;

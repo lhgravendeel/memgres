@@ -405,8 +405,11 @@ class CastEvaluator {
             DomainType nullDomain = executor.database.getDomain(
                     typeSpec.toLowerCase().replaceAll("\\(.*\\)", "").trim());
             if (nullDomain != null && domainChainRejectsNull(nullDomain)) {
-                throw new MemgresException("domain " + typeDisplayName(nullDomain.getName())
+                MemgresException ex = new MemgresException("domain "
+                        + typeDisplayName(nullDomain.getName())
                         + " does not allow null values", "23502");
+                ex.setDatatype(nullDomain.getName());
+                throw ex;
             }
             return null;
         }
@@ -1057,8 +1060,9 @@ class CastEvaluator {
             }
             case "hstore":
                 if (!executor.database.hasExtension("hstore")) {
-                    throw new MemgresException("type \"hstore\" does not exist\n"
-                            + "  Hint: You need to install the hstore extension: CREATE EXTENSION hstore;", "42704");
+                    // Nothing has created the type, so the server has never heard of it and has
+                    // no extension to recommend -- it says only that there is no such type.
+                    throw new MemgresException("type \"hstore\" does not exist", "42704");
                 }
                 if (val instanceof HstoreValue) return val;
                 return HstoreValue.parse(val.toString());
@@ -1532,9 +1536,15 @@ class CastEvaluator {
     private void failIfViolated(Expression check, RowContext ctx, String domainName, String constraintName) {
         Object result = executor.evalExpr(check, ctx);
         if (result != null && !executor.isTruthy(result)) {
-            throw new MemgresException("value for domain "
+            MemgresException ex = new MemgresException("value for domain "
                     + TypeNamespace.display(executor.database, executor.session, domainName)
                     + " violates check constraint \"" + constraintName + "\"", "23514");
+            ex.setConstraint(constraintName);
+            // The field is already about one type, so the qualifier the sentence needs to stay
+            // unambiguous has no work to do in it: the bare name is what PostgreSQL sends there,
+            // however the cast happened to be written.
+            ex.setDatatype(TypeNamespace.bare(domainName));
+            throw ex;
         }
     }
 

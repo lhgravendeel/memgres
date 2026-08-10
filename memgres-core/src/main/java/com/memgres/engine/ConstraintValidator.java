@@ -183,7 +183,7 @@ class ConstraintValidator {
                 ex.setTable(table.getName());
                 String schema = findSchemaName(table);
                 if (schema != null) ex.setSchema(schema);
-                ex.setDetail("Failing row contains (" + formatRow(row) + ").");
+                ex.setDetail("Failing row contains (" + formatRow(table, row) + ").");
                 throw ex;
             }
         }
@@ -430,6 +430,10 @@ class ConstraintValidator {
             ex.setTable(table.getName());
             String schema = findSchemaName(table);
             if (schema != null) ex.setSchema(schema);
+            // The row itself is printed, as it is for a not-null violation: a statement writing
+            // many rows at once otherwise says only that one of them was refused. The computed
+            // row is the one shown, so a generated column appears with the value it was judged on.
+            ex.setDetail("Failing row contains (" + formatRow(table, evalRow) + ").");
             throw ex;
         }
     }
@@ -920,11 +924,41 @@ class ConstraintValidator {
                 if (!excludeOpMatches(op, newVal, existVal)) { allMatch = false; break; }
             }
             if (allMatch) {
-                throw new MemgresException(
+                MemgresException ex = new MemgresException(
                         "conflicting key value violates exclusion constraint \"" + sc.getName() + "\"",
                         "23P01");
+                ex.setConstraint(sc.getName());
+                ex.setDetail(excludeKeyDetail(elements, colIndices, newRow, existingRow));
+                throw ex;
             }
         }
+    }
+
+    /**
+     * Both keys, the way PostgreSQL prints them. An exclusion constraint is broken by a pair of
+     * rows, so naming only the row being written leaves the reader to go looking for the row it
+     * collided with.
+     */
+    private static String excludeKeyDetail(List<StoredConstraint.ExcludeElement> elements,
+                                           int[] colIndices, Object[] newRow, Object[] existingRow) {
+        StringBuilder cols = new StringBuilder();
+        for (int i = 0; i < elements.size(); i++) {
+            if (i > 0) cols.append(", ");
+            cols.append(elements.get(i).column());
+        }
+        return "Key (" + cols + ")=(" + excludeKeyValues(colIndices, newRow)
+                + ") conflicts with existing key (" + cols + ")=("
+                + excludeKeyValues(colIndices, existingRow) + ").";
+    }
+
+    /** The values one row holds in the constraint's columns, in the order the constraint names them. */
+    private static String excludeKeyValues(int[] colIndices, Object[] row) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < colIndices.length; i++) {
+            if (i > 0) sb.append(", ");
+            sb.append(row[colIndices[i]]);
+        }
+        return sb.toString();
     }
 
     private boolean excludeOpMatches(String op, Object a, Object b) {
@@ -995,9 +1029,20 @@ class ConstraintValidator {
         if (isRangeColumn(referencing) && isRangeColumn(referenced)) return;
         MemgresException ex = new MemgresException("foreign key constraint \"" + fk.getName()
                 + "\" cannot be implemented", "42804");
-        ex.setDetail("Key column \"" + fkCols.get(fkCols.size() - 1)
-                + "\" of a PERIOD foreign key must be of a range type.");
+        // A PERIOD is matched against a PERIOD, so what the reader has to see is the pair that
+        // could not be matched and what each side of it holds -- the same detail any foreign key
+        // over incompatible types carries.
+        ex.setDetail("Key columns \"" + fkCols.get(fkCols.size() - 1)
+                + "\" of the referencing table and \"" + refCols.get(refCols.size() - 1)
+                + "\" of the referenced table are of incompatible types: "
+                + columnTypeName(referencing) + " and " + columnTypeName(referenced) + ".");
         throw ex;
+    }
+
+    /** The type a column holds, named the way PostgreSQL names it in an error. */
+    private static String columnTypeName(Column column) {
+        return column == null || column.getType() == null
+                ? "unknown" : column.getType().toRegtypeDisplay();
     }
 
     private static boolean isRangeColumn(Column column) {
@@ -1648,12 +1693,25 @@ class ConstraintValidator {
         return TypeCoercion.areEqual(a, b);
     }
 
-    /** Format a row as a comma-separated string for error detail messages. */
-    private String formatRow(Object[] row) {
+    /**
+     * Format a row as a comma-separated string for error detail messages.
+     *
+     * <p>A virtual generated column is shown as the word {@code virtual} rather than as what it
+     * works out to. PostgreSQL prints the row as it is stored, and a virtual column is not stored:
+     * it is computed again whenever it is read, so there is no value in the row to print. A stored
+     * generated column is in the row like any other and prints like one.
+     */
+    private String formatRow(Table table, Object[] row) {
+        List<Column> columns = table == null ? null : table.getColumns();
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < row.length; i++) {
             if (i > 0) sb.append(", ");
-            sb.append(row[i] == null ? "null" : row[i].toString());
+            if (columns != null && i < columns.size()
+                    && columns.get(i).isVirtual() && columns.get(i).isGenerated()) {
+                sb.append("virtual");
+            } else {
+                sb.append(row[i] == null ? "null" : row[i].toString());
+            }
         }
         return sb.toString();
     }
@@ -2169,11 +2227,17 @@ class ConstraintValidator {
             if (published) break;
         }
         if (published && !childTable.hasUsableReplicaIdentity()) {
-            String verb = "update".equals(dmlVerb) ? "updates" : "deletes";
-            throw new MemgresException(
-                    "cannot " + dmlVerb + " table \"" + tableName
-                            + "\" because it does not have a replica identity and publishes " + verb,
+            // Worded as PostgreSQL words it for a write named directly: a DELETE is "delete from",
+            // and the advice names the write that was refused.
+            boolean updating = "update".equals(dmlVerb);
+            MemgresException ex = new MemgresException(
+                    "cannot " + (updating ? "update" : "delete from") + " table \"" + tableName
+                            + "\" because it does not have a replica identity and publishes "
+                            + (updating ? "updates" : "deletes"),
                     "55000");
+            ex.setHint("To enable " + (updating ? "updating" : "deleting from")
+                    + " the table, set REPLICA IDENTITY using ALTER TABLE.");
+            throw ex;
         }
     }
 

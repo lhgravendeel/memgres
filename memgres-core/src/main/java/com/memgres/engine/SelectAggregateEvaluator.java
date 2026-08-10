@@ -1051,10 +1051,17 @@ class SelectAggregateEvaluator {
                 types.append(argTypeName(item.expr(), sample));
             }
         }
+        String name = osa.funcName().toLowerCase();
         MemgresException e = new MemgresException(
-                "function " + osa.funcName().toLowerCase() + "(" + types + ") does not exist", "42883");
-        e.setHint("No function matches the given name and argument types. "
-                + "You might need to add explicit type casts.");
+                "function " + name + "(" + types + ") does not exist", "42883");
+        // Casting nothing would resolve a hypothetical-set call: its direct arguments are the row
+        // being ranked, so it is the count that has to change, and PostgreSQL names both counts.
+        if (HYPOTHETICAL_SET_AGGREGATES.contains(name)) {
+            int keys = osa.withinGroupOrderBy() == null ? 0 : osa.withinGroupOrderBy().size();
+            e.setHint("To use the hypothetical-set aggregate " + name
+                    + ", the number of hypothetical direct arguments (here " + osa.args().size()
+                    + ") must match the number of ordering columns (here " + keys + ").");
+        }
         return e;
     }
 
@@ -1118,7 +1125,7 @@ class SelectAggregateEvaluator {
                 }
                 Expression arg = fn.args().get(0);
                 if (fn.distinct() && fn.args().size() > 1) {
-                    throw new MemgresException("function count(text, text) does not exist\n  Hint: No function matches the given name and argument types.", "42883");
+                    throw new MemgresException("function count(text, text) does not exist\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
                 }
                 if (fn.distinct()) {
                     Set<String> seen = new HashSet<>();
@@ -1267,7 +1274,7 @@ class SelectAggregateEvaluator {
             }
             case "string_agg": {
                 if (fn.args().size() < 2) {
-                    throw new MemgresException("function string_agg(text) does not exist\n  Hint: No function matches the given name and argument types.", "42883");
+                    throw new MemgresException("function string_agg(text) does not exist\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
                 }
                 if (group.isEmpty()) return null;
                 Expression arg = fn.args().get(0);
@@ -2027,7 +2034,7 @@ class SelectAggregateEvaluator {
             if (val == null) continue;
             if (val instanceof PgMoney) {
                 throw new MemgresException("function " + fname + "(money) does not exist"
-                        + "\n  Hint: No function matches the given name and argument types.", "42883");
+                        + "\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
             }
             // A value that is not a number at all is the same missing function sum reports; it
             // used to escape the accumulation loop below as an internal parse failure (XX000).
@@ -2057,7 +2064,7 @@ class SelectAggregateEvaluator {
         String typeName = declared != null ? declared.toRegtypeDisplay() : argTypeName(arg, sample);
         MemgresException e = new MemgresException(
                 "function " + fname + "(" + typeName + ") does not exist", "42883");
-        e.setHint("No function matches the given name and argument types.");
+        e.setHint("No function matches the given name and argument types. You might need to add explicit type casts.");
         return e;
     }
 

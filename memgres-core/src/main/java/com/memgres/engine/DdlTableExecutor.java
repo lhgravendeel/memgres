@@ -97,16 +97,25 @@ class DdlTableExecutor {
                     // the child gets one column, so a second parent's wider type has nowhere
                     // to go and its rows would silently change shape on the way in.
                     if (existing.getType() != col.getType()) {
+                        // Which two types disagreed is the detail: the message names the column,
+                        // and a reader with two parents in front of them has to be told which of
+                        // the two the child would have had to store.
                         throw new MemgresException("inherited column \"" + col.getName()
-                                + "\" has a type conflict", "42804");
+                                + "\" has a type conflict\n  Detail: "
+                                + existing.getType().toRegtypeDisplay() + " versus "
+                                + col.getType().toRegtypeDisplay(), "42804");
                     }
                     // A default the child does not override would have to be picked from two
                     // parents, and there is no rule for choosing.
                     if (!childDeclared.contains(col.getName().toLowerCase())
                             && existing.getDefaultValue() != null && col.getDefaultValue() != null
                             && !existing.getDefaultValue().equals(col.getDefaultValue())) {
+                        // PostgreSQL says how to settle it: a default written on the child leaves
+                        // nothing to choose between.
                         throw new MemgresException("column \"" + col.getName()
-                                + "\" inherits conflicting default values", "42611");
+                                + "\" inherits conflicting default values"
+                                + "\n  Hint: To resolve the conflict, specify a default explicitly.",
+                                "42611");
                     }
                 }
             }
@@ -385,8 +394,11 @@ class DdlTableExecutor {
                 boolean fromParent = inheritedColumns.stream()
                         .anyMatch(c -> c.getName().equalsIgnoreCase(def.name()));
                 if (fromParent && stmt.inherits() != null && inheritedCol.getType() != col.getType()) {
-                    throw new MemgresException("column \"" + def.name() + "\" has a type conflict",
-                            "42804");
+                    // The parent's type comes first: it is the one already holding rows, and the
+                    // second is what this definition asked for.
+                    throw new MemgresException("column \"" + def.name() + "\" has a type conflict"
+                            + "\n  Detail: " + inheritedCol.getType().toRegtypeDisplay()
+                            + " versus " + col.getType().toRegtypeDisplay(), "42804");
                 }
                 columns.set(existingIdx, col);
             } else {
@@ -804,8 +816,8 @@ class DdlTableExecutor {
                 String constraintKind = sc.getType() == StoredConstraint.Type.PRIMARY_KEY ? "PRIMARY KEY" : "UNIQUE";
                 throw new MemgresException(
                         "unique constraint on partitioned table must include all partitioning columns\n"
-                        + "  Detail: " + constraintKind + " constraint missing column \""
-                        + partKey + "\" which is part of the partition key.",
+                        + "  Detail: " + constraintKind + " constraint on table \"" + table.getName()
+                        + "\" lacks column \"" + partKey + "\" which is part of the partition key.",
                         "0A000");
             }
         }
@@ -992,9 +1004,16 @@ class DdlTableExecutor {
                 Integer otherModulus = existingPart.getPartitionModulus();
                 if (otherModulus == null || otherModulus <= 0) continue;
                 if (modulus % otherModulus != 0 && otherModulus % modulus != 0) {
-                    throw new MemgresException(
+                    MemgresException e = new MemgresException(
                             "every hash partition modulus must be a factor of the next larger modulus",
                             "42P17");
+                    // Which of the two moduli is the larger decides how PostgreSQL words the
+                    // relation that fails to hold between them.
+                    e.setDetail("The new modulus " + modulus
+                            + (modulus > otherModulus ? " is not divisible by " : " is not a factor of ")
+                            + otherModulus + ", the modulus of existing partition \""
+                            + existingPart.getName() + "\".");
+                    throw e;
                 }
             }
             for (Table existingPart : parent.getPartitions()) {
@@ -1226,8 +1245,10 @@ class DdlTableExecutor {
                             throw new MemgresException("column \"" + ident + "\" does not exist", "42703");
                         }
                     } else if (generatedColNames.contains(identLower)) {
-                        throw new MemgresException(
+                        MemgresException e = new MemgresException(
                                 "cannot use generated column \"" + ident + "\" in column generation expression", "42P17");
+                        e.setDetail("A generated column cannot reference another generated column.");
+                        throw e;
                     }
                 }
             }
@@ -1301,6 +1322,10 @@ class DdlTableExecutor {
             }
             if (droppedTable != null) {
                 if (!cascade) {
+                    // Everything in the way goes on one detail, the way PostgreSQL reports it: a
+                    // script told only of the first dependent learns of the rest by dropping that
+                    // one and being refused again.
+                    List<String> dependents = new ArrayList<>();
                     // Check FK dependencies: any table in any schema referencing this table
                     for (Schema s : executor.database.getSchemas().values()) {
                         for (Table otherTable : s.getTables().values()) {
@@ -1310,27 +1335,22 @@ class DdlTableExecutor {
                                 if (!sc.getReferencesTable().equalsIgnoreCase(name)) continue;
                                 if (sc.getReferencesSchema() != null
                                         && !sc.getReferencesSchema().equalsIgnoreCase(schemaName)) continue;
-                                throw new MemgresException(
-                                        "cannot drop table " + name + " because other objects depend on it\n"
-                                        + "  Detail: constraint " + sc.getName() + " on table " + otherTable.getName() + " depends on table " + name,
-                                        "2BP01");
+                                dependents.add("constraint " + sc.getName() + " on table "
+                                        + visibleName(s.getName(), otherTable.getName())
+                                        + " depends on table " + visibleName(schemaName, name));
                             }
                         }
                     }
                     // An inheritance child reads its parent's definition, so the parent cannot go
                     // while the child is still there — and a reader of either would otherwise find
                     // a child whose inherited columns come from a table that no longer exists.
-                    List<String> dependents = new ArrayList<>();
                     for (Table child : droppedTable.getChildren()) {
                         if (together.contains(child.getName().toLowerCase())) continue;
                         dependents.add("table " + child.getName()
                                 + " depends on table " + visibleName(schemaName, name));
                     }
-                    for (String v : ViewDependencies.directDependents(
-                            executor.database, schemaName, name)) {
-                        dependents.add("view " + RelationNamespace.bareName(v)
-                                + " depends on table " + visibleName(schemaName, name));
-                    }
+                    dependents.addAll(ViewDependencies.dependencyLines(executor.database,
+                            schemaName, name, "table", executor.searchPathSchemas()));
                     if (!dependents.isEmpty()) {
                         MemgresException e = new MemgresException("cannot drop table "
                                 + visibleName(schemaName, name)

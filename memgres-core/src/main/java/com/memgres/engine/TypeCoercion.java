@@ -434,10 +434,13 @@ public final class TypeCoercion {
         }
 
         // A numeric special reaches its column as text, and a declared precision has no room for
-        // one: PostgreSQL calls that an overflow of the field rather than bad input syntax.
-        if (type == DataType.NUMERIC && column.getPrecision() != null
-                && NumericLimits.specialNumericOrNull(value) != null) {
-            throw new MemgresException("numeric field overflow", "22003");
+        // one: PostgreSQL calls that an overflow of the field rather than bad input syntax, and
+        // names the field it would not fit in.
+        if (type == DataType.NUMERIC && column.getPrecision() != null) {
+            Double special = NumericLimits.specialNumericOrNull(value);
+            if (special != null) {
+                rejectNonFiniteNumeric(special.doubleValue(), column.getPrecision(), column.getScale());
+            }
         }
         try {
             Object coerced = coerce(value, type);
@@ -586,7 +589,9 @@ public final class TypeCoercion {
     /** A declared numeric(p[,s]) has no room for NaN or an infinity. */
     private static void rejectNonFiniteNumeric(double value, int precision, Integer scale) {
         if (Double.isNaN(value) || Double.isInfinite(value)) {
-            throw new MemgresException("numeric field overflow", "22003");
+            // Refused with the same sentence a cast to numeric(p,s) is refused with, so the field
+            // is named however the value arrived at it.
+            rejectSpecialForTypmod(value, precision, scale == null ? 0 : scale.intValue());
         }
     }
 
@@ -750,21 +755,15 @@ public final class TypeCoercion {
     // ---- Out-of-range exception helpers (with datatype field for wire protocol) ----
 
     private static MemgresException smallintOutOfRange() {
-        MemgresException e = new MemgresException("smallint out of range", "22003");
-        e.setDatatype("smallint");
-        return e;
+        return new MemgresException("smallint out of range", "22003");
     }
 
     private static MemgresException integerOutOfRange() {
-        MemgresException e = new MemgresException("integer out of range", "22003");
-        e.setDatatype("integer");
-        return e;
+        return new MemgresException("integer out of range", "22003");
     }
 
     private static MemgresException bigintOutOfRange() {
-        MemgresException e = new MemgresException("bigint out of range", "22003");
-        e.setDatatype("bigint");
-        return e;
+        return new MemgresException("bigint out of range", "22003");
     }
 
     // ---- Conversion helpers ----
@@ -1777,14 +1776,19 @@ public final class TypeCoercion {
         long nanos = m.group(7) == null ? 0
                 : new java.math.BigDecimal(m.group(7)).movePointRight(9).longValue();
         if (year > maxYear) throw outOfRange(outOfRangeNoun, original);
-        if (month < 1 || month > 12) throw fieldOutOfRange(original);
+        // A month outside 1..12 and a day outside 1..31 are the two mistakes PostgreSQL suspects
+        // of being a date written in another field order, and they are the only ones it offers the
+        // DateStyle advice for. February the 30th is a real day of some other month, so it is
+        // refused with the message alone, as is a year of zero and a clock field out of range.
+        if (month < 1 || month > 12) throw misorderedField(original);
         LocalDate date;
         try {
             date = LocalDate.of((int) year, month, 1);
         } catch (RuntimeException e) {
             throw outOfRange(outOfRangeNoun, original);
         }
-        if (day < 1 || day > date.lengthOfMonth()) throw fieldOutOfRange(original);
+        if (day < 1 || day > 31) throw misorderedField(original);
+        if (day > date.lengthOfMonth()) throw fieldOutOfRange(original);
         // PG reads 24:00:00 as the following midnight and a 60th second as the next minute, but
         // only when nothing finer is written past them.
         if (hour > 24 || (hour == 24 && (minute != 0 || second != 0 || nanos != 0))) {
@@ -1811,6 +1815,13 @@ public final class TypeCoercion {
     private static MemgresException fieldOutOfRange(String original) {
         return new MemgresException(
                 "date/time field value out of range: \"" + original + "\"", "22008");
+    }
+
+    /** The same, for a field a different field order would have read as a legal one. */
+    private static MemgresException misorderedField(String original) {
+        MemgresException ex = fieldOutOfRange(original);
+        ex.setHint("Perhaps you need a different \"DateStyle\" setting.");
+        return ex;
     }
 
     private static MemgresException outOfRange(String noun, String original) {

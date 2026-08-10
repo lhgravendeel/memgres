@@ -101,8 +101,22 @@ final class RelationNamespace {
         MemgresException e = wrongKind(db, schemaName, name, wantedKind);
         if (e == null) return;
         String found = kindOf(db, schemaName, name);
-        e.setHint("Use DROP " + found.toUpperCase() + " to remove " + article(found) + " " + found + ".");
+        // PostgreSQL has one DROP TYPE for every kind of type, so a composite is sent there
+        // rather than to a DROP COMPOSITE TYPE no grammar accepts.
+        String object = COMPOSITE.equals(found) ? "type" : found;
+        e.setHint("Use DROP " + object.toUpperCase() + " to remove " + article(object) + " " + object + ".");
         throw e;
+    }
+
+    /**
+     * How a relation is named in a message about it: bare when the search path already reaches
+     * the schema it lives in, schema-qualified when it does not and the bare name would name
+     * something else — or nothing.
+     */
+    static String shownName(java.util.List<String> searchPath, String schemaName, String name) {
+        String schema = schemaName == null ? "public" : schemaName;
+        if (searchPath != null && searchPath.contains(schema.toLowerCase())) return name;
+        return schema + "." + name;
     }
 
     /** The wrong-kind refusal for this name, or null when the kind is right or the name is free. */

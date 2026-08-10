@@ -1372,9 +1372,9 @@ class ExprEvaluator {
         String t = DataType.canonicalName(declared);
         if (!"text".equals(t) && !"character varying".equals(t) && !"character".equals(t)
                 && !"name".equals(t) && !"boolean".equals(t)) return;
-        throw new MemgresException("operator does not exist: " + symbol + " " + t
-                + "\n  Hint: No operator matches the given name and argument types."
-                + " You might need to add explicit type casts.", "42883");
+        // The advice follows from the message: an operator written in front of its one operand has
+        // one argument to cast, and PostgreSQL says so in the singular.
+        throw new MemgresException("operator does not exist: " + symbol + " " + t, "42883");
     }
 
     Object evalUnaryValue(UnaryExpr.UnaryOp op, Object val) {
@@ -1575,6 +1575,18 @@ class ExprEvaluator {
         }
     }
 
+    /**
+     * The same reading, keeping the reader's complaint. A caller that only wants a yes or no asks
+     * the question above; one that is about to refuse the text has to hand on the error the reader
+     * raised, because only that names in its detail which rule the text broke.
+     */
+    static void requireJson(String s) {
+        if (s == null) {
+            throw new MemgresException("invalid input syntax for type json", "22P02");
+        }
+        JsonTextValidator.validate(s.trim());
+    }
+
     private boolean hasUniqueKeys(String s) {
         s = s.trim();
         if (!s.startsWith("{")) return true;
@@ -1629,9 +1641,7 @@ class ExprEvaluator {
         }
         // PG: invalid JSON input always errors — the implicit cast to json/jsonb fails
         // before JSON_EXISTS runs, so ON ERROR cannot catch it
-        if (!isValidJson(json)) {
-            throw new MemgresException("invalid input syntax for type json", "22P02");
-        }
+        requireJson(json);
         try {
             // Substitute PASSING variables into path
             if (je.passing() != null && !je.passing().isEmpty()) {
@@ -1656,9 +1666,7 @@ class ExprEvaluator {
         String json = inputVal.toString();
         String path = pathVal.toString().trim();
         // PG: invalid JSON input always throws an error regardless of ON ERROR behavior
-        if (!isValidJson(json)) {
-            throw new MemgresException("invalid input syntax for type json", "22P02");
-        }
+        requireJson(json);
         try {
             // Substitute PASSING variables
             if (jv.passing != null && !jv.passing.isEmpty()) {
@@ -1715,7 +1723,7 @@ class ExprEvaluator {
         String path = pathVal.toString().trim();
         try {
             if (!isValidJson(json)) {
-                if (jq.onError == JsonExistsExpr.OnBehavior.ERROR) throw new MemgresException("invalid input syntax for type json", "22P02");
+                if (jq.onError == JsonExistsExpr.OnBehavior.ERROR) requireJson(json);
                 return handleJsonQueryOnEmpty(jq);
             }
             List<String> results = executor.functionEvaluator.evaluateJsonPathAll(json, path);
@@ -1782,6 +1790,13 @@ class ExprEvaluator {
                     // no pair of types to resolve an operator between.
                     resolvable = false;
                 }
+            } else if (in.fromAny()) {
+                // A written ARRAY[...] arrives here as its elements. Where those elements are
+                // themselves arrays the comparison is still against the innermost value, because
+                // an array type in PostgreSQL says nothing about how many dimensions it has:
+                // ARRAY[ARRAY[1],ARRAY[2]] is an integer[], and = ANY over it resolves against
+                // integer rather than against integer[].
+                other = innermostElementOperand(other);
             }
             if (resolvable) {
                 executor.binaryOpEvaluator.rejectUnresolvableOperator(
@@ -1969,7 +1984,9 @@ class ExprEvaluator {
         String pat = patternVal.toString();
         String esc = like.escape();
         if (esc != null && esc.length() > 1) {
-            throw new MemgresException("invalid escape string", "22025");
+            // PostgreSQL states the rule the string broke rather than only calling it invalid.
+            throw new MemgresException("invalid escape string"
+                    + "\n  Hint: Escape string must be empty or one character.", "22025");
         }
         boolean matches = likeMatch(str, pat, esc, like.caseInsensitive());
         return like.negated() ? !matches : matches;
@@ -2505,10 +2522,25 @@ class ExprEvaluator {
         return element == null ? null : new CastExpr(array, element.getPgName());
     }
 
+    /**
+     * The value an array's elements are, however deeply the constructor nests them. PostgreSQL's
+     * array types carry no dimensionality — {@code ARRAY[ARRAY[1],ARRAY[2]]} is an
+     * {@code integer[]} — so what {@code = ANY} compares against is the innermost value.
+     */
+    private static Expression innermostElementOperand(Expression element) {
+        Expression current = element;
+        while (current instanceof ArrayExpr && !((ArrayExpr) current).isRow()) {
+            java.util.List<Expression> items = ((ArrayExpr) current).elements();
+            if (items == null || items.isEmpty()) return current;
+            current = items.get(0);
+        }
+        return current;
+    }
+
     private static Expression arrayElementOperand(Expression array) {
         if (array instanceof ArrayExpr) {
             java.util.List<Expression> items = ((ArrayExpr) array).elements();
-            return items.isEmpty() ? null : items.get(0);
+            return items.isEmpty() ? null : innermostElementOperand(items.get(0));
         }
         if (array instanceof CastExpr) {
             String type = ((CastExpr) array).typeName();
@@ -4494,11 +4526,8 @@ class ExprEvaluator {
 
     /** PostgreSQL's complaint that a row and a single value have no comparison between them. */
     static MemgresException noRecordOperator(String otherType, boolean otherOnLeft) {
-        MemgresException e = new MemgresException("operator does not exist: "
+        return new MemgresException("operator does not exist: "
                 + (otherOnLeft ? otherType + " = record" : "record = " + otherType), "42883");
-        e.setHint("No operator matches the given name and argument types. "
-                + "You might need to add explicit type casts.");
-        return e;
     }
 
     /** The operators that compare two rows entry by entry. */
@@ -4625,11 +4654,11 @@ class ExprEvaluator {
     }
 
     private static MemgresException integerOutOfRange(DataType width) {
+        // PostgreSQL sends no datatype field with an integer overflow: the width is already in the
+        // message, and the field is reserved for the declared type a domain or a cast named.
         String name = width == DataType.SMALLINT ? "smallint"
                 : width == DataType.INTEGER ? "integer" : "bigint";
-        MemgresException e = new MemgresException(name + " out of range", "22003");
-        e.setDatatype(name);
-        return e;
+        return new MemgresException(name + " out of range", "22003");
     }
 
     /** The family a declared type belongs to, or null when it is one this rule leaves alone. */

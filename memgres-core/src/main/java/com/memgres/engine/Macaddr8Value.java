@@ -169,7 +169,12 @@ public class Macaddr8Value implements Comparable<Macaddr8Value> {
      */
     public MacaddrValue toMacaddr() {
         if (bytes[3] != (byte) 0xFF || bytes[4] != (byte) 0xFE) {
-            throw new MemgresException("macaddr8 data out of range to convert to macaddr", "22003");
+            // PostgreSQL spells out which addresses do convert, so a caller can tell from the
+            // error whether its address could ever have been one of them.
+            throw new MemgresException("macaddr8 data out of range to convert to macaddr"
+                    + "\n  Hint: Only addresses that have FF and FE as values in the 4th and 5th"
+                    + " bytes from the left, for example xx:xx:xx:ff:fe:xx:xx:xx, are eligible to"
+                    + " be converted from macaddr8 to macaddr.", "22003");
         }
         byte[] result = new byte[6];
         System.arraycopy(bytes, 0, result, 0, 3);

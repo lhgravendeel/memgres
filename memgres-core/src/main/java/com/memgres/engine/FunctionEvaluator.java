@@ -525,8 +525,7 @@ class FunctionEvaluator {
         if (!coercionAdmitted(coercionTargetOf(typeName), staticArgType(arg, ctx))) {
             throw new MemgresException("function " + fn.name() + "("
                     + coercionArgTypeName(arg, ctx) + ") does not exist\n"
-                    + "  Hint: No function matches the given name and argument types."
-                    + " You might need to add explicit type casts.", "42883");
+                    + "  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
         }
         Object value = executor.evalExpr(arg, ctx);
         // void carries no value at all: whatever is handed to it, PostgreSQL prints nothing.
@@ -737,8 +736,7 @@ class FunctionEvaluator {
                     && e.getMessage().startsWith("operator does not exist")) {
                 throw new MemgresException("function " + fn.name() + "("
                         + argTypeNames(fn, ctx) + ") does not exist"
-                        + "\n  Hint: No function matches the given name and argument types."
-                        + " You might need to add explicit type casts.", "42883");
+                        + "\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
             }
             throw e;
         }
@@ -772,7 +770,7 @@ class FunctionEvaluator {
         if (fn.args().size() < min) {
             throw new MemgresException(
                 "function " + fn.name() + "() does not exist" +
-                (fn.args().isEmpty() ? "" : "\n  Hint: No function matches the given name and argument types."), "42883");
+                (fn.args().isEmpty() ? "" : "\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts."), "42883");
         }
     }
 
@@ -784,10 +782,7 @@ class FunctionEvaluator {
         if (!executor.database.hasExtension(extensionName)) {
             String sig = functionName + "(" + String.join(", ",
                     java.util.Collections.nCopies(argCount, "unknown")) + ")";
-            throw new MemgresException(
-                    "function " + sig + " does not exist\n" +
-                    "  Hint: No function matches the given name and argument types. " +
-                    "You might need to add explicit type casts.", "42883");
+            throw new MemgresException("function " + sig + " does not exist", "42883");
         }
     }
 
@@ -882,9 +877,7 @@ class FunctionEvaluator {
         if (value instanceof List<?>) return (List<?>) value;
         throw new MemgresException("function " + functionName + "("
                 + AstExecutor.pgTypeNameOf(value) + ", " + AstExecutor.pgTypeNameOf(value)
-                + ") does not exist\n"
-                + "  Hint: No function matches the given name and argument types. "
-                + "You might need to add explicit type casts.", "42883");
+                + ") does not exist", "42883");
     }
 
     /** A null array read as the empty one, which is what the concatenating functions do with it. */
@@ -1184,9 +1177,7 @@ class FunctionEvaluator {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
                 String text = arg.toString();
-                if (!ExprEvaluator.isValidJson(text)) {
-                    throw new MemgresException("invalid input syntax for type json", "22P02");
-                }
+                ExprEvaluator.requireJson(text);
                 return text;
             }
             case "crc32": {
@@ -1359,7 +1350,7 @@ class FunctionEvaluator {
                 return FromFunctionResolver.regexpSplitToTableValues(evaluatedArgs(fn, ctx));
             case "generate_series": {
                 if (fn.args().size() < 2) {
-                    throw new MemgresException("function generate_series() does not exist\n  Hint: No function matches the given name and argument types.", "42883");
+                    throw new MemgresException("function generate_series() does not exist\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
                 }
                 Object startObj = executor.evalExpr(fn.args().get(0), ctx);
                 Object stopObj = executor.evalExpr(fn.args().get(1), ctx);
@@ -1841,8 +1832,12 @@ class FunctionEvaluator {
                     lbList = arrayFillBounds(lbArg);
                     if (lbList == null) return null;
                     if (lbList.size() != dimsList.size()) {
-                        throw new MemgresException("wrong number of array subscripts", "2202E");
+                        MemgresException e =
+                                new MemgresException("wrong number of array subscripts", "2202E");
+                        e.setDetail("Low bound array has different size than dimensions array.");
+                        throw e;
                     }
+
                 }
                 if (dimsList.size() > 6) {
                     throw new MemgresException("number of array dimensions (" + dimsList.size()
@@ -2021,7 +2016,7 @@ class FunctionEvaluator {
             }
             case "unnest": {
                 if (fn.args().isEmpty()) {
-                    throw new MemgresException("function unnest() does not exist\n  Hint: No function matches the given name and argument types.", "42883");
+                    throw new MemgresException("function unnest() does not exist\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
                 }
                 // The many-argument form of unnest exists only as a FROM item -- it produces a
                 // row of several columns, which a select-list expression has no room for, and
@@ -2782,16 +2777,17 @@ class FunctionEvaluator {
                 // pg_log_backend_memory_contexts(int) → boolean — stub, returns true
                 return true;
             }
-            case "pg_promote": {
-                // pg_promote(boolean, integer) → boolean — only valid on a standby server
-                throw new MemgresException("recovery is not in progress", "55000");
-            }
+            case "pg_promote":
             case "pg_wal_replay_pause":
             case "pg_wal_replay_resume": {
                 // Recovery control, and this server is not recovering — the same 55000 PostgreSQL
                 // gives on a primary. The name was listed in pg_proc and answered 42883, which told
                 // a monitoring tool the function was missing rather than that it did not apply.
-                throw new MemgresException("recovery is not in progress", "55000");
+                // PostgreSQL adds what the whole family has in common, so a caller reading the
+                // Hint learns why the call did not apply rather than only that it did not.
+                throw new MemgresException("recovery is not in progress"
+                        + "\n  Hint: Recovery control functions can only be executed"
+                        + " during recovery.", "55000");
             }
             case "pg_switch_wal": {
                 // Forces a WAL segment switch and answers with the LSN it ended at. memgres keeps
@@ -3287,7 +3283,17 @@ class FunctionEvaluator {
                 if (userFunc != null) {
                     // Procedures cannot be called via SELECT; must use CALL
                     if (userFunc.isProcedure()) {
-                        throw new MemgresException(name + " is a procedure\nHint: To call a procedure, use CALL.", "42809");
+                        // PostgreSQL names the routine by its argument types, the same way it
+                        // names one written in a FROM, so two overloads are told apart.
+                        StringBuilder procTypes = new StringBuilder();
+                        for (PgFunction.Param p : userFunc.getParams()) {
+                            if ("OUT".equalsIgnoreCase(p.mode())) continue;
+                            if (procTypes.length() > 0) procTypes.append(", ");
+                            procTypes.append(p.typeName() == null ? "any"
+                                    : CatalogSystemFunctions.readableTypeName(p.typeName()));
+                        }
+                        throw new MemgresException(name + "(" + procTypes + ") is a procedure"
+                                + "\n  Hint: To call a procedure, use CALL.", "42809");
                     }
                     // Collect input params (excluding OUT)
                     List<PgFunction.Param> inputParams = new ArrayList<>();
@@ -4175,7 +4181,7 @@ class FunctionEvaluator {
                 + ("cardinality".equals(name) || "unnest".equals(name) || "array_dims".equals(name)
                         || "array_ndims".equals(name) ? "" : ", integer");
         return new MemgresException("function " + name + "(" + args + ") does not exist"
-                + "\n  Hint: No function matches the given name and argument types.", "42883");
+                + "\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
     }
 
     /**
@@ -4260,7 +4266,9 @@ class FunctionEvaluator {
         PgArray bounds = PgArray.from(arg);
         if (bounds == null) return null;
         if (bounds.dims().length > 1) {
-            throw new MemgresException("wrong number of array subscripts", "2202E");
+            MemgresException e = new MemgresException("wrong number of array subscripts", "2202E");
+            e.setDetail("Dimension array must be one dimensional.");
+            throw e;
         }
         // The extents are integers however the argument was written: read out of a literal they
         // arrive as the text they were spelled with.
@@ -4536,8 +4544,7 @@ class FunctionEvaluator {
         }
         MemgresException e = new MemgresException(
                 "function unnest(" + types + ") does not exist", "42883");
-        e.setHint("No function matches the given name and argument types."
-                + " You might need to add explicit type casts.");
+        e.setHint("No function matches the given name and argument types. You might need to add explicit type casts.");
         e.setPositionToken("unnest");
         return e;
     }

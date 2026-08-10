@@ -609,7 +609,8 @@ public class Lexer {
                     continue;
                 }
                 // Invalid: not enough characters for escape
-                throw ParseException.saying("invalid Unicode escape value",
+                throw ParseException.saying("invalid Unicode escape value"
+                                + "\n  Hint: Unicode escapes must be \\XXXX or \\+XXXXXX.",
                         new Token(TokenType.ERROR, val, start), "42601");
             }
             sb.append(val.charAt(i));

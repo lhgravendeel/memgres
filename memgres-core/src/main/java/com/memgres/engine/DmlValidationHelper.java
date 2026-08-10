@@ -25,6 +25,19 @@ class DmlValidationHelper {
         return TypeNamespace.display(executor.database, executor.session, stored);
     }
 
+    /**
+     * A value the column's domain refuses. PostgreSQL names both the domain and the constraint in
+     * the error's own fields, and it names the domain there bare: the field is already about one
+     * type, so the qualifier the sentence needs to stay unambiguous has no work to do in it.
+     */
+    private MemgresException domainCheckViolation(String domainName, String constraintName) {
+        MemgresException ex = new MemgresException("value for domain " + domainDisplay(domainName)
+                + " violates check constraint \"" + constraintName + "\"", "23514");
+        ex.setConstraint(constraintName);
+        ex.setDatatype(TypeNamespace.bare(domainName));
+        return ex;
+    }
+
     void applyCitextFolding(Table table, Object[] row) {
         for (int i = 0; i < table.getColumns().size() && i < row.length; i++) {
             if (row[i] instanceof String) {
@@ -80,8 +93,11 @@ class DmlValidationHelper {
                 }
                 for (DomainType domain : chain) {
                     if (row[i] == null && domain.isNotNull()) {
-                        throw new MemgresException("domain " + domainDisplay(domain.getName())
+                        MemgresException ex = new MemgresException("domain "
+                                + domainDisplay(domain.getName())
                                 + " does not allow null values", "23502");
+                        ex.setDatatype(domain.getName());
+                        throw ex;
                     }
                     // A domain CHECK still runs for NULL: CHECK (VALUE IS NOT NULL) rejects it
                     Table tempTable = new Table("_domain_check",
@@ -92,10 +108,7 @@ class DmlValidationHelper {
                     if (domain.getParsedCheck() != null) {
                         Object result = executor.evalExpr(domain.getParsedCheck(), tempCtx);
                         if (result != null && !executor.isTruthy(result)) {
-                            throw new MemgresException(
-                                    "value for domain " + domainDisplay(domainName)
-                                            + " violates check constraint \"" + domain.getName() + "_check\"",
-                                    "23514");
+                            throw domainCheckViolation(domainName, domain.getName() + "_check");
                         }
                     }
                     // Check named constraints added via ALTER DOMAIN ADD CONSTRAINT
@@ -103,10 +116,7 @@ class DmlValidationHelper {
                         if (nc.parsedCheck() != null) {
                             Object result = executor.evalExpr(nc.parsedCheck(), tempCtx);
                             if (result != null && !executor.isTruthy(result)) {
-                                throw new MemgresException(
-                                        "value for domain " + domainDisplay(domainName)
-                                                + " violates check constraint \"" + nc.name() + "\"",
-                                        "23514");
+                                throw domainCheckViolation(domainName, nc.name());
                             }
                         }
                     }

@@ -46,7 +46,7 @@ class MathFunctions {
                         "function abs() does not exist", "42883");
                 }
                 if (fn.args().size() > 1) {
-                    throw new MemgresException("function abs() does not exist\n  Hint: No function matches the given name and argument types.", "42883");
+                    throw new MemgresException("function abs() does not exist\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
                 }
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
@@ -178,7 +178,7 @@ class MathFunctions {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
                 if (arg instanceof String && !FunctionEvaluator.isNumericString(((String) arg))) {
-                    throw new MemgresException("function sqrt(text) does not exist\n  Hint: No function matches the given name and argument types.", "42883");
+                    throw new MemgresException("function sqrt(text) does not exist\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
                 }
                 Double sp = special(arg);
                 if (sp != null) {

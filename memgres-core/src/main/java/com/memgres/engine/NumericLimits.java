@@ -81,11 +81,12 @@ final class NumericLimits {
 
     // ---- two's-complement boundaries ----
 
-    /** The out-of-range error PG raises, tagged with the type so ERROR fields carry it too. */
+    /**
+     * The out-of-range error PG raises. It carries no type field: the message names the type, and
+     * the field is reserved for the errors that name a declared object.
+     */
     static MemgresException integerOutOfRange(String typeName) {
-        MemgresException e = new MemgresException(typeName + " out of range", "22003");
-        e.setDatatype(typeName);
-        return e;
+        return new MemgresException(typeName + " out of range", "22003");
     }
 
     /**
@@ -279,10 +280,8 @@ final class NumericLimits {
 
     /** The message PG gives when an input value has no representation in the target float type. */
     static MemgresException outOfRangeForType(Object value, String typeName) {
-        MemgresException e = new MemgresException(
+        return new MemgresException(
                 "\"" + plainText(value) + "\" is out of range for type " + typeName, "22003");
-        e.setDatatype(typeName);
-        return e;
     }
 
     /**

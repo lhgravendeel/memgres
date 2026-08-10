@@ -28,8 +28,13 @@ class JsonFunctions {
         if (!(base instanceof com.memgres.engine.parser.ast.CastExpr)) return;
         String typeName = ((com.memgres.engine.parser.ast.CastExpr) base).typeName();
         if (typeName != null && "record".equalsIgnoreCase(typeName.trim())) {
-            throw new MemgresException(
+            MemgresException e = new MemgresException(
                     "could not determine row type for result of " + name, "0A000");
+            // There are two ways to say what the row looks like, and PostgreSQL names both
+            // rather than only refusing the one that was written.
+            e.setHint("Provide a non-null record argument, or call the function in the FROM"
+                    + " clause using a column definition list.");
+            throw e;
         }
     }
 
@@ -80,7 +85,7 @@ class JsonFunctions {
         if (fn.args().size() < min) {
             throw new MemgresException(
                 "function " + fn.name() + "() does not exist" +
-                (fn.args().isEmpty() ? "" : "\n  Hint: No function matches the given name and argument types."), "42883");
+                (fn.args().isEmpty() ? "" : "\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts."), "42883");
         }
     }
 

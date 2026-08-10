@@ -643,22 +643,36 @@ public class RowContext {
         return sb.append('.').toString();
     }
 
-    /** The column of {@code table} closest to a name it does not have, or null when none is near. */
+    /**
+     * How far apart two names may be spelled before a suggestion stops being one. PostgreSQL keeps
+     * a candidate only while it is within three edits of what was written, so a name that shares a
+     * long tail with the written one — {@code op_bytes} against {@code read_bytes} — is no
+     * suggestion however much of it matches.
+     */
+    private static final int FURTHEST_SUGGESTION = 3;
+
+    /**
+     * The column of {@code table} closest to a name it does not have, or null when none is near.
+     *
+     * <p>Two things decide it, and both are measured against the name as written. The comparison is
+     * of the spellings themselves, so a column named {@code MiXeD} is not a near miss for
+     * {@code mixed}: four of its five letters are cased differently and that is four edits away.
+     * And the distance allowed grows with what was written rather than with what was found, so a
+     * one-letter name has no near misses at all while {@code abcdefg} still reaches {@code abcd}.
+     */
     private static String closestColumn(String typo, Table table) {
         if (table == null || typo == null) return null;
         String bestName = null;
         int bestDist = Integer.MAX_VALUE;
-        String lowerTypo = typo.toLowerCase();
         for (Column col : table.getColumns()) {
-            String colName = col.getName().toLowerCase();
-            int dist = editDistance(lowerTypo, colName);
+            int dist = editDistance(typo, col.getName());
             if (dist < bestDist) {
                 bestDist = dist;
                 bestName = col.getName();
             }
         }
-        // Only suggest if the edit distance is small relative to the name length
-        return bestName != null && bestDist <= Math.max(1, typo.length() / 2) ? bestName : null;
+        if (bestName == null || bestDist > FURTHEST_SUGGESTION) return null;
+        return bestDist <= typo.length() / 2 ? bestName : null;
     }
 
     /** Compute Levenshtein edit distance between two strings. */

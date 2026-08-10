@@ -129,9 +129,10 @@ class Round13WireProtocolGapsTest {
     void errorResponse_datatypeName_on_overflow() {
         ServerErrorMessage m = getErrorFields("SELECT (2147483647 + 1)::int");
         assertNotNull(m);
-        // PG emits datatype_name = 'integer' on overflow
-        assertNotNull(m.getDatatype(),
-                "expected d (datatypeName) field on numeric overflow");
+        // The message names the type, and PostgreSQL sends no d field with it: that field names a
+        // declared object, and an overflow is about the arithmetic rather than about a type.
+        assertNull(m.getDatatype(),
+                "PostgreSQL sends no d (datatypeName) field on numeric overflow");
     }
 
     // =========================================================================

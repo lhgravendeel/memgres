@@ -18,6 +18,17 @@ final class JsonTextValidator {
     private final String text;
     private int pos;
     private int depth;
+    // The token last read. Punctuation stands for itself; the rest are named below. PostgreSQL
+    // reports the text of the token it stopped at, so where that begins and ends is kept too.
+    private int token;
+    private int tokenStart;
+    private int tokenEnd;
+
+    private static final int INVALID = 0;
+    private static final int END = 1;
+    private static final int STRING = 2;
+    /** A number, or one of true, false and null: a value that stands on its own. */
+    private static final int SCALAR = 3;
 
     private JsonTextValidator(String text) {
         this.text = text;
@@ -26,130 +37,176 @@ final class JsonTextValidator {
     /** @throws MemgresException 22P02 when {@code text} is not exactly one JSON document */
     static void validate(String text) {
         JsonTextValidator v = new JsonTextValidator(text);
-        v.skipWhitespace();
+        v.lex();
         v.readValue();
-        v.skipWhitespace();
+        v.lex();
         // Anything after the first document is a second value, which json input does not take
-        if (v.pos != text.length()) throw invalid();
-    }
-
-    private static MemgresException invalid() {
-        return new MemgresException("invalid input syntax for type json", "22P02");
+        if (v.token != END) throw v.wanted("end of input");
     }
 
     /**
-     * The same error carrying the DETAIL line PostgreSQL writes under it. The primary message is
-     * the same for every way a document can be malformed, so the detail is the only part that
-     * says which one it was.
+     * The error carrying the DETAIL line PostgreSQL writes under it. The primary message is the
+     * same for every way a document can be malformed, so the detail is the only part that says
+     * which one it was.
      */
     private static MemgresException invalid(String detail) {
-        MemgresException e = invalid();
+        MemgresException e = new MemgresException("invalid input syntax for type json", "22P02");
         e.setDetail(detail);
         return e;
     }
 
+    /**
+     * What PostgreSQL says about the token the reader stopped at. Running out of text is its own
+     * complaint; otherwise the reader names what it wanted in that place and what it found.
+     */
+    private MemgresException wanted(String what) {
+        if (token == END) return invalid("The input string ended unexpectedly.");
+        return invalid("Expected " + what + ", but found \"" + tokenText() + "\".");
+    }
+
+    private String tokenText() {
+        return text.substring(tokenStart, tokenEnd);
+    }
+
     private void readValue() {
-        if (pos >= text.length()) throw invalid();
-        char c = text.charAt(pos);
-        switch (c) {
+        switch (token) {
             case '{': readObject(); return;
             case '[': readArray(); return;
-            case '"': readString(); return;
-            case 't': expect("true"); return;
-            case 'f': expect("false"); return;
-            case 'n': expect("null"); return;
-            default: readNumber();
+            case STRING: case SCALAR: return;
+            default: throw wanted("JSON value");
         }
     }
 
     private void readObject() {
         enter();
-        pos++; // {
-        skipWhitespace();
-        if (peek() == '}') { pos++; depth--; return; }
-        while (true) {
-            skipWhitespace();
-            // A key is always a quoted string; {a: 1} is not JSON
-            if (peek() != '"') throw invalid();
-            readString();
-            skipWhitespace();
-            if (peek() != ':') throw invalid();
-            pos++;
-            skipWhitespace();
-            readValue();
-            skipWhitespace();
-            char c = peek();
-            if (c == ',') { pos++; continue; }
-            if (c == '}') { pos++; depth--; return; }
-            throw invalid();
+        lex();
+        if (token != '}') {
+            boolean firstKey = true;
+            for (;;) {
+                // A key is always a quoted string; {a: 1} is not JSON
+                if (token != STRING) throw wanted(firstKey ? "string or \"}\"" : "string");
+                firstKey = false;
+                lex();
+                if (token != ':') throw wanted("\":\"");
+                lex();
+                readValue();
+                lex();
+                if (token == ',') { lex(); continue; }
+                if (token == '}') break;
+                throw wanted("\",\" or \"}\"");
+            }
         }
+        depth--;
     }
 
     private void readArray() {
         enter();
-        pos++; // [
-        skipWhitespace();
-        if (peek() == ']') { pos++; depth--; return; }
-        while (true) {
-            skipWhitespace();
-            readValue();
-            skipWhitespace();
-            char c = peek();
-            if (c == ',') { pos++; continue; }
-            if (c == ']') { pos++; depth--; return; }
-            throw invalid();
+        lex();
+        if (token != ']') {
+            for (;;) {
+                readValue();
+                lex();
+                if (token == ',') { lex(); continue; }
+                if (token == ']') break;
+                throw wanted("\",\" or \"]\"");
+            }
         }
+        depth--;
     }
 
-    private void readString() {
-        pos++; // opening quote
-        while (true) {
-            if (pos >= text.length()) throw invalid();   // no closing quote
-            char c = text.charAt(pos++);
-            if (c == '"') return;
-            if (c == '\\') {
-                if (pos >= text.length()) throw invalid();
-                char esc = text.charAt(pos++);
-                if ("\"\\/bfnrt".indexOf(esc) >= 0) continue;
-                if (esc == 'u') {
-                    if (pos + 4 > text.length()) throw invalid(BAD_UNICODE_ESCAPE);
-                    for (int i = 0; i < 4; i++) {
-                        if (Character.digit(text.charAt(pos + i), 16) < 0) {
-                            throw invalid(BAD_UNICODE_ESCAPE);
-                        }
-                    }
-                    pos += 4;
-                    continue;
-                }
-                throw invalid("Escape sequence \"\\" + esc + "\" is invalid.");
-            }
-            if (c < 0x20) throw invalid();  // a raw control character is not allowed in a string
+    /**
+     * Read the next token. Text that is no token of JSON's is refused here rather than handed on,
+     * because PostgreSQL's lexer runs ahead of its parser: {@code [1,2] x} is a bad token, not a
+     * document that should have ended.
+     */
+    private void lex() {
+        skipWhitespace();
+        tokenStart = pos;
+        if (pos >= text.length()) { tokenEnd = pos; token = END; return; }
+        char c = text.charAt(pos);
+        if (c == '{' || c == '}' || c == '[' || c == ']' || c == ',' || c == ':') {
+            pos++;
+            tokenEnd = pos;
+            token = c;
+            return;
         }
+        if (c == '"') lexString();
+        else if (c == '-' || isDigit(c)) lexNumber();
+        else lexWord();
+        if (token == INVALID) throw invalid("Token \"" + tokenText() + "\" is invalid.");
+    }
+
+    private void lexString() {
+        pos++; // opening quote
+        while (pos < text.length()) {
+            char c = text.charAt(pos++);
+            if (c == '"') {
+                tokenEnd = pos;
+                token = STRING;
+                return;
+            }
+            if (c == '\\') readEscape();
+            else if (c < 0x20) throw invalid("Character with value 0x" + hex(c) + " must be escaped.");
+        }
+        // A string with no closing quote is no token at all, and PostgreSQL names all of it
+        tokenEnd = pos;
+        token = INVALID;
+    }
+
+    private void readEscape() {
+        if (pos >= text.length()) return;   // the unfinished string is the complaint
+        char esc = text.charAt(pos++);
+        if ("\"\\/bfnrt".indexOf(esc) >= 0) return;
+        if (esc == 'u') {
+            if (pos + 4 > text.length()) throw invalid(BAD_UNICODE_ESCAPE);
+            for (int i = 0; i < 4; i++) {
+                if (Character.digit(text.charAt(pos + i), 16) < 0) throw invalid(BAD_UNICODE_ESCAPE);
+            }
+            pos += 4;
+            return;
+        }
+        throw invalid("Escape sequence \"\\" + esc + "\" is invalid.");
     }
 
     /** JSON's number grammar: no leading plus, no leading zeros, digits either side of the point. */
-    private void readNumber() {
-        int start = pos;
-        if (peek() == '-') pos++;
-        int intStart = pos;
-        while (pos < text.length() && isDigit(text.charAt(pos))) pos++;
-        int intLen = pos - intStart;
-        if (intLen == 0) throw invalid();                       // ".5" has no integer part
-        if (intLen > 1 && text.charAt(intStart) == '0') throw invalid();   // "007"
+    private void lexNumber() {
+        boolean bad = false;
+        if (text.charAt(pos) == '-') pos++;
+        if (pos < text.length() && text.charAt(pos) == '0') pos++;
+        else if (!skipDigits()) bad = true;                          // "-" has no digits at all
         if (pos < text.length() && text.charAt(pos) == '.') {
             pos++;
-            int fracStart = pos;
-            while (pos < text.length() && isDigit(text.charAt(pos))) pos++;
-            if (pos == fracStart) throw invalid();              // "1." has no fraction
+            if (!skipDigits()) bad = true;                           // "1." has no fraction
         }
         if (pos < text.length() && (text.charAt(pos) == 'e' || text.charAt(pos) == 'E')) {
             pos++;
             if (pos < text.length() && (text.charAt(pos) == '+' || text.charAt(pos) == '-')) pos++;
-            int expStart = pos;
-            while (pos < text.length() && isDigit(text.charAt(pos))) pos++;
-            if (pos == expStart) throw invalid();
+            if (!skipDigits()) bad = true;
         }
-        if (pos == start) throw invalid();
+        // Whatever runs on from a number with no delimiter between belongs to the same bad token,
+        // which is how "007" is named whole rather than as a zero followed by something else.
+        while (pos < text.length() && isWordChar(text.charAt(pos))) {
+            pos++;
+            bad = true;
+        }
+        tokenEnd = pos;
+        token = bad ? INVALID : SCALAR;
+    }
+
+    private boolean skipDigits() {
+        int from = pos;
+        while (pos < text.length() && isDigit(text.charAt(pos))) pos++;
+        return pos > from;
+    }
+
+    /** The only bare words JSON has are true, false and null; anything else is named and refused. */
+    private void lexWord() {
+        while (pos < text.length() && isWordChar(text.charAt(pos))) pos++;
+        if (pos == tokenStart) pos++;   // punctuation of its own: name that one character
+        tokenEnd = pos;
+        String word = tokenText();
+        token = word.equals("true") || word.equals("false") || word.equals("null")
+                ? SCALAR : INVALID;
     }
 
     private void enter() {
@@ -157,17 +214,19 @@ final class JsonTextValidator {
         if (++depth > PgErrors.MAX_RECURSION_DEPTH) throw PgErrors.stackDepthExceeded();
     }
 
+    private static String hex(char c) {
+        String s = Integer.toHexString(c);
+        return s.length() < 2 ? "0" + s : s;
+    }
+
     private static boolean isDigit(char c) {
         return c >= '0' && c <= '9';
     }
 
-    private char peek() {
-        return pos < text.length() ? text.charAt(pos) : '\0';
-    }
-
-    private void expect(String word) {
-        if (!text.startsWith(word, pos)) throw invalid();
-        pos += word.length();
+    /** PostgreSQL's JSON_ALPHANUMERIC_CHAR: how far a bare word or a bad number reaches. */
+    private static boolean isWordChar(char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+                || c == '_' || c > 127;
     }
 
     private void skipWhitespace() {

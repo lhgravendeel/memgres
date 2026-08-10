@@ -62,8 +62,14 @@ class DdlViewExecutor {
                     Column oldCol = oldResult.getColumns().get(i);
                     Column newCol = newResult.getColumns().get(i);
                     if (!oldCol.getName().equalsIgnoreCase(newCol.getName())) {
-                        throw new MemgresException("cannot change name of view column \"" + oldCol.getName()
+                        MemgresException renamed = new MemgresException(
+                                "cannot change name of view column \"" + oldCol.getName()
                                 + "\" to \"" + newCol.getName() + "\"", "42P16");
+                        // CREATE OR REPLACE keeps the view's columns; renaming one is a statement
+                        // of its own, and PostgreSQL names it.
+                        renamed.setHint("Use ALTER VIEW ... RENAME COLUMN ... to change name of"
+                                + " view column instead.");
+                        throw renamed;
                     }
                     if (oldCol.getType() != newCol.getType()) {
                         throw new MemgresException("cannot change data type of view column \"" + oldCol.getName()
@@ -89,9 +95,12 @@ class DdlViewExecutor {
         query = applyColumnAliasList(stmt, query);
 
         // A CHECK OPTION on a view no INSERT can reach is a promise that can never be kept.
-        if (stmt.checkOption() != null && !isAutoUpdatable(query)) {
-            throw PgErrors.notImplemented(
+        String obstacle = stmt.checkOption() != null ? autoUpdatableObstacle(query) : null;
+        if (obstacle != null) {
+            MemgresException e = PgErrors.notImplemented(
                     "WITH CHECK OPTION is supported only on automatically updatable views");
+            e.setHint(obstacle);
+            throw e;
         }
 
         // "view will be a temporary view": a view whose query reads a temp table cannot outlive
@@ -181,24 +190,48 @@ class DdlViewExecutor {
     }
 
     /**
-     * Whether a view over this query is automatically updatable — the same test the DML path
-     * makes when it resolves a view back to its base table.
+     * What stands in the way of updating a view over this query by rewriting the write onto its
+     * base table, worded as PostgreSQL words it, or null when nothing does. The tests run in
+     * PostgreSQL's order, because a query that breaks two of them is reported by the same one it
+     * reports there.
      */
-    private boolean isAutoUpdatable(Statement query) {
-        if (!(query instanceof SelectStmt)) return false;
+    private String autoUpdatableObstacle(Statement query) {
+        if (query instanceof SetOpStmt) {
+            return "Views containing UNION, INTERSECT, or EXCEPT are not automatically updatable.";
+        }
+        if (!(query instanceof SelectStmt)) {
+            return "Views that do not select from a single table or view are not automatically"
+                    + " updatable.";
+        }
         SelectStmt sel = (SelectStmt) query;
-        if (sel.distinct()) return false;
-        if (sel.from() == null || sel.from().size() != 1) return false;
-        if (!(sel.from().get(0) instanceof SelectStmt.TableRef)) return false;
-        if (sel.groupBy() != null && !sel.groupBy().isEmpty()) return false;
-        if (sel.having() != null) return false;
-        if (sel.limit() != null || sel.offset() != null) return false;
+        if (sel.distinct()) {
+            return "Views containing DISTINCT are not automatically updatable.";
+        }
+        if (sel.groupBy() != null && !sel.groupBy().isEmpty()) {
+            return "Views containing GROUP BY are not automatically updatable.";
+        }
+        if (sel.having() != null) {
+            return "Views containing HAVING are not automatically updatable.";
+        }
+        if (sel.withClauses() != null && !sel.withClauses().isEmpty()) {
+            return "Views containing WITH are not automatically updatable.";
+        }
+        if (sel.limit() != null || sel.offset() != null) {
+            return "Views containing LIMIT or OFFSET are not automatically updatable.";
+        }
         if (sel.targets() != null) {
             for (SelectStmt.SelectTarget target : sel.targets()) {
-                if (StoredExprCheck.hasAggregate(target.expr())) return false;
+                if (StoredExprCheck.hasAggregate(target.expr())) {
+                    return "Views that return aggregate functions are not automatically updatable.";
+                }
             }
         }
-        return true;
+        if (sel.from() == null || sel.from().size() != 1
+                || !(sel.from().get(0) instanceof SelectStmt.TableRef)) {
+            return "Views that do not select from a single table or view are not automatically"
+                    + " updatable.";
+        }
+        return null;
     }
 
     // ---- SELECT * freeze (star expansion at CREATE VIEW time) ----

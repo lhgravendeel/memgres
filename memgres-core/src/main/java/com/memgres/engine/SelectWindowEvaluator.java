@@ -1353,11 +1353,8 @@ class SelectWindowEvaluator {
     private void evaluateLeadLag(WindowFuncExpr wf, String funcName, List<RowContext> contexts,
                                   List<Integer> sortedPartition, Object[] results) {
         if (wf.args().isEmpty()) {
-            MemgresException e = new MemgresException(
+            throw new MemgresException(
                     "function " + funcName + "() does not exist", "42883");
-            e.setHint("No function matches the given name and argument types. "
-                    + "You might need to add explicit type casts.");
-            throw e;
         }
         Expression arg = wf.args().get(0);
         Object defaultVal = wf.args().size() > 2 ? executor.evalExpr(wf.args().get(2), null) : null;
@@ -1413,11 +1410,7 @@ class SelectWindowEvaluator {
             sig.append(pgTypeName(v));
         }
         sig.append(')');
-        MemgresException e = new MemgresException(
-                "function " + sig + " does not exist", "42883");
-        e.setHint("No function matches the given name and argument types. "
-                + "You might need to add explicit type casts.");
-        throw e;
+        throw new MemgresException("function " + sig + " does not exist", "42883");
     }
 
     private void evaluateAggregateWindowFunction(WindowFuncExpr wf, String funcName,

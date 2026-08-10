@@ -52,8 +52,10 @@ class DdlObjectExecutor {
             for (String label : stmt.enumLabels()) {
                 if (!seen.add(label)) {
                     // PostgreSQL surfaces this as the pg_enum index it violates, not as a DDL error
-                    throw new MemgresException("duplicate key value violates unique constraint "
-                            + "\"pg_enum_typid_label_index\"", "23505");
+                    MemgresException dup = new MemgresException("duplicate key value violates "
+                            + "unique constraint \"pg_enum_typid_label_index\"", "23505");
+                    dup.setConstraint("pg_enum_typid_label_index");
+                    throw dup;
                 }
             }
             // A type created under a name a dropped type used to answer to is a new type, and
@@ -73,8 +75,13 @@ class DdlObjectExecutor {
             // for, and why a definition that names one without having reserved the name first is
             // refused rather than left to fail when the function is looked up.
             if (stmt.rangeCanonical() && !wasShell) {
-                throw PgErrors.invalidObjectState(
+                MemgresException e = PgErrors.invalidObjectState(
                         "cannot specify a canonical function without a pre-created shell type");
+                // Three statements in order are what it takes, and PostgreSQL spells them out
+                // because the order is the whole of the difficulty.
+                e.setHint("Create the type as a shell type, then create its canonicalization "
+                        + "function, then do a full CREATE TYPE.");
+                throw e;
             }
             if (stmt.rangeSubtypeOpclass() == null) {
                 DdlDefinitionChecks.requireOrderableRangeSubtype(subtype.dataType());
@@ -503,7 +510,8 @@ class DdlObjectExecutor {
             }
         }
         throw new MemgresException(
-                "function " + funcName + "(" + canonicalTypeList(argTypes) + ") does not exist", "42883");
+                "function " + funcName + "(" + canonicalTypeList(argTypes) + ") does not exist",
+                "42883").withoutHint();
     }
 
     /** True when the function's declared input parameters are exactly these types. */
@@ -678,7 +686,7 @@ class DdlObjectExecutor {
             if (stmt.rightArg() != null && !"NONE".equalsIgnoreCase(stmt.rightArg().trim())) {
                 sig.append(' ').append(DataType.canonicalName(stmt.rightArg()));
             }
-            throw new MemgresException("operator does not exist: " + sig, "42883");
+            throw new MemgresException("operator does not exist: " + sig, "42883").withoutHint();
         }
 
         switch (stmt.action()) {
@@ -997,6 +1005,32 @@ class DdlObjectExecutor {
      */
     private void checkReplaceKeepsSignature(PgFunction existing, CreateFunctionStmt stmt,
                                             List<PgFunction.Param> params) {
+        try {
+            checkReplaceKeepsIdentity(existing, stmt, params);
+        } catch (MemgresException e) {
+            // Every one of these refusals has the same way out, and PostgreSQL writes it out
+            // rather than leaving the reader to work out the signature a DROP has to name.
+            if ("42P13".equals(e.getSqlState())) {
+                e.setHint("Use DROP " + (existing.isProcedure() ? "PROCEDURE" : "FUNCTION") + " "
+                        + existing.getName() + "(" + identityArguments(existing.getParams())
+                        + ") first.");
+            }
+            throw e;
+        }
+    }
+
+    /** The arguments a DROP of this routine has to name: its input parameters' types, in order. */
+    private static String identityArguments(List<PgFunction.Param> params) {
+        StringBuilder sb = new StringBuilder();
+        for (PgFunction.Param p : inParams(params)) {
+            if (sb.length() > 0) sb.append(',');
+            sb.append(DataType.canonicalName(p.typeName()));
+        }
+        return sb.toString();
+    }
+
+    private void checkReplaceKeepsIdentity(PgFunction existing, CreateFunctionStmt stmt,
+                                           List<PgFunction.Param> params) {
         // A function is SELECTed and a procedure is CALLed, so one never silently becomes the
         // other. PostgreSQL calls this the wrong kind of object rather than a bad definition.
         if (existing.isProcedure() != stmt.isProcedure()) {
@@ -2191,7 +2225,8 @@ class DdlObjectExecutor {
                     + "\n  Detail: Tables cannot have INSTEAD OF triggers.");
         }
         if ((timing == PgTrigger.Timing.BEFORE || timing == PgTrigger.Timing.AFTER) && isView) {
-            throw new MemgresException("\"" + stmt.table() + "\" is a view\n  Detail: Views cannot have BEFORE or AFTER row-level triggers.", "42809");
+            throw new MemgresException("\"" + stmt.table() + "\" is a view"
+                    + "\n  Detail: Views cannot have row-level BEFORE or AFTER triggers.", "42809");
         }
         // Validate table/view existence (skip for INSTEAD OF on views — resolveTable rejects non-updatable views)
         if (stmt.table() != null && !(timing == PgTrigger.Timing.INSTEAD_OF && isView)) {
@@ -2213,7 +2248,8 @@ class DdlObjectExecutor {
         if (stmt.functionName() != null) {
             PgFunction trigFunc = executor.database.getFunction(stmt.functionName());
             if (trigFunc == null) {
-                throw new MemgresException("function " + stmt.functionName() + "() does not exist", "42883");
+                throw new MemgresException("function " + stmt.functionName() + "() does not exist",
+                        "42883").withoutHint();
             }
             String trigRetType = trigFunc.getReturnType();
             if (trigRetType != null && !trigRetType.isEmpty()
@@ -2721,11 +2757,17 @@ class DdlObjectExecutor {
         // A view is a relation like any other: what reads it depends on it, so dropping it
         // blocks on those readers and CASCADE takes them with it.
         String bareViewName = RelationNamespace.bareName(stmt.name());
-        if (oldView != null && !stmt.cascade()
-                && !ViewDependencies.directDependents(executor.database, dropViewSchema, bareViewName)
-                    .isEmpty()) {
-            throw new MemgresException("cannot drop " + (wantMaterialized ? "materialized view " : "view ")
-                    + bareViewName + " because other objects depend on it", "2BP01");
+        List<String> viewDependents = oldView == null || stmt.cascade() ? Cols.listOf()
+                : ViewDependencies.dependencyLines(executor.database, dropViewSchema, bareViewName,
+                        wantMaterialized ? "materialized view" : "view",
+                        executor.searchPathSchemas());
+        if (!viewDependents.isEmpty()) {
+            MemgresException e = new MemgresException("cannot drop "
+                    + (wantMaterialized ? "materialized view " : "view ") + bareViewName
+                    + " because other objects depend on it", "2BP01");
+            e.setDetail(String.join("\n", viewDependents));
+            e.setHint("Use DROP ... CASCADE to drop the dependent objects too.");
+            throw e;
         }
         if (oldView != null && stmt.cascade()) {
             List<String> cascaded = new ArrayList<>();
@@ -2896,9 +2938,14 @@ class DdlObjectExecutor {
                     if (sc.getType() != StoredConstraint.Type.PRIMARY_KEY
                             && sc.getType() != StoredConstraint.Type.UNIQUE) continue;
                     if (sc.getName() == null || !sc.getName().equalsIgnoreCase(bareIndexName)) continue;
-                    throw new MemgresException("cannot drop index " + bareIndexName
+                    MemgresException e = new MemgresException("cannot drop index " + bareIndexName
                             + " because constraint " + sc.getName() + " on table "
                             + owner.getName() + " requires it", "2BP01");
+                    // The index belongs to the constraint, so the constraint is the thing there
+                    // is to drop, and PostgreSQL names the statement that would work.
+                    e.setHint("You can drop constraint " + sc.getName() + " on table "
+                            + owner.getName() + " instead.");
+                    throw e;
                 }
             }
         }
@@ -3040,20 +3087,19 @@ class DdlObjectExecutor {
         if (dependents.isEmpty()) return;
         String display = TypeNamespace.display(executor.database, executor.session, key);
         if (!stmt.cascade()) {
-            StringBuilder detail = new StringBuilder();
+            // One dependent per line of a single detail. Written as repeated labelled sections
+            // only the first of them reached the client and the rest stayed inside the message.
+            List<String> lines = new ArrayList<>();
             for (String d : dependents) {
-                detail.append("\n  Detail: column ").append(d)
-                        .append(" depends on type ").append(display);
+                lines.add(d + " depends on type " + display);
             }
-            throw new MemgresException("cannot drop type " + display
-                    + " because other objects depend on it" + detail, "2BP01");
+            MemgresException e = new MemgresException("cannot drop type " + display
+                    + " because other objects depend on it", "2BP01");
+            e.setDetail(String.join("\n", lines));
+            e.setHint("Use DROP ... CASCADE to drop the dependent objects too.");
+            throw e;
         }
-        List<String> cascaded = new ArrayList<>();
-        for (String d : dependents) {
-            int dot = d.indexOf('.');
-            cascaded.add("column " + d.substring(dot + 1) + " of table " + d.substring(0, dot));
-        }
-        noticeDropCascades(executor, cascaded);
+        noticeDropCascades(executor, dependents);
     }
 
     /** The schema a DROP looks in: the one it named, or the session's own. */
@@ -3082,8 +3128,12 @@ class DdlObjectExecutor {
             String lookIn = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
             String owner = TypeNamespace.rowTypeOwner(executor.database, lookIn, stmt.name());
             if (owner != null) {
-                throw new MemgresException("cannot drop type " + written + " because " + owner
-                        + " " + written + " requires it", "2BP01");
+                MemgresException e = new MemgresException("cannot drop type " + written
+                        + " because " + owner + " " + written + " requires it", "2BP01");
+                // A row type goes when its relation does, so PostgreSQL names the drop that
+                // would take both rather than leaving the reader with no way forward.
+                e.setHint("You can drop " + owner + " " + written + " instead.");
+                throw e;
             }
             if (!stmt.ifExists()) {
                 throw new MemgresException("type \"" + written + "\" does not exist", "42704");
@@ -3124,12 +3174,15 @@ class DdlObjectExecutor {
     }
 
     /**
-     * Every table column whose declared type is the type stored under {@code key}, as
-     * "table.column". A column records the type it was declared with under the same key, so a
-     * column of a.e is not found by dropping b.e.
+     * Every table column whose declared type is the type stored under {@code key}, described the
+     * way PostgreSQL describes a column that stands in the way of a drop — {@code column c of
+     * table t}, with the table schema-qualified where the search path does not reach it. A column
+     * records the type it was declared with under the same key, so a column of a.e is not found
+     * by dropping b.e.
      */
     private List<String> columnsDeclaredAsType(String key) {
         List<String> found = new ArrayList<>();
+        List<String> visible = executor.searchPathSchemas();
         for (Schema schema : executor.database.getSchemas().values()) {
             for (Table t : schema.getTables().values()) {
                 for (Column c : t.getColumns()) {
@@ -3137,7 +3190,8 @@ class DdlObjectExecutor {
                     // it exactly as a column declared as an enum depends on that.
                     if (sameType(key, c.getEnumTypeName()) || sameType(key, c.getCompositeTypeName())
                             || sameType(key, c.getDomainTypeName())) {
-                        found.add(t.getName() + "." + c.getName());
+                        found.add("column " + c.getName() + " of table "
+                                + RelationNamespace.shownName(visible, schema.getName(), t.getName()));
                     }
                 }
             }
@@ -3685,8 +3739,7 @@ class DdlObjectExecutor {
                 // the stored rows, and nothing would ever put it right.
                 forEachDomainValue(stmt.domainName(), (tableName, columnName, value) -> {
                     if (value == null) {
-                        throw new MemgresException("column \"" + columnName + "\" of table \""
-                                + tableName + "\" contains null values", "23502");
+                        throw PgErrors.columnContainsNulls(columnName, "table", tableName);
                     }
                 });
                 domain.setNotNull(true);
@@ -3893,8 +3946,10 @@ class DdlObjectExecutor {
             RowContext valCtx = new RowContext(valTable, null, new Object[]{value});
             Object result = executor.evalExpr(checkExpr, valCtx);
             if (!executor.isTruthy(result)) {
-                throw new MemgresException("column \"" + columnName + "\" of table \"" + tableName
-                        + "\" contains values that violate the new constraint", "23514");
+                MemgresException ex = new MemgresException("column \"" + columnName + "\" of table \""
+                        + tableName + "\" contains values that violate the new constraint", "23514");
+                ex.setColumn(columnName);
+                throw ex;
             }
         });
     }
@@ -3910,7 +3965,10 @@ class DdlObjectExecutor {
         if (s.table() == null) return null;
         Database.ViewDef view = executor.database.getView(s.table());
         if (view != null && !view.materialized()) {
-            throw PgErrors.wrongObjectType("cannot create index on relation \"" + s.table() + "\"");
+            MemgresException e = PgErrors.wrongObjectType(
+                    "cannot create index on relation \"" + s.table() + "\"");
+            e.setDetail("This operation is not supported for views.");
+            throw e;
         }
         if (executor.database.hasIndex(s.table())) {
             throw PgErrors.wrongObjectType("cannot open relation \"" + s.table() + "\"");
@@ -4218,7 +4276,8 @@ class DdlObjectExecutor {
                     }
                     if (!partColFound) {
                         throw new MemgresException("unique constraint on partitioned table must include all partitioning columns\n"
-                                + "  Detail: UNIQUE constraint missing column \"" + partCol + "\" which is part of the partition key.",
+                                + "  Detail: UNIQUE constraint on table \"" + s.table()
+                                + "\" lacks column \"" + partCol + "\" which is part of the partition key.",
                                 "0A000");
                     }
                 }
@@ -4649,7 +4708,8 @@ class DdlObjectExecutor {
         if (func == null) {
             if (isKnownBuiltinFunction(stmt.functionName)) return;
             throw new MemgresException("function " + stmt.functionName + "("
-                    + canonicalTypeList(stmt.funcArgTypes) + ") does not exist", "42883");
+                    + canonicalTypeList(stmt.funcArgTypes) + ") does not exist",
+                    "42883").withoutHint();
         }
         List<PgFunction.Param> params = func.getParams();
         String firstParam = params.isEmpty() ? null : params.get(0).typeName();

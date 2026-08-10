@@ -141,8 +141,7 @@ class RangeFunctions {
         throw new MemgresException("function " + rangeType + "("
                 + (loName != null ? loName : "integer") + ", "
                 + (hiName != null ? hiName : "integer") + ") does not exist"
-                + "\n  Hint: No function matches the given name and argument types."
-                + " You might need to add explicit type casts.", "42883");
+                + "\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
     }
 
     /** The PG type name a bound value can only have come from, or null when int4 accepts it. */

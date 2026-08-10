@@ -97,7 +97,9 @@ class DdlAdminExecutor {
                     // PG default: max_prepared_transactions = 0, which disables PREPARE TRANSACTION
                     int maxPrepared = executor.database.getMaxPreparedTransactions();
                     if (maxPrepared <= 0) {
-                        throw new MemgresException("prepared transactions are disabled\n  Hint: Set max_prepared_transactions to a nonzero value.", "55000");
+                        throw new MemgresException("prepared transactions are disabled"
+                                + "\n  Hint: Set \"max_prepared_transactions\" to a nonzero value.",
+                                "55000");
                     }
                     String gid = stmt.savepointName();
                     Database.PreparedTransaction pt = executor.session.prepareTransaction(gid);
@@ -554,10 +556,17 @@ class DdlAdminExecutor {
         if (owned.isEmpty()) return "no objects";
         String key = owned.get(0);
         int colon = key.indexOf(':');
-        if (colon > 0) {
-            return key.substring(0, colon) + " " + key.substring(colon + 1);
-        }
-        return key;
+        if (colon < 0) return key;
+        String kind = key.substring(0, colon);
+        String name = key.substring(colon + 1);
+        int dot = name.indexOf('.');
+        String schema = dot > 0 ? name.substring(0, dot) : null;
+        String bare = dot > 0 ? name.substring(dot + 1) : name;
+        // A materialized view is stored beside the plain views and the ownership key does not
+        // say which of the two it is, so the view itself is asked.
+        Database.ViewDef view = "view".equals(kind) ? executor.database.getView(bare) : null;
+        if (view != null && view.materialized()) kind = "materialized view";
+        return kind + " " + RelationNamespace.shownName(executor.searchPathSchemas(), schema, bare);
     }
 
     // ---- CREATE RULE ----
@@ -708,8 +717,10 @@ class DdlAdminExecutor {
                 // SELECT rule has no row for.
                 throw PgErrors.invalidObjectState("ON SELECT rule cannot use OLD");
             }
-            throw PgErrors.wrongObjectType(
+            MemgresException e = PgErrors.wrongObjectType(
                     "relation \"" + s.table() + "\" cannot have ON SELECT rules");
+            e.setDetail("This operation is not supported for tables.");
+            throw e;
         }
         if (!s.orReplace() && executor.database.hasRule(s.name(), s.table())) {
             throw new MemgresException("rule \"" + s.name() + "\" for relation \""

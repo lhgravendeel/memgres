@@ -19,6 +19,23 @@ final class ArrayLiteral {
     /** PostgreSQL is built with MAXDIM 6, and says so when an array is nested deeper. */
     private static final int MAX_DIM = 6;
 
+    // Every malformed literal carries the same message, so the rule the text broke is said in the
+    // DETAIL line instead. These are the sentences array input writes there.
+    private static final String MUST_START =
+            "Array value must start with \"{\" or dimension information.";
+    private static final String NEEDS_DIMENSIONS =
+            "\"[\" must introduce explicitly-specified array dimensions.";
+    private static final String MISSING_DIMENSION_VALUE = "Missing array dimension value.";
+    private static final String MISSING_CLOSING_BRACKET = "Missing \"]\" after array dimensions.";
+    private static final String MISSING_EQUALS = "Missing \"=\" after array dimensions.";
+    private static final String CONTENTS_MUST_START = "Array contents must start with \"{\".";
+    private static final String DIMENSIONS_DISAGREE =
+            "Specified array dimensions do not match array contents.";
+    private static final String RAGGED =
+            "Multidimensional arrays must have sub-arrays with matching dimensions.";
+    private static final String UNEXPECTED_END = "Unexpected end of input.";
+    private static final String JUNK_AFTER_BRACE = "Junk after closing right brace.";
+
     // Where the reader stands within one brace level. PostgreSQL rejects a literal by finding a
     // character that cannot follow what came before it, so the shape check is a walk over these.
     private static final int NO_LEVEL = 0;
@@ -129,17 +146,23 @@ final class ArrayLiteral {
             if (p >= text.length() || text.charAt(p) != '[') break;
             p++;
             if (declared.size() >= MAX_DIM) throw dimensionOverflow();
+            // A bound that is not a number is not a bound: before the colon that leaves the "["
+            // introducing nothing, after it there is a dimension value missing.
+            String unreadable = NEEDS_DIMENSIONS;
             int q = skipSignedDigits(text, p);
-            if (q == p) throw malformed(text);
+            if (q == p) throw malformed(text, unreadable);
             int lb = 1;
             if (q < text.length() && text.charAt(q) == ':') {
-                lb = toBound(text.substring(p, q), text);
+                lb = toBound(text.substring(p, q), text, unreadable);
                 p = q + 1;
+                unreadable = MISSING_DIMENSION_VALUE;
                 q = skipSignedDigits(text, p);
-                if (q == p) throw malformed(text);
+                if (q == p) throw malformed(text, unreadable);
             }
-            if (q >= text.length() || text.charAt(q) != ']') throw malformed(text);
-            int ub = toBound(text.substring(p, q), text);
+            if (q >= text.length() || text.charAt(q) != ']') {
+                throw malformed(text, MISSING_CLOSING_BRACKET);
+            }
+            int ub = toBound(text.substring(p, q), text, unreadable);
             p = q + 1;
             if (ub < lb) {
                 throw new MemgresException("upper bound cannot be less than lower bound", "2202E");
@@ -148,19 +171,23 @@ final class ArrayLiteral {
         }
 
         if (!declared.isEmpty()) {
-            if (p >= text.length() || text.charAt(p) != '=') throw malformed(text);
+            if (p >= text.length() || text.charAt(p) != '=') throw malformed(text, MISSING_EQUALS);
             p++;
             while (p < text.length() && isSpace(text.charAt(p))) p++;
         }
-        if (p >= text.length() || text.charAt(p) != '{') throw malformed(text);
+        if (p >= text.length() || text.charAt(p) != '{') {
+            // Text with no dimensions in front of it never began an array at all; text whose
+            // dimensions were read is an array whose contents are missing.
+            throw malformed(text, declared.isEmpty() ? MUST_START : CONTENTS_MUST_START);
+        }
 
         int[] dims = countDimensions(text, p);
         int[] lowerBounds = new int[dims.length];
         for (int i = 0; i < dims.length; i++) lowerBounds[i] = 1;
         if (!declared.isEmpty()) {
-            if (declared.size() != dims.length) throw malformed(text);
+            if (declared.size() != dims.length) throw malformed(text, DIMENSIONS_DISAGREE);
             for (int i = 0; i < dims.length; i++) {
-                if (declared.get(i)[1] != dims[i]) throw malformed(text);
+                if (declared.get(i)[1] != dims[i]) throw malformed(text, DIMENSIONS_DISAGREE);
                 lowerBounds[i] = declared.get(i)[0];
             }
         }
@@ -196,25 +223,29 @@ final class ArrayLiteral {
                 if (state == ELEM_STARTED || state == QUOTED_ELEM_STARTED) emptyArray = false;
                 char c = ptr < str.length() ? str.charAt(ptr) : '\0';
                 if (c == '\0') {
-                    throw malformed(str);
+                    throw malformed(str, UNEXPECTED_END);
                 } else if (c == '\\') {
                     if (state != LEVEL_STARTED && state != ELEM_STARTED
                             && state != QUOTED_ELEM_STARTED && state != ELEM_DELIMITED) {
-                        throw malformed(str);
+                        throw elementNotAllowed(str, state);
                     }
                     if (state != QUOTED_ELEM_STARTED) state = ELEM_STARTED;
-                    if (ptr + 1 >= str.length()) throw malformed(str);
+                    if (ptr + 1 >= str.length()) throw malformed(str, UNEXPECTED_END);
                     ptr++;
                 } else if (c == '"') {
                     if (state != LEVEL_STARTED && state != QUOTED_ELEM_STARTED
                             && state != ELEM_DELIMITED) {
-                        throw malformed(str);
+                        throw elementNotAllowed(str, state);
                     }
+
                     inQuotes = !inQuotes;
                     state = inQuotes ? QUOTED_ELEM_STARTED : QUOTED_ELEM_COMPLETED;
                 } else if (c == '{' && !inQuotes) {
                     if (state != NO_LEVEL && state != LEVEL_STARTED && state != LEVEL_DELIMITED) {
-                        throw malformed(str);
+                        // A sub-array standing where the level before it held a plain element is a
+                        // row of the wrong shape, not a brace in the wrong place.
+                        throw state == ELEM_DELIMITED
+                                ? malformed(str, RAGGED) : unexpectedChar(str, '{');
                     }
                     state = LEVEL_STARTED;
                     if (nestLevel >= MAX_DIM) throw dimensionOverflow();
@@ -227,14 +258,14 @@ final class ArrayLiteral {
                     boolean levelEmpty = state == LEVEL_STARTED;
                     if (!levelEmpty && state != ELEM_STARTED && state != QUOTED_ELEM_COMPLETED
                             && state != LEVEL_COMPLETED) {
-                        throw malformed(str);
+                        throw unexpectedChar(str, '}');
                     }
-                    if (nestLevel == 0) throw malformed(str);
+                    if (nestLevel == 0) throw unexpectedChar(str, '}');
                     state = LEVEL_COMPLETED;
                     nestLevel--;
                     int count = levelEmpty ? 0 : nelems[nestLevel];
                     if (nelemsLast[nestLevel] >= 0 && count != nelemsLast[nestLevel]) {
-                        throw malformed(str);
+                        throw malformed(str, RAGGED);
                     }
                     nelemsLast[nestLevel] = count;
                     nelems[nestLevel] = 1;
@@ -247,7 +278,7 @@ final class ArrayLiteral {
                 } else if (!inQuotes && c == ',') {
                     if (state != ELEM_STARTED && state != QUOTED_ELEM_COMPLETED
                             && state != LEVEL_COMPLETED) {
-                        throw malformed(str);
+                        throw unexpectedChar(str, ',');
                     }
                     state = state == LEVEL_COMPLETED ? LEVEL_DELIMITED : ELEM_DELIMITED;
                     itemdone = true;
@@ -255,7 +286,7 @@ final class ArrayLiteral {
                 } else if (!inQuotes && !isSpace(c)) {
                     if (state != LEVEL_STARTED && state != ELEM_STARTED
                             && state != ELEM_DELIMITED) {
-                        throw malformed(str);
+                        throw elementNotAllowed(str, state);
                     }
                     state = ELEM_STARTED;
                 }
@@ -265,7 +296,7 @@ final class ArrayLiteral {
             ptr++;
         }
         while (ptr < str.length()) {
-            if (!isSpace(str.charAt(ptr))) throw malformed(str);
+            if (!isSpace(str.charAt(ptr))) throw malformed(str, JUNK_AFTER_BRACE);
             ptr++;
         }
         if (emptyArray) return new int[0];
@@ -362,22 +393,20 @@ final class ArrayLiteral {
         return out;
     }
 
+    /** A dimension bound reaches over one optional sign and the digits after it, or nowhere. */
     private static int skipSignedDigits(String text, int from) {
         int q = from;
-        while (q < text.length()) {
-            char c = text.charAt(q);
-            if (c >= '0' && c <= '9') q++;
-            else if (c == '-' || c == '+') q++;
-            else break;
-        }
-        return q;
+        if (q < text.length() && (text.charAt(q) == '-' || text.charAt(q) == '+')) q++;
+        int digits = q;
+        while (q < text.length() && text.charAt(q) >= '0' && text.charAt(q) <= '9') q++;
+        return q == digits ? from : q;
     }
 
-    private static int toBound(String text, String source) {
+    private static int toBound(String text, String source, String unreadable) {
         try {
             return Integer.parseInt(text.startsWith("+") ? text.substring(1) : text);
         } catch (NumberFormatException e) {
-            throw malformed(source);
+            throw malformed(source, unreadable);
         }
     }
 
@@ -386,8 +415,27 @@ final class ArrayLiteral {
         return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == 0x0b;
     }
 
-    private static MemgresException malformed(String text) {
-        return new MemgresException("malformed array literal: \"" + text + "\"", "22P02");
+    private static MemgresException malformed(String text, String detail) {
+        MemgresException e =
+                new MemgresException("malformed array literal: \"" + text + "\"", "22P02");
+        e.setDetail(detail);
+        return e;
+    }
+
+    private static MemgresException unexpectedChar(String text, char c) {
+        return malformed(text, "Unexpected \"" + c + "\" character.");
+    }
+
+    /**
+     * What array input says when something that would begin an element stands where one cannot.
+     * The complaint names what was read before it rather than the character found: after a closed
+     * quote the quoting is at fault, after a closed sub-array the element is one the level has no
+     * room for, and after a sub-array delimiter a bare element leaves the level ragged.
+     */
+    private static MemgresException elementNotAllowed(String text, int state) {
+        if (state == LEVEL_DELIMITED) return malformed(text, RAGGED);
+        if (state == LEVEL_COMPLETED) return malformed(text, "Unexpected array element.");
+        return malformed(text, "Incorrectly quoted array element.");
     }
 
     private static MemgresException dimensionOverflow() {

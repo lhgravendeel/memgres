@@ -528,8 +528,13 @@ public class PlpgsqlExecutor {
         else if (value instanceof Map) width = ((Map<?, ?>) value).size();
         else return;
         if (width != fields.size()) {
+            // The two widths are the detail behind the complaint: the message says the record does
+            // not fit, and how many fields each side has is what shows why.
             throw new MemgresException(
-                    "returned record type does not match expected record type", "42804");
+                    "returned record type does not match expected record type"
+                            + "\n  Detail: Number of returned columns (" + width
+                            + ") does not match expected column count (" + fields.size() + ").",
+                    "42804");
         }
         // A row constructor builds an anonymous record whose fields are whatever its expressions
         // were: nothing has coerced them to the declared type, so a field holding text where the
@@ -540,8 +545,16 @@ public class PlpgsqlExecutor {
                 String want = valueClass(fields.get(i).typeName());
                 String got = valueClassOf(values.get(i));
                 if (want != null && got != null && !want.equals(got)) {
+                    // Which field disagreed, and how: the record is handed back under a name it
+                    // does not fit, and the field that does not fit is the whole of the reason.
                     throw new MemgresException(
-                            "returned record type does not match expected record type", "42804");
+                            "returned record type does not match expected record type"
+                                    + "\n  Detail: Returned type "
+                                    + returnedTypeName(values.get(i))
+                                    + " does not match expected type "
+                                    + DataType.canonicalName(fields.get(i).typeName())
+                                    + " in column \"" + fields.get(i).name()
+                                    + "\" (position " + (i + 1) + ").", "42804");
                 }
             }
         }
@@ -571,6 +584,17 @@ public class PlpgsqlExecutor {
             default:
                 return null;
         }
+    }
+
+    /** The type PostgreSQL names for a value a record handed back, as its detail spells it. */
+    private static String returnedTypeName(Object value) {
+        if (value instanceof Integer || value instanceof Short) return "integer";
+        if (value instanceof Long) return "bigint";
+        if (value instanceof java.math.BigDecimal) return "numeric";
+        if (value instanceof Double) return "double precision";
+        if (value instanceof Float) return "real";
+        if (value instanceof Boolean) return "boolean";
+        return "text";
     }
 
     /** The same broad kind, read off a value, or null when the value does not say. */
@@ -1417,7 +1441,9 @@ public class PlpgsqlExecutor {
         if (!stmt.elseBody().isEmpty()) {
             executeStatements(stmt.elseBody(), scope);
         } else {
-            throw new MemgresException("case not found", "20000");
+            // PostgreSQL says what was missing from the statement, not only that nothing matched.
+            throw new MemgresException("case not found"
+                    + "\n  Hint: CASE statement is missing ELSE part.", "20000");
         }
     }
 
@@ -2008,8 +2034,14 @@ public class PlpgsqlExecutor {
                 database.getRowType(elementType);
         if (fields == null) return;
         if (result.getColumns() != null && result.getColumns().size() != fields.size()) {
+            // The two widths are the detail behind the complaint: the message says the query does
+            // not fit the declared type, and the counts are what show why.
             throw new MemgresException(
-                    "structure of query does not match function result type", "42804");
+                    "structure of query does not match function result type"
+                            + "\n  Detail: Number of returned columns ("
+                            + result.getColumns().size()
+                            + ") does not match expected column count (" + fields.size() + ").",
+                    "42804");
         }
     }
 
@@ -2316,6 +2348,9 @@ public class PlpgsqlExecutor {
                         throw new MemgresException("query returned no rows", "P0002");
                     }
                     if (result.getRows().size() > 1) {
+                        // No advice here, where a static INTO STRICT is advised to add a LIMIT:
+                        // this query is a string the block computed, and PostgreSQL does not
+                        // suggest editing text it cannot see.
                         throw new MemgresException("query returned more than one row", "P0003");
                     }
                 }
@@ -2452,7 +2487,11 @@ public class PlpgsqlExecutor {
                     throw new MemgresException("query returned no rows", "P0002");
                 }
                 if (rowCount > 1) {
-                    throw new MemgresException("query returned more than one row", "P0003");
+                    // PostgreSQL advises on the too-many-rows case and not on the empty one, since
+                    // only the query that returned too much can be narrowed.
+                    throw new MemgresException("query returned more than one row"
+                            + "\n  Hint: Make sure the query returns a single row,"
+                            + " or use LIMIT 1.", "P0003");
                 }
             }
             if (!result.getRows().isEmpty()) {
@@ -3804,8 +3843,12 @@ public class PlpgsqlExecutor {
                             // #variable_conflict names the winner; without it PG reports the
                             // ambiguity, and a SQL-language body always lets the column win.
                             if (!columnWins && "error".equals(variableConflict)) {
+                                // PostgreSQL names the two things the identifier could have meant,
+                                // which is what separates this from two tables sharing a column.
                                 throw new MemgresException(
-                                        "column reference \"" + lowerName + "\" is ambiguous", "42702");
+                                        "column reference \"" + lowerName + "\" is ambiguous"
+                                                + "\n  Detail: It could refer to either a PL/pgSQL"
+                                                + " variable or a table column.", "42702");
                             }
                             if (columnWins || "use_column".equals(variableConflict)) {
                                 appendTokenToSb(sb, t);

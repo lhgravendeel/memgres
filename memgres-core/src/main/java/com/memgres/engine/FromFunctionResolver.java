@@ -260,7 +260,7 @@ class FromFunctionResolver {
                             : CatalogSystemFunctions.readableTypeName(p.typeName()));
                 }
                 throw new MemgresException(fname + "(" + types + ") is a procedure"
-                        + "\nHint: To call a procedure, use CALL.", "42809");
+                        + "\n  Hint: To call a procedure, use CALL.", "42809");
             }
             checkRecordColumnDefinitionList(userFunc, funcFrom);
             // Raw, not stripped: a column definition list gives the columns their types too.
@@ -894,7 +894,7 @@ class FromFunctionResolver {
     private List<RowContext> resolveExpandArray(String alias, List<String> colAliases, List<Object> evalArgs) {
         if (evalArgs.isEmpty()) {
             throw new MemgresException("function _pg_expandarray() does not exist"
-                    + "\n  Hint: No function matches the given name and argument types.", "42883");
+                    + "\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
         }
         String valueCol = (colAliases != null && !colAliases.isEmpty()) ? colAliases.get(0) : "x";
         String indexCol = (colAliases != null && colAliases.size() >= 2) ? colAliases.get(1) : "n";
@@ -925,7 +925,7 @@ class FromFunctionResolver {
                     + " You might need to add explicit type casts.", "42725");
         }
         if (evalArgs.isEmpty()) {
-            throw new MemgresException("function unnest() does not exist\n  Hint: No function matches the given name and argument types.", "42883");
+            throw new MemgresException("function unnest() does not exist\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
         }
         if (evalArgs.size() > 1) {
             return resolveMultiUnnest(alias, colAliases, evalArgs, argExprs);
@@ -1684,8 +1684,11 @@ class FromFunctionResolver {
                 // list written alongside only renames them, and never says how many there are.
                 boolean namedBySignature = userFunc.hasOutParams();
                 if (cols.isEmpty() && !namedBySignature && colAliases != null && !colAliases.isEmpty()) {
-                    checkRecordShape(userFunc, colAliases.size(), firstRow.length);
+                    // A column whose type does not fit is what PostgreSQL reports first, even
+                    // when the list is the wrong length as well: it walks the columns it has
+                    // before it counts them.
                     checkRecordColumnTypes(userFunc, colAliases, firstRow);
+                    checkRecordShape(userFunc, colAliases.size(), firstRow.length);
                     for (int i = 0; i < colAliases.size(); i++) {
                         cols.add(columnFromDef(colAliases.get(i), i + 1));
                     }
@@ -1829,6 +1832,8 @@ class FromFunctionResolver {
         // the query it just ran against the record type it resolved, which is a datatype
         // mismatch. Same fault, two codes, and a client that branches on SQLSTATE sees both.
         MemgresException e = recordShapeError(userFunc);
+        // Both counts are the detail: which one is larger is visible from them, and the writer of
+        // the definition list needs to know what the body actually produced.
         e.setDetail("Number of returned columns (" + produced
                 + ") does not match expected column count (" + declared + ").");
         e.setPgContext("SQL function \"" + userFunc.getName() + "\" statement 1");
@@ -1845,13 +1850,31 @@ class FromFunctionResolver {
             String def = colAliases.get(i);
             int sp = def == null ? -1 : def.indexOf(' ');
             if (sp <= 0) continue;
-            String want = valueClass(def.substring(sp + 1).trim());
+            String declared = def.substring(sp + 1).trim();
+            String want = valueClass(declared);
             String got = valueClass(firstRow[i]);
             if (want == null || got == null || want.equals(got)) continue;
             MemgresException e = recordShapeError(userFunc);
+            // PostgreSQL names both types and the column they disagree at, by name and by
+            // position, so the writer of the definition list can see which entry to change.
+            e.setDetail("Returned type " + producedTypeName(firstRow[i])
+                    + " does not match expected type " + DataType.canonicalName(declared)
+                    + " in column \"" + def.substring(0, sp).trim()
+                    + "\" (position " + (i + 1) + ").");
             e.setPgContext("SQL function \"" + userFunc.getName() + "\" statement 1");
             throw e;
         }
+    }
+
+    /** The type name PostgreSQL would print for a value the body produced. */
+    private static String producedTypeName(Object value) {
+        if (value instanceof String) return "text";
+        if (value instanceof Boolean) return "boolean";
+        if (value instanceof Integer) return "integer";
+        if (value instanceof Long) return "bigint";
+        if (value instanceof Short) return "smallint";
+        if (value instanceof Float || value instanceof Double) return "double precision";
+        return "numeric";
     }
 
     /**
@@ -2036,7 +2059,7 @@ class FromFunctionResolver {
         // Validate JSON input
         if (!ExprEvaluator.isValidJson(json)) {
             if (jt.onError == JsonExistsExpr.OnBehavior.ERROR) {
-                throw new MemgresException("invalid input syntax for type json", "22P02");
+                ExprEvaluator.requireJson(json);
             }
             return contexts; // EMPTY ON ERROR (default)
         }

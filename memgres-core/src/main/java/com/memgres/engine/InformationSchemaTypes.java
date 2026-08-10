@@ -90,7 +90,12 @@ public final class InformationSchemaTypes {
         if (value == null || !"yes_or_no".equals(bare)) return value;
         String text = value.toString();
         if ("YES".equals(text) || "NO".equals(text)) return value;
-        throw new MemgresException("value for domain " + SCHEMA + ".yes_or_no"
+        MemgresException ex = new MemgresException("value for domain " + SCHEMA + ".yes_or_no"
                 + " violates check constraint \"yes_or_no_check\"", "23514");
+        ex.setConstraint("yes_or_no_check");
+        // The qualifier belongs to the sentence, which has to say which yes_or_no; the field is
+        // already about one type and carries the bare name.
+        ex.setDatatype("yes_or_no");
+        throw ex;
     }
 }

@@ -334,8 +334,7 @@ public final class BuiltinCallTypes {
         if (printed.equals("overlaps")) printed = "pg_catalog." + printed;
         return new MemgresException("function " + printed
                 + "(" + written(argOids) + ") does not exist"
-                + "\n  Hint: No function matches the given name and argument types."
-                + " You might need to add explicit type casts.", "42883");
+                + "\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
     }
 
     /**

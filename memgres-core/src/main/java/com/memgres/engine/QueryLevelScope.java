@@ -400,8 +400,7 @@ final class QueryLevelScope {
         }
         MemgresException e = new MemgresException(
                 "function " + nameOf(call) + "(" + types + ") does not exist", "42883");
-        e.setHint("No function matches the given name and argument types."
-                + " You might need to add explicit type casts.");
+        e.setHint("No function matches the given name and argument types. You might need to add explicit type casts.");
         return e;
     }
 

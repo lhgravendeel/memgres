@@ -742,19 +742,30 @@ public class RangeOperations {
         s = s.trim();
         String elem = elemOfRangeType(rangeType);
         if (s.equalsIgnoreCase("empty")) return emptyLike(elem);
-        if (s.length() < 3) throw new MemgresException("malformed range literal: \"" + s + "\"", "22P02");
-
+        if (s.isEmpty() || (s.charAt(0) != '[' && s.charAt(0) != '(')) {
+            throw malformedRange(s, "Missing left parenthesis or bracket.");
+        }
         char first = s.charAt(0);
-        char last = s.charAt(s.length() - 1);
-        if ((first != '[' && first != '(') || (last != ']' && last != ')')) {
-            throw new MemgresException("malformed range literal: \"" + s + "\"", "22P02");
+        // A range ends at the first bracket that closes it, not at the last bracket in the text.
+        // Reading to the end instead made "[1,2)]" a range whose upper bound was "2)", and the
+        // complaint that came back was about the integer rather than about the literal.
+        int close = closingBracket(s, 0);
+        if (close < 0) throw malformedRange(s, "Unexpected end of input.");
+        if (!s.substring(close + 1).trim().isEmpty()) {
+            throw malformedRange(s, "Junk after right parenthesis or bracket.");
         }
 
+        char last = s.charAt(close);
         boolean li = first == '[';
         boolean ui = last == ']';
-        String inner = s.substring(1, s.length() - 1);
+        String inner = s.substring(1, close);
         String[] parts = splitBounds(inner);
-        if (parts == null) throw new MemgresException("malformed range literal: \"" + s + "\"", "22P02");
+        if (parts == null) {
+            // A range has exactly two bounds, so the comma between them is either missing or
+            // there is one more than there is room for.
+            throw malformedRange(s, boundSeparator(inner) < -1
+                    ? "Too many commas." : "Missing comma after lower bound.");
+        }
 
         String loRaw = parts[0].trim();
         String hiRaw = parts[1].trim();
@@ -771,6 +782,17 @@ public class RangeOperations {
      * which is also what keeps the geometric types, written with several commas, out of here.
      */
     private static String[] splitBounds(String inner) {
+        int at = boundSeparator(inner);
+        if (at < 0) return null;
+        return new String[]{inner.substring(0, at), inner.substring(at + 1)};
+    }
+
+    /**
+     * Where a range's inner text separates its bounds, ignoring commas inside a quoted bound: the
+     * comma's position, -1 when there is none, and -2 when there is more than one. Which of the
+     * two failures it was is what PostgreSQL puts in the error's detail.
+     */
+    private static int boundSeparator(String inner) {
         boolean inQuotes = false;
         int at = -1;
         for (int i = 0; i < inner.length(); i++) {
@@ -778,22 +800,28 @@ public class RangeOperations {
             if (c == '\\') { i++; continue; }
             if (c == '"') { inQuotes = !inQuotes; continue; }
             if (c == ',' && !inQuotes) {
-                if (at >= 0) return null;
+                if (at >= 0) return -2;
                 at = i;
             }
         }
-        if (at < 0) return null;
-        return new String[]{inner.substring(0, at), inner.substring(at + 1)};
+        return at;
     }
 
-    /** The two bound texts of a range literal, unquoted, or null when it has no such pair. */
+    /**
+     * The two bound texts of a range literal, unquoted, or null when it has no such pair.
+     *
+     * <p>The range ends where it closes, as it does when it is read: text with something after the
+     * closing bracket has no pair of bounds to offer, and saying so leaves the complaint to the
+     * reader, which knows the literal is malformed rather than the bound out of range.
+     */
     static String[] boundTexts(String literal) {
         String s = literal.trim();
         if (s.length() < 3) return null;
         char first = s.charAt(0);
-        char last = s.charAt(s.length() - 1);
-        if ((first != '[' && first != '(') || (last != ']' && last != ')')) return null;
-        String[] parts = splitBounds(s.substring(1, s.length() - 1));
+        if (first != '[' && first != '(') return null;
+        int close = closingBracket(s, 0);
+        if (close < 0 || !s.substring(close + 1).trim().isEmpty()) return null;
+        String[] parts = splitBounds(s.substring(1, close));
         if (parts == null) return null;
         return new String[]{stripQuotes(parts[0]), stripQuotes(parts[1])};
     }
@@ -1017,7 +1045,9 @@ public class RangeOperations {
     public static java.util.List<PgRange> parseMultirangeLiteral(String text, String rangeType) {
         java.util.List<PgRange> out = new java.util.ArrayList<PgRange>();
         int p = skipSpace(text, 0);
-        if (p >= text.length() || text.charAt(p) != '{') throw malformedMultirange(text);
+        if (p >= text.length() || text.charAt(p) != '{') {
+            throw malformedMultirange(text, "Missing left brace.");
+        }
         p++;
         p = skipSpace(text, p);
         if (p < text.length() && text.charAt(p) == '}') {
@@ -1025,18 +1055,20 @@ public class RangeOperations {
         } else {
             for (;;) {
                 p = skipSpace(text, p);
-                if (p >= text.length()) throw malformedMultirange(text);
+                if (p >= text.length()) {
+                    throw malformedMultirange(text, "Unexpected end of input.");
+                }
                 char c = text.charAt(p);
                 if (c == '[' || c == '(') {
                     int end = closingBracket(text, p);
-                    if (end < 0) throw malformedMultirange(text);
+                    if (end < 0) throw malformedMultirange(text, "Unexpected end of input.");
                     out.add(parse(text.substring(p, end + 1), rangeType));
                     p = end + 1;
                 } else if (text.regionMatches(true, p, "empty", 0, 5)) {
                     out.add(emptyLike(elemOfRangeType(rangeType)));
                     p += 5;
                 } else {
-                    throw malformedMultirange(text);
+                    throw malformedMultirange(text, "Expected range start.");
                 }
                 p = skipSpace(text, p);
                 if (p < text.length() && text.charAt(p) == ',') {
@@ -1047,10 +1079,13 @@ public class RangeOperations {
                     p++;
                     break;
                 }
-                throw malformedMultirange(text);
+                throw malformedMultirange(text, p >= text.length()
+                        ? "Unexpected end of input." : "Expected comma or end of multirange.");
             }
         }
-        if (skipSpace(text, p) != text.length()) throw malformedMultirange(text);
+        if (skipSpace(text, p) != text.length()) {
+            throw malformedMultirange(text, "Junk after closing right brace.");
+        }
         return out;
     }
 
@@ -1072,8 +1107,18 @@ public class RangeOperations {
         return -1;
     }
 
-    private static MemgresException malformedMultirange(String text) {
-        return new MemgresException("malformed multirange literal: \"" + text + "\"", "22P02");
+    private static MemgresException malformedRange(String text, String detail) {
+        MemgresException e =
+                new MemgresException("malformed range literal: \"" + text + "\"", "22P02");
+        e.setDetail(detail);
+        return e;
+    }
+
+    private static MemgresException malformedMultirange(String text, String detail) {
+        MemgresException e =
+                new MemgresException("malformed multirange literal: \"" + text + "\"", "22P02");
+        e.setDetail(detail);
+        return e;
     }
 
     /**

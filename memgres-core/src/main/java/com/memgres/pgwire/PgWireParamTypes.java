@@ -352,8 +352,7 @@ final class PgWireParamTypes {
             throw new MemgresException("operator does not exist: "
                     + typeName(typeOid(b.left())) + " " + symbolOf(b.op()) + " "
                     + typeName(typeOid(b.right()))
-                    + "\n  Hint: No operator matches the given name and argument types."
-                    + " You might need to add explicit type casts.", "42883");
+                    + "\n  Hint: No operator matches the given name and argument types. You might need to add explicit type casts.", "42883");
         }
 
         private boolean isComparison(BinaryExpr.BinOp op) {
