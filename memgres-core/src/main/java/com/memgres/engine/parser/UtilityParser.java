@@ -13,6 +13,11 @@ import java.util.Set;
  * extracted from Parser to reduce class size.
  */
 class UtilityParser {
+
+    /** The opening of every "syntax error at or near" message. */
+    private static final String SYNTAX_AT = "syntax error at or near \"";
+    private static final String Q = "\"";
+
     private final Parser parser;
 
     UtilityParser(Parser parser) {
@@ -284,6 +289,29 @@ class UtilityParser {
         return token.type() == TokenType.KEYWORD ? token.value().toLowerCase() : token.value();
     }
 
+    /**
+     * The role named by SET ROLE or SET SESSION AUTHORIZATION.
+     *
+     * <p>Both are written with an optional {@code TO} or {@code =} before the name, which was not
+     * read, so {@code SET ROLE TO alice} set the role to the word "to". {@code NONE} gives the
+     * role up; only SESSION AUTHORIZATION also accepts {@code DEFAULT}, and SET ROLE DEFAULT is
+     * a syntax error rather than a way of clearing it.
+     */
+    private String readRoleTarget(boolean allowDefault) {
+        if (parser.checkKeyword("TO")) parser.advance();
+        else parser.match(TokenType.EQUALS);
+        if (parser.checkKeyword("NONE")) { parser.advance(); return "none"; }
+        if (parser.checkKeyword("DEFAULT")) {
+            Token t = parser.peek();
+            if (!allowDefault) throw ParseException.saying(SYNTAX_AT + t.raw() + Q, t, "42601");
+            parser.advance();
+            return "default";
+        }
+        Token t = parser.peek();
+        if (t.type() == TokenType.STRING_LITERAL) { parser.advance(); return t.value(); }
+        return parser.readIdentifier();
+    }
+
     SetStmt parseSet() {
         parser.expectKeyword("SET");
 
@@ -293,15 +321,13 @@ class UtilityParser {
                 && parser.tokens.get(parser.pos + 1).value().equals("AUTHORIZATION")) {
             parser.advance(); // SESSION
             parser.advance(); // AUTHORIZATION
-            String authValue = parser.readIdentifier();
-            return new SetStmt("session_authorization", authValue);
+            return new SetStmt("session_authorization", readRoleTarget(true));
         }
 
-        // SET ROLE name | NONE | DEFAULT
+        // SET ROLE [TO|=] name | NONE
         if (parser.checkKeyword("ROLE")) {
             parser.advance();
-            String roleVal = parser.readIdentifier();
-            return new SetStmt("role", roleVal);
+            return new SetStmt("role", readRoleTarget(false));
         }
 
         boolean isSession = parser.matchKeyword("SESSION");
@@ -318,8 +344,7 @@ class UtilityParser {
                 && parser.tokens.get(parser.pos + 1).value().equals("AUTHORIZATION")) {
             parser.advance(); // SESSION
             parser.advance(); // AUTHORIZATION
-            String authValue = parser.readIdentifier();
-            return new SetStmt("session_authorization", authValue, true);
+            return new SetStmt("session_authorization", readRoleTarget(true), true);
         }
 
         // SET XML OPTION { DOCUMENT | CONTENT }
@@ -438,9 +463,20 @@ class UtilityParser {
 
     // ---- DISCARD ----
 
+    /** The things DISCARD knows how to throw away. */
+    private static final java.util.Set<String> DISCARD_TARGETS = Cols.setOf(
+            "all", "plans", "sequences", "temp", "temporary");
+
     DiscardStmt parseDiscard() {
         parser.expectKeyword("DISCARD");
+        Token targetToken = parser.peek();
         String target = parser.readIdentifier();
+        // DISCARD names one of these, and anything else is a syntax error where it stands rather
+        // than a discard of nothing at all.
+        if (target == null || !DISCARD_TARGETS.contains(target.toLowerCase())) {
+            throw ParseException.saying(SYNTAX_AT + targetToken.raw() + Q, targetToken, "42601");
+        }
+        parser.expectEndOfStatement();
         return new DiscardStmt(target);
     }
 
@@ -617,205 +653,360 @@ class UtilityParser {
 
     TransactionStmt parseSavepoint() {
         parser.expectKeyword("SAVEPOINT");
-        String name = parser.readIdentifier();
+        // A savepoint is named the way a column is, so a reserved word is not a name for one:
+        // SAVEPOINT ALL and SAVEPOINT select are syntax errors rather than savepoints.
+        String name = parser.readColumnName();
+        parser.expectEndOfStatement();
         return new TransactionStmt(TransactionStmt.TransactionAction.SAVEPOINT, name);
     }
 
     TransactionStmt parseReleaseSavepoint() {
         parser.expectKeyword("RELEASE");
         parser.matchKeyword("SAVEPOINT");
-        String name = parser.readIdentifier();
+        String name = parser.readColumnName();
         return new TransactionStmt(TransactionStmt.TransactionAction.RELEASE_SAVEPOINT, name);
     }
 
     // ---- EXPLAIN ----
 
+    /**
+     * {@code EXPLAIN [ANALYZE [VERBOSE]] [VERBOSE] [(option, ...)] statement}.
+     *
+     * <p>The options are a list of name/value pairs, not a fixed sequence of keywords: a name may
+     * be any word, a value may be missing, and what a value means is the option's business. Reading
+     * them with one branch per keyword accepted {@code EXPLAIN ANALYZE (COSTS OFF)} — which is two
+     * grammars at once — refused {@code COSTS 1} and {@code COSTS 'off'}, which are ordinary
+     * boolean spellings, and let an empty list and a trailing comma through.
+     *
+     * <p>Only a statement that has a plan can be explained. Anything else is a syntax error at the
+     * word that begins it, so {@code EXPLAIN (ANALYZE) TRUNCATE t} is refused rather than emptying
+     * the table to find out how long it took.
+     */
     ExplainStmt parseExplain() {
         parser.expectKeyword("EXPLAIN");
-        boolean analyze = parser.matchKeyword("ANALYZE");
-        boolean verbose = parser.matchKeyword("VERBOSE");
-        String format = "TEXT";
+        List<ExplainOption> options = new ArrayList<>();
+        boolean legacyForm = false;
+        if (parser.checkKeyword("ANALYZE") || parser.checkKeyword("ANALYSE")) {
+            parser.advance();
+            options.add(new ExplainOption("analyze", null, false));
+            legacyForm = true;
+            if (parser.checkKeyword("VERBOSE")) {
+                parser.advance();
+                options.add(new ExplainOption("verbose", null, false));
+            }
+        } else if (parser.checkKeyword("VERBOSE")) {
+            parser.advance();
+            options.add(new ExplainOption("verbose", null, false));
+            legacyForm = true;
+        }
+        // A parenthesis after the legacy spelling begins the query, never an option list.
+        if (!legacyForm && parser.check(TokenType.LEFT_PAREN)
+                && Math.max(0, parser.countLeadingParensBeforeQuery()) == 0) {
+            parseExplainOptions(options);
+        }
+
+        Statement stmt = parseExplainableStatement();
+        return buildExplain(stmt, options);
+    }
+
+    /** One {@code name [value]} pair from an EXPLAIN option list. */
+    private static final class ExplainOption {
+        final String name;
+        final String value;
+        /** True when the value was written as a number, which only 0 and 1 mean anything as. */
+        final boolean numeric;
+        ExplainOption(String name, String value, boolean numeric) {
+            this.name = name;
+            this.value = value;
+            this.numeric = numeric;
+        }
+    }
+
+    /** A token as the reader wrote it: a string constant keeps the quotes that made it one. */
+    private static String asWritten(Token token) {
+        if (token.type() == TokenType.STRING_LITERAL) return "'" + token.value() + "'";
+        return token.raw();
+    }
+
+    private void parseExplainOptions(List<ExplainOption> options) {
+        parser.expect(TokenType.LEFT_PAREN);
+        while (true) {
+            Token nameToken = parser.peek();
+            if (nameToken.type() != TokenType.IDENTIFIER && nameToken.type() != TokenType.KEYWORD
+                    && nameToken.type() != TokenType.QUOTED_IDENTIFIER) {
+                throw ParseException.saying(SYNTAX_AT + asWritten(nameToken) + Q, nameToken, "42601");
+            }
+            parser.advance();
+            // An unquoted word is folded to lower case, the way every identifier is; a quoted one
+            // keeps what was written, so it matches no option and is reported as written.
+            String name = nameToken.type() == TokenType.QUOTED_IDENTIFIER
+                    ? nameToken.value() : nameToken.value().toLowerCase();
+            String value = null;
+            boolean numeric = false;
+            if (!parser.check(TokenType.COMMA) && !parser.check(TokenType.RIGHT_PAREN)) {
+                Token valueToken = parser.peek();
+                if (valueToken.type() == TokenType.INTEGER_LITERAL
+                        || valueToken.type() == TokenType.FLOAT_LITERAL) {
+                    parser.advance();
+                    value = valueToken.value();
+                    numeric = true;
+                } else if (valueToken.type() == TokenType.MINUS || valueToken.type() == TokenType.PLUS) {
+                    parser.advance();
+                    Token number = parser.advance();
+                    value = (valueToken.type() == TokenType.MINUS ? "-" : "") + number.value();
+                    numeric = true;
+                } else if (valueToken.type() == TokenType.IDENTIFIER
+                        || valueToken.type() == TokenType.KEYWORD) {
+                    parser.advance();
+                    value = valueToken.value().toLowerCase();
+                } else if (valueToken.type() == TokenType.STRING_LITERAL
+                        || valueToken.type() == TokenType.QUOTED_IDENTIFIER) {
+                    parser.advance();
+                    value = valueToken.value();
+                } else {
+                    throw ParseException.saying(SYNTAX_AT + asWritten(valueToken) + Q, valueToken, "42601");
+                }
+            }
+            options.add(new ExplainOption(name, value, numeric));
+            if (parser.match(TokenType.COMMA)) continue;
+            break;
+        }
+        Token closing = parser.peek();
+        if (!parser.check(TokenType.RIGHT_PAREN)) {
+            throw ParseException.saying(SYNTAX_AT + closing.raw() + Q, closing, "42601");
+        }
+        parser.advance();
+    }
+
+    /**
+     * The statements that have a plan. PostgreSQL's grammar admits exactly these after EXPLAIN;
+     * every other statement is a syntax error at its first word.
+     */
+    private Statement parseExplainableStatement() {
+        Token first = parser.peek();
+        if (parser.isAtEnd() || first.type() == TokenType.EOF) {
+            throw ParseException.saying("syntax error at end of input", first, "42601");
+        }
+        if (parser.check(TokenType.LEFT_PAREN)) return parser.parseStatement();
+        String word = first.value() == null ? "" : first.value().toUpperCase();
+        if (word.equals("SELECT") || word.equals("VALUES") || word.equals("TABLE")
+                || word.equals("WITH") || word.equals("INSERT") || word.equals("UPDATE")
+                || word.equals("DELETE") || word.equals("MERGE") || word.equals("DECLARE")
+                || word.equals("EXECUTE")) {
+            return parser.parseStatement();
+        }
+        if (word.equals("CREATE")) {
+            // CREATE TABLE ... AS and CREATE MATERIALIZED VIEW ... AS carry a query; every other
+            // CREATE does not, and fails at the word that follows CREATE.
+            int offset = 1;
+            while (parser.checkKeywordAt(offset, "TEMP") || parser.checkKeywordAt(offset, "TEMPORARY")
+                    || parser.checkKeywordAt(offset, "UNLOGGED") || parser.checkKeywordAt(offset, "GLOBAL")
+                    || parser.checkKeywordAt(offset, "LOCAL")) {
+                offset++;
+            }
+            if (parser.checkKeywordAt(offset, "TABLE")) {
+                requireCreateAsShape(offset + 1);
+                return parser.parseStatement();
+            }
+            if (parser.checkKeywordAt(offset, "MATERIALIZED")) {
+                return parser.parseStatement();
+            }
+            Token bad = parser.peekAt(offset);
+            throw ParseException.saying(SYNTAX_AT + bad.raw() + Q, bad, "42601");
+        }
+        if (word.equals("REFRESH")) return parser.parseStatement();
+        throw ParseException.saying(SYNTAX_AT + first.raw() + Q, first, "42601");
+    }
+
+    /**
+     * Only {@code CREATE TABLE name [(col, ...)] AS query} can be explained, so the parenthesised
+     * list after the name holds column names alone. A column definition there — a name with a type
+     * after it — is the point at which PostgreSQL stops reading.
+     */
+    private void requireCreateAsShape(int offset) {
+        int at = offset;
+        // qualified name: ident [. ident]*
+        at++;
+        while (parser.peekAt(at).type() == TokenType.DOT) at += 2;
+        if (parser.peekAt(at).type() == TokenType.LEFT_PAREN) {
+            at++;
+            while (true) {
+                Token name = parser.peekAt(at);
+                if (name.type() == TokenType.RIGHT_PAREN) { at++; break; }
+                at++;
+                Token next = parser.peekAt(at);
+                if (next.type() == TokenType.COMMA) { at++; continue; }
+                if (next.type() == TokenType.RIGHT_PAREN) { at++; break; }
+                throw ParseException.saying(SYNTAX_AT + next.raw() + Q, next, "42601");
+            }
+        }
+        if (!parser.checkKeywordAt(at, "AS")) {
+            Token bad = parser.peekAt(at);
+            throw ParseException.saying(SYNTAX_AT + bad.raw() + Q, bad, "42601");
+        }
+    }
+
+    /**
+     * Apply the option list. A name that is not an option, and a value an option cannot use, are
+     * reported only after the statement itself has been analysed: PostgreSQL reads the query first,
+     * so a missing table is what a reader hears about before a misspelled option.
+     */
+    private ExplainStmt buildExplain(Statement stmt, List<ExplainOption> options) {
+        boolean analyze = false;
+        boolean verbose = false;
         boolean costs = true;
-        boolean memory = false;
-        boolean serialize = false;
-        boolean genericPlan = false;
         boolean buffers = false;
         boolean wal = false;
         boolean settings = false;
-        // Deferred option error: collected here so that table-existence checks
-        // in the executor run first (matching PostgreSQL's error priority).
-        String deferredOptionError = null;
-        // SQLSTATE for the deferred error: 42601 for unrecognized option names,
-        // 22023 for invalid option values (bad FORMAT, non-boolean value, etc.)
-        String deferredOptionSqlState = null;
+        boolean memory = false;
+        boolean genericPlan = false;
+        boolean timing = false;
+        boolean summary = false;
+        boolean timingSet = false;
+        boolean summarySet = false;
+        String serializeMode = "none";
+        String format = "TEXT";
+        String deferredError = null;
+        String deferredSqlState = null;
 
-        // Handle EXPLAIN (options) format — but not EXPLAIN (SELECT ...) which is a parenthesized query
-        int explainQueryParens = Math.max(0, parser.countLeadingParensBeforeQuery());
-        if (parser.check(TokenType.LEFT_PAREN) && explainQueryParens == 0) {
-            parser.advance();
-            while (!parser.check(TokenType.RIGHT_PAREN) && !parser.isAtEnd()) {
-                parser.match(TokenType.COMMA); // options separated by commas
-                if (parser.check(TokenType.RIGHT_PAREN)) break;
-                // EXPLAIN options can be keywords or identifiers (e.g., COSTS is an identifier)
-                Token optToken = parser.peek();
-                String optName = optToken.value().toUpperCase();
-                if (optName.equals("ANALYZE") || optName.equals("ANALYSE")) {
-                    parser.advance();
-                    try {
-                        analyze = !consumeExplainBooleanOption();
-                    } catch (ParseException e) {
-                        if (deferredOptionError == null) { deferredOptionError = e.getMessage(); deferredOptionSqlState = "22023"; }
-                    }
-                } else if (optName.equals("VERBOSE")) {
-                    parser.advance();
-                    try {
-                        verbose = !consumeExplainBooleanOption();
-                    } catch (ParseException e) {
-                        if (deferredOptionError == null) { deferredOptionError = e.getMessage(); deferredOptionSqlState = "22023"; }
-                    }
-                } else if (optName.equals("FORMAT")) {
-                    parser.advance();
-                    Token f = parser.advance();
-                    format = f.value().toUpperCase();
-                    if (!format.equals("TEXT") && !format.equals("XML") && !format.equals("JSON") && !format.equals("YAML")) {
-                        if (deferredOptionError == null) {
-                            deferredOptionError = "unrecognized value for EXPLAIN option \"FORMAT\": \"" + f.value() + "\"" +
-                                    " at position " + f.position() + " near '" + f.value() + "'";
-                            deferredOptionSqlState = "22023";
-                        }
-                    }
-                } else if (optName.equals("COSTS")) {
-                    parser.advance();
-                    try {
-                        costs = !consumeExplainBooleanOption();
-                    } catch (ParseException e) {
-                        if (deferredOptionError == null) { deferredOptionError = e.getMessage(); deferredOptionSqlState = "22023"; }
-                    }
-                } else if (optName.equals("SERIALIZE")) {
-                    parser.advance();
-                    serialize = true;
-                    // SERIALIZE takes TEXT or BINARY (or a boolean ON/OFF/TRUE/FALSE)
-                    if (parser.checkKeyword("TEXT") || parser.checkKeyword("BINARY")) {
-                        parser.advance();
-                    } else {
-                        try {
-                            if (consumeExplainBooleanOption()) serialize = false;
-                        } catch (ParseException e) {
-                            if (deferredOptionError == null) { deferredOptionError = e.getMessage(); deferredOptionSqlState = "22023"; }
-                        }
-                    }
-                } else if (optName.equals("MEMORY")) {
-                    parser.advance();
-                    memory = true;
-                    try {
-                        if (consumeExplainBooleanOption()) memory = false;
-                    } catch (ParseException e) {
-                        if (deferredOptionError == null) { deferredOptionError = e.getMessage(); deferredOptionSqlState = "22023"; }
-                    }
-                } else if (optName.equals("GENERIC_PLAN")) {
-                    parser.advance();
-                    genericPlan = true;
-                    try {
-                        if (consumeExplainBooleanOption()) genericPlan = false;
-                    } catch (ParseException e) {
-                        if (deferredOptionError == null) { deferredOptionError = e.getMessage(); deferredOptionSqlState = "22023"; }
-                    }
-                } else if (optName.equals("BUFFERS")) {
-                    parser.advance();
-                    try {
-                        buffers = !consumeExplainBooleanOption();
-                    } catch (ParseException e) {
-                        if (deferredOptionError == null) { deferredOptionError = e.getMessage(); deferredOptionSqlState = "22023"; }
-                    }
-                } else if (optName.equals("WAL")) {
-                    parser.advance();
-                    try {
-                        wal = !consumeExplainBooleanOption();
-                    } catch (ParseException e) {
-                        if (deferredOptionError == null) { deferredOptionError = e.getMessage(); deferredOptionSqlState = "22023"; }
-                    }
-                } else if (optName.equals("SETTINGS")) {
-                    parser.advance();
-                    settings = true;
-                    try {
-                        if (consumeExplainBooleanOption()) settings = false;
-                    } catch (ParseException e) {
-                        if (deferredOptionError == null) { deferredOptionError = e.getMessage(); deferredOptionSqlState = "22023"; }
-                    }
-                } else if (optName.equals("TIMING") || optName.equals("SUMMARY")) {
-                    parser.advance();
-                    try {
-                        consumeExplainBooleanOption();
-                    } catch (ParseException e) {
-                        if (deferredOptionError == null) { deferredOptionError = e.getMessage(); deferredOptionSqlState = "22023"; }
-                    }
-                } else {
-                    Token unknown = parser.advance();
-                    if (deferredOptionError == null) {
-                        deferredOptionError = "unrecognized EXPLAIN option \"" + unknown.value() + "\"" +
-                                " at position " + unknown.position() + " near '" + unknown.value() + "'";
-                        deferredOptionSqlState = "42601";
-                    }
+        for (ExplainOption opt : options) {
+            try {
+                if (opt.name.equals("analyze") || opt.name.equals("analyse")) analyze = booleanOption(opt);
+                else if (opt.name.equals("verbose")) verbose = booleanOption(opt);
+                else if (opt.name.equals("costs")) costs = booleanOption(opt);
+                else if (opt.name.equals("buffers")) buffers = booleanOption(opt);
+                else if (opt.name.equals("wal")) wal = booleanOption(opt);
+                else if (opt.name.equals("settings")) settings = booleanOption(opt);
+                else if (opt.name.equals("memory")) memory = booleanOption(opt);
+                else if (opt.name.equals("generic_plan")) genericPlan = booleanOption(opt);
+                else if (opt.name.equals("timing")) { timing = booleanOption(opt); timingSet = true; }
+                else if (opt.name.equals("summary")) { summary = booleanOption(opt); summarySet = true; }
+                else if (opt.name.equals("serialize")) serializeMode = serializeOption(opt);
+                else if (opt.name.equals("format")) format = formatOption(opt);
+                else {
+                    throw new ExplainOptionError(
+                            "unrecognized EXPLAIN option \"" + opt.name + "\"", "42601");
+                }
+            } catch (ExplainOptionError e) {
+                if (deferredError == null) {
+                    deferredError = e.getMessage();
+                    deferredSqlState = e.sqlState;
                 }
             }
-            parser.expect(TokenType.RIGHT_PAREN);
         }
-
-        Statement stmt = parser.parseStatement();
-        ExplainStmt explainStmt = new ExplainStmt(stmt, analyze, verbose, format, costs, deferredOptionError, deferredOptionSqlState, memory, serialize, genericPlan, buffers, wal);
-        explainStmt.settings = settings;
-        return explainStmt;
-    }
-
-    /** Consume an optional TRUE/FALSE/ON/OFF value after an EXPLAIN option. Returns true if value was FALSE/OFF.
-     *  Rejects non-boolean values like integers or unrecognized identifiers. */
-    boolean consumeExplainBooleanOption() {
-        if (parser.checkKeyword("FALSE") || parser.checkKeyword("OFF")) { parser.advance(); return true; }
-        if (parser.checkKeyword("TRUE") || parser.checkKeyword("ON")) { parser.advance(); return false; }
-        // If there's a non-boolean value (integer, string, unrecognized identifier), reject it
-        if (!parser.check(TokenType.COMMA) && !parser.check(TokenType.RIGHT_PAREN) && !parser.isAtEnd()) {
-            Token t = parser.peek();
-            if (t.type() == TokenType.INTEGER_LITERAL || t.type() == TokenType.FLOAT_LITERAL
-                    || t.type() == TokenType.STRING_LITERAL
-                    || t.type() == TokenType.IDENTIFIER || t.type() == TokenType.KEYWORD) {
-                throw new ParseException("\"" + t.value() + "\" is not a valid boolean value", t, "22023");
+        if (deferredError == null) {
+            if (wal && !analyze) {
+                deferredError = "EXPLAIN option WAL requires ANALYZE";
+                deferredSqlState = "22023";
+            } else if (!serializeMode.equals("none") && !analyze) {
+                deferredError = "EXPLAIN option SERIALIZE requires ANALYZE";
+                deferredSqlState = "22023";
+            } else if (timing && !analyze) {
+                deferredError = "EXPLAIN option TIMING requires ANALYZE";
+                deferredSqlState = "22023";
+            } else if (genericPlan && analyze) {
+                deferredError = "EXPLAIN options ANALYZE and GENERIC_PLAN cannot be used together";
+                deferredSqlState = "22023";
             }
         }
-        return false; // no value = default (true)
+        if (!timingSet) timing = analyze;
+        if (!summarySet) summary = analyze;
+
+        ExplainStmt explain = new ExplainStmt(stmt, analyze, verbose, format, costs,
+                deferredError, deferredSqlState, memory, !serializeMode.equals("none"),
+                genericPlan, buffers, wal);
+        explain.settings = settings;
+        explain.timing = timing;
+        explain.summary = summary;
+        explain.serializeMode = serializeMode;
+        return explain;
+    }
+
+    /** An option error, carried until the statement itself has been read. */
+    private static final class ExplainOptionError extends RuntimeException {
+        final String sqlState;
+        ExplainOptionError(String message, String sqlState) {
+            super(message);
+            this.sqlState = sqlState;
+        }
+    }
+
+    /**
+     * The values a boolean option takes: nothing at all, the numbers 0 and 1, and the four words
+     * {@code true}, {@code false}, {@code on} and {@code off} however they were quoted. Anything
+     * else — {@code yes}, {@code t}, {@code 2} — is not a spelling PostgreSQL reads as a boolean.
+     */
+    private boolean booleanOption(ExplainOption opt) {
+        if (opt.value == null) return true;
+        if (opt.numeric) {
+            if (opt.value.equals("0")) return false;
+            if (opt.value.equals("1")) return true;
+        } else {
+            if (opt.value.equalsIgnoreCase("true")) return true;
+            if (opt.value.equalsIgnoreCase("false")) return false;
+            if (opt.value.equalsIgnoreCase("on")) return true;
+            if (opt.value.equalsIgnoreCase("off")) return false;
+        }
+        throw new ExplainOptionError(opt.name + " requires a Boolean value", "42601");
+    }
+
+    private String serializeOption(ExplainOption opt) {
+        if (opt.value == null) return "text";
+        String v = opt.value;
+        if (v.equals("off") || v.equals("none")) return "none";
+        if (v.equals("text")) return "text";
+        if (v.equals("binary")) return "binary";
+        throw new ExplainOptionError("unrecognized value for EXPLAIN option \"serialize\": \""
+                + opt.value + "\"", "22023");
+    }
+
+    private String formatOption(ExplainOption opt) {
+        if (opt.value == null) {
+            throw new ExplainOptionError("format requires a parameter", "42601");
+        }
+        String v = opt.value;
+        if (v.equals("text") || v.equals("xml") || v.equals("json") || v.equals("yaml")) {
+            return v.toUpperCase();
+        }
+        throw new ExplainOptionError("unrecognized value for EXPLAIN option \"format\": \""
+                + opt.value + "\"", "22023");
     }
 
     // ---- LISTEN / NOTIFY / UNLISTEN ----
 
     ListenStmt parseListen() {
         parser.expectKeyword("LISTEN");
-        String channel = parser.readIdentifier();
+        // A channel is named the way a column is: one plain identifier, no list, no literal.
+        String channel = parser.readObjectName();
+        parser.expectEndOfStatement();
         return new ListenStmt(channel);
     }
 
     NotifyStmt parseNotify() {
         parser.expectKeyword("NOTIFY");
-        String channel = parser.readIdentifier();
+        String channel = parser.readObjectName();
         String payload = null;
         if (parser.match(TokenType.COMMA)) {
             Token payloadToken = parser.peek();
-            if (payloadToken.type() != TokenType.STRING_LITERAL) {
-                throw new ParseException("syntax error at or near \"" + payloadToken.value() + "\"", payloadToken);
+            // The payload is one string constant, however it is quoted; it is not an expression.
+            if (payloadToken.type() != TokenType.STRING_LITERAL
+                    && payloadToken.type() != TokenType.DOLLAR_STRING_LITERAL) {
+                throw new ParseException(SYNTAX_AT + asWritten(payloadToken) + Q, payloadToken);
             }
             payload = parser.advance().value();
         }
+        parser.expectEndOfStatement();
         return new NotifyStmt(channel, payload);
     }
 
     UnlistenStmt parseUnlisten() {
         parser.expectKeyword("UNLISTEN");
         if (parser.match(TokenType.STAR)) {
+            parser.expectEndOfStatement();
             return new UnlistenStmt(null);
         }
-        String channel = parser.readIdentifier();
-        // PG only accepts a single channel, not a comma-separated list
-        if (parser.check(TokenType.COMMA)) {
-            throw new ParseException("syntax error at or near \",\"", parser.peek());
-        }
+        String channel = parser.readObjectName();
+        parser.expectEndOfStatement();
         return new UnlistenStmt(channel);
     }
 
@@ -833,6 +1024,12 @@ class UtilityParser {
         List<String> paramTypes = new ArrayList<>();
         if (parser.check(TokenType.LEFT_PAREN)) {
             parser.advance();
+            // PREPARE p () AS ... has an empty list where a type belongs; PostgreSQL's grammar
+            // has no production for it, so it fails at the parenthesis that closes nothing.
+            if (parser.check(TokenType.RIGHT_PAREN)) {
+                Token t = parser.peek();
+                throw ParseException.saying(SYNTAX_AT + t.raw() + Q, t, "42601");
+            }
             if (!parser.check(TokenType.RIGHT_PAREN)) {
                 do {
                     paramTypes.add(parser.parseTypeName());
@@ -851,9 +1048,10 @@ class UtilityParser {
         List<Expression> params = new ArrayList<>();
         if (parser.check(TokenType.LEFT_PAREN)) {
             parser.advance();
-            if (!parser.check(TokenType.RIGHT_PAREN)) {
-                params = parser.parseExpressionList();
-            }
+            // An argument list is written only when there are arguments in it. Accepting an empty
+            // one made EXECUTE p() a way of saying EXECUTE p, which is not a spelling PostgreSQL
+            // has: it is the closing bracket that is out of place.
+            params = parser.parseExpressionList();
             parser.expect(TokenType.RIGHT_PAREN);
         }
         return new ExecuteStmt(name, params);
@@ -873,27 +1071,37 @@ class UtilityParser {
 
     DeclareCursorStmt parseDeclareCursor() {
         parser.expectKeyword("DECLARE");
-        String name = parser.readIdentifier();
-        // Optional: BINARY, INSENSITIVE, [NO] SCROLL
-        boolean binary = parser.matchKeyword("BINARY");
-        parser.matchKeyword("INSENSITIVE");
+        String name = parser.readObjectName();
+        // The options are a list, in any order and repeatable, as PostgreSQL's cursor_options is:
+        // reading them as a fixed sequence made "SCROLL BINARY" and "SCROLL INSENSITIVE" syntax
+        // errors, and let "SCROLL NO SCROLL" through as a plain no-scroll cursor.
+        boolean binary = false;
         boolean scroll = false;
         boolean explicitNoScroll = false;
-        if (parser.matchKeyword("NO")) {
-            parser.matchKeyword("SCROLL");
-            scroll = false;
-            explicitNoScroll = true;
-        } else if (parser.matchKeyword("SCROLL")) {
-            scroll = true;
+        while (true) {
+            if (parser.matchWord("BINARY")) { binary = true; continue; }
+            if (parser.matchWord("INSENSITIVE")) { continue; }
+            if (parser.matchWord("ASENSITIVE")) { continue; }
+            if (parser.matchWord("SCROLL")) { scroll = true; continue; }
+            if (parser.checkKeyword("NO")) {
+                parser.advance();
+                parser.expectKeyword("SCROLL");
+                explicitNoScroll = true;
+                continue;
+            }
+            break;
+        }
+        if (scroll && explicitNoScroll) {
+            throw new MemgresException("cannot specify both SCROLL and NO SCROLL", "42P11");
         }
         parser.expectKeyword("CURSOR");
-        // Optional: WITH HOLD / WITHOUT HOLD
+        // Optional: WITH HOLD / WITHOUT HOLD. HOLD is not optional after either word.
         boolean withHold = false;
         if (parser.matchKeyword("WITH")) {
-            parser.matchKeyword("HOLD");
+            parser.expectKeyword("HOLD");
             withHold = true;
         } else if (parser.matchKeyword("WITHOUT")) {
-            parser.matchKeyword("HOLD");
+            parser.expectKeyword("HOLD");
         }
         parser.expectKeyword("FOR");
         int cursorExtraParens = Math.max(0, parser.countLeadingParensBeforeQuery());
@@ -927,50 +1135,76 @@ class UtilityParser {
         } else if (parser.matchKeyword("FORWARD")) {
             if (parser.matchKeyword("ALL")) {
                 direction = FetchStmt.Direction.FORWARD_ALL;
-            } else if (parser.peek().type() == TokenType.INTEGER_LITERAL) {
+            } else if (isSignedCount()) {
                 direction = FetchStmt.Direction.FORWARD;
-                count = Integer.parseInt(parser.advance().value());
+                count = parseFetchCount();
             } else {
                 direction = FetchStmt.Direction.FORWARD;
             }
         } else if (parser.matchKeyword("BACKWARD")) {
             if (parser.matchKeyword("ALL")) {
                 direction = FetchStmt.Direction.BACKWARD_ALL;
-            } else if (parser.peek().type() == TokenType.INTEGER_LITERAL) {
+            } else if (isSignedCount()) {
                 direction = FetchStmt.Direction.BACKWARD;
-                count = Integer.parseInt(parser.advance().value());
+                count = parseFetchCount();
             } else {
                 direction = FetchStmt.Direction.BACKWARD;
             }
         } else if (parser.matchKeyword("ALL")) {
             direction = FetchStmt.Direction.ALL;
-        } else if (parser.peek().type() == TokenType.INTEGER_LITERAL || (parser.peek().type() == TokenType.MINUS)) {
+        } else if (isSignedCount()) {
             // FETCH count [IN|FROM] cursor
-            boolean negative = parser.match(TokenType.MINUS);
-            count = Integer.parseInt(parser.advance().value());
-            if (negative) count = -count;
+            count = parseFetchCount();
             direction = count >= 0 ? FetchStmt.Direction.FORWARD : FetchStmt.Direction.BACKWARD;
             if (count < 0) count = -count;
         }
 
         parser.matchKeyword("FROM");
         parser.matchKeyword("IN");
-        String cursorName = parser.readIdentifier();
+        String cursorName = parser.readObjectName();
+        parser.expectEndOfStatement();
         return new FetchStmt(direction, count, cursorName, isMove);
     }
 
+    /** Whether a signed integer count stands here. */
+    private boolean isSignedCount() {
+        TokenType t = parser.peek().type();
+        if (t == TokenType.INTEGER_LITERAL) return true;
+        if (t != TokenType.MINUS && t != TokenType.PLUS) return false;
+        return parser.pos + 1 < parser.tokens.size()
+                && parser.tokens.get(parser.pos + 1).type() == TokenType.INTEGER_LITERAL;
+    }
+
+    /**
+     * A fetch count, which PostgreSQL's grammar takes as a signed integer constant. A number too
+     * large to be one is a syntax error at the number rather than a NumberFormatException reaching
+     * the client as an internal error, and a leading plus is part of the constant.
+     */
     int parseFetchCount() {
         boolean negative = parser.match(TokenType.MINUS);
-        int val = Integer.parseInt(parser.advance().value());
-        return negative ? -val : val;
+        if (!negative) parser.match(TokenType.PLUS);
+        Token tok = parser.advance();
+        long val;
+        try {
+            val = Long.parseLong(tok.value());
+        } catch (NumberFormatException e) {
+            throw ParseException.saying(SYNTAX_AT + tok.value() + Q, tok, "42601");
+        }
+        if (negative) val = -val;
+        if (val > Integer.MAX_VALUE || val < Integer.MIN_VALUE) {
+            throw ParseException.saying(SYNTAX_AT + tok.value() + Q, tok, "42601");
+        }
+        return (int) val;
     }
 
     CloseStmt parseClose() {
         parser.expectKeyword("CLOSE");
         if (parser.matchKeyword("ALL")) {
+            parser.expectEndOfStatement();
             return new CloseStmt(null, true);
         }
-        String name = parser.readIdentifier();
+        String name = parser.readObjectName();
+        parser.expectEndOfStatement();
         return new CloseStmt(name, false);
     }
 
@@ -1047,7 +1281,14 @@ class UtilityParser {
                 parser.expectKeyword("OPTION");
                 withAdmin = true;
             }
-            return new GrantStmt(privileges, null, null, grantees, false, withAdmin, true, null);
+            // A membership grant carries GRANTED BY too, and dropping the clause here meant the
+            // grantor was never a name the statement had to answer for.
+            String roleGrantor = null;
+            if (parser.matchIdentifier("GRANTED")) {
+                parser.expectKeyword("BY");
+                roleGrantor = parser.readIdentifier();
+            }
+            return new GrantStmt(privileges, null, null, grantees, false, withAdmin, true, null, roleGrantor);
         }
 
         // GRANT privileges ON object TO roles
@@ -1273,20 +1514,53 @@ class UtilityParser {
 
     // ---- DO block ----
 
+    /**
+     * {@code DO [LANGUAGE lang] body [LANGUAGE lang]}.
+     *
+     * <p>PostgreSQL reads this as a list of items — a body and at most one language — so both
+     * orders are allowed and naming the language twice is a redundant option. Reading two tokens
+     * and discarding them accepted a language that does not exist, a language that has no inline
+     * form, a body that is not a string at all, and anything written after the block.
+     */
     SetStmt parseDo() {
         parser.expectKeyword("DO");
-        // DO [LANGUAGE lang] body [LANGUAGE lang]
-        if (parser.matchKeyword("LANGUAGE")) {
-            parser.readIdentifierOrString(); // plpgsql or 'plpgsql'
+        String language = null;
+        String body = null;
+        while (true) {
+            if (parser.checkKeyword("LANGUAGE")) {
+                parser.advance();
+                if (language != null) {
+                    throw ParseException.saying("conflicting or redundant options", parser.peek(), "42601");
+                }
+                language = parser.readIdentifierOrString();
+                continue;
+            }
+            Token t = parser.peek();
+            if (t.type() == TokenType.STRING_LITERAL || t.type() == TokenType.DOLLAR_STRING_LITERAL) {
+                if (body != null) {
+                    throw ParseException.saying("conflicting or redundant options", t, "42601");
+                }
+                body = parser.advance().value();
+                continue;
+            }
+            break;
         }
-        // Get the dollar-quoted or string literal body
-        Token bodyToken = parser.advance();
-        String body = bodyToken.value();
-        // Consume optional trailing LANGUAGE
-        if (parser.matchKeyword("LANGUAGE")) {
-            parser.readIdentifierOrString(); // plpgsql or 'plpgsql'
+        if (body == null) {
+            Token t = parser.peek();
+            if (parser.isAtEnd() || t.type() == TokenType.SEMICOLON || t.type() == TokenType.EOF) {
+                throw ParseException.saying("syntax error at end of input", t, "42601");
+            }
+            throw ParseException.saying(SYNTAX_AT + t.raw() + Q, t, "42601");
         }
-        return new SetStmt("do_block", body);
+        parser.expectEndOfStatement();
+        // The language travels with the body so the executor can refuse one that has no inline
+        // form; a body with nothing in it has no block to compile and PostgreSQL says so.
+        if (body.trim().isEmpty()) {
+            throw ParseException.saying("syntax error at end of input", parser.peek(), "42601");
+        }
+        SetStmt doStmt = new SetStmt("do_block", body);
+        doStmt.setAuxiliary(language);
+        return doStmt;
     }
 
     // ---- RESET ----
@@ -1367,9 +1641,23 @@ class UtilityParser {
                 tokenValues.add(identifierSpelling(tok));
             }
         }
-        // A function/aggregate argument list is not part of the name: COMMENT ON FUNCTION f(int)
+        // A routine's argument list says which routine of that name this is, so it travels with
+        // the name. Dropping it meant a comment on one overload was a comment on whichever
+        // overload happened to be found, and a signature that matches none was not noticed.
         int paren = tokenValues.indexOf("(");
-        if (paren > 0) tokenValues = new ArrayList<>(tokenValues.subList(0, paren));
+        String argumentList = null;
+        if (paren > 0) {
+            StringBuilder args = new StringBuilder();
+            for (int i = paren; i < tokenValues.size(); i++) {
+                String piece = tokenValues.get(i);
+                if (piece.equals("(") || piece.equals(")")) args.append(piece);
+                else if (piece.equals(",")) args.append(", ");
+                else args.append(args.length() > 0 && args.charAt(args.length() - 1) != '('
+                        && !args.toString().endsWith(", ") ? " " : "").append(piece);
+            }
+            argumentList = args.toString();
+            tokenValues = new ArrayList<>(tokenValues.subList(0, paren));
+        }
         String objectType;
         String objectName;
         // CONSTRAINT c ON t / TRIGGER t ON r / RULE r ON t / POLICY p ON t name the object
@@ -1390,16 +1678,22 @@ class UtilityParser {
                     : "TABLE";
             objectName = !tokenValues.isEmpty()
                     ? tokenValues.get(tokenValues.size() - 1) : "";
+            if (argumentList != null) objectName = objectName + argumentList;
         }
         parser.expectKeyword("IS");
         String comment = null;
         if (parser.matchKeyword("NULL")) {
             comment = null;
-        } else if (parser.check(TokenType.STRING_LITERAL)) {
+        } else if (parser.check(TokenType.STRING_LITERAL)
+                || parser.check(TokenType.DOLLAR_STRING_LITERAL)) {
             comment = parser.advance().value();
         } else {
-            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+            // A comment is one string constant or NULL, never an expression. Swallowing the rest
+            // of the line instead accepted 'a' || 'b', 42 and current_user, and filed nothing.
+            Token text = parser.peek();
+            throw ParseException.saying(SYNTAX_AT + asWritten(text) + Q, text, "42601");
         }
+        parser.expectEndOfStatement();
         // Store the comment (null for IS NULL to trigger removal)
         return new SetStmt("comment:" + objectType + ":" + objectName, comment);
     }
@@ -1490,14 +1784,24 @@ class UtilityParser {
                 Token optToken = parser.advance();
                 String opt = optToken.value().toUpperCase();
                 if (!VALID_VACUUM_OPTIONS.contains(opt)) {
-                    throw new ParseException("unrecognized VACUUM option \"" + optToken.value() + "\"", optToken);
+                    // ParseException(message, token) reports the token and drops the message, so
+                    // the option that was not recognised was reported as a plain syntax error.
+                    // An option name is folded like any other unquoted word.
+                    throw ParseException.saying("unrecognized VACUUM option \""
+                            + optToken.value().toLowerCase(java.util.Locale.ROOT) + "\"",
+                            optToken, "42601");
                 }
-                if (opt.equals("ANALYZE") || opt.equals("ANALYSE")) hasAnalyze = true;
-                if (opt.equals("VERBOSE")) hasVerbose = true;
                 // Some options take a value (PARALLEL n, BUFFER_USAGE_LIMIT n, INDEX_CLEANUP bool)
+                String optValue = null;
                 if (!parser.check(TokenType.COMMA) && !parser.check(TokenType.RIGHT_PAREN) && !parser.isAtEnd()) {
-                    parser.advance(); // consume value
+                    optValue = parser.advance().value();
                 }
+                // A boolean option that was given FALSE is off, not merely written: reading the
+                // name alone made VACUUM (ANALYZE FALSE) analyse.
+                boolean optOn = optValue == null || !("false".equalsIgnoreCase(optValue)
+                        || "off".equalsIgnoreCase(optValue) || "0".equals(optValue));
+                if ((opt.equals("ANALYZE") || opt.equals("ANALYSE")) && optOn) hasAnalyze = true;
+                if (opt.equals("VERBOSE") && optOn) hasVerbose = true;
             }
             parser.expect(TokenType.RIGHT_PAREN);
         } else {
@@ -1513,7 +1817,25 @@ class UtilityParser {
             matchOnlyBeforeRelation();
             vacuumTable = parser.readIdentifier();
             if (parser.match(TokenType.DOT)) vacuumTable = vacuumTable + "." + parser.readIdentifier();
-            if (parser.check(TokenType.LEFT_PAREN)) parser.consumeUntilParen();
+            if (parser.check(TokenType.LEFT_PAREN)) {
+                // A column list says which columns to gather statistics for, so it means nothing
+                // without ANALYZE — and PostgreSQL says so before it opens the relation. The list
+                // has at least one column in it.
+                parser.advance();
+                if (parser.check(TokenType.RIGHT_PAREN)) {
+                    Token t = parser.peek();
+                    throw ParseException.saying(SYNTAX_AT + t.raw() + Q, t, "42601");
+                }
+                do {
+                    parser.readColumnName();
+                } while (parser.match(TokenType.COMMA));
+                parser.expect(TokenType.RIGHT_PAREN);
+                if (!hasAnalyze) {
+                    throw new MemgresException(
+                            "ANALYZE option must be specified when a column list is provided",
+                            "0A000");
+                }
+            }
         }
         // Encode flags + table into the value string
         String value = vacuumTable != null ? "table:" + vacuumTable : "ok";

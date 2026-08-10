@@ -57,8 +57,16 @@ class SetRoleTest {
     }
 
     @Test
-    void testSetRoleDefault() throws SQLException {
-        exec("SET ROLE DEFAULT");
+    void setRoleHasNoDefaultSpelling() {
+        // SET ROLE takes a role name or NONE. DEFAULT belongs to the general SET grammar, which
+        // ROLE does not go through, so PostgreSQL stops at the word.
+        SQLException e = assertThrows(SQLException.class, () -> exec("SET ROLE DEFAULT"));
+        assertEquals("42601", e.getSQLState());
+    }
+
+    @Test
+    void setRoleNoneGivesTheRoleUp() throws SQLException {
+        exec("SET ROLE NONE");
     }
 
     @Test

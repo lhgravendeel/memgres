@@ -461,6 +461,45 @@ public final class PlpgsqlBodyValidator {
         }
     }
 
+    /**
+     * A statement in a body that answers with rows has to say where they go. PostgreSQL has
+     * PERFORM for running a query for its effect and INTO for keeping its row; a bare SELECT is
+     * neither, and running it anyway threw the rows away silently.
+     */
+    private void requireDestination(PlpgsqlStatement.SqlStmt stmt) {
+        if (stmt.intoVars() != null && !stmt.intoVars().isEmpty()) return;
+        String sql = stmt.sql();
+        if (sql == null) return;
+        com.memgres.engine.parser.ast.Statement parsed;
+        try {
+            parsed = com.memgres.engine.parser.Parser.parse(sql);
+        } catch (RuntimeException e) {
+            return;   // a body this cannot read is left for execution to report
+        }
+        if (returnsRows(parsed)) {
+            throw new MemgresException("query has no destination for result data", "42601");
+        }
+    }
+
+    /** Whether this statement hands rows back to whoever ran it. */
+    private static boolean returnsRows(com.memgres.engine.parser.ast.Statement parsed) {
+        if (parsed instanceof com.memgres.engine.parser.ast.SelectStmt) return true;
+        if (parsed instanceof com.memgres.engine.parser.ast.SetOpStmt) return true;
+        if (parsed instanceof com.memgres.engine.parser.ast.InsertStmt) {
+            java.util.List<?> r = ((com.memgres.engine.parser.ast.InsertStmt) parsed).returning;
+            return r != null && !r.isEmpty();
+        }
+        if (parsed instanceof com.memgres.engine.parser.ast.UpdateStmt) {
+            java.util.List<?> r = ((com.memgres.engine.parser.ast.UpdateStmt) parsed).returning;
+            return r != null && !r.isEmpty();
+        }
+        if (parsed instanceof com.memgres.engine.parser.ast.DeleteStmt) {
+            java.util.List<?> r = ((com.memgres.engine.parser.ast.DeleteStmt) parsed).returning;
+            return r != null && !r.isEmpty();
+        }
+        return false;
+    }
+
     private void validateReturnSet(String form) {
         if (routine == null || routine.setReturning()) return;
         throw new MemgresException(
@@ -544,7 +583,9 @@ public final class PlpgsqlBodyValidator {
                 || stmt instanceof PlpgsqlStatement.ReturnQueryExecuteStmt) {
             validateReturnSet("QUERY");
         } else if (stmt instanceof PlpgsqlStatement.SqlStmt) {
-            checkWritable(((PlpgsqlStatement.SqlStmt) stmt).intoVars());
+            PlpgsqlStatement.SqlStmt sql = (PlpgsqlStatement.SqlStmt) stmt;
+            checkWritable(sql.intoVars());
+            requireDestination(sql);
         } else if (stmt instanceof PlpgsqlStatement.ExecuteStmt) {
             checkWritable(((PlpgsqlStatement.ExecuteStmt) stmt).intoVars());
         } else if (stmt instanceof PlpgsqlStatement.FetchStmt) {

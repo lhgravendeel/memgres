@@ -895,8 +895,18 @@ class ExprEvaluator {
                 case "cmin": return rowMeta != null ? (int) rowMeta[2] : 0;
                 case "cmax": return rowMeta != null ? (int) rowMeta[3] : 0;
                 case "ctid": {
-                    long ctidNum = rowMeta != null && rowMeta.length > 4 ? rowMeta[4] : 0;
-                    return "(0," + ctidNum + ")";
+                    // Every row has a place of its own. Where no place was recorded — rows a
+                    // CREATE TABLE AS or a COPY put there — the fallback was zero for all of
+                    // them, so every row shared one ctid: DISTINCT ctid counted one row, and
+                    // DELETE WHERE ctid = ... deleted the whole table.
+                    if (rowMeta != null && rowMeta.length > 4 && rowMeta[4] != 0) {
+                        return "(0," + rowMeta[4] + ")";
+                    }
+                    java.util.List<Object[]> rows = ref.table.getRows();
+                    for (int i = 0; i < rows.size(); i++) {
+                        if (rows.get(i) == ref.row) return "(0," + (i + 1) + ")";
+                    }
+                    return "(0,0)";
                 }
                 default: return 0L;
             }
@@ -991,9 +1001,12 @@ class ExprEvaluator {
             return leftVal.toString().startsWith(rightVal.toString());
         }
 
-        // Determine arg type names for operator lookup
-        String leftType = cop.left() != null ? AstExecutor.pgTypeNameOf(leftVal) : "NONE";
-        String rightType = AstExecutor.pgTypeNameOf(rightVal);
+        // Determine arg type names for operator lookup. A bare string constant has no type of
+        // its own until something gives it one, so it is offered as unknown and takes whatever
+        // the operator declares — which is how 'a' reaches an integer parameter and is refused
+        // as one rather than reported as a missing text operator.
+        String leftType = cop.left() != null ? operandTypeName(cop.left(), leftVal, ctx) : "NONE";
+        String rightType = operandTypeName(cop.right(), rightVal, ctx);
 
         // Try to find matching operator in database
         PgOperator pgOp = resolveOperator(cop.schema(), cop.opSymbol(), leftType, rightType);
@@ -1021,10 +1034,12 @@ class ExprEvaluator {
             if (rightVal == null) return null;
         }
 
-        // Build argument list and call
+        // Build argument list and call. An operand the operator declares a type for arrives as
+        // that type: a bare constant has none of its own, and handing it to the backing function
+        // unconverted asked that function to multiply a string by a number.
         java.util.List<Object> args = new java.util.ArrayList<>();
-        if (cop.left() != null) args.add(leftVal);
-        args.add(rightVal);
+        if (cop.left() != null) args.add(asDeclared(leftVal, pgOp.getLeftArg()));
+        args.add(asDeclared(rightVal, pgOp.getRightArg()));
 
         PlpgsqlExecutor plExec = new PlpgsqlExecutor(executor, executor.database, executor.session);
         return plExec.executeFunction(func, args);
@@ -1034,6 +1049,37 @@ class ExprEvaluator {
      * Resolve a PgOperator by schema, name, and argument types.
      * Tries exact match first, then fuzzy matching on arg types.
      */
+    /** An operand as the type the operator declares for it. */
+    private Object asDeclared(Object value, String declaredType) {
+        if (value == null || declaredType == null) return value;
+        String bare = declaredType.trim().toLowerCase();
+        if (bare.isEmpty() || bare.equals("any") || bare.startsWith("anyelement")
+                || bare.equals("\"any\"")) {
+            return value;
+        }
+        return executor.castEvaluator.applyCast(value, bare);
+    }
+
+    /**
+     * The type an operand offers an operator.
+     *
+     * <p>What the expression was written as decides this, not what its value happens to be held
+     * in: an integer column read as a Java long is still an integer, and offering it as a bigint
+     * put it past every operator declared for integers.
+     */
+    private String operandTypeName(Expression expr, Object value, RowContext ctx) {
+        if (isUntypedConstant(expr)) return "unknown";
+        String declared = executor.binaryOpEvaluator.declaredTypeForResolution(expr, ctx);
+        if (declared != null && !declared.isEmpty()) return declared.toLowerCase();
+        return AstExecutor.pgTypeNameOf(value);
+    }
+
+    /** Whether this operand is a string constant nothing has yet given a type to. */
+    private static boolean isUntypedConstant(Expression expr) {
+        return expr instanceof Literal
+                && ((Literal) expr).literalType() == Literal.LiteralType.STRING;
+    }
+
     PgOperator resolveOperator(String schema, String opSymbol, String leftType, String rightType) {
         // Search schemas: explicit schema, or search_path
         java.util.List<String> schemas = new java.util.ArrayList<>();
@@ -1105,13 +1151,32 @@ class ExprEvaluator {
         if ("NONE".equals(declaredType) && "NONE".equals(actualType)) return true;
         // "any" type matches anything
         if ("any".equals(declaredType) || "anyelement".equals(declaredType) || "\"any\"".equals(declaredType)) return true;
-        // "unknown" is the type of NULL — matches any declared type (PG implicit coercion)
+        // "unknown" is the type of NULL and of a literal nothing has typed yet — it takes the
+        // type the operator declares.
         if ("unknown".equals(actualType)) return true;
-        // Numeric type aliases
-        if (isNumericType(declaredType) && isNumericType(actualType)) return true;
+        // A number reaches a parameter of a wider kind and not a narrower one: an integer is a
+        // numeric without losing anything, a numeric is not an integer. Treating every numeric
+        // type as interchangeable made an operator declared for two integers answer for two
+        // numerics, which is an operator PostgreSQL says does not exist.
+        int actual = numericWidth(actualType);
+        int declared = numericWidth(declaredType);
+        if (actual > 0 && declared > 0) return actual <= declared;
         // Text type aliases
         if (isTextType(declaredType) && isTextType(actualType)) return true;
         return false;
+    }
+
+    /** How wide a number is, so a narrower one may stand where a wider is declared. */
+    private static int numericWidth(String t) {
+        switch (t) {
+            case "smallint": case "int2": return 1;
+            case "integer": case "int": case "int4": return 2;
+            case "bigint": case "int8": return 3;
+            case "numeric": case "decimal": return 4;
+            case "real": case "float4": return 5;
+            case "double precision": case "float8": case "float": case "double": return 6;
+            default: return 0;
+        }
     }
 
     private static boolean isNumericType(String t) {
@@ -1123,6 +1188,40 @@ class ExprEvaluator {
 
     private static boolean isTextType(String t) {
         return "text".equals(t) || "varchar".equals(t) || "character varying".equals(t) || "char".equals(t);
+    }
+
+    /** Nothing: the marker for "no user-defined cast applies", since null is a real answer. */
+    private static final Object NO_USER_CAST = new Object();
+
+    /**
+     * The value as a cast created WITH FUNCTION produces it, or {@link #NO_USER_CAST}.
+     *
+     * <p>A cast the reader created is the one that applies between those two types; going through
+     * the ordinary text conversion instead ignored the function that was written for it.
+     */
+    private Object userDefinedCast(CastExpr cast, Object val, RowContext ctx) {
+        if (val == null) return NO_USER_CAST;
+        String sourceName = executor.binaryOpEvaluator.declaredTypeForResolution(cast.expr(), ctx);
+        if (sourceName == null) return NO_USER_CAST;
+        int sourceOid = typeOidOf(stripTypeModifier(sourceName));
+        int targetOid = typeOidOf(stripTypeModifier(cast.typeName()));
+        if (sourceOid <= 0 || targetOid <= 0 || sourceOid == targetOid) return NO_USER_CAST;
+        String function = executor.database.castFunctionFor(sourceOid, targetOid);
+        if (function == null) return NO_USER_CAST;
+        PgFunction func = executor.database.getFunction(function.contains(".")
+                ? function.substring(function.lastIndexOf('.') + 1) : function);
+        if (func == null) return NO_USER_CAST;
+        PlpgsqlExecutor plExec = new PlpgsqlExecutor(executor, executor.database, executor.session);
+        return plExec.executeFunction(func, java.util.Collections.singletonList(val));
+    }
+
+    /** The OID of a type, whether it is one the engine has built in or one the reader created. */
+    private int typeOidOf(String typeName) {
+        DataType built = DataType.fromPgName(typeName.toLowerCase());
+        if (built != null) return built.getOid();
+        String key = TypeNamespace.oidKeyFor(executor.database, typeName);
+        return executor.systemCatalog.getOid(
+                key != null ? key : TypeNamespace.oidKey(null, typeName));
     }
 
     /** A type name without the width or precision written after it. */
@@ -1161,6 +1260,8 @@ class ExprEvaluator {
     private Object evalCast(CastExpr cast, RowContext ctx) {
         rejectMissingCast(cast, ctx);
         Object val = evalExpr(cast.expr(), ctx);
+        Object byFunction = userDefinedCast(cast, val, ctx);
+        if (byFunction != NO_USER_CAST) return byFunction;
         // A blank-padded string is stored padded and read back trimmed: PostgreSQL's conversion
         // from bpchar to any other string type drops the blanks the declaration added, which is
         // why 'ab'::char(5)::text is two characters and not five.
@@ -3894,6 +3995,10 @@ class ExprEvaluator {
                 }
                 return DataType.TEXT;
             }
+            // A backend's pid is an integer, and the calls that take one resolve on that. Read as
+            // text it was an argument no signature of pg_blocking_pids accepts, so the call
+            // settled on no declared result type at all.
+            if (name.equals("pg_backend_pid")) return DataType.INTEGER;
             if (name.equals("uuid_generate_v4") || name.equals("gen_random_uuid") || name.equals("uuidv4")) return DataType.UUID;
             if (name.equals("json_serialize")) return DataType.TEXT;
             // date_part answers in double precision and extract in numeric, whatever unit either

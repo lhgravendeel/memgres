@@ -340,6 +340,21 @@ public final class BuiltinCallTypes {
      * settle on one signature. Never throws: a result type is read to describe a call, not to
      * decide whether it may run.
      */
+    /**
+     * The result type of a name that has only one signature, whatever it was called with.
+     *
+     * <p>Resolution needs the argument types to choose between overloads, and an argument whose
+     * own type is unsettled leaves it with nothing to choose on. Where there is nothing to choose
+     * between, the one signature is the answer — which is how pg_blocking_pids is known to give
+     * an integer array even when what it was passed is not yet typed.
+     */
+    public static int soleResultType(String name) {
+        List<Signature> declared = Index.BY_NAME.get(name == null ? "" : name.toLowerCase(Locale.ROOT));
+        if (declared == null || declared.size() != 1) return 0;
+        int result = declared.get(0).result;
+        return POLYMORPHIC.contains(Integer.valueOf(result)) ? 0 : result;
+    }
+
     public static int resultType(String name, int[] argOids) {
         List<Signature> candidates;
         try {

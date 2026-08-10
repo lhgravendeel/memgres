@@ -50,6 +50,12 @@ public class ExpressionParser {
         return tokens.get(pos);
     }
 
+    /** The token {@code offset} places ahead, or the last one when the input ends before that. */
+    protected Token peekAt(int offset) {
+        int index = Math.min(pos + offset, tokens.size() - 1);
+        return tokens.get(index);
+    }
+
     protected Token advance() {
         Token t = tokens.get(pos);
         pos++;
@@ -94,6 +100,29 @@ public class ExpressionParser {
     protected boolean checkKeyword(String keyword) {
         Token t = peek();
         return t.type() == TokenType.KEYWORD && t.value().equalsIgnoreCase(keyword);
+    }
+
+    /**
+     * Match a word that is not reserved, whatever kind of token it arrived as.
+     *
+     * <p>An unreserved word may be spelled by a KEYWORD token or by an IDENTIFIER one depending on
+     * whether the lexer happens to know it, and a grammar that only matched keywords refused
+     * ASENSITIVE — which is an ordinary word PostgreSQL's cursor options accept.
+     */
+    protected boolean matchWord(String word) {
+        Token t = peek();
+        if ((t.type() == TokenType.KEYWORD || t.type() == TokenType.IDENTIFIER)
+                && t.value().equalsIgnoreCase(word)) {
+            advance();
+            return true;
+        }
+        return false;
+    }
+
+    protected boolean checkWord(String word) {
+        Token t = peek();
+        return (t.type() == TokenType.KEYWORD || t.type() == TokenType.IDENTIFIER)
+                && t.value().equalsIgnoreCase(word);
     }
 
     protected boolean matchKeyword(String keyword) {
@@ -291,11 +320,43 @@ public class ExpressionParser {
         return null;
     }
 
+    /**
+     * A name that has to be a plain identifier: not a string literal, and not a keyword
+     * PostgreSQL reserves. A channel, a cursor and a prepared statement are all named this way,
+     * and reading them with the general identifier reader accepted {@code LISTEN 'ch'} and
+     * {@code DECLARE select CURSOR} alike.
+     */
+    protected String readObjectName() {
+        Token t = peek();
+        if (t.type() == TokenType.STRING_LITERAL || t.type() == TokenType.DOLLAR_STRING_LITERAL) {
+            throw ParseException.saying("syntax error at or near \"'" + t.value() + "'\"", t, "42601");
+        }
+        return readColumnName();
+    }
+
+    /** Nothing may follow a statement but its semicolon. */
+    protected void expectEndOfStatement() {
+        if (isAtEnd()) return;
+        Token t = peek();
+        if (t.type() == TokenType.SEMICOLON || t.type() == TokenType.EOF) return;
+        throw ParseException.saying("syntax error at or near \"" + tokenAsWritten(t) + "\"", t, "42601");
+    }
+
+    /** A token as the reader wrote it: a string constant keeps the quotes that made it one. */
+    protected static String tokenAsWritten(Token token) {
+        if (token.type() == TokenType.STRING_LITERAL) return "'" + token.value() + "'";
+        return token.raw();
+    }
+
+
+
     protected String readColumnName() {
         Token t = peek();
         if (t.type() == TokenType.KEYWORD && !PgKeywords.canBeColumnName(t.value())) {
+            // PostgreSQL names the word as it was written, not folded: SAVEPOINT ALL stops at
+            // "ALL" and SAVEPOINT select at "select".
             throw ParseException.saying(
-                    "syntax error at or near \"" + t.value().toLowerCase() + "\"", t, "42601");
+                    "syntax error at or near \"" + t.raw() + "\"", t, "42601");
         }
         return readIdentifier();
     }

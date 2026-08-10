@@ -739,6 +739,13 @@ public class Lexer {
                     pos++; // skip closing "
                     // PG truncates identifiers to NAMEDATALEN-1 = 63 bytes
                     String qid = sb.toString();
+                    // An identifier written with nothing between its quotes names nothing, and
+                    // PostgreSQL says so at the quotes rather than letting an empty name through.
+                    if (qid.isEmpty()) {
+                        throw ParseException.saying(
+                                "zero-length delimited identifier at or near \"\"\"\"",
+                                new Token(TokenType.ERROR, "\"\"", start), "42601");
+                    }
                     if (qid.length() > 63) qid = qid.substring(0, 63);
                     return new Token(TokenType.QUOTED_IDENTIFIER, qid, start);
                 }

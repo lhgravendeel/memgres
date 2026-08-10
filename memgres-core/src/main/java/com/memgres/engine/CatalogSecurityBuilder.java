@@ -79,17 +79,17 @@ class CatalogSecurityBuilder {
 
     Table buildPgDatabase() {
         List<Column> cols = Cols.listOf(
-                colNN("oid", DataType.INTEGER),
-                colNN("datname", DataType.TEXT),
-                colNN("datdba", DataType.INTEGER),
+                colNN("oid", DataType.OID),
+                colNN("datname", DataType.NAME),
+                colNN("datdba", DataType.OID),
                 col("encoding", DataType.INTEGER),
-                col("datlocprovider", DataType.CHAR),
+                col("datlocprovider", DataType.INTERNAL_CHAR),
                 col("datistemplate", DataType.BOOLEAN),
                 col("datallowconn", DataType.BOOLEAN),
                 col("datconnlimit", DataType.INTEGER),
                 col("datfrozenxid", DataType.XID),
-                col("datminmxid", DataType.INTEGER),
-                col("dattablespace", DataType.INTEGER),
+                col("datminmxid", DataType.XID),
+                col("dattablespace", DataType.OID),
                 col("datcollate", DataType.TEXT),
                 col("datctype", DataType.TEXT),
                 col("datlocale", DataType.TEXT),
@@ -156,7 +156,7 @@ class CatalogSecurityBuilder {
                 col("rolconnlimit", DataType.INTEGER),
                 col("rolvaliduntil", DataType.TIMESTAMPTZ),
                 col("rolbypassrls", DataType.BOOLEAN),
-                col("rolconfig", DataType.TEXT),
+                col("rolconfig", DataType.TEXT_ARRAY),
                 col("rolpassword", DataType.TEXT)
         );
         Table table = new Table("pg_roles", cols);
@@ -608,19 +608,19 @@ class CatalogSecurityBuilder {
         Table table = new Table("pg_locks", cols);
         int dbOid = oids.oid("db:memgres");
 
-        // Expose relation locks for all tables (simulating AccessShareLock held by active sessions)
+        // The relations each session's transaction actually holds a lock on, with the mode the
+        // statement took: a SELECT takes AccessShareLock, SELECT FOR UPDATE RowShareLock, and a
+        // statement that changes rows RowExclusiveLock. A row for every relation whether or not
+        // anything had touched it described locks nobody held.
         for (Session s : database.getActiveSessions()) {
-            for (Map.Entry<String, Schema> schemaEntry : database.getSchemas().entrySet()) {
-                String schemaName = schemaEntry.getKey();
-                for (Map.Entry<String, Table> tableEntry : schemaEntry.getValue().getTables().entrySet()) {
-                    int relOid = oids.oid("rel:" + schemaName + "." + tableEntry.getKey());
-                    table.insertRow(new Object[]{
-                            "relation", dbOid, relOid, null, null, null, null,
-                            null, null, null,
-                            String.valueOf(s.getPid()) + "/1", s.getPid(),
-                            "AccessShareLock", true, false, null
-                    });
-                }
+            for (Map.Entry<String, String> held : s.getRelationLocks().entrySet()) {
+                int relOid = oids.oid("rel:" + held.getKey());
+                table.insertRow(new Object[]{
+                        "relation", dbOid, relOid, null, null, null, null,
+                        null, null, null,
+                        String.valueOf(s.getPid()) + "/1", s.getPid(),
+                        held.getValue(), true, false, null
+                });
             }
         }
 
@@ -639,12 +639,38 @@ class CatalogSecurityBuilder {
             }
         }
 
+        // A session inside a transaction holds a lock on its own virtual transaction, and one on
+        // its transaction id once it has been assigned one. Both are always granted and always
+        // exclusive, and a client reading pg_locks to see whether it is in a transaction found
+        // neither of them.
+        for (Session s : database.getActiveSessions()) {
+            String virtual = s.getPid() + "/1";
+            // A live backend always holds a lock on its own virtual transaction, whether or not
+            // a transaction block is open: every statement runs inside a transaction of some
+            // kind. Showing it only inside a block left a client asking pg_locks about its own
+            // backend finding nothing at all.
+            table.insertRow(new Object[]{
+                    "virtualxid", null, null, null, null, virtual, null,
+                    null, null, null, virtual, s.getPid(), "ExclusiveLock", true, true, null
+            });
+            // The lock on a transaction id joins it only once one has been assigned, which is
+            // when a transaction block is open.
+            if (s.getStatus() == Session.TransactionStatus.IN_TRANSACTION) {
+                table.insertRow(new Object[]{
+                        "transactionid", null, null, null, null, null, s.getTransactionId(),
+                        null, null, null, virtual, s.getPid(), "ExclusiveLock", true, false, null
+                });
+            }
+        }
+
         // Expose advisory locks: one row per (session, lock, mode), with the key split into
         // classid (high 32 bits / first int) and objid (low 32 bits / second int) like PG.
         for (Database.AdvisoryLockRow row : database.getAdvisoryLockRows()) {
             table.insertRow(new Object[]{
                     "advisory", dbOid, null, null, null, null, null,
-                    row.classId, row.objId, row.objSubId,
+                    // An OID is unsigned, so the high half of a key with its top bit set reads
+                    // as a large number and not as a negative one.
+                    row.classId & 0xFFFFFFFFL, row.objId & 0xFFFFFFFFL, row.objSubId,
                     String.valueOf(row.session.getPid()) + "/1", row.session.getPid(),
                     row.exclusive ? "ExclusiveLock" : "ShareLock", true, false, null
             });

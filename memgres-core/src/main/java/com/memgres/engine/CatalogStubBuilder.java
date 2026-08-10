@@ -232,6 +232,20 @@ class CatalogStubBuilder {
     static String buildIndexDef(String indexName, String tableName, boolean isUnique,
                                 String method, List<String> indexCols, List<String> columnOptions,
                                 List<String> includeColumns, boolean nullsNotDistinct, String whereClause) {
+        return buildIndexDef(indexName, tableName, isUnique, method, indexCols, columnOptions,
+                includeColumns, nullsNotDistinct, whereClause, null);
+    }
+
+    /**
+     * The definition an index was created with, including the storage parameters it carries.
+     *
+     * <p>The parameters were left out, so a definition read back from the catalogue could not
+     * recreate the index it described: a fillfactor set at creation vanished from the text.
+     */
+    static String buildIndexDef(String indexName, String tableName, boolean isUnique,
+                                String method, List<String> indexCols, List<String> columnOptions,
+                                List<String> includeColumns, boolean nullsNotDistinct,
+                                String whereClause, java.util.Map<String, String> reloptions) {
         StringBuilder sb = new StringBuilder();
         sb.append("CREATE ").append(isUnique ? "UNIQUE " : "").append("INDEX ").append(indexName)
           .append(" ON ").append(tableName != null ? tableName : "unknown")
@@ -267,6 +281,14 @@ class CatalogStubBuilder {
         }
         if (nullsNotDistinct) {
             sb.append(" NULLS NOT DISTINCT");
+        }
+        if (reloptions != null && !reloptions.isEmpty()) {
+            StringBuilder opts = new StringBuilder();
+            for (java.util.Map.Entry<String, String> e : reloptions.entrySet()) {
+                if (opts.length() > 0) opts.append(", ");
+                opts.append(e.getKey()).append("='").append(e.getValue()).append('\'');
+            }
+            sb.append(" WITH (").append(opts).append(')');
         }
         if (whereClause != null && !whereClause.isEmpty()) {
             sb.append(" WHERE ").append(whereClause);
@@ -2074,8 +2096,9 @@ class CatalogStubBuilder {
                 col("name", DataType.TEXT),
                 col("statement", DataType.TEXT),
                 col("prepare_time", DataType.TIMESTAMPTZ),
-                col("parameter_types", DataType.TEXT_ARRAY),
-                col("result_types", DataType.TEXT_ARRAY),
+                // Both are regtype[]: they hold types, and a reader that asks pg_typeof gets that.
+                col("parameter_types", DataType.REGTYPE_ARRAY),
+                col("result_types", DataType.REGTYPE_ARRAY),
                 col("from_sql", DataType.BOOLEAN),
                 col("generic_plans", DataType.BIGINT),
                 col("custom_plans", DataType.BIGINT)
@@ -2108,10 +2131,50 @@ class CatalogStubBuilder {
         return table;
     }
 
-    /** Convert a list of type name strings to a List<Object> for regtype[] array storage. */
+    /**
+     * A list of type names as regtype[] holds them: under the name a reader would write.
+     *
+     * <p>The declared spelling was kept verbatim, so a parameter written {@code int} was reported
+     * as "int" where PostgreSQL reports "integer" — regtype prints a type's own name, not the
+     * alias the statement happened to use.
+     */
     private List<Object> toRegTypeList(java.util.List<String> types) {
         if (types == null || types.isEmpty()) return new ArrayList<>();
-        return new ArrayList<>(types);
+        List<Object> named = new ArrayList<>();
+        for (String type : types) {
+            named.add(type == null ? null : canonicalTypeName(type));
+        }
+        return named;
+    }
+
+    /** The name regtype prints for a type written as {@code written}. */
+    private static String canonicalTypeName(String written) {
+        String bare = written.trim();
+        String suffix = "";
+        while (bare.endsWith("[]")) {
+            bare = bare.substring(0, bare.length() - 2).trim();
+            suffix = suffix + "[]";
+        }
+        DataType type = DataType.fromPgName(bare.toLowerCase());
+        if (type == null) return written;
+        String name = type.getPgName();
+        // The catalogue spellings are what pg_type holds; regtype prints the readable name.
+        if (name.startsWith("_")) return written;
+        switch (type) {
+            case INTEGER: return "integer" + suffix;
+            case SMALLINT: return "smallint" + suffix;
+            case BIGINT: return "bigint" + suffix;
+            case REAL: return "real" + suffix;
+            case DOUBLE_PRECISION: return "double precision" + suffix;
+            case BOOLEAN: return "boolean" + suffix;
+            case CHAR: return "character" + suffix;
+            case VARCHAR: return "character varying" + suffix;
+            case TIMESTAMP: return "timestamp without time zone" + suffix;
+            case TIMESTAMPTZ: return "timestamp with time zone" + suffix;
+            case TIME: return "time without time zone" + suffix;
+            case TIMETZ: return "time with time zone" + suffix;
+            default: return name + suffix;
+        }
     }
 
     // formatParamTypes and formatResultTypes removed — arrays now stored as List<Object> directly

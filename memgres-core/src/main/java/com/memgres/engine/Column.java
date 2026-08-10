@@ -19,7 +19,12 @@ public class Column {
     private final String generatedExpr;
     private final boolean virtual;          // PG 18: VIRTUAL generated column (computed on read)
     private String domainTypeName;
+    /** The collation this column sorts by, when one was written for it. */
+    private String collation;
+
     private String compositeTypeName;  // For composite type columns (e.g., "pair")
+
+
     private final DataType arrayElementType; // For array columns, the element type (e.g., INTEGER for integer[])
     private int tableOid;    // PgWire RowDescription: source table OID (0 if not from a real table)
     private short attNum;    // PgWire RowDescription: column attribute number (0 if not from a real table)
@@ -159,6 +164,10 @@ public class Column {
         c.parsedDefaultExpr = parsedDefaultExpr;
         return c;
     }
+
+    public String getCollation() { return collation; }
+
+    public void setCollation(String collation) { this.collation = collation; }
 
     public String getName() { return name; }
     public DataType getType() { return type; }

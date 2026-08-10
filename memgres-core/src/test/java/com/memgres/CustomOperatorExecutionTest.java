@@ -1073,9 +1073,22 @@ class CustomOperatorExecutionTest {
                     + "BEGIN RETURN a + b; END; $$ LANGUAGE plpgsql");
             stmt.execute("CREATE OPERATOR <+> (LEFTARG = integer, RIGHTARG = integer, FUNCTION = int_add)");
 
-            SQLException ex = assertThrows(SQLException.class,
+            // A bare string constant has no type of its own, so it takes the one the operator
+            // declares — and "hello" is not an integer. The complaint is about the value, not
+            // about a missing operator.
+            SQLException untyped = assertThrows(SQLException.class,
                     () -> stmt.executeQuery("SELECT 'hello' <+> 'world'"));
-            assertEquals("42883", ex.getSQLState());
+            assertEquals("22P02", untyped.getSQLState());
+            assertTrue(untyped.getMessage()
+                    .contains("invalid input syntax for type integer: \"hello\""),
+                    untyped.getMessage());
+
+            // A value that already has a type keeps it, and a bigint reaches no integer operator.
+            SQLException typed = assertThrows(SQLException.class,
+                    () -> stmt.executeQuery("SELECT 1::bigint <+> 2::bigint"));
+            assertEquals("42883", typed.getSQLState());
+            assertTrue(typed.getMessage().contains("operator does not exist: bigint <+> bigint"),
+                    typed.getMessage());
         }
     }
 

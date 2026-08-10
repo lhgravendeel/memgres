@@ -257,6 +257,17 @@ class CatalogSystemFunctions {
                     }
                 }
 
+                // An empty array says nothing about what it would have held, so the call's own
+                // declaration decides: pg_blocking_pids answers an integer array whether or not
+                // anything is blocking.
+                if (rawExpr instanceof FunctionCallExpr && value.get() instanceof java.util.List
+                        && ((java.util.List<?>) value.get()).isEmpty()) {
+                    DataType declared = declaredResultType((FunctionCallExpr) rawExpr, ctx);
+                    if (declared != null && DataType.elementOf(declared) != null) {
+                        return pgTypeDisplayName(declared);
+                    }
+                }
+
                 if (rawExpr instanceof CastExpr) {
                     CastExpr cast = (CastExpr) rawExpr;
                     // float(p) names two different types depending on p, so the modifier is
@@ -444,7 +455,9 @@ class CatalogSystemFunctions {
             case "current_catalog":
                 return executor.session != null ? executor.session.getDatabaseName() : "memgres";
             case "current_schema":
-                return executor.session != null ? executor.session.getEffectiveSchema() : "public";
+                // The schema a name would resolve in, which is nothing at all when the path
+                // names no schema that exists.
+                return executor.session != null ? executor.session.getReportedSchema() : "public";
             case "current_schemas": {
                 boolean includeImplicit = false;
                 if (!fn.args().isEmpty()) {
@@ -452,7 +465,8 @@ class CatalogSystemFunctions {
                     includeImplicit = arg instanceof Boolean ? ((Boolean) arg) : "true".equalsIgnoreCase(String.valueOf(arg));
                 }
                 if (executor.session != null) {
-                    return new java.util.ArrayList<Object>(executor.session.getEffectiveSearchPath(includeImplicit));
+                    return new java.util.ArrayList<Object>(
+                            executor.session.getExistingSearchPath(includeImplicit));
                 }
                 List<Object> schemas = new java.util.ArrayList<>();
                 if (includeImplicit) schemas.add("pg_catalog");
@@ -648,6 +662,9 @@ class CatalogSystemFunctions {
                     GucSettings.requireKnown(settingName);
                     String settingValue = String.valueOf(executor.evalExpr(fn.args().get(1), ctx));
                     GucSettings.checkAssignable(settingName, settingValue);
+                    // And by the same value checks: a time zone nobody has, an encoding that is
+                    // not one and a role that does not exist are refused here as they are there.
+                    executor.sessionExecutor.validateGucValue(settingName, settingValue);
                     boolean isLocal = fn.args().size() >= 3 && executor.isTruthy(executor.evalExpr(fn.args().get(2), ctx));
                     // set_config runs inside a query, so a transaction-scoped setting is subject
                     // to the same rules the SET statement is: the isolation level can no longer
@@ -1183,7 +1200,10 @@ class CatalogSystemFunctions {
             DataType argType = executor.exprEvaluator.inferExprType(args.get(i));
             written[i] = argType == null ? 0 : argType.getOid();
         }
-        return DataType.fromOid(BuiltinCallTypes.resultType(called, written));
+        DataType resolved = DataType.fromOid(BuiltinCallTypes.resultType(called, written));
+        if (resolved != null) return resolved;
+        // A name with one signature answers with that signature's type, whatever it was passed.
+        return DataType.fromOid(BuiltinCallTypes.soleResultType(called));
     }
 
     /**
@@ -1238,7 +1258,25 @@ class CatalogSystemFunctions {
         return dt == DataType.TEXT || dt == DataType.VARCHAR || dt == DataType.CHAR;
     }
 
+    /** A type written the way a message names it: integer, not int. */
+    static String readableTypeName(String written) {
+        String bare = written.trim();
+        String suffix = "";
+        while (bare.endsWith("[]")) {
+            bare = bare.substring(0, bare.length() - 2).trim();
+            suffix = suffix + "[]";
+        }
+        int paren = bare.indexOf('(');
+        if (paren > 0) bare = bare.substring(0, paren).trim();
+        DataType type = DataType.fromPgName(bare.toLowerCase());
+        return type == null ? written : pgTypeDisplayName(type) + suffix;
+    }
+
     static String pgTypeDisplayName(DataType dt) {
+        // An array type is named after its element with brackets after it, not by the catalogue
+        // spelling that puts an underscore in front: pg_typeof answers regtype[], not _regtype.
+        DataType element = DataType.elementOf(dt);
+        if (element != null) return pgTypeDisplayName(element) + "[]";
         switch (dt) {
             case INTEGER:
             case SERIAL:

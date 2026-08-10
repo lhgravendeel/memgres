@@ -188,46 +188,56 @@ class DollarQuoteWithRegexTest {
     // =========================================================================
 
     @Test
-    void testDoDollarDollarWithFormatSpecifiers() throws SQLException {
+    void testDoDollarDollarWithFormatSpecifiers() {
+        // A dollar quote ends at the first repeat of its own tag, so the extra dollar
+        // behind it is left over and PostgreSQL stops there.
+        SQLException e = assertThrows(SQLException.class, () -> {
         // $do$$ is a valid dollar-quote tag: $do$ followed by $
         // But inside the body, %1$I has $I which looks like a dollar-quote start
-        exec("CREATE TABLE fmt_a (id serial PRIMARY KEY, owner_name text)");
-        exec("CREATE TABLE fmt_b (id serial PRIMARY KEY, owner_name text)");
-        exec("""
-            DO $do$$
-            DECLARE
-                tbl text;
-                tables text[] := array['fmt_a', 'fmt_b'];
-            BEGIN
-                FOREACH tbl IN ARRAY tables LOOP
-                    EXECUTE FORMAT(
-                        'ALTER TABLE %1$I ENABLE ROW LEVEL SECURITY',
-                        tbl
-                    );
-                END LOOP;
-            END;
-            $do$$
+                exec("CREATE TABLE fmt_a (id serial PRIMARY KEY, owner_name text)");
+                exec("CREATE TABLE fmt_b (id serial PRIMARY KEY, owner_name text)");
+                exec("""
+                DO $do$$
+                DECLARE
+                    tbl text;
+                    tables text[] := array['fmt_a', 'fmt_b'];
+                BEGIN
+                    FOREACH tbl IN ARRAY tables LOOP
+                        EXECUTE FORMAT(
+                            'ALTER TABLE %1$I ENABLE ROW LEVEL SECURITY',
+                            tbl
+                        );
+                    END LOOP;
+                END;
+                $do$$
         """);
+        });
+        assertEquals("42601", e.getSQLState());
     }
 
     @Test
-    void testDoDollarDollarWithComplexFormat() throws SQLException {
-        exec("CREATE TABLE fmt_c (id serial PRIMARY KEY, visible boolean DEFAULT true, workspace_id text, path text)");
-        exec("""
-            DO $do$$
-            DECLARE
-                tbl text;
-                tables text[] := array['fmt_c'];
-            BEGIN
-                FOREACH tbl IN ARRAY tables LOOP
-                    EXECUTE FORMAT(
-                        'CREATE POLICY see_own ON %1$I FOR ALL USING (SPLIT_PART(%1$I.path, ''/'', 1) = ''u'')',
-                        tbl
-                    );
-                END LOOP;
-            END;
-            $do$$
+    void testDoDollarDollarWithComplexFormat() {
+        // A dollar quote ends at the first repeat of its own tag, so the extra dollar
+        // behind it is left over and PostgreSQL stops there.
+        SQLException e = assertThrows(SQLException.class, () -> {
+            exec("CREATE TABLE fmt_c (id serial PRIMARY KEY, visible boolean DEFAULT true, workspace_id text, path text)");
+                exec("""
+                DO $do$$
+                DECLARE
+                    tbl text;
+                    tables text[] := array['fmt_c'];
+                BEGIN
+                    FOREACH tbl IN ARRAY tables LOOP
+                        EXECUTE FORMAT(
+                            'CREATE POLICY see_own ON %1$I FOR ALL USING (SPLIT_PART(%1$I.path, ''/'', 1) = ''u'')',
+                            tbl
+                        );
+                    END LOOP;
+                END;
+                $do$$
         """);
+        });
+        assertEquals("42601", e.getSQLState());
     }
 
     // =========================================================================

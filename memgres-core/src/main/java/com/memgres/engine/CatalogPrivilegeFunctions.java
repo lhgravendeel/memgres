@@ -312,11 +312,12 @@ class CatalogPrivilegeFunctions {
 
     private boolean isMemberOfRole(String user, String target, Priv priv) {
         if (user.equals(target)) return true;
-        // M12: Superusers can always SET ROLE (USAGE) to any role
-        if ("USAGE".equals(priv.name) || "SET".equals(priv.name)) {
-            Map<String, String> attrs = executor.database.getRoles().get(user);
-            if (attrs != null && "true".equalsIgnoreCase(attrs.get("SUPERUSER"))) return true;
-        }
+        // A superuser is a member of every role, however the question is spelled. PostgreSQL
+        // answers that from the role's own attributes before it reads pg_auth_members, and it
+        // does so for MEMBER as much as for USAGE and SET — asking about MEMBER walked the
+        // memberships instead and answered false for a superuser who is a member of everything.
+        Map<String, String> attrs = executor.database.getRoles().get(user);
+        if (attrs != null && "true".equalsIgnoreCase(attrs.get("SUPERUSER"))) return true;
         if (priv.grantOption) return false;
         Map<String, Set<String>> memberships = executor.database.getRoleMemberships();
         Set<String> visited = new HashSet<>();

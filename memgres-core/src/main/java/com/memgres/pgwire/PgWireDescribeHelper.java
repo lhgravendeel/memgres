@@ -633,14 +633,14 @@ class PgWireDescribeHelper {
     List<Column> inferColumns(String sql) {
         String upper = stripLeadingComments(sql).toUpperCase();
         if (upper.startsWith("FETCH")) {
-            String cursorName = extractCursorName(upper);
+            String cursorName = extractCursorName(sql);
             if (cursorName != null) {
                 Session.CursorState cursor = session.getCursor(cursorName);
                 if (cursor != null) return cursor.getColumns();
             }
         }
         if (upper.startsWith("EXECUTE")) {
-            String planName = extractPlanName(upper);
+            String planName = extractPlanName(sql);
             if (planName != null) {
                 Session.PreparedStmt plan = session.getPreparedStatement(planName);
                 if (plan != null && plan.body() != null) {
@@ -886,27 +886,77 @@ class PgWireDescribeHelper {
         return i < len ? sql.substring(i).trim() : "";
     }
 
-    private static String extractCursorName(String upperSql) {
-        int fromIdx = upperSql.indexOf(" FROM ");
-        if (fromIdx < 0) fromIdx = upperSql.indexOf(" IN ");
-        if (fromIdx < 0) return null;
-        String rest = upperSql.substring(fromIdx).trim();
-        int spaceIdx = rest.indexOf(' ');
-        if (spaceIdx < 0) return null;
-        rest = rest.substring(spaceIdx).trim();
-        int endIdx = rest.indexOf(' ');
-        String name = endIdx > 0 ? rest.substring(0, endIdx) : rest;
-        name = name.replace(";", "").trim();
-        return name.isEmpty() ? null : name.toLowerCase();
+    /** The words that may stand between FETCH or MOVE and the cursor it names. */
+    private static final java.util.Set<String> FETCH_DIRECTIONS =
+            new java.util.HashSet<>(java.util.Arrays.asList(
+                    "NEXT", "PRIOR", "FIRST", "LAST", "ABSOLUTE", "RELATIVE",
+                    "FORWARD", "BACKWARD", "ALL", "FROM", "IN"));
+
+    /**
+     * The cursor a FETCH or MOVE names.
+     *
+     * <p>The name was looked for after a FROM or an IN, so {@code FETCH c} -- where the direction
+     * and the word are both left out -- named no cursor at all, and the rows it returned reached
+     * the client with no shape to read them by. It was also read out of the upper-cased text with
+     * its quotes left on, so {@code FETCH ALL FROM "C"} looked for a cursor spelled with quotes
+     * around an upper-cased name and found none.
+     */
+    private static String extractCursorName(String sql) {
+        String rest = stripLeadingComments(sql).trim();
+        while (rest.endsWith(";")) rest = rest.substring(0, rest.length() - 1).trim();
+        int keyword = endOfWord(rest);
+        if (keyword < 0) return null;
+        rest = rest.substring(keyword).trim();
+        // Everything the statement may say about where to move goes first, and a count is written
+        // as a plain number, so what is left when neither is what the cursor is called.
+        while (!rest.isEmpty() && rest.charAt(0) != '"') {
+            int end = endOfWord(rest);
+            String word = end < 0 ? rest : rest.substring(0, end);
+            String upper = word.toUpperCase(java.util.Locale.ROOT);
+            if (!FETCH_DIRECTIONS.contains(upper) && !upper.matches("[-+]?[0-9]+")) break;
+            if (end < 0) return null;
+            rest = rest.substring(end).trim();
+        }
+        if (rest.isEmpty()) return null;
+        if (rest.charAt(0) == '"') {
+            int close = rest.indexOf('"', 1);
+            return close < 0 ? null : rest.substring(1, close);
+        }
+        int end = endOfWord(rest);
+        String name = end < 0 ? rest : rest.substring(0, end);
+        return name.isEmpty() ? null : name.toLowerCase(java.util.Locale.ROOT);
     }
 
-    private static String extractPlanName(String upperSql) {
-        String rest = upperSql.substring("EXECUTE".length()).trim();
+    /** Where the first word of {@code text} ends, or -1 when the whole of it is one word. */
+    private static int endOfWord(String text) {
+        for (int i = 0; i < text.length(); i++) {
+            if (Character.isWhitespace(text.charAt(i))) return i;
+        }
+        return -1;
+    }
+
+    /**
+     * The prepared statement a name in an EXECUTE refers to.
+     *
+     * <p>The name was read out of the upper-cased text with its quotes left on, so
+     * {@code EXECUTE "p"} looked for a statement called {@code "P"} — quotes and all — found
+     * none, and described no columns while the execution still sent rows. The client then had
+     * tuples with no shape to read them by.
+     */
+    private static String extractPlanName(String sql) {
+        String rest = sql.substring(sql.toUpperCase(java.util.Locale.ROOT)
+                .indexOf("EXECUTE") + "EXECUTE".length()).trim();
+        if (rest.startsWith("\"")) {
+            int close = rest.indexOf('"', 1);
+            if (close < 0) return null;
+            String quoted = rest.substring(1, close);
+            return quoted.isEmpty() ? null : quoted;
+        }
         int endIdx = rest.indexOf('(');
         if (endIdx < 0) endIdx = rest.indexOf(' ');
         if (endIdx < 0) endIdx = rest.indexOf(';');
         String name = endIdx > 0 ? rest.substring(0, endIdx).trim() : rest.replace(";", "").trim();
-        return name.isEmpty() ? null : name.toLowerCase();
+        return name.isEmpty() ? null : name.toLowerCase(java.util.Locale.ROOT);
     }
 
     // ---- Wire protocol helpers ----

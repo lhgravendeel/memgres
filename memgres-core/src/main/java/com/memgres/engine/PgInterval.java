@@ -1186,12 +1186,29 @@ public class PgInterval implements Comparable<PgInterval> {
         if (this == o) return true;
         if (!(o instanceof PgInterval)) return false;
         PgInterval that = (PgInterval) o;
-        return months == that.months && days == that.days && microseconds == that.microseconds;
+        // Two intervals are equal when they measure the same span, which is the same question
+        // comparison answers: a month is thirty days and a day is twenty-four hours. Comparing
+        // the three fields separately made '1 mon', '30 days' and '720 hours' three values, so
+        // GROUP BY made three groups of what PostgreSQL counts as one.
+        if (isInfinite() || that.isInfinite()) {
+            return months == that.months && days == that.days && microseconds == that.microseconds;
+        }
+        return normalizedMicros() == that.normalizedMicros();
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(months, days, microseconds);
+        if (isInfinite()) return Objects.hash(months, days, microseconds);
+        long total = normalizedMicros();
+        return (int) (total ^ (total >>> 32));
+    }
+
+    /** The span this interval measures, with a month thirty days and a day twenty-four hours. */
+    public long normalizedMicroseconds() { return normalizedMicros(); }
+
+    private long normalizedMicros() {
+        return months * 30L * 24 * 3600 * 1_000_000L
+                + days * 24L * 3600 * 1_000_000L + microseconds;
     }
 
     @Override
@@ -1201,9 +1218,7 @@ public class PgInterval implements Comparable<PgInterval> {
             int theirs = other.isPositiveInfinity() ? 1 : other.isNegativeInfinity() ? -1 : 0;
             return Integer.compare(mine, theirs);
         }
-        // Approximate comparison: 1 month = 30 days, 1 day = 24 hours
-        long thisTotalMicros = months * 30L * 24 * 3600 * 1_000_000L + days * 24L * 3600 * 1_000_000L + microseconds;
-        long otherTotalMicros = other.months * 30L * 24 * 3600 * 1_000_000L + other.days * 24L * 3600 * 1_000_000L + other.microseconds;
-        return Long.compare(thisTotalMicros, otherTotalMicros);
+        // 1 month = 30 days, 1 day = 24 hours, which is how PostgreSQL orders intervals too.
+        return Long.compare(normalizedMicros(), other.normalizedMicros());
     }
 }

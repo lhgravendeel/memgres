@@ -56,6 +56,14 @@ class SessionExecutor {
                 // schema, so the prefix must survive into the stored key
                 boolean relationScoped = objType.equals("CONSTRAINT") || objType.equals("TRIGGER")
                         || objType.equals("RULE") || objType.equals("POLICY");
+                // A routine's argument list is part of what was written but not of its name.
+                String writtenArgs = null;
+                int signatureAt = bareName.indexOf('(');
+                if (signatureAt > 0) {
+                    writtenArgs = bareName.substring(signatureAt);
+                    objName = objName.substring(0, objName.indexOf('('));
+                    bareName = bareName.substring(0, signatureAt);
+                }
                 if (objName.contains(".") && !objType.equals("COLUMN") && !relationScoped) {
                     int dot = objName.indexOf('.');
                     writtenSchema = objName.substring(0, dot);
@@ -69,6 +77,11 @@ class SessionExecutor {
                 // not relations settle it for themselves below.
                 String schemaName = relationSchema(writtenSchema, bareName);
                 if (objType.equals("TABLE") || objType.equals("RELATION")) {
+                    // A sequence is a relation but it is not a table, and PostgreSQL says which
+                    // it is rather than filing the comment against the wrong kind of object.
+                    if (executor.database.hasSequence(schemaName, bareName)) {
+                        throw new MemgresException("\"" + bareName + "\" is not a table", "42809");
+                    }
                     try {
                         executor.resolveTable(schemaName, bareName);
                     } catch (MemgresException e) {
@@ -118,9 +131,25 @@ class SessionExecutor {
                                     executor.database, executor.session, colSchema);
                         }
                         try {
-                            Table commentTable = executor.resolveTable(colSchema, colTable);
-                            if (commentTable.getColumnIndex(colPart) < 0) {
-                                throw new MemgresException("column \"" + colPart + "\" of relation \"" + colTable + "\" does not exist", "42703");
+                            // A composite type has attributes and a pg_class row of its own, so a
+                            // comment can be filed against one of them exactly as against a
+                            // table's column. Only relations were looked for, so it was not.
+                            List<CreateTypeStmt.CompositeField> fields =
+                                    executor.database.getCompositeType(colTable);
+                            if (fields != null) {
+                                boolean known = false;
+                                for (CreateTypeStmt.CompositeField f : fields) {
+                                    if (f.name().equalsIgnoreCase(colPart)) { known = true; break; }
+                                }
+                                if (!known) {
+                                    throw new MemgresException("column \"" + colPart
+                                            + "\" of relation \"" + colTable + "\" does not exist", "42703");
+                                }
+                            } else {
+                                Table commentTable = executor.resolveTable(colSchema, colTable);
+                                if (commentTable.getColumnIndex(colPart) < 0) {
+                                    throw new MemgresException("column \"" + colPart + "\" of relation \"" + colTable + "\" does not exist", "42703");
+                                }
                             }
                         } catch (MemgresException e) {
                             if ("42703".equals(e.getSqlState())) throw e;
@@ -133,13 +162,26 @@ class SessionExecutor {
                         bareName = colTable + "." + colPart;
                     }
                 } else if (objType.equals("FUNCTION") || objType.equals("PROCEDURE") || objType.equals("ROUTINE")) {
+                    String wanted = objType;
                     // Normalize PROCEDURE/ROUTINE to FUNCTION for comment storage
                     objType = "FUNCTION";
-                    PgFunction fn = executor.database.getFunction(bareName);
+                    String routine = bareName;
+                    PgFunction fn = routineWithSignature(routine, writtenArgs);
                     if (fn == null) {
-                        throw new MemgresException("function " + bareName + " does not exist", "42883");
+                        throw new MemgresException("function " + commentRoutineSignature(routine, writtenArgs)
+                                + " does not exist", "42883");
+                    }
+                    // FUNCTION and PROCEDURE each name one kind of routine, and ROUTINE either.
+                    if (wanted.equals("FUNCTION") && fn.isProcedure()) {
+                        throw new MemgresException(commentRoutineSignature(bareName, writtenArgs)
+                                + " is not a function", "42809");
+                    }
+                    if (wanted.equals("PROCEDURE") && !fn.isProcedure()) {
+                        throw new MemgresException(commentRoutineSignature(bareName, writtenArgs)
+                                + " is not a procedure", "42809");
                     }
                     if (writtenSchema == null) schemaName = Database.schemaOf(fn);
+                    bareName = routine;
                 } else if (objType.equals("SCHEMA")) {
                     String schemaN = bareName;
                     if (executor.database.getSchema(schemaN) == null) {
@@ -156,6 +198,72 @@ class SessionExecutor {
                     objType = "TYPE";
                     schemaName = TypeNamespace.schemaOfKey(typeKey);
                     bareName = TypeNamespace.nameOfKey(typeKey);
+                } else if (objType.equals("SEQUENCE")) {
+                    if (!executor.database.hasSequence(schemaName, bareName)) {
+                        throw new MemgresException(
+                                "relation \"" + objName + "\" does not exist", "42P01");
+                    }
+                } else if (objType.equals("MATERIALIZED VIEW")) {
+                    Database.ViewDef mv = executor.database.getView(bareName);
+                    if (mv == null || !mv.materialized) {
+                        throw new MemgresException(
+                                "relation \"" + objName + "\" does not exist", "42P01");
+                    }
+                } else if (objType.equals("ROLE") || objType.equals("USER")) {
+                    if (!executor.database.getRoles().containsKey(bareName.toLowerCase())) {
+                        throw new MemgresException(
+                                "role \"" + bareName + "\" does not exist", "42704");
+                    }
+                } else if (objType.equals("EXTENSION")) {
+                    if (!executor.database.hasExtension(bareName)) {
+                        throw new MemgresException(
+                                "extension \"" + bareName + "\" does not exist", "42704");
+                    }
+                } else if (objType.equals("LANGUAGE")) {
+                    if (!languageExists(bareName)) {
+                        throw new MemgresException(
+                                "language \"" + bareName + "\" does not exist", "42704");
+                    }
+                } else if (objType.equals("COLLATION")) {
+                    if (executor.database.getCollation(bareName) == null
+                            && !BUILT_IN_COLLATIONS.contains(bareName.toLowerCase())) {
+                        throw new MemgresException("collation \"" + bareName
+                                + "\" for encoding \"UTF8\" does not exist", "42704");
+                    }
+                } else if (objType.equals("EVENT TRIGGER")) {
+                    if (executor.database.getEventTrigger(bareName) == null) {
+                        throw new MemgresException(
+                                "event trigger \"" + bareName + "\" does not exist", "42704");
+                    }
+                } else if (objType.equals("LARGE OBJECT")) {
+                    long oid;
+                    try {
+                        oid = Long.parseLong(bareName.trim());
+                    } catch (NumberFormatException e) {
+                        oid = -1;
+                    }
+                    if (oid < 0 || !executor.database.getLargeObjectStore().exists(oid)) {
+                        throw new MemgresException(
+                                "large object " + bareName + " does not exist", "42704");
+                    }
+                } else if (objType.equals("AGGREGATE")) {
+                    // An aggregate is named the way a function is, and the complaint is the same
+                    // shape: the routine is missing, or it is there and is not an aggregate.
+                    String routine = bareName;
+                    boolean isAggregate = executor.database.getUserAggregates()
+                            .containsKey(routine.toLowerCase());
+                    PgFunction fn = executor.database.getFunction(routine);
+                    if (fn == null && !isAggregate) {
+                        throw new MemgresException("aggregate " + commentRoutineSignature(bareName, writtenArgs)
+                                + " does not exist", "42883");
+                    }
+                    if (!isAggregate) {
+                        throw new MemgresException("function " + commentRoutineSignature(bareName, writtenArgs)
+                                + " is not an aggregate", "42809");
+                    }
+                    objType = "FUNCTION";
+                    if (writtenSchema == null && fn != null) schemaName = Database.schemaOf(fn);
+                    bareName = routine;
                 } else if (relationScoped) {
                     // The name is "<relation>.<object>", and the relation may carry a schema of
                     // its own. Written, it settles which relation this is; bare, the search path
@@ -177,6 +285,11 @@ class SessionExecutor {
         }
 
         if (name.equals("do_block")) {
+            // Only a language with an inline handler can carry a DO block, and only a language
+            // the catalogue has at all can be named. Discarding the word ran every block as
+            // PL/pgSQL, whatever it said it was written in.
+            String language = stmt.auxiliary() == null ? "plpgsql" : stmt.auxiliary();
+            requireInlineLanguage(language);
             String body = stmt.value();
             if (body != null && !Strs.isBlank(body)) {
                 executePlpgsqlBlock(body);
@@ -250,6 +363,9 @@ class SessionExecutor {
                     if (!param.contains(".") && !guc.isKnown(param)) {
                         throw new MemgresException("unrecognized configuration parameter \"" + param + "\"", "42704");
                     }
+                    // Putting a parameter back to its default is still changing it, so a preset
+                    // the server fixed at startup refuses RESET exactly as it refuses SET.
+                    GucSettings.checkAssignable(param, null);
                     // A transaction-scoped setting has no session value to fall back to: it is
                     // derived afresh from its default_ counterpart when a transaction starts, so
                     // there is nothing for RESET to restore and PG says so.
@@ -272,6 +388,7 @@ class SessionExecutor {
         }
 
         if (name.equals("max_prepared_transactions")) {
+            GucSettings.checkAssignable(name, stmt.value());
             try {
                 int val = Integer.parseInt(stmt.value());
                 executor.database.setMaxPreparedTransactions(val);
@@ -284,16 +401,8 @@ class SessionExecutor {
 
         if (name.equals("session_authorization")) {
             String user = stmt.value();
-            if (user != null && !user.equalsIgnoreCase("DEFAULT")) {
-                // Validate that the role/user exists (PG 22023 for nonexistent)
-                if (!executor.database.getRoles().containsKey(user.toLowerCase())
-                        && !user.equalsIgnoreCase("test") && !user.equalsIgnoreCase("postgres")
-                        && !user.equalsIgnoreCase("memgres")) {
-                    String connectingUser = executor.session != null ? executor.session.getConnectingUser() : null;
-                    if (connectingUser == null || !user.equalsIgnoreCase(connectingUser)) {
-                        throw new MemgresException("invalid value for parameter \"session_authorization\": \"" + user + "\"", "22023");
-                    }
-                }
+            if (user != null && !user.equalsIgnoreCase("DEFAULT") && !user.equalsIgnoreCase("NONE")) {
+                requireRole(user, "session_authorization");
                 if (guc != null) {
                     guc.set("session_authorization", user);
                     // SET SESSION AUTHORIZATION also resets ROLE to the new session user
@@ -323,12 +432,7 @@ class SessionExecutor {
                     && !role.equalsIgnoreCase("current_user") && !role.equalsIgnoreCase("session_user")) {
                 String sessionUser = guc != null ? guc.get("session_authorization") : "test";
                 if (sessionUser == null) sessionUser = "test";
-                // Check if role exists
-                if (!executor.database.getRoles().containsKey(role.toLowerCase())
-                        && !role.equalsIgnoreCase(sessionUser)
-                        && !role.equalsIgnoreCase("test") && !role.equalsIgnoreCase("postgres")) {
-                    throw new MemgresException("invalid value for parameter \"role\": \"" + role + "\"", "22023");
-                }
+                requireRole(role, "role");
                 // Superusers can SET ROLE to any role without membership.
                 if (!role.equalsIgnoreCase(sessionUser)
                         && !sessionUser.equalsIgnoreCase("postgres")
@@ -389,6 +493,9 @@ class SessionExecutor {
         }
 
         if (name.equals("analyze") || name.equals("vacuum")) {
+            if (name.equals("vacuum") && executor.session != null && executor.session.isInRoutine()) {
+                throw new MemgresException("VACUUM cannot be executed from a function", "25001");
+            }
             // VACUUM cannot run inside a transaction block
             if (name.equals("vacuum") && executor.session != null && executor.session.isInTransaction()) {
                 throw new MemgresException("VACUUM cannot run inside a transaction block", "25001");
@@ -1089,8 +1196,10 @@ class SessionExecutor {
 
         if (guc != null && !internalNames.contains(name)) {
             String value = stmt.value();
-            // SET param TO DEFAULT is equivalent to RESET param
+            // SET param TO DEFAULT is equivalent to RESET param, and is refused for the same
+            // parameters RESET is: putting one back to its default is still changing it.
             if (value != null && value.equalsIgnoreCase("DEFAULT")) {
+                GucSettings.checkAssignable(name, null);
                 guc.reset(name);
                 return QueryResult.message(QueryResult.Type.SET, "SET");
             }
@@ -1100,7 +1209,7 @@ class SessionExecutor {
             }
             // H37: Normalize DateStyle to canonical PG form before storing
             if (name.equals("datestyle") && value != null) {
-                value = normalizeDateStyle(value);
+                value = normalizeDateStyle(value, guc.get("datestyle"));
             }
             if (stmt.isLocal()) {
                 if (executor.session != null && !executor.session.isInTransaction()) {
@@ -1125,6 +1234,26 @@ class SessionExecutor {
         return QueryResult.message(QueryResult.Type.SET, "SET");
     }
 
+    /** The encodings a client may ask to speak. */
+    private static final Set<String> KNOWN_CLIENT_ENCODINGS = new HashSet<>(Arrays.asList(
+            "UTF8", "UNICODE", "SQLASCII", "LATIN1", "LATIN2", "LATIN3", "LATIN4", "LATIN5",
+            "LATIN6", "LATIN7", "LATIN8", "LATIN9", "LATIN10", "WIN1250", "WIN1251", "WIN1252",
+            "WIN1253", "WIN1254", "WIN1255", "WIN1256", "WIN1257", "WIN1258", "WIN866", "WIN874",
+            "KOI8R", "KOI8U", "ISO88595", "ISO88596", "ISO88597", "ISO88598", "EUCJP", "EUCCN",
+            "EUCKR", "EUCTW", "EUCJIS2004", "SJIS", "SHIFTJIS", "SHIFTJIS2004", "BIG5", "GBK",
+            "UHC", "GB18030", "JOHAB", "MULE_INTERNAL", "MULEINTERNAL"));
+
+    /** A setting value as it was written, with the quotes that carried it taken off. */
+    private static String unquoteSetting(String value) {
+        String trimmed = value.trim();
+        if (trimmed.length() >= 2
+                && ((trimmed.startsWith("'") && trimmed.endsWith("'"))
+                    || (trimmed.startsWith("\"") && trimmed.endsWith("\"")))) {
+            return trimmed.substring(1, trimmed.length() - 1);
+        }
+        return trimmed;
+    }
+
     /** GUCs whose value belongs to one transaction and is re-derived when the next one starts. */
     private static final Set<String> TRANSACTION_SCOPED_GUCS = Cols.setOf(
             "transaction_isolation", "transaction_read_only", "transaction_deferrable");
@@ -1141,7 +1270,7 @@ class SessionExecutor {
             "serializable", "repeatable read", "read committed", "read uncommitted");
 
     /** Validate a GUC parameter value based on the known type of the parameter. */
-    private void validateGucValue(String name, String value) {
+    void validateGucValue(String name, String value) {
         if (value == null || Strs.isBlank(value)) return;
         String lname = name.toLowerCase();
         // An isolation level the engine does not have would leave the session claiming an
@@ -1238,6 +1367,25 @@ class SessionExecutor {
             return;
         }
         // TimeZone
+        // An encoding the server cannot speak is not a client encoding, and setting one would
+        // have every later value written in a form the client cannot read.
+        if (lname.equals("client_encoding")) {
+            String encoding = unquoteSetting(value).toUpperCase(java.util.Locale.ROOT)
+                    .replace("-", "").replace("_", "");
+            if (!KNOWN_CLIENT_ENCODINGS.contains(encoding)) {
+                throw new MemgresException("invalid value for parameter \"client_encoding\": \""
+                        + unquoteSetting(value) + "\"", "22023");
+            }
+            return;
+        }
+        // A role a session may be set to has to be one the server has.
+        if (lname.equals("role") || lname.equals("session_authorization")) {
+            String role = unquoteSetting(value);
+            if (!role.equalsIgnoreCase("none") && !role.equalsIgnoreCase("default")) {
+                requireRole(role, lname);
+            }
+            return;
+        }
         if (lname.equals("timezone")) {
             String tz = value.trim();
             // Remove surrounding quotes if present
@@ -1248,7 +1396,10 @@ class SessionExecutor {
             try {
                 java.time.ZoneId.of(tz);
             } catch (Exception e) {
-                throw new MemgresException("unrecognized time zone name: \"" + tz + "\"", "22023");
+                // A zone nobody has is an invalid value for the parameter, which is how
+                // PostgreSQL reports it, by statement or by set_config alike.
+                throw new MemgresException(
+                        "invalid value for parameter \"TimeZone\": \"" + tz + "\"", "22023");
             }
         }
     }
@@ -1277,6 +1428,13 @@ class SessionExecutor {
         String iso = encodedMode(encoded, "iso");
         String ro = encodedMode(encoded, "ro");
         String def = encodedMode(encoded, "def");
+        // A procedural body runs inside the transaction the calling statement started, and that
+        // statement is a query the transaction has already run. Read as a session outside any
+        // block, a DO block setting the isolation level was allowed to say nothing at all.
+        if (iso != null && (session.isInFunctionContext() || session.isInRoutine())) {
+            throw new MemgresException(
+                    "SET TRANSACTION ISOLATION LEVEL must be called before any query", "25001");
+        }
         if (!session.isInTransaction()) {
             if (iso != null) warnOutsideBlock(session, "SET TRANSACTION");
             if (ro != null) warnOutsideBlock(session, "SET TRANSACTION");
@@ -1306,6 +1464,15 @@ class SessionExecutor {
             session.getGucSettings().set("transaction_deferrable", def);
         }
         if (ro != null) {
+            // A transaction may be made read-only at any point, but a read-only one cannot be
+            // made read-write again once it has run a query: that would change the mode a
+            // statement already ran under. Only isolation and deferrability were guarded, so the
+            // one direction that does matter went through silently.
+            boolean currentlyReadOnly = "on".equals(session.getGucSettings().get("transaction_read_only"));
+            if ("off".equals(ro) && currentlyReadOnly && session.hasRunQueryInTransaction()) {
+                throw new MemgresException(
+                        "transaction read-write mode must be set before any query", "25001");
+            }
             session.getGucSettings().set("transaction_read_only", ro);
         }
     }
@@ -1328,25 +1495,177 @@ class SessionExecutor {
     }
 
     /** Normalize a DateStyle value to PG canonical form (e.g. "ISO, DMY"). */
-    private static String normalizeDateStyle(String value) {
+    /**
+     * DateStyle holds two things — an output style and a field order — and a value may name
+     * either or both. The one it does not name keeps what it had; defaulting it instead meant
+     * {@code SET datestyle = 'ISO'} silently put the order back to MDY.
+     */
+    private static String normalizeDateStyle(String value, String current) {
         String trimmed = value.trim();
         if ((trimmed.startsWith("'") && trimmed.endsWith("'"))
                 || (trimmed.startsWith("\"") && trimmed.endsWith("\""))) {
             trimmed = trimmed.substring(1, trimmed.length() - 1);
         }
         String lower = trimmed.toLowerCase();
-        // Determine output style
-        String style = "ISO"; // default
+        String currentLower = current == null ? "" : current.toLowerCase();
+        String style = null;
         if (lower.contains("sql")) style = "SQL";
         else if (lower.contains("postgres")) style = "Postgres";
         else if (lower.contains("german")) style = "German";
         else if (lower.contains("iso")) style = "ISO";
-        // Determine date order
-        String order = "MDY"; // default
+        if (style == null) {
+            if (currentLower.contains("sql")) style = "SQL";
+            else if (currentLower.contains("postgres")) style = "Postgres";
+            else if (currentLower.contains("german")) style = "German";
+            else style = "ISO";
+        }
+        String order = null;
         if (lower.contains("dmy") || lower.contains("euro")) order = "DMY";
         else if (lower.contains("ymd")) order = "YMD";
-        else if (lower.contains("us")) order = "MDY";
+        else if (lower.contains("us") || lower.contains("mdy")) order = "MDY";
+        if (order == null) {
+            if (currentLower.contains("dmy")) order = "DMY";
+            else if (currentLower.contains("ymd")) order = "YMD";
+            else order = "MDY";
+        }
         return style + ", " + order;
+    }
+
+    /** The role a grant names, with the session's own spelled out. */
+    private String resolveRoleSpec(String role) {
+        if (role == null) return null;
+        String lower = role.toLowerCase();
+        if (lower.equals("current_user") || lower.equals("session_user")
+                || lower.equals("current_role")) {
+            return executor.sessionUser();
+        }
+        return role;
+    }
+
+    /**
+     * A role named in a membership grant has to exist — PUBLIC included, which is a grantee for
+     * privileges but is not a role that can hold or be held as a membership.
+     */
+    private void requireGrantRole(String role) {
+        if (role == null) return;
+        String lower = role.toLowerCase();
+        // A grant may name the session's own role rather than spell it out.
+        if (lower.equals("current_user") || lower.equals("session_user")
+                || lower.equals("current_role")) {
+            return;
+        }
+        if (executor.database.getRoles().containsKey(lower)) return;
+        String connecting = executor.session != null ? executor.session.getConnectingUser() : null;
+        if (connecting != null && role.equalsIgnoreCase(connecting)) return;
+        throw new MemgresException("role \"" + lower + "\" does not exist", "42704");
+    }
+
+    /** The collations every server has, whatever the catalogue was told to hold. */
+    private static final Set<String> BUILT_IN_COLLATIONS = new HashSet<>(Arrays.asList(
+            "default", "c", "posix", "ucs_basic", "unicode", "pg_c_utf8"));
+
+    /** Whether pg_language has a row for this language. */
+    private boolean languageExists(String language) {
+        Table languages = executor.systemCatalog.resolve("pg_catalog", "pg_language", executor.session);
+        int nameIdx = languages == null ? -1 : languages.getColumnIndex("lanname");
+        if (nameIdx < 0) return false;
+        for (Object[] row : languages.getRows()) {
+            if (language.equalsIgnoreCase(String.valueOf(row[nameIdx]))) return true;
+        }
+        return false;
+    }
+
+    /**
+     * A routine written the way a message names it: the name, then the argument types under the
+     * names a reader would write them with.
+     */
+    private static String commentRoutineSignature(String name, String writtenArgs) {
+        if (writtenArgs == null) return name;
+        String args = writtenArgs.substring(1, writtenArgs.lastIndexOf(')')).trim();
+        if (args.isEmpty()) return name + "()";
+        StringBuilder sb = new StringBuilder(name).append('(');
+        String[] parts = args.split(",");
+        for (int i = 0; i < parts.length; i++) {
+            if (i > 0) sb.append(", ");
+            sb.append(readableTypeSpelling(parts[i].trim()));
+        }
+        return sb.append(')').toString();
+    }
+
+    /**
+     * The routine of this name whose parameters are the ones written, or null when none is.
+     * A name with no argument list names the routine of that name whatever it takes.
+     */
+    private PgFunction routineWithSignature(String name, String writtenArgs) {
+        List<PgFunction> overloads = executor.database.getFunctionOverloads(name);
+        if (overloads == null || overloads.isEmpty()) return null;
+        if (writtenArgs == null) return overloads.get(0);
+        String wanted = writtenArgs.substring(1, writtenArgs.lastIndexOf(')')).trim();
+        List<String> want = new ArrayList<>();
+        if (!wanted.isEmpty()) {
+            for (String part : wanted.split(",")) want.add(readableTypeSpelling(part.trim()));
+        }
+        for (PgFunction fn : overloads) {
+            List<String> have = new ArrayList<>();
+            for (PgFunction.Param p : fn.getParams()) {
+                String mode = p.mode() == null ? "IN" : p.mode().toUpperCase();
+                if ("OUT".equals(mode)) continue;
+                have.add(readableTypeSpelling(p.typeName() == null ? "" : p.typeName().trim()));
+            }
+            if (have.equals(want)) return fn;
+        }
+        return null;
+    }
+
+    private static String readableTypeSpelling(String written) {
+        DataType type = DataType.fromPgName(written.toLowerCase());
+        if (type == null) return written;
+        return CatalogSystemFunctions.pgTypeDisplayName(type);
+    }
+
+    /**
+     * A role named by SET ROLE or SET SESSION AUTHORIZATION has to be one that exists.
+     *
+     * <p>The complaint was that the value was invalid for the parameter, which is what PostgreSQL
+     * says for a parameter whose value is out of range; for a role it names the role that is not
+     * there. The check also waved through three names spelled into the code — test, postgres and
+     * memgres — so those were accepted whether or not the server had them.
+     */
+    private void requireRole(String role, String parameter) {
+        if (role == null) return;
+        String lower = role.toLowerCase();
+        if (executor.database.getRoles().containsKey(lower)) return;
+        String connecting = executor.session != null ? executor.session.getConnectingUser() : null;
+        if (connecting != null && role.equalsIgnoreCase(connecting)) return;
+        throw new MemgresException("role \"" + role + "\" does not exist", "22023");
+    }
+
+    /**
+     * Refuse a language that cannot carry a DO block. A language the catalogue does not have does
+     * not exist at all; one that has no inline handler — sql, c, internal — has no inline form.
+     */
+    private void requireInlineLanguage(String language) {
+        Table languages = executor.systemCatalog.resolve("pg_catalog", "pg_language", executor.session);
+        int nameIdx = languages == null ? -1 : languages.getColumnIndex("lanname");
+        int inlineIdx = languages == null ? -1 : languages.getColumnIndex("laninline");
+        Object inline = null;
+        boolean known = false;
+        if (nameIdx >= 0) {
+            for (Object[] row : languages.getRows()) {
+                if (language.equals(row[nameIdx])) {
+                    known = true;
+                    inline = inlineIdx >= 0 ? row[inlineIdx] : null;
+                    break;
+                }
+            }
+        }
+        if (!known) {
+            throw new MemgresException("language \"" + language + "\" does not exist", "42704");
+        }
+        if (!(inline instanceof Number) || ((Number) inline).intValue() == 0) {
+            throw new MemgresException(
+                    "language \"" + language + "\" does not support inline code execution", "0A000");
+        }
     }
 
     private void executePlpgsqlBlock(String body) {
@@ -1360,12 +1679,21 @@ class SessionExecutor {
         if (executor.session != null) {
             String target = stmt.target().toUpperCase();
             if (target.equals("ALL")) {
+                if (executor.session.isInRoutine()) {
+                    throw new MemgresException(
+                        "DISCARD ALL cannot be executed from a function", "25001");
+                }
                 // PG: DISCARD ALL cannot run inside a transaction block
                 if (executor.session.isInTransaction()) {
                     throw new MemgresException(
                         "DISCARD ALL cannot run inside a transaction block", "25001");
                 }
                 executor.session.getGucSettings().resetAll();
+                // RESET ROLE and RESET SESSION AUTHORIZATION are part of DISCARD ALL, so the
+                // session speaks as the user it connected as again. Resetting the settings and
+                // leaving the field beside them meant it kept answering as the role it gave up.
+                executor.session.setConnectingUser(
+                        executor.session.getGucSettings().get("session_authorization"));
                 // L7: PG resets application_name to '' on DISCARD ALL
                 executor.session.getGucSettings().setBootDefault("application_name", "");
                 executor.session.removeAllPreparedStatements();
@@ -1399,8 +1727,11 @@ class SessionExecutor {
         if (stmt.lockMode() != null && !VALID_LOCK_MODES.contains(stmt.lockMode().toUpperCase())) {
             throw new MemgresException("syntax error at or near \"" + stmt.lockMode().split("\\s+")[0].toLowerCase() + "\"", "42601");
         }
-        // PG requires LOCK to be inside an explicit transaction
-        if (executor.session == null || !executor.session.isInTransaction()) {
+        // PG requires LOCK to be inside an explicit transaction. A routine body is one: a
+        // procedure or DO block runs inside a transaction whether or not the caller opened it,
+        // so a LOCK written in one is inside a transaction block and PostgreSQL takes it.
+        if (executor.session == null
+                || (!executor.session.isInTransaction() && !executor.session.isInRoutine())) {
             throw new MemgresException("LOCK TABLE can only be used in transaction blocks", "25P01");
         }
         // Convert PG mode name to pg_locks mode column format (e.g. "ACCESS EXCLUSIVE" -> "AccessExclusiveLock")
@@ -1421,7 +1752,16 @@ class SessionExecutor {
                 schema = table.substring(0, dot);
                 table = table.substring(dot + 1);
             }
-            executor.resolveTable(schema, table);
+            // A catalogue is a relation and can be locked like one; only user tables were looked
+            // for, so LOCK TABLE pg_class said the relation was not there.
+            try {
+                executor.resolveTable(schema, table);
+            } catch (MemgresException e) {
+                if (executor.systemCatalog.resolve(
+                        tblName.contains(".") ? schema : null, table, executor.session) == null) {
+                    throw e;
+                }
+            }
             String tableKey = schema + "." + table;
             executor.session.addTableLock(tableKey, modeStr);
             executor.database.acquireTableLock(tableKey, modeStr, executor.session, stmt.nowait());
@@ -1487,16 +1827,33 @@ class SessionExecutor {
             if (!grantorName.equalsIgnoreCase("current_user") && !grantorName.equalsIgnoreCase("session_user")
                     && !grantorName.equalsIgnoreCase("current_role")
                     && !grantorName.equalsIgnoreCase(currentUser)) {
+                // A grantor is a role first: naming one that is not there is a missing role, and
+                // only a role that exists can then be one the session is not allowed to act as.
+                requireGrantRole(grantorName);
+                if (s.isRoleGrant()) {
+                    throw new MemgresException(
+                            "permission denied to grant privileges as role \"" + grantorName + "\"", "42501");
+                }
                 throw new MemgresException("grantor must be current user", "0A000");
             }
         }
 
         if (s.isRoleGrant()) {
-            // Track role memberships
+            // Membership is between two roles, and both have to be roles. Recording a name that
+            // is not one built a membership nothing could ever be a member of, and pg_has_role
+            // then answered about roles the server does not have.
             if (s.privileges() != null && s.grantees() != null) {
+                // The grantor is resolved before the roles the grant is between.
+                if (s.grantor() != null) requireGrantRole(s.grantor());
+                // PostgreSQL reads the grantees next, so a missing member is what it names.
+                for (String member : s.grantees()) requireGrantRole(member);
+                for (String grantedRole : s.privileges()) requireGrantRole(grantedRole);
                 for (String grantedRole : s.privileges()) {
                     for (String member : s.grantees()) {
-                        executor.database.addRoleMembership(grantedRole, member, s.withAdminOption());
+                        // CURRENT_USER names the session's own role; recording it by that
+                        // spelling made a membership of a role nobody is.
+                        executor.database.addRoleMembership(resolveRoleSpec(grantedRole),
+                                resolveRoleSpec(member), s.withAdminOption());
                     }
                 }
             }
@@ -1695,11 +2052,15 @@ class SessionExecutor {
 
     QueryResult executeRevoke(RevokeStmt s) {
         if (s.isRoleGrant()) {
-            // Remove role memberships
+            // Taking a membership away names the same two roles granting one does, and both
+            // have to be roles for there to be a membership between them.
             if (s.privileges() != null && s.grantees() != null) {
+                for (String member : s.grantees()) requireGrantRole(member);
+                for (String grantedRole : s.privileges()) requireGrantRole(grantedRole);
                 for (String grantedRole : s.privileges()) {
                     for (String member : s.grantees()) {
-                        executor.database.removeRoleMembership(grantedRole, member);
+                        executor.database.removeRoleMembership(resolveRoleSpec(grantedRole),
+                                resolveRoleSpec(member));
                     }
                 }
             }
@@ -1772,12 +2133,21 @@ class SessionExecutor {
                 && !(stmt.body() instanceof com.memgres.engine.parser.ast.UpdateStmt)
                 && !(stmt.body() instanceof com.memgres.engine.parser.ast.DeleteStmt)
                 && !(stmt.body() instanceof com.memgres.engine.parser.ast.SetOpStmt)
-                && !(stmt.body() instanceof com.memgres.engine.parser.ast.MergeStmt)) {
+                && !(stmt.body() instanceof com.memgres.engine.parser.ast.MergeStmt)
+                && !(stmt.body() instanceof com.memgres.engine.parser.ast.CreateTableAsStmt)) {
             throw new MemgresException("utility statements cannot be prepared", "42601");
         }
         // Always infer param count from $N references in body
-        List<String> paramTypes = stmt.paramTypes();
+        List<String> paramTypes = declaredParameterTypes(stmt.paramTypes());
         int inferredCount = maxParamIndex(stmt.body());
+        // The relations and columns the query names have to be there now. PREPARE is where
+        // PostgreSQL analyses the statement, so a table that is missing is reported here and the
+        // statement is not remembered — EXECUTE then says there is no such prepared statement,
+        // rather than repeating the analysis failure at every execution.
+        new StatementAnalyzer(executor).analyze(stmt.body());
+        // Every parameter the query uses has to have a type. One that was never written about —
+        // $1 where only $2 appears — has nothing to infer from, and PostgreSQL names it.
+        requireEveryParameterTyped(inferredCount, paramTypes, stmt.body());
         // Validate the body at PREPARE time (PG does full analysis/type-checking here)
         validatePreparedBody(stmt.body(), paramTypes);
         // Extract original body SQL from the raw PREPARE statement for verbatim pg_prepared_statements display.
@@ -1973,23 +2343,74 @@ class SessionExecutor {
      */
     private List<String> inferResultTypesViaDryRun(Statement body) {
         try {
-            String sql = SqlUnparser.toSql(body);
-            if (sql == null) return null;
-            sql = sql.replaceAll("\\$\\d+", "NULL");
-            if (!sql.toUpperCase().contains("LIMIT")) {
-                sql = sql + " LIMIT 0";
-            }
-            QueryResult result = executor.execute(sql);
-            if (result.getColumns() != null && !result.getColumns().isEmpty()) {
-                List<String> types = new ArrayList<>();
-                for (Column col : result.getColumns()) {
-                    types.add(col.getType().toRegtypeDisplay());
+            SelectStmt sel = body instanceof SelectStmt ? (SelectStmt) body
+                    : body instanceof SetOpStmt ? firstSelectArm((SetOpStmt) body) : null;
+            if (sel == null || sel.targets() == null || sel.targets().isEmpty()) return null;
+            // The relations are opened for their columns, not for their rows: what a query answers
+            // is settled by what it is written as. Running it to read the shape back ran what the
+            // target list called, so preparing a query over nextval() moved the sequence and
+            // preparing one over a function wrote whatever that function writes.
+            List<RowContext.TableBinding> bindings = sel.from() == null || sel.from().isEmpty()
+                    ? null : executor.fromResolver.resolveTableBindings(sel.from());
+            RowContext shape = bindings == null || bindings.isEmpty() ? null : new RowContext(bindings);
+            List<String> types = new ArrayList<>();
+            for (SelectStmt.SelectTarget target : sel.targets()) {
+                if (target.expr() instanceof WildcardExpr) {
+                    if (bindings == null) return null;
+                    for (RowContext.TableBinding b : bindings) {
+                        Table t = b.sourceTable != null ? b.sourceTable : b.table();
+                        if (t == null) return null;
+                        for (Column col : t.getColumns()) types.add(col.getType().toRegtypeDisplay());
+                    }
+                    continue;
                 }
-                return types;
+                String declared = executor.binaryOpEvaluator.declaredTypeForResolution(
+                        target.expr(), shape);
+                if (declared == null) declared = shapeOnlyType(target.expr(), shape);
+                if (declared == null) return null;
+                types.add(declared);
             }
+            return types.isEmpty() ? null : types;
         } catch (Exception e) {
-            // Dry run failed — type inference is best-effort
+            // Reading the shape is best-effort: a query whose columns cannot be named without
+            // running it simply has none recorded.
         }
+        return null;
+    }
+
+    /**
+     * The type of an expression that can be worked out by evaluating it, because evaluating it
+     * changes nothing: a literal, and the casts and operators built over literals. A call is
+     * excluded whatever it is called — a function is free to write, and reading a prepared
+     * statement's shape is not permission to let it.
+     */
+    private String shapeOnlyType(Expression expr, RowContext shape) {
+        if (!isValueOnly(expr)) return null;
+        try {
+            Object value = executor.evalExpr(expr, shape);
+            return value == null ? null : AstExecutor.pgTypeNameOf(value);
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    /** Whether an expression is built only from literals, casts and operators over them. */
+    private static boolean isValueOnly(Expression expr) {
+        if (expr instanceof Literal) return true;
+        if (expr instanceof CastExpr) return isValueOnly(((CastExpr) expr).expr());
+        if (expr instanceof UnaryExpr) return isValueOnly(((UnaryExpr) expr).operand());
+        if (expr instanceof BinaryExpr) {
+            BinaryExpr bin = (BinaryExpr) expr;
+            return isValueOnly(bin.left()) && isValueOnly(bin.right());
+        }
+        return false;
+    }
+
+    /** The arm of a set operation whose columns the whole of it answers with. */
+    private static SelectStmt firstSelectArm(SetOpStmt setOp) {
+        Statement left = setOp.left();
+        if (left instanceof SelectStmt) return (SelectStmt) left;
+        if (left instanceof SetOpStmt) return firstSelectArm((SetOpStmt) left);
         return null;
     }
 
@@ -2042,6 +2463,84 @@ class SessionExecutor {
      * Validate a prepared statement body at PREPARE time, matching PG behavior
      * which performs type analysis before storing the prepared statement.
      */
+    /**
+     * The parameter types as PREPARE records them.
+     *
+     * <p>A declared parameter type is a type, not a type with a size: PostgreSQL drops the
+     * modifier, so {@code PREPARE p (varchar(3))} takes a varchar of any length and
+     * {@code PREPARE p (numeric(2,1))} does not round what it is given. Keeping the modifier
+     * turned the declaration into a cast, which truncated and rounded the caller's values.
+     */
+    private List<String> declaredParameterTypes(List<String> declared) {
+        if (declared == null) return null;
+        List<String> plain = new ArrayList<>();
+        for (String type : declared) {
+            if (type == null) { plain.add(null); continue; }
+            String name = type.trim();
+            int paren = name.indexOf('(');
+            if (paren > 0) {
+                String tail = name.substring(name.indexOf(')') + 1);
+                name = name.substring(0, paren).trim() + tail;
+            }
+            requireTypeExists(name);
+            plain.add(name);
+        }
+        return plain;
+    }
+
+    /** A declared parameter type that names nothing is reported the way any missing type is. */
+    private void requireTypeExists(String name) {
+        String bare = name.toLowerCase().trim();
+        while (bare.endsWith("[]")) bare = bare.substring(0, bare.length() - 2).trim();
+        if (bare.isEmpty()) return;
+        if (DataType.fromPgName(bare) != null) return;
+        if (executor.database.isCompositeType(bare) || executor.database.getDomain(bare) != null
+                || executor.database.getCustomEnum(bare) != null
+                || executor.database.isRangeType(bare)) {
+            return;
+        }
+        throw new MemgresException("type \"" + name + "\" does not exist", "42704");
+    }
+
+    /**
+     * Every parameter up to the highest one written has to be one the query says something about.
+     * {@code SELECT $2} uses $2 and never mentions $1, so $1 has no type to be given.
+     */
+    private void requireEveryParameterTyped(int highest, List<String> declared, Statement body) {
+        int declaredCount = declared == null ? 0 : declared.size();
+        if (highest <= declaredCount) return;
+        Set<Integer> used = new HashSet<>();
+        collectParamIndexes(body, used);
+        for (int i = 1; i <= highest; i++) {
+            if (i <= declaredCount) continue;
+            if (!used.contains(Integer.valueOf(i))) {
+                throw new MemgresException(
+                        "could not determine data type of parameter $" + i, "42P18");
+            }
+        }
+    }
+
+    /** The parameter numbers a statement actually writes. */
+    private void collectParamIndexes(Object node, Set<Integer> found) {
+        if (node == null) return;
+        if (node instanceof ParamRef) {
+            found.add(Integer.valueOf(((ParamRef) node).index()));
+            return;
+        }
+        if (node instanceof Iterable) {
+            for (Object o : (Iterable<?>) node) collectParamIndexes(o, found);
+            return;
+        }
+        if (!isAstNodeClass(node.getClass())) return;
+        for (java.lang.reflect.Field field : node.getClass().getDeclaredFields()) {
+            if (java.lang.reflect.Modifier.isStatic(field.getModifiers())) continue;
+            try {
+                field.setAccessible(true);
+                collectParamIndexes(field.get(node), found);
+            } catch (Exception e) { /* inaccessible: treat as leaf */ }
+        }
+    }
+
     private void validatePreparedBody(Statement body, List<String> paramTypes) {
         validatePreparedQueryShape(body);
         if (body instanceof SelectStmt) {
@@ -2158,6 +2657,13 @@ class SessionExecutor {
      * CASE WHEN (boolean context), operators providing type context.
      * @param hasTypeContext true if an ancestor provides type context (e.g., inside COALESCE, CAST, etc.)
      */
+    /** Whether this operand offers a type to the other side of an operator. */
+    private static boolean isTypedOperand(Expression expr, List<String> paramTypes) {
+        if (!(expr instanceof ParamRef)) return true;
+        int idx = ((ParamRef) expr).index() - 1;
+        return paramTypes != null && idx >= 0 && idx < paramTypes.size();
+    }
+
     private void checkForUntypedParams(Expression expr, List<String> paramTypes, boolean hasTypeContext) {
         if (expr == null) return;
         if (expr instanceof ParamRef) {
@@ -2198,9 +2704,11 @@ class SessionExecutor {
         // BinaryExpr with typed operand provides context
         if (expr instanceof BinaryExpr) {
             BinaryExpr b = (BinaryExpr) expr;
-            // If one side is typed (literal, cast, etc.), the other gets context
-            boolean leftTyped = !(b.left() instanceof ParamRef);
-            boolean rightTyped = !(b.right() instanceof ParamRef);
+            // If one side is typed (literal, cast, etc.), the other gets context. A parameter
+            // the statement declared a type for is typed too: PREPARE p (int) AS SELECT $1 + $2
+            // gives $2 the integer $1 already is, which is how PostgreSQL types it.
+            boolean leftTyped = isTypedOperand(b.left(), paramTypes);
+            boolean rightTyped = isTypedOperand(b.right(), paramTypes);
             checkForUntypedParams(b.left(), paramTypes, hasTypeContext || rightTyped);
             checkForUntypedParams(b.right(), paramTypes, hasTypeContext || leftTyped);
             return;
@@ -2392,8 +2900,10 @@ class SessionExecutor {
         int expectedParams = declaredCount > 0 ? Math.max(declaredCount, inferredFromBody) : inferredFromBody;
         int actualParams = stmt.params() != null ? stmt.params().size() : 0;
         if (actualParams != expectedParams) {
-            throw new MemgresException("wrong number of parameters for prepared statement \"" + stmt.name()
-                    + "\": expected " + expectedParams + ", got " + actualParams, "42601");
+            // How many were expected and how many arrived is the detail behind the complaint, not
+            // the complaint itself, and a client matching on the message read a different one.
+            throw new MemgresException(
+                    "wrong number of parameters for prepared statement \"" + stmt.name() + "\"", "42601");
         }
         // Bind parameters
         List<Object> savedParams = new ArrayList<>(executor.boundParameters);
@@ -2535,8 +3045,18 @@ class SessionExecutor {
         if (executor.session.getCursor(stmt.name()) != null) {
             throw new MemgresException("cursor \"" + stmt.name() + "\" already exists", "42P03");
         }
-        // Execute the query to get all results (may be SELECT or UNION/INTERSECT/EXCEPT)
-        QueryResult result = executor.executeStatement(stmt.query());
+        // Execute the query to get all results (may be SELECT or UNION/INTERSECT/EXCEPT), keeping
+        // the stored rows behind each answer so WHERE CURRENT OF can name a row rather than
+        // hunting for one whose columns happen to match.
+        List<List<RowContext.TableBinding>> provenance = new ArrayList<>();
+        QueryResult result;
+        List<List<RowContext.TableBinding>> outerProvenance = executor.cursorRowProvenance;
+        executor.cursorRowProvenance = provenance;
+        try {
+            result = executor.executeStatement(stmt.query());
+        } finally {
+            executor.cursorRowProvenance = outerProvenance;
+        }
         List<Object[]> rows = result.getRows() != null ? new ArrayList<>(result.getRows()) : new ArrayList<>();
         List<Column> columns = result.getColumns() != null ? result.getColumns() : Cols.listOf();
         // PG stores the full DECLARE statement in pg_cursors.statement, not just the query.
@@ -2544,9 +3064,13 @@ class SessionExecutor {
                 ("DECLARE " + stmt.name() + (stmt.scroll ? " SCROLL" : "")
                  + " CURSOR" + (stmt.withHold ? " WITH HOLD" : "")
                  + " FOR " + SqlUnparser.toSql(stmt.query()));
-        executor.session.addCursor(stmt.name(),
-                new Session.CursorState(stmt.name(), columns, rows,
-                        queryText, stmt.withHold, stmt.binary, stmt.scroll, stmt.explicitNoScroll));
+        Session.CursorState cursor = new Session.CursorState(stmt.name(), columns, rows,
+                queryText, stmt.withHold, stmt.binary, stmt.scroll, stmt.explicitNoScroll);
+        // Only a scan that answered one row per stored row can be positioned onto one of them.
+        if (provenance.size() == rows.size()) cursor.setProvenance(provenance);
+        cursor.setLocking(stmt.query() instanceof SelectStmt
+                && ((SelectStmt) stmt.query()).lockClause() != null);
+        executor.session.addCursor(stmt.name(), cursor);
         return QueryResult.message(QueryResult.Type.SET, "DECLARE CURSOR");
     }
 

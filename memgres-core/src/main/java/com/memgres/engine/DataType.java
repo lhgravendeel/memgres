@@ -105,6 +105,7 @@ public enum DataType {
     FLOAT8_ARRAY(1022, "_float8"),
     NUMERIC_ARRAY(1231, "_numeric"),
     TEXT_ARRAY(1009, "_text"),
+    REGTYPE_ARRAY(2211, "_regtype"),
     VARCHAR_ARRAY(1015, "_varchar"),
     CHAR_ARRAY(1014, "_bpchar"),
     NAME_ARRAY(1003, "_name"),
@@ -467,6 +468,7 @@ public enum DataType {
             case FLOAT8_ARRAY: return DOUBLE_PRECISION;
             case NUMERIC_ARRAY: return NUMERIC;
             case TEXT_ARRAY: return TEXT;
+            case REGTYPE_ARRAY: return REGTYPE;
             case VARCHAR_ARRAY: return VARCHAR;
             case CHAR_ARRAY: return CHAR;
             case NAME_ARRAY: return NAME;

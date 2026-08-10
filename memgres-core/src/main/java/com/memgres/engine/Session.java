@@ -18,6 +18,10 @@ public class Session {
 
     private final Database database;
     private final AstExecutor executor;
+
+    /** The executor this session's statements run through. */
+    public AstExecutor executor() { return executor; }
+
     private String databaseName = "memgres";
     private DatabaseRegistry databaseRegistry;
     private volatile TransactionStatus status = TransactionStatus.IDLE;
@@ -302,6 +306,10 @@ public class Session {
         private final boolean explicitNoScroll;
         private final java.time.OffsetDateTime creationTime;
         private boolean committed; // true after the declaring transaction commits
+        /** The stored rows each answer came from, when the query was a scan that has them. */
+        private List<List<RowContext.TableBinding>> provenance;
+        /** Whether the query was written FOR UPDATE or FOR SHARE, which changes what is refused. */
+        private boolean locking;
 
         public CursorState(String name, List<Column> columns, List<Object[]> rows,
                            String queryText, boolean holdable, boolean binary, boolean scrollable,
@@ -346,6 +354,39 @@ public class Session {
         }
 
         public void setPosition(int pos) { this.position = pos; }
+
+        public void setProvenance(List<List<RowContext.TableBinding>> rowProvenance) {
+            this.provenance = rowProvenance;
+        }
+
+        public void setLocking(boolean forUpdateOrShare) { this.locking = forUpdateOrShare; }
+
+        public boolean isLocking() { return locking; }
+
+        /**
+         * The stored row of {@code table} this cursor is on, or null when its query is not a scan
+         * that reads that table. PostgreSQL calls a cursor that reads the table directly a simply
+         * updatable scan of it, and only such a cursor can be named by WHERE CURRENT OF.
+         */
+        public Object[] currentRowOf(Table table) {
+            if (provenance == null || position < 0 || position >= provenance.size()) return null;
+            for (RowContext.TableBinding binding : provenance.get(position)) {
+                if (binding.row == null) continue;
+                if (binding.table == table || binding.sourceTable == table) return binding.row;
+            }
+            return null;
+        }
+
+        /** Whether the query behind this cursor reads {@code table} at all. */
+        public boolean scans(Table table) {
+            if (provenance == null) return false;
+            for (List<RowContext.TableBinding> bindings : provenance) {
+                for (RowContext.TableBinding binding : bindings) {
+                    if (binding.table == table || binding.sourceTable == table) return true;
+                }
+            }
+            return false;
+        }
     }
 
     // SSI: tables read and written by this serializable transaction (for write-skew detection)
@@ -523,6 +564,17 @@ public class Session {
         boolean allowedWhileAborted = upper.startsWith("COMMIT") || upper.startsWith("END")
                 || upper.startsWith("ABORT") || upper.startsWith("ROLLBACK");
         if (status == TransactionStatus.FAILED && !allowedWhileAborted) {
+            // The statement is read before the transaction is judged unfit to run it, so text
+            // that is not a statement at all is a syntax error even here. Refusing first told a
+            // client its transaction was aborted when what it had actually sent was nonsense.
+            try {
+                com.memgres.engine.parser.Parser.parse(sql, new ArrayList<String>());
+            } catch (MemgresException parseFailure) {
+                throw parseFailure;
+            } catch (RuntimeException ignored) {
+                // Anything the parser could not make sense of in another way is left to the
+                // aborted-transaction report below, which is the answer for a readable statement.
+            }
             throw new MemgresException(
                     "current transaction is aborted, commands ignored until end of transaction block",
                     "25P02");
@@ -656,6 +708,22 @@ public class Session {
         database.clearUncommittedObjects(this);
         // M13: snapshot session GUC overrides so plain SET can be rolled back
         gucSessionSnapshot = gucSettings.snapshotSessionOverrides();
+        // LISTEN is undone by ROLLBACK the way any other statement is: a channel subscribed to in
+        // a transaction that did not commit was never subscribed to.
+        listenSnapshot = new LinkedHashSet<>(database.getNotificationManager().getListeningChannels(this));
+    }
+
+    /** The channels this session was listening to when the transaction began. */
+    private Set<String> listenSnapshot;
+
+    /** Put back the channels the session was listening to before work that did not stand. */
+    private void restoreListens(Set<String> snapshot) {
+        if (snapshot == null) return;
+        NotificationManager manager = database.getNotificationManager();
+        for (String channel : manager.getListeningChannels(this)) {
+            if (!snapshot.contains(channel)) manager.unlisten(this, channel);
+        }
+        for (String channel : snapshot) manager.listen(this, channel);
     }
 
     /** Returns the transaction start timestamp (frozen for now()/current_timestamp stability), or null if not in a transaction. */
@@ -781,6 +849,9 @@ public class Session {
             gucSettings.restoreSessionOverrides(gucSessionSnapshot);
             gucSessionSnapshot = null;
         }
+        restoreSessionIdentity();
+        restoreListens(listenSnapshot);
+        listenSnapshot = null;
         // Reset per-transaction GUCs (transaction_read_only, transaction_isolation)
         gucSettings.reset("transaction_read_only");
         gucSettings.reset("transaction_isolation");
@@ -901,6 +972,9 @@ public class Session {
         final MvccSnapshot mvcc;
         /** The cursors that existed when the savepoint was taken; later ones die with it. */
         final Set<String> cursorNames;
+        /** The channels subscribed to, and the advisory locks held, when it was taken. */
+        Set<String> listens;
+        Map<Database.AdvisoryLockId, int[]> advisoryHolds;
 
         SavepointFrame(String name, int undoPosition, int notificationCount,
                        int deferredCheckCount, long lockMark,
@@ -966,13 +1040,25 @@ public class Session {
         internalSavepoint(name);
     }
 
+    /**
+     * Put back the user the session speaks as, after its settings have been.
+     *
+     * <p>SET SESSION AUTHORIZATION changes a setting and a field beside it. The setting was on the
+     * undo log and the field was not, so a rolled-back transaction left the session still
+     * answering current_user with the role it had given up.
+     */
+    private void restoreSessionIdentity() {
+        String authorized = gucSettings.get("session_authorization");
+        if (authorized != null && !authorized.isEmpty()) setConnectingUser(authorized);
+    }
+
     /** A savepoint the engine takes for itself, such as a PL/pgSQL exception block. */
     public void internalSavepoint(String name) {
         if (status != TransactionStatus.IN_TRANSACTION) {
             // Implicit BEGIN
             begin();
         }
-        savepoints.add(new SavepointFrame(name, undoLog.size(),
+        SavepointFrame frame = new SavepointFrame(name, undoLog.size(),
                 deferredNotifications.size(), deferredFkChecks.size(),
                 database.currentRowLockMark(),
                 getGucSettings().snapshotSessionOverrides(),
@@ -980,7 +1066,10 @@ public class Session {
                 // Snapshot current MVCC maps so we can restore on ROLLBACK TO SAVEPOINT.
                 // Deep-copy the outer maps; inner collections are identity-based.
                 MvccSnapshot.capture(uncommittedInserts, uncommittedUpdates, uncommittedDeletes),
-                new LinkedHashSet<>(cursors.keySet())));
+                new LinkedHashSet<>(cursors.keySet()));
+        frame.listens = new LinkedHashSet<>(database.getNotificationManager().getListeningChannels(this));
+        frame.advisoryHolds = database.advisoryXactHolds(this);
+        savepoints.add(frame);
     }
 
     /** Snapshot of MVCC tracking maps at savepoint creation time. */
@@ -1080,6 +1169,9 @@ public class Session {
         if (frame.localGucs != null) {
             getGucSettings().restoreTransactionOverrides(frame.localGucs);
         }
+        restoreSessionIdentity();
+        restoreListens(frame.listens);
+        database.restoreAdvisoryXactHolds(this, frame.advisoryHolds);
 
         // Truncate deferred notifications to the savepoint's count
         if (frame.notificationCount < deferredNotifications.size()) {
@@ -1338,9 +1430,10 @@ public class Session {
                 if ("pg_catalog".equals(s) || "information_schema".equals(s)
                         || database.getSchema(s) != null) return s;
             }
-            if (hasEntries) {
-                throw new MemgresException("no schema has been selected to create in", "3F000");
-            }
+            // A path that names schemas but reaches none of them, and a path written empty,
+            // both select nothing to create in. Falling back to public created the relation
+            // somewhere the reader had excluded.
+            throw new MemgresException("no schema has been selected to create in", "3F000");
         }
         return "public";
     }
@@ -1349,6 +1442,61 @@ public class Session {
      * Returns the full effective search path as an ordered list of schema names.
      * Matches PG's current_schemas() behavior.
      */
+    /**
+     * The search path as {@code current_schemas} reports it: the schemas that are there.
+     *
+     * <p>A path may name a schema that does not exist — nothing stops {@code SET search_path} from
+     * naming one — and PostgreSQL simply does not look in it, so it is not part of the path either.
+     * Reporting the names as written listed a schema no name could ever resolve in, and adding
+     * "public" whether or not the path asked for it reported one the reader had excluded.
+     */
+    public List<String> getExistingSearchPath(boolean includeImplicit) {
+        // What the path names, in the order it names it, keeping only the schemas that are there.
+        List<String> named = new ArrayList<>();
+        String searchPath = gucSettings.get("search_path");
+        String tempSchema = getTempSchemaName();
+        boolean namesTemp = false;
+        boolean namesCatalog = false;
+        if (searchPath != null) {
+            for (String sp : searchPath.split(",")) {
+                String s = sp.trim().replace("\"", "").replace("'", "");
+                if (s.isEmpty()) continue;
+                if (s.equals("$user")) s = getConnectingUser();
+                if (s == null) continue;
+                if (s.equals("pg_temp") || s.equals(tempSchema)) {
+                    namesTemp = true;
+                    if (database.getSchema(tempSchema) == null) continue;
+                    s = tempSchema;
+                } else if (s.equals("pg_catalog")) {
+                    namesCatalog = true;
+                }
+                if (named.contains(s)) continue;
+                if ("pg_catalog".equals(s) || "information_schema".equals(s)
+                        || database.getSchema(s) != null) {
+                    named.add(s);
+                }
+            }
+        }
+        if (!includeImplicit) return named;
+        // The implicit schemas come first — the session's temporary one, then the catalogue —
+        // but only while the path has not said where it wants them. A path that names pg_catalog
+        // puts it where it was named, and prepending it regardless reported an order the reader
+        // had deliberately changed.
+        List<String> result = new ArrayList<>();
+        if (!namesTemp && database.getSchema(tempSchema) != null) result.add(tempSchema);
+        if (!namesCatalog) result.add("pg_catalog");
+        for (String s : named) {
+            if (!result.contains(s)) result.add(s);
+        }
+        return result;
+    }
+
+    /** The first schema of the path that exists, or null when none of them does. */
+    public String getReportedSchema() {
+        List<String> path = getExistingSearchPath(false);
+        return path.isEmpty() ? null : path.get(0);
+    }
+
     public List<String> getEffectiveSearchPath(boolean includeImplicit) {
         List<String> result = new ArrayList<>();
         if (includeImplicit) result.add("pg_catalog");
@@ -1368,16 +1516,20 @@ public class Session {
 
     // ---- Prepared statements ----
 
+    // A prepared statement and a cursor are named by an identifier, which is folded to lower case
+    // when it is written plainly and kept as it stands when it is quoted. Folding the name again
+    // here made PREPARE "P" and EXECUTE p the same statement, which in PostgreSQL they are not.
+
     public void addPreparedStatement(String name, PreparedStmt stmt) {
-        preparedStatements.put(name.toLowerCase(), stmt);
+        preparedStatements.put(name, stmt);
     }
 
     public PreparedStmt getPreparedStatement(String name) {
-        return preparedStatements.get(name.toLowerCase());
+        return preparedStatements.get(name);
     }
 
     public void removePreparedStatement(String name) {
-        preparedStatements.remove(name.toLowerCase());
+        preparedStatements.remove(name);
     }
 
     public void removeAllPreparedStatements() {
@@ -1404,15 +1556,15 @@ public class Session {
     }
 
     public void addCursor(String name, CursorState cursor) {
-        cursors.put(name.toLowerCase(), cursor);
+        cursors.put(name, cursor);
     }
 
     public CursorState getCursor(String name) {
-        return cursors.get(name.toLowerCase());
+        return cursors.get(name);
     }
 
     public void removeCursor(String name) {
-        cursors.remove(name.toLowerCase());
+        cursors.remove(name);
     }
 
     public void removeAllCursors() {
@@ -1444,6 +1596,40 @@ public class Session {
         tableLocks.put(tableKey, mode);
     }
 
+    /**
+     * The lock a statement takes on a relation it touches, and how strong it is.
+     *
+     * <p>pg_locks used to show an AccessShareLock on every relation for every session, whether or
+     * not anything had touched it and whether or not a transaction was open. So a reader looking
+     * for what a transaction holds saw locks nobody had taken, and never saw that an UPDATE holds
+     * a stronger one than a SELECT.
+     */
+    private final Map<String, String> relationLocks = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** Rank of the lock modes a statement can take, weakest first. */
+    private static final List<String> RELATION_LOCK_STRENGTH = java.util.Arrays.asList(
+            "AccessShareLock", "RowShareLock", "RowExclusiveLock", "ShareUpdateExclusiveLock",
+            "ShareLock", "ShareRowExclusiveLock", "ExclusiveLock", "AccessExclusiveLock");
+
+    /** Record that this statement touched {@code tableKey}, keeping the strongest lock taken. */
+    public void recordRelationLock(String tableKey, String mode) {
+        if (tableKey == null || mode == null) return;
+        // Locks belong to a transaction; outside one PostgreSQL has already let them go by the
+        // time anything can look.
+        if (status != TransactionStatus.IN_TRANSACTION) return;
+        String held = relationLocks.get(tableKey);
+        if (held != null
+                && RELATION_LOCK_STRENGTH.indexOf(held) >= RELATION_LOCK_STRENGTH.indexOf(mode)) {
+            return;
+        }
+        relationLocks.put(tableKey, mode);
+    }
+
+    /** The relations this session's transaction holds a lock on, and the mode of each. */
+    public Map<String, String> getRelationLocks() {
+        return relationLocks;
+    }
+
     /** Get explicit table locks. */
     public Map<String, String> getTableLocks() {
         return tableLocks;
@@ -1451,6 +1637,8 @@ public class Session {
 
     /** Release all explicit table locks. Called on commit/rollback. */
     public void releaseTableLocks() {
+        // The locks a statement took go with the transaction that took them.
+        relationLocks.clear();
         tableLocks.clear();
         if (database != null) {
             database.releaseTableLocks(this);
@@ -1516,6 +1704,17 @@ public class Session {
 
     public void exitRoutine() {
         if (routineDepth > 0) routineDepth--;
+    }
+
+    /**
+     * Whether a function, procedure or DO block is on the call chain.
+     *
+     * <p>Several statements cannot run from one — VACUUM and DISCARD among them — and the gates
+     * that refuse them asked whether a transaction was open instead, which a DO block's implicit
+     * transaction leaves false. So they ran from inside a routine and PostgreSQL refuses them.
+     */
+    public boolean isInRoutine() {
+        return routineDepth > 0;
     }
 
     public void enterTriggerCall() {
@@ -1986,6 +2185,14 @@ public class Session {
 
     /** Import an exported snapshot into this session's RR snapshots. */
     public void importSnapshot(Database db, String snapshotId) {
+        // Whether the transaction may take another transaction's snapshot at all is settled
+        // before the identifier is read, so a session at READ COMMITTED is told what is wrong
+        // with the transaction rather than what is wrong with a name it was never going to use.
+        String level = getEffectiveIsolationLevel();
+        if (level != null && !level.startsWith("serializable") && !level.startsWith("repeatable")) {
+            throw new MemgresException("a snapshot-importing transaction must have isolation level "
+                    + "SERIALIZABLE or REPEATABLE READ", "0A000");
+        }
         Map<String, List<Object[]>> snap = db.importSnapshot(snapshotId);
         if (snap == null) {
             throw new MemgresException("invalid snapshot identifier: \"" + snapshotId + "\"", "22023");

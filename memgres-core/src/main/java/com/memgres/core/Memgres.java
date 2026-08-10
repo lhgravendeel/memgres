@@ -42,7 +42,7 @@ public class Memgres implements Closeable {
     private int actualPort;
     private DatabaseSnapshot snapshot;
 
-    private Memgres(int port, int maxConnections, String bindAddress, boolean logStatements,
+    private Memgres(int port, int maxConnections, int maxPreparedTransactions, String bindAddress, boolean logStatements,
                     String defaultDatabaseName, boolean autoCreateDatabases) {
         this.requestedPort = port;
         this.maxConnections = maxConnections;
@@ -52,6 +52,7 @@ public class Memgres implements Closeable {
         this.autoCreateDatabases = autoCreateDatabases;
         this.registry = new DatabaseRegistry(defaultDatabaseName);
         this.registry.setMaxConnections(maxConnections);
+        this.registry.setMaxPreparedTransactions(maxPreparedTransactions);
         this.registry.setAutoCreateDatabases(autoCreateDatabases);
         this.database = registry.getDefaultDatabase();
     }
@@ -125,6 +126,7 @@ public class Memgres implements Closeable {
         private boolean logAllStatements = false;
         private String defaultDatabaseName = "memgres";
         private boolean autoCreateDatabases = true;
+        private int maxPreparedTransactions = 0;
 
         public Builder port(int port) {
             this.port = port;
@@ -137,6 +139,18 @@ public class Memgres implements Closeable {
          */
         public Builder maxConnections(int maxConnections) {
             this.maxConnections = maxConnections;
+            return this;
+        }
+
+        /**
+         * How many two-phase transactions may be prepared at once.
+         *
+         * <p>PostgreSQL fixes this at server start and refuses SET for it, so a server that is to
+         * allow PREPARE TRANSACTION is built with it rather than told about it afterwards.
+         * Default is 0, which turns two-phase commit off exactly as PostgreSQL's default does.
+         */
+        public Builder maxPreparedTransactions(int maxPreparedTransactions) {
+            this.maxPreparedTransactions = maxPreparedTransactions;
             return this;
         }
 
@@ -180,7 +194,7 @@ public class Memgres implements Closeable {
         }
 
         public Memgres build() {
-            return new Memgres(port, maxConnections, bindAddress, logAllStatements,
+            return new Memgres(port, maxConnections, maxPreparedTransactions, bindAddress, logAllStatements,
                     defaultDatabaseName, autoCreateDatabases);
         }
     }

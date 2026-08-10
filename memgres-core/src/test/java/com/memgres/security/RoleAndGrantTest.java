@@ -209,8 +209,10 @@ class RoleAndGrantTest {
 
     @Test
     @DisplayName("setRole: SET ROLE DEFAULT succeeds")
-    void setRole_default_succeeds() {
-        assertDoesNotThrow(() -> exec("SET ROLE DEFAULT"));
+    void setRole_default_isASyntaxError() {
+        // SET ROLE takes a role name or NONE; DEFAULT is not one of its spellings.
+        SQLException e = assertThrows(SQLException.class, () -> exec("SET ROLE DEFAULT"));
+        assertEquals("42601", e.getSQLState());
     }
 
     @Test

@@ -727,6 +727,7 @@ class DdlObjectExecutor {
 
     QueryResult executeCreateFunction(CreateFunctionStmt stmt) {
         SchemaQualifier.requireSchema(executor.database, executor.session, stmt.schema());
+        rejectOutParameterAfterDefault(stmt);
         if ("pg_catalog".equalsIgnoreCase(stmt.schema())) {
             throw new MemgresException("permission denied to create function in schema pg_catalog", "42501");
         }
@@ -1726,32 +1727,257 @@ class DdlObjectExecutor {
 
     // ---- CALL ----
 
-    QueryResult executeCall(CallStmt stmt) {
-        PgFunction function;
-        String callName = stmt.name();
+    /**
+     * A procedure's OUT parameters come before any parameter with a default.
+     *
+     * <p>A CALL supplies its arguments in order and an OUT parameter takes a place in that order,
+     * so one written after a defaulted parameter can never be reached: the call would have to
+     * leave out the default to get to it. PostgreSQL refuses the declaration rather than the call.
+     */
+    private void rejectOutParameterAfterDefault(CreateFunctionStmt stmt) {
+        if (stmt.parsedParams == null || !stmt.isProcedure()) return;
+        boolean seenDefault = false;
+        for (CreateFunctionStmt.FuncParam p : stmt.parsedParams) {
+            String mode = p.mode == null ? "IN" : p.mode.toUpperCase();
+            if ("OUT".equals(mode)) {
+                if (seenDefault) {
+                    throw new MemgresException(
+                            "procedure OUT parameters cannot appear after one with a default value",
+                            "42P13");
+                }
+                continue;
+            }
+            if (p.defaultExpr != null && !p.defaultExpr.isEmpty()) seenDefault = true;
+        }
+    }
+
+    /** A CALL argument is a value; a query that produces one is not one. */
+    private void rejectSubqueryArgument(Expression expr) {
+        if (expr == null) return;
+        if (expr instanceof SubqueryExpr) {
+            throw new MemgresException("cannot use subquery in CALL argument", "0A000");
+        }
+        for (Expression child : argumentChildren(expr)) rejectSubqueryArgument(child);
+    }
+
+    /** Nor is an aggregate, which needs rows to aggregate and a CALL has none. */
+    private void rejectAggregateArgument(Expression expr) {
+        if (expr == null) return;
+        if (expr instanceof FunctionCallExpr
+                && CALL_AGGREGATES.contains(((FunctionCallExpr) expr).name().toLowerCase())) {
+            throw new MemgresException(
+                    "aggregate functions are not allowed in CALL arguments", "42803");
+        }
+        for (Expression child : argumentChildren(expr)) rejectAggregateArgument(child);
+    }
+
+    private static final Set<String> CALL_AGGREGATES = new HashSet<>(Arrays.asList(
+            "count", "sum", "avg", "min", "max", "array_agg", "string_agg", "bool_and", "bool_or",
+            "every", "json_agg", "jsonb_agg", "xmlagg", "stddev", "variance"));
+
+    /** The sub-expressions of a CALL argument, for the two things an argument may not contain. */
+    private static List<Expression> argumentChildren(Expression expr) {
+        List<Expression> kids = new ArrayList<>();
+        if (expr instanceof BinaryExpr) {
+            kids.add(((BinaryExpr) expr).left());
+            kids.add(((BinaryExpr) expr).right());
+        } else if (expr instanceof UnaryExpr) {
+            kids.add(((UnaryExpr) expr).operand());
+        } else if (expr instanceof FunctionCallExpr) {
+            List<Expression> args = ((FunctionCallExpr) expr).args();
+            if (args != null) kids.addAll(args);
+        } else if (expr instanceof CastExpr) {
+            kids.add(((CastExpr) expr).expr());
+        }
+        return kids;
+    }
+
+    /** The types a call's arguments have, named the way a message names them. */
+    private List<String> callArgumentTypes(List<Expression> args) {
+        List<String> names = new ArrayList<>();
+        for (Expression arg : args) {
+            names.add(callArgumentType(
+                    arg instanceof NamedArgExpr ? ((NamedArgExpr) arg).value() : arg));
+        }
+        return names;
+    }
+
+    private String callArgumentType(Expression arg) {
+        if (arg instanceof CastExpr) return ((CastExpr) arg).typeName();
+        Object value;
+        try {
+            value = executor.evalExpr(arg, null);
+        } catch (RuntimeException e) {
+            return "unknown";
+        }
+        if (value instanceof Integer) return "integer";
+        if (value instanceof Short) return "smallint";
+        if (value instanceof Long) return "bigint";
+        if (value instanceof Boolean) return "boolean";
+        if (value instanceof java.math.BigDecimal) return "numeric";
+        if (value instanceof Float) return "real";
+        if (value instanceof Double) return "double precision";
+        if (value instanceof String) return "text";
+        return "unknown";
+    }
+
+    /**
+     * The procedure a call names: the one of that name whose parameters the call can supply.
+     */
+    private PgFunction resolveProcedure(String callName, int argCount, List<String> argTypes) {
+        List<PgFunction> candidates;
         if (callName.contains(".")) {
             String[] parts = callName.split("\\.", 2);
-            function = executor.database.getFunction(parts[0], parts[1]);
+            candidates = executor.database.getFunctionOverloads(parts[0], parts[1]);
         } else {
-            function = executor.database.getFunction(callName);
+            candidates = executor.database.getFunctionOverloads(callName);
         }
+        if (candidates == null || candidates.isEmpty()) return null;
+        // Prefer a signature the arguments actually fit; fall back to one that merely takes that
+        // many, so a call with an argument of no knowable type still reaches a procedure.
+        for (PgFunction candidate : candidates) {
+            if (acceptsArgumentCount(candidate, argCount)
+                    && acceptsArgumentTypes(candidate, argTypes)) {
+                return candidate;
+            }
+        }
+        for (PgFunction candidate : candidates) {
+            if (acceptsArgumentCount(candidate, argCount) && argTypes.contains("unknown")) {
+                return candidate;
+            }
+        }
+        // A name that exists but takes other arguments is still "does not exist" with the types
+        // written; a name that is not a procedure at all is reported by the caller.
+        for (PgFunction candidate : candidates) {
+            if (!candidate.isProcedure()) return candidate;
+        }
+        return null;
+    }
+
+    /**
+     * Whether the arguments written can be passed to this routine's parameters.
+     *
+     * <p>A value is passed when its type is the parameter's, or when it is a kind of number the
+     * parameter's type holds without losing anything: an integer fits a bigint or a numeric, and
+     * a numeric does not fit an integer. PostgreSQL will not silently round an argument down to
+     * reach a procedure, and neither did the call the reader wrote.
+     */
+    private static boolean acceptsArgumentTypes(PgFunction fn, List<String> argTypes) {
+        for (PgFunction.Param p : fn.getParams()) {
+            if ("VARIADIC".equalsIgnoreCase(p.mode())) return true;
+        }
+        int at = 0;
+        for (PgFunction.Param p : fn.getParams()) {
+            String mode = p.mode() == null ? "IN" : p.mode().toUpperCase();
+            if ("OUT".equals(mode)) continue;
+            if (at >= argTypes.size()) break;
+            String given = argTypes.get(at++);
+            if ("unknown".equals(given)) continue;
+            if (!typeFits(given, p.typeName())) return false;
+        }
+        return true;
+    }
+
+    /** Whether a value of {@code given} reaches a parameter declared {@code declared}. */
+    private static boolean typeFits(String given, String declared) {
+        if (declared == null) return true;
+        String want = declared.trim().toLowerCase();
+        int paren = want.indexOf('(');
+        if (paren > 0) want = want.substring(0, paren).trim();
+        String have = given.toLowerCase();
+        if (have.equals(want)) return true;
+        int haveRank = numericRank(have);
+        int wantRank = numericRank(want);
+        if (haveRank > 0 && wantRank > 0) return haveRank <= wantRank;
+        // Names for one type, written more than one way.
+        if (want.equals("int") || want.equals("int4") || want.equals("integer")) {
+            return have.equals("integer") || have.equals("smallint");
+        }
+        if (want.equals("varchar") || want.equals("character varying")) return have.equals("text");
+        if (want.equals("text")) return have.equals("text") || have.equals("character varying");
+        return false;
+    }
+
+    /** How wide a number is, so a narrower one may be passed where a wider is declared. */
+    private static int numericRank(String type) {
+        switch (type) {
+            case "smallint": case "int2": return 1;
+            case "integer": case "int": case "int4": return 2;
+            case "bigint": case "int8": return 3;
+            case "numeric": case "decimal": return 4;
+            case "real": case "float4": return 5;
+            case "double precision": case "float8": return 6;
+            default: return 0;
+        }
+    }
+
+    /** Whether an OUT parameter comes before any parameter that takes a value. */
+    private static boolean hasLeadingOut(PgFunction fn) {
+        for (PgFunction.Param p : fn.getParams()) {
+            String mode = p.mode() == null ? "IN" : p.mode().toUpperCase();
+            if ("OUT".equals(mode)) return true;
+            return false;
+        }
+        return false;
+    }
+
+    /** A routine call written with VARIADIC passes one array where the tail would go. */
+    private static boolean writtenVariadic(CallStmt stmt) {
+        for (Expression arg : stmt.args()) {
+            if (arg instanceof NamedArgExpr
+                    && "__variadic__".equals(((NamedArgExpr) arg).name())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Whether this routine can be called with that many arguments. */
+    private static boolean acceptsArgumentCount(PgFunction fn, int argCount) {
+        int required = 0;
+        int accepted = 0;
+        int total = fn.getParams().size();
+        for (PgFunction.Param p : fn.getParams()) {
+            String mode = p.mode() == null ? "IN" : p.mode().toUpperCase();
+            if ("OUT".equals(mode)) continue;
+            accepted++;
+            if (p.defaultExpr() == null) required++;
+        }
+        boolean variadic = false;
+        for (PgFunction.Param p : fn.getParams()) {
+            if ("VARIADIC".equalsIgnoreCase(p.mode())) variadic = true;
+        }
+        if (variadic) return argCount >= required - 1;
+        return argCount == total || (argCount >= required && argCount <= accepted);
+    }
+
+    QueryResult executeCall(CallStmt stmt) {
+        // What a CALL may be given: values, not queries and not aggregates. Both are refused
+        // before anything is looked up, the way PostgreSQL refuses them.
+        for (Expression arg : stmt.args()) {
+            rejectSubqueryArgument(arg);
+            rejectAggregateArgument(arg);
+        }
+        String callName = stmt.name();
+        List<String> argTypes = callArgumentTypes(stmt.args());
+        PgFunction function = resolveProcedure(callName, stmt.args().size(), argTypes);
         if (function == null) {
-            String argTypes = stmt.args().isEmpty() ? "" : stmt.args().stream().map(a -> {
-                try { Object v = executor.evalExpr(a, null);
-                    return v instanceof Integer ? "integer" : v instanceof Long ? "bigint" : "unknown";
-                } catch (Exception e) { return "unknown"; }
-            }).collect(Collectors.joining(", "));
-            throw new MemgresException("procedure " + stmt.name() + "(" + argTypes + ") does not exist", "42883");
+            // A procedure is its name and the types it takes, so a call that matches no
+            // signature names the types it was written with. Looking the name up alone found
+            // whichever overload was stored first and ran it on the wrong arguments.
+            throw new MemgresException("procedure " + stmt.name() + "("
+                    + String.join(", ", argTypes) + ") does not exist", "42883");
         }
         if (!function.isProcedure()) {
-            String argTypes = function.getParams().stream()
+            String declared = function.getParams().stream()
                     .filter(p -> !"OUT".equalsIgnoreCase(p.mode()))
                     .map(PgFunction.Param::typeName)
                     .collect(Collectors.joining(", "));
-            throw new MemgresException(stmt.name() + "(" + argTypes + ") is not a procedure", "42809");
+            throw new MemgresException(stmt.name() + "(" + declared + ") is not a procedure", "42809");
         }
         // Count required IN params (minimum) and total params (maximum, including OUT/INOUT)
         int requiredInParams = 0, inParamCount = 0, totalParams = function.getParams().size();
+        @SuppressWarnings("unused") boolean typesNamed = true;
         List<PgFunction.Param> outParams = new ArrayList<>();
         for (PgFunction.Param p : function.getParams()) {
             String mode = p.mode() != null ? p.mode().toUpperCase() : "IN";
@@ -1768,23 +1994,82 @@ class DdlObjectExecutor {
         }
         // PG allows CALL with either just IN args or all args (including OUT placeholders)
         int argCount = stmt.args().size();
-        if (argCount != totalParams && (argCount < requiredInParams || argCount > inParamCount)) {
-            String argTypes = stmt.args().isEmpty() ? "" : "integer";
-            throw new MemgresException("procedure " + stmt.name() + "(" + argTypes + ") does not exist", "42883");
+        // A VARIADIC parameter takes the whole tail, so a call may pass more arguments than the
+        // procedure declares parameters and still be the procedure that was declared.
+        boolean variadicTail = false;
+        for (PgFunction.Param p : function.getParams()) {
+            if ("VARIADIC".equalsIgnoreCase(p.mode())) variadicTail = true;
+        }
+        // Every parameter takes a place in a CALL's argument list, an OUT one included: it is
+        // written as a placeholder and the value it is given is thrown away. Accepting a call
+        // that named only the IN parameters made CALL p(3) reach a p(int, OUT int) that no such
+        // call in PostgreSQL ever reaches.
+        int requiredParams = 0;
+        for (PgFunction.Param p : function.getParams()) {
+            if (p.defaultExpr() == null || p.defaultExpr().isEmpty()) requiredParams++;
+        }
+        if (!variadicTail && (argCount < requiredParams || argCount > totalParams)) {
+            throw new MemgresException("procedure " + stmt.name() + "("
+                    + String.join(", ", argTypes) + ") does not exist", "42883");
         }
         // Build args list: only pass IN/INOUT values to executeFunction
+        // A call's arguments line up with the parameters in order. An OUT parameter takes a place
+        // in that order and gives nothing to the body; an IN or INOUT parameter the call did not
+        // reach takes the value its declaration gives it. Counting only the IN parameters put the
+        // arguments against the wrong ones whenever an OUT came first, and dropping the ones the
+        // call left off had the body read an unset variable as null.
         List<Object> args = new ArrayList<>();
         int argIdx = 0;
-        for (int i = 0; i < function.getParams().size(); i++) {
-            PgFunction.Param p = function.getParams().get(i);
+        boolean placeholdersGiven = argCount == totalParams || hasLeadingOut(function);
+        // An argument written with a name goes to the parameter of that name wherever it sits,
+        // and one written after VARIADIC is the whole tail as an array.
+        Map<String, Expression> byName = new LinkedHashMap<>();
+        Expression variadic = null;
+        for (Expression arg : stmt.args()) {
+            if (!(arg instanceof NamedArgExpr)) continue;
+            NamedArgExpr named = (NamedArgExpr) arg;
+            if ("__variadic__".equals(named.name())) variadic = named.value();
+            else byName.put(named.name().toLowerCase(), named.value());
+        }
+        for (PgFunction.Param p : function.getParams()) {
             String mode = p.mode() != null ? p.mode().toUpperCase() : "IN";
             if ("OUT".equals(mode)) {
-                if (argCount == totalParams) argIdx++; // skip the OUT placeholder arg
-            } else {
-                // IN or INOUT
-                if (argIdx < stmt.args().size()) {
-                    args.add(executor.evalExpr(stmt.args().get(argIdx++), null));
+                if (placeholdersGiven && argIdx < stmt.args().size()
+                        && !(stmt.args().get(argIdx) instanceof NamedArgExpr)) {
+                    argIdx++;
                 }
+                continue;
+            }
+            Expression named = p.name() == null ? null : byName.get(p.name().toLowerCase());
+            if (named != null) {
+                args.add(executor.evalExpr(named, null));
+                continue;
+            }
+            if ("VARIADIC".equals(mode) && variadic != null) {
+                args.add(executor.evalExpr(variadic, null));
+                continue;
+            }
+            if ("VARIADIC".equals(mode)) {
+                // Written without the keyword, the arguments left over are the array the
+                // parameter takes: CALL p(1, 2, 3) reaches VARIADIC a int[] as {1,2,3}. They are
+                // handed over one by one, because gathering them is what binding the parameter
+                // already does — collected here as well the array held one array inside it.
+                while (argIdx < stmt.args().size()) {
+                    Expression tailArg = stmt.args().get(argIdx++);
+                    if (tailArg instanceof NamedArgExpr) continue;
+                    args.add(executor.evalExpr(tailArg, null));
+                }
+                continue;
+            }
+            // Skip the positions the named arguments already filled.
+            while (argIdx < stmt.args().size() && stmt.args().get(argIdx) instanceof NamedArgExpr) {
+                argIdx++;
+            }
+            if (argIdx < stmt.args().size()) {
+                args.add(executor.evalExpr(stmt.args().get(argIdx++), null));
+            } else if (p.defaultExpr() != null && !p.defaultExpr().isEmpty()) {
+                args.add(executor.evalExpr(
+                        com.memgres.engine.parser.Parser.parseExpression(p.defaultExpr()), null));
             }
         }
         // Start implicit transaction for procedure (PG behavior: CALL in autocommit starts a txn)
@@ -1860,6 +2145,12 @@ class DdlObjectExecutor {
                 break;
         }
         boolean isView = stmt.table() != null && executor.database.hasView(stmt.table());
+        // PostgreSQL opens the relation before it judges what kind it is, so a trigger named on
+        // a relation that is not there is a missing relation — not a table that cannot take an
+        // INSTEAD OF trigger, which is what "not a view" was read as.
+        if (stmt.table() != null && !isView) {
+            executor.resolveTable(triggerTableSchema, stmt.table());
+        }
         if (timing == PgTrigger.Timing.INSTEAD_OF && !isView) {
             throw PgErrors.wrongObjectType("\"" + stmt.table() + "\" is a table"
                     + "\n  Detail: Tables cannot have INSTEAD OF triggers.");
@@ -2251,9 +2542,18 @@ class DdlObjectExecutor {
                 // Which locale-derived collations a machine has is a property of the machine, so
                 // an unknown name is not something to refuse — but IF EXISTS still says what it
                 // skipped when memgres has no collation of that name.
-                if (stmt.ifExists() && executor.database.getCollation(stmt.name()) == null) {
-                    noticeSkipped("collation \"" + stmt.name() + "\"");
+                if (executor.database.getCollation(stmt.name()) == null) {
+                    if (stmt.ifExists()) noticeSkipped("collation \"" + stmt.name() + "\"");
+                    break;
                 }
+                // A column that sorts by this collation is written in terms of it, and
+                // PostgreSQL will not take away something another object depends on. Dropping
+                // nothing at all left the collation answering for a name that had been removed.
+                if (!stmt.cascade() && columnCollatedBy(stmt.name()) != null) {
+                    throw new MemgresException("cannot drop collation " + stmt.name()
+                            + " because other objects depend on it", "2BP01");
+                }
+                executor.database.removeCollation(stmt.name());
                 break;
             }
             case CONVERSION: {
@@ -3696,6 +3996,13 @@ class DdlObjectExecutor {
     }
 
     QueryResult executeCreateIndex(CreateIndexStmt s) {
+        // Building an index concurrently takes more than one transaction of its own, so it cannot
+        // be one step inside somebody else's. Running it anyway made a statement PostgreSQL
+        // refuses look like it had worked.
+        if (s.concurrently && executor.session != null && executor.session.isInTransaction()) {
+            throw new MemgresException(
+                    "CREATE INDEX CONCURRENTLY cannot run inside a transaction block", "25001");
+        }
         // The relation is opened before the statement is analysed, and opening it starts by
         // finding the schema it was written under.
         SchemaQualifier.requireSchema(executor.database, executor.session, s.schema());
@@ -3979,6 +4286,13 @@ class DdlObjectExecutor {
             executor.database.setIndexColumnOptions(idxSchemaForMeta, s.name(), s.columnOptions());
             executor.database.setIndexIncludeColumns(idxSchemaForMeta, s.name(), s.includeColumns());
             executor.database.setIndexNullsNotDistinct(idxSchemaForMeta, s.name(), s.nullsNotDistinct());
+            // The storage parameters an index was created WITH are part of what it is: pg_class
+            // lists them and pg_get_indexdef writes them back. Only ALTER INDEX SET recorded
+            // them, so an index created with a fillfactor reported none.
+            if (s.withOptions() != null && !s.withOptions().isEmpty()) {
+                executor.database.setIndexReloptions(
+                        Database.idxKey(idxSchemaForMeta, s.name()), s.withOptions());
+            }
             executor.database.registerSchemaObject(idxSchemaForMeta, "index", s.name());
             executor.recordUndo(new Session.CreateIndexUndo(
                     Database.idxKey(idxSchemaForMeta, s.name())));
@@ -4178,6 +4492,20 @@ class DdlObjectExecutor {
         }
     }
 
+    /** The first column that sorts by this collation, or null when none does. */
+    private String columnCollatedBy(String collation) {
+        for (Schema schema : executor.database.getSchemas().values()) {
+            for (Table table : schema.getTables().values()) {
+                for (Column column : table.getColumns()) {
+                    if (collation.equalsIgnoreCase(column.getCollation())) {
+                        return table.getName() + "." + column.getName();
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
     // ---- CREATE COLLATION ----
 
     QueryResult executeCreateCollation(CreateCollationStmt stmt) {
@@ -4186,7 +4514,10 @@ class DdlObjectExecutor {
             if (stmt.ifNotExists) {
                 return QueryResult.message(QueryResult.Type.SET, "CREATE COLLATION");
             }
-            throw new MemgresException("collation \"" + name + "\" already exists", "42710");
+            // PostgreSQL names the encoding a collation is for, because two collations of
+            // one name may exist for two encodings.
+            throw new MemgresException(
+                    "collation \"" + name + "\" for encoding \"UTF8\" already exists", "42710");
         }
 
         String provider = "c";
@@ -4246,13 +4577,21 @@ class DdlObjectExecutor {
         } else if (castMethod.equals("b")) {
             validateBinaryCoercible(stmt);
         }
+        // A cast from a type to itself converts nothing, so there is no cast to create. The
+        // function is judged first, because a cast written with one that does not fit is wrong
+        // about the function before it is wrong about the types.
+        if (sourceOid == targetOid) {
+            throw new MemgresException(
+                    "source data type and target data type are the same", "42P17");
+        }
         if (executor.database.getUserDefinedCasts().stream()
                 .anyMatch(c -> (int) c[0] == sourceOid && (int) c[1] == targetOid)) {
             throw new MemgresException("cast from type " + DataType.canonicalName(stmt.sourceType)
                     + " to type " + DataType.canonicalName(stmt.targetType) + " already exists", "42710");
         }
         // Store in database for inclusion in pg_cast virtual table
-        executor.database.addUserCast(sourceOid, targetOid, castFunc, stmt.castContext, castMethod);
+        executor.database.addUserCast(sourceOid, targetOid, castFunc, stmt.castContext, castMethod,
+                castMethod.equals("f") ? stmt.functionName : null);
         return QueryResult.command(QueryResult.Type.CREATE_TYPE, 0);
     }
 

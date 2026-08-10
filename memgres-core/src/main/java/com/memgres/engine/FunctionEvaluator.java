@@ -17,6 +17,36 @@ import java.util.*;
  */
 class FunctionEvaluator {
 
+    /**
+     * How many values one generate_series call may answer with.
+     *
+     * <p>It was ten thousand, which is not a limit so much as a truncation: a series over fifty
+     * years of days answered its first ten thousand and said nothing about the rest. The bound
+     * that remains guards against a runaway call, set past any series a query means to read.
+     */
+    private static final int SERIES_LIMIT = 10_000_000;
+
+    /**
+     * An enum with no labels has no first or last value. Reading one off the empty list reached
+     * the client as an internal error about an array index.
+     */
+    private static void requireEnumHasValues(String enumType, CustomEnum ce) {
+        if (ce.getLabels().isEmpty()) {
+            String bare = enumType.contains(".")
+                    ? enumType.substring(enumType.lastIndexOf('.') + 1) : enumType;
+            throw new MemgresException("enum " + bare + " contains no values", "55000");
+        }
+    }
+
+    /** A step of zero never reaches the end, so PostgreSQL refuses one. */
+    private static void requireNonZeroStep(PgInterval step) {
+        if (step != null && step.getMonths() == 0 && step.getDays() == 0
+                && step.getMicroseconds() == 0) {
+            throw new MemgresException("step size cannot equal zero", "22023");
+        }
+    }
+
+
     /** PG's NOTIFY payload must stay under 8000 bytes. */
     private static final int NOTIFY_PAYLOAD_LIMIT = 8000;
 
@@ -1258,7 +1288,9 @@ class FunctionEvaluator {
                 if (channel == null || channel.toString().trim().isEmpty()) {
                     throw new MemgresException("channel name cannot be empty", "22023");
                 }
-                if (payload != null && payload.toString().length() >= NOTIFY_PAYLOAD_LIMIT) {
+                if (payload != null && payload.toString()
+                        .getBytes(java.nio.charset.StandardCharsets.UTF_8).length
+                        >= NOTIFY_PAYLOAD_LIMIT) {
                     throw new MemgresException("payload string too long", "22023");
                 }
                 if (channel != null) {
@@ -1302,10 +1334,11 @@ class FunctionEvaluator {
                     java.time.OffsetDateTime tzStop = stopObj instanceof java.time.OffsetDateTime ? (java.time.OffsetDateTime) stopObj
                             : TypeCoercion.toOffsetDateTime(stopObj);
                     PgInterval step = stepObj != null ? TypeCoercion.toInterval(stepObj) : new PgInterval(0, 1, 0);
+                    requireNonZeroStep(step);
                     boolean ascending = !tzStart.isAfter(tzStop);
                     List<Object> result = new ArrayList<>();
                     java.time.OffsetDateTime cur = tzStart;
-                    for (int i = 0; i < 10000; i++) {
+                    for (int i = 0; i < SERIES_LIMIT; i++) {
                         if (ascending ? cur.isAfter(tzStop) : cur.isBefore(tzStop)) break;
                         result.add(cur);
                         java.time.OffsetDateTime next = step.addTo(cur);
@@ -1321,10 +1354,11 @@ class FunctionEvaluator {
                     LocalDateTime start = startObj instanceof LocalDate ? ((LocalDate) startObj).atStartOfDay() : TypeCoercion.toLocalDateTime(startObj);
                     LocalDateTime stop = stopObj instanceof LocalDate ? ((LocalDate) stopObj).atStartOfDay() : TypeCoercion.toLocalDateTime(stopObj);
                     PgInterval step = stepObj != null ? TypeCoercion.toInterval(stepObj) : new PgInterval(0, 1, 0);
+                    requireNonZeroStep(step);
                     boolean ascending = !start.isAfter(stop);
                     List<Object> result = new ArrayList<>();
                     LocalDateTime cur = start;
-                    for (int i = 0; i < 10000; i++) {
+                    for (int i = 0; i < SERIES_LIMIT; i++) {
                         if (ascending ? cur.isAfter(stop) : cur.isBefore(stop)) break;
                         result.add(dateInput ? cur.toLocalDate() : cur);
                         LocalDateTime next = step.addTo(cur);
@@ -1348,11 +1382,14 @@ class FunctionEvaluator {
                     java.math.BigDecimal nStep = stepObj != null
                             ? TypeCoercion.toBigDecimal(stepObj) : java.math.BigDecimal.ONE;
                     List<Object> numeric = new ArrayList<>();
+                    if (nStep.signum() == 0) {
+                        throw new MemgresException("step size cannot equal zero", "22023");
+                    }
                     if (nStep.signum() != 0) {
                         boolean up = nStep.signum() > 0;
                         // Each value is the start plus so many steps, which carries the scale that
                         // adding the step that many times carries.
-                        for (int i = 0; i < 10000; i++) {
+                        for (int i = 0; i < SERIES_LIMIT; i++) {
                             java.math.BigDecimal v = i == 0 ? nStart
                                     : nStart.add(nStep.multiply(java.math.BigDecimal.valueOf(i)));
                             if (up ? v.compareTo(nStop) > 0 : v.compareTo(nStop) < 0) break;
@@ -1364,6 +1401,9 @@ class FunctionEvaluator {
                 long start = executor.toLong(startObj);
                 long stop = executor.toLong(stopObj);
                 long step = stepObj != null ? executor.toLong(stepObj) : 1;
+                if (step == 0) {
+                    throw new MemgresException("step size cannot equal zero", "22023");
+                }
                 List<Object> result = new ArrayList<>();
                 if (step > 0) {
                     for (long v = start; v <= stop; v += step) {
@@ -2514,13 +2554,17 @@ class FunctionEvaluator {
                 String enumType = resolveEnumTypeFromArg(fn.args().get(0), ctx);
                 if (enumType == null) return null;
                 CustomEnum ce = executor.database.getCustomEnum(enumType);
-                return ce == null ? null : ce.getLabels().get(0);
+                if (ce == null) return null;
+                requireEnumHasValues(enumType, ce);
+                return ce.getLabels().get(0);
             }
             case "enum_last": {
                 String enumType = resolveEnumTypeFromArg(fn.args().get(0), ctx);
                 if (enumType == null) return null;
                 CustomEnum ce = executor.database.getCustomEnum(enumType);
-                return ce == null ? null : ce.getLabels().get(ce.getLabels().size() - 1);
+                if (ce == null) return null;
+                requireEnumHasValues(enumType, ce);
+                return ce.getLabels().get(ce.getLabels().size() - 1);
             }
             case "enum_range": {
                 if (fn.args().size() >= 2) {

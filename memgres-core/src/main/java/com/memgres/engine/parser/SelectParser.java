@@ -205,7 +205,11 @@ class SelectParser {
         }
         if (parser.checkKeyword("VALUES")) {
             // A bare VALUES list is a query in its own right, so it may be a set-op arm
-            return parseValuesBody();
+            Statement values = parseValuesBody();
+            if (parser.checkKeyword("FOR")) {
+                throw new MemgresException("FOR UPDATE cannot be applied to VALUES", "0A000");
+            }
+            return values;
         }
         return parser.parseSelect();
     }
@@ -665,6 +669,12 @@ class SelectParser {
                 changed = true;
             }
             if (parser.matchKeyword("OFFSET")) { offset = parser.parseExpression(); changed = true; }
+            // A row lock is taken on a row of a table, and a VALUES list has none: there is
+            // nothing for FOR UPDATE to lock. Reading the clause and going on left the query
+            // claiming a lock it could never hold.
+            if (parser.checkKeyword("FOR")) {
+                throw new MemgresException("FOR UPDATE cannot be applied to VALUES", "0A000");
+            }
             if (changed) {
                 return new SelectStmt(sel.distinct(), sel.distinctOn(), sel.targets(), sel.from(),
                         sel.where(), sel.groupBy(), sel.having(), sel.windowDefs(), orderBy, limit,

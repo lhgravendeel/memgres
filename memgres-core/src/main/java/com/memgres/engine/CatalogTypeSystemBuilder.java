@@ -120,14 +120,14 @@ class CatalogTypeSystemBuilder {
 
     Table buildPgExtension() {
         List<Column> cols = Cols.listOf(
-                colNN("oid", DataType.INTEGER),
-                colNN("extname", DataType.TEXT),
-                col("extowner", DataType.INTEGER),
-                col("extnamespace", DataType.INTEGER),
+                colNN("oid", DataType.OID),
+                colNN("extname", DataType.NAME),
+                col("extowner", DataType.OID),
+                col("extnamespace", DataType.OID),
                 col("extrelocatable", DataType.BOOLEAN),
                 col("extversion", DataType.TEXT),
-                col("extconfig", DataType.TEXT),
-                col("extcondition", DataType.TEXT),
+                col("extconfig", DataType.OID_ARRAY),
+                col("extcondition", DataType.TEXT_ARRAY),
                 col("xmin", DataType.INTEGER)
         );
         // Populate with plpgsql extension (always present in PG)
@@ -148,10 +148,10 @@ class CatalogTypeSystemBuilder {
 
     Table buildPgLanguage() {
         List<Column> cols = Cols.listOf(
-                colNN("oid", DataType.INTEGER), colNN("lanname", DataType.TEXT),
-                col("lanowner", DataType.INTEGER), col("lanispl", DataType.BOOLEAN),
-                col("lanpltrusted", DataType.BOOLEAN), col("lanplcallfoid", DataType.INTEGER),
-                col("laninline", DataType.INTEGER), col("lanvalidator", DataType.INTEGER),
+                colNN("oid", DataType.OID), colNN("lanname", DataType.NAME),
+                col("lanowner", DataType.OID), col("lanispl", DataType.BOOLEAN),
+                col("lanpltrusted", DataType.BOOLEAN), col("lanplcallfoid", DataType.OID),
+                col("laninline", DataType.OID), col("lanvalidator", DataType.OID),
                 col("lanacl", DataType.ACLITEM_ARRAY), col("xmin", DataType.INTEGER));
         Table table = new Table("pg_language", cols);
         // Language handler/validator/inline function OIDs (must match entries in pg_proc)
@@ -2055,9 +2055,9 @@ class CatalogTypeSystemBuilder {
 
     Table buildPgAmop() {
         List<Column> cols = Cols.listOf(
-                colNN("oid", DataType.INTEGER), col("amopfamily", DataType.INTEGER),
+                colNN("oid", DataType.OID), col("amopfamily", DataType.OID),
                 col("amoplefttype", DataType.INTEGER), col("amoprighttype", DataType.INTEGER),
-                col("amopstrategy", DataType.SMALLINT), col("amoppurpose", DataType.CHAR),
+                col("amopstrategy", DataType.SMALLINT), col("amoppurpose", DataType.INTERNAL_CHAR),
                 col("amopopr", DataType.INTEGER),
                 col("amopmethod", DataType.INTEGER), col("amopsortfamily", DataType.INTEGER),
                 col("xmin", DataType.INTEGER));

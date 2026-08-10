@@ -112,9 +112,18 @@ class SelectSetOpExecutor {
                 TypeCoercion.TypeCategory rightCat = TypeCoercion.categoryOf(rightType);
                 if (leftCat == rightCat && leftCat == TypeCoercion.TypeCategory.NUMERIC) {
                     DataType wider = widenNumericSetOp(leftType, rightType);
-                    if (wider != leftType) {
+                    // A set operation gives its column one type and reads every arm as that type,
+                    // so the integer 1 and the numeric 1.0 are one value. Only the column's
+                    // declaration was widened and the values were left as they came, so the two
+                    // stayed unequal: UNION kept both, INTERSECT matched neither, and EXCEPT
+                    // removed nothing.
+                    if (leftType != wider) {
+                        coerceColumnValues(leftResult, ci, wider);
                         Column orig = columns.get(ci);
                         columns.set(ci, new Column(orig.getName(), wider, orig.isNullable(), orig.isPrimaryKey(), orig.getDefaultValue()));
+                    }
+                    if (rightType != wider) {
+                        coerceColumnValues(rightResult, ci, wider);
                     }
                 } else if (leftCat == rightCat
                         && leftCat == TypeCoercion.TypeCategory.DATETIME) {

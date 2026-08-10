@@ -82,6 +82,38 @@ class DmlExecutor {
 
     /** Resolve the schema-qualified key for a table's row metadata.
      *  When schema is null, find the actual schema by scanning database schemas. */
+    /**
+     * A catalogue view cannot be written to.
+     *
+     * <p>Nothing looked for one, so a statement naming pg_cursors or pg_settings was told the
+     * relation did not exist — which is not what it is. PostgreSQL says the view is not one it
+     * can write through, and names the verb that was tried.
+     */
+    private void rejectCatalogViewWrite(String tableName, String verb) {
+        if (tableName == null) return;
+        String bare = tableName.contains(".")
+                ? tableName.substring(tableName.lastIndexOf('.') + 1) : tableName;
+        if (!bare.toLowerCase().startsWith("pg_")) return;
+        if (executor.systemCatalog.resolve(null, bare, executor.session) == null) return;
+        if (!"v".equals(PgCatalogRelations.relkind(bare.toLowerCase()))) return;
+        throw new MemgresException("cannot " + verb + " view \"" + bare + "\"", "55000");
+    }
+
+    /**
+     * Note the lock this statement takes on the relation it writes to, so pg_locks can report it.
+     */
+    private void recordRelationLock(String schema, String tableName, String mode) {
+        if (executor.session == null || tableName == null) return;
+        String bare = tableName;
+        String schemaName = schema;
+        if (schemaName == null && bare.contains(".")) {
+            schemaName = bare.substring(0, bare.indexOf('.'));
+            bare = bare.substring(bare.indexOf('.') + 1);
+        }
+        if (schemaName == null) schemaName = executor.defaultSchema();
+        executor.session.recordRelationLock(schemaName.toLowerCase() + "." + bare.toLowerCase(), mode);
+    }
+
     private String resolveTableSchemaKey(String schema, Table table) {
         if (schema != null) return schema + "." + table.getName();
         // Find the actual schema containing this table instance
@@ -407,6 +439,8 @@ class DmlExecutor {
         List<DmlValidationHelper.ViewCheck> viewCheckExprs = validationHelper.collectViewCheckExprs(stmt.table());
         // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
         executor.viewDmlVerb = "insert into";
+        recordRelationLock(stmt.schema(), stmt.table(), "RowExclusiveLock");
+        rejectCatalogViewWrite(stmt.table(), "insert into");
         Table table = executor.resolveTable(schemaName, stmt.table(), stmt.schema() != null);
         // A VALUES row is written out in full; it is not read from any relation, so there is
         // nothing for an aggregate to aggregate or for a window call to be numbered against.
@@ -680,9 +714,6 @@ class DmlExecutor {
             // Apply citext lowercasing for columns with citext-based domains
             validationHelper.applyCitextFolding(table, row);
 
-            // Compute generated columns
-            computeGeneratedColumns(table, row);
-
             // INSTEAD OF INSERT triggers (on views): trigger handles the insert, skip normal path
             if (hasInsteadOfInsert) {
                 Object[] insteadRow = triggerHelper.executeTriggers(triggers, PgTrigger.Timing.INSTEAD_OF, PgTrigger.Event.INSERT, row, null, table);
@@ -705,6 +736,11 @@ class DmlExecutor {
                 // BEFORE trigger returned NULL: skip this row (not inserted, not counted, no RETURNING)
                 continue;
             }
+
+            // A generated column is computed from the row that is about to be stored, which is the
+            // row the BEFORE triggers have finished with. Computing it from the row as written
+            // stored a value derived from a column the triggers then changed.
+            computeGeneratedColumns(table, row);
 
             // Validate enum values
             validationHelper.validateEnumValues(row, table);
@@ -1341,6 +1377,8 @@ class DmlExecutor {
         List<DmlValidationHelper.ViewCheck> viewCheckExprs = validationHelper.collectViewCheckExprs(stmt.table());
         // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
         executor.viewDmlVerb = "update";
+        recordRelationLock(stmt.schema(), stmt.table(), "RowExclusiveLock");
+        rejectCatalogViewWrite(stmt.table(), "update");
         Table table = executor.resolveTable(schemaName, stmt.table(), stmt.schema() != null);
         // An UPDATE names one row at a time; there is no group behind it to aggregate and no
         // result to number a window against, in either the assignments or the WHERE.
@@ -2059,6 +2097,8 @@ class DmlExecutor {
         String schemaName = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
         // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
         executor.viewDmlVerb = "delete from";
+        recordRelationLock(stmt.schema(), stmt.table(), "RowExclusiveLock");
+        rejectCatalogViewWrite(stmt.table(), "delete from");
         Table table = executor.resolveTable(schemaName, stmt.table(), stmt.schema() != null);
         // As for UPDATE: a DELETE's WHERE picks rows one at a time, so nothing in it may need a
         // group or a finished result to have a value.
@@ -2895,40 +2935,44 @@ class DmlExecutor {
      * Filter table rows to the single row positioned by the named cursor.
      * Matches by comparing column values from the cursor's current row against the table row values.
      */
+    /**
+     * The one row a cursor is on, for WHERE CURRENT OF.
+     *
+     * <p>The row was found by comparing the cursor's columns against every row of the table and
+     * taking the first that matched. A cursor's select list need not carry a key — {@code SELECT nm
+     * FROM t ORDER BY id DESC} carries none — so two rows that share a value were the same row to
+     * that search, and it updated whichever came first in storage rather than the one the cursor
+     * had reached. The cursor remembers the stored rows it walked, so the row it is on is the row
+     * it is on.
+     */
     private List<Object[]> filterByCurrentOf(com.memgres.engine.parser.ast.CurrentOfExpr cof,
                                               Table table, List<Object[]> candidateRows) {
         Session.CursorState cursor = executor.session.getCursor(cof.cursorName());
-        if (cursor == null) throw new MemgresException("cursor \"" + cof.cursorName() + "\" does not exist", "34000");
-        int pos = cursor.getPosition();
+        if (cursor == null) {
+            throw new MemgresException("cursor \"" + cof.cursorName() + "\" does not exist", "34000");
+        }
         // A cursor that has not fetched yet, or has run past the end, is not on a row: PG says
         // so rather than quietly matching nothing
+        int pos = cursor.getPosition();
         if (pos < 0 || pos >= cursor.getRowCount()) {
             throw new MemgresException(
                     "cursor \"" + cof.cursorName() + "\" is not positioned on a row", "24000");
         }
-        Object[] cursorRow = cursor.getRow(pos);
-        // Map cursor columns to table column indices
-        List<Column> cursorCols = cursor.getColumns();
-        int[] tableColIdx = new int[cursorCols.size()];
-        for (int i = 0; i < cursorCols.size(); i++) {
-            tableColIdx[i] = table.getColumnIndex(cursorCols.get(i).getName());
+        Object[] current = cursor.currentRowOf(table);
+        if (current == null) {
+            // A cursor that locks its rows was written to be updated through, so the complaint is
+            // that it does not reach this table; one that does not was never updatable at all.
+            String why = cursor.isLocking()
+                    ? "\" does not have a FOR UPDATE/SHARE reference to table \""
+                    : "\" is not a simply updatable scan of table \"";
+            throw new MemgresException(
+                    "cursor \"" + cof.cursorName() + why + table.getName() + "\"", "24000");
         }
-        // Find the table row matching all cursor column values
         List<Object[]> result = new ArrayList<>();
         for (Object[] row : candidateRows) {
-            boolean match = true;
-            for (int i = 0; i < cursorCols.size(); i++) {
-                if (tableColIdx[i] < 0) continue; // cursor column not in table (e.g., computed)
-                Object tableVal = row[tableColIdx[i]];
-                Object cursorVal = cursorRow[i];
-                if (!java.util.Objects.equals(tableVal, cursorVal)) {
-                    match = false;
-                    break;
-                }
-            }
-            if (match) {
+            if (row == current) {
                 result.add(row);
-                break; // Only one row should match
+                break;
             }
         }
         return result;

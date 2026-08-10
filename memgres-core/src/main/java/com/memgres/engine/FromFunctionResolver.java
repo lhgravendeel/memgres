@@ -236,6 +236,20 @@ class FromFunctionResolver {
         // Try user-defined function
         PgFunction userFunc = executor.database.getFunction(fname);
         if (userFunc != null) {
+            // A procedure produces no rows to read from, so it cannot stand in a FROM list.
+            // Only calls written as expressions were checked, so reading one here answered with
+            // an empty relation rather than saying what it is.
+            if (userFunc.isProcedure()) {
+                StringBuilder types = new StringBuilder();
+                for (PgFunction.Param p : userFunc.getParams()) {
+                    if ("OUT".equalsIgnoreCase(p.mode())) continue;
+                    if (types.length() > 0) types.append(", ");
+                    types.append(p.typeName() == null ? "any"
+                            : CatalogSystemFunctions.readableTypeName(p.typeName()));
+                }
+                throw new MemgresException(fname + "(" + types + ") is a procedure"
+                        + "\nHint: To call a procedure, use CALL.", "42809");
+            }
             checkRecordColumnDefinitionList(userFunc, funcFrom);
             // Raw, not stripped: a column definition list gives the columns their types too.
             return resolveUserFunction(userFunc, alias, rawColAliases, evalArgs);

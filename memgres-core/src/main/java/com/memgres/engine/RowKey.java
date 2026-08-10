@@ -144,6 +144,20 @@ final class RowKey {
             }
             return sb.append(']').toString();
         }
+        // An interval is the span it measures, and two spellings of one span are one value:
+        // '1 mon', '30 days' and '720 hours' are the same interval, so they group together. The
+        // written form made three keys where PostgreSQL counts one.
+        if (val instanceof PgInterval) {
+            PgInterval interval = (PgInterval) val;
+            return "\0IVL" + (interval.isInfinite() ? interval.toString()
+                    : String.valueOf(interval.normalizedMicroseconds()));
+        }
+        // A number is the number it is, whatever width it is held in, so 1 and 1.0 are one value
+        // — which is what lets the two branches of a set operation meet.
+        if (val instanceof Integer || val instanceof Long || val instanceof Short
+                || val instanceof java.math.BigInteger) {
+            return new BigDecimal(val.toString()).stripTrailingZeros().toPlainString();
+        }
         // Use NUL-prefixed type tag to prevent cross-type/cross-column collisions
         return "\0V" + val.getClass().getName() + "\0" + val;
     }

@@ -11,9 +11,12 @@ INSERT INTO demo VALUES (1, 'x');
 -- end-expected
 SELECT pg_backend_pid() > 0 AS current_pid_is_positive;
 
+-- A relation lock belongs to the transaction that took it. This statement reads pg_locks, not
+-- demo, and nothing else is open, so PostgreSQL holds no lock on demo to find. Verified against
+-- PostgreSQL 18: the answer is f.
 -- begin-expected
 -- columns: found_relation_lock
--- row: t
+-- row: f
 -- end-expected
 SELECT EXISTS (
     SELECT 1

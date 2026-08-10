@@ -489,7 +489,7 @@ public class PlpgsqlParser {
                 case "EXECUTE":
                     return parseExecute();
                 case "NULL": {
-                    advance(); match(TokenType.SEMICOLON); return new PlpgsqlStatement.NullStmt(); 
+                    advance(); expectSemicolon(); return new PlpgsqlStatement.NullStmt(); 
                 }
                 case "BEGIN":
                     return parseBlock();
@@ -510,10 +510,11 @@ public class PlpgsqlParser {
                     return parseRollback();
                 case "ABORT":
                     return parseAbort();
-                case "SAVEPOINT": {
-                    // PG 18: SAVEPOINT is not valid in PL/pgSQL — reject at creation time
-                    throw new MemgresException("syntax error at or near \"" + peek().value() + "\"", "42601");
-                }
+                case "SAVEPOINT":
+                    // SAVEPOINT reads as an ordinary SQL statement and is refused when it runs,
+                    // the way every other transaction command a body cannot give is. Refusing it
+                    // at compile time named it a syntax error, which is not what it is.
+                    return parseSqlStmt();
                 case "ASSERT":
                     return parseAssert();
                 case "CALL":
@@ -1366,7 +1367,7 @@ public class PlpgsqlParser {
         // PG accepts = as a synonym for := everywhere an assignment is written
         if (match(TokenType.COLON_EQUALS) || match(TokenType.EQUALS)) {
             String value = collectUntilSemicolon();
-            match(TokenType.SEMICOLON);
+            expectSemicolon();
             if (sawSubscript) {
                 return new PlpgsqlStatement.SubscriptAssignment(baseName, steps, value);
             }
@@ -1418,6 +1419,21 @@ public class PlpgsqlParser {
     }
 
     // ---- Token collecting helpers ----
+
+    /**
+     * Every statement in a PL/pgSQL body ends with a semicolon, and the one that does not is a
+     * syntax error where it runs out — at the word that could not follow it, or at the end of the
+     * input when nothing did. Treating the terminator as optional let a block missing one compile
+     * and run, so text PostgreSQL refuses did whatever the reader guessed it meant.
+     */
+    private void expectSemicolon() {
+        if (match(TokenType.SEMICOLON)) return;
+        Token t = peek();
+        if (isAtEnd() || t.type() == TokenType.EOF) {
+            throw new MemgresException("syntax error at end of input", "42601");
+        }
+        throw new MemgresException("syntax error at or near \"" + t.raw() + "\"", "42601");
+    }
 
     private String collectUntilSemicolon() {
         StringBuilder sb = new StringBuilder();

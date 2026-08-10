@@ -73,6 +73,13 @@ class PgDumpFullRoundTripTest {
                         .filter(e -> !e.contains("GRANT") && !e.contains("REVOKE")
                                 && !e.contains("OWNER TO") && !e.contains("pg_catalog"))
                         .collect(Collectors.toList())));
+
+        // A dump empties the search path so the names it writes are read exactly as written.
+        // The connection that ran it still has that empty path, and the assertions below name
+        // their tables unqualified, so the path they are read under is put back first.
+        try (Statement s = tgtConn.createStatement()) {
+            s.execute("RESET search_path");
+        }
     }
 
     @AfterAll

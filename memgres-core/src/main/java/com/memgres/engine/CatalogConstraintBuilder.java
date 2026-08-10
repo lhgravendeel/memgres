@@ -861,6 +861,16 @@ class CatalogConstraintBuilder {
                         }
                     }
                 }
+                if (colIdx < 0) {
+                    // A composite type's attributes are columns too, held by the relation the
+                    // type carries rather than by a table of that name.
+                    List<com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField> fields = database.getCompositeType(relName);
+                    if (fields != null) {
+                        for (int i = 0; i < fields.size(); i++) {
+                            if (fields.get(i).name().equalsIgnoreCase(colName)) { colIdx = i; break; }
+                        }
+                    }
+                }
                 if (colIdx < 0) return null;
                 return new Object[]{oids.oid("rel:" + schema + "." + relName),
                         pgClassClassOid, colIdx + 1, desc, 1};

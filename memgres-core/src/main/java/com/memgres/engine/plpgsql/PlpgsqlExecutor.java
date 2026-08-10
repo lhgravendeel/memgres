@@ -27,6 +27,8 @@ public class PlpgsqlExecutor {
 
     // Procedure transaction control context (PG 11+)
     private boolean isProcedureExecution;
+    /** Whether the routine now running was declared SECURITY DEFINER. */
+    private boolean securityDefinerExecution;
     private int exceptionBlockDepth;
     // Track current function name for PG_EXCEPTION_CONTEXT
     private String currentFunctionName;
@@ -239,7 +241,11 @@ public class PlpgsqlExecutor {
         }
         // PG compiles a DO block before running it, so a declaration it rejects never reaches a
         // statement — nothing the block would have done takes effect.
-        PlpgsqlBodyValidator.validate(astExecutor, block, null);
+        // A DO block is compiled as a function returning void: RETURN takes no value in one,
+        // and RETURN NEXT and RETURN QUERY have no set to add to. Compiling it with no routine
+        // at all skipped every one of those checks.
+        PlpgsqlBodyValidator.validate(astExecutor, block, null,
+                new PlpgsqlBodyValidator.Routine(false, "void", false));
         // DO blocks are anonymous code blocks that support transaction control (PG 11+)
         this.isProcedureExecution = true;
         this.currentFunctionName = null;
@@ -273,6 +279,9 @@ public class PlpgsqlExecutor {
 
     private Object executeFunctionCall(PgFunction function, List<Object> args) {
         this.isProcedureExecution = function.isProcedure();
+        // A routine that runs as its owner cannot end the caller's transaction: committing would
+        // leave the rest of the call running under an identity the caller never chose.
+        this.securityDefinerExecution = function.isSecurityDefiner();
         this.currentFunctionName = function.getName();
         // Track function call depth: when inside a non-procedure function, transaction control is forbidden
         boolean enteredFunctionContext = false;
@@ -926,6 +935,12 @@ public class PlpgsqlExecutor {
                     }
                 }
                 throw rs;
+            } catch (ExitSignal | ContinueSignal signal) {
+                // EXIT and CONTINUE leave the block; they do not fail in it. Carried out as
+                // exceptions and caught with the rest, a loop left from inside a block that has an
+                // EXCEPTION clause ran the handler and went round again instead of stopping.
+                releaseSubtxnSavepoint(subtxnSavepoint, implicitTxnStarted);
+                throw signal;
             } catch (MemgresException e) {
                 // Rollback to savepoint to undo changes made in the try body (subtransaction rollback)
                 if (session != null) {
@@ -1282,12 +1297,37 @@ public class PlpgsqlExecutor {
         }
     }
 
+    /**
+     * The transaction commands a body cannot give.
+     *
+     * <p>A routine runs inside the caller's transaction, so it cannot open, name or unwind one:
+     * COMMIT and ROLLBACK end the caller's and start another, and are the only two PL/pgSQL has.
+     * Passing the rest through to the engine let a DO block open a transaction that nothing then
+     * closed, and every statement after it in the session was refused as part of an aborted one.
+     */
+    private void rejectTransactionCommand(String sql) {
+        String head = sql.toUpperCase(java.util.Locale.ROOT).trim();
+        for (String command : UNSUPPORTED_IN_PLPGSQL) {
+            if (head.equals(command) || head.startsWith(command + " ") || head.startsWith(command + ";")) {
+                throw new MemgresException("unsupported transaction command in PL/pgSQL", "0A000");
+            }
+        }
+    }
+
+    private static final String[] UNSUPPORTED_IN_PLPGSQL = {
+            "START TRANSACTION", "BEGIN", "SAVEPOINT", "RELEASE SAVEPOINT", "RELEASE",
+            "ROLLBACK TO SAVEPOINT", "ROLLBACK TO", "ABORT", "END TRANSACTION",
+            "PREPARE TRANSACTION", "COMMIT PREPARED", "ROLLBACK PREPARED"};
+
     private void validateTransactionControl(String command) {
         if (!isProcedureExecution) {
             throw new MemgresException("invalid transaction termination", "2D000");
         }
         // When called from within a function context (even indirectly), transaction control is forbidden
         if (session != null && session.isInFunctionContext()) {
+            throw new MemgresException("invalid transaction termination", "2D000");
+        }
+        if (securityDefinerExecution) {
             throw new MemgresException("invalid transaction termination", "2D000");
         }
         // When inside an explicit transaction block (user-issued BEGIN), procedure COMMIT/ROLLBACK is forbidden
@@ -2362,6 +2402,7 @@ public class PlpgsqlExecutor {
 
     private void executeSql(PlpgsqlStatement.SqlStmt stmt, Scope scope) {
         String originalSql = stmt.sql().trim();
+        rejectTransactionCommand(originalSql);
         String sql = substituteVariables(originalSql, scope);
 
         // For CALL statements, detect OUT params and bind results back to PL/pgSQL variables

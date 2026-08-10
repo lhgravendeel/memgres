@@ -1007,6 +1007,11 @@ class StringFunctions {
                     Object arg2 = executor.evalExpr(fn.args().get(2), ctx);
                     // 3rd arg is start position (int), not flags
                     start = executor.toInt(arg2);
+                    // Positions are counted from one, so there is no position zero to start at.
+                    if (start < 1) {
+                        throw new MemgresException(
+                                "invalid value for parameter \"start\": " + start, "22023");
+                    }
                 }
                 if (fn.args().size() > 3) {
                     Object flagsVal = executor.evalExpr(fn.args().get(3), ctx);

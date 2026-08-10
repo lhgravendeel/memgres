@@ -3595,23 +3595,23 @@ OK: 2 rows affected
 SQL: EXPLAIN SELECT * FROM admin_t WHERE id = 1
 RESULT: 1 columns, 2 rows
 COLUMNS: QUERY PLAN
-ROW: Seq Scan on admin_t  (cost=0.00..1.002 rows=2 width=0)
-ROW:   Filter: (...)
+ROW: Seq Scan on admin_t  (cost=0.00..0.01 rows=1 width=4)
+ROW:   Filter: (id = 1)
 --- STMT 22 ---
 SQL: EXPLAIN (COSTS OFF) SELECT * FROM admin_t ORDER BY id
-RESULT: 1 columns, 1 rows
+RESULT: 1 columns, 3 rows
 COLUMNS: QUERY PLAN
-ROW: Seq Scan on admin_t\n  Sort Key: (...)
+ROW: Sort
+ROW:   Sort Key: id
+ROW:   ->  Seq Scan on admin_t
 --- STMT 23 ---
 SQL: EXPLAIN ANALYZE SELECT * FROM admin_t WHERE id = 1
-RESULT: 1 columns, 6 rows
+RESULT: 1 columns, 4 rows
 COLUMNS: QUERY PLAN
-ROW: Seq Scan on admin_t  (cost=0.00..1.02 rows=2 width=0) (actual time=0,144..0,144 rows=1 loops=1)
-ROW:   Filter: (...)
-ROW:   Rows Removed by Filter: 0
-ROW:   Output: (...)
-ROW: Planning Time: 0,042 ms
-ROW: Execution Time: 0,421 ms
+ROW: Seq Scan on admin_t  (cost=0.00..0.01 rows=1 width=4) (actual time=0.180..0.180 rows=1.00 loops=1)
+ROW:   Filter: (id = 1)
+ROW: Planning Time: 0.030 ms
+ROW: Execution Time: 0.297 ms
 --- STMT 24 ---
 SQL: ANALYZE admin_t
 OK: 0 rows affected
@@ -3726,19 +3726,19 @@ SQL: SHOW no_such_guc
 ERROR [42704]: ERROR: unrecognized configuration parameter "no_such_guc"
 --- STMT 60 ---
 SQL: LISTEN
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: syntax error at end of input
 --- STMT 61 ---
 SQL: NOTIFY
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: syntax error at end of input
 --- STMT 62 ---
 SQL: UNLISTEN no_such_chan, other
 ERROR [42601]: ERROR: syntax error at or near ","
 --- STMT 63 ---
 SQL: EXPLAIN ()
-ERROR [42601]: ERROR: syntax error at end of input
+ERROR [42601]: ERROR: syntax error at or near ")"
 --- STMT 64 ---
 SQL: VACUUM (NOTANOPTION) admin_t
-ERROR [42601]: ERROR: syntax error at or near "notanoption"
+ERROR [42601]: ERROR: syntax error at or near "NOTANOPTION"
 --- STMT 65 ---
 SQL: ALTER VIEW no_such_view RENAME COLUMN a TO b
 ERROR [42P01]: ERROR: relation "no_such_view" does not exist

@@ -61,12 +61,15 @@ class DoLanguageClauseTest {
         """);
     }
 
+    /** Only a language with an inline handler can carry a DO block, and sql has none. */
     @Test
-    void testDoLanguageStringLiteralSql() throws SQLException {
-        exec("""
+    void testDoLanguageStringLiteralSql() {
+        SQLException e = assertThrows(SQLException.class, () -> exec("""
             DO LANGUAGE 'sql'
             $$ SELECT 1; $$
-        """);
+        """));
+        assertEquals("0A000", e.getSQLState());
+        assertTrue(e.getMessage().contains("does not support inline code execution"));
     }
 
     // =========================================================================
@@ -85,11 +88,13 @@ class DoLanguageClauseTest {
     }
 
     @Test
-    void testDoLanguageIdentifierSql() throws SQLException {
-        exec("""
+    void testDoLanguageIdentifierSql() {
+        SQLException e = assertThrows(SQLException.class, () -> exec("""
             DO LANGUAGE sql
             $$ SELECT 1; $$
-        """);
+        """));
+        assertEquals("0A000", e.getSQLState());
+        assertTrue(e.getMessage().contains("does not support inline code execution"));
     }
 
     // =========================================================================
@@ -193,14 +198,19 @@ class DoLanguageClauseTest {
     }
 
     @Test
-    void testDoLanguageWithTripleDollar() throws SQLException {
-        exec("""
-            DO LANGUAGE 'plpgsql' $$$
-            BEGIN
-                RAISE NOTICE 'triple dollar';
-            END;
-            $$$
+    void testDoLanguageWithTripleDollar() {
+        // A dollar quote ends at the first repeat of its own tag, so the extra dollar
+        // behind it is left over and PostgreSQL stops there.
+        SQLException e = assertThrows(SQLException.class, () -> {
+            exec("""
+                DO LANGUAGE 'plpgsql' $$$
+                BEGIN
+                    RAISE NOTICE 'triple dollar';
+                END;
+                $$$
         """);
+        });
+        assertEquals("42601", e.getSQLState());
     }
 
     // =========================================================================
