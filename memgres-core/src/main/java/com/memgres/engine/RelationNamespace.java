@@ -150,6 +150,16 @@ final class RelationNamespace {
         return kind.startsWith("i") ? "an" : "a";
     }
 
+    /**
+     * The kind as PostgreSQL words it when it says an operation is not supported for a relation of
+     * that kind. It names them in the plural, and an index is the one whose plural is not simply
+     * the word with an s on the end.
+     */
+    static String pluralKind(String kind) {
+        if (kind == null) return null;
+        return kind.endsWith("index") ? kind + "es" : kind + "s";
+    }
+
     /** Strip a schema qualifier a caller may have left on the name. */
     static String bareName(String name) {
         int dot = name.lastIndexOf('.');

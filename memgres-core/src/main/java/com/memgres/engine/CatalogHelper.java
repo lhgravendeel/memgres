@@ -449,6 +449,33 @@ public final class CatalogHelper {
         return RuleDeparser.deparse(parsed, RuleDeparser.forDomain(valueType));
     }
 
+    /**
+     * Render a generated column's expression the way PostgreSQL's deparser renders it.
+     *
+     * <p>The clause is kept as the text it was written as, and echoing that text back handed the
+     * reader a token stream rather than a definition -- {@code upper ( a :: TEXT )}. PostgreSQL
+     * prints the analysed tree: it brackets what needs bracketing and leaves alone what does not
+     * ({@code a} for a bare column reference, {@code (a * 2)} for an operator), names types in
+     * pg_catalog's own spelling, and shows the casts parse analysis inserted, so {@code b / 2}
+     * over a numeric column comes back as {@code (b / (2)::numeric)}.
+     *
+     * @param owner the relation the column belongs to; its column types are what let the deparser
+     *              decide which casts PostgreSQL would have inserted
+     */
+    public static String renderGeneratedExpr(Table owner, Column col) {
+        String raw = col == null ? null : col.getGeneratedExpr();
+        if (raw == null) return null;
+        try {
+            com.memgres.engine.parser.ast.Expression parsed =
+                    com.memgres.engine.parser.Parser.parseExpression(raw);
+            if (parsed == null) return raw;
+            return RuleDeparser.deparse(parsed, RuleDeparser.forTable(owner));
+        } catch (RuntimeException e) {
+            // An expression that will not parse is reported as it was written
+            return raw;
+        }
+    }
+
     /** Format a column default for information_schema / pg_attrdef, matching PG conventions. */
     public static String formatColumnDefault(Column col) {
         String def = col.getDefaultValue();
@@ -640,20 +667,11 @@ public final class CatalogHelper {
      * name and only the pair identifies it.
      */
     public static java.util.List<String> getSequenceNames(Database database) {
-        java.util.Set<String> names = new java.util.LinkedHashSet<>(database.getSequences().keySet());
-        for (java.util.Map.Entry<String, Schema> schemaEntry : database.getSchemas().entrySet()) {
-            for (java.util.Map.Entry<String, Table> tableEntry : schemaEntry.getValue().getTables().entrySet()) {
-                Table t = tableEntry.getValue();
-                for (Column col : t.getColumns()) {
-                    if (col.getType() == DataType.SERIAL || col.getType() == DataType.BIGSERIAL || col.getType() == DataType.SMALLSERIAL) {
-                        names.add(Database.seqKey(schemaEntry.getKey(), t.getName() + "_" + col.getName() + "_seq"));
-                    } else if (col.getDefaultValue() != null && col.getDefaultValue().contains("__identity__")) {
-                        names.add(Database.seqKey(schemaEntry.getKey(), t.getName() + "_" + col.getName() + "_seq"));
-                    }
-                }
-            }
-        }
-        return new java.util.ArrayList<>(names);
+        // Every serial and identity column has a real sequence, created with the column, so the
+        // registry is the whole list. Composing <table>_<column>_seq for such columns as well
+        // named relations nothing backs: after a table or column rename the composed name is not
+        // the sequence's, and a partition that inherits an identity column has no sequence at all.
+        return new java.util.ArrayList<>(database.getSequences().keySet());
     }
 
     /** The schema half of a {@code schema.name} pair from {@link #getSequenceNames}. */
@@ -669,30 +687,17 @@ public final class CatalogHelper {
     }
 
     /**
-     * Determine the data type for a sequence based on the source SERIAL column type. The sequence
-     * is named {@code schema.name}, and only that schema's tables can be the ones that made it.
+     * A sequence's data type, which is what {@code AS} settled when it was created and what
+     * pg_sequence.seqtypid reports. This used to be guessed from a column whose composed
+     * {@code <table>_<column>_seq} name matched, so a standalone {@code CREATE SEQUENCE ... AS
+     * integer} — which matches no column — always answered bigint.
      */
     public static DataType getSequenceDataType(Database database, String qualifiedSeqName) {
-        Schema schema = database.getSchema(schemaOf(qualifiedSeqName));
-        String seqName = nameOf(qualifiedSeqName);
-        if (schema != null) {
-            for (Table t : schema.getTables().values()) {
-                for (Column col : t.getColumns()) {
-                    String expected = t.getName() + "_" + col.getName() + "_seq";
-                    if (expected.equalsIgnoreCase(seqName)) {
-                        switch (col.getType()) {
-                            case SMALLSERIAL:
-                            case SMALLINT:
-                                return DataType.SMALLINT;
-                            case SERIAL:
-                            case INTEGER:
-                                return DataType.INTEGER;
-                            default:
-                                return DataType.BIGINT;
-                        }
-                    }
-                }
-            }
+        Sequence seq = database.getSequence(qualifiedSeqName);
+        if (seq != null) {
+            String declared = seq.getDataType();
+            if ("smallint".equals(declared)) return DataType.SMALLINT;
+            if ("integer".equals(declared)) return DataType.INTEGER;
         }
         return DataType.BIGINT;
     }

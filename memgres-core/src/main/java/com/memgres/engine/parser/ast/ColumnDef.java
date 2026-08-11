@@ -41,6 +41,20 @@ public final class ColumnDef {
     private String primaryKeyName;
     private String uniqueName;
     private String foreignKeyName;
+    private String notNullName;
+
+    // The rest of the options of the sequence behind an identity column. START and INCREMENT are
+    // fields of their own above; the others used to be read and thrown away, so a bound, a cache
+    // size or a sequence name written in the option list described a sequence nobody built.
+    private Long identityMinValue;
+    private Long identityMaxValue;
+    private Integer identityCache;
+    private Boolean identityCycle;
+    private String identitySequenceName;
+    private boolean identityOptionsWritten;
+
+    // A NOT NULL may say it is not to travel to inheritance children, exactly as a CHECK may.
+    private boolean notNullNoInherit;
 
     /** The name written for this column's PRIMARY KEY, or null to generate one. */
     public String primaryKeyName() { return primaryKeyName; }
@@ -56,6 +70,51 @@ public final class ColumnDef {
     public String foreignKeyName() { return foreignKeyName; }
 
     public void setForeignKeyName(String name) { this.foreignKeyName = name; }
+
+    /** The name written for this column's NOT NULL constraint, or null to generate one. */
+    public String notNullName() { return notNullName; }
+
+    public void setNotNullName(String name) { this.notNullName = name; }
+
+    /** MINVALUE written for the identity sequence, or null for the type's own lower bound. */
+    public Long identityMinValue() { return identityMinValue; }
+
+    /** MAXVALUE written for the identity sequence, or null for the type's own upper bound. */
+    public Long identityMaxValue() { return identityMaxValue; }
+
+    /** CACHE written for the identity sequence, or null for PostgreSQL's default of one. */
+    public Integer identityCache() { return identityCache; }
+
+    /** CYCLE or NO CYCLE written for the identity sequence, or null when neither was. */
+    public Boolean identityCycle() { return identityCycle; }
+
+    /** SEQUENCE NAME written for the identity sequence, possibly schema-qualified. */
+    public String identitySequenceName() { return identitySequenceName; }
+
+    /** True when the definition wrote an identity option list at all, empty or not. */
+    public boolean identityOptionsWritten() { return identityOptionsWritten; }
+
+    /** True when the NOT NULL said NO INHERIT, so inheritance children do not receive it. */
+    public boolean notNullNoInherit() { return notNullNoInherit; }
+
+    public void setNotNullNoInherit(boolean noInherit) { this.notNullNoInherit = noInherit; }
+
+    /**
+     * Carry the identity sequence's options from the definition onto the column.
+     *
+     * @param written whether an option list was written at all, which is what tells an identity
+     *                column whose sequence the statement described from one left entirely to
+     *                PostgreSQL's defaults
+     */
+    public void setIdentityOptions(Long minValue, Long maxValue, Integer cache, Boolean cycle,
+                                   String sequenceName, boolean written) {
+        this.identityMinValue = minValue;
+        this.identityMaxValue = maxValue;
+        this.identityCache = cache;
+        this.identityCycle = cycle;
+        this.identitySequenceName = sequenceName;
+        this.identityOptionsWritten = written;
+    }
 
     public ColumnDef(
             String name,

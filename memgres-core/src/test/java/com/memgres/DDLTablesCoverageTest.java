@@ -750,10 +750,14 @@ class DDLTablesCoverageTest {
         exec("CREATE TABLE ct_part_h (id INTEGER, val TEXT) PARTITION BY HASH (id)");
         exec("CREATE TABLE ct_part_h_0 PARTITION OF ct_part_h FOR VALUES WITH (MODULUS 2, REMAINDER 0)");
         exec("CREATE TABLE ct_part_h_1 PARTITION OF ct_part_h FOR VALUES WITH (MODULUS 2, REMAINDER 1)");
-        exec("INSERT INTO ct_part_h_0 VALUES (1, 'a')");
-        exec("INSERT INTO ct_part_h_1 VALUES (2, 'b')");
-        assertEquals(1, queryInt("SELECT COUNT(*) FROM ct_part_h_0"));
-        assertEquals(1, queryInt("SELECT COUNT(*) FROM ct_part_h_1"));
+        // Which partition a key lands in is PostgreSQL's hash function's answer, not one the
+        // writer chooses: over MODULUS 2 both 1 and 2 hash to remainder 0, so a row named for the
+        // other partition is refused by that partition's own bound.
+        exec("INSERT INTO ct_part_h VALUES (1, 'a')");
+        exec("INSERT INTO ct_part_h VALUES (2, 'b')");
+        assertEquals(2, queryInt("SELECT COUNT(*) FROM ct_part_h_0"));
+        assertEquals(0, queryInt("SELECT COUNT(*) FROM ct_part_h_1"));
+        assertEquals(2, queryInt("SELECT COUNT(*) FROM ct_part_h"));
         exec("DROP TABLE IF EXISTS ct_part_h_0");
         exec("DROP TABLE IF EXISTS ct_part_h_1");
         exec("DROP TABLE IF EXISTS ct_part_h");

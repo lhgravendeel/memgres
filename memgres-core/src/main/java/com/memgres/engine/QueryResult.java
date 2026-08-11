@@ -21,18 +21,26 @@ public class QueryResult {
     private final int affectedRows;
     private final String message;
     private final CopyStmt copyStmt;  // context for COPY_OUT / COPY_IN
+    /** For COPY FROM STDIN: what the copy is refused with once it has been opened, if anything. */
+    private final MemgresException copyRefusal;
 
     private QueryResult(Type type, List<Column> columns, List<Object[]> rows, int affectedRows, String message) {
         this(type, columns, rows, affectedRows, message, null);
     }
 
     private QueryResult(Type type, List<Column> columns, List<Object[]> rows, int affectedRows, String message, CopyStmt copyStmt) {
+        this(type, columns, rows, affectedRows, message, copyStmt, null);
+    }
+
+    private QueryResult(Type type, List<Column> columns, List<Object[]> rows, int affectedRows,
+                        String message, CopyStmt copyStmt, MemgresException copyRefusal) {
         this.type = type;
         this.columns = columns;
         this.rows = rows;
         this.affectedRows = affectedRows;
         this.message = message;
         this.copyStmt = copyStmt;
+        this.copyRefusal = copyRefusal;
     }
 
     public static QueryResult select(List<Column> columns, List<Object[]> rows) {
@@ -66,6 +74,17 @@ public class QueryResult {
         return new QueryResult(Type.COPY_IN, Collections.emptyList(), Collections.emptyList(), 0, null, copyStmt);
     }
 
+    /**
+     * A COPY FROM STDIN that is refused as soon as it has begun. PostgreSQL opens the copy stream
+     * from the statement alone and only looks at what kind of relation it is storing rows in once
+     * it comes to store them, so the client is asked for data and then told the statement failed.
+     * The refusal travels with the result because the CopyInResponse has to go out before it.
+     */
+    public static QueryResult copyInRefused(CopyStmt copyStmt, MemgresException refusal) {
+        return new QueryResult(Type.COPY_IN, Collections.emptyList(), Collections.emptyList(),
+                0, null, copyStmt, refusal);
+    }
+
     public Type getType() {
         return type;
     }
@@ -88,5 +107,9 @@ public class QueryResult {
 
     public CopyStmt getCopyStmt() {
         return copyStmt;
+    }
+
+    public MemgresException getCopyRefusal() {
+        return copyRefusal;
     }
 }

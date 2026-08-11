@@ -84,6 +84,16 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
         QueryResult describeResult;
         boolean rowDescriptionSent;
         boolean describeAttempted;
+        /**
+         * True once the portal has delivered everything it has. A cleared suspendedResult cannot
+         * say so on its own — it looks exactly like a portal that has not started — so an Execute
+         * on a finished portal ran the statement a second time, side effects and all.
+         */
+        boolean done;
+        /** Whether the finished portal returned rows, which is what decides how PG answers it. */
+        boolean rowReturning;
+        /** The finished result's kind, so the zero-count tag names the right verb. */
+        QueryResult.Type completedType;
         String stmtName = "";
 
         Portal(String sql, List<Object> paramValues, short[] resultFormatCodes) {
@@ -117,7 +127,7 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
         this.session = new Session(database);
         this.session.setDatabaseName(databaseName);
         this.session.setDatabaseRegistry(registry);
-        this.copyHandler = new PgWireCopyHandler(session);
+        this.copyHandler = new PgWireCopyHandler(session, this);
         this.describeHelper = new PgWireDescribeHelper(session, database);
     }
 
@@ -281,8 +291,7 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
         }
         sendErrorSimple(ctx, msg.getSqlState(), msg.getQuery());
         if (PgWireDecoder.isExtendedQueryMessage(msg.getOffendingType())) {
-            errorPendingUntilSync = true;
-            ctx.flush();
+            extendedErrorReported(ctx);
         } else {
             sendReadyForQuery(ctx, session);
         }
@@ -362,7 +371,7 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                 this.session = new Session(database);
                 this.session.setDatabaseName(requestedDb);
                 this.session.setDatabaseRegistry(registry);
-                this.copyHandler = new PgWireCopyHandler(session);
+                this.copyHandler = new PgWireCopyHandler(session, this);
                 this.describeHelper = new PgWireDescribeHelper(session, database);
             }
 
@@ -897,9 +906,13 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
             if (result.rowDescSent()) {
                 rowDescSentByDescribe = true;
                 portal.rowDescriptionSent = true;
-                if (result.cachedResult() != null) {
-                    portal.describeResult = result.cachedResult();
-                }
+            }
+            // A Describe that had to run the statement to learn its shape has already applied it,
+            // so Execute has to report that run rather than start another. Keeping the result only
+            // when a row description went with it left the statement to run a second time whenever
+            // it turned out to have no columns.
+            if (result.cachedResult() != null) {
+                portal.describeResult = result.cachedResult();
             }
         }
     }
@@ -1043,6 +1056,18 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
             return;
         }
 
+        // A portal that has run to its end is finished. PostgreSQL answers one that returned rows
+        // with an empty result of the same kind, and refuses one that did not — it does not run
+        // the statement again, which had been writing a second row and creating a second table.
+        if (portal.done) {
+            if (portal.rowReturning) {
+                sendCommandCompleteWithNotices(ctx, exhaustedPortalTag(portal.completedType));
+            } else {
+                sendExtendedError(ctx, "55000", "portal \"" + portalName + "\" cannot be run");
+            }
+            return;
+        }
+
         String sqlSnip = portal.sql().substring(0, Math.min(70, portal.sql().length())).replace("\n", " ");
 
         try {
@@ -1079,7 +1104,7 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                             } catch (MemgresException e) {
                                 enrichErrorPosition(e, s);
                                 sendErrorWithDetails(ctx, e, true);
-                                errorPendingUntilSync = true;
+                                extendedErrorReported(ctx);
                                 return;
                             }
                         }
@@ -1099,22 +1124,34 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
 
             rowDescSentByDescribe = false;
 
+            // Any portal that returns rows can be fetched from, which includes INSERT, UPDATE,
+            // DELETE and MERGE with RETURNING. COPY is its own protocol and is not one of them.
+            boolean rowReturning = result.getType() != QueryResult.Type.COPY_OUT
+                    && result.getType() != QueryResult.Type.COPY_IN
+                    && result.getRows() != null && result.getColumns() != null
+                    && !result.getColumns().isEmpty();
+
             // Handle maxRows (cursor-based fetching with portal suspend/resume)
-            if (maxRows > 0 && result.getType() == QueryResult.Type.SELECT) {
+            if (maxRows > 0 && rowReturning) {
                 List<Object[]> allRows = result.getRows();
                 int offset = portal.suspendedOffset;
                 int end = Math.min(offset + maxRows, allRows.size());
                 for (int i = offset; i < end; i++) {
                     sendDataRow(ctx, allRows.get(i), result.getColumns(), portal.resultFormatCodes());
                 }
-                if (end < allRows.size()) {
+                // PostgreSQL suspends whenever the limit was reached, even when reaching it took
+                // the last row: whether anything follows is the next Execute's answer to give.
+                if (end - offset == maxRows) {
                     portal.suspendedResult = result;
                     portal.suspendedOffset = end;
                     sendPortalSuspended(ctx);
                 } else {
                     portal.suspendedResult = null;
                     portal.suspendedOffset = 0;
-                    sendCommandCompleteWithNotices(ctx, "SELECT " + allRows.size());
+                    portal.done = true;
+                    portal.rowReturning = true;
+                    portal.completedType = result.getType();
+                    sendCommandCompleteWithNotices(ctx, commandTag(result, end - offset));
                 }
             } else {
                 // CALL with OUT params: PG sends RowDescription during Execute (not Describe)
@@ -1134,6 +1171,9 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                 } else {
                     sendResultDataOnly(ctx, result, portal.resultFormatCodes());
                 }
+                portal.done = true;
+                portal.rowReturning = rowReturning;
+                portal.completedType = result.getType();
             }
             // Emit ParameterStatus updates for tracked GUC parameters after SET
             if (result.getType() == QueryResult.Type.SET) {
@@ -1143,7 +1183,7 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
             LOG.warn("[PROTO] Execute ERROR {}: {} | {}", e.getSqlState(), e.getMessage(), sqlSnip);
             enrichErrorPosition(e, portal.sql());
             sendErrorWithDetails(ctx, e, true);
-            errorPendingUntilSync = true;
+            extendedErrorReported(ctx);
         } catch (ArithmeticException e) {
             String errMsg = e.getMessage() != null ? e.getMessage() : "arithmetic error";
             LOG.warn("[PROTO] Execute ARITH ERROR: {} | {}", errMsg, sqlSnip);
@@ -1157,7 +1197,7 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
             MemgresException translated = PgErrors.translate(e);
             enrichErrorPosition(translated, portal.sql());
             sendErrorWithDetails(ctx, translated, true);
-            errorPendingUntilSync = true;
+            extendedErrorReported(ctx);
         } finally {
             if (session != null) session.setIdleState();
         }
@@ -1252,6 +1292,46 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
         }
     }
 
+    /**
+     * The tag for one Execute of a portal that returns rows. PostgreSQL counts the rows that
+     * Execute delivered — a resumed portal reports its own rows, not the whole result — while a
+     * portal that returns none keeps the statement's affected-row count.
+     */
+    private static String commandTag(QueryResult result, int rowsThisExecute) {
+        switch (result.getType()) {
+            case SELECT:
+            case SELECT_INTO:
+                return "SELECT " + rowsThisExecute;
+            case INSERT:
+                return "INSERT 0 " + rowsThisExecute;
+            case UPDATE:
+                return "UPDATE " + rowsThisExecute;
+            case DELETE:
+                return "DELETE " + rowsThisExecute;
+            case MERGE:
+                return "MERGE " + rowsThisExecute;
+            default:
+                return commandTag(result);
+        }
+    }
+
+    /** What PostgreSQL answers an Execute on a portal that has already delivered everything. */
+    private static String exhaustedPortalTag(QueryResult.Type type) {
+        if (type == null) return "SELECT 0";
+        switch (type) {
+            case INSERT:
+                return "INSERT 0 0";
+            case UPDATE:
+                return "UPDATE 0";
+            case DELETE:
+                return "DELETE 0";
+            case MERGE:
+                return "MERGE 0";
+            default:
+                return "SELECT 0";
+        }
+    }
+
     /** Send a full query result (simple query protocol): RowDescription + DataRows + CommandComplete. */
     private void sendQueryResult(ChannelHandlerContext ctx, QueryResult result) {
         switch (result.getType()) {
@@ -1276,7 +1356,7 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                 copyHandler.sendCopyOutResult(ctx, result);
                 break;
             case COPY_IN:
-                copyHandler.sendCopyInResult(ctx, result);
+                copyHandler.sendCopyInResult(ctx, result, false);
                 break;
             case EMPTY: {
                 ByteBuf buf = ctx.alloc().buffer();
@@ -1316,7 +1396,7 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                 copyHandler.sendCopyOutResult(ctx, result);
                 break;
             case COPY_IN:
-                copyHandler.sendCopyInResult(ctx, result);
+                copyHandler.sendCopyInResult(ctx, result, true);
                 break;
             case EMPTY: {
                 ByteBuf buf = ctx.alloc().buffer();
@@ -1505,7 +1585,40 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
     /** Send an error for extended query protocol (sets error flag to skip until Sync). */
     private void sendExtendedError(ChannelHandlerContext ctx, String sqlState, String message) {
         sendError(ctx, sqlState, message, true);
+        extendedErrorReported(ctx);
+    }
+
+    /**
+     * A COPY under the extended protocol failed, so everything up to Sync is skipped just as it
+     * is for any other extended error. The copy handler sends its own ErrorResponse — it is the
+     * one that knows what went wrong — and this is what stops the messages that follow.
+     */
+    void setErrorPendingUntilSync(ChannelHandlerContext ctx) {
+        extendedErrorReported(ctx);
+    }
+
+    /**
+     * What an ErrorResponse inside an extended-query sequence carries with it. PostgreSQL does all
+     * three for every error, whichever layer raised it.
+     *
+     * <p>Everything up to Sync is skipped. The transaction the error happened in is aborted: from
+     * that moment the block can do no more work, the statements after it are refused with 25P02,
+     * and COMMIT throws away what it had done rather than making it permanent. Only a statement
+     * that reached the executor used to abort here, so an error the protocol layer raised for
+     * itself — a portal that has already run to its end, a message whose bytes could not be read —
+     * left the block open and running: ReadyForQuery answered T where PostgreSQL answers E.
+     *
+     * <p>And the bytes go out now rather than at the next Sync, because PostgreSQL flushes as soon
+     * as it has written an ErrorResponse. Nothing else would push them: the messages up to Sync are
+     * skipped, and a client's Flush among them is skipped with them, so a client that flushes and
+     * waits for the answer was waiting on a buffer.
+     */
+    private void extendedErrorReported(ChannelHandlerContext ctx) {
         errorPendingUntilSync = true;
+        if (session != null && session.getStatus() == Session.TransactionStatus.IN_TRANSACTION) {
+            session.restoreStatus(Session.TransactionStatus.FAILED);
+        }
+        ctx.flush();
     }
 
     /** A connection the server is about to drop; PG reports these at FATAL, not ERROR. */
@@ -1957,8 +2070,7 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                 // result. Inside an extended-query sequence the client's own Sync produces it, so
                 // this only answers where the client is actually waiting for one.
                 if (PgWireDecoder.isExtendedQueryMessage(currentFrontendType)) {
-                    errorPendingUntilSync = true;
-                    ctx.flush();
+                    extendedErrorReported(ctx);
                 } else {
                     sendReadyForQuery(ctx, session);
                 }

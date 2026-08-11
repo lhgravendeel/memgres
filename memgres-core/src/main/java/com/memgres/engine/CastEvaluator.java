@@ -1495,6 +1495,31 @@ class CastEvaluator {
                     if (pr.values().size() != rowFields.size()) {
                         throw new MemgresException("cannot cast type record to " + typeName, "42846");
                     }
+                    // Each field becomes a value of the type the composite declares for it, which
+                    // is how a field typed by a domain comes to be judged by that domain's NOT
+                    // NULL and its CHECKs -- exactly as a column of it would be. Nothing coerced
+                    // the fields, so a domain reached through a composite was the one place its
+                    // constraints never ran.
+                    List<Object> fieldValues = new ArrayList<>(pr.values());
+                    for (int i = 0; i < fieldValues.size(); i++) {
+                        fieldValues.set(i, coerceCompositeField(fieldValues.get(i),
+                                rowFields.get(i).typeName()));
+                    }
+                    return new AstExecutor.PgRow(fieldValues);
+                }
+                // The same composite written as text is read the same way and judged the same way;
+                // the value itself goes on being the text it was written as.
+                if (val instanceof String && rowFields != null) {
+                    String recordText = ((String) val).trim();
+                    if (recordText.startsWith("(")) {
+                        List<RecordLiteral.Field> parts = RecordLiteral.parse(recordText);
+                        for (int i = 0; i < parts.size() && i < rowFields.size(); i++) {
+                            RecordLiteral.Field part = parts.get(i);
+                            coerceCompositeField(
+                                    part.quoted || !part.text.isEmpty() ? part.text : null,
+                                    rowFields.get(i).typeName());
+                        }
+                    }
                 }
                 // If this type is not a known composite either, it doesn't exist
                 if (rowFields == null) {
@@ -1529,6 +1554,25 @@ class CastEvaluator {
         for (DomainType.NamedConstraint nc : domain.getNamedConstraints()) {
             if (nc.parsedCheck() == null) continue;
             failIfViolated(nc.parsedCheck(), checkCtx, reportedName, nc.name());
+        }
+    }
+
+    /**
+     * A composite's field read as the type the composite declares for it.
+     *
+     * <p>A type whose input function cannot read the text is left alone, which is what a composite
+     * built over a relation's own columns has always relied on. What may not be swallowed is a
+     * constraint the type carries: a domain's NOT NULL and its CHECKs are the reason the field is
+     * coerced at all, and PostgreSQL refuses the whole value when one of them fails.
+     */
+    private Object coerceCompositeField(Object value, String fieldType) {
+        if (fieldType == null) return value;
+        try {
+            return applyCast(value, fieldType);
+        } catch (MemgresException e) {
+            String state = e.getSqlState();
+            if (state != null && state.startsWith("23")) throw e;
+            return value;
         }
     }
 

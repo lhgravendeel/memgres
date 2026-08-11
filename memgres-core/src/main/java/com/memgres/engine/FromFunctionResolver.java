@@ -167,7 +167,12 @@ class FromFunctionResolver {
 
     private List<RowContext> doResolveFunctionFrom(SelectStmt.FunctionFrom funcFrom) {
         String rawFname = funcFrom.functionName().toLowerCase();
-        String fname = rawFname.contains(".") ? rawFname.substring(rawFname.lastIndexOf('.') + 1) : rawFname;
+        // A dot in a function's name separates the schema it was written under from the function
+        // itself, and only the function is looked up. The TABLESAMPLE marker is not a function name
+        // at all -- it carries the relation being sampled, and that relation may itself be written
+        // schema.table -- so it keeps every part of its name and is still recognised as the marker.
+        String fname = rawFname.contains(".") && !rawFname.startsWith("__tablesample__:")
+                ? rawFname.substring(rawFname.lastIndexOf('.') + 1) : rawFname;
         String alias = funcFrom.alias() != null ? funcFrom.alias() : fname;
         List<String> rawColAliases = funcFrom.columnAliases();
         // Strip type info from column aliases for most functions (jsonb_to_record/json_to_record use raw aliases)
@@ -1467,14 +1472,29 @@ class FromFunctionResolver {
     private List<RowContext> resolveTablesample(String fname, String alias, List<Object> evalArgs) {
         String tableName = fname.substring("__tablesample__:".length());
         String method = evalArgs.get(0).toString();
-        double pct = executor.toDouble(evalArgs.get(1));
-        Long seed = evalArgs.size() > 2 ? Long.parseLong(evalArgs.get(2).toString()) : null;
-
-        if (pct < 0) {
-            throw new MemgresException("tablesample percentage must not be negative", "2202H");
+        // Both parameters are read before anything is sampled, and PostgreSQL says so rather than
+        // sampling with nothing in hand: the percentage is 2202H and the seed 2202G.
+        if (evalArgs.get(1) == null) {
+            throw new MemgresException("TABLESAMPLE parameter cannot be null", "2202H");
         }
-        if (pct > 100) {
-            throw new MemgresException("tablesample percentage must be between 0 and 100", "2202H");
+        double pct = executor.toDouble(evalArgs.get(1));
+        // REPEATABLE is declared over double precision, so a fraction is a seed and not a fault in
+        // the statement. What the sampler wants of it is a repeatable starting point: a whole
+        // number is used as itself, so a seed that always picked these rows still picks them.
+        Long seed = null;
+        if (evalArgs.size() > 2) {
+            if (evalArgs.get(2) == null) {
+                throw new MemgresException("TABLESAMPLE REPEATABLE parameter cannot be null", "2202G");
+            }
+            double written = executor.toDouble(evalArgs.get(2));
+            seed = Long.valueOf(written == Math.rint(written) && !Double.isInfinite(written)
+                    ? (long) written : Double.doubleToLongBits(written));
+        }
+
+        // The sampler reads the percentage as a fraction of the whole, so anything outside 0..100
+        // names no fraction at all. PostgreSQL says the same words either side of the range.
+        if (pct < 0 || pct > 100) {
+            throw new MemgresException("sample percentage must be between 0 and 100", "2202H");
         }
 
         // Sampling reads a fraction of a stored relation's pages, so there has to be one. A WITH
@@ -1484,13 +1504,50 @@ class FromFunctionResolver {
                     "TABLESAMPLE clause can only be applied to tables and materialized views",
                     "0A000");
         }
-        Table table;
-        try {
-            table = executor.resolveTable(null, tableName);
-        } catch (MemgresException e) {
-            throw new MemgresException("relation \"" + tableName + "\" does not exist", "42P01");
+        // A qualified relation names the schema to look in; the qualifier is not part of the
+        // relation's own name, so the two halves are told apart before the relation is opened.
+        int qualifier = tableName.indexOf('.');
+        String sampleSchema = qualifier > 0 ? tableName.substring(0, qualifier) : null;
+        String sampleName = qualifier > 0 ? tableName.substring(qualifier + 1) : tableName;
+        // And it has to be a relation whose pages are its own. A view has none -- reading it runs
+        // its query -- and neither has a sequence, so PostgreSQL refuses both by kind before it
+        // samples anything. Resolving first rewrote a view to the table underneath it and sampled
+        // that, which is a relation the statement never named. A materialized view does hold its
+        // rows, and PostgreSQL samples it.
+        List<String> samplePath = sampleSchema != null
+                ? java.util.Collections.singletonList(sampleSchema)
+                : executor.relationSearchPath();
+        Database.ViewDef sampledMatview = null;
+        for (String schema : samplePath) {
+            String kind = RelationNamespace.kindOf(executor.database, schema, sampleName);
+            if (kind == null) continue;
+            if (RelationNamespace.VIEW.equals(kind) || RelationNamespace.SEQUENCE.equals(kind)) {
+                throw new MemgresException(
+                        "TABLESAMPLE clause can only be applied to tables and materialized views",
+                        "0A000");
+            }
+            // A materialized view's rows are not in the schema's tables, so the lookup below would
+            // not find them and the statement was refused as naming nothing -- a relation the same
+            // session can read without TABLESAMPLE. The rows it holds are what PostgreSQL samples.
+            if (RelationNamespace.MATVIEW.equals(kind)) {
+                sampledMatview = executor.database.getView(schema, sampleName);
+            }
+            break;
         }
-        List<Object[]> allRows = new ArrayList<>(table.getRows());
+        Table table;
+        if (sampledMatview != null) {
+            table = matviewRelation(sampledMatview, sampleName);
+        } else {
+            try {
+                table = executor.resolveTable(sampleSchema, sampleName, sampleSchema != null);
+            } catch (MemgresException e) {
+                throw new MemgresException("relation \"" + tableName + "\" does not exist", "42P01");
+            }
+        }
+        // The rows of an inheritance child or a partition belong to the relation named, so a
+        // sampled scan draws from the same population a plain scan reads. Sampling the relation's
+        // own list alone made TABLESAMPLE see a fraction of a table it could not report.
+        List<Object[]> allRows = new ArrayList<>(table.getAllRows());
         List<Object[]> sampledRows;
 
         if (pct == 100.0) {
@@ -1514,6 +1571,29 @@ class FromFunctionResolver {
             contexts.add(new RowContext(table, tableAlias, row));
         }
         return contexts;
+    }
+
+    /**
+     * A materialized view's stored rows, as a relation a sampled scan can read.
+     *
+     * <p>PostgreSQL keeps the rows of the last refresh, which is why it samples a materialized
+     * view as it samples a table. One that has never been populated holds nothing to sample, and
+     * PostgreSQL refuses every scan of it -- sampled or plain -- until a REFRESH has run.
+     */
+    private Table matviewRelation(Database.ViewDef view, String name) {
+        if (!view.populated()) {
+            MemgresException e = new MemgresException(
+                    "materialized view \"" + view.name() + "\" has not been populated", "55000");
+            e.setHint("Use the REFRESH MATERIALIZED VIEW command.");
+            throw e;
+        }
+        List<Column> cols = view.cachedColumns() != null
+                ? view.cachedColumns() : new ArrayList<Column>();
+        Table held = new Table(name, cols);
+        if (view.cachedRows() != null) {
+            for (Object[] row : view.cachedRows()) held.insertRow(row);
+        }
+        return held;
     }
 
     // ---- ROWS FROM ----
@@ -2348,7 +2428,9 @@ class FromFunctionResolver {
             throw new MemgresException("relation \"" + tableName + "\" does not exist", "42P01");
         }
 
-        String colName = colAliases != null && !colAliases.isEmpty() ? colAliases.get(0) : "pg_partition_ancestors";
+        // PostgreSQL declares the output parameter as relid, so an unaliased call is queried by
+        // that name; naming the column after the function made every such query fail.
+        String colName = colAliases != null && !colAliases.isEmpty() ? colAliases.get(0) : "relid";
         Column col = new Column(colName, DataType.TEXT, true, false, null);
         Table virtualTable = new Table(alias, Cols.listOf(col));
         List<RowContext> contexts = new ArrayList<>();

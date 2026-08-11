@@ -28,8 +28,21 @@ class DdlTableParser {
     private final Parser parser;
     private final List<TableConstraint> pendingColumnChecks = new ArrayList<>();
 
+    /**
+     * The relation whose column definitions are being read. PostgreSQL names it in every complaint
+     * about a contradictory definition -- {@code multiple default values specified for column "a"
+     * of table "t"} -- and the name is not otherwise in scope in the clause loop, because the same
+     * loop serves CREATE TABLE and ALTER TABLE ADD COLUMN.
+     */
+    private String relationName;
+
     DdlTableParser(Parser parser) {
         this.parser = parser;
+    }
+
+    /** Tell the column-definition reader which relation the definitions belong to. */
+    void setRelationName(String name) {
+        this.relationName = name;
     }
 
     Statement parseCreateTable(boolean temporary, boolean unlogged) {
@@ -40,6 +53,47 @@ class DdlTableParser {
         if (parser.match(TokenType.DOT)) {
             schema = name;
             name = parser.readIdentifier();
+        }
+        setRelationName(name);
+
+        // CREATE TABLE name OF composite_type [ (constraint, ...) ]: a typed table takes its
+        // columns from the type, so what may be written here are constraints rather than columns.
+        if (parser.matchKeyword("OF")) {
+            // PostgreSQL's grammar reads a plain, possibly qualified name here rather than a type
+            // with a modifier, because the parenthesis that may follow opens the constraint list.
+            // Reading it as a modifier took "(PRIMARY" for a width and stopped on the KEY after it.
+            String ofType = parser.readIdentifier();
+            if (parser.match(TokenType.DOT)) {
+                ofType = ofType.toLowerCase() + "." + parser.readIdentifier().toLowerCase();
+            }
+            List<TableConstraint> ofConstraints = new ArrayList<TableConstraint>();
+            List<ColumnDef> ofColumnOptions = new ArrayList<ColumnDef>();
+            if (parser.match(TokenType.LEFT_PAREN)) {
+                if (!parser.check(TokenType.RIGHT_PAREN)) {
+                    do {
+                        // The element list of a typed table holds table constraints and, for a
+                        // column the type already declares, the options written for it here:
+                        // PostgreSQL's own alternative is ColId WITH OPTIONS ColQualList.
+                        if (isTableConstraintStart()) {
+                            ofConstraints.add(parseTableConstraint());
+                            continue;
+                        }
+                        String optionColumn = parser.readColumnName();
+                        parser.expectKeyword("WITH");
+                        parser.expectKeyword("OPTIONS");
+                        ofColumnOptions.add(parseColumnQualifiers(optionColumn, null));
+                        while (!pendingColumnChecks.isEmpty()) {
+                            ofConstraints.add(pendingColumnChecks.remove(0));
+                        }
+                    } while (parser.match(TokenType.COMMA));
+                }
+                parser.expect(TokenType.RIGHT_PAREN);
+            }
+            CreateTableStmt typed = new CreateTableStmt(schema, name, ifNotExists, temporary,
+                    unlogged, ofColumnOptions, ofConstraints, null, null, null, null,
+                    null, null, null, null);
+            typed.setOfType(ofType);
+            return typed;
         }
 
         // CREATE TABLE ... (a, b) AS query -- a bare name list renaming the query's columns,
@@ -211,8 +265,17 @@ class DdlTableParser {
             else { parser.expectKeyword("HASH"); partitionBy = "HASH"; }
             parser.expect(TokenType.LEFT_PAREN);
             StringBuilder partColBuf = new StringBuilder(readPartitionElement());
+            int partElements = 1;
             while (parser.match(TokenType.COMMA)) {
                 partColBuf.append(", ").append(readPartitionElement());
+                partElements++;
+            }
+            // LIST matches one value against a written list, so there is nothing for a second
+            // column to be matched against. RANGE compares a tuple of keys and HASH hashes one,
+            // and PostgreSQL takes several columns for both.
+            if (partElements > 1 && "LIST".equals(partitionBy)) {
+                throw new MemgresException("cannot use \"list\" partition strategy with more than"
+                        + " one column", "42P17");
             }
             partitionCol = partColBuf.toString();
             parser.expect(TokenType.RIGHT_PAREN);
@@ -282,7 +345,17 @@ class DdlTableParser {
     ColumnDef parseColumnDef() {
         String colName = parser.readColumnName();
         String typeName = parser.parseTypeName();
+        return parseColumnQualifiers(colName, typeName);
+    }
 
+    /**
+     * The qualifiers of a column definition, over a name and a type already read.
+     *
+     * <p>A typed table writes them on their own — {@code col WITH OPTIONS NOT NULL} — because the
+     * type comes from the composite the table is OF and there is none to read here. The list of
+     * qualifiers PostgreSQL takes is the same one either way, so both are read by this.
+     */
+    ColumnDef parseColumnQualifiers(String colName, String typeName) {
         boolean notNull = false;
         boolean pk = false;
         boolean unique = false;
@@ -308,10 +381,39 @@ class DdlTableParser {
         String pkName = null;
         String uqName = null;
         String fkName = null;
+        String nnName = null;
+        // The clauses of a column definition are a set, not a sequence: PostgreSQL refuses one
+        // that says the same thing twice or two contradictory things, rather than letting the last
+        // clause written decide what the column is.
+        boolean sawNotNull = false, sawNull = false, sawDefault = false;
+        boolean sawIdentity = false, sawGenerated = false;
+        boolean notNullNoInherit = false;
+        IdentityOptions identityOptions = null;
+        // SERIAL stands for a column whose default draws from a sequence, so a DEFAULT written
+        // beside it is a second default even though the first one is made by the executor.
+        if (isSerialTypeName(typeName)) sawDefault = true;
 
         while (true) {
-            if (parser.matchKeywords("NOT", "NULL")) { notNull = true; pendingName = null; continue; }
-            if (parser.matchKeyword("NULL")) { notNull = false; continue; }
+            if (parser.matchKeywords("NOT", "NULL")) {
+                if (sawNull) throw conflictingNullDeclarations(colName);
+                notNull = true;
+                sawNotNull = true;
+                // A NOT NULL may say it is not to travel to inheritance children, exactly as a
+                // table-level CHECK may; reading nothing after the two words made NO INHERIT a
+                // syntax error on a definition PostgreSQL accepts.
+                notNullNoInherit = parser.matchKeywords("NO", "INHERIT");
+                // A CONSTRAINT clause names this NOT NULL just as it names a key, and PG stores
+                // that name: it is what pg_constraint lists and what DROP CONSTRAINT asks for.
+                nnName = pendingName;
+                pendingName = null;
+                continue;
+            }
+            if (parser.matchKeyword("NULL")) {
+                if (sawNotNull) throw conflictingNullDeclarations(colName);
+                notNull = false;
+                sawNull = true;
+                continue;
+            }
             if (parser.matchKeywords("PRIMARY", "KEY")) {
                 pk = true;
                 notNull = true;
@@ -349,6 +451,14 @@ class DdlTableParser {
                 continue;
             }
             if (parser.matchKeyword("DEFAULT")) {
+                // A column has one default; a second clause contradicts the first rather than
+                // replacing it, and PostgreSQL names the column and its table when it says so.
+                if (sawDefault) {
+                    throw com.memgres.engine.PgErrors.syntax(
+                            "multiple default values specified for column \"" + colName
+                            + "\" of table \"" + relationOrEmpty() + "\"");
+                }
+                sawDefault = true;
                 Expression written = parser.parseExpression();
                 // A column with no default already answers NULL, so DEFAULT NULL adds nothing:
                 // PostgreSQL records no default for it at all, and pg_attribute says the column
@@ -417,14 +527,18 @@ class DdlTableParser {
                     parser.expectKeyword("AS");
                     if (parser.checkKeyword("IDENTITY")) {
                         parser.advance();
+                        requireOneGeneration(colName, sawIdentity || sawGenerated);
+                        sawIdentity = true;
                         identity = "ALWAYS";
                         if (parser.check(TokenType.LEFT_PAREN)) {
                             parser.advance();
-                            long[] opts = parseSequenceOptionsInParens();
-                            identityStart = opts[0] != Long.MIN_VALUE ? opts[0] : null;
-                            identityIncrement = opts[1] != Long.MIN_VALUE ? opts[1] : null;
+                            identityOptions = parseSequenceOptionsInParens();
+                            identityStart = identityOptions.start;
+                            identityIncrement = identityOptions.increment;
                         }
                     } else {
+                        requireOneGeneration(colName, sawIdentity || sawGenerated);
+                        sawGenerated = true;
                         parser.expect(TokenType.LEFT_PAREN);
                         generatedExpr = buildRawSqlUntilCloseParen();
                         parser.expect(TokenType.RIGHT_PAREN);
@@ -441,13 +555,22 @@ class DdlTableParser {
                     parser.matchKeyword("BY");
                     parser.matchKeyword("DEFAULT");
                     parser.expectKeyword("AS");
+                    // Only identity may be written BY DEFAULT: a generation expression is
+                    // recomputed for every row, so there is nothing for a written value to
+                    // override. PostgreSQL names that rule rather than reporting the paren.
+                    if (parser.check(TokenType.LEFT_PAREN)) {
+                        throw com.memgres.engine.PgErrors.syntax(
+                                "for a generated column, GENERATED ALWAYS must be specified");
+                    }
                     parser.expectKeyword("IDENTITY");
+                    requireOneGeneration(colName, sawIdentity || sawGenerated);
+                    sawIdentity = true;
                     identity = "BY DEFAULT";
                     if (parser.check(TokenType.LEFT_PAREN)) {
                         parser.advance();
-                        long[] opts = parseSequenceOptionsInParens();
-                        identityStart = opts[0] != Long.MIN_VALUE ? opts[0] : null;
-                        identityIncrement = opts[1] != Long.MIN_VALUE ? opts[1] : null;
+                        identityOptions = parseSequenceOptionsInParens();
+                        identityStart = identityOptions.start;
+                        identityIncrement = identityOptions.increment;
                     }
                 }
                 continue;
@@ -472,7 +595,9 @@ class DdlTableParser {
 
         Integer precision = null;
         Integer scale = null;
-        int parenStart = typeName.indexOf('(');
+        // A typed table's column options carry no type at all, so there is no modifier to read
+        // off one: the composite the table is OF settles both.
+        int parenStart = typeName == null ? -1 : typeName.indexOf('(');
         if (parenStart >= 0) {
             int parenEnd = typeName.indexOf(')');
             if (parenEnd > parenStart) {
@@ -492,31 +617,138 @@ class DdlTableParser {
         def.setPrimaryKeyName(pkName);
         def.setUniqueName(uqName);
         def.setForeignKeyName(fkName);
+        def.setNotNullName(nnName);
+        def.setNotNullNoInherit(notNullNoInherit);
+        if (identityOptions != null) {
+            def.setIdentityOptions(identityOptions.minValue, identityOptions.maxValue,
+                    identityOptions.cache, identityOptions.cycle, identityOptions.sequenceName,
+                    identityOptions.any);
+        }
         return def;
     }
 
-    long[] parseSequenceOptionsInParens() {
-        long startWith = Long.MIN_VALUE;
-        long incrementBy = Long.MIN_VALUE;
+    /**
+     * The CHECK and UNIQUE NULLS NOT DISTINCT clauses a column definition carried, taken away from
+     * the parser. CREATE TABLE collects them with the table's own constraints; ALTER TABLE ADD
+     * COLUMN has to take them from here or they are simply dropped.
+     */
+    List<TableConstraint> drainPendingColumnChecks() {
+        List<TableConstraint> drained = new ArrayList<TableConstraint>(pendingColumnChecks);
+        pendingColumnChecks.clear();
+        return drained;
+    }
+
+    /**
+     * The options of the sequence behind an identity column, exactly as CREATE SEQUENCE writes
+     * them. Every one of them is PostgreSQL's to check before the column is defined, so keeping
+     * only START and INCREMENT meant no option check ever ran.
+     */
+    static final class IdentityOptions {
+        Long start;
+        Long increment;
+        Long minValue;
+        Long maxValue;
+        Integer cache;
+        Boolean cycle;
+        String sequenceName;
+        /** Whether the list said anything at all, which is what tells a described sequence from a default one. */
+        boolean any;
+    }
+
+    IdentityOptions parseSequenceOptionsInParens() {
+        IdentityOptions opts = new IdentityOptions();
         while (!parser.isAtEnd() && !parser.check(TokenType.RIGHT_PAREN)) {
-            if (parser.matchKeyword("START")) {
+            if (parser.matchKeywords("SEQUENCE", "NAME")) {
+                String seqName = parser.readIdentifier();
+                if (parser.match(TokenType.DOT)) seqName = seqName + "." + parser.readIdentifier();
+                opts.sequenceName = seqName;
+                opts.any = true;
+            } else if (parser.matchKeyword("START")) {
                 parser.matchKeyword("WITH");
-                startWith = Long.parseLong(parser.advance().value());
+                // The lexer hands a minus over as a token of its own, so reading one raw token
+                // saw "-" and failed with an internal error where PostgreSQL takes the value.
+                opts.start = Long.valueOf(DdlParser.readSeqLong(parser));
+                opts.any = true;
             } else if (parser.matchKeyword("INCREMENT")) {
                 parser.matchKeyword("BY");
-                incrementBy = Long.parseLong(parser.advance().value());
-            } else if (parser.matchKeyword("MINVALUE") || parser.matchKeyword("MAXVALUE") || parser.matchKeyword("CACHE")) {
-                if (!parser.isAtEnd() && !parser.check(TokenType.RIGHT_PAREN) && parser.peek().type() == TokenType.INTEGER_LITERAL) {
-                    parser.advance();
-                }
-            } else if (parser.matchKeywords("NO", "MINVALUE") || parser.matchKeywords("NO", "MAXVALUE") || parser.matchKeyword("CYCLE")) {
-                // consumed
+                opts.increment = Long.valueOf(DdlParser.readSeqLong(parser));
+                opts.any = true;
+            } else if (parser.matchKeywords("NO", "MINVALUE")) {
+                opts.minValue = null;
+                opts.any = true;
+            } else if (parser.matchKeywords("NO", "MAXVALUE")) {
+                opts.maxValue = null;
+                opts.any = true;
+            } else if (parser.matchKeywords("NO", "CYCLE")) {
+                opts.cycle = Boolean.FALSE;
+                opts.any = true;
+            } else if (parser.matchKeyword("MINVALUE")) {
+                opts.minValue = Long.valueOf(DdlParser.readSeqLong(parser));
+                opts.any = true;
+            } else if (parser.matchKeyword("MAXVALUE")) {
+                opts.maxValue = Long.valueOf(DdlParser.readSeqLong(parser));
+                opts.any = true;
+            } else if (parser.matchKeyword("CACHE")) {
+                opts.cache = Integer.valueOf((int) DdlParser.readSeqLong(parser));
+                opts.any = true;
+            } else if (parser.matchKeyword("CYCLE")) {
+                opts.cycle = Boolean.TRUE;
+                opts.any = true;
             } else {
                 parser.advance();
             }
         }
         parser.expect(TokenType.RIGHT_PAREN);
-        return new long[]{startWith, incrementBy};
+        return opts;
+    }
+
+    /** The relation the definition belongs to, as PostgreSQL names it in these complaints. */
+    private String relationOrEmpty() {
+        return relationName == null ? "" : relationName;
+    }
+
+    /** {@code 42601} -- the definition says both that the column may be null and that it may not. */
+    private MemgresException conflictingNullDeclarations(String colName) {
+        return com.memgres.engine.PgErrors.syntax(
+                "conflicting NULL/NOT NULL declarations for column \"" + colName
+                + "\" of table \"" + relationOrEmpty() + "\"");
+    }
+
+    /**
+     * A column's value comes either from an identity sequence or from a generation expression, and
+     * PostgreSQL refuses a definition that asks for both.
+     */
+    private void requireOneGeneration(String colName, boolean already) {
+        if (already) {
+            throw com.memgres.engine.PgErrors.syntax(
+                    "both identity and generation expression specified for column \"" + colName
+                    + "\" of table \"" + relationOrEmpty() + "\"");
+        }
+    }
+
+    /** True for the pseudo-types that stand for an integer column fed by a sequence. */
+    private static boolean isSerialTypeName(String typeName) {
+        if (typeName == null) return false;
+        String bare = typeName.replaceAll("\\(.*\\)", "").trim();
+        return bare.equalsIgnoreCase("serial") || bare.equalsIgnoreCase("bigserial")
+                || bare.equalsIgnoreCase("smallserial") || bare.equalsIgnoreCase("serial2")
+                || bare.equalsIgnoreCase("serial4") || bare.equalsIgnoreCase("serial8");
+    }
+
+    /**
+     * {@code INCLUDE (col, ...)} after a key's column list, standard since PG 11. The named
+     * columns are payload carried in the index rather than part of the key -- PostgreSQL compares
+     * only the key columns for uniqueness -- so they are kept apart from the key list from here on.
+     */
+    private List<String> parseIncludeColumns() {
+        if (!parser.matchKeyword("INCLUDE")) return null;
+        parser.expect(TokenType.LEFT_PAREN);
+        List<String> cols = new ArrayList<String>();
+        do {
+            cols.add(parser.readIdentifier());
+        } while (parser.match(TokenType.COMMA));
+        parser.expect(TokenType.RIGHT_PAREN);
+        return cols;
     }
 
     /**
@@ -682,13 +914,17 @@ class DdlTableParser {
                 cols.add(parser.readIdentifier());
             } while (parser.match(TokenType.COMMA));
             parser.expect(TokenType.RIGHT_PAREN);
+            List<String> pkInclude = parseIncludeColumns();
             Deferrability pkDef = parseDeferrability();
             boolean pkDeferrable = pkDef.deferrable, pkInitiallyDeferred = pkDef.initiallyDeferred;
             if (parseNotEnforced()) {
                 throw new MemgresException("PRIMARY KEY constraints cannot be marked NOT ENFORCED", "0A000");
             }
-            return new TableConstraint(constraintName, TableConstraint.ConstraintType.PRIMARY_KEY,
+            TableConstraint pkConstraint = new TableConstraint(constraintName,
+                    TableConstraint.ConstraintType.PRIMARY_KEY,
                     cols, null, null, null, null, null, false, pkDeferrable, pkInitiallyDeferred, false, null);
+            pkConstraint.setIncludedColumns(pkInclude);
+            return pkConstraint;
         }
 
         if (parser.matchKeyword("UNIQUE")) {
@@ -722,13 +958,17 @@ class DdlTableParser {
             }
             List<String> cols = parser.parseColumnOrExpressionList();
             parser.expect(TokenType.RIGHT_PAREN);
+            List<String> uqInclude = parseIncludeColumns();
             Deferrability uqDef = parseDeferrability();
             boolean uqDeferrable = uqDef.deferrable, uqInitiallyDeferred = uqDef.initiallyDeferred;
             if (parseNotEnforced()) {
                 throw new MemgresException("UNIQUE constraints cannot be marked NOT ENFORCED", "0A000");
             }
-            return new TableConstraint(constraintName, TableConstraint.ConstraintType.UNIQUE,
+            TableConstraint uqConstraint = new TableConstraint(constraintName,
+                    TableConstraint.ConstraintType.UNIQUE,
                     cols, null, null, null, null, null, nullsNotDistinct, uqDeferrable, uqInitiallyDeferred, false, null);
+            uqConstraint.setIncludedColumns(uqInclude);
+            return uqConstraint;
         }
 
         if (parser.matchKeyword("CHECK")) {
@@ -889,6 +1129,8 @@ class DdlTableParser {
     static final class Deferrability {
         boolean deferrable;
         boolean initiallyDeferred;
+        /** Whether NOT DEFERRABLE was written, which INITIALLY DEFERRED cannot then undo. */
+        boolean sawNotDeferrable;
         /** The first clause as it was written, for the error a misplaced one raises. */
         String firstClause;
 
@@ -912,6 +1154,7 @@ class DdlTableParser {
                 parser.advance();
                 d.deferrable = false;
                 d.initiallyDeferred = false;
+                d.sawNotDeferrable = true;
                 d.saw("NOT DEFERRABLE");
                 continue;
             }
@@ -924,6 +1167,13 @@ class DdlTableParser {
                     && (parser.checkKeywordAt(1, "DEFERRED") || parser.checkKeywordAt(1, "IMMEDIATE"))) {
                 parser.advance();
                 if (parser.matchKeyword("DEFERRED")) {
+                    // A bare INITIALLY DEFERRED carries DEFERRABLE with it, but it cannot carry it
+                    // over a NOT DEFERRABLE the same clause list already wrote down: the two say
+                    // opposite things about when the constraint is checked.
+                    if (d.sawNotDeferrable) {
+                        throw com.memgres.engine.PgErrors.syntax(
+                                "constraint declared INITIALLY DEFERRED must be DEFERRABLE");
+                    }
                     d.initiallyDeferred = true;
                     d.deferrable = true;
                     d.saw("INITIALLY DEFERRED");

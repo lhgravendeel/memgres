@@ -22,6 +22,14 @@ public final class CreateTriggerStmt implements Statement {
     public final boolean deferrable;
     public final boolean initiallyDeferred;
     public final List<String> functionArgs;
+    /**
+     * Whether CREATE CONSTRAINT TRIGGER was the statement. A constraint trigger is a constraint
+     * as well as a trigger -- pg_constraint holds a row for it and pg_get_triggerdef spells the
+     * word out -- and neither is possible if the flag is dropped at the parse.
+     */
+    public final boolean constraintTrigger;
+    /** The relation a constraint trigger's FROM clause named, or null when none was written. */
+    public final String constraintRelation;
 
     public CreateTriggerStmt(
             String name,
@@ -79,6 +87,32 @@ public final class CreateTriggerStmt implements Statement {
             boolean initiallyDeferred,
             List<String> functionArgs
     ) {
+        this(name, timing, events, table, schema, functionName, orReplace, whenClause,
+                updateOfColumns, newTransitionTable, oldTransitionTable, forEachStatement,
+                deferrable, initiallyDeferred, functionArgs, false, null);
+    }
+
+    public CreateTriggerStmt(
+            String name,
+            String timing,
+            List<String> events,
+            String table,
+            String schema,
+            String functionName,
+            boolean orReplace,
+            String whenClause,
+            List<String> updateOfColumns,
+            String newTransitionTable,
+            String oldTransitionTable,
+            boolean forEachStatement,
+            boolean deferrable,
+            boolean initiallyDeferred,
+            List<String> functionArgs,
+            boolean constraintTrigger,
+            String constraintRelation
+    ) {
+        this.constraintTrigger = constraintTrigger;
+        this.constraintRelation = constraintRelation;
         this.name = name;
         this.timing = timing;
         this.events = events;
@@ -122,6 +156,8 @@ public final class CreateTriggerStmt implements Statement {
     public String oldTransitionTable() { return oldTransitionTable; }
     public boolean forEachStatement() { return forEachStatement; }
     public List<String> functionArgs() { return functionArgs; }
+    public boolean constraintTrigger() { return constraintTrigger; }
+    public String constraintRelation() { return constraintRelation; }
 
     @Override
     public boolean equals(Object o) {

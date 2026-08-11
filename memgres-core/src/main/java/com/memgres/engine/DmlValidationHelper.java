@@ -2,6 +2,7 @@ package com.memgres.engine;
 
 import com.memgres.engine.util.Cols;
 
+import com.memgres.engine.parser.ast.CreateTypeStmt;
 import com.memgres.engine.parser.ast.Expression;
 import com.memgres.engine.parser.ast.SelectStmt;
 
@@ -80,6 +81,15 @@ class DmlValidationHelper {
     void validateDomainChecks(Object[] row, Table table) {
         for (int i = 0; i < table.getColumns().size(); i++) {
             Column col = table.getColumns().get(i);
+            // A composite's fields are values of the types the composite declares for them, so a
+            // field typed by a domain is judged by that domain wherever the composite is built --
+            // including from a plain string written into the column, and from an assignment to one
+            // field, neither of which passes through a cast to the composite. An array of a
+            // composite is judged element by element by the cast that builds it, so only a value
+            // of the composite itself is judged here.
+            if (col.getCompositeTypeName() != null && col.getArrayElementType() == null) {
+                validateCompositeFieldDomains(row[i], col.getCompositeTypeName());
+            }
             String domainName = col.getDomainTypeName();
             if (domainName != null) {
                 // Walk from the base domain outwards: a domain over a domain inherits its
@@ -122,6 +132,63 @@ class DmlValidationHelper {
                     }
                 }
             }
+        }
+    }
+
+    /**
+     * Every domain a composite value's fields are declared with, run against those fields.
+     *
+     * <p>PostgreSQL builds a value of the field's own type for each field of a composite, whichever
+     * way the composite was written, and a domain's constraints run wherever a value of it is
+     * built. Only the value already held is judged: nothing here changes what is stored.
+     */
+    private void validateCompositeFieldDomains(Object value, String typeName) {
+        if (value == null) return;
+        List<CreateTypeStmt.CompositeField> fields = executor.database.getRowType(typeName);
+        if (fields == null) return;
+        if (value instanceof AstExecutor.PgRow) {
+            List<Object> values = ((AstExecutor.PgRow) value).values();
+            for (int i = 0; i < values.size() && i < fields.size(); i++) {
+                Object field = values.get(i);
+                // A value already held as itself is written the way its own output function writes
+                // it, which is the form its input function reads back.
+                checkFieldAgainstItsType(field == null ? null : field.toString(), true,
+                        fields.get(i).typeName());
+            }
+            return;
+        }
+        if (value instanceof String && RecordLiteral.looksLikeRecord((String) value)) {
+            // The literal is read by the composite's own reader, which is the only thing that
+            // knows which quotes were structure and which were content.
+            List<RecordLiteral.Field> parts = RecordLiteral.parse((String) value);
+            for (int i = 0; i < parts.size() && i < fields.size(); i++) {
+                checkFieldAgainstItsType(parts.get(i).text, parts.get(i).quoted,
+                        fields.get(i).typeName());
+            }
+        }
+    }
+
+    /**
+     * One field read as the type its composite declares for it, for the constraints that reading
+     * runs. A domain carries them itself and a composite carries its own fields' ones, so those
+     * are the only two types a field is re-read as; anything else has nothing to answer for.
+     */
+    private void checkFieldAgainstItsType(String text, boolean quoted, String fieldType) {
+        if (text == null || fieldType == null) return;
+        // An unquoted field with nothing in it is the SQL null, which no CHECK is run for here.
+        if (text.isEmpty() && !quoted) return;
+        if (executor.database.isCompositeType(fieldType)) {
+            validateCompositeFieldDomains(text, fieldType);
+            return;
+        }
+        if (!executor.database.isDomain(fieldType)) return;
+        try {
+            executor.castEvaluator.applyCast(text, fieldType.toLowerCase().trim());
+        } catch (MemgresException e) {
+            // A type whose input function cannot read the text is not what is being judged: only
+            // the constraints the type carries are, and PostgreSQL refuses the whole write when
+            // one of those fails.
+            if (e.getSqlState() != null && e.getSqlState().startsWith("23")) throw e;
         }
     }
 

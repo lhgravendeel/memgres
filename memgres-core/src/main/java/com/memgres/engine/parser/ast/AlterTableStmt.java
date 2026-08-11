@@ -32,6 +32,22 @@ public final class AlterTableStmt implements Statement {
 
     public boolean only() { return only; }
 
+    /**
+     * The word the statement's own keyword used for the relation's kind — {@code "view"} for
+     * ALTER VIEW, {@code "materialized view"} for ALTER MATERIALIZED VIEW — or null for ALTER
+     * TABLE, which reaches whatever kind its action allows. Those statements share this node
+     * because their remaining actions are ALTER TABLE actions, but PostgreSQL opens the relation
+     * under the kind its keyword named and refuses any other with {@code 42809}.
+     */
+    private String writtenKind;
+
+    public String writtenKind() { return writtenKind; }
+
+    public AlterTableStmt withWrittenKind(String kind) {
+        this.writtenKind = kind;
+        return this;
+    }
+
     public interface AlterAction {}
 
         public static final class AddColumn implements AlterAction {
@@ -44,6 +60,19 @@ public final class AlterTableStmt implements Statement {
         }
 
         public AddColumn(ColumnDef column) { this(column, false); }
+
+        /**
+         * The table constraints the column's own definition produced — a CHECK written on the
+         * column, which PostgreSQL stores on the table and which carries the name a CONSTRAINT
+         * clause gave it. These were parsed and left behind, so the rule held over nothing.
+         */
+        private java.util.List<TableConstraint> inlineConstraints;
+
+        public java.util.List<TableConstraint> inlineConstraints() { return inlineConstraints; }
+
+        public void setInlineConstraints(java.util.List<TableConstraint> inlineConstraints) {
+            this.inlineConstraints = inlineConstraints;
+        }
 
         public ColumnDef column() { return column; }
         public boolean ifNotExists() { return ifNotExists; }
@@ -673,10 +702,67 @@ public final class AlterTableStmt implements Statement {
             return "SetStorageParams[params=" + params + "]";
         }
     }
+
+    /**
+     * ALTER TABLE ... RESET (storage_parameter, ...). PostgreSQL removes each named option from
+     * pg_class.reloptions, and accepts a name that was never set without complaint -- so the list
+     * of names is the whole of what the statement says, and reading past it left the executor
+     * nothing to remove.
+     */
+    public static final class ResetStorageParams implements AlterAction {
+        public final java.util.List<String> names;
+
+        public ResetStorageParams(java.util.List<String> names) { this.names = names; }
+
+        public java.util.List<String> names() { return names; }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+            return java.util.Objects.equals(names, ((ResetStorageParams) o).names);
+        }
+
+        @Override
+        public int hashCode() {
+            return java.util.Objects.hashCode(names);
+        }
+
+        @Override
+        public String toString() {
+            return "ResetStorageParams[names=" + names + "]";
+        }
+    }
     /**
      * SET WITHOUT CLUSTER / SET WITHOUT OIDS. Neither has anything to change in an in-memory
      * database, but a partitioned table has no index to mark clustered, and PostgreSQL says so.
      */
+    /**
+     * CLUSTER ON names the index a later CLUSTER of this relation would order it by. The name is
+     * carried rather than read and dropped: it has to be an index of this relation, and only
+     * whoever executes the statement can say whether it is.
+     */
+    public static final class ClusterOn implements AlterAction {
+        public final String indexName;
+
+        public ClusterOn(String indexName) { this.indexName = indexName; }
+
+        public String indexName() { return indexName; }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+            return java.util.Objects.equals(indexName, ((ClusterOn) o).indexName);
+        }
+
+        @Override
+        public int hashCode() { return java.util.Objects.hashCode(indexName); }
+
+        @Override
+        public String toString() { return "ClusterOn[indexName=" + indexName + "]"; }
+    }
+
     public static final class SetWithoutCluster implements AlterAction {
         public final boolean cluster;
 
@@ -921,6 +1007,51 @@ public final class AlterTableStmt implements Statement {
         public String method() { return method; }
     }
 
+    /**
+     * ALTER COLUMN ... SET INCREMENT BY / START WITH / MINVALUE / MAXVALUE / CACHE / CYCLE, which
+     * alter the sequence behind an identity column by exactly the rules ALTER SEQUENCE follows.
+     * They used to be read and dropped, so every one of them was a silent no-op.
+     */
+    public static final class AlterIdentitySequence implements AlterColumnAction {
+        public final Long increment;
+        public final Long minValue;
+        public final Long maxValue;
+        public final Long startWith;
+        public final Integer cache;
+        public final Boolean cycle;
+        // NO MINVALUE and NO MAXVALUE ask for the bound back rather than leaving it alone, so they
+        // are a third answer beside "this value" and "nothing said about it".
+        public final boolean noMinValue;
+        public final boolean noMaxValue;
+
+        public AlterIdentitySequence(Long increment, Long minValue, Long maxValue, Long startWith,
+                                     Integer cache, Boolean cycle) {
+            this(increment, minValue, maxValue, startWith, cache, cycle, false, false);
+        }
+
+        public AlterIdentitySequence(Long increment, Long minValue, Long maxValue, Long startWith,
+                                     Integer cache, Boolean cycle,
+                                     boolean noMinValue, boolean noMaxValue) {
+            this.increment = increment;
+            this.minValue = minValue;
+            this.maxValue = maxValue;
+            this.startWith = startWith;
+            this.cache = cache;
+            this.cycle = cycle;
+            this.noMinValue = noMinValue;
+            this.noMaxValue = noMaxValue;
+        }
+
+        public Long increment() { return increment; }
+        public Long minValue() { return minValue; }
+        public Long maxValue() { return maxValue; }
+        public Long startWith() { return startWith; }
+        public Integer cache() { return cache; }
+        public Boolean cycle() { return cycle; }
+        public boolean noMinValue() { return noMinValue; }
+        public boolean noMaxValue() { return noMaxValue; }
+    }
+
     /** ALTER COLUMN ... DROP IDENTITY [IF EXISTS] — distinct from DROP DEFAULT, which never complains. */
     public static final class DropIdentity implements AlterColumnAction {
         public final boolean ifExists;
@@ -933,6 +1064,31 @@ public final class AlterTableStmt implements Statement {
         public final boolean ifExists;
         public DropExpression(boolean ifExists) { this.ifExists = ifExists; }
         public boolean ifExists() { return ifExists; }
+    }
+
+    /**
+     * ALTER COLUMN ... SET EXPRESSION AS (expr) — a generated column's new expression. PostgreSQL
+     * recomputes every stored row from it at once, which is what makes this a rewrite rather than
+     * a catalog change.
+     */
+    public static final class SetExpression implements AlterColumnAction {
+        public final String expression;
+        public SetExpression(String expression) { this.expression = expression; }
+        public String expression() { return expression; }
+    }
+
+    /** ALTER COLUMN ... SET (option = value, ...) — per-column planner options. */
+    public static final class SetColumnOptions implements AlterColumnAction {
+        public final java.util.Map<String, String> options;
+        public SetColumnOptions(java.util.Map<String, String> options) { this.options = options; }
+        public java.util.Map<String, String> options() { return options; }
+    }
+
+    /** ALTER COLUMN ... RESET (option, ...) — the same options, put back to their defaults. */
+    public static final class ResetColumnOptions implements AlterColumnAction {
+        public final java.util.List<String> options;
+        public ResetColumnOptions(java.util.List<String> options) { this.options = options; }
+        public java.util.List<String> options() { return options; }
     }
 
         public static final class ColumnNoOp implements AlterColumnAction {

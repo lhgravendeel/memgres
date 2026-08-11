@@ -1744,8 +1744,10 @@ class SelectParser {
                 throw new ParseException("Expected sampling method", parser.peek());
             }
             if (!method.equals("system") && !method.equals("bernoulli")) {
+                // PostgreSQL names the method bare here: what was written is an identifier the
+                // grammar resolves, not a string, so it is not quoted back.
                 throw new com.memgres.engine.MemgresException(
-                    "tablesample method \"" + method + "\" does not exist", "42704");
+                    "tablesample method " + method + " does not exist", "42704");
             }
             parser.expect(TokenType.LEFT_PAREN);
             Expression pctExpr = parser.parseExpression();

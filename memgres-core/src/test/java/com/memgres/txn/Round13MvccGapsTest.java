@@ -112,17 +112,13 @@ class Round13MvccGapsTest {
                 b.commit();
             }
 
-            // PG SSI: A's commit should fail (40001) because B inserted a row
-            // that would have been visible to A's predicate.
-            SQLException ex = assertThrows(SQLException.class, () -> {
-                try (Statement sa = a.createStatement()) {
-                    sa.execute("INSERT INTO r13_phantom VALUES (100)");
-                }
-                a.commit();
-            });
-            assertEquals("40001", ex.getSQLState(),
-                    "expected 40001 serialization_failure; got " + ex.getSQLState());
-            a.rollback();
+            // PG holds one rw-dependency between two transactions to be no anomaly: A read a
+            // predicate B then wrote, but B read nothing A wrote, so there is no cycle and both
+            // transactions commit. Measured against PG 18: A's INSERT and COMMIT both succeed.
+            try (Statement sa = a.createStatement()) {
+                sa.execute("INSERT INTO r13_phantom VALUES (100)");
+            }
+            a.commit();
         }
     }
 

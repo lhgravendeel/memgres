@@ -185,7 +185,9 @@ class DmlParser {
 
     UpdateStmt parseUpdate(List<SelectStmt.CommonTableExpr> withClauses) {
         parser.expectKeyword("UPDATE");
-        parser.matchKeyword("ONLY"); // optional ONLY keyword
+        // ONLY decides whether the statement reaches the relation's partitions and inheritance
+        // children, so it has to travel with the statement rather than be read and dropped.
+        boolean only = parser.matchKeyword("ONLY");
 
         String schema = null;
         String table = parser.readIdentifier();
@@ -233,7 +235,7 @@ class DmlParser {
             if (parser.checkKeyword("ORDER")) throw new ParseException("syntax error at or near \"ORDER\"", parser.peek());
         }
 
-        return new UpdateStmt(schema, table, alias, sets, from, where, returning, withClauses);
+        return new UpdateStmt(schema, table, alias, sets, from, where, returning, withClauses, only);
     }
 
     /** The brackets written after a name, or null when there are none. */
@@ -379,7 +381,9 @@ class DmlParser {
         parser.expectKeyword("DELETE");
         parser.expectKeyword("FROM");
 
-        parser.matchKeyword("ONLY"); // optional ONLY keyword
+        // ONLY decides whether the statement reaches the relation's partitions and inheritance
+        // children, so it has to travel with the statement rather than be read and dropped.
+        boolean only = parser.matchKeyword("ONLY");
         String schema = null;
         String table = parser.readIdentifier();
         if (parser.match(TokenType.DOT)) {
@@ -422,7 +426,7 @@ class DmlParser {
             if (parser.checkKeyword("ORDER")) throw new ParseException("syntax error at or near \"ORDER\"", parser.peek());
         }
 
-        return new DeleteStmt(schema, table, alias, using, where, returning, withClauses);
+        return new DeleteStmt(schema, table, alias, using, where, returning, withClauses, only);
     }
 
     MergeStmt parseMerge() {
@@ -524,7 +528,14 @@ class DmlParser {
                             if (parser.match(TokenType.LEFT_PAREN)) {
                                 columns = new ArrayList<>();
                                 do {
-                                    columns.add(parser.readIdentifier());
+                                    // PostgreSQL reads a dotted name here as a field of a column of
+                                    // the target, so the name it looks for -- and the one it says is
+                                    // missing -- is the part before the dot, not a relation.
+                                    String column = parser.readIdentifier();
+                                    while (parser.match(TokenType.DOT)) {
+                                        parser.readIdentifier();
+                                    }
+                                    columns.add(column);
                                 } while (parser.match(TokenType.COMMA));
                                 parser.expect(TokenType.RIGHT_PAREN);
                             }

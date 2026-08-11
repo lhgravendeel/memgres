@@ -49,6 +49,12 @@ class CompositeTypeHandler {
             }
             return null;
         }
+        if (expr instanceof SubscriptExpr) {
+            // One element of an array of a composite is a value of that composite: PostgreSQL
+            // types a subscript as the array's element type, so (cs[1]).a names a field of the
+            // composite rather than a field of something that has none.
+            return arrayElementCompositeType(((SubscriptExpr) expr).base(), ctx);
+        }
         if (expr instanceof FunctionCallExpr) {
             FunctionCallExpr fn = (FunctionCallExpr) expr;
             // populate_record / json_populate_record return the type of their first argument
@@ -98,6 +104,34 @@ class CompositeTypeHandler {
                 }
             }
             return null;
+        }
+        return null;
+    }
+
+    /**
+     * The composite type an expression's array holds elements of, or null when it holds anything
+     * else.
+     *
+     * <p>A column declared as an array of a composite is carried as the text its array prints as
+     * and typed text, so the type it answers with says neither that it is an array nor what its
+     * elements are -- only the column's own declaration does. PostgreSQL types both {@code cs[1]}
+     * and {@code unnest(cs)} as the composite, which is what makes a field of one reachable.
+     */
+    String arrayElementCompositeType(Expression expr, RowContext ctx) {
+        if (expr instanceof ColumnRef && ctx != null) {
+            ColumnRef ref = (ColumnRef) expr;
+            Column col = ctx.resolveColumnDef(ref.table(), ref.column());
+            if (col != null && col.getArrayElementType() != null
+                    && col.getCompositeTypeName() != null) {
+                return col.getCompositeTypeName().toLowerCase();
+            }
+            return null;
+        }
+        if (expr instanceof CastExpr) {
+            String written = ((CastExpr) expr).typeName().toLowerCase().trim();
+            if (!written.endsWith("[]")) return null;
+            String element = written.substring(0, written.length() - 2).trim();
+            return executor.database.isCompositeType(element) ? element : null;
         }
         return null;
     }

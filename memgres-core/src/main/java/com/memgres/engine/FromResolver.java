@@ -885,7 +885,7 @@ class FromResolver {
                         // produces no rows for this left row removes it — the same as the
                         // lateral-subquery branch above, which skips it. Padding it with NULLs
                         // instead answered LEFT JOIN LATERAL to a query that did not write one.
-                        for (RowContext rightCtx : functionResolver.resolveFunctionFrom(funcFrom)) {
+                        for (RowContext rightCtx : resolveFunctionItem(funcFrom)) {
                             newAccumulated.add(joinExecutor.mergeContexts(leftCtx, rightCtx));
                         }
                     } finally {
@@ -926,9 +926,100 @@ class FromResolver {
     List<RowContext> resolveFromItem(SelectStmt.FromItem fromItem) {
         if (fromItem instanceof SelectStmt.TableRef) return resolveTableRef(((SelectStmt.TableRef) fromItem));
         if (fromItem instanceof SelectStmt.SubqueryFrom) return resolveSubquery(((SelectStmt.SubqueryFrom) fromItem));
-        if (fromItem instanceof SelectStmt.FunctionFrom) return functionResolver.resolveFunctionFrom(((SelectStmt.FunctionFrom) fromItem));
+        if (fromItem instanceof SelectStmt.FunctionFrom) return resolveFunctionItem(((SelectStmt.FunctionFrom) fromItem));
         if (fromItem instanceof SelectStmt.JoinFrom) return joinExecutor.executeJoin(((SelectStmt.JoinFrom) fromItem));
         throw new IllegalArgumentException("Unknown FromItem type: " + fromItem.getClass().getSimpleName());
+    }
+
+    /**
+     * A set-returning call in FROM, with a relation of a composite type given that composite's own
+     * columns.
+     *
+     * <p>PostgreSQL types {@code unnest(cs)} over an array of a composite as returning the
+     * composite itself, and a FROM item whose rows are of a composite type supplies one column per
+     * field -- which is what lets {@code u.a} name a field of the record. The call builds a
+     * relation of one column holding the record as it is written, so the values are already right
+     * and only the shape of the relation in front of them is wrong. An alias list or WITH
+     * ORDINALITY names the columns itself, so neither is re-shaped here.
+     */
+    private List<RowContext> resolveFunctionItem(SelectStmt.FunctionFrom funcFrom) {
+        List<RowContext> contexts = functionResolver.resolveFunctionFrom(funcFrom);
+        if (contexts.isEmpty() || funcFrom.withOrdinality()) return contexts;
+        if (!"unnest".equalsIgnoreCase(funcFrom.functionName())) return contexts;
+        if (funcFrom.columnAliases() != null && !funcFrom.columnAliases().isEmpty()) return contexts;
+        if (funcFrom.args() == null || funcFrom.args().size() != 1) return contexts;
+        String typeName = executor.compositeTypeHandler.arrayElementCompositeType(
+                funcFrom.args().get(0), executor.outerContextStack.peek());
+        if (typeName == null) return contexts;
+        List<CreateTypeStmt.CompositeField> fields =
+                executor.compositeTypeHandler.resolveFieldsForType(typeName);
+        if (fields == null || fields.isEmpty()) return contexts;
+        String alias = funcFrom.alias() != null ? funcFrom.alias() : funcFrom.functionName();
+        List<Column> cols = new ArrayList<>();
+        String[] declared = new String[fields.size()];
+        for (int i = 0; i < fields.size(); i++) {
+            DataType fieldType = DataType.fromPgName(fields.get(i).typeName());
+            cols.add(new Column(fields.get(i).name(),
+                    fieldType != null ? fieldType : DataType.TEXT, true, false, null));
+            declared[i] = fieldType != null ? fieldType.getPgName() : fields.get(i).typeName();
+        }
+        Table expanded = new Table(alias, cols);
+        expanded.setFunctionResult(true);
+        expanded.setDefinedColumnTypes(declared);
+        List<RowContext> byField = new ArrayList<>(contexts.size());
+        for (RowContext ctx : contexts) {
+            List<RowContext.TableBinding> bound = ctx.getBindings();
+            if (bound.size() != 1 || bound.get(0).row().length != 1) return contexts;
+            Object element = bound.get(0).row()[0];
+            Object[] row = new Object[fields.size()];
+            for (int i = 0; i < fields.size(); i++) {
+                row[i] = executor.extractCompositeField(element, fields.get(i).name(), typeName);
+            }
+            expanded.insertRow(row);
+            byField.add(new RowContext(expanded, alias, row));
+        }
+        return byField;
+    }
+
+    /**
+     * A catalog relation's rows, without those describing a relation this transaction's snapshot
+     * did not hold.
+     *
+     * <p>PostgreSQL snapshots the database rather than the relations a transaction happens to read,
+     * and the catalogs are snapshotted with it: a relation another session created and committed
+     * after a REPEATABLE READ transaction took its snapshot is not in that transaction's pg_class
+     * either. The catalog here is derived from the live database at every reference, so what the
+     * snapshot did not hold has to be taken back out of it. A relation this transaction made
+     * itself is its own to see, as it is everywhere else.
+     */
+    private List<Object[]> snapshotVisibleCatalogRows(Table catalogTable, String catalogName) {
+        Session session = executor.session;
+        if (session == null || !session.isRRSnapshotTaken()) return catalogTable.getRows();
+        // Both relations carry the OID of the relation they describe; the column it is written in
+        // is all that differs.
+        String relationColumn = "pg_class".equals(catalogName) ? "oid"
+                : "pg_attribute".equals(catalogName) ? "attrelid" : null;
+        if (relationColumn == null) return catalogTable.getRows();
+        int oidIndex = catalogTable.getColumnIndex(relationColumn);
+        if (oidIndex < 0) return catalogTable.getRows();
+        Set<Integer> unseen = new HashSet<>();
+        for (Map.Entry<String, Schema> schemaEntry : executor.database.getSchemas().entrySet()) {
+            for (Map.Entry<String, Table> tableEntry : schemaEntry.getValue().getTables().entrySet()) {
+                Table candidate = tableEntry.getValue();
+                if (session.hasRRSnapshot(schemaEntry.getKey() + "." + tableEntry.getKey())
+                        || executor.database.wasCreatedBy(candidate, session)) continue;
+                unseen.add(executor.systemCatalog.getOid(
+                        "rel:" + schemaEntry.getKey() + "." + candidate.getName()));
+            }
+        }
+        if (unseen.isEmpty()) return catalogTable.getRows();
+        List<Object[]> shown = new ArrayList<>();
+        for (Object[] row : catalogTable.getRows()) {
+            if (row[oidIndex] instanceof Number
+                    && unseen.contains(((Number) row[oidIndex]).intValue())) continue;
+            shown.add(row);
+        }
+        return shown;
     }
 
     /**
@@ -1086,7 +1177,8 @@ class FromResolver {
                 lastResolvedRightTable = catalogTable;
                 lastResolvedRightAlias = alias;
                 List<RowContext> contexts = new ArrayList<>();
-                for (Object[] row : catalogTable.getRows()) {
+                for (Object[] row : snapshotVisibleCatalogRows(catalogTable,
+                        tableRef.table().toLowerCase())) {
                     contexts.add(new RowContext(catalogTable, alias, row));
                 }
                 return contexts;
@@ -1124,7 +1216,11 @@ class FromResolver {
         String schemaTableKey = schemaName + "." + tableRef.table();
         Session currentSession = executor.session;
         if (currentSession != null && currentSession.hasRRSnapshot(schemaTableKey)) {
-            List<Object[]> snapshot = currentSession.getRRSnapshot(schemaTableKey);
+            // ONLY reads what the relation stores itself, so it reads the part of the snapshot
+            // that came from there rather than the rows its partitions and children hold for it.
+            List<Object[]> snapshot = tableRef.only()
+                    ? currentSession.getRRSnapshotOwnRows(schemaTableKey)
+                    : currentSession.getRRSnapshot(schemaTableKey);
             boolean snapshotHasVirtual = executor.dmlExecutor.hasVirtualColumns(table);
             List<RowContext> contexts = new ArrayList<>();
             for (Object[] row : snapshot) {
@@ -1426,32 +1522,21 @@ class FromResolver {
         for (RowContext ctx : contexts) {
             // PG semantics: row must pass ALL restrictive policies
             // AND at least ONE permissive policy (if any exist).
-            boolean passesPermissive;
-            if (permissivePolicies.isEmpty()) {
-                passesPermissive = false;
-            } else {
-                passesPermissive = false;
-                for (RlsPolicy policy : permissivePolicies) {
-                    try {
-                        Object result = executor.evalExpr(policy.getUsingExpr(), ctx);
-                        if (Boolean.TRUE.equals(result)) {
-                            passesPermissive = true;
-                            break;
-                        }
-                    } catch (Exception e) {
-                        // Expression evaluation failed; row does not pass this policy
-                    }
+            // PostgreSQL evaluates a policy as part of the query, so whatever the expression raises
+            // is reported with its own SQLSTATE. Dropping the row instead left the query looking
+            // like it had succeeded while quietly hiding the row that raised.
+            boolean passesPermissive = false;
+            for (RlsPolicy policy : permissivePolicies) {
+                Object result = executor.evalExpr(policy.getUsingExpr(), ctx);
+                if (Boolean.TRUE.equals(result)) {
+                    passesPermissive = true;
+                    break;
                 }
             }
             boolean passesRestrictive = true;
             for (RlsPolicy policy : restrictivePolicies) {
-                try {
-                    Object result = executor.evalExpr(policy.getUsingExpr(), ctx);
-                    if (!Boolean.TRUE.equals(result)) {
-                        passesRestrictive = false;
-                        break;
-                    }
-                } catch (Exception e) {
+                Object result = executor.evalExpr(policy.getUsingExpr(), ctx);
+                if (!Boolean.TRUE.equals(result)) {
                     passesRestrictive = false;
                     break;
                 }
@@ -1658,7 +1743,8 @@ class FromResolver {
                     for (RowContext ctx : contexts) {
                         visibleRows.add(getFirstRow(ctx));
                     }
-                    List<Object[]> snapshot = currentSession.getOrCreateRRSnapshot(schemaTableKey, visibleRows);
+                    List<Object[]> snapshot =
+                            currentSession.getOrCreateRRSnapshot(schemaTableKey, visibleRows, table);
                     if (snapshot != null) {
                         List<RowContext> snapshotContexts = new ArrayList<>();
                         for (Object[] row : snapshot) {
@@ -1704,7 +1790,8 @@ class FromResolver {
                 for (RowContext ctx : filtered) {
                     visibleRows.add(getFirstRow(ctx));
                 }
-                List<Object[]> snapshot = currentSession.getOrCreateRRSnapshot(schemaTableKey, visibleRows);
+                List<Object[]> snapshot =
+                        currentSession.getOrCreateRRSnapshot(schemaTableKey, visibleRows, table);
                 if (snapshot != null) {
                     List<RowContext> snapshotContexts = new ArrayList<>();
                     for (Object[] row : snapshot) {

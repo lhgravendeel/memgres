@@ -87,6 +87,9 @@ public class Schema {
     /** The transaction that dropped these relations has ended; stop holding them for anyone. */
     void forgetDroppedBy(Session dropper) {
         droppedUncommitted.values().removeIf(v -> v[1] == dropper);
+        // A relation that transaction renamed goes on answering to its old name for everyone
+        // else, and that too ends when the transaction does.
+        for (Table t : tables.values()) t.forgetUncommittedRename(dropper);
     }
 
     public Map<String, Table> getTables() {

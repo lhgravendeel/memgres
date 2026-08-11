@@ -146,6 +146,12 @@ final class ObjectIdentity {
     void relationCreated(String schema, String name) {
         String key = relKey(schema, name);
         if (oidMap.remove(key) != null) mutations.incrementAndGet();
+        // The number is handed out here, not at the first question about the name, because
+        // PostgreSQL assigns an OID when the object is created: the numbers then run in creation
+        // order, and everything ordered by OID -- pg_class as pg_dump reads it, the list of what
+        // depends on a type -- comes back in the order the objects were made rather than in the
+        // order some catalog query happened to walk the schemas.
+        oid(key);
     }
 
     /**

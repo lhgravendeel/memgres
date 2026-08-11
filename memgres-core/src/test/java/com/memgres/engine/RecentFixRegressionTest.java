@@ -125,7 +125,10 @@ class RecentFixRegressionTest {
                 conn.unwrap(org.postgresql.core.BaseConnection.class));
         java.io.StringWriter sw = new java.io.StringWriter();
         try {
-            cm.copyOut("COPY m24_esc TO STDOUT WITH (FORMAT csv, ESCAPE '\\\\')", sw);
+            // Standard-conforming strings are on, so the escape option has to be written as a
+            // one-character literal: '\\' would be the two-character string PostgreSQL refuses
+            // with "COPY escape must be a single one-byte character".
+            cm.copyOut("COPY m24_esc TO STDOUT WITH (FORMAT csv, ESCAPE '\\')", sw);
         } catch (java.io.IOException e) {
             throw new SQLException(e);
         }

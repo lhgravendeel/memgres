@@ -1497,8 +1497,7 @@ class FunctionEvaluator {
                 }
                 // A qualifier names one schema's sequence and no other's: stripping it made
                 // nextval('other.s') advance whichever sequence of that name was found first.
-                Sequence seq = resolveSequence(seqName);
-                if (seq == null) throw new MemgresException("relation \"" + seqName + "\" does not exist", "42P01");
+                Sequence seq = requireSequence(seqName);
                 long nv;
                 if (executor.session != null && seq.getCache() > 1) {
                     nv = executor.session.nextvalCached(seq);
@@ -1506,14 +1505,14 @@ class FunctionEvaluator {
                     nv = seq.nextVal();
                 }
                 executor.lastSequenceValue = nv;
-                executor.sessionSequenceValues.put(seq.qualifiedName().toLowerCase(), nv);
+                executor.lastSequenceInstanceId = seq.getInstanceId();
+                executor.sessionSequenceValues.put(seq.getInstanceId(), nv);
                 return nv;
             }
             case "currval": {
                 String seqName = String.valueOf(executor.evalExpr(fn.args().get(0), ctx));
-                Sequence seq = resolveSequence(seqName);
-                if (seq == null) throw new MemgresException("relation \"" + seqName + "\" does not exist", "42P01");
-                Long drawn = executor.sessionSequenceValues.get(seq.qualifiedName().toLowerCase());
+                Sequence seq = requireSequence(seqName);
+                Long drawn = executor.sessionSequenceValues.get(seq.getInstanceId());
                 if (drawn == null) {
                     throw new MemgresException("currval of sequence \"" + seq.getName()
                             + "\" is not yet defined in this session", "55000");
@@ -1521,7 +1520,17 @@ class FunctionEvaluator {
                 return drawn;
             }
             case "lastval": {
-                if (executor.lastSequenceValue == null) {
+                // The sequence that produced the value has to still be there: dropping it makes
+                // lastval undefined again, so a sequence re-created under the same name does not
+                // answer with the dropped one's value.
+                boolean producerStillThere = false;
+                for (Sequence produced : executor.database.getSequences().values()) {
+                    if (produced.getInstanceId() == executor.lastSequenceInstanceId) {
+                        producerStillThere = true;
+                        break;
+                    }
+                }
+                if (executor.lastSequenceValue == null || !producerStillThere) {
                     throw new MemgresException(
                             "lastval is not yet defined in this session", "55000");
                 }
@@ -1544,15 +1553,13 @@ class FunctionEvaluator {
                 } else {
                     seqName = String.valueOf(seqArg);
                 }
-                Sequence seq = resolveSequence(seqName);
-                if (seq == null) throw new MemgresException("relation \"" + seqName + "\" does not exist", "42P01");
+                Sequence seq = requireSequence(seqName);
                 try { return seq.currVal(); }
                 catch (Exception e) { return null; } // never been used -> null
             }
             case "setval": {
                 String seqName = String.valueOf(executor.evalExpr(fn.args().get(0), ctx));
-                Sequence seq = resolveSequence(seqName);
-                if (seq == null) throw new MemgresException("relation \"" + seqName + "\" does not exist", "42P01");
+                Sequence seq = requireSequence(seqName);
                 Object rawVal = executor.evalExpr(fn.args().get(1), ctx);
                 if (rawVal == null) return null; // PG treats setval(seq, NULL) as a no-op returning NULL
                 long val = executor.toLong(rawVal);
@@ -1568,7 +1575,7 @@ class FunctionEvaluator {
                 // setval defines currval for the session that called it, but only when the
                 // value counts as already used.
                 if (marksCurrval) {
-                    executor.sessionSequenceValues.put(seq.qualifiedName().toLowerCase(), val);
+                    executor.sessionSequenceValues.put(seq.getInstanceId(), val);
                 }
                 // Also sync the table's serial counter if this sequence matches tableName_colName_seq
                 // This ensures GENERATED ALWAYS AS IDENTITY / SERIAL columns pick up the new value
@@ -2806,6 +2813,41 @@ class FunctionEvaluator {
                 // pg_safe_snapshot_blocking_pids(int) → int[] — stub, returns empty int array
                 return "{}";
             }
+            case "satisfies_hash_partition": {
+                // satisfies_hash_partition(regclass, modulus, remainder, VARIADIC key) → bool:
+                // whether a row with this key belongs in the hash partition holding that remainder
+                // of that modulus. It answers from the same hash the router uses, so a caller can
+                // check where a row would land without writing it.
+                requireArgs(fn, 4);
+                Object relArg = executor.evalExpr(fn.args().get(0), ctx);
+                Object modArg = executor.evalExpr(fn.args().get(1), ctx);
+                Object remArg = executor.evalExpr(fn.args().get(2), ctx);
+                if (relArg == null || modArg == null || remArg == null) return null;
+                String relName = relArg.toString().trim();
+                if (relName.length() >= 2 && relName.startsWith("\"") && relName.endsWith("\"")) {
+                    relName = relName.substring(1, relName.length() - 1);
+                }
+                Table hashTable = executor.resolveTableAnySchema(relName);
+                if (!"HASH".equalsIgnoreCase(hashTable.getPartitionStrategy())) {
+                    throw new MemgresException("\"" + hashTable.getName()
+                            + "\" is not a hash partitioned table", "22023");
+                }
+                int modulus = ((Number) modArg).intValue();
+                if (modulus <= 0) {
+                    throw new MemgresException("modulus for hash partition must be an integer"
+                            + " value greater than zero", "22023");
+                }
+                int remainder = ((Number) remArg).intValue();
+                // The key columns arrive as the variadic tail; a NULL among them contributes
+                // nothing to the hash, exactly as it does when a row is routed.
+                List<Object> keyValues = new ArrayList<>();
+                for (int ki = 3; ki < fn.args().size(); ki++) {
+                    keyValues.add(executor.evalExpr(fn.args().get(ki), ctx));
+                }
+                long rowHash = DmlPartitionHelper.pgHashRow(
+                        keyValues.size() == 1 ? keyValues.get(0) : keyValues);
+                return Long.remainderUnsigned(rowHash, modulus) == remainder;
+            }
             case "pg_partition_ancestors": {
                 // pg_partition_ancestors(regclass) → set of regclass — returns the table itself
                 requireArgs(fn, 1);
@@ -3626,6 +3668,73 @@ class FunctionEvaluator {
         }
         Object val = executor.evalExpr(arg, ctx);
         return val == null ? null : val.toString();
+    }
+
+    /**
+     * The sequence a written name reaches, or the refusal PostgreSQL gives when it reaches
+     * something else. Opening a relation that is not a sequence is a complaint about that
+     * relation's kind -- {@code cannot open relation "t"}, with the kind spelled out on the detail
+     * line -- and only a name that reaches no relation at all is reported as one that is not there.
+     */
+    private Sequence requireSequence(String written) {
+        String seqName = regclassName(written);
+        Sequence seq = resolveSequence(seqName);
+        if (seq != null) return seq;
+        int dot = seqName.indexOf('.');
+        String bare = dot > 0 ? seqName.substring(dot + 1) : seqName;
+        List<String> path = new ArrayList<String>();
+        if (dot > 0) {
+            path.add(SchemaQualifier.resolveAlias(executor.session, seqName.substring(0, dot)));
+        } else {
+            if (executor.session != null) path.add(executor.session.getTempSchemaName());
+            path.addAll(executor.searchPathSchemas());
+        }
+        for (String schema : path) {
+            String kind = RelationNamespace.kindOf(executor.database, schema, bare);
+            if (kind == null) continue;
+            MemgresException wrongKind =
+                    new MemgresException("cannot open relation \"" + bare + "\"", "42809");
+            wrongKind.setDetail("This operation is not supported for "
+                    + RelationNamespace.pluralKind(kind) + ".");
+            throw wrongKind;
+        }
+        throw new MemgresException("relation \"" + seqName + "\" does not exist", "42P01");
+    }
+
+    /**
+     * A regclass argument's text read the way PostgreSQL reads it: as a relation name, so the
+     * double quotes around a part of it are identifier quoting rather than characters of the name,
+     * and a part written without them is folded to lower case. It is this name, and not the text it
+     * was written as, that a complaint about a missing relation quotes back.
+     */
+    private static String regclassName(String written) {
+        if (written == null) return null;
+        String text = written.trim();
+        StringBuilder out = new StringBuilder();
+        StringBuilder part = new StringBuilder();
+        boolean inQuotes = false;
+        boolean quotedPart = false;
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (c == '"') {
+                if (inQuotes && i + 1 < text.length() && text.charAt(i + 1) == '"') {
+                    part.append('"');
+                    i++;
+                } else {
+                    inQuotes = !inQuotes;
+                    quotedPart = true;
+                }
+            } else if (c == '.' && !inQuotes) {
+                out.append(quotedPart ? part.toString() : part.toString().trim().toLowerCase());
+                out.append('.');
+                part.setLength(0);
+                quotedPart = false;
+            } else {
+                part.append(c);
+            }
+        }
+        out.append(quotedPart ? part.toString() : part.toString().trim().toLowerCase());
+        return out.toString();
     }
 
     /**

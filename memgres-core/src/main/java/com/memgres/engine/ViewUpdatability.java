@@ -175,12 +175,12 @@ final class ViewUpdatability {
     }
 
     private static boolean isUnconditionalInsteadRule(Database db, String relation, String event) {
-        String rule = db.getRule(relation, event);
-        if (rule == null) return false;
-        if (!rule.startsWith("INSTEAD") && !"INSTEAD_NOTHING".equals(rule)) return false;
-        // A rule with a WHERE of its own only replaces the write for the rows it matches, so
-        // PostgreSQL does not count it as making the view updatable.
-        return db.getRuleQualification(relation, event) == null;
+        for (Database.StoredRule rule : db.getRules(relation, event)) {
+            // A rule with a WHERE of its own only replaces the write for the rows it matches, so
+            // PostgreSQL does not count it as making the view updatable.
+            if (rule.isInstead() && rule.getQualification() == null) return true;
+        }
+        return false;
     }
 
     /**

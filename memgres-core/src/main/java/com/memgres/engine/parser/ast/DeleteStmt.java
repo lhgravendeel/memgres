@@ -13,7 +13,34 @@ public final class DeleteStmt implements Statement {
     public final Expression where;
     public final List<SelectStmt.SelectTarget> returning;
     public final List<SelectStmt.CommonTableExpr> withClauses;
+    /**
+     * ONLY was written before the relation name, which keeps the statement to that relation's own
+     * storage: PostgreSQL does not follow it down to the partitions or the inheritance children,
+     * so DELETE FROM ONLY a partitioned table removes nothing at all.
+     */
+    public final boolean only;
 
+    public DeleteStmt(
+            String schema,
+            String table,
+            String alias,
+            List<SelectStmt.FromItem> using,
+            Expression where,
+            List<SelectStmt.SelectTarget> returning,
+            List<SelectStmt.CommonTableExpr> withClauses,
+            boolean only
+    ) {
+        this.schema = schema;
+        this.table = table;
+        this.alias = alias;
+        this.using = using;
+        this.where = where;
+        this.returning = returning;
+        this.withClauses = withClauses;
+        this.only = only;
+    }
+
+    /** Constructor for a statement that did not write ONLY. */
     public DeleteStmt(
             String schema,
             String table,
@@ -23,13 +50,7 @@ public final class DeleteStmt implements Statement {
             List<SelectStmt.SelectTarget> returning,
             List<SelectStmt.CommonTableExpr> withClauses
     ) {
-        this.schema = schema;
-        this.table = table;
-        this.alias = alias;
-        this.using = using;
-        this.where = where;
-        this.returning = returning;
-        this.withClauses = withClauses;
+        this(schema, table, alias, using, where, returning, withClauses, false);
     }
 
     /** Constructor without alias. */
@@ -58,6 +79,7 @@ public final class DeleteStmt implements Statement {
     public Expression where() { return where; }
     public List<SelectStmt.SelectTarget> returning() { return returning; }
     public List<SelectStmt.CommonTableExpr> withClauses() { return withClauses; }
+    public boolean only() { return only; }
 
     @Override
     public boolean equals(Object o) {
@@ -70,16 +92,17 @@ public final class DeleteStmt implements Statement {
             && java.util.Objects.equals(using, that.using)
             && java.util.Objects.equals(where, that.where)
             && java.util.Objects.equals(returning, that.returning)
-            && java.util.Objects.equals(withClauses, that.withClauses);
+            && java.util.Objects.equals(withClauses, that.withClauses)
+            && only == that.only;
     }
 
     @Override
     public int hashCode() {
-        return java.util.Objects.hash(schema, table, alias, using, where, returning, withClauses);
+        return java.util.Objects.hash(schema, table, alias, using, where, returning, withClauses, only);
     }
 
     @Override
     public String toString() {
-        return "DeleteStmt[schema=" + schema + ", " + "table=" + table + ", " + "alias=" + alias + ", " + "using=" + using + ", " + "where=" + where + ", " + "returning=" + returning + ", " + "withClauses=" + withClauses + "]";
+        return "DeleteStmt[schema=" + schema + ", " + "table=" + table + ", " + "alias=" + alias + ", " + "using=" + using + ", " + "where=" + where + ", " + "returning=" + returning + ", " + "withClauses=" + withClauses + ", " + "only=" + only + "]";
     }
 }

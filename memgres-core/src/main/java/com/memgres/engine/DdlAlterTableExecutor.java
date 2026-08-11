@@ -50,13 +50,26 @@ class DdlAlterTableExecutor {
         this.executor = ddl.executor;
     }
 
-    /** True if the expression text calls a built-in VOLATILE function (see PER_ROW_VOLATILE_FUNCTIONS). */
-    private static boolean hasVolatileFunction(String exprStr) {
-        String norm = exprStr.toLowerCase().replaceAll("\\s+", "");
-        for (String fn : PER_ROW_VOLATILE_FUNCTIONS) {
-            if (norm.contains(fn + "(")) return true;
-        }
-        return false;
+    /**
+     * True when the expression really calls one of {@link #PER_ROW_VOLATILE_FUNCTIONS}.
+     *
+     * <p>Asked of the parse tree rather than of the text the default was written as. A string
+     * literal that happens to spell a call — {@code DEFAULT 'random(9)'} — is a value, not a
+     * function, and taking it for one sent the column down the per-row path, where nothing checks
+     * the value against the column's own declaration.
+     */
+    private static boolean hasVolatileFunction(Expression expr) {
+        if (expr == null) return false;
+        return AstWalk.anyMatch(expr, new java.util.function.Predicate<Object>() {
+            @Override public boolean test(Object n) {
+                if (!(n instanceof FunctionCallExpr)) return false;
+                String fname = ((FunctionCallExpr) n).name;
+                if (fname == null) return false;
+                int dot = fname.lastIndexOf('.');
+                return PER_ROW_VOLATILE_FUNCTIONS.contains(
+                        (dot >= 0 ? fname.substring(dot + 1) : fname).toLowerCase());
+            }
+        });
     }
 
     QueryResult executeAlterTable(AlterTableStmt stmt) {
@@ -70,11 +83,12 @@ class DdlAlterTableExecutor {
         }
         SchemaQualifier.requireSchema(executor.database, executor.session, stmt.schema());
         String schemaName = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
+        requireWrittenKind(stmt, schemaName);
         rejectCompositeTypeTarget(schemaName, stmt.table());
-        rejectActionsOnOtherRelationKinds(stmt);
+        rejectActionsOnOtherRelationKinds(stmt, schemaName);
         QueryResult indexResult = alterIndexRelation(stmt, schemaName);
         if (indexResult != null) return indexResult;
-        QueryResult viewResult = alterViewRelation(stmt);
+        QueryResult viewResult = alterViewRelation(stmt, schemaName);
         if (viewResult != null) return viewResult;
         Table table;
         try {
@@ -112,6 +126,21 @@ class DdlAlterTableExecutor {
      * because what a composite is made of is ALTER TYPE's business. PostgreSQL names the bare
      * relation even when the statement qualified it, and points the reader at the right statement.
      */
+    /**
+     * ALTER VIEW and ALTER MATERIALIZED VIEW hand their remaining actions to this path, but
+     * PostgreSQL opens the relation under the kind its keyword named: a table an ALTER VIEW
+     * reaches is {@code 42809 "t" is not a view} before the action is looked at, and IF EXISTS
+     * does not soften it — that excuses a relation which is not there, not one of another kind.
+     * ALTER VIEW ... RENAME COLUMN is the exception PostgreSQL makes (it renames a column of any
+     * relation kind), and it is parsed elsewhere, so it never reaches here.
+     */
+    private void requireWrittenKind(AlterTableStmt stmt, String schemaName) {
+        if (stmt.writtenKind() == null || stmt.table() == null) return;
+        String bare = RelationNamespace.bareName(stmt.table());
+        RelationNamespace.requireKind(executor.database,
+                relationSchemaFor(stmt, schemaName, bare), bare, stmt.writtenKind());
+    }
+
     private void rejectCompositeTypeTarget(String schemaName, String written) {
         if (written == null) return;
         String bare = RelationNamespace.bareName(written);
@@ -229,36 +258,43 @@ class DdlAlterTableExecutor {
      *
      * @return the result when the statement targeted a view, or null to continue as a table
      */
-    private QueryResult alterViewRelation(AlterTableStmt stmt) {
-        String bare = stmt.table().contains(".")
-                ? stmt.table().substring(stmt.table().lastIndexOf('.') + 1) : stmt.table();
-        Database.ViewDef view = executor.database.getView(bare);
+    private QueryResult alterViewRelation(AlterTableStmt stmt, String schemaName) {
+        String bare = RelationNamespace.bareName(stmt.table());
+        // The single-argument lookup answers a qualified name with public's view of that name, so
+        // ALTER TABLE s.v renamed some other schema's relation and never touched the one named.
+        Database.ViewDef view = executor.database.getView(relationSchemaFor(stmt, schemaName, bare), bare);
         if (view == null) return null;
+        recordViewColumnDefaults(view, stmt);
         for (AlterTableStmt.AlterAction action : stmt.actions()) {
-            // Anything else the view accepts, such as a column default, is left to the ordinary
-            // path rather than half-handled here.
+            // A column default is settled above, against the view itself. Sending it on to the
+            // ordinary path as well resolved the view to the relation underneath and wrote the
+            // default there, giving a table nobody altered a default of its own. Anything this
+            // path does not handle is still left to that one.
             if (!(action instanceof AlterTableStmt.RenameTable
                     || action instanceof AlterTableStmt.RenameColumn
-                    || action instanceof AlterTableStmt.SetSchema)) {
+                    || action instanceof AlterTableStmt.SetSchema
+                    || action instanceof AlterTableStmt.SetStorageParams
+                    || action instanceof AlterTableStmt.ResetStorageParams
+                    || isColumnDefaultAction(action))) {
                 return null;
             }
         }
         for (AlterTableStmt.AlterAction action : stmt.actions()) {
             if (action instanceof AlterTableStmt.RenameTable) {
                 String newName = ((AlterTableStmt.RenameTable) action).newName();
-                RelationNamespace.requireFree(executor.database,
-                        view.schemaName() != null ? view.schemaName() : executor.defaultSchema(),
-                        newName, null);
-                if (executor.database.getView(newName) != null) {
-                    throw new MemgresException("relation \"" + newName + "\" already exists", "42P07");
-                }
                 String viewSchema = view.schemaName() != null
                         ? view.schemaName() : executor.defaultSchema();
-                executor.database.removeView(bare);
+                RelationNamespace.requireFree(executor.database, viewSchema, newName, null);
+                // The new name has to be free in the schema this view lives in; asking whether any
+                // schema holds a view of that name refused renames PostgreSQL allows.
+                if (executor.database.getView(viewSchema, newName) != null) {
+                    throw new MemgresException("relation \"" + newName + "\" already exists", "42P07");
+                }
+                executor.database.removeView(viewSchema, bare);
                 executor.database.addView(withViewName(view, newName, view.cachedColumns()));
                 executor.identity().relationRenamed(view.materialized() ? "m" : "v",
                         viewSchema, bare, viewSchema, newName);
-                view = executor.database.getView(newName);
+                view = executor.database.getView(viewSchema, newName);
                 bare = newName;
             } else if (action instanceof AlterTableStmt.RenameColumn) {
                 AlterTableStmt.RenameColumn rc = (AlterTableStmt.RenameColumn) action;
@@ -273,7 +309,8 @@ class DdlAlterTableExecutor {
                 executor.database.addView(new Database.ViewDef(bare, view.schemaName(), relabelled,
                         view.orReplace(), view.materialized(), renamed, view.cachedRows(),
                         view.sourceSQL(), view.checkOption(), view.reloptions(), view.populated()));
-                view = executor.database.getView(bare);
+                view = executor.database.getView(view.schemaName() != null
+                        ? view.schemaName() : executor.defaultSchema(), bare);
             } else if (action instanceof AlterTableStmt.SetSchema) {
                 String target = ((AlterTableStmt.SetSchema) action).newSchema();
                 if (executor.database.getSchema(target) == null) {
@@ -281,17 +318,47 @@ class DdlAlterTableExecutor {
                 }
                 String viewSchema = view.schemaName() != null
                         ? view.schemaName() : executor.defaultSchema();
-                executor.database.removeView(bare);
+                executor.database.removeView(viewSchema, bare);
                 executor.database.addView(new Database.ViewDef(view.name(), target, view.query(),
                         view.orReplace(), view.materialized(), view.cachedColumns(),
                         view.cachedRows(), view.sourceSQL(), view.checkOption(),
                         view.reloptions(), view.populated()));
                 executor.identity().relationRenamed(view.materialized() ? "m" : "v",
                         viewSchema, bare, target, bare);
-                view = executor.database.getView(bare);
+                view = executor.database.getView(target, bare);
+            } else if (action instanceof AlterTableStmt.SetStorageParams) {
+                AlterTableStmt.SetStorageParams set = (AlterTableStmt.SetStorageParams) action;
+                if (!set.reloptions()) continue;
+                Map<String, String> merged = view.reloptions() == null
+                        ? new LinkedHashMap<String, String>()
+                        : new LinkedHashMap<String, String>(view.reloptions());
+                for (Map.Entry<String, String> opt : set.params().entrySet()) {
+                    merged.put(opt.getKey(), DdlIndexValidator.normalizeRelOptionValue(
+                            "heap", opt.getKey(), opt.getValue()));
+                }
+                view = replaceViewReloptions(view, bare, merged);
+            } else if (action instanceof AlterTableStmt.ResetStorageParams) {
+                // A view carries storage parameters like any other relation, so RESET takes them
+                // off it. PostgreSQL accepts a name that was never set and reports NULL rather
+                // than an empty list once the last one is gone.
+                AlterTableStmt.ResetStorageParams reset = (AlterTableStmt.ResetStorageParams) action;
+                if (view.reloptions() == null) continue;
+                Map<String, String> remaining = new LinkedHashMap<String, String>(view.reloptions());
+                for (String name : reset.names()) remaining.remove(name);
+                view = replaceViewReloptions(view, bare, remaining.isEmpty() ? null : remaining);
             }
         }
         return QueryResult.command(QueryResult.Type.CREATE_TABLE, 0);
+    }
+
+    /** The same view with another set of storage parameters, put back under its own name. */
+    private Database.ViewDef replaceViewReloptions(Database.ViewDef view, String bare,
+                                                   Map<String, String> reloptions) {
+        String viewSchema = view.schemaName() != null ? view.schemaName() : executor.defaultSchema();
+        executor.database.addView(new Database.ViewDef(view.name(), view.schemaName(), view.query(),
+                view.orReplace(), view.materialized(), view.cachedColumns(), view.cachedRows(),
+                view.sourceSQL(), view.checkOption(), reloptions, view.populated()));
+        return executor.database.getView(viewSchema, bare);
     }
 
     private List<Column> renameViewColumn(Database.ViewDef view, String oldName, String newName,
@@ -393,11 +460,10 @@ class DdlAlterTableExecutor {
      * that are about the relation's name or ownership. Anything that would reshape stored rows
      * has no meaning on those, and PostgreSQL names the offending action when it refuses.
      */
-    private void rejectActionsOnOtherRelationKinds(AlterTableStmt stmt) {
-        String bare = stmt.table().contains(".")
-                ? stmt.table().substring(stmt.table().lastIndexOf('.') + 1) : stmt.table();
-        Database.ViewDef view = executor.database.getView(bare);
-        String ownSchemaName = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
+    private void rejectActionsOnOtherRelationKinds(AlterTableStmt stmt, String schemaName) {
+        String bare = RelationNamespace.bareName(stmt.table());
+        String ownSchemaName = relationSchemaFor(stmt, schemaName, bare);
+        Database.ViewDef view = executor.database.getView(ownSchemaName, bare);
         boolean isSequence = view == null && executor.database.hasSequence(ownSchemaName, bare);
         Schema ownSchema = executor.database.getSchema(ownSchemaName);
         boolean isIndex = view == null && !isSequence
@@ -418,10 +484,17 @@ class DdlAlterTableExecutor {
                     || action instanceof AlterTableStmt.OwnerTo) {
                 continue;
             }
-            // Renaming a column, and giving one a default that INSERT through the view can
-            // use, are both meaningful for a view but not for a sequence.
+            // Renaming a column, giving one a default that INSERT through the view can use, and
+            // setting or clearing the relation's storage parameters are all meaningful for a
+            // view -- security_barrier and check_option are storage parameters -- but not for a
+            // sequence.
+            // A column default is one only an ordinary view carries: it stands in for the base
+            // relation's while a write is rewritten through the view, and a materialized view
+            // takes no writes at all, so PostgreSQL refuses it there as it does on a sequence.
             if (view != null && (action instanceof AlterTableStmt.RenameColumn
-                    || isColumnDefaultAction(action))) {
+                    || action instanceof AlterTableStmt.SetStorageParams
+                    || action instanceof AlterTableStmt.ResetStorageParams
+                    || (isColumnDefaultAction(action) && !view.materialized()))) {
                 continue;
             }
             MemgresException e = new MemgresException("ALTER action " + alterActionName(action)
@@ -433,6 +506,52 @@ class DdlAlterTableExecutor {
                     : view.materialized() ? "This operation is not supported for materialized views."
                     : "This operation is not supported for views.");
             throw e;
+        }
+    }
+
+    /**
+     * The schema a written relation name reaches. A qualifier names one schema and no other; a
+     * bare name is the search path's business, and PostgreSQL reaches the first relation on it.
+     */
+    private String relationSchemaFor(AlterTableStmt stmt, String schemaName, String bare) {
+        String written = stmt.schema();
+        if (written == null && stmt.table() != null && stmt.table().indexOf('.') >= 0) {
+            written = stmt.table().substring(0, stmt.table().lastIndexOf('.'));
+        }
+        if (written != null) return written;
+        String onPath = RelationNamespace.schemaHolding(executor.database,
+                executor.relationSearchPath(), bare);
+        return onPath != null ? onPath : schemaName;
+    }
+
+    /**
+     * A default written on a view column belongs to the view and to nothing else: PostgreSQL files
+     * it against the view's own relation and substitutes it only while a write through the view is
+     * being rewritten onto the base relation, which is why the base relation's catalogue row stays
+     * empty and an INSERT naming the table directly stores NULL.
+     */
+    private void recordViewColumnDefaults(Database.ViewDef view, AlterTableStmt stmt) {
+        if (view.cachedColumns() == null) return;
+        for (AlterTableStmt.AlterAction action : stmt.actions()) {
+            if (!isColumnDefaultAction(action)) continue;
+            AlterTableStmt.AlterColumn alterCol = (AlterTableStmt.AlterColumn) action;
+            String written = alterCol.action() instanceof AlterTableStmt.SetDefault
+                    ? DdlExecutor.exprToDefaultString(
+                            ((AlterTableStmt.SetDefault) alterCol.action()).expr())
+                    : null;
+            boolean found = false;
+            for (Column col : view.cachedColumns()) {
+                if (col.getName().equalsIgnoreCase(alterCol.column())) {
+                    col.setDefaultValue(written);
+                    found = true;
+                }
+            }
+            // The view is the relation the statement named, so a column the view does not publish
+            // is the column that is not there; the relation underneath is never consulted for it.
+            if (!found) {
+                throw new MemgresException("column \"" + alterCol.column() + "\" of relation \""
+                        + stmt.table() + "\" does not exist", "42703");
+            }
         }
     }
 
@@ -462,6 +581,7 @@ class DdlAlterTableExecutor {
         if (action instanceof AlterTableStmt.NoForceRls) return "NO FORCE ROW SECURITY";
         if (action instanceof AlterTableStmt.SetLogged) return "SET LOGGED";
         if (action instanceof AlterTableStmt.SetStorageParams) return "SET";
+        if (action instanceof AlterTableStmt.ResetStorageParams) return "RESET";
         if (action instanceof AlterTableStmt.AlterColumn) {
             return "ALTER COLUMN ... " + alterColumnActionName(
                     ((AlterTableStmt.AlterColumn) action).action());
@@ -521,13 +641,25 @@ class DdlAlterTableExecutor {
                     throw new MemgresException("column \"" + notNullColumn
                             + "\" is in a primary key", "42P16");
                 }
+                // The named spelling of DROP NOT NULL answers to the same rule as the column
+                // spelling: the constraint belongs to whichever relation declared it.
+                rejectDropNotNullUnderParent(table, notNullColumn, stmt.table(), true);
                 // Dropping the constraint is what makes the column nullable again.
                 table.alterColumnNullable(notNullColumn, true);
                 table.setNotNullConstraintName(notNullColumn, null);
+                if (!stmt.only()) clearNotNullOnDescendants(table, notNullColumn);
                 return table;
             }
             if (!dropConstraint.ifExists() && dropped == null) {
                 throw new MemgresException("constraint \"" + dropConstraint.name() + "\" of relation \"" + stmt.table() + "\" does not exist", "42704");
+            }
+            // A constraint a partition or a child carries because its parent declares it belongs
+            // to the parent. Dropping it on the descendant alone would leave the descendant
+            // taking rows the parent's own rule rejects, and a read through the parent would
+            // return them, so PostgreSQL sends the writer to the relation that declared it.
+            if (dropped != null && dropped.getInheritedFrom() != null) {
+                throw new MemgresException("cannot drop inherited constraint \""
+                        + dropped.getName() + "\" of relation \"" + stmt.table() + "\"", "42P16");
             }
             // The columns carry their own "in the primary key" flag, so dropping the constraint
             // has to clear it or the column keeps refusing DROP NOT NULL for a key that is gone.
@@ -538,6 +670,13 @@ class DdlAlterTableExecutor {
                 }
             }
             table.removeConstraint(dropConstraint.name());
+            // The copy a partition or an inheritance child holds is this constraint, not one of
+            // its own, so it goes with it: PostgreSQL drops the descendants' copies too, and ONLY
+            // asks instead that each of them keep it as its own from now on. A copy left behind
+            // still marked as the parent's could be withdrawn from nowhere -- the parent no longer
+            // knows the name, and a descendant may not drop what it inherited.
+            if (stmt.only()) makeInheritedCopiesLocal(table, dropConstraint.name());
+            else dropInheritedCopies(table, dropConstraint.name());
         } else if (action instanceof AlterTableStmt.EnableRls) {
             table.setRlsEnabled(true);
         } else if (action instanceof AlterTableStmt.DisableRls) {
@@ -561,6 +700,11 @@ class DdlAlterTableExecutor {
             table.removePartition(partition);
             partition.setPartitionParent(null);
             partition.clearPartitionBounds();
+            // A detached table keeps the constraints it carried, but they are its own from now on:
+            // PostgreSQL records them as local, which is what lets the standalone table drop them.
+            // Left marked as the partitioned table's, they could never be withdrawn and a
+            // violation would go on naming a relation this one no longer belongs to.
+            adoptInheritedConstraints(partition, table);
         } else if (action instanceof AlterTableStmt.RenameConstraint) {
             AlterTableStmt.RenameConstraint renameConstraint = (AlterTableStmt.RenameConstraint) action;
             StoredConstraint oldConstraint = table.getConstraint(renameConstraint.oldName());
@@ -571,7 +715,11 @@ class DdlAlterTableExecutor {
                     table.setNotNullConstraintName(nnCol, renameConstraint.newName());
                     return table;
                 }
-                throw new MemgresException("constraint \"" + renameConstraint.oldName() + "\" does not exist");
+                // Without a SQLSTATE this inferred the bare class 42000, which no PostgreSQL
+                // server sends. PostgreSQL says "for table" when a rename cannot find the
+                // constraint and "of relation" when a drop cannot; the two are not interchangeable.
+                throw new MemgresException("constraint \"" + renameConstraint.oldName()
+                        + "\" for table \"" + stmt.table() + "\" does not exist", "42704");
             }
             table.removeConstraint(renameConstraint.oldName());
             StoredConstraint newConstraint = new StoredConstraint(
@@ -620,6 +768,10 @@ class DdlAlterTableExecutor {
             // A child has to be able to stand in for its parent, so every parent column must be
             // present with the same type before the link is made.
             validateInheritedColumns(parentTable, table, stmt.table());
+            // ...and it has to carry the parent's CHECK constraints already. PostgreSQL adds no
+            // rule to the child behind the writer's back, so a child that would enforce less than
+            // its parent is refused rather than attached.
+            requireInheritedChecks(parentTable, table);
             table.setParentTable(parentTable);
             parentTable.addChild(table);
         } else if (action instanceof AlterTableStmt.NoInherit) {
@@ -631,6 +783,10 @@ class DdlAlterTableExecutor {
             }
             parentTable.removeChild(table);
             table.setParentTable(null);
+            // Breaking the link leaves the CHECK constraints standing, as the child's own: a table
+            // that inherits from nobody has nothing to inherit a rule from, and PostgreSQL records
+            // each of them local so the child can drop them itself.
+            adoptInheritedConstraints(table, parentTable);
         } else if (action instanceof AlterTableStmt.DisableTrigger) {
             AlterTableStmt.DisableTrigger dt = (AlterTableStmt.DisableTrigger) action;
             setTriggerEnabled(table, dt.triggerName(), "D");
@@ -644,9 +800,10 @@ class DdlAlterTableExecutor {
                         + stmt.table() + "\" does not exist", "42704");
             }
         } else if (action instanceof AlterTableStmt.SetStorageParams) {
+            AlterTableStmt.SetStorageParams setParams = (AlterTableStmt.SetStorageParams) action;
             // A partitioned table holds no rows of its own, so there is no storage for a storage
             // parameter to describe and PostgreSQL refuses the form outright.
-            if (((AlterTableStmt.SetStorageParams) action).reloptions() && isPartitioned(table)) {
+            if (setParams.reloptions() && isPartitioned(table)) {
                 MemgresException e = new MemgresException(
                         "cannot specify storage parameters for a partitioned table", "42809");
                 // The rows live in the leaves, so the leaves are where a storage parameter has
@@ -654,22 +811,93 @@ class DdlAlterTableExecutor {
                 e.setHint("Specify storage parameters for its leaf partitions instead.");
                 throw e;
             }
-            // Nothing is stored, but a parameter PostgreSQL does not recognise or a value it
-            // will not take stops the statement here rather than being quietly accepted.
+            // A parameter PostgreSQL does not recognise or a value it will not take stops the
+            // statement here rather than being quietly accepted...
             if (table != null && !table.isViewProjection()) {
-                DdlIndexValidator.checkRelOptions("heap",
-                        ((AlterTableStmt.SetStorageParams) action).params());
+                DdlIndexValidator.checkRelOptions("heap", setParams.params());
+                // ...and one it does take is stored, so pg_class.reloptions reports what was set.
+                // Re-setting an option moves it to the end of the array, because PostgreSQL
+                // removes the old entry and appends the new one; the SET TABLESPACE and SET
+                // ACCESS METHOD forms carry no parameters and must change nothing.
+                if (setParams.reloptions()) {
+                    Map<String, String> merged = table.getReloptions() == null
+                            ? new LinkedHashMap<String, String>()
+                            : new LinkedHashMap<String, String>(table.getReloptions());
+                    for (Map.Entry<String, String> opt : setParams.params().entrySet()) {
+                        merged.remove(opt.getKey());
+                        merged.put(opt.getKey(), DdlIndexValidator.normalizeRelOptionValue(
+                                "heap", opt.getKey(), opt.getValue()));
+                    }
+                    setReloptionsWithUndo(table, merged);
+                }
+            }
+        } else if (action instanceof AlterTableStmt.ResetStorageParams) {
+            // PostgreSQL accepts RESET of an option that was never set, and reports NULL rather
+            // than an empty array once the last one is gone -- the same answer as a table nobody
+            // ever set an option on.
+            AlterTableStmt.ResetStorageParams reset = (AlterTableStmt.ResetStorageParams) action;
+            if (table != null && !table.isViewProjection() && table.getReloptions() != null) {
+                Map<String, String> remaining =
+                        new LinkedHashMap<String, String>(table.getReloptions());
+                for (String name : reset.names()) remaining.remove(name);
+                setReloptionsWithUndo(table, remaining.isEmpty() ? null : remaining);
             }
         } else if (action instanceof AlterTableStmt.SetWithoutCluster) {
             if (((AlterTableStmt.SetWithoutCluster) action).cluster() && isPartitioned(table)) {
                 throw new MemgresException(
                         "cannot mark index clustered in partitioned table", "0A000");
             }
+        } else if (action instanceof AlterTableStmt.ClusterOn) {
+            String clusterIndex = ((AlterTableStmt.ClusterOn) action).indexName();
+            requireIndexOfRelation(clusterIndex, table, stmt, schemaName);
+            executor.database.setClusteredIndex(clusterIndex);
         } else if (action instanceof AlterTableStmt.SetLogged) {
             AlterTableStmt.SetLogged sl = (AlterTableStmt.SetLogged) action;
             table.setUnlogged(!sl.logged());
         }
         return table;
+    }
+
+    /**
+     * CLUSTER ON names an index of the relation being altered. PostgreSQL says the index does not
+     * exist when the name reaches none, and says it is not this relation's when the name reaches an
+     * index of another -- so a statement that clustered on the wrong index is told which of the two
+     * it got wrong. A key's own index answers to the constraint's name.
+     */
+    private void requireIndexOfRelation(String indexName, Table table, AlterTableStmt stmt,
+                                        String schemaName) {
+        if (indexName == null) return;
+        if (table != null) {
+            for (StoredConstraint sc : table.getConstraints()) {
+                if ((sc.getType() == StoredConstraint.Type.PRIMARY_KEY
+                        || sc.getType() == StoredConstraint.Type.UNIQUE)
+                        && indexName.equalsIgnoreCase(sc.getName())) {
+                    return;
+                }
+            }
+        }
+        if (!executor.database.hasIndex(schemaName, indexName)) {
+            throw new MemgresException("index \"" + indexName + "\" for table \""
+                    + stmt.table() + "\" does not exist", "42704");
+        }
+        String owner = executor.database.getIndexTable(indexName);
+        String qualified = schemaName + "." + stmt.table();
+        if (owner != null && !owner.equalsIgnoreCase(qualified)
+                && !owner.equalsIgnoreCase(stmt.table())) {
+            throw PgErrors.wrongObjectType("\"" + indexName + "\" is not an index for table \""
+                    + stmt.table() + "\"");
+        }
+    }
+
+    /**
+     * Store a new storage-parameter map, remembering what was there first. DDL is transactional in
+     * PostgreSQL, so a rolled-back SET or RESET has to leave pg_class.reloptions unchanged.
+     */
+    private void setReloptionsWithUndo(Table table, Map<String, String> updated) {
+        Map<String, String> previous = table.getReloptions() == null ? null
+                : new LinkedHashMap<String, String>(table.getReloptions());
+        executor.recordUndo(new Session.SetReloptionsUndo(table, previous));
+        table.setReloptions(updated);
     }
 
     private void executeAddColumn(AlterTableStmt.AddColumn addCol, Table table,
@@ -679,14 +907,35 @@ class DdlAlterTableExecutor {
             if (addCol.ifNotExists()) return;
             throw new MemgresException("column \"" + def.name() + "\" of relation \"" + stmt.table() + "\" already exists", "42701");
         }
+        rejectDirectPartitionColumnChange(table, "add column to a partition");
+        // A typed table has exactly the columns its composite type declares. A column added here
+        // would be one the type does not have, so PostgreSQL refuses it and sends the writer to
+        // ALTER TYPE, which changes the shape of every table built on that type.
+        if (table.getOfTypeName() != null) {
+            throw PgErrors.wrongObjectType("cannot add column to typed table");
+        }
         DdlDefinitionChecks.rejectSystemColumnName(def.name());
         DdlDefinitionChecks.validateDefaultExpression(def.defaultExpr());
+        // A collation the database does not hold is not one a column can be declared with, and
+        // PostgreSQL settles that where the clause is written rather than at the first comparison.
+        DdlDefinitionChecks.requireCollationExists(executor.database, def.collation);
         executor.selectExecutor.placementCheck.rejectStoredDefinition(
                 def.defaultExpr(), "DEFAULT expressions", null);
         // A child that lacks one of its parent's columns cannot stand in for the parent, so PG
         // refuses to add a column to a parent alone.
         if (stmt.only() && !childRelations(table).isEmpty()) {
             throw new MemgresException("column must be added to child tables too", "42P16");
+        }
+        // A column's own PRIMARY KEY clause makes a real constraint, and a table has at most one
+        // primary key — so a second declaration is a fault in the statement, caught before the
+        // column or its sequence is created rather than accepted and quietly not stored.
+        if (def.primaryKey()) {
+            for (StoredConstraint existing : table.getConstraints()) {
+                if (existing.getType() == StoredConstraint.Type.PRIMARY_KEY) {
+                    throw new MemgresException("multiple primary keys for table \""
+                            + stmt.table() + "\" are not allowed", "42P16");
+                }
+            }
         }
 
         DdlExecutor.ResolvedType resolved = ddl.resolveColumnType(def.typeName(), null);
@@ -697,6 +946,19 @@ class DdlAlterTableExecutor {
         DataType arrayElementType = resolved.arrayElementType();
 
         String defaultVal = def.defaultExpr() != null ? DdlExecutor.exprToDefaultString(def.defaultExpr()) : null;
+        // A domain carries a default of its own, and a column of that domain takes it when the
+        // column declares none: PostgreSQL fills the rows already stored with it, and leaving them
+        // NULL under a NOT NULL domain is a state it has no way to represent. It is kept apart from
+        // defaultVal because the column gets no pg_attrdef entry of its own — measured against
+        // PostgreSQL, information_schema.column_default stays empty while the rows still read 7.
+        Object domainDefault = null;
+        if (defaultVal == null && domainTypeName != null) {
+            DomainType addDomain = executor.database.getDomain(domainTypeName);
+            if (addDomain != null && addDomain.getDefaultValue() != null) {
+                domainDefault = executor.evaluateDefault(addDomain.getDefaultValue(),
+                        addDomain.getBaseType());
+            }
+        }
         String genExpr = def.generatedExpr();
 
         // SERIAL/BIGSERIAL/SMALLSERIAL: create a real sequence (same as CREATE TABLE)
@@ -705,6 +967,8 @@ class DdlAlterTableExecutor {
                 String seqName = stmt.table() + "_" + def.name() + "_seq";
                 Sequence seq = new Sequence(seqName, null, null, null, null);
                 seq.setSchemaName(schemaName);
+                // The sequence belongs to this column and dies with it.
+                seq.ownedBy(stmt.table(), def.name(), true);
                 executor.database.addSequence(seq);
                 executor.database.registerSchemaObject(schemaName, "sequence", seqName);
                 defaultVal = "nextval('" + seqName + "'::regclass)";
@@ -713,12 +977,22 @@ class DdlAlterTableExecutor {
 
         // GENERATED AS IDENTITY on ADD COLUMN
         if (def.identity() != null) {
-            String seqName = stmt.table() + "_" + def.name() + "_seq";
-            if (!executor.database.hasSequence(schemaName, seqName)) {
-                Sequence seq = new Sequence(seqName, def.identityStart(), def.identityIncrement(), null, null);
-                seq.setSchemaName(schemaName);
+            // SEQUENCE NAME names the relation that feeds the column; without one the name is
+            // composed the way PostgreSQL composes it.
+            String writtenSeq = def.identitySequenceName();
+            int seqDot = writtenSeq == null ? -1 : writtenSeq.lastIndexOf('.');
+            String seqSchema = seqDot > 0 ? writtenSeq.substring(0, seqDot) : schemaName;
+            String seqName = writtenSeq == null ? stmt.table() + "_" + def.name() + "_seq"
+                    : (seqDot > 0 ? writtenSeq.substring(seqDot + 1) : writtenSeq);
+            if (!executor.database.hasSequence(seqSchema, seqName)) {
+                // The same sequence CREATE TABLE would build: bounded by the column's own type,
+                // carrying whatever the option list said, and checked by the same rules. Building
+                // it with no bounds at all let a smallint identity column added by ALTER run past
+                // 32767 where one declared at CREATE TABLE stops.
+                Sequence seq = DdlTableExecutor.buildIdentitySequence(def, dt, seqName, seqSchema,
+                        stmt.table());
                 executor.database.addSequence(seq);
-                executor.database.registerSchemaObject(schemaName, "sequence", seqName);
+                executor.database.registerSchemaObject(seqSchema, "sequence", seqName);
             }
             if ("ALWAYS".equalsIgnoreCase(def.identity())) {
                 defaultVal = "__identity__:always:seq:" + seqName;
@@ -745,7 +1019,8 @@ class DdlAlterTableExecutor {
 
         // DEFAULT NULL fills the existing rows with nothing, so it leaves the column exactly as
         // empty as no default at all and the new rule cannot hold over the rows already stored.
-        boolean fillsExistingRows = defaultVal != null && !"null".equalsIgnoreCase(defaultVal.trim());
+        boolean fillsExistingRows = (defaultVal != null && !"null".equalsIgnoreCase(defaultVal.trim()))
+                || domainDefault != null;
         if (def.notNull() && !fillsExistingRows && genExpr == null && !table.getRows().isEmpty()) {
             throw PgErrors.columnContainsNulls(def.name(), "relation", stmt.table());
         }
@@ -775,7 +1050,7 @@ class DdlAlterTableExecutor {
         boolean sequenceBacked = defaultVal != null
                 && (defaultVal.contains("nextval(") || defaultVal.startsWith("__identity__"));
         boolean volatileDefault = !sequenceBacked && defaultVal != null && genExpr == null
-                && hasVolatileFunction(defaultVal);
+                && hasVolatileFunction(def.defaultExpr());
         Object evaluatedDefault;
         if (sequenceBacked || volatileDefault) {
             evaluatedDefault = null;
@@ -824,14 +1099,34 @@ class DdlAlterTableExecutor {
                 RowContext tempCtx = new RowContext(tempTable, table.getName(), tempRow);
                 Object checkResult = executor.evalExpr(def.checkConstraintExpr(), tempCtx);
                 if (!executor.isTruthy(checkResult)) {
-                    throw new MemgresException("check constraint \"" + def.name()
-                            + "_check\" is violated by some row", "23514");
+                    // The name is the one the constraint will carry, which includes the table:
+                    // reporting "<column>_check" named a constraint the catalogue never holds,
+                    // and left the reader without the relation the rule belongs to.
+                    String violated = stmt.table() + "_" + def.name() + "_check";
+                    List<TableConstraint> declared = addCol.inlineConstraints();
+                    if (declared != null) {
+                        for (TableConstraint tc : declared) {
+                            if (tc.type() == TableConstraint.ConstraintType.CHECK && tc.name() != null) {
+                                violated = tc.name();
+                                break;
+                            }
+                        }
+                    }
+                    MemgresException failed = new MemgresException("check constraint \"" + violated
+                            + "\" of relation \"" + stmt.table() + "\" is violated by some row", "23514");
+                    failed.setConstraint(violated);
+                    throw failed;
                 }
             } catch (MemgresException me) {
-                if ("23514".equals(me.getSqlState())) throw me;
+                // Whatever the predicate raises is the statement's answer, the same as at ADD
+                // CONSTRAINT: a default the column's own CHECK cannot evaluate is not a definition
+                // PostgreSQL would store.
+                throw me;
             } catch (Exception ignored) {}
         }
 
+        // Nothing of the column's own to fill with, so the domain's default is what the rows get.
+        if (evaluatedDefault == null) evaluatedDefault = domainDefault;
         // Mark column as having a missing value if it was added with a DEFAULT and the table has existing rows
         if (evaluatedDefault != null && !table.getRows().isEmpty()) {
             col.setAttHasMissing(true);
@@ -876,15 +1171,47 @@ class DdlAlterTableExecutor {
                     } else {
                         v = executor.evaluateDefault(defaultVal, dt);
                     }
-                    if (v != null) {
-                        try {
-                            v = TypeCoercion.coerceForStorage(v, col);
-                        } catch (Exception ignored) {
-                            // keep the uncoerced value rather than losing it
-                        }
-                    }
+                    // The value has to be storable in the column being added. PostgreSQL rewrites
+                    // the whole table for a volatile default, so a row that cannot take its value
+                    // aborts the statement; keeping the uncoerced value stored something the
+                    // column's declaration says is impossible.
+                    if (v != null) v = TypeCoercion.coerceForStorage(v, col);
                     row[newColIdx] = v;
                 }
+            }
+        }
+
+        // The constraints written on the column itself. PostgreSQL builds their indexes at the end
+        // of the ALTER, over the rows the backfill has just written, which is why ADD COLUMN b int
+        // UNIQUE DEFAULT 7 on a table of two rows is refused rather than stored — and why a
+        // refused one leaves the table exactly as it was, column and all.
+        List<StoredConstraint> inlineAdded = new ArrayList<>();
+        try {
+            ddl.tableExecutor.storeInlineColumnConstraints(table, def, schemaName, stmt.table(),
+                    inlineAdded);
+            List<TableConstraint> declaredChecks = addCol.inlineConstraints();
+            if (declaredChecks != null) {
+                for (TableConstraint tc : declaredChecks) {
+                    StoredConstraint sc = ddl.convertTableConstraint(stmt.table(), tc, table);
+                    if (sc == null) continue;
+                    table.addConstraint(sc);
+                    inlineAdded.add(sc);
+                }
+            }
+            for (StoredConstraint sc : inlineAdded) {
+                DdlTableExecutor.validatePartitionKeyCoverage(table, sc);
+                table.validateNewUniqueConstraint(sc);
+            }
+        } catch (RuntimeException refused) {
+            for (StoredConstraint sc : inlineAdded) {
+                if (sc.getName() != null) table.removeConstraint(sc.getName());
+            }
+            table.removeColumn(def.name());
+            throw refused;
+        }
+        for (StoredConstraint sc : inlineAdded) {
+            if (sc.getName() != null) {
+                executor.recordUndo(new Session.AddConstraintUndo(schemaName, stmt.table(), sc.getName()));
             }
         }
 
@@ -971,6 +1298,186 @@ class DdlAlterTableExecutor {
     }
 
     /**
+     * Every relation below this one, at any depth: its partitions and its inheritance children.
+     * A statement that names a parent is a statement about all of them, because every row they
+     * hold is a row of the parent.
+     */
+    private static List<Table> descendantRelations(Table table) {
+        List<Table> found = new ArrayList<>();
+        collectDescendants(table, found);
+        return found;
+    }
+
+    private static void collectDescendants(Table table, List<Table> found) {
+        for (Table child : childRelations(table)) {
+            // Multiple inheritance can reach one child down two paths; it is one relation still.
+            if (containsIdentity(found, child)) continue;
+            found.add(child);
+            collectDescendants(child, found);
+        }
+    }
+
+    /**
+     * A column cannot be declared NOT NULL while a row holds a null in it. The rows a parent
+     * stands for are stored in its partitions and its inheritance children, so PostgreSQL names
+     * the relation the offending row is really in rather than the one the statement named.
+     */
+    private static void requireColumnHasNoNulls(Table table, String column, String relationName) {
+        int colIdx = table.getColumnIndex(column);
+        if (colIdx < 0) return;
+        for (Object[] row : table.getRows()) {
+            if (row[colIdx] == null) {
+                throw PgErrors.columnContainsNulls(column, "relation", relationName);
+            }
+        }
+    }
+
+    /**
+     * Take the NOT NULL flag off everything below the table along with its own. PostgreSQL 18
+     * keeps a NOT NULL in pg_constraint like any other constraint, and what a partition or an
+     * inheritance child carries is the parent's constraint counted on the descendant rather than
+     * one of its own -- so dropping the parent's drops it all the way down. ONLY asks for the
+     * named relation alone, and the caller decides that.
+     */
+    private static void clearNotNullOnDescendants(Table table, String column) {
+        for (Table child : childRelations(table)) {
+            if (child.getColumnIndex(column) < 0) continue;
+            child.alterColumnNullable(column, true);
+            child.setNotNullConstraintName(column, null);
+            clearNotNullOnDescendants(child, column);
+        }
+    }
+
+    /**
+     * A NOT NULL a parent declares is the descendant's too, and it is the parent's to withdraw: a
+     * partition or an inheritance child that could drop it on its own would take a null every row
+     * of the parent is supposed to be free of. PostgreSQL refuses both, and words the two refusals
+     * differently -- a partition is told the partitioned table marks the column, an inheritance
+     * child is told the constraint it holds came from somewhere else and is named which one.
+     *
+     * @param named true when the statement named the constraint rather than the column, which
+     *              PostgreSQL answers with the inherited-constraint wording in either case
+     */
+    private static void rejectDropNotNullUnderParent(Table table, String column, String tableName,
+                                                     boolean named) {
+        Table partitionParent = table.getPartitionParent();
+        if (columnRequiresNotNull(partitionParent, column)) {
+            if (!named) {
+                throw new MemgresException("column \"" + column
+                        + "\" is marked NOT NULL in parent table", "42P16");
+            }
+            throw cannotDropInheritedNotNull(partitionParent, column, tableName);
+        }
+        for (Table parent : table.getInheritParents()) {
+            if (!columnRequiresNotNull(parent, column)) continue;
+            throw cannotDropInheritedNotNull(parent, column, tableName);
+        }
+    }
+
+    /**
+     * The refusal PostgreSQL gives for an inherited NOT NULL, naming the constraint the descendant
+     * holds: a constraint taken from a parent keeps the name the parent gave it, so the name comes
+     * from the relation highest in the chain that declares the column NOT NULL.
+     */
+    private static MemgresException cannotDropInheritedNotNull(Table parent, String column,
+                                                               String tableName) {
+        Table owner = parent;
+        while (true) {
+            Table above = null;
+            for (Table candidate : owner.getDirectParents()) {
+                if (columnRequiresNotNull(candidate, column)) { above = candidate; break; }
+            }
+            if (above == null) break;
+            owner = above;
+        }
+        String conname = owner.notNullConstraintName(column);
+        if (conname == null) conname = owner.defaultNotNullConstraintName(column);
+        return new MemgresException("cannot drop inherited constraint \"" + conname
+                + "\" of relation \"" + tableName + "\"", "42P16");
+    }
+
+    /** True when this relation has the column and declares it NOT NULL. */
+    private static boolean columnRequiresNotNull(Table table, String column) {
+        if (table == null || column == null) return false;
+        int idx = table.getColumnIndex(column);
+        return idx >= 0 && !table.getColumns().get(idx).isNullable();
+    }
+
+    /**
+     * A default declared on a parent is the hierarchy's default: PostgreSQL recurses into the
+     * partitions and the inheritance children and replaces whatever each of them had, so a
+     * descendant's own SET DEFAULT is overwritten rather than kept. ONLY asks for the parent alone.
+     */
+    private static void propagateColumnDefault(Table table, String column, String defaultValue,
+                                               boolean only) {
+        if (only) return;
+        for (Table child : childRelations(table)) {
+            if (child.getColumnIndex(column) < 0) continue;
+            child.alterColumnDefault(column, defaultValue);
+            propagateColumnDefault(child, column, defaultValue, false);
+        }
+    }
+
+    /**
+     * A CHECK declared on a parent holds over every row of the hierarchy, so a table joining one
+     * has to carry the rule already: PostgreSQL refuses the link while the child is missing it
+     * rather than adding the constraint itself. A NO INHERIT constraint was never going to
+     * travel, so it is not asked for.
+     */
+    private static void requireInheritedChecks(Table parent, Table child) {
+        for (StoredConstraint sc : parent.getConstraints()) {
+            if (sc.getType() != StoredConstraint.Type.CHECK || sc.isNoInherit()) continue;
+            if (sc.getName() == null || child.getConstraint(sc.getName()) != null) continue;
+            throw PgErrors.datatypeMismatch("child table is missing constraint \""
+                    + sc.getName() + "\"");
+        }
+    }
+
+    /**
+     * A child stands in for its parent, so it may not take a null in a column the parent declares
+     * NOT NULL. PostgreSQL makes the writer declare it on the child rather than adding the
+     * constraint itself, and names the column and the table it is missing from.
+     */
+    private static void requireNotNullWhereParentIs(Column parentCol, Column childCol,
+                                                    String childName) {
+        if (parentCol.isNullable() || !childCol.isNullable()) return;
+        throw PgErrors.datatypeMismatch("column \"" + parentCol.getName()
+                + "\" in child table \"" + childName + "\" must be marked NOT NULL");
+    }
+
+    /**
+     * The partition key decides which partition a row belongs in, so the column it reads may
+     * neither be dropped nor retyped: the bounds already stored were written in that column's
+     * type, and a key naming a column that is gone routes nothing at all. PostgreSQL refuses both
+     * whether or not the table has any partitions yet, and an expression key stands for every
+     * column the expression names.
+     *
+     * @param verb {@code drop} or {@code alter}, the word PostgreSQL uses for the statement asked
+     */
+    private static void rejectPartitionKeyColumnChange(Table table, String column, String verb,
+                                                       String tableName) {
+        if (column == null || !partitionKeyNames(table.getPartitionColumn(), column)) return;
+        throw new MemgresException("cannot " + verb + " column \"" + column
+                + "\" because it is part of the partition key of relation \"" + tableName + "\"",
+                "42P16");
+    }
+
+    /** True when one of a partition key's entries is this column, or is an expression reading it. */
+    private static boolean partitionKeyNames(String partitionKey, String column) {
+        if (partitionKey == null) return false;
+        for (String key : DdlTableExecutor.splitTopLevel(partitionKey)) {
+            String entry = key.trim();
+            if (entry.isEmpty()) continue;
+            if (entry.indexOf('(') >= 0) {
+                if (expressionNamesColumn(entry, column)) return true;
+            } else if (entry.equalsIgnoreCase(column)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
      * True when the column is one the table gets from a parent. PG records this as
      * {@code attinhcount}; here it is reconstructed by looking up the ancestor chain, which is
      * equivalent because a child always carries every one of its parent's columns.
@@ -1044,6 +1551,7 @@ class DdlAlterTableExecutor {
                 throw PgErrors.datatypeMismatch("child table \"" + childName
                         + "\" has different type for column \"" + pc.getName() + "\"");
             }
+            requireNotNullWhereParentIs(pc, child.getColumns().get(idx), childName);
         }
     }
 
@@ -1069,13 +1577,21 @@ class DdlAlterTableExecutor {
         }
         // The NOT NULL constraint keeps the name it had, which was derived from the old column
         // name, so that name has to be written down before the column changes underneath it.
+        // A sequence that belongs to this column is recorded against the column's name, so the
+        // rename has to reach it: without that the sequence stopped answering for the column and
+        // outlived the table that owned it.
+        for (Sequence owned : executor.database.getSequences().values()) {
+            if (owned.isOwnedBy(stmt.table(), rename.oldName())) {
+                owned.setOwnedByColumn(rename.newName());
+            }
+        }
         table.pinNotNullConstraintName(rename.oldName());
         table.renameColumn(rename.oldName(), rename.newName());
         table.moveNotNullConstraintName(rename.oldName(), rename.newName());
         propagateRenameColumn(table, rename.oldName(), rename.newName());
         rewriteIncomingForeignKeys(stmt.table(), schemaName, rename.oldName(), rename.newName());
         rewriteIndexMetadata(stmt.table(), schemaName, rename.oldName(), rename.newName());
-        rewriteDependentViews(stmt.table(), rename.oldName(), rename.newName());
+        rewriteDependentViews(schemaName, stmt.table(), rename.oldName(), rename.newName());
         executor.recordUndo(new Session.RenameColumnUndo(schemaName, stmt.table(),
                 rename.newName(), rename.oldName()));
     }
@@ -1088,6 +1604,119 @@ class DdlAlterTableExecutor {
         }
     }
 
+    /**
+     * A partition holds exactly its parent's columns, so a column is added to or dropped from the
+     * partitioned table and reaches the partitions from there. The propagation path arrives at a
+     * partition from its parent, so this guard sits where the statement named the relation.
+     */
+    private static void rejectDirectPartitionColumnChange(Table table, String what) {
+        if (table == null || table.getPartitionParent() == null) return;
+        throw PgErrors.wrongObjectType("cannot " + what);
+    }
+
+    /** True when the stored expression text really names this column, read as a parse tree. */
+    private static boolean expressionNamesColumn(String exprText, String column) {
+        Expression parsed;
+        try {
+            parsed = com.memgres.engine.parser.Parser.parseExpression(exprText);
+        } catch (RuntimeException e) {
+            // An expression that will not parse can only be judged by its text, which is what the
+            // loose test did for every expression.
+            return exprText.toLowerCase().contains(column.toLowerCase());
+        }
+        return AstWalk.anyMatch(parsed, new java.util.function.Predicate<Object>() {
+            @Override public boolean test(Object n) {
+                return n instanceof ColumnRef
+                        && column.equalsIgnoreCase(((ColumnRef) n).column());
+            }
+        });
+    }
+
+    /**
+     * The views whose query really reads this column of this relation.
+     *
+     * <p>Read off the view's parse tree: a view depends on the column only when one of its FROM
+     * items is this relation and the query names the column against that item, or expands it with
+     * a wildcard. A view that survives only as unparsed text cannot be judged that way, so the
+     * old, looser text test is kept for it rather than letting the drop through unchecked.
+     */
+    private List<Database.ViewDef> dependentViewsOf(String schemaName, String tableName,
+                                                    String column) {
+        List<Database.ViewDef> found = new ArrayList<>();
+        for (Map.Entry<String, Database.ViewDef> entry : executor.database.getViews().entrySet()) {
+            Database.ViewDef vd = entry.getValue();
+            if (vd.query() == null) {
+                String sql = vd.sourceSQL() == null ? "" : vd.sourceSQL().toLowerCase();
+                if (sql.contains(tableName.toLowerCase()) && sql.contains(column.toLowerCase())) {
+                    found.add(vd);
+                }
+                continue;
+            }
+            if (viewReadsColumn(vd, schemaName, tableName, column)) found.add(vd);
+        }
+        return found;
+    }
+
+    /** True when the view's query names this column of this relation. */
+    private boolean viewReadsColumn(Database.ViewDef vd, String schemaName, String tableName,
+                                    String column) {
+        final Set<String> relationNames = new HashSet<>();
+        AstWalk.forEach(vd.query(), new java.util.function.Consumer<Object>() {
+            @Override public void accept(Object n) {
+                if (!(n instanceof SelectStmt.TableRef)) return;
+                SelectStmt.TableRef ref = (SelectStmt.TableRef) n;
+                if (ref.table == null || !ref.table.equalsIgnoreCase(tableName)) return;
+                String refSchema = ref.schema != null ? ref.schema : schemaName;
+                if (refSchema != null && !refSchema.equalsIgnoreCase(schemaName)) return;
+                relationNames.add(ref.table.toLowerCase());
+                if (ref.alias != null) relationNames.add(ref.alias.toLowerCase());
+            }
+        });
+        if (relationNames.isEmpty()) return false;
+        return AstWalk.anyMatch(vd.query(), new java.util.function.Predicate<Object>() {
+            @Override public boolean test(Object n) {
+                if (n instanceof ColumnRef) {
+                    ColumnRef cr = (ColumnRef) n;
+                    if (!column.equalsIgnoreCase(cr.column())) return false;
+                    return cr.table() == null || relationNames.contains(cr.table().toLowerCase());
+                }
+                if (n instanceof WildcardExpr) {
+                    // A star over the relation stands for every column it has, this one included.
+                    WildcardExpr w = (WildcardExpr) n;
+                    return w.table() == null || relationNames.contains(w.table().toLowerCase());
+                }
+                return false;
+            }
+        });
+    }
+
+    /**
+     * Drop each view CASCADE reached, and any view built over one of those in turn — the same
+     * cascade DROP VIEW itself performs, because a view over a dropped view loses its source.
+     *
+     * <p>PostgreSQL says what CASCADE took, so a script that meant to drop one column has some way
+     * of learning it dropped three views along with it.
+     */
+    private void dropDependentViews(List<Database.ViewDef> views) {
+        List<String> cascaded = new ArrayList<>();
+        for (Database.ViewDef vd : views) {
+            String viewSchema = vd.schemaName() != null ? vd.schemaName() : executor.defaultSchema();
+            if (executor.database.getView(viewSchema, vd.name()) == null) continue;
+            for (String dependent : ViewDependencies.cascadeDependents(
+                    executor.database, viewSchema, vd.name())) {
+                Database.ViewDef dep = executor.database.getView(dependent);
+                if (dep == null) continue;
+                executor.recordUndo(new Session.DropViewUndo(dependent, dep));
+                executor.database.removeView(dependent);
+                cascaded.add("view " + RelationNamespace.bareName(dependent));
+            }
+            executor.recordUndo(new Session.DropViewUndo(vd.name(), vd));
+            executor.database.removeView(viewSchema, vd.name());
+            cascaded.add("view " + vd.name());
+        }
+        DdlObjectExecutor.noticeDropCascades(executor, cascaded);
+    }
+
     private void propagateRenameColumn(Table parent, String oldName, String newName) {
         for (Table child : childRelations(parent)) {
             if (child.getColumnIndex(oldName) < 0) continue;
@@ -1096,8 +1725,44 @@ class DdlAlterTableExecutor {
         }
     }
 
+    /**
+     * Drop the sequences that belong to one column of a table.
+     *
+     * <p>A sequence created for a serial or identity column and one attached with ALTER SEQUENCE
+     * ... OWNED BY both go when the column does; a sequence a DEFAULT merely names is somebody
+     * else's and stays, which is the one distinction PostgreSQL draws here.
+     *
+     * @param defaultSeqName the sequence the column's default draws from, read before the default
+     *                       is cleared and used for a column that predates ownership being recorded
+     */
+    private void dropSequencesOwnedBy(Table table, String tableName, String column,
+                                      String defaultSeqName) {
+        List<Sequence> doomed = new ArrayList<>();
+        for (Sequence seq : new ArrayList<>(executor.database.getSequences().values())) {
+            if (seq.isOwnedBy(tableName, column)) doomed.add(seq);
+        }
+        if (doomed.isEmpty() && defaultSeqName != null) {
+            Sequence byName = executor.database.getSequenceFor(table.getSchemaName(), defaultSeqName);
+            if (byName != null && byName.isInternal()) doomed.add(byName);
+        }
+        for (Sequence seq : doomed) {
+            executor.recordUndo(new Session.DropSequenceUndo(seq.qualifiedName(), seq));
+            executor.database.removeSequence(seq.getSchemaName(), seq.getName());
+            executor.database.unregisterSchemaObject(seq.getSchemaName(), "sequence", seq.getName());
+            executor.database.removeObjectOwner("sequence:" + seq.getName());
+        }
+    }
+
     private void executeDropColumn(AlterTableStmt.DropColumn dropCol, Table table,
                                     AlterTableStmt stmt, String schemaName) {
+        // A typed table has exactly the columns its composite type declares, so there is no column
+        // of its own for it to lose: dropping one would leave the table disagreeing with the type
+        // it was declared OF. PostgreSQL refuses before it looks the column up at all, which is why
+        // a name that is not there -- and IF EXISTS, and CASCADE -- get this refusal and not a
+        // quiet success. ALTER TYPE is what changes the shape of every table built on the type.
+        if (table.getOfTypeName() != null) {
+            throw PgErrors.wrongObjectType("cannot drop column from typed table");
+        }
         if (dropCol.ifExists() && table.getColumnIndex(dropCol.column()) < 0) {
             return;
         }
@@ -1112,6 +1777,7 @@ class DdlAlterTableExecutor {
             throw new MemgresException("cannot drop inherited column \""
                     + dropCol.column() + "\"", "42P16");
         }
+        rejectPartitionKeyColumnChange(table, dropCol.column(), "drop", stmt.table());
         // A partition holds exactly the parent's columns, so dropping one from the parent alone
         // would leave the two disagreeing about a shape they are required to share.
         if (stmt.only() && !table.getPartitions().isEmpty()) {
@@ -1123,19 +1789,22 @@ class DdlAlterTableExecutor {
             e.setHint("Do not specify the ONLY keyword.");
             throw e;
         }
-        // Check for dependent generated columns
-        String colNameLower = dropCol.column().toLowerCase();
+        rejectDirectPartitionColumnChange(table, "drop column from a partition");
+        // Which columns a generation expression really names comes from its parse tree. A
+        // substring test made every one- or two-letter column look like a dependency of every
+        // expression that happened to spell it inside a longer word.
         List<String> dependentGenCols = new ArrayList<>();
         for (Column c : table.getColumns()) {
-            if (c.getGeneratedExpr() != null && !c.getName().equalsIgnoreCase(dropCol.column())) {
-                String genExpr = c.getGeneratedExpr().toLowerCase();
-                if (genExpr.contains(colNameLower)) {
-                    dependentGenCols.add(c.getName());
-                }
+            if (c.getGeneratedExpr() == null || c.getName().equalsIgnoreCase(dropCol.column())) {
+                continue;
+            }
+            if (expressionNamesColumn(c.getGeneratedExpr(), dropCol.column())) {
+                dependentGenCols.add(c.getName());
             }
         }
+        List<Database.ViewDef> dependentViews =
+                dependentViewsOf(schemaName, stmt.table(), dropCol.column());
         if (!dropCol.cascade()) {
-            String colName = dropCol.column().toLowerCase();
             if (!dependentGenCols.isEmpty()) {
                 MemgresException e = new MemgresException("cannot drop column " + dropCol.column()
                         + " of table " + stmt.table()
@@ -1152,14 +1821,21 @@ class DdlAlterTableExecutor {
                 e.setHint("Use DROP ... CASCADE to drop the dependent objects too.");
                 throw e;
             }
-            for (Map.Entry<String, Database.ViewDef> viewEntry : executor.database.getViews().entrySet()) {
-                String viewSql = viewEntry.getValue().query() != null ? viewEntry.getValue().query().toString() : "";
-                if (viewSql.toLowerCase().contains(stmt.table().toLowerCase())
-                        && viewSql.toLowerCase().contains(colName)) {
-                    throw new MemgresException("cannot drop column \"" + dropCol.column()
-                            + "\" of table \"" + stmt.table()
-                            + "\" because view \"" + viewEntry.getValue().name() + "\" depends on it", "42P16");
+            if (!dependentViews.isEmpty()) {
+                // Same shape as the generated-column arm above, which is what PostgreSQL sends:
+                // 2BP01 is dependent_objects_still_exist, and 42P16 is a different class that a
+                // client branching on the code does not recognise here.
+                MemgresException e = new MemgresException("cannot drop column " + dropCol.column()
+                        + " of table " + stmt.table()
+                        + " because other objects depend on it", "2BP01");
+                List<String> viewLines = new ArrayList<>();
+                for (Database.ViewDef vd : dependentViews) {
+                    viewLines.add("view " + vd.name() + " depends on column " + dropCol.column()
+                            + " of table " + stmt.table());
                 }
+                e.setDetail(String.join("\n", viewLines));
+                e.setHint("Use DROP ... CASCADE to drop the dependent objects too.");
+                throw e;
             }
             // FOREIGN KEY constraints (on any table, including self-references) whose REFERENCED
             // columns include the dropped column depend on it via the unique index — PG requires
@@ -1186,8 +1862,17 @@ class DdlAlterTableExecutor {
                     }
                 }
             }
+        } else {
+            // CASCADE says to drop what depends on the column, not to stop asking: a view left
+            // standing would go on selecting a column that is no longer there.
+            dropDependentViews(dependentViews);
         }
         Column droppedCol = table.getColumns().get(colIdx);
+        // A sequence that belongs to this column goes with it: the one created for a serial or
+        // identity column, and the one ALTER SEQUENCE ... OWNED BY attached. Leaving it behind
+        // kept its name taken, so the same migration could not be run twice.
+        dropSequencesOwnedBy(table, stmt.table(), dropCol.column(),
+                Sequence.nameInDefault(droppedCol.getDefaultValue()));
         List<Object> colValues = new ArrayList<>();
         for (Object[] row : table.getRows()) {
             colValues.add(row[colIdx]);
@@ -1278,27 +1963,35 @@ class DdlAlterTableExecutor {
         if (schema.getTable(rename.newName()) != null) {
             throw new MemgresException("relation \"" + rename.newName() + "\" already exists", "42P07");
         }
+        // The same relation under another name. Building a replacement carried across only the
+        // fields the copy remembered, so a renamed partition lost its bound and its parent, a
+        // renamed parent lost its children, and UNLOGGED, REPLICA IDENTITY, FORCE ROW LEVEL
+        // SECURITY, the storage parameters, the policies and the NOT NULL constraint names were
+        // all left on the discarded object.
         schema.removeTable(stmt.table());
-        Table renamed = new Table(rename.newName(), table.getColumns());
-        for (Object[] row : table.getRows()) renamed.insertRow(row);
-        for (StoredConstraint sc : table.getConstraints()) renamed.addConstraint(sc);
-        if (table.getPartitionStrategy() != null) {
-            renamed.setPartitionStrategy(table.getPartitionStrategy());
-            renamed.setPartitionColumn(table.getPartitionColumn());
+        table.setName(rename.newName());
+        schema.addTable(table);
+        Table renamed = table;
+        // A sequence that belongs to this table is recorded against the table's name, so the
+        // rename has to reach it or the sequence stops going where the table goes.
+        for (Sequence owned : executor.database.getSequences().values()) {
+            if (stmt.table().equalsIgnoreCase(owned.getOwnedByTable())) {
+                owned.setOwnedByTable(rename.newName());
+            }
         }
-        for (Table partition : table.getPartitions()) {
-            renamed.addPartition(partition);
-            partition.setPartitionParent(renamed);
-        }
-        if (table.getParentTable() != null) {
-            renamed.setParentTable(table.getParentTable());
-        }
-        renamed.setRlsEnabled(table.isRlsEnabled());
-        schema.addTable(renamed);
         // A rename is a name appearing and a name going away, and neither has happened for
         // anyone else until this transaction commits: the new name is hidden the way any
-        // uncommitted relation is, and the old one is held the way any uncommitted drop is.
+        // uncommitted relation is, the old one is held the way any uncommitted drop is, and the
+        // relation itself goes on giving its old name to every session but this one — it is one
+        // object under two names, so without that the new name is read straight off it.
         executor.database.markUncommittedObject(renamed, executor.session);
+        renamed.markUncommittedRename(stmt.table(), executor.session);
+        // A temp table's ON COMMIT action survives its rename in PostgreSQL: the action belongs
+        // to the relation, and this is the same relation answering to a new name.
+        if (executor.session != null) {
+            executor.session.retargetOnCommitDeleteRows(schemaName, stmt.table(), table,
+                    rename.newName(), renamed);
+        }
         executor.recordUndo(new Session.RenameTableUndo(
                 schemaName, stmt.table(), rename.newName(), table));
         // The same table under a new name: the OID stays with it, and so do the comment, the
@@ -1385,40 +2078,77 @@ class DdlAlterTableExecutor {
         } else if (alterCol.action() instanceof AlterTableStmt.DropDefault) {
             rejectDefaultOnGeneratedColumn(table, alterCol.column(), stmt.table(), "DROP");
             table.alterColumnDefault(alterCol.column(), null);
+            propagateColumnDefault(table, alterCol.column(), null, stmt.only());
         } else if (alterCol.action() instanceof AlterTableStmt.SetNotNull) {
             rejectOnlyNotNullOnPartitioned(table, stmt, alterCol.column());
-            int colIdx = table.getColumnIndex(alterCol.column());
-            if (colIdx >= 0) {
-                for (Object[] row : table.getRows()) {
-                    if (row[colIdx] == null) {
-                        throw PgErrors.columnContainsNulls(alterCol.column(), "relation", stmt.table());
-                    }
+            requireColumnHasNoNulls(table, alterCol.column(), stmt.table());
+            // A partitioned parent stores no rows of its own, and an inheritance child's rows are
+            // the parent's rows too, so the data that decides whether the rule can hold at all
+            // lives below: PostgreSQL scans the descendants and names the one at fault.
+            if (!stmt.only()) {
+                for (Table descendant : descendantRelations(table)) {
+                    requireColumnHasNoNulls(descendant, alterCol.column(), descendant.getName());
                 }
             }
             table.alterColumnNullable(alterCol.column(), false);
+            // Each of them keeps its own copy of the column list, so the flag has to reach them
+            // or the parent forbids a null its own descendants go on taking.
+            if (!stmt.only()) {
+                setColumnsNotNull(table, Collections.singletonList(alterCol.column()));
+            }
         } else if (alterCol.action() instanceof AlterTableStmt.DropNotNull) {
-            requireColumn(table, alterCol.column(), stmt.table());
+            Column nullable = requireColumn(table, alterCol.column(), stmt.table());
+            // Identity fills the column for every row, so there is no nullability to drop.
+            // PostgreSQL refuses at the identity level, ahead of the primary key rule.
+            if (isIdentityColumn(nullable)) {
+                throw new MemgresException("column \"" + alterCol.column() + "\" of relation \""
+                        + stmt.table() + "\" is an identity column", "42601");
+            }
             // A primary key column can never hold a null, so a catalog saying it may is a
             // contradiction with the constraint that still rejects one.
             if (isPrimaryKeyColumn(table, alterCol.column())) {
                 throw new MemgresException("column \"" + alterCol.column()
                         + "\" is in a primary key", "42P16");
             }
+            // The rule belongs to whichever relation declared it, so a descendant is sent to that
+            // one rather than allowed to weaken what the parent answers for.
+            rejectDropNotNullUnderParent(table, alterCol.column(), stmt.table(), false);
             table.alterColumnNullable(alterCol.column(), true);
             // The constraint is gone, and a later SET NOT NULL makes a new one under the
             // default name rather than resurrecting the name this one carried.
             table.setNotNullConstraintName(alterCol.column(), null);
+            if (!stmt.only()) clearNotNullOnDescendants(table, alterCol.column());
         } else if (alterCol.action() instanceof AlterTableStmt.DropIdentity) {
             executeDropIdentity((AlterTableStmt.DropIdentity) alterCol.action(),
                     alterCol.column(), table, stmt);
         } else if (alterCol.action() instanceof AlterTableStmt.DropExpression) {
             executeDropExpression((AlterTableStmt.DropExpression) alterCol.action(),
                     alterCol.column(), table, stmt);
+        } else if (alterCol.action() instanceof AlterTableStmt.SetExpression) {
+            executeSetExpression((AlterTableStmt.SetExpression) alterCol.action(),
+                    alterCol.column(), table, stmt);
+        } else if (alterCol.action() instanceof AlterTableStmt.SetColumnOptions) {
+            requireColumn(table, alterCol.column(), stmt.table());
+            checkAttributeOptions(
+                    ((AlterTableStmt.SetColumnOptions) alterCol.action()).options().keySet());
+        } else if (alterCol.action() instanceof AlterTableStmt.ResetColumnOptions) {
+            requireColumn(table, alterCol.column(), stmt.table());
+            checkAttributeOptions(
+                    ((AlterTableStmt.ResetColumnOptions) alterCol.action()).options());
         } else if (alterCol.action() instanceof AlterTableStmt.SetStatistics) {
             AlterTableStmt.SetStatistics ss = (AlterTableStmt.SetStatistics) alterCol.action();
             int colIdx = table.getColumnIndex(alterCol.column());
             if (colIdx < 0) throw new MemgresException("column \"" + alterCol.column() + "\" of relation \"" + stmt.table() + "\" does not exist", "42703");
-            table.getColumns().get(colIdx).setAttStattarget((short) ss.target());
+            // -1 puts the column back to the system default, which the catalogue reports as null;
+            // below that there is no target to set. Above PostgreSQL's ceiling the statement is
+            // taken but the value is clamped, so pg_attribute reports 10000 rather than what was
+            // written -- and a short could not hold even that.
+            if (ss.target() < -1) {
+                throw PgErrors.invalidParameter(
+                        "statistics target " + ss.target() + " is too low");
+            }
+            table.getColumns().get(colIdx).setAttStattarget(ss.target() == -1 ? null
+                    : Integer.valueOf(Math.min(ss.target(), 10000)));
         } else if (alterCol.action() instanceof AlterTableStmt.SetStorage) {
             AlterTableStmt.SetStorage ss = (AlterTableStmt.SetStorage) alterCol.action();
             Column col = requireColumn(table, alterCol.column(), stmt.table());
@@ -1427,9 +2157,49 @@ class DdlAlterTableExecutor {
             AlterTableStmt.SetCompression sc = (AlterTableStmt.SetCompression) alterCol.action();
             Column col = requireColumn(table, alterCol.column(), stmt.table());
             col.setAttCompression(DdlDefinitionChecks.compressionCode(sc.method(), col));
+        } else if (alterCol.action() instanceof AlterTableStmt.AlterIdentitySequence) {
+            executeAlterIdentitySequence((AlterTableStmt.AlterIdentitySequence) alterCol.action(),
+                    alterCol.column(), table, stmt);
         } else if (alterCol.action() instanceof AlterTableStmt.ColumnNoOp) {
             // no-op
         }
+    }
+
+    /**
+     * SET INCREMENT BY / START WITH / MINVALUE / MAXVALUE / CACHE / CYCLE on an identity column.
+     *
+     * <p>The options are the sequence's own, so they go through the validator ALTER SEQUENCE uses
+     * and are refused in the same words — a START left below a new MINVALUE being the one that
+     * otherwise reads as an accepted statement. Only an identity column has a sequence of its own
+     * to alter: a serial column has one too, but PostgreSQL keeps the two apart and refuses this
+     * there as well.
+     */
+    private void executeAlterIdentitySequence(AlterTableStmt.AlterIdentitySequence action,
+                                              String column, Table table, AlterTableStmt stmt) {
+        Column col = requireColumn(table, column, stmt.table());
+        if (!isIdentityColumn(col)) {
+            throw new MemgresException("column \"" + column + "\" of relation \""
+                    + stmt.table() + "\" is not an identity column", "55000");
+        }
+        Sequence seq = executor.database.getSequenceFor(table.getSchemaName(),
+                Sequence.nameInDefault(col.getDefaultValue()));
+        if (seq == null) return;
+        // NO MINVALUE and NO MAXVALUE put the bound back to what the sequence's own type gives a
+        // sequence that never named one: 1 and the type's ceiling going up, the type's floor and
+        // -1 going down.
+        long step = action.increment() != null ? action.increment().longValue() : seq.getIncrementBy();
+        Long minValue = action.minValue();
+        if (action.noMinValue()) {
+            minValue = Long.valueOf(step > 0 ? 1L : DdlSequenceValidator.typeMin(seq.getDataType()));
+        }
+        Long maxValue = action.maxValue();
+        if (action.noMaxValue()) {
+            maxValue = Long.valueOf(step > 0 ? DdlSequenceValidator.typeMax(seq.getDataType()) : -1L);
+        }
+        DdlSequenceValidator.Params p = DdlSequenceValidator.forAlter(seq, null, action.increment(),
+                minValue, maxValue, action.startWith(), false, null, action.cache());
+        DdlSequenceValidator.apply(seq, p);
+        if (action.cycle() != null) seq.setCycle(action.cycle().booleanValue());
     }
 
     /**
@@ -1487,6 +2257,11 @@ class DdlAlterTableExecutor {
             throw new MemgresException("column \"" + column + "\" of relation \""
                     + stmt.table() + "\" is not an identity column", "55000");
         }
+        // The sequence exists only to feed this column, so removing the identity removes it. The
+        // name has to be read before the default that carries it is cleared, or nothing is left
+        // saying which sequence it was — and a later ADD GENERATED then reused the stale one.
+        dropSequencesOwnedBy(table, stmt.table(), column,
+                Sequence.nameInDefault(col.getDefaultValue()));
         table.alterColumnDefault(column, null);
     }
 
@@ -1494,6 +2269,58 @@ class DdlAlterTableExecutor {
      * DROP EXPRESSION turns a stored generated column into an ordinary one, keeping the values
      * already computed. A virtual column has no stored values to keep, so PG does not offer it.
      */
+    /**
+     * The options a plain column carries. PostgreSQL takes only the two that tell the planner how
+     * many distinct values to expect, and names anything else rather than storing it.
+     */
+    private static void checkAttributeOptions(java.util.Collection<String> names) {
+        for (String name : names) {
+            if ("n_distinct".equalsIgnoreCase(name)
+                    || "n_distinct_inherited".equalsIgnoreCase(name)) {
+                continue;
+            }
+            throw PgErrors.invalidParameter("unrecognized parameter \"" + name + "\"");
+        }
+    }
+
+    /**
+     * ALTER COLUMN ... SET EXPRESSION AS (expr) gives a generated column a new expression, and
+     * PostgreSQL recomputes every stored row from it at once — that is what makes the statement a
+     * rewrite rather than a catalog change. A column that generates nothing has no expression to
+     * replace, and PostgreSQL says so rather than quietly making it generated.
+     */
+    private void executeSetExpression(AlterTableStmt.SetExpression action, String column,
+                                      Table table, AlterTableStmt stmt) {
+        Column col = requireColumn(table, column, stmt.table());
+        if (col.getGeneratedExpr() == null) {
+            throw new MemgresException("column \"" + column + "\" of relation \""
+                    + stmt.table() + "\" is not a generated column", "55000");
+        }
+        DdlExecutor.checkExpressionImmutability(action.expression(), executor.database,
+                "generation expression is not immutable");
+        if (action.expression().toLowerCase().replaceAll("\\s+", "").contains("select")) {
+            throw new MemgresException(
+                    "cannot use subquery in column generation expression", "0A000");
+        }
+        try {
+            Expression parsed = com.memgres.engine.parser.Parser.parseExpression(action.expression());
+            ddl.validateExprColumnRefs(parsed, table, column);
+        } catch (MemgresException me) {
+            throw me;
+        } catch (Exception ignored) {
+            // An expression that will not parse is reported by whatever reads it next
+        }
+        int idx = table.getColumnIndex(column);
+        Column updated = col.withGeneratedExpr(action.expression());
+        table.getColumns().set(idx, updated);
+        // A VIRTUAL generated column is computed on read, so only a stored one has rows to redo.
+        if (!updated.isVirtual()) {
+            for (Object[] row : table.getRows()) {
+                row[idx] = executor.dmlExecutor.evalGeneratedColumn(table, row, updated);
+            }
+        }
+    }
+
     private void executeDropExpression(AlterTableStmt.DropExpression action, String column,
                                         Table table, AlterTableStmt stmt) {
         Column col = requireColumn(table, column, stmt.table());
@@ -1535,11 +2362,25 @@ class DdlAlterTableExecutor {
      */
     private void executeSetType(AlterTableStmt.AlterColumn alterCol, AlterTableStmt.SetType setType,
                                  Table table, AlterTableStmt stmt, String schemaName) {
+        // serial is CREATE TABLE shorthand rather than a type, so there is nothing to retype a
+        // column to and PostgreSQL says no type of that name exists.
+        DdlDefinitionChecks.rejectSerialPseudotype(setType.typeName());
+        int generatedIdx = table.getColumnIndex(alterCol.column());
+        // A generated column's values come from its expression on every row, so there is no old
+        // value for a USING clause to convert.
+        if (generatedIdx >= 0 && setType.usingExpr() != null
+                && table.getColumns().get(generatedIdx).getGeneratedExpr() != null) {
+            MemgresException e = new MemgresException(
+                    "cannot specify USING when altering type of generated column", "42611");
+            e.setDetail("Column \"" + alterCol.column() + "\" is a generated column.");
+            throw e;
+        }
         if (table.getColumnIndex(alterCol.column()) >= 0) {
             if (isInheritedColumn(table, alterCol.column())) {
                 throw new MemgresException("cannot alter inherited column \""
                         + alterCol.column() + "\"", "42P16");
             }
+            rejectPartitionKeyColumnChange(table, alterCol.column(), "alter", stmt.table());
             if (stmt.only() && !childRelations(table).isEmpty()) {
                 throw new MemgresException("type of inherited column \"" + alterCol.column()
                         + "\" must be changed in child tables too", "42P16");
@@ -1608,19 +2449,16 @@ class DdlAlterTableExecutor {
         // resolveColumnType; a retype names the same types and must reject the same widths.
         TypeCoercion.checkDeclaredTypeLimits(setType.typeName());
         // Check for generated column dependencies
-        String alterColLower = alterCol.column().toLowerCase();
         for (Column c : table.getColumns()) {
-            if (c.getGeneratedExpr() != null && !c.getName().equalsIgnoreCase(alterCol.column())) {
-                String genExpr = c.getGeneratedExpr().toLowerCase();
-                if (genExpr.contains(alterColLower)) {
-                    MemgresException e = new MemgresException(
-                            "cannot alter type of a column used by a generated column", "0A000");
-                    // Which generated column is in the way is the one thing the message leaves
-                    // out, and it is what has to be dropped before the retype can go through.
-                    e.setDetail("Column \"" + alterCol.column() + "\" is used by generated column \""
-                            + c.getName() + "\".");
-                    throw e;
-                }
+            if (c.getGeneratedExpr() != null && !c.getName().equalsIgnoreCase(alterCol.column())
+                    && expressionNamesColumn(c.getGeneratedExpr(), alterCol.column())) {
+                MemgresException e = new MemgresException(
+                        "cannot alter type of a column used by a generated column", "0A000");
+                // Which generated column is in the way is the one thing the message leaves
+                // out, and it is what has to be dropped before the retype can go through.
+                e.setDetail("Column \"" + alterCol.column() + "\" is used by generated column \""
+                        + c.getName() + "\".");
+                throw e;
             }
         }
         DataType currentType = table.getColumns().get(colIdx).getType();
@@ -1640,18 +2478,16 @@ class DdlAlterTableExecutor {
                         + alterCol.column() + "::" + targetName + "\".", "42804");
             }
         }
-        // Check for view dependencies
-        for (Database.ViewDef view : executor.database.getViews().values()) {
-            String viewSql = view.sourceSQL() != null ? view.sourceSQL().toLowerCase()
-                    : (view.query() != null ? view.query().toString().toLowerCase() : "");
-            String tblPattern = "\\b" + java.util.regex.Pattern.quote(tableName.toLowerCase()) + "\\b";
-            if (java.util.regex.Pattern.compile(tblPattern).matcher(viewSql).find()) {
-                boolean usesWildcard = viewSql.contains("*") || viewSql.contains("wildcard");
-                String colPattern = "\\b" + java.util.regex.Pattern.quote(alterCol.column().toLowerCase()) + "\\b";
-                if (usesWildcard || java.util.regex.Pattern.compile(colPattern).matcher(viewSql).find()) {
-                    throw new MemgresException("cannot alter type of a column used by a view or rule", "0A000");
-                }
-            }
+        // Check for view dependencies. Which views really read the column is read off their parse
+        // trees, the same question DROP COLUMN asks, so the two refuse for the same reasons.
+        for (Database.ViewDef vd : dependentViewsOf(schemaName, tableName, alterCol.column())) {
+            MemgresException e = new MemgresException(
+                    "cannot alter type of a column used by a view or rule", "0A000");
+            // A view reads its table through a rule, and the rule is the object in the way, so
+            // PostgreSQL names it beside the view it belongs to and the column it reads.
+            e.setDetail("rule _RETURN on view " + vd.name() + " depends on column \""
+                    + alterCol.column() + "\"");
+            throw e;
         }
         // Check for index dependencies
         if (currentType != dt && setType.usingExpr() == null) {
@@ -1814,9 +2650,7 @@ class DdlAlterTableExecutor {
                                     Table table, AlterTableStmt stmt) {
         String defaultVal = DdlExecutor.exprToDefaultString(setDefault.expr());
 
-        if (defaultVal.contains("__set_increment__")) {
-            handleSetIncrement(alterCol.column(), defaultVal, table);
-        } else if (defaultVal.contains("__restart__")) {
+        if (defaultVal.contains("__restart__")) {
             handleRestart(alterCol.column(), defaultVal, table, stmt);
         } else if (defaultVal.contains("__identity__")) {
             handleIdentity(alterCol.column(), defaultVal, table, stmt);
@@ -1832,6 +2666,7 @@ class DdlAlterTableExecutor {
                 if (value != null) checkDefaultFits(value, col, alterCol.column(), setDefault.expr());
             }
             table.alterColumnDefault(alterCol.column(), defaultVal);
+            propagateColumnDefault(table, alterCol.column(), defaultVal, stmt.only());
         }
     }
 
@@ -1885,19 +2720,6 @@ class DdlAlterTableExecutor {
                 + target.toRegtypeDisplay() + " but default expression is of type " + exprType);
         e.setHint("You will need to rewrite or cast the expression.");
         return e;
-    }
-
-    private void handleSetIncrement(String column, String defaultVal, Table table) {
-        String marker = DdlExecutor.extractMarker(defaultVal);
-        int colIdx = table.getColumnIndex(column);
-        Column col = colIdx >= 0 ? table.getColumns().get(colIdx) : null;
-        if (col != null && col.getDefaultValue() != null && col.getDefaultValue().contains("nextval")) {
-            Sequence seq = findBackingSequence(table, col);
-            if (seq != null) {
-                long inc = Long.parseLong(marker.substring(marker.indexOf(":") + 1));
-                seq.setIncrementBy(inc);
-            }
-        }
     }
 
     private void handleRestart(String column, String defaultVal, Table table, AlterTableStmt stmt) {
@@ -2003,6 +2825,9 @@ class DdlAlterTableExecutor {
         if (!executor.database.hasSequence(identitySchema, seqName)) {
             Sequence added = new Sequence(seqName, startWith, incrementBy, null, null);
             added.setSchemaName(identitySchema);
+            // The sequence belongs to this column and dies with it, whatever the column is
+            // called later on.
+            added.ownedBy(stmt.table(), column, true);
             executor.database.addSequence(added);
             executor.database.registerSchemaObject(identitySchema, "sequence", seqName);
         } else if (startWith != null || incrementBy != null) {
@@ -2173,9 +2998,12 @@ class DdlAlterTableExecutor {
         }
         if (addConstraint.constraint().type() == TableConstraint.ConstraintType.NOT_NULL) {
             for (String colName : addConstraint.constraint().columns()) {
-                // The rows already stored decide whether the rule can hold at all.
+                // The rows already stored decide whether the rule can hold at all — unless NOT
+                // VALID was written, which is exactly the request to leave them alone. The column
+                // is still marked NOT NULL below, because PostgreSQL enforces such a constraint on
+                // every row written from now on and only VALIDATE CONSTRAINT looks back.
                 int colIdx = table.getColumnIndex(colName);
-                if (colIdx >= 0) {
+                if (colIdx >= 0 && !addConstraint.notValid()) {
                     for (Object[] row : table.getRows()) {
                         if (row[colIdx] == null) {
                             throw PgErrors.columnContainsNulls(colName, "relation", stmt.table());
@@ -2196,12 +3024,41 @@ class DdlAlterTableExecutor {
         }
 
         if (addConstraint.constraint().type() == TableConstraint.ConstraintType.CHECK) {
+            // A CHECK answers yes or no about one row, and a set-returning call answers with rows:
+            // there is nothing there for the constraint to test.
+            if (executor.selectExecutor.containsSrf(addConstraint.constraint().checkExpr())) {
+                throw PgErrors.notImplemented(
+                        "set-returning functions are not allowed in check constraints");
+            }
             executor.selectExecutor.placementCheck.rejectStoredDefinition(
                     addConstraint.constraint().checkExpr(), "check constraints", "check constraint");
             DdlDefinitionChecks.requireBooleanPredicate(
                     addConstraint.constraint().checkExpr(), table, "CHECK");
         }
 
+        // Same definition checks CREATE TABLE runs: a key over a column the table does not have
+        // was stored with an attribute number nothing answers to and enforced nothing.
+        TableConstraint.ConstraintType addedKind = addConstraint.constraint().type();
+        if (addedKind == TableConstraint.ConstraintType.PRIMARY_KEY
+                || addedKind == TableConstraint.ConstraintType.UNIQUE
+                || addedKind == TableConstraint.ConstraintType.EXCLUDE) {
+            DdlDefinitionChecks.validateKeyColumns(table, addConstraint.constraint().columns(),
+                    addedKind == TableConstraint.ConstraintType.PRIMARY_KEY ? "primary key"
+                            : addedKind == TableConstraint.ConstraintType.UNIQUE ? "unique"
+                            : "exclusion");
+            DdlDefinitionChecks.requireKeyColumnsExist(table,
+                    addConstraint.constraint().includedColumns());
+            if (addedKind == TableConstraint.ConstraintType.EXCLUDE) {
+                DdlDefinitionChecks.requireExclusionCapableAccessMethod(
+                        addConstraint.constraint().excludeMethod());
+                DdlDefinitionChecks.requireCommutativeExclusionOperators(
+                        table, addConstraint.constraint().excludeElements());
+                // And with one the index's own operator class knows about.
+                DdlDefinitionChecks.requireExclusionOperatorInFamily(
+                        table, addConstraint.constraint().excludeElements(),
+                        addConstraint.constraint().excludeMethod());
+            }
+        }
         List<String> rawCols = addConstraint.constraint().columns();
         boolean isUsingIndex = rawCols != null && rawCols.size() == 1 && rawCols.get(0).startsWith("__using_index__:");
         if (isUsingIndex) {
@@ -2260,6 +3117,15 @@ class DdlAlterTableExecutor {
                 }
                 if (sc.getType() == StoredConstraint.Type.CHECK && sc.getCheckExpr() != null) {
                     validateCheckConstraintData(sc, table);
+                    // A partitioned parent stores no rows of its own, and an inheritance child's
+                    // rows are the parent's rows too, so the rows that decide whether the rule can
+                    // hold live below. PostgreSQL names the descendant whose row breaks it, and a
+                    // NO INHERIT constraint stops at the relation that declared it.
+                    if (!sc.isNoInherit()) {
+                        for (Table descendant : descendantRelations(table)) {
+                            validateCheckConstraintData(sc, descendant);
+                        }
+                    }
                 }
             }
             if (sc.getType() == StoredConstraint.Type.PRIMARY_KEY || sc.getType() == StoredConstraint.Type.UNIQUE) {
@@ -2280,9 +3146,7 @@ class DdlAlterTableExecutor {
                 // information_schema.columns.is_nullable = 'NO'), on the table and its partitions.
                 setColumnsNotNull(table, sc.getColumns());
             }
-            if (sc.getType() == StoredConstraint.Type.PRIMARY_KEY || sc.getType() == StoredConstraint.Type.UNIQUE) {
-                propagateConstraintToPartitions(table, sc);
-            }
+            propagateConstraintToChildren(table, sc);
         }
     }
 
@@ -2297,24 +3161,101 @@ class DdlAlterTableExecutor {
      * {@code StoredConstraint} copy (see {@link StoredConstraint#copyForPartition}) rather than
      * sharing the parent's instance.
      */
-    /** Marks the given columns NOT NULL on a table and, recursively, on all its partitions. */
+    /** Marks the given columns NOT NULL on a table and, recursively, on everything below it. */
     private void setColumnsNotNull(Table table, List<String> columns) {
         for (String col : columns) {
             if (table.getColumnIndex(col) >= 0) {
                 table.alterColumnNullable(col, false);
             }
         }
-        for (Table partition : table.getPartitions()) {
-            setColumnsNotNull(partition, columns);
+        // A partition and an inheritance child each keep their own copy of the column list, so a
+        // NOT NULL declared on the parent has to reach both. Following the partitions alone left
+        // every inherited child taking a null the parent forbids.
+        for (Table child : childRelations(table)) {
+            setColumnsNotNull(child, columns);
         }
     }
 
-    private void propagateConstraintToPartitions(Table table, StoredConstraint sc) {
+    /**
+     * Give every relation below this one its own copy of a constraint just declared on the parent.
+     *
+     * <p>Row storage lives in the leaves, so a constraint the parent alone carries enforces
+     * nothing at all. PostgreSQL passes a partition every kind of constraint the partitioned table
+     * has, which is why the whole hierarchy answers for one rule, while ordinary inheritance
+     * passes CHECK constraints only: a child there is a table in its own right, and its keys and
+     * its foreign keys are its own.
+     */
+    private void propagateConstraintToChildren(Table table, StoredConstraint sc) {
         for (Table partition : table.getPartitions()) {
             DdlTableExecutor.validatePartitionKeyCoverage(partition, sc);
-            partition.addConstraint(sc.copyForPartition(partition.getName()));
-            propagateConstraintToPartitions(partition, sc);
+            StoredConstraint copy = sc.copyForPartition(partition.getName());
+            // A CHECK and a foreign key keep the name they were declared with, so the copy has to
+            // remember whose rule it is: that is what DROP CONSTRAINT on the partition consults.
+            // A key constraint is renamed for the partition, the way creation-time copies are.
+            if (sc.getType() == StoredConstraint.Type.CHECK
+                    || sc.getType() == StoredConstraint.Type.FOREIGN_KEY) {
+                copy.setInheritedFrom(table.getName());
+            }
+            partition.addConstraint(copy);
+            propagateConstraintToChildren(partition, copy);
         }
+        if (sc.getType() != StoredConstraint.Type.CHECK || sc.isNoInherit()) return;
+        for (Table child : table.getChildren()) {
+            // A child that already declares the rule under this name keeps its own copy, which is
+            // the merge PostgreSQL performs rather than storing the constraint twice.
+            if (sc.getName() != null && child.getConstraint(sc.getName()) != null) continue;
+            StoredConstraint copy = sc.copyForPartition(child.getName());
+            copy.setInheritedFrom(table.getName());
+            child.addConstraint(copy);
+            propagateConstraintToChildren(child, copy);
+        }
+    }
+
+    /**
+     * Take the copies of a dropped constraint off every relation below the one that declared it.
+     *
+     * <p>A rule the parent hands down is enforced by the descendants that store the rows, so a
+     * drop that stopped at the parent left it in force with nobody able to withdraw it. PostgreSQL
+     * drops the copies with the original, and leaves standing only what a descendant declared for
+     * itself -- which keeps its own name and answers to nobody else's drop.
+     */
+    private static void dropInheritedCopies(Table parent, String constraintName) {
+        for (Table child : childRelations(parent)) {
+            StoredConstraint copy = child.getConstraint(constraintName);
+            if (copy == null || !isInheritedFrom(copy, parent)) continue;
+            child.removeConstraint(constraintName);
+            dropInheritedCopies(child, constraintName);
+        }
+    }
+
+    /**
+     * ONLY drops the parent's own constraint and leaves each descendant holding its copy, which
+     * makes that copy local: it is the descendant's from then on, and the descendant's to drop.
+     */
+    private static void makeInheritedCopiesLocal(Table parent, String constraintName) {
+        for (Table child : childRelations(parent)) {
+            StoredConstraint copy = child.getConstraint(constraintName);
+            if (copy == null || !isInheritedFrom(copy, parent)) continue;
+            copy.setInheritedFrom(null);
+        }
+    }
+
+    /**
+     * Everything this relation carried because it belonged to the given parent becomes its own.
+     * PostgreSQL keeps the constraints a detached partition (or a table taken out of an
+     * inheritance hierarchy) holds and records them as local, which is what makes them droppable
+     * from the standalone table afterwards.
+     */
+    private static void adoptInheritedConstraints(Table relation, Table formerParent) {
+        for (StoredConstraint sc : relation.getConstraints()) {
+            if (isInheritedFrom(sc, formerParent)) sc.setInheritedFrom(null);
+        }
+    }
+
+    /** True when this copy is the one the named parent handed down, rather than the child's own. */
+    private static boolean isInheritedFrom(StoredConstraint sc, Table parent) {
+        return sc.getInheritedFrom() != null && parent != null
+                && sc.getInheritedFrom().equalsIgnoreCase(parent.getName());
     }
 
     private void validateForeignKeyData(StoredConstraint sc, Table table, String tableName) {
@@ -2391,22 +3332,25 @@ class DdlAlterTableExecutor {
     }
 
     private void validateCheckConstraintData(StoredConstraint sc, Table table) {
-        ddl.validateExprColumnRefs(sc.getCheckExpr(), table, null);
+        // Every name in the predicate has to be a column of the relation, and then the columns
+        // the relation keeps for itself are refused: a CHECK is evaluated over the row being
+        // written, which does not carry its own xmin or ctid yet.
+        ddl.validateExprColumnRefs(sc.getCheckExpr(), table, null, true);
+        DdlDefinitionChecks.rejectSystemColumnInCheck(sc.getCheckExpr());
         boolean hasVirtual = executor.dmlExecutor.hasVirtualColumns(table);
         for (Object[] row : table.getRows()) {
             Object[] evalRow = hasVirtual ? executor.dmlExecutor.computeVirtualColumns(table, row) : row;
             RowContext checkCtx = new RowContext(table, null, evalRow);
-            try {
-                Object result = executor.evalExpr(sc.getCheckExpr(), checkCtx);
-                if (result instanceof Boolean && !((Boolean) result)) {
-                    MemgresException ex = new MemgresException("check constraint \"" + sc.getName()
-                            + "\" of relation \"" + table.getName() + "\" is violated by some row",
-                            "23514");
-                    ex.setConstraint(sc.getName());
-                    throw ex;
-                }
-            } catch (MemgresException me) {
-                if ("23514".equals(me.getSqlState())) throw me;
+            // Whatever evaluating the predicate raises is the statement's answer: a division by
+            // zero or a bad cast in a CHECK aborts the ALTER exactly as a violation does, and
+            // discarding it stored a constraint the table's own rows cannot satisfy.
+            Object result = executor.evalExpr(sc.getCheckExpr(), checkCtx);
+            if (result instanceof Boolean && !((Boolean) result)) {
+                MemgresException ex = new MemgresException("check constraint \"" + sc.getName()
+                        + "\" of relation \"" + table.getName() + "\" is violated by some row",
+                        "23514");
+                ex.setConstraint(sc.getName());
+                throw ex;
             }
         }
     }
@@ -2498,6 +3442,11 @@ class DdlAlterTableExecutor {
         partition.setPartitionParent(table);
         partition.setParentColumnRemap(buildParentColumnRemap(table, partition));
         table.addPartition(partition);
+        // An index on a partitioned table is a rule about every partition, so a table joining the
+        // hierarchy is indexed the way one created inside it is: it takes a copy of each of the
+        // parent's indexes, or keeps a matching index it already carries as that copy. Without
+        // this the attached table ended up with no index at all and was scanned row by row.
+        ddl.tableExecutor.copyParentIndexes(table, partition, schemaName, partSchemaName);
     }
 
     /** ATTACH/DETACH PARTITION only apply to a partitioned table. */
@@ -2526,7 +3475,9 @@ class DdlAlterTableExecutor {
      * narrows that set, so any row the default is holding which the new bounds would now cover
      * makes the default's own constraint false.
      */
-    private void validateDefaultPartitionRows(Table parent, Table incoming, String partName) {
+    static void validateDefaultPartitionRows(Table parent, Table incoming, String partName) {
+        // The default partition is what a row falls back to, so adding one narrows nothing.
+        if (incoming.isDefaultPartition()) return;
         String strategy = parent.getPartitionStrategy();
         if (strategy == null) return;
         String partCol = parent.getPartitionColumn();
@@ -2630,6 +3581,7 @@ class DdlAlterTableExecutor {
                 throw new MemgresException("child table \"" + partName
                         + "\" has different type for column \"" + pp.getName() + "\"", "42804");
             }
+            requireNotNullWhereParentIs(pp, match, partName);
         }
     }
 
@@ -2679,7 +3631,7 @@ class DdlAlterTableExecutor {
     }
 
     @SuppressWarnings("unchecked")
-    private boolean rowSatisfiesBounds(Object value, Table partition, String strategy) {
+    private static boolean rowSatisfiesBounds(Object value, Table partition, String strategy) {
         switch (strategy.toUpperCase()) {
             case "RANGE":
                 if (value == null) return false; // NULL never matches RANGE
@@ -2787,30 +3739,56 @@ class DdlAlterTableExecutor {
     }
 
     /**
-     * After renaming a column, rewrite any view whose sourceSQL references
-     * the base table so that occurrences of the old column name are replaced
-     * with the new column name.  The view is then re-parsed and re-registered.
+     * After renaming a column, rewrite every view that reads it so that it goes on reading the
+     * same column under its new name. The view is then re-parsed and re-registered.
+     *
+     * <p>Which views those are is read off the parse tree: a view depends on the column only when
+     * one of its FROM items is this relation. Testing the stored text for the relation's name made
+     * a view over {@code t_summary} a dependent of {@code t}, and rewrote a definition that never
+     * read the column -- leaving a view that fails on every read.
      */
-    private void rewriteDependentViews(String tableName, String oldCol, String newCol) {
+    private void rewriteDependentViews(String schemaName, String tableName, String oldCol,
+                                       String newCol) {
         for (Database.ViewDef vd : new ArrayList<>(executor.database.getViews().values())) {
+            Set<String> refNames = vd.query == null
+                    ? null : relationRefNames(vd.query, schemaName, tableName);
+            if (refNames != null && refNames.isEmpty()) continue;
             // Get SQL text from sourceSQL or unparse from the AST
             String sql = vd.sourceSQL;
             if (sql == null || sql.isEmpty()) {
                 sql = SqlUnparser.toSql(vd.query);
             }
             if (sql == null || sql.isEmpty()) continue;
-            String sqlLower = sql.toLowerCase();
-            if (!sqlLower.contains(tableName.toLowerCase())) continue;
-            if (!sqlLower.contains(oldCol.toLowerCase())) continue;
-            // Replace old column name with new, word-boundary aware
-            String updated = sql.replaceAll("(?i)\\b" + java.util.regex.Pattern.quote(oldCol) + "\\b", newCol);
+            if (refNames == null) {
+                // A view that survives only as text has no tree to read, so the old, looser test
+                // is kept for it rather than leaving it naming a column that has gone.
+                String sqlLower = sql.toLowerCase();
+                if (!sqlLower.contains(tableName.toLowerCase())) continue;
+                if (!sqlLower.contains(oldCol.toLowerCase())) continue;
+            }
+            // An unqualified reference belongs to the renamed relation only while no other FROM
+            // item supplies a column of that name; where one does, the query had to qualify it.
+            boolean qualifiedOnly = refNames != null
+                    && otherFromItemHasColumn(vd.query, refNames, schemaName, oldCol);
+            String updated = renameColumnTokens(sql, refNames, oldCol, newCol, qualifiedOnly);
             if (updated.equals(sql)) continue;
             try {
                 Statement parsed = com.memgres.engine.parser.Parser.parse(updated);
+                // A view publishes the column names it was created with, so renaming a column of
+                // the relation underneath renames what the view reads and not what it shows.
+                // PostgreSQL gives the select item the old name back as an alias, which is why
+                // pg_get_viewdef then reads "v2 AS v" and why queries naming v still work.
+                boolean keptOutputName = restoreViewOutputName(parsed, oldCol, newCol);
+                // The stored text is what pg_get_viewdef prints, so once the parse tree carries
+                // the alias the text has to carry it too. Keeping the plain substitution left the
+                // definition reading "v2", which publishes the base relation's new name as the
+                // view's own -- the one thing renaming a base column must not do.
+                String storedSql = keptOutputName ? SqlUnparser.toSql(parsed) : updated;
+                if (storedSql == null || storedSql.isEmpty()) storedSql = updated;
                 // Keep regular-view column metadata (used by catalogs) in sync with the
                 // rewritten output names. Materialized views keep their own column names.
                 List<Column> newCachedCols = vd.cachedColumns;
-                if (!vd.materialized && vd.cachedColumns != null) {
+                if (!vd.materialized && !keptOutputName && vd.cachedColumns != null) {
                     newCachedCols = new ArrayList<>();
                     for (Column c : vd.cachedColumns) {
                         if (c.getName().equalsIgnoreCase(oldCol)) {
@@ -2825,11 +3803,181 @@ class DdlAlterTableExecutor {
                 }
                 Database.ViewDef newView = new Database.ViewDef(
                         vd.name, vd.schemaName, parsed, vd.orReplace, vd.materialized,
-                        newCachedCols, vd.cachedRows, updated, vd.checkOption, vd.reloptions, vd.populated);
+                        newCachedCols, vd.cachedRows, storedSql, vd.checkOption, vd.reloptions, vd.populated);
                 executor.database.addView(newView);
             } catch (Exception ignored) {
                 // If re-parse fails, leave the view as-is
             }
         }
+    }
+
+    /**
+     * Give a select item that was the renamed column its old name back as an alias, and say whether
+     * anything was given one. The name a view publishes is settled when the view is created, so a
+     * column of the relation underneath may be renamed without the view's own column following it.
+     * Only a bare name is touched: an item that already carries an alias publishes that alias, and
+     * one the view never spelled -- a star, an expression -- has no name here to restore.
+     */
+    private static boolean restoreViewOutputName(Statement parsed, String oldCol, String newCol) {
+        if (!(parsed instanceof SelectStmt)) return false;
+        List<SelectStmt.SelectTarget> targets = ((SelectStmt) parsed).targets();
+        if (targets == null) return false;
+        boolean restored = false;
+        for (int i = 0; i < targets.size(); i++) {
+            SelectStmt.SelectTarget target = targets.get(i);
+            if (target.alias() != null || !(target.expr() instanceof ColumnRef)) continue;
+            if (!newCol.equalsIgnoreCase(((ColumnRef) target.expr()).column())) continue;
+            try {
+                targets.set(i, new SelectStmt.SelectTarget(target.expr(), oldCol));
+                restored = true;
+            } catch (UnsupportedOperationException immutable) {
+                // A target list that cannot be written to is left as it stands rather than
+                // half rewritten.
+                return restored;
+            }
+        }
+        return restored;
+    }
+
+    /** The names, its alias included, by which a stored query reaches one relation. */
+    private static Set<String> relationRefNames(Object query, final String schemaName,
+                                                final String tableName) {
+        final Set<String> names = new HashSet<>();
+        AstWalk.forEach(query, new java.util.function.Consumer<Object>() {
+            @Override public void accept(Object n) {
+                if (!(n instanceof SelectStmt.TableRef)) return;
+                SelectStmt.TableRef ref = (SelectStmt.TableRef) n;
+                if (ref.table == null || !ref.table.equalsIgnoreCase(tableName)) return;
+                String refSchema = ref.schema != null ? ref.schema : schemaName;
+                if (refSchema != null && schemaName != null
+                        && !refSchema.equalsIgnoreCase(schemaName)) {
+                    return;
+                }
+                names.add(ref.table.toLowerCase());
+                if (ref.alias != null) names.add(ref.alias.toLowerCase());
+            }
+        });
+        return names;
+    }
+
+    /**
+     * True when another FROM item of the same query has a column of this name. That is what makes
+     * an unqualified reference to it ambiguous, so nothing may be assumed about which relation it
+     * belongs to: only a reference the query qualified is the renamed relation's.
+     */
+    private boolean otherFromItemHasColumn(Object query, final Set<String> refNames,
+                                           String schemaName, String column) {
+        final List<SelectStmt.TableRef> refs = new ArrayList<>();
+        AstWalk.forEach(query, new java.util.function.Consumer<Object>() {
+            @Override public void accept(Object n) {
+                if (n instanceof SelectStmt.TableRef) refs.add((SelectStmt.TableRef) n);
+            }
+        });
+        for (SelectStmt.TableRef ref : refs) {
+            if (ref.table == null || refNames.contains(ref.table.toLowerCase())) continue;
+            String schema = ref.schema != null ? ref.schema
+                    : (schemaName != null ? schemaName : executor.defaultSchema());
+            Schema holder = executor.database.getSchema(schema);
+            Table other = holder == null ? null : holder.getTable(ref.table);
+            if (other != null && other.getColumnIndex(column) >= 0) return true;
+            Database.ViewDef otherView = executor.database.getView(schema, ref.table);
+            if (otherView == null || otherView.cachedColumns() == null) continue;
+            for (Column c : otherView.cachedColumns()) {
+                if (c.getName().equalsIgnoreCase(column)) return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * The same SQL with references to one column renamed, read as tokens rather than as text.
+     *
+     * <p>A substitution over the whole statement cannot tell a column reference from the contents
+     * of a string literal, from an alias, or from another relation's column of the same name, and
+     * rewrote all of them: a view selecting {@code 'v'::text} came to publish {@code 'v2'}, and a
+     * join renamed the column of the relation nobody altered, leaving a definition that fails on
+     * every read. The lexer tells the three apart.
+     *
+     * @param refNames the names the renamed relation answers to here, or null to accept any
+     * @param qualifiedOnly true when only a reference the query qualified may be rewritten
+     */
+    private static String renameColumnTokens(String sql, Set<String> refNames, String oldCol,
+                                             String newCol, boolean qualifiedOnly) {
+        List<com.memgres.engine.parser.Token> tokens;
+        try {
+            tokens = new com.memgres.engine.parser.Lexer(sql).tokenize();
+        } catch (RuntimeException notLexable) {
+            return sql;
+        }
+        StringBuilder out = new StringBuilder();
+        int copied = 0;
+        for (int i = 0; i < tokens.size(); i++) {
+            com.memgres.engine.parser.Token t = tokens.get(i);
+            if (!namesIdentifier(t, oldCol)) continue;
+            com.memgres.engine.parser.Token before = i > 0 ? tokens.get(i - 1) : null;
+            // What follows AS is the name the view publishes, not a reference to the renamed one.
+            if (before != null && before.type() == com.memgres.engine.parser.TokenType.KEYWORD
+                    && "AS".equals(before.value())) {
+                continue;
+            }
+            if (before != null && before.type() == com.memgres.engine.parser.TokenType.DOT) {
+                com.memgres.engine.parser.Token owner = i >= 2 ? tokens.get(i - 2) : null;
+                if (owner == null) continue;
+                if (refNames != null && !refNames.contains(owner.value().toLowerCase())) continue;
+            } else if (qualifiedOnly) {
+                continue;
+            }
+            int start = t.position();
+            int end = identifierEnd(sql, start, t);
+            if (end < 0 || start < copied) continue;
+            out.append(sql, copied, start).append(writtenName(sql.charAt(start) == '"', newCol));
+            copied = end;
+        }
+        if (copied == 0) return sql;
+        out.append(sql, copied, sql.length());
+        return out.toString();
+    }
+
+    /** True when this token is the identifier {@code name}, however the statement spelled it. */
+    private static boolean namesIdentifier(com.memgres.engine.parser.Token t, String name) {
+        switch (t.type()) {
+            // A column may be named with a word the lexer folds into a keyword, so the kind alone
+            // does not say whether the token is an identifier.
+            case IDENTIFIER: case QUOTED_IDENTIFIER: case KEYWORD:
+                return t.value() != null && t.value().equalsIgnoreCase(name);
+            default:
+                return false;
+        }
+    }
+
+    /** Where the identifier token starting at {@code start} ends in the source, or -1. */
+    private static int identifierEnd(String sql, int start,
+                                     com.memgres.engine.parser.Token t) {
+        if (start < 0 || start >= sql.length()) return -1;
+        if (sql.charAt(start) == '"') {
+            for (int i = start + 1; i < sql.length(); i++) {
+                if (sql.charAt(i) != '"') continue;
+                if (i + 1 < sql.length() && sql.charAt(i + 1) == '"') {
+                    i++;
+                    continue;
+                }
+                return i + 1;
+            }
+            return -1;
+        }
+        String written = t.raw();
+        if (written == null || written.isEmpty()) return -1;
+        return sql.regionMatches(true, start, written, 0, written.length())
+                ? start + written.length() : -1;
+    }
+
+    /** A name as it has to be written to mean itself: quoted where a bare word would not do. */
+    private static String writtenName(boolean wasQuoted, String name) {
+        boolean plain = !name.isEmpty() && !Character.isDigit(name.charAt(0));
+        for (int i = 0; plain && i < name.length(); i++) {
+            char c = name.charAt(i);
+            plain = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_';
+        }
+        return plain && !wasQuoted ? name : "\"" + name.replace("\"", "\"\"") + "\"";
     }
 }

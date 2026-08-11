@@ -28,6 +28,18 @@ public class PgTrigger {
      * an ordinary session — a replica trigger waits for a session in replica mode.
      */
     private String enabledState = "O";
+    /** Set when CREATE CONSTRAINT TRIGGER was the statement, rather than CREATE TRIGGER. */
+    private boolean constraintTrigger;
+    /** The relation a constraint trigger's FROM clause named, or null when none was written. */
+    private String constraintRelation;
+    /**
+     * The partitioned relation this trigger was cloned from, or null when it was written on the
+     * relation it sits on. PostgreSQL clones a partitioned table's FOR EACH ROW triggers onto
+     * every partition and points each copy's {@code tgparentid} at the trigger it came from: the
+     * copy is a catalog row of its own, it goes when the original does, and it may not be dropped
+     * on its own because the original requires it.
+     */
+    private String clonedFromTable;
 
     public PgTrigger(String name, Timing timing, Event event, String tableName, String functionName) {
         this(name, timing, event, tableName, functionName, null, null, null, false, null, false, false);
@@ -119,6 +131,19 @@ public class PgTrigger {
         return !("O".equals(enabledState) || "A".equals(enabledState));
     }
 
+    /**
+     * Whether this trigger fires while the session is in the given replication role. PostgreSQL
+     * decides it per trigger: {@code tgenabled} 'O' fires only in origin or local, 'R' only in
+     * replica, 'A' in both and 'D' in neither. Deciding it once for the whole statement left an
+     * ENABLE REPLICA trigger with no mode at all in which it ran.
+     */
+    public boolean firesUnderReplicationRole(boolean replicaRole) {
+        if ("A".equals(enabledState)) return true;
+        if ("D".equals(enabledState)) return false;
+        if ("R".equals(enabledState)) return replicaRole;
+        return !replicaRole;
+    }
+
     public void setDisabled(boolean disabled) {
         this.enabledState = disabled ? "D" : "O";
     }
@@ -146,5 +171,37 @@ public class PgTrigger {
 
     public java.util.List<String> getArgs() {
         return args;
+    }
+
+    /**
+     * Whether this was created as a CONSTRAINT TRIGGER. PostgreSQL records one in pg_constraint
+     * as well as pg_trigger, and pg_get_triggerdef prints CREATE CONSTRAINT TRIGGER along with
+     * the deferrability that is the point of the form; a definition without those words restores
+     * an ordinary trigger that fires immediately.
+     */
+    public boolean isConstraintTrigger() {
+        return constraintTrigger;
+    }
+
+    public void setConstraintTrigger(boolean constraintTrigger) {
+        this.constraintTrigger = constraintTrigger;
+    }
+
+    /** The relation a constraint trigger's FROM clause named, which tgconstrrelid points at. */
+    public String getConstraintRelation() {
+        return constraintRelation;
+    }
+
+    public void setConstraintRelation(String constraintRelation) {
+        this.constraintRelation = constraintRelation;
+    }
+
+    /** The partitioned relation this is a copy of, or null when it was written where it sits. */
+    public String getClonedFromTable() {
+        return clonedFromTable;
+    }
+
+    public void setClonedFromTable(String clonedFromTable) {
+        this.clonedFromTable = clonedFromTable;
     }
 }

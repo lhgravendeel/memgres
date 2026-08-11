@@ -790,7 +790,11 @@ public class PlpgsqlExecutor {
             for (int i = 0; i < table.getColumns().size(); i++)
                 oldMap.put(table.getColumns().get(i).getName().toLowerCase(), oldRow[i]);
         }
-        scope.declare("new", newMap);
+        // A row-level DELETE trigger has no NEW row: PostgreSQL leaves it unassigned, so RETURN NEW
+        // returns nothing and the row is skipped, while RETURN OLD lets the delete go ahead.
+        boolean deleteRowTrigger = trigger != null && !trigger.isForEachStatement()
+                && trigger.getEvent() == PgTrigger.Event.DELETE;
+        scope.declare("new", deleteRowTrigger ? null : newMap);
         scope.declare("old", oldMap);
         scope.declare("found", false);
 
@@ -837,9 +841,23 @@ public class PlpgsqlExecutor {
             if (retVal == null) {
                 // BEFORE/INSTEAD OF row triggers: RETURN NULL skips the row.
                 // AFTER (and statement-level) triggers: the return value is ignored.
-                return skipCapable ? null : newRow;
+                if (skipCapable) return null;
+                return deleteRowTrigger ? oldRow : newRow;
+            }
+            // NEW and OLD are both declared for every trigger, and the one the event does not have
+            // is an empty record. A composite always has fields, so an empty one can only be that
+            // record: PostgreSQL reads it as NULL, and RETURN OLD from a BEFORE INSERT trigger
+            // skips the row exactly as RETURN NULL does. Copying its nothing over NEW instead let
+            // the row through.
+            if (retVal instanceof Map && ((Map<?, ?>) retVal).isEmpty()) {
+                if (skipCapable) return null;
+                return deleteRowTrigger ? oldRow : newRow;
             }
             if (retVal instanceof Map) {
+                // The row a DELETE trigger returns says only that the delete goes ahead. There is no
+                // NEW row to write it back into, and writing the entry-time values back over the row
+                // undid whatever the trigger body had done to it.
+                if (deleteRowTrigger) return oldRow;
                 // AFTER triggers: PG ignores the returned row entirely
                 if (!afterTiming && newRow != null) {
                     @SuppressWarnings("unchecked")
@@ -857,14 +875,14 @@ public class PlpgsqlExecutor {
         }
 
         // Copy NEW map back (skipped for AFTER triggers: modifications to NEW are ignored, as in PG)
-        if (!afterTiming) {
+        if (!afterTiming && !deleteRowTrigger) {
             @SuppressWarnings("unchecked")
             Map<String, Object> finalNew = (Map<String, Object>) scope.get("new");
             if (finalNew != null && newRow != null) {
                 copyMapToRow(finalNew, newRow, table);
             }
         }
-        return newRow;
+        return deleteRowTrigger ? oldRow : newRow;
     }
 
     /**
@@ -3820,7 +3838,9 @@ public class PlpgsqlExecutor {
                     // Also don't substitute common SQL keywords that happen to match variable names
                     if (!isPrecededByDot && !isInInsertColList && !isOutputOnly
                             && !scan.protectedTokens.contains(i)
-                            && isSubstitutableVariable(t.value(), scope)) {
+                            && isSubstitutableVariable(t.value(), scope,
+                                    i + 1 < tokens.size()
+                                            && tokens.get(i + 1).type() == TokenType.DOT)) {
                         // An identifier that matches both a variable and a column of a table
                         // referenced by this statement is ambiguous. PL/pgSQL (with the PG
                         // default plpgsql.variable_conflict = error) raises 42702; SQL-language
@@ -3875,6 +3895,14 @@ public class PlpgsqlExecutor {
                             boolean followedByDot = i + 1 < tokens.size() && tokens.get(i + 1).type() == TokenType.DOT;
                             if (followedByDot) {
                                 appendTokenToSb(sb, t);
+                            } else if (mapVal.isEmpty()
+                                    && ("new".equals(lowerName) || "old".equals(lowerName))) {
+                                // The record the event does not carry is declared empty rather than
+                                // absent, so OLD.col still resolves. Read whole it is NULL in
+                                // PostgreSQL, which is what a body shared by an INSERT and an
+                                // UPDATE trigger tests with `OLD IS NULL`. A row literal with no
+                                // fields left SQL the evaluator read as an unresolvable column.
+                                appendValue(sb, null);
                             } else if (mapVal.size() == 1) {
                                 appendValue(sb, mapVal.values().iterator().next());
                             } else {
@@ -4113,10 +4141,20 @@ public class PlpgsqlExecutor {
         }
     }
 
-    private boolean isSubstitutableVariable(String name, Scope scope) {
+    /**
+     * Whether this occurrence of a name is to be replaced by its value.
+     *
+     * @param fieldAccess true when a field of the record is being read rather than the record
+     *        itself. NEW and OLD are read a field at a time far more often than whole, and
+     *        {@code NEW.col} is resolved against the record elsewhere — but read whole they are
+     *        values like any other, and the record the event does not carry is NULL. That is what
+     *        a trigger body shared by an INSERT and an UPDATE tests with {@code OLD IS NULL};
+     *        leaving the bare name in the SQL made it an identifier nothing answers to.
+     */
+    private boolean isSubstitutableVariable(String name, Scope scope, boolean fieldAccess) {
         // Don't substitute certain SQL keywords even if they're in scope
         String upper = name.toUpperCase();
-        if (upper.equals("NEW") || upper.equals("OLD")) return false;
+        if (upper.equals("NEW") || upper.equals("OLD")) return !fieldAccess && scope.has(name);
         if (upper.equals("FOUND")) return true;
         return scope.has(name);
     }

@@ -26,6 +26,15 @@ public final class CreateTableStmt implements Statement {
     public final List<String> likeTables;
     public final String onCommitAction;
     public final java.util.Map<String, String> withOptions;
+    /**
+     * The composite type a typed table takes its columns from: CREATE TABLE t OF ct. The columns
+     * are the type's attributes, so the definition list holds no column definitions at all and
+     * whoever executes the statement reads them off the type.
+     */
+    private String ofType;
+
+    public String ofType() { return ofType; }
+    public void setOfType(String ofType) { this.ofType = ofType; }
 
     public CreateTableStmt(
             String schema,

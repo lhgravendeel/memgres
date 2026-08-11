@@ -37,6 +37,65 @@ class DmlExecutor {
     // View columns computed from an expression: named by a write, they are refused rather than
     // reported missing, because the column exists and only the place to write it does not.
     private Set<String> activeViewExprCols;
+    // The view's own column names by position, including the computed ones. A positional write
+    // names nothing, so this is the only list that can say which view column a value was aimed at.
+    private List<String> activeViewColNames;
+
+    /**
+     * Take the view the statement's target resolved through, before resolving anything else can
+     * change it. All four fields are taken together: one left standing from an earlier statement
+     * describes a view this one is not writing through.
+     */
+    private void captureViewTarget() {
+        this.activeViewColMap = executor.lastViewColumnMapping;
+        this.activeViewColOrder = executor.lastViewColumnOrder;
+        this.activeViewExprCols = executor.lastViewExpressionColumns;
+        this.activeViewColNames = executor.lastViewColumnNames;
+    }
+
+    /**
+     * The columns the relation the statement named exposes, in order, or null when it named a
+     * table. PostgreSQL rewrites a write on an auto-updatable view onto the base relation but
+     * resolves the statement's own lists against the relation as written, so a view's names are
+     * the names RETURNING may use and a base column the view leaves out is not a column at all.
+     * A view whose definition selects everything is answered as null: its columns are the base
+     * relation's own, which is what the base relation already says.
+     */
+    private List<String> targetViewColumns() {
+        List<String> names = activeViewColNames;
+        if (names == null || names.isEmpty()) return null;
+        for (String name : names) {
+            if (name == null) return null;
+        }
+        return names;
+    }
+
+    /** Whether RETURNING may name this column: the view's list decides it when there is one. */
+    private boolean returningColumnExists(String column, Table table) {
+        List<String> viewCols = targetViewColumns();
+        if (viewCols == null) return table.getColumnIndex(column) >= 0;
+        for (String viewCol : viewCols) {
+            if (viewCol.equalsIgnoreCase(column)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Which of the base relation's columns stand behind the view's, one per view column, so that
+     * RETURNING * answers with the view's row rather than the row it was rewritten onto. Null
+     * unless every view column is a column of the base relation under a name of its own.
+     */
+    private int[] viewProjection(Table table) {
+        List<String> names = targetViewColumns();
+        List<String> order = activeViewColOrder;
+        if (names == null || order == null || names.size() != order.size()) return null;
+        int[] indexes = new int[order.size()];
+        for (int i = 0; i < order.size(); i++) {
+            indexes[i] = table.getColumnIndex(order.get(i));
+            if (indexes[i] < 0) return null;
+        }
+        return indexes;
+    }
 
     /** Translate a view column name to the base table column name using the active mapping. */
     private String mapViewColumn(String colName) {
@@ -46,6 +105,27 @@ class DmlExecutor {
         return mapped != null ? mapped : colName;
     }
 
+    /**
+     * The default the view this write is going through gives a base relation column, or null.
+     *
+     * <p>PostgreSQL keeps a view's column defaults on the view itself and substitutes them while
+     * it rewrites the write onto the base relation, so a write through the view takes them and one
+     * naming the relation directly does not. They are looked up here, on the name the statement
+     * wrote, rather than being copied onto the base relation, which would give that relation a
+     * default nobody declared on it.
+     */
+    private String viewColumnDefault(String schemaName, String written, String baseColumn) {
+        if (written == null || baseColumn == null) return null;
+        Database.ViewDef view = executor.database.getView(schemaName, written);
+        if (view == null || view.cachedColumns() == null) return null;
+        for (Column viewCol : view.cachedColumns()) {
+            if (viewCol.getDefaultValue() == null) continue;
+            String base = mapViewColumn(viewCol.getName());
+            if (base != null && base.equalsIgnoreCase(baseColumn)) return viewCol.getDefaultValue();
+        }
+        return null;
+    }
+
     /** Build a single-table RowContext that also resolves renamed view column names (if any). */
     private RowContext viewAwareCtx(Table table, String alias, Object[] row) {
         RowContext ctx = new RowContext(table, alias, row);
@@ -53,11 +133,21 @@ class DmlExecutor {
         return ctx;
     }
 
-    /** Returns true when session_replication_role suppresses user triggers. */
-    private boolean triggersDisabled() {
-        if (executor.session == null) return false;
-        String role = executor.session.getGucSettings().get("session_replication_role");
-        return role != null && role.equalsIgnoreCase("replica");
+    /**
+     * The triggers of a list this statement may fire. PostgreSQL decides it one trigger at a time
+     * rather than once for the statement: tgenabled 'O' fires only while session_replication_role
+     * is origin or local, 'R' only while it is replica, 'A' always and 'D' never. Reading the
+     * setting for the statement suppressed every trigger in replica mode, which left an ENABLE
+     * REPLICA trigger with no mode at all in which it ran.
+     */
+    private List<PgTrigger> enabledTriggers(List<PgTrigger> all) {
+        if (all == null || all.isEmpty()) return Cols.listOf();
+        boolean replicaRole = DmlTriggerHelper.inReplicaRole(executor);
+        List<PgTrigger> kept = new ArrayList<PgTrigger>();
+        for (PgTrigger candidate : all) {
+            if (candidate.firesUnderReplicationRole(replicaRole)) kept.add(candidate);
+        }
+        return kept;
     }
 
     /** Record row metadata (xmin, cmin) for system column support. */
@@ -78,6 +168,9 @@ class DmlExecutor {
             long cmin = executor.session.getCommandId();
             executor.database.setRowUpdateMeta(tableKey, row, xmin, cmin);
         }
+        // The row now holds what this statement wrote, so a relation reading it through columns of
+        // its own has to be shown the same values.
+        if (executor.session != null) executor.session.rowWasUpdatedInPlace(row);
     }
 
     /** Resolve the schema-qualified key for a table's row metadata.
@@ -208,10 +301,21 @@ class DmlExecutor {
                 pending = executor.constraintValidator
                         .findUncommittedUniqueConflict(targetTable, storedRow, null);
                 if (pending == null) {
-                    executor.constraintValidator.validateConstraints(checkTable, row, null);
+                    // Routing settles the bounds below the relation the statement named; the
+                    // bounds above it are its own partition constraint, and the row has to pass
+                    // them whether or not it was routed further down. A partition that is itself
+                    // partitioned has both: a row written into it routes to one of its own
+                    // partitions and still has to belong in it.
+                    partitionHelper.checkPartitionConstraint(checkTable, row);
                     if (targetTable != checkTable) {
+                        // The row is stored in the partition and the partition carries a copy of
+                        // every constraint it inherited, so PostgreSQL names the partition rather
+                        // than the partitioned table the statement wrote to. Checking the leaf
+                        // first is what makes its copy the one that raises; the parent is checked
+                        // after it, for anything the leaf has no copy of.
                         executor.constraintValidator.validateConstraints(targetTable, storedRow, null);
                     }
+                    executor.constraintValidator.validateConstraints(checkTable, row, null);
                     targetTable.insertRow(storedRow);
                     return;
                 }
@@ -291,9 +395,29 @@ class DmlExecutor {
         }
         if (oc.doUpdate() != null) {
             for (InsertStmt.SetClause set : oc.doUpdate()) {
-                if (table.getColumnIndex(set.column()) < 0) {
+                int colIdx = table.getColumnIndex(set.column());
+                if (colIdx < 0) {
                     throw new MemgresException("column \"" + set.column() + "\" of relation \""
                             + table.getName() + "\" does not exist", "42703");
+                }
+                // What a generated column holds is the relation's to compute, so DEFAULT is the
+                // only thing that may be written to one. This belongs here rather than in the row
+                // loop because PostgreSQL settles the SET list while planning: the statement is
+                // refused even when nothing conflicts and the action would never have run, so no
+                // row goes in that PostgreSQL would not have let in.
+                Column target = table.getColumns().get(colIdx);
+                boolean toDefault = isDefaultLiteral(set.value());
+                if (target.isGenerated() && !toDefault) {
+                    throw new MemgresException("column \"" + target.getName()
+                            + "\" can only be updated to DEFAULT\n  Detail: Column \""
+                            + target.getName() + "\" is a generated column.", "428C9");
+                }
+                if (!toDefault && target.getDefaultValue() != null
+                        && target.getDefaultValue().contains("__identity__:always")) {
+                    throw new MemgresException("column \"" + target.getName()
+                            + "\" can only be updated to DEFAULT\n  Detail: Column \""
+                            + target.getName() + "\" is an identity column defined as GENERATED"
+                            + " ALWAYS.", "428C9");
                 }
             }
         }
@@ -388,6 +512,10 @@ class DmlExecutor {
         if (target == null) return;
         Table table = describeWrittenRelation(target);
         if (table == null) return;
+        // The names below are the ones this statement's own target exposes. A renaming captured
+        // for an earlier statement describes a view this one is not writing through, and reading
+        // it here turned an ordinary column of an ordinary table into a column that is not there.
+        captureViewTarget();
         // The column list of an INSERT is validated against the target the moment the target is
         // known, before the VALUES or the SELECT behind them is looked at.
         if (stmt instanceof InsertStmt) {
@@ -472,9 +600,7 @@ class DmlExecutor {
             }
         }
         // Capture view column mapping/order before any further resolveTable calls clobber them.
-        this.activeViewColMap = executor.lastViewColumnMapping;
-        this.activeViewColOrder = executor.lastViewColumnOrder;
-        this.activeViewExprCols = executor.lastViewExpressionColumns;
+        captureViewTarget();
         // C6: Enforce INSERT privilege
         executor.checkTablePrivilege("INSERT", schemaName, stmt.table());
         // Check table-level locks (blocks if ACCESS EXCLUSIVE held by another session)
@@ -484,27 +610,44 @@ class DmlExecutor {
         // write on the base table, so the base table's rules apply as well — a rule of the
         // view's own takes precedence, as it does in PG, because it replaces the rewrite.
         String ruleRelation = stmt.table();
-        String ruleVal = executor.database.getRule(ruleRelation, "INSERT");
-        if (ruleVal == null && table != null && table.getName() != null
+        List<Database.StoredRule> insertRules = executor.database.getRules(ruleRelation, "INSERT");
+        if (insertRules.isEmpty() && table != null && table.getName() != null
                 && !table.getName().equalsIgnoreCase(stmt.table())) {
             ruleRelation = table.getName();
-            ruleVal = executor.database.getRule(ruleRelation, "INSERT");
+            insertRules = executor.database.getRules(ruleRelation, "INSERT");
         }
         // A rule that writes back to its own table re-enters itself; PG detects that while
         // rewriting the statement and never runs any of it.
-        if (ruleVal != null && executor.isRuleExpanding(ruleRelation, "INSERT")) {
+        if (!insertRules.isEmpty() && executor.isRuleExpanding(ruleRelation, "INSERT")) {
             throw PgErrors.infiniteRecursionInRules(ruleRelation);
         }
-        // Check for DO ALSO rule - will be applied after normal insert
-        String alsoRuleSql = null;
-        if (ruleVal != null && ruleVal.startsWith("ALSO:")) {
-            alsoRuleSql = ruleVal.substring("ALSO:".length());
+        // ON CONFLICT and a rule both rewrite the same INSERT, and PostgreSQL has no defined order
+        // for the two, so it refuses the combination outright rather than running them beside each
+        // other.
+        if (stmt.onConflict() != null
+                && (rulesForbidOnConflict(stmt.table())
+                    || (table != null && rulesForbidOnConflict(table.getName())))) {
+            throw new MemgresException("INSERT with ON CONFLICT clause cannot be used with table"
+                    + " that has INSERT or UPDATE rules", "0A000");
         }
-        if ("INSTEAD_NOTHING".equals(ruleVal)) {
-            return QueryResult.command(QueryResult.Type.INSERT, 0);
+        // An INSTEAD rule stands in for the statement, so the statement has no rows of its own to
+        // report and RETURNING is refused before any of it runs.
+        rejectReturningThroughInsteadRule(stmt.returning(), "INSERT", stmt.table(), insertRules);
+        // An INSTEAD rule written without a WHERE replaces the statement outright: nothing reaches
+        // the relation and only the rules' actions run, with the last action that is itself an
+        // INSERT speaking for the statement. A DO INSTEAD NOTHING of that kind leaves no action to
+        // run and so reports no rows. A rule that does carry a WHERE only claims the rows it holds
+        // for, which is decided per row below.
+        boolean insteadWholeInsert = false;
+        for (Database.StoredRule rule : insertRules) {
+            if (rule.isInstead() && rule.getQualification() == null) {
+                insteadWholeInsert = true;
+                break;
+            }
         }
-        if (ruleVal != null && ruleVal.startsWith("INSTEAD:")) {
-            int ruleCount = runInsertRuleActions(ruleVal.substring("INSTEAD:".length()), stmt, table, ruleRelation);
+        if (insteadWholeInsert) {
+            int ruleCount = runInsertRuleActions(insertRules, stmt.values(), null, stmt, table,
+                    ruleRelation);
             return QueryResult.command(QueryResult.Type.INSERT, ruleCount);
         }
 
@@ -521,6 +664,27 @@ class DmlExecutor {
                 }
             }
         }
+        // A VALUES list with no column list names nothing, so the loop above sees nothing to
+        // check -- but the values still land on the view's columns from the left, and one of the
+        // positions they reach may be a computed column. Without this the value was written
+        // straight into whatever base column sat behind that position. Only the positions the row
+        // actually reaches count: PostgreSQL accepts a short VALUES list that stops before the
+        // computed column.
+        if (activeViewExprCols != null && stmt.columns() == null && activeViewColNames != null
+                && stmt.values() != null) {
+            int widest = 0;
+            for (List<Expression> valueRow : stmt.values()) {
+                if (valueRow.size() > widest) widest = valueRow.size();
+            }
+            for (int i = 0; i < activeViewColNames.size() && i < widest; i++) {
+                String viewCol = activeViewColNames.get(i);
+                if (viewCol == null || !activeViewExprCols.contains(viewCol.toLowerCase())) continue;
+                MemgresException ex = new MemgresException("cannot insert into column \"" + viewCol
+                        + "\" of view \"" + stmt.table() + "\"", "0A000");
+                ex.setDetail(ViewUpdatability.DETAIL_NOT_COLUMN);
+                throw ex;
+            }
+        }
         // Every name the statement writes to is resolved against the relation before any row is
         // looked at, so an INSERT into a column that is not there is refused the same way whether
         // the VALUES list is empty, the SELECT behind it returns nothing, or the table is empty.
@@ -532,7 +696,7 @@ class DmlExecutor {
         // PG 18: RETURNING OLD/NEW is supported with ON CONFLICT DO NOTHING
         // Non-conflicting rows return NEW.*, conflicting (skipped) rows return nothing
 
-        List<PgTrigger> triggers = triggersDisabled() ? Cols.listOf() : executor.database.getTriggersForTable(stmt.table());
+        List<PgTrigger> triggers = enabledTriggers(rowTriggersFor(table, stmt.table()));
         // Check for INSTEAD OF triggers (on views)
         boolean hasInsteadOfInsert = triggers.stream().anyMatch(
                 t -> t.getTiming() == PgTrigger.Timing.INSTEAD_OF && t.getEvent() == PgTrigger.Event.INSERT);
@@ -569,6 +733,12 @@ class DmlExecutor {
         List<RowContext> valueRowContexts = expandSrfValueRows(valueRows, srfExpandedRows);
         if (valueRowContexts != null) valueRows = srfExpandedRows;
 
+        // A qualified INSTEAD rule replaces the statement only for the rows its WHERE holds for.
+        // PostgreSQL writes the rest itself and reports their count, so which rows those are is
+        // settled before anything is written.
+        Set<Integer> ruleSuppressedRows = insteadClaimedRows(insertRules, valueRows,
+                valueRowContexts, stmt, table);
+
         // Pre-validate all rows' column counts before inserting any rows (atomicity)
         for (List<Expression> valueRow : valueRows) {
             if (stmt.columns() != null && stmt.columns().size() != valueRow.size()) {
@@ -604,6 +774,8 @@ class DmlExecutor {
         int valueRowIdx = -1;
         for (List<Expression> valueRow : valueRows) {
             valueRowIdx++;
+            // A row an INSTEAD rule claimed is the rule's to deal with, not the statement's.
+            if (ruleSuppressedRows.contains(valueRowIdx)) continue;
             // Non-null only for a VALUES row a set-returning call expanded, and then it holds the
             // element of each call that belongs to this row.
             RowContext valueCtx = valueRowContexts == null ? null : valueRowContexts.get(valueRowIdx);
@@ -692,7 +864,13 @@ class DmlExecutor {
             for (int i = 0; i < table.getColumns().size(); i++) {
                 if (filledCols.contains(i)) continue;
                 Column col = table.getColumns().get(i);
-                if (col.getDefaultValue() != null && col.getDefaultValue().startsWith("__identity__")) {
+                // A default the view carries stands in for the base relation's, because that is
+                // the default the statement's own relation declares.
+                String throughView = viewColumnDefault(schemaName, stmt.table(), col.getName());
+                if (throughView != null) {
+                    row[i] = wrapEnumValue(col, TypeCoercion.coerceForStorage(
+                            executor.evaluateDefault(throughView, col.getType()), col));
+                } else if (col.getDefaultValue() != null && col.getDefaultValue().startsWith("__identity__")) {
                     row[i] = resolveIdentityNextVal(table, col);
                 } else if ((col.getType() == DataType.SERIAL || col.getType() == DataType.BIGSERIAL || col.getType() == DataType.SMALLSERIAL)
                         && col.getDefaultValue() != null && col.getDefaultValue().contains("nextval(")) {
@@ -848,6 +1026,19 @@ class DmlExecutor {
                 // validation above intentionally stays against the parent's declared
                 // constraints; the partition carries its own copy (see createPartitionOfTable).
                 Table conflictTable = partitionHelper.routeToPartition(table, row);
+                // A row another session has inserted but not committed may yet be rolled back, so
+                // there is no telling whether it is a conflict: PostgreSQL makes the second
+                // inserter wait for that transaction to end and only then decides between the
+                // insert and the ON CONFLICT action. Acting on the uncommitted row instead wrote
+                // through it, and both writes went when its transaction rolled back.
+                Object[] conflictProbe = conflictTable == table ? row : conflictTable.rowFromParent(row);
+                while (true) {
+                    StatementCancel.check();
+                    ConstraintValidator.PendingUniqueConflict pendingInsert = executor.constraintValidator
+                            .findUncommittedUniqueConflict(conflictTable, conflictProbe, null);
+                    if (pendingInsert == null) break;
+                    awaitPendingInsert(conflictTable, pendingInsert);
+                }
                 rejectSecondUpdateOfSameKey(stmt.onConflict(), conflictTable, row, conflictKeysActedOn);
                 Object[] conflictRow = conflictHelper.findConflictingRow(conflictTable, row, stmt.onConflict());
                 if (conflictRow != null) {
@@ -858,7 +1049,16 @@ class DmlExecutor {
                         // DO UPDATE: update the conflicting row
                         // Build RowContext with "excluded" binding so the standard expression
                         // evaluator resolves EXCLUDED.col references for all expression types
-                        Object[] evalConflict = hasVirtualColumns(conflictTable) ? computeVirtualColumns(conflictTable, conflictRow) : conflictRow;
+                        Object[] evalConflict = conflictRow;
+                        if (hasVirtualColumns(conflictTable)) {
+                            // A VIRTUAL generated column is not stored: PostgreSQL rewrites a
+                            // reference to one into its generation expression, so the expression is
+                            // evaluated where the reference stood and nowhere else. A conflict
+                            // clause that never names the column never evaluates it.
+                            evalConflict = computeVirtualColumns(conflictTable, conflictRow,
+                                    columnsNamed(conflictTable, stmt.alias(), stmt.onConflict().doUpdate(),
+                                            stmt.onConflict().doUpdateWhereClause(), stmt.returning()));
+                        }
                         List<RowContext.TableBinding> conflictBindings = new ArrayList<>();
                         conflictBindings.add(new RowContext.TableBinding(conflictTable, stmt.alias(), evalConflict));
                         conflictBindings.add(new RowContext.TableBinding(conflictTable, "excluded", row));
@@ -887,8 +1087,22 @@ class DmlExecutor {
                                 throw new MemgresException("Column not found: " + set.column());
                             }
                             conflictUpdCols.add(set.column().toLowerCase());
+                            Column setCol = conflictTable.getColumns().get(colIdx);
+                            // DO UPDATE is an UPDATE, and SET col = DEFAULT asks for the column's
+                            // own default there as it does anywhere else. A stored generated column
+                            // is left alone: its value is computed again from the row this leaves,
+                            // which is the only value DEFAULT can mean for it.
+                            if (isDefaultLiteral(set.value())) {
+                                if (setCol.isGenerated()) continue;
+                                newRow[colIdx] = setCol.getDefaultValue() == null ? null
+                                        : TypeCoercion.coerceForStorage(
+                                                executor.evaluateDefault(setCol.getDefaultValue(),
+                                                        setCol.getType(), setCol.getParsedDefaultExpr()),
+                                                setCol);
+                                continue;
+                            }
                             Object val = executor.evalExpr(set.value(), conflictCtx);
-                            newRow[colIdx] = TypeCoercion.coerceForStorage(val, conflictTable.getColumns().get(colIdx));
+                            newRow[colIdx] = TypeCoercion.coerceForStorage(val, setCol);
                         }
                         // The conflict path is an UPDATE, so it fires UPDATE row triggers.
                         newRow = triggerHelper.executeTriggers(triggers, PgTrigger.Timing.BEFORE,
@@ -896,6 +1110,7 @@ class DmlExecutor {
                         if (newRow == null) continue;   // BEFORE trigger suppressed the row
                         computeGeneratedColumns(conflictTable, newRow);
                         // Validate constraints BEFORE mutating the row to avoid index corruption
+                        partitionHelper.checkPartitionConstraint(conflictTable, newRow);
                         executor.constraintValidator.validateConstraints(conflictTable, newRow, conflictRow);
                         try {
                             conflictTable.updateRowInPlace(conflictRow, oldRow, newRow);
@@ -931,6 +1146,12 @@ class DmlExecutor {
                 String insertRlsSchema = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
                 if (!executor.shouldBypassRls(table, insertRlsSchema)) {
                     enforceRlsWithCheck(table, row, "INSERT");
+                    // RETURNING reads the new row back, so PostgreSQL requires it to pass the SELECT
+                    // policies too and refuses the statement when it does not. The check runs before
+                    // the write, so there is nothing to undo.
+                    if (stmt.returning() != null && !stmt.returning().isEmpty()) {
+                        enforceRlsWithCheck(table, row, "SELECT");
+                    }
                 }
             }
 
@@ -944,11 +1165,6 @@ class DmlExecutor {
             final Object[] undoRow = storedRow;
             statementUndo.record(() -> undoTable.removeRow(undoRow));
             recordInsertUndo(stmt.schema(), targetTable.getName(), storedRow);
-            // C10: If routed to a child partition, also sync parent's RR snapshot
-            if (targetTable != table && executor.session != null) {
-                String parentKey = (stmt.schema() != null ? stmt.schema() : executor.defaultSchema()) + "." + table.getName();
-                executor.session.syncParentSnapshotOnInsert(parentKey, row);
-            }
             recordRowMeta(stmt.schema(), targetTable, row);
             inserted++;
             insertedRows.add(Arrays.copyOf(row, row.length));
@@ -980,9 +1196,10 @@ class DmlExecutor {
             throw e;
         }
 
-        // Execute DO ALSO rule if present
-        if (alsoRuleSql != null) {
-            runInsertRuleActions(alsoRuleSql, stmt, table, ruleRelation);
+        // Every rule the event carries runs beside the statement, in rule-name order, for the rows
+        // its own WHERE holds for. The rows an INSTEAD rule claimed were kept out of the write above.
+        if (!insertRules.isEmpty()) {
+            runInsertRuleActions(insertRules, valueRows, valueRowContexts, stmt, table, ruleRelation);
         }
 
         // Track DML statistics
@@ -1022,101 +1239,119 @@ class DmlExecutor {
 
         // Handle COPY (subquery) TO form
         if (stmt.subquery() != null) {
+            // There is no relation to open here, so the options are the first thing PostgreSQL
+            // settles -- a bad option is reported even when the query reads a missing table.
+            raiseCopyOptionError(stmt);
             // Execute the subquery (validates table references, producing 42P01 for missing tables)
             QueryResult subResult = executor.executeStatement(stmt.subquery());
             return QueryResult.copyOut(subResult.getColumns(), subResult.getRows(), stmt);
         }
 
+        String copySchema = "public";
+        String copyTableName = stmt.table();
+        if (copyTableName.contains(".")) {
+            int dot = copyTableName.indexOf('.');
+            copySchema = copyTableName.substring(0, dot);
+            copyTableName = copyTableName.substring(dot + 1);
+        }
+        String copyKind = rejectCopyRelationKind(stmt, copySchema, copyTableName);
+
         if (!stmt.isFrom()) {
-            // Check if target is a view
-            Database.ViewDef viewDef = executor.database.getView(stmt.table());
-            if (viewDef != null) {
-                // Execute the view query to get filtered results
+            // A materialized view holds rows of its own and PostgreSQL reads them out. They are
+            // reached through a query because only a table has a row list to walk here.
+            if (RelationNamespace.MATVIEW.equals(copyKind)) {
                 String colList = (stmt.columns() != null && !stmt.columns().isEmpty())
                         ? String.join(", ", stmt.columns())
                         : "*";
-                String sql = "SELECT " + colList + " FROM " + stmt.table();
-                if (stmt.whereClause() != null && !stmt.whereClause().isEmpty()) {
-                    sql += " WHERE " + stmt.whereClause();
-                }
-                QueryResult viewResult = executor.execute(sql, Cols.listOf());
-                return QueryResult.copyOut(viewResult.getColumns(), viewResult.getRows(), stmt);
-            }
-            // COPY TO STDOUT: if WHERE clause present, use SELECT to filter
-            if (stmt.whereClause() != null && !stmt.whereClause().isEmpty()) {
-                String colList = (stmt.columns() != null && !stmt.columns().isEmpty())
-                        ? String.join(", ", stmt.columns())
-                        : "*";
-                String sql = "SELECT " + colList + " FROM " + stmt.table() + " WHERE " + stmt.whereClause();
-                QueryResult selectResult = executor.execute(sql, Cols.listOf());
-                return QueryResult.copyOut(selectResult.getColumns(), selectResult.getRows(), stmt);
-            }
-            String copySchema = "public";
-            String copyTableName = stmt.table();
-            if (copyTableName.contains(".")) {
-                int dot = copyTableName.indexOf('.');
-                copySchema = copyTableName.substring(0, dot);
-                copyTableName = copyTableName.substring(dot + 1);
+                QueryResult mvResult = executor.execute(
+                        "SELECT " + colList + " FROM " + stmt.table(), Cols.listOf());
+                raiseCopyOptionError(stmt);
+                return QueryResult.copyOut(mvResult.getColumns(), mvResult.getRows(), stmt);
             }
             // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
             Table table = executor.resolveTable(copySchema, copyTableName, stmt.table().contains("."));
-            List<Column> columns;
+            List<Column> columns = new ArrayList<>();
             List<Integer> colIndices = new ArrayList<>();
             if (stmt.columns() != null && !stmt.columns().isEmpty()) {
-                columns = new ArrayList<>();
                 for (String colName : stmt.columns()) {
                     int idx = table.getColumnIndex(colName);
                     if (idx < 0) throw new MemgresException(
                         "column \"" + colName + "\" of relation \"" + stmt.table() + "\" does not exist", "42703");
+                    rejectGeneratedCopyColumn(table.getColumns().get(idx));
                     colIndices.add(idx);
                     columns.add(table.getColumns().get(idx));
                 }
             } else {
-                columns = table.getColumns();
-                for (int i = 0; i < columns.size(); i++) colIndices.add(i);
+                // A generated column is left out of the data in both directions: its value is a
+                // function of the row, and COPY FROM refuses to read one back — so writing it out
+                // produced a dump this server could not restore.
+                for (int i = 0; i < table.getColumns().size(); i++) {
+                    Column col = table.getColumns().get(i);
+                    if (col.isGenerated()) continue;
+                    colIndices.add(i);
+                    columns.add(col);
+                }
             }
-            boolean copyHasVirtual = hasVirtualColumns(table);
+            // The relation and the columns the statement named are settled; now the options are.
+            raiseCopyOptionError(stmt);
+            checkCopyOptionColumns(table, stmt.forceQuote());
+            checkCopyOptionColumns(table, stmt.forceNotNull());
+            checkCopyOptionColumns(table, stmt.forceNull());
             List<Object[]> rows = new ArrayList<>();
             for (Object[] tableRow : table.getRows()) {
-                Object[] srcRow = copyHasVirtual ? computeVirtualColumns(table, tableRow) : tableRow;
                 Object[] row = new Object[colIndices.size()];
                 for (int i = 0; i < colIndices.size(); i++) {
-                    row[i] = srcRow[colIndices.get(i)];
+                    row[i] = tableRow[colIndices.get(i)];
                 }
                 rows.add(row);
             }
             return QueryResult.copyOut(columns, rows, stmt);
         }
 
-        // COPY FROM STDIN: validate table/columns, then return COPY_IN for PgWireHandler
-        String fromSchema = "public";
-        String fromTableName = stmt.table();
-        if (fromTableName.contains(".")) {
-            int dot = fromTableName.indexOf('.');
-            fromSchema = fromTableName.substring(0, dot);
-            fromTableName = fromTableName.substring(dot + 1);
+        // A relation COPY FROM cannot write to is refused only once the copy has been opened, so
+        // everything the statement can be judged on by itself is settled first and the refusal
+        // travels back with the result for the wire to raise after its CopyInResponse.
+        MemgresException intoRefusal = copyIntoRefusal(copyKind, copyTableName);
+        if (intoRefusal != null) {
+            raiseCopyOptionError(stmt);
+            parseCopyWhere(stmt);
+            return QueryResult.copyInRefused(stmt, intoRefusal);
         }
+
+        // COPY FROM STDIN: validate table/columns, then return COPY_IN for PgWireHandler
         // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
-        Table table = executor.resolveTable(fromSchema, fromTableName, stmt.table().contains("."));
+        Table table = executor.resolveTable(copySchema, copyTableName, stmt.table().contains("."));
         if (stmt.columns() != null && !stmt.columns().isEmpty()) {
             Set<String> seen = new java.util.HashSet<>();
             for (String colName : stmt.columns()) {
                 int idx = table.getColumnIndex(colName);
                 if (idx < 0) throw new MemgresException(
                     "column \"" + colName + "\" of relation \"" + stmt.table() + "\" does not exist", "42703");
+                // Refused now rather than when the first data row arrives: PostgreSQL never sends
+                // a CopyInResponse for a statement it has already decided against.
+                rejectGeneratedCopyColumn(table.getColumns().get(idx));
                 if (!seen.add(colName.toLowerCase())) {
                     throw new MemgresException(
                         "column \"" + colName + "\" specified more than once", "42701");
                 }
             }
         }
+        // The relation and the columns the statement named are settled; now the options are.
+        raiseCopyOptionError(stmt);
+        checkCopyOptionColumns(table, stmt.forceNotNull());
+        checkCopyOptionColumns(table, stmt.forceNull());
+        // COPY FREEZE writes rows visible to everyone at once, which is only safe while nobody
+        // else can have seen the relation, so PostgreSQL allows it only for a table this
+        // subtransaction created or truncated.
+        if (stmt.freeze() && !executor.database.wasCreatedBy(table, executor.session)) {
+            throw new MemgresException("cannot perform COPY FREEZE because the table was not "
+                    + "created or truncated in the current subtransaction", "55000");
+        }
+
+        parseCopyWhere(stmt);
 
         // If inline data is present (non-wire COPY FROM), handle it directly
         if (stmt.inlineData() != null) {
-            Expression inlineWhereExpr = null;
-            if (stmt.whereClause() != null && !stmt.whereClause().isEmpty()) {
-                inlineWhereExpr = com.memgres.engine.parser.Parser.parseExpression(stmt.whereClause());
-            }
             int inserted = 0;
             for (List<String> dataRow : stmt.inlineData()) {
                 Object[] row = new Object[table.getColumns().size()];
@@ -1131,15 +1366,19 @@ class DmlExecutor {
                     }
                 }
                 // Apply WHERE clause filtering (COPY FROM ... WHERE)
-                if (inlineWhereExpr != null) {
+                if (stmt.parsedWhere() != null) {
                     RowContext ctx = new RowContext(table, null, row);
-                    if (!executor.isTruthy(executor.evalExpr(inlineWhereExpr, ctx))) {
+                    if (!executor.isTruthy(executor.evalExpr(stmt.parsedWhere(), ctx))) {
                         continue; // Row does not match WHERE clause; skip it
                     }
                 }
-                validateAndInsertWaiting(table, row, table, row);
-                recordInsertUndo(null, stmt.table(), row);
-                recordRowMeta(null, table, row);
+                // A partitioned table stores nothing of its own: every row belongs to one of its
+                // leaves, and one that belongs to none is refused rather than left on the parent.
+                Table targetTable = partitionHelper.routeToPartition(table, row);
+                // An ATTACHed partition may order its columns differently from the parent.
+                Object[] storedRow = targetTable == table ? row : targetTable.rowFromParent(row);
+                validateAndInsertWaiting(table, row, targetTable, storedRow);
+                recordCopyInsert(stmt, table, targetTable, row, storedRow);
                 inserted++;
             }
             return QueryResult.command(QueryResult.Type.INSERT, inserted);
@@ -1165,15 +1404,6 @@ class DmlExecutor {
         fillDefaults(table, row);
         List<Integer> colIndices = resolveColumnIndices(stmt, table);
 
-        // Validate column count
-        if (values.size() > colIndices.size()) {
-            throw new MemgresException("extra data after last expected column", "22P04");
-        }
-        if (values.size() < colIndices.size()) {
-            throw new MemgresException("missing data for column \"" +
-                table.getColumns().get(colIndices.get(values.size())).getName() + "\"", "22P04");
-        }
-
         // A GENERATED ALWAYS identity refuses a written value from INSERT and UPDATE, but not
         // from COPY: PostgreSQL lets COPY write the column as given, which is what carries the
         // identity values across a dump and restore. Refusing it here meant pg_dump could write
@@ -1185,10 +1415,18 @@ class DmlExecutor {
         List<String> forceNull = stmt.forceNull();
         String effectiveNullStr = stmt.nullString() != null ? stmt.nullString() : "";
 
-        for (int i = 0; i < values.size() && i < colIndices.size(); i++) {
-            String val = values.get(i);
+        for (int i = 0; i < colIndices.size(); i++) {
             int colIdx = colIndices.get(i);
             Column col = table.getColumns().get(colIdx);
+            // PostgreSQL walks the target columns and reads each one's field as it goes, so a
+            // line runs out of fields only after the fields it does carry have been converted:
+            // an empty line on a two-column table fails in the first column's input function,
+            // not on the column that has no field at all.
+            if (i >= values.size()) {
+                throw new MemgresException(
+                        "missing data for column \"" + col.getName() + "\"", "22P04");
+            }
+            String val = values.get(i);
 
             // DEFAULT option: replace marker string with column default
             if (val != null && stmt.defaultString() != null && val.equals(stmt.defaultString())) {
@@ -1221,12 +1459,22 @@ class DmlExecutor {
             }
         }
 
+        // Checked where PostgreSQL checks it: once the target columns have all been read, so a
+        // line with too many fields is reported after the fields that belong have been converted.
+        if (values.size() > colIndices.size()) {
+            throw new MemgresException("extra data after last expected column", "22P04");
+        }
+
         // Compute generated columns
         computeGeneratedColumns(table, row);
 
         // Apply WHERE clause filtering (COPY FROM ... WHERE)
-        if (stmt.whereClause() != null && !stmt.whereClause().isEmpty()) {
-            Expression whereExpr = com.memgres.engine.parser.Parser.parseExpression(stmt.whereClause());
+        Expression whereExpr = stmt.parsedWhere();
+        if (whereExpr == null && stmt.whereClause() != null && !stmt.whereClause().isEmpty()) {
+            whereExpr = com.memgres.engine.parser.Parser.parseExpression(stmt.whereClause());
+            stmt.setParsedWhere(whereExpr);
+        }
+        if (whereExpr != null) {
             RowContext ctx = new RowContext(table, null, row);
             if (!executor.isTruthy(executor.evalExpr(whereExpr, ctx))) {
                 return null; // Row does not match WHERE clause; skip it
@@ -1234,43 +1482,63 @@ class DmlExecutor {
         }
 
         // Fire BEFORE INSERT triggers
-        List<PgTrigger> triggers = triggersDisabled() ? Cols.listOf() : executor.database.getTriggersForTable(stmt.table());
+        List<PgTrigger> triggers = enabledTriggers(executor.database.getTriggersForTable(stmt.table()));
         if (triggers != null && !triggers.isEmpty()) {
             Object[] modified = triggerHelper.executeTriggers(triggers, PgTrigger.Timing.BEFORE, PgTrigger.Event.INSERT, row, null, table);
             if (modified == null) return null; // BEFORE trigger returned null = skip row
             row = modified;
         }
 
-        validateAndInsertWaiting(table, row, table, row);
-        recordInsertUndo(null, stmt.table(), row);
-        recordRowMeta(null, table, row);
+        // A partitioned table stores nothing of its own: every row belongs to one of its leaves,
+        // and one that belongs to none is refused rather than left sitting on the parent, where
+        // nothing but a per-partition query would ever show it had gone astray.
+        Table targetTable = partitionHelper.routeToPartition(table, row);
+        // An ATTACHed partition may order its columns differently from the parent.
+        Object[] storedRow = targetTable == table ? row : targetTable.rowFromParent(row);
+        validateAndInsertWaiting(table, row, targetTable, storedRow);
+        recordCopyInsert(stmt, table, targetTable, row, storedRow);
 
         // Fire AFTER INSERT triggers
         if (triggers != null && !triggers.isEmpty()) {
-            triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.INSERT, row, null, table);
+            triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.INSERT, row, null, targetTable);
         }
 
-        return row;
+        // The rollback set matches rows by identity, so what is handed back has to be the array
+        // that was actually stored — for a routed row that is the leaf's copy, not the parent's.
+        return storedRow;
     }
 
     private void fillDefaults(Table table, Object[] row) {
         for (int i = 0; i < table.getColumns().size(); i++) {
-            Column col = table.getColumns().get(i);
-            if (col.getDefaultValue() != null && col.getDefaultValue().startsWith("__identity__")) {
-                row[i] = resolveIdentityNextVal(table, col);
-            } else if ((col.getType() == DataType.SERIAL || col.getType() == DataType.BIGSERIAL || col.getType() == DataType.SMALLSERIAL)
-                    && col.getDefaultValue() != null && col.getDefaultValue().contains("nextval(")) {
-                row[i] = resolveSerialNextVal(table, col);
-            } else if ((col.getType() == DataType.SERIAL || col.getType() == DataType.BIGSERIAL || col.getType() == DataType.SMALLSERIAL)
-                    && col.getDefaultValue() == null) {
-                // Default was removed (e.g. DROP SEQUENCE CASCADE) — no auto-value
-            } else if (col.getType() == DataType.SERIAL || col.getType() == DataType.BIGSERIAL || col.getType() == DataType.SMALLSERIAL) {
-                row[i] = table.nextSerial();
-            } else if (col.getDefaultValue() != null) {
-                Object defVal = executor.evaluateDefault(col.getDefaultValue(), col.getType(), col.getParsedDefaultExpr());
-                row[i] = TypeCoercion.coerceForStorage(defVal, col);
-            }
+            row[i] = defaultValueFor(table, table.getColumns().get(i));
         }
+    }
+
+    /**
+     * The value a column takes when the statement supplies none: its DEFAULT, worked out now.
+     *
+     * <p>A serial or an identity column draws from its sequence, and that is a value consumed.
+     * PostgreSQL evaluates a default expression once for every place the statement it rewrote
+     * holds one, so a rule reading NEW of an inserted row draws a value of its own rather than
+     * the one the row was given.
+     */
+    private Object defaultValueFor(Table table, Column col) {
+        boolean serial = col.getType() == DataType.SERIAL || col.getType() == DataType.BIGSERIAL
+                || col.getType() == DataType.SMALLSERIAL;
+        if (col.getDefaultValue() != null && col.getDefaultValue().startsWith("__identity__")) {
+            return resolveIdentityNextVal(table, col);
+        } else if (serial && col.getDefaultValue() != null && col.getDefaultValue().contains("nextval(")) {
+            return resolveSerialNextVal(table, col);
+        } else if (serial && col.getDefaultValue() == null) {
+            // Default was removed (e.g. DROP SEQUENCE CASCADE) — no auto-value
+            return null;
+        } else if (serial) {
+            return table.nextSerial();
+        } else if (col.getDefaultValue() != null) {
+            Object defVal = executor.evaluateDefault(col.getDefaultValue(), col.getType(), col.getParsedDefaultExpr());
+            return TypeCoercion.coerceForStorage(defVal, col);
+        }
+        return null;
     }
 
     /**
@@ -1326,7 +1594,8 @@ class DmlExecutor {
     private long drawFromSequence(Sequence seq) {
         long value = seq.nextVal();
         executor.lastSequenceValue = value;
-        executor.sessionSequenceValues.put(seq.qualifiedName().toLowerCase(), value);
+        executor.lastSequenceInstanceId = seq.getInstanceId();
+        executor.sessionSequenceValues.put(seq.getInstanceId(), value);
         return value;
     }
 
@@ -1349,10 +1618,7 @@ class DmlExecutor {
                 int idx = table.getColumnIndex(colName);
                 Column col = table.getColumns().get(idx);
                 // Reject explicit generated columns in COPY FROM column list
-                if (stmt.isFrom() && col.isGenerated()) {
-                    throw new MemgresException("column \"" + colName + "\" is a generated column\n" +
-                        "  Detail: Generated columns cannot be used in COPY.", "42601");
-                }
+                if (stmt.isFrom()) rejectGeneratedCopyColumn(col);
                 colIndices.add(idx);
             }
         } else {
@@ -1366,6 +1632,156 @@ class DmlExecutor {
         return colIndices;
     }
 
+    /**
+     * A generated column may not be named in a COPY column list, in either direction: its value is
+     * computed from the row rather than carried in the data. PostgreSQL refuses the statement, not
+     * the row, so for COPY FROM this has to fire before the CopyInResponse goes out.
+     */
+    private static void rejectGeneratedCopyColumn(Column col) {
+        if (!col.isGenerated()) return;
+        MemgresException e = new MemgresException(
+                "column \"" + col.getName() + "\" is a generated column", "42P10");
+        e.setDetail("Generated columns cannot be used in COPY.");
+        throw e;
+    }
+
+    /**
+     * Read the COPY FROM WHERE clause, and refuse what may not stand in one.
+     *
+     * <p>The WHERE picks rows one at a time as they arrive: there is no group behind a row to
+     * aggregate, no result to number a window call against, and no query for a nested one to run
+     * in. Read as a general expression, all three parsed and evaluated like anything else.
+     */
+    private void parseCopyWhere(CopyStmt stmt) {
+        if (stmt.whereClause() == null || stmt.whereClause().isEmpty()) return;
+        Expression copyWhere = com.memgres.engine.parser.Parser.parseExpression(stmt.whereClause());
+        executor.selectExecutor.placementCheck.rejectSubquery(copyWhere, "COPY FROM WHERE condition");
+        executor.selectExecutor.placementCheck.reject(copyWhere, "COPY FROM WHERE conditions");
+        stmt.setParsedWhere(copyWhere);
+    }
+
+    /**
+     * Raise what the WITH list earned, if anything. PostgreSQL reads a COPY option list against
+     * its option set only once it has the relation open and the named columns resolved, so the
+     * relation that is not there and the column that is not a column are both reported ahead of
+     * an option nobody recognises.
+     */
+    private static void raiseCopyOptionError(CopyStmt stmt) {
+        RuntimeException e = stmt.optionError();
+        if (e != null) throw e;
+    }
+
+    /** A column a FORCE_QUOTE, FORCE_NOT_NULL or FORCE_NULL option names has to be one. */
+    private static void checkCopyOptionColumns(Table table, List<String> names) {
+        if (names == null) return;
+        for (String name : names) {
+            if ("*".equals(name)) continue;
+            if (table.getColumnIndex(name) < 0) {
+                throw new MemgresException("column \"" + name + "\" of relation \""
+                        + table.getName() + "\" does not exist", "42703");
+            }
+        }
+    }
+
+    /**
+     * What PostgreSQL will not copy out of, and the kind it names when it refuses.
+     *
+     * <p>COPY reads and writes a heap. The kinds that hold no rows of their own are refused by
+     * name rather than quietly answering with nothing: a partitioned table's rows all live in its
+     * leaves, so reading one streamed an empty result. A view is read through the COPY (SELECT
+     * ...) form. A materialized view holds rows of its own and is read like a table.
+     *
+     * @return the kind the name reached, or null when it reaches nothing
+     */
+    private String rejectCopyRelationKind(CopyStmt stmt, String schema, String bareName) {
+        String holding = copySchemaHolding(stmt, schema, bareName);
+        String kind = RelationNamespace.kindOf(executor.database, holding, bareName);
+        if (kind == null || stmt.isFrom()) return kind;
+        if (RelationNamespace.VIEW.equals(kind)) {
+            throw copyKindRefusal("cannot copy from view \"" + bareName + "\"",
+                    "Try the COPY (SELECT ...) TO variant.");
+        }
+        if (RelationNamespace.SEQUENCE.equals(kind)) {
+            throw copyKindRefusal("cannot copy from sequence \"" + bareName + "\"", null);
+        }
+        if (RelationNamespace.INDEX.equals(kind)) {
+            throw copyKindRefusal("cannot copy from index \"" + bareName + "\"", null);
+        }
+        if (RelationNamespace.TABLE.equals(kind) && isPartitionedParent(holding, bareName)) {
+            throw copyKindRefusal("cannot copy from partitioned table \"" + bareName + "\"",
+                    "Try the COPY (SELECT ...) TO variant.");
+        }
+        return kind;
+    }
+
+    /**
+     * What PostgreSQL will not copy into, or null when the relation can take rows.
+     *
+     * <p>This one is not raised where the others are. PostgreSQL settles the option list, the
+     * column list and the WHERE from the statement, opens the copy stream, and only then reaches
+     * the code that stores rows — which is where it finds it has been asked to store them in
+     * something that is not a table. So the CopyInResponse has already gone out when the refusal
+     * arrives, and a client is left one message further along than the statement's failure alone
+     * would leave it. A view is written only through an INSTEAD OF INSERT trigger, which is what
+     * the hint tells the reader to provide, so a view carrying one is copied into.
+     */
+    private MemgresException copyIntoRefusal(String kind, String bareName) {
+        if (RelationNamespace.VIEW.equals(kind)) {
+            if ((ViewUpdatability.insteadOfEvents(executor.database, bareName)
+                    & ViewUpdatability.INSERT) != 0) {
+                return null;
+            }
+            return copyKindRefusal("cannot copy to view \"" + bareName + "\"",
+                    "To enable copying to a view, provide an INSTEAD OF INSERT trigger.");
+        }
+        if (RelationNamespace.MATVIEW.equals(kind)) {
+            return copyKindRefusal("cannot copy to materialized view \"" + bareName + "\"", null);
+        }
+        if (RelationNamespace.SEQUENCE.equals(kind)) {
+            return copyKindRefusal("cannot copy to sequence \"" + bareName + "\"", null);
+        }
+        if (RelationNamespace.INDEX.equals(kind)) {
+            return copyKindRefusal("cannot copy to index \"" + bareName + "\"", null);
+        }
+        return null;
+    }
+
+    /** The schema the COPY's relation name reaches: the written one, or the one the path finds. */
+    private String copySchemaHolding(CopyStmt stmt, String schema, String bareName) {
+        if (stmt.table().contains(".")) return schema;
+        String holding = RelationNamespace.schemaHolding(executor.database,
+                executor.relationSearchPath(), bareName);
+        return holding == null ? schema : holding;
+    }
+
+    private static MemgresException copyKindRefusal(String message, String hint) {
+        MemgresException e = new MemgresException(message, "42809");
+        if (hint != null) e.setHint(hint);
+        return e;
+    }
+
+    private boolean isPartitionedParent(String schema, String bareName) {
+        Schema s = executor.database.getSchema(schema == null ? "public" : schema.toLowerCase());
+        Table t = s != null ? s.getTable(bareName) : null;
+        return t != null && t.getPartitionStrategy() != null;
+    }
+
+    /**
+     * Record the undo and the row metadata for a row a COPY stored. A row that routed to a
+     * partition was stored in the leaf, so that is the relation it has to be taken out of again
+     * if the COPY fails, and the parent's own snapshot has to be told the row is there.
+     */
+    private void recordCopyInsert(CopyStmt stmt, Table table, Table targetTable,
+                                  Object[] row, Object[] storedRow) {
+        if (targetTable == table) {
+            recordInsertUndo(null, stmt.table(), storedRow);
+            recordRowMeta(null, table, row);
+            return;
+        }
+        recordInsertUndo(targetTable.getSchemaName(), targetTable.getName(), storedRow);
+        recordRowMeta(targetTable.getSchemaName(), targetTable, row);
+    }
+
     // ---- UPDATE ----
 
     QueryResult executeUpdate(UpdateStmt stmt) {
@@ -1376,10 +1792,13 @@ class DmlExecutor {
         // Check read-only transaction
         checkReadOnly("UPDATE");
         rejectMaterializedViewWrite(stmt.table());
-        // A rule rewrites the statement before anything else looks at the table, so an
-        // INSTEAD NOTHING rule means no update happens and none of the checks below apply.
+        // A rule rewrites the statement before anything else looks at the table, so an unqualified
+        // INSTEAD NOTHING rule means no update happens and none of the checks below apply. A rule
+        // with a WHERE takes only the rows it holds for out of the statement.
+        List<Expression> insteadSuppress = new ArrayList<>();
         QueryResult ruled = applyInsteadRule(stmt.table(), "UPDATE", QueryResult.Type.UPDATE,
-                stmt.where(), stmt.setClauses());
+                stmt.where(), stmt.setClauses(), stmt.alias(), stmt.from(), stmt.returning(),
+                insteadSuppress);
         if (ruled != null) return ruled;
         // A DO ALSO rule is added to the statement, so its actions run against the rows as they
         // are now and the statement then goes on to do its own work.
@@ -1398,10 +1817,11 @@ class DmlExecutor {
         // result to number a window against, in either the assignments or the WHERE.
         checkUpdatePlacement(stmt, table);
         // Capture view column mapping before further resolveTable calls clobber it (renamed-column views).
-        this.activeViewColMap = executor.lastViewColumnMapping;
-        this.activeViewColOrder = executor.lastViewColumnOrder;
+        captureViewTarget();
+        // The view's own WHERE goes with them: it is part of what this statement may reach.
+        List<AstExecutor.ViewQual> viewQuals = executor.lastViewQuals;
         // A view column computed from an expression has nothing to assign back to.
-        Set<String> viewExprCols = executor.lastViewExpressionColumns;
+        Set<String> viewExprCols = activeViewExprCols;
         if (viewExprCols != null) {
             for (InsertStmt.SetClause set : stmt.setClauses()) {
                 if (viewExprCols.contains(set.column().toLowerCase())) {
@@ -1430,7 +1850,7 @@ class DmlExecutor {
                     + "\n  Hint: SET target columns cannot be qualified with the relation name.",
                     "42703");
         }
-        requireTargetColumns(table, stmt.table(), setTargets);
+        requireTargetColumns(table, stmt.table(), setTargets, true);
         // The rest of the statement is resolved against the same relation, so a name in the
         // WHERE or on the right of an assignment is refused before the scan rather than by
         // whichever row happened to reach the evaluator first.
@@ -1453,7 +1873,7 @@ class DmlExecutor {
         checkReplicaIdentity(table, stmt.table(), "update");
         // Validate RETURNING columns exist before processing rows
         validateReturning(stmt.returning(), table);
-        List<PgTrigger> triggers = triggersDisabled() ? Cols.listOf() : executor.database.getTriggersForTable(stmt.table());
+        List<PgTrigger> triggers = enabledTriggers(rowTriggersFor(table, stmt.table()));
         // INSTEAD OF UPDATE triggers on a view: the trigger performs the actual work; the virtual
         // view table's rows are only used to evaluate WHERE and populate OLD/NEW for the trigger.
         boolean hasInsteadOfUpdate = triggers.stream().anyMatch(
@@ -1512,16 +1932,44 @@ class DmlExecutor {
             updatedColumnNames.add(set.column().toLowerCase());
         }
 
-        // Collect rows from all partitions for partitioned tables
-        List<Object[]> rows = new ArrayList<>();
-        if (table.getPartitionStrategy() != null && !table.getPartitions().isEmpty()) {
-            List<Table> allTables = new ArrayList<>();
-            DmlPartitionHelper.collectAllPartitionTables(table, allTables);
-            for (Table t : allTables) {
-                rows.addAll(t.getRows());
-            }
+        // Every relation that stores rows for this one: its partitions and its inheritance
+        // children. ONLY keeps the statement to the named relation's own storage, which for a
+        // partitioned table is nothing at all. Each row is remembered against the relation that
+        // holds it, because that is the one whose indexes have to follow the change.
+        List<Table> updateTargets = new ArrayList<>();
+        if (stmt.only()) {
+            updateTargets.add(table);
         } else {
-            rows.addAll(table.getRows());
+            DmlPartitionHelper.collectRelationAndDescendants(table, updateTargets);
+        }
+        Map<Object[], Table> updateRowOwner = new IdentityHashMap<>();
+        List<Object[]> rows = new ArrayList<>();
+        for (Table t : updateTargets) {
+            for (Object[] r : t.getRows()) {
+                rows.add(r);
+                updateRowOwner.put(r, t);
+            }
+        }
+        // What the statement may reach before its own WHERE has said a word. An UPDATE through an
+        // auto-updatable view reaches only the rows the view shows, because PostgreSQL rewrites it
+        // onto the base relation with the view's qualification added. A transaction reading from a
+        // snapshot reaches only rows that existed when it was taken -- a row another session has
+        // inserted since is one it is not shown, and PostgreSQL passes over it rather than
+        // reporting a conflict about it -- while a row it was shown that another transaction has
+        // deleted and committed ends it, there being no version of that row left to write. The
+        // snapshot pairs rows with the relation they were read from, so a relation whose rows live
+        // in partitions or children is left to the check that follows.
+        rows = executor.filterByViewQuals(viewQuals, table, rows);
+        if (executor.session != null && updateTargets.size() == 1) {
+            String snapshotKey = schemaName + "." + stmt.table();
+            executor.session.checkRRConcurrentDelete(snapshotKey, table, image ->
+                    stmt.where() == null || executor.isTruthy(
+                            executor.evalExpr(stmt.where(), viewAwareCtx(table, stmt.alias(), image))));
+            List<Object[]> visible = new ArrayList<>(rows.size());
+            for (Object[] r : rows) {
+                if (executor.session.isVisibleInRRSnapshot(snapshotKey, r)) visible.add(r);
+            }
+            rows = visible;
         }
 
         // Fire BEFORE STATEMENT triggers
@@ -1542,6 +1990,13 @@ class DmlExecutor {
                 : snapshotTargetTables(collectTargetTables(table));
         try {
         boolean fromUpdateHasVirtual = hasVirtualColumns(table);
+        // A VIRTUAL generated column is not stored: PostgreSQL rewrites a reference to one into its
+        // generation expression, so what the statement names is what is evaluated and an UPDATE
+        // that never names the column never evaluates it. One context serves both the qualification
+        // and the assignments here, so it carries everything the statement names.
+        Set<String> fromUpdateReads = fromUpdateHasVirtual
+                ? columnsNamed(table, stmt.alias(), stmt.setClauses(), stmt.where(), stmt.returning())
+                : null;
         if (fromContexts != null) {
             // Multi-table UPDATE: join main table with FROM tables
             List<Object[]> matchedRows = new ArrayList<>();
@@ -1549,7 +2004,8 @@ class DmlExecutor {
             List<RowContext> matchedFromContexts = new ArrayList<>();
             for (Object[] row : rows) {
                 for (RowContext fromCtx : fromContexts) {
-                    Object[] evalRow = fromUpdateHasVirtual ? computeVirtualColumns(table, row) : row;
+                    Object[] evalRow = fromUpdateHasVirtual
+                            ? computeVirtualColumns(table, row, fromUpdateReads) : row;
                     RowContext mainCtx = viewAwareCtx(table, stmt.alias(), evalRow);
                     RowContext combined = mainCtx.merge(fromCtx);
                     if (stmt.where() == null || executor.isTruthy(executor.evalExpr(stmt.where(), combined))) {
@@ -1569,15 +2025,24 @@ class DmlExecutor {
             for (int i = 0; i < matchedRows.size(); i++) {
                 Object[] row = matchedRows.get(i);
                 if (updated.contains(row)) continue; // Each row updated at most once
+                // A qualified INSTEAD rule has already spoken for the rows its WHERE holds for.
+                if (!insteadSuppress.isEmpty()) {
+                    Object[] proposed = Arrays.copyOf(row, row.length);
+                    applySetClauses(stmt.setClauses(), table, proposed, matchedContexts.get(i));
+                    if (ruleSuppressesRow(insteadSuppress, table, row, proposed)) continue;
+                }
                 updated.add(row);
                 Object[] oldRow = Arrays.copyOf(row, row.length);
                 Object[] newRow = triggerHelper.executeTriggers(triggers, PgTrigger.Timing.BEFORE, PgTrigger.Event.UPDATE, row, oldRow, table, updatedColumnNames);
                 if (newRow == null) {
                     continue;
                 }
-                // RLS USING filter: skip rows not visible under UPDATE policy
+                // RLS USING filter: skip rows not visible under the UPDATE policies, and under the
+                // SELECT policies as well when the statement reads a column of the target
                 if (rlsUpdateActive) {
-                    List<Object[]> rlsCheck = filterRowsByRlsUsing(table, Collections.singletonList(row), "UPDATE", stmt.alias());
+                    List<Object[]> rlsCheck = filterRowsForWrite(table,
+                            Collections.singletonList(row), "UPDATE", stmt.alias(),
+                            readsTargetRelation(stmt.where(), stmt.returning(), stmt.setClauses()));
                     if (rlsCheck.isEmpty()) continue;
                 }
                 RowContext ctx = matchedContexts.get(i);
@@ -1585,12 +2050,22 @@ class DmlExecutor {
                 // RLS WITH CHECK on the new row
                 if (rlsUpdateActive) {
                     enforceRlsWithCheck(table, newRow, "UPDATE");
+                    // RETURNING reads the updated row back, so it has to pass the SELECT policies
+                    // too; PostgreSQL refuses the whole statement when it does not.
+                    if (stmt.returning() != null && !stmt.returning().isEmpty()) {
+                        enforceRlsWithCheck(table, newRow, "SELECT");
+                    }
                 }
                 computeGeneratedColumns(table, newRow);
                 executor.constraintValidator.validateConstraints(table, newRow, row);
                 validationHelper.validateDomainChecks(newRow, table);
+                // A statement that names a partition may not move a row out of that partition's
+                // bound: the row was never offered to the partitioned table, so PostgreSQL
+                // refuses the update rather than re-routing it.
+                partitionHelper.checkPartitionConstraint(table, newRow);
                 recordUpdateUndo(stmt.schema(), stmt.table(), row, oldRow);
-                table.updateRowInPlace(row, oldRow, newRow);
+                Table fromOwner = updateRowOwner.get(row);
+                (fromOwner != null ? fromOwner : table).updateRowInPlace(row, oldRow, newRow);
                 recordRowUpdateMeta(stmt.schema(), table, row);
                 updatedCount++;
                 executor.constraintValidator.handleFkOnUpdate(table, oldRow, row);
@@ -1621,21 +2096,49 @@ class DmlExecutor {
         // Simple UPDATE (no FROM clause)
         String updateAlias = stmt.alias();
         boolean updateHasVirtual = hasVirtualColumns(table);
+        // A VIRTUAL generated column is not stored: PostgreSQL rewrites a reference to one into its
+        // generation expression, which then stands where the reference stood. The qualification is
+        // read for every row scanned, so what it names is worked out there; the assignments and
+        // RETURNING are read for the rows it kept, and so is what they name. Working every one out
+        // for every row scanned lost the write outright: an expression that raises for a row the
+        // statement passes over -- 10/a where a is zero -- ended a statement PostgreSQL completes.
+        Set<String> updateFilters = updateHasVirtual
+                ? columnsNamed(table, updateAlias, stmt.where()) : null;
+        Set<String> updateReads = updateHasVirtual
+                ? columnsNamed(table, updateAlias, stmt.setClauses(), stmt.where(), stmt.returning())
+                : null;
         if (stmt.where() instanceof com.memgres.engine.parser.ast.CurrentOfExpr) {
             com.memgres.engine.parser.ast.CurrentOfExpr cof = (com.memgres.engine.parser.ast.CurrentOfExpr) stmt.where();
             rows = filterByCurrentOf(cof, table, rows);
         } else if (stmt.where() != null) {
             final List<Object[]> scanned = rows;
-            final Table updateTable = table;
             rows = matchAgainstCommittedRows(table, scanned, row -> {
-                Object[] evalRow = updateHasVirtual ? computeVirtualColumns(table, row) : row;
+                Object[] evalRow = updateHasVirtual
+                        ? computeVirtualColumns(table, row, updateFilters) : row;
                 return executor.isTruthy(executor.evalExpr(stmt.where(), viewAwareCtx(table, updateAlias, evalRow)));
-            }, () -> rescanTable(updateTable));
+            }, () -> executor.filterByViewQuals(viewQuals, table,
+                    rescanTargets(updateTargets, updateRowOwner)));
         }
 
-        // RLS USING filter for UPDATE: restrict which rows can be updated
+        // A qualified INSTEAD rule has already spoken for the rows its WHERE holds for.
+        if (!insteadSuppress.isEmpty()) {
+            List<Object[]> keptRows = new ArrayList<>();
+            for (Object[] row : rows) {
+                Object[] proposed = Arrays.copyOf(row, row.length);
+                Object[] setEvalRow = updateHasVirtual
+                        ? computeVirtualColumns(table, row, updateReads) : row;
+                applySetClauses(stmt.setClauses(), table, proposed,
+                        viewAwareCtx(table, updateAlias, setEvalRow));
+                if (!ruleSuppressesRow(insteadSuppress, table, row, proposed)) keptRows.add(row);
+            }
+            rows = keptRows;
+        }
+
+        // RLS USING filter for UPDATE: restrict which rows can be updated, by the UPDATE policies
+        // and by the SELECT policies as well when the statement reads a column of the target
         if (rlsUpdateActive) {
-            rows = filterRowsByRlsUsing(table, rows, "UPDATE", updateAlias);
+            rows = filterRowsForWrite(table, rows, "UPDATE", updateAlias,
+                    readsTargetRelation(stmt.where(), stmt.returning(), stmt.setClauses()));
         }
 
         // PG's UPDATE takes a FOR UPDATE lock on every row it touches; a concurrent
@@ -1654,7 +2157,7 @@ class DmlExecutor {
             Object[] newRow = Arrays.copyOf(row, row.length);
 
             // Apply SET clauses first, then fire BEFORE UPDATE triggers so they see NEW with proposed values
-            Object[] evalRow = updateHasVirtual ? computeVirtualColumns(table, row) : row;
+            Object[] evalRow = updateHasVirtual ? computeVirtualColumns(table, row, updateReads) : row;
             applySetClauses(stmt.setClauses(), table, newRow, viewAwareCtx(table, updateAlias, evalRow));
 
             // INSTEAD OF UPDATE trigger on a view: the trigger does the real work (against base
@@ -1673,6 +2176,11 @@ class DmlExecutor {
             // RLS WITH CHECK on the new row after SET clauses
             if (rlsUpdateActive) {
                 enforceRlsWithCheck(table, newRow, "UPDATE");
+                // RETURNING reads the updated row back, so it has to pass the SELECT policies too;
+                // PostgreSQL refuses the whole statement when it does not.
+                if (stmt.returning() != null && !stmt.returning().isEmpty()) {
+                    enforceRlsWithCheck(table, newRow, "SELECT");
+                }
             }
 
             // BEFORE UPDATE triggers (see NEW with SET-applied values, can further modify NEW)
@@ -1685,23 +2193,25 @@ class DmlExecutor {
             validationHelper.enforceViewCheckOption(viewCheckExprs, table, newRow);
             executor.constraintValidator.validateConstraints(table, newRow, row);
             validationHelper.validateDomainChecks(newRow, table);
+            // A statement that names a partition may not move a row out of that partition's
+            // bound: the row was never offered to the partitioned table, so PostgreSQL refuses
+            // the update rather than re-routing it.
+            partitionHelper.checkPartitionConstraint(table, newRow);
             recordUpdateUndo(stmt.schema(), stmt.table(), row, oldRow);
 
             // Check if partition key changed and row needs to move between partitions
             if (table.getPartitionStrategy() != null && !table.getPartitions().isEmpty()) {
                 Table newTarget = partitionHelper.routeToPartition(table, newRow);
-                Table currentPartition = null;
-                List<Table> allParts = new ArrayList<>();
-                DmlPartitionHelper.collectAllPartitionTables(table, allParts);
-                for (Table pt : allParts) {
-                    if (pt.getRows().contains(row)) {
-                        currentPartition = pt;
-                        break;
-                    }
-                }
+                Table currentPartition = updateRowOwner.get(row);
                 if (currentPartition != null && currentPartition != newTarget) {
+                    // The destination is a relation with rules of its own: its constraints and
+                    // its bound decide whether it may hold this row, and PostgreSQL names it in
+                    // the error. Both are settled before the row leaves its old home, or a
+                    // refused update would delete the row and never store it anywhere.
+                    Object[] movedRow = newTarget.rowFromParent(Arrays.copyOf(newRow, newRow.length));
+                    partitionHelper.checkPartitionConstraint(newTarget, movedRow);
+                    executor.constraintValidator.validateConstraints(newTarget, movedRow, null);
                     currentPartition.deleteRow(row);
-                    Object[] movedRow = Arrays.copyOf(newRow, newRow.length);
                     newTarget.insertRow(movedRow);
                 } else if (currentPartition != null) {
                     currentPartition.updateRowInPlace(row, oldRow, newRow);
@@ -1711,7 +2221,10 @@ class DmlExecutor {
                     recordRowUpdateMeta(stmt.schema(), table, row);
                 }
             } else {
-                table.updateRowInPlace(row, oldRow, newRow);
+                // A row read through an inheritance parent is stored in the child, and that is
+                // the relation whose indexes have to follow the change.
+                Table owner = updateRowOwner.get(row);
+                (owner != null ? owner : table).updateRowInPlace(row, oldRow, newRow);
                 recordRowUpdateMeta(stmt.schema(), table, row);
             }
             updatedCount++;
@@ -1791,63 +2304,71 @@ class DmlExecutor {
         }
     }
 
-    /** Evaluate one policy's WITH CHECK expression (falling back to USING) against a new row. */
+    /**
+     * Evaluate one policy's WITH CHECK expression (falling back to USING) against a new row. An
+     * error raised inside a policy is the statement's error, as it is in PostgreSQL, and not a
+     * verdict on whether the row may be written: reporting a division by zero as "you are not
+     * allowed" tells the writer nothing about what went wrong.
+     */
     private boolean rlsCheckPasses(RlsPolicy policy, RowContext ctx) {
         Expression checkExpr = policy.getWithCheckExpr();
         if (checkExpr == null) checkExpr = policy.getUsingExpr();
         if (checkExpr == null) return true;
-        try {
-            return Boolean.TRUE.equals(executor.evalExpr(checkExpr, ctx));
-        } catch (Exception e) {
-            return false;
-        }
+        return Boolean.TRUE.equals(executor.evalExpr(checkExpr, ctx));
     }
 
     /**
-     * Filter rows by RLS USING policies for UPDATE/DELETE.
-     * Returns only the rows that pass applicable USING policies.
+     * Filter rows by the RLS USING policies for a command, through the same gate the SELECT side
+     * uses so that a query and a write answer the same way about the same row.
      */
     private List<Object[]> filterRowsByRlsUsing(Table table, List<Object[]> rows, String command, String alias) {
-        String effectiveRole = executor.currentRole();
-        List<RlsPolicy> permissivePolicies = new ArrayList<>();
-        List<RlsPolicy> restrictivePolicies = new ArrayList<>();
-        for (RlsPolicy p : table.getRlsPolicies()) {
-            if (p.appliesTo(command) && p.getUsingExpr() != null && p.appliesToRole(effectiveRole)) {
-                if (p.isRestrictive()) {
-                    restrictivePolicies.add(p);
-                } else {
-                    permissivePolicies.add(p);
-                }
-            }
-        }
-        // Default-deny: no applicable policies → 0 rows
-        if (permissivePolicies.isEmpty() && restrictivePolicies.isEmpty()) {
-            return new ArrayList<>();
-        }
-        List<Object[]> filtered = new ArrayList<>();
+        List<RowContext> contexts = new ArrayList<>();
+        Map<RowContext, Object[]> source = new IdentityHashMap<>();
         for (Object[] row : rows) {
             RowContext ctx = new RowContext(table, alias, row);
-            boolean passesPermissive = permissivePolicies.isEmpty() ? false : false;
-            if (!permissivePolicies.isEmpty()) {
-                for (RlsPolicy policy : permissivePolicies) {
-                    try {
-                        Object result = executor.evalExpr(policy.getUsingExpr(), ctx);
-                        if (Boolean.TRUE.equals(result)) { passesPermissive = true; break; }
-                    } catch (Exception e) { /* row doesn't pass */ }
-                }
-            }
-            boolean passesRestrictive = true;
-            for (RlsPolicy policy : restrictivePolicies) {
-                try {
-                    Object result = executor.evalExpr(policy.getUsingExpr(), ctx);
-                    if (!Boolean.TRUE.equals(result)) { passesRestrictive = false; break; }
-                } catch (Exception e) { passesRestrictive = false; break; }
-            }
-            if (passesPermissive && passesRestrictive) {
-                filtered.add(row);
-            }
+            contexts.add(ctx);
+            source.put(ctx, row);
+        }
+        List<Object[]> filtered = new ArrayList<>();
+        for (RowContext ctx : executor.fromResolver.filterByRlsUsing(contexts, table, command)) {
+            filtered.add(source.get(ctx));
         }
         return filtered;
+    }
+
+    /**
+     * The rows an UPDATE or DELETE may act on: the command's own USING policies decide, and the
+     * SELECT policies decide as well whenever the statement reads a column of the relation it
+     * writes. Measured against a table with an UPDATE policy but no SELECT policy, {@code SET n=99}
+     * touches every row, while {@code WHERE id=1}, {@code SET n=n+1}, {@code DELETE ... WHERE id=4}
+     * and any RETURNING see none — a row the user cannot read is a row the statement does not find.
+     */
+    private List<Object[]> filterRowsForWrite(Table table, List<Object[]> rows, String command,
+                                              String alias, boolean readsTarget) {
+        List<Object[]> allowed = filterRowsByRlsUsing(table, rows, command, alias);
+        if (!readsTarget || allowed.isEmpty()) return allowed;
+        return filterRowsByRlsUsing(table, allowed, "SELECT", alias);
+    }
+
+    /**
+     * Whether the statement reads a column of the relation it writes: any column named in its WHERE
+     * or on the right of an assignment, and any RETURNING list at all, which projects the row back.
+     * A bare {@code WHERE true} names nothing, which is why having a WHERE is not the test.
+     */
+    private static boolean readsTargetRelation(Expression where, List<?> returning,
+                                               List<InsertStmt.SetClause> setClauses) {
+        if (returning != null && !returning.isEmpty()) return true;
+        if (AstWalk.anyMatch(where, node -> node instanceof ColumnRef)) return true;
+        return AstWalk.anyMatch(setValueExprs(setClauses), node -> node instanceof ColumnRef);
+    }
+
+    /** The expressions on the right of a statement's assignments. */
+    private static List<Expression> setValueExprs(List<InsertStmt.SetClause> setClauses) {
+        List<Expression> values = new ArrayList<>();
+        if (setClauses != null) {
+            for (InsertStmt.SetClause set : setClauses) values.add(set.value());
+        }
+        return values;
     }
 
     /**
@@ -1877,15 +2398,19 @@ class DmlExecutor {
         return matchAgainstCommittedRows(table, rows, matches, null);
     }
 
-    /** Read a table's rows again, following its partitions, after a wait has ended. */
-    private List<Object[]> rescanTable(Table table) {
+    /**
+     * Read the statement's target relations again after a wait has ended: the relation may hold
+     * rows that were not there when the scan began, so the map from row to the relation that
+     * stores it is rebuilt from the same list.
+     */
+    private List<Object[]> rescanTargets(List<Table> targets, Map<Object[], Table> owners) {
         List<Object[]> fresh = new ArrayList<>();
-        if (table.getPartitionStrategy() != null && !table.getPartitions().isEmpty()) {
-            List<Table> allTables = new ArrayList<>();
-            DmlPartitionHelper.collectAllPartitionTables(table, allTables);
-            for (Table t : allTables) fresh.addAll(t.getRows());
-        } else {
-            fresh.addAll(table.getRows());
+        owners.clear();
+        for (Table t : targets) {
+            for (Object[] r : t.getRows()) {
+                fresh.add(r);
+                owners.put(r, t);
+            }
         }
         return fresh;
     }
@@ -1908,6 +2433,10 @@ class DmlExecutor {
         }
         final String key = executor.constraintValidator.uncommittedKey(table);
         List<Object[]> scan = rows;
+        // The relation as this statement found it, taken before the first wait and read from
+        // once one has ended. See the second reading of the qualification below.
+        List<Object[]> asOfStatement = null;
+        boolean waited = false;
         while (true) {
             // The wait below can end without the row having moved. Polling the cancel token here
             // means a statement_timeout or a client cancel still ends this loop if it does.
@@ -1936,29 +2465,46 @@ class DmlExecutor {
             List<Object[]> result = new ArrayList<>();
             Session blocker = null;
             Set<Object[]> seen = Collections.newSetFromMap(new IdentityHashMap<Object[], Boolean>());
-            for (Object[] row : scan) {
-                seen.add(row);
-                if (notCommitted.contains(row)) continue;
-                Object[] committed = otherOld.containsKey(row) ? otherOld.get(row) : row;
-                if (committed == null || !matches.test(committed)) continue;
-                Session own = owner.get(row);
-                if (own != null) { blocker = own; break; }
-                result.add(row);
-            }
-            // A row another transaction has deleted without committing is gone from the scan but
-            // is still committed-live: this statement has to wait for the outcome before it can
-            // say whether it deleted it.
-            if (blocker == null) {
-                for (Object[] row : hiddenByOther) {
-                    if (seen.contains(row)) continue;
-                    if (matches.test(row)) { blocker = owner.get(row); break; }
+            // A qualification read again after a wait is judged one part on the version the other
+            // transaction left behind and one part on the relation as this statement found it:
+            // PostgreSQL substitutes the new version of the row being judged and runs the rest of
+            // the qualification under the snapshot the statement started with. A subquery over the
+            // target relation that read the write it waited for would answer from data this
+            // statement is not entitled to see, and a row it had already chosen would quietly stop
+            // matching -- the statement then touches nothing and reports that it did.
+            boolean reading = waited && me.readImageOf(key, asOfStatement);
+            try {
+                for (Object[] row : scan) {
+                    seen.add(row);
+                    if (notCommitted.contains(row)) continue;
+                    Object[] committed = otherOld.containsKey(row) ? otherOld.get(row) : row;
+                    if (committed == null || !matches.test(committed)) continue;
+                    Session own = owner.get(row);
+                    if (own != null) { blocker = own; break; }
+                    result.add(row);
                 }
+                // A row another transaction has deleted without committing is gone from the scan but
+                // is still committed-live: this statement has to wait for the outcome before it can
+                // say whether it deleted it.
+                if (blocker == null) {
+                    for (Object[] row : hiddenByOther) {
+                        if (seen.contains(row)) continue;
+                        if (matches.test(row)) { blocker = owner.get(row); break; }
+                    }
+                }
+            } finally {
+                if (reading) me.stopReadingImageOf(key);
             }
             if (blocker == null) return result;
+            // Taken while the transaction being waited for still holds its write, so the image
+            // holds the version this statement is entitled to read rather than the one it waits
+            // for. Nothing is taken until a wait is really about to happen.
+            if (asOfStatement == null) asOfStatement = me.committedImageOf(key, table);
             final Session waitFor = blocker;
             executor.database.awaitConcurrentWrite(me, waitFor,
                     () -> waitFor.isInTransaction() && !waitFor.isDoomed()
                             && waitFor.hasUncommittedWork(key), table.getName());
+            waited = true;
             if (rescan != null) scan = rescan.get();
         }
     }
@@ -1979,21 +2525,21 @@ class DmlExecutor {
                 throw new MemgresException("Column not found: " + set.column());
             }
             Column genCol = table.getColumns().get(colIdx);
-            // Reject explicit writes to GENERATED ALWAYS AS ... STORED columns
+            // Reject explicit writes to GENERATED ALWAYS AS ... STORED columns. The casts that used
+            // to stand in these three branches read the value as a Literal only to discard it, so
+            // any caller reaching them with an expression would throw ClassCastException instead of
+            // the refusal PostgreSQL gives.
             if (genCol.isGenerated() && !(set.value() instanceof Literal && ((Literal) set.value()).literalType() == Literal.LiteralType.DEFAULT)) {
-                Literal lit = (Literal) set.value();
                 throw new MemgresException("column \"" + genCol.getName() + "\" can only be updated to DEFAULT\n  Detail: Column \"" + genCol.getName() + "\" is a generated column.", "428C9");
             }
             if (genCol.isGenerated()) continue; // DEFAULT, skip (will be recomputed)
             // Reject explicit writes to GENERATED ALWAYS AS IDENTITY columns
             if (genCol.getDefaultValue() != null && genCol.getDefaultValue().contains("__identity__:always")
                     && !(set.value() instanceof Literal && ((Literal) set.value()).literalType() == Literal.LiteralType.DEFAULT)) {
-                Literal lit2 = (Literal) set.value();
                 throw new MemgresException("column \"" + genCol.getName() + "\" can only be updated to DEFAULT\n  Detail: Column \"" + genCol.getName() + "\" is an identity column defined as GENERATED ALWAYS.", "428C9");
             }
             // For UPDATE SET col = DEFAULT, apply the column's default value
             if (set.value() instanceof Literal && ((Literal) set.value()).literalType() == Literal.LiteralType.DEFAULT) {
-                Literal lit = (Literal) set.value();
                 Column col = table.getColumns().get(colIdx);
                 if (col.getDefaultValue() != null) {
                     newRow[colIdx] = TypeCoercion.coerceForStorage(
@@ -2023,6 +2569,91 @@ class DmlExecutor {
             } else {
                 newRow[colIdx] = TypeCoercion.coerceForStorage(val, table.getColumns().get(colIdx));
             }
+        }
+    }
+
+    /**
+     * Carry out a referential action as the UPDATE on the referencing table that it is.
+     *
+     * <p>PostgreSQL runs ON DELETE / ON UPDATE SET NULL, SET DEFAULT and CASCADE as an ordinary
+     * UPDATE of the child, so the child's BEFORE triggers see it and may rewrite it, its stored
+     * generated columns are computed again from the new key, and its own NOT NULL, CHECK, UNIQUE,
+     * domain and foreign-key rules decide whether the write on the parent may go ahead at all.
+     * Writing the row directly skipped every one of those: a NOT NULL column could be left holding
+     * NULL and a CHECK left holding a value it forbids.
+     *
+     * @param changedColumns the columns the action writes, so an {@code UPDATE OF} trigger is
+     *     selected the same way it would be for a statement the client wrote
+     * @param decided the constraint the action belongs to, which the caller has already checked
+     *     against the referenced table as it will be once the statement is over
+     * @return the rows actually written, in the order they were written
+     */
+    List<ConstraintValidator.ActionRow> applyReferentialUpdate(
+            Table child, String childSchema, List<ConstraintValidator.ActionRow> pending,
+            Set<String> changedColumns, StoredConstraint decided) {
+        List<ConstraintValidator.ActionRow> written = new ArrayList<>();
+        if (pending.isEmpty()) return written;
+        List<PgTrigger> triggers = enabledTriggers(rowTriggersFor(child, child.getName()));
+        for (ConstraintValidator.ActionRow action : pending) {
+            // Whatever the BEFORE trigger returns is what gets written, and NULL means this row is
+            // left alone — the same contract an UPDATE the client wrote lives under.
+            Object[] newRow = triggerHelper.executeTriggers(triggers, PgTrigger.Timing.BEFORE,
+                    PgTrigger.Event.UPDATE, action.newValues, action.oldValues, child, changedColumns);
+            if (newRow == null) continue;
+            computeGeneratedColumns(child, newRow);
+            executor.constraintValidator.validateConstraints(child, newRow, action.row, decided);
+            validationHelper.validateDomainChecks(newRow, child);
+            // Record undo before the write, so a later row of the same action failing still leaves
+            // this one restorable.
+            executor.constraintValidator.recordCascadeUpdateUndo(
+                    childSchema, child.getName(), action.row, action.oldValues);
+            child.updateRowInPlace(action.row, action.oldValues, newRow);
+            written.add(action);
+        }
+        for (ConstraintValidator.ActionRow action : written) {
+            triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.UPDATE,
+                    action.row, action.oldValues, child, changedColumns);
+        }
+        return written;
+    }
+
+    /**
+     * The delete half of the same rule: ON DELETE CASCADE is a DELETE on the referencing table.
+     *
+     * <p>Its BEFORE DELETE triggers run first, and one that returns NULL keeps its row — PostgreSQL
+     * lets the trigger win and leaves the reference dangling rather than overriding it — and its
+     * AFTER DELETE triggers run once the rows are gone.
+     *
+     * @param cascadeFurther given the rows that survived the BEFORE triggers, so the walk into the
+     *     child's own dependents happens while those rows are still there
+     */
+    void applyReferentialDelete(Table child, String childSchema, Set<Object[]> rows,
+                                java.util.function.Consumer<Set<Object[]>> cascadeFurther) {
+        if (rows.isEmpty()) return;
+        List<PgTrigger> triggers = enabledTriggers(rowTriggersFor(child, child.getName()));
+        if (!triggers.isEmpty()) {
+            Set<Object[]> vetoed = Collections.newSetFromMap(new IdentityHashMap<Object[], Boolean>());
+            for (Object[] row : new ArrayList<>(rows)) {
+                if (triggerHelper.executeTriggers(triggers, PgTrigger.Timing.BEFORE,
+                        PgTrigger.Event.DELETE, row, row, child) == null) {
+                    vetoed.add(row);
+                }
+            }
+            rows.removeAll(vetoed);
+        }
+        cascadeFurther.accept(rows);
+        if (rows.isEmpty()) return;
+        List<Object[]> deleted = new ArrayList<>(rows);
+        List<Object[]> oldRows = new ArrayList<>();
+        for (Object[] row : deleted) {
+            oldRows.add(Arrays.copyOf(row, row.length));
+        }
+        child.deleteRows(rows);
+        // Record undo so ROLLBACK can restore the deleted rows
+        executor.constraintValidator.recordCascadeDeleteUndo(childSchema, child.getName(), deleted);
+        for (Object[] row : oldRows) {
+            triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER,
+                    PgTrigger.Event.DELETE, row, row, child);
         }
     }
 
@@ -2105,8 +2736,9 @@ class DmlExecutor {
         // Check read-only transaction
         checkReadOnly("DELETE");
         rejectMaterializedViewWrite(stmt.table());
+        List<Expression> insteadSuppress = new ArrayList<>();
         QueryResult ruledDelete = applyInsteadRule(stmt.table(), "DELETE", QueryResult.Type.DELETE,
-                stmt.where(), null);
+                stmt.where(), null, stmt.alias(), stmt.using(), stmt.returning(), insteadSuppress);
         if (ruledDelete != null) return ruledDelete;
         // As for UPDATE: a DO ALSO rule runs beside the statement, over the rows about to go.
         applyAlsoRule(stmt.table(), "DELETE", stmt.where(), null, stmt.alias(), stmt.using());
@@ -2130,8 +2762,9 @@ class DmlExecutor {
         BooleanContext.check(stmt.where(), "WHERE", dmlScope(table,
                 stmt.alias() != null ? stmt.alias() : stmt.table(), stmt.using()));
         // Capture view column mapping before further resolveTable calls clobber it (renamed-column views).
-        this.activeViewColMap = executor.lastViewColumnMapping;
-        this.activeViewColOrder = executor.lastViewColumnOrder;
+        captureViewTarget();
+        // The view's own WHERE goes with them: it is part of what this statement may reach.
+        List<AstExecutor.ViewQual> viewQuals = executor.lastViewQuals;
         // The WHERE is resolved against the relation before the scan, so a name that is not a
         // column of it is refused whether or not there is a row for the evaluator to trip over.
         if (stmt.using() == null || stmt.using().isEmpty()) {
@@ -2139,8 +2772,8 @@ class DmlExecutor {
         }
         // INSTEAD OF DELETE triggers on a view: the trigger performs the actual work; the virtual
         // view table's rows are only used to match WHERE and populate OLD for the trigger.
-        List<PgTrigger> deleteTriggersEarly = triggersDisabled() ? Cols.listOf()
-                : executor.database.getTriggersForTable(stmt.table());
+        List<PgTrigger> deleteTriggersEarly =
+                enabledTriggers(executor.database.getTriggersForTable(stmt.table()));
         boolean hasInsteadOfDelete = deleteTriggersEarly.stream().anyMatch(
                 t -> t.getTiming() == PgTrigger.Timing.INSTEAD_OF && t.getEvent() == PgTrigger.Event.DELETE);
         // C6: Enforce DELETE privilege
@@ -2155,8 +2788,13 @@ class DmlExecutor {
         if (hasInsteadOfDelete) {
             List<Object[]> matched = new ArrayList<>();
             boolean idHasVirtual = hasVirtualColumns(table);
+            // The qualification is read for every row, so a VIRTUAL generated column is worked out
+            // for one only where the qualification names it: PostgreSQL evaluates the generation
+            // expression where the reference to the column stands and nowhere else.
+            Set<String> idFilters = idHasVirtual
+                    ? columnsNamed(table, stmt.alias(), stmt.where()) : null;
             for (Object[] row : table.getRows()) {
-                Object[] evalRow = idHasVirtual ? computeVirtualColumns(table, row) : row;
+                Object[] evalRow = idHasVirtual ? computeVirtualColumns(table, row, idFilters) : row;
                 if (stmt.where() == null
                         || executor.isTruthy(executor.evalExpr(stmt.where(), viewAwareCtx(table, stmt.alias(), evalRow)))) {
                     matched.add(row);
@@ -2165,8 +2803,11 @@ class DmlExecutor {
             int cnt = 0;
             List<Object[]> insteadReturning = new ArrayList<>();
             for (Object[] row : matched) {
+                // A DELETE has no NEW row: PostgreSQL leaves it unassigned, so the trigger sees only
+                // OLD and nothing it returns is written back over the row it was handed. Passing the
+                // live row as NEW undid whatever the trigger body had written to it.
                 Object[] res = triggerHelper.executeTriggers(deleteTriggersEarly,
-                        PgTrigger.Timing.INSTEAD_OF, PgTrigger.Event.DELETE, row, row, table);
+                        PgTrigger.Timing.INSTEAD_OF, PgTrigger.Event.DELETE, null, row, table);
                 if (res != null) {
                     cnt++;
                     if (hasReturning) {
@@ -2202,57 +2843,14 @@ class DmlExecutor {
             rlsDeleteActive = true;
         }
 
-        if (stmt.where() == null) {
-            // Collect all tables (including partitions) for DELETE ALL
-            List<Table> allTables = new ArrayList<>();
-            DmlPartitionHelper.collectAllPartitionTables(table, allTables);
-
-            List<Object[]> allRowsCopy = new ArrayList<>();
-            for (Table t : allTables) {
-                allRowsCopy.addAll(t.getRows());
-            }
-            // RLS USING filter for DELETE: restrict which rows can be deleted
-            if (rlsDeleteActive) {
-                allRowsCopy = filterRowsByRlsUsing(table, allRowsCopy, "DELETE", stmt.alias());
-            }
-            java.util.Set<Object[]> deleteSet = Collections.newSetFromMap(new IdentityHashMap<>());
-            deleteSet.addAll(allRowsCopy);
-            for (Object[] row : allRowsCopy) {
-                executor.constraintValidator.handleFkOnDelete(table, row, deleteSet);
-            }
-            // Collect RETURNING before deleting
-            List<Object[]> returningRows = new ArrayList<>();
-            if (hasReturning) {
-                for (Object[] row : allRowsCopy) {
-                    returningRows.add(evalReturning(stmt.returning(), table, stmt.alias(), row, row, null));
-                }
-            }
-            recordDeleteUndo(stmt.schema(), stmt.table(), allRowsCopy);
-            int count;
-            if (rlsDeleteActive) {
-                // RLS filtered: delete specific rows, not all
-                count = allRowsCopy.size();
-                for (Table t : allTables) {
-                    t.deleteRows(deleteSet);
-                }
-            } else {
-                count = 0;
-                for (Table t : allTables) {
-                    count += t.deleteAll();
-                }
-            }
-            // Track DML statistics
-            if (count > 0) table.incrementTupDeleted(count);
-            if (hasReturning) {
-                return QueryResult.returning(QueryResult.Type.DELETE,
-                        buildReturningColumns(stmt.returning(), table), returningRows, count);
-            }
-            return QueryResult.command(QueryResult.Type.DELETE, count);
-        }
-
-        // Collect rows from all partitions (for partitioned tables) or just this table
+        // Every relation that stores rows for this one: its partitions and its inheritance
+        // children. ONLY keeps the statement to the named relation's own storage.
         List<Table> tablesToScan = new ArrayList<>();
-        DmlPartitionHelper.collectAllPartitionTables(table, tablesToScan);
+        if (stmt.only()) {
+            tablesToScan.add(table);
+        } else {
+            DmlPartitionHelper.collectRelationAndDescendants(table, tablesToScan);
+        }
 
         // Build list of (owningTable, row) pairs
         List<Object[]> allRows = new ArrayList<>();
@@ -2263,18 +2861,40 @@ class DmlExecutor {
                 rowOwner.put(row, t);
             }
         }
+        // What the statement may reach before its own WHERE has said a word: the rows the view
+        // shows, and the rows this transaction's snapshot holds. A row it was shown that another
+        // transaction has deleted and committed ends the transaction instead.
+        allRows = executor.filterByViewQuals(viewQuals, table, allRows);
+        if (executor.session != null && tablesToScan.size() == 1) {
+            String snapshotKey = schemaName + "." + stmt.table();
+            executor.session.checkRRConcurrentDelete(snapshotKey, table, image ->
+                    stmt.where() == null || executor.isTruthy(
+                            executor.evalExpr(stmt.where(), viewAwareCtx(table, stmt.alias(), image))));
+            List<Object[]> visible = new ArrayList<>(allRows.size());
+            for (Object[] r : allRows) {
+                if (executor.session.isVisibleInRRSnapshot(snapshotKey, r)) visible.add(r);
+            }
+            allRows = visible;
+        }
 
         Set<Object[]> toDelete = Collections.newSetFromMap(new IdentityHashMap<>());
         List<Object[]> deleteOrder = new ArrayList<>();
 
         boolean deleteHasVirtual = hasVirtualColumns(table);
+        // The qualification is read for every row scanned, so only the VIRTUAL generated columns it
+        // names are worked out: PostgreSQL rewrites a reference to one into its generation
+        // expression, and a DELETE that never names the column never evaluates it -- which is what
+        // keeps a relation whose expression raises for some row a relation rows can be deleted from.
+        Set<String> deleteFilters = deleteHasVirtual
+                ? columnsNamed(table, stmt.alias(), stmt.where()) : null;
         Map<Object[], RowContext> deleteUsingCtxMap = new IdentityHashMap<>();
         if (stmt.using() != null && !stmt.using().isEmpty()) {
             // DELETE ... USING: join main table with USING tables, delete matching main rows
             List<RowContext> usingContexts =
                     executor.fromResolver.resolveWrittenFromClause(stmt.using());
             for (Object[] row : allRows) {
-                Object[] evalRow = deleteHasVirtual ? computeVirtualColumns(table, row) : row;
+                Object[] evalRow = deleteHasVirtual
+                        ? computeVirtualColumns(table, row, deleteFilters) : row;
                 RowContext mainCtx = viewAwareCtx(table, stmt.alias(), evalRow);
                 for (RowContext usingCtx : usingContexts) {
                     RowContext merged = mainCtx.merge(usingCtx);
@@ -2312,7 +2932,12 @@ class DmlExecutor {
             final Map<Object[], Table> deleteOwner = rowOwner;
             final List<Table> deleteTables = tablesToScan;
             toDelete.addAll(matchAgainstCommittedRows(table, allRows, row -> {
-                Object[] evalRow = deleteHasVirtual ? computeVirtualColumns(table, row) : row;
+                // A DELETE with no WHERE takes every row, and takes the same path as any other so
+                // that its row and statement triggers fire, its transition table is built and a
+                // BEFORE trigger's veto is honoured.
+                if (stmt.where() == null) return true;
+                Object[] evalRow = deleteHasVirtual
+                        ? computeVirtualColumns(table, row, deleteFilters) : row;
                 return executor.isTruthy(executor.evalExpr(stmt.where(), viewAwareCtx(table, stmt.alias(), evalRow)));
             }, () -> {
                 // A wait has ended, so the table may hold rows that were not there when it began.
@@ -2325,13 +2950,28 @@ class DmlExecutor {
                         deleteOwner.put(r, t);
                     }
                 }
-                return deleteScan;
+                // The rows the view shows are still the only ones this statement may reach.
+                return executor.filterByViewQuals(viewQuals, table, deleteScan);
             }));
         }
 
-        // RLS USING filter for DELETE: remove rows that don't pass DELETE policies
+        // A qualified INSTEAD rule has already spoken for the rows its WHERE holds for; the
+        // statement PostgreSQL rewrote acts on the rest.
+        if (!insteadSuppress.isEmpty()) {
+            Set<Object[]> spokenFor = Collections.newSetFromMap(new IdentityHashMap<>());
+            for (Object[] row : toDelete) {
+                if (ruleSuppressesRow(insteadSuppress, table, row, null)) spokenFor.add(row);
+            }
+            toDelete.removeAll(spokenFor);
+            deleteOrder.removeIf(spokenFor::contains);
+        }
+
+        // RLS USING filter for DELETE: remove rows that don't pass the DELETE policies, and the
+        // SELECT policies too when the statement reads a column of the target
         if (rlsDeleteActive) {
-            List<Object[]> rlsAllowed = filterRowsByRlsUsing(table, new ArrayList<>(toDelete), "DELETE", stmt.alias());
+            List<Object[]> rlsAllowed = filterRowsForWrite(table, new ArrayList<>(toDelete),
+                    "DELETE", stmt.alias(),
+                    readsTargetRelation(stmt.where(), stmt.returning(), null));
             Set<Object[]> rlsAllowedSet = Collections.newSetFromMap(new IdentityHashMap<>());
             rlsAllowedSet.addAll(rlsAllowed);
             toDelete.retainAll(rlsAllowedSet);
@@ -2349,7 +2989,7 @@ class DmlExecutor {
         }
 
         // Fire BEFORE DELETE triggers (for DELETE, OLD = deleted row, NEW = null)
-        List<PgTrigger> triggers = triggersDisabled() ? Cols.listOf() : executor.database.getTriggersForTable(table.getName());
+        List<PgTrigger> triggers = enabledTriggers(rowTriggersFor(table, table.getName()));
 
         // Fire BEFORE STATEMENT triggers
         triggerHelper.fireStatementTriggers(triggers, PgTrigger.Timing.BEFORE, PgTrigger.Event.DELETE, table, null, null);
@@ -2357,7 +2997,7 @@ class DmlExecutor {
         if (!triggers.isEmpty()) {
             Set<Object[]> skipRows = Collections.newSetFromMap(new IdentityHashMap<>());
             for (Object[] row : new ArrayList<>(toDelete)) {
-                Object[] result = triggerHelper.executeTriggers(triggers, PgTrigger.Timing.BEFORE, PgTrigger.Event.DELETE, row, row, table);
+                Object[] result = triggerHelper.executeTriggers(triggers, PgTrigger.Timing.BEFORE, PgTrigger.Event.DELETE, null, row, table);
                 if (result == null) skipRows.add(row);
             }
             toDelete.removeAll(skipRows);
@@ -2404,7 +3044,7 @@ class DmlExecutor {
         // Fire queued AFTER DELETE row triggers
         if (!triggers.isEmpty()) {
             for (Object[] row : oldRowsForTransition) {
-                triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.DELETE, row, row, table);
+                triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.DELETE, null, row, table);
             }
         }
 
@@ -2459,6 +3099,10 @@ class DmlExecutor {
     }
 
     private QueryResult executeMergeInner(MergeStmt stmt) {
+        // A MERGE writes, and PostgreSQL refuses a write in a read-only transaction before it knows
+        // whether any WHEN clause would have fired: a MERGE whose every arm turns out inert is
+        // refused just the same.
+        checkReadOnly("MERGE");
         String schemaName = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
         rejectMaterializedViewWrite(stmt.targetTable());
         // A MERGE onto a view that cannot take it is refused by the action it wanted to perform,
@@ -2466,8 +3110,17 @@ class DmlExecutor {
         // can stand in for a MERGE, so the advice it is given names a trigger and nothing else.
         executor.viewDmlVerb = mergeViewDmlVerb(stmt);
         executor.viewDmlByMerge = true;
+        // A WITH CHECK OPTION is written on the view, so it has to be read off the name the
+        // statement gave, before resolveTable replaces it with the base relation underneath.
+        List<DmlValidationHelper.ViewCheck> viewCheckExprs =
+                validationHelper.collectViewCheckExprs(stmt.targetTable());
+        recordRelationLock(stmt.schema(), stmt.targetTable(), "RowExclusiveLock");
+        rejectCatalogViewWrite(stmt.targetTable(), executor.viewDmlVerb);
         // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
         Table targetTable = executor.resolveTable(schemaName, stmt.targetTable(), stmt.schema() != null);
+        // Capture the view column mapping before a later resolveTable clobbers it, so a MERGE
+        // through a view whose columns are renamed reads and writes them as an UPDATE does.
+        captureViewTarget();
         String targetAlias = stmt.targetAlias() != null ? stmt.targetAlias() : stmt.targetTable();
         checkMergePlacement(stmt, targetTable, targetAlias);
 
@@ -2480,51 +3133,76 @@ class DmlExecutor {
             }
         }
 
-        checkMergeWhenClauses(stmt, targetAlias);
-
-        // Validate UPDATE SET columns exist in target table before executing
-        for (MergeStmt.WhenClause clause : stmt.whenClauses()) {
-            List<InsertStmt.SetClause> setsToValidate = null;
-            if (clause instanceof MergeStmt.WhenMatched && !((MergeStmt.WhenMatched) clause).isDelete()) {
-                setsToValidate = ((MergeStmt.WhenMatched) clause).setClauses();
-            } else if (clause instanceof MergeStmt.WhenNotMatchedBySource && !((MergeStmt.WhenNotMatchedBySource) clause).isDelete()) {
-                setsToValidate = ((MergeStmt.WhenNotMatchedBySource) clause).setClauses();
-            }
-            if (setsToValidate != null) {
-                for (InsertStmt.SetClause set : setsToValidate) {
-                    int colIdx = targetTable.getColumnIndex(set.column());
-                    if (colIdx < 0) {
-                        throw new MemgresException("column \"" + set.column() + "\" of relation \"" + stmt.targetTable() + "\" does not exist", "42703");
-                    }
-                }
-            }
+        checkMergeWhenClauses(stmt, targetTable, targetAlias);
+        // Every name an arm writes to, and every name it reads off the target, is resolved here --
+        // where PostgreSQL resolves it, while it is still analysing the statement. Leaving it to
+        // the per-row evaluator meant a MERGE whose arms never fired quietly reported success.
+        checkMergeTargetNames(stmt, targetTable, targetAlias);
+        // PostgreSQL does not rewrite a MERGE at all, so a relation carrying a rule cannot take
+        // one: the rewriter refuses the statement outright and blames the relation as written.
+        rejectMergeOnRuledRelation(stmt, targetTable);
+        // The actions the WHEN clauses can perform decide both the rights the statement needs and
+        // which statement-level triggers fire, so work them out once.
+        List<PgTrigger.Event> mergeEvents = mergeStatementEvents(stmt);
+        checkMergePrivileges(stmt, schemaName, mergeEvents);
+        // Check table-level locks (blocks if ACCESS EXCLUSIVE held by another session)
+        executor.database.checkTableLockForDml(schemaName + "." + stmt.targetTable(), executor.session);
+        if (mergeEvents.contains(PgTrigger.Event.UPDATE)) {
+            checkReplicaIdentity(targetTable, stmt.targetTable(), "update");
+        } else if (mergeEvents.contains(PgTrigger.Event.DELETE)) {
+            checkReplicaIdentity(targetTable, stmt.targetTable(), "delete");
         }
 
         // Validate RETURNING columns
         validateReturning(stmt.returning(), targetTable);
 
+        List<PgTrigger> triggers = enabledTriggers(rowTriggersFor(targetTable, stmt.targetTable()));
+        // PostgreSQL fires the BEFORE STATEMENT trigger of every action the MERGE could perform,
+        // before a single row is read -- both the INSERT and the UPDATE trigger of a two-armed
+        // MERGE, whether or not a row ends up taking each arm.
+        for (PgTrigger.Event event : mergeEvents) {
+            triggerHelper.fireStatementTriggers(triggers, PgTrigger.Timing.BEFORE, event, targetTable, null, null);
+        }
+
         // Resolve source rows
         List<RowContext> sourceRows = executor.fromResolver.resolveFromItem(stmt.source());
+        // RETURNING reads the source through the context the source produced rather than through a
+        // resolved relation: a VALUES list is a source like any other and has none behind it.
+        RowContext mergeSourceSample = sourceRows.isEmpty() ? null : sourceRows.get(0);
+        // WHEN NOT MATCHED BY SOURCE fires for a target row no source row paired with, and
+        // RETURNING still reads the source columns there -- as nulls, which is what PG answers.
+        RowContext mergeNullSourceCtx = nullSourceContext(mergeSourceSample);
+        String mergeSrcAlias = mergeSourceAlias(stmt.source());
 
-        // Extract source table for MERGE RETURNING * (includes source columns)
-        Table mergeSourceTable = null;
-        if (!sourceRows.isEmpty()) {
-            List<RowContext.TableBinding> srcBindings = sourceRows.get(0).getBindings();
-            if (!srcBindings.isEmpty()) {
-                mergeSourceTable = srcBindings.get(0).table();
+        // The rows of a partitioned relation live in its leaves, so the scan that pairs source rows
+        // with target rows has to walk them the way UPDATE and DELETE do. Reading the parent alone
+        // left every MATCHED arm inert and turned every source row into an INSERT.
+        List<Table> scanTables = collectTargetTables(targetTable);
+        Map<Object[], Table> mergeRowOwner = new IdentityHashMap<>();
+        List<Object[]> originalTargetRows = new ArrayList<>();
+        for (Table part : scanTables) {
+            for (Object[] partRow : part.getRows()) {
+                originalTargetRows.add(partRow);
+                mergeRowOwner.put(partRow, part);
             }
         }
 
-        // Snapshot target rows before MERGE so we can roll back on failure
-        List<Object[]> snapshotRows = new ArrayList<>();
-        for (Object[] row : targetTable.getRows()) {
-            snapshotRows.add(Arrays.copyOf(row, row.length));
+        // Row-level security decides what the join may see as much as what it may write: a row no
+        // SELECT policy admits is genuinely NOT MATCHED, and the NOT MATCHED arm runs for it.
+        boolean mergeRlsActive = targetTable.isRlsEnabled()
+                && !executor.shouldBypassRls(targetTable, schemaName);
+        if (mergeRlsActive) {
+            originalTargetRows = filterRowsByRlsUsing(targetTable, originalTargetRows, "SELECT", targetAlias);
         }
+
+        // Snapshot every table the statement can write to, so a failure part-way rolls the whole
+        // MERGE back. A partitioned target holds nothing in the parent, and restoring the parent
+        // alone left behind every row the INSERT arm had already routed into a leaf.
+        Map<Table, List<Object[]>> mergeSnapshot = snapshotTargetTables(scanTables);
 
         int mergeCount = 0;
         boolean hasReturning = stmt.returning() != null && !stmt.returning().isEmpty();
         List<Object[]> returningRows = hasReturning ? new ArrayList<>() : null;
-        List<PgTrigger> triggers = triggersDisabled() ? Cols.listOf() : executor.database.getTriggersForTable(stmt.targetTable());
 
         // Track rows to delete (we must not modify the row list while iterating)
         Set<Object[]> rowsToDelete = Collections.newSetFromMap(new IdentityHashMap<>());
@@ -2541,11 +3219,19 @@ class DmlExecutor {
         Set<Object[]> matchedBySourceRows = Collections.newSetFromMap(new IdentityHashMap<>());
         // Collect new rows to insert
         List<Object[]> rowsToInsert = new ArrayList<>();
-
-        // Use snapshot rows for ON-condition matching (PG matches against pre-MERGE state)
-        List<Object[]> originalTargetRows = new ArrayList<>(targetTable.getRows());
+        // What each action actually touched: the AFTER STATEMENT triggers read these as their
+        // transition tables, and the per-relation tuple counters are raised from them.
+        List<Object[]> mergeUpdatedOld = new ArrayList<>();
+        List<Object[]> mergeUpdatedNew = new ArrayList<>();
+        List<Object[]> mergeDeletedOld = new ArrayList<>();
 
         boolean mergeTargetHasVirtual = hasVirtualColumns(targetTable);
+        // A VIRTUAL generated column is not stored: PostgreSQL rewrites a reference to one into its
+        // generation expression, so a MERGE works out the ones it names and no others.
+        Set<String> mergeTargetReads = mergeTargetHasVirtual
+                ? columnsNamed(targetTable, targetAlias, stmt.onCondition(), stmt.whenClauses(),
+                        stmt.returning())
+                : null;
         // Collect unmatched source rows for deferred NOT MATCHED BY TARGET processing
         List<RowContext> unmatchedSourceRows = new ArrayList<>();
         try {
@@ -2553,8 +3239,9 @@ class DmlExecutor {
             // Find matching target rows for this source row using the original snapshot
             List<Object[]> matchedTargetRows = new ArrayList<>();
             for (Object[] targetRow : originalTargetRows) {
-                Object[] evalRow = mergeTargetHasVirtual ? computeVirtualColumns(targetTable, targetRow) : targetRow;
-                RowContext targetCtx = new RowContext(targetTable, targetAlias, evalRow);
+                Object[] evalRow = mergeTargetHasVirtual
+                        ? computeVirtualColumns(targetTable, targetRow, mergeTargetReads) : targetRow;
+                RowContext targetCtx = viewAwareCtx(targetTable, targetAlias, evalRow);
                 RowContext combined = targetCtx.merge(sourceCtx);
                 if (executor.isTruthy(executor.evalExpr(stmt.onCondition(), combined))) {
                     matchedBySourceRows.add(targetRow);
@@ -2575,8 +3262,9 @@ class DmlExecutor {
                 // WHEN MATCHED clauses
                 for (Object[] targetRow : matchedTargetRows) {
                     if (processedTargetRows.contains(targetRow)) continue;
-                    Object[] evalRow = mergeTargetHasVirtual ? computeVirtualColumns(targetTable, targetRow) : targetRow;
-                    RowContext targetCtx = new RowContext(targetTable, targetAlias, evalRow);
+                    Object[] evalRow = mergeTargetHasVirtual
+                            ? computeVirtualColumns(targetTable, targetRow, mergeTargetReads) : targetRow;
+                    RowContext targetCtx = viewAwareCtx(targetTable, targetAlias, evalRow);
                     RowContext combined = targetCtx.merge(sourceCtx);
 
                     for (MergeStmt.WhenClause clause : stmt.whenClauses()) {
@@ -2587,31 +3275,34 @@ class DmlExecutor {
                                 continue;
                             }
                             if (wm.isDelete()) {
+                                requireMergeRowVisible(mergeRlsActive, targetTable, targetRow, "DELETE", targetAlias);
                                 // DELETE — collect RETURNING before marking for deletion
                                 if (hasReturning) {
                                     executor.currentMergeAction = "DELETE";
-                                    returningRows.add(evalReturning(stmt.returning(), targetTable, targetAlias, targetRow, targetRow, null, sourceCtx));
+                                    returningRows.add(evalMergeReturning(stmt.returning(), targetTable, targetAlias,
+                                            targetRow, targetRow, null, sourceCtx, mergeSrcAlias));
                                 }
                                 executor.constraintValidator.handleFkOnDelete(targetTable, targetRow);
                                 rowsToDelete.add(targetRow);
+                                mergeDeletedOld.add(Arrays.copyOf(targetRow, targetRow.length));
                                 processedTargetRows.add(targetRow);
                                 affectedTargetRows.add(targetRow);
                                 mergeCount++;
                             } else if (wm.setClauses() != null && !wm.setClauses().isEmpty()) {
+                                requireMergeRowVisible(mergeRlsActive, targetTable, targetRow, "UPDATE", targetAlias);
                                 // UPDATE — evaluate all SET RHS against original row snapshot onto a
                                 // working copy, then let BEFORE triggers see/modify it before committing.
                                 Object[] oldRow = Arrays.copyOf(targetRow, targetRow.length);
                                 Object[] newRow = Arrays.copyOf(targetRow, targetRow.length);
                                 Set<String> updCols = new HashSet<>();
-                                for (int si = 0; si < wm.setClauses().size(); si++) {
-                                    InsertStmt.SetClause set = wm.setClauses().get(si);
-                                    int colIdx = targetTable.getColumnIndex(set.column());
-                                    if (colIdx < 0) {
-                                        throw new MemgresException("Column not found: " + set.column());
-                                    }
+                                for (InsertStmt.SetClause set : wm.setClauses()) {
                                     updCols.add(set.column().toLowerCase());
-                                    newRow[colIdx] = TypeCoercion.coerceForStorage(
-                                            executor.evalExpr(set.value(), combined), targetTable.getColumns().get(colIdx));
+                                }
+                                // The assignment machinery the UPDATE path uses, so a MERGE resolves
+                                // a view's renamed columns and understands SET col = DEFAULT too.
+                                applySetClauses(wm.setClauses(), targetTable, newRow, combined);
+                                if (mergeRlsActive) {
+                                    enforceRlsWithCheck(targetTable, newRow, "UPDATE");
                                 }
                                 // Fire BEFORE UPDATE row triggers: PG fires them per matched row.
                                 // They may modify NEW or return NULL to skip the row entirely.
@@ -2627,17 +3318,23 @@ class DmlExecutor {
                                 // straight onto the live row left every index pointing at the
                                 // values the row used to hold.
                                 computeGeneratedColumns(targetTable, newRow);
+                                validationHelper.enforceViewCheckOption(viewCheckExprs, targetTable, newRow);
                                 executor.constraintValidator.validateConstraints(targetTable, newRow, targetRow);
+                                validationHelper.validateDomainChecks(newRow, targetTable);
                                 recordUpdateUndo(stmt.schema(), stmt.targetTable(), targetRow, oldRow);
-                                targetTable.updateRowInPlace(targetRow, oldRow, newRow);
-                                executor.constraintValidator.handleFkOnUpdate(targetTable, oldRow, targetRow);
+                                Object[] writtenRow = writeMergeUpdate(stmt, targetTable, mergeRowOwner,
+                                        targetRow, oldRow, newRow);
+                                executor.constraintValidator.handleFkOnUpdate(targetTable, oldRow, writtenRow);
                                 // Fire AFTER UPDATE triggers for MERGE
-                                triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.UPDATE, targetRow, oldRow, targetTable, updCols);
+                                triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.UPDATE, writtenRow, oldRow, targetTable, updCols);
                                 // Collect RETURNING after update (uses new values)
                                 if (hasReturning) {
                                     executor.currentMergeAction = "UPDATE";
-                                    returningRows.add(evalReturning(stmt.returning(), targetTable, targetAlias, targetRow, oldRow, targetRow, sourceCtx));
+                                    returningRows.add(evalMergeReturning(stmt.returning(), targetTable, targetAlias,
+                                            writtenRow, oldRow, writtenRow, sourceCtx, mergeSrcAlias));
                                 }
+                                mergeUpdatedOld.add(oldRow);
+                                mergeUpdatedNew.add(Arrays.copyOf(writtenRow, writtenRow.length));
                                 processedTargetRows.add(targetRow);
                                 affectedTargetRows.add(targetRow);
                                 mergeCount++;
@@ -2663,40 +3360,40 @@ class DmlExecutor {
                     if (matchedBySourceRows.contains(targetRow)) continue;
                     if (processedTargetRows.contains(targetRow)) continue;
                     if (rowsToDelete.contains(targetRow)) continue;
-                    Object[] evalRow = mergeTargetHasVirtual ? computeVirtualColumns(targetTable, targetRow) : targetRow;
-                    RowContext targetCtx = new RowContext(targetTable, targetAlias, evalRow);
+                    Object[] evalRow = mergeTargetHasVirtual
+                            ? computeVirtualColumns(targetTable, targetRow, mergeTargetReads) : targetRow;
+                    RowContext targetCtx = viewAwareCtx(targetTable, targetAlias, evalRow);
                     for (MergeStmt.WhenClause clause : stmt.whenClauses()) {
                         if (clause instanceof MergeStmt.WhenNotMatchedBySource) {
                             MergeStmt.WhenNotMatchedBySource wnmbs = (MergeStmt.WhenNotMatchedBySource) clause;
                             if (wnmbs.andCondition() != null && !executor.isTruthy(executor.evalExpr(wnmbs.andCondition(), targetCtx))) {
                                 continue;
                             }
-                            // Build null-padded source context for RETURNING * (NOT MATCHED BY SOURCE has no source row)
-                            RowContext nullSourceCtx = null;
-                            if (mergeSourceTable != null) {
-                                Object[] nullSourceRow = new Object[mergeSourceTable.getColumns().size()];
-                                nullSourceCtx = new RowContext(mergeSourceTable, null, nullSourceRow);
-                            }
+                            // The source row RETURNING reads here is all nulls: this arm fires
+                            // precisely because no source row paired with the target row.
+                            RowContext nullSourceCtx = mergeNullSourceCtx;
                             if (wnmbs.isDelete()) {
+                                requireMergeRowVisible(mergeRlsActive, targetTable, targetRow, "DELETE", targetAlias);
                                 if (hasReturning) {
                                     executor.currentMergeAction = "DELETE";
-                                    returningRows.add(evalReturning(stmt.returning(), targetTable, targetAlias, targetRow, targetRow, null, nullSourceCtx));
+                                    returningRows.add(evalMergeReturning(stmt.returning(), targetTable, targetAlias,
+                                            targetRow, targetRow, null, nullSourceCtx, mergeSrcAlias));
                                 }
                                 executor.constraintValidator.handleFkOnDelete(targetTable, targetRow);
                                 rowsToDelete.add(targetRow);
+                                mergeDeletedOld.add(Arrays.copyOf(targetRow, targetRow.length));
                                 mergeCount++;
                             } else if (wnmbs.setClauses() != null && !wnmbs.setClauses().isEmpty()) {
+                                requireMergeRowVisible(mergeRlsActive, targetTable, targetRow, "UPDATE", targetAlias);
                                 Object[] oldRow = Arrays.copyOf(targetRow, targetRow.length);
                                 Object[] newRow = Arrays.copyOf(targetRow, targetRow.length);
                                 Set<String> updCols = new HashSet<>();
                                 for (InsertStmt.SetClause set : wnmbs.setClauses()) {
-                                    int colIdx = targetTable.getColumnIndex(set.column());
-                                    if (colIdx < 0) {
-                                        throw new MemgresException("Column not found: " + set.column());
-                                    }
                                     updCols.add(set.column().toLowerCase());
-                                    Object val = executor.evalExpr(set.value(), targetCtx);
-                                    newRow[colIdx] = TypeCoercion.coerceForStorage(val, targetTable.getColumns().get(colIdx));
+                                }
+                                applySetClauses(wnmbs.setClauses(), targetTable, newRow, targetCtx);
+                                if (mergeRlsActive) {
+                                    enforceRlsWithCheck(targetTable, newRow, "UPDATE");
                                 }
                                 // Fire BEFORE UPDATE row triggers (may modify NEW or skip via NULL).
                                 newRow = triggerHelper.executeTriggers(triggers, PgTrigger.Timing.BEFORE, PgTrigger.Event.UPDATE, newRow, oldRow, targetTable, updCols);
@@ -2710,15 +3407,21 @@ class DmlExecutor {
                                 // straight onto the live row left every index pointing at the
                                 // values the row used to hold.
                                 computeGeneratedColumns(targetTable, newRow);
+                                validationHelper.enforceViewCheckOption(viewCheckExprs, targetTable, newRow);
                                 executor.constraintValidator.validateConstraints(targetTable, newRow, targetRow);
+                                validationHelper.validateDomainChecks(newRow, targetTable);
                                 recordUpdateUndo(stmt.schema(), stmt.targetTable(), targetRow, oldRow);
-                                targetTable.updateRowInPlace(targetRow, oldRow, newRow);
-                                executor.constraintValidator.handleFkOnUpdate(targetTable, oldRow, targetRow);
-                                triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.UPDATE, targetRow, oldRow, targetTable, updCols);
+                                Object[] writtenRow = writeMergeUpdate(stmt, targetTable, mergeRowOwner,
+                                        targetRow, oldRow, newRow);
+                                executor.constraintValidator.handleFkOnUpdate(targetTable, oldRow, writtenRow);
+                                triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.UPDATE, writtenRow, oldRow, targetTable, updCols);
                                 if (hasReturning) {
                                     executor.currentMergeAction = "UPDATE";
-                                    returningRows.add(evalReturning(stmt.returning(), targetTable, targetAlias, targetRow, oldRow, targetRow, nullSourceCtx));
+                                    returningRows.add(evalMergeReturning(stmt.returning(), targetTable, targetAlias,
+                                            writtenRow, oldRow, writtenRow, nullSourceCtx, mergeSrcAlias));
                                 }
+                                mergeUpdatedOld.add(oldRow);
+                                mergeUpdatedNew.add(Arrays.copyOf(writtenRow, writtenRow.length));
                                 mergeCount++;
                             }
                             // DO NOTHING: empty setClauses, no action and nothing to count
@@ -2745,35 +3448,23 @@ class DmlExecutor {
                         fillDefaults(targetTable, newRow);
                         if (wnm.columns() != null) {
                             for (int i = 0; i < wnm.columns().size(); i++) {
-                                int colIdx = targetTable.getColumnIndex(wnm.columns().get(i));
+                                // A view names its own columns, and a MERGE through one writes to
+                                // the columns of the table underneath.
+                                int colIdx = targetTable.getColumnIndex(mapViewColumn(wnm.columns().get(i)));
                                 if (colIdx < 0) {
-                                    throw new MemgresException("Column not found: " + wnm.columns().get(i));
+                                    throw new MemgresException("column \"" + wnm.columns().get(i)
+                                            + "\" of relation \"" + stmt.targetTable() + "\" does not exist", "42703");
                                 }
-                                Column genCol = targetTable.getColumns().get(colIdx);
-                                if (genCol.isGenerated()) {
-                                    throw new MemgresException("cannot insert a non-DEFAULT value into column \"" + genCol.getName() + "\"\n  Detail: Column \"" + genCol.getName() + "\" is a generated column.", "428C9");
-                                }
-                                if (genCol.getDefaultValue() != null && genCol.getDefaultValue().contains("__identity__:always")) {
-                                    throw new MemgresException("cannot insert a non-DEFAULT value into column \""
-                                            + genCol.getName() + "\"\n  Detail: Column \"" + genCol.getName()
-                                            + "\" is an identity column defined as GENERATED ALWAYS."
-                                            + "\n  Hint: Use OVERRIDING SYSTEM VALUE to override.", "428C9");
-                                }
+                                // DEFAULT asks for the column's default, which fillDefaults has
+                                // already put there. It is also the one value a column the system
+                                // computes may be given, so nothing is evaluated for it.
+                                if (isDefaultLiteral(wnm.values().get(i))) continue;
                                 Object val = executor.evalExpr(wnm.values().get(i), sourceCtx);
                                 newRow[colIdx] = TypeCoercion.coerceForStorage(val, targetTable.getColumns().get(colIdx));
                             }
                         } else if (wnm.values() != null) {
                             for (int i = 0; i < wnm.values().size() && i < newRow.length; i++) {
-                                Column genCol = targetTable.getColumns().get(i);
-                                if (genCol.isGenerated()) {
-                                    throw new MemgresException("cannot insert a non-DEFAULT value into column \"" + genCol.getName() + "\"\n  Detail: Column \"" + genCol.getName() + "\" is a generated column.", "428C9");
-                                }
-                                if (genCol.getDefaultValue() != null && genCol.getDefaultValue().contains("__identity__:always")) {
-                                    throw new MemgresException("cannot insert a non-DEFAULT value into column \""
-                                            + genCol.getName() + "\"\n  Detail: Column \"" + genCol.getName()
-                                            + "\" is an identity column defined as GENERATED ALWAYS."
-                                            + "\n  Hint: Use OVERRIDING SYSTEM VALUE to override.", "428C9");
-                                }
+                                if (isDefaultLiteral(wnm.values().get(i))) continue;
                                 Object val = executor.evalExpr(wnm.values().get(i), sourceCtx);
                                 newRow[i] = TypeCoercion.coerceForStorage(val, targetTable.getColumns().get(i));
                             }
@@ -2786,11 +3477,22 @@ class DmlExecutor {
                             // BEFORE trigger suppressed this row: not inserted, not counted.
                             break;
                         }
+                        // A row written through a view has to satisfy the view's check option, and
+                        // a row written under row-level security its WITH CHECK policies, exactly
+                        // as an ordinary INSERT's does.
+                        validationHelper.enforceViewCheckOption(viewCheckExprs, targetTable, newRow);
+                        if (mergeRlsActive) {
+                            enforceRlsWithCheck(targetTable, newRow, "INSERT");
+                        }
                         validationHelper.validateEnumValues(newRow, targetTable);
                         Table routedTable = partitionHelper.routeToPartition(targetTable, newRow);
                         routedTable.getWriteLock().lock();
                         try {
+                            // A partition is stored as an ordinary table whose bound nothing else
+                            // on this path consults, so a MERGE naming one is tested against it.
+                            partitionHelper.checkPartitionConstraint(routedTable, newRow);
                             executor.constraintValidator.validateConstraints(targetTable, newRow, null);
+                            validationHelper.validateDomainChecks(newRow, targetTable);
                             routedTable.insertRow(newRow);
                             try {
                                 executor.constraintValidator.validateConstraints(routedTable, newRow, newRow);
@@ -2801,11 +3503,13 @@ class DmlExecutor {
                         } finally {
                             routedTable.getWriteLock().unlock();
                         }
+                        recordRowMeta(stmt.schema(), routedTable, newRow);
                         rowsToInsert.add(newRow);
                         triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.INSERT, newRow, null, targetTable);
                         if (hasReturning) {
                             executor.currentMergeAction = "INSERT";
-                            returningRows.add(evalReturning(stmt.returning(), targetTable, targetAlias, newRow, null, newRow, sourceCtx));
+                            returningRows.add(evalMergeReturning(stmt.returning(), targetTable, targetAlias,
+                                    newRow, null, newRow, sourceCtx, mergeSrcAlias));
                         }
                         mergeCount++;
                         break;
@@ -2813,28 +3517,19 @@ class DmlExecutor {
                 }
             }
 
-            // Apply deletes atomically under write lock so concurrent readers
-            // never see the intermediate empty-table state.
+            // Apply deletes to whichever table holds each row: a partitioned target keeps its rows
+            // in the leaves, and rebuilding the parent left every one of them in place.
             if (!rowsToDelete.isEmpty()) {
-                targetTable.getWriteLock().lock();
-                try {
-                    List<Object[]> allRows = new ArrayList<>(targetTable.getRows());
-                    List<Object[]> deletedRows = new ArrayList<>();
-                    for (Object[] row : allRows) {
-                        if (rowsToDelete.contains(row)) {
-                            deletedRows.add(row);
-                        }
+                List<Object[]> deletedRows = new ArrayList<>();
+                for (Object[] row : originalTargetRows) {
+                    if (rowsToDelete.contains(row)) {
+                        deletedRows.add(row);
                     }
-                    // Record undo (and run the RR conflict check) before mutating.
-                    recordDeleteUndo(stmt.schema(), stmt.targetTable(), deletedRows);
-                    targetTable.deleteAll();
-                    for (Object[] row : allRows) {
-                        if (!rowsToDelete.contains(row)) {
-                            targetTable.insertRow(row);
-                        }
-                    }
-                } finally {
-                    targetTable.getWriteLock().unlock();
+                }
+                // Record undo (and run the RR conflict check) before mutating.
+                recordDeleteUndo(stmt.schema(), stmt.targetTable(), deletedRows);
+                for (Table part : scanTables) {
+                    part.deleteRows(rowsToDelete);
                 }
             }
 
@@ -2851,18 +3546,28 @@ class DmlExecutor {
                 }
                 recordInsertUndo(stmt.schema(), routedTable.getName(), newRow);
             }
-        } catch (MemgresException e) {
-            // MERGE is atomic; roll back all changes (updates, deletes, inserts) on failure
-            executor.currentMergeAction = null;
-            targetTable.getWriteLock().lock();
-            try {
-                targetTable.deleteAll();
-                for (Object[] origRow : snapshotRows) {
-                    targetTable.insertRow(origRow);
+
+            // The AFTER STATEMENT trigger of each action the arms could perform, holding the rows
+            // that action actually touched -- the same pairing the other three paths use.
+            for (PgTrigger.Event event : mergeEvents) {
+                if (event == PgTrigger.Event.INSERT) {
+                    triggerHelper.fireStatementTriggers(triggers, PgTrigger.Timing.AFTER, event, targetTable, rowsToInsert, null);
+                } else if (event == PgTrigger.Event.UPDATE) {
+                    triggerHelper.fireStatementTriggers(triggers, PgTrigger.Timing.AFTER, event, targetTable, mergeUpdatedNew, mergeUpdatedOld);
+                } else {
+                    triggerHelper.fireStatementTriggers(triggers, PgTrigger.Timing.AFTER, event, targetTable, null, mergeDeletedOld);
                 }
-            } finally {
-                targetTable.getWriteLock().unlock();
             }
+
+            // Track DML statistics
+            if (!rowsToInsert.isEmpty()) targetTable.incrementTupInserted(rowsToInsert.size());
+            if (!mergeUpdatedNew.isEmpty()) targetTable.incrementTupUpdated(mergeUpdatedNew.size());
+            if (!mergeDeletedOld.isEmpty()) targetTable.incrementTupDeleted(mergeDeletedOld.size());
+        } catch (MemgresException e) {
+            // MERGE is atomic; roll back all changes (updates, deletes, inserts) on failure. Every
+            // leaf is restored, not only the parent: the INSERT arm routes rows into the leaves.
+            executor.currentMergeAction = null;
+            restoreTargetTables(mergeSnapshot);
             // The table is back as it was, so the statement's undo entries describe changes that
             // have already been reversed; replaying them would write the same rows twice.
             if (executor.session != null) executor.session.discardUndoForCurrentStatement();
@@ -2871,10 +3576,327 @@ class DmlExecutor {
 
         executor.currentMergeAction = null;
         if (hasReturning) {
-            List<Column> retCols = buildReturningColumns(stmt.returning(), targetTable, mergeSourceTable);
+            List<Column> retCols = buildMergeReturningColumns(stmt.returning(), targetTable, targetAlias,
+                    mergeSourceSample, mergeSrcAlias);
             return QueryResult.returning(QueryResult.Type.MERGE, retCols, returningRows, mergeCount);
         }
         return QueryResult.command(QueryResult.Type.MERGE, mergeCount);
+    }
+
+    /** Whether an expression is the DEFAULT keyword, which asks for the column's own default. */
+    private static boolean isDefaultLiteral(Expression expr) {
+        return expr instanceof Literal && ((Literal) expr).literalType() == Literal.LiteralType.DEFAULT;
+    }
+
+    /**
+     * The actions a MERGE's WHEN clauses can perform, in the order PostgreSQL considers them. A DO
+     * NOTHING arm performs none: it needs no privilege and fires no statement trigger.
+     */
+    private List<PgTrigger.Event> mergeStatementEvents(MergeStmt stmt) {
+        boolean inserts = false;
+        boolean updates = false;
+        boolean deletes = false;
+        for (MergeStmt.WhenClause clause : stmt.whenClauses()) {
+            if (clause instanceof MergeStmt.WhenMatched) {
+                MergeStmt.WhenMatched wm = (MergeStmt.WhenMatched) clause;
+                if (wm.isDelete()) deletes = true;
+                else if (wm.setClauses() != null && !wm.setClauses().isEmpty()) updates = true;
+            } else if (clause instanceof MergeStmt.WhenNotMatchedBySource) {
+                MergeStmt.WhenNotMatchedBySource ws = (MergeStmt.WhenNotMatchedBySource) clause;
+                if (ws.isDelete()) deletes = true;
+                else if (ws.setClauses() != null && !ws.setClauses().isEmpty()) updates = true;
+            } else if (clause instanceof MergeStmt.WhenNotMatched) {
+                if (!((MergeStmt.WhenNotMatched) clause).doNothing()) inserts = true;
+            }
+        }
+        List<PgTrigger.Event> events = new ArrayList<>();
+        if (inserts) events.add(PgTrigger.Event.INSERT);
+        if (updates) events.add(PgTrigger.Event.UPDATE);
+        if (deletes) events.add(PgTrigger.Event.DELETE);
+        return events;
+    }
+
+    /**
+     * The rights a MERGE needs: SELECT on the target, because it reads the target to decide which
+     * rows the ON condition pairs, and then one right for each kind of action its arms can perform.
+     */
+    private void checkMergePrivileges(MergeStmt stmt, String schemaName, List<PgTrigger.Event> events) {
+        executor.checkTablePrivilege("SELECT", schemaName, stmt.targetTable());
+        for (PgTrigger.Event event : events) {
+            executor.checkTablePrivilege(event.name(), schemaName, stmt.targetTable());
+        }
+    }
+
+    /**
+     * PostgreSQL does not rewrite a MERGE, so a relation that carries a rule cannot take one: the
+     * rewriter refuses the statement outright rather than try to put the rule's actions in its
+     * place. It blames the relation the statement named, which is the view when the write is aimed
+     * at one, and a view carrying a non-SELECT rule is refused for exactly the same reason.
+     */
+    private void rejectMergeOnRuledRelation(MergeStmt stmt, Table targetTable) {
+        String[] events = {"INSERT", "UPDATE", "DELETE"};
+        for (String event : events) {
+            String rule = executor.database.getRule(stmt.targetTable(), event);
+            if (rule == null && targetTable != null && targetTable.getName() != null
+                    && !targetTable.getName().equalsIgnoreCase(stmt.targetTable())) {
+                rule = executor.database.getRule(targetTable.getName(), event);
+            }
+            if (rule == null) continue;
+            MemgresException ex = new MemgresException(
+                    "cannot execute MERGE on relation \"" + stmt.targetTable() + "\"", "0A000");
+            ex.setDetail("MERGE is not supported for relations with rules.");
+            throw ex;
+        }
+    }
+
+    /**
+     * The names a MERGE writes on its target and reads off it, resolved before the scan.
+     *
+     * <p>PostgreSQL resolves them while it is still analysing the statement, so it reports a column
+     * that is not there whether or not a row ever reaches the arm that named it — a MERGE over an
+     * empty source used to report success. A system column is refused with its own complaint ahead
+     * of the missing-column check, because it is not missing; it just cannot be assigned to. And a
+     * column the system computes may only be assigned DEFAULT, which is refused here rather than
+     * per row, so nothing draws a value from an identity sequence the statement will not use.
+     */
+    private void checkMergeTargetNames(MergeStmt stmt, Table targetTable, String targetAlias) {
+        String relationName = stmt.targetTable();
+        requireMergeTargetColumns(targetTable, stmt.onCondition(), targetAlias, relationName);
+        for (MergeStmt.WhenClause clause : stmt.whenClauses()) {
+            List<InsertStmt.SetClause> sets = null;
+            Expression andCondition = null;
+            if (clause instanceof MergeStmt.WhenMatched) {
+                MergeStmt.WhenMatched wm = (MergeStmt.WhenMatched) clause;
+                andCondition = wm.andCondition();
+                if (!wm.isDelete()) sets = wm.setClauses();
+            } else if (clause instanceof MergeStmt.WhenNotMatchedBySource) {
+                MergeStmt.WhenNotMatchedBySource ws = (MergeStmt.WhenNotMatchedBySource) clause;
+                andCondition = ws.andCondition();
+                if (!ws.isDelete()) sets = ws.setClauses();
+            } else if (clause instanceof MergeStmt.WhenNotMatched) {
+                MergeStmt.WhenNotMatched wn = (MergeStmt.WhenNotMatched) clause;
+                requireMergeTargetColumns(targetTable, wn.andCondition(), targetAlias, relationName);
+                if (wn.values() != null) {
+                    for (Expression value : wn.values()) {
+                        requireMergeTargetColumns(targetTable, value, targetAlias, relationName);
+                    }
+                }
+                continue;
+            }
+            requireMergeTargetColumns(targetTable, andCondition, targetAlias, relationName);
+            if (sets == null) continue;
+            for (InsertStmt.SetClause set : sets) {
+                String col = set.column().toLowerCase();
+                if (col.equals("ctid") || col.equals("xmin") || col.equals("xmax")
+                        || col.equals("cmin") || col.equals("cmax") || col.equals("tableoid")) {
+                    throw new MemgresException(
+                            "cannot assign to system column \"" + set.column() + "\"", "0A000");
+                }
+                // A view column computed from an expression is a real column of the view — it is
+                // returned by SELECT — but there is nothing behind it to write to.
+                if (activeViewExprCols != null && activeViewExprCols.contains(col)) {
+                    MemgresException ex = new MemgresException("cannot update column \"" + set.column()
+                            + "\" of view \"" + relationName + "\"", "0A000");
+                    ex.setDetail(ViewUpdatability.DETAIL_NOT_COLUMN);
+                    throw ex;
+                }
+                int colIdx = targetTable.getColumnIndex(mapViewColumn(set.column()));
+                if (colIdx < 0) {
+                    throw new MemgresException("column \"" + set.column() + "\" of relation \""
+                            + relationName + "\" does not exist", "42703");
+                }
+                Column genCol = targetTable.getColumns().get(colIdx);
+                boolean toDefault = isDefaultLiteral(set.value());
+                if (genCol.isGenerated() && !toDefault) {
+                    throw new MemgresException("column \"" + genCol.getName()
+                            + "\" can only be updated to DEFAULT\n  Detail: Column \""
+                            + genCol.getName() + "\" is a generated column.", "428C9");
+                }
+                if (!toDefault && genCol.getDefaultValue() != null
+                        && genCol.getDefaultValue().contains("__identity__:always")) {
+                    throw new MemgresException("column \"" + genCol.getName()
+                            + "\" can only be updated to DEFAULT\n  Detail: Column \""
+                            + genCol.getName() + "\" is an identity column defined as GENERATED ALWAYS.",
+                            "428C9");
+                }
+                requireMergeTargetColumns(targetTable, set.value(), targetAlias, relationName);
+            }
+        }
+    }
+
+    /**
+     * Refuse a name the MERGE wrote against its target that the target does not have. Only a
+     * reference the writer qualified with the target is judged: a MERGE reads two relations, so an
+     * unqualified name may perfectly well be one of the source's columns, and a subquery brings a
+     * scope of its own that this cannot see into.
+     */
+    private void requireMergeTargetColumns(Table table, Expression expr, String targetAlias,
+                                           String relationName) {
+        if (table == null || expr == null) return;
+        if (AstWalk.anyMatch(expr, n -> n instanceof SubqueryExpr || n instanceof ExistsExpr
+                || n instanceof ArraySubqueryExpr || n instanceof SelectStmt)) {
+            return;
+        }
+        AstWalk.forEach(expr, node -> {
+            if (!(node instanceof ColumnRef)) return;
+            ColumnRef cr = (ColumnRef) node;
+            String qualifier = cr.table();
+            if (qualifier == null) return;
+            if (!qualifier.equalsIgnoreCase(targetAlias) && !qualifier.equalsIgnoreCase(relationName)) {
+                return;   // another relation's name: not this scope's to judge
+            }
+            if (SYSTEM_COLUMNS.contains(cr.column().toLowerCase())) return;
+            if (table.getColumnIndex(mapViewColumn(cr.column())) < 0) {
+                // PostgreSQL leaves a qualified name as it was written.
+                throw new MemgresException("column " + qualifier + "." + cr.column()
+                        + " does not exist", "42703");
+            }
+        });
+    }
+
+    /**
+     * A row the ON condition paired but the policy for the action does not admit. PostgreSQL raises
+     * rather than passing over it: a plain UPDATE quietly leaves such a row alone because its WHERE
+     * never claimed it, but a MERGE's join already did, so it has to say it could not act.
+     */
+    private void requireMergeRowVisible(boolean rlsActive, Table table, Object[] row,
+                                        String command, String alias) {
+        if (!rlsActive) return;
+        if (!filterRowsByRlsUsing(table, Collections.singletonList(row), command, alias).isEmpty()) return;
+        throw new MemgresException("target row violates row-level security policy (USING expression)"
+                + " for table \"" + table.getName() + "\"", "42501");
+    }
+
+    /**
+     * Write a MERGE's UPDATE arm through the table that actually holds the row. When the target is
+     * partitioned and the assignment moves the row out of its partition's bounds, PostgreSQL moves
+     * the row: updating it where it lay left it in a partition its values no longer belong to.
+     */
+    private Object[] writeMergeUpdate(MergeStmt stmt, Table targetTable, Map<Object[], Table> owners,
+                                      Object[] targetRow, Object[] oldRow, Object[] newRow) {
+        Table owner = owners.get(targetRow);
+        if (owner == null) owner = targetTable;
+        if (targetTable.getPartitionStrategy() != null && !targetTable.getPartitions().isEmpty()) {
+            Table routed = partitionHelper.routeToPartition(targetTable, newRow);
+            if (routed != null && routed != owner) {
+                owner.deleteRow(targetRow);
+                Object[] movedRow = Arrays.copyOf(newRow, newRow.length);
+                routed.insertRow(movedRow);
+                owners.put(movedRow, routed);
+                return movedRow;
+            }
+        }
+        owner.updateRowInPlace(targetRow, oldRow, newRow);
+        recordRowUpdateMeta(stmt.schema(), targetTable, targetRow);
+        return targetRow;
+    }
+
+    /**
+     * A source row of all nulls, shaped like the source. WHEN NOT MATCHED BY SOURCE fires for a
+     * target row that no source row paired with, and RETURNING still reads the source's columns
+     * there — as nulls, which is what PostgreSQL answers.
+     */
+    private RowContext nullSourceContext(RowContext sample) {
+        if (sample == null) return null;
+        List<RowContext.TableBinding> bindings = new ArrayList<>();
+        for (RowContext.TableBinding b : sample.getBindings()) {
+            bindings.add(new RowContext.TableBinding(b.table(), b.alias(), new Object[b.row().length]));
+        }
+        return new RowContext(bindings);
+    }
+
+    /** Whether a qualified reference names the MERGE's source rather than its target. */
+    private boolean mergeNamesSource(String qualifier, RowContext sourceCtx, String sourceAlias) {
+        if (qualifier == null) return false;
+        if (qualifier.equalsIgnoreCase(sourceAlias)) return true;
+        if (sourceCtx == null) return false;
+        for (RowContext.TableBinding b : sourceCtx.getBindings()) {
+            if (mergeBindingNamed(b, qualifier)) return true;
+        }
+        return false;
+    }
+
+    /** Whether one binding of the source answers to the given name. */
+    private boolean mergeBindingNamed(RowContext.TableBinding b, String qualifier) {
+        if (b.alias() != null && b.alias().equalsIgnoreCase(qualifier)) return true;
+        return b.table() != null && b.table().getName() != null
+                && b.table().getName().equalsIgnoreCase(qualifier);
+    }
+
+    /**
+     * RETURNING for a MERGE, which is read over the join the statement ran rather than over the
+     * target alone. PostgreSQL answers an unqualified {@code *} with every column of the source
+     * followed by every column of the target — in that order — and a qualified one with the columns
+     * of whichever of the two relations it names. OLD and NEW still mean the target row before and
+     * after the action, and every other expression is evaluated as it is for any other write.
+     */
+    private Object[] evalMergeReturning(List<SelectStmt.SelectTarget> returning, Table table,
+                                        String alias, Object[] row, Object[] oldRow, Object[] newRow,
+                                        RowContext sourceCtx, String sourceAlias) {
+        List<Object> values = new ArrayList<>();
+        for (SelectStmt.SelectTarget target : returning) {
+            if (target.expr() instanceof WildcardExpr) {
+                WildcardExpr we = (WildcardExpr) target.expr();
+                String qualifier = we.table();
+                boolean oldOrNew = qualifier != null
+                        && (qualifier.equalsIgnoreCase("old") || qualifier.equalsIgnoreCase("new"));
+                if (!oldOrNew) {
+                    boolean wantsSource = qualifier == null
+                            || mergeNamesSource(qualifier, sourceCtx, sourceAlias);
+                    if (wantsSource && sourceCtx != null) {
+                        for (RowContext.TableBinding b : sourceCtx.getBindings()) {
+                            if (qualifier != null && !qualifier.equalsIgnoreCase(sourceAlias)
+                                    && !mergeBindingNamed(b, qualifier)) {
+                                continue;
+                            }
+                            for (Object val : b.row()) values.add(val);
+                        }
+                    }
+                    if (qualifier == null || qualifier.equalsIgnoreCase(alias)
+                            || qualifier.equalsIgnoreCase(table.getName())) {
+                        for (Object val : row) values.add(val);
+                    }
+                    continue;
+                }
+            }
+            Object[] one = evalReturning(Cols.listOf(target), table, alias, row, oldRow, newRow, sourceCtx);
+            for (Object val : one) values.add(val);
+        }
+        return values.toArray();
+    }
+
+    /** Column metadata for a MERGE's RETURNING, in the order {@link #evalMergeReturning} fills it. */
+    private List<Column> buildMergeReturningColumns(List<SelectStmt.SelectTarget> returning, Table table,
+                                                    String alias, RowContext sourceSample, String sourceAlias) {
+        List<Column> cols = new ArrayList<>();
+        for (SelectStmt.SelectTarget target : returning) {
+            if (target.expr() instanceof WildcardExpr) {
+                WildcardExpr we = (WildcardExpr) target.expr();
+                String qualifier = we.table();
+                boolean oldOrNew = qualifier != null
+                        && (qualifier.equalsIgnoreCase("old") || qualifier.equalsIgnoreCase("new"));
+                if (!oldOrNew) {
+                    boolean wantsSource = qualifier == null
+                            || mergeNamesSource(qualifier, sourceSample, sourceAlias);
+                    if (wantsSource && sourceSample != null) {
+                        for (RowContext.TableBinding b : sourceSample.getBindings()) {
+                            if (qualifier != null && !qualifier.equalsIgnoreCase(sourceAlias)
+                                    && !mergeBindingNamed(b, qualifier)) {
+                                continue;
+                            }
+                            if (b.table() != null) cols.addAll(b.table().getColumns());
+                        }
+                    }
+                    if (qualifier == null || qualifier.equalsIgnoreCase(alias)
+                            || qualifier.equalsIgnoreCase(table.getName())) {
+                        cols.addAll(table.getColumns());
+                    }
+                    continue;
+                }
+            }
+            cols.addAll(buildReturningColumns(Cols.listOf(target), table));
+        }
+        return cols;
     }
 
     // ---- Statement atomicity: snapshot / restore target-table rows ----
@@ -2885,15 +3907,33 @@ class DmlExecutor {
     // lean on (Session.recordUndo only records inside a transaction), so we snapshot the
     // affected table(s) up front and, on failure, restore them. Mirrors the MERGE executor.
 
-    /** Collect the target table plus all of its leaf partitions (rows can live on either). */
+    /** Collect the target relation plus every relation that stores rows for it. */
     private List<Table> collectTargetTables(Table table) {
         List<Table> tables = new ArrayList<>();
-        if (table.getPartitionStrategy() != null && !table.getPartitions().isEmpty()) {
-            DmlPartitionHelper.collectAllPartitionTables(table, tables);
-        } else {
-            tables.add(table);
-        }
+        DmlPartitionHelper.collectRelationAndDescendants(table, tables);
         return tables;
+    }
+
+    /**
+     * The triggers a write to this relation fires. PostgreSQL clones a partitioned table's FOR
+     * EACH ROW triggers onto every partition, and it is the partition's own copy that fires: the
+     * copy is a catalogue row of its own, so reaching up to the parent for it as well fired the
+     * one trigger twice for one row. A statement-level trigger is not cloned and stays with the
+     * relation it was declared on, and plain inheritance children inherit no triggers at all.
+     */
+    private List<PgTrigger> rowTriggersFor(Table table, String named) {
+        List<PgTrigger> own = executor.database.getTriggersForTable(named);
+        // A write through an auto-updatable view is rewritten onto the base relation, so the base
+        // relation's triggers are the ones that fire. Looking them up under the name the statement
+        // wrote found only the view's, which has none — the rows were written and every BEFORE and
+        // AFTER trigger on the table behind the view was silently skipped. The view's own triggers
+        // stay first, so the INSTEAD OF scan reads them before anything the base relation adds.
+        if (table != null && table.getName() != null && !table.getName().equalsIgnoreCase(named)) {
+            List<PgTrigger> throughView = new ArrayList<PgTrigger>(own);
+            throughView.addAll(executor.database.getTriggersForTable(table.getName()));
+            own = throughView;
+        }
+        return own;
     }
 
     /** Deep-copy every row of each given table so the statement can be rolled back. */
@@ -2936,34 +3976,23 @@ class DmlExecutor {
         }
     }
 
+    /**
+     * The value a generated column takes for a row, worked out from the generation expression
+     * against that row.
+     *
+     * <p>PostgreSQL evaluates the stored expression with the other columns as values, exactly as
+     * it evaluates a CHECK constraint. Writing those values into the expression's own text and
+     * reading the text back as SQL made a value that spells a column name into that column's
+     * value, ordinary table data into syntax -- a text value holding a subquery ran it -- and
+     * every value with no literal spelling, a bytea or a timestamp or an array, into whatever
+     * Java printed it as. Whatever the expression raises is the statement's error: a value
+     * PostgreSQL never computed must not be written in its place.
+     */
     Object evalGeneratedColumn(Table table, Object[] row, Column col) {
-        // Substitute column names with their literal values
-        String sql = col.getGeneratedExpr();
-        for (int j = 0; j < table.getColumns().size(); j++) {
-            Column c = table.getColumns().get(j);
-            if (c.isGenerated()) continue;
-            Object val = row[j];
-            String replacement;
-            if (val == null) {
-                replacement = "NULL";
-            } else if (val instanceof Number || val instanceof Boolean) {
-                replacement = val.toString();
-            } else if (val instanceof HstoreValue) {
-                replacement = "'" + val.toString().replace("'", "''") + "'::hstore";
-            } else {
-                replacement = "'" + val.toString().replace("'", "''") + "'";
-            }
-            sql = sql.replaceAll("(?i)\\b" + java.util.regex.Pattern.quote(c.getName()) + "\\b", replacement);
-        }
-        try {
-            QueryResult result = executor.execute("SELECT " + sql);
-            if (!result.getRows().isEmpty() && result.getRows().get(0).length > 0) {
-                return TypeCoercion.coerceForStorage(result.getRows().get(0)[0], col);
-            }
-        } catch (MemgresException e) {
-            throw e; // Propagate errors like division by zero
-        } catch (Exception e) { /* ignore non-Memgres exceptions */ }
-        return null;
+        Expression expr = col.getGeneratedExprAst();
+        if (expr == null) return null;
+        Object value = executor.evalExpr(expr, new RowContext(table, null, row));
+        return TypeCoercion.coerceForStorage(value, col);
     }
 
     // ---- Helper: WHERE CURRENT OF ----
@@ -3026,7 +4055,7 @@ class DmlExecutor {
     }
 
     /**
-     * Clone a row and fill in VIRTUAL generated column values.
+     * Clone a row and fill in the VIRTUAL generated columns the scan reading it must have.
      * The original row is not modified (virtual columns are not stored).
      */
     Object[] computeVirtualColumns(Table table, Object[] row) {
@@ -3037,21 +4066,204 @@ class DmlExecutor {
         Object[] result = row.clone();
         for (int i = 0; i < table.getColumns().size(); i++) {
             Column col = table.getColumns().get(i);
-            if (col.isVirtual()) {
-                if (strict) {
-                    // PG 18: virtual columns cannot use user-defined functions; reject at read time
-                    checkVirtualColumnUdfAtRead(col);
+            if (!col.isVirtual()) continue;
+            if (strict) {
+                // A virtual column is not stored: PostgreSQL rewrites a reference to one into its
+                // generation expression, so the expression is evaluated where the reference stood
+                // and nowhere else. A scan reads its own qualifications for every row it passes
+                // over, so those are worked out here, and everything else the query names is
+                // worked out for the rows the qualifications kept. That is what leaves a relation
+                // whose expression raises for one row -- 10/a where a is zero -- readable by a
+                // query that filters that row out, counts the rows, or reads other columns.
+                if (!scanQualificationReads(table, col)) continue;
+                fillVirtualColumn(table, result, i, col);
+            } else {
+                try {
                     result[i] = evalGeneratedColumn(table, result, col);
-                } else {
-                    try {
-                        result[i] = evalGeneratedColumn(table, result, col);
-                    } catch (Exception e) {
-                        result[i] = null;
-                    }
+                } catch (Exception e) {
+                    result[i] = null;
                 }
             }
         }
         return result;
+    }
+
+    /**
+     * Clone a row and fill in the VIRTUAL generated columns named here, a null set naming them all.
+     */
+    Object[] computeVirtualColumns(Table table, Object[] row, Set<String> named) {
+        Object[] result = row.clone();
+        fillVirtualColumns(table, result, named);
+        return result;
+    }
+
+    /**
+     * Work out, for the rows a query kept, the VIRTUAL generated columns it reads.
+     *
+     * <p>PostgreSQL puts the generation expression where the reference to the column stood, so the
+     * select list's is evaluated for the rows the WHERE let through and for no others. Working
+     * every one out as the relation was scanned raised, for a row the query discards, an error the
+     * query never asked for -- and on an UPDATE, a DELETE or a RETURNING it lost the write.
+     *
+     * <p>The rows are the query's own copies, made as the relation was scanned, so they are filled
+     * in place: the context in front of a row carries what the FROM clause worked out about it, and
+     * building a new one around a new row would drop that. One row reaches as many contexts as the
+     * join it feeds found matches for it, so each is filled once.
+     */
+    void computeVirtualColumnsForOutput(List<RowContext> contexts,
+                                        java.util.function.Supplier<Set<String>> read) {
+        Set<String> named = null;
+        Set<Object[]> filled = null;
+        for (RowContext ctx : contexts) {
+            for (RowContext.TableBinding binding : ctx.getBindings()) {
+                Table table = binding.table();
+                if (table == null || binding.row() == null || !hasVirtualColumns(table)) continue;
+                if (filled == null) {
+                    named = read.get();
+                    filled = Collections.newSetFromMap(new IdentityHashMap<Object[], Boolean>());
+                }
+                if (!filled.add(binding.row())) continue;
+                fillVirtualColumns(table, binding.row(), named);
+            }
+        }
+    }
+
+    /** Work out the VIRTUAL generated columns named here into a row; a null set names them all. */
+    private void fillVirtualColumns(Table table, Object[] row, Set<String> named) {
+        for (int i = 0; i < table.getColumns().size(); i++) {
+            Column col = table.getColumns().get(i);
+            if (!col.isVirtual()) continue;
+            if (named != null && !named.contains(col.getName().toLowerCase())) continue;
+            fillVirtualColumn(table, row, i, col);
+        }
+    }
+
+    private void fillVirtualColumn(Table table, Object[] row, int index, Column col) {
+        // PG 18: virtual columns cannot use user-defined functions; reject at read time
+        checkVirtualColumnUdfAtRead(col);
+        row[index] = evalGeneratedColumn(table, row, col);
+    }
+
+    /**
+     * The columns these parts of a statement name, in lower case, or null when they name every
+     * column the relation has -- which is what a {@code *} asks for, and what the relation's own
+     * name read as a value asks for, a whole-row reference being all of its columns at once.
+     */
+    private static Set<String> columnsNamed(Table table, String alias, Object... parts) {
+        final Set<String> named = new HashSet<>();
+        final boolean[] everyColumn = {false};
+        AstWalk.forEach(Arrays.asList(parts), node -> {
+            if (node instanceof WildcardExpr || node instanceof CompositeStarExpr) {
+                everyColumn[0] = true;
+            } else if (node instanceof ColumnRef) {
+                String column = ((ColumnRef) node).column();
+                if (column != null) named.add(column.toLowerCase());
+            }
+        });
+        if (everyColumn[0]) return null;
+        if (table != null && named.contains(table.getName().toLowerCase())) return null;
+        if (alias != null && named.contains(alias.toLowerCase())) return null;
+        return named;
+    }
+
+    /**
+     * What one query asks a relation for. Deciding it costs a walk of the statement, so it is
+     * decided only if a virtual column is actually reached -- nearly no relation has one.
+     */
+    private static final class ColumnDemand {
+        private final java.util.function.Supplier<Set<String>> read;
+        private final java.util.function.Supplier<Set<String>> filtered;
+        private Set<String> readColumns;
+        private boolean readSettled;
+        private boolean readSettling;
+        private Set<String> filteredColumns;
+        private boolean filteredSettled;
+
+        ColumnDemand(java.util.function.Supplier<Set<String>> read,
+                     java.util.function.Supplier<Set<String>> filtered) {
+            this.read = read;
+            this.filtered = filtered;
+        }
+
+        /** The columns the query reads anywhere, or null when it reads every column there is. */
+        Set<String> readColumns() {
+            if (!readSettled) {
+                // A query asks what the query around it reads while working out what it reads
+                // itself, and the one being worked out is not an answer to that question.
+                readSettling = true;
+                try {
+                    readColumns = read.get();
+                } finally {
+                    readSettling = false;
+                }
+                readSettled = true;
+            }
+            return readColumns;
+        }
+
+        /** True while this query's own answer is still being worked out. */
+        boolean settling() { return readSettling; }
+
+        /**
+         * True when the query's own qualifications read this column, and for every column when
+         * they read them all.
+         */
+        boolean filters(String column) {
+            if (!filteredSettled) {
+                filteredColumns = filtered.get();
+                filteredSettled = true;
+            }
+            return filteredColumns == null || filteredColumns.contains(column.toLowerCase());
+        }
+    }
+
+    /** The queries reading a relation right now, the innermost last. */
+    private final List<ColumnDemand> columnDemands = new ArrayList<>();
+
+    /**
+     * Read a relation for a query that reads these columns and whose own qualifications read those;
+     * a null set names every column. What the query names is what settles whether a VIRTUAL
+     * generated column's expression is evaluated at all, and where: PostgreSQL puts the expression
+     * where the reference to the column stood, so a qualification's is worked out for every row
+     * scanned and the rest for the rows the qualification kept.
+     */
+    void enterColumnDemand(java.util.function.Supplier<Set<String>> read,
+                           java.util.function.Supplier<Set<String>> filtered) {
+        columnDemands.add(new ColumnDemand(read, filtered));
+    }
+
+    void exitColumnDemand() {
+        columnDemands.remove(columnDemands.size() - 1);
+    }
+
+    /**
+     * What the query around the one now running reads of the relations it holds, or null when it
+     * reads every column -- which is also the answer when there is no query around it.
+     *
+     * <p>PostgreSQL pulls a derived table up into the query that reads it, so a {@code *} written
+     * in one asks for what the query around it asks of it and no more: {@code SELECT k FROM (SELECT
+     * * FROM t) s} reads k of t and nothing else.
+     */
+    Set<String> enclosingColumnsRead() {
+        for (int i = columnDemands.size() - 1; i >= 0; i--) {
+            ColumnDemand demand = columnDemands.get(i);
+            // The query asking is the one whose own answer is still being worked out.
+            if (demand.settling()) continue;
+            return demand.readColumns();
+        }
+        return null;
+    }
+
+    /**
+     * Whether the qualifications of whatever is reading {@code table} name this column. Anything
+     * reading a row for its own reasons -- a constraint, an index, a write -- has named nothing,
+     * and then every column is named. A relation under row-level security is read by its policy as
+     * well as by the query, and the policy is not written in the query, so that names all of them
+     * too.
+     */
+    private boolean scanQualificationReads(Table table, Column col) {
+        if (columnDemands.isEmpty() || table.isRlsEnabled()) return true;
+        return columnDemands.get(columnDemands.size() - 1).filters(col.getName());
     }
 
     /**
@@ -3093,57 +4305,150 @@ class DmlExecutor {
     // ---- Read-only transaction check ----
 
     /**
-     * Apply an INSTEAD rule for an UPDATE or DELETE. INSTEAD NOTHING reports the command as having
-     * touched no rows; INSTEAD &lt;command&gt; runs that command in its place. Returns null when no
-     * such rule applies and the statement should run normally.
+     * Whether a relation carries a rule that leaves ON CONFLICT nothing PostgreSQL will define.
+     *
+     * <p>An UPDATE rule counts wherever it stands, disabled or not, because the rewriter notices one
+     * while it is looking for the rules this event fires and never asks whether that one would have
+     * fired. An INSERT rule counts only when it fires and has an action to run, so a disabled one
+     * and a DO INSTEAD NOTHING both leave ON CONFLICT accepted, as does a rule on any other event.
+     * All four were measured against PostgreSQL.
+     */
+    private boolean rulesForbidOnConflict(String relation) {
+        if (relation == null) return false;
+        if (executor.database.getRule(relation, "UPDATE") != null) return true;
+        for (Database.StoredRule rule : executor.database.getRules(relation, "INSERT")) {
+            if (!rule.isNothing()) return true;
+        }
+        return false;
+    }
+
+    /**
+     * A statement an INSTEAD rule stands in for never runs, so it has no rows of its own for a
+     * RETURNING clause to report. PostgreSQL can answer one only from a rule action that carries a
+     * RETURNING clause of its own, and refuses the statement outright otherwise — reporting the
+     * count of a rule action instead left the caller a result with no columns in it. A rule with a
+     * WHERE is refused as well: it takes rows out of the statement, and PostgreSQL accepts a
+     * RETURNING clause only in the action of an unconditional rule, so there is nothing the rest of
+     * the rows could be answered from either.
+     */
+    private void rejectReturningThroughInsteadRule(List<SelectStmt.SelectTarget> returning,
+                                                   String verb, String relation,
+                                                   List<Database.StoredRule> rules) {
+        if (returning == null || returning.isEmpty()) return;
+        boolean anyInstead = false;
+        for (Database.StoredRule rule : rules) {
+            if (!rule.isInstead()) continue;
+            anyInstead = true;
+            if (rule.getQualification() == null && rule.getBody() != null
+                    && rule.getBody().toUpperCase().contains("RETURNING")) {
+                return;
+            }
+        }
+        if (!anyInstead) return;
+        // Raised while the statement is being rewritten rather than while it is being read, so
+        // there is no parse location to report and PostgreSQL sends none.
+        MemgresException ex = new MemgresException("cannot perform " + verb
+                + " RETURNING on relation \"" + relation + "\"", "0A000").suppressPosition();
+        ex.setHint("You need an unconditional ON " + verb
+                + " DO INSTEAD rule with a RETURNING clause.");
+        throw ex;
+    }
+
+    /**
+     * Apply the INSTEAD rules an UPDATE or DELETE carries. A rule written without a WHERE replaces
+     * the statement outright, so the caller reports what the rule's actions did and the statement
+     * never runs. A rule with a WHERE replaces the statement only for the rows it holds for: its
+     * actions run for those, its qualification is handed back so the scan can leave them alone, and
+     * the statement goes on to act on the rest and to report its own row count.
+     *
+     * @param returning  the statement's RETURNING list, which a rule that stands in for it has to
+     *                   answer for
+     * @param suppressed collects the WHERE of every rule that spoke for part of the statement
+     * @return the result to report in place of the statement, or null when the statement runs
      */
     private QueryResult applyInsteadRule(String tableName, String event, QueryResult.Type type,
-                                         Expression where, List<InsertStmt.SetClause> setClauses) {
-        String ruleVal = executor.database.getRule(tableName, event);
-        if (ruleVal == null) return null;
+                                         Expression where, List<InsertStmt.SetClause> setClauses,
+                                         String alias, List<SelectStmt.FromItem> extraFrom,
+                                         List<SelectStmt.SelectTarget> returning,
+                                         List<Expression> suppressed) {
+        List<Database.StoredRule> rules = executor.database.getRules(tableName, event);
+        boolean anyInstead = false;
+        boolean wholeStatement = false;
+        for (Database.StoredRule rule : rules) {
+            if (!rule.isInstead()) continue;
+            anyInstead = true;
+            if (rule.getQualification() == null) wholeStatement = true;
+        }
+        if (!anyInstead) return null;
+        rejectReturningThroughInsteadRule(returning, event, tableName, rules);
         // A rule whose command lands back on its own relation would re-enter itself forever.
         if (executor.isRuleExpanding(tableName, event)) {
             throw PgErrors.infiniteRecursionInRules(tableName);
         }
-        if ("INSTEAD_NOTHING".equals(ruleVal)) {
-            return QueryResult.command(type, 0);
+        // When a rule replaced the whole statement, the statement the client sent never runs and so
+        // its row count is not the answer. PostgreSQL lets the last action that is the same kind of
+        // command as the original speak for it, and reports nothing at all when no action is: a
+        // DELETE replaced by an INSERT deleted nothing. A rule that claimed only some of the rows
+        // leaves the statement to report its own count for the rest.
+        int count = 0;
+        for (Database.StoredRule rule : rules) {
+            if (!rule.isInstead()) continue;
+            if (!wholeStatement && rule.getQualification() != null) {
+                suppressed.add(com.memgres.engine.parser.Parser.parseExpression(
+                        rule.getQualification()));
+            }
+            if (rule.isNothing()) continue;
+            // The rule's command speaks of OLD and NEW, which only mean something against a row the
+            // statement would have touched. PG rewrites the query to say the same thing; here the
+            // rows are read back through the relation and the command runs once per row.
+            count = runRowRuleActions(tableName, event, rule.getBody(), where, setClauses,
+                    wholeStatement ? type : null, rule.getQualification(), alias, extraFrom);
         }
-        if (!ruleVal.startsWith("INSTEAD:")) return null;
-
-        // The rule's command speaks of OLD and NEW, which only mean something against a row the
-        // statement would have touched. PG rewrites the query to say the same thing; here the
-        // rows are read back through the relation and the command runs once per row.
-        String ruleSql = ruleVal.substring("INSTEAD:".length());
-        // The statement the client sent never runs, so its row count is not the answer. PostgreSQL
-        // lets the last action that is the same kind of command as the original speak for it, and
-        // reports nothing at all when no action is: a DELETE replaced by an INSERT deleted nothing.
-        int count = runRowRuleActions(tableName, event, ruleSql, where, setClauses, type, null);
-        return QueryResult.command(type, count);
+        return wholeStatement ? QueryResult.command(type, count) : null;
     }
 
     /**
-     * Run the actions of a DO ALSO rule on an UPDATE or DELETE. PostgreSQL adds them to the
-     * statement rather than in place of it, so they run against the rows as they stand before the
-     * statement writes and the statement itself goes on to run and report its own row count.
-     * Only the INSERT event ever reached its rules here, so an ON UPDATE or ON DELETE rule
-     * declared DO ALSO never fired at all.
+     * Whether a qualified INSTEAD rule already spoke for this row. Its WHERE reads OLD as the row as
+     * it stands and NEW as the row the assignments would make, the same way a trigger's WHEN does,
+     * and PostgreSQL keeps the rows it holds for out of the statement it rewrote.
      */
-    private void applyAlsoRule(String tableName, String event, Expression where,
-                               List<InsertStmt.SetClause> setClauses) {
-        applyAlsoRule(tableName, event, where, setClauses, null, null);
+    private boolean ruleSuppressesRow(List<Expression> quals, Table table, Object[] oldRow,
+                                      Object[] newRow) {
+        if (quals.isEmpty()) return false;
+        RowContext ctx = new RowContext(table, "old", oldRow);
+        if (newRow != null) ctx = ctx.merge(new RowContext(table, "new", newRow));
+        for (Expression qual : quals) {
+            if (executor.isTruthy(executor.evalExpr(qual, ctx))) return true;
+        }
+        return false;
     }
 
+    /**
+     * Run the actions of the DO ALSO rules on an UPDATE or DELETE. PostgreSQL adds them to the
+     * statement rather than in place of it, so they run against the rows as they stand before the
+     * statement writes and the statement itself goes on to run and report its own row count. Every
+     * rule the event carries runs, in rule-name order, for the rows its own WHERE holds for.
+     */
     private void applyAlsoRule(String tableName, String event, Expression where,
                                List<InsertStmt.SetClause> setClauses, String alias,
                                List<SelectStmt.FromItem> extraFrom) {
-        String ruleVal = executor.database.getRule(tableName, event);
-        if (ruleVal == null || !ruleVal.startsWith("ALSO:")) return;
+        List<Database.StoredRule> rules = executor.database.getRules(tableName, event);
+        boolean any = false;
+        for (Database.StoredRule rule : rules) {
+            if (!rule.isInstead() && !rule.isNothing()) {
+                any = true;
+                break;
+            }
+        }
+        if (!any) return;
         if (executor.isRuleExpanding(tableName, event)) {
             throw PgErrors.infiniteRecursionInRules(tableName);
         }
-        runRowRuleActions(tableName, event, ruleVal.substring("ALSO:".length()), where,
-                setClauses, null, executor.database.getRuleQualification(tableName, event),
-                alias, extraFrom);
+        for (Database.StoredRule rule : rules) {
+            if (rule.isInstead() || rule.isNothing()) continue;
+            runRowRuleActions(tableName, event, rule.getBody(), where, setClauses, null,
+                    rule.getQualification(), alias, extraFrom);
+        }
     }
 
     /**
@@ -3155,13 +4460,6 @@ class DmlExecutor {
      * @param qualification the rule's WHERE, evaluated per row against OLD/NEW, or null
      * @return the row count of the last action of {@code tagType}, or 0
      */
-    private int runRowRuleActions(String tableName, String event, String ruleSql, Expression where,
-                                  List<InsertStmt.SetClause> setClauses, QueryResult.Type tagType,
-                                  String qualification) {
-        return runRowRuleActions(tableName, event, ruleSql, where, setClauses, tagType,
-                qualification, null, null);
-    }
-
     private int runRowRuleActions(String tableName, String event, String ruleSql, Expression where,
                                   List<InsertStmt.SetClause> setClauses, QueryResult.Type tagType,
                                   String qualification, String alias,
@@ -3181,17 +4479,21 @@ class DmlExecutor {
         // none, while the same action reading NEW.b writes one per row.
         boolean[] perRow = new boolean[actions.length];
         for (int a = 0; a < actions.length; a++) {
-            perRow[a] = mentionsRowAlias(actions[a]);
+            perRow[a] = actionReadsRow(actions[a]);
         }
         boolean[] ranOnce = new boolean[actions.length];
+        // The WHERE is read as SQL once and then judged against each row with OLD and NEW bound to
+        // it, the same way the actions are. PostgreSQL keeps the qualification part of the query it
+        // rewrote, where OLD and NEW are range-table entries an expression reads.
+        Expression qualExpr = qualification == null ? null
+                : com.memgres.engine.parser.Parser.parseExpression(qualification);
         executor.enterRuleExpansion(tableName, event);
         try {
             for (Object[] row : affected.getRows()) {
-                RowContext rowCtx = new RowContext(rowShape, null, row);
-                // Substitute once per row: the values do not change between the actions.
-                String[] substituted = new String[actions.length];
-                for (int a = 0; a < actions.length; a++) substituted[a] = actions[a];
-                String qual = qualification;
+                // The row as OLD and as NEW: what an assignment would write stands where the
+                // assignment names a column, and every other column is what it was.
+                Object[] oldRow = new Object[cols.size()];
+                Object[] newRow = new Object[cols.size()];
                 for (int i = 0; i < cols.size(); i++) {
                     String colName = cols.get(i).getName();
                     Object oldVal = row[i];
@@ -3204,21 +4506,16 @@ class DmlExecutor {
                             }
                         }
                     }
-                    for (int a = 0; a < actions.length; a++) {
-                        substituted[a] = substituteRowAlias(substituted[a], "NEW", colName, newVal);
-                        substituted[a] = substituteRowAlias(substituted[a], "OLD", colName, oldVal);
-                    }
-                    if (qual != null) {
-                        qual = substituteRowAlias(qual, "NEW", colName, newVal);
-                        qual = substituteRowAlias(qual, "OLD", colName, oldVal);
-                    }
+                    oldRow[i] = oldVal;
+                    newRow[i] = newVal;
                 }
+                RowContext rowAliases = rowAliasContext(rowShape, oldRow, newRow);
                 // A qualified rule fires only for the rows its WHERE holds for.
-                if (qual != null && !ruleQualificationHolds(qual)) continue;
+                if (qualExpr != null && !ruleQualificationHolds(qualExpr, rowAliases)) continue;
                 for (int a = 0; a < actions.length; a++) {
                     if (!perRow[a] && ranOnce[a]) continue;
                     ranOnce[a] = true;
-                    QueryResult actionResult = executor.execute(substituted[a], Cols.listOf());
+                    QueryResult actionResult = runRuleAction(actions[a], rowAliases);
                     if (tagType != null && actionResult != null && actionResult.getType() == tagType) {
                         actionSetsTag[a] = true;
                         actionCounts[a] += actionResult.getAffectedRows();
@@ -3240,72 +4537,177 @@ class DmlExecutor {
                 .compile("(?i)\\b(OLD|NEW)\\s*\\.").matcher(sql).find();
     }
 
-    /** Evaluate a rule's qualification once OLD and NEW have been replaced by the row's values. */
-    private boolean ruleQualificationHolds(String qualification) {
+    /**
+     * Whether a rule's qualification holds for one row, with OLD and NEW bound to it.
+     *
+     * <p>PostgreSQL evaluates the qualification as part of the query it rewrote, with OLD and NEW
+     * as range-table entries, so the row reaches it as values an expression reads. Writing those
+     * values into the qualification's text and reading the text back as SQL turned ordinary data
+     * into syntax: a value that spelled {@code NEW.b} became the next substitution's target, a
+     * {@code NEW.a} written inside one of the qualification's own string literals became whatever
+     * the row held there, and a value with no literal spelling -- a bytea, an array -- became
+     * whatever Java printed it as, so the WHERE compared something the row never held. Whatever it
+     * raises is the statement's error, and what is not true does not fire: an unknown is not a yes.
+     */
+    private boolean ruleQualificationHolds(Expression qualification, RowContext rowAliases) {
+        // A subquery inside the qualification reads OLD and NEW too, and it reaches them the way
+        // any correlated reference does: through the context the row was pushed onto.
+        executor.outerContextStack.push(rowAliases);
         try {
-            QueryResult r = executor.execute("SELECT (" + qualification + ")", Cols.listOf());
-            if (r == null || r.getRows().isEmpty()) return true;
-            Object v = r.getRows().get(0)[0];
-            return Boolean.TRUE.equals(v) || "t".equals(v) || "true".equals(String.valueOf(v));
-        } catch (RuntimeException e) {
-            // A qualification this engine cannot evaluate must not swallow the rule.
-            return true;
+            return executor.isTruthy(executor.evalExpr(qualification, rowAliases));
+        } finally {
+            executor.outerContextStack.pop();
         }
     }
 
     /**
-     * Run each action of an INSERT rule once per inserted row, with {@code NEW.col} replaced by
-     * the value the statement supplied for that column.
+     * The values a row being inserted carries for each column, as {@code NEW} reads them. NEW
+     * carries every column of it -- the ones the statement supplied and the ones it left to their
+     * defaults — not a name left standing in the rule's own SQL.
      */
-    private int runInsertRuleActions(String storedBody, InsertStmt stmt, Table table,
-                                      String ruleRelation) {
-        if (stmt.values() == null) return 0;
+    private java.util.LinkedHashMap<String, Object> insertRuleNewValues(
+            List<Expression> valueRow, RowContext valueCtx, InsertStmt stmt, Table table) {
+        // Values arrive in the order the statement names them, and through a view that is
+        // the view's own column order mapped onto the base table.
+        List<String> colNames = stmt.columns();
+        if (colNames == null) colNames = activeViewColOrder;
+        if (colNames == null) {
+            colNames = new ArrayList<>();
+            for (Column c : table.getColumns()) colNames.add(c.getName());
+        }
+        java.util.LinkedHashMap<String, Object> values = new java.util.LinkedHashMap<>();
+        for (Column c : table.getColumns()) values.put(c.getName(), null);
+        Set<String> supplied = new HashSet<>();
+        for (int ci = 0; ci < Math.min(colNames.size(), valueRow.size()); ci++) {
+            // The relation's own spelling of the column, so a value supplied under another case
+            // replaces the null placed for it rather than standing beside it.
+            String colName = colNames.get(ci);
+            int colIdx = table.getColumnIndex(colName);
+            if (colIdx >= 0) colName = table.getColumns().get(colIdx).getName();
+            // DEFAULT is not a value and evaluates to nothing: it asks for the column's default,
+            // which is what a column the statement leaves out asks for as well.
+            if (isDefaultLiteral(valueRow.get(ci))) continue;
+            values.put(colName, executor.evalExpr(valueRow.get(ci), valueCtx));
+            supplied.add(colName.toLowerCase());
+        }
+        // PostgreSQL fills in the default of every column the statement did not supply while it is
+        // rewriting the statement, which is before the rules are applied, so NEW carries the
+        // default rather than a null. A column the system computes is left alone: a generated
+        // column is computed after the rewriter has run, and NEW reads null for one.
+        for (Column c : table.getColumns()) {
+            if (supplied.contains(c.getName().toLowerCase()) || c.isGenerated()) continue;
+            values.put(c.getName(), defaultValueFor(table, c));
+        }
+        return values;
+    }
+
+    /**
+     * Whether a rule's WHERE holds for the row about to be written, with NEW standing for it.
+     *
+     * <p>NEW is a relation the qualification reads, not text written into it: a value that spells
+     * {@code NEW.b} is a value, and the qualification's own string literals are left as they were.
+     */
+    private boolean insertRuleFires(Database.StoredRule rule, Table table,
+                                    java.util.LinkedHashMap<String, Object> newValues) {
+        if (rule.getQualification() == null) return true;
+        return ruleQualificationHolds(
+                com.memgres.engine.parser.Parser.parseExpression(rule.getQualification()),
+                rowAliasContext(table, null, insertRuleNewRow(table, newValues)));
+    }
+
+    /**
+     * The rows a qualified INSTEAD rule speaks for, by their place in the VALUES list. PostgreSQL
+     * rewrites the statement to skip exactly those and to write the rest itself, so a rule with a
+     * WHERE diverts the rows it matches and leaves the others where they were going.
+     */
+    private Set<Integer> insteadClaimedRows(List<Database.StoredRule> rules,
+                                            List<List<Expression>> valueRows,
+                                            List<RowContext> valueRowContexts,
+                                            InsertStmt stmt, Table table) {
+        Set<Integer> claimed = new HashSet<>();
+        if (rules.isEmpty() || valueRows == null) return claimed;
+        boolean anyQualifiedInstead = false;
+        for (Database.StoredRule rule : rules) {
+            if (rule.isInstead() && rule.getQualification() != null) {
+                anyQualifiedInstead = true;
+                break;
+            }
+        }
+        if (!anyQualifiedInstead) return claimed;
+        for (int i = 0; i < valueRows.size(); i++) {
+            RowContext valueCtx = valueRowContexts == null ? null : valueRowContexts.get(i);
+            java.util.LinkedHashMap<String, Object> newValues =
+                    insertRuleNewValues(valueRows.get(i), valueCtx, stmt, table);
+            for (Database.StoredRule rule : rules) {
+                if (!rule.isInstead() || rule.getQualification() == null) continue;
+                if (insertRuleFires(rule, table, newValues)) {
+                    claimed.add(i);
+                    break;
+                }
+            }
+        }
+        return claimed;
+    }
+
+    /**
+     * Run the actions of the INSERT rules once per row the statement offered, in rule-name order,
+     * with {@code NEW.col} replaced by the value that row carries and the rules whose WHERE the row
+     * does not hold for left out.
+     */
+    private int runInsertRuleActions(List<Database.StoredRule> rules,
+                                     List<List<Expression>> valueRows,
+                                     List<RowContext> valueRowContexts,
+                                     InsertStmt stmt, Table table, String ruleRelation) {
+        if (valueRows == null || rules.isEmpty()) return 0;
         // A rule whose action writes back to the same relation would expand forever.
         executor.enterRuleExpansion(ruleRelation, "INSERT");
         try {
-            return runInsertRuleActionRows(storedBody, stmt, table);
+            return runInsertRuleActionRows(rules, valueRows, valueRowContexts, stmt, table);
         } finally {
             executor.exitRuleExpansion(ruleRelation, "INSERT");
         }
     }
 
     /** Returns the row count of the last action that is itself an INSERT, or 0 when none is. */
-    private int runInsertRuleActionRows(String storedBody, InsertStmt stmt, Table table) {
-        String[] allActions = Database.ruleActions(storedBody);
-        int[] actionCounts = new int[allActions.length];
-        boolean[] actionSetsTag = new boolean[allActions.length];
-        for (List<Expression> valueRow : stmt.values()) {
-            // Values arrive in the order the statement names them, and through a view that is
-            // the view's own column order mapped onto the base table.
-            List<String> colNames = stmt.columns();
-            if (colNames == null) colNames = activeViewColOrder;
-            if (colNames == null) {
-                colNames = new ArrayList<>();
-                for (Column c : table.getColumns()) colNames.add(c.getName());
+    private int runInsertRuleActionRows(List<Database.StoredRule> rules,
+                                        List<List<Expression>> valueRows,
+                                        List<RowContext> valueRowContexts,
+                                        InsertStmt stmt, Table table) {
+        List<String> flatActions = new ArrayList<>();
+        List<Integer> actionRule = new ArrayList<>();
+        for (int r = 0; r < rules.size(); r++) {
+            Database.StoredRule rule = rules.get(r);
+            if (rule.isNothing()) continue;
+            for (String action : Database.ruleActions(rule.getBody())) {
+                flatActions.add(action);
+                actionRule.add(r);
             }
-            for (int a = 0; a < allActions.length; a++) {
-                String sql = allActions[a];
-                for (int ci = 0; ci < Math.min(colNames.size(), valueRow.size()); ci++) {
-                    Object val = executor.evalExpr(valueRow.get(ci), null);
-                    String colName = colNames.get(ci);
-                    String replacement = val == null ? "NULL"
-                            : val instanceof Number ? val.toString()
-                            : "'" + val.toString().replace("'", "''") + "'";
-                    sql = sql.replaceAll("(?i)NEW\\s*\\.\\s*" + colName, replacement);
-                }
-                // NEW carries every column of the row being inserted, so one the statement did
-                // not supply is null there — not a name left standing in the rule's own SQL.
-                for (Column c : table.getColumns()) {
-                    sql = sql.replaceAll("(?i)NEW\\s*\\.\\s*" + c.getName(), "NULL");
-                }
-                QueryResult actionResult = executor.execute(sql, Cols.listOf());
+        }
+        int[] actionCounts = new int[flatActions.size()];
+        boolean[] actionSetsTag = new boolean[flatActions.size()];
+        for (int i = 0; i < valueRows.size(); i++) {
+            RowContext valueCtx = valueRowContexts == null ? null : valueRowContexts.get(i);
+            java.util.LinkedHashMap<String, Object> newValues =
+                    insertRuleNewValues(valueRows.get(i), valueCtx, stmt, table);
+            // Each rule's WHERE is judged once for the row, not once for each of its actions.
+            boolean[] fires = new boolean[rules.size()];
+            for (int r = 0; r < rules.size(); r++) {
+                fires[r] = insertRuleFires(rules.get(r), table, newValues);
+            }
+            // NEW is a relation the action reads, not text written into it: a value that spells
+            // NEW.b is a value, and the action's own string literals are left as they were.
+            RowContext rowAliases =
+                    rowAliasContext(table, null, insertRuleNewRow(table, newValues));
+            for (int a = 0; a < flatActions.size(); a++) {
+                if (!fires[actionRule.get(a)]) continue;
+                QueryResult actionResult = runRuleAction(flatActions.get(a), rowAliases);
                 if (actionResult != null && actionResult.getType() == QueryResult.Type.INSERT) {
                     actionSetsTag[a] = true;
                     actionCounts[a] += actionResult.getAffectedRows();
                 }
             }
         }
-        for (int a = allActions.length - 1; a >= 0; a--) {
+        for (int a = flatActions.size() - 1; a >= 0; a--) {
             if (actionSetsTag[a]) return actionCounts[a];
         }
         return 0;
@@ -3343,18 +4745,72 @@ class DmlExecutor {
         return executor.executeStatement(sel);
     }
 
-    /** Replace one {@code OLD.col} or {@code NEW.col} reference with the value it stands for. */
-    private String substituteRowAlias(String sql, String alias, String column, Object value) {
-        String replacement = java.util.regex.Matcher.quoteReplacement(sqlLiteral(value));
-        return sql.replaceAll("(?i)\\b" + alias + "\\s*\\.\\s*" + java.util.regex.Pattern.quote(column)
-                + "\\b", replacement);
+    /**
+     * Run one action of a rule with the row it fires for bound to OLD and NEW.
+     *
+     * <p>PostgreSQL rewrites the action with OLD and NEW as range-table entries and evaluates it,
+     * so the row reaches the action as values that an expression reads. Writing those values into
+     * the action's text instead made a value that spells {@code NEW.b} into the next
+     * substitution's target, ordinary data into syntax, and a {@code NEW.a} written inside one of
+     * the action's own string literals into whatever the row held there.
+     */
+    private QueryResult runRuleAction(String actionSql, RowContext rowAliases) {
+        executor.outerContextStack.push(rowAliases);
+        try {
+            return executor.execute(actionSql, Cols.listOf());
+        } finally {
+            executor.outerContextStack.pop();
+        }
     }
 
-    private String sqlLiteral(Object value) {
-        if (value == null) return "NULL";
-        if (value instanceof Number) return value.toString();
-        if (value instanceof Boolean) return ((Boolean) value) ? "TRUE" : "FALSE";
-        return "'" + value.toString().replace("'", "''") + "'";
+    /**
+     * OLD and NEW as a rule's action reads them: relations of the target's shape, bound to the
+     * row before and after the statement. Either may be left out, for the event that has no such
+     * row -- an INSERT has no old one.
+     */
+    private RowContext rowAliasContext(Table shape, Object[] oldRow, Object[] newRow) {
+        List<RowContext.TableBinding> bindings = new ArrayList<>();
+        if (oldRow != null) bindings.add(new RowContext.TableBinding(shape, "old", oldRow));
+        if (newRow != null) bindings.add(new RowContext.TableBinding(shape, "new", newRow));
+        return new RowContext(bindings);
+    }
+
+    /** The values NEW carries for an inserted row, in the target's own column order. */
+    private Object[] insertRuleNewRow(Table table,
+                                      java.util.LinkedHashMap<String, Object> newValues) {
+        Object[] newRow = new Object[table.getColumns().size()];
+        for (int c = 0; c < newRow.length; c++) {
+            newRow[c] = newValues.get(table.getColumns().get(c).getName());
+        }
+        return newRow;
+    }
+
+    /**
+     * Whether a rule action reads the row it fires for, which is what decides between running it
+     * once for the statement and once for every row. The answer is in the parse tree: a
+     * {@code NEW.} written inside one of the action's own string literals is part of that string
+     * and not a reference to anything. An action that will not parse is judged by its text, there
+     * being no tree to ask.
+     */
+    private boolean actionReadsRow(String actionSql) {
+        if (actionSql == null) return false;
+        String sql = actionSql.trim();
+        if (sql.endsWith(";")) sql = sql.substring(0, sql.length() - 1).trim();
+        try {
+            return AstWalk.anyMatch(com.memgres.engine.parser.Parser.parse(sql),
+                    DmlExecutor::namesRowAlias);
+        } catch (RuntimeException notParsed) {
+            return mentionsRowAlias(actionSql);
+        }
+    }
+
+    /** True when an AST node is a reference to OLD or NEW. */
+    private static boolean namesRowAlias(Object node) {
+        String qualifier = null;
+        if (node instanceof ColumnRef) qualifier = ((ColumnRef) node).table();
+        if (node instanceof WildcardExpr) qualifier = ((WildcardExpr) node).table();
+        return qualifier != null
+                && (qualifier.equalsIgnoreCase("old") || qualifier.equalsIgnoreCase("new"));
     }
 
     private void checkReadOnly(String command) {
@@ -3471,11 +4927,15 @@ class DmlExecutor {
     private Object[] evalReturning(List<SelectStmt.SelectTarget> returning, Table table, String alias,
                                     Object[] row, Object[] oldRow, Object[] newRow,
                                     RowContext sourceCtx) {
-        // Compute virtual generated column values for RETURNING evaluation
+        // A VIRTUAL generated column is not stored, and PostgreSQL puts its generation expression
+        // where the reference to it stood: RETURNING evaluates it for the columns it names and for
+        // no others, so a write to a relation whose expression raises for the row it touched is
+        // still a write that goes through.
         if (hasVirtualColumns(table)) {
-            row = computeVirtualColumns(table, row);
-            if (oldRow != null) oldRow = computeVirtualColumns(table, oldRow);
-            if (newRow != null) newRow = computeVirtualColumns(table, newRow);
+            Set<String> returned = columnsNamed(table, alias, returning);
+            row = computeVirtualColumns(table, row, returned);
+            if (oldRow != null) oldRow = computeVirtualColumns(table, oldRow, returned);
+            if (newRow != null) newRow = computeVirtualColumns(table, newRow, returned);
         }
         // Check if RETURNING references OLD or NEW (qualified column refs or wildcards)
         boolean usesOldNew = false;
@@ -3539,7 +4999,7 @@ class DmlExecutor {
                 WildcardExpr we = (WildcardExpr) target.expr();
                 if (we.table() != null && we.table().equalsIgnoreCase("OLD")) {
                     Object[] src = oldRow != null ? oldRow : new Object[table.getColumns().size()];
-                    for (Object val : src) values.add(val);
+                    addStarValues(values, table, src);
                 } else if (we.table() != null && we.table().equalsIgnoreCase("NEW")) {
                     // For DELETE (oldRow == row && newRow == null): NEW is all NULLs
                     Object[] src;
@@ -3550,10 +5010,10 @@ class DmlExecutor {
                     } else {
                         src = row;
                     }
-                    for (Object val : src) values.add(val);
+                    addStarValues(values, table, src);
                 } else {
                     // Bare * or table.* — return current row (NEW behavior, backward compat)
-                    for (Object val : row) values.add(val);
+                    addStarValues(values, table, row);
                     // For MERGE RETURNING *, also include source row columns
                     if (we.table() == null && sourceCtx != null) {
                         for (RowContext.TableBinding b : sourceCtx.getBindings()) {
@@ -3566,6 +5026,16 @@ class DmlExecutor {
             }
         }
         return values.toArray();
+    }
+
+    /** The values a * stands for: the view's columns when the write is going through one. */
+    private void addStarValues(List<Object> values, Table table, Object[] row) {
+        int[] projection = viewProjection(table);
+        if (projection == null) {
+            for (Object val : row) values.add(val);
+            return;
+        }
+        for (int index : projection) values.add(row[index]);
     }
 
     /** Check if an expression tree contains OLD.col or NEW.col references. */
@@ -3640,7 +5110,7 @@ class DmlExecutor {
      * that exists but is out of reach here, which is a different complaint from naming a relation
      * that is not in the query at all.
      */
-    private void checkMergeWhenClauses(MergeStmt stmt, String targetAlias) {
+    private void checkMergeWhenClauses(MergeStmt stmt, Table targetTable, String targetAlias) {
         // WITH RECURSIVE is refused outright, self-referencing or not.
         if (stmt.withClauses() != null) {
             for (SelectStmt.CommonTableExpr cte : stmt.withClauses()) {
@@ -3682,7 +5152,56 @@ class DmlExecutor {
                         for (Expression value : wn.values()) rejectOutOfReachAlias(value, targetAlias);
                     }
                 }
+                // A name is looked up before it is counted: PostgreSQL resolves each column of
+                // the list against the target as it reads it, so a name that is not a column of
+                // the target is reported as missing even when it is written twice.
+                checkMergeInsertArm(wn, targetTable, stmt.targetTable());
                 rejectDuplicateInsertColumns(wn.columns());
+            }
+        }
+    }
+
+    /**
+     * What a MERGE's INSERT arm has to satisfy before any row is read — the rules an ordinary
+     * INSERT is held to. A column list names columns of the target and is matched against the
+     * VALUES list one for one. Without a column list the values fill the relation's columns from
+     * the left, and PostgreSQL accepts fewer of them than there are columns but never more, so the
+     * two complaints are not symmetric. A column the system computes may only be given DEFAULT, and
+     * it is refused here rather than while the row is built, before anything has drawn a value from
+     * an identity sequence the statement is not going to use.
+     */
+    private void checkMergeInsertArm(MergeStmt.WhenNotMatched wn, Table targetTable, String relationName) {
+        if (targetTable == null || wn.doNothing()) return;
+        List<Expression> values = wn.values();
+        if (values == null) return;   // INSERT DEFAULT VALUES names nothing to match
+        List<String> columns = wn.columns();
+        if (columns != null) {
+            requireTargetColumns(targetTable, relationName, columns);
+            if (values.size() > columns.size()) {
+                throw new MemgresException("INSERT has more expressions than target columns", "42601");
+            }
+            if (values.size() < columns.size()) {
+                throw new MemgresException("INSERT has more target columns than expressions", "42601");
+            }
+        } else if (values.size() > targetTable.getColumns().size()) {
+            throw new MemgresException("INSERT has more expressions than target columns", "42601");
+        }
+        for (int i = 0; i < values.size(); i++) {
+            if (isDefaultLiteral(values.get(i))) continue;
+            int colIdx = columns != null
+                    ? targetTable.getColumnIndex(mapViewColumn(columns.get(i))) : i;
+            if (colIdx < 0 || colIdx >= targetTable.getColumns().size()) continue;
+            Column genCol = targetTable.getColumns().get(colIdx);
+            if (genCol.isGenerated()) {
+                throw new MemgresException("cannot insert a non-DEFAULT value into column \""
+                        + genCol.getName() + "\"\n  Detail: Column \"" + genCol.getName()
+                        + "\" is a generated column.", "428C9");
+            }
+            if (genCol.getDefaultValue() != null && genCol.getDefaultValue().contains("__identity__:always")) {
+                throw new MemgresException("cannot insert a non-DEFAULT value into column \""
+                        + genCol.getName() + "\"\n  Detail: Column \"" + genCol.getName()
+                        + "\" is an identity column defined as GENERATED ALWAYS."
+                        + "\n  Hint: Use OVERRIDING SYSTEM VALUE to override.", "428C9");
             }
         }
     }
@@ -3910,9 +5429,29 @@ class DmlExecutor {
      * wrote, which is the view when the write goes through one.
      */
     private void requireTargetColumns(Table table, String relationName, List<String> columnNames) {
+        requireTargetColumns(table, relationName, columnNames, false);
+    }
+
+    /**
+     * The system columns an UPDATE may not assign to. PostgreSQL has a complaint of its own for
+     * those — "cannot assign to system column" — so the target-column check leaves them to it.
+     * There is no oid among them: a user table stopped carrying one in PostgreSQL 12, so writing
+     * that name is a column that does not exist like any other.
+     *
+     * @param systemColumnsReported true when a later check reports an assignment to a system
+     *        column in PostgreSQL's own words
+     */
+    private static final Set<String> UNASSIGNABLE_SYSTEM_COLUMNS = Cols.setOf(
+            "ctid", "xmin", "xmax", "cmin", "cmax", "tableoid");
+
+    private void requireTargetColumns(Table table, String relationName, List<String> columnNames,
+                                      boolean systemColumnsReported) {
         if (table == null || columnNames == null) return;
         for (String name : columnNames) {
-            if (name == null || SYSTEM_COLUMNS.contains(name.toLowerCase())) continue;
+            if (name == null) continue;
+            if (systemColumnsReported && UNASSIGNABLE_SYSTEM_COLUMNS.contains(name.toLowerCase())) {
+                continue;
+            }
             if (table.getColumnIndex(mapViewColumn(name)) < 0) {
                 throw new MemgresException("column \"" + name + "\" of relation \""
                         + relationName + "\" does not exist", "42703");
@@ -3969,10 +5508,13 @@ class DmlExecutor {
                 boolean isOldNew = cr.table() != null &&
                         (cr.table().equalsIgnoreCase("old") || cr.table().equalsIgnoreCase("new"));
                 if (cr.table() == null || cr.table().equalsIgnoreCase(table.getName()) || isOldNew) {
-                    int idx = table.getColumnIndex(cr.column());
-                    if (idx < 0) {
-                        String qualifier = cr.table() != null ? cr.table() + "." : "";
-                        throw new MemgresException("column " + qualifier + cr.column() + " does not exist", "42703");
+                    if (!returningColumnExists(cr.column(), table)) {
+                        // PostgreSQL quotes a bare name and leaves a qualified one as written; the
+                        // unquoted form also defeated the position enrichment, which finds the
+                        // token in the statement text by its quotes.
+                        throw new MemgresException("column " + (cr.table() == null
+                                ? "\"" + cr.column() + "\"" : cr.table() + "." + cr.column())
+                                + " does not exist", "42703");
                     }
                 }
             }
@@ -3984,29 +5526,45 @@ class DmlExecutor {
         return buildReturningColumns(returning, table, null);
     }
 
+    /**
+     * What a RETURNING * answers with. Through a view that is the view's own columns under their
+     * own names: the statement was rewritten onto the base relation, but the relation it named is
+     * the view, and a base column the view does not show is not one of its columns.
+     */
+    private List<Column> returningStarColumns(Table table) {
+        int[] projection = viewProjection(table);
+        if (projection == null) return table.getColumns();
+        List<String> names = targetViewColumns();
+        List<Column> cols = new ArrayList<>(projection.length);
+        for (int i = 0; i < projection.length; i++) {
+            Column base = table.getColumns().get(projection[i]);
+            cols.add(new Column(names.get(i), base.getType(), base.isNullable(), false, null));
+        }
+        return cols;
+    }
+
     /** Build Column metadata for RETURNING clause, with optional source table for MERGE. */
     private List<Column> buildReturningColumns(List<SelectStmt.SelectTarget> returning, Table table, Table sourceTable) {
         List<Column> cols = new ArrayList<>();
         for (SelectStmt.SelectTarget target : returning) {
             if (target.expr() instanceof WildcardExpr) {
                 WildcardExpr we = (WildcardExpr) target.expr();
-                if (we.table() == null) {
-                    // Bare * — for MERGE, include target + source columns
-                    cols.addAll(table.getColumns());
-                    if (sourceTable != null) {
-                        cols.addAll(sourceTable.getColumns());
-                    }
-                } else {
-                    cols.addAll(table.getColumns());
+                cols.addAll(returningStarColumns(table));
+                if (we.table() == null && sourceTable != null) {
+                    cols.addAll(sourceTable.getColumns());
                 }
             } else if (target.alias() != null) {
                 cols.add(new Column(target.alias(), DataType.TEXT, true, false, null));
             } else if (target.expr() instanceof ColumnRef) {
                 ColumnRef cr = (ColumnRef) target.expr();
                 String colName = cr.column();
-                int idx = table.getColumnIndex(colName);
+                int idx = table.getColumnIndex(mapViewColumn(colName));
                 if (idx >= 0) {
-                    cols.add(table.getColumns().get(idx));
+                    Column base = table.getColumns().get(idx);
+                    // The answer carries the name the statement wrote, which through a view whose
+                    // columns are renamed is the view's name and not the base relation's.
+                    cols.add(colName.equalsIgnoreCase(base.getName()) ? base
+                            : new Column(colName, base.getType(), base.isNullable(), false, null));
                 } else {
                     cols.add(new Column(colName, DataType.TEXT, true, false, null));
                 }

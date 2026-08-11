@@ -9,6 +9,7 @@ import com.memgres.engine.parser.ast.FunctionCallExpr;
 import com.memgres.engine.parser.ast.Literal;
 import com.memgres.engine.parser.ast.SelectStmt;
 import com.memgres.engine.parser.ast.SubqueryExpr;
+import com.memgres.engine.parser.ast.TableConstraint;
 import com.memgres.engine.parser.ast.UnaryExpr;
 import com.memgres.engine.util.Cols;
 
@@ -305,6 +306,366 @@ public final class DdlDefinitionChecks {
     private static String baseTypeName(String typeName) {
         if (typeName == null) return "";
         return typeName.replaceAll("\\(.*\\)", "").replace("[]", "").trim();
+    }
+
+    // ---- key column lists ----
+
+    /**
+     * The columns a key names have to be the relation's own, and each may be named once.
+     * PostgreSQL settles both before it stores the constraint; a key over a column that is not
+     * there was stored with an attribute number nothing answers to, and enforced nothing at all.
+     *
+     * @param kind how PostgreSQL words the constraint in the duplicate message: "primary key",
+     *     "unique" or "exclusion"
+     */
+    public static void validateKeyColumns(Table table, java.util.List<String> columns, String kind) {
+        if (columns == null || table == null) return;
+        Set<String> seen = new java.util.HashSet<String>();
+        for (String written : columns) {
+            if (written == null || isExpressionKeyElement(written)) continue;
+            if (table.getColumnIndex(written) < 0) {
+                throw new MemgresException("column \"" + written
+                        + "\" named in key does not exist", "42703");
+            }
+            if (!seen.add(written.toLowerCase())) {
+                throw new MemgresException("column \"" + written + "\" appears twice in "
+                        + kind + " constraint", "42701");
+            }
+        }
+    }
+
+    /**
+     * The existence half alone, for the payload columns of an {@code INCLUDE} clause: those are
+     * carried in the index rather than compared, so naming one twice is not a key collision.
+     */
+    public static void requireKeyColumnsExist(Table table, java.util.List<String> columns) {
+        if (columns == null || table == null) return;
+        for (String written : columns) {
+            if (written == null || isExpressionKeyElement(written)) continue;
+            if (table.getColumnIndex(written) < 0) {
+                throw new MemgresException("column \"" + written
+                        + "\" named in key does not exist", "42703");
+            }
+        }
+    }
+
+    /**
+     * True when the key element is an expression rather than a bare column name. An expression key
+     * is resolved when it is evaluated, so there is no name here to look up.
+     */
+    private static boolean isExpressionKeyElement(String written) {
+        return written.startsWith("__using_index__:")
+                || written.indexOf('(') >= 0 || written.indexOf(' ') >= 0
+                || written.indexOf('+') >= 0 || written.indexOf('-') >= 0
+                || written.indexOf('*') >= 0 || written.indexOf('/') >= 0;
+    }
+
+    /**
+     * An exclusion constraint is enforced by an index that can answer "does any stored value stand
+     * in this relation to the new one", and only some access methods can. PostgreSQL names the
+     * method rather than storing a constraint that would never fire.
+     */
+    public static void requireExclusionCapableAccessMethod(String method) {
+        if (method == null) return;
+        String m = method.toLowerCase();
+        if (m.equals("btree") || m.equals("gist") || m.equals("spgist")) return;
+        throw PgErrors.notImplemented("access method \"" + method
+                + "\" does not support exclusion constraints");
+    }
+
+    /**
+     * {@code serial} is CREATE TABLE shorthand for an integer column with a sequence behind it,
+     * not a type: no type of that name exists, so naming one where a type is expected is 42704.
+     * The column-definition paths keep accepting it, which is the one place the shorthand means
+     * something.
+     */
+    public static void rejectSerialPseudotype(String written) {
+        if (written == null) return;
+        String bare = baseTypeName(written);
+        String lower = bare.toLowerCase();
+        if (lower.equals("serial") || lower.equals("bigserial") || lower.equals("smallserial")
+                || lower.equals("serial2") || lower.equals("serial4") || lower.equals("serial8")) {
+            throw PgErrors.undefinedObject("type", bare);
+        }
+    }
+
+    /**
+     * A system column's value is settled by the write itself, so a CHECK cannot be evaluated
+     * against one: PostgreSQL refuses the constraint rather than storing one that would read a
+     * column the row does not carry yet.
+     */
+    /** True for a name every relation carries whether or not anybody declared it. */
+    static boolean isSystemColumnName(String name) {
+        return name != null && SYSTEM_COLUMN_NAMES.contains(name.toLowerCase());
+    }
+
+    public static void rejectSystemColumnInCheck(Expression expr) {
+        if (expr == null) return;
+        Object found = AstWalk.findFirst(expr, new java.util.function.Predicate<Object>() {
+            @Override public boolean test(Object n) {
+                return n instanceof ColumnRef
+                        && ((ColumnRef) n).column() != null
+                        && SYSTEM_COLUMN_NAMES.contains(((ColumnRef) n).column().toLowerCase());
+            }
+        });
+        if (found != null) {
+            throw new MemgresException("system column \"" + ((ColumnRef) found).column()
+                    + "\" reference in check constraint is invalid", "42P10");
+        }
+    }
+
+    /** The collations every database has, whatever encoding it was created with. */
+    private static final Set<String> BUILTIN_COLLATIONS = Cols.setOf(
+            "c", "posix", "default", "ucs_basic", "unicode", "icu_root", "pg_c_utf8",
+            "c.utf-8", "c.utf8");
+
+    /**
+     * {@code 42704} when a COLLATE clause names a collation the database does not hold. PostgreSQL
+     * resolves the name where it is written -- in a column definition, in a domain -- rather than
+     * at the first comparison that would have used it, so nothing is ever created carrying a
+     * collation that nothing could be sorted by.
+     */
+    public static void requireCollationExists(Database db, String collation) {
+        if (collation == null) return;
+        String name = collation.toLowerCase().replace("\"", "");
+        if (name.startsWith("pg_catalog.")) name = name.substring("pg_catalog.".length());
+        if (BUILTIN_COLLATIONS.contains(name)) return;
+        if (db != null && db.getCollation(name) != null) return;
+        throw new MemgresException("collation \"" + collation
+                + "\" for encoding \"UTF8\" does not exist", "42704");
+    }
+
+    /** The operators that are their own commutator, and so the ones an exclusion may compare with. */
+    private static final Set<String> COMMUTATIVE_EXCLUSION_OPERATORS =
+            Cols.setOf("=", "<>", "!=", "&&", "~=");
+
+    /**
+     * An exclusion constraint asks whether a stored value and a new one stand in some relation, and
+     * the answer has to be the same whichever of the two is written first: the index may compare
+     * the pair either way round. PostgreSQL takes only an operator that is its own commutator, and
+     * names the operator with the types it would have compared. An element whose key is an
+     * expression is left alone -- there is no column there whose type could be named.
+     */
+    public static void requireCommutativeExclusionOperators(
+            Table table, java.util.List<TableConstraint.ExcludeElement> elements) {
+        if (elements == null || table == null) return;
+        for (TableConstraint.ExcludeElement element : elements) {
+            String op = element.operator();
+            if (op == null || COMMUTATIVE_EXCLUSION_OPERATORS.contains(op)) continue;
+            int idx = element.column() == null ? -1 : table.getColumnIndex(element.column());
+            if (idx < 0) continue;
+            DataType dt = table.getColumns().get(idx).getType();
+            if (dt == null) continue;
+            String type = dt.toRegtypeDisplay();
+            MemgresException e = new MemgresException(
+                    "operator " + op + "(" + type + "," + type + ") is not commutative", "42809");
+            e.setDetail("Only commutative operators can be used in exclusion constraints.");
+            throw e;
+        }
+    }
+
+    /**
+     * An exclusion constraint is enforced by an index, so the operator it compares with has to be
+     * one the index's operator class knows about: PostgreSQL looks the operator up in that class's
+     * operator family and refuses the constraint when it is not a member. The default access
+     * method, taken when no USING is written, is btree, whose only search operators are the five
+     * ordering ones — so {@code <>} is refused there although a gist class over the same type
+     * carries it.
+     *
+     * <p>Only {@code <>} is judged. An operator the type does not have at all is a different
+     * complaint (there is no operator to look up), and every ordering operator has already been
+     * refused as not commutative before this runs.
+     */
+    public static void requireExclusionOperatorInFamily(
+            Table table, java.util.List<TableConstraint.ExcludeElement> elements, String method) {
+        if (elements == null || table == null) return;
+        if (method != null && !"btree".equalsIgnoreCase(method)) return;
+        for (TableConstraint.ExcludeElement element : elements) {
+            String op = element.operator();
+            if (op == null || !(op.equals("<>") || op.equals("!="))) continue;
+            int idx = element.column() == null ? -1 : table.getColumnIndex(element.column());
+            if (idx < 0) continue;
+            Column col = table.getColumns().get(idx);
+            if (col.getEnumTypeName() != null || col.getDomainTypeName() != null
+                    || col.getCompositeTypeName() != null || col.getArrayElementType() != null) {
+                continue;
+            }
+            String[] family = btreeOperatorFamily(col.getType());
+            if (family == null) continue;
+            String operand = family[1] != null ? family[1] : col.getType().toRegtypeDisplay();
+            // PostgreSQL names the operator by its own name, so a written != is reported as <>.
+            MemgresException e = new MemgresException("operator <>(" + operand + "," + operand
+                    + ") is not a member of operator family \"" + family[0] + "\"", "42809");
+            e.setDetail("The exclusion operator must be related to the index operator class"
+                    + " for the constraint.");
+            throw e;
+        }
+    }
+
+    /**
+     * The btree operator family a column type's default operator class belongs to, and the type
+     * whose operators that class holds where it is not the column's own — a varchar borrows text's
+     * class, so the operator PostgreSQL resolves and names is text's. Null for a type whose class
+     * this engine does not model, which leaves the constraint unjudged rather than wrongly refused.
+     */
+    private static String[] btreeOperatorFamily(DataType dt) {
+        if (dt == null) return null;
+        switch (dt) {
+            case SMALLINT: case INTEGER: case BIGINT: return new String[]{"integer_ops", null};
+            case NUMERIC: return new String[]{"numeric_ops", null};
+            case REAL: case DOUBLE_PRECISION: return new String[]{"float_ops", null};
+            case BOOLEAN: return new String[]{"bool_ops", null};
+            case TEXT: return new String[]{"text_ops", null};
+            case VARCHAR: return new String[]{"text_ops", "text"};
+            case CHAR: return new String[]{"bpchar_ops", null};
+            case BYTEA: return new String[]{"bytea_ops", null};
+            case UUID: return new String[]{"uuid_ops", null};
+            case DATE: case TIMESTAMP: case TIMESTAMPTZ:
+                return new String[]{"datetime_ops", null};
+            case TIME: return new String[]{"time_ops", null};
+            case TIMETZ: return new String[]{"timetz_ops", null};
+            case INTERVAL: return new String[]{"interval_ops", null};
+            case INET: case CIDR: return new String[]{"network_ops", null};
+            case MACADDR: return new String[]{"macaddr_ops", null};
+            case MACADDR8: return new String[]{"macaddr8_ops", null};
+            case MONEY: return new String[]{"money_ops", null};
+            case OID: return new String[]{"oid_ops", null};
+            case JSONB: return new String[]{"jsonb_ops", null};
+            default: return null;
+        }
+    }
+
+    /**
+     * A bare string literal standing where a value of the column's type is expected is read with
+     * that type's input function, so one the type cannot read is refused when the definition is
+     * written rather than at the first row that relies on it. Only the numeric types are judged
+     * here, which is as far as the DEFAULT path judges one.
+     */
+    public static void requireUntypedLiteralReadableAs(Expression expr, DataType dataType) {
+        if (dataType == null || !isUntypedLiteral(expr)) return;
+        if (TypeCoercion.categoryOf(dataType) != TypeCoercion.TypeCategory.NUMERIC) return;
+        String written = ((Literal) expr).value();
+        if (written == null) return;
+        try {
+            new java.math.BigDecimal(written);
+        } catch (NumberFormatException e) {
+            throw new MemgresException("invalid input syntax for type "
+                    + dataType.toRegtypeDisplay() + ": \"" + written + "\"", "22P02");
+        }
+    }
+
+    /**
+     * A generation expression has to produce a value the column can hold, and PostgreSQL settles
+     * that where the column is defined rather than at the first row: it coerces the expression to
+     * the column's type in assignment context, and a pair with no such cast is refused. The
+     * complaint is the one a DEFAULT of the wrong type gets, down to the words "default
+     * expression", because it is the same code that stores both.
+     *
+     * <p>Only a type this engine can read straight off the expression is judged -- a cast names
+     * its own, a literal that is not the untyped string kind carries one, and a reference to a
+     * column already declared on this table has that column's. Everything else is left to the row
+     * that first relies on it, and so is a column whose type is a domain, an enum, a composite or
+     * an array, which PostgreSQL names in its own terms rather than in its base type's.
+     */
+    public static void requireGenerationExprFits(Expression expr, DdlExecutor.ResolvedType resolved,
+                                                 String columnName,
+                                                 java.util.List<Column> declared) {
+        requireStoredExprFits(expr, resolved, columnName, declared);
+    }
+
+    /**
+     * A DEFAULT written in a column definition is judged the same way, and by the same rule: the
+     * expression is coerced to the column's type in assignment context, and a pair with no such
+     * cast is refused where the column is defined.
+     *
+     * <p>Left unjudged, the definition is stored and every INSERT that leaves the column out fails
+     * on a value the statement never wrote -- a table nobody can insert into without naming the
+     * column, which is not a state PostgreSQL lets a CREATE TABLE reach.
+     */
+    public static void requireDefaultExprFits(Expression expr, DdlExecutor.ResolvedType resolved,
+                                              String columnName,
+                                              java.util.List<Column> declared) {
+        requireStoredExprFits(expr, resolved, columnName, declared);
+    }
+
+    /** The shared rule: what a stored expression produces has to be what the column can hold. */
+    private static void requireStoredExprFits(Expression expr, DdlExecutor.ResolvedType resolved,
+                                              String columnName,
+                                              java.util.List<Column> declared) {
+        if (resolved == null) return;
+        requireUntypedLiteralReadableAs(expr, resolved.dataType());
+        if (expr == null || resolved.dataType() == null || resolved.enumTypeName() != null
+                || resolved.domainTypeName() != null || resolved.compositeTypeName() != null
+                || resolved.arrayElementType() != null) {
+            return;
+        }
+        String exprType = plainExpressionTypeName(expr, declared);
+        if (exprType == null || TypeCoercion.assignableFrom(exprType, resolved.dataType())) return;
+        MemgresException e = PgErrors.datatypeMismatch("column \"" + columnName + "\" is of type "
+                + resolved.dataType().toRegtypeDisplay()
+                + " but default expression is of type " + exprType);
+        e.setHint("You will need to rewrite or cast the expression.");
+        throw e;
+    }
+
+    /**
+     * The type an expression plainly has, with a column of the same table resolved against the
+     * columns declared before it. Null wherever the type is not decidable from the expression
+     * alone, which leaves the caller to judge nothing.
+     */
+    private static String plainExpressionTypeName(Expression expr, java.util.List<Column> declared) {
+        if (expr instanceof UnaryExpr && ((UnaryExpr) expr).op() == UnaryExpr.UnaryOp.NEGATE) {
+            return plainExpressionTypeName(((UnaryExpr) expr).operand(), declared);
+        }
+        if (expr instanceof ColumnRef) {
+            ColumnRef ref = (ColumnRef) expr;
+            if (declared == null) return null;
+            for (Column c : declared) {
+                if (!c.getName().equalsIgnoreCase(ref.column())) continue;
+                if (c.getEnumTypeName() != null || c.getDomainTypeName() != null
+                        || c.getCompositeTypeName() != null || c.getArrayElementType() != null
+                        || c.getType() == null) {
+                    return null;
+                }
+                return c.getType().toRegtypeDisplay();
+            }
+            return null;
+        }
+        if (expr instanceof Literal
+                && ((Literal) expr).literalType() == Literal.LiteralType.INTEGER) {
+            // An integer literal's type follows its magnitude, the way PostgreSQL's lexer settles
+            // it: 2147483648 is a bigint and not an integer.
+            String written = ((Literal) expr).value();
+            if (written == null) return null;
+            try {
+                java.math.BigInteger n = new java.math.BigInteger(written.trim());
+                if (n.bitLength() < 32) return "integer";
+                return n.bitLength() < 64 ? "bigint" : "numeric";
+            } catch (NumberFormatException notANumber) {
+                return null;
+            }
+        }
+        return defaultExpressionTypeName(expr, null);
+    }
+
+    /**
+     * LIKE copies the shape of a relation that has one. A sequence and an index are relations too
+     * and PostgreSQL finds them by name, then refuses them: there are no columns there to copy.
+     */
+    public static void requireLikeableSource(Database db, String schemaName, String written) {
+        if (db == null || written == null) return;
+        int dot = written.indexOf('.');
+        String schema = dot > 0 ? written.substring(0, dot) : schemaName;
+        String bare = dot > 0 ? written.substring(dot + 1) : written;
+        String kind = RelationNamespace.kindOf(db, schema, bare);
+        if (!RelationNamespace.SEQUENCE.equals(kind) && !RelationNamespace.INDEX.equals(kind)) {
+            return;
+        }
+        MemgresException e = new MemgresException(
+                "relation \"" + bare + "\" is invalid in LIKE clause", "42809");
+        e.setDetail("This operation is not supported for "
+                + RelationNamespace.pluralKind(kind) + ".");
+        throw e;
     }
 
     /**

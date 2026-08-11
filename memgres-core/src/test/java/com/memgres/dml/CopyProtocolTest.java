@@ -928,7 +928,16 @@ class CopyProtocolTest {
         exec("CREATE TABLE ct_vsrc(id int, name text, score int)");
         exec("INSERT INTO ct_vsrc VALUES (1, 'alice', 90), (2, 'bob', 80)");
         exec("CREATE VIEW ct_vw AS SELECT id, name FROM ct_vsrc WHERE score >= 85");
-        String out = copyOut("COPY ct_vw TO STDOUT WITH (FORMAT csv)");
+        // COPY names a relation it reads storage from, so PostgreSQL takes only plain
+        // tables, materialized views and foreign tables; a view has no storage and is
+        // refused with 42809, pointing at COPY (SELECT ...) TO instead.
+        SQLException ex = assertThrows(SQLException.class,
+                () -> copyOut("COPY ct_vw TO STDOUT WITH (FORMAT csv)"));
+        assertEquals("42809", ex.getSQLState(), "a view is the wrong kind of object for COPY");
+        assertTrue(ex.getMessage().contains("cannot copy from view \"ct_vw\""),
+                "PG wording expected, got: " + ex.getMessage());
+        // The variant PostgreSQL points at does read through the view's definition.
+        String out = copyOut("COPY (SELECT id, name FROM ct_vw) TO STDOUT WITH (FORMAT csv)");
         assertTrue(out.contains("alice"), "View COPY should include alice (score=90)");
         assertFalse(out.contains("bob"), "View COPY should exclude bob (score=80)");
         String[] lines = Strs.strip(out).split("\n");
@@ -1196,14 +1205,25 @@ class CopyProtocolTest {
     }
 
     // ========================================================================
-    // WHERE clause (PG 12+)
+    // WHERE clause (PG 12+) — COPY FROM only
     // ========================================================================
 
     @Test @Order(220)
-    void copyTo_withWhere_filtersRows() throws Exception {
+    void copyFrom_withWhere_filtersRows() throws Exception {
         exec("CREATE TABLE ct_where(id int, name text, score int)");
-        exec("INSERT INTO ct_where VALUES (1, 'alice', 90), (2, 'bob', 60), (3, 'charlie', 80)");
-        String out = copyOut("COPY ct_where TO STDOUT WITH (FORMAT csv) WHERE score >= 80");
+        // PostgreSQL takes WHERE on COPY FROM only: it decides which incoming rows are
+        // stored. On COPY TO the same clause is a syntax error (42601) — the reading side
+        // filters with COPY (SELECT ... WHERE ...) TO instead.
+        SQLException ex = assertThrows(SQLException.class,
+                () -> copyOut("COPY ct_where TO STDOUT WITH (FORMAT csv) WHERE score >= 80"));
+        assertEquals("42601", ex.getSQLState(), "WHERE on COPY TO is a syntax error");
+        assertTrue(ex.getMessage().contains("WHERE clause not allowed with COPY TO"),
+                "PG wording expected, got: " + ex.getMessage());
+
+        long stored = copyIn("COPY ct_where FROM STDIN WITH (FORMAT csv) WHERE score >= 80",
+                "1,alice,90\n2,bob,60\n3,charlie,80\n");
+        assertEquals(2, stored, "only the rows the WHERE keeps are counted");
+        String out = copyOut("COPY (SELECT * FROM ct_where ORDER BY id) TO STDOUT WITH (FORMAT csv)");
         assertTrue(out.contains("alice"), "alice (90) should pass filter");
         assertTrue(out.contains("charlie"), "charlie (80) should pass filter");
         assertFalse(out.contains("bob"), "bob (60) should be filtered out");
@@ -1213,21 +1233,23 @@ class CopyProtocolTest {
     }
 
     @Test @Order(221)
-    void copyTo_withWhere_noMatch() throws Exception {
+    void copyFrom_withWhere_noMatch() throws Exception {
         exec("CREATE TABLE ct_where2(id int, score int)");
-        exec("INSERT INTO ct_where2 VALUES (1, 10), (2, 20)");
-        String out = copyOut("COPY ct_where2 TO STDOUT WHERE score > 100");
-        assertEquals("", out, "No rows match → empty output");
+        // A WHERE nothing satisfies stores nothing and is not an error.
+        long stored = copyIn("COPY ct_where2 FROM STDIN WHERE score > 100", "1\t10\n2\t20\n");
+        assertEquals(0, stored, "No rows match → nothing stored");
+        assertEquals(0, rowCount("ct_where2"), "No rows match → table stays empty");
         exec("DROP TABLE ct_where2");
     }
 
     @Test @Order(222)
-    void copyTo_withWhere_textFormat() throws Exception {
+    void copyFrom_withWhere_textFormat() throws Exception {
         exec("CREATE TABLE ct_where3(id int, active boolean)");
-        exec("INSERT INTO ct_where3 VALUES (1, true), (2, false), (3, true)");
-        String out = copyOut("COPY ct_where3 TO STDOUT WHERE active = true");
-        String[] lines = Strs.strip(out).split("\n");
-        assertEquals(2, lines.length, "Only active=true rows");
+        // The WHERE sees the row already converted to the column's types, so a boolean
+        // column compares as a boolean rather than as the text that arrived on the wire.
+        long stored = copyIn("COPY ct_where3 FROM STDIN WHERE active = true", "1\tt\n2\tf\n3\tt\n");
+        assertEquals(2, stored, "Only active=true rows");
+        assertEquals(2, rowCount("ct_where3"), "Only active=true rows are stored");
         exec("DROP TABLE ct_where3");
     }
 

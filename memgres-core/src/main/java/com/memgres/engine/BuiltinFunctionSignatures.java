@@ -1139,6 +1139,7 @@ public final class BuiltinFunctionSignatures {
             {"rtrim", "25", "25", "fi", "1"},
             {"rtrim", "17", "17 17", "fi", "2"},
             {"rtrim", "25", "25 25", "fi", "2"},
+            {"satisfies_hash_partition", "16", "26 23 23 2276", "fi", "4+"},
             {"scale", "23", "1700", "fi", "1"},
             {"schema_to_xml", "142", "19 16 16 25", "fs", "4"},
             {"session_user", "19", "", "fs", "0"},

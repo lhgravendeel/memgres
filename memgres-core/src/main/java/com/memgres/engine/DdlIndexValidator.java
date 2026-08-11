@@ -635,6 +635,38 @@ final class DdlIndexValidator {
         }
     }
 
+    /**
+     * A storage parameter's value as PostgreSQL stores it. A boolean or an enumerated option keeps
+     * the word that was written but in lower case -- {@code On} is stored as {@code on}, not
+     * canonicalised to {@code true} -- so pg_class.reloptions reads back the way PostgreSQL's
+     * does. The lexer hands keyword tokens over upper-cased, which is how {@code false} arrived as
+     * {@code FALSE}. A parameter this engine does not model is left exactly as it was written.
+     *
+     * <p>A parameter written with no value at all is a flag being turned on: PostgreSQL stores
+     * {@code autovacuum_enabled} as {@code autovacuum_enabled=true}.
+     */
+    static String normalizeRelOptionValue(String kind, String name, String value) {
+        if (value == null) return "true";
+        String trimmed = value.trim();
+        Map<String, RelOption> known = REL_OPTIONS.get(kind == null ? "btree" : kind.toLowerCase());
+        RelOption option = known == null || name == null ? null : known.get(name.toLowerCase());
+        if (option == null) return trimmed;
+        if (option.kind == 'b' || option.kind == 'e') {
+            return trimmed.toLowerCase(java.util.Locale.ROOT);
+        }
+        return trimmed;
+    }
+
+    /** A whole WITH clause, with every value normalised the way the catalogue reports it. */
+    static Map<String, String> normalizeRelOptions(String kind, Map<String, String> options) {
+        if (options == null) return null;
+        Map<String, String> out = new java.util.LinkedHashMap<String, String>();
+        for (Map.Entry<String, String> entry : options.entrySet()) {
+            out.put(entry.getKey(), normalizeRelOptionValue(kind, entry.getKey(), entry.getValue()));
+        }
+        return out;
+    }
+
     /** An integer or floating-point storage parameter: it must parse, and it must be in range. */
     private static void checkNumericOption(String name, String value, RelOption option) {
         double parsed;

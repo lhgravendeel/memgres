@@ -17,6 +17,11 @@ public class Column {
     private final Integer precision;
     private final Integer scale;
     private final String generatedExpr;
+    /**
+     * The generation expression as a parse tree, worked out the first time a row needs it and
+     * kept from then on. See {@link #getGeneratedExprAst()}.
+     */
+    private volatile Expression generatedExprAst;
     private final boolean virtual;          // PG 18: VIRTUAL generated column (computed on read)
     private String domainTypeName;
     /** The collation this column sorts by, when one was written for it. */
@@ -28,7 +33,10 @@ public class Column {
     private final DataType arrayElementType; // For array columns, the element type (e.g., INTEGER for integer[])
     private int tableOid;    // PgWire RowDescription: source table OID (0 if not from a real table)
     private short attNum;    // PgWire RowDescription: column attribute number (0 if not from a real table)
-    private short attStattarget = -1;  // pg_attribute.attstattarget (-1 = use system default)
+    // pg_attribute.attstattarget: null means the column has no target of its own and the system
+    // default applies, which is what PostgreSQL 17 and later report there. A short could not hold
+    // the 10000 ceiling either, so a larger target wrapped negative on the way in.
+    private Integer attStattarget;
     private String attStorageOverride;  // pg_attribute.attstorage override (null = use type default)
     private String attCompression = "";  // pg_attribute.attcompression (empty = default, "p" = pglz, "l" = lz4)
     private boolean attHasMissing;       // pg_attribute.atthasmissing (true when added via ALTER TABLE ADD COLUMN with DEFAULT)
@@ -185,6 +193,26 @@ public class Column {
     public Integer getPrecision() { return precision; }
     public Integer getScale() { return scale; }
     public String getGeneratedExpr() { return generatedExpr; }
+
+    /**
+     * The generation expression's parse tree, or null when the column has no generation
+     * expression.
+     *
+     * <p>PostgreSQL computes a generated column from the stored expression against the row's own
+     * values, so the tree is what the value comes from. Writing the row's values into the
+     * expression's text and reading that text back as SQL makes a value that spells a column name
+     * into that column and a value that spells SQL into SQL. Parsed once, since the text never
+     * changes: ALTER TABLE ... SET EXPRESSION builds a new column.
+     */
+    public Expression getGeneratedExprAst() {
+        Expression ast = generatedExprAst;
+        if (ast == null && generatedExpr != null) {
+            ast = com.memgres.engine.parser.Parser.parseExpression(generatedExpr);
+            generatedExprAst = ast;
+        }
+        return ast;
+    }
+
     public boolean isGenerated() { return generatedExpr != null; }
     public boolean isVirtual() { return virtual; }
     public String getDomainTypeName() { return domainTypeName; }
@@ -198,8 +226,8 @@ public class Column {
     public void setTableOid(int tableOid) { this.tableOid = tableOid; }
     public short getAttNum() { return attNum; }
     public void setAttNum(short attNum) { this.attNum = attNum; }
-    public short getAttStattarget() { return attStattarget; }
-    public void setAttStattarget(short attStattarget) { this.attStattarget = attStattarget; }
+    public Integer getAttStattarget() { return attStattarget; }
+    public void setAttStattarget(Integer attStattarget) { this.attStattarget = attStattarget; }
     public String getAttStorageOverride() { return attStorageOverride; }
     public void setAttStorageOverride(String attStorageOverride) { this.attStorageOverride = attStorageOverride; }
     public String getAttCompression() { return attCompression; }

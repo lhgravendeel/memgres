@@ -210,4 +210,99 @@ class PartitionRrIntegrityTest {
             exec("DROP TABLE IF EXISTS m7b_t");
         }
     }
+
+    // === A snapshot of a relation holds what the relations below it hold for it ===
+
+    /**
+     * Reading a relation reads its partitions and its inheritance children too, so the snapshot a
+     * repeatable-read transaction reads it from has to hold their rows as well. ONLY reads the
+     * relation's own storage, which for a partitioned table is nothing at all.
+     */
+    @Test
+    void aSnapshotOfAParentHoldsWhatItsChildrenHoldForIt() throws Exception {
+        exec("CREATE TABLE rrp_ip (id int, t text)");
+        exec("CREATE TABLE rrp_ic (extra int) INHERITS (rrp_ip)");
+        exec("INSERT INTO rrp_ip VALUES (1,'p')");
+        exec("INSERT INTO rrp_ic VALUES (2,'c',9)");
+        try {
+            conn.setAutoCommit(false);
+            exec("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+            assertEquals(List.of("1,p", "2,c"), query("SELECT id, t FROM rrp_ip ORDER BY id"));
+            assertEquals(List.of("1"), query("SELECT count(*) FROM ONLY rrp_ip"));
+            conn.commit();
+        } finally {
+            conn.setAutoCommit(true);
+            exec("DROP TABLE IF EXISTS rrp_ic");
+            exec("DROP TABLE IF EXISTS rrp_ip");
+        }
+    }
+
+    /**
+     * A row written through one of the names it can be reached by is the same row under all of
+     * them, so the transaction that wrote it sees its own write through the child it is stored in
+     * and through the parent it is read from alike.
+     */
+    @Test
+    void aWriteThroughOneNameIsSeenThroughTheOther() throws Exception {
+        exec("CREATE TABLE rrq_ip (id int, t text)");
+        exec("CREATE TABLE rrq_ic (extra int) INHERITS (rrq_ip)");
+        exec("INSERT INTO rrq_ip VALUES (1,'p')");
+        exec("INSERT INTO rrq_ic VALUES (2,'c',9)");
+        try {
+            conn.setAutoCommit(false);
+            exec("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+            assertEquals(List.of("2"), query("SELECT count(*) FROM rrq_ip"));
+
+            // A row inserted straight into the child is a row of the parent as well.
+            exec("INSERT INTO rrq_ic VALUES (3,'c2',8)");
+            assertEquals(List.of("3"), query("SELECT count(*) FROM rrq_ip"));
+
+            // An update through the parent reaches the row the child stores.
+            exec("UPDATE rrq_ip SET t = 'x' WHERE id = 2");
+            assertEquals(List.of("2,x"), query("SELECT id, t FROM rrq_ip WHERE id = 2"));
+            assertEquals(List.of("2,x,9"),
+                    query("SELECT id, t, extra FROM rrq_ic WHERE id = 2"));
+
+            // And so does a delete.
+            exec("DELETE FROM rrq_ip WHERE id = 2");
+            assertEquals(List.of("2"), query("SELECT count(*) FROM rrq_ip"));
+            assertEquals(List.of("1"), query("SELECT count(*) FROM rrq_ic"));
+            conn.commit();
+            assertEquals(List.of("2"), query("SELECT count(*) FROM rrq_ip"));
+        } finally {
+            conn.setAutoCommit(true);
+            exec("DROP TABLE IF EXISTS rrq_ic");
+            exec("DROP TABLE IF EXISTS rrq_ip");
+        }
+    }
+
+    /**
+     * The same for a partitioned table, whose rows all live in relations below it: what it held
+     * when the snapshot was taken, what the transaction writes to it afterwards, and what it takes
+     * away again.
+     */
+    @Test
+    void aSnapshotOfAPartitionedTableFollowsItsOwnWrites() throws Exception {
+        exec("CREATE TABLE rrr_pp (id int) PARTITION BY RANGE (id)");
+        exec("CREATE TABLE rrr_pc PARTITION OF rrr_pp FOR VALUES FROM (1) TO (100)");
+        exec("INSERT INTO rrr_pp VALUES (1),(2),(3)");
+        try {
+            conn.setAutoCommit(false);
+            exec("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+            assertEquals(List.of("3"), query("SELECT count(*) FROM rrr_pp"));
+            exec("DELETE FROM rrr_pp WHERE id = 2");
+            assertEquals(List.of("2"), query("SELECT count(*) FROM rrr_pp"));
+            exec("UPDATE rrr_pp SET id = 50 WHERE id = 3");
+            assertEquals(List.of("1"), query("SELECT count(*) FROM rrr_pp WHERE id = 50"));
+            exec("INSERT INTO rrr_pp VALUES (7)");
+            assertEquals(List.of("3"), query("SELECT count(*) FROM rrr_pp"));
+            // A partitioned table stores no rows itself, so ONLY finds none of them.
+            assertEquals(List.of("0"), query("SELECT count(*) FROM ONLY rrr_pp"));
+            conn.commit();
+            assertEquals(List.of("3"), query("SELECT count(*) FROM rrr_pp"));
+        } finally {
+            conn.setAutoCommit(true);
+            exec("DROP TABLE IF EXISTS rrr_pp");
+        }
+    }
 }

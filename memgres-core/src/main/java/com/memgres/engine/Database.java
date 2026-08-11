@@ -576,8 +576,11 @@ public class Database {
     // Granted privileges: role (lowercase) -> set of "privilege:objectType:objectName" entries
     private final Map<String, Set<String>> rolePrivileges = new ConcurrentHashMap<>();
 
-    // Rules: "table:EVENT" -> rule type (e.g., "INSTEAD_NOTHING")
+    // Rule identity and definitions for the catalogs: "name:", "def:", "state:", "everhad:" keys
     private final Map<String, String> rules = new ConcurrentHashMap<>();
+
+    // What each relation's rules do, in the order PostgreSQL fires them: by rule name
+    private final Map<String, List<StoredRule>> relationRules = new ConcurrentHashMap<>();
 
     // Object comments: "objectType:objectName" -> comment text
     private final Map<String, String> comments = new ConcurrentHashMap<>();
@@ -1110,7 +1113,67 @@ public class Database {
 
     public List<CreateTypeStmt.CompositeField> getCompositeType(String name) {
         String key = TypeNamespace.find(compositeTypes.keySet(), name);
-        return key == null ? null : compositeTypes.get(key);
+        return key == null ? null : liveAttributes(compositeTypes.get(key));
+    }
+
+    /**
+     * Give a composite type that already exists a new attribute list.
+     *
+     * <p>ALTER TYPE ... ADD/DROP/RENAME/ALTER ATTRIBUTE rewrites the list rather than editing it in
+     * place, and the map {@link #getCompositeTypes()} hands back is filtered to what the reading
+     * session may see -- while another session holds uncommitted DDL that reading is a copy, and
+     * writing through the copy threw the change away: the ALTER reported success while the type kept
+     * the attributes it had, and the next statement that named the new attribute was told there was
+     * no such column. What a type is made of is not a question of what one session can see, so it is
+     * written to the stored map. The new list inherits whatever the old one recorded about a
+     * transaction that has not committed yet, or a type created and then altered inside one
+     * still-open transaction would become visible to every other session the moment it was altered.
+     */
+    public void replaceCompositeFields(String key, List<CreateTypeStmt.CompositeField> fields) {
+        if (key == null) return;
+        List<CreateTypeStmt.CompositeField> previous = compositeTypes.put(key, fields);
+        if (previous == null) return;
+        Session creator = uncommittedObjects.remove(previous);
+        if (creator != null) uncommittedObjects.put(fields, creator);
+    }
+
+    private static final String DROPPED_ATTRIBUTE_PREFIX = "........pg.dropped.";
+    private static final String DROPPED_ATTRIBUTE_SUFFIX = "........";
+
+    /**
+     * The name PostgreSQL gives an attribute that ALTER TYPE ... DROP ATTRIBUTE took away.
+     *
+     * <p>A dropped attribute is not deleted: its pg_attribute row stays behind, marked dropped and
+     * renamed to something no statement could have written, so the attributes after it keep their
+     * numbers and the next one added takes a number of its own rather than the one just freed.
+     * pg_attribute is where a client reads the shape of a composite, and a row that simply vanished
+     * told it the type had renumbered itself.
+     */
+    public static String droppedAttributeName(int attnum) {
+        return DROPPED_ATTRIBUTE_PREFIX + attnum + DROPPED_ATTRIBUTE_SUFFIX;
+    }
+
+    /** Whether this attribute is one of those placeholders rather than a live attribute. */
+    public static boolean isDroppedAttribute(CreateTypeStmt.CompositeField field) {
+        return field != null && field.name() != null
+                && field.name().startsWith(DROPPED_ATTRIBUTE_PREFIX)
+                && field.name().endsWith(DROPPED_ATTRIBUTE_SUFFIX);
+    }
+
+    /**
+     * A composite type's attributes without the placeholders a drop left behind. The placeholders
+     * hold their numbers in the catalogs, but the type itself is made of what is left: a value of it
+     * has one field per surviving attribute, which is what everything outside the catalogs asks for.
+     * The list itself comes back when nothing was dropped, which is the ordinary case.
+     */
+    private static List<CreateTypeStmt.CompositeField> liveAttributes(
+            List<CreateTypeStmt.CompositeField> fields) {
+        if (fields == null) return null;
+        List<CreateTypeStmt.CompositeField> live = new ArrayList<>();
+        for (CreateTypeStmt.CompositeField f : fields) {
+            if (!isDroppedAttribute(f)) live.add(f);
+        }
+        return live.size() == fields.size() ? fields : live;
     }
 
     /**
@@ -1665,6 +1728,7 @@ public class Database {
     }
 
     public List<PgTrigger> getTriggersForTable(String tableName) {
+        syncPartitionTriggers();
         List<PgTrigger> list = triggers.get(tableName.toLowerCase());
         if (list == null || list.isEmpty()) return Cols.listOf();
         List<PgTrigger> sorted = new ArrayList<>(list);
@@ -1673,7 +1737,105 @@ public class Database {
     }
 
     public Map<String, List<PgTrigger>> getAllTriggers() {
+        syncPartitionTriggers();
         return triggers;
+    }
+
+    /**
+     * Give every partition its own copy of the row triggers the relation it belongs to carries.
+     *
+     * <p>PostgreSQL clones a partitioned table's FOR EACH ROW triggers onto each partition: the
+     * partition owns a pg_trigger row whose tgparentid points back at the trigger it was cloned
+     * from, which is why the partition's catalog shows the trigger and why DROP TRIGGER on the
+     * partition is refused. A statement-level trigger fires once for the statement, on the
+     * relation it was declared on, and is not cloned.
+     *
+     * <p>Partitions are created and attached long after the trigger was written, and detached
+     * again, so the copies are brought up to date whenever the registry is read rather than at
+     * the one place a partition happens to be attached. The same pass takes a copy away when its
+     * relation is no longer a partition of the relation it was cloned from, or when the original
+     * has been dropped, which is what PostgreSQL does at DETACH PARTITION and at DROP TRIGGER.
+     */
+    private void syncPartitionTriggers() {
+        if (triggers.isEmpty()) return;
+        Iterator<Map.Entry<String, List<PgTrigger>>> stale = triggers.entrySet().iterator();
+        while (stale.hasNext()) {
+            List<PgTrigger> list = stale.next().getValue();
+            if (list.isEmpty()) continue;
+            list.removeIf(t -> t.getClonedFromTable() != null && !stillCloned(t));
+            // A relation left holding nothing but copies that have gone carries no triggers at
+            // all; an entry that was already empty is left as it was found.
+            if (list.isEmpty()) stale.remove();
+        }
+        for (Map.Entry<String, List<PgTrigger>> entry : new ArrayList<>(triggers.entrySet())) {
+            for (PgTrigger trigger : new ArrayList<>(entry.getValue())) {
+                if (trigger.getClonedFromTable() != null || trigger.isForEachStatement()) continue;
+                Table on = relationOf(trigger);
+                if (on != null && !on.getPartitions().isEmpty()) cloneOntoPartitions(trigger, on);
+            }
+        }
+    }
+
+    /** Copy one trigger down the partition tree, each copy recording its immediate parent. */
+    private void cloneOntoPartitions(PgTrigger trigger, Table on) {
+        for (Table partition : on.getPartitions()) {
+            cloneOntoPartitions(cloneOnto(trigger, on, partition), partition);
+        }
+    }
+
+    /**
+     * The partition's copy of a trigger, made if it is not there yet. One the partition already
+     * carries under that name and event stands: PostgreSQL refuses a CREATE TRIGGER on the parent
+     * that would collide with it, so a collision here is a trigger somebody wrote by hand.
+     */
+    private PgTrigger cloneOnto(PgTrigger trigger, Table parent, Table partition) {
+        List<PgTrigger> here = triggers.computeIfAbsent(
+                partition.getName().toLowerCase(), k -> new ArrayList<>());
+        for (PgTrigger existing : here) {
+            if (existing.getName().equalsIgnoreCase(trigger.getName())
+                    && existing.getEvent() == trigger.getEvent()) {
+                return existing;
+            }
+        }
+        PgTrigger clone = new PgTrigger(trigger.getName(), trigger.getTiming(), trigger.getEvent(),
+                partition.getName(), trigger.getFunctionName(), trigger.getUpdateColumns(),
+                trigger.getNewTransitionTable(), trigger.getOldTransitionTable(),
+                trigger.isForEachStatement(), trigger.getWhenClause(), trigger.isDeferrable(),
+                trigger.isInitiallyDeferred(), trigger.getArgs());
+        clone.setSchemaName(trigger.getSchemaName());
+        clone.setEnabledState(trigger.getEnabledState());
+        clone.setConstraintTrigger(trigger.isConstraintTrigger());
+        clone.setConstraintRelation(trigger.getConstraintRelation());
+        clone.setClonedFromTable(parent.getName());
+        here.add(clone);
+        return clone;
+    }
+
+    /** Whether a copy's relation is still a partition of the one that carries the original. */
+    private boolean stillCloned(PgTrigger clone) {
+        Table on = relationOf(clone);
+        // A relation this cannot find is one being dropped; its triggers go with the relation.
+        if (on == null) return true;
+        Table parent = on.getPartitionParent();
+        if (parent == null || !parent.getName().equalsIgnoreCase(clone.getClonedFromTable())) {
+            return false;
+        }
+        List<PgTrigger> original = triggers.get(parent.getName().toLowerCase());
+        if (original == null) return false;
+        for (PgTrigger t : original) {
+            if (t.getName().equalsIgnoreCase(clone.getName()) && t.getEvent() == clone.getEvent()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** The relation a trigger sits on, in the schema the trigger recorded. */
+    private Table relationOf(PgTrigger trigger) {
+        if (trigger.getTableName() == null) return null;
+        Schema schema = getSchema(
+                trigger.getSchemaName() != null ? trigger.getSchemaName() : "public");
+        return schema == null ? null : schema.getTable(trigger.getTableName());
     }
 
     public void removeTrigger(String name, String tableName) {
@@ -1705,6 +1867,7 @@ public class Database {
 
     /** Triggers on the named table, restricted to one schema where that is recorded. */
     public List<PgTrigger> getTriggersForTable(String schemaName, String tableName) {
+        syncPartitionTriggers();
         List<PgTrigger> list = triggers.get(tableName.toLowerCase());
         if (list == null) return new ArrayList<>();
         if (schemaName == null) return new ArrayList<>(list);
@@ -1796,6 +1959,17 @@ public class Database {
         if (object == null || uncommittedObjects.isEmpty()) return true;
         Session creator = uncommittedObjects.get(object);
         return creator == null || creator == viewer || !creator.isInTransaction();
+    }
+
+    /**
+     * True when this session made the object inside a transaction that is still open.
+     *
+     * <p>COPY FREEZE asks: it writes rows already visible to everybody, which is only safe while
+     * nobody else can have seen the relation at all.
+     */
+    public boolean wasCreatedBy(Object object, Session creator) {
+        if (object == null || creator == null) return false;
+        return uncommittedObjects.get(object) == creator;
     }
 
     /**
@@ -1906,7 +2080,20 @@ public class Database {
     /** The sequence of this name in this schema, and in no other. */
     public Sequence getSequence(String schemaName, String name) {
         if (name == null) return null;
-        return sequences.get(seqKey(schemaName, name));
+        return visibleOne(sequences.get(seqKey(schemaName, name)));
+    }
+
+    /**
+     * The object, or nothing when another session created it inside a transaction that is still
+     * open. DDL is transactional, so until that transaction commits the object may never have
+     * existed and a second session must be told the name reaches nothing -- not that it reaches
+     * a relation of the wrong kind, which is what a lookup that skipped this reported.
+     */
+    private <T> T visibleOne(T object) {
+        if (object == null || uncommittedObjects.isEmpty()) return object;
+        Session viewer = CURRENT_VIEWER.get();
+        if (viewer == null) return object;
+        return isObjectVisibleTo(object, viewer) ? object : null;
     }
 
     /**
@@ -1918,10 +2105,12 @@ public class Database {
         if (name == null) return null;
         int dot = name.indexOf('.');
         if (dot > 0) return getSequence(name.substring(0, dot), name.substring(dot + 1));
-        Sequence pub = sequences.get(seqKey("public", name));
+        Sequence pub = visibleOne(sequences.get(seqKey("public", name)));
         if (pub != null) return pub;
         for (Map.Entry<String, Sequence> e : sequences.entrySet()) {
-            if (e.getValue().getName().equalsIgnoreCase(name)) return e.getValue();
+            if (!e.getValue().getName().equalsIgnoreCase(name)) continue;
+            Sequence seq = visibleOne(e.getValue());
+            if (seq != null) return seq;
         }
         return null;
     }
@@ -1999,68 +2188,234 @@ public class Database {
         return storedBody.split(RULE_ACTION_SEPARATOR, -1);
     }
 
-    public void addRule(String table, String event, String ruleType) {
-        rules.put(table.toLowerCase() + ":" + event.toUpperCase(), ruleType);
-    }
+    /**
+     * One CREATE RULE, kept whole. PostgreSQL holds a rule under its own name, fires every rule an
+     * event carries in rule-name order, and reads each rule's own WHERE to decide which rows its
+     * actions run for. Keying the behaviour by relation and event instead left room for one rule
+     * per pair, so a second CREATE RULE silently replaced the first and dropping or disabling any
+     * one of them retired them all.
+     */
+    public static final class StoredRule {
+        private String name;
+        private final String event;
+        private final boolean instead;
+        private final String qualification;
+        private final String body;
+        private boolean disabled;
 
-    public void addRuleByName(String ruleName, String table) {
-        addRuleByName(ruleName, table, null);
+        StoredRule(String name, String event, boolean instead, String qualification, String body) {
+            this.name = name;
+            this.event = event;
+            this.instead = instead;
+            this.qualification = qualification;
+            this.body = body;
+        }
+
+        public String getName() { return name; }
+
+        public String getEvent() { return event; }
+
+        public boolean isInstead() { return instead; }
+
+        /** The rule's WHERE, or null when it fires for every row the statement touches. */
+        public String getQualification() { return qualification; }
+
+        /** The rule's actions, joined by {@link Database#RULE_ACTION_SEPARATOR}. */
+        public String getBody() { return body; }
+
+        public boolean isDisabled() { return disabled; }
+
+        /** Whether the rule performs no action at all: DO INSTEAD NOTHING and DO ALSO NOTHING. */
+        public boolean isNothing() { return body == null || body.isEmpty(); }
     }
 
     /**
-     * Remember which event a named rule was declared for, so dropping it by name can also retire
-     * the behaviour it installed rather than leaving the rule firing under a deleted name.
+     * Register a rule under its own name, replacing one of the same name as CREATE OR REPLACE RULE
+     * does. The list is kept in rule-name order because that is the order PostgreSQL fires them in.
      */
-    public void addRuleByName(String ruleName, String table, String event) {
-        rules.put("name:" + ruleName.toLowerCase() + ":" + table.toLowerCase(),
-                event != null ? event.toUpperCase() : "exists");
+    public void addRule(String ruleName, String table, String event, boolean instead,
+                        String body, String qualification) {
+        String key = table.toLowerCase();
+        List<StoredRule> rebuilt = new ArrayList<>();
+        List<StoredRule> existing = relationRules.get(key);
+        if (existing != null) {
+            for (StoredRule r : existing) {
+                if (!r.getName().equalsIgnoreCase(ruleName)) rebuilt.add(r);
+            }
+        }
+        rebuilt.add(new StoredRule(ruleName, event == null ? "" : event.toUpperCase(),
+                instead, qualification, body));
+        rebuilt.sort((a, b) -> a.getName().compareToIgnoreCase(b.getName()));
+        relationRules.put(key, rebuilt);
+    }
+
+    /**
+     * The rules this relation carries for the event, in the order they fire. A disabled rule keeps
+     * its place in the catalogs but does not fire, so it is left out.
+     */
+    public List<StoredRule> getRules(String table, String event) {
+        List<StoredRule> out = new ArrayList<>();
+        List<StoredRule> list = relationRules.get(table.toLowerCase());
+        if (list == null) return out;
+        String want = event.toUpperCase();
+        for (StoredRule r : list) {
+            if (!r.isDisabled() && want.equals(r.getEvent())) out.add(r);
+        }
+        return out;
+    }
+
+    private StoredRule findRule(String ruleName, String table) {
+        List<StoredRule> list = relationRules.get(table.toLowerCase());
+        if (list == null) return null;
+        for (StoredRule r : list) {
+            if (r.getName().equalsIgnoreCase(ruleName)) return r;
+        }
+        return null;
     }
 
     public boolean hasRule(String ruleName, String table) {
-        return rules.containsKey("name:" + ruleName.toLowerCase() + ":" + table.toLowerCase());
+        return findRule(ruleName, table) != null;
     }
 
     /**
      * ALTER RULE ... RENAME TO: the rule keeps its event and its action, under a new name.
      * Reporting success without re-keying leaves the rule answering only to a name that is
-     * no longer written anywhere, so DROP RULE on the new name cannot find it.
+     * no longer written anywhere, so DROP RULE on the new name cannot find it. The name also
+     * decides when the rule fires relative to the others, so the list is put back in order.
      */
     public void renameRule(String ruleName, String table, String newName) {
-        String oldKey = "name:" + ruleName.toLowerCase() + ":" + table.toLowerCase();
-        String event = rules.remove(oldKey);
-        if (event == null) return;
-        rules.put("name:" + newName.toLowerCase() + ":" + table.toLowerCase(), event);
+        StoredRule rule = findRule(ruleName, table);
+        if (rule == null) return;
+        rule.name = newName;
+        List<StoredRule> resorted = new ArrayList<>(relationRules.get(table.toLowerCase()));
+        resorted.sort((a, b) -> a.getName().compareToIgnoreCase(b.getName()));
+        relationRules.put(table.toLowerCase(), resorted);
         String definition = rules.remove("def:" + ruleName.toLowerCase());
         if (definition != null) rules.put("def:" + newName.toLowerCase(), definition);
         String state = rules.remove("state:" + ruleName.toLowerCase() + ":" + table.toLowerCase());
         if (state != null) rules.put("state:" + newName.toLowerCase() + ":" + table.toLowerCase(), state);
     }
 
-    public void removeRule(String ruleName, String table) {
-        String event = rules.remove("name:" + ruleName.toLowerCase() + ":" + table.toLowerCase());
-        rules.remove("def:" + ruleName.toLowerCase());
-        rules.remove("state:" + ruleName.toLowerCase() + ":" + table.toLowerCase());
-        if (event != null && !"exists".equals(event)) {
-            rules.remove(table.toLowerCase() + ":" + event);
-            rules.remove("off:" + table.toLowerCase() + ":" + event);
-            rules.remove("qual:" + table.toLowerCase() + ":" + event);
+    /**
+     * The constraint trigger of this name anywhere in the database, or null. A constraint trigger
+     * is a constraint as well as a trigger -- SET CONSTRAINTS names it, and pg_constraint holds a
+     * row for it -- but it is kept here rather than among a table's stored constraints, so a
+     * lookup that searches only those cannot find it.
+     */
+    public PgTrigger findConstraintTrigger(String name) {
+        for (List<PgTrigger> onOneRelation : triggers.values()) {
+            for (PgTrigger t : onOneRelation) {
+                if (t.isConstraintTrigger() && t.getName().equalsIgnoreCase(name)) return t;
+            }
+        }
+        return null;
+    }
+
+    // What each rule's actions name, so a DROP of one of those relations can be refused
+    private final Map<String, RuleDependency> ruleDependencies = new ConcurrentHashMap<>();
+
+    /**
+     * The relations one rule's actions name, kept as they were written: PostgreSQL prints the
+     * rule's own name and the relation it is on when it refuses to drop something the rule needs.
+     */
+    private static final class RuleDependency {
+        private final String ruleName;
+        private final String table;
+        private final List<String> relations;
+
+        RuleDependency(String ruleName, String table, List<String> relations) {
+            this.ruleName = ruleName;
+            this.table = table;
+            this.relations = relations;
+        }
+
+        boolean names(String relation) {
+            String wanted = RelationNamespace.bareName(relation);
+            for (String r : relations) {
+                if (RelationNamespace.bareName(r).equalsIgnoreCase(wanted)) return true;
+            }
+            return false;
         }
     }
 
+    private static String ruleDependencyKey(String ruleName, String table) {
+        return ruleName.toLowerCase() + ":" + table.toLowerCase();
+    }
+
     /**
-     * Park or restore a named rule's behaviour for ALTER TABLE ... DISABLE/ENABLE RULE. The rule
-     * itself stays registered so it keeps its place in the catalogs and can be switched back on.
+     * Record which relations a rule's actions name. PostgreSQL writes a pg_depend row for each of
+     * them, and that is what makes DROP TABLE refuse while a rule that writes to the table is
+     * still there: without it the rule outlives its target and the ruled relation cannot be
+     * written to at all.
+     */
+    public void addRuleDependencies(String ruleName, String table, List<String> relations) {
+        String key = ruleDependencyKey(ruleName, table);
+        if (relations == null || relations.isEmpty()) {
+            ruleDependencies.remove(key);
+            return;
+        }
+        ruleDependencies.put(key, new RuleDependency(ruleName, table, new ArrayList<>(relations)));
+    }
+
+    /**
+     * One line per rule that names this relation, worded as PostgreSQL words the detail of the
+     * refusal. A rule whose own relation has gone is left out: it can no longer fire.
+     */
+    public List<String> ruleDependencyLines(String table) {
+        List<String> lines = new ArrayList<>();
+        for (RuleDependency dep : ruleDependencies.values()) {
+            if (!dep.names(table)) continue;
+            if (findRule(dep.ruleName, dep.table) == null || !relationStillThere(dep.table)) continue;
+            lines.add("rule " + dep.ruleName + " on table " + dep.table
+                    + " depends on table " + RelationNamespace.bareName(table));
+        }
+        return lines;
+    }
+
+    /** The rules naming this relation, as {rule name, relation}, so CASCADE can drop them. */
+    public List<String[]> rulesDependingOn(String table) {
+        List<String[]> found = new ArrayList<>();
+        for (RuleDependency dep : ruleDependencies.values()) {
+            if (!dep.names(table)) continue;
+            if (findRule(dep.ruleName, dep.table) == null || !relationStillThere(dep.table)) continue;
+            found.add(new String[]{ dep.ruleName, dep.table });
+        }
+        return found;
+    }
+
+    /** Whether some schema still holds a relation of this bare name, of any kind. */
+    private boolean relationStillThere(String name) {
+        for (Schema schema : schemas.values()) {
+            if (schema.getTable(name) != null) return true;
+        }
+        return getView(name) != null;
+    }
+
+    /** DROP RULE: only the named rule goes, and the others on the relation go on firing. */
+    public void removeRule(String ruleName, String table) {
+        ruleDependencies.remove(ruleDependencyKey(ruleName, table));
+        rules.remove("def:" + ruleName.toLowerCase());
+        rules.remove("state:" + ruleName.toLowerCase() + ":" + table.toLowerCase());
+        String key = table.toLowerCase();
+        List<StoredRule> existing = relationRules.get(key);
+        if (existing == null) return;
+        List<StoredRule> kept = new ArrayList<>();
+        for (StoredRule r : existing) {
+            if (!r.getName().equalsIgnoreCase(ruleName)) kept.add(r);
+        }
+        relationRules.put(key, kept);
+    }
+
+    /**
+     * Park or restore a named rule for ALTER TABLE ... DISABLE/ENABLE RULE. Only that rule stops
+     * firing; it stays registered so it keeps its place in the catalogs and can be switched back on.
      *
      * @return false when no rule of that name is defined on the relation
      */
     public boolean setRuleEnabled(String ruleName, String table, boolean enabled) {
-        String event = rules.get("name:" + ruleName.toLowerCase() + ":" + table.toLowerCase());
-        if (event == null) return false;
-        if ("exists".equals(event)) return true;
-        String live = table.toLowerCase() + ":" + event;
-        String parked = "off:" + live;
-        String spec = rules.remove(enabled ? parked : live);
-        if (spec != null) rules.put(enabled ? live : parked, spec);
+        StoredRule rule = findRule(ruleName, table);
+        if (rule == null) return false;
+        rule.disabled = !enabled;
         return true;
     }
 
@@ -2143,6 +2498,14 @@ public class Database {
         String from = oldTable.toLowerCase();
         String to = newTable.toLowerCase();
         if (from.equals(to)) return;
+        // What the rules do is kept per relation, so the whole list moves with the name.
+        List<StoredRule> behaviour = relationRules.remove(from);
+        if (behaviour != null) {
+            List<StoredRule> atTarget = relationRules.get(to);
+            if (atTarget != null) behaviour.addAll(atTarget);
+            behaviour.sort((a, b) -> a.getName().compareToIgnoreCase(b.getName()));
+            relationRules.put(to, behaviour);
+        }
         Map<String, String> moved = new LinkedHashMap<>();
         for (Map.Entry<String, String> e : new LinkedHashMap<>(rules).entrySet()) {
             String k = e.getKey();
@@ -2153,11 +2516,6 @@ public class Database {
                 rekeyed = k.substring(0, k.length() - from.length()) + to;
             } else if (k.startsWith("state:") && k.endsWith(":" + from)) {
                 rekeyed = k.substring(0, k.length() - from.length()) + to;
-            } else if (k.startsWith("qual:" + from + ":") || k.startsWith("off:" + from + ":")) {
-                int colon = k.indexOf(':');
-                rekeyed = k.substring(0, colon + 1) + to + k.substring(colon + 1 + from.length());
-            } else if (k.startsWith(from + ":")) {
-                rekeyed = to + k.substring(from.length());
             } else if (k.startsWith("def:") && e.getValue().startsWith(from + "|")) {
                 // The definition records the relation it is on in its first field.
                 moved.put(k, to + e.getValue().substring(from.length()));
@@ -2192,11 +2550,30 @@ public class Database {
                     t.isDeferrable(), t.isInitiallyDeferred(), t.getArgs());
             moved.setSchemaName(newSchema != null ? newSchema : t.getSchemaName());
             moved.setEnabledState(t.getEnabledState());
+            moved.setConstraintTrigger(t.isConstraintTrigger());
+            moved.setConstraintRelation(t.getConstraintRelation());
             rebuilt.add(moved);
         }
         List<PgTrigger> atTarget = triggers.get(to);
         if (atTarget != null) rebuilt.addAll(0, atTarget);
         triggers.put(to, rebuilt);
+    }
+
+    /**
+     * Drop the rules a relation carries, for a relation that is being dropped.
+     *
+     * <p>PostgreSQL records a rule as part of the relation it sits on, so dropping the relation
+     * deletes its rules with it -- no CASCADE is needed and none of them is named in the cascade
+     * report, because nothing outside the relation depends on them. Leaving them registered kept
+     * them in {@code pg_rules} describing a relation that was no longer there.
+     */
+    public void dropRulesOn(String table) {
+        List<StoredRule> carried = relationRules.get(table.toLowerCase());
+        if (carried != null) {
+            // Each goes through the ordinary drop, so what the rule depended on is forgotten too.
+            for (StoredRule r : new ArrayList<>(carried)) removeRule(r.getName(), table);
+        }
+        clearRuleHistory(table);
     }
 
     /**
@@ -2207,37 +2584,27 @@ public class Database {
     public void clearRuleHistory(String table) {
         String lower = table.toLowerCase();
         rules.remove("everhad:" + lower);
-        java.util.List<String> gone = new java.util.ArrayList<>();
-        for (java.util.Map.Entry<String, String> e : rules.entrySet()) {
-            String k = e.getKey();
-            if (k.startsWith("name:") && k.endsWith(":" + lower)) {
-                gone.add(k);
-                gone.add("def:" + k.substring(5, k.length() - lower.length() - 1));
-                gone.add("state:" + k.substring(5));
-            } else if (k.startsWith(lower + ":") || k.startsWith("off:" + lower + ":")
-                    || k.startsWith("qual:" + lower + ":")) {
-                gone.add(k);
-            }
+        List<StoredRule> gone = relationRules.remove(lower);
+        if (gone == null) return;
+        for (StoredRule r : gone) {
+            rules.remove("def:" + r.getName().toLowerCase());
+            rules.remove("state:" + r.getName().toLowerCase() + ":" + lower);
         }
-        for (String k : gone) rules.remove(k);
-    }
-
-    public String getRule(String table, String event) {
-        return rules.get(table.toLowerCase() + ":" + event.toUpperCase());
     }
 
     /**
-     * A rule's WHERE, kept beside its actions so the rows it fires for can be told apart from
-     * the rows it does not. Without it a qualified rule either fires for every row or for none.
+     * The name of the first rule this relation carries for the event, or null when it carries none.
+     * A statement PostgreSQL will not rewrite asks only whether there is one; everything that fires
+     * rules reads them through {@link #getRules}, which hands back each rule's own WHERE.
      */
-    public void addRuleQualification(String table, String event, String qualification) {
-        String key = "qual:" + table.toLowerCase() + ":" + event.toUpperCase();
-        if (qualification == null) rules.remove(key);
-        else rules.put(key, qualification);
-    }
-
-    public String getRuleQualification(String table, String event) {
-        return rules.get("qual:" + table.toLowerCase() + ":" + event.toUpperCase());
+    public String getRule(String table, String event) {
+        List<StoredRule> list = relationRules.get(table.toLowerCase());
+        if (list == null) return null;
+        String want = event.toUpperCase();
+        for (StoredRule r : list) {
+            if (want.equals(r.getEvent())) return r.getName();
+        }
+        return null;
     }
 
     // Comments. The name half of a key is schema-qualified for everything a schema holds, so

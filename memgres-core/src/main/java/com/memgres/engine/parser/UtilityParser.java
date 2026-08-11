@@ -28,86 +28,40 @@ class UtilityParser {
 
     CopyStmt parseCopy() {
         parser.expectKeyword("COPY");
-        // COPY (SELECT ...) TO: subquery form
+        // The target is either a query in parentheses or a relation with an optional column
+        // list. Both take the same options and the same trailing clauses, so both are read here:
+        // a second, smaller loop is a second set of rules for the same syntax, and the query form
+        // was accepting options and a trailing WHERE that PostgreSQL refuses.
+        Statement subquery = null;
+        String table = null;
+        List<String> columns = null;
         if (parser.check(TokenType.LEFT_PAREN)) {
             parser.advance(); // consume (
-            Statement subquery = parser.parseStatement();
+            subquery = parser.parseStatement();
             parser.expect(TokenType.RIGHT_PAREN);
-            parser.expectKeyword("TO");
-            String source;
-            if (parser.check(TokenType.STRING_LITERAL)) {
-                source = parser.advance().value();
-            } else {
-                source = parser.readIdentifier().toUpperCase();
+        } else {
+            // Table name: handle schema-qualified names (schema.table)
+            table = parser.readIdentifier();
+            if (parser.match(TokenType.DOT)) {
+                // schema.table: preserve schema-qualified name
+                table = table + "." + parser.readIdentifier();
             }
-            // Parse options for subquery COPY TO
-            String format = "text";
-            String delimiter = null;
-            String nullString = null;
-            boolean header = false;
-            if (parser.matchKeyword("WITH") || parser.check(TokenType.LEFT_PAREN)) {
-                if (parser.check(TokenType.LEFT_PAREN)) parser.advance();
-                while (!parser.check(TokenType.RIGHT_PAREN) && !parser.isAtEnd()) {
-                    String opt = parser.readIdentifier().toUpperCase();
-                    switch (opt) {
-                        case "FORMAT":
-                            format = parser.readIdentifier().toLowerCase();
-                            break;
-                        case "DELIMITER":
-                            delimiter = parser.advance().value();
-                            break;
-                        case "NULL":
-                            nullString = parser.advance().value();
-                            break;
-                        case "HEADER": {
-                            header = true; parser.matchKeyword("TRUE"); 
-                            break;
-                        }
-                        case "CSV":
-                            format = "csv";
-                            break;
-                        default: {
-                            if (!parser.check(TokenType.COMMA) && !parser.check(TokenType.RIGHT_PAREN) && !parser.isAtEnd())
-                                parser.advance();
-                            break;
-                        }
-                    }
-                    parser.match(TokenType.COMMA);
-                }
-                parser.match(TokenType.RIGHT_PAREN);
+            // Optional column list
+            if (parser.match(TokenType.LEFT_PAREN)) {
+                columns = new ArrayList<>();
+                do {
+                    columns.add(parser.readIdentifier());
+                } while (parser.match(TokenType.COMMA));
+                parser.expect(TokenType.RIGHT_PAREN);
             }
-            if (parser.matchKeyword("CSV")) {
-                format = "csv";
-                if (parser.matchKeyword("HEADER")) header = true;
-            }
-            if (delimiter == null) delimiter = "csv".equals(format) ? "," : "\t";
-            if (nullString == null) nullString = "csv".equals(format) ? "" : "\\N";
-            return new CopyStmt(null, null, false, source, format, delimiter, nullString, header, null, subquery);
         }
 
-        // Table name: handle schema-qualified names (schema.table)
-        String table = parser.readIdentifier();
-        if (parser.match(TokenType.DOT)) {
-            // schema.table: preserve schema-qualified name
-            table = table + "." + parser.readIdentifier();
-        }
-
-        // Optional column list
-        List<String> columns = null;
-        if (parser.match(TokenType.LEFT_PAREN)) {
-            columns = new java.util.ArrayList<>();
-            do {
-                columns.add(parser.readIdentifier());
-            } while (parser.match(TokenType.COMMA));
-            parser.expect(TokenType.RIGHT_PAREN);
-        }
-
-        boolean isFrom;
-        if (parser.matchKeyword("FROM")) {
+        // A query is a source of rows and nothing else, so only the relation form reads FROM.
+        boolean isFrom = false;
+        if (subquery == null && parser.matchKeyword("FROM")) {
             isFrom = true;
         } else {
             parser.expectKeyword("TO");
-            isFrom = false;
         }
 
         // Source: filename string, STDIN/STDOUT, or PROGRAM 'command'
@@ -125,122 +79,59 @@ class UtilityParser {
         }
 
         // Optional WITH (options)
-        String format = "text";
-        String delimiter = null; // null = use format default later
-        String nullString = null; // null = use format default later
-        boolean header = false;
-        String quote = "\"";
-        String escape = null; // null = same as quote char
-        List<String> forceQuote = null;
-        List<String> forceNotNull = null;
-        List<String> forceNull = null;
-        boolean headerMatch = false;
-        boolean freeze = false;
-        String encoding = null;
-        String onError = null;
-        String rejectLimit = null;
-        String defaultString = null;
-
+        CopyOptions opts = new CopyOptions();
         if (parser.matchKeyword("WITH") || parser.check(TokenType.LEFT_PAREN)) {
-            if (parser.check(TokenType.LEFT_PAREN)) {
+            boolean parenthesised = parser.check(TokenType.LEFT_PAREN);
+            if (parenthesised) {
                 parser.advance(); // consume '('
             }
             while (!parser.check(TokenType.RIGHT_PAREN) && !parser.isAtEnd()) {
-                String opt = parser.readIdentifier().toUpperCase();
-                switch (opt) {
-                    case "FORMAT":
-                        format = parser.readIdentifier().toLowerCase();
-                        break;
-                    case "DELIMITER":
-                        delimiter = parser.advance().value();
-                        break;
-                    case "NULL":
-                        nullString = parser.advance().value();
-                        break;
-                    case "HEADER": {
-                        header = true;
-                        if (parser.matchKeyword("TRUE")) { /* already set */ }
-                        else if (parser.matchKeyword("FALSE")) { header = false; }
-                        else if (parser.matchKeyword("MATCH")) { headerMatch = true; }
-                        break;
-                    }
-                    case "QUOTE":
-                        quote = parser.advance().value();
-                        break;
-                    case "ESCAPE":
-                        escape = parser.advance().value();
-                        break;
-                    case "FORCE_QUOTE":
-                        forceQuote = parseColumnListOption();
-                        break;
-                    case "FORCE_NOT_NULL":
-                        forceNotNull = parseColumnListOption();
-                        break;
-                    case "FORCE_NULL":
-                        forceNull = parseColumnListOption();
-                        break;
-                    case "FREEZE": {
-                        freeze = true;
-                        parser.matchKeyword("TRUE");
-                        break;
-                    }
-                    case "ENCODING":
-                        encoding = parser.advance().value();
-                        break;
-                    case "ON_ERROR":
-                        onError = parser.readIdentifier().toLowerCase();
-                        break;
-                    case "REJECT_LIMIT":
-                        rejectLimit = parser.advance().value();
-                        break;
-                    case "LOG_VERBOSITY":
-                        parser.readIdentifier();
-                        break;
-                    case "DEFAULT":
-                        defaultString = parser.advance().value();
-                        break;
-                    case "CSV":
-                        format = "csv";
-                        break;
-                    default: {
-                        // Skip unknown option values
-                        if (!parser.check(TokenType.COMMA) && !parser.check(TokenType.RIGHT_PAREN) && !parser.isAtEnd()) {
-                            parser.advance();
-                        }
-                        break;
-                    }
+                try {
+                    readCopyOption(opts, isFrom, parenthesised);
+                } catch (MemgresException e) {
+                    // The list is still read to its end: this is a complaint about the options,
+                    // and PostgreSQL does not make it until the relation is open.
+                    opts.defer(e);
+                    skipRestOfOptionList();
+                    break;
                 }
                 parser.match(TokenType.COMMA);
             }
             parser.match(TokenType.RIGHT_PAREN);
         }
 
-        // A limit on how many rows may be rejected only means something where rows are allowed
-        // to be rejected at all, so PostgreSQL refuses the one written without the other.
-        if (rejectLimit != null && !"ignore".equalsIgnoreCase(onError)) {
-            throw new MemgresException("COPY REJECT_LIMIT requires ON_ERROR to be set to IGNORE",
-                    "22023");
-        }
-
         // Handle CSV keyword without WITH (old-style syntax)
         if (parser.matchKeyword("CSV")) {
-            format = "csv";
-            if (parser.matchKeyword("HEADER")) header = true;
+            opts.format = "csv";
+            if (parser.matchKeyword("HEADER")) opts.header = true;
         }
 
         // Handle BINARY keyword without WITH
         if (parser.matchKeyword("BINARY")) {
-            format = "binary";
+            opts.format = "binary";
         }
 
-        // Set format-dependent defaults
-        if (delimiter == null) delimiter = "csv".equals(format) ? "," : "\t";
-        if (nullString == null) nullString = "csv".equals(format) ? "" : "\\N";
-        if (escape == null) escape = quote;
+        // PostgreSQL settles the options against each other and against the direction before it
+        // reads or writes anything, so a statement it will not run moves no data at all -- but
+        // after it has opened the relation, so the refusal waits with the rest of them.
+        try {
+            opts.validate(isFrom);
+        } catch (MemgresException e) {
+            opts.defer(e);
+        }
 
-        // Handle WHERE clause for COPY FROM/TO
+        // WHERE picks the rows a COPY FROM loads. On the way out there is nothing left to pick
+        // from, so PostgreSQL refuses a WHERE on COPY TO, and the query form has no grammar for
+        // one at all — there it is a syntax error rather than a clause nobody reads.
         String whereClause = null;
-        if (parser.matchKeyword("WHERE")) {
+        if (parser.checkKeyword("WHERE")) {
+            if (subquery != null) {
+                throw new MemgresException(SYNTAX_AT + parser.peek().value() + Q, "42601");
+            }
+            if (!isFrom) {
+                throw new MemgresException("WHERE clause not allowed with COPY TO", "42601");
+            }
+            parser.advance();
             // Capture the rest as WHERE clause text
             StringBuilder wb = new StringBuilder();
             while (!parser.isAtEnd() && parser.peek().type() != TokenType.SEMICOLON) {
@@ -255,8 +146,39 @@ class UtilityParser {
             whereClause = wb.toString();
         }
 
-        return new CopyStmt(table, columns, isFrom, source, format, delimiter, nullString, header, null, null,
-                quote, escape, forceQuote, forceNotNull, forceNull, headerMatch, freeze, encoding, whereClause, onError, defaultString);
+        // Only now do the format's defaults fill in what was omitted: every check above turns on
+        // what was written, and a default is not something anybody wrote.
+        boolean csv = "csv".equals(opts.format);
+        String delimiter = opts.delimiter != null ? opts.delimiter : (csv ? "," : "\t");
+        String nullString = opts.nullString != null ? opts.nullString : (csv ? "" : "\\N");
+        String quote = opts.quote != null ? opts.quote : "\"";
+        String escape = opts.escape != null ? opts.escape : quote;
+
+        CopyStmt stmt = new CopyStmt(table, columns, isFrom, source, opts.format, delimiter,
+                nullString, opts.header, null, subquery, quote, escape, opts.forceQuote,
+                opts.forceNotNull, opts.forceNull, opts.headerMatch, opts.freeze, opts.encoding,
+                whereClause, opts.onError, opts.defaultString, opts.rejectLimit,
+                opts.logVerbosity);
+        stmt.setOptionError(opts.deferred);
+        return stmt;
+    }
+
+    /**
+     * Step over what is left of an option list after one of its entries was refused. The list may
+     * hold parenthesised column lists of its own, so the depth is counted rather than the first
+     * closing parenthesis taken.
+     */
+    private void skipRestOfOptionList() {
+        int depth = 0;
+        while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
+            if (parser.check(TokenType.LEFT_PAREN)) {
+                depth++;
+            } else if (parser.check(TokenType.RIGHT_PAREN)) {
+                if (depth == 0) return;
+                depth--;
+            }
+            parser.advance();
+        }
     }
 
     /** Parse a column list option like FORCE_QUOTE (col1, col2) or FORCE_QUOTE *. */
@@ -277,6 +199,344 @@ class UtilityParser {
             cols.add("*");
         }
         return cols;
+    }
+
+    /** Read one entry of a COPY option list, refusing what PostgreSQL's own option loop refuses. */
+    private void readCopyOption(CopyOptions opts, boolean isFrom, boolean parenthesised) {
+        String opt = parser.readIdentifier().toUpperCase();
+        switch (opt) {
+            case "FORMAT":
+                opts.format = parser.readIdentifier().toLowerCase();
+                if (!"text".equals(opts.format) && !"csv".equals(opts.format)
+                        && !"binary".equals(opts.format)) {
+                    throw new MemgresException(
+                            "COPY format \"" + opts.format + "\" not recognized", "22023");
+                }
+                break;
+            case "DELIMITER":
+                opts.delimiter = parser.advance().value();
+                break;
+            case "NULL":
+                opts.nullString = parser.advance().value();
+                break;
+            case "DEFAULT":
+                opts.defaultString = parser.advance().value();
+                break;
+            case "HEADER": {
+                // HEADER on its own means true. Otherwise PostgreSQL reads a Boolean or the word
+                // "match", which only a COPY FROM has anything to match against, and it refuses
+                // anything else rather than quietly taking the option as given.
+                String value = readOptionValue();
+                if (value == null) {
+                    opts.header = true;
+                } else if ("MATCH".equalsIgnoreCase(value)) {
+                    if (!isFrom) {
+                        throw new MemgresException(
+                                "cannot use \"match\" with HEADER in COPY TO", "0A000");
+                    }
+                    opts.header = true;
+                    opts.headerMatch = true;
+                } else {
+                    Boolean flag = booleanValue(value);
+                    if (flag == null) {
+                        throw new MemgresException(
+                                "header requires a Boolean value or \"match\"", "42601");
+                    }
+                    opts.header = flag.booleanValue();
+                }
+                break;
+            }
+            case "QUOTE":
+                opts.quote = parser.advance().value();
+                break;
+            case "ESCAPE":
+                opts.escape = parser.advance().value();
+                break;
+            case "FORCE_QUOTE":
+                opts.forceQuote = parseColumnListOption();
+                break;
+            case "FORCE_NOT_NULL":
+                opts.forceNotNull = parseColumnListOption();
+                break;
+            case "FORCE_NULL":
+                opts.forceNull = parseColumnListOption();
+                break;
+            case "FREEZE": {
+                String value = readOptionValue();
+                Boolean flag = value == null ? Boolean.TRUE : booleanValue(value);
+                if (flag == null) {
+                    throw new MemgresException("freeze requires a Boolean value", "42601");
+                }
+                opts.freeze = flag.booleanValue();
+                break;
+            }
+            case "ENCODING":
+                opts.encoding = parser.advance().value();
+                if (!isEncodingName(opts.encoding)) {
+                    throw new MemgresException(
+                            "argument to option \"encoding\" must be a valid encoding name", "22023");
+                }
+                break;
+            case "ON_ERROR":
+                opts.onError = parser.readIdentifier().toLowerCase();
+                if (!"stop".equals(opts.onError) && !"ignore".equals(opts.onError)) {
+                    throw new MemgresException(
+                            "COPY ON_ERROR \"" + opts.onError + "\" not recognized", "22023");
+                }
+                break;
+            case "LOG_VERBOSITY":
+                opts.logVerbosity = parser.readIdentifier().toLowerCase();
+                if (!"default".equals(opts.logVerbosity) && !"verbose".equals(opts.logVerbosity)
+                        && !"silent".equals(opts.logVerbosity)) {
+                    throw new MemgresException(
+                            "COPY LOG_VERBOSITY \"" + opts.logVerbosity + "\" not recognized", "22023");
+                }
+                break;
+            case "REJECT_LIMIT": {
+                String raw = parser.advance().value();
+                long limit;
+                try {
+                    limit = Long.parseLong(raw.trim());
+                } catch (NumberFormatException e) {
+                    limit = 0;
+                }
+                if (limit <= 0) {
+                    throw new MemgresException(
+                            "REJECT_LIMIT (" + raw + ") must be greater than zero", "22023");
+                }
+                opts.rejectLimit = Long.valueOf(limit);
+                break;
+            }
+            case "CSV":
+            case "BINARY":
+                // The pre-9.0 spelling names the format as a bare word after WITH. Inside a
+                // parenthesised list PostgreSQL knows no option of that name.
+                if (parenthesised) throw unknownCopyOption(opt);
+                opts.format = "CSV".equals(opt) ? "csv" : "binary";
+                break;
+            default:
+                // PostgreSQL reads a COPY option list against a fixed set of names and refuses one
+                // it does not know. Stepping over the unknown one left the statement running under
+                // options nobody had looked at, including ones that change how the data is read.
+                throw unknownCopyOption(opt);
+        }
+    }
+
+    private static MemgresException unknownCopyOption(String opt) {
+        return new MemgresException("option \"" + opt.toLowerCase() + "\" not recognized", "42601");
+    }
+
+    /**
+     * The value an option carries, or null when it carries none. Only a literal or one of the
+     * words PostgreSQL's grammar accepts here counts, so the clause after a bare {@code HEADER}
+     * is not read as the header's value.
+     */
+    private String readOptionValue() {
+        Token t = parser.peek();
+        if (t.type() == TokenType.STRING_LITERAL || t.type() == TokenType.INTEGER_LITERAL) {
+            parser.advance();
+            return t.value();
+        }
+        if ((t.type() == TokenType.KEYWORD || t.type() == TokenType.IDENTIFIER)
+                && BOOLEAN_WORDS.contains(t.value().toUpperCase())) {
+            parser.advance();
+            return t.value();
+        }
+        return null;
+    }
+
+    /** PostgreSQL's Boolean spellings, or null when the word is not one of them. */
+    private static Boolean booleanValue(String value) {
+        String v = value.trim().toLowerCase();
+        if ("true".equals(v) || "t".equals(v) || "yes".equals(v) || "y".equals(v)
+                || "on".equals(v) || "1".equals(v)) {
+            return Boolean.TRUE;
+        }
+        if ("false".equals(v) || "f".equals(v) || "no".equals(v) || "n".equals(v)
+                || "off".equals(v) || "0".equals(v)) {
+            return Boolean.FALSE;
+        }
+        return null;
+    }
+
+    private static final Set<String> BOOLEAN_WORDS = Cols.setOf(
+            "TRUE", "FALSE", "T", "F", "YES", "NO", "Y", "N", "ON", "OFF", "MATCH");
+
+    /**
+     * True when the name is one PostgreSQL knows an encoding by. Its own alias table is what
+     * decides: {@code Charset.isSupported} is a different set, which would take names the server
+     * refuses and refuse LATIN1 and WIN1252, which the server takes. Names are compared with the
+     * punctuation dropped, so ISO-8859-1 and iso88591 are the one encoding.
+     */
+    private static boolean isEncodingName(String name) {
+        if (name == null) return false;
+        StringBuilder key = new StringBuilder(name.length());
+        for (int i = 0; i < name.length(); i++) {
+            char c = name.charAt(i);
+            if (Character.isLetterOrDigit(c)) key.append(Character.toLowerCase(c));
+        }
+        return PG_ENCODINGS.contains(key.toString());
+    }
+
+    private static final Set<String> PG_ENCODINGS = Cols.setOf(
+            "abc", "alt", "big5", "bigfive", "ceuc", "chinese",
+            "cp1250", "cp1251", "cp1252", "cp1253", "cp1254", "cp1255", "cp1256", "cp1257",
+            "cp1258", "cp866", "cp874", "cp932", "cp936", "cp949", "cp950",
+            "eucchinese", "euccn", "eucjis2004", "eucjp", "euckr", "euctaiwan", "euctw",
+            "gb18030", "gbk",
+            "iso88591", "iso885910", "iso885913", "iso885914", "iso885915", "iso885916",
+            "iso88592", "iso88593", "iso88594", "iso88595", "iso88596", "iso88597", "iso88598",
+            "iso88599", "johab", "koi8", "koi8r", "koi8u",
+            "latin1", "latin10", "latin2", "latin3", "latin4", "latin5", "latin6", "latin7",
+            "latin8", "latin9", "mskanji", "muleinternal", "shiftjis", "shiftjis2004", "sjis",
+            "sqlascii", "tcvn", "tcvn5712", "thai", "tis620", "uhc", "unicode", "utf8",
+            "vscii", "win", "win1250", "win1251", "win1252", "win1253", "win1254", "win1255",
+            "win1256", "win1257", "win1258", "win866", "win874", "win932", "win936", "win949",
+            "win950", "windows1250", "windows1251", "windows1252", "windows1253", "windows1254",
+            "windows1255", "windows1256", "windows1257", "windows1258", "windows866",
+            "windows874", "windows932", "windows936", "windows949", "windows950");
+
+    /**
+     * The COPY options as written, before the format's defaults fill in what was omitted.
+     *
+     * <p>Several of PostgreSQL's checks turn on the difference between "not given" and "given the
+     * value the default would have had": QUOTE outside CSV mode is refused even when it names the
+     * very character CSV would have used, so the defaults cannot be applied before the checks.
+     */
+    private static final class CopyOptions {
+        String format = "text";
+        String delimiter;
+        String nullString;
+        String quote;
+        String escape;
+        String defaultString;
+        String encoding;
+        String onError;
+        String logVerbosity;
+        Long rejectLimit;
+        List<String> forceQuote;
+        List<String> forceNotNull;
+        List<String> forceNull;
+        boolean header;
+        boolean headerMatch;
+        boolean freeze;
+        /** The first refusal the options earned, kept for the executor to raise in its turn. */
+        MemgresException deferred;
+
+        void defer(MemgresException e) {
+            if (deferred == null) deferred = e;
+        }
+
+        /**
+         * Outside CSV a backslash introduces an escape and the other characters here occur inside
+         * escaped data, so a delimiter spelled with one of them could not be told from the data
+         * it is meant to separate.
+         */
+        private static final String UNSAFE_TEXT_DELIMITERS =
+                "\\.abcdefghijklmnopqrstuvwxyz0123456789";
+
+        void validate(boolean isFrom) {
+            boolean binary = "binary".equals(format);
+            boolean csv = "csv".equals(format);
+
+            // Asked before the defaults are filled in, because they ask what was written.
+            if (binary && delimiter != null) throw inBinaryMode("DELIMITER");
+            if (binary && nullString != null) throw inBinaryMode("NULL");
+            if (binary && defaultString != null) throw inBinaryMode("DEFAULT");
+
+            String delim = delimiter != null ? delimiter : (csv ? "," : "\t");
+            String nulls = nullString != null ? nullString : (csv ? "" : "\\N");
+            String quoted = quote != null ? quote : "\"";
+
+            if (delim.length() != 1) {
+                throw new MemgresException(
+                        "COPY delimiter must be a single one-byte character", "0A000");
+            }
+            if (delim.indexOf('\r') >= 0 || delim.indexOf('\n') >= 0) {
+                throw new MemgresException(
+                        "COPY delimiter cannot be newline or carriage return", "22023");
+            }
+            if (nulls.indexOf('\r') >= 0 || nulls.indexOf('\n') >= 0) {
+                throw new MemgresException(
+                        "COPY null representation cannot use newline or carriage return", "22023");
+            }
+            if (defaultString != null
+                    && (defaultString.indexOf('\r') >= 0 || defaultString.indexOf('\n') >= 0)) {
+                throw new MemgresException(
+                        "COPY default representation cannot use newline or carriage return", "22023");
+            }
+            if (!csv && UNSAFE_TEXT_DELIMITERS.indexOf(delim.charAt(0)) >= 0) {
+                throw new MemgresException("COPY delimiter cannot be \"" + delim + "\"", "22023");
+            }
+            if (binary && header) {
+                throw new MemgresException("cannot specify HEADER in BINARY mode", "0A000");
+            }
+            if (!csv && quote != null) throw requiresCsv("QUOTE");
+            if (csv && quoted.length() != 1) {
+                throw new MemgresException("COPY quote must be a single one-byte character", "0A000");
+            }
+            if (csv && delim.charAt(0) == quoted.charAt(0)) {
+                throw new MemgresException("COPY delimiter and quote must be different", "22023");
+            }
+            if (!csv && escape != null) throw requiresCsv("ESCAPE");
+            if (csv && escape != null && escape.length() != 1) {
+                throw new MemgresException("COPY escape must be a single one-byte character", "0A000");
+            }
+            if (!csv && forceQuote != null) throw requiresCsv("FORCE_QUOTE");
+            if (forceQuote != null && isFrom) {
+                throw new MemgresException("COPY FORCE_QUOTE cannot be used with COPY FROM", "0A000");
+            }
+            if (!csv && forceNotNull != null) throw requiresCsv("FORCE_NOT_NULL");
+            if (forceNotNull != null && !isFrom) throw notWithCopyTo("FORCE_NOT_NULL");
+            if (!csv && forceNull != null) throw requiresCsv("FORCE_NULL");
+            if (forceNull != null && !isFrom) throw notWithCopyTo("FORCE_NULL");
+            if (nulls.indexOf(delim.charAt(0)) >= 0) {
+                throw new MemgresException(
+                        "COPY delimiter character must not appear in the NULL specification", "22023");
+            }
+            if (csv && nulls.indexOf(quoted.charAt(0)) >= 0) {
+                throw new MemgresException(
+                        "CSV quote character must not appear in the NULL specification", "22023");
+            }
+            if (freeze && !isFrom) throw notWithCopyTo("FREEZE");
+            if (defaultString != null) {
+                if (!isFrom) {
+                    throw new MemgresException("COPY DEFAULT cannot be used with COPY TO", "0A000");
+                }
+                if (defaultString.indexOf(delim.charAt(0)) >= 0) {
+                    throw new MemgresException(
+                            "COPY delimiter must not appear in the DEFAULT specification", "0A000");
+                }
+                if (csv && defaultString.indexOf(quoted.charAt(0)) >= 0) {
+                    throw new MemgresException(
+                            "CSV quote character must not appear in the DEFAULT specification", "0A000");
+                }
+                // A field matching both markers would have to mean two things at once.
+                if (defaultString.equals(nulls)) {
+                    throw new MemgresException(
+                            "NULL specification and DEFAULT specification cannot be the same", "0A000");
+                }
+            }
+            if (onError != null && !"stop".equals(onError) && !isFrom) throw notWithCopyTo("ON_ERROR");
+            // A limit on how many rows may be rejected only means something where rows are allowed
+            // to be rejected at all, so PostgreSQL refuses the one written without the other.
+            if (rejectLimit != null && !"ignore".equals(onError)) {
+                throw new MemgresException(
+                        "COPY REJECT_LIMIT requires ON_ERROR to be set to IGNORE", "22023");
+            }
+        }
+
+        private static MemgresException inBinaryMode(String option) {
+            return new MemgresException("cannot specify " + option + " in BINARY mode", "42601");
+        }
+
+        private static MemgresException requiresCsv(String option) {
+            return new MemgresException("COPY " + option + " requires CSV mode", "0A000");
+        }
+
+        private static MemgresException notWithCopyTo(String option) {
+            return new MemgresException("COPY " + option + " cannot be used with COPY TO", "22023");
+        }
     }
 
     // ---- SET ----

@@ -35,6 +35,9 @@ class DdlAdminExecutor {
     }
 
     QueryResult executeTransaction(TransactionStmt stmt) {
+        // Whether the COMMIT below found a transaction block that had already failed, which is what
+        // decides the tag it answers with.
+        boolean discarded = false;
         if (executor.session != null) {
             switch (stmt.action()) {
                 case BEGIN: {
@@ -53,6 +56,18 @@ class DdlAdminExecutor {
                 }
                 case COMMIT: {
                     if (stmt.chain()) requireTransactionBlock("COMMIT AND CHAIN");
+                    // A COMMIT with no transaction open is not refused, but it makes nothing
+                    // permanent either: PostgreSQL warns rather than let a script believe the work
+                    // before it had been committed by this statement.
+                    if (!executor.session.isInTransaction()) {
+                        executor.session.addNotice("WARNING", "25P01",
+                                "there is no transaction in progress", null);
+                    }
+                    // A transaction block that has already failed can only be thrown away, and
+                    // PostgreSQL reports what the COMMIT did rather than what it was asked to do:
+                    // the command tag is ROLLBACK. Answering COMMIT left a client reading the tag
+                    // unable to tell that everything its transaction wrote had been discarded.
+                    discarded = executor.session.isFailed();
                     String savedIso = chainedValue(stmt, "transaction_isolation");
                     String savedRo = chainedValue(stmt, "transaction_read_only");
                     String savedDef = chainedValue(stmt, "transaction_deferrable");
@@ -130,7 +145,9 @@ class DdlAdminExecutor {
             case BEGIN:
                 return QueryResult.message(QueryResult.Type.BEGIN, "BEGIN");
             case COMMIT:
-                return QueryResult.message(QueryResult.Type.COMMIT, "COMMIT");
+                return discarded
+                        ? QueryResult.message(QueryResult.Type.ROLLBACK, "ROLLBACK")
+                        : QueryResult.message(QueryResult.Type.COMMIT, "COMMIT");
             case ROLLBACK:
                 return QueryResult.message(QueryResult.Type.ROLLBACK, "ROLLBACK");
             case SAVEPOINT:
@@ -338,6 +355,9 @@ class DdlAdminExecutor {
             throw PgErrors.wrongObjectType("\"" + stmt.table() + "\" is not a table");
         }
         Table table = executor.resolveTable("public", stmt.table());
+        // A policy decides which of the relation's rows a role can see, so writing one is the
+        // owner's to do — a role holding only SELECT could otherwise grant itself every row.
+        executor.requireTableOwner(executor.defaultSchema(), stmt.table());
         for (RlsPolicy existing : table.getRlsPolicies()) {
             if (existing.getName().equalsIgnoreCase(stmt.name())) {
                 throw new MemgresException("policy \"" + stmt.name() + "\" for table \""
@@ -372,6 +392,8 @@ class DdlAdminExecutor {
 
     QueryResult executeAlterPolicy(AlterPolicyStmt stmt) {
         Table table = executor.resolveTable("public", stmt.table());
+        // Changing what a policy admits is as much the owner's to do as writing one.
+        executor.requireTableOwner(executor.defaultSchema(), stmt.table());
         RlsPolicy found = null;
         for (RlsPolicy p : table.getRlsPolicies()) {
             if (p.getName().equalsIgnoreCase(stmt.name())) { found = p; break; }
@@ -572,29 +594,33 @@ class DdlAdminExecutor {
     // ---- CREATE RULE ----
 
     QueryResult executeCreateRule(CreateRuleStmt s) {
+        // What kind of relation was named settles before it is opened as a table: a sequence and a
+        // materialized view carry no rules at all, and a view already has the one ON SELECT rule
+        // that says what it contains.
+        checkRuleRelationKind(s);
         // Validate target table/view exists
         Table on = executor.resolveTable(executor.defaultSchema(), s.table());
         checkRuleDefinition(s);
         checkRuleQualification(s, on);
+        // A rule's actions are analysed as the rule is written rather than when it fires, so a
+        // relation or a column an action names that is not there is reported by the CREATE RULE
+        // that wrote it instead of by whoever writes to the relation next.
+        List<String> dependsOn = checkRuleActions(s, on);
         String joined = String.join(Database.RULE_ACTION_SEPARATOR, s.commands());
         // DO ALSO NOTHING and DO NOTHING are rules that do nothing, not rules whose action is the
         // word NOTHING. Registering the word made the next write try to run it as a statement.
         if ("NOTHING".equalsIgnoreCase(joined.trim())) joined = "";
-        // Store INSTEAD NOTHING rules for enforcement
-        if ("INSTEAD".equals(s.action()) && "NOTHING".equals(s.command())) {
-            executor.database.addRule(s.table(), s.event(), "INSTEAD_NOTHING");
-        } else if ("INSTEAD".equals(s.action()) && !joined.isEmpty()) {
-            executor.database.addRule(s.table(), s.event(), "INSTEAD:" + joined);
-        } else if ("ALSO".equals(s.action()) && !joined.isEmpty()) {
-            executor.database.addRule(s.table(), s.event(), "ALSO:" + joined);
-        }
-        // The qualification decides which rows the rule fires for, so it is kept with it.
-        executor.database.addRuleQualification(s.table(), s.event(), s.whereClause());
-        // Track rule name with full definition for pg_rules
-        executor.database.addRuleByName(s.name(), s.table(), s.event());
         boolean instead = "INSTEAD".equals(s.action());
+        // Every rule is registered under its own name, with its own WHERE: PostgreSQL fires all the
+        // rules an event carries, in rule-name order, and each rule's WHERE decides which rows its
+        // actions run for.
+        executor.database.addRule(s.name(), s.table(), s.event(), instead, joined, s.whereClause());
+        // Track rule name with full definition for pg_rules
         executor.database.addRuleDefinition(s.name(), s.table(),
                 ruleDefinitionText(s, instead), s.event(), instead);
+        // What the actions name is what the rule depends on, and PostgreSQL records it: dropping
+        // one of those relations is refused while the rule that writes to it is still there.
+        executor.database.addRuleDependencies(s.name(), s.table(), dependsOn);
         return QueryResult.message(QueryResult.Type.SET, "CREATE RULE");
     }
 
@@ -758,10 +784,299 @@ class DdlAdminExecutor {
         aliases.add("old");
         aliases.add("new");
         if (on != null && on.getName() != null) aliases.add(on.getName().toLowerCase());
+        // OLD and NEW in a qualification are the rows of the relation the rule is on, and their
+        // columns are that relation's: PostgreSQL resolves them while it is writing the rule.
+        // Leaving them unresolved stored a rule whose WHERE could never be evaluated, and the
+        // relation could not be written to at all from that point on.
+        checkActionRowReferences(qualification,
+                executor.database.hasView(s.table()) ? null : on);
+        // A call in the qualification is resolved there and then as well, by name and argument
+        // list together, so a name nothing answers to is a function that does not exist. Naming
+        // the argument types is what the refusal needs, and in a qualification they come from the
+        // relation the rule is on, which both OLD and NEW stand for.
+        FilterCheck.reject(executor.selectExecutor, qualification, null);
+        resolveRuleCalls(qualification,
+                ruleScope(executor.database.hasView(s.table()) ? null : on, null));
         // A qualification is read one row at a time, so nothing needing a group belongs in it,
         // and no call in it may carry a clause only an aggregate has a use for.
         executor.selectExecutor.placementCheck.rejectStoredDefinition(qualification, "WHERE", null);
         BooleanContext.check(qualification, "WHERE", BooleanContext.Types.of(on, aliases));
+    }
+
+    /**
+     * Which kinds of relation may carry a rule. PostgreSQL opens the relation first, so a name
+     * that reaches nothing is a missing relation whatever the rule said; but a sequence cannot
+     * have rules at all, a materialized view is never rewritten, and an ON SELECT rule on a view
+     * would be a second definition of what the view contains.
+     */
+    private void checkRuleRelationKind(CreateRuleStmt s) {
+        if (s.table() == null) return;
+        String kind = RelationNamespace.kindOf(
+                executor.database, executor.defaultSchema(), s.table());
+        if (RelationNamespace.SEQUENCE.equals(kind)) {
+            MemgresException noRules = PgErrors.wrongObjectType(
+                    "relation \"" + s.table() + "\" cannot have rules");
+            noRules.setDetail("This operation is not supported for sequences.");
+            throw noRules;
+        }
+        if (RelationNamespace.MATVIEW.equals(kind)) {
+            throw PgErrors.notImplemented("rules on materialized views are not supported");
+        }
+        if (RelationNamespace.VIEW.equals(kind) && "SELECT".equals(s.event())) {
+            throw new MemgresException("\"" + s.table() + "\" is already a view", "55000");
+        }
+    }
+
+    /**
+     * The commands a rule's action list may hold. PostgreSQL's grammar admits only these, so
+     * anything else is a syntax error at the word that opened it rather than a rule that is
+     * stored and then found to be unrunnable.
+     */
+    private static final Set<String> RULE_ACTION_COMMANDS =
+            Cols.setOf("select", "insert", "update", "delete", "notify", "with", "values", "table");
+
+    /**
+     * Analyse a rule's actions the way PostgreSQL does when the rule is written: every relation an
+     * action names has to be there, and OLD and NEW resolve against the relation the rule is on.
+     * Storing the text unread left both mistakes for whoever wrote to the relation next, with the
+     * statement that made them long gone.
+     *
+     * @return the relations the actions name, which the rule then depends on
+     */
+    private List<String> checkRuleActions(CreateRuleStmt s, Table on) {
+        List<String> dependsOn = new ArrayList<>();
+        // A view's rule resolves OLD and NEW against the view's own columns, and what a view
+        // resolves to here is the relation behind it, whose columns may be named differently.
+        Table rowSource = executor.database.hasView(s.table()) ? null : on;
+        for (String action : s.commands()) {
+            String written = action == null ? "" : action.trim();
+            if (written.isEmpty() || "NOTHING".equalsIgnoreCase(written)) continue;
+            rejectNonRuleCommand(written);
+            com.memgres.engine.parser.ast.Statement parsed;
+            try {
+                parsed = com.memgres.engine.parser.Parser.parse(written);
+            } catch (RuntimeException unreadable) {
+                continue; // an action this engine cannot read is reported when the rule fires
+            }
+            List<String> named = actionRelations(parsed);
+            for (String relation : named) {
+                if (!relationVisible(relation)) {
+                    throw new MemgresException(
+                            "relation \"" + relation + "\" does not exist", "42P01");
+                }
+                if (!relation.equalsIgnoreCase(s.table()) && !dependsOn.contains(relation)) {
+                    dependsOn.add(relation);
+                }
+            }
+            // An INSERT's column list is matched against the relation before anything it is handed
+            // is read, so a column the relation does not hold is what PostgreSQL reports even when
+            // the values name something missing as well.
+            if (parsed instanceof InsertStmt) {
+                InsertStmt insert = (InsertStmt) parsed;
+                rejectMissingActionColumns(insert.schema(), insert.table(), insert.columns());
+            }
+            checkActionRowReferences(parsed, rowSource);
+            // The calls an action makes are resolved as the rule is written, by name and argument
+            // list together. A name nothing answers to used to be left for the write that fires
+            // the rule, so the mistake was reported by whoever inserted into the relation next --
+            // and until the rule was dropped, nothing could be written to it at all.
+            FilterCheck.reject(executor.selectExecutor, parsed, null);
+            resolveRuleCalls(parsed, ruleScope(rowSource, named));
+            // An UPDATE's assignments are read before its targets are matched to the relation's
+            // columns, so a target the relation does not hold is reported after whatever the
+            // expression assigned to it is itself wrong about.
+            if (parsed instanceof UpdateStmt) {
+                UpdateStmt update = (UpdateStmt) parsed;
+                List<String> targets = new ArrayList<>();
+                if (update.setClauses() != null) {
+                    for (InsertStmt.SetClause set : update.setClauses()) targets.add(set.column());
+                }
+                rejectMissingActionColumns(update.schema(), update.table(), targets);
+            }
+        }
+        return dependsOn;
+    }
+
+    /**
+     * The columns an action names in the relation it writes to. PostgreSQL matches an INSERT's
+     * column list, and an UPDATE's assignment targets, against that relation while it is writing
+     * the rule: {@code column "nope" of relation "log" does not exist}, 42703. Storing the action
+     * unread left the mistake for whoever wrote to the relation the rule is on.
+     */
+    private void rejectMissingActionColumns(String schema, String table, List<String> columns) {
+        if (table == null || columns == null || columns.isEmpty()) return;
+        Table target;
+        try {
+            target = executor.resolveTable(
+                    schema == null ? executor.defaultSchema() : schema, table);
+        } catch (RuntimeException unreachable) {
+            return; // a relation this cannot open is reported for being missing, not for a column
+        }
+        if (target == null) return;
+        for (String column : columns) {
+            if (column == null || target.getColumnIndex(column) >= 0) continue;
+            // A system column is not one the relation's definition lists, and writing to one is a
+            // complaint of its own rather than a column that is not there.
+            if (DdlDefinitionChecks.isSystemColumnName(column)) continue;
+            throw new MemgresException("column \"" + column + "\" of relation \""
+                    + table + "\" does not exist", "42703");
+        }
+    }
+
+    /**
+     * The names a rule's action or its qualification resolves against. PostgreSQL builds a range
+     * table for a rule while it is writing the rule — OLD and NEW, both of which are rows of the
+     * relation the rule is on, alongside whatever relations the action itself names — and that is
+     * what lets it name the type of every argument a call was handed. Without those types a call
+     * can only be judged on its name, and {@code nosuch(new.v)} is then stored unread; PostgreSQL
+     * refuses it as {@code function nosuch(text) does not exist}.
+     *
+     * @param rowSource the relation OLD and NEW stand for, or null where it is not settled here
+     * @param named     the relations the action names, or null for a qualification, which names none
+     */
+    private QueryLevelScope ruleScope(Table rowSource, List<String> named) {
+        List<RowContext.TableBinding> bindings = new ArrayList<>();
+        if (rowSource != null) {
+            bindings.add(new RowContext.TableBinding(rowSource, "old", null));
+            bindings.add(new RowContext.TableBinding(rowSource, "new", null));
+        }
+        if (named != null) {
+            for (String written : named) {
+                int dot = written.lastIndexOf('.');
+                String schema = dot > 0 ? written.substring(0, dot) : null;
+                String bare = dot > 0 ? written.substring(dot + 1) : written;
+                // A catalog relation is described rather than stored, and memgres spells some of
+                // its columns with a type of its own where PostgreSQL declares a narrower one, so
+                // reading one here would resolve away a call PostgreSQL runs.
+                if (SystemCatalog.isSystemCatalog(schema, bare)) continue;
+                Table table;
+                try {
+                    table = executor.resolveTable(
+                            schema == null ? executor.defaultSchema() : schema, bare);
+                } catch (RuntimeException unreachable) {
+                    continue; // a name that reaches nothing was already reported as such
+                }
+                if (table == null || table.isFunctionResult()) continue;
+                bindings.add(new RowContext.TableBinding(table, bare, null));
+            }
+        }
+        return new QueryLevelScope(executor.selectExecutor, bindings, null, null);
+    }
+
+    /**
+     * Resolves every call a rule's action or qualification makes, by name and argument list
+     * together, which is how PostgreSQL resolves a call: a name nothing answers to, an argument
+     * count no signature of that name takes, and argument types no signature of it accepts are all
+     * the same refusal — {@code function upper(text, text) does not exist}, 42883 — and all three
+     * are settled while the rule is being written rather than left for the next write to the
+     * relation, which until the rule was dropped could not be made at all.
+     */
+    private static void resolveRuleCalls(Object node, QueryLevelScope scope) {
+        if (node == null) return;
+        final List<Object> calls = new ArrayList<>();
+        AstWalk.forEach(node, n -> {
+            if (n instanceof FunctionCallExpr || n instanceof WindowFuncExpr) calls.add(n);
+        });
+        for (Object call : calls) {
+            String name = call instanceof FunctionCallExpr
+                    ? ((FunctionCallExpr) call).name() : ((WindowFuncExpr) call).name();
+            if (name == null) continue;
+            // count(*) counts rows rather than values and has no argument list to resolve against.
+            if (call instanceof FunctionCallExpr && ((FunctionCallExpr) call).star()) continue;
+            scope.rejectUnresolvableCall(call, QueryLevelScope.bareName(name));
+        }
+    }
+
+    /** The command an action is, which is its first word, and whether a rule may hold it. */
+    private static void rejectNonRuleCommand(String action) {
+        int end = 0;
+        while (end < action.length() && Character.isLetter(action.charAt(end))) end++;
+        String word = action.substring(0, end);
+        if (word.isEmpty() || RULE_ACTION_COMMANDS.contains(word.toLowerCase())) return;
+        throw PgErrors.syntax("syntax error at or near \"" + word + "\"");
+    }
+
+    /**
+     * The relations an action names: the one it writes to, and every one in a FROM clause. A name
+     * the action's own WITH clause binds is that query's, and OLD and NEW are the rows the
+     * rewriter puts in scope rather than relations to go looking for.
+     */
+    private static List<String> actionRelations(com.memgres.engine.parser.ast.Statement parsed) {
+        final Set<String> bound = new LinkedHashSet<>();
+        bound.add("old");
+        bound.add("new");
+        AstWalk.forEach(parsed, node -> {
+            if (node instanceof SelectStmt.CommonTableExpr) {
+                String cteName = ((SelectStmt.CommonTableExpr) node).name;
+                if (cteName != null) bound.add(cteName.toLowerCase());
+            }
+        });
+        final List<String> named = new ArrayList<>();
+        if (parsed instanceof InsertStmt) {
+            addActionRelation(named, ((InsertStmt) parsed).schema(), ((InsertStmt) parsed).table());
+        } else if (parsed instanceof UpdateStmt) {
+            addActionRelation(named, ((UpdateStmt) parsed).schema(), ((UpdateStmt) parsed).table());
+        } else if (parsed instanceof DeleteStmt) {
+            addActionRelation(named, ((DeleteStmt) parsed).schema(), ((DeleteStmt) parsed).table());
+        }
+        AstWalk.forEach(parsed, node -> {
+            if (node instanceof SelectStmt.TableRef) {
+                SelectStmt.TableRef ref = (SelectStmt.TableRef) node;
+                addActionRelation(named, ref.schema(), ref.table());
+            }
+        });
+        List<String> out = new ArrayList<>();
+        for (String relation : named) {
+            if (!bound.contains(RelationNamespace.bareName(relation).toLowerCase())) out.add(relation);
+        }
+        return out;
+    }
+
+    private static void addActionRelation(List<String> named, String schema, String table) {
+        if (table == null || table.isEmpty()) return;
+        String written = schema == null ? table : schema + "." + table;
+        if (!named.contains(written)) named.add(written);
+    }
+
+    /** Whether this session can reach a relation of any kind under the name an action wrote. */
+    private boolean relationVisible(String written) {
+        int dot = written.lastIndexOf('.');
+        String schema = dot > 0 ? written.substring(0, dot) : null;
+        String bare = dot > 0 ? written.substring(dot + 1) : written;
+        // A catalog relation belongs to no schema's tables: it is built when it is read.
+        if (SystemCatalog.isSystemCatalog(schema, bare)) return true;
+        if (schema != null) {
+            return RelationNamespace.kindOf(executor.database, schema, bare) != null;
+        }
+        for (String candidate : executor.searchPathSchemas()) {
+            if (RelationNamespace.kindOf(executor.database, candidate, bare) != null) return true;
+        }
+        // A relation the path does not reach by kind may still be one this session can open --
+        // a temporary table lives in a schema of its own.
+        return executor.resolveTableSafe(bare) != null || executor.database.getView(bare) != null;
+    }
+
+    /**
+     * OLD and NEW in an action or in the rule's own qualification are the rows of the relation the
+     * rule is on, so their columns are that relation's columns -- along with the system columns
+     * every relation carries.
+     */
+    private static void checkActionRowReferences(Object parsed, Table on) {
+        if (on == null) return;
+        Object missing = AstWalk.findFirst(parsed, node -> {
+            if (!(node instanceof ColumnRef)) return false;
+            ColumnRef ref = (ColumnRef) node;
+            if (ref.table() == null || ref.column() == null) return false;
+            if (!ref.table().equalsIgnoreCase("old") && !ref.table().equalsIgnoreCase("new")) {
+                return false;
+            }
+            return !DdlDefinitionChecks.isSystemColumnName(ref.column())
+                    && on.getColumnIndex(ref.column()) < 0;
+        });
+        if (missing == null) return;
+        ColumnRef ref = (ColumnRef) missing;
+        throw new MemgresException("column " + ref.table().toLowerCase() + "." + ref.column()
+                + " does not exist", "42703");
     }
 
     /** True when a rule action names {@code OLD.x} or {@code NEW.x} anywhere inside it. */

@@ -72,8 +72,11 @@ class DdlViewExecutor {
                         throw renamed;
                     }
                     if (oldCol.getType() != newCol.getType()) {
-                        throw new MemgresException("cannot change data type of view column \"" + oldCol.getName()
-                                + "\" from " + oldCol.getType() + " to " + newCol.getType(), "42P16");
+                        // The types are named the way PostgreSQL names them, as everywhere else
+                        // that reports one; the enum constant is this engine's spelling, not SQL's.
+                        throw new MemgresException("cannot change data type of view column \""
+                                + oldCol.getName() + "\" from " + oldCol.getType().toRegtypeDisplay()
+                                + " to " + newCol.getType().toRegtypeDisplay(), "42P16");
                     }
                 }
             } catch (MemgresException e) {
@@ -94,8 +97,14 @@ class DdlViewExecutor {
         // Apply the optional column alias list: CREATE [MATERIALIZED] VIEW v(a, b) AS ...
         query = applyColumnAliasList(stmt, query);
 
-        // A CHECK OPTION on a view no INSERT can reach is a promise that can never be kept.
-        String obstacle = stmt.checkOption() != null ? autoUpdatableObstacle(query) : null;
+        // A CHECK OPTION on a view no INSERT can reach is a promise that can never be kept. It may
+        // be written either as the WITH CHECK OPTION suffix or as a check_option storage parameter,
+        // and PostgreSQL refuses both on a view that is not automatically updatable.
+        String declaredCheckOption = stmt.checkOption();
+        if (declaredCheckOption == null && stmt.withOptions() != null) {
+            declaredCheckOption = stmt.withOptions().get("check_option");
+        }
+        String obstacle = declaredCheckOption != null ? autoUpdatableObstacle(query) : null;
         if (obstacle != null) {
             MemgresException e = PgErrors.notImplemented(
                     "WITH CHECK OPTION is supported only on automatically updatable views");

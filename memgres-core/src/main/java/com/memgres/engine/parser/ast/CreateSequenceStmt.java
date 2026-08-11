@@ -17,6 +17,12 @@ public final class CreateSequenceStmt implements Statement {
     private String ownedByTable;
     private String ownedByColumn;
 
+    /** UNLOGGED, which a sequence takes as a table does and pg_class reports as relpersistence 'u'. */
+    private boolean unlogged;
+
+    public boolean unlogged() { return unlogged; }
+    public void setUnlogged(boolean unlogged) { this.unlogged = unlogged; }
+
     public Integer getCache() { return cache; }
     public void setCache(Integer cache) { this.cache = cache; }
     public String getAsType() { return asType; }

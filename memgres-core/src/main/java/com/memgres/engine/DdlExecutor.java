@@ -33,7 +33,100 @@ class DdlExecutor {
 
     // ---- Delegation methods ----
 
-    QueryResult executeCreateTable(CreateTableStmt stmt) { return tableExecutor.executeCreateTable(stmt); }
+    QueryResult executeCreateTable(CreateTableStmt stmt) {
+        return tableExecutor.executeCreateTable(typedTableColumns(stmt));
+    }
+
+    /**
+     * A typed table's columns are a composite type's attributes, so they are read off the type here
+     * and the rest of CREATE TABLE goes on as though they had been written out. PostgreSQL insists
+     * on a stand-alone type: the row type a table owns is refused rather than copied, because the
+     * typed table would then have to follow every change to the other relation's shape.
+     */
+    private CreateTableStmt typedTableColumns(CreateTableStmt stmt) {
+        String written = stmt.ofType();
+        if (written == null) return stmt;
+        String typeName = written.toLowerCase().trim();
+        if (executor.database.getTable(typeName) != null) {
+            MemgresException e = PgErrors.wrongObjectType(
+                    "type " + written + " is the row type of another table");
+            e.setDetail("A typed table must use a stand-alone composite type"
+                    + " created with CREATE TYPE.");
+            throw e;
+        }
+        List<CreateTypeStmt.CompositeField> fields = executor.database.getCompositeType(typeName);
+        if (fields == null) throw PgErrors.undefinedObject("type", written);
+        List<ColumnDef> columns = new ArrayList<>();
+        for (CreateTypeStmt.CompositeField field : fields) {
+            Integer[] typmod = declaredTypmod(field.typeName());
+            // WITH OPTIONS says what else the column carries -- a default, NOT NULL, a key -- on
+            // a column whose type the composite settles, so the two halves are put together here.
+            ColumnDef options = writtenColumnOptions(stmt.columns(), field.name());
+            columns.add(options == null
+                    ? new ColumnDef(field.name(), field.typeName(), typmod[0], typmod[1],
+                            false, false, false, null, null, null)
+                    : withDeclaredType(options, field.typeName(), typmod[0], typmod[1]));
+        }
+        // Options may only be written for a column the type declares: there is no other way for
+        // one to exist on a typed table, so PostgreSQL refuses the name rather than adding it.
+        if (stmt.columns() != null) {
+            for (ColumnDef option : stmt.columns()) {
+                if (writtenColumnOptions(columns, option.name()) == null) {
+                    throw new MemgresException(
+                            "column \"" + option.name() + "\" does not exist", "42703");
+                }
+            }
+        }
+        CreateTableStmt typed = new CreateTableStmt(stmt.schema(), stmt.name(), stmt.ifNotExists(),
+                stmt.temporary(), stmt.unlogged(), columns, stmt.constraints(), null, null, null,
+                null, null, null, stmt.onCommitAction(), stmt.withOptions());
+        typed.setOfType(written);
+        return typed;
+    }
+
+    /** The options written for one column of a typed table, or null when none were. */
+    private static ColumnDef writtenColumnOptions(List<ColumnDef> written, String columnName) {
+        if (written == null || columnName == null) return null;
+        for (ColumnDef def : written) {
+            if (columnName.equalsIgnoreCase(def.name())) return def;
+        }
+        return null;
+    }
+
+    /** The same column options over the type the composite declares for that column. */
+    private static ColumnDef withDeclaredType(ColumnDef options, String typeName,
+                                              Integer precision, Integer scale) {
+        ColumnDef merged = new ColumnDef(options.name(), typeName, precision, scale,
+                options.notNull(), options.primaryKey(), options.unique(), options.defaultExpr(),
+                options.referencesTable(), options.referencesColumn(), options.generatedExpr(),
+                options.generatedVirtual(), options.identity(), options.refOnDelete(),
+                options.refOnUpdate(), options.identityStart(), options.identityIncrement(),
+                options.deferrable(), options.initiallyDeferred(), options.notEnforced(),
+                options.refMatchType(), options.checkConstraintExpr());
+        merged.collation = options.collation;
+        merged.setPrimaryKeyName(options.primaryKeyName());
+        merged.setUniqueName(options.uniqueName());
+        merged.setForeignKeyName(options.foreignKeyName());
+        merged.setNotNullName(options.notNullName());
+        merged.setNotNullNoInherit(options.notNullNoInherit());
+        return merged;
+    }
+
+    /** The {@code (p)} or {@code (p,s)} written after a type name, as a precision and a scale. */
+    private static Integer[] declaredTypmod(String typeName) {
+        Integer[] typmod = {null, null};
+        int open = typeName == null ? -1 : typeName.indexOf('(');
+        int close = open < 0 ? -1 : typeName.indexOf(')', open + 1);
+        if (close < 0) return typmod;
+        String[] parts = typeName.substring(open + 1, close).split(",");
+        try {
+            typmod[0] = Integer.valueOf(parts[0].trim());
+            if (parts.length > 1) typmod[1] = Integer.valueOf(parts[1].trim());
+        } catch (NumberFormatException ignored) {
+            return new Integer[]{null, null};
+        }
+        return typmod;
+    }
     QueryResult executeDropTable(DropTableStmt stmt) { return tableExecutor.executeDropTable(stmt); }
     QueryResult executeTruncate(TruncateStmt stmt) { return tableExecutor.executeTruncate(stmt); }
     QueryResult executeCreateTableAs(CreateTableAsStmt stmt) { return tableExecutor.executeCreateTableAs(stmt); }
@@ -320,32 +413,49 @@ class DdlExecutor {
 
     /** Recursively validate that all column references in an expression exist in the given table. */
     void validateExprColumnRefs(Expression expr, Table table, String newColName) {
+        validateExprColumnRefs(expr, table, newColName, false);
+    }
+
+    /**
+     * @param systemColumnsResolve true where a system column is a name the expression may reach.
+     *        A CHECK is such a place: PostgreSQL resolves every name in it first — {@code xmin}
+     *        and {@code tableoid} are columns of the relation and resolve — and only then refuses
+     *        the constraint for reading one. Reporting them as columns that do not exist put the
+     *        wrong complaint in front of the right one.
+     */
+    void validateExprColumnRefs(Expression expr, Table table, String newColName,
+                                boolean systemColumnsResolve) {
         if (expr == null) return;
         if (expr instanceof ColumnRef) {
             ColumnRef ref = (ColumnRef) expr;
             String col = ref.column();
+            if (systemColumnsResolve && DdlDefinitionChecks.isSystemColumnName(col)) return;
             if (table.getColumnIndex(col) < 0 && !col.equalsIgnoreCase(newColName)) {
                 throw new MemgresException("column \"" + col + "\" does not exist", "42703");
             }
         } else if (expr instanceof BinaryExpr) {
             BinaryExpr bin = (BinaryExpr) expr;
-            validateExprColumnRefs(bin.left(), table, newColName);
-            validateExprColumnRefs(bin.right(), table, newColName);
+            validateExprColumnRefs(bin.left(), table, newColName, systemColumnsResolve);
+            validateExprColumnRefs(bin.right(), table, newColName, systemColumnsResolve);
         } else if (expr instanceof CustomOperatorExpr) {
             CustomOperatorExpr cop = (CustomOperatorExpr) expr;
-            if (cop.left() != null) validateExprColumnRefs(cop.left(), table, newColName);
-            validateExprColumnRefs(cop.right(), table, newColName);
+            if (cop.left() != null) {
+                validateExprColumnRefs(cop.left(), table, newColName, systemColumnsResolve);
+            }
+            validateExprColumnRefs(cop.right(), table, newColName, systemColumnsResolve);
         } else if (expr instanceof UnaryExpr) {
             UnaryExpr un = (UnaryExpr) expr;
-            validateExprColumnRefs(un.operand(), table, newColName);
+            validateExprColumnRefs(un.operand(), table, newColName, systemColumnsResolve);
         } else if (expr instanceof FunctionCallExpr) {
             FunctionCallExpr fn = (FunctionCallExpr) expr;
             if (fn.args() != null) {
-                for (Expression arg : fn.args()) validateExprColumnRefs(arg, table, newColName);
+                for (Expression arg : fn.args()) {
+                    validateExprColumnRefs(arg, table, newColName, systemColumnsResolve);
+                }
             }
         } else if (expr instanceof CastExpr) {
             CastExpr cast = (CastExpr) expr;
-            validateExprColumnRefs(cast.expr(), table, newColName);
+            validateExprColumnRefs(cast.expr(), table, newColName, systemColumnsResolve);
         }
     }
 
@@ -434,9 +544,16 @@ class DdlExecutor {
         // Which type a written name denotes is settled once, here, and the column records the
         // answer: with two schemas each holding an e, a column declared a.e has to keep reading
         // a.e's definition however the search path moves afterwards.
-        String baseType = TypeNamespace.qualify(executor.database, executor.session,
-                fullTypeName.replace("[]", "").trim());
-        if (!baseType.equals(fullTypeName.replace("[]", "").trim())) {
+        String writtenBase = fullTypeName.replace("[]", "").trim();
+        // An unqualified type name is the search path's to answer, and PostgreSQL looks nowhere
+        // else: a type held by a schema the path does not reach is not reachable by its bare name
+        // at all, which is exactly what ALTER TYPE ... SET SCHEMA takes away. A name that resolves
+        // to no user-defined type is a built-in or a mistake, so the enums, domains, composites,
+        // ranges and shells below are not searched for it -- searching them anyway went on finding
+        // a type in the schema it had just been moved out of.
+        String resolvedType = TypeNamespace.resolve(executor.database, executor.session, writtenBase);
+        String baseType = resolvedType == null ? writtenBase : resolvedType;
+        if (!baseType.equals(writtenBase)) {
             fullTypeName = isArray ? baseType + "[]" : baseType;
         }
         if (isArray) {
@@ -471,7 +588,7 @@ class DdlExecutor {
         String domainInterval = null;
 
         if (dataType == null) {
-            if (executor.database.isCustomEnum(baseType)) {
+            if (resolvedType != null && executor.database.isCustomEnum(baseType)) {
                 dataType = DataType.ENUM;
                 enumTypeName = baseType;
                 // A custom enum's base name never matches DataType.fromPgName, so the isArray
@@ -484,7 +601,7 @@ class DdlExecutor {
                 if (isArray) {
                     arrayElementType = DataType.ENUM;
                 }
-            } else if (executor.database.isDomain(baseType)) {
+            } else if (resolvedType != null && executor.database.isDomain(baseType)) {
                 DomainType domain = executor.database.getDomain(baseType);
                 dataType = domain.getBaseType();
                 domainTypeName = baseType;
@@ -496,7 +613,7 @@ class DdlExecutor {
                 domainScale = domain.getScale();
                 domainInterval = domain.getIntervalQualifier();
                 if (domain.getArrayElementType() != null) arrayElementType = domain.getArrayElementType();
-            } else if (executor.database.isCompositeType(baseType)) {
+            } else if (resolvedType != null && executor.database.isCompositeType(baseType)) {
                 dataType = DataType.TEXT;
                 compositeTypeName = baseType;
                 // As for an enum above, a composite's name never matches a built-in, so an array
@@ -504,7 +621,7 @@ class DdlExecutor {
                 if (isArray) {
                     arrayElementType = DataType.TEXT;
                 }
-            } else if (executor.database.isRangeType(baseType)) {
+            } else if (resolvedType != null && executor.database.isRangeType(baseType)) {
                 // A range is carried as the text it prints as, whichever subtype it was built over:
                 // PostgreSQL's own range types are held that way here too, so a column of a range
                 // the reader defined stores exactly what a column of int4range stores.
@@ -512,7 +629,7 @@ class DdlExecutor {
                 if (isArray) {
                     arrayElementType = DataType.TEXT;
                 }
-            } else if (executor.database.isShellType(baseType)) {
+            } else if (resolvedType != null && executor.database.isShellType(baseType)) {
                 // A shell has no representation yet, so nothing can be declared as one
                 throw new MemgresException("type \""
                         + TypeNamespace.display(executor.database, executor.session, baseType)
@@ -962,10 +1079,11 @@ class DdlExecutor {
             }
             return Integer.compare(la.size(), lb.size());
         }
+        // Bounds compare the way values of the key's type compare. Reducing both to double first
+        // rounded anything past 2^53, so a one-value bigint range looked empty and two bounds that
+        // genuinely overlap compared equal and the overlapping pair was accepted.
         if (a instanceof Number && b instanceof Number) {
-            Number nb = (Number) b;
-            Number na = (Number) a;
-            return Double.compare(na.doubleValue(), nb.doubleValue());
+            return TypeCoercion.compare(a, b);
         }
         if (a.getClass() == b.getClass() && a instanceof Comparable) {
             return ((Comparable) a).compareTo(b);

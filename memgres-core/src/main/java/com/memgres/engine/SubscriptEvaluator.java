@@ -196,6 +196,12 @@ final class SubscriptEvaluator {
     /** An array held as the text of its literal, when the expression says it is an array. */
     private PgArray arrayFromText(Expression base, String text, RowContext ctx) {
         if (!PgArray.looksLikeArrayText(text)) return null;
+        // An array of a composite is carried as text and typed text, so the declared type below
+        // says neither that it is an array nor what its elements are -- only the column's own
+        // declaration does. PostgreSQL subscripts it as the array it was declared.
+        if (executor.compositeTypeHandler.arrayElementCompositeType(base, ctx) != null) {
+            return PgArray.from(text);
+        }
         String typeName = declaredTypeName(base, text, ctx);
         if (typeName != null && (typeName.startsWith("json") || typeName.equals("text")
                 || typeName.equals("hstore"))) {

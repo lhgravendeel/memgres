@@ -30,6 +30,19 @@ public final class TableConstraint {
      */
     private boolean period;
 
+    /**
+     * The columns of an {@code INCLUDE} clause: payload the index carries rather than key columns.
+     * Kept in a field of their own because folding them into {@link #columns} would silently make
+     * them part of the key, and PostgreSQL compares only the key columns for uniqueness.
+     */
+    private List<String> includedColumns;
+
+    public List<String> includedColumns() { return includedColumns; }
+
+    public void setIncludedColumns(List<String> includedColumns) {
+        this.includedColumns = includedColumns;
+    }
+
     public boolean period() { return period; }
 
     public void setPeriod(boolean period) { this.period = period; }

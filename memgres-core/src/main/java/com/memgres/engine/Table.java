@@ -14,7 +14,12 @@ import java.util.concurrent.locks.ReentrantLock;
  */
 public class Table {
 
-    private final String name;
+    /**
+     * A rename is the same relation under another name, so the name is changed on the table
+     * rather than copied onto a replacement. Every partition bound, inheritance link, policy,
+     * storage parameter and constraint name a copy would have had to remember stays where it is.
+     */
+    private volatile String name;
     // CopyOnWriteArrayList: safe for concurrent reads (getColumnIndex from DML threads)
     // while DDL methods (renameColumn, alterColumnType, etc.) modify via set().
     private final List<Column> columns;
@@ -44,7 +49,12 @@ public class Table {
     private volatile java.time.OffsetDateTime lastAnalyze;
 
     // Inheritance
-    private Table parentTable;
+    /**
+     * Every table this one directly inherits from, in the order they were named. PostgreSQL keeps
+     * one pg_inherits row per parent with inhseqno counting from 1, so a table declared under two
+     * parents has two of them; a single field kept only whichever came last.
+     */
+    private final List<Table> inheritParents = new CopyOnWriteArrayList<>();
     private final List<Table> children = new CopyOnWriteArrayList<>();
 
     // Partitioning
@@ -89,8 +99,51 @@ public class Table {
         this.columns = new CopyOnWriteArrayList<>(columns);
     }
 
+    /**
+     * The name this relation answers to for the session asking. A rename inside an open
+     * transaction has happened for nobody else yet, and since the rename changes the one
+     * relation object rather than making a second one, everyone else would otherwise read the
+     * new name off it — which is the new name leaking out of an uncommitted transaction.
+     */
     public String getName() {
-        return name;
+        String previous = renamedFrom;
+        if (previous == null) return name;
+        Session renamer = renamedBy;
+        if (renamer == null || !renamer.isInTransaction()) return name;
+        Session viewer = Database.currentViewer();
+        return viewer == null || viewer == renamer ? name : previous;
+    }
+
+    /**
+     * Rename this table. Only a schema that has already removed it under the old name may call
+     * this: the schema keys its tables by name, so the two have to move together.
+     */
+    public void setName(String name) {
+        this.name = name;
+    }
+
+    /**
+     * The name this relation is still known by outside the transaction that renamed it, and the
+     * session that did. DDL is transactional, so until that transaction ends the old name is the
+     * relation's name for every other session.
+     */
+    private volatile String renamedFrom;
+    private volatile Session renamedBy;
+
+    /** Record that {@code renamer}, mid-transaction, renamed this relation away from {@code from}. */
+    void markUncommittedRename(String from, Session renamer) {
+        if (renamer == null || !renamer.isInTransaction()) return;
+        // Two renames in one transaction: the name everyone else knows is the one it started with.
+        if (renamedFrom == null || renamedBy != renamer) renamedFrom = from;
+        renamedBy = renamer;
+    }
+
+    /** That transaction has ended, one way or the other; the name it left is the name. */
+    void forgetUncommittedRename(Session renamer) {
+        if (renamedBy == renamer) {
+            renamedBy = null;
+            renamedFrom = null;
+        }
     }
 
     /**
@@ -444,11 +497,25 @@ public class Table {
         }
     }
 
+    /**
+     * The index of a column the caller has to be able to find, in PostgreSQL's words when it
+     * cannot: the complaint names the relation the name was looked for in, and quotes the name.
+     * The SQLSTATE is stated here rather than left to be inferred from the message text, which
+     * is what "Column not found" was relying on.
+     */
+    private int requireColumnIndex(String columnName) {
+        int idx = getColumnIndex(columnName);
+        if (idx < 0) {
+            throw new MemgresException("column \"" + columnName + "\" of relation \""
+                    + name + "\" does not exist", "42703");
+        }
+        return idx;
+    }
+
     public void removeColumn(String columnName) {
         writeLock.lock();
         try {
-            int idx = getColumnIndex(columnName);
-            if (idx < 0) throw new MemgresException("Column not found: " + columnName);
+            int idx = requireColumnIndex(columnName);
             // PG drops constraints that depend on the column automatically: single-column
             // constraints, multi-column PK/UNIQUE/FK containing it, and CHECK/EXCLUDE/partial
             // constraints whose expressions reference it. Without this they linger in
@@ -554,7 +621,11 @@ public class Table {
         writeLock.lock();
         try {
             int idx = getColumnIndex(oldName);
-            if (idx < 0) throw new MemgresException("Column not found: " + oldName);
+            // A rename names only the column: PostgreSQL leaves the relation out of this one,
+            // where DROP COLUMN and ALTER COLUMN both name it.
+            if (idx < 0) {
+                throw new MemgresException("column \"" + oldName + "\" does not exist", "42703");
+            }
             Column old = columns.get(idx);
             columns.set(idx, old.withName(newName));
             columnsChanged();
@@ -589,8 +660,7 @@ public class Table {
      * precision/scale constraint.
      */
     public void alterColumnType(String columnName, DataType newType, Integer precision, Integer scale) {
-        int idx = getColumnIndex(columnName);
-        if (idx < 0) throw new MemgresException("Column not found: " + columnName);
+        int idx = requireColumnIndex(columnName);
         // Historical behavior for callers that don't resolve type metadata themselves
         // (e.g. serial->int conversion): carry over the old column's enum type name.
         alterColumnType(columnName, newType, precision, scale, columns.get(idx).getEnumTypeName(), null);
@@ -605,23 +675,20 @@ public class Table {
      */
     public void alterColumnType(String columnName, DataType newType, Integer precision, Integer scale,
                                 String enumTypeName, DataType arrayElementType) {
-        int idx = getColumnIndex(columnName);
-        if (idx < 0) throw new MemgresException("Column not found: " + columnName);
+        int idx = requireColumnIndex(columnName);
         Column old = columns.get(idx);
         columns.set(idx, old.withType(newType, precision, scale, enumTypeName, arrayElementType));
         columnsChanged();
     }
 
     public void alterColumnDefault(String columnName, String defaultValue) {
-        int idx = getColumnIndex(columnName);
-        if (idx < 0) throw new MemgresException("Column not found: " + columnName);
+        int idx = requireColumnIndex(columnName);
         columns.set(idx, columns.get(idx).withDefault(defaultValue));
         columnsChanged();
     }
 
     public void alterColumnNullable(String columnName, boolean nullable) {
-        int idx = getColumnIndex(columnName);
-        if (idx < 0) throw new MemgresException("Column not found: " + columnName);
+        int idx = requireColumnIndex(columnName);
         columns.set(idx, columns.get(idx).withNullable(nullable));
         columnsChanged();
     }
@@ -940,12 +1007,53 @@ public class Table {
 
     public boolean isViewProjection() { return viewProjection; }
     public void setViewProjection(boolean viewProjection) { this.viewProjection = viewProjection; }
+
+    /**
+     * The composite type this table was declared OF, schema-qualified, or null.
+     *
+     * <p>A typed table's shape is the type's, not its own: PostgreSQL refuses to add a column to
+     * one, and refuses to drop the type while the table stands. Both need the table to remember
+     * which type it came from, because the columns alone no longer say.
+     */
+    public String getOfTypeName() { return ofTypeName; }
+    public void setOfTypeName(String ofTypeName) { this.ofTypeName = ofTypeName; }
+
+    private String ofTypeName;
     public Map<String, String> getReloptions() { return reloptions; }
     public void setReloptions(Map<String, String> reloptions) { this.reloptions = reloptions; }
 
     // Inheritance
-    public Table getParentTable() { return parentTable; }
-    public void setParentTable(Table parent) { this.parentTable = parent; }
+    /** The first parent, which is the only one for all but a multiply-inheriting table. */
+    public Table getParentTable() { return inheritParents.isEmpty() ? null : inheritParents.get(0); }
+
+    /** Records another inheritance parent; a null clears every link, as NO INHERIT does. */
+    public void setParentTable(Table parent) {
+        if (parent == null) {
+            inheritParents.clear();
+            return;
+        }
+        for (Table existing : inheritParents) {
+            if (existing == parent) return;
+        }
+        inheritParents.add(parent);
+    }
+
+    /** Every table this one inherits from, in the order the declaration named them. */
+    public List<Table> getInheritParents() { return inheritParents; }
+
+    /**
+     * The relations this one takes its columns from: the partitioned table it is a partition of,
+     * or the tables it was declared to inherit. PostgreSQL counts them per column in
+     * pg_attribute.attinhcount and calls a column local only when none of them declares it.
+     */
+    public List<Table> getDirectParents() {
+        if (partitionParent == null) return inheritParents;
+        List<Table> out = new ArrayList<>(inheritParents.size() + 1);
+        out.add(partitionParent);
+        out.addAll(inheritParents);
+        return out;
+    }
+
     public List<Table> getChildren() { return children; }
     public void addChild(Table child) { children.add(child); }
     public void removeChild(Table child) { children.remove(child); }
@@ -971,7 +1079,15 @@ public class Table {
 
     /** Re-orders a row written through the parent into this partition's own column order. */
     public Object[] rowFromParent(Object[] parentRow) {
-        if (parentColumnRemap == null) return parentRow;
+        if (parentColumnRemap == null) {
+            // The orders agree, so the row passes straight through — but a partition that ended
+            // up with a different number of columns from its parent would otherwise hand a short
+            // row to code indexing by its own columns, which reads past the end of it.
+            if (parentRow != null && parentRow.length != columns.size()) {
+                return java.util.Arrays.copyOf(parentRow, columns.size());
+            }
+            return parentRow;
+        }
         Object[] out = new Object[columns.size()];
         for (int i = 0; i < parentColumnRemap.length && i < parentRow.length; i++) {
             int target = parentColumnRemap[i];

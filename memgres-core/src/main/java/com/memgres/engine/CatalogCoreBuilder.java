@@ -683,7 +683,13 @@ class CatalogCoreBuilder {
                         0, database.getAnalyzedTables().contains(schemaEntry.getKey() + "." + t.getName()) ? (double) t.getRows().size() : -1.0, 0, 0, 0, // relpages, reltuples (M22: -1 = never-analyzed), relallvisible, relallfrozen, reltoastrelid
                         hasIdx, false, relPersistence(schemaEntry.getKey(), t.isUnlogged()), relkind, // relhasindex, relisshared, relpersistence, relkind
                         (short) t.getColumns().size(), checkCount, // relnatts, relchecks
-                        hasRules(t.getName()), hasTriggers, false, t.isRlsEnabled(), t.isRlsForced(), // relhasrules..relforcerowsecurity
+                        // relhassubclass: a partitioned table or an inheritance parent has
+                        // children, and a planner reads the flag to decide whether to look for
+                        // any. PostgreSQL never clears it once set; reporting it from the links
+                        // themselves is closer than reporting it never.
+                        hasRules(t.getName()), hasTriggers,
+                        !t.getPartitions().isEmpty() || !t.getChildren().isEmpty(),
+                        t.isRlsEnabled(), t.isRlsForced(), // relhasrules..relforcerowsecurity
 
                         true, String.valueOf(t.getReplicaIdentity()), relispartition, // relispopulated, relreplident, relispartition
                         0, 0, 0,            // relrewrite, relfrozenxid, relminmxid
@@ -735,7 +741,7 @@ class CatalogCoreBuilder {
                     sOid, seqName, oids.oid("ns:" + explSeqSchema),
                     0, 0, seqOwnerOid, 0, sOid, 0,
                     1, 1.0, 0, 0, 0,
-                    false, false, "p", "S",
+                    false, false, relPersistence(explSeqSchema, explSeq.isUnlogged()), "S",
                     (short) 3, (short) 0,   // sequences have 3 columns (last_value, log_cnt, is_called)
                     false, false, false, false, false,
 
@@ -743,36 +749,10 @@ class CatalogCoreBuilder {
                     null, null, null, 1
             });
         }
-        // Sequences - implicit from SERIAL/BIGSERIAL/SMALLSERIAL and identity columns
-        for (Map.Entry<String, Schema> seqSchemaEntry : database.getSchemas().entrySet()) {
-            String seqSchemaName = seqSchemaEntry.getKey();
-            int seqNsOid = oids.oid("ns:" + seqSchemaName);
-            for (Map.Entry<String, Table> seqTableEntry : seqSchemaEntry.getValue().getTables().entrySet()) {
-                Table seqT = seqTableEntry.getValue();
-                for (Column seqCol : seqT.getColumns()) {
-                    String implicitSeqName = null;
-                    if (seqCol.getType() == DataType.SERIAL || seqCol.getType() == DataType.BIGSERIAL || seqCol.getType() == DataType.SMALLSERIAL) {
-                        implicitSeqName = seqT.getName() + "_" + seqCol.getName() + "_seq";
-                    } else if (seqCol.getDefaultValue() != null && seqCol.getDefaultValue().contains("__identity__")) {
-                        implicitSeqName = seqT.getName() + "_" + seqCol.getName() + "_seq";
-                    }
-                    if (implicitSeqName != null && !database.hasSequence(seqSchemaName, implicitSeqName)) {
-                        int isOid = oids.oid("rel:" + seqSchemaName + "." + implicitSeqName);
-                        table.insertRow(new Object[]{
-                                isOid, implicitSeqName, seqNsOid,
-                                0, 0, 10, 0, isOid, 0,
-                                1, 1.0, 0, 0, 0,
-                                false, false, "p", "S",
-                                (short) 3, (short) 0,
-                                false, false, false, false, false,
-
-                                true, "n", false, 0, 0, 0,
-                                null, null, null, 1
-                        });
-                    }
-                }
-            }
-        }
+        // Every serial and identity column's sequence is one of the sequences above, created with
+        // the column. Composing <table>_<column>_seq for such columns as well emitted a row for a
+        // relation nothing backs: after a table or column rename the composed name is not the
+        // sequence's, and a partition that inherits an identity column has no sequence of its own.
 
         // Indexes (from explicit CREATE INDEX)
         Set<String> addedIndexNames = new HashSet<>();
@@ -951,6 +931,9 @@ class CatalogCoreBuilder {
             }
             return sb.toString();
         }
+        // An enum bound is stored as the typed value so it orders by declaration position; the
+        // deparse still has to read as the label PostgreSQL prints.
+        if (val instanceof AstExecutor.PgEnum) return "'" + val + "'";
         if (val instanceof String) {
             String s = (String) val;
             if (s.equalsIgnoreCase("MINVALUE") || s.equalsIgnoreCase("MAXVALUE")) return s;
@@ -1001,7 +984,7 @@ class CatalogCoreBuilder {
             for (Map.Entry<String, Table> tableEntry : schemaEntry.getValue().getTables().entrySet()) {
                 Table t = tableEntry.getValue();
                 int relOid = oids.oid("rel:" + schemaEntry.getKey() + "." + t.getName());
-                addUserRelationAttributes(table, relOid, t.getColumns());
+                addUserRelationAttributes(table, relOid, t.getColumns(), false, t);
             }
         }
 
@@ -1021,15 +1004,26 @@ class CatalogCoreBuilder {
 
     /** Insert one pg_attribute row per column for a user relation (table or view). */
     private void addUserRelationAttributes(Table table, int relOid, List<Column> columns) {
-        addUserRelationAttributes(table, relOid, columns, false);
+        addUserRelationAttributes(table, relOid, columns, false, null);
+    }
+
+    private void addUserRelationAttributes(Table table, int relOid, List<Column> columns,
+                                           boolean forceNullable) {
+        addUserRelationAttributes(table, relOid, columns, forceNullable, null);
     }
 
     /**
      * @param forceNullable true for a view, whose columns carry no storage constraint of
      *                      their own regardless of what the underlying column declares
+     * @param owner the relation these columns belong to when it is a table; the relations it
+     *              inherits from are what attinhcount and attislocal are read from. Null for a
+     *              view, which inherits from nothing.
      */
     private void addUserRelationAttributes(Table table, int relOid, List<Column> columns,
-                                           boolean forceNullable) {
+                                           boolean forceNullable, Table owner) {
+        // The parents are the same list for every column of the relation, so the walk over the
+        // inheritance links is done once rather than once per column.
+        List<Table> directParents = owner == null ? null : owner.getDirectParents();
         for (int i = 0; i < columns.size(); i++) {
                     Column c = columns.get(i);
                     // Determine identity type
@@ -1070,6 +1064,15 @@ class CatalogCoreBuilder {
                     }
                     // Use column-level overrides if set
                     String effectiveStorage = c.getAttStorageOverride() != null ? c.getAttStorageOverride() : storage;
+                    // A column a parent also declares was inherited, and PostgreSQL counts how
+                    // many parents declare it; a column no parent has is local, which is every
+                    // column of an ordinary table.
+                    short inhCount = 0;
+                    if (directParents != null) {
+                        for (Table parentRel : directParents) {
+                            if (parentRel.getColumnIndex(c.getName()) >= 0) inhCount++;
+                        }
+                    }
                     table.insertRow(new Object[]{
                             relOid,
                             c.getName(),
@@ -1088,7 +1091,7 @@ class CatalogCoreBuilder {
                                     : oids.oid("collation:" + c.getCollation().toLowerCase()),
                             // attndims: PG records 1 for a column declared as an array, and a
                             // client deciding whether to read the value as an array reads it.
-                            1, true, 0, null,
+                            1, inhCount == 0, inhCount, null,
                             DataType.isArrayType(colType) || c.getArrayElementType() != null ? 1 : 0,
                             null,  // xmin, attislocal, attinhcount, attfdwoptions, attndims, attacl
                             null,      // attoptions
@@ -1312,10 +1315,16 @@ class CatalogCoreBuilder {
             java.util.List<com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField> fields = ctEntry.getValue();
             for (int i = 0; i < fields.size(); i++) {
                 com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField f = fields.get(i);
-                int atttypid = resolveTypeOidByName(f.typeName());
+                // An attribute a drop took away keeps its row and its number: PostgreSQL marks it
+                // dropped and clears atttypid, so the attributes after it do not shift and a client
+                // reading the shape of the type sees the gap rather than a type that renumbered
+                // itself. The modifier it was declared with stays on the row, as PostgreSQL leaves
+                // it there.
+                boolean dropped = Database.isDroppedAttribute(f);
+                int atttypid = dropped ? 0 : resolveTypeOidByName(f.typeName());
                 table.insertRow(new Object[]{
                         ctRelOid, f.name(), atttypid, (short) (i + 1),
-                        false, -1, (short) -1, false, false,
+                        false, writtenTypmod(f.typeName()), (short) -1, dropped, false,
                         "", "", 0, 1, true, 0, null, 0, null,
                         null, (short) -1, "p", "", false, null, false, "i"
                 });
@@ -2834,6 +2843,37 @@ class CatalogCoreBuilder {
         DataType arr = DataType.fromOid(declaredOid);
         DataType elem = arr == null ? null : DataType.elementOf(arr);
         return elem != null ? elem.getOid() : declaredOid;
+    }
+
+    /**
+     * The modifier a written type name carries, packed the way {@code atttypmod} carries it.
+     *
+     * <p>A composite type's attribute is stored as the type name the statement wrote, so the width
+     * in {@code varchar(5)} and the precision in {@code numeric(8,2)} are in that text and nowhere
+     * else. Answering -1 for every one of them said each attribute had been declared with no
+     * modifier at all: {@code format_type} named an unbounded varchar where PostgreSQL names
+     * varchar(5), and a client sizing an input from the catalog was told the wrong type.
+     */
+    private static int writtenTypmod(String typeName) {
+        if (typeName == null) return -1;
+        String lower = typeName.toLowerCase(Locale.ROOT).trim();
+        // An array takes its modifier from its element, and that is where it is written.
+        if (lower.endsWith("[]")) lower = lower.substring(0, lower.length() - 2).trim();
+        int open = lower.indexOf('(');
+        int close = lower.indexOf(')', open + 1);
+        if (open <= 0 || close < 0) return -1;
+        DataType dt = DataType.fromPgName(lower.substring(0, open).trim());
+        if (dt == null) return -1;
+        String[] parts = lower.substring(open + 1, close).split(",");
+        Integer precision;
+        Integer scale = null;
+        try {
+            precision = Integer.valueOf(parts[0].trim());
+            if (parts.length > 1) scale = Integer.valueOf(parts[1].trim());
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+        return CatalogHelper.attTypmod(dt, precision, scale, null);
     }
 
     private int resolveTypeOidByName(String typeName) {

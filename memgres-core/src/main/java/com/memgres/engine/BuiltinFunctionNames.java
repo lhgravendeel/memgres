@@ -119,6 +119,7 @@ public final class BuiltinFunctionNames {
             "regexp_like", "regexp_match", "regexp_matches", "regexp_replace", "regexp_split_to_array",
             "regexp_substr", "repeat", "replace",
             "reverse", "right", "round", "row_number", "rpad", "rtrim",
+            "satisfies_hash_partition",
             "session_user", "set_config", "setseed", "setval",
             "setweight", "sha224", "sha256", "sha384", "sha512", "shobj_description", "sign",
             "skeys", "slice", "slope", "split_part", "sqrt", "starts_with",

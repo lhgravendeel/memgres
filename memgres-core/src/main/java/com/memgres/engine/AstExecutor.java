@@ -47,12 +47,29 @@ public class AstExecutor {
     final DmlExecutor dmlExecutor = new DmlExecutor(this);
     final DdlExecutor ddlExecutor = new DdlExecutor(this);
     Long lastSequenceValue = null; // for lastval()
+    /** Which sequence produced {@link #lastSequenceValue}, so lastval can tell whether it is gone. */
+    long lastSequenceInstanceId = 0;
     /**
      * The value each sequence last produced <em>for this session</em>. currval reports what this
      * connection drew, so it cannot be answered from state the sequence shares with every other
      * connection — doing so hands one caller another caller's generated key.
+     *
+     * <p>Keyed by the sequence's identity rather than its name, as PostgreSQL keys it by relid: a
+     * rename carries the entry along, and a DROP followed by a CREATE of the same name starts over
+     * with currval undefined instead of inheriting the dropped sequence's value.
      */
-    final java.util.Map<String, Long> sessionSequenceValues = new java.util.HashMap<>();
+    final java.util.Map<Long, Long> sessionSequenceValues = new java.util.HashMap<>();
+
+    /**
+     * Forget every sequence value this session drew, which is what DISCARD SEQUENCES drops:
+     * currval and lastval are undefined again and no reserved CACHE block is still held.
+     */
+    void clearSequenceState() {
+        sessionSequenceValues.clear();
+        lastSequenceValue = null;
+        lastSequenceInstanceId = 0;
+        if (session != null) session.clearSequenceCache();
+    }
     final FromResolver fromResolver = new FromResolver(this);
     /** The types a relation's definition settles for its columns, read from the definition. */
     final DefinedTypes definedTypes = new DefinedTypes(this);
@@ -100,11 +117,43 @@ public class AstExecutor {
     List<String> lastViewColumnOrder = null;
 
     /**
+     * The view's own column names, one per view-column position, the computed ones included. A
+     * positional write names nothing, so this is the only list that can say which view column a
+     * value was aimed at.
+     */
+    List<String> lastViewColumnNames = null;
+
+    /**
      * View columns whose target is an expression rather than a plain column reference.
      * PG allows such a view to be updatable but rejects assigning to those columns with
      * 0A000 ("cannot update column ... of view ...").
      */
     Set<String> lastViewExpressionColumns = null;
+
+    /**
+     * The qualification of each view a write is being rewritten through, innermost first.
+     * PostgreSQL rewrites an UPDATE or a DELETE on an auto-updatable view into one on the base
+     * relation with the view's own WHERE added to the statement's, so a write through the view
+     * reaches only the rows the view shows. Null when the target is a plain table.
+     */
+    List<ViewQual> lastViewQuals = null;
+
+    /**
+     * One view's WHERE, kept with the name its own FROM item answers to and the column renaming
+     * in force below it. A view over a view writes its condition in the names the relation it
+     * reads exposes, which are not always the base table's.
+     */
+    static final class ViewQual {
+        final Expression expr;
+        final String relationName;
+        final Map<String, String> columnNames;
+
+        ViewQual(Expression expr, String relationName, Map<String, String> columnNames) {
+            this.expr = expr;
+            this.relationName = relationName;
+            this.columnNames = columnNames;
+        }
+    }
 
     /**
      * The phrase PG uses when refusing DML on a non-updatable view: "insert into",
@@ -361,6 +410,11 @@ public class AstExecutor {
         boolean failed = true;
         try {
             QueryResult result = executeStatementInner(stmt);
+            // That transaction of its own now commits, and a DEFERRABLE INITIALLY DEFERRED
+            // constraint is checked when it does: after the statement's AFTER triggers and its
+            // data-modifying WITH items, never row by row as it runs. The statement is not
+            // reported as having succeeded until those checks have passed.
+            session.runEndOfStatementDeferredChecks();
             failed = false;
             return result;
         } finally {
@@ -1173,7 +1227,9 @@ public class AstExecutor {
         if (hasPrivilegeDirectOrInherited(role, privilege, "TABLE", qualName)) return;
         // Also check PUBLIC grants
         if (hasPrivilegeDirectOrInherited("public", privilege, "TABLE", qualName)) return;
-        throw new MemgresException("permission denied for table \"" + tableName + "\"", "42501");
+        // PostgreSQL leaves the name unquoted here, unlike the messages that report a relation
+        // that is missing or of the wrong kind.
+        throw new MemgresException("permission denied for table " + tableName, "42501");
     }
 
     /** Check if role has a privilege directly or through role membership. */
@@ -1235,15 +1291,27 @@ public class AstExecutor {
      * about it to refuse on.
      */
     void requireTableOwner(String schemaName, String tableName) {
-        if (session == null || schemaName == null || tableName == null) return;
+        requireRelationOwner(schemaName, tableName, "table");
+    }
+
+    /**
+     * The same rule, worded the way PostgreSQL words it for the objects that hang off a relation:
+     * DROP POLICY says relation where ALTER TABLE and DROP TABLE say table.
+     */
+    void requireRelationOwner(String schemaName, String relationName) {
+        requireRelationOwner(schemaName, relationName, "relation");
+    }
+
+    private void requireRelationOwner(String schemaName, String relationName, String noun) {
+        if (session == null || schemaName == null || relationName == null) return;
         String owner = database.getObjectOwner(
-                "table:" + schemaName.toLowerCase() + "." + tableName.toLowerCase());
+                "table:" + schemaName.toLowerCase() + "." + relationName.toLowerCase());
         if (owner == null) return;
         String role = currentRole();
         if (role == null || role.equalsIgnoreCase(owner)) return;
         if (isRoleSuperuser(role)) return;
         if (database.isRoleMemberOf(role, owner)) return;
-        throw new MemgresException("must be owner of table " + tableName, "42501");
+        throw new MemgresException("must be owner of " + noun + " " + relationName, "42501");
     }
 
     /**
@@ -1294,7 +1362,12 @@ public class AstExecutor {
     Table resolveTable(String schemaName, String tableName, boolean userQualified) {
         lastViewColumnMapping = null; // reset before each resolution
         lastViewColumnOrder = null;
+        lastViewColumnNames = null;
         lastViewExpressionColumns = null;
+        // A plain table carries no qualification of its own, so nothing a view resolved earlier
+        // said may be left standing here: it would hold rows back from a write that is not going
+        // through any view at all.
+        lastViewQuals = null;
         String tempSchemaName = session != null ? session.getTempSchemaName() : "pg_temp";
         // Resolve pg_temp alias to the actual session temp schema
         if ("pg_temp".equalsIgnoreCase(schemaName)) {
@@ -1554,15 +1627,30 @@ public class AstExecutor {
         }
         String refSchema = ref.schema() != null ? ref.schema() : defaultSchema();
         Table baseTable;
-        try { baseTable = resolveTable(refSchema, ref.table()); } catch (MemgresException e) { return null; }
+        List<ViewQual> quals;
+        try {
+            baseTable = resolveTable(refSchema, ref.table());
+            // Resolving what this view reads from settles the qualification below it, and that
+            // relation is also this view's own WHERE's frame of reference: the names it writes are
+            // the ones that relation exposes, under the renaming recorded for it.
+            quals = lastViewQuals != null
+                    ? new ArrayList<ViewQual>(lastViewQuals) : new ArrayList<ViewQual>();
+            if (sel.where() != null) {
+                quals.add(new ViewQual(sel.where(),
+                        ref.alias() != null ? ref.alias() : ref.table(), lastViewColumnMapping));
+            }
+        } catch (MemgresException e) { return null; }
         // Build column mapping: view alias → base column name, plus the ordered base-column
         // list (one entry per view-column position) used for positional INSERT remapping.
         lastViewColumnMapping = null;
         lastViewColumnOrder = null;
+        lastViewColumnNames = null;
         lastViewExpressionColumns = null;
+        lastViewQuals = quals.isEmpty() ? null : quals;
         if (sel.targets() != null) {
             Map<String, String> mapping = new LinkedHashMap<>();
             List<String> order = new ArrayList<>();
+            List<String> viewColumnNames = new ArrayList<>();
             Set<String> exprCols = new java.util.LinkedHashSet<>();
             boolean allSimpleColumns = true;
             for (SelectStmt.SelectTarget target : sel.targets()) {
@@ -1578,15 +1666,44 @@ public class AstExecutor {
                     order.add(baseCol);
                 }
                 String viewCol = target.alias() != null ? target.alias() : baseCol;
+                viewColumnNames.add(viewCol);
                 if (viewCol != null && baseCol != null && !viewCol.equalsIgnoreCase(baseCol)) {
                     mapping.put(viewCol.toLowerCase(), baseCol);
                 }
             }
+            if (!viewColumnNames.isEmpty()) lastViewColumnNames = viewColumnNames;
             if (!mapping.isEmpty()) lastViewColumnMapping = mapping;
             if (allSimpleColumns && !order.isEmpty()) lastViewColumnOrder = order;
             if (!exprCols.isEmpty()) lastViewExpressionColumns = exprCols;
         }
         return baseTable;
+    }
+
+    /**
+     * The rows of {@code table} a write going through a view may reach. PostgreSQL rewrites an
+     * UPDATE or a DELETE on an auto-updatable view into one on the base relation with the view's
+     * own qualification added, so a row the view does not show is not a row the write can touch.
+     * With no view in the way -- the ordinary case of a write to a table -- the rows come back
+     * exactly as they were given.
+     */
+    List<Object[]> filterByViewQuals(List<ViewQual> quals, Table table, List<Object[]> rows) {
+        if (quals == null || quals.isEmpty()) return rows;
+        List<Object[]> shown = new ArrayList<>(rows.size());
+        for (Object[] row : rows) {
+            if (viewQualsPass(quals, table, row)) shown.add(row);
+        }
+        return shown;
+    }
+
+    /** Whether one stored row passes every view in the chain the write is going through. */
+    boolean viewQualsPass(List<ViewQual> quals, Table table, Object[] row) {
+        if (quals == null || quals.isEmpty()) return true;
+        for (ViewQual qual : quals) {
+            RowContext ctx = new RowContext(table, qual.relationName, row);
+            if (qual.columnNames != null) ctx.setColumnAliases(qual.columnNames);
+            if (!isTruthy(evalExpr(qual.expr, ctx))) return false;
+        }
+        return true;
     }
 
     private Table buildVirtualTableForView(Database.ViewDef view, String viewName) {
@@ -1924,7 +2041,11 @@ public class AstExecutor {
                     }
                 }
                 // Rename only this specific overload, not all overloads
+                String nameBeforeRename = func.getName();
                 database.renameFunctionOverload(func, stmt.targetValue());
+                // DDL is transactional: a rolled-back rename has to leave the routine answering to
+                // the name it had, with the schema registration and ownership that went with it.
+                recordUndo(new Session.RenameFunctionUndo(nameBeforeRename, func));
                 return QueryResult.message(QueryResult.Type.SET, tag);
             }
             case SET_SCHEMA: {
@@ -2219,8 +2340,11 @@ public class AstExecutor {
                                             "cannot attach index \"" + childIdx
                                             + "\" as a partition of index \"" + parentIdx + "\"",
                                             "55000");
+                                    // The name is the relation's own, as PostgreSQL prints it:
+                                    // the schema the map keys the partition under is memgres's
+                                    // bookkeeping rather than part of what the partition is called.
                                     taken.setDetail("Another index is already attached for partition \""
-                                            + childTable + "\".");
+                                            + RelationNamespace.bareName(childTable) + "\".");
                                     throw taken;
                                 }
                             }

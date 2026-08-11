@@ -2026,31 +2026,13 @@ class ExprEvaluator {
     }
 
     /** PG validates CASE branch type compatibility at plan time. Reject obvious mismatches. */
-    /** Validate a collation name at runtime, raising 42704 if unknown. */
+    /**
+     * Validate a collation name at runtime, raising 42704 if unknown. Which names exist is one
+     * question with one answer, so a COLLATE in an expression and a COLLATE in a column definition
+     * ask it in the same place.
+     */
     private void validateCollationAtRuntime(String collation) {
-        if (collation == null) return;
-        String lower = collation.toLowerCase().replace("\"", "");
-        // Built-in collations that are always available
-        if (lower.equals("c") || lower.equals("posix") || lower.equals("default")
-                || lower.equals("ucs_basic") || lower.equals("unicode") || lower.equals("icu_root")
-                || lower.equals("pg_c_utf8")
-                || lower.equals("c.utf-8") || lower.equals("c.utf8")) {
-            return;
-        }
-        // Schema-qualified built-in collations
-        if (lower.startsWith("pg_catalog.")) {
-            String unqualified = lower.substring("pg_catalog.".length());
-            if (unqualified.equals("c") || unqualified.equals("posix") || unqualified.equals("default")
-                    || unqualified.equals("ucs_basic") || unqualified.equals("unicode")
-                    || unqualified.equals("icu_root") || unqualified.equals("pg_c_utf8")) {
-                return;
-            }
-        }
-        // User-defined collations in the database
-        if (executor.database.getCollation(lower) != null) {
-            return;
-        }
-        throw new MemgresException("collation \"" + collation + "\" for encoding \"UTF8\" does not exist", "42704");
+        DdlDefinitionChecks.requireCollationExists(executor.database, collation);
     }
 
     private void validateCaseBranchTypes(CaseExpr c) {

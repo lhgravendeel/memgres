@@ -258,6 +258,13 @@ class PgWireDescribeHelper {
                     if (Memgres.logAllStatements) LOG.info("[PROTO] Describe Portal → RowDesc (DML exec, {} cols, {} rows) {}", result.getColumns().size(), result.getRows().size(), sqlSnip);
                     return new DescribePortalResult(true, result);
                 }
+                // The statement has already run. It turned out to have no columns to describe,
+                // but discarding the result here let Execute run it a second time -- every row
+                // written twice, and a primary key turning that into a duplicate-key error on a
+                // statement that had already applied. NoData describes it; this is the result
+                // Execute reports.
+                sendNoData(ctx);
+                return new DescribePortalResult(false, result);
             } catch (Exception e) {
                 LOG.warn("[PROTO] Describe Portal DML exec failed: {} | {}", e.getMessage(), sqlSnip);
             }
@@ -772,23 +779,36 @@ class PgWireDescribeHelper {
         if (retIdx < 0) return null;
         String retPart = sql.substring(retIdx + "RETURNING".length()).trim();
         if (retPart.equals("*")) {
-            List<Column> cols = new ArrayList<>(table.getColumns());
-            if (mergeSourceTable != null) {
-                cols.addAll(mergeSourceTable.getColumns());
-            }
+            if (!upper.startsWith("MERGE")) return new ArrayList<>(table.getColumns());
+            // A MERGE's RETURNING reads over the join the statement walks, and it walks the source
+            // first: PostgreSQL answers the source's columns and then the target's. A source that
+            // is no relation of its own — a VALUES list, a subquery — has no columns to read off
+            // the catalogue, so nothing is described from the text and the statement itself says.
+            if (mergeSourceTable == null) return null;
+            List<Column> cols = new ArrayList<>(mergeSourceTable.getColumns());
+            cols.addAll(table.getColumns());
             return cols;
         }
         List<Column> result = new ArrayList<>();
         for (String colExpr : retPart.split(",")) {
-            String colName = colExpr.trim().replace("\"", "");
-            int asIdx = colName.toUpperCase().indexOf(" AS ");
-            if (asIdx >= 0) colName = colName.substring(0, asIdx).trim();
+            String item = colExpr.trim().replace("\"", "");
+            // The alias is the name PostgreSQL puts in the row description: `a AS r2` is labelled
+            // r2, not a. Dropping it here and adding the base table's own Column made the wire
+            // label disagree with the one the engine builds for the same statement. withName keeps
+            // the column's type metadata, which is what the type OID is worked out from.
+            String alias = null;
+            String colName = item;
+            int asIdx = item.toUpperCase().indexOf(" AS ");
+            if (asIdx >= 0) {
+                alias = item.substring(asIdx + 4).trim();
+                colName = item.substring(0, asIdx).trim();
+            }
             Column found = null;
             for (Column c : table.getColumns()) {
                 if (c.getName().equalsIgnoreCase(colName)) { found = c; break; }
             }
-            if (found != null) result.add(found);
-            else return null;
+            if (found == null) return null;
+            result.add(alias == null || alias.isEmpty() ? found : found.withName(alias));
         }
         return result.isEmpty() ? null : result;
     }

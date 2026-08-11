@@ -320,11 +320,12 @@ class CatalogStubBuilder {
             long maxValue = seq != null ? seq.getMaxValue() : getDefaultSeqMax(seqDataType);
             long minValue = seq != null ? seq.getMinValue() : 1L;
             boolean cycle = seq != null && seq.isCycle();
+            long cacheSize = seq != null ? (long) seq.getCache() : 1L;
             table.insertRow(new Object[]{
                     seqOid, typOid,
                     startWith, incrementBy,
                     maxValue, minValue,
-                    1L, cycle
+                    cacheSize, cycle
             });
         }
         return table;
@@ -1821,14 +1822,17 @@ class CatalogStubBuilder {
                         table.insertRow(new Object[]{ childOid, parentOid, seqno, false });
                     }
                 }
-                // Inheritance relationship: child has parentTable (but NOT partition)
-                if (t.getParentTable() != null && t.getPartitionParent() == null) {
-                    String parentSchema = findSchemaForTable(t.getParentTable());
-                    if (parentSchema != null) {
-                        int parentOid = oids.oid("rel:" + parentSchema + "." + t.getParentTable().getName());
-                        int seqno = t.getParentTable().getChildren().indexOf(t) + 1;
-                        if (seqno <= 0) seqno = 1;
-                        table.insertRow(new Object[]{ childOid, parentOid, seqno, false });
+                // Inheritance relationship: one row per parent, numbered in the order the child
+                // named them, which is what inhseqno counts. A table may inherit from several
+                // parents, so the list is walked rather than a single link followed.
+                if (t.getPartitionParent() == null) {
+                    List<Table> inheritParents = t.getInheritParents();
+                    for (int p = 0; p < inheritParents.size(); p++) {
+                        Table inheritParent = inheritParents.get(p);
+                        String parentSchema = findSchemaForTable(inheritParent);
+                        if (parentSchema == null) continue;
+                        int parentOid = oids.oid("rel:" + parentSchema + "." + inheritParent.getName());
+                        table.insertRow(new Object[]{ childOid, parentOid, p + 1, false });
                     }
                 }
             }

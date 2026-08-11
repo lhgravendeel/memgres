@@ -87,6 +87,9 @@ class SessionExecutor {
                     } catch (MemgresException e) {
                         throw new MemgresException("relation \"" + objName + "\" does not exist", "42P01");
                     }
+                    // A comment is part of the relation's own definition, and everything a schema
+                    // reader is told about it comes from there, so setting one is the owner's.
+                    executor.requireTableOwner(schemaName, bareName);
                 } else if (objType.equals("VIEW")) {
                     if (!executor.database.hasView(bareName)) {
                         throw new MemgresException("view \"" + objName + "\" does not exist", "42P01");
@@ -1101,12 +1104,20 @@ class SessionExecutor {
                     for (String cn : namesStr.split(",")) {
                         String constraintName = bareConstraintName(cn.trim());
                         StoredConstraint sc = findConstraint(constraintName);
-                        if (sc == null) {
+                        // A constraint trigger is a constraint as well as a trigger: SET
+                        // CONSTRAINTS names it and pg_constraint holds a row for it. It is kept
+                        // among the triggers rather than among a table's stored constraints, so a
+                        // lookup that read only those answered that it does not exist.
+                        PgTrigger constraintTrigger = sc != null ? null
+                                : executor.database.findConstraintTrigger(constraintName);
+                        if (sc == null && constraintTrigger == null) {
                             throw PgErrors.undefinedObject("constraint", constraintName);
                         }
                         // IMMEDIATE is what a non-deferrable constraint already is, so only asking
                         // for DEFERRED is a request it cannot honour.
-                        if (deferred && !sc.isDeferrable()) {
+                        boolean deferrable = sc != null
+                                ? sc.isDeferrable() : constraintTrigger.isDeferrable();
+                        if (deferred && !deferrable) {
                             throw new MemgresException(
                                     "constraint \"" + constraintName + "\" is not deferrable", "42809");
                         }
@@ -1710,6 +1721,12 @@ class SessionExecutor {
                 }
                 // pg_advisory_unlock_all() — release all session-level advisory locks
                 executor.database.advisoryUnlockAll(executor.session);
+                // DISCARD ALL includes DISCARD SEQUENCES, so currval and lastval are undefined
+                // again and no reserved CACHE block is still held.
+                executor.clearSequenceState();
+            } else if (target.equals("SEQUENCES")) {
+                // The sequence state is the session's own: what it drew, and any block it reserved.
+                executor.clearSequenceState();
             } else if (target.equals("PLANS")) {
                 // PG DISCARD PLANS invalidates cached query plans, forcing re-planning on next use.
                 // It does NOT deallocate prepared statements. Since Memgres has no plan cache, this is a no-op.
