@@ -204,6 +204,36 @@ public class AstExecutor {
         return expansionsInProgress.contains("rule:" + event + ":" + relation.toLowerCase());
     }
 
+    /**
+     * The schema holding the relation a name reaches, which is what says which relation a rule
+     * or a trigger written on that name belongs to.
+     *
+     * <p>A rule belongs to the relation rather than to its name: two schemas may each hold a
+     * relation called {@code t} and each carries its own rules, so a write has to look for them
+     * where the name it wrote reaches. A name written with no schema reaches the relation the
+     * search path reaches, and the temporary schema comes first for a relation unless the path
+     * says where it stands -- the same order the name itself is resolved in.
+     */
+    String relationSchemaOf(String writtenSchema, String relation) {
+        String bare = relation == null ? "" : RelationNamespace.bareName(relation);
+        int dot = relation == null ? -1 : relation.lastIndexOf('.');
+        String written = writtenSchema != null ? writtenSchema
+                : (dot > 0 ? relation.substring(0, dot) : null);
+        String temp = session != null ? session.getTempSchemaName() : null;
+        if (written != null) {
+            return "pg_temp".equalsIgnoreCase(written) && temp != null ? temp : written;
+        }
+        List<String> order = new ArrayList<>();
+        if (temp != null && !searchPathNamesTemp()) order.add(temp);
+        for (String entry : searchPathSchemas()) {
+            order.add("pg_temp".equalsIgnoreCase(entry) && temp != null ? temp : entry);
+        }
+        for (String schemaName : order) {
+            if (RelationNamespace.kindOf(database, schemaName, bare) != null) return schemaName;
+        }
+        return defaultSchema();
+    }
+
     // When true, column references with no context throw instead of returning column name as string
     private boolean strictColumnRefs = false;
 
@@ -225,6 +255,10 @@ public class AstExecutor {
     }
 
     public QueryResult execute(String sql, List<Object> parameters) {
+        // Where the statement begins in the text handed over. An error's position is reported
+        // against that text, and the parser is given only what is left after the trim.
+        int textOffset = 0;
+        while (textOffset < sql.length() && sql.charAt(textOffset) <= ' ') textOffset++;
         sql = sql.trim();
         if (sql.endsWith(";")) {
             sql = sql.substring(0, sql.length() - 1).trim();
@@ -255,6 +289,7 @@ public class AstExecutor {
             if (stmt == null) return QueryResult.empty(); // empty input (only comments)
             rejectQualifiedTypeSchemas(stmt, typeSchemas);
             rejectNestedDataModifyingCtes(stmt);
+            rejectMisplacedDefault(stmt, textOffset);
             // The FULL JOIN restriction is asked of the statement the client sent and of nothing
             // else; a statement run from inside one — a function body, a catalog lookup — is not
             // the outermost query, so what it holds is left alone. See FullJoinAdmissibility.
@@ -341,6 +376,45 @@ public class AstExecutor {
         }
     }
 
+    /**
+     * A DEFAULT written where it does not ask a column for its default.
+     *
+     * <p>The keyword is not a value. It may only be the whole of a value an INSERT supplies for a
+     * column or the whole of what an assignment writes — parentheses around it change nothing, and
+     * one element of a multi-column assignment counts as the whole of what that element writes.
+     * PostgreSQL refuses it anywhere else while it analyses the statement, so an empty relation is
+     * refused exactly as a full one is. Judged only where the expression came to be evaluated, the
+     * same statement quietly did nothing whenever no row reached the evaluator.
+     *
+     * <p>Which of a statement's faults it is reported for is a question of order. PostgreSQL reads
+     * a statement one clause at a time and an expression's operands left to right, and answers for
+     * whatever it meets first — so {@code WHERE nosuchcol = DEFAULT} is a column that is not
+     * there, while {@code WHERE DEFAULT = nosuchcol} is this. The reading the protocol layer does
+     * before it answers Parse is asked for here too, which is what puts the two complaints in one
+     * order however the client sent the statement.
+     */
+    private void rejectMisplacedDefault(Statement stmt, int textOffset) {
+        if (AstWalk.findFirst(stmt, node -> MisplacedDefault.isKeyword(node)) == null) return;
+        Set<Object> standing = MisplacedDefault.standingPlaces(stmt);
+        Literal keyword = MisplacedDefault.anywhere(stmt, standing);
+        if (keyword == null) return;
+        Literal inReadingOrder = MisplacedDefault.first(stmt, standing);
+        if (inReadingOrder != null) keyword = inReadingOrder;
+        // The range table is built before the statement's expressions are read, and the columns of
+        // a clause are resolved as the clause is read, so a name that reaches nothing is what
+        // PostgreSQL reports about whenever it stands earlier in the reading than the keyword.
+        try {
+            analyzeWithoutRunning(stmt, textOffset);
+            fromResolver.checkRelationNamesExist(stmt);
+        } catch (MemgresException reported) {
+            throw reported;
+        } catch (RuntimeException | StackOverflowError unreadable) {
+            // Reading a statement is not the place to invent a failure. Whatever the reading could
+            // not make sense of leaves the keyword itself as the answer, which is what it was.
+        }
+        throw MisplacedDefault.error(keyword, textOffset);
+    }
+
     /** The WITH lists that count as the statement's own, including each arm of a set operation. */
     private static void collectTopLevelCtes(Statement stmt, Set<Object> out) {
         if (stmt == null) return;
@@ -371,6 +445,17 @@ public class AstExecutor {
     private static boolean isDataModifying(Statement stmt) {
         return stmt instanceof InsertStmt || stmt instanceof UpdateStmt || stmt instanceof DeleteStmt
                 || stmt instanceof MergeStmt;
+    }
+
+    /**
+     * Whether this statement has a relation it writes rows to. A SELECT that locks the rows it
+     * reads is one of them: PostgreSQL writes the lock into each tuple it takes, so FOR UPDATE
+     * moves the command counter exactly as a write does. See {@link #executeStatement}.
+     */
+    private static boolean writesRows(Statement stmt) {
+        if (stmt instanceof ExplainStmt) return false;
+        if (stmt instanceof SelectStmt) return ((SelectStmt) stmt).lockClause() != null;
+        return isDataModifying(stmt) || stmt instanceof CopyStmt;
     }
 
     /**
@@ -407,6 +492,10 @@ public class AstExecutor {
         // be undone if it does not finish. Nested calls join this scope rather than opening one.
         if (session == null) return executeStatementInner(stmt);
         session.beginStatementScope();
+        // PostgreSQL takes the command identifier when a statement opens the relation it writes to,
+        // so a write consumes one whether or not any row turned out to match: an UPDATE that found
+        // nothing still moves the counter that the next statement's cmin reports.
+        if (writesRows(stmt)) session.noteCommandIdUsed();
         boolean failed = true;
         try {
             QueryResult result = executeStatementInner(stmt);
@@ -1130,7 +1219,44 @@ public class AstExecutor {
      * mismatch where PostgreSQL reports the missing relation.
      */
     public void analyzeWithoutRunning(Statement stmt) {
-        new StatementAnalyzer(this).analyze(stmt);
+        analyzeWithoutRunning(stmt, 0);
+    }
+
+    /**
+     * The same reading, of a tree parsed from text beginning {@code textOffset} characters into
+     * the statement the client sent. What the reading points at is pointed at in that statement,
+     * not in whatever was handed to the parser.
+     */
+    public void analyzeWithoutRunning(Statement stmt, int textOffset) {
+        // Reading a statement is a read of the catalog, and the catalog answers differently to
+        // different sessions: a relation another session's open transaction dropped is still
+        // there for everyone else, and one it created is there for nobody else. Analysing
+        // without saying whose statement this is asked the catalog a question it cannot answer,
+        // and a reader was told a live relation was missing.
+        Session outerViewer = Database.bindViewer(session);
+        try {
+            new StatementAnalyzer(this, textOffset).analyzeAtParse(stmt);
+        } finally {
+            Database.bindViewer(outerViewer);
+        }
+    }
+
+    /**
+     * How many columns a statement answers with, or -1 when reading it does not settle that.
+     *
+     * <p>PostgreSQL settles this while it plans the statement, which is before Bind holds a
+     * client's list of result formats against it. Running the statement to find out is the side
+     * effect this reader exists to avoid, so a width it cannot work out is no width at all.
+     */
+    public int resultColumnsWithoutRunning(Statement stmt) {
+        Session outerViewer = Database.bindViewer(session);
+        try {
+            return new StatementAnalyzer(this).resultColumns(stmt);
+        } catch (RuntimeException | StackOverflowError e) {
+            return -1;
+        } finally {
+            Database.bindViewer(outerViewer);
+        }
     }
 
     java.util.List<String> relationSearchPath() {

@@ -312,9 +312,14 @@ class DdlExecutor {
                 // parse every column entry (plain identifiers included) as an expression so
                 // uniqueness enforcement and ON CONFLICT matching can evaluate/compare them
                 // structurally. Mirrors the detection used for CREATE UNIQUE INDEX.
+                // A key that names a column of the relation is that column, whatever characters
+                // its name holds: "A b" is one name and not an expression, and reading it as one
+                // left the constraint enforcing nothing and every later write asking for a column
+                // called a.
                 boolean hasExprCols = cols.stream().anyMatch(c ->
-                        c.contains("(") || c.contains(" ") || c.contains("+") || c.contains("-")
-                        || c.contains("*") || c.contains("/") || c.contains("||"));
+                        (existing == null || existing.getColumnIndex(c) < 0)
+                        && (c.contains("(") || c.contains(" ") || c.contains("+") || c.contains("-")
+                        || c.contains("*") || c.contains("/") || c.contains("||")));
                 if (hasExprCols) {
                     List<Expression> exprCols = new ArrayList<>();
                     for (String col : cols) {
@@ -425,37 +430,82 @@ class DdlExecutor {
      */
     void validateExprColumnRefs(Expression expr, Table table, String newColName,
                                 boolean systemColumnsResolve) {
+        validateExprColumnRefs(expr, table, newColName, systemColumnsResolve, false);
+    }
+
+    /**
+     * @param qualifiersNameRelation true where the expression is being read from the statement
+     *        that writes it, so a qualifier on a name is still there to be judged. PostgreSQL
+     *        stores a reference to the relation itself rather than the name the reader wrote, so
+     *        the same expression re-read against a descendant carries no qualifier to judge; this
+     *        engine keeps what was written, and so judges it only where it was written.
+     */
+    void validateExprColumnRefs(Expression expr, Table table, String newColName,
+                                boolean systemColumnsResolve, boolean qualifiersNameRelation) {
         if (expr == null) return;
         if (expr instanceof ColumnRef) {
             ColumnRef ref = (ColumnRef) expr;
             String col = ref.column();
+            // The relation the expression is stored on is the only one in scope, so a qualifier
+            // naming anything else is a table the statement never mentioned rather than a column
+            // that is missing. A column of composite type is no exception: c.x names a relation c,
+            // and the field is reached by writing (c).x.
+            if (qualifiersNameRelation && ref.table() != null) {
+                if (!ref.table().equals(table.getName())) {
+                    throw new MemgresException("missing FROM-clause entry for table \""
+                            + ref.table() + "\"", "42P01");
+                }
+                // A three-part name may carry the relation's own schema and only that one: another
+                // schema's relation of the same name is a relation that exists but is not this one,
+                // which PostgreSQL words differently from one that does not exist at all.
+                if (ref.schema() != null && table.getSchemaName() != null
+                        && !ref.schema().equals(table.getSchemaName())) {
+                    MemgresException e = new MemgresException(
+                            "invalid reference to FROM-clause entry for table \""
+                            + ref.table() + "\"", "42P01");
+                    e.setDetail("There is an entry for table \"" + ref.table()
+                            + "\", but it cannot be referenced from this part of the query.");
+                    throw e;
+                }
+            }
             if (systemColumnsResolve && DdlDefinitionChecks.isSystemColumnName(col)) return;
             if (table.getColumnIndex(col) < 0 && !col.equalsIgnoreCase(newColName)) {
-                throw new MemgresException("column \"" + col + "\" does not exist", "42703");
+                // A name looked for under a relation is reported with the relation, as it was
+                // written and unquoted; one looked for on its own is quoted.
+                throw new MemgresException("column " + (ref.table() == null
+                        ? "\"" + col + "\"" : ref.table() + "." + col)
+                        + " does not exist", "42703");
             }
         } else if (expr instanceof BinaryExpr) {
             BinaryExpr bin = (BinaryExpr) expr;
-            validateExprColumnRefs(bin.left(), table, newColName, systemColumnsResolve);
-            validateExprColumnRefs(bin.right(), table, newColName, systemColumnsResolve);
+            validateExprColumnRefs(bin.left(), table, newColName, systemColumnsResolve,
+                    qualifiersNameRelation);
+            validateExprColumnRefs(bin.right(), table, newColName, systemColumnsResolve,
+                    qualifiersNameRelation);
         } else if (expr instanceof CustomOperatorExpr) {
             CustomOperatorExpr cop = (CustomOperatorExpr) expr;
             if (cop.left() != null) {
-                validateExprColumnRefs(cop.left(), table, newColName, systemColumnsResolve);
+                validateExprColumnRefs(cop.left(), table, newColName, systemColumnsResolve,
+                        qualifiersNameRelation);
             }
-            validateExprColumnRefs(cop.right(), table, newColName, systemColumnsResolve);
+            validateExprColumnRefs(cop.right(), table, newColName, systemColumnsResolve,
+                    qualifiersNameRelation);
         } else if (expr instanceof UnaryExpr) {
             UnaryExpr un = (UnaryExpr) expr;
-            validateExprColumnRefs(un.operand(), table, newColName, systemColumnsResolve);
+            validateExprColumnRefs(un.operand(), table, newColName, systemColumnsResolve,
+                    qualifiersNameRelation);
         } else if (expr instanceof FunctionCallExpr) {
             FunctionCallExpr fn = (FunctionCallExpr) expr;
             if (fn.args() != null) {
                 for (Expression arg : fn.args()) {
-                    validateExprColumnRefs(arg, table, newColName, systemColumnsResolve);
+                    validateExprColumnRefs(arg, table, newColName, systemColumnsResolve,
+                            qualifiersNameRelation);
                 }
             }
         } else if (expr instanceof CastExpr) {
             CastExpr cast = (CastExpr) expr;
-            validateExprColumnRefs(cast.expr(), table, newColName, systemColumnsResolve);
+            validateExprColumnRefs(cast.expr(), table, newColName, systemColumnsResolve,
+                    qualifiersNameRelation);
         }
     }
 
@@ -500,6 +550,35 @@ class DdlExecutor {
         public Integer domainPrecision() { return domainPrecision; }
         public Integer domainScale() { return domainScale; }
         public String domainIntervalQualifier() { return domainIntervalQualifier; }
+
+        /**
+         * The domain's name written the way this session would write it: bare when the search path
+         * reaches the schema holding it, qualified when it does not. PostgreSQL names a type that
+         * way wherever it prints one, and the stored key cannot answer it on its own -- a key
+         * always carries a schema, so a message built from it said public.d where the reader
+         * wrote d.
+         */
+        private String domainDisplayName;
+
+        void setDomainDisplayName(String display) { this.domainDisplayName = display; }
+
+        /** Falls back to the stored key, for a resolution that never settled the display name. */
+        public String domainDisplayName() {
+            return domainDisplayName != null ? domainDisplayName : domainTypeName;
+        }
+
+        /**
+         * The name of the user-defined type the column was declared with -- an enum, a composite
+         * or a range -- written the way this session would write it, and null for every other
+         * type. Each of the three is a type in its own right wherever PostgreSQL prints one, and
+         * none of them carries a collation, so a complaint about one has to name it rather than
+         * the representation this engine happens to store its values in.
+         */
+        private String userTypeDisplayName;
+
+        void setUserTypeDisplayName(String display) { this.userTypeDisplayName = display; }
+
+        public String userTypeDisplayName() { return userTypeDisplayName; }
 
         public DataType dataType() { return dataType; }
         public String enumTypeName() { return enumTypeName; }
@@ -582,6 +661,7 @@ class DdlExecutor {
         String enumTypeName = null;
         String domainTypeName = null;
         String compositeTypeName = null;
+        String rangeTypeName = null;
         boolean domainNotNull = false;
         Integer domainPrecision = null;
         Integer domainScale = null;
@@ -626,6 +706,7 @@ class DdlExecutor {
                 // PostgreSQL's own range types are held that way here too, so a column of a range
                 // the reader defined stores exactly what a column of int4range stores.
                 dataType = DataType.TEXT;
+                rangeTypeName = baseType;
                 if (isArray) {
                     arrayElementType = DataType.TEXT;
                 }
@@ -658,6 +739,22 @@ class DdlExecutor {
         ResolvedType resolved = new ResolvedType(dataType, enumTypeName, domainTypeName,
                 compositeTypeName, arrayElementType, domainNotNull);
         resolved.setDomainTypmod(domainPrecision, domainScale, domainInterval);
+        // How the reader would have written the domain's name is settled here, while the session
+        // whose search path decides it is still in hand. An error raised later has only the stored
+        // key to go on, and a key always carries a schema.
+        if (domainTypeName != null) {
+            resolved.setDomainDisplayName(
+                    TypeNamespace.displayFor(executor.database, executor.session, domainTypeName));
+        }
+        // An enum, a composite and a range are named here for the same reason, and while the same
+        // session is still in hand: each is a type PostgreSQL names in its own right, and the key
+        // a later message would have to fall back on always carries a schema.
+        String userTypeName = enumTypeName != null ? enumTypeName
+                : compositeTypeName != null ? compositeTypeName : rangeTypeName;
+        if (userTypeName != null) {
+            resolved.setUserTypeDisplayName(
+                    TypeNamespace.displayFor(executor.database, executor.session, userTypeName));
+        }
         return resolved;
     }
 

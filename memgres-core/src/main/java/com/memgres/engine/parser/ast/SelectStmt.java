@@ -524,6 +524,16 @@ public final class SelectStmt implements Statement {
         /** CYCLE ... SET c TO <value> DEFAULT <default>; both null for the boolean default. */
         public final Expression cycleMarkValue;
         public final Expression cycleMarkDefault;
+        /**
+         * MATERIALIZED (TRUE), NOT MATERIALIZED (FALSE), or written neither way (null).
+         *
+         * <p>PostgreSQL pulls a WITH item up into the query that reads it, and plans the pulled-up
+         * copy as part of that query; an item it keeps apart is computed on its own first. Which of
+         * the two happens is visible from the outside — a qualification of the reading query
+         * reaches the relation under a pulled-up item and not under one kept apart — so the word
+         * the writer used has to be carried rather than discarded.
+         */
+        public final Boolean materialized;
 
         public CommonTableExpr(
                 String name,
@@ -555,6 +565,26 @@ public final class SelectStmt implements Statement {
                 Expression cycleMarkValue,
                 Expression cycleMarkDefault
         ) {
+            this(name, columnNames, query, recursive, searchColumn, searchDepthFirst, searchByColumns,
+                    cycleColumn, cyclePathColumn, cycleByColumns, cycleMarkValue, cycleMarkDefault,
+                    null);
+        }
+
+        public CommonTableExpr(
+                String name,
+                List<String> columnNames,
+                Statement query,
+                boolean recursive,
+                String searchColumn,
+                boolean searchDepthFirst,
+                List<String> searchByColumns,
+                String cycleColumn,
+                String cyclePathColumn,
+                List<String> cycleByColumns,
+                Expression cycleMarkValue,
+                Expression cycleMarkDefault,
+                Boolean materialized
+        ) {
             this.name = name;
             this.columnNames = columnNames;
             this.query = query;
@@ -567,6 +597,7 @@ public final class SelectStmt implements Statement {
             this.cycleByColumns = cycleByColumns;
             this.cycleMarkValue = cycleMarkValue;
             this.cycleMarkDefault = cycleMarkDefault;
+            this.materialized = materialized;
         }
 
         public CommonTableExpr(
@@ -588,6 +619,13 @@ public final class SelectStmt implements Statement {
             this(name, columnNames, query, recursive, null, false, null, null, null, null);
         }
 
+        /** As written, carrying the MATERIALIZED / NOT MATERIALIZED word the item was given. */
+        public CommonTableExpr(String name, List<String> columnNames, Statement query,
+                               boolean recursive, Boolean materialized) {
+            this(name, columnNames, query, recursive, null, false, null, null, null, null, null,
+                    null, materialized);
+        }
+
         public String name() { return name; }
         public List<String> columnNames() { return columnNames; }
         public Statement query() { return query; }
@@ -600,6 +638,7 @@ public final class SelectStmt implements Statement {
         public List<String> cycleByColumns() { return cycleByColumns; }
         public Expression cycleMarkValue() { return cycleMarkValue; }
         public Expression cycleMarkDefault() { return cycleMarkDefault; }
+        public Boolean materialized() { return materialized; }
 
         @Override
         public boolean equals(Object o) {

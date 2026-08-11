@@ -363,7 +363,7 @@ class ConstraintValidator {
                     ex.setTable(table.getName());
                     String schema = findSchemaName(table);
                     if (schema != null) ex.setSchema(schema);
-                    ex.setDetail(buildKeyDetail(columns, newVals));
+                    ex.setDetail(buildKeyDetail(table, columns, newVals));
                     throw ex;
                 }
             }
@@ -416,7 +416,7 @@ class ConstraintValidator {
                     ex.setTable(table.getName());
                     String schema = findSchemaName(table);
                     if (schema != null) ex.setSchema(schema);
-                    ex.setDetail(buildKeyDetail(columns, newVals));
+                    ex.setDetail(buildKeyDetail(table, columns, newVals));
                     throw ex;
                 }
                 return;
@@ -454,26 +454,19 @@ class ConstraintValidator {
                 ex.setTable(table.getName());
                 String schema = findSchemaName(table);
                 if (schema != null) ex.setSchema(schema);
-                ex.setDetail(buildKeyDetail(columns, newVals));
+                ex.setDetail(buildKeyDetail(table, columns, newVals));
                 throw ex;
             }
         }
     }
 
-    /** Build PG-style DETAIL string: "Key (col1, col2)=(val1, val2) already exists." */
-    private String buildKeyDetail(List<String> columns, Object[] vals) {
-        StringBuilder sb = new StringBuilder("Key (");
-        for (int i = 0; i < columns.size(); i++) {
-            if (i > 0) sb.append(", ");
-            sb.append(columns.get(i));
-        }
-        sb.append(")=(");
-        for (int i = 0; i < vals.length; i++) {
-            if (i > 0) sb.append(", ");
-            sb.append(vals[i] == null ? "null" : vals[i]);
-        }
-        sb.append(") already exists.");
-        return sb.toString();
+    /**
+     * The DETAIL of a duplicate key: <em>Key (col1, col2)=(val1, val2) already exists.</em> The key
+     * is named as PostgreSQL names it, which is not always as it was written down -- a name needing
+     * quotes gets them, and a key that is an expression is deparsed.
+     */
+    private String buildKeyDetail(Table table, List<String> columns, Object[] vals) {
+        return IndexKeyDescription.alreadyExists(table, columns, vals);
     }
 
     private void validateCheck(Table table, Object[] row, StoredConstraint sc) {
@@ -656,7 +649,7 @@ class ConstraintValidator {
                 ex.setTable(table.getName());
                 String schema = findSchemaName(table);
                 if (schema != null) ex.setSchema(schema);
-                ex.setDetail(buildKeyDetail(columns, vals));
+                ex.setDetail(buildKeyDetail(table, columns, vals));
                 throw ex;
             }
         }

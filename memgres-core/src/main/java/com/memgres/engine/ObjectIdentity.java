@@ -205,13 +205,18 @@ final class ObjectIdentity {
         }
         movePrivileges(oldSchema, bare(oldName), newSchema, bare(newName));
         moveOwner(kind, oldSchema, bare(oldName), newSchema, bare(newName));
-        // A trigger and a rule are on the relation, not on its name. Both registries are keyed by
-        // bare name, so they can only be moved when nothing else answers to either name — the
-        // same reason a comment stays put.
+        // A trigger is on the relation, not on its name, but the trigger registry is keyed by
+        // bare name, so triggers can only be moved when nothing else answers to either name --
+        // the same reason a comment stays put.
         if (("r".equals(kind) || "v".equals(kind) || "m".equals(kind))
                 && unambiguous(oldName, newName, newSchema)) {
             database.retargetTriggers(bare(oldName), bare(newName), newSchema);
-            database.retargetRules(bare(oldName), bare(newName));
+        }
+        // A rule is on the relation too, and it records which schema's relation that is, so it
+        // goes with the relation whatever else answers to the name -- including a move that
+        // changes only the schema, which leaves the rule filed under a relation that has gone.
+        if ("r".equals(kind) || "v".equals(kind) || "m".equals(kind)) {
+            database.retargetRules(oldSchema, bare(oldName), newSchema, bare(newName));
         }
         if ("r".equals(kind)) retargetIndexes(oldSchema, bare(oldName), newSchema, bare(newName));
         if (renamed) sweepOtherSpellings(bare(oldName));

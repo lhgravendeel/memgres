@@ -175,6 +175,71 @@ class CompositeTypeHandler {
         return null;
     }
 
+    /**
+     * Refuse a value that is not shaped like the composite it is being made into.
+     *
+     * <p>PostgreSQL answers a badly shaped value two different ways, and which one it gives
+     * depends on what the value already was. A row constructor is a record being converted, so a
+     * record holding the wrong number of fields is a cast that cannot be made and the type is
+     * named. Text is input for the type's own reader, so text of the wrong shape is bad input and
+     * the literal that could not be read is quoted back. Stored, the two are the same text, which
+     * is why the question is asked while the value still knows which it was.
+     *
+     * <p>A field whose own type is a composite is read by that type's reader in turn, and it is
+     * read before the fields after it are counted -- which is why a badly shaped nested value is
+     * blamed on the inner type and quotes the inner text rather than the whole literal.
+     */
+    void requireCompositeShape(Object value, String typeName) {
+        if (value == null || typeName == null) return;
+        List<CreateTypeStmt.CompositeField> fields = executor.database.getRowType(typeName);
+        if (fields == null) return;
+        if (value instanceof AstExecutor.PgRow) {
+            List<Object> values = ((AstExecutor.PgRow) value).values();
+            if (values.size() != fields.size()) {
+                // The type is named the way this session would write it rather than by the key it
+                // is stored under, and PostgreSQL adds which way the record was the wrong shape --
+                // that is what tells the writer whether to add a field or take one away.
+                MemgresException wrongShape = new MemgresException("cannot cast type record to "
+                        + TypeNamespace.display(executor.database, executor.session, typeName),
+                        "42846");
+                wrongShape.setDetail(values.size() > fields.size()
+                        ? "Input has too many columns." : "Input has too few columns.");
+                throw wrongShape;
+            }
+            for (int i = 0; i < values.size(); i++) {
+                requireCompositeShape(values.get(i), fields.get(i).typeName());
+            }
+            return;
+        }
+        if (!(value instanceof String)) return;
+        String text = ((String) value).trim();
+        if (text.isEmpty() || text.charAt(0) != '(') {
+            throw malformedRecord(text, "Missing left parenthesis.");
+        }
+        if (text.length() < 2 || text.charAt(text.length() - 1) != ')') {
+            throw malformedRecord(text, "Unexpected end of input.");
+        }
+        List<RecordLiteral.Field> parts = RecordLiteral.parse(text);
+        for (int i = 0; i < parts.size() && i < fields.size(); i++) {
+            RecordLiteral.Field part = parts.get(i);
+            // An unquoted field with nothing in it is the SQL null, which every type accepts.
+            if (!part.quoted && part.text.isEmpty()) continue;
+            requireCompositeShape(part.text, fields.get(i).typeName());
+        }
+        if (parts.size() != fields.size()) {
+            throw malformedRecord(text, parts.size() > fields.size()
+                    ? "Too many columns." : "Too few columns.");
+        }
+    }
+
+    /** PostgreSQL quotes the literal its record reader could not read and says what stopped it. */
+    private MemgresException malformedRecord(String text, String detail) {
+        MemgresException ex = new MemgresException(
+                "malformed record literal: \"" + text + "\"", "22P02");
+        ex.setDetail(detail);
+        return ex;
+    }
+
     /** The fields of a composite literal, as the composite's own reader reads them. */
     String[] splitCompositeString(String inner) {
         List<RecordLiteral.Field> fields = RecordLiteral.parse(inner);

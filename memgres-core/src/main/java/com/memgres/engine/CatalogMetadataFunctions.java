@@ -116,7 +116,7 @@ class CatalogMetadataFunctions {
                                             CatalogConstraintBuilder.constraintKey(
                                                     schemaName, tbl.getName(), conname));
                                     if (nnOid == coid) {
-                                        return "NOT NULL " + c.getName();
+                                        return "NOT NULL " + RuleDeparser.quoteIdentifier(c.getName());
                                     }
                                 }
                             }
@@ -186,11 +186,11 @@ class CatalogMetadataFunctions {
                     }
                 }
                 // A rule written with CREATE RULE is stored as the text it deparses to.
-                for (java.util.Map.Entry<String, String[]> entry
-                        : executor.database.getRuleDefinitions().entrySet()) {
-                    int rOid = executor.systemCatalog.getOid(
-                            "rule:" + entry.getKey() + "_" + entry.getValue()[0]);
-                    if (rOid == ruleOid) return entry.getValue()[1];
+                for (Database.StoredRule rule : executor.database.getRuleEntries()) {
+                    int rOid = executor.systemCatalog.getOid("rule:"
+                            + (rule.getSchema() == null ? "public" : rule.getSchema())
+                            + "." + rule.getTable() + ":" + rule.getName());
+                    if (rOid == ruleOid) return rule.getDefinition();
                 }
                 return null;
             }
@@ -605,14 +605,16 @@ class CatalogMetadataFunctions {
         String whereClause = CatalogHelper.deparseIndexPredicate(executor.database, tableName,
                 executor.database.getIndexWhereClause(indexKey));
         List<String> normalizedCols = CatalogHelper.deparseIndexColumns(executor.database, tableName, cols);
-        List<String> columnOptions = executor.database.getIndexColumnOptions(indexKey);
+        List<String> columnOptions = CatalogHelper.deparseIndexOptions(executor.database, tableName,
+                idxMethod, cols, executor.database.getIndexColumnOptions(indexKey));
         List<String> includeColumns = executor.database.getIndexIncludeColumns(indexKey);
         boolean nullsNotDistinct = executor.database.isIndexNullsNotDistinct(indexKey)
                 || constraintNullsNotDistinct;
         // The pretty form drops the schema from the table name when the search path reaches it,
         // which is the only difference between the two spellings PostgreSQL prints.
         return CatalogStubBuilder.buildIndexDef(indexName,
-                pretty ? unqualifiedWhenOnPath(tableName) : tableName, unique, idxMethod,
+                CatalogHelper.indexRelationRef(executor.database, tableName,
+                        pretty ? unqualifiedWhenOnPath(tableName) : tableName), unique, idxMethod,
                 normalizedCols, columnOptions, includeColumns, nullsNotDistinct, whereClause,
                 executor.database.getIndexReloptions(indexKey));
     }
@@ -853,62 +855,16 @@ class CatalogMetadataFunctions {
                     if (t != null) break;
                 }
             }
-            if (t != null) cols = t.getColumns();
+            if (t != null) {
+                cols = t.getColumns();
+                // A dropped column keeps its number, so an attnum is not a position in what is
+                // left: the columns past the hole answer to numbers larger than the list is long.
+                int at = t.columnIndexOfAttnum(attnum);
+                return at < 0 || at >= cols.size() ? null : cols.get(at).getName();
+            }
         }
         if (cols == null || attnum > cols.size()) return null;
         return cols.get(attnum - 1).getName();
-    }
-
-    /**
-     * The declared types of the columns a view's own query reads, so the deparser can print an
-     * untyped literal as the constant PostgreSQL resolved it to. Only the relations the FROM list
-     * names are gathered; a column of anything else is left unanswered and printed as written.
-     */
-    private SqlUnparser.ColumnTypes readColumnTypes(Database.ViewDef view) {
-        final Map<String, Table> byName = new LinkedHashMap<>();
-        if (view.query() instanceof SelectStmt) {
-            collectReadRelations(((SelectStmt) view.query()).from(),
-                    view.schemaName() == null ? "public" : view.schemaName(), byName);
-        }
-        return new SqlUnparser.ColumnTypes() {
-            @Override
-            public String typeOf(String relation, String column) {
-                for (Map.Entry<String, Table> entry : byName.entrySet()) {
-                    if (relation != null && !relation.equalsIgnoreCase(entry.getKey())) continue;
-                    for (Column c : entry.getValue().getColumns()) {
-                        if (!c.getName().equalsIgnoreCase(column)) continue;
-                        // A domain, an enum or a composite is named in its own terms; only a
-                        // column whose type this deparser can name settles a literal's form.
-                        if (c.getEnumTypeName() != null || c.getDomainTypeName() != null
-                                || c.getCompositeTypeName() != null
-                                || c.getArrayElementType() != null || c.getType() == null) {
-                            return null;
-                        }
-                        return c.getType().toRegtypeDisplay();
-                    }
-                }
-                return null;
-            }
-        };
-    }
-
-    /** Every relation a FROM list names, filed under the name a column reference would use. */
-    private void collectReadRelations(List<SelectStmt.FromItem> items, String schemaName,
-                                      Map<String, Table> out) {
-        if (items == null) return;
-        for (SelectStmt.FromItem item : items) {
-            if (item instanceof SelectStmt.TableRef) {
-                SelectStmt.TableRef ref = (SelectStmt.TableRef) item;
-                String schema = ref.schema() != null ? ref.schema() : schemaName;
-                Schema s = executor.database.getSchema(schema);
-                Table t = s != null ? s.getTable(ref.table()) : null;
-                if (t != null) out.put(ref.alias() != null ? ref.alias() : ref.table(), t);
-            } else if (item instanceof SelectStmt.JoinFrom) {
-                SelectStmt.JoinFrom join = (SelectStmt.JoinFrom) item;
-                collectReadRelations(java.util.Arrays.asList(join.left(), join.right()),
-                        schemaName, out);
-            }
-        }
     }
 
     private Object evalPgGetViewdef(FunctionCallExpr fn, RowContext ctx) {
@@ -958,22 +914,15 @@ class CatalogMetadataFunctions {
             // name up meant two schemas' views of one name answered with whichever came first.
             Database.ViewDef view = executor.database.getView(viewName);
             if (view != null && view.query() != null) {
-                String sql;
-                if (relationsAreVisible(view)) {
-                    // The pretty form is the parse tree printed with the parentheses precedence
-                    // needs, so it is deparsed rather than echoed: text left behind by a rewrite
-                    // was written by the plain deparser, and echoing it printed the plain form's
-                    // parentheses under a flag that asks for none of them.
-                    sql = minimizeParens
-                            ? SqlUnparser.toSqlPretty(view.query(), readColumnTypes(view))
-                            : (view.sourceSQL() != null ? view.sourceSQL()
-                                                        : SqlUnparser.toSql(view.query()));
-                } else {
-                    // Nothing the body names would be found by its bare name from here, so the
-                    // definition is written with the relations qualified.
-                    sql = SqlUnparser.toSqlQualified(view.query(), view.schemaName(), minimizeParens);
-                }
-                return SqlUnparser.prettyViewDef(sql, wrapColumn) + ";";
+                // Both forms are laid out, and both are deparsed rather than echoed: text left
+                // behind by a rewrite was written on one line, and no amount of reformatting it
+                // afterwards reaches inside a sub-select, a CASE or a WITH clause.
+                // Nothing the body names would be found by its bare name from a schema off the
+                // search path, so from there the relations are written qualified.
+                String qualifyingSchema = relationsAreVisible(view) ? null : view.schemaName();
+                return ViewDeparser.viewDef(view.query(), minimizeParens, wrapColumn,
+                        ViewDeparser.columnTypesOf(executor.database, view), qualifyingSchema)
+                        + ";";
             }
         }
         // An OID that names no view, or names a relation that is not one, has no definition:
@@ -2036,16 +1985,18 @@ class CatalogMetadataFunctions {
 
     // ---- Helper methods ----
 
-    /** A key's columns as a definition spells them, with PERIOD in front of the last of a temporal one. */
+    /**
+     * A key's columns as a definition spells them, with PERIOD in front of the last of a temporal
+     * one. A name is quoted where it has to be: a definition is text that has to read back as the
+     * same key, and "A b" written bare names two things instead of one.
+     */
     private static String keyColumnList(java.util.List<String> columns, boolean period) {
-        if (!period || columns == null || columns.isEmpty()) {
-            return String.join(", ", columns == null ? java.util.Collections.<String>emptyList() : columns);
-        }
+        if (columns == null || columns.isEmpty()) return "";
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < columns.size(); i++) {
             if (i > 0) sb.append(", ");
-            if (i == columns.size() - 1) sb.append("PERIOD ");
-            sb.append(columns.get(i));
+            if (period && i == columns.size() - 1) sb.append("PERIOD ");
+            sb.append(RuleDeparser.quoteIdentifier(columns.get(i)));
         }
         return sb.toString();
     }
@@ -2130,13 +2081,13 @@ class CatalogMetadataFunctions {
         StringBuilder sb = new StringBuilder();
         switch (sc.getType()) {
             case PRIMARY_KEY:
-                sb.append("PRIMARY KEY (").append(String.join(", ", sc.getColumns())).append(")");
+                sb.append("PRIMARY KEY (").append(keyColumnList(sc.getColumns(), false)).append(")");
                 break;
             case UNIQUE:
                 // NULLS NOT DISTINCT is part of what the constraint says, so the definition it
                 // reports back has to say it too.
                 sb.append("UNIQUE ").append(sc.isNullsNotDistinct() ? "NULLS NOT DISTINCT " : "")
-                        .append("(").append(String.join(", ", sc.getColumns())).append(")");
+                        .append("(").append(keyColumnList(sc.getColumns(), false)).append(")");
                 break;
             case CHECK:
                 sb.append("CHECK (")

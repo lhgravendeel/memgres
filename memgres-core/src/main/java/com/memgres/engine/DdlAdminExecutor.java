@@ -41,6 +41,14 @@ class DdlAdminExecutor {
         if (executor.session != null) {
             switch (stmt.action()) {
                 case BEGIN: {
+                    // A block that is already open cannot be opened again, and PostgreSQL warns
+                    // rather than refuse: the statements after this one belong to the block that
+                    // was already running, not to a new one this BEGIN started, and a script that
+                    // ends "its" transaction ends theirs.
+                    if (executor.session.isInTransaction()) {
+                        executor.session.addNotice("WARNING", "25001",
+                                "there is already a transaction in progress", null);
+                    }
                     executor.session.begin();
                     executor.session.setExplicitTransactionBlock(true);
                     if (stmt.isolationLevel() != null) {
@@ -83,6 +91,12 @@ class DdlAdminExecutor {
                 }
                 case ROLLBACK: {
                     if (stmt.chain()) requireTransactionBlock("ROLLBACK AND CHAIN");
+                    // A ROLLBACK with no transaction open undoes nothing, and PostgreSQL warns
+                    // rather than let a script believe the work before it had been thrown away.
+                    if (!executor.session.isInTransaction()) {
+                        executor.session.addNotice("WARNING", "25P01",
+                                "there is no transaction in progress", null);
+                    }
                     String savedIso = chainedValue(stmt, "transaction_isolation");
                     String savedRo = chainedValue(stmt, "transaction_read_only");
                     String savedDef = chainedValue(stmt, "transaction_deferrable");
@@ -143,7 +157,10 @@ class DdlAdminExecutor {
         }
         switch (stmt.action()) {
             case BEGIN:
-                return QueryResult.message(QueryResult.Type.BEGIN, "BEGIN");
+                // BEGIN and START TRANSACTION open the same block, and PostgreSQL answers each
+                // with the verb it was given: a client reading the tag is told what it asked for.
+                return QueryResult.message(QueryResult.Type.BEGIN,
+                        stmt.startTransaction() ? "START TRANSACTION" : "BEGIN");
             case COMMIT:
                 return discarded
                         ? QueryResult.message(QueryResult.Type.ROLLBACK, "ROLLBACK")
@@ -594,12 +611,15 @@ class DdlAdminExecutor {
     // ---- CREATE RULE ----
 
     QueryResult executeCreateRule(CreateRuleStmt s) {
+        // A qualifier on the relation says which schema holds it, and a schema that is not there
+        // is what PostgreSQL reports rather than the relation being missing from it.
+        SchemaQualifier.requireSchema(executor.database, executor.session, s.schema());
         // What kind of relation was named settles before it is opened as a table: a sequence and a
         // materialized view carry no rules at all, and a view already has the one ON SELECT rule
         // that says what it contains.
         checkRuleRelationKind(s);
         // Validate target table/view exists
-        Table on = executor.resolveTable(executor.defaultSchema(), s.table());
+        Table on = executor.resolveTable(ruleSchema(s), s.table(), s.schema() != null);
         checkRuleDefinition(s);
         checkRuleQualification(s, on);
         // A rule's actions are analysed as the rule is written rather than when it fires, so a
@@ -611,17 +631,34 @@ class DdlAdminExecutor {
         // word NOTHING. Registering the word made the next write try to run it as a statement.
         if ("NOTHING".equalsIgnoreCase(joined.trim())) joined = "";
         boolean instead = "INSTEAD".equals(s.action());
-        // Every rule is registered under its own name, with its own WHERE: PostgreSQL fires all the
-        // rules an event carries, in rule-name order, and each rule's WHERE decides which rows its
-        // actions run for.
-        executor.database.addRule(s.name(), s.table(), s.event(), instead, joined, s.whereClause());
+        // Every rule is registered under its own name, on the relation in the schema it was
+        // written on, with its own WHERE: PostgreSQL fires all the rules an event carries, in
+        // rule-name order, and each rule's WHERE decides which rows its actions run for.
+        executor.database.addRule(ruleSchema(s), s.name(), s.table(), s.event(), instead,
+                joined, s.whereClause());
         // Track rule name with full definition for pg_rules
-        executor.database.addRuleDefinition(s.name(), s.table(),
-                ruleDefinitionText(s, instead), s.event(), instead);
+        executor.database.addRuleDefinition(ruleSchema(s), s.name(), s.table(),
+                ruleDefinitionText(s, instead));
         // What the actions name is what the rule depends on, and PostgreSQL records it: dropping
         // one of those relations is refused while the rule that writes to it is still there.
-        executor.database.addRuleDependencies(s.name(), s.table(), dependsOn);
+        executor.database.addRuleDependencies(ruleSchema(s), s.name(), s.table(),
+                relationsWithTheirSchemas(dependsOn));
         return QueryResult.message(QueryResult.Type.SET, "CREATE RULE");
+    }
+
+    /**
+     * What the rule's actions name, each under the schema that holds it. PostgreSQL records the
+     * relation itself, so a name written bare is settled here against the search path as it stands
+     * while the rule is being written: matching on the bare name alone made a rule that writes to
+     * one schema's relation refuse the drop of another schema's relation of the same name.
+     */
+    private List<String> relationsWithTheirSchemas(List<String> written) {
+        List<String> out = new ArrayList<>();
+        for (String relation : written) {
+            out.add(executor.relationSchemaOf(null, relation) + "."
+                    + RelationNamespace.bareName(relation));
+        }
+        return out;
     }
 
     /**
@@ -632,7 +669,7 @@ class DdlAdminExecutor {
     private String ruleDefinitionText(CreateRuleStmt s, boolean instead) {
         StringBuilder sb = new StringBuilder("CREATE RULE ").append(s.name()).append(" AS");
         sb.append("\n    ON ").append(s.event()).append(" TO ")
-                .append(executor.defaultSchema()).append('.').append(s.table());
+                .append(ruleSchema(s)).append('.').append(s.table());
         if (s.whereClause() != null) {
             sb.append("\n   WHERE ").append(normaliseRuleQualification(s));
         }
@@ -668,7 +705,7 @@ class DdlAdminExecutor {
         try {
             Expression parsed = new com.memgres.engine.parser.Parser(
                     new com.memgres.engine.parser.Lexer(s.whereClause()).tokenize()).parseExpression();
-            Table on = executor.resolveTable(executor.defaultSchema(), s.table());
+            Table on = executor.resolveTable(ruleSchema(s), s.table(), s.schema() != null);
             return lowerRowAliases(RuleDeparser.deparse(parsed, RuleDeparser.forTable(on)));
         } catch (RuntimeException e) {
             return s.whereClause();
@@ -696,14 +733,19 @@ class DdlAdminExecutor {
             if (!(parsed instanceof InsertStmt)) return action;
             InsertStmt ins = (InsertStmt) parsed;
             if (ins.values() == null || ins.values().isEmpty()) return action;
-            Table target = executor.resolveTable(executor.defaultSchema(), ins.table());
+            Table target = executor.resolveTable(
+                    ins.schema() == null ? executor.defaultSchema() : ins.schema(), ins.table());
             List<String> columnNames = new ArrayList<>();
             if (ins.columns() != null && !ins.columns().isEmpty()) {
                 columnNames.addAll(ins.columns());
             } else {
                 for (Column c : target.getColumns()) columnNames.add(c.getName());
             }
-            StringBuilder sb = new StringBuilder("INSERT INTO ").append(ins.table()).append(" (");
+            // A relation the action wrote a schema for is written back with it: PostgreSQL
+            // qualifies a name the search path does not reach, which is what one was written for.
+            StringBuilder sb = new StringBuilder("INSERT INTO ")
+                    .append(ins.schema() == null ? "" : ins.schema() + ".")
+                    .append(ins.table()).append(" (");
             for (int i = 0; i < columnNames.size(); i++) {
                 if (i > 0) sb.append(", ");
                 sb.append(columnNames.get(i));
@@ -748,7 +790,7 @@ class DdlAdminExecutor {
             e.setDetail("This operation is not supported for tables.");
             throw e;
         }
-        if (!s.orReplace() && executor.database.hasRule(s.name(), s.table())) {
+        if (!s.orReplace() && executor.database.hasRule(ruleSchema(s), s.name(), s.table())) {
             throw new MemgresException("rule \"" + s.name() + "\" for relation \""
                     + s.table() + "\" already exists", "42710");
         }
@@ -790,6 +832,12 @@ class DdlAdminExecutor {
         // relation could not be written to at all from that point on.
         checkActionRowReferences(qualification,
                 executor.database.hasView(s.table()) ? null : on);
+        // Every other column the qualification names is resolved here too. A qualification reads
+        // OLD and NEW unqualified as well as by name -- PostgreSQL puts both in scope for it, and
+        // for no action -- so a bare column of the ruled relation is one of its own.
+        if (on != null && !executor.database.hasView(s.table())) {
+            rejectMissingRuleColumns(qualification, ruleColumnScope(qualification, on, true));
+        }
         // A call in the qualification is resolved there and then as well, by name and argument
         // list together, so a name nothing answers to is a function that does not exist. Naming
         // the argument types is what the refusal needs, and in a qualification they come from the
@@ -812,7 +860,7 @@ class DdlAdminExecutor {
     private void checkRuleRelationKind(CreateRuleStmt s) {
         if (s.table() == null) return;
         String kind = RelationNamespace.kindOf(
-                executor.database, executor.defaultSchema(), s.table());
+                executor.database, ruleSchema(s), s.table());
         if (RelationNamespace.SEQUENCE.equals(kind)) {
             MemgresException noRules = PgErrors.wrongObjectType(
                     "relation \"" + s.table() + "\" cannot have rules");
@@ -848,6 +896,8 @@ class DdlAdminExecutor {
         // A view's rule resolves OLD and NEW against the view's own columns, and what a view
         // resolves to here is the relation behind it, whose columns may be named differently.
         Table rowSource = executor.database.hasView(s.table()) ? null : on;
+        // Whether an action already carried a RETURNING list, which is what the rule answers with.
+        boolean seenReturning = false;
         for (String action : s.commands()) {
             String written = action == null ? "" : action.trim();
             if (written.isEmpty() || "NOTHING".equalsIgnoreCase(written)) continue;
@@ -876,6 +926,12 @@ class DdlAdminExecutor {
                 rejectMissingActionColumns(insert.schema(), insert.table(), insert.columns());
             }
             checkActionRowReferences(parsed, rowSource);
+            // Every other column the action names is resolved against the relations the action
+            // itself holds. OLD and NEW are in scope for an action by name alone, and so is the
+            // relation an INSERT writes to, so a bare column of either is not one the action can
+            // reach: PostgreSQL reports it missing and says the name it names is in a table this
+            // part of the query cannot reference.
+            rejectMissingRuleColumns(parsed, ruleColumnScope(parsed, rowSource, false));
             // The calls an action makes are resolved as the rule is written, by name and argument
             // list together. A name nothing answers to used to be left for the write that fires
             // the rule, so the mistake was reported by whoever inserted into the relation next --
@@ -893,6 +949,7 @@ class DdlAdminExecutor {
                 }
                 rejectMissingActionColumns(update.schema(), update.table(), targets);
             }
+            seenReturning |= checkRuleReturning(s, parsed, rowSource, seenReturning);
         }
         return dependsOn;
     }
@@ -1075,8 +1132,392 @@ class DdlAdminExecutor {
         });
         if (missing == null) return;
         ColumnRef ref = (ColumnRef) missing;
-        throw new MemgresException("column " + ref.table().toLowerCase() + "." + ref.column()
-                + " does not exist", "42703");
+        MemgresException e = new MemgresException("column " + ref.table().toLowerCase() + "."
+                + ref.column() + " does not exist", "42703");
+        // OLD and NEW are relations in the rewritten query, so a near miss among the ruled
+        // relation's columns is offered under the name the rule wrote rather than bare.
+        String hint = RowContext.suggestClosestColumn(ref.column(), Collections.singletonList(
+                new RowContext.TableBinding(on, ref.table().toLowerCase(), null)));
+        if (hint != null) e.setHint(hint);
+        throw e;
+    }
+
+    /** The schema the relation a rule is written on is looked for in, and the rule is filed in. */
+    private String ruleSchema(CreateRuleStmt s) {
+        return executor.relationSchemaOf(s.schema(), s.table());
+    }
+
+    /**
+     * The relations a rule's action or qualification resolves its columns against, or null where
+     * something in it answers to names no relation holds: a CTE, a subquery or a function written
+     * in a FROM clause, an alias list that renames a relation's columns, or a view, whose columns
+     * are its own rather than those of the relation this resolves it to. Answering null leaves the
+     * columns unresolved, which is what became of all of them before.
+     */
+    private List<RowContext.TableBinding> ruleColumnSources(Object node) {
+        final Set<String> withItems = new LinkedHashSet<>();
+        final List<SelectStmt.TableRef> written = new ArrayList<>();
+        final boolean[] opaque = new boolean[1];
+        AstWalk.forEach(node, n -> {
+            if (n instanceof SelectStmt.CommonTableExpr) {
+                String cte = ((SelectStmt.CommonTableExpr) n).name;
+                if (cte != null) withItems.add(cte.toLowerCase());
+            } else if (n instanceof SelectStmt.SubqueryFrom || n instanceof SelectStmt.FunctionFrom) {
+                opaque[0] = true;
+            } else if (n instanceof SelectStmt.TableRef) {
+                written.add((SelectStmt.TableRef) n);
+            }
+        });
+        if (opaque[0]) return null;
+        List<RowContext.TableBinding> sources = new ArrayList<>();
+        // The relation a statement writes to answers for its own columns too: an UPDATE's
+        // assignments and a DELETE's WHERE are read against the rows being written.
+        if (node instanceof InsertStmt) {
+            InsertStmt insert = (InsertStmt) node;
+            if (!addRuleColumnSource(sources, insert.schema(), insert.table(), null)) return null;
+        } else if (node instanceof UpdateStmt) {
+            UpdateStmt update = (UpdateStmt) node;
+            if (!addRuleColumnSource(sources, update.schema(), update.table(), null)) return null;
+        } else if (node instanceof DeleteStmt) {
+            DeleteStmt delete = (DeleteStmt) node;
+            if (!addRuleColumnSource(sources, delete.schema(), delete.table(), null)) return null;
+        }
+        for (SelectStmt.TableRef ref : written) {
+            if (ref.table() == null || withItems.contains(ref.table().toLowerCase())) return null;
+            if (ref.columnAliases() != null && !ref.columnAliases().isEmpty()) return null;
+            if (!addRuleColumnSource(sources, ref.schema(), ref.table(), ref.alias())) return null;
+        }
+        return sources;
+    }
+
+    /**
+     * Binds one relation an action names under the name its columns answer to, which is its alias
+     * wherever it was given one.
+     *
+     * @return false where the name reaches nothing whose columns can be read here
+     */
+    private boolean addRuleColumnSource(List<RowContext.TableBinding> sources,
+                                        String schema, String table, String alias) {
+        if (table == null) return false;
+        // A catalog relation is described rather than stored, so there is no relation to read.
+        if (SystemCatalog.isSystemCatalog(schema, table)) return false;
+        if (executor.database.getView(table) != null) return false;
+        Table resolved;
+        try {
+            resolved = executor.resolveTable(
+                    schema == null ? executor.defaultSchema() : schema, table);
+        } catch (RuntimeException unreachable) {
+            return false; // a name that reaches nothing was already reported as such
+        }
+        if (resolved == null || resolved.isFunctionResult()) return false;
+        sources.add(new RowContext.TableBinding(resolved, alias == null ? table : alias, null));
+        return true;
+    }
+
+    /**
+     * What a rule's action or qualification reads its columns against.
+     *
+     * <p>PostgreSQL keeps two lists of relations while it writes a rule, and they are not the
+     * same one. The range table holds every relation the statement names, OLD and NEW among them;
+     * the namespace holds the ones a bare column may be read from. An action reaches OLD and NEW
+     * by name alone, and the relation an INSERT writes to the same way -- that relation's columns
+     * answer bare inside a RETURNING list or an ON CONFLICT clause, which read the row being
+     * written, and nowhere else. What is in the namespace settles whether a column is there; what
+     * is in the range table is what the complaint about one that is not is worded from.
+     */
+    private static final class RuleColumnScope {
+        private final List<RowContext.TableBinding> rangeTable = new ArrayList<>();
+        private final List<RowContext.TableBinding> namespace = new ArrayList<>();
+        private final List<RowContext.TableBinding> writtenTo = new ArrayList<>();
+        private final Set<Object> readsWrittenTo =
+                Collections.newSetFromMap(new IdentityHashMap<Object, Boolean>());
+        // The references standing where EXCLUDED is in scope beside the relation being written to.
+        private Set<Object> besideExcluded =
+                Collections.newSetFromMap(new IdentityHashMap<Object, Boolean>());
+
+        /** The relations a bare column standing at this node may be read from. */
+        private List<RowContext.TableBinding> visibleTo(Object ref) {
+            if (writtenTo.isEmpty() || !readsWrittenTo.contains(ref)) return namespace;
+            List<RowContext.TableBinding> both = new ArrayList<>(namespace);
+            both.addAll(writtenTo);
+            return both;
+        }
+
+        /** The relations a qualified column may name, the one being written to among them. */
+        private List<RowContext.TableBinding> named() {
+            List<RowContext.TableBinding> all = new ArrayList<>(writtenTo);
+            all.addAll(namespace);
+            return all;
+        }
+    }
+
+    /**
+     * The scope one action or one qualification is read in, or null where something in it answers
+     * to names no relation holds.
+     *
+     * @param rowsUnqualified whether a bare column may be read from OLD and NEW, which is so of a
+     *                        qualification and of no action
+     */
+    private RuleColumnScope ruleColumnScope(Object node, Table rowSource, boolean rowsUnqualified) {
+        List<RowContext.TableBinding> named = ruleColumnSources(node);
+        if (named == null) return null;
+        final RuleColumnScope scope = new RuleColumnScope();
+        if (rowSource != null) {
+            List<RowContext.TableBinding> rows = Cols.listOf(
+                    new RowContext.TableBinding(rowSource, "old", null),
+                    new RowContext.TableBinding(rowSource, "new", null));
+            scope.rangeTable.addAll(rows);
+            if (rowsUnqualified) scope.namespace.addAll(rows);
+        }
+        scope.rangeTable.addAll(named);
+        List<RowContext.TableBinding> readable = new ArrayList<>(named);
+        if (node instanceof InsertStmt && !readable.isEmpty()) {
+            // The relation being written to comes first out of ruleColumnSources. A value being
+            // written is not read from the row it is being written into, so it is out of the
+            // namespace -- except where the statement reads that row back.
+            scope.writtenTo.add(readable.remove(0));
+            InsertStmt insert = (InsertStmt) node;
+            AstWalk.forEach(insert.returning(), n -> {
+                if (n instanceof ColumnRef) scope.readsWrittenTo.add(n);
+            });
+            AstWalk.forEach(insert.onConflict(), n -> {
+                if (n instanceof ColumnRef) scope.readsWrittenTo.add(n);
+            });
+            scope.besideExcluded = columnRefsBesideExcluded(insert.onConflict());
+        }
+        scope.namespace.addAll(readable);
+        return scope;
+    }
+
+    /**
+     * The columns written where EXCLUDED stands beside the relation being written to: the
+     * assignments of an ON CONFLICT DO UPDATE and its own WHERE.
+     *
+     * <p>A sub-select written inside one of them brings relations of its own and is left out, so
+     * that a name it reads is judged against those rather than against the two rows the conflict
+     * clause holds.
+     */
+    private static Set<Object> columnRefsBesideExcluded(InsertStmt.OnConflict onConflict) {
+        Set<Object> refs = Collections.newSetFromMap(new IdentityHashMap<Object, Boolean>());
+        if (onConflict == null) return refs;
+        Set<Object> seen = Collections.newSetFromMap(new IdentityHashMap<Object, Boolean>());
+        final Deque<Object> queue = new ArrayDeque<>();
+        if (onConflict.doUpdate() != null) {
+            for (InsertStmt.SetClause set : onConflict.doUpdate()) {
+                if (set.value() != null) queue.add(set.value());
+            }
+        }
+        if (onConflict.doUpdateWhereClause() != null) queue.add(onConflict.doUpdateWhereClause());
+        while (!queue.isEmpty()) {
+            Object node = queue.poll();
+            if (node instanceof com.memgres.engine.parser.ast.Statement) continue;
+            if (!seen.add(node)) continue;
+            if (node instanceof ColumnRef) {
+                refs.add(node);
+                continue;
+            }
+            AstWalk.forEachChild(node, queue::add);
+        }
+        return refs;
+    }
+
+    /**
+     * Refuses the first column a rule names that nothing in scope where it stands supplies.
+     *
+     * <p>A name the range table holds out of reach of the part of the query that wrote it is
+     * reported as such rather than as a name nothing answers to: PostgreSQL names the one relation
+     * that holds it, or says there are several and to write a qualified name. Only where no
+     * relation holds the name at all does it look for a near miss.
+     */
+    private static void rejectMissingRuleColumns(Object node, RuleColumnScope scope) {
+        if (scope == null) return;
+        final List<ColumnRef> refs = new ArrayList<>();
+        final Set<String> outputNames = new LinkedHashSet<>();
+        AstWalk.forEach(node, n -> {
+            if (n instanceof ColumnRef) refs.add((ColumnRef) n);
+            // A name the select list gives an expression is one ORDER BY and GROUP BY answer to.
+            if (n instanceof SelectStmt.SelectTarget) {
+                String alias = ((SelectStmt.SelectTarget) n).alias();
+                if (alias != null) outputNames.add(alias.toLowerCase());
+            }
+        });
+        for (ColumnRef ref : refs) {
+            String column = ref.column();
+            if (column == null || "*".equals(column)
+                    || DdlDefinitionChecks.isSystemColumnName(column)) {
+                continue;
+            }
+            if (ref.table() == null) {
+                List<RowContext.TableBinding> readable = scope.visibleTo(ref);
+                // Inside an ON CONFLICT DO UPDATE the row already there and the row being written
+                // are both in scope, and EXCLUDED holds every column the relation holds, so a
+                // column of it written without a relation name answers to both. PostgreSQL refuses
+                // to choose between them rather than pick one.
+                if (scope.besideExcluded.contains(ref)
+                        && suppliesRuleColumn(scope.writtenTo, column)) {
+                    throw new MemgresException(
+                            "column reference \"" + column + "\" is ambiguous", "42702");
+                }
+                if (suppliesRuleColumn(readable, column)) continue;
+                if (outputNames.contains(column.toLowerCase())) continue;
+                MemgresException e = new MemgresException(
+                        "column \"" + column + "\" does not exist", "42703");
+                List<String> outOfReach = new ArrayList<>();
+                for (RowContext.TableBinding b : scope.rangeTable) {
+                    if (isOneOf(readable, b) || b.table().getColumnIndex(column) < 0) continue;
+                    outOfReach.add(b.alias() != null ? b.alias() : b.table().getName());
+                }
+                if (outOfReach.size() == 1) {
+                    e.setDetail("There is a column named \"" + column + "\" in table \""
+                            + outOfReach.get(0) + "\", but it cannot be referenced from this part"
+                            + " of the query.");
+                } else if (!outOfReach.isEmpty()) {
+                    e.setDetail("There are columns named \"" + column + "\", but they are in"
+                            + " tables that cannot be referenced from this part of the query.");
+                    e.setHint("Try using a table-qualified name.");
+                } else {
+                    String hint = RowContext.suggestClosestColumnAcross(column, scope.rangeTable);
+                    if (hint != null) e.setHint(hint);
+                }
+                throw e;
+            }
+            // A qualifier written with a schema of its own names the relation in that schema, and
+            // one nothing in scope answers to names something else again -- a relation an
+            // enclosing query holds, a composite value, a type being cast to.
+            if (ref.schema() != null) continue;
+            List<RowContext.TableBinding> qualified = new ArrayList<>();
+            for (RowContext.TableBinding b : scope.named()) {
+                if (b.alias() != null && b.alias().equalsIgnoreCase(ref.table())) qualified.add(b);
+            }
+            if (qualified.isEmpty() || suppliesRuleColumn(qualified, column)) continue;
+            MemgresException e = new MemgresException(
+                    "column " + ref.table() + "." + column + " does not exist", "42703");
+            String hint = RowContext.suggestClosestColumn(column, qualified);
+            if (hint != null) e.setHint(hint);
+            throw e;
+        }
+    }
+
+    /** Whether this very binding is one of them: one relation bound twice is bound twice. */
+    private static boolean isOneOf(List<RowContext.TableBinding> bindings,
+                                   RowContext.TableBinding one) {
+        for (RowContext.TableBinding b : bindings) {
+            if (b == one) return true;
+        }
+        return false;
+    }
+
+    /**
+     * What a rule's action may hand back. PostgreSQL answers the statement that fired the rule
+     * from the action's RETURNING list, so only a rule that stands in for the statement may carry
+     * one -- there is nothing for a rule that runs beside it to answer with -- and the list has to
+     * describe the relation the rule is on, whatever the relation the action writes to holds.
+     */
+    private boolean checkRuleReturning(CreateRuleStmt s,
+                                       com.memgres.engine.parser.ast.Statement parsed,
+                                       Table on, boolean seenReturning) {
+        List<SelectStmt.SelectTarget> returning = null;
+        String actionSchema = null;
+        String actionTable = null;
+        if (parsed instanceof InsertStmt) {
+            returning = ((InsertStmt) parsed).returning();
+            actionSchema = ((InsertStmt) parsed).schema();
+            actionTable = ((InsertStmt) parsed).table();
+        } else if (parsed instanceof UpdateStmt) {
+            returning = ((UpdateStmt) parsed).returning();
+            actionSchema = ((UpdateStmt) parsed).schema();
+            actionTable = ((UpdateStmt) parsed).table();
+        } else if (parsed instanceof DeleteStmt) {
+            returning = ((DeleteStmt) parsed).returning();
+            actionSchema = ((DeleteStmt) parsed).schema();
+            actionTable = ((DeleteStmt) parsed).table();
+        }
+        if (returning == null || returning.isEmpty()) return false;
+        // The statement a rule stands in for is answered from one action's RETURNING list, so
+        // there is no choosing between two of them; and a rule that only speaks for some of the
+        // rows leaves the rest with nothing to be answered from at all.
+        if (seenReturning) {
+            throw PgErrors.notImplemented("cannot have multiple RETURNING lists in a rule");
+        }
+        if (s.whereClause() != null) {
+            throw PgErrors.notImplemented(
+                    "RETURNING lists are not supported in conditional rules");
+        }
+        if (!"INSTEAD".equals(s.action())) {
+            throw PgErrors.notImplemented(
+                    "RETURNING lists are not supported in non-INSTEAD rules");
+        }
+        List<Column> entries = returningEntryColumns(returning, actionSchema, actionTable, on);
+        if (on == null || entries == null) return true;
+        List<Column> wanted = on.getColumns();
+        if (entries.size() != wanted.size()) {
+            throw new MemgresException("RETURNING list has too "
+                    + (entries.size() < wanted.size() ? "few" : "many") + " entries", "42P17");
+        }
+        for (int i = 0; i < entries.size(); i++) {
+            // An entry whose type this cannot name is left unjudged rather than guessed at.
+            if (entries.get(i) == null) continue;
+            String gave = CatalogHelper.pgTypeName(entries.get(i).getType());
+            String needs = CatalogHelper.pgTypeName(wanted.get(i).getType());
+            if (gave.equals(needs)) continue;
+            MemgresException e = new MemgresException("RETURNING list's entry " + (i + 1)
+                    + " has different type from column \"" + wanted.get(i).getName() + "\"",
+                    "42P17");
+            e.setDetail("RETURNING list entry has type " + gave + ", but column has type "
+                    + needs + ".");
+            throw e;
+        }
+        return true;
+    }
+
+    /**
+     * The columns an action's RETURNING list stands for, one per entry, with a null where the
+     * entry is an expression this cannot name a type for. A star is expanded against the relation
+     * the action writes to, because that is what settles how many entries the list really has.
+     * Null where the list holds something whose width cannot be worked out here.
+     */
+    private List<Column> returningEntryColumns(List<SelectStmt.SelectTarget> returning,
+                                               String actionSchema, String actionTable, Table on) {
+        Table target;
+        try {
+            target = actionTable == null ? null : executor.resolveTable(
+                    actionSchema == null ? executor.defaultSchema() : actionSchema, actionTable);
+        } catch (RuntimeException unreachable) {
+            return null; // a relation this cannot open says nothing about the list's width
+        }
+        if (target == null) return null;
+        List<Column> entries = new ArrayList<>();
+        for (SelectStmt.SelectTarget entry : returning) {
+            if (entry.expr() instanceof WildcardExpr) {
+                WildcardExpr star = (WildcardExpr) entry.expr();
+                if (star.table() != null && !star.table().equalsIgnoreCase(target.getName())) {
+                    return null;
+                }
+                entries.addAll(target.getColumns());
+                continue;
+            }
+            if (entry.expr() instanceof ColumnRef) {
+                ColumnRef ref = (ColumnRef) entry.expr();
+                Table from = target;
+                if (ref.table() != null && ("old".equalsIgnoreCase(ref.table())
+                        || "new".equalsIgnoreCase(ref.table()))) {
+                    from = on;
+                }
+                int index = from == null ? -1 : from.getColumnIndex(ref.column());
+                entries.add(index >= 0 ? from.getColumns().get(index) : null);
+                continue;
+            }
+            entries.add(null);
+        }
+        return entries;
+    }
+
+    /** Whether one of these relations holds a column of that name. */
+    private static boolean suppliesRuleColumn(List<RowContext.TableBinding> sources, String column) {
+        for (RowContext.TableBinding b : sources) {
+            if (b.table().getColumnIndex(column) >= 0) return true;
+        }
+        return false;
     }
 
     /** True when a rule action names {@code OLD.x} or {@code NEW.x} anywhere inside it. */

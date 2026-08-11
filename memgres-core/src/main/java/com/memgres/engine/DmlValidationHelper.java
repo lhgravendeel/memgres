@@ -39,6 +39,22 @@ class DmlValidationHelper {
         return ex;
     }
 
+    /**
+     * A value on its way into a column, held to the column's type before it is stored.
+     *
+     * <p>A composite is judged here rather than once it is stored, because stored it is the same
+     * text whichever way it was written and PostgreSQL answers the two ways differently: a record
+     * of the wrong shape is a cast it cannot make, text of the wrong shape is input its reader
+     * cannot read.
+     */
+    Object storedValue(Object value, Column column) {
+        if (column.getCompositeTypeName() != null && column.getArrayElementType() == null) {
+            executor.compositeTypeHandler.requireCompositeShape(value,
+                    column.getCompositeTypeName());
+        }
+        return TypeCoercion.coerceForStorage(value, column);
+    }
+
     void applyCitextFolding(Table table, Object[] row) {
         for (int i = 0; i < table.getColumns().size() && i < row.length; i++) {
             if (row[i] instanceof String) {
@@ -88,6 +104,7 @@ class DmlValidationHelper {
             // composite is judged element by element by the cast that builds it, so only a value
             // of the composite itself is judged here.
             if (col.getCompositeTypeName() != null && col.getArrayElementType() == null) {
+                row[i] = valueOfComposite(row[i], col.getCompositeTypeName());
                 validateCompositeFieldDomains(row[i], col.getCompositeTypeName());
             }
             String domainName = col.getDomainTypeName();
@@ -190,6 +207,97 @@ class DmlValidationHelper {
             // one of those fails.
             if (e.getSqlState() != null && e.getSqlState().startsWith("23")) throw e;
         }
+    }
+
+    /**
+     * A value being written into a composite-typed column, built as a value of that composite.
+     *
+     * <p>PostgreSQL makes a value of the column's own type before it stores a row, and for a
+     * composite that means one field of each attribute's declared type. A record with the wrong
+     * number of fields is not a value of the type at all, and an attribute declared varchar(3) has
+     * no room for a fourth character wherever the value is built -- the same refusal a column of
+     * that width gives. Storing whatever text the writer happened to write let a column of the
+     * composite hold anything shaped like a record.
+     */
+    private Object valueOfComposite(Object value, String typeName) {
+        executor.compositeTypeHandler.requireCompositeShape(value, typeName);
+        if (!(value instanceof String)) return value;
+        String text = ((String) value).trim();
+        if (!RecordLiteral.looksLikeRecord(text)) return value;
+        List<CreateTypeStmt.CompositeField> fields = executor.database.getRowType(typeName);
+        if (fields == null) return value;
+        List<RecordLiteral.Field> parts = RecordLiteral.parse(text);
+        List<Object> held = new ArrayList<>();
+        boolean changed = false;
+        for (int i = 0; i < parts.size(); i++) {
+            RecordLiteral.Field part = parts.get(i);
+            // An unquoted field with nothing in it is the SQL null, which no width bounds.
+            Object was = part.quoted || !part.text.isEmpty() ? part.text : null;
+            Object now = fieldHeldToItsType(was, fields.get(i).typeName());
+            if (now != was) changed = true;
+            held.add(now);
+        }
+        // Only a value the attribute types actually changed is rewritten, so a record that was
+        // already what its type says stays exactly as it was written.
+        return changed ? new AstExecutor.PgRow(held).toPgText() : value;
+    }
+
+    /**
+     * One field held to the width, length or scale its composite declares for it. A declaration
+     * with no modifier bounds nothing, which is the ordinary case and leaves the field alone.
+     */
+    private Object fieldHeldToItsType(Object value, String fieldType) {
+        if (value == null || fieldType == null) return value;
+        String spec = fieldType.trim();
+        int open = spec.indexOf('(');
+        int close = spec.indexOf(')', open + 1);
+        if (open <= 0 || close < 0) return value;
+        String base = spec.substring(0, open).trim().toLowerCase(Locale.ROOT);
+        String[] args = spec.substring(open + 1, close).split(",");
+        int first;
+        try {
+            first = Integer.parseInt(args[0].trim());
+        } catch (NumberFormatException e) {
+            return value;
+        }
+        if (base.equals("varchar") || base.equals("character varying")) {
+            String s = value.toString();
+            if (s.length() > first) {
+                throw new MemgresException(
+                        "value too long for type character varying(" + first + ")", "22001");
+            }
+            return value;
+        }
+        if (base.equals("char") || base.equals("character") || base.equals("bpchar")) {
+            String s = value.toString();
+            if (s.length() > first) {
+                throw new MemgresException(
+                        "value too long for type character(" + first + ")", "22001");
+            }
+            StringBuilder padded = new StringBuilder(s);
+            while (padded.length() < first) padded.append(' ');
+            return padded.toString();
+        }
+        if (base.equals("numeric") || base.equals("decimal")) {
+            java.math.BigDecimal bd;
+            try {
+                bd = new java.math.BigDecimal(value.toString().trim());
+            } catch (NumberFormatException e) {
+                return value;
+            }
+            int scale = 0;
+            if (args.length > 1) {
+                try {
+                    scale = Integer.parseInt(args[1].trim());
+                } catch (NumberFormatException e) {
+                    return value;
+                }
+            }
+            java.math.BigDecimal rounded = bd.setScale(scale, java.math.RoundingMode.HALF_UP);
+            TypeCoercion.checkNumericTypmod(rounded, first, scale);
+            return rounded;
+        }
+        return value;
     }
 
     /**

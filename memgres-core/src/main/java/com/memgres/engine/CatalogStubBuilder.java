@@ -152,9 +152,11 @@ class CatalogStubBuilder {
             String vSchema = vd.schemaName() != null ? vd.schemaName() : "public";
             String viewDef = null;
             if (vd.query() != null) {
-                String raw = vd.sourceSQL() != null ? vd.sourceSQL() : SqlUnparser.toSql(vd.query());
-                // M19: pg_views.definition uses PG's pretty multi-line form (with trailing ;).
-                viewDef = SqlUnparser.prettyViewDef(raw) + ";";
+                // pg_views.definition is pg_get_viewdef(oid) and nothing else, so it is deparsed
+                // the same way: the two answering differently for one view is a thing no reader
+                // of the catalogue can make sense of.
+                viewDef = ViewDeparser.viewDef(vd.query(), false, 0,
+                        ViewDeparser.columnTypesOf(database, vd), null) + ";";
             }
             table.insertRow(new Object[]{vSchema, vd.name(), "memgres", viewDef});
         }
@@ -188,9 +190,12 @@ class CatalogStubBuilder {
             }
             boolean isUnique = database.isUniqueIndex(indexKey);
             String method = database.getIndexMethod(indexKey);
-            String indexDef = buildIndexDef(indexName, storedTableQualified, isUnique, method,
+            String indexDef = buildIndexDef(indexName,
+                    CatalogHelper.indexRelationRef(database, storedTableQualified,
+                            storedTableQualified), isUnique, method,
                     CatalogHelper.deparseIndexColumns(database, storedTableQualified, indexCols),
-                    database.getIndexColumnOptions(indexKey),
+                    CatalogHelper.deparseIndexOptions(database, storedTableQualified, method,
+                            indexCols, database.getIndexColumnOptions(indexKey)),
                     database.getIndexIncludeColumns(indexKey),
                     database.isIndexNullsNotDistinct(indexKey),
                     CatalogHelper.deparseIndexPredicate(database, storedTableQualified,
@@ -210,9 +215,17 @@ class CatalogStubBuilder {
                         String indexName = sc.getName();
                         if (addedIndexes.contains(
                                 Database.idxKey(schemaName, indexName).toLowerCase())) continue;
-                        String indexDef = "CREATE UNIQUE INDEX " + indexName
-                                + " ON " + schemaName + "." + t.getName()
-                                + " USING btree (" + String.join(", ", sc.getColumns()) + ")"
+                        String indexDef = "CREATE UNIQUE INDEX "
+                                + RuleDeparser.quoteIdentifier(indexName)
+                                // A partitioned table's key index is the parent of the partitions'
+                                // own indexes rather than an index over their rows, which is why
+                                // PostgreSQL writes it ON ONLY.
+                                + (t.getPartitionStrategy() != null ? " ON ONLY " : " ON ")
+                                + schemaName + "." + t.getName()
+                                + " USING btree (" + String.join(", ",
+                                        CatalogHelper.deparseIndexColumns(database,
+                                                schemaName + "." + t.getName(), sc.getColumns()))
+                                + ")"
                                 // The index a UNIQUE NULLS NOT DISTINCT constraint creates is
                                 // itself a NULLS NOT DISTINCT index, and reads back as one.
                                 + (sc.isNullsNotDistinct() ? " NULLS NOT DISTINCT" : "");
@@ -247,7 +260,8 @@ class CatalogStubBuilder {
                                 List<String> includeColumns, boolean nullsNotDistinct,
                                 String whereClause, java.util.Map<String, String> reloptions) {
         StringBuilder sb = new StringBuilder();
-        sb.append("CREATE ").append(isUnique ? "UNIQUE " : "").append("INDEX ").append(indexName)
+        sb.append("CREATE ").append(isUnique ? "UNIQUE " : "").append("INDEX ")
+          .append(RuleDeparser.quoteIdentifier(indexName))
           .append(" ON ").append(tableName != null ? tableName : "unknown")
           .append(" USING ").append(method != null ? method : "btree").append(" (");
         for (int i = 0; i < indexCols.size(); i++) {
@@ -257,6 +271,10 @@ class CatalogStubBuilder {
                 String opts = columnOptions.get(i);
                 if (opts != null && !opts.isEmpty()) {
                     // Parse stored options: "opclass:xxx DESC NULLS FIRST"
+                    // Where the nulls go is written down only when it is not what the sort
+                    // direction already implies: ascending puts them last and descending puts
+                    // them first, so PostgreSQL writes back only the other two of the four.
+                    boolean descending = false;
                     for (String part : opts.split(" ")) {
                         if (part.startsWith("collate:")) {
                             sb.append(" COLLATE \"").append(part.substring(8).replace("\"", "")).append('"');
@@ -264,12 +282,13 @@ class CatalogStubBuilder {
                             sb.append(' ').append(part.substring(8));
                         } else if ("DESC".equals(part)) {
                             sb.append(" DESC");
+                            descending = true;
                         } else if ("NULLS".equals(part)) {
                             // Will be followed by FIRST or LAST
                         } else if ("FIRST".equals(part)) {
-                            sb.append(" NULLS FIRST");
+                            if (!descending) sb.append(" NULLS FIRST");
                         } else if ("LAST".equals(part)) {
-                            sb.append(" NULLS LAST");
+                            if (descending) sb.append(" NULLS LAST");
                         }
                     }
                 }
@@ -277,7 +296,14 @@ class CatalogStubBuilder {
         }
         sb.append(')');
         if (includeColumns != null && !includeColumns.isEmpty()) {
-            sb.append(" INCLUDE (").append(String.join(", ", includeColumns)).append(')');
+            // An INCLUDE list carries column names and nothing else, so each one is written the
+            // way a name is written: quoted where reading it back bare would not find it.
+            StringBuilder included = new StringBuilder();
+            for (String included1 : includeColumns) {
+                if (included.length() > 0) included.append(", ");
+                included.append(RuleDeparser.quoteIdentifier(included1));
+            }
+            sb.append(" INCLUDE (").append(included).append(')');
         }
         if (nullsNotDistinct) {
             sb.append(" NULLS NOT DISTINCT");
@@ -669,7 +695,7 @@ class CatalogStubBuilder {
                 // PostgreSQL answers for an unused slot.
                 Object[] row = new Object[cols.size()];
                 row[0] = relOid;
-                row[1] = (short) (i + 1);
+                row[1] = (short) t.attnumAt(i);
                 row[2] = false;
                 row[3] = 0.0f;
                 row[4] = 0;
@@ -1511,7 +1537,7 @@ class CatalogStubBuilder {
                 int attnum = i + 1;
                 if (refTable != null && !colName.startsWith("(")) {
                     int idx = refTable.getColumnIndex(colName);
-                    if (idx >= 0) attnum = idx + 1;
+                    if (idx >= 0) attnum = refTable.attnumAt(idx);
                 }
                 keys.append(attnum);
             }
@@ -1776,7 +1802,7 @@ class CatalogStubBuilder {
                     for (int ci = 0; ci < partColParts.length; ci++) {
                         if (ci > 0) attrsBuf.append(' ');
                         int colIdx = t.getColumnIndex(partColParts[ci].trim());
-                        attrsBuf.append(colIdx >= 0 ? colIdx + 1 : 0);
+                        attrsBuf.append(t.attnumAt(colIdx));
                     }
                     partattrs = attrsBuf.toString();
                 }
@@ -2486,11 +2512,13 @@ class CatalogStubBuilder {
                 col("definition", DataType.TEXT)
         );
         Table table = new Table("pg_rules", cols);
-        for (java.util.Map.Entry<String, String[]> entry : database.getRuleDefinitions().entrySet()) {
-            String ruleName = entry.getKey();
-            String tableName = entry.getValue()[0];
-            String definition = entry.getValue()[1];
-            table.insertRow(new Object[]{"public", tableName, ruleName, definition});
+        for (Database.StoredRule rule : database.getRuleEntries()) {
+            // A rule is on a relation, and the relation is in a schema: naming public for every
+            // one of them described a rule on a relation the reader could not find.
+            table.insertRow(new Object[]{
+                    rule.getSchema() == null ? "public" : rule.getSchema(),
+                    rule.getTable(), rule.getName(), rule.getDefinition()
+            });
         }
         return table;
     }

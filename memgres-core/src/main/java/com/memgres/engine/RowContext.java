@@ -20,12 +20,25 @@ public class RowContext {
         public final String alias;
         public final Object[] row;
         public final Table sourceTable;
+        /**
+         * The row as the relation that stores it holds it, which is the tuple its system columns
+         * belong to. A row read through a partitioned or an inheritance parent is rearranged to
+         * that parent's columns, and the rearranged copy lives nowhere: ctid, xmin and the rest
+         * are answered from the place the row occupies in the relation below.
+         */
+        public final Object[] storedRow;
 
         public TableBinding(Table table, String alias, Object[] row, Table sourceTable) {
+            this(table, alias, row, sourceTable, row);
+        }
+
+        public TableBinding(Table table, String alias, Object[] row, Table sourceTable,
+                            Object[] storedRow) {
             this.table = table;
             this.alias = alias;
             this.row = row;
             this.sourceTable = sourceTable;
+            this.storedRow = storedRow;
         }
 
         /** Convenience constructor without sourceTable (defaults to table). */
@@ -37,6 +50,7 @@ public class RowContext {
         public String alias() { return alias; }
         public Object[] row() { return row; }
         public Table sourceTable() { return sourceTable; }
+        public Object[] storedRow() { return storedRow; }
 
         @Override
         public boolean equals(Object o) {
@@ -351,14 +365,16 @@ public class RowContext {
      * For unqualified references, throws on ambiguity (column exists in multiple tables).
      */
     public Object resolveColumn(String tableQualifier, String columnName) {
-        // Handle tableoid pseudo-column
-        if ("tableoid".equalsIgnoreCase(columnName)) {
-            return resolveTableoid(tableQualifier);
-        }
-        // Handle system columns: ctid, xmin, xmax, cmin, cmax
+        // Handle system columns: tableoid, ctid, xmin, xmax, cmin, cmax. A FROM item may expose a
+        // column of its own under one of these names -- a subquery, a CTE or a view that projects
+        // ctid has an ordinary column called ctid -- and PostgreSQL resolves the name against the
+        // columns the item exposes before it looks for a system column. Reading the derived
+        // relation's own position instead renumbered every row it carried up.
         String lcCol = columnName.toLowerCase();
-        if (lcCol.equals("ctid") || lcCol.equals("xmin") || lcCol.equals("xmax")
-                || lcCol.equals("cmin") || lcCol.equals("cmax")) {
+        boolean systemName = lcCol.equals("tableoid") || lcCol.equals("ctid") || lcCol.equals("xmin")
+                || lcCol.equals("xmax") || lcCol.equals("cmin") || lcCol.equals("cmax");
+        if (systemName && !aBindingDeclares(tableQualifier, columnName)) {
+            if (lcCol.equals("tableoid")) return resolveTableoid(tableQualifier);
             return resolveSystemColumn(tableQualifier, lcCol);
         }
         // Translate view column names to base-table names for renamed-column view DML.
@@ -435,6 +451,18 @@ public class RowContext {
         return result;
     }
 
+    /** Whether a FROM item this name may reach declares a column of its own under that name. */
+    private boolean aBindingDeclares(String tableQualifier, String columnName) {
+        if (tableQualifier != null) {
+            TableBinding b = getBinding(tableQualifier);
+            return b != null && b.table().getColumnIndex(columnName) >= 0;
+        }
+        for (TableBinding b : bindings) {
+            if (b.table().getColumnIndex(columnName) >= 0) return true;
+        }
+        return false;
+    }
+
     /**
      * Resolve the tableoid pseudo-column for a binding.
      * Returns a placeholder integer that will be resolved via SystemCatalog OID lookup.
@@ -473,7 +501,7 @@ public class RowContext {
             b = bindings.get(0);
         }
         Table table = b.sourceTable();
-        Object[] row = b.row();
+        Object[] row = b.storedRow();
         if (colName.equals("ctid")) {
             // Return a SystemColumnRef so ExprEvaluator can compute with metadata
             return new SystemColumnRef(table, row, "ctid");
@@ -640,6 +668,39 @@ public class RowContext {
             if (i > 0) sb.append(i == suggestions.size() - 1 ? " or the column " : ", the column ");
             sb.append(suggestions.get(i));
         }
+        return sb.append('.').toString();
+    }
+
+    /**
+     * The hint for a name nothing in a range table answers to, in the order the range table holds
+     * its relations and with a relation it holds twice offering its column twice.
+     *
+     * <p>PostgreSQL keeps the closest spelling it found anywhere and offers it while one or two
+     * columns are that close. Three equally close and it says nothing at all rather than list
+     * them, which is the difference between a suggestion and a catalogue.
+     */
+    static String suggestClosestColumnAcross(String typo, List<TableBinding> bindings) {
+        if (typo == null) return null;
+        List<String> closest = new ArrayList<>();
+        int shortest = Integer.MAX_VALUE;
+        for (TableBinding b : bindings) {
+            if (b.table() == null) continue;
+            String relation = b.alias() != null ? b.alias() : b.table().getName();
+            for (Column col : b.table().getColumns()) {
+                int distance = editDistance(typo, col.getName());
+                if (distance > FURTHEST_SUGGESTION || distance > typo.length() / 2) continue;
+                if (distance > shortest) continue;
+                if (distance < shortest) {
+                    shortest = distance;
+                    closest.clear();
+                }
+                closest.add("\"" + relation + "." + col.getName() + "\"");
+            }
+        }
+        if (closest.isEmpty() || closest.size() > 2) return null;
+        StringBuilder sb = new StringBuilder("Perhaps you meant to reference the column ");
+        sb.append(closest.get(0));
+        if (closest.size() > 1) sb.append(" or the column ").append(closest.get(1));
         return sb.append('.').toString();
     }
 

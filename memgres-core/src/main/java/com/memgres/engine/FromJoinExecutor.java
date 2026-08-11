@@ -456,14 +456,8 @@ class FromJoinExecutor {
         for (RowContext leftCtx : leftContexts) {
             executor.outerContextStack.push(leftCtx);
             try {
-                QueryResult subResult;
-                if (sqf.subquery() instanceof SelectStmt) {
-                    SelectStmt sel = (SelectStmt) sqf.subquery();
-                    subResult = executor.executeSelect(sel);
-                } else {
-                    subResult = executor.executeStatement(sqf.subquery());
-                }
-                String alias = sqf.alias() != null ? sqf.alias() : "subquery";
+                QueryResult subResult = fromResolver.readLateralSubquery(sqf);
+                String alias = FromResolver.lateralAlias(sqf);
                 // An alias list renames what the item exposes, so it has to be applied here as
                 // well as on the comma-separated form: without it the names in
                 // "JOIN LATERAL (SELECT t.v) l(z)" stayed the sub-select's own and z was a column
@@ -471,8 +465,13 @@ class FromJoinExecutor {
                 Table virtualTable = new Table(alias, FromFunctionResolver.applyColumnAliases(
                         new ArrayList<>(subResult.getColumns()), sqf.columnAliases()));
                 boolean matched = false;
+                // A VIRTUAL generated column the sub-select left for this relation to work out is
+                // worked out here, because the join condition and the query's WHERE may read it.
+                boolean lateralVirtual = executor.dmlExecutor.hasVirtualColumns(virtualTable);
                 for (Object[] row : subResult.getRows()) {
-                    RowContext rightCtx = new RowContext(virtualTable, alias, row);
+                    RowContext rightCtx = new RowContext(virtualTable, alias, lateralVirtual
+                            ? executor.dmlExecutor.computeVirtualColumns(virtualTable, alias, row)
+                            : row);
                     RowContext merged = mergeContexts(leftCtx, rightCtx);
                     if (join.on() != null) {
                         if (joinConditionHolds(join.on(), merged)) {

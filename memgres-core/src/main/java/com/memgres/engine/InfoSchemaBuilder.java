@@ -754,7 +754,10 @@ public class InfoSchemaBuilder {
             // genuine xmin column of type xid, and dropping it here would leave this view
             // one column short of what pg_class and pg_attribute say the relation has.
             if (!isUserTable && CatalogCoreBuilder.isSystemColumn(col)) continue;
-            ordinal++;
+            // A column ALTER TABLE dropped keeps the number it had, so PostgreSQL leaves the hole
+            // here rather than renumbering the columns that outlived it: what this view reports is
+            // the relation's attribute number and not a running count of the rows written.
+            ordinal = t.hasDroppedAttributes() ? t.attnumAt(i) : ordinal + 1;
             DataType dt = col.getType();
             // PG reports every array column as data_type 'ARRAY' and leaves the element type to
             // udt_name, so the test is the type's arrayness rather than a list of four of them.
@@ -1383,9 +1386,10 @@ public class InfoSchemaBuilder {
             String vSchema = vd.schemaName() != null ? vd.schemaName() : "public";
             String viewDef = "";
             if (vd.query() != null) {
-                String raw = vd.sourceSQL() != null ? vd.sourceSQL() : SqlUnparser.toSql(vd.query());
-                // M19: information_schema.views.view_definition uses the pretty form (with trailing ;).
-                viewDef = SqlUnparser.prettyViewDef(raw) + ";";
+                // view_definition is pg_get_viewdef(oid) and nothing else, so it is deparsed the
+                // same way rather than reformatted from whatever text a rewrite left behind.
+                viewDef = ViewDeparser.viewDef(vd.query(), false, 0,
+                        ViewDeparser.columnTypesOf(database, vd), null) + ";";
             }
             // PG derives these from pg_relation_is_updatable: is_updatable wants UPDATE and
             // DELETE both, is_insertable_into wants INSERT. Deriving them from the same place

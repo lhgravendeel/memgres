@@ -273,6 +273,18 @@ class DdlObjectExecutor {
         // name however the statement wrote it.
         String typeName = TypeNamespace.nameOfKey(typeKey);
 
+        // What a type is made of is shared state: every value of it and every column declared with
+        // it reads the attribute list, so an attribute added, dropped, renamed or retyped inside a
+        // transaction that rolls back has to leave the list it found -- the same reason ALTER
+        // DOMAIN records what it displaced. RENAME TO and SET SCHEMA move the list whole and have
+        // nothing here to put back.
+        if (stmt.action() == AlterTypeStmt.Action.ADD_ATTRIBUTE
+                || stmt.action() == AlterTypeStmt.Action.DROP_ATTRIBUTE
+                || stmt.action() == AlterTypeStmt.Action.ALTER_ATTRIBUTE_TYPE
+                || stmt.action() == AlterTypeStmt.Action.RENAME_ATTRIBUTE) {
+            executor.recordUndo(new Session.AlterCompositeTypeUndo(typeKey, fields));
+        }
+
         switch (stmt.action()) {
             case ADD_ATTRIBUTE: {
                 if (hasAttribute(fields, stmt.value())) {
@@ -323,6 +335,7 @@ class DdlObjectExecutor {
                     throw new MemgresException("column \"" + stmt.value() + "\" of relation \""
                             + typeName + "\" does not exist", "42703");
                 }
+                refuseAttributeTypeChangeInUse(typeKey, stmt.cascade());
                 List<CreateTypeStmt.CompositeField> newFields = new ArrayList<>();
                 for (CreateTypeStmt.CompositeField f : fields) {
                     if (f.name().equalsIgnoreCase(stmt.value())) {
@@ -389,6 +402,118 @@ class DdlObjectExecutor {
                 break;
         }
         return QueryResult.command(QueryResult.Type.ALTER_TYPE, 0);
+    }
+
+    /**
+     * Refuse an attribute type change while something is holding values of the type.
+     *
+     * <p>A stored value of a composite is laid out by the attribute types the type had when it was
+     * written, so PostgreSQL will not change one under a relation that holds such values: it names
+     * the first column that does and refuses, and CASCADE does not excuse it. A table declared OF
+     * the type is the one case CASCADE is for -- its whole shape is the type's, so the change can
+     * reshape it -- and PostgreSQL says so in the hint. The column check comes first: with both in
+     * the way, it is the column PostgreSQL names.
+     */
+    private void refuseAttributeTypeChangeInUse(String typeKey, boolean cascade) {
+        String shown = TypeNamespace.display(executor.database, executor.session, typeKey);
+        Set<String> holding = typeKeysBuiltOn(typeKey);
+        Table typedTable = null;
+        // Relations in the order they were created, and within one relation its columns from the
+        // first: that is the order PostgreSQL walks the dependencies in, and it names the first it
+        // finds. The relation is named bare, whatever schema it lives in.
+        List<Object[]> found = new ArrayList<>();
+        for (Schema schema : executor.database.getSchemas().values()) {
+            for (Table t : schema.getTables().values()) {
+                if (sameType(typeKey, t.getOfTypeName())) {
+                    if (typedTable == null) typedTable = t;
+                    continue;
+                }
+                int relOid = executor.systemCatalog.getOid(
+                        "rel:" + schema.getName() + "." + t.getName());
+                List<Column> cols = t.getColumns();
+                for (int i = 0; i < cols.size(); i++) {
+                    Column c = cols.get(i);
+                    if (columnHoldsOneOf(holding, c)) {
+                        found.add(new Object[]{Integer.valueOf(relOid), Integer.valueOf(i),
+                                t.getName() + "." + c.getName()});
+                    }
+                }
+            }
+        }
+        if (!found.isEmpty()) {
+            java.util.Collections.sort(found, new java.util.Comparator<Object[]>() {
+                @Override
+                public int compare(Object[] a, Object[] b) {
+                    int byRelation = Integer.compare((Integer) a[0], (Integer) b[0]);
+                    return byRelation != 0 ? byRelation
+                            : Integer.compare((Integer) a[1], (Integer) b[1]);
+                }
+            });
+            throw new MemgresException("cannot alter type \"" + shown + "\" because column \""
+                    + found.get(0)[2] + "\" uses it", "0A000");
+        }
+        if (typedTable != null && !cascade) {
+            MemgresException e = new MemgresException("cannot alter type \"" + shown
+                    + "\" because it is the type of a typed table", "2BP01");
+            e.setHint("Use ALTER ... CASCADE to alter the typed tables too.");
+            throw e;
+        }
+    }
+
+    /**
+     * Every type whose values contain one of this type: the type itself, any composite with an
+     * attribute of one of them, and any domain built over one of them, followed round until
+     * nothing new turns up. A column of any of them holds a value laid out by this type's
+     * attributes, which is why PostgreSQL refuses the change for all of them alike.
+     */
+    private Set<String> typeKeysBuiltOn(String typeKey) {
+        Set<String> keys = new LinkedHashSet<>();
+        keys.add(typeKey);
+        boolean grew = true;
+        while (grew) {
+            grew = false;
+            for (Map.Entry<String, List<CreateTypeStmt.CompositeField>> e
+                    : executor.database.getCompositeTypes().entrySet()) {
+                if (keys.contains(e.getKey()) || e.getValue() == null) continue;
+                for (CreateTypeStmt.CompositeField f : e.getValue()) {
+                    if (keys.contains(TypeNamespace.find(executor.database.typeKeys(),
+                            bareTypeName(f.typeName())))) {
+                        keys.add(e.getKey());
+                        grew = true;
+                        break;
+                    }
+                }
+            }
+            for (Map.Entry<String, DomainType> e : executor.database.getDomains().entrySet()) {
+                if (keys.contains(e.getKey())) continue;
+                String base = e.getValue().getBaseTypeName();
+                if (base != null && keys.contains(TypeNamespace.find(
+                        executor.database.typeKeys(), bareTypeName(base)))) {
+                    keys.add(e.getKey());
+                    grew = true;
+                }
+            }
+        }
+        return keys;
+    }
+
+    /** Whether this column was declared with one of those types, as an array of one or not. */
+    private boolean columnHoldsOneOf(Set<String> keys, Column c) {
+        String declared = c.getCompositeTypeName() != null
+                ? c.getCompositeTypeName() : c.getDomainTypeName();
+        if (declared == null) return false;
+        return keys.contains(TypeNamespace.find(executor.database.typeKeys(),
+                bareTypeName(declared)));
+    }
+
+    /** A written type name with its modifier and its array brackets taken off. */
+    private static String bareTypeName(String written) {
+        if (written == null) return null;
+        String t = written.trim();
+        int paren = t.indexOf('(');
+        if (paren > 0) t = t.substring(0, paren).trim();
+        while (t.endsWith("[]")) t = t.substring(0, t.length() - 2).trim();
+        return t;
     }
 
     /**
@@ -2618,10 +2743,56 @@ class DdlObjectExecutor {
      */
     static void noticeDropCascades(AstExecutor executor, List<String> objects) {
         if (objects == null || objects.isEmpty() || executor.session == null) return;
-        String text = objects.size() == 1
-                ? "drop cascades to " + objects.get(0)
-                : "drop cascades to " + objects.size() + " other objects";
-        executor.session.addNotice("NOTICE", "00000", text, null);
+        if (objects.size() == 1) {
+            executor.session.addNotice("NOTICE", "00000",
+                    "drop cascades to " + objects.get(0), null);
+            return;
+        }
+        // Past one dependent the message is only a count, so PostgreSQL puts the names under
+        // DETAIL, one "drop cascades to <object>" line each. Without them a script was told four
+        // things had gone and never which four.
+        List<String> lines = new ArrayList<>();
+        for (String object : objects) lines.add("drop cascades to " + object);
+        executor.session.addNotice("NOTICE", "00000",
+                "drop cascades to " + objects.size() + " other objects", null,
+                dependencyDetail(lines));
+    }
+
+    /** How many dependents PostgreSQL names to the client before it stops listing them. */
+    private static final int MAX_REPORTED_DEPENDENTS = 100;
+
+    /**
+     * The DETAIL a drop reports, one dependent to a line.
+     *
+     * <p>PostgreSQL names a hundred of them and no more: past that the client is told how many
+     * were left out and the whole list goes to the server log instead, so that dropping a
+     * relation thousands of objects hang from does not send all of them down the wire.
+     */
+    static String dependencyDetail(List<String> lines) {
+        int shown = Math.min(lines.size(), MAX_REPORTED_DEPENDENTS);
+        StringBuilder detail = new StringBuilder();
+        for (int i = 0; i < shown; i++) {
+            if (i > 0) detail.append('\n');
+            detail.append(lines.get(i));
+        }
+        int hidden = lines.size() - shown;
+        if (hidden > 0) {
+            detail.append("\nand ").append(hidden)
+                    .append(hidden == 1 ? " other object" : " other objects")
+                    .append(" (see server log for list)");
+        }
+        return detail.toString();
+    }
+
+    /**
+     * How PostgreSQL words a drop it will not make. A statement naming one object names it; one
+     * naming several says only that it cannot have what it asked for, because it judged the whole
+     * set at once and what is in the way may be in the way of any of them.
+     */
+    static String cannotDropMessage(boolean severalNamed, String what) {
+        return severalNamed
+                ? "cannot drop desired object(s) because other objects depend on them"
+                : "cannot drop " + what + " because other objects depend on it";
     }
 
     /** IF EXISTS says what to skip, and PostgreSQL says which one it skipped. */
@@ -2632,6 +2803,43 @@ class DdlObjectExecutor {
     }
 
     QueryResult executeDropStmt(DropStmt stmt) {
+        // Every name the statement lists goes, and each of them knows what the others are:
+        // PostgreSQL works out the whole set before it looks for what would be left pointing at
+        // one of them, so an object the same DROP takes down is no reason to refuse.
+        Set<String> together = new HashSet<>();
+        if (!stmt.more().isEmpty()) {
+            together.add(RelationNamespace.bareName(stmt.name()).toLowerCase());
+            for (DropStmt other : stmt.more()) {
+                together.add(RelationNamespace.bareName(other.name()).toLowerCase());
+            }
+        }
+        // A name the list gives twice stands for one object, and PostgreSQL drops it once rather
+        // than reporting the second as missing.
+        Set<String> named = new HashSet<>();
+        named.add(dropTargetIdentity(stmt));
+        QueryResult result = executeDropOne(stmt, together);
+        for (DropStmt other : stmt.more()) {
+            if (!named.add(dropTargetIdentity(other))) continue;
+            result = executeDropOne(other, together);
+        }
+        return result;
+    }
+
+    /**
+     * What one name in a DROP list stands for: the schema it reaches and the name itself, so that
+     * a relation written bare and the same relation written with the schema that holds it are the
+     * one object. A signature is part of the identity where the kind has one.
+     */
+    private String dropTargetIdentity(DropStmt stmt) {
+        String written = stmt.schema() != null ? stmt.schema()
+                : SchemaQualifier.qualifierOf(stmt.name());
+        String schema = written != null ? written : executor.defaultSchema();
+        return stmt.objectType() + ":" + schema.toLowerCase() + "."
+                + RelationNamespace.bareName(stmt.name()).toLowerCase()
+                + (stmt.paramTypes() == null ? "" : stmt.paramTypes().toString().toLowerCase());
+    }
+
+    private QueryResult executeDropOne(DropStmt stmt, Set<String> together) {
         // A DROP that names a schema of its own is looking in that schema, so a schema which is
         // not there is what is missing — PostgreSQL reports 3F000 rather than naming an object
         // it never went looking for. SCHEMA and EXTENSION name no schema of their own.
@@ -2643,7 +2851,7 @@ class DdlObjectExecutor {
         switch (stmt.objectType()) {
             case VIEW:
             case MATERIALIZED_VIEW:
-                dropView(stmt);
+                dropView(stmt, together);
                 break;
             case SEQUENCE:
                 dropSequence(stmt);
@@ -2830,7 +3038,7 @@ class DdlObjectExecutor {
         return holder != null ? holder : executor.defaultSchema();
     }
 
-    private void dropView(DropStmt stmt) {
+    private void dropView(DropStmt stmt, Set<String> together) {
         // A materialized view is a different kind of object from a view, and dropping one by the
         // wrong name would destroy stored data on what is usually a typo.
         Database.ViewDef existing = executor.database.getView(stmt.name());
@@ -2868,27 +3076,29 @@ class DdlObjectExecutor {
         if (oldView != null) {
             executor.recordUndo(new Session.DropViewUndo(stmt.name(), oldView,
                     executor.database.getTriggersForTable(dropViewSchema,
+                            RelationNamespace.bareName(stmt.name())),
+                    executor.database.snapshotRulesOn(dropViewSchema,
                             RelationNamespace.bareName(stmt.name()))));
         }
         // A view is a relation like any other: what reads it depends on it, so dropping it
         // blocks on those readers and CASCADE takes them with it.
         String bareViewName = RelationNamespace.bareName(stmt.name());
         List<String> viewDependents = oldView == null || stmt.cascade() ? Cols.listOf()
-                : ViewDependencies.dependencyLines(executor.database, dropViewSchema, bareViewName,
+                : ViewDependencies.dependencyLines(executor.database, executor.systemCatalog,
+                        dropViewSchema, bareViewName,
                         wantMaterialized ? "materialized view" : "view",
-                        executor.searchPathSchemas());
+                        executor.searchPathSchemas(), together);
         if (!viewDependents.isEmpty()) {
-            MemgresException e = new MemgresException("cannot drop "
-                    + (wantMaterialized ? "materialized view " : "view ") + bareViewName
-                    + " because other objects depend on it", "2BP01");
-            e.setDetail(String.join("\n", viewDependents));
+            MemgresException e = new MemgresException(cannotDropMessage(together.size() > 1,
+                    (wantMaterialized ? "materialized view " : "view ") + bareViewName), "2BP01");
+            e.setDetail(dependencyDetail(viewDependents));
             e.setHint("Use DROP ... CASCADE to drop the dependent objects too.");
             throw e;
         }
         if (oldView != null && stmt.cascade()) {
             List<String> cascaded = new ArrayList<>();
             for (String dependent : ViewDependencies.cascadeDependents(
-                    executor.database, dropViewSchema, bareViewName)) {
+                    executor.database, executor.systemCatalog, dropViewSchema, bareViewName)) {
                 cascaded.add("view " + RelationNamespace.bareName(dependent));
                 executor.database.removeView(dependent);
             }
@@ -2899,6 +3109,10 @@ class DdlObjectExecutor {
         // view. Leaving it registered kept the dependency it records on its function alive, and
         // the function could then never be dropped -- for a trigger on a relation that was gone.
         executor.database.removeTriggersForTable(dropViewSchema, bareViewName);
+        // A rule belongs to the relation it is written on, and a view is a relation like any
+        // other. Leaving one registered kept pg_rules describing a rule on a relation that was no
+        // longer there, and a table created under the name afterwards inherited it.
+        executor.database.dropRulesOn(dropViewSchema, bareViewName);
         executor.database.removeView(stmt.name());
     }
 
@@ -2945,7 +3159,7 @@ class DdlObjectExecutor {
                 lines.add("default value for column " + dep.columnName() + " of table "
                         + dep.tableRef(visibleSchemas) + " depends on sequence " + shown);
             }
-            e.setDetail(String.join("\n", lines));
+            e.setDetail(dependencyDetail(lines));
             e.setHint("Use DROP ... CASCADE to drop the dependent objects too.");
             throw e;
         }
@@ -2998,18 +3212,39 @@ class DdlObjectExecutor {
      * sequence's own schema let the drop succeed and left the default pointing at nothing.
      */
     private List<SequenceDependent> findSequenceDependents(Sequence seq) {
-        List<SequenceDependent> result = new ArrayList<>();
+        // PostgreSQL reports these in the order it recorded them: the tables in the order they
+        // were created, and within one table its columns from the first to the last. Walking the
+        // schema maps reported them in whatever order those maps happened to hold them, which for
+        // three tables drawing on one sequence was neither. Each column is kept beside its
+        // relation's OID -- which follows creation order -- and its position, and the list is put
+        // in that order once it is complete.
+        List<Object[]> found = new ArrayList<>();
         for (java.util.Map.Entry<String, Schema> se : executor.database.getSchemas().entrySet()) {
             for (Table tbl : se.getValue().getTables().values()) {
-                for (Column col : tbl.getColumns()) {
+                int relOid = executor.systemCatalog.getOid(
+                        "rel:" + se.getKey() + "." + tbl.getName());
+                List<Column> cols = tbl.getColumns();
+                for (int i = 0; i < cols.size(); i++) {
+                    Column col = cols.get(i);
                     String written = Sequence.nameInDefault(col.getDefaultValue());
                     if (written == null) continue;
                     if (executor.database.getSequenceFor(se.getKey(), written) == seq) {
-                        result.add(new SequenceDependent(se.getKey(), tbl, col));
+                        found.add(new Object[]{relOid, i,
+                                new SequenceDependent(se.getKey(), tbl, col)});
                     }
                 }
             }
         }
+        java.util.Collections.sort(found, new java.util.Comparator<Object[]>() {
+            @Override
+            public int compare(Object[] a, Object[] b) {
+                int byRelation = Integer.compare((Integer) a[0], (Integer) b[0]);
+                return byRelation != 0 ? byRelation
+                        : Integer.compare((Integer) a[1], (Integer) b[1]);
+            }
+        });
+        List<SequenceDependent> result = new ArrayList<>();
+        for (Object[] entry : found) result.add((SequenceDependent) entry[2]);
         return result;
     }
 
@@ -3166,7 +3401,7 @@ class DdlObjectExecutor {
             }
             MemgresException e = new MemgresException("cannot drop function " + written
                     + " because other objects depend on it", "2BP01");
-            e.setDetail(String.join("\n", lines));
+            e.setDetail(dependencyDetail(lines));
             e.setHint("Use DROP ... CASCADE to drop the dependent objects too.");
             throw e;
         }
@@ -3246,7 +3481,13 @@ class DdlObjectExecutor {
 
     private void dropTrigger(DropStmt stmt) {
         if (stmt.onTable() != null) {
-            List<PgTrigger> tableTriggers = executor.database.getTriggersForTable(stmt.onTable());
+            // The relation may be written with the schema that holds it, and the trigger registry
+            // is keyed by the relation's bare name. PostgreSQL names the relation as it was
+            // written when it is not there, and without its schema when the trigger is not.
+            String written = stmt.onTable();
+            String onSchema = executor.relationSchemaOf(null, written);
+            String onTable = RelationNamespace.bareName(written);
+            List<PgTrigger> tableTriggers = executor.database.getTriggersForTable(onSchema, onTable);
             PgTrigger named = null;
             for (PgTrigger t : tableTriggers) {
                 if (t.getName().equalsIgnoreCase(stmt.name())) { named = t; break; }
@@ -3258,7 +3499,7 @@ class DdlObjectExecutor {
             // part of it.
             if (named != null && named.getClonedFromTable() != null) {
                 MemgresException required = new MemgresException("cannot drop trigger " + stmt.name()
-                        + " on table " + stmt.onTable() + " because trigger " + stmt.name()
+                        + " on table " + onTable + " because trigger " + stmt.name()
                         + " on table " + named.getClonedFromTable() + " requires it", "2BP01");
                 required.setHint("You can drop trigger " + stmt.name() + " on table "
                         + named.getClonedFromTable() + " instead.");
@@ -3268,20 +3509,20 @@ class DdlObjectExecutor {
             if (!found) {
                 // A trigger is named by its relation, so a relation that is not there is what is
                 // missing — PostgreSQL names that rather than the trigger it never looked for.
-                boolean relationThere = ddl.resolveTableOrNull(stmt.onTable()) != null
-                        || executor.database.hasView(stmt.onTable());
+                boolean relationThere =
+                        RelationNamespace.kindOf(executor.database, onSchema, onTable) != null;
                 if (!stmt.ifExists()) {
                     if (!relationThere) {
                         throw new MemgresException(
-                                "relation \"" + stmt.onTable() + "\" does not exist", "42P01");
+                                "relation \"" + written + "\" does not exist", "42P01");
                     }
-                    throw new MemgresException("trigger \"" + stmt.name() + "\" for table \"" + stmt.onTable() + "\" does not exist", "42704");
+                    throw new MemgresException("trigger \"" + stmt.name() + "\" for table \"" + onTable + "\" does not exist", "42704");
                 }
                 noticeSkipped(relationThere
-                        ? "trigger \"" + stmt.name() + "\" for relation \"" + stmt.onTable() + "\""
-                        : "relation \"" + stmt.onTable() + "\"");
+                        ? "trigger \"" + stmt.name() + "\" for relation \"" + onTable + "\""
+                        : "relation \"" + written + "\"");
             }
-            executor.database.removeTrigger(stmt.name(), stmt.onTable());
+            executor.database.removeTrigger(stmt.name(), onTable);
         }
     }
 
@@ -3302,7 +3543,7 @@ class DdlObjectExecutor {
             }
             MemgresException e = new MemgresException("cannot drop type " + display
                     + " because other objects depend on it", "2BP01");
-            e.setDetail(String.join("\n", lines));
+            e.setDetail(dependencyDetail(lines));
             e.setHint("Use DROP ... CASCADE to drop the dependent objects too.");
             throw e;
         }
@@ -3508,6 +3749,11 @@ class DdlObjectExecutor {
                     }
                 }
                 tableNames.forEach(schema::removeTable);
+                // A rule goes with the relation it is written on, and these relations have just
+                // gone.
+                for (String tName : tableNames) {
+                    executor.database.dropRulesOn(droppedSchemaName, tName);
+                }
 
                 String schemaName = stmt.name().toLowerCase();
                 Set<String> registeredObjects = new HashSet<>(executor.database.getSchemaObjects(schemaName));
@@ -3592,17 +3838,23 @@ class DdlObjectExecutor {
     }
 
     private void dropRule(DropStmt stmt) {
-        String onTable = stmt.onTable() != null ? stmt.onTable() : "";
-        if (stmt.onTable() != null && ddl.resolveTableOrNull(stmt.onTable()) == null
-                && !executor.database.hasView(stmt.onTable())) {
+        // A written qualifier says which schema holds the relation the rule is on; a rule on
+        // another schema's relation of that name is a different rule. PostgreSQL names the
+        // relation without its schema when it reports the rule missing.
+        String written = stmt.onTable() != null ? stmt.onTable() : "";
+        String onSchema = executor.relationSchemaOf(null, written);
+        String onTable = RelationNamespace.bareName(written);
+        if (stmt.onTable() != null
+                && RelationNamespace.kindOf(executor.database, onSchema, onTable) == null) {
             if (!stmt.ifExists()) {
-                executor.resolveTable(executor.defaultSchema(), stmt.onTable());
+                throw new MemgresException(
+                        "relation \"" + written + "\" does not exist", "42P01");
             }
-            noticeSkipped("relation \"" + stmt.onTable() + "\"");
+            noticeSkipped("relation \"" + written + "\"");
             return;
         }
-        if (executor.database.hasRule(stmt.name(), onTable)) {
-            executor.database.removeRule(stmt.name(), onTable);
+        if (executor.database.hasRule(onSchema, stmt.name(), onTable)) {
+            executor.database.removeRule(onSchema, stmt.name(), onTable);
         } else if (!stmt.ifExists()) {
             throw new MemgresException("rule \"" + stmt.name() + "\" for relation \"" + onTable + "\" does not exist", "42704");
         } else {
@@ -4014,7 +4266,12 @@ class DdlObjectExecutor {
     }
 
     QueryResult executeAlterDomain(AlterDomainStmt stmt) {
-        DomainType domain = executor.database.getDomain(stmt.domainName());
+        // Which domain a bare name means is the search path's answer, and one held by a schema the
+        // path does not reach is not a domain this statement can name at all -- the same rule DROP
+        // DOMAIN and COMMENT ON DOMAIN already follow.
+        String domainKey =
+                TypeNamespace.resolve(executor.database, executor.session, stmt.domainName());
+        DomainType domain = domainKey == null ? null : executor.database.getDomain(domainKey);
         if (domain == null) {
             throw new MemgresException("type \"" + stmt.domainName() + "\" does not exist", "42704");
         }
@@ -4413,6 +4670,18 @@ class DdlObjectExecutor {
         // subquery is reported even when the access method or the index name is also wrong.
         checkIndexExpressionsAndPredicate(s);
         Table indexTarget = resolveIndexTarget(s);
+        // An index nobody named still gets one: PostgreSQL derives it from the relation and from
+        // what each indexed column is worth as a name, and numbers it when a relation of that name
+        // already lives in the schema. Leaving the name null registered nothing at all and still
+        // reported success, so the index the writer asked for simply was not there afterwards.
+        if (s.name() == null && s.table() != null && s.columns() != null) {
+            s = new CreateIndexStmt(
+                    IndexNameChooser.choose(executor.database, indexSchema, s.table(), indexTarget,
+                            s.columns(), s.includeColumns()),
+                    s.schema(), s.table(), s.columns(), s.unique(), s.ifNotExists(),
+                    s.concurrently(), s.method(), s.includeColumns(), s.whereClause(),
+                    s.columnOptions(), s.nullsNotDistinct(), s.withOptions());
+        }
         if (indexTarget != null) {
             DdlIndexValidator.validate(executor.database, indexTarget, s.method(), s.unique(),
                     s.columns(), s.columnOptions(), s.includeColumns(), s.withOptions());
@@ -4431,6 +4700,15 @@ class DdlObjectExecutor {
                 String idxSchema = s.schema() != null ? s.schema() : executor.defaultSchema();
                 Table idxTable = executor.resolveTable(idxSchema, s.table());
                 for (String col : s.columns()) {
+                    // CURRENT_DATE and the other value functions SQL writes without an argument
+                    // list are keys of the same kind as a call, not names of columns: PostgreSQL
+                    // reads them through the grammar that admits a call and then refuses them for
+                    // being no more than stable. A relation that does hold a column of that name
+                    // can still be indexed on it, because only a quoted name reaches it.
+                    if (DdlIndexValidator.isSqlValueFunction(col) && idxTable.getColumnIndex(col) < 0) {
+                        throw new MemgresException(
+                                "functions in index expression must be marked IMMUTABLE", "42P17");
+                    }
                     // Skip expression-based index columns (contain parens, operators, or spaces)
                     if (col.contains("(") || col.contains(")") || col.contains(" ")
                             || col.contains("+") || col.contains("*") || col.contains("/") || col.contains("||")) {
@@ -4602,10 +4880,14 @@ class DdlObjectExecutor {
                             wherePred = com.memgres.engine.parser.Parser.parseExpression(s.whereClause());
                         } catch (Exception ignored) {}
                     }
-                    // Parse expression columns if any
+                    // Parse expression columns if any. A key that names a column of the relation
+                    // is that column whatever characters its name happens to hold: "A b" is one
+                    // quoted name, not two words, and reading it as an expression left the index
+                    // enforcing something the relation has no column for.
                     boolean hasExprCols = s.columns().stream().anyMatch(c ->
-                            c.contains("(") || c.contains(" ") || c.contains("+") || c.contains("-")
-                            || c.contains("*") || c.contains("/") || c.contains("||"));
+                            valTable.getColumnIndex(c) < 0
+                            && (c.contains("(") || c.contains(" ") || c.contains("+") || c.contains("-")
+                            || c.contains("*") || c.contains("/") || c.contains("||")));
                     List<Expression> parsedExprs = null;
                     if (hasExprCols) {
                         parsedExprs = new ArrayList<>();
@@ -4635,12 +4917,15 @@ class DdlObjectExecutor {
                         }
                         // Compute key values
                         StringBuilder keyBuilder = new StringBuilder();
+                        List<Object> keyValues = new ArrayList<>();
                         if (parsedExprs != null) {
                             for (Expression expr : parsedExprs) {
                                 try {
                                     Object val = executor.evalExpr(expr, rowCtx);
+                                    keyValues.add(val);
                                     keyBuilder.append(val == null ? "\0NULL\0" : val.toString()).append('\1');
                                 } catch (Exception e) {
+                                    keyValues.add(null);
                                     keyBuilder.append("\0ERR\0").append('\1');
                                 }
                             }
@@ -4649,16 +4934,26 @@ class DdlObjectExecutor {
                                 int ci = valTable.getColumnIndex(col);
                                 if (ci >= 0) {
                                     Object val = evalRow[ci];
+                                    keyValues.add(val);
                                     keyBuilder.append(val == null ? "\0NULL\0" : val.toString()).append('\1');
                                 }
                             }
                         }
                         String key = keyBuilder.toString();
-                        if (!key.contains("\0NULL\0") && !seenKeys.add(key)) {
-                            String idxName = s.name() != null ? s.name() : s.table() + "_unique";
-                            throw new MemgresException(
-                                "could not create unique index \"" + idxName + "\"\n  "
-                                + "Detail: Key already exists.", "23505");
+                        // A null in the key makes its row unlike every other, so it cannot stop the
+                        // index being built -- unless the index was declared NULLS NOT DISTINCT,
+                        // which is what that clause is for.
+                        boolean comparable = s.nullsNotDistinct() || !key.contains("\0NULL\0");
+                        if (comparable && !seenKeys.add(key)) {
+                            // Nothing was written here, so the complaint is about what the table
+                            // was found holding, not about a key that already exists: PostgreSQL
+                            // ends this one "is duplicated." and names the index as the constraint.
+                            MemgresException dup = new MemgresException(
+                                    "could not create unique index \"" + s.name() + "\"", "23505");
+                            dup.setConstraint(s.name());
+                            dup.setDetail(IndexKeyDescription.duplicated(
+                                    valTable, s.columns(), keyValues.toArray()));
+                            throw dup;
                         }
                     }
                 }
@@ -4744,8 +5039,9 @@ class DdlObjectExecutor {
                 // For expression-based indexes (e.g., lower(email), (a + b)), parse and store the expressions
                 // Detect expressions: contains parens, operators, or spaces (not a simple column name)
                 boolean hasExprCols = s.columns().stream().anyMatch(c ->
-                        c.contains("(") || c.contains(" ") || c.contains("+") || c.contains("-")
-                        || c.contains("*") || c.contains("/") || c.contains("||"));
+                        idxTable.getColumnIndex(c) < 0
+                        && (c.contains("(") || c.contains(" ") || c.contains("+") || c.contains("-")
+                        || c.contains("*") || c.contains("/") || c.contains("||")));
                 if (hasExprCols) {
                     List<Expression> exprCols = new ArrayList<>();
                     for (String col : s.columns()) {

@@ -576,11 +576,15 @@ public class Database {
     // Granted privileges: role (lowercase) -> set of "privilege:objectType:objectName" entries
     private final Map<String, Set<String>> rolePrivileges = new ConcurrentHashMap<>();
 
-    // Rule identity and definitions for the catalogs: "name:", "def:", "state:", "everhad:" keys
+    // Whether a relation has, or once had, rules: "everhad:<schema>.<relation>" keys
     private final Map<String, String> rules = new ConcurrentHashMap<>();
 
-    // What each relation's rules do, in the order PostgreSQL fires them: by rule name
+    // What each relation's rules do, in the order PostgreSQL fires them: by the relation's bare
+    // name, with each rule carrying the schema of the relation it was written on
     private final Map<String, List<StoredRule>> relationRules = new ConcurrentHashMap<>();
+
+    // The order rules were written in, which is the order the catalogs describe them in
+    private final AtomicLong ruleCreations = new AtomicLong();
 
     // Object comments: "objectType:objectName" -> comment text
     private final Map<String, String> comments = new ConcurrentHashMap<>();
@@ -2194,22 +2198,43 @@ public class Database {
      * actions run for. Keying the behaviour by relation and event instead left room for one rule
      * per pair, so a second CREATE RULE silently replaced the first and dropping or disabling any
      * one of them retired them all.
+     *
+     * <p>A rule belongs to a relation, and a relation belongs to a schema, so the rule carries the
+     * schema of the relation it was written on. Two schemas may each hold a relation of the same
+     * name and in PostgreSQL each carries its own rules; filing them under the bare name alone
+     * fired both relations' rules for a write to either, and let a CREATE or a DROP of one take
+     * the other's away.
      */
     public static final class StoredRule {
+        private String schema;
+        private String table;
         private String name;
         private final String event;
         private final boolean instead;
         private final String qualification;
         private final String body;
+        private final long created;
+        private String definition;
+        private String enabledState = "O";
         private boolean disabled;
 
-        StoredRule(String name, String event, boolean instead, String qualification, String body) {
+        StoredRule(String schema, String table, String name, String event, boolean instead,
+                   String qualification, String body, long created) {
+            this.schema = schema;
+            this.table = table;
             this.name = name;
             this.event = event;
             this.instead = instead;
             this.qualification = qualification;
             this.body = body;
+            this.created = created;
         }
+
+        /** The schema of the relation the rule is on, which is the schema the rule is in. */
+        public String getSchema() { return schema; }
+
+        /** The relation the rule is on. */
+        public String getTable() { return table; }
 
         public String getName() { return name; }
 
@@ -2223,6 +2248,18 @@ public class Database {
         /** The rule's actions, joined by {@link Database#RULE_ACTION_SEPARATOR}. */
         public String getBody() { return body; }
 
+        /** The rule as {@code pg_get_ruledef} writes it, or null until it has been described. */
+        public String getDefinition() { return definition; }
+
+        /**
+         * Which of PostgreSQL's four firing modes the rule is in, as {@code pg_rewrite.ev_enabled}
+         * spells them: {@code O} origin (the default), {@code D} disabled, {@code R} replica,
+         * {@code A} always. Only {@code O} and {@code A} fire in an ordinary session -- a replica
+         * rule waits for a session in replica mode -- so the behaviour follows the code rather
+         * than being set apart from it.
+         */
+        public String getEnabledState() { return enabledState; }
+
         public boolean isDisabled() { return disabled; }
 
         /** Whether the rule performs no action at all: DO INSTEAD NOTHING and DO ALSO NOTHING. */
@@ -2230,21 +2267,34 @@ public class Database {
     }
 
     /**
+     * Whether a rule filed under a relation's name is one a lookup in {@code schema} reaches. A
+     * caller with no schema to go on reaches all of them, which is what a lookup by the bare name
+     * did for every one of them.
+     */
+    private static boolean ruleInSchema(StoredRule rule, String schema) {
+        return schema == null || rule.schema == null || rule.schema.equalsIgnoreCase(schema);
+    }
+
+    /**
      * Register a rule under its own name, replacing one of the same name as CREATE OR REPLACE RULE
      * does. The list is kept in rule-name order because that is the order PostgreSQL fires them in.
+     * Only a rule on the same relation is replaced: another schema's relation of that name keeps
+     * whatever it was written with.
      */
-    public void addRule(String ruleName, String table, String event, boolean instead,
+    public void addRule(String schema, String ruleName, String table, String event, boolean instead,
                         String body, String qualification) {
         String key = table.toLowerCase();
         List<StoredRule> rebuilt = new ArrayList<>();
         List<StoredRule> existing = relationRules.get(key);
         if (existing != null) {
             for (StoredRule r : existing) {
-                if (!r.getName().equalsIgnoreCase(ruleName)) rebuilt.add(r);
+                if (!r.getName().equalsIgnoreCase(ruleName) || !ruleInSchema(r, schema)) {
+                    rebuilt.add(r);
+                }
             }
         }
-        rebuilt.add(new StoredRule(ruleName, event == null ? "" : event.toUpperCase(),
-                instead, qualification, body));
+        rebuilt.add(new StoredRule(schema, table, ruleName, event == null ? "" : event.toUpperCase(),
+                instead, qualification, body, ruleCreations.incrementAndGet()));
         rebuilt.sort((a, b) -> a.getName().compareToIgnoreCase(b.getName()));
         relationRules.put(key, rebuilt);
     }
@@ -2253,28 +2303,28 @@ public class Database {
      * The rules this relation carries for the event, in the order they fire. A disabled rule keeps
      * its place in the catalogs but does not fire, so it is left out.
      */
-    public List<StoredRule> getRules(String table, String event) {
+    public List<StoredRule> getRules(String schema, String table, String event) {
         List<StoredRule> out = new ArrayList<>();
         List<StoredRule> list = relationRules.get(table.toLowerCase());
         if (list == null) return out;
         String want = event.toUpperCase();
         for (StoredRule r : list) {
-            if (!r.isDisabled() && want.equals(r.getEvent())) out.add(r);
+            if (!r.isDisabled() && want.equals(r.getEvent()) && ruleInSchema(r, schema)) out.add(r);
         }
         return out;
     }
 
-    private StoredRule findRule(String ruleName, String table) {
+    private StoredRule findRule(String schema, String ruleName, String table) {
         List<StoredRule> list = relationRules.get(table.toLowerCase());
         if (list == null) return null;
         for (StoredRule r : list) {
-            if (r.getName().equalsIgnoreCase(ruleName)) return r;
+            if (r.getName().equalsIgnoreCase(ruleName) && ruleInSchema(r, schema)) return r;
         }
         return null;
     }
 
-    public boolean hasRule(String ruleName, String table) {
-        return findRule(ruleName, table) != null;
+    public boolean hasRule(String schema, String ruleName, String table) {
+        return findRule(schema, ruleName, table) != null;
     }
 
     /**
@@ -2283,17 +2333,21 @@ public class Database {
      * no longer written anywhere, so DROP RULE on the new name cannot find it. The name also
      * decides when the rule fires relative to the others, so the list is put back in order.
      */
-    public void renameRule(String ruleName, String table, String newName) {
-        StoredRule rule = findRule(ruleName, table);
+    public void renameRule(String schema, String ruleName, String table, String newName) {
+        StoredRule rule = findRule(schema, ruleName, table);
         if (rule == null) return;
+        // What a rule's actions name is filed under the rule's name too, so it is re-filed here or
+        // the drop of a relation the renamed rule writes to stops being refused.
+        RuleDependency dependency =
+                ruleDependencies.remove(ruleDependencyKey(ruleName, rule.schema, table));
         rule.name = newName;
+        if (dependency != null) {
+            ruleDependencies.put(ruleDependencyKey(newName, rule.schema, table),
+                    new RuleDependency(newName, rule.schema, table, dependency.relations));
+        }
         List<StoredRule> resorted = new ArrayList<>(relationRules.get(table.toLowerCase()));
         resorted.sort((a, b) -> a.getName().compareToIgnoreCase(b.getName()));
         relationRules.put(table.toLowerCase(), resorted);
-        String definition = rules.remove("def:" + ruleName.toLowerCase());
-        if (definition != null) rules.put("def:" + newName.toLowerCase(), definition);
-        String state = rules.remove("state:" + ruleName.toLowerCase() + ":" + table.toLowerCase());
-        if (state != null) rules.put("state:" + newName.toLowerCase() + ":" + table.toLowerCase(), state);
     }
 
     /**
@@ -2315,31 +2369,41 @@ public class Database {
     private final Map<String, RuleDependency> ruleDependencies = new ConcurrentHashMap<>();
 
     /**
-     * The relations one rule's actions name, kept as they were written: PostgreSQL prints the
-     * rule's own name and the relation it is on when it refuses to drop something the rule needs.
+     * The relations one rule's actions name, each under the schema that holds it: PostgreSQL prints
+     * the rule's own name and the relation it is on when it refuses to drop something the rule
+     * needs, and it records the relation itself rather than the name it was written under, so
+     * another schema's relation of the same name is nothing to the rule.
      */
     private static final class RuleDependency {
         private final String ruleName;
+        private final String schema;
         private final String table;
         private final List<String> relations;
 
-        RuleDependency(String ruleName, String table, List<String> relations) {
+        RuleDependency(String ruleName, String schema, String table, List<String> relations) {
             this.ruleName = ruleName;
+            this.schema = schema;
             this.table = table;
             this.relations = relations;
         }
 
-        boolean names(String relation) {
+        boolean names(String relationSchema, String relation) {
             String wanted = RelationNamespace.bareName(relation);
             for (String r : relations) {
-                if (RelationNamespace.bareName(r).equalsIgnoreCase(wanted)) return true;
+                if (!RelationNamespace.bareName(r).equalsIgnoreCase(wanted)) continue;
+                // A relation recorded without a schema was written before one could be worked out
+                // for it, and answers to the bare name as it always did.
+                int dot = r.lastIndexOf('.');
+                if (dot <= 0 || relationSchema == null) return true;
+                if (r.substring(0, dot).equalsIgnoreCase(relationSchema)) return true;
             }
             return false;
         }
     }
 
-    private static String ruleDependencyKey(String ruleName, String table) {
-        return ruleName.toLowerCase() + ":" + table.toLowerCase();
+    private static String ruleDependencyKey(String ruleName, String schema, String table) {
+        return ruleName.toLowerCase() + ":" + (schema == null ? "" : schema.toLowerCase())
+                + "." + table.toLowerCase();
     }
 
     /**
@@ -2348,60 +2412,62 @@ public class Database {
      * still there: without it the rule outlives its target and the ruled relation cannot be
      * written to at all.
      */
-    public void addRuleDependencies(String ruleName, String table, List<String> relations) {
-        String key = ruleDependencyKey(ruleName, table);
+    public void addRuleDependencies(String schema, String ruleName, String table,
+                                    List<String> relations) {
+        String key = ruleDependencyKey(ruleName, schema, table);
         if (relations == null || relations.isEmpty()) {
             ruleDependencies.remove(key);
             return;
         }
-        ruleDependencies.put(key, new RuleDependency(ruleName, table, new ArrayList<>(relations)));
+        ruleDependencies.put(key,
+                new RuleDependency(ruleName, schema, table, new ArrayList<>(relations)));
     }
 
     /**
-     * One line per rule that names this relation, worded as PostgreSQL words the detail of the
-     * refusal. A rule whose own relation has gone is left out: it can no longer fire.
+     * The rules whose actions name this relation, as {rule name, relation, schema of the
+     * relation}: what a DROP of it is refused for, and what a CASCADE takes with it. A rule whose
+     * own relation has gone is left out, because it can no longer fire. They come back in the
+     * order they were written, which is the order PostgreSQL reports them in.
      */
-    public List<String> ruleDependencyLines(String table) {
-        List<String> lines = new ArrayList<>();
+    public List<String[]> rulesDependingOn(String schema, String table) {
+        List<StoredRule> found = new ArrayList<>();
         for (RuleDependency dep : ruleDependencies.values()) {
-            if (!dep.names(table)) continue;
-            if (findRule(dep.ruleName, dep.table) == null || !relationStillThere(dep.table)) continue;
-            lines.add("rule " + dep.ruleName + " on table " + dep.table
-                    + " depends on table " + RelationNamespace.bareName(table));
+            if (!dep.names(schema, table)) continue;
+            StoredRule rule = findRule(dep.schema, dep.ruleName, dep.table);
+            if (rule == null || !relationStillThere(dep.schema, dep.table)) continue;
+            found.add(rule);
         }
-        return lines;
+        found.sort((a, b) -> Long.compare(a.created, b.created));
+        List<String[]> out = new ArrayList<>();
+        for (StoredRule r : found) out.add(new String[]{ r.name, r.table, r.schema });
+        return out;
     }
 
-    /** The rules naming this relation, as {rule name, relation}, so CASCADE can drop them. */
-    public List<String[]> rulesDependingOn(String table) {
-        List<String[]> found = new ArrayList<>();
-        for (RuleDependency dep : ruleDependencies.values()) {
-            if (!dep.names(table)) continue;
-            if (findRule(dep.ruleName, dep.table) == null || !relationStillThere(dep.table)) continue;
-            found.add(new String[]{ dep.ruleName, dep.table });
+    /** Whether this schema still holds a relation of this bare name, of any kind. */
+    private boolean relationStillThere(String schema, String name) {
+        for (Schema s : schemas.values()) {
+            if (schema != null && !s.getName().equalsIgnoreCase(schema)) continue;
+            if (s.getTable(name) != null) return true;
         }
-        return found;
-    }
-
-    /** Whether some schema still holds a relation of this bare name, of any kind. */
-    private boolean relationStillThere(String name) {
-        for (Schema schema : schemas.values()) {
-            if (schema.getTable(name) != null) return true;
-        }
-        return getView(name) != null;
+        return (schema == null ? getView(name) : getView(schema, name)) != null;
     }
 
     /** DROP RULE: only the named rule goes, and the others on the relation go on firing. */
-    public void removeRule(String ruleName, String table) {
-        ruleDependencies.remove(ruleDependencyKey(ruleName, table));
-        rules.remove("def:" + ruleName.toLowerCase());
-        rules.remove("state:" + ruleName.toLowerCase() + ":" + table.toLowerCase());
+    public void removeRule(String schema, String ruleName, String table) {
+        for (Map.Entry<String, RuleDependency> e : new ArrayList<>(ruleDependencies.entrySet())) {
+            RuleDependency dep = e.getValue();
+            if (dep.ruleName.equalsIgnoreCase(ruleName) && dep.table.equalsIgnoreCase(table)
+                    && (schema == null || dep.schema == null
+                        || dep.schema.equalsIgnoreCase(schema))) {
+                ruleDependencies.remove(e.getKey());
+            }
+        }
         String key = table.toLowerCase();
         List<StoredRule> existing = relationRules.get(key);
         if (existing == null) return;
         List<StoredRule> kept = new ArrayList<>();
         for (StoredRule r : existing) {
-            if (!r.getName().equalsIgnoreCase(ruleName)) kept.add(r);
+            if (!r.getName().equalsIgnoreCase(ruleName) || !ruleInSchema(r, schema)) kept.add(r);
         }
         relationRules.put(key, kept);
     }
@@ -2412,8 +2478,8 @@ public class Database {
      *
      * @return false when no rule of that name is defined on the relation
      */
-    public boolean setRuleEnabled(String ruleName, String table, boolean enabled) {
-        StoredRule rule = findRule(ruleName, table);
+    public boolean setRuleEnabled(String schema, String ruleName, String table, boolean enabled) {
+        StoredRule rule = findRule(schema, ruleName, table);
         if (rule == null) return false;
         rule.disabled = !enabled;
         return true;
@@ -2421,111 +2487,97 @@ public class Database {
 
     /**
      * Record which of PostgreSQL's four firing modes a rule is in, as {@code pg_rewrite.ev_enabled}
-     * spells them: {@code O} origin (the default), {@code D} disabled, {@code R} replica, {@code A}
-     * always. Only {@code O} and {@code A} fire in an ordinary session — a replica rule waits for a
-     * session in replica mode — so the behaviour follows the code rather than being set apart.
+     * spells them.
      *
      * @return false when no rule of that name is defined on the relation
      */
-    public boolean setRuleEnabledState(String ruleName, String table, String state) {
-        boolean firesHere = "O".equals(state) || "A".equals(state);
-        if (!setRuleEnabled(ruleName, table, firesHere)) return false;
-        rules.put("state:" + ruleName.toLowerCase() + ":" + table.toLowerCase(), state);
+    public boolean setRuleEnabledState(String schema, String ruleName, String table, String state) {
+        StoredRule rule = findRule(schema, ruleName, table);
+        if (rule == null) return false;
+        rule.disabled = !("O".equals(state) || "A".equals(state));
+        rule.enabledState = state;
         return true;
     }
 
-    /** The {@code ev_enabled} code a rule carries; {@code O} until something else is asked for. */
-    public String getRuleEnabledState(String ruleName, String table) {
-        String s = rules.get("state:" + ruleName.toLowerCase() + ":" + table.toLowerCase());
-        return s != null ? s : "O";
-    }
-
-    public void addRuleDefinition(String ruleName, String table, String definition) {
-        addRuleDefinition(ruleName, table, definition, null, false);
-    }
-
     /**
-     * Remember a rule well enough for the catalogs to describe it. {@code pg_rewrite} reports the
-     * event a rule fires on and whether it replaces the statement, so those are kept beside the
-     * text rather than parsed back out of it.
+     * Remember a rule well enough for the catalogs to describe it: the text {@code pg_get_ruledef}
+     * writes goes on the rule itself, beside the event it fires on and whether it replaces the
+     * statement, so nothing has to be parsed back out of the text.
      */
-    public void addRuleDefinition(String ruleName, String table, String definition,
-                                  String event, boolean instead) {
+    public void addRuleDefinition(String schema, String ruleName, String table, String definition) {
         // pg_class.relhasrules is documented as "has (or once had) rules": PostgreSQL only clears
         // the flag at VACUUM, so dropping the rule leaves it standing.
-        rules.put("everhad:" + table.toLowerCase(), "t");
-        rules.put("def:" + ruleName.toLowerCase(), table.toLowerCase()
-                + "|" + (event == null ? "" : event.toUpperCase())
-                + "|" + (instead ? "t" : "f")
-                + "|" + definition);
+        rules.put(everHadKey(schema, table), "t");
+        StoredRule rule = findRule(schema, ruleName, table);
+        if (rule != null) rule.definition = definition;
     }
 
     /**
-     * Every stored rule, as {@code name -> {table, definition, event, "t"/"f" for INSTEAD}}.
-     * The definition is last because it is the only part that may itself contain the separator.
+     * Every rule written with CREATE RULE, in the order they were written -- which is the order
+     * PostgreSQL's catalogs hand them back in. A rule is described by the relation it is on, so
+     * two relations may each carry one of the same name and both are here.
      */
-    public java.util.Map<String, String[]> getRuleDefinitions() {
-        java.util.Map<String, String[]> result = new java.util.LinkedHashMap<>();
-        for (java.util.Map.Entry<String, String> e : rules.entrySet()) {
-            if (!e.getKey().startsWith("def:")) continue;
-            String ruleName = e.getKey().substring(4);
-            String[] parts = e.getValue().split("\\|", 4);
-            if (parts.length == 4) {
-                result.put(ruleName, new String[]{ parts[0], parts[3], parts[1], parts[2] });
-            } else if (parts.length >= 2) {
-                // A definition stored before the event was kept alongside it.
-                result.put(ruleName, new String[]{ parts[0],
-                        e.getValue().substring(parts[0].length() + 1), "", "f" });
-            }
-        }
-        return result;
+    public List<StoredRule> getRuleEntries() {
+        List<StoredRule> all = new ArrayList<>();
+        for (List<StoredRule> onOneRelation : relationRules.values()) all.addAll(onOneRelation);
+        all.sort((a, b) -> Long.compare(a.created, b.created));
+        return all;
     }
 
-    /** Whether a relation has, or once had, a rule — what {@code relhasrules} reports. */
-    public boolean everHadRules(String table) {
-        return rules.containsKey("everhad:" + table.toLowerCase());
+    private static String everHadKey(String schema, String table) {
+        return "everhad:" + (schema == null ? "" : schema.toLowerCase())
+                + "." + table.toLowerCase();
+    }
+
+    /** Whether a relation has, or once had, a rule -- what {@code relhasrules} reports. */
+    public boolean everHadRules(String schema, String table) {
+        if (schema != null) return rules.containsKey(everHadKey(schema, table));
+        String underAnySchema = "." + table.toLowerCase();
+        for (String key : rules.keySet()) {
+            if (key.startsWith("everhad:") && key.endsWith(underAnySchema)) return true;
+        }
+        return false;
     }
 
     /**
-     * A renamed relation takes its rules with it. PostgreSQL records the relation a rule is on as
-     * an OID, so a rename changes nothing about the rule; memgres keys every part of a rule by
-     * the relation's bare name, so all of them are rewritten here or the rule stops firing, drops
-     * out of {@code pg_rules}, and cannot be dropped by name any more.
+     * A renamed or moved relation takes its rules with it. PostgreSQL records the relation a rule
+     * is on as an OID, so neither a rename nor a move to another schema is anything to the rule;
+     * memgres files a rule under the relation's name and schema, so both are rewritten here or the
+     * rule stops firing, drops out of {@code pg_rules}, and cannot be dropped by name any more.
      *
      * @see ObjectIdentity#relationRenamed
      */
-    void retargetRules(String oldTable, String newTable) {
+    void retargetRules(String oldSchema, String oldTable, String newSchema, String newTable) {
         String from = oldTable.toLowerCase();
         String to = newTable.toLowerCase();
-        if (from.equals(to)) return;
-        // What the rules do is kept per relation, so the whole list moves with the name.
-        List<StoredRule> behaviour = relationRules.remove(from);
-        if (behaviour != null) {
-            List<StoredRule> atTarget = relationRules.get(to);
-            if (atTarget != null) behaviour.addAll(atTarget);
-            behaviour.sort((a, b) -> a.getName().compareToIgnoreCase(b.getName()));
-            relationRules.put(to, behaviour);
+        String everHad = rules.remove(everHadKey(oldSchema, oldTable));
+        if (everHad != null) rules.put(everHadKey(newSchema, newTable), everHad);
+        List<StoredRule> underName = relationRules.get(from);
+        if (underName == null) return;
+        List<StoredRule> moved = new ArrayList<>();
+        List<StoredRule> stay = new ArrayList<>();
+        for (StoredRule r : underName) {
+            if (ruleInSchema(r, oldSchema)) moved.add(r); else stay.add(r);
         }
-        Map<String, String> moved = new LinkedHashMap<>();
-        for (Map.Entry<String, String> e : new LinkedHashMap<>(rules).entrySet()) {
-            String k = e.getKey();
-            String rekeyed = null;
-            if (k.equals("everhad:" + from)) {
-                rekeyed = "everhad:" + to;
-            } else if (k.startsWith("name:") && k.endsWith(":" + from)) {
-                rekeyed = k.substring(0, k.length() - from.length()) + to;
-            } else if (k.startsWith("state:") && k.endsWith(":" + from)) {
-                rekeyed = k.substring(0, k.length() - from.length()) + to;
-            } else if (k.startsWith("def:") && e.getValue().startsWith(from + "|")) {
-                // The definition records the relation it is on in its first field.
-                moved.put(k, to + e.getValue().substring(from.length()));
-                continue;
+        for (StoredRule r : moved) {
+            // What the rule's actions name is filed under the relation the rule is on as well.
+            RuleDependency dependency =
+                    ruleDependencies.remove(ruleDependencyKey(r.name, r.schema, r.table));
+            r.schema = newSchema;
+            r.table = newTable;
+            if (dependency != null) {
+                ruleDependencies.put(ruleDependencyKey(r.name, newSchema, newTable),
+                        new RuleDependency(r.name, newSchema, newTable, dependency.relations));
             }
-            if (rekeyed == null) continue;
-            rules.remove(k);
-            moved.put(rekeyed, e.getValue());
         }
-        rules.putAll(moved);
+        // A move to another schema leaves the rules where they are: they are filed under the
+        // relation's bare name, which has not changed.
+        if (from.equals(to)) return;
+        if (stay.isEmpty()) relationRules.remove(from); else relationRules.put(from, stay);
+        List<StoredRule> atTarget = relationRules.get(to);
+        if (atTarget != null) moved.addAll(atTarget);
+        moved.sort((a, b) -> a.getName().compareToIgnoreCase(b.getName()));
+        relationRules.put(to, moved);
     }
 
     /**
@@ -2567,29 +2619,110 @@ public class Database {
      * report, because nothing outside the relation depends on them. Leaving them registered kept
      * them in {@code pg_rules} describing a relation that was no longer there.
      */
-    public void dropRulesOn(String table) {
+    public void dropRulesOn(String schema, String table) {
         List<StoredRule> carried = relationRules.get(table.toLowerCase());
         if (carried != null) {
             // Each goes through the ordinary drop, so what the rule depended on is forgotten too.
-            for (StoredRule r : new ArrayList<>(carried)) removeRule(r.getName(), table);
+            for (StoredRule r : new ArrayList<>(carried)) {
+                if (ruleInSchema(r, schema)) removeRule(schema, r.getName(), table);
+            }
         }
-        clearRuleHistory(table);
+        clearRuleHistory(schema, table);
     }
 
     /**
-     * Forget every rule a name carried, for a relation newly created under it. Dropping a relation
-     * takes its rules with it in PostgreSQL, so a table created under the same name afterwards
-     * starts with none and with relhasrules false.
+     * Everything some rules amount to, so that a DROP which is rolled back brings them back with
+     * it. PostgreSQL deletes the rules along with what they belong to and restores both together;
+     * keeping only the relation left it standing without the rules it was written with, and they
+     * could not even be dropped by name afterwards.
      */
-    public void clearRuleHistory(String table) {
-        String lower = table.toLowerCase();
-        rules.remove("everhad:" + lower);
-        List<StoredRule> gone = relationRules.remove(lower);
-        if (gone == null) return;
-        for (StoredRule r : gone) {
-            rules.remove("def:" + r.getName().toLowerCase());
-            rules.remove("state:" + r.getName().toLowerCase() + ":" + lower);
+    public static final class RuleSnapshot {
+        private final List<StoredRule> carried;
+        private final Map<String, String> catalogued;
+        private final Map<String, RuleDependency> dependencies;
+
+        RuleSnapshot(List<StoredRule> carried, Map<String, String> catalogued,
+                     Map<String, RuleDependency> dependencies) {
+            this.carried = carried;
+            this.catalogued = catalogued;
+            this.dependencies = dependencies;
         }
+    }
+
+    /** What {@link #dropRulesOn} is about to take away, or null where the relation carries none. */
+    public RuleSnapshot snapshotRulesOn(String schema, String table) {
+        List<StoredRule> underName = relationRules.get(table.toLowerCase());
+        if (underName == null) return null;
+        List<StoredRule> carried = new ArrayList<>();
+        for (StoredRule r : underName) {
+            if (ruleInSchema(r, schema)) carried.add(r);
+        }
+        return snapshotOf(carried);
+    }
+
+    /**
+     * What one rule amounts to. A rule that merely writes to the relation being dropped sits on a
+     * relation of its own, so it is in no relation's snapshot; a CASCADE takes it away and a
+     * rollback has to find it again.
+     */
+    public RuleSnapshot snapshotRule(String schema, String ruleName, String table) {
+        StoredRule rule = findRule(schema, ruleName, table);
+        return rule == null ? null : snapshotOf(Cols.listOf(rule));
+    }
+
+    private RuleSnapshot snapshotOf(List<StoredRule> carried) {
+        if (carried.isEmpty()) return null;
+        Map<String, String> catalogued = new LinkedHashMap<>();
+        Map<String, RuleDependency> dependencies = new LinkedHashMap<>();
+        for (StoredRule r : carried) {
+            String everHad = rules.get(everHadKey(r.schema, r.table));
+            if (everHad != null) catalogued.put(everHadKey(r.schema, r.table), everHad);
+            String key = ruleDependencyKey(r.name, r.schema, r.table);
+            RuleDependency dependency = ruleDependencies.get(key);
+            if (dependency != null) dependencies.put(key, dependency);
+        }
+        return new RuleSnapshot(new ArrayList<>(carried), catalogued, dependencies);
+    }
+
+    /** Puts back what a DROP took away, for a DROP that has been rolled back. */
+    public void restoreRules(RuleSnapshot snapshot) {
+        if (snapshot == null) return;
+        for (StoredRule r : snapshot.carried) {
+            String key = r.table.toLowerCase();
+            List<StoredRule> rebuilt = new ArrayList<>();
+            List<StoredRule> existing = relationRules.get(key);
+            if (existing != null) {
+                for (StoredRule there : existing) {
+                    if (there != r && (!there.getName().equalsIgnoreCase(r.name)
+                            || !ruleInSchema(there, r.schema))) {
+                        rebuilt.add(there);
+                    }
+                }
+            }
+            rebuilt.add(r);
+            rebuilt.sort((a, b) -> a.getName().compareToIgnoreCase(b.getName()));
+            relationRules.put(key, rebuilt);
+        }
+        rules.putAll(snapshot.catalogued);
+        ruleDependencies.putAll(snapshot.dependencies);
+    }
+
+    /**
+     * Forget every rule this relation carried, for a relation newly created under its name.
+     * Dropping a relation takes its rules with it in PostgreSQL, so a table created under the same
+     * name afterwards starts with none and with relhasrules false. Another schema's relation of
+     * that name is a different relation and keeps its own.
+     */
+    public void clearRuleHistory(String schema, String table) {
+        rules.remove(everHadKey(schema, table));
+        String key = table.toLowerCase();
+        List<StoredRule> gone = relationRules.get(key);
+        if (gone == null) return;
+        List<StoredRule> kept = new ArrayList<>();
+        for (StoredRule r : gone) {
+            if (!ruleInSchema(r, schema)) kept.add(r);
+        }
+        if (kept.isEmpty()) relationRules.remove(key); else relationRules.put(key, kept);
     }
 
     /**
@@ -2597,12 +2730,12 @@ public class Database {
      * A statement PostgreSQL will not rewrite asks only whether there is one; everything that fires
      * rules reads them through {@link #getRules}, which hands back each rule's own WHERE.
      */
-    public String getRule(String table, String event) {
+    public String getRule(String schema, String table, String event) {
         List<StoredRule> list = relationRules.get(table.toLowerCase());
         if (list == null) return null;
         String want = event.toUpperCase();
         for (StoredRule r : list) {
-            if (want.equals(r.getEvent())) return r.getName();
+            if (want.equals(r.getEvent()) && ruleInSchema(r, schema)) return r.getName();
         }
         return null;
     }

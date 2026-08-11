@@ -356,6 +356,38 @@ class CastEvaluator {
     }
 
     /**
+     * Refuse a cast to a name that denotes no type this session can see.
+     *
+     * <p>A schema the search path does not reach holds nothing a bare name could have meant, so a
+     * type moved out of sight is one PostgreSQL reports as not existing at all. Every value but
+     * null finds that out further down, where the name is resolved before it is read; the name
+     * itself is the same question either way. A built-in of the same name still answers first, and
+     * so does the row type a relation of that name carries.
+     */
+    private void refuseUnreachableType(String typeName) {
+        if (executor.database == null || typeName.isEmpty()) return;
+        String bare = typeName;
+        while (bare.endsWith("[]")) bare = bare.substring(0, bare.length() - 2).trim();
+        if (bare.isEmpty()) return;
+        if (DataType.fromPgName(bare) != null) return;
+        if (KEPT_AS_WRITTEN.contains(bare)) return;
+        if (PolymorphicTypes.isPolymorphic(bare)) return;
+        if (InformationSchemaTypes.isOne(bare)) return;
+        if (TypeNamespace.resolve(executor.database, executor.session, bare) != null) return;
+        if (executor.database.getTable(bare) != null) return;
+        // Only a name some schema does hold is refused. A name nothing at all answers to is left
+        // alone here, because this is a value being cast rather than a type being resolved, and
+        // every type memgres holds no value class for reaches this same point.
+        String suffix = "." + bare;
+        for (String key : executor.database.typeKeys()) {
+            if (key.endsWith(suffix)) {
+                // PostgreSQL names the type as it was written, brackets and all.
+                throw new MemgresException("type \"" + typeName + "\" does not exist", "42704");
+            }
+        }
+    }
+
+    /**
      * A written type name rewritten as {@code schema.name} once the search path says which type it
      * denotes. Anything that is not a user-defined type — every built-in, and every name that
      * denotes nothing — is handed back exactly as written, so only the ambiguity this resolves is
@@ -400,10 +432,17 @@ class CastEvaluator {
         // so everything downstream reads the same one: with search_path = b, ::e is b's e.
         typeSpec = qualifyUserType(typeSpec);
         if (val == null) {
+            // A name that denotes no type is refused before the value is looked at, and null is
+            // no exception: it left here before any of the resolution below had run, so a bare
+            // name went on finding a type in whatever schema happened to hold it.
+            String nullTypeName = typeSpec.toLowerCase().replaceAll("\\(.*\\)", "").trim();
+            refuseUnreachableType(nullTypeName);
             // A NOT NULL domain rejects null even through a cast, and the constraint is
             // inherited from every domain it is built on
-            DomainType nullDomain = executor.database.getDomain(
-                    typeSpec.toLowerCase().replaceAll("\\(.*\\)", "").trim());
+            String nullTypeKey =
+                    TypeNamespace.resolve(executor.database, executor.session, nullTypeName);
+            DomainType nullDomain = nullTypeKey == null ? null
+                    : executor.database.getDomain(nullTypeKey);
             if (nullDomain != null && domainChainRejectsNull(nullDomain)) {
                 MemgresException ex = new MemgresException("domain "
                         + typeDisplayName(nullDomain.getName())
@@ -575,11 +614,11 @@ class CastEvaluator {
             case "int":
             case "int4":
                 if (val instanceof byte[]) return (int) bytesToInteger((byte[]) val, 4, "integer");
-                return TypeCoercion.toInteger(val);
+                return readIntegerFor(val, "integer");
             case "bigint":
             case "int8":
                 if (val instanceof byte[]) return bytesToInteger((byte[]) val, 8, "bigint");
-                return TypeCoercion.toLong(val);
+                return readBigintFor(val);
             case "smallint":
             case "int2": {
                 if (val instanceof byte[]) return (short) bytesToInteger((byte[]) val, 2, "smallint");
@@ -1441,8 +1480,15 @@ class CastEvaluator {
                 return new RegnamespaceValue(nsOid, nsName);
             }
             default: {
-                // Check if it's a domain type
-                DomainType domain = executor.database.getDomain(typeName);
+                // Which schema's type a bare name means is the search path's answer, and a type
+                // held by a schema the path does not reach is not a type that name can mean at
+                // all. Only the enum branch below asked this way; a domain, a range and a
+                // composite were looked up by name across every schema, so a cast went on finding
+                // one that ALTER TYPE ... SET SCHEMA had just moved out of sight.
+                String declaredTypeKey =
+                        TypeNamespace.resolve(executor.database, executor.session, typeName);
+                DomainType domain = declaredTypeKey == null ? null
+                        : executor.database.getDomain(declaredTypeKey);
                 if (domain != null) {
                     // A domain over a domain inherits its base's constraints, so walk from the
                     // base outwards. PG reports the constraint the base declared, but names the
@@ -1481,7 +1527,8 @@ class CastEvaluator {
                 // A range the reader defined is read the way a built-in range is: the text goes
                 // through the range input function and comes back written the way PostgreSQL
                 // writes a range, rather than being refused as a type nothing here knows.
-                if (executor.database.getRangeSubtype(typeName) != null) {
+                if (declaredTypeKey != null
+                        && executor.database.getRangeSubtype(declaredTypeKey) != null) {
                     return RangeOperations.parse(val.toString().trim()).toString();
                 }
                 // Cast to "record": ROW values are already record types, return as-is
@@ -1489,12 +1536,17 @@ class CastEvaluator {
                     return val;
                 }
                 // ROW cast to a composite type, which a table also defines; check arity
-                List<CreateTypeStmt.CompositeField> rowFields = executor.database.getRowType(typeName);
+                List<CreateTypeStmt.CompositeField> rowFields =
+                        reachableRowType(typeName, declaredTypeKey);
+                // The shape is judged before anything is read out of the value, by the same
+                // reader the write path uses: a record of the wrong shape and text of the wrong
+                // shape are two different answers, and a badly shaped field of a field is blamed
+                // on the type whose fields were counted.
+                if (rowFields != null) {
+                    executor.compositeTypeHandler.requireCompositeShape(val, typeName);
+                }
                 if (val instanceof AstExecutor.PgRow && rowFields != null) {
                     AstExecutor.PgRow pr = (AstExecutor.PgRow) val;
-                    if (pr.values().size() != rowFields.size()) {
-                        throw new MemgresException("cannot cast type record to " + typeName, "42846");
-                    }
                     // Each field becomes a value of the type the composite declares for it, which
                     // is how a field typed by a domain comes to be judged by that domain's NOT
                     // NULL and its CHECKs -- exactly as a column of it would be. Nothing coerced
@@ -1574,6 +1626,20 @@ class CastEvaluator {
             if (state != null && state.startsWith("23")) throw e;
             return value;
         }
+    }
+
+    /**
+     * The composite a written name denotes for this session, or null when it denotes none.
+     *
+     * <p>A type the search path does not reach is not a type the name can mean, so a composite in
+     * a schema outside the path answers nothing at all. A relation is different: it carries a
+     * composite of its own name that answers to the relation namespace rather than to the type
+     * namespace, which is what lets a row be cast to a table's type.
+     */
+    private List<CreateTypeStmt.CompositeField> reachableRowType(String written, String typeKey) {
+        if (typeKey != null) return executor.database.getRowType(typeKey);
+        if (executor.database.getCompositeType(written) != null) return null;
+        return executor.database.getRowType(written);
     }
 
     /** A CHECK that answers NULL passes, the way it does on a table; only an explicit false fails. */
@@ -1662,6 +1728,18 @@ class CastEvaluator {
             if ("22003".equals(e.getSqlState())) {
                 throw outOfRangeFor(val, typeName);
             }
+            throw e;
+        }
+    }
+
+    /**
+     * The same, for bigint, whose reader hands back a number too wide for an int.
+     */
+    private static long readBigintFor(Object val) {
+        try {
+            return TypeCoercion.toLong(val).longValue();
+        } catch (MemgresException e) {
+            if ("22003".equals(e.getSqlState())) throw outOfRangeFor(val, "bigint");
             throw e;
         }
     }

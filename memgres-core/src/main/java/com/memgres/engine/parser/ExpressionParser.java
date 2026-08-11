@@ -1721,8 +1721,9 @@ public class ExpressionParser {
                     return specialFormParser.parseTimestamp(); 
                 }
                 case "DEFAULT": {
-                    advance();
-                    return Literal.ofDefault();
+                    // The tree carries no offsets of its own, and a misplaced DEFAULT is reported
+                    // against the keyword, so where this one was written is kept with the node.
+                    return Literal.ofDefault(advance().position());
                 }
                 case "OPERATOR": {
                     return specialFormParser.parsePrefixQualifiedOperator(); 

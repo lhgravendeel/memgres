@@ -497,51 +497,32 @@ public final class CatalogHelper {
             } else if (col.getEnumTypeName() != null) {
                 typeName = TypeNamespace.nameOfKey(col.getEnumTypeName());
             }
-            return def + "::" + typeName;
+            def = def + "::" + typeName;
         }
-        String folded = foldCastOfLiteral(def);
-        return folded != null ? folded : def;
+        return deparseStoredDefault(def);
     }
 
-    /** {@code 'literal'::typename} written as a column default, split into its two parts. */
-    private static final java.util.regex.Pattern CAST_OF_LITERAL =
-            java.util.regex.Pattern.compile("^'((?:[^']|'')*)'::\\s*([A-Za-z_][A-Za-z0-9_ ]*(?:\\[])?)$");
-
     /**
-     * How PostgreSQL reports a cast of a literal, which is not how it was written.
+     * A stored default reported the way {@code pg_get_expr} reports it.
      *
-     * <p>Parse analysis turns {@code '7'::int} into a constant of the target type, and
-     * {@code pg_get_expr} then prints that constant. A constant is printed bare when reading the
-     * printed text back gives the same type again, which is true of {@code integer} and
-     * {@code boolean} and of nothing else here — {@code '7'::bigint} still reads as an integer, so
-     * it keeps its label. The label itself is the type's canonical name, so {@code int[]} is
-     * reported as {@code integer[]}.
-     *
-     * @return the reported form, or null when the default is not a cast of a literal
+     * <p>PostgreSQL never echoes the text a default was written as. It prints the tree parse
+     * analysis left behind, in which a cast of a constant to the type that constant already reads
+     * as has folded away, a bare literal carries the label its column's type gave it, and every
+     * operator expression wears the parentheses the unpretty form always puts round one -- so
+     * {@code 1::int} is reported as {@code 1}, {@code 1.9::numeric} as {@code 1.9} and
+     * {@code 2 + 3} as {@code (2 + 3)}. Echoing the written text instead gave a catalogue that
+     * disagreed with the one pg_dump reads, for a default that behaves identically either way.
      */
-    private static String foldCastOfLiteral(String def) {
-        java.util.regex.Matcher m = CAST_OF_LITERAL.matcher(def.trim());
-        if (!m.matches()) return null;
-        String literal = m.group(1);
-        String written = m.group(2).trim();
-        boolean isArray = written.endsWith("[]");
-        DataType dt = DataType.fromPgName(isArray
-                ? written.substring(0, written.length() - 2).trim() : written);
-        if (dt == null) return null;
-        if (!isArray && dt == DataType.INTEGER) {
-            try {
-                return String.valueOf(Integer.parseInt(literal.trim()));
-            } catch (NumberFormatException e) {
-                return null; // not a value of the type; leave the default as written
-            }
+    private static String deparseStoredDefault(String def) {
+        try {
+            com.memgres.engine.parser.ast.Expression parsed =
+                    com.memgres.engine.parser.Parser.parseExpression(def);
+            if (parsed == null) return def;
+            return RuleDeparser.deparse(parsed, null);
+        } catch (RuntimeException e) {
+            // A default that will not parse is reported as it was written
+            return def;
         }
-        if (!isArray && dt == DataType.BOOLEAN) {
-            String v = literal.trim().toLowerCase();
-            if ("t".equals(v) || "true".equals(v)) return "true";
-            if ("f".equals(v) || "false".equals(v)) return "false";
-            return null;
-        }
-        return "'" + literal + "'::" + pgTypeName(dt) + (isArray ? "[]" : "");
     }
 
     /**
@@ -634,8 +615,9 @@ public final class CatalogHelper {
         if (columns == null || columns.isEmpty()) return null;
         List<Object> attnums = new java.util.ArrayList<>();
         for (String col : columns) {
-            int idx = table.getColumnIndex(col);
-            attnums.add(idx + 1);
+            // A dropped column does not give its number back, so a key holds the relation's
+            // attribute number rather than the column's position among the columns that are left.
+            attnums.add(table.attnumOf(col));
         }
         return attnums;
     }
@@ -753,6 +735,84 @@ public final class CatalogHelper {
         } catch (Exception e) {
             return col;
         }
+    }
+
+    /**
+     * The per-key options an index definition prints. An operator class is left out where it is
+     * the one the key's own type takes by default: PostgreSQL prints a class only when reading the
+     * definition back would otherwise choose a different one.
+     */
+    public static List<String> deparseIndexOptions(Database database, String qualifiedTable,
+                                                   String method, List<String> cols,
+                                                   List<String> options) {
+        if (options == null) return null;
+        Table t = resolveTable(database, qualifiedTable);
+        List<String> out = new java.util.ArrayList<>(options.size());
+        for (int i = 0; i < options.size(); i++) {
+            String key = cols != null && i < cols.size() ? cols.get(i) : null;
+            out.add(withoutDefaultOpclass(database, t, method, key, options.get(i)));
+        }
+        return out;
+    }
+
+    private static String withoutDefaultOpclass(Database database, Table t, String method,
+                                                String key, String opts) {
+        if (opts == null || !opts.contains("opclass:")) return opts;
+        String am = method == null || method.isEmpty() ? "btree" : method.toLowerCase();
+        String written = DdlIndexValidator.defaultOpclass(am, indexKeyTypeName(database, t, key));
+        if (written == null) return opts;
+        StringBuilder kept = new StringBuilder();
+        for (String part : opts.split(" ")) {
+            if (part.startsWith("opclass:")
+                    && written.equalsIgnoreCase(part.substring("opclass:".length()))) {
+                continue;
+            }
+            if (kept.length() > 0) kept.append(' ');
+            kept.append(part);
+        }
+        return kept.toString();
+    }
+
+    /**
+     * The type an index key is of: a column's declared type, or the type the expression comes out
+     * as. An operator class belongs to a type, so this is what decides whether the one written
+     * down is the one the key would have taken anyway.
+     */
+    private static String indexKeyTypeName(Database database, Table t, String key) {
+        if (t == null || key == null) return null;
+        int idx = t.getColumnIndex(key);
+        if (idx >= 0) {
+            Column col = t.getColumns().get(idx);
+            // A domain has no operator class of its own: it indexes through the class the type
+            // underneath it takes, so that is the type the written class is compared against.
+            if (col.getDomainTypeName() != null) {
+                DomainType domain = database == null ? null
+                        : database.getDomain(col.getDomainTypeName());
+                return domain == null || domain.getBaseType() == null
+                        ? null : pgTypeName(domain.getBaseType());
+            }
+            return DdlIndexValidator.indexedTypeName(col);
+        }
+        try {
+            RuleDeparser.PgType type = RuleDeparser.typeOf(
+                    com.memgres.engine.parser.Parser.parseExpression(key), RuleDeparser.forTable(t));
+            return DdlIndexValidator.indexedTypeName(type);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * The relation an index definition is written against, as {@code pg_get_indexdef} writes it.
+     *
+     * <p>An index on a partitioned table stores no rows of its own: it is the parent that the
+     * partitions' own indexes hang from. PostgreSQL therefore writes it {@code ON ONLY}, so that
+     * replaying the definition rebuilds that parent alone instead of indexing every partition
+     * over again.
+     */
+    public static String indexRelationRef(Database database, String qualifiedTable, String shown) {
+        Table owner = resolveTable(database, qualifiedTable);
+        return owner != null && owner.getPartitionStrategy() != null ? "ONLY " + shown : shown;
     }
 
     /** Renders a partial-index predicate the way pg_get_indexdef does. */

@@ -62,18 +62,30 @@ public class Session {
         public final String sqlState;
         public final String message;
         public final String hint;
+        /**
+         * The DETAIL field. PostgreSQL puts here the list a message only counts -- the objects a
+         * CASCADE took away -- so a client that reads the count can still learn which they were.
+         */
+        public final String detail;
 
         public PgNotice(String severity, String sqlState, String message, String hint) {
+            this(severity, sqlState, message, hint, null);
+        }
+
+        public PgNotice(String severity, String sqlState, String message, String hint,
+                        String detail) {
             this.severity = severity;
             this.sqlState = sqlState;
             this.message = message;
             this.hint = hint;
+            this.detail = detail;
         }
 
         public String severity() { return severity; }
         public String sqlState() { return sqlState; }
         public String message() { return message; }
         public String hint() { return hint; }
+        public String detail() { return detail; }
 
         @Override
         public boolean equals(Object o) {
@@ -83,17 +95,18 @@ public class Session {
             return java.util.Objects.equals(severity, that.severity)
                 && java.util.Objects.equals(sqlState, that.sqlState)
                 && java.util.Objects.equals(message, that.message)
-                && java.util.Objects.equals(hint, that.hint);
+                && java.util.Objects.equals(hint, that.hint)
+                && java.util.Objects.equals(detail, that.detail);
         }
 
         @Override
         public int hashCode() {
-            return java.util.Objects.hash(severity, sqlState, message, hint);
+            return java.util.Objects.hash(severity, sqlState, message, hint, detail);
         }
 
         @Override
         public String toString() {
-            return "PgNotice[severity=" + severity + ", " + "sqlState=" + sqlState + ", " + "message=" + message + ", " + "hint=" + hint + "]";
+            return "PgNotice[severity=" + severity + ", " + "sqlState=" + sqlState + ", " + "message=" + message + ", " + "hint=" + hint + ", " + "detail=" + detail + "]";
         }
     }
     private final List<PgNotice> pendingNotices = new ArrayList<>();
@@ -228,11 +241,22 @@ public class Session {
     public long getCommandId() { return commandId; }
     /** Increment command counter (called before each statement execution). */
     public void incrementCommandId() { commandId++; }
+    /** Whether the command now running has taken the counter's current value for a write. */
+    private boolean commandIdUsed = false;
+    /**
+     * Note that the statement now running has written something, so the counter belongs to it.
+     *
+     * <p>PostgreSQL takes the command identifier when a statement opens the relation it writes,
+     * which is what makes a write consume one whether or not any row matched, and leaves it where
+     * it is for a statement that only read. See {@link #endStatementScope(boolean)}.
+     */
+    public void noteCommandIdUsed() { commandIdUsed = true; }
     /** Reset virtual transaction ID after autocommit statement completes. */
     public void resetAutocommitTxId() {
         if (status == TransactionStatus.IDLE) {
             transactionId = 0;
             commandId = 0;
+            commandIdUsed = false;
             // An autocommit statement's transaction ends here, so its locks end with it —
             // PG never leaves a FOR UPDATE or relation lock behind after an implicit commit.
             database.unlockAllRows(this);
@@ -779,6 +803,9 @@ public class Session {
         ssiTxnStartSeq = database.allocateSsiSequence();
         transactionId = database.allocateTransactionId();
         commandId = 0;
+        commandIdUsed = false;
+        partitionMovesPending.clear();
+        partitionMovesCommitted.clear();
         undoLog.clear();
         savepoints.clear();
         queryRanInTransaction = false;
@@ -848,6 +875,7 @@ public class Session {
         // Clear SSI tracking
         clearSsiState();
         takeBackLentTupleIdentities();
+        publishPartitionMoves();
         // Swap MVCC maps to new empty instances (atomic from cross-session readers' perspective)
         uncommittedInserts = new ConcurrentHashMap<>();
         uncommittedUpdates = new ConcurrentHashMap<>();
@@ -921,6 +949,8 @@ public class Session {
         // session's uncommitted work, so another session would briefly read them as committed.
         applyUndo(0);
         takeBackLentTupleIdentities();
+        // Nothing moved: the undo has put every row back in the partition it came from.
+        partitionMovesPending.clear();
         // Swap MVCC maps to new empty instances (atomic from cross-session readers' perspective)
         uncommittedInserts = new ConcurrentHashMap<>();
         uncommittedUpdates = new ConcurrentHashMap<>();
@@ -1345,6 +1375,12 @@ public class Session {
     // Notice support (RAISE NOTICE/WARNING, DDL skipped notices)
     public void addNotice(String severity, String sqlState, String message, String hint) {
         pendingNotices.add(new PgNotice(severity, sqlState, message, hint));
+    }
+
+    /** A notice that carries a DETAIL, the way a CASCADE's notice lists what it took. */
+    public void addNotice(String severity, String sqlState, String message, String hint,
+                          String detail) {
+        pendingNotices.add(new PgNotice(severity, sqlState, message, hint, detail));
     }
 
     public List<PgNotice> drainPendingNotices() {
@@ -2132,6 +2168,10 @@ public class Session {
         if (status == TransactionStatus.IN_TRANSACTION) {
             uncommittedInserts.computeIfAbsent(schemaTable,
                     k -> Collections.synchronizedSet(Collections.newSetFromMap(new IdentityHashMap<>()))).add(row);
+            for (String also : otherNamesForRow(schemaTable, row)) {
+                uncommittedInserts.computeIfAbsent(also,
+                        k -> Collections.synchronizedSet(Collections.newSetFromMap(new IdentityHashMap<>()))).add(row);
+            }
             if (isSerializable()) {
                 // An insert is what a scan of the relation would have found had it run afterwards,
                 // so it answers a read of the whole relation as well as one of this row.
@@ -2159,6 +2199,11 @@ public class Session {
             if (tableUpdates.putIfAbsent(row, oldValues) == null) {
                 lendTupleIdentity(schemaTable, row, oldValues);
             }
+            for (String also : otherNamesForRow(schemaTable, row)) {
+                uncommittedUpdates.computeIfAbsent(also,
+                        k -> Collections.synchronizedMap(new IdentityHashMap<>()))
+                        .putIfAbsent(row, oldValues);
+            }
             // The version a concurrent reader was entitled to is the one this write replaced, so
             // that is the row the two transactions conflict over.
             if (isSerializable()) ssiWriteTables.add(rowKey(schemaTable, oldValues));
@@ -2177,6 +2222,9 @@ public class Session {
                 if (snapshot != null) swapInLiveRow(snapshot, row, oldValues);
                 if (own != null) swapInLiveRow(own, row, oldValues);
                 pairSnapshotRow(schemaTable, row, row);
+                // The row that has taken the image's place in the snapshot stands for the same
+                // tuple, in the same relation, as the image it replaced.
+                inheritCopiedRowStorage(schemaTable, image, row);
             }
         }
     }
@@ -2194,9 +2242,48 @@ public class Session {
      */
     private void lendTupleIdentity(String schemaTable, Object[] row, Object[] oldValues) {
         if (database == null || oldValues == null || oldValues == row) return;
-        Map<Object[], long[]> identities = database.getRowMeta(schemaTable);
+        // Where a row lives is kept under the name of the relation that holds it, which for a write
+        // through a partitioned table or an inheritance parent is not the name the statement wrote.
+        Map<Object[], long[]> identities = database.getRowMeta(storageKeyOf(schemaTable, row));
         long[] identity = identities.get(row);
         if (identity != null) identities.put(oldValues, Arrays.copyOf(identity, identity.length));
+    }
+
+    /**
+     * The other names a row this session has just written answers to: the relation that stores it
+     * and every relation above that one, less the name the statement itself wrote.
+     *
+     * <p>A row lives in exactly one relation and may be written through any of the relations above
+     * it -- an UPDATE naming a partitioned table writes a row of a partition, one naming an
+     * inheritance parent writes a row of a child. Everybody who has to undo another session's
+     * uncommitted work does it one relation at a time, against the relation being read, so work
+     * filed only under the name the statement happened to write is invisible from every other name
+     * the same row answers to. A reader of the partition was shown a version nobody had committed,
+     * and a reader of the partitioned table was shown a row that had already been deleted.
+     */
+    private List<String> otherNamesForRow(String schemaTable, Object[] row) {
+        Table written = tableForKey(schemaTable);
+        if (written == null || !sharesItsRows(written)) return Collections.emptyList();
+        List<String> names = new ArrayList<>();
+        addWithAncestors(relationHolding(written, row), names);
+        names.remove(schemaTable);
+        return names;
+    }
+
+    /** The name the relation holding this row keeps its row metadata under. */
+    private String storageKeyOf(String schemaTable, Object[] row) {
+        Table written = tableForKey(schemaTable);
+        if (written == null || !sharesItsRows(written)) return schemaTable;
+        return keyOf(relationHolding(written, row));
+    }
+
+    private static void addWithAncestors(Table relation, List<String> names) {
+        if (relation == null) return;
+        String key = keyOf(relation);
+        if (names.contains(key)) return;
+        names.add(key);
+        addWithAncestors(relation.getPartitionParent(), names);
+        for (Table parent : relation.getInheritParents()) addWithAncestors(parent, names);
     }
 
     /**
@@ -2206,6 +2293,10 @@ public class Session {
      * server runs.
      */
     private void takeBackLentTupleIdentities() {
+        // What was lent to the copies this transaction's snapshots and images are made of goes
+        // with them: the transaction they were taken for is over.
+        copiedIdentities.clear();
+        copiedRowStorage.clear();
         if (database == null) return;
         for (String schemaTable : uncommittedUpdates.keySet()) {
             Map<Object[], long[]> identities = database.getRowMeta(schemaTable);
@@ -2213,6 +2304,40 @@ public class Session {
                 identities.remove(preImage);
             }
         }
+    }
+
+    /**
+     * The rows this transaction's UPDATEs have taken out of the partition that held them, and the
+     * ones the last transaction of this session to do so left behind when it committed.
+     *
+     * <p>PostgreSQL cannot follow a row that has changed partition: the version it wrote is in
+     * another relation, so a statement that waited to lock the old one has nowhere to go and is
+     * told the tuple moved rather than being allowed to pass silently over a row it was entitled
+     * to act on. A waiter asks the transaction it waited for, so only that transaction's moves
+     * have to be kept, and only until this session begins another.
+     */
+    private final Set<Object[]> partitionMovesPending =
+            Collections.newSetFromMap(new IdentityHashMap<Object[], Boolean>());
+    private final Set<Object[]> partitionMovesCommitted =
+            Collections.newSetFromMap(new IdentityHashMap<Object[], Boolean>());
+
+    /** Record that this transaction has taken a row out of the partition that held it. */
+    public void noteRowMovedToAnotherPartition(Object[] row) {
+        if (status == TransactionStatus.IN_TRANSACTION && row != null) {
+            partitionMovesPending.add(row);
+        }
+    }
+
+    /** Whether this session's last committed transaction moved this row to another partition. */
+    public boolean movedRowToAnotherPartition(Object[] row) {
+        return row != null && partitionMovesCommitted.contains(row);
+    }
+
+    /** What a commit leaves behind for a statement that waited on one of the rows it moved. */
+    private void publishPartitionMoves() {
+        partitionMovesCommitted.clear();
+        partitionMovesCommitted.addAll(partitionMovesPending);
+        partitionMovesPending.clear();
     }
 
     /**
@@ -2250,7 +2375,10 @@ public class Session {
 
     /** Whether this relation shares its rows with another: it has a parent, children or both. */
     private boolean relationIsLinked(String schemaTable) {
-        Table relation = tableForKey(schemaTable);
+        return sharesItsRows(tableForKey(schemaTable));
+    }
+
+    private static boolean sharesItsRows(Table relation) {
         return relation != null
                 && (relation.getPartitionParent() != null || !relation.getInheritParents().isEmpty()
                     || !relation.getChildren().isEmpty() || !relation.getPartitions().isEmpty());
@@ -2261,6 +2389,12 @@ public class Session {
         if (status == TransactionStatus.IN_TRANSACTION) {
             uncommittedDeletes.computeIfAbsent(schemaTable,
                     k -> Collections.synchronizedList(new ArrayList<>())).addAll(rows);
+            for (Object[] row : rows) {
+                for (String also : otherNamesForRow(schemaTable, row)) {
+                    uncommittedDeletes.computeIfAbsent(also,
+                            k -> Collections.synchronizedList(new ArrayList<>())).add(row);
+                }
+            }
             if (isSerializable()) {
                 for (Object[] row : rows) ssiWriteTables.add(rowKey(schemaTable, row));
             }
@@ -2373,6 +2507,16 @@ public class Session {
     /** Get or create a REPEATABLE READ snapshot for a table. Returns null if not in RR mode. */
     public List<Object[]> getOrCreateRRSnapshot(String schemaTable, List<Object[]> currentVisibleRows,
                                                 Table table) {
+        return getOrCreateRRSnapshot(schemaTable, currentVisibleRows, table, null);
+    }
+
+    /**
+     * The same, told where each of the caller's rows was read from. A partitioned table's rows and
+     * an inheritance parent's belong to the relations below it, and a snapshot that forgets which
+     * one shows every row as living nowhere and as belonging to the relation it was read through.
+     */
+    public List<Object[]> getOrCreateRRSnapshot(String schemaTable, List<Object[]> currentVisibleRows,
+                                                Table table, List<RowContext> rowSources) {
         String isolation = getEffectiveIsolationLevel();
         if (!"repeatable read".equals(isolation) && !"serializable".equals(isolation)) {
             return null; // Not in RR/SERIALIZABLE mode
@@ -2413,12 +2557,28 @@ public class Session {
         // partition/inheritance child rows via getAllRowsWithSource.
         List<Object[]> snapshot = new ArrayList<>(currentVisibleRows.size());
         Map<Object[], Object[]> paired = new IdentityHashMap<>();
-        for (Object[] row : currentVisibleRows) {
+        // Whatever the snapshot this one replaces lent to its own copies is nobody's to read now.
+        forgetCopiedTupleIdentities(schemaTable);
+        for (int i = 0; i < currentVisibleRows.size(); i++) {
+            Object[] row = currentVisibleRows.get(i);
             Object[] image = Arrays.copyOf(row, row.length);
             snapshot.add(image);
+            // A row this relation reads through a partition or an inheritance child lives there,
+            // and its tuple identity is kept under that relation's name rather than this one's --
+            // against the row as that relation stores it, which is not the copy read up here.
+            RowContext.TableBinding source = readFrom(rowSources, i);
             // What the caller can see may be the pre-image of another session's uncommitted work;
-            // what this transaction would later write to is the stored row behind it.
-            paired.put(database.liveRowForSnapshotCopy(row, this), image);
+            // what this transaction would later write to is the stored row behind it, which for a
+            // row read through a relation above is the one that relation holds and not the copy.
+            Object[] tuple = source == null || source.storedRow() == null ? row : source.storedRow();
+            paired.put(database.liveRowForSnapshotCopy(tuple, this), image);
+            Table storage = source == null ? null : source.sourceTable();
+            if (storage == null || storage == table) {
+                lendTupleIdentityToCopy(schemaTable, row, image);
+            } else {
+                lendTupleIdentityToCopy(keyOf(storage), source.storedRow(), image);
+                noteCopiedRowStorage(schemaTable, image, storage, null);
+            }
         }
         rrSnapshots.put(schemaTable, snapshot);
         rrSnapshotsOwn.remove(schemaTable);
@@ -2647,10 +2807,11 @@ public class Session {
      */
     private void showRowToAncestors(String schemaTable, Object[] row) {
         if (rrSnapshots.isEmpty()) return;
-        showRowToAncestors(tableForKey(schemaTable), row, row);
+        Table home = tableForKey(schemaTable);
+        showRowToAncestors(home, home, row, row);
     }
 
-    private void showRowToAncestors(Table storage, Object[] stored, Object[] row) {
+    private void showRowToAncestors(Table storage, Table home, Object[] stored, Object[] row) {
         if (storage == null) return;
         List<Table> parents = new ArrayList<>();
         if (storage.getPartitionParent() != null) parents.add(storage.getPartitionParent());
@@ -2662,7 +2823,10 @@ public class Session {
             if (snapshot != null) snapshot.add(mapped);
             // The row belongs to the child's storage, so ONLY on the parent still does not see it.
             pairSnapshotRow(key, stored, mapped);
-            showRowToAncestors(parent, stored, mapped);
+            // Where the row lives and which relation it belongs to belong to that storage as well,
+            // so the copy the relation above reads is told which row it stands for.
+            noteCopiedRowStorage(key, mapped, home, stored);
+            showRowToAncestors(parent, home, stored, mapped);
         }
     }
 
@@ -2712,16 +2876,23 @@ public class Session {
         rrSnapshotLive.put(schemaTable, paired);
         List<Object[]> images = new ArrayList<>(table.getRows().size());
         List<Object[]> from = new ArrayList<>(table.getRows().size());
-        collectOwnCommittedRows(table, images, from);
+        // Which relation each image's row lives in: this one, or one of the relations below it.
+        List<Table> storedIn = new ArrayList<>(table.getRows().size());
+        collectOwnCommittedRows(table, images, from, storedIn);
         if (!table.getChildren().isEmpty() || !table.getPartitions().isEmpty()) {
             // What ONLY reads is what the relation stores itself, which is what stands here
             // before the rows its descendants hold for it are added.
             rrSnapshotsOwn.put(schemaTable, new ArrayList<>(images));
-            for (Table child : table.getChildren()) collectUp(child, table, images, from);
-            for (Table partition : table.getPartitions()) collectUp(partition, table, images, from);
+            for (Table child : table.getChildren()) collectUp(child, table, images, from, storedIn);
+            for (Table partition : table.getPartitions()) {
+                collectUp(partition, table, images, from, storedIn);
+            }
         }
         for (int i = 0; i < images.size(); i++) {
             if (from.get(i) != null) paired.put(from.get(i), images.get(i));
+            if (storedIn.get(i) != table) {
+                noteCopiedRowStorage(schemaTable, images.get(i), storedIn.get(i), null);
+            }
         }
         return images;
     }
@@ -2732,8 +2903,8 @@ public class Session {
      * another session's uncommitted delete still keeps alive.
      */
     private void collectOwnCommittedRows(Table storage, List<Object[]> images,
-                                         List<Object[]> from) {
-        String key = storage.getSchemaName() + "." + storage.getName();
+                                         List<Object[]> from, List<Table> storedIn) {
+        String key = keyOf(storage);
         Set<Object[]> otherInserts = Collections.newSetFromMap(new IdentityHashMap<>());
         Map<Object[], Object[]> otherUpdates = new IdentityHashMap<>();
         List<Object[]> otherDeletes = new ArrayList<>();
@@ -2747,18 +2918,81 @@ public class Session {
             if (otherInserts.contains(row)) continue; // uncommitted insert: invisible
             Object[] oldValues = otherUpdates.get(row);
             Object[] src = oldValues != null ? oldValues : row;
-            images.add(Arrays.copyOf(src, src.length));
+            Object[] image = Arrays.copyOf(src, src.length);
+            images.add(image);
             from.add(row);
+            storedIn.add(storage);
+            lendTupleIdentityToCopy(key, src, image);
         }
         for (Object[] deletedRow : otherDeletes) {
             if (otherInserts.contains(deletedRow)) continue; // inserted+deleted in same txn
+            // A row deleted through a relation above the one that stores it is filed under both
+            // names, and it belongs to the one below: that relation's own pass puts it back, in
+            // its own columns, and this one would otherwise put it back a second time.
+            if (deleteBelongsBelow(storage, deletedRow)) continue;
             // If the row was updated before being deleted, the committed state
             // is the pre-update old values, not the row's current contents.
             Object[] oldValues = otherUpdates.get(deletedRow);
             Object[] src = oldValues != null ? oldValues : deletedRow;
-            images.add(Arrays.copyOf(src, src.length));
+            Object[] image = Arrays.copyOf(src, src.length);
+            images.add(image);
             from.add(null);
+            // A statement written against this relation may have deleted a row one of the
+            // relations below it holds, and while the delete is uncommitted the row is still
+            // theirs: where it lives and which relation it belongs to are answered from there.
+            Table home = relationHolding(storage, src);
+            storedIn.add(home);
+            lendTupleIdentityToCopy(home == storage ? key : keyOf(home), src, image);
         }
+    }
+
+    /**
+     * Which of this relation and the relations below it a row belongs to.
+     *
+     * <p>A write is recorded against the relation the statement named, which for a partitioned
+     * table or an inheritance parent is not the relation the row lives in. Where a row lives is
+     * kept under the name of the one that does hold it, so that is where it has to be looked for.
+     */
+    private Table relationHolding(Table relation, Object[] row) {
+        if (database == null || row == null) return relation;
+        if (database.getRowMeta(keyOf(relation)).containsKey(row)) return relation;
+        Table below = relationHoldingBelow(relation, row);
+        return below != null ? below : relation;
+    }
+
+    private Table relationHoldingBelow(Table relation, Object[] row) {
+        List<Table> descendants = new ArrayList<>(relation.getChildren());
+        descendants.addAll(relation.getPartitions());
+        for (Table descendant : descendants) {
+            if (database.getRowMeta(keyOf(descendant)).containsKey(row)) return descendant;
+            Table found = relationHoldingBelow(descendant, row);
+            if (found != null) return found;
+        }
+        return null;
+    }
+
+    /**
+     * Whether one of the relations below this one has the same deleted row filed under its own
+     * name, which is how a delete says the row was not this relation's to hold.
+     */
+    private boolean deleteBelongsBelow(Table relation, Object[] row) {
+        List<Table> descendants = new ArrayList<>(relation.getChildren());
+        descendants.addAll(relation.getPartitions());
+        for (Table descendant : descendants) {
+            for (Session other : database.getActiveSessions()) {
+                if (other == this || !other.isInTransaction()) continue;
+                for (Object[] gone : other.getUncommittedDeletes(keyOf(descendant))) {
+                    if (gone == row) return true;
+                }
+            }
+            if (deleteBelongsBelow(descendant, row)) return true;
+        }
+        return false;
+    }
+
+    /** Which of this relation and the relations below it stores a row. See {@link #relationHolding}. */
+    public Table relationStoringRow(Table relation, Object[] row) {
+        return relation == null ? null : relationHolding(relation, row);
     }
 
     /**
@@ -2770,15 +3004,27 @@ public class Session {
      * column order the relation itself declares. Each of them is a relation in its own right, so
      * another session's uncommitted work on one is undone under that one's own name.
      */
-    private void collectUp(Table child, Table parent, List<Object[]> images, List<Object[]> from) {
+    private void collectUp(Table child, Table parent, List<Object[]> images, List<Object[]> from,
+                           List<Table> storedIn) {
         List<Object[]> below = new ArrayList<>();
         List<Object[]> belowFrom = new ArrayList<>();
-        collectOwnCommittedRows(child, below, belowFrom);
-        for (Table grandchild : child.getChildren()) collectUp(grandchild, child, below, belowFrom);
-        for (Table partition : child.getPartitions()) collectUp(partition, child, below, belowFrom);
+        List<Table> belowStorage = new ArrayList<>();
+        collectOwnCommittedRows(child, below, belowFrom, belowStorage);
+        for (Table grandchild : child.getChildren()) {
+            collectUp(grandchild, child, below, belowFrom, belowStorage);
+        }
+        for (Table partition : child.getPartitions()) {
+            collectUp(partition, child, below, belowFrom, belowStorage);
+        }
         for (int i = 0; i < below.size(); i++) {
-            images.add(rowAsParentReadsIt(child, parent, below.get(i)));
+            Object[] mapped = rowAsParentReadsIt(child, parent, below.get(i));
+            // Rearranging a row to the columns of the relation above it makes another copy of it,
+            // and the tuple that copy stands for is still the one its own relation stores.
+            Table home = belowStorage.get(i);
+            lendCopiedTupleIdentity(keyOf(home), below.get(i), mapped);
+            images.add(mapped);
             from.add(belowFrom.get(i));
+            storedIn.add(home);
         }
     }
 
@@ -2814,6 +3060,11 @@ public class Session {
         if (database == null || table == null || table.isRlsEnabled()) return null;
         if (!table.getPartitions().isEmpty() || !table.getChildren().isEmpty()
                 || table.getParentTable() != null) return null;
+        // A relation this transaction already reads from a snapshot needs no image of its own:
+        // what it holds for this transaction is fixed for the whole of it, wait or no wait.
+        if (rrSnapshots.containsKey(schemaTable)) return null;
+        // Whatever the image this one replaces lent to its own copies is nobody's to read now.
+        forgetCopiedTupleIdentities(schemaTable);
         Set<Object[]> notCommittedYet =
                 Collections.newSetFromMap(new IdentityHashMap<Object[], Boolean>());
         Map<Object[], Object[]> beforeTheirWrite = new IdentityHashMap<>();
@@ -2826,12 +3077,12 @@ public class Session {
         }
         List<Object[]> image = new ArrayList<>();
         for (Object[] row : table.getRows()) {
-            addToImage(image, row, notCommittedYet, beforeTheirWrite);
+            addToImage(schemaTable, image, row, notCommittedYet, beforeTheirWrite);
         }
         // A row another session has deleted without committing is not in the relation any more,
         // and is still one of its rows to everybody else.
         for (Object[] row : goneButUncommitted) {
-            addToImage(image, row, notCommittedYet, beforeTheirWrite);
+            addToImage(schemaTable, image, row, notCommittedYet, beforeTheirWrite);
         }
         return image;
     }
@@ -2841,11 +3092,15 @@ public class Session {
      * a write that lands while a statement is still reading from the image goes into the stored
      * row itself, and the image is what that statement began with.
      */
-    private static void addToImage(List<Object[]> image, Object[] row, Set<Object[]> notCommittedYet,
-                                   Map<Object[], Object[]> beforeTheirWrite) {
+    private void addToImage(String schemaTable, List<Object[]> image, Object[] row,
+                            Set<Object[]> notCommittedYet,
+                            Map<Object[], Object[]> beforeTheirWrite) {
         if (notCommittedYet.contains(row)) return;
         Object[] committed = beforeTheirWrite.containsKey(row) ? beforeTheirWrite.get(row) : row;
-        if (committed != null) image.add(Arrays.copyOf(committed, committed.length));
+        if (committed == null) return;
+        Object[] asCommitted = Arrays.copyOf(committed, committed.length);
+        image.add(asCommitted);
+        lendTupleIdentityToCopy(schemaTable, committed, asCommitted);
     }
 
     /**
@@ -2865,6 +3120,202 @@ public class Session {
     public void stopReadingImageOf(String schemaTable) {
         rrSnapshots.remove(schemaTable);
         rrSnapshotLive.remove(schemaTable);
+    }
+
+    /** The relations a statement of this session is holding a fixed image of. */
+    private final List<String> statementImages = new ArrayList<>();
+
+    /**
+     * Read every relation another transaction is part-way through writing from a fixed image of
+     * what the committed transactions left in it, for as long as the statement now running lasts.
+     *
+     * <p>PostgreSQL re-reads one thing and one thing only once a wait has ended: the row that was
+     * waited for, against the version that transaction left behind. Everything else the statement
+     * reads -- a subquery in the qualification, one on the right of an assignment, one in
+     * RETURNING, the relation an UPDATE names in its FROM -- is still read through the snapshot
+     * the statement began with, so a statement that waited goes on seeing what it started with.
+     * Only a relation somebody is writing can change under it while it waits, so those are the
+     * ones an image is worth the copy of.
+     */
+    public void readImagesForStatement(String schemaTable, Table table) {
+        installStatementImage(schemaTable, table);
+        if (database == null) return;
+        Set<String> beingWritten = new LinkedHashSet<>();
+        for (Session other : database.getActiveSessions()) {
+            if (other == this || !other.isInTransaction()) continue;
+            other.addUncommittedRelationKeys(beingWritten);
+        }
+        for (String key : beingWritten) {
+            if (!key.equals(schemaTable)) installStatementImage(key, tableForKey(key));
+        }
+    }
+
+    private void installStatementImage(String schemaTable, Table table) {
+        if (table == null) return;
+        List<Object[]> image = committedImageOf(schemaTable, table);
+        if (image != null && readImageOf(schemaTable, image)) statementImages.add(schemaTable);
+    }
+
+    /** Add the relations this transaction has written to and not committed. */
+    private void addUncommittedRelationKeys(Set<String> keys) {
+        for (Map.Entry<String, Set<Object[]>> written : uncommittedInserts.entrySet()) {
+            if (!written.getValue().isEmpty()) keys.add(written.getKey());
+        }
+        for (Map.Entry<String, Map<Object[], Object[]>> written : uncommittedUpdates.entrySet()) {
+            if (!written.getValue().isEmpty()) keys.add(written.getKey());
+        }
+        for (Map.Entry<String, List<Object[]>> written : uncommittedDeletes.entrySet()) {
+            if (!written.getValue().isEmpty()) keys.add(written.getKey());
+        }
+    }
+
+    /**
+     * Give the images back once the statement reading through them is over. Outside REPEATABLE
+     * READ, PostgreSQL gives every statement a snapshot of its own, so the next one reads the
+     * relations as the committed transactions have left them by then.
+     */
+    public void releaseStatementImages() {
+        if (statementImages.isEmpty()) return;
+        for (String schemaTable : statementImages) stopReadingImageOf(schemaTable);
+        statementImages.clear();
+    }
+
+    /**
+     * The tuple identity each snapshot or image copy stands for, by relation. It is this
+     * session's own book because a copy is: no other session can be shown one, and the whole of
+     * it goes when the snapshot it was written for does.
+     */
+    private final Map<String, Map<Object[], long[]>> copiedIdentities = new LinkedHashMap<>();
+
+    /**
+     * Hand a snapshot's or an image's copy of a row the identity the stored row is wearing.
+     *
+     * <p>Where a row sits and which transaction wrote it belong to the row rather than to the
+     * values it holds: a transaction reading from a snapshot is reading a version that is still
+     * there, at the place it has always occupied, and PostgreSQL answers ctid, xmin and the rest
+     * from that place. A snapshot made of fresh copies carries none of it, so every row a
+     * repeatable-read transaction read came back living at (0,0) and written by transaction 0 --
+     * with no concurrency involved at all.
+     */
+    private void lendTupleIdentityToCopy(String schemaTable, Object[] stored, Object[] copy) {
+        if (database == null || stored == null || copy == null || stored == copy) return;
+        long[] identity = database.getRowMeta(schemaTable).get(stored);
+        if (identity == null) return;
+        rememberCopiedIdentity(schemaTable, copy, identity);
+    }
+
+    /**
+     * Hand a copy of a copy the identity the first one already stands for.
+     *
+     * <p>A row a relation reads through one of its partitions or its inheritance children is
+     * copied twice: once out of the storage relation and once again into the columns the relation
+     * above declares. The second copy stands for the same tuple as the first, and it is the one
+     * that ends up in the snapshot.
+     */
+    private void lendCopiedTupleIdentity(String schemaTable, Object[] from, Object[] to) {
+        if (from == null || to == null || from == to) return;
+        long[] identity = tupleIdentityOfCopy(schemaTable, from);
+        if (identity == null) return;
+        rememberCopiedIdentity(schemaTable, to, identity);
+    }
+
+    private void rememberCopiedIdentity(String schemaTable, Object[] copy, long[] identity) {
+        Map<Object[], long[]> copies = copiedIdentities.get(schemaTable);
+        if (copies == null) {
+            copies = new IdentityHashMap<>();
+            copiedIdentities.put(schemaTable, copies);
+        }
+        copies.put(copy, Arrays.copyOf(identity, identity.length));
+    }
+
+    /** What a copy this session reads a relation through stands for, if it stands for anything. */
+    public long[] tupleIdentityOfCopy(String schemaTable, Object[] row) {
+        Map<Object[], long[]> copies = copiedIdentities.get(schemaTable);
+        return copies == null ? null : copies.get(row);
+    }
+
+    /**
+     * Which relation stores the row each snapshot copy stands for, where that is not the relation
+     * the snapshot is of. A partitioned table's snapshot is made of what its partitions hold and
+     * an inheritance parent's holds what its children do; which relation a row belongs to and
+     * where in it the row lives are properties of that relation, and PostgreSQL answers tableoid
+     * and ctid from it however the row was reached.
+     */
+    private final Map<String, Map<Object[], RowHome>> copiedRowStorage = new LinkedHashMap<>();
+
+    /**
+     * Where a row a snapshot holds actually lives: the relation that stores it and, where the
+     * snapshot stands for a row that is still there to be read, that row itself.
+     */
+    private static final class RowHome {
+        final Table storage;
+        final Object[] stored;
+
+        RowHome(Table storage, Object[] stored) {
+            this.storage = storage;
+            this.stored = stored;
+        }
+    }
+
+    /**
+     * Record that a row of this session's snapshot of {@code schemaTable} lives in {@code storage}.
+     * {@code stored} is the row it stands for there, or null when the snapshot's own copy is what
+     * the tuple has to be read from -- a row another session has since written or deleted.
+     */
+    private void noteCopiedRowStorage(String schemaTable, Object[] copy, Table storage,
+                                      Object[] stored) {
+        if (copy == null || storage == null) return;
+        Map<Object[], RowHome> rows = copiedRowStorage.get(schemaTable);
+        if (rows == null) {
+            rows = new IdentityHashMap<>();
+            copiedRowStorage.put(schemaTable, rows);
+        }
+        rows.put(copy, new RowHome(storage, stored));
+    }
+
+    /** Give a row that has taken a snapshot copy's place whatever the copy stood for. */
+    private void inheritCopiedRowStorage(String schemaTable, Object[] copy, Object[] taking) {
+        Map<Object[], RowHome> rows = copiedRowStorage.get(schemaTable);
+        RowHome home = rows == null || copy == null ? null : rows.get(copy);
+        if (home != null) rows.put(taking, new RowHome(home.storage, taking));
+    }
+
+    /**
+     * The relation that stores a row this session reads through its snapshot of
+     * {@code schemaTable}, or null when the relation stores the row itself.
+     */
+    public Table snapshotRowStorage(String schemaTable, Object[] row) {
+        Map<Object[], RowHome> rows = copiedRowStorage.get(schemaTable);
+        RowHome home = rows == null ? null : rows.get(row);
+        return home == null ? null : home.storage;
+    }
+
+    /**
+     * The stored row a snapshot row of {@code schemaTable} stands for, where it stands for one
+     * that is still in the relation below. Null where the snapshot's copy is the tuple to read.
+     */
+    public Object[] snapshotRowTuple(String schemaTable, Object[] row) {
+        Map<Object[], RowHome> rows = copiedRowStorage.get(schemaTable);
+        RowHome home = rows == null ? null : rows.get(row);
+        return home == null ? null : home.stored;
+    }
+
+    /** The name a relation is snapshotted and its row metadata is kept under. */
+    private static String keyOf(Table table) {
+        return table.getSchemaName() + "." + table.getName();
+    }
+
+    /** Where the caller read its {@code i}th row from, or null when it did not say. */
+    private static RowContext.TableBinding readFrom(List<RowContext> rowSources, int i) {
+        if (rowSources == null || i >= rowSources.size()) return null;
+        List<RowContext.TableBinding> bound = rowSources.get(i).getBindings();
+        return bound.isEmpty() ? null : bound.get(0);
+    }
+
+    /** Forget what was lent to copies of one relation's rows that nothing reads any more. */
+    private void forgetCopiedTupleIdentities(String schemaTable) {
+        copiedIdentities.remove(schemaTable);
+        copiedRowStorage.remove(schemaTable);
     }
 
     /** Check if a REPEATABLE READ snapshot already exists for this table. */
@@ -3059,7 +3510,16 @@ public class Session {
         // Every write passes here, and it passes here before it happens, which is what both of the
         // following need: the row is still the version the statement began with.
         noteCommandWrite(entry);
-        if (entry instanceof UpdateUndo) ((UpdateUndo) entry).rememberRowIdentity(database);
+        // A statement that has written anything -- rows of its own or the catalogue entries a
+        // CREATE or an ALTER leaves behind -- has taken the command counter's current value, and
+        // the next statement of the transaction reads the one after it.
+        commandIdUsed = true;
+        if (entry instanceof UpdateUndo) {
+            UpdateUndo update = (UpdateUndo) entry;
+            String written = (update.schema() != null ? update.schema() : "public")
+                    + "." + update.tableName();
+            update.rememberRowIdentity(database, storageKeyOf(written, update.row()));
+        }
     }
 
     /** Where the undo log stands now, for a caller that may need to drop what it adds. */
@@ -3113,6 +3573,7 @@ public class Session {
         if (stmtScopeDepth == 0) {
             stmtScopeMark = undoLog.size();
             stmtScopeOutsideTransaction = status != TransactionStatus.IN_TRANSACTION;
+            releaseStatementImages();
         }
         stmtScopeDepth++;
     }
@@ -3125,11 +3586,26 @@ public class Session {
     public void endStatementScope(boolean failed) {
         if (stmtScopeDepth > 0) stmtScopeDepth--;
         if (stmtScopeDepth > 0) return;
+        // PostgreSQL's command counter moves on for a command that used it -- one that wrote rows,
+        // its own or the catalogue's -- and stands still for one that only read. cmin and cmax
+        // report the counter as it stood when the row version was written, so the second write of
+        // a transaction answers 1 where the first answered 0. Outside an explicit transaction each
+        // statement is a transaction of its own and every one of them starts again from zero.
+        if (commandIdUsed) {
+            commandIdUsed = false;
+            commandId++;
+        }
+        if (stmtScopeOutsideTransaction && status != TransactionStatus.IN_TRANSACTION) {
+            commandId = 0;
+        }
         // A relation's statement-level triggers are fired once per statement, so what this one
         // fired is forgotten with it. A statement that failed owes nothing either: the rows its
         // referential actions wrote are about to be undone.
         statementTriggerScope.clear();
         endOfStatementTriggers.clear();
+        // A statement that had to wait read the relations it found through images of them for as
+        // long as it ran; the next statement reads them as they stand now.
+        releaseStatementImages();
         int mark = stmtScopeMark;
         boolean outside = stmtScopeOutsideTransaction;
         stmtScopeMark = -1;
@@ -3283,6 +3759,40 @@ public class Session {
             // registry beside it was told the type had gone.
             db.removeCompositeType(TypeNamespace.key(schema, typeName));
             db.unregisterSchemaObject(schema, "composite", typeName);
+        }
+    }
+
+    /**
+     * Undo an ALTER TYPE that rewrote a composite's attributes.
+     *
+     * <p>DDL is transactional, and what a type is made of is read by every value of it and by
+     * every column declared with it. An attribute added, dropped, renamed or retyped inside a
+     * transaction that rolled back has to leave the list it found: otherwise the rolled-back
+     * attribute goes on being part of the type for every session, and the placeholder a rolled-back
+     * drop left behind goes on holding a number no statement ever took.
+     */
+    public static final class AlterCompositeTypeUndo implements UndoEntry {
+        public final String typeKey;
+        private final List<com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField> fields;
+
+        public AlterCompositeTypeUndo(String typeKey,
+                List<com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField> fields) {
+            this.typeKey = typeKey;
+            this.fields = fields == null ? null
+                    : new ArrayList<com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField>(
+                            fields);
+        }
+
+        @Override
+        public void undo(Database db) {
+            if (fields != null) db.replaceCompositeFields(typeKey, fields);
+        }
+
+        public String typeKey() { return typeKey; }
+
+        @Override
+        public String toString() {
+            return "AlterCompositeTypeUndo[typeKey=" + typeKey + "]";
         }
     }
 
@@ -3493,10 +4003,14 @@ public class Session {
          * answers with the ctid, xmin and cmin it had. The engine hands an updated row a fresh
          * tuple id, which would otherwise leave the row wearing the identity of a write that never
          * happened. This is the last moment the row still carries the old one.
+         *
+         * @param storageKey the name the relation that holds the row keeps its metadata under,
+         *        which for a write through a partitioned table or an inheritance parent is not the
+         *        name the statement wrote
          */
-        void rememberRowIdentity(Database db) {
+        void rememberRowIdentity(Database db, String storageKey) {
             if (db == null || metaKey != null) return;
-            metaKey = (schema != null ? schema : "public") + "." + tableName;
+            metaKey = storageKey;
             long[] meta = db.getRowMeta(metaKey).get(row);
             if (meta != null) priorMeta = java.util.Arrays.copyOf(meta, meta.length);
         }
@@ -3616,6 +4130,8 @@ public class Session {
         public final Table table;
         /** Triggers the DROP removed; a rollback has to put them back with the table. */
         public final java.util.List<PgTrigger> triggers;
+        /** Rules the DROP removed, for the same reason: a rule belongs to its relation. */
+        public final Database.RuleSnapshot rules;
 
         public DropTableUndo(String schema, String tableName, Table table) {
             this(schema, tableName, table, null);
@@ -3623,10 +4139,16 @@ public class Session {
 
         public DropTableUndo(String schema, String tableName, Table table,
                              java.util.List<PgTrigger> triggers) {
+            this(schema, tableName, table, triggers, null);
+        }
+
+        public DropTableUndo(String schema, String tableName, Table table,
+                             java.util.List<PgTrigger> triggers, Database.RuleSnapshot rules) {
             this.schema = schema;
             this.tableName = tableName;
             this.table = table;
             this.triggers = triggers;
+            this.rules = rules;
         }
 
         @Override
@@ -3634,6 +4156,7 @@ public class Session {
             Schema s = db.getSchema(schema);
             if (s != null) s.addTable(table);
             db.restoreTriggersForTable(tableName, triggers);
+            db.restoreRules(rules);
             // If the dropped table was a partition, re-attach it to its parent's routing list
             Table parent = table.getPartitionParent();
             if (parent != null && !parent.getPartitions().contains(table)) {
@@ -3671,6 +4194,25 @@ public class Session {
         @Override
         public String toString() {
             return "DropTableUndo[schema=" + schema + ", " + "tableName=" + tableName + ", " + "table=" + table + "]";
+        }
+    }
+
+    /**
+     * Undo a drop that took a rule off a relation the statement never named. A rule that merely
+     * writes to the relation being dropped sits on a relation of its own, so it is in no
+     * relation's undo record; PostgreSQL rolls a catalogue change back whole, and leaving these
+     * behind left that relation without the rule it was written with.
+     */
+    public static final class DropRulesUndo implements UndoEntry {
+        public final Database.RuleSnapshot rules;
+
+        public DropRulesUndo(Database.RuleSnapshot rules) {
+            this.rules = rules;
+        }
+
+        @Override
+        public void undo(Database db) {
+            db.restoreRules(rules);
         }
     }
 
@@ -3899,6 +4441,8 @@ public class Session {
         public final Database.ViewDef view;
         /** Triggers the DROP removed; a rollback has to put them back with the view. */
         public final java.util.List<PgTrigger> triggers;
+        /** Rules the DROP removed, for the same reason: a rule belongs to its relation. */
+        public final Database.RuleSnapshot rules;
 
         public DropViewUndo(String viewName, Database.ViewDef view) {
             this(viewName, view, null);
@@ -3906,15 +4450,22 @@ public class Session {
 
         public DropViewUndo(String viewName, Database.ViewDef view,
                             java.util.List<PgTrigger> triggers) {
+            this(viewName, view, triggers, null);
+        }
+
+        public DropViewUndo(String viewName, Database.ViewDef view,
+                            java.util.List<PgTrigger> triggers, Database.RuleSnapshot rules) {
             this.viewName = viewName;
             this.view = view;
             this.triggers = triggers;
+            this.rules = rules;
         }
 
         @Override
         public void undo(Database db) {
             db.addView(view);
             db.restoreTriggersForTable(RelationNamespace.bareName(viewName), triggers);
+            db.restoreRules(rules);
         }
 
         public String viewName() { return viewName; }
@@ -4052,7 +4603,9 @@ public class Session {
             // undo. Asking for the column then raised over the top of the refusal that was on its
             // way out, and the reader was told the column does not exist instead of why.
             if (table != null && table.getColumnIndex(columnName) >= 0) {
-                table.removeColumn(columnName);
+                // The column was never part of the relation, so its number goes back with it:
+                // PostgreSQL hands the next ADD COLUMN that same number rather than one past it.
+                table.removeColumn(columnName, false);
             }
         }
 
@@ -4139,6 +4692,169 @@ public class Session {
         @Override
         public String toString() {
             return "DropColumnUndo[schema=" + schema + ", " + "tableName=" + tableName + ", " + "column=" + column + ", " + "position=" + position + ", " + "values=" + values + "]";
+        }
+    }
+
+    /**
+     * Put back the constraints a dropped column took with it.
+     *
+     * <p>A rule written over a column cannot outlive the column, so dropping one drops the other;
+     * a statement that rolled back dropped neither, and a relation left without the rule would go
+     * on taking rows it was written to refuse. The constraints are restored after the column,
+     * because a key constraint indexes the column's position.
+     */
+    public static final class DropColumnConstraintsUndo implements UndoEntry {
+        public final String schema;
+        public final String tableName;
+        private final List<StoredConstraint> constraints;
+
+        public DropColumnConstraintsUndo(String schema, String tableName,
+                List<StoredConstraint> constraints) {
+            this.schema = schema;
+            this.tableName = tableName;
+            this.constraints = constraints;
+        }
+
+        @Override
+        public void undo(Database db) {
+            Schema s = db.getSchema(schema);
+            if (s == null) return;
+            Table table = s.getTable(tableName);
+            if (table == null) return;
+            for (StoredConstraint sc : constraints) {
+                if (sc.getName() != null && table.getConstraint(sc.getName()) != null) continue;
+                table.addConstraint(sc);
+            }
+        }
+
+        @Override
+        public String toString() {
+            return "DropColumnConstraintsUndo[schema=" + schema + ", tableName=" + tableName
+                    + ", constraints=" + constraints.size() + "]";
+        }
+    }
+
+    /**
+     * Undo a column drop that reached a relation because the parent it takes the column from lost
+     * it. The column comes back holding what it held, and recorded as the parent's again: restored
+     * as a column of the relation's own it would claim to have been declared where it was only
+     * ever inherited, and restored empty it would not be the column the transaction dropped.
+     */
+    public static final class DropInheritedColumnUndo implements UndoEntry {
+        public final String schema;
+        public final String tableName;
+        public final Column column;
+        public final int position;
+        private final List<Object> values;
+        private final boolean columnInherited;
+        private final boolean notNullInherited;
+
+        public DropInheritedColumnUndo(String schema, String tableName, Column column,
+                int position, List<Object> values, boolean columnInherited,
+                boolean notNullInherited) {
+            this.schema = schema;
+            this.tableName = tableName;
+            this.column = column;
+            this.position = position;
+            this.values = values;
+            this.columnInherited = columnInherited;
+            this.notNullInherited = notNullInherited;
+        }
+
+        @Override
+        public void undo(Database db) {
+            Schema s = db.getSchema(schema);
+            if (s == null) return;
+            Table table = s.getTable(tableName);
+            if (table == null) return;
+            table.addColumnAt(column, position, values);
+            if (columnInherited) table.markColumnInherited(column.getName());
+            if (notNullInherited) table.markNotNullInherited(column.getName());
+        }
+
+        @Override
+        public String toString() {
+            return "DropInheritedColumnUndo[schema=" + schema + ", tableName=" + tableName
+                    + ", column=" + column + ", position=" + position + "]";
+        }
+    }
+
+    /**
+     * Undo the record that a relation's column has become its own. ALTER TABLE ONLY ... DROP
+     * COLUMN leaves every child holding the column as one it declared itself; a statement that
+     * rolled back leaves each of them holding it on their parent's behalf, exactly as before.
+     */
+    public static final class ColumnLocalityUndo implements UndoEntry {
+        public final String schema;
+        public final String tableName;
+        public final String columnName;
+
+        public ColumnLocalityUndo(String schema, String tableName, String columnName) {
+            this.schema = schema;
+            this.tableName = tableName;
+            this.columnName = columnName;
+        }
+
+        @Override
+        public void undo(Database db) {
+            Schema s = db.getSchema(schema);
+            if (s == null) return;
+            Table table = s.getTable(tableName);
+            if (table != null) table.markColumnInherited(columnName);
+        }
+
+        @Override
+        public String toString() {
+            return "ColumnLocalityUndo[schema=" + schema + ", tableName=" + tableName
+                    + ", columnName=" + columnName + "]";
+        }
+    }
+
+    /**
+     * Undo the counts a relation kept when the parent it takes a column from dropped that column
+     * from itself. A statement that rolled back leaves every one of them counting the parent
+     * again, because the parent has its column -- and the rules on it -- back.
+     */
+    public static final class InheritedConstraintCountUndo implements UndoEntry {
+        public final String schema;
+        public final String tableName;
+        public final String columnName;
+        private final List<String> constraintNames;
+        private final boolean notNullCounted;
+        private final String previousNotNullName;
+
+        public InheritedConstraintCountUndo(String schema, String tableName, String columnName,
+                List<String> constraintNames, boolean notNullCounted,
+                String previousNotNullName) {
+            this.schema = schema;
+            this.tableName = tableName;
+            this.columnName = columnName;
+            this.constraintNames = constraintNames;
+            this.notNullCounted = notNullCounted;
+            this.previousNotNullName = previousNotNullName;
+        }
+
+        @Override
+        public void undo(Database db) {
+            Schema s = db.getSchema(schema);
+            if (s == null) return;
+            Table table = s.getTable(tableName);
+            if (table == null) return;
+            for (String conname : constraintNames) {
+                StoredConstraint sc = table.getConstraint(conname);
+                if (sc != null) sc.setRetainedInheritCount(sc.getRetainedInheritCount() - 1);
+            }
+            if (notNullCounted) {
+                table.setRetainedNotNullInheritCount(columnName,
+                        table.retainedNotNullInheritCount(columnName) - 1);
+                table.pinInheritedNotNullName(columnName, previousNotNullName);
+            }
+        }
+
+        @Override
+        public String toString() {
+            return "InheritedConstraintCountUndo[schema=" + schema + ", tableName=" + tableName
+                    + ", columnName=" + columnName + "]";
         }
     }
 

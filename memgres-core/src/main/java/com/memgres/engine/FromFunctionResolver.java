@@ -246,8 +246,8 @@ class FromFunctionResolver {
         if (fname.equals("ts_parse")) return resolveTsParse(alias, colAliases, evalArgs);
         if (fname.equals("ts_token_type")) return resolveTsTokenType(alias, colAliases, evalArgs);
         if (fname.equals("pg_listening_channels")) return resolvePgListeningChannels(alias);
-        if (fname.equals("skeys")) return resolveHstoreSkeys(alias, evalArgs);
-        if (fname.equals("svals")) return resolveHstoreSvals(alias, evalArgs);
+        if (fname.equals("skeys")) return resolveHstoreSkeys(alias, colAliases, evalArgs);
+        if (fname.equals("svals")) return resolveHstoreSvals(alias, colAliases, evalArgs);
         if (fname.equals("each")) return resolveHstoreEach(alias, colAliases, evalArgs);
 
         // Try user-defined function
@@ -398,7 +398,7 @@ class FromFunctionResolver {
      * already decided. Named one by one rather than by exclusion so that a function whose shape
      * this file does not know stays as permissive as it was.
      */
-    private static final Set<String> SINGLE_VALUE_SRFS = new HashSet<>(Arrays.asList(
+    static final Set<String> SINGLE_VALUE_SRFS = new HashSet<>(Arrays.asList(
             "generate_series", "generate_subscripts", "unnest", "string_to_table",
             "regexp_split_to_table", "json_object_keys", "jsonb_object_keys",
             "json_array_elements", "jsonb_array_elements",
@@ -1322,7 +1322,7 @@ class FromFunctionResolver {
         if (evalArgs.size() < 2) throw new MemgresException("function jsonb_path_query requires at least 2 arguments", "42883");
         Object jsonVal = evalArgs.get(0);
         Object pathVal = evalArgs.get(1);
-        String colName = firstColAlias(colAliases, "jsonb_path_query");
+        String colName = firstColAlias(colAliases, alias);
         Table virtualTable = new Table(alias, Cols.listOf(new Column(colName, DataType.JSONB, true, false, null)));
         List<RowContext> contexts = new ArrayList<>();
         if (jsonVal != null && pathVal != null) {
@@ -1384,8 +1384,10 @@ class FromFunctionResolver {
     private List<RowContext> resolveJsonObjectKeys(String fname, String alias, List<String> colAliases,
                                                    List<Object> evalArgs) {
         if (evalArgs.isEmpty()) throw new MemgresException("function " + fname + "() requires 1 argument", "42883");
+        // A call whose rows are one value answers under the name the FROM clause gave it, and
+        // only under the function's own name where the clause gave it none.
         Table virtualTable = new Table(alias, Cols.listOf(
-                new Column(firstColAlias(colAliases, fname), DataType.TEXT, true, false, null)));
+                new Column(firstColAlias(colAliases, alias), DataType.TEXT, true, false, null)));
         List<RowContext> contexts = new ArrayList<>();
         Object json = evalArgs.get(0);
         if (json != null) {
@@ -2670,12 +2672,14 @@ class FromFunctionResolver {
 
     // ---- hstore SRFs: skeys, svals, each ----
 
-    private List<RowContext> resolveHstoreSkeys(String alias, List<Object> evalArgs) {
+    private List<RowContext> resolveHstoreSkeys(String alias, List<String> colAliases,
+                                                List<Object> evalArgs) {
         if (evalArgs.isEmpty() || evalArgs.get(0) == null) return java.util.Collections.emptyList();
         HstoreValue h = evalArgs.get(0) instanceof HstoreValue
                 ? (HstoreValue) evalArgs.get(0) : HstoreValue.parse(evalArgs.get(0).toString());
         String effectiveAlias = alias != null ? alias : "skeys";
-        Column col = new Column("skeys", DataType.TEXT, true, false, null);
+        Column col = new Column(firstColAlias(colAliases, effectiveAlias),
+                DataType.TEXT, true, false, null);
         Table vt = new Table(effectiveAlias, Cols.listOf(col));
         List<RowContext> rows = new ArrayList<>();
         for (String k : h.keys()) {
@@ -2684,12 +2688,14 @@ class FromFunctionResolver {
         return rows;
     }
 
-    private List<RowContext> resolveHstoreSvals(String alias, List<Object> evalArgs) {
+    private List<RowContext> resolveHstoreSvals(String alias, List<String> colAliases,
+                                                List<Object> evalArgs) {
         if (evalArgs.isEmpty() || evalArgs.get(0) == null) return java.util.Collections.emptyList();
         HstoreValue h = evalArgs.get(0) instanceof HstoreValue
                 ? (HstoreValue) evalArgs.get(0) : HstoreValue.parse(evalArgs.get(0).toString());
         String effectiveAlias = alias != null ? alias : "svals";
-        Column col = new Column("svals", DataType.TEXT, true, false, null);
+        Column col = new Column(firstColAlias(colAliases, effectiveAlias),
+                DataType.TEXT, true, false, null);
         Table vt = new Table(effectiveAlias, Cols.listOf(col));
         List<RowContext> rows = new ArrayList<>();
         for (String v : h.values()) {

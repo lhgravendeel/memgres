@@ -11,6 +11,8 @@ public final class TransactionStmt implements Statement {
     public final Boolean readOnly;
     public final boolean chain; // AND CHAIN (PG 11+)
     public final Boolean deferrable; // [NOT] DEFERRABLE
+    /** Whether the block was opened with START TRANSACTION rather than BEGIN. */
+    public final boolean startTransaction;
 
     public TransactionStmt(TransactionAction action, String savepointName, String isolationLevel, Boolean readOnly) {
         this(action, savepointName, isolationLevel, readOnly, false);
@@ -22,12 +24,23 @@ public final class TransactionStmt implements Statement {
 
     public TransactionStmt(TransactionAction action, String savepointName, String isolationLevel,
                            Boolean readOnly, boolean chain, Boolean deferrable) {
+        this(action, savepointName, isolationLevel, readOnly, chain, deferrable, false);
+    }
+
+    /**
+     * @param startTransaction true when the statement was written as START TRANSACTION. The two
+     *        spellings open the same block, and PostgreSQL reports back the one that was used.
+     */
+    public TransactionStmt(TransactionAction action, String savepointName, String isolationLevel,
+                           Boolean readOnly, boolean chain, Boolean deferrable,
+                           boolean startTransaction) {
         this.action = action;
         this.savepointName = savepointName;
         this.isolationLevel = isolationLevel;
         this.readOnly = readOnly;
         this.chain = chain;
         this.deferrable = deferrable;
+        this.startTransaction = startTransaction;
     }
 
     public enum TransactionAction {
@@ -46,6 +59,7 @@ public final class TransactionStmt implements Statement {
     public Boolean readOnly() { return readOnly; }
     public boolean chain() { return chain; }
     public Boolean deferrable() { return deferrable; }
+    public boolean startTransaction() { return startTransaction; }
 
     @Override
     public boolean equals(Object o) {

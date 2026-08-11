@@ -743,7 +743,10 @@ class UtilityParser {
     // ---- Transaction statements ----
 
     TransactionStmt parseTransactionBegin() {
-        if (parser.matchKeyword("START")) {
+        // Which of the two spellings opened the block is kept, because it is the one PostgreSQL
+        // answers with: START TRANSACTION completes as START TRANSACTION, not as BEGIN.
+        boolean started = parser.matchKeyword("START");
+        if (started) {
             parser.matchKeyword("TRANSACTION");
         } else {
             parser.expectKeyword("BEGIN");
@@ -752,7 +755,7 @@ class UtilityParser {
         }
         TransactionModes modes = parseTransactionModes();
         return new TransactionStmt(TransactionStmt.TransactionAction.BEGIN, null,
-                modes.isolationLevel, modes.readOnly, false, modes.deferrable);
+                modes.isolationLevel, modes.readOnly, false, modes.deferrable, started);
     }
 
     /** Render a mode list as "iso=...;ro=on;def=off", listing only the modes that were written. */

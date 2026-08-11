@@ -218,15 +218,52 @@ public final class DdlDefinitionChecks {
     // ---- COLLATE ----
 
     /**
-     * {@code 42804} when a COLLATE clause names a type that carries no collation. Type names
-     * this engine does not recognise (domains, enums, composites) are left to the executor.
+     * {@code 42804} when a COLLATE clause names a type that carries no collation.
+     *
+     * <p>This is the last of the three questions one COLLATE clause raises, and PostgreSQL asks it
+     * last: what the written type is, whether the collation named exists, and only then whether the
+     * two go together. So the caller resolves the type and the collation first and this judges what
+     * came out -- a clause written on a type that does not exist, or naming a collation that does
+     * not, is reported as that rather than as a type with no collation.
+     *
+     * <p>A domain is a type of its own wherever PostgreSQL prints one: whether it carries a
+     * collation is its base type's answer, given under the domain's own name. The serial shorthand
+     * is named by the integer type it stands for, which is the type the column would have had. An
+     * enum, a composite and a range are types of their own too, and none of them carries a
+     * collation at all -- so the answer is theirs and not that of the representation this engine
+     * stores their values in, under which an enum reads as a label and a composite or a range as
+     * the text it prints as, all three of them collatable.
      */
-    public static void rejectUncollatableType(String typeName) {
-        DataType dt = DataType.fromPgName(baseTypeName(typeName));
+    public static void rejectUncollatableType(String typeName, DdlExecutor.ResolvedType resolved,
+                                              String collation) {
+        if (collation == null) return;
+        boolean isArray = typeName != null
+                && typeName.replaceAll("\\(.*\\)", "").trim().endsWith("[]");
+        if (resolved != null && resolved.domainTypeName() != null) {
+            DataType base = integerBehindSerial(resolved.dataType());
+            if (base == null || COLLATABLE_TYPES.contains(base)) return;
+            throw PgErrors.datatypeMismatch("collations are not supported by type "
+                    + resolved.domainDisplayName() + (isArray ? "[]" : ""));
+        }
+        if (resolved != null && resolved.userTypeDisplayName() != null) {
+            throw PgErrors.datatypeMismatch("collations are not supported by type "
+                    + resolved.userTypeDisplayName() + (isArray ? "[]" : ""));
+        }
+        DataType dt = integerBehindSerial(DataType.fromPgName(baseTypeName(typeName)));
         if (dt == null || COLLATABLE_TYPES.contains(dt)) return;
-        boolean isArray = typeName != null && typeName.replaceAll("\\(.*\\)", "").trim().endsWith("[]");
         throw PgErrors.datatypeMismatch("collations are not supported by type "
                 + dt.toRegtypeDisplay() + (isArray ? "[]" : ""));
+    }
+
+    /**
+     * The integer type a serial column is really of. The shorthand is not a type, so it is not one
+     * PostgreSQL ever names: a complaint about a serial column names smallint, integer or bigint.
+     */
+    private static DataType integerBehindSerial(DataType dt) {
+        if (dt == DataType.SMALLSERIAL) return DataType.SMALLINT;
+        if (dt == DataType.SERIAL) return DataType.INTEGER;
+        if (dt == DataType.BIGSERIAL) return DataType.BIGINT;
+        return dt;
     }
 
     // ---- identity ----
@@ -353,7 +390,7 @@ public final class DdlDefinitionChecks {
      * True when the key element is an expression rather than a bare column name. An expression key
      * is resolved when it is evaluated, so there is no name here to look up.
      */
-    private static boolean isExpressionKeyElement(String written) {
+    static boolean isExpressionKeyElement(String written) {
         return written.startsWith("__using_index__:")
                 || written.indexOf('(') >= 0 || written.indexOf(' ') >= 0
                 || written.indexOf('+') >= 0 || written.indexOf('-') >= 0
@@ -564,8 +601,10 @@ public final class DdlDefinitionChecks {
      * <p>Only a type this engine can read straight off the expression is judged -- a cast names
      * its own, a literal that is not the untyped string kind carries one, and a reference to a
      * column already declared on this table has that column's. Everything else is left to the row
-     * that first relies on it, and so is a column whose type is a domain, an enum, a composite or
-     * an array, which PostgreSQL names in its own terms rather than in its base type's.
+     * that first relies on it, and so is a column whose type is an enum, a composite or an array,
+     * which PostgreSQL names in its own terms rather than in its base type's. A column declared
+     * with a domain is judged: PostgreSQL asks for a cast to the type the domain is built over,
+     * and names the domain when there is none.
      */
     public static void requireGenerationExprFits(Expression expr, DdlExecutor.ResolvedType resolved,
                                                  String columnName,
@@ -595,14 +634,21 @@ public final class DdlDefinitionChecks {
         if (resolved == null) return;
         requireUntypedLiteralReadableAs(expr, resolved.dataType());
         if (expr == null || resolved.dataType() == null || resolved.enumTypeName() != null
-                || resolved.domainTypeName() != null || resolved.compositeTypeName() != null
+                || resolved.compositeTypeName() != null
                 || resolved.arrayElementType() != null) {
             return;
         }
         String exprType = plainExpressionTypeName(expr, declared);
         if (exprType == null || TypeCoercion.assignableFrom(exprType, resolved.dataType())) return;
+        // A domain is the type the column has, so it is the name PostgreSQL puts in the complaint,
+        // even though the cast it looked for was one to the type the domain is built over. Saying
+        // the base type there names a type the writer never wrote down. It is spelled the way the
+        // reader would have spelled it -- bare where the search path reaches the domain, qualified
+        // where it does not -- because that is how PostgreSQL prints any type name.
+        String columnType = resolved.domainTypeName() != null ? resolved.domainDisplayName()
+                : resolved.dataType().toRegtypeDisplay();
         MemgresException e = PgErrors.datatypeMismatch("column \"" + columnName + "\" is of type "
-                + resolved.dataType().toRegtypeDisplay()
+                + columnType
                 + " but default expression is of type " + exprType);
         e.setHint("You will need to rewrite or cast the expression.");
         throw e;
@@ -645,7 +691,12 @@ public final class DdlDefinitionChecks {
                 return null;
             }
         }
-        return defaultExpressionTypeName(expr, null);
+        // Beyond a column of the table being defined, the answer is the one the boolean contexts
+        // already settle on: the same literals, operators and calls decide what a DEFAULT produces
+        // as decide whether a WHERE is a condition, so one reading of an expression serves both.
+        // It stays one-sided -- silence where the type is not certain leaves the definition
+        // standing, which is what a wrong answer here would not.
+        return BooleanContext.typeOf(expr, BooleanContext.Types.none());
     }
 
     /**

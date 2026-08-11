@@ -471,6 +471,17 @@ class CatalogCoreBuilder {
         return key == null ? fallback : oids.oid(key);
     }
 
+    /**
+     * The OID a column declared with a composite type points at. An array of a composite is a type
+     * of its own with an OID of its own, registered beside the composite's, exactly as an array of
+     * any other type is.
+     */
+    private int compositeColumnOid(Column c, int fallback) {
+        String key = TypeNamespace.oidKeyFor(database, c.getCompositeTypeName());
+        if (key == null) return fallback;
+        return oids.oid(c.getArrayElementType() != null ? key + "[]" : key);
+    }
+
     private int rowTypeArrayOid(String schemaName, String relName) {
         return oids.oid(TypeNamespace.oidKey(schemaName, relName) + "[]");
     }
@@ -682,12 +693,12 @@ class CatalogCoreBuilder {
                         0,               // reltablespace
                         0, database.getAnalyzedTables().contains(schemaEntry.getKey() + "." + t.getName()) ? (double) t.getRows().size() : -1.0, 0, 0, 0, // relpages, reltuples (M22: -1 = never-analyzed), relallvisible, relallfrozen, reltoastrelid
                         hasIdx, false, relPersistence(schemaEntry.getKey(), t.isUnlogged()), relkind, // relhasindex, relisshared, relpersistence, relkind
-                        (short) t.getColumns().size(), checkCount, // relnatts, relchecks
+                        (short) t.getAttributeCount(), checkCount, // relnatts, relchecks
                         // relhassubclass: a partitioned table or an inheritance parent has
                         // children, and a planner reads the flag to decide whether to look for
                         // any. PostgreSQL never clears it once set; reporting it from the links
                         // themselves is closer than reporting it never.
-                        hasRules(t.getName()), hasTriggers,
+                        hasRules(schemaEntry.getKey(), t.getName()), hasTriggers,
                         !t.getPartitions().isEmpty() || !t.getChildren().isEmpty(),
                         t.isRlsEnabled(), t.isRlsForced(), // relhasrules..relforcerowsecurity
 
@@ -1024,8 +1035,21 @@ class CatalogCoreBuilder {
         // The parents are the same list for every column of the relation, so the walk over the
         // inheritance links is done once rather than once per column.
         List<Table> directParents = owner == null ? null : owner.getDirectParents();
+        // PostgreSQL updates a dropped column's row in place rather than deleting it, so the row
+        // stays where it was among the relation's attributes and the columns after it keep their
+        // numbers. Writing the rows in that order leaves a reader that does not sort them looking
+        // at what PostgreSQL would have shown.
+        List<Table.DroppedAttribute> dropped = owner == null
+                ? java.util.Collections.<Table.DroppedAttribute>emptyList()
+                : owner.getDroppedAttributes();
+        int nextDropped = 0;
         for (int i = 0; i < columns.size(); i++) {
                     Column c = columns.get(i);
+                    int attnum = owner == null ? i + 1 : owner.attnumAt(i);
+                    while (nextDropped < dropped.size()
+                            && dropped.get(nextDropped).getAttnum() < attnum) {
+                        addDroppedRelationAttribute(table, relOid, dropped.get(nextDropped++));
+                    }
                     // Determine identity type
                     // SERIAL/BIGSERIAL/SMALLSERIAL are NOT identity columns (attidentity stays empty)
                     // Only actual GENERATED AS IDENTITY columns get 'd' or 'a'
@@ -1050,6 +1074,10 @@ class CatalogCoreBuilder {
                     // from the same record pg_type answers from, so the two cannot disagree.
                     short attlen = typeLength(colType);
                     String storage = typeStorage(colType);
+                    // A composite value starts on a double boundary whatever it is made of, which
+                    // is what pg_type records for every composite. The column carries the value as
+                    // text, and text's alignment is the carrier's rather than the type's.
+                    String align = c.getCompositeTypeName() != null ? "d" : typeAlign(colType);
                     // The declared width, precision or interval qualifier, packed the way
                     // format_type and every client that sizes a column read it back.
                     int typmod = CatalogHelper.attTypmod(c);
@@ -1061,6 +1089,13 @@ class CatalogCoreBuilder {
                         atttypid = userTypeOid(c.getEnumTypeName(), atttypid);
                     } else if (c.getDomainTypeName() != null) {
                         atttypid = userTypeOid(c.getDomainTypeName(), atttypid);
+                    } else if (c.getCompositeTypeName() != null) {
+                        // A composite is a type the same way an enum or a domain is, and a column
+                        // declared as one is a column of it. Carrying the value as text left the
+                        // column pointing at text's OID, so format_type named text where
+                        // PostgreSQL names the composite and a client had no way to learn what
+                        // shape the value has.
+                        atttypid = compositeColumnOid(c, atttypid);
                     }
                     // Use column-level overrides if set
                     String effectiveStorage = c.getAttStorageOverride() != null ? c.getAttStorageOverride() : storage;
@@ -1073,11 +1108,20 @@ class CatalogCoreBuilder {
                             if (parentRel.getColumnIndex(c.getName()) >= 0) inhCount++;
                         }
                     }
+                    // Whether the relation declared the column for itself is a separate question:
+                    // a child that lists an inherited column in its own definition is told the
+                    // column is local and inherited once over, while one that says nothing about
+                    // it is told only that it inherited it. A partition declares nothing of its
+                    // own, and a column nobody hands down any longer is the relation's own
+                    // whatever it once was.
+                    boolean attIsLocal = inhCount == 0
+                            || (owner != null && owner.getPartitionParent() == null
+                                && owner.isColumnLocal(c.getName()));
                     table.insertRow(new Object[]{
                             relOid,
                             c.getName(),
                             atttypid,
-                            (short) (i + 1),
+                            (short) attnum,
                             !forceNullable && !c.isNullable(),
                             typmod,
                             attlen,
@@ -1091,7 +1135,7 @@ class CatalogCoreBuilder {
                                     : oids.oid("collation:" + c.getCollation().toLowerCase()),
                             // attndims: PG records 1 for a column declared as an array, and a
                             // client deciding whether to read the value as an array reads it.
-                            1, inhCount == 0, inhCount, null,
+                            1, attIsLocal, inhCount, null,
                             DataType.isArrayType(colType) || c.getArrayElementType() != null ? 1 : 0,
                             null,  // xmin, attislocal, attinhcount, attfdwoptions, attndims, attacl
                             null,      // attoptions
@@ -1101,9 +1145,52 @@ class CatalogCoreBuilder {
                             c.isAttHasMissing(), // atthasmissing
                             null,      // attmissingval
                             byValue(colType), // attbyval
-                            typeAlign(colType)  // attalign
+                            align  // attalign
                     });
         }
+        while (nextDropped < dropped.size()) {
+            addDroppedRelationAttribute(table, relOid, dropped.get(nextDropped++));
+        }
+    }
+
+    /**
+     * The pg_attribute row a DROP COLUMN leaves behind.
+     *
+     * <p>PostgreSQL does not delete the row. It marks the attribute dropped, clears its type link
+     * -- the type may itself be gone by then -- and renames it to something no statement could
+     * have written, so that the attributes after it keep the numbers a constraint, an index, a
+     * default or a trigger is already holding. What the declared type settled about the row's
+     * layout stays on the row, because the rows already stored are still laid out that way.
+     */
+    private void addDroppedRelationAttribute(Table table, int relOid, Table.DroppedAttribute gone) {
+        Column c = gone.getColumn();
+        DataType colType = c.getType();
+        table.insertRow(new Object[]{
+                relOid,
+                Database.droppedAttributeName(gone.getAttnum()),
+                0,                       // atttypid: the type link is cleared
+                (short) gone.getAttnum(),
+                false,                   // attnotnull: nothing is required of a column that is gone
+                CatalogHelper.attTypmod(c),
+                typeLength(colType),
+                true,                    // attisdropped
+                false,                   // atthasdef: the default went with the column
+                "", "",                  // attidentity, attgenerated
+                c.getCollation() == null ? 0
+                        : oids.oid("collation:" + c.getCollation().toLowerCase()),
+                1, gone.isLocal(), gone.getInheritCount(), null,
+                DataType.isArrayType(colType) || c.getArrayElementType() != null ? 1 : 0,
+                null,      // xmin, attislocal, attinhcount, attfdwoptions, attndims, attacl
+                null,      // attoptions
+                c.getAttStattarget(), // attstattarget
+                c.getAttStorageOverride() != null
+                        ? c.getAttStorageOverride() : typeStorage(colType), // attstorage
+                c.getAttCompression(), // attcompression
+                false,     // atthasmissing
+                null,      // attmissingval
+                byValue(colType), // attbyval
+                c.getCompositeTypeName() != null ? "d" : typeAlign(colType) // attalign
+        });
     }
 
     /**
@@ -1322,11 +1409,22 @@ class CatalogCoreBuilder {
                 // it there.
                 boolean dropped = Database.isDroppedAttribute(f);
                 int atttypid = dropped ? 0 : resolveTypeOidByName(f.typeName());
+                // How wide a value of the attribute is, whether it is passed by value, what
+                // boundary it starts on and how it is stored are the declared type's answers and
+                // not the attribute's: a planner reading them lays the row out from them, and
+                // saying -1 and "p" for every attribute described a type made only of varlenas.
+                // A dropped attribute keeps them -- PostgreSQL clears its atttypid and leaves the
+                // rest of the row as the type it was declared with wrote it.
+                String[] layout = attributeLayout(f.typeName());
                 table.insertRow(new Object[]{
                         ctRelOid, f.name(), atttypid, (short) (i + 1),
-                        false, writtenTypmod(f.typeName()), (short) -1, dropped, false,
+                        false, writtenTypmod(f.typeName()),
+                        layout == null ? (short) -1 : Short.parseShort(layout[0]),
+                        dropped, false,
                         "", "", 0, 1, true, 0, null, 0, null,
-                        null, (short) -1, "p", "", false, null, false, "i"
+                        null, (short) -1, layout == null ? "p" : layout[3], "", false, null,
+                        layout != null && "t".equals(layout[1]),
+                        layout == null ? "i" : layout[2]
                 });
             }
         }
@@ -2859,6 +2957,14 @@ class CatalogCoreBuilder {
         String lower = typeName.toLowerCase(Locale.ROOT).trim();
         // An array takes its modifier from its element, and that is where it is written.
         if (lower.endsWith("[]")) lower = lower.substring(0, lower.length() - 2).trim();
+        // An interval writes the fields it keeps as words rather than in brackets -- "interval
+        // hour to minute" -- and those fields are as much a modifier as a width is. Reading only
+        // what stands inside brackets threw the whole qualifier away, so format_type named a
+        // full-range interval where PostgreSQL names the narrowed one.
+        if (lower.equals("interval") || lower.startsWith("interval ")
+                || lower.startsWith("interval(")) {
+            return intervalWrittenTypmod(lower);
+        }
         int open = lower.indexOf('(');
         int close = lower.indexOf(')', open + 1);
         if (open <= 0 || close < 0) return -1;
@@ -2874,6 +2980,78 @@ class CatalogCoreBuilder {
             return -1;
         }
         return CatalogHelper.attTypmod(dt, precision, scale, null);
+    }
+
+    /**
+     * The modifier an interval declaration carries. PostgreSQL packs the fields the qualifier
+     * keeps into the high half of the number and the fractional-seconds precision into the low
+     * half, and {@code interval second(2)} writes both: the qualifier before the brackets and the
+     * precision inside them.
+     */
+    private static int intervalWrittenTypmod(String written) {
+        String qualifier = written.substring("interval".length()).trim();
+        Integer precision = null;
+        int open = qualifier.indexOf('(');
+        if (open >= 0) {
+            int close = qualifier.indexOf(')', open + 1);
+            if (close < 0) return -1;
+            try {
+                precision = Integer.valueOf(qualifier.substring(open + 1, close).trim());
+            } catch (NumberFormatException e) {
+                return -1;
+            }
+            qualifier = qualifier.substring(0, open).trim();
+        }
+        return CatalogHelper.attTypmod(DataType.INTERVAL, precision, null,
+                qualifier.isEmpty() ? null : qualifier);
+    }
+
+    /**
+     * How a value of the type a composite attribute was declared with is laid out: its width,
+     * whether it is passed by value, what boundary it starts on and how it is stored, in that
+     * order. PostgreSQL keeps these on the type and copies them onto every attribute of it, which
+     * is why an attribute a drop took away still reports the ones its declared type had even
+     * though its atttypid has been cleared.
+     *
+     * <p>An array is a varlena of its own whatever it holds, so only the boundary comes from the
+     * element. A type memgres keeps no record of leaves the caller its own answer.
+     */
+    private String[] attributeLayout(String typeName) {
+        if (typeName == null) return null;
+        String lower = typeName.toLowerCase(Locale.ROOT).trim();
+        int paren = lower.indexOf('(');
+        if (paren > 0) {
+            int close = lower.lastIndexOf(')');
+            String tail = close >= 0 && close + 1 < lower.length() ? lower.substring(close + 1) : "";
+            lower = (lower.substring(0, paren) + tail).trim();
+        }
+        boolean array = lower.endsWith("[]");
+        if (array) lower = lower.substring(0, lower.length() - 2).trim();
+        // The fields an interval was narrowed to are a qualifier, not another type.
+        if (lower.startsWith("interval ")) lower = "interval";
+        String[] attrs = typeAttrs(layoutTypname(lower));
+        if (attrs == null) return null;
+        if (array) return new String[]{"-1", "f", attrs[7], "x"};
+        return new String[]{attrs[1], attrs[2], attrs[7], attrs[8]};
+    }
+
+    /**
+     * The pg_type name whose layout a written type name has. A type the reader defined is laid out
+     * as what it is made of: an enum is the four bytes of its OID, a composite is a record whatever
+     * its attributes are, and a domain is exactly the type it is built on.
+     */
+    private String layoutTypname(String written) {
+        DataType dt = DataType.fromPgName(written);
+        if (dt != null) return storedTypeName(dt);
+        String key = TypeNamespace.find(database.typeKeys(), written);
+        if (key == null) return written;
+        if (database.getCustomEnums().containsKey(key)) return "int4";
+        if (database.getCompositeTypes().containsKey(key)) return "record";
+        DomainType domain = database.getDomains().get(key);
+        if (domain != null && domain.getBaseType() != null) {
+            return storedTypeName(domain.getBaseType());
+        }
+        return written;
     }
 
     private int resolveTypeOidByName(String typeName) {
@@ -2894,10 +3072,16 @@ class CatalogCoreBuilder {
         // name found nothing, so every array-typed parameter and result was recorded as OID 0 —
         // a type a client cannot look up and cannot name.
         if (lower.endsWith("[]")) {
-            int elem = resolveTypeOidByName(lower.substring(0, lower.length() - 2));
+            String element = lower.substring(0, lower.length() - 2);
+            int elem = resolveTypeOidByName(element);
             DataType elemType = elem == 0 ? null : DataType.fromOid(elem);
             DataType arrayType = elemType == null ? null : DataType.arrayOf(elemType);
-            return arrayType != null ? arrayType.getOid() : 0;
+            if (arrayType != null) return arrayType.getOid();
+            // An array of a type the reader defined is a type of its own with an OID of its own,
+            // registered beside the element's. Answering zero for it left an attribute declared
+            // "myenum[]" pointing at no type at all, which format_type prints as a dash.
+            String userKey = TypeNamespace.oidKeyFor(database, element);
+            return userKey == null ? 0 : oids.oid(userKey + "[]");
         }
         // Handle common aliases
         switch (lower) {
@@ -2943,8 +3127,8 @@ class CatalogCoreBuilder {
      * only clears the flag at VACUUM, so a relation whose rules have all been dropped still
      * answers true.
      */
-    private boolean hasRules(String relName) {
-        return database.everHadRules(relName);
+    private boolean hasRules(String schemaName, String relName) {
+        return database.everHadRules(schemaName, relName);
     }
 
     private static String relPersistence(String schemaName, boolean unlogged) {

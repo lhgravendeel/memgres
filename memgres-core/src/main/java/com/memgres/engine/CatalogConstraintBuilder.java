@@ -35,7 +35,7 @@ class CatalogConstraintBuilder {
         List<Object> attnums = new ArrayList<>();
         for (int i = 0; i < t.getColumns().size(); i++) {
             if (named.contains(t.getColumns().get(i).getName().toLowerCase())) {
-                attnums.add(Integer.valueOf(i + 1));
+                attnums.add(Integer.valueOf(t.attnumAt(i)));
             }
         }
         return attnums.isEmpty() ? null : attnums;
@@ -235,6 +235,13 @@ class CatalogConstraintBuilder {
                     // may drop it -- reporting every row as local claimed a partition's key and an
                     // inherited CHECK were declared where they are merely obeyed.
                     int coninhcount = inheritedParentCount(t, sc);
+                    // Whether the relation declared the rule for itself is a separate question
+                    // from how many parents also carry it: a child that restates its parent's
+                    // CHECK under the same name is told it declared it and inherits it once over.
+                    // A partition declares nothing of its own, and a rule nobody hands down any
+                    // longer is the relation's own whatever it once was.
+                    boolean conislocal = coninhcount == 0
+                            || (t.getPartitionParent() == null && sc.getInheritedFrom() == null);
                     table.insertRow(new Object[]{
                             oids.oid(constraintKey(schemaEntry.getKey(), t.getName(), sc.getName())),
                             sc.getName(),
@@ -248,7 +255,7 @@ class CatalogConstraintBuilder {
                             // PostgreSQL reports convalidated false for it whatever was recorded.
                             sc.isDeferrable(), sc.isInitiallyDeferred(),
                             sc.isConvalidated() && !sc.isNotEnforced(), // condeferrable, condeferred, convalidated
-                            coninhcount == 0, conindid,
+                            conislocal, conindid,
                             confupdtype,
                             confdeltype,
                             confmatchtype, conpfeqop, conppeqop, conffeqop, null /*confdelsetcols*/, coninhcount,
@@ -273,32 +280,22 @@ class CatalogConstraintBuilder {
                     // but skip columns covered by UNIQUE constraints promoted from index
                     if (!c.isNullable() && !isPromotedUnique) {
                         List<Object> nnConkey = columnNamesToAttnums(t, Cols.listOf(c.getName()));
-                        // A NOT NULL a parent declares is enforced by everything below it, and the
-                        // constraint keeps the name of the relation highest in the chain that
-                        // declared the column -- the name PostgreSQL uses when it refuses a
-                        // descendant permission to drop it. The descendant's row is not its own:
-                        // conislocal false, with one count per direct parent that passed the rule
-                        // down. Following only the partitions left an inheritance child claiming
-                        // as its own a rule it merely obeys.
-                        int coninhcount = 0;
+                        // A NOT NULL a parent declares is enforced by everything below it, and a
+                        // descendant that never declared it holds the parent's constraint, under
+                        // the parent's name -- the name PostgreSQL uses when it refuses that
+                        // descendant permission to drop it -- with one count per direct parent
+                        // that passed the rule down. But a relation that restated NOT NULL in its
+                        // own definition declared it however many parents also do: PostgreSQL
+                        // gives that one the relation's own name and lets it be dropped there. So
+                        // the walk for the name stops at the first relation that declared it,
+                        // rather than running all the way to the top of the chain.
+                        int coninhcount = t.retainedNotNullInheritCount(c.getName());
                         for (Table direct : t.getDirectParents()) {
                             if (declaresNotNull(direct, c.getName())) coninhcount++;
                         }
-                        Table owner = t;
-                        while (true) {
-                            Table above = null;
-                            for (Table candidate : owner.getDirectParents()) {
-                                if (declaresNotNull(candidate, c.getName())) { above = candidate; break; }
-                            }
-                            if (above == null) break;
-                            owner = above;
-                        }
-                        // The writer may have named the constraint; only fall back to the
-                        // default spelling when nobody did.
-                        String conname = owner.notNullConstraintName(c.getName());
-                        if (conname == null) {
-                            conname = owner.getName() + "_" + c.getName() + "_not_null";
-                        }
+                        boolean notNullIsLocal = coninhcount == 0
+                                || (t.getPartitionParent() == null && t.isNotNullLocal(c.getName()));
+                        String conname = notNullConstraintName(t, c.getName());
                         table.insertRow(new Object[]{
                                 oids.oid(constraintKey(schemaEntry.getKey(), t.getName(), conname)),
                                 conname,
@@ -309,7 +306,7 @@ class CatalogConstraintBuilder {
                                 nnConkey,
                                 null,
                                 false, false, true,
-                                coninhcount == 0, 0,
+                                notNullIsLocal, 0,
                                 " ", " ",
                                 " " /*confmatchtype*/, null, null, null, null, coninhcount,
                                 false,
@@ -447,26 +444,51 @@ class CatalogConstraintBuilder {
     }
 
     /**
-     * How many parents handed this constraint down to the relation that carries it.
+     * How many parents hand this constraint down to the relation that carries it.
      *
-     * <p>A CHECK or a foreign key keeps the name it was declared with and remembers whose rule it
-     * is. A partition's key constraint is renamed after the partition, so it is recognised instead
-     * by what it constrains -- a partition takes the partitioned table's keys, while an inheritance
-     * child's keys are its own. A relation that declares a rule for itself was handed nothing.
+     * <p>It is a count, not a flag: a rule two parents both declare reaches the child twice, and
+     * that number is what decides whether letting one parent go leaves the child still holding
+     * somebody else's rule. So it is answered from the parents the relation has now rather than
+     * from a note of which one the copy came from, which could only ever remember one of them.
+     *
+     * <p>A CHECK keeps the name it was declared with, and it is the only kind ordinary inheritance
+     * passes down -- a child's keys and foreign keys are its own. A partition takes every rule the
+     * partitioned table declares, and its key constraint is renamed after the partition, so that
+     * one is recognised by what it constrains instead of by the name it now answers to.
      */
-    private static int inheritedParentCount(Table t, StoredConstraint sc) {
-        int count = 0;
+    static int inheritedParentCount(Table t, StoredConstraint sc) {
+        // A parent that dropped its own copy along with the column it tests told this relation
+        // nothing, so what it handed down goes on being counted; the links no longer say so.
+        int count = sc.getRetainedInheritCount();
         for (Table parent : t.getDirectParents()) {
             if (parent == null) continue;
-            if (sc.getInheritedFrom() != null
-                    && sc.getInheritedFrom().equalsIgnoreCase(parent.getName())) {
-                count++;
-            } else if (parent == t.getPartitionParent() && isKeyConstraint(sc)
-                    && hasMatchingKey(parent, sc)) {
+            if (parent == t.getPartitionParent()) {
+                if (isKeyConstraint(sc) ? hasMatchingKey(parent, sc)
+                        : declaresConstraint(parent, sc.getName())) {
+                    count++;
+                }
+            } else if (sc.getType() == StoredConstraint.Type.CHECK
+                    && declaresInheritableCheck(parent, sc.getName())) {
                 count++;
             }
         }
         return count;
+    }
+
+    /** True when this relation carries a constraint of the given name. */
+    private static boolean declaresConstraint(Table parent, String name) {
+        return name != null && parent.getConstraint(name) != null;
+    }
+
+    /**
+     * True when the parent declares a CHECK of this name that travels. NO INHERIT says the rule
+     * was never going to reach a child at all, so a child carrying that name declared it itself.
+     */
+    private static boolean declaresInheritableCheck(Table parent, String name) {
+        if (name == null) return false;
+        StoredConstraint parentCon = parent.getConstraint(name);
+        return parentCon != null && parentCon.getType() == StoredConstraint.Type.CHECK
+                && !parentCon.isNoInherit();
     }
 
     /** A constraint an index stands behind, which a partition takes from the partitioned table. */
@@ -495,10 +517,42 @@ class CatalogConstraintBuilder {
     }
 
     /** True when this relation has the column and declares it NOT NULL. */
-    private static boolean declaresNotNull(Table table, String column) {
+    static boolean declaresNotNull(Table table, String column) {
         if (table == null || column == null) return false;
         int idx = table.getColumnIndex(column);
         return idx >= 0 && !table.getColumns().get(idx).isNullable();
+    }
+
+    /**
+     * The name this column's NOT NULL constraint answers to.
+     *
+     * <p>PostgreSQL gives a constraint its name once, when it is created, and never works it out
+     * again: a relation that never declared the rule holds the constraint of the relation that
+     * did, under that relation's name -- which is the name a drop has to quote and the name a
+     * refusal names it by. So the search climbs to the first relation whose own definition said
+     * NOT NULL and stops there, even where a relation further up says it too, and a relation that
+     * has been told the rule is its own answers with the name it holds.
+     */
+    static String notNullConstraintName(Table t, String column) {
+        Table owner = t;
+        while (!owner.isNotNullLocal(column)) {
+            // A relation whose parent has let the column go, or which has left the parent that
+            // declared the rule while another goes on handing it down, holds a name the links no
+            // longer lead to. That name was written down when it stopped being derivable, and it
+            // is the name the constraint has always answered to.
+            String written = owner.inheritedNotNullName(column);
+            if (written != null) return written;
+            Table above = null;
+            for (Table candidate : owner.getDirectParents()) {
+                if (declaresNotNull(candidate, column)) { above = candidate; break; }
+            }
+            if (above == null) break;
+            owner = above;
+        }
+        // The writer may have named the constraint; only fall back to the default spelling when
+        // nobody did.
+        String conname = owner.notNullConstraintName(column);
+        return conname != null ? conname : owner.getName() + "_" + column + "_not_null";
     }
 
     Table buildPgIndex() {
@@ -559,7 +613,7 @@ class CatalogConstraintBuilder {
                             exprParts.append(colName);
                         } else {
                             if (indkey.length() > 0) indkey.append(" ");
-                            indkey.append(colIdx + 1); // 1-based
+                            indkey.append(t.attnumAt(colIdx)); // the relation's attribute number
                         }
                     }
                     if (indkey.length() > 0) {
@@ -578,8 +632,13 @@ class CatalogConstraintBuilder {
                             indkeyElems.add(Integer.parseInt(num));
                         }
                         PgVector indkeyVec = new PgVector(indkeyElems);
-                        // Get WHERE predicate for partial indexes
-                        String whereClause = database.getIndexWhereClause(indexKey);
+                        // Get WHERE predicate for partial indexes. pg_get_expr prints the
+                        // stored tree, so indpred holds the deparsed predicate -- with the
+                        // parentheses the unpretty form always puts round an operator expression
+                        // -- rather than the text CREATE INDEX happened to write.
+                        String whereClause = CatalogHelper.deparseIndexPredicate(database,
+                                schemaEntry.getKey() + "." + t.getName(),
+                                database.getIndexWhereClause(indexKey));
                         String indexprs = hasExprCols ? exprParts.toString() : null;
                         // Build indoption, indclass, indcollation as PgVectors
                         List<String> columnOptions = database.getIndexColumnOptions(indexKey);
@@ -612,7 +671,7 @@ class CatalogConstraintBuilder {
                             for (String incCol : includeColumns) {
                                 int colIdx = t.getColumnIndex(incCol);
                                 if (colIdx >= 0) {
-                                    indkeyElems.add(colIdx + 1);
+                                    indkeyElems.add(t.attnumAt(colIdx));
                                 } else {
                                     indkeyElems.add(0);
                                 }
@@ -656,7 +715,7 @@ class CatalogConstraintBuilder {
                         for (String colName : sc.getColumns()) {
                             int colIdx = t.getColumnIndex(colName);
                             if (colIdx >= 0) {
-                                indkeyList.add(colIdx + 1);
+                                indkeyList.add(t.attnumAt(colIdx));
                             }
                         }
                         if (!indkeyList.isEmpty()) {
@@ -731,7 +790,7 @@ class CatalogConstraintBuilder {
                         String genExpr = CatalogHelper.renderGeneratedExpr(t, c);
                         table.insertRow(new Object[]{
                                 oids.oid("attrdef:" + t.getName() + "." + c.getName()),
-                                relOid, (short) (i + 1), genExpr
+                                relOid, (short) t.attnumAt(i), genExpr
                         });
                     } else if (c.getDefaultValue() != null || c.getType() == DataType.SERIAL
                             || c.getType() == DataType.BIGSERIAL || c.getType() == DataType.SMALLSERIAL) {
@@ -740,7 +799,7 @@ class CatalogConstraintBuilder {
                                 : "nextval('" + t.getName() + "_" + c.getName() + "_seq'::regclass)";
                         table.insertRow(new Object[]{
                                 oids.oid("attrdef:" + t.getName() + "." + c.getName()),
-                                relOid, (short) (i + 1), defaultExpr
+                                relOid, (short) t.attnumAt(i), defaultExpr
                         });
                     }
                 }
@@ -877,16 +936,18 @@ class CatalogConstraintBuilder {
             });
         }
         // A rule written with CREATE RULE is a row here too, and it is the only place a client can
-        // learn that a relation carries one.
-        for (java.util.Map.Entry<String, String[]> entry : database.getRuleDefinitions().entrySet()) {
-            String ruleName = entry.getKey();
-            String relName = entry.getValue()[0];
-            int relOid = oids.oid("rel:public." + relName);
+        // learn that a relation carries one. Two schemas may each hold a relation of the same
+        // name, and each carries its own rules, so both the relation this points at and the rule's
+        // own identity are settled by the schema as well as by the name.
+        for (Database.StoredRule rule : database.getRuleEntries()) {
+            String ruleSchema = rule.getSchema() == null ? "public" : rule.getSchema();
+            int relOid = oids.oid("rel:" + ruleSchema + "." + rule.getTable());
             table.insertRow(new Object[]{
-                    oids.oid("rule:" + ruleName + "_" + relName), ruleName, relOid,
-                    ruleEventType(entry.getValue()[2]),
-                    database.getRuleEnabledState(ruleName, relName),
-                    "t".equals(entry.getValue()[3]),
+                    oids.oid("rule:" + ruleSchema + "." + rule.getTable() + ":" + rule.getName()),
+                    rule.getName(), relOid,
+                    ruleEventType(rule.getEvent()),
+                    rule.getEnabledState(),
+                    rule.isInstead(),
                     null, null, 1
             });
         }
@@ -1001,8 +1062,12 @@ class CatalogConstraintBuilder {
                 Schema s = database.getSchema(schema);
                 Table t = s == null ? null : s.getTable(relName);
                 int colIdx = -1;
+                // A comment on a column is filed against the column's attribute number, and a
+                // column dropped before it leaves the ones after holding the numbers they had.
+                int colAttnum = -1;
                 if (t != null) {
                     colIdx = t.getColumnIndex(colName);
+                    if (colIdx >= 0) colAttnum = t.attnumAt(colIdx);
                 } else {
                     Database.ViewDef v = database.getView(schema, relName);
                     List<Column> vcols = v == null ? null : v.cachedColumns();
@@ -1024,7 +1089,7 @@ class CatalogConstraintBuilder {
                 }
                 if (colIdx < 0) return null;
                 return new Object[]{oids.oid("rel:" + schema + "." + relName),
-                        pgClassClassOid, colIdx + 1, desc, 1};
+                        pgClassClassOid, colAttnum > 0 ? colAttnum : colIdx + 1, desc, 1};
             }
             case "type":
             case "domain": {
@@ -1061,8 +1126,8 @@ class CatalogConstraintBuilder {
             case "rule": {
                 int dotIdx = bare.lastIndexOf('.');
                 if (dotIdx <= 0) return null;
-                return new Object[]{oids.oid("rule:" + bare.substring(dotIdx + 1) + "_"
-                        + bare.substring(0, dotIdx)), pgRewriteClassOid, 0, desc, 1};
+                return new Object[]{oids.oid("rule:" + schema + "." + bare.substring(0, dotIdx)
+                        + ":" + bare.substring(dotIdx + 1)), pgRewriteClassOid, 0, desc, 1};
             }
             case "policy": {
                 int dotIdx = bare.lastIndexOf('.');
@@ -1189,8 +1254,8 @@ class CatalogConstraintBuilder {
             for (PgTrigger trig : entry.getValue()) {
                 if (trig.getUpdateColumns() == null || t == null) continue;
                 for (String colName : trig.getUpdateColumns()) {
-                    int idx = t.getColumnIndex(colName);
-                    if (idx >= 0 && !attrNums.contains(idx + 1)) attrNums.add(idx + 1);
+                    int attnum = t.attnumOf(colName);
+                    if (attnum > 0 && !attrNums.contains(attnum)) attrNums.add(attnum);
                 }
             }
             // A CONSTRAINT TRIGGER's deferrability is part of when it runs, and a client asking

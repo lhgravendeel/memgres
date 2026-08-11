@@ -634,7 +634,7 @@ class DdlAlterTableExecutor {
             AlterTableStmt.DropConstraint dropConstraint = (AlterTableStmt.DropConstraint) action;
             StoredConstraint dropped = table.getConstraint(dropConstraint.name());
             String notNullColumn = dropped == null
-                    ? table.notNullConstraintColumn(dropConstraint.name()) : null;
+                    ? notNullColumnNamed(table, dropConstraint.name()) : null;
             if (notNullColumn != null) {
                 int nnIdx = table.getColumnIndex(notNullColumn);
                 if (nnIdx >= 0 && table.getColumns().get(nnIdx).isPrimaryKey()) {
@@ -651,15 +651,23 @@ class DdlAlterTableExecutor {
                 return table;
             }
             if (!dropConstraint.ifExists() && dropped == null) {
-                throw new MemgresException("constraint \"" + dropConstraint.name() + "\" of relation \"" + stmt.table() + "\" does not exist", "42704");
+                // PostgreSQL reads the constraint's name out of the parse tree rather than out of
+                // the statement text, so it has no place in the text to point the reader at and
+                // sends no Position at all. The same is true of every refusal below about a
+                // constraint a relation holds for a parent.
+                throw new MemgresException("constraint \"" + dropConstraint.name()
+                        + "\" of relation \"" + stmt.table() + "\" does not exist", "42704")
+                        .suppressPosition();
             }
             // A constraint a partition or a child carries because its parent declares it belongs
             // to the parent. Dropping it on the descendant alone would leave the descendant
             // taking rows the parent's own rule rejects, and a read through the parent would
             // return them, so PostgreSQL sends the writer to the relation that declared it.
-            if (dropped != null && dropped.getInheritedFrom() != null) {
+            if (dropped != null
+                    && CatalogConstraintBuilder.inheritedParentCount(table, dropped) > 0) {
                 throw new MemgresException("cannot drop inherited constraint \""
-                        + dropped.getName() + "\" of relation \"" + stmt.table() + "\"", "42P16");
+                        + dropped.getName() + "\" of relation \"" + stmt.table() + "\"", "42P16")
+                        .suppressPosition();
             }
             // The columns carry their own "in the primary key" flag, so dropping the constraint
             // has to clear it or the column keeps refusing DROP NOT NULL for a key that is gone.
@@ -697,14 +705,23 @@ class DdlAlterTableExecutor {
                 throw new MemgresException("relation \"" + detach.partitionName()
                         + "\" is not a partition of relation \"" + stmt.table() + "\"", "42P01");
             }
+            // The name a constraint answers to has to be written down while the link that leads
+            // to it is still there; once it is gone there is nothing left to read the name from.
+            pinInheritedNotNullNames(partition);
             table.removePartition(partition);
             partition.setPartitionParent(null);
             partition.clearPartitionBounds();
+            // The indexes the partition holds stop being copies of the partitioned table's the
+            // moment it leaves the hierarchy. Left tied to the parent's index they went on being
+            // reported as belonging to a relation this one is no longer part of, and dropping the
+            // parent's index would have taken an index on a standalone table with it.
+            detachPartitionIndexes(partition, detachSchemaName);
             // A detached table keeps the constraints it carried, but they are its own from now on:
             // PostgreSQL records them as local, which is what lets the standalone table drop them.
             // Left marked as the partitioned table's, they could never be withdrawn and a
             // violation would go on naming a relation this one no longer belongs to.
             adoptInheritedConstraints(partition, table);
+            adoptInheritedNotNulls(partition, table);
         } else if (action instanceof AlterTableStmt.RenameConstraint) {
             AlterTableStmt.RenameConstraint renameConstraint = (AlterTableStmt.RenameConstraint) action;
             StoredConstraint oldConstraint = table.getConstraint(renameConstraint.oldName());
@@ -781,12 +798,20 @@ class DdlAlterTableExecutor {
                 throw new MemgresException("relation \"" + noInherit.parentTable()
                         + "\" is not a parent of relation \"" + stmt.table() + "\"", "42P01");
             }
+            // Same as DETACH: a relation declared under two parents keeps the name the first one
+            // gave the rule, and reading it afresh from the parent that is left would rename a
+            // constraint PostgreSQL renames nowhere.
+            pinInheritedNotNullNames(table);
             parentTable.removeChild(table);
-            table.setParentTable(null);
+            // Only the parent the statement named is let go: a child declared under two of them
+            // goes on inheriting from the other, and breaking every link took that parent's
+            // columns and constraints away from the child along with the one that was asked for.
+            table.removeParentTable(parentTable);
             // Breaking the link leaves the CHECK constraints standing, as the child's own: a table
             // that inherits from nobody has nothing to inherit a rule from, and PostgreSQL records
             // each of them local so the child can drop them itself.
             adoptInheritedConstraints(table, parentTable);
+            adoptInheritedNotNulls(table, parentTable);
         } else if (action instanceof AlterTableStmt.DisableTrigger) {
             AlterTableStmt.DisableTrigger dt = (AlterTableStmt.DisableTrigger) action;
             setTriggerEnabled(table, dt.triggerName(), "D");
@@ -795,7 +820,8 @@ class DdlAlterTableExecutor {
             setTriggerEnabled(table, et.triggerName(), et.state());
         } else if (action instanceof AlterTableStmt.SetRuleEnabled) {
             AlterTableStmt.SetRuleEnabled sr = (AlterTableStmt.SetRuleEnabled) action;
-            if (!executor.database.setRuleEnabledState(sr.ruleName(), stmt.table(), sr.state())) {
+            if (!executor.database.setRuleEnabledState(table.getSchemaName(), sr.ruleName(),
+                    stmt.table(), sr.state())) {
                 throw new MemgresException("rule \"" + sr.ruleName() + "\" for relation \""
                         + stmt.table() + "\" does not exist", "42704");
             }
@@ -915,10 +941,17 @@ class DdlAlterTableExecutor {
             throw PgErrors.wrongObjectType("cannot add column to typed table");
         }
         DdlDefinitionChecks.rejectSystemColumnName(def.name());
-        DdlDefinitionChecks.validateDefaultExpression(def.defaultExpr());
+        // What the column's type is comes next: PostgreSQL settles the written type name while it
+        // is still reading the definition, ahead of the collation, ahead of anything the DEFAULT
+        // says and ahead of the rules about which tables the column has to be added to.
+        DdlExecutor.ResolvedType resolved = ddl.resolveColumnType(def.typeName(), null);
         // A collation the database does not hold is not one a column can be declared with, and
-        // PostgreSQL settles that where the clause is written rather than at the first comparison.
+        // PostgreSQL settles that where the clause is written rather than at the first comparison
+        // -- resolving the name the clause holds before asking whether the type it was written on
+        // carries a collation at all, which is the last thing it asks about the clause.
         DdlDefinitionChecks.requireCollationExists(executor.database, def.collation);
+        DdlDefinitionChecks.rejectUncollatableType(def.typeName(), resolved, def.collation);
+        DdlDefinitionChecks.validateDefaultExpression(def.defaultExpr());
         executor.selectExecutor.placementCheck.rejectStoredDefinition(
                 def.defaultExpr(), "DEFAULT expressions", null);
         // A child that lacks one of its parent's columns cannot stand in for the parent, so PG
@@ -938,12 +971,19 @@ class DdlAlterTableExecutor {
             }
         }
 
-        DdlExecutor.ResolvedType resolved = ddl.resolveColumnType(def.typeName(), null);
         DataType dt = resolved.dataType();
         String enumTypeName = resolved.enumTypeName();
         String domainTypeName = resolved.domainTypeName();
         String compositeTypeName = resolved.compositeTypeName();
         DataType arrayElementType = resolved.arrayElementType();
+        // And whatever the DEFAULT is, it has to produce a value this column can hold. PostgreSQL
+        // settles that here, where the column is defined, rather than at the first row that takes
+        // it -- by the same rule CREATE TABLE goes by, so a column means the same thing whichever
+        // statement declared it. Left unjudged, a default the column could never hold was stored
+        // and every INSERT that omitted the column failed on a value nobody wrote; and one that
+        // happened to coerce, integer 1 into a boolean column, was taken outright.
+        DdlDefinitionChecks.requireDefaultExprFits(def.defaultExpr(), resolved, def.name(),
+                table.getColumns());
 
         String defaultVal = def.defaultExpr() != null ? DdlExecutor.exprToDefaultString(def.defaultExpr()) : null;
         // A domain carries a default of its own, and a column of that domain takes it when the
@@ -977,6 +1017,17 @@ class DdlAlterTableExecutor {
 
         // GENERATED AS IDENTITY on ADD COLUMN
         if (def.identity() != null) {
+            // Identity is fed by a sequence, and so is the serial shorthand, so a column cannot be
+            // both -- and a DEFAULT written beside an identity is the same contradiction.
+            // PostgreSQL refuses the definition rather than letting one of the two decide, and
+            // CREATE TABLE goes by the same rule, so a column means the same thing whichever
+            // statement declared it. Left unjudged, a column added this way came out carrying an
+            // identity over a type that already had a sequence of its own.
+            if (def.defaultExpr() != null || dt == DataType.SERIAL || dt == DataType.BIGSERIAL
+                    || dt == DataType.SMALLSERIAL) {
+                throw PgErrors.syntax("both default and identity specified for column \""
+                        + def.name() + "\" of table \"" + stmt.table() + "\"");
+            }
             // SEQUENCE NAME names the relation that feeds the column; without one the name is
             // composed the way PostgreSQL composes it.
             String writtenSeq = def.identitySequenceName();
@@ -1011,7 +1062,14 @@ class DdlAlterTableExecutor {
             }
             try {
                 Expression genParsed = com.memgres.engine.parser.Parser.parseExpression(genExpr);
-                ddl.validateExprColumnRefs(genParsed, table, def.name());
+                ddl.validateExprColumnRefs(genParsed, table, def.name(), false, true);
+                // What the expression produces has to be a value the column can hold, and
+                // PostgreSQL settles that where the column is defined rather than at the first row
+                // it is computed for -- the same rule, and the same complaint, a DEFAULT written
+                // here gets. It is judged from the tree rather than from the text the expression is
+                // stored as, so one that will not parse is left to whatever reads it next.
+                DdlDefinitionChecks.requireGenerationExprFits(genParsed, resolved, def.name(),
+                        table.getColumns());
             } catch (MemgresException me) {
                 throw me;
             } catch (Exception ignored) {}
@@ -1206,7 +1264,9 @@ class DdlAlterTableExecutor {
             for (StoredConstraint sc : inlineAdded) {
                 if (sc.getName() != null) table.removeConstraint(sc.getName());
             }
-            table.removeColumn(def.name());
+            // The statement refused itself, so the column was never there: taking it back off
+            // must not leave its number taken the way a DROP COLUMN does.
+            table.removeColumn(def.name(), false);
             throw refused;
         }
         for (StoredConstraint sc : inlineAdded) {
@@ -1238,6 +1298,10 @@ class DdlAlterTableExecutor {
             if (child.getColumnIndex(col.getName()) >= 0) continue;
             Column copy = col.withName(col.getName());
             child.addColumn(copy, defaultValue);
+            // The child holds the column because the parent declares it, not because its own
+            // definition named it, and PostgreSQL keeps the two apart in attislocal.
+            child.markColumnInherited(col.getName());
+            if (!copy.isNullable()) child.markNotNullInherited(col.getName());
             propagateAddColumn(child, copy, defaultValue);
         }
     }
@@ -1285,7 +1349,7 @@ class DdlAlterTableExecutor {
                                                      String tableName) {
         if (tc == null || !tc.noInherit() || !isPartitioned(table)) return;
         throw new MemgresException("cannot add NO INHERIT constraint to partitioned table \""
-                + tableName + "\"", "42P16");
+                + tableName + "\"", "42P16").suppressPosition();
     }
 
     /** The relations that mirror this table's column list: inheritance children and partitions. */
@@ -1372,28 +1436,51 @@ class DdlAlterTableExecutor {
             if (!columnRequiresNotNull(parent, column)) continue;
             throw cannotDropInheritedNotNull(parent, column, tableName);
         }
+        // A parent that dropped the column withdrew nothing from the relations that kept it, so
+        // the rule is still one of theirs to hold rather than theirs to withdraw, and there is no
+        // parent left to name it by: the name is the one the constraint answers to here.
+        if (table.retainedNotNullInheritCount(column) > 0) {
+            throw new MemgresException("cannot drop inherited constraint \""
+                    + CatalogConstraintBuilder.notNullConstraintName(table, column)
+                    + "\" of relation \"" + tableName + "\"", "42P16").suppressPosition();
+        }
     }
 
     /**
      * The refusal PostgreSQL gives for an inherited NOT NULL, naming the constraint the descendant
-     * holds: a constraint taken from a parent keeps the name the parent gave it, so the name comes
-     * from the relation highest in the chain that declares the column NOT NULL.
+     * holds: a constraint taken from a parent keeps the name the relation that declared it gave
+     * it, which is the first relation up the chain whose own definition said NOT NULL rather than
+     * the last -- a relation that restates the rule declares a constraint of its own, and that is
+     * the one everything below it holds.
      */
     private static MemgresException cannotDropInheritedNotNull(Table parent, String column,
                                                                String tableName) {
-        Table owner = parent;
-        while (true) {
-            Table above = null;
-            for (Table candidate : owner.getDirectParents()) {
-                if (columnRequiresNotNull(candidate, column)) { above = candidate; break; }
-            }
-            if (above == null) break;
-            owner = above;
-        }
-        String conname = owner.notNullConstraintName(column);
-        if (conname == null) conname = owner.defaultNotNullConstraintName(column);
+        String conname = CatalogConstraintBuilder.notNullConstraintName(parent, column);
         return new MemgresException("cannot drop inherited constraint \"" + conname
-                + "\" of relation \"" + tableName + "\"", "42P16");
+                + "\" of relation \"" + tableName + "\"", "42P16").suppressPosition();
+    }
+
+    /**
+     * The column a NOT NULL constraint of this name covers, read from the name the constraint
+     * really answers to.
+     *
+     * <p>A constraint has one name, the one it was declared with, and a relation holding one it
+     * took from a parent holds it under that name: a descendant that knew only the name it would
+     * have chosen for itself answered that no such constraint existed, where PostgreSQL's answer
+     * is that the constraint is there and may not be dropped here -- and answered that the name it
+     * would have chosen is a constraint of its own, where PostgreSQL holds no constraint of that
+     * name anywhere.
+     */
+    private static String notNullColumnNamed(Table table, String name) {
+        if (name == null) return null;
+        for (Column c : table.getColumns()) {
+            if (c.isNullable()) continue;
+            if (name.equalsIgnoreCase(
+                    CatalogConstraintBuilder.notNullConstraintName(table, c.getName()))) {
+                return c.getName();
+            }
+        }
+        return null;
     }
 
     /** True when this relation has the column and declares it NOT NULL. */
@@ -1427,10 +1514,52 @@ class DdlAlterTableExecutor {
     private static void requireInheritedChecks(Table parent, Table child) {
         for (StoredConstraint sc : parent.getConstraints()) {
             if (sc.getType() != StoredConstraint.Type.CHECK || sc.isNoInherit()) continue;
-            if (sc.getName() == null || child.getConstraint(sc.getName()) != null) continue;
-            throw PgErrors.datatypeMismatch("child table is missing constraint \""
-                    + sc.getName() + "\"");
+            if (sc.getName() == null) continue;
+            StoredConstraint own = child.getConstraint(sc.getName());
+            if (own == null) {
+                throw PgErrors.datatypeMismatch("child table is missing constraint \""
+                        + sc.getName() + "\"").suppressPosition();
+            }
+            // A rule the relation declared NO INHERIT is about its own rows and nobody else's, so
+            // it is not the parent's rule under the same name. PostgreSQL refuses rather than
+            // merging the two, because the merged constraint would be one the relation is holding
+            // on the parent's behalf -- which is exactly what NO INHERIT said it is not.
+            if (own.isNoInherit()) {
+                throw new MemgresException("constraint \"" + sc.getName()
+                        + "\" conflicts with non-inherited constraint on child table \""
+                        + child.getName() + "\"", "42P17").suppressPosition();
+            }
+            // The relation has to be enforcing the parent's rule, not merely a rule of the same
+            // name: the two become one constraint, and a relation joining the hierarchy with a
+            // different test under that name would go on enforcing its own while the catalogue
+            // said it held the parent's. PostgreSQL compares what the two constraints say rather
+            // than how they were written, so a pair of parentheses makes no difference and the
+            // same comparison written the other way round does.
+            if (!sameCheckDefinition(parent, sc, child, own)) {
+                throw PgErrors.datatypeMismatch("child table \"" + child.getName()
+                        + "\" has different definition for check constraint \""
+                        + sc.getName() + "\"").suppressPosition();
+            }
         }
+    }
+
+    /**
+     * True when two CHECK constraints of the same name say the same thing.
+     *
+     * <p>PostgreSQL compares the two parse trees, so what the writer typed is beside the point:
+     * {@code CHECK ((j) > 0)} is the constraint {@code CHECK (j > 0)} written differently, while
+     * {@code CHECK (0 < j)} is a different rule that happens to hold over the same rows. Reading
+     * each of them back the way {@code pg_get_constraintdef} does asks exactly that question --
+     * the deparser writes one text per tree -- against each relation's own column types, because
+     * a literal is printed in the type it is compared with.
+     */
+    private static boolean sameCheckDefinition(Table parent, StoredConstraint parentCheck,
+                                               Table child, StoredConstraint childCheck) {
+        String above = RuleDeparser.deparse(parentCheck.getCheckExpr(),
+                RuleDeparser.forTable(parent));
+        String below = RuleDeparser.deparse(childCheck.getCheckExpr(),
+                RuleDeparser.forTable(child));
+        return above.equals(below);
     }
 
     /**
@@ -1442,7 +1571,8 @@ class DdlAlterTableExecutor {
                                                     String childName) {
         if (parentCol.isNullable() || !childCol.isNullable()) return;
         throw PgErrors.datatypeMismatch("column \"" + parentCol.getName()
-                + "\" in child table \"" + childName + "\" must be marked NOT NULL");
+                + "\" in child table \"" + childName + "\" must be marked NOT NULL")
+                .suppressPosition();
     }
 
     /**
@@ -1557,6 +1687,13 @@ class DdlAlterTableExecutor {
 
     private void executeRenameColumn(AlterTableStmt.RenameColumn rename, Table table,
                                       AlterTableStmt stmt, String schemaName) {
+        // A typed table's column names are its composite type's, so a rename here would leave the
+        // table answering to a name the type does not declare. PostgreSQL refuses before it looks
+        // the column up at all, which is why a name that is not there gets this refusal and not an
+        // undefined column. ALTER TYPE is what renames a column on every table built on the type.
+        if (table.getOfTypeName() != null) {
+            throw PgErrors.wrongObjectType("cannot rename column of typed table");
+        }
         if (table.getColumnIndex(rename.oldName()) < 0) {
             throw new MemgresException("column \"" + rename.oldName() + "\" does not exist", "42703");
         }
@@ -1596,11 +1733,144 @@ class DdlAlterTableExecutor {
                 rename.newName(), rename.oldName()));
     }
 
+    /**
+     * A column dropped from a parent goes from every relation that was holding it on the parent's
+     * behalf, and from no other.
+     *
+     * <p>A relation holds the column once for each parent that declares it, so one parent letting
+     * go does not take it away while another still hands it down, and a child whose own definition
+     * named the column keeps it whatever its parents do -- with the values it holds in it, which
+     * a drop that reached it would have thrown away. A partition declares nothing of its own, so
+     * it holds exactly what the partitioned table holds. Everything below is reached through the
+     * relation itself: one that keeps the column goes on handing it down, so the walk stops there.
+     */
     private void propagateDropColumn(Table parent, String column) {
         for (Table child : childRelations(parent)) {
-            if (child.getColumnIndex(column) < 0) continue;
+            int idx = child.getColumnIndex(column);
+            if (idx < 0 || keepsDroppedColumn(child, column)) continue;
+            // What this relation is handing down has to be read before it lets the column go.
+            List<String> handedDown = inheritableChecksOn(child, column);
+            String handedDownNotNull =
+                    CatalogConstraintBuilder.declaresNotNull(child, column)
+                            ? CatalogConstraintBuilder.notNullConstraintName(child, column) : null;
+            // The child's copy has to come back with the parent's if the statement is rolled back,
+            // and it has to come back holding what it held: a column restored empty is not the
+            // column the transaction dropped, and it is recorded as the parent's again rather than
+            // as one the child would then be claiming to have declared.
+            Column droppedCol = child.getColumns().get(idx);
+            List<Object> colValues = new ArrayList<>();
+            for (Object[] row : child.getRows()) {
+                colValues.add(row[idx]);
+            }
+            recordDroppedColumnConstraints(child, column, child.getSchemaName(), child.getName());
+            executor.recordUndo(new Session.DropInheritedColumnUndo(child.getSchemaName(),
+                    child.getName(), droppedCol, idx, colValues,
+                    !child.isColumnLocal(column), !child.isNotNullLocal(column)));
             child.removeColumn(column);
             propagateDropColumn(child, column);
+            keepInheritedConstraintCounts(child, column, handedDown, handedDownNotNull);
+        }
+    }
+
+    /**
+     * The names of the CHECK constraints this relation hands down that the column would take with
+     * it. A rule marked NO INHERIT was never going to travel, so nothing below counts it.
+     */
+    private static List<String> inheritableChecksOn(Table table, String column) {
+        List<String> names = new ArrayList<>();
+        for (StoredConstraint sc : table.getConstraints()) {
+            if (sc.getType() != StoredConstraint.Type.CHECK || sc.isNoInherit()) continue;
+            if (sc.getName() == null || !sc.dependsOnColumn(column)) continue;
+            names.add(sc.getName());
+        }
+        return names;
+    }
+
+    /**
+     * A relation that goes on holding a column its parent has dropped goes on holding the rules on
+     * it, counted as it counted them.
+     *
+     * <p>PostgreSQL never decrements a descendant's count for a constraint that was dropped as a
+     * dependency of a dropped column: the count says how many parents handed the rule down when
+     * the descendant took it, and dropping a column tells the descendants nothing about the rules
+     * that went with it. So the relation goes on reporting the rule as one it holds for somebody,
+     * under the name that parent gave it, and it is still refused permission to withdraw it --
+     * which is what stops a hierarchy losing a rule its parent never asked it to lose.
+     *
+     * @param handedDown the CHECK constraints the parent was handing down, read before it let the
+     *                   column go
+     * @param handedDownNotNull the name the parent's NOT NULL on the column answered to, or null
+     *                          when the parent did not declare one
+     */
+    private void keepInheritedConstraintCounts(Table parent, String column,
+                                               List<String> handedDown,
+                                               String handedDownNotNull) {
+        for (Table child : childRelations(parent)) {
+            if (child.getColumnIndex(column) < 0) continue;
+            List<String> counted = new ArrayList<>();
+            for (String conname : handedDown) {
+                StoredConstraint held = child.getConstraint(conname);
+                if (held == null) continue;
+                held.setRetainedInheritCount(held.getRetainedInheritCount() + 1);
+                counted.add(conname);
+            }
+            boolean countedNotNull = handedDownNotNull != null
+                    && CatalogConstraintBuilder.declaresNotNull(child, column);
+            String hadName = child.inheritedNotNullName(column);
+            if (countedNotNull) {
+                child.setRetainedNotNullInheritCount(column,
+                        child.retainedNotNullInheritCount(column) + 1);
+                // The name the parent gave the rule is the name it goes on answering to, and
+                // there is nothing left above to read it from once the parent's column is gone.
+                if (!child.isNotNullLocal(column)) {
+                    child.pinInheritedNotNullName(column, handedDownNotNull);
+                }
+            }
+            if (counted.isEmpty() && !countedNotNull) continue;
+            executor.recordUndo(new Session.InheritedConstraintCountUndo(child.getSchemaName(),
+                    child.getName(), column, counted, countedNotNull, hadName));
+        }
+    }
+
+    /**
+     * Write down the constraints this column is about to take with it, so that a statement which
+     * rolls back gives them back. They are recorded before the column's own undo entry, which is
+     * what puts the column back first: a key constraint is rebuilt over the column's position.
+     */
+    private void recordDroppedColumnConstraints(Table table, String column, String schemaName,
+                                                String tableName) {
+        List<StoredConstraint> doomed = new ArrayList<>();
+        for (StoredConstraint sc : table.getConstraints()) {
+            if (sc.dependsOnColumn(column)) doomed.add(sc);
+        }
+        if (doomed.isEmpty()) return;
+        executor.recordUndo(new Session.DropColumnConstraintsUndo(schemaName, tableName, doomed));
+    }
+
+    /**
+     * True when a relation goes on holding a column the parent it takes it from has just dropped:
+     * another parent still declares it, or its own definition named it. A partition holds the
+     * partitioned table's columns and declares none of its own.
+     */
+    private static boolean keepsDroppedColumn(Table child, String column) {
+        for (Table parent : child.getDirectParents()) {
+            if (parent.getColumnIndex(column) >= 0) return true;
+        }
+        return child.getPartitionParent() == null && child.isColumnLocal(column);
+    }
+
+    /**
+     * ONLY leaves the children holding the column, and each of them holds it for itself from then
+     * on: the parent has stopped declaring it, so there is nobody left it could be held for. A
+     * child that takes the same column from another parent as well goes on counting that one, so
+     * the column is the child's own and inherited at the same time.
+     */
+    private void makeDroppedColumnLocal(Table parent, String column) {
+        for (Table child : childRelations(parent)) {
+            if (child.getColumnIndex(column) < 0 || child.isColumnLocal(column)) continue;
+            executor.recordUndo(new Session.ColumnLocalityUndo(child.getSchemaName(),
+                    child.getName(), column));
+            child.markColumnLocal(column);
         }
     }
 
@@ -1703,7 +1973,7 @@ class DdlAlterTableExecutor {
             String viewSchema = vd.schemaName() != null ? vd.schemaName() : executor.defaultSchema();
             if (executor.database.getView(viewSchema, vd.name()) == null) continue;
             for (String dependent : ViewDependencies.cascadeDependents(
-                    executor.database, viewSchema, vd.name())) {
+                    executor.database, executor.systemCatalog, viewSchema, vd.name())) {
                 Database.ViewDef dep = executor.database.getView(dependent);
                 if (dep == null) continue;
                 executor.recordUndo(new Session.DropViewUndo(dependent, dep));
@@ -1877,11 +2147,20 @@ class DdlAlterTableExecutor {
         for (Object[] row : table.getRows()) {
             colValues.add(row[colIdx]);
         }
+        recordDroppedColumnConstraints(table, dropCol.column(), schemaName, stmt.table());
         executor.recordUndo(new Session.DropColumnUndo(schemaName, stmt.table(), droppedCol, colIdx, colValues));
+        // What the relation is handing down has to be read before it lets the column go: the
+        // relations that keep the column go on counting these, whichever form of the statement
+        // this is.
+        List<String> handedDown = inheritableChecksOn(table, dropCol.column());
+        String handedDownNotNull = CatalogConstraintBuilder.declaresNotNull(table, dropCol.column())
+                ? CatalogConstraintBuilder.notNullConstraintName(table, dropCol.column()) : null;
         table.removeColumn(dropCol.column());
         // Without ONLY the parent's shape is the hierarchy's shape, so the column goes from the
         // children too; with ONLY the children keep it as a column of their own.
-        if (!stmt.only()) propagateDropColumn(table, dropCol.column());
+        if (stmt.only()) makeDroppedColumnLocal(table, dropCol.column());
+        else propagateDropColumn(table, dropCol.column());
+        keepInheritedConstraintCounts(table, dropCol.column(), handedDown, handedDownNotNull);
         // Drop incoming FOREIGN KEY constraints that referenced the dropped column (reached only
         // with CASCADE, or when the FK's own columns also contained the dropped column).
         for (Schema sch : executor.database.getSchemas().values()) {
@@ -2304,7 +2583,7 @@ class DdlAlterTableExecutor {
         }
         try {
             Expression parsed = com.memgres.engine.parser.Parser.parseExpression(action.expression());
-            ddl.validateExprColumnRefs(parsed, table, column);
+            ddl.validateExprColumnRefs(parsed, table, column, false, true);
         } catch (MemgresException me) {
             throw me;
         } catch (Exception ignored) {
@@ -2362,6 +2641,30 @@ class DdlAlterTableExecutor {
      */
     private void executeSetType(AlterTableStmt.AlterColumn alterCol, AlterTableStmt.SetType setType,
                                  Table table, AlterTableStmt stmt, String schemaName) {
+        // A USING expression is resolved against the relation while the statement is still being
+        // read, before anything about the retype itself has been settled -- so a name it cannot
+        // resolve is reported as a plain undefined column, with no relation clause, ahead of the
+        // column being retyped, the type it is being retyped to and every rule about which table
+        // may carry the change. The relation's own system columns are names the expression may
+        // reach, so they resolve. Left unresolved, the expression was only ever evaluated per row,
+        // which meant a retype of an empty table took a USING clause naming nothing at all.
+        if (setType.usingExpr() != null) {
+            ddl.validateExprColumnRefs(setType.usingExpr(), table, null, true, true);
+        }
+        // PostgreSQL settles which column is being retyped before it settles what it is being
+        // retyped to, so a statement that gets both wrong is reported as the undefined column: a
+        // type name nothing answers to -- serial among them, being CREATE TABLE shorthand rather
+        // than a type -- says nothing about a column the relation does not carry at all.
+        requireColumn(table, alterCol.column(), stmt.table());
+        // A typed table's columns are its composite type's, so retyping one would leave the table
+        // disagreeing with the type it was declared OF; ALTER TYPE is what changes the shape of
+        // every table built on that type. Unlike RENAME COLUMN, PostgreSQL looks the column up
+        // first -- a name that is not there is an undefined column, not this -- and then refuses
+        // everything else, including a retype to the type the column already has and one naming a
+        // type that does not exist.
+        if (table.getOfTypeName() != null && table.getColumnIndex(alterCol.column()) >= 0) {
+            throw PgErrors.wrongObjectType("cannot alter column type of typed table");
+        }
         // serial is CREATE TABLE shorthand rather than a type, so there is nothing to retype a
         // column to and PostgreSQL says no type of that name exists.
         DdlDefinitionChecks.rejectSerialPseudotype(setType.typeName());
@@ -2381,6 +2684,7 @@ class DdlAlterTableExecutor {
                         + alterCol.column() + "\"", "42P16");
             }
             rejectPartitionKeyColumnChange(table, alterCol.column(), "alter", stmt.table());
+            checkRetypeCollation(setType);
             if (stmt.only() && !childRelations(table).isEmpty()) {
                 throw new MemgresException("type of inherited column \"" + alterCol.column()
                         + "\" must be changed in child tables too", "42P16");
@@ -2398,6 +2702,23 @@ class DdlAlterTableExecutor {
             retypeColumn(alterCol, setType, child, child.getName(), schemaName);
             propagateSetType(alterCol, setType, child, schemaName);
         }
+    }
+
+    /**
+     * What a COLLATE clause written on a retype is checked for, in PostgreSQL's order: the name
+     * written has to name a type, the collation name a collation, and only then is the type asked
+     * whether it carries a collation at all. The target type is settled the way a written column
+     * definition settles it, so the clause is judged against the same answer ADD COLUMN reaches --
+     * a name nothing answers to, a width the type cannot have and a name that is still only a
+     * shell are all reported from there, ahead of the clause, because none of them leaves a type
+     * the clause could have been written on.
+     */
+    private void checkRetypeCollation(AlterTableStmt.SetType setType) {
+        if (setType.collation() == null) return;
+        DdlExecutor.ResolvedType resolved = ddl.resolveColumnType(setType.typeName(), null);
+        DdlDefinitionChecks.requireCollationExists(executor.database, setType.collation());
+        DdlDefinitionChecks.rejectUncollatableType(setType.typeName(), resolved,
+                setType.collation());
     }
 
     private void retypeColumn(AlterTableStmt.AlterColumn alterCol, AlterTableStmt.SetType setType,
@@ -2615,7 +2936,8 @@ class DdlAlterTableExecutor {
                 MemgresException dup = new MemgresException("could not create unique index \""
                         + uniqueIndex + "\"", "23505");
                 dup.setConstraint(uniqueIndex);
-                dup.setDetail("Key (" + column + ")=(" + v + ") is duplicated.");
+                dup.setDetail(IndexKeyDescription.duplicated(table,
+                        java.util.Collections.singletonList(column), new Object[]{v}));
                 throw dup;
             }
         }
@@ -3032,6 +3354,14 @@ class DdlAlterTableExecutor {
             }
             executor.selectExecutor.placementCheck.rejectStoredDefinition(
                     addConstraint.constraint().checkExpr(), "check constraints", "check constraint");
+            // Every name in the predicate is resolved against the relation the constraint is
+            // being stored on, and resolved before the predicate is asked to be a boolean.
+            // PostgreSQL resolves them whether or not the rows already stored are to be checked:
+            // NOT VALID and NOT ENFORCED defer the rows, not the names. Left to the pass that
+            // reads the rows, a constraint declared either way was stored naming a column nothing
+            // answers to.
+            ddl.validateExprColumnRefs(addConstraint.constraint().checkExpr(), table, null,
+                    true, true);
             DdlDefinitionChecks.requireBooleanPredicate(
                     addConstraint.constraint().checkExpr(), table, "CHECK");
         }
@@ -3172,6 +3502,15 @@ class DdlAlterTableExecutor {
         // NOT NULL declared on the parent has to reach both. Following the partitions alone left
         // every inherited child taking a null the parent forbids.
         for (Table child : childRelations(table)) {
+            // The rule is the parent's: a descendant taking it on now did not declare it, so the
+            // constraint answers to the parent's name and only the parent may withdraw it. One
+            // that already refuses a null said so for itself and keeps its own name.
+            for (String col : columns) {
+                int idx = child.getColumnIndex(col);
+                if (idx >= 0 && child.getColumns().get(idx).isNullable()) {
+                    child.markNotNullInherited(col);
+                }
+            }
             setColumnsNotNull(child, columns);
         }
     }
@@ -3248,7 +3587,77 @@ class DdlAlterTableExecutor {
      */
     private static void adoptInheritedConstraints(Table relation, Table formerParent) {
         for (StoredConstraint sc : relation.getConstraints()) {
-            if (isInheritedFrom(sc, formerParent)) sc.setInheritedFrom(null);
+            if (!isInheritedFrom(sc, formerParent)) continue;
+            // Under two parents only the named link is broken, and a rule the other parent still
+            // declares has not become the relation's own: it is re-filed under the parent that
+            // goes on handing it down, so the relation is still refused permission to drop it.
+            Table stillFrom = null;
+            for (Table parent : relation.getDirectParents()) {
+                if (sc.getName() != null && parent.getConstraint(sc.getName()) != null) {
+                    stillFrom = parent;
+                    break;
+                }
+            }
+            // A count held over from a parent that dropped its own copy is a count nothing can
+            // withdraw, so leaving the hierarchy does not make the rule the relation's own either:
+            // PostgreSQL turns conislocal on only where the count has reached nought.
+            if (stillFrom == null && sc.getRetainedInheritCount() > 0) continue;
+            sc.setInheritedFrom(stillFrom == null ? null : stillFrom.getName());
+        }
+    }
+
+    /**
+     * Write down what each of this relation's inherited NOT NULL constraints answers to, before a
+     * link changes underneath it.
+     *
+     * <p>PostgreSQL names a constraint when it is created and never names it again. memgres reads
+     * the name off the parent that declared the rule, which is the same answer for as long as that
+     * parent is there -- so the answer is recorded at the moment the relation stops being able to
+     * reach it, and a relation still holding the rule for another parent goes on answering to the
+     * name it was given rather than to the remaining parent's.
+     */
+    private static void pinInheritedNotNullNames(Table relation) {
+        for (Column c : relation.getColumns()) {
+            if (c.isNullable() || relation.isNotNullLocal(c.getName())) continue;
+            relation.pinInheritedNotNullName(c.getName(),
+                    CatalogConstraintBuilder.notNullConstraintName(relation, c.getName()));
+        }
+    }
+
+    /**
+     * The NOT NULL constraints a relation held on a parent's behalf become its own when it leaves
+     * that parent, under the names they already answer to.
+     *
+     * <p>PostgreSQL writes a constraint's name down when it is created and never works it out
+     * again, so a detached partition -- or a table taken out of an inheritance hierarchy -- goes
+     * on carrying the name the relation that declared the rule gave it. Working the name out
+     * afresh from the links that are left renamed the constraint after the relation itself, which
+     * is not the name a DROP CONSTRAINT has to quote. Being the relation's own is the other half:
+     * it is what lets the standalone table withdraw the rule, and PostgreSQL leaves it the
+     * relation's own even where the relation is declared under that parent again afterwards. A
+     * parent that goes on handing the same rule down leaves it exactly as it was, because the
+     * relation is still holding that one for somebody else.
+     */
+    private static void adoptInheritedNotNulls(Table relation, Table formerParent) {
+        for (Column c : relation.getColumns()) {
+            String column = c.getName();
+            if (c.isNullable() || relation.isNotNullLocal(column)) continue;
+            if (!CatalogConstraintBuilder.declaresNotNull(formerParent, column)) continue;
+            boolean handedDownStill = false;
+            for (Table parent : relation.getDirectParents()) {
+                if (CatalogConstraintBuilder.declaresNotNull(parent, column)) {
+                    handedDownStill = true;
+                    break;
+                }
+            }
+            // A rule another parent still hands down is left exactly as it was: the relation is
+            // still holding that one for somebody, and it goes on answering to the name written
+            // down before the link that led to it went.
+            if (handedDownStill) continue;
+            String held = relation.inheritedNotNullName(column);
+            relation.setNotNullConstraintName(column, held != null ? held
+                    : CatalogConstraintBuilder.notNullConstraintName(formerParent, column));
+            relation.markNotNullLocal(column);
         }
     }
 
@@ -3434,6 +3843,13 @@ class DdlAlterTableExecutor {
         }
         // C4a: Validate column compatibility (names and types must match parent)
         validatePartitionColumns(table, partition, attach.partitionName());
+        // ...and the rules it will have to answer for. A partition enforces every CHECK the
+        // partitioned table declares, and PostgreSQL adds none to a table joining the hierarchy
+        // behind the writer's back: one that does not already carry the rule would take rows the
+        // partitioned table rejects, and a read through the parent would return them. The rules
+        // are looked at before the rows, so a table missing one is told which rule it is missing
+        // rather than which of its rows is at fault.
+        requireInheritedChecks(table, partition);
         // C4b: Validate existing rows satisfy partition bounds
         validateExistingRowBounds(partition, table, attach.partitionName());
         // Rows the default partition absorbed only because nothing else claimed them would now
@@ -3447,6 +3863,21 @@ class DdlAlterTableExecutor {
         // parent's indexes, or keeps a matching index it already carries as that copy. Without
         // this the attached table ended up with no index at all and was scanned row by row.
         ddl.tableExecutor.copyParentIndexes(table, partition, schemaName, partSchemaName);
+    }
+
+    /**
+     * Free the detached relation's own indexes from the ones they were copies of. Only its own
+     * are freed: an index on one of its sub-partitions is a copy of an index on a relation that
+     * is leaving with it, and that whole subtree stays as it was.
+     */
+    private void detachPartitionIndexes(Table partition, String partitionSchema) {
+        String qualified = partitionSchema + "." + partition.getName();
+        for (String childKey : new ArrayList<>(executor.database.getIndexParentMap().keySet())) {
+            String owner = executor.database.getIndexTable(childKey);
+            if (owner != null && owner.equalsIgnoreCase(qualified)) {
+                executor.database.getIndexParentMap().remove(childKey);
+            }
+        }
     }
 
     /** ATTACH/DETACH PARTITION only apply to a partitioned table. */
@@ -3557,11 +3988,14 @@ class DdlAlterTableExecutor {
                 // A partition holds the parent's rows and nothing besides, so a column of its own
                 // has nowhere to be stored; PostgreSQL says what the rule is, not only that this
                 // table breaks it.
+                // PostgreSQL reads the two relations out of the catalogue rather than out of the
+                // statement text, so none of the refusals here has a place in the text to point
+                // the reader at and none carries a Position.
                 throw new MemgresException("table \"" + partName
                         + "\" contains column \"" + pc.getName()
                         + "\" not found in parent \"" + parent.getName() + "\""
                         + "\n  Detail: The new partition may contain only the columns present"
-                        + " in parent.", "42804");
+                        + " in parent.", "42804").suppressPosition();
             }
         }
         // Check parent columns exist in partition AND have a matching type
@@ -3575,11 +4009,12 @@ class DdlAlterTableExecutor {
             }
             if (match == null) {
                 throw new MemgresException("child table is missing column \""
-                        + pp.getName() + "\"", "42804");
+                        + pp.getName() + "\"", "42804").suppressPosition();
             }
             if (!sameColumnType(pp, match)) {
                 throw new MemgresException("child table \"" + partName
-                        + "\" has different type for column \"" + pp.getName() + "\"", "42804");
+                        + "\" has different type for column \"" + pp.getName() + "\"", "42804")
+                        .suppressPosition();
             }
             requireNotNullWhereParentIs(pp, match, partName);
         }

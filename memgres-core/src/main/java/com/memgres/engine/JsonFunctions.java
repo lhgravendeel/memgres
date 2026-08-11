@@ -648,6 +648,13 @@ class JsonFunctions {
         String relation = wholeRowRelation(arg);
         if (relation != null && ctx != null) {
             RowContext.TableBinding b = ctx.getBinding(relation);
+            // The relation may belong to a query this one is written inside rather than to this
+            // one: to_jsonb(o.*) in a subquery names the row of the query around it, because that
+            // is where PostgreSQL resolves a name this query's own FROM clause has not got.
+            for (Iterator<RowContext> it = executor.outerContextStack.descendingIterator();
+                    b == null && it.hasNext(); ) {
+                b = it.next().getBinding(relation);
+            }
             if (b != null && b.table() != null && !b.table().getColumns().isEmpty()) {
                 Map<String, Object> record = new java.util.LinkedHashMap<>();
                 for (int i = 0; i < b.table().getColumns().size(); i++) {

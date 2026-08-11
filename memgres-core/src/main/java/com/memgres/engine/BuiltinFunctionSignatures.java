@@ -128,6 +128,33 @@ public final class BuiltinFunctionSignatures {
         return null;
     }
 
+    /**
+     * Whether a signature of this name that takes this many arguments declares text at this
+     * position.
+     *
+     * <p>A string written with no type of its own is resolved to whatever the parameter it fills
+     * is declared as, and a definition shows that resolution: {@code date_trunc('month', ts)} is
+     * stored, and printed back, as {@code date_trunc('month'::text, ts)}. Where the candidates
+     * disagree about a position PostgreSQL settles an untyped string on the string category, so
+     * one candidate declaring text is enough to say what the constant became — which is why
+     * {@code timezone('UTC', ts)} resolves to the call over text rather than the one over
+     * interval. A variadic signature is passed over: its tail is collected into an array rather
+     * than filled one parameter at a time. A name PostgreSQL declares nothing for is answered
+     * false, because the table's silence about a name is not a claim about it.
+     */
+    static boolean someSignatureTakesTextAt(String name, int arity, int position) {
+        if (name == null || position < 0 || position >= arity) return false;
+        String key = name.toLowerCase(java.util.Locale.ROOT);
+        for (String[] sig : SIGNATURES) {
+            if (!sig[0].equals(key) || !declaredByPostgres(sig) || isVariadic(sig)) continue;
+            if (sig[2].isEmpty()) continue;
+            String[] params = sig[2].split(" ");
+            if (params.length < arity || fewestArguments(sig) > arity) continue;
+            if ("25".equals(params[position])) return true;
+        }
+        return false;
+    }
+
     /** The fewest arguments this signature accepts — pronargs less its defaulted parameters. */
     static int fewestArguments(String[] signature) {
         int params = signature[2].isEmpty() ? 0 : signature[2].split(" ").length;

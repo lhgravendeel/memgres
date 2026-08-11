@@ -1828,6 +1828,37 @@ public final class TypeCoercion {
         return new MemgresException(noun + " out of range: \"" + original + "\"", "22008");
     }
 
+    /**
+     * A clock reading on its own, by the field rules {@link #parseCalendarLiteral} reads the clock
+     * part of a timestamp by: an hour, a minute and optionally a second, each written with one
+     * digit or two, and optionally a fraction of a second rounded to microseconds.
+     *
+     * <p>Null for anything that is no clock reading at all, and null for a reading whose fields
+     * are out of range -- the caller has an answer of its own for both, and PostgreSQL tells the
+     * two apart the same way.
+     */
+    private static LocalTime clockLiteral(String s) {
+        java.util.regex.Matcher m = CLOCK_LITERAL.matcher(s);
+        if (!m.matches()) return null;
+        int hour = Integer.parseInt(m.group(1));
+        int minute = Integer.parseInt(m.group(2));
+        int second = m.group(3) == null ? 0 : Integer.parseInt(m.group(3));
+        String fraction = m.group(4);
+        long nanos = fraction == null || fraction.isEmpty() ? 0
+                : new java.math.BigDecimal("0." + fraction).movePointRight(9).longValue();
+        // The hour may reach 24 only when nothing follows it, and a 60th second is the next
+        // minute -- the same two rules the clock part of a timestamp is read by.
+        if (hour > 24 || (hour == 24 && (minute != 0 || second != 0 || nanos != 0))) return null;
+        if (minute > 59 || second > 60 || (second == 60 && nanos != 0)) return null;
+        long micros = ((hour * 60L + minute) * 60L + second) * 1_000_000L
+                + Math.round(nanos / 1000.0);
+        return micros >= 86_400_000_000L ? TIME_END_OF_DAY : LocalTime.ofNanoOfDay(micros * 1000L);
+    }
+
+    /** An hour, a minute, and optionally a second and a fraction of one. */
+    private static final java.util.regex.Pattern CLOCK_LITERAL =
+            java.util.regex.Pattern.compile("^(\\d{1,2}):(\\d{1,2})(?::(\\d{1,2})(?:\\.(\\d*))?)?$");
+
     public static LocalTime toLocalTime(Object val) {
         if (val instanceof LocalTime) return ((LocalTime) val);
         if (val instanceof LocalDateTime) return ((LocalDateTime) val).toLocalTime();
@@ -1840,6 +1871,12 @@ public final class TypeCoercion {
         // is out of range. java.time stops a nanosecond short of it, so it is held as that.
         if (s.matches("24:00(:00(\\.0+)?)?")) return TIME_END_OF_DAY;
         try { return roundedToMicros(LocalTime.parse(s)); } catch (DateTimeParseException e) {
+            // A field written with one digit names the same time as one written with two, and the
+            // seconds may be left off: PostgreSQL reads '3:4' as three minutes past three. The
+            // reader a timestamp's clock part already goes through takes that spelling, so a time
+            // standing on its own is not read any more narrowly here.
+            LocalTime clock = clockLiteral(s);
+            if (clock != null) return clock;
             // Try parsing as time with timezone offset (e.g., "10:30:00+02")
             try {
                 return java.time.OffsetTime.parse(s, java.time.format.DateTimeFormatter.ISO_OFFSET_TIME).toLocalTime();
@@ -1864,12 +1901,17 @@ public final class TypeCoercion {
                 int tzIdx = Math.max(plusIdx, minusIdx);
                 if (tzIdx > 0) {
                     timePart = s.substring(0, tzIdx);
-                    try { return LocalTime.parse(timePart); } catch (DateTimeParseException e3) { /* fall through */ }
+                    try { return LocalTime.parse(timePart); } catch (DateTimeParseException e3) {
+                        LocalTime written = clockLiteral(timePart);
+                        if (written != null) return written;
+                    }
                 }
             }
             // Use 22008 for well-formatted but out-of-range times (e.g. 25:00:00); text that is
-            // no time at all gets PG's 22007 wording, which names the type it would not read as
-            if (!s.matches("\\d{1,2}:\\d{2}(:\\d{2})?.*")) {
+            // no time at all gets PG's 22007 wording, which names the type it would not read as.
+            // A clock whose fields are written one digit wide is well formatted too, so a field
+            // out of range in one is reported as out of range rather than as a spelling mistake.
+            if (!s.matches("\\d{1,2}:\\d{2}(:\\d{2})?.*") && !s.matches(CLOCK_LITERAL.pattern())) {
                 throw new MemgresException(
                         "invalid input syntax for type time: \"" + val + "\"", "22007");
             }
@@ -1957,9 +1999,27 @@ public final class TypeCoercion {
             return timePart + "+00";
         } catch (DateTimeParseException e) { /* fall through */ }
 
-        String errCode = s.matches("\\d{1,2}:\\d{2}(:\\d{2})?.*") ? "22008" : "22007";
+        // A clock written with one-digit fields, or with the seconds left off, names the same
+        // reading as one written in full -- the reader a timestamp's clock part goes through takes
+        // those spellings -- so writing it out in full is all a timetz needs to be read the same
+        // way. Anything the readers above already took has been answered before this is reached.
+        java.util.regex.Matcher loose = LOOSE_TIMETZ.matcher(s);
+        if (loose.matches()) {
+            LocalTime clock = clockLiteral(loose.group(1));
+            String zone = loose.group(2) == null ? "" : loose.group(2);
+            if (clock != null && !(toString(clock) + zone).equals(s)) {
+                return toTimeTz(toString(clock) + zone);
+            }
+        }
+        String errCode = s.matches("\\d{1,2}:\\d{2}(:\\d{2})?.*")
+                || s.matches(CLOCK_LITERAL.pattern()) ? "22008" : "22007";
         throw new MemgresException("date/time field value out of range: \"" + val + "\"", errCode);
     }
+
+    /** A clock reading in any of its spellings, with the offset a timetz may carry written after it. */
+    private static final java.util.regex.Pattern LOOSE_TIMETZ =
+            java.util.regex.Pattern.compile(
+                    "^(\\d{1,2}:\\d{1,2}(?::\\d{1,2}(?:\\.\\d*)?)?)\\s*([+-].*)?$");
 
     /** True when the value is a timetz -- memgres holds one as its printed HH:MM:SS±TZ text. */
     public static boolean looksLikeTimeTz(Object val) {

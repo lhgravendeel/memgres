@@ -352,18 +352,22 @@ class DdlAlterActionParser {
         if (parser.matchKeywords("DROP", "DEFAULT")) return new AlterTableStmt.DropDefault();
         if (parser.matchKeyword("TYPE") || parser.matchKeywords("SET", "DATA", "TYPE")) {
             String typeName = parser.parseTypeName();
-            // A collation only exists for the collatable types, so naming one for any other type
-            // is a contradiction PG refuses rather than silently ignoring.
+            // A collation only exists for the collatable types, so naming one for any other type is
+            // a contradiction PG refuses rather than silently ignoring -- but it refuses it last,
+            // after the column, the type name and the collation name have all been settled. So the
+            // clause is carried to the executor rather than judged here, where nothing else is
+            // known yet. Discarding it left a retype to a collatable type never checking that the
+            // collation named existed at all.
+            String collation = null;
             if (parser.matchKeyword("COLLATE")) {
-                com.memgres.engine.DdlDefinitionChecks.rejectUncollatableType(typeName);
-                String collation = parser.readIdentifier();
+                collation = parser.readIdentifier();
                 if (parser.match(TokenType.DOT)) collation = collation + "." + parser.readIdentifier();
                 ExpressionParser.validateCollationStatic(collation, parser.peek());
             }
             // Capture optional USING clause for data conversion
             Expression usingExpr = null;
             if (parser.matchKeyword("USING")) usingExpr = parser.parseExpression();
-            return new AlterTableStmt.SetType(typeName, usingExpr);
+            return new AlterTableStmt.SetType(typeName, usingExpr, collation);
         }
         // SET (option = value, ...) and RESET (option, ...) are per-column planner options rather
         // than one of the words below, so they are told apart by the paren that follows.

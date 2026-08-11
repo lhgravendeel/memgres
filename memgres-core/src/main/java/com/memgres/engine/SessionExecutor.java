@@ -321,7 +321,10 @@ class SessionExecutor {
             if (param.equalsIgnoreCase("pg_stat_statements.max")) {
                 throw new MemgresException("unrecognized configuration parameter \"pg_stat_statements.max\"", "42704");
             }
-            if (guc != null && !guc.isKnown(param) && !param.isEmpty() && !param.contains(".")) {
+            // A name with a schema in front of it is a custom parameter, and PostgreSQL has no
+            // such parameter until something sets one: the placeholder is made by the SET, so
+            // reading one nothing has set is as unrecognized as any other name would be.
+            if (guc != null && !guc.isKnown(param) && !param.isEmpty()) {
                 throw new MemgresException("unrecognized configuration parameter \"" + param + "\"", "42704");
             }
             String value = guc != null ? guc.getForDisplay(param) : null;
@@ -3459,16 +3462,20 @@ class SessionExecutor {
             return QueryResult.message(QueryResult.Type.SET, "DROP");
         }
         if (kind.equals("alter_rule")) {
-            if (!executor.database.hasRule(first, second)) {
+            // A written qualifier says which schema holds the relation the rule is on, and
+            // PostgreSQL names the relation without its schema when it reports one missing.
+            String onSchema = executor.relationSchemaOf(null, second);
+            String onTable = RelationNamespace.bareName(second);
+            if (!executor.database.hasRule(onSchema, first, onTable)) {
                 throw new MemgresException("rule \"" + first + "\" for relation \""
-                        + second + "\" does not exist", "42704");
+                        + onTable + "\" does not exist", "42704");
             }
             if (!third.isEmpty()) {
-                if (executor.database.hasRule(third, second)) {
+                if (executor.database.hasRule(onSchema, third, onTable)) {
                     throw new MemgresException("rule \"" + third + "\" for relation \""
-                            + second + "\" already exists", "42710");
+                            + onTable + "\" already exists", "42710");
                 }
-                executor.database.renameRule(first, second, third);
+                executor.database.renameRule(onSchema, first, onTable, third);
             }
             return QueryResult.message(QueryResult.Type.SET, "ALTER RULE");
         }

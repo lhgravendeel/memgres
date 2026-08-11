@@ -347,16 +347,77 @@ class DdlParser {
                 parser.expect(TokenType.RIGHT_PAREN);
                 castName = sourceType.toLowerCase() + "->" + targetType.toLowerCase();
             }
+            // A cast is named one at a time, so the comma a list would need is a syntax error.
+            if (parser.check(TokenType.COMMA)) throw ParseException.at(parser.peek());
             boolean cascade2 = parser.matchKeyword("CASCADE");
             parser.matchKeyword("RESTRICT");
             return new DropStmt(objectType, castName, null, ifExists, cascade2);
         }
 
+        DropTarget first = parseDropTarget(objectType);
+        // One DROP may name several objects of the one kind, and PostgreSQL takes all of them
+        // down in the same statement; reading only the first left every later name standing
+        // without a word said about it. The kinds whose grammar names a single object -- a rule
+        // and a trigger, which are written with the relation they sit on, a cast, and an
+        // operator class or family -- have no list at all, and the comma is a syntax error.
+        List<DropTarget> targets = new ArrayList<>();
+        targets.add(first);
+        while (parser.check(TokenType.COMMA)) {
+            if (!dropNamesAList(objectType)) throw ParseException.at(parser.peek());
+            parser.advance();
+            targets.add(parseDropTarget(objectType));
+        }
+
+        boolean cascade = parser.matchKeyword("CASCADE");
+        parser.matchKeyword("RESTRICT");
+
+        // CASCADE and RESTRICT are written once and settle for every name, so the names after the
+        // first are built only now that the behaviour is known.
+        List<DropStmt> more = new ArrayList<>();
+        for (int i = 1; i < targets.size(); i++) {
+            more.add(targets.get(i).toStatement(objectType, ifExists, cascade, null));
+        }
+        return first.toStatement(objectType, ifExists, cascade, more);
+    }
+
+    /** Whether PostgreSQL's grammar lets this kind of DROP name more than one object. */
+    private static boolean dropNamesAList(DropStmt.ObjectType objectType) {
+        return objectType != DropStmt.ObjectType.TRIGGER
+                && objectType != DropStmt.ObjectType.RULE
+                && objectType != DropStmt.ObjectType.POLICY
+                && objectType != DropStmt.ObjectType.OPERATOR_CLASS
+                && objectType != DropStmt.ObjectType.OPERATOR_FAMILY;
+    }
+
+    /** One name a DROP lists, read before CASCADE or RESTRICT is settled for the whole list. */
+    private static final class DropTarget {
+        private final String name;
+        private final String onTable;
+        private final String schema;
+        private final List<String> paramTypes;
+
+        DropTarget(String name, String onTable, String schema, List<String> paramTypes) {
+            this.name = name;
+            this.onTable = onTable;
+            this.schema = schema;
+            this.paramTypes = paramTypes;
+        }
+
+        DropStmt toStatement(DropStmt.ObjectType objectType, boolean ifExists, boolean cascade,
+                             List<DropStmt> more) {
+            return new DropStmt(objectType, name, onTable, ifExists, cascade, paramTypes, schema,
+                    more);
+        }
+    }
+
+    /** The name, signature and relation of one object a DROP statement names. */
+    private DropTarget parseDropTarget(DropStmt.ObjectType objectType) {
         String name;
         String qualifier = null;
         if (objectType == DropStmt.ObjectType.OPERATOR) {
             StringBuilder sb = new StringBuilder();
             while (!parser.isAtEnd() && !parser.check(TokenType.LEFT_PAREN) && !parser.check(TokenType.SEMICOLON)
+                    && !parser.check(TokenType.COMMA)
                     && !parser.checkKeyword("CASCADE") && !parser.checkKeyword("RESTRICT")) {
                 sb.append(parser.advance().value());
             }
@@ -429,16 +490,17 @@ class DdlParser {
         if ((objectType == DropStmt.ObjectType.TRIGGER || objectType == DropStmt.ObjectType.RULE)
                 && parser.matchKeyword("ON")) {
             onTable = parser.readIdentifier();
+            // The relation a rule or a trigger is on may be written with the schema that holds it.
+            // Reading the qualifier as the whole name left the drop looking for a relation called
+            // after the schema, and the one the statement named was never reached.
+            if (parser.match(TokenType.DOT)) onTable = onTable + "." + parser.readIdentifier();
         }
         // For OPERATOR CLASS/FAMILY, store the USING method in onTable
         if (opMethod != null) {
             onTable = opMethod;
         }
 
-        boolean cascade = parser.matchKeyword("CASCADE");
-        parser.matchKeyword("RESTRICT");
-
-        return new DropStmt(objectType, name, onTable, ifExists, cascade, funcParamTypes, dropSchema);
+        return new DropTarget(name, onTable, dropSchema, funcParamTypes);
     }
 
     /**
@@ -995,6 +1057,7 @@ class DdlParser {
             parser.consumeLeadingParens(viewParens);
             Statement query = parser.tryParseSetOp(parseViewBody());
             parser.consumeTrailingParens(viewParens);
+            query = applyTrailingQueryClauses(query);
             boolean withData = true;
             if (parser.matchKeyword("WITH")) {
                 if (parser.matchKeyword("NO")) { parser.expectKeyword("DATA"); withData = false; }
@@ -1024,6 +1087,7 @@ class DdlParser {
         parser.consumeLeadingParens(viewParens2);
         Statement query = parser.tryParseSetOp(parseViewBody());
         parser.consumeTrailingParens(viewParens2);
+        query = applyTrailingQueryClauses(query);
 
         String checkOption = null;
         if (parser.matchKeyword("WITH")) {
@@ -1036,6 +1100,56 @@ class DdlParser {
 
         return new CreateViewStmt(name, query, orReplace, false, columnNames, true, checkOption, withOptions)
                 .withSchema(viewSchema);
+    }
+
+    /**
+     * Read the clauses that order and limit a whole parenthesised body.
+     *
+     * <p>{@code (SELECT ...) ORDER BY x LIMIT n} closes its parenthesis before those clauses, so
+     * the query inside never sees them; without reading them here the view was stored as the
+     * query alone and answered every row of it.
+     */
+    private Statement applyTrailingQueryClauses(Statement query) {
+        List<SelectStmt.OrderByItem> orderBy;
+        Expression limit;
+        Expression offset;
+        if (query instanceof SetOpStmt) {
+            SetOpStmt setOp = (SetOpStmt) query;
+            orderBy = setOp.orderBy();
+            limit = setOp.limit();
+            offset = setOp.offset();
+        } else if (query instanceof SelectStmt) {
+            SelectStmt select = (SelectStmt) query;
+            orderBy = select.orderBy();
+            limit = select.limit();
+            offset = select.offset();
+        } else {
+            return query;
+        }
+        boolean changed = false;
+        if (parser.matchKeywords("ORDER", "BY")) {
+            orderBy = parser.parseOrderByList();
+            changed = true;
+        }
+        if (parser.matchKeyword("LIMIT")) {
+            limit = parser.matchKeyword("ALL") ? Literal.ofNull() : parser.parseExpression();
+            changed = true;
+        }
+        if (parser.matchKeyword("OFFSET")) {
+            offset = parser.parseExpression();
+            changed = true;
+        }
+        if (!changed) return query;
+        if (query instanceof SetOpStmt) {
+            SetOpStmt setOp = (SetOpStmt) query;
+            return new SetOpStmt(setOp.left(), setOp.op(), setOp.all(), setOp.right(), orderBy,
+                    limit, offset, setOp.withTies());
+        }
+        SelectStmt select = (SelectStmt) query;
+        return new SelectStmt(select.distinct(), select.distinctOn(), select.targets(),
+                select.from(), select.where(), select.groupBy(), select.having(),
+                select.windowDefs(), orderBy, limit, offset, select.withClauses(),
+                select.groupingSets(), select.lockClause(), select.withTies());
     }
 
     /**
@@ -1326,8 +1440,15 @@ class DdlParser {
             throw new ParseException("unrecognized rule event", eventToken);
         }
         parser.expectKeyword("TO");
+        // A rule is written on one relation, and a qualifier says which schema holds it rather
+        // than being part of the relation's name. Folding the two into one string sent the
+        // executor looking in the current schema for a relation literally called "s.t".
+        String schema = null;
         String table = parser.readIdentifier();
-        if (parser.match(TokenType.DOT)) table = table + "." + parser.readIdentifier();
+        if (parser.match(TokenType.DOT)) {
+            schema = table;
+            table = parser.readIdentifier();
+        }
         StringBuilder where = new StringBuilder();
         if (parser.matchKeyword("WHERE")) {
             int depth = 0;
@@ -1355,7 +1476,7 @@ class DdlParser {
             }
             if (sb.length() > 0) commands.add(sb.toString().trim());
         }
-        return new CreateRuleStmt(name, event, table, action, commands,
+        return new CreateRuleStmt(name, event, schema, table, action, commands,
                 where.length() == 0 ? null : where.toString().trim(), orReplace);
     }
 
@@ -1885,7 +2006,13 @@ class DdlParser {
             // The type an attribute is changed to is written the way a column's is, modifier and
             // all: ALTER ATTRIBUTE y TYPE varchar(5) changes it to varchar(5), not to varchar.
             String newType = parser.parseTypeName();
-            return new AlterTypeStmt(typeName, AlterTypeStmt.Action.ALTER_ATTRIBUTE_TYPE, attrName, newType, false, null, null);
+            // CASCADE is what lets the change reach the tables declared OF this type; without it
+            // PostgreSQL refuses rather than reshaping a relation the statement did not name.
+            // RESTRICT is the default written out.
+            boolean cascade = parser.matchKeyword("CASCADE");
+            if (!cascade) parser.matchKeyword("RESTRICT");
+            return new AlterTypeStmt(typeName, AlterTypeStmt.Action.ALTER_ATTRIBUTE_TYPE, attrName,
+                    newType, false, null, null, false, cascade);
         }
         if (parser.matchKeywords("SET", "SCHEMA"))
             return new AlterTypeStmt(typeName, AlterTypeStmt.Action.SET_SCHEMA, parser.readIdentifier(), null, false, null, null);

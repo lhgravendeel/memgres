@@ -345,7 +345,7 @@ class DdlTableParser {
     ColumnDef parseColumnDef() {
         String colName = parser.readColumnName();
         String typeName = parser.parseTypeName();
-        return parseColumnQualifiers(colName, typeName);
+        return parseColumnQualifiers(colName, serialSpelling(typeName));
     }
 
     /**
@@ -577,7 +577,9 @@ class DdlTableParser {
             }
             if (parser.matchKeyword("COLLATE")) {
                 if (!parser.isClauseKeyword()) {
-                    com.memgres.engine.DdlDefinitionChecks.rejectUncollatableType(typeName);
+                    // Whether the type carries a collation at all is the executor's to say, and it
+                    // says it last: PostgreSQL settles the type name and then the collation name
+                    // before it asks whether the two go together.
                     String collation = parser.readIdentifier();
                     if (parser.match(TokenType.DOT)) collation = collation + "." + parser.readIdentifier();
                     ExpressionParser.validateCollationStatic(collation, parser.peek());
@@ -733,6 +735,50 @@ class DdlTableParser {
         return bare.equalsIgnoreCase("serial") || bare.equalsIgnoreCase("bigserial")
                 || bare.equalsIgnoreCase("smallserial") || bare.equalsIgnoreCase("serial2")
                 || bare.equalsIgnoreCase("serial4") || bare.equalsIgnoreCase("serial8");
+    }
+
+    /**
+     * The type a column declared with the serial shorthand really has.
+     *
+     * <p>serial2, serial4 and serial8 are the same shorthand as smallserial, serial and bigserial:
+     * PostgreSQL matches all six spellings where a column's type is written and rewrites the column
+     * to an integer column with a sequence behind it. The shorthand means that only in a column
+     * definition -- a cast, a domain, a composite field or a retype naming one of these words finds
+     * no type of the name at all -- so the numbered spellings are folded onto the words they stand
+     * for here, where a column definition is read, rather than made types of their own. A name
+     * written under a schema is a real type name and is left alone: pg_catalog holds no serial2.
+     *
+     * <p>Neither an array of the shorthand nor a modifier written after it means anything. One
+     * sequence stands behind one serial column, so there is nothing for an array of them to draw
+     * from; and the integer type the shorthand stands for takes no modifier -- which is the type
+     * PostgreSQL names when it turns one down, because that is the type the column would have had.
+     */
+    private static String serialSpelling(String typeName) {
+        if (typeName == null) return null;
+        String written = typeName.replaceAll("\\(.*\\)", "").trim();
+        boolean isArray = written.endsWith("[]");
+        String scalar = isArray ? written.substring(0, written.length() - 2).trim() : written;
+        if (scalar.indexOf('.') >= 0 || !isSerialTypeName(scalar)) return typeName;
+        if (isArray) {
+            throw com.memgres.engine.PgErrors.notImplemented("array of serial is not implemented");
+        }
+        String folded;
+        String integerType;
+        if (scalar.equalsIgnoreCase("smallserial") || scalar.equalsIgnoreCase("serial2")) {
+            folded = "smallserial";
+            integerType = "smallint";
+        } else if (scalar.equalsIgnoreCase("bigserial") || scalar.equalsIgnoreCase("serial8")) {
+            folded = "bigserial";
+            integerType = "bigint";
+        } else {
+            folded = "serial";
+            integerType = "integer";
+        }
+        if (!written.equals(typeName.trim())) {
+            throw com.memgres.engine.PgErrors.syntax(
+                    "type modifier is not allowed for type \"" + integerType + "\"");
+        }
+        return folded;
     }
 
     /**

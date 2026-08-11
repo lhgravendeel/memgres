@@ -88,8 +88,16 @@ class PgCatalogFunctionTest {
     }
 
     @Test
-    void testPgCatalogCurrentUser() throws SQLException {
-        assertNotNull(query1("SELECT pg_catalog.current_user"));
+    void testPgCatalogCurrentUser() {
+        // current_user is a value written without parentheses, so a name in front of it is read
+        // as a relation's, not as a schema's. PostgreSQL refuses it for the same reason it refuses
+        // any other qualifier the FROM clause does not answer to. The call form, with the
+        // parentheses, is a function reference and is accepted — see testPgCatalogCurrentSchema.
+        SQLException e = assertThrows(SQLException.class,
+                () -> query1("SELECT pg_catalog.current_user"));
+        assertEquals("42P01", e.getSQLState());
+        assertTrue(e.getMessage().contains("missing FROM-clause entry for table \"pg_catalog\""),
+                e.getMessage());
     }
 
     @Test

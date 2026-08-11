@@ -1,6 +1,8 @@
 package com.memgres.engine;
 
 import com.memgres.engine.parser.ast.AnyAllArrayExpr;
+import com.memgres.engine.parser.ast.AtTimeZoneExpr;
+import com.memgres.engine.parser.ast.NamedArgExpr;
 import com.memgres.engine.parser.ast.SubscriptExpr;
 import com.memgres.engine.parser.ast.ArrayExpr;
 import com.memgres.engine.parser.ast.BetweenExpr;
@@ -127,12 +129,26 @@ public final class RuleDeparser {
 
     /** Column-type lookup for a domain CHECK, where the only "column" is {@code VALUE}. */
     public static ColumnTypes forDomain(final PgType valueType) {
-        return new ColumnTypes() {
-            @Override
-            public PgType typeOf(String columnName) {
-                return "value".equalsIgnoreCase(columnName) ? valueType : null;
-            }
-        };
+        return new DomainValue(valueType);
+    }
+
+    /**
+     * The lookup a domain CHECK is read against. PostgreSQL writes the domain's own placeholder
+     * back as the keyword {@code VALUE}, so the renderer has to be able to tell that placeholder
+     * from an ordinary relation column that happens to be called value — which PostgreSQL writes
+     * in lower case like any other name.
+     */
+    private static final class DomainValue implements ColumnTypes {
+        private final PgType valueType;
+
+        DomainValue(PgType valueType) {
+            this.valueType = valueType;
+        }
+
+        @Override
+        public PgType typeOf(String columnName) {
+            return "value".equalsIgnoreCase(columnName) ? valueType : null;
+        }
     }
 
     /** A lookup that resolves nothing; casts are then never inserted. */
@@ -192,10 +208,29 @@ public final class RuleDeparser {
     }
 
     private static boolean looksLikeFunction(Expression e) {
+        // AT TIME ZONE is one of the calls SQL gives a syntax of its own, and PostgreSQL's rule
+        // admits those as readily as an ordinary call: the spelling already carries parentheses
+        // of its own, so a second pair would be one pair too many.
+        if (e instanceof AtTimeZoneExpr) return true;
         if (!(e instanceof FunctionCallExpr)) return false;
         String n = ((FunctionCallExpr) e).name();
+        // XMLSERIALIZE produces text and is then coerced to whatever type the key asked for, so a
+        // key asking for anything but text has that coercion sitting on top of the call and is
+        // parenthesised for it.
+        if ("xmlserialize".equalsIgnoreCase(n)) return xmlSerializeType((FunctionCallExpr) e) == null;
         // A cast written in function syntax deparses as a cast, not a call.
         return n != null && !isTypeName(n);
+    }
+
+    /**
+     * The type an XMLSERIALIZE was asked for, when it is one the call answers with on its own —
+     * null when it is text, which is what the call already produces.
+     */
+    private static PgType xmlSerializeType(FunctionCallExpr fn) {
+        List<Expression> args = fn.args();
+        if (args == null || args.size() < 3 || !(args.get(2) instanceof Literal)) return null;
+        PgType asked = parseTypeName(((Literal) args.get(2)).value());
+        return asked != null && asked.dt == DataType.TEXT ? null : asked;
     }
 
     // ------------------------------------------------------------------
@@ -261,6 +296,8 @@ public final class RuleDeparser {
         if (e instanceof ColumnRef) return cols.typeOf(((ColumnRef) e).column());
         if (e instanceof CastExpr) return parseTypeName(((CastExpr) e).typeName());
         if (e instanceof CollateExpr) return typeOf(((CollateExpr) e).expr(), cols);
+        if (e instanceof NamedArgExpr) return typeOf(((NamedArgExpr) e).value(), cols);
+        if (e instanceof AtTimeZoneExpr) return atTimeZoneType(typeOf(((AtTimeZoneExpr) e).expr(), cols));
         if (e instanceof UnaryExpr) {
             UnaryExpr u = (UnaryExpr) e;
             if (u.op() == UnaryExpr.UnaryOp.NOT) return PgType.of(DataType.BOOLEAN);
@@ -274,6 +311,8 @@ public final class RuleDeparser {
         if (e instanceof BinaryExpr) {
             BinaryExpr b = (BinaryExpr) e;
             if (isBooleanResult(b.op())) return PgType.of(DataType.BOOLEAN);
+            PgType json = jsonResultType(b.op(), typeOf(b.left(), cols));
+            if (json != null) return json;
             if (b.op() == BinaryExpr.BinOp.CONCAT) return PgType.of(DataType.TEXT);
             PgType[] tg = operandTargets(b.op(), typeOf(b.left(), cols), typeOf(b.right(), cols));
             return tg[0] != null ? tg[0] : tg[1];
@@ -290,6 +329,26 @@ public final class RuleDeparser {
             return functionReturnType((FunctionCallExpr) e, cols);
         }
         return null;
+    }
+
+    /**
+     * The type AT TIME ZONE answers with. It moves a value across the boundary the zone marks:
+     * a value that carried a zone loses it and one that carried none gains it, which is why the
+     * same clause reads a timestamptz out of a timestamp and a timestamp out of a timestamptz.
+     */
+    private static PgType atTimeZoneType(PgType inner) {
+        if (inner == null || inner.dt == null) return null;
+        switch (inner.dt) {
+            case TIMESTAMP:
+                return PgType.of(DataType.TIMESTAMPTZ);
+            case TIMESTAMPTZ:
+                return PgType.of(DataType.TIMESTAMP);
+            case TIME:
+            case TIMETZ:
+                return PgType.of(DataType.TIMETZ);
+            default:
+                return null;
+        }
     }
 
     private static boolean isBooleanResult(BinaryExpr.BinOp op) {
@@ -330,6 +389,10 @@ public final class RuleDeparser {
                 return PgType.of(integerLiteralType(lit.value()));
             case FLOAT:
                 return PgType.of(DataType.NUMERIC);
+            case BIT_STRING:
+                // A bit-string literal is a constant of the bit type whatever reads it, which is
+                // what makes a comparison with a bit varying resolve to bit varying's operator.
+                return PgType.of(DataType.BIT);
             case BOOLEAN:
                 return PgType.of(DataType.BOOLEAN);
             default:
@@ -393,6 +456,8 @@ public final class RuleDeparser {
         if (lt == null && rt == null) return new PgType[]{null, null};
         // An untyped literal takes the type of its sibling before resolution runs.
         if (lt == null) lt = rt;
+        PgType json = jsonOperandTarget(op, lt, rt);
+        if (json != null) return new PgType[]{lt, json};
         if (rt == null) rt = lt;
 
         PgType text = PgType.of(DataType.TEXT);
@@ -411,6 +476,12 @@ public final class RuleDeparser {
             return new PgType[]{f8, f8};
         }
 
+        // Everything else is settled by the entry of pg_operator the two types resolve to, which
+        // is what puts inet's operator between a cidr and an inet and bit varying's between a bit
+        // varying and a bit. The rules below stand in wherever that leaves the choice open.
+        PgType[] resolved = resolvedTargets(op, lt, rt);
+        if (resolved != null) return resolved;
+
         PgType[] str = stringTargets(lt, rt);
         if (str != null) return str;
 
@@ -420,6 +491,77 @@ public final class RuleDeparser {
         if (num != null) return num;
 
         return new PgType[]{lt, rt};
+    }
+
+    /**
+     * The types the operator this spelling resolves to reads its operands as, or null where
+     * neither type is one pg_operator is written over or the choice between its entries is not
+     * settled. A type carrying a width keeps the one it was declared with, since the conversion
+     * PostgreSQL leaves out is the one that would have nothing to do.
+     */
+    private static PgType[] resolvedTargets(BinaryExpr.BinOp op, PgType lt, PgType rt) {
+        if (lt.dt == null || rt.dt == null) return null;
+        int[] readAs = OperandTypes.forOperator(operatorText(op), lt.dt.getOid(), rt.dt.getOid());
+        if (readAs == null) return null;
+        DataType left = DataType.fromOid(readAs[0]);
+        DataType right = DataType.fromOid(readAs[1]);
+        if (left == null || right == null) return null;
+        return new PgType[]{left == lt.dt ? lt : PgType.of(left),
+                right == rt.dt ? rt : PgType.of(right)};
+    }
+
+    /**
+     * What a json operator answers with, or null where the operator is not one of them. The two
+     * arrows that end in a second {@code >} read the member out as text; the rest hand back a
+     * document, which is why an index over one of them indexes json and an index over the other
+     * indexes text.
+     */
+    private static PgType jsonResultType(BinaryExpr.BinOp op, PgType lt) {
+        if (lt == null || (lt.dt != DataType.JSON && lt.dt != DataType.JSONB)) return null;
+        switch (op) {
+            case JSON_ARROW_TEXT:
+            case JSON_HASH_ARROW_TEXT:
+                return PgType.of(DataType.TEXT);
+            case JSON_ARROW:
+            case JSON_SUBSCRIPT:
+            case JSON_HASH_ARROW:
+            case SUBTRACT:
+            case CONCAT:
+                return lt;
+            default:
+                return null;
+        }
+    }
+
+    /**
+     * What the right-hand side of a json operator resolves to, or null where the operator is not
+     * one of them.
+     *
+     * <p>These operators are declared over the type they take rather than over the document they
+     * read, so a constant written beside one does not become another document: {@code j -> 'k'}
+     * names the member called k, which is a text key, and {@code j #> '{a}'} walks a path, which
+     * is an array of them. Taking the type from the left operand instead wrote a key down as a
+     * document, which is not what the operator was resolved against.
+     */
+    private static PgType jsonOperandTarget(BinaryExpr.BinOp op, PgType lt, PgType rt) {
+        if (lt == null || (lt.dt != DataType.JSON && lt.dt != DataType.JSONB)) return null;
+        switch (op) {
+            case JSON_ARROW:
+            case JSON_SUBSCRIPT:
+            case JSON_ARROW_TEXT:
+            case SUBTRACT:
+                // A number picks an element out of an array, and there is an operator for that.
+                return category(rt) == CAT_INT ? rt : PgType.of(DataType.TEXT);
+            case JSONB_EXISTS:
+                return PgType.of(DataType.TEXT);
+            case JSON_HASH_ARROW:
+            case JSON_HASH_ARROW_TEXT:
+            case JSONB_EXISTS_ANY:
+            case JSONB_EXISTS_ALL:
+                return PgType.arrayOf(DataType.TEXT);
+            default:
+                return null;
+        }
     }
 
     private static boolean concatenable(PgType t) {
@@ -543,6 +685,13 @@ public final class RuleDeparser {
         if (e instanceof Literal) {
             return renderLiteral((Literal) e, target);
         }
+        // An array constructor takes its element type from the context it stands in, so a bare
+        // constant inside one is printed as a constant of that type: ARRAY['x'::text] beside a
+        // text[] column, not ARRAY['x'].
+        if (e instanceof ArrayExpr && target != null && target.elem != null
+                && !((ArrayExpr) e).isRow()) {
+            return renderArray((ArrayExpr) e, PgType.of(target.elem), cols);
+        }
 
         String body = renderNode(e, cols);
         if (suppressCast || target == null) return body;
@@ -554,7 +703,7 @@ public final class RuleDeparser {
     private static String renderNode(Expression e, ColumnTypes cols) {
         if (e instanceof ColumnRef) {
             ColumnRef r = (ColumnRef) e;
-            String col = "value".equalsIgnoreCase(r.column()) && cols.typeOf("value") != null
+            String col = "value".equalsIgnoreCase(r.column()) && cols instanceof DomainValue
                     ? "VALUE" : quoteIdentifier(r.column());
             return (r.table() != null ? quoteIdentifier(r.table()) + "." : "") + col;
         }
@@ -567,8 +716,28 @@ public final class RuleDeparser {
             return "(" + renderNode(c.expr(), cols) + ")::" + formatType(to);
         }
         if (e instanceof CollateExpr) {
+            // A collation written inside an expression is a node of that expression and is
+            // bracketed like one: upper((b COLLATE "C")). Only a collation an index key takes for
+            // its own stands unbracketed, and that one is no longer part of the expression.
             CollateExpr c = (CollateExpr) e;
-            return renderNode(c.expr(), cols) + " COLLATE " + quoteCollation(c.collation());
+            return "(" + renderNode(c.expr(), cols) + " COLLATE " + quoteCollation(c.collation()) + ")";
+        }
+        if (e instanceof AtTimeZoneExpr) {
+            // The clause is a call on the zone and the value, and PostgreSQL writes the call back
+            // in the syntax it was written in, parentheses included. A zone written as a bare
+            // string is a constant of no type until the call resolves it, and the call it resolves
+            // to is the one taking text.
+            AtTimeZoneExpr z = (AtTimeZoneExpr) e;
+            PgType zoneType = typeOf(z.zone(), cols);
+            return "(" + render(z.expr(), null, cols, false) + " AT TIME ZONE "
+                    + render(z.zone(), zoneType == null ? PgType.of(DataType.TEXT) : null, cols, false)
+                    + ")";
+        }
+        if (e instanceof NamedArgExpr) {
+            // An argument written under a parameter's name is written back under it, because
+            // which parameter it fills is part of what the call says.
+            NamedArgExpr named = (NamedArgExpr) e;
+            return quoteIdentifier(named.name()) + " => " + render(named.value(), null, cols, false);
         }
         if (e instanceof BinaryExpr) {
             return renderBinary((BinaryExpr) e, cols);
@@ -729,14 +898,33 @@ public final class RuleDeparser {
     /** PG rewrites IN (list) into {@code = ANY (ARRAY[...])}. */
     private static String renderIn(InExpr in, ColumnTypes cols) {
         PgType lt = typeOf(in.expr(), cols);
-        StringBuilder sb = new StringBuilder("(");
-        sb.append(render(in.expr(), null, cols, false));
-        sb.append(in.negated() ? " <> ALL (ARRAY[" : " = ANY (ARRAY[");
+        // Every item of the list is read as the one type the list settles on together with the
+        // value being tested, and the comparison is resolved over that type. That is what puts a
+        // conversion on the value tested and another on the array of items: a character varying
+        // has no equality of its own, so both sides come back read as text.
+        PgType element = lt;
         for (int i = 0; i < in.values().size(); i++) {
-            if (i > 0) sb.append(", ");
-            sb.append(render(in.values().get(i), lt, cols, false));
+            element = unify(element, typeOf(in.values().get(i), cols));
         }
-        return sb.append("]))").toString();
+        PgType[] readAs = lt == null || element == null ? null
+                : operandTargets(in.negated() ? BinaryExpr.BinOp.NOT_EQUAL
+                        : BinaryExpr.BinOp.EQUAL, lt, element);
+        StringBuilder items = new StringBuilder("ARRAY[");
+        for (int i = 0; i < in.values().size(); i++) {
+            if (i > 0) items.append(", ");
+            items.append(render(in.values().get(i), element, cols, false));
+        }
+        items.append(']');
+        StringBuilder sb = new StringBuilder("(");
+        sb.append(render(in.expr(), readAs == null ? null : readAs[0], cols, false));
+        sb.append(in.negated() ? " <> ALL (" : " = ANY (");
+        if (readAs != null && !readAs[1].sameAs(element) && readAs[1].dt != null) {
+            sb.append('(').append(items).append(")::")
+              .append(formatType(PgType.arrayOf(readAs[1].dt)));
+        } else {
+            sb.append(items);
+        }
+        return sb.append("))").toString();
     }
 
     private static String renderArrayOperand(Expression arr, PgType elemTarget, ColumnTypes cols) {
@@ -771,7 +959,17 @@ public final class RuleDeparser {
     }
 
     private static String renderFunction(FunctionCallExpr fn, ColumnTypes cols) {
-        String name = lower(fn.name());
+        // A name written under a schema the search path reaches on its own is written back without
+        // it: what PG prints is the function the call resolved to, and pg_catalog and public are
+        // always in reach, so pg_catalog.lower(c) reads back as lower(c).
+        String name = unqualify(lower(fn.name()));
+
+        // A value function is a keyword of the grammar rather than a call, so a default or a
+        // check written with one reads back as the keyword: CURRENT_DATE, not current_date().
+        if (!fn.star() && !fn.distinct() && (fn.args() == null || fn.args().isEmpty())) {
+            String keyword = SqlValueFunctions.keywordOf(name, false);
+            if (keyword != null) return keyword;
+        }
 
         // A cast written in function-call syntax, e.g. int4(x), deparses as a cast.
         if (isTypeName(name) && fn.args().size() == 1) {
@@ -787,8 +985,25 @@ public final class RuleDeparser {
                     + ") IN (" + render(fn.args().get(1), PgType.of(DataType.TEXT), cols, false) + "))";
         }
 
+        if ("xmlserialize".equals(name)) {
+            String written = renderXmlSerialize(fn, cols);
+            if (written != null) return written;
+        }
+
+        // A call SQL spells with keywords of its own is written back with them. PostgreSQL keeps
+        // which of the two spellings was used, so substring(s, 1, 2) and SUBSTRING(s FROM 1 FOR 2)
+        // read back differently even though they call the same function.
+        if (fn.spelledInGrammar) {
+            String written = renderSqlSyntax(fn, name, cols);
+            if (written != null) return written;
+        }
+
         List<PgType> targets = argumentTargets(fn, name, cols);
-        StringBuilder sb = new StringBuilder(UPPERCASE_FUNCS.contains(name) ? name.toUpperCase() : name);
+        // A name the grammar knows is written in quotes, or reading the definition back would
+        // find the construct that name spells instead of the function: substring(s, 1, 2) is a
+        // call on "substring", while SUBSTRING(s FROM 1 FOR 2) is the construct.
+        StringBuilder sb = new StringBuilder(
+                UPPERCASE_FUNCS.contains(name) ? name.toUpperCase() : quoteFunctionName(name));
         sb.append('(');
         if (fn.distinct()) sb.append("DISTINCT ");
         if (fn.star()) {
@@ -802,6 +1017,98 @@ public final class RuleDeparser {
         return sb.append(')').toString();
     }
 
+    /**
+     * The SQL-syntax spelling of a call PostgreSQL prints back in that syntax, or null when the
+     * call is not one of them. EXTRACT names its field as a word rather than a string; TRIM says
+     * which end it trims in place of choosing between three function names; SUBSTRING and OVERLAY
+     * write their offsets after FROM and FOR.
+     */
+    private static String renderSqlSyntax(FunctionCallExpr fn, String name, ColumnTypes cols) {
+        List<Expression> args = fn.args();
+        PgType text = PgType.of(DataType.TEXT);
+        int n = args.size();
+        if ("extract".equals(name) && n == 2 && args.get(0) instanceof Literal) {
+            return "EXTRACT(" + ((Literal) args.get(0)).value()
+                    + " FROM " + render(args.get(1), null, cols, false) + ")";
+        }
+        if ((n == 1 || n == 2)
+                && ("btrim".equals(name) || "ltrim".equals(name) || "rtrim".equals(name))) {
+            String end = "ltrim".equals(name) ? "LEADING" : "rtrim".equals(name) ? "TRAILING" : "BOTH";
+            return "TRIM(" + end + " "
+                    + (n == 2 ? render(args.get(1), text, cols, false) + " " : "")
+                    + "FROM " + render(args.get(0), text, cols, false) + ")";
+        }
+        if ("substring".equals(name) && (n == 2 || n == 3)) {
+            // Only the offset form keeps the spelling: SUBSTRING(s FROM pattern) resolves to the
+            // call that matches a pattern, which is a different function and prints as one. An
+            // uncoerced string constant is a pattern here, whatever its type is later settled to.
+            PgType from = typeOf(args.get(1), cols);
+            if (from != null && category(from) == CAT_STRING) return null;
+            if (args.get(1) instanceof Literal
+                    && ((Literal) args.get(1)).literalType() == Literal.LiteralType.STRING) {
+                return null;
+            }
+            StringBuilder sb = new StringBuilder("SUBSTRING(")
+                    .append(render(args.get(0), text, cols, false))
+                    .append(" FROM ").append(render(args.get(1), null, cols, false));
+            if (n == 3) sb.append(" FOR ").append(render(args.get(2), null, cols, false));
+            return sb.append(')').toString();
+        }
+        if ("overlay".equals(name) && (n == 3 || n == 4)) {
+            StringBuilder sb = new StringBuilder("OVERLAY(")
+                    .append(render(args.get(0), text, cols, false))
+                    .append(" PLACING ").append(render(args.get(1), text, cols, false))
+                    .append(" FROM ").append(render(args.get(2), null, cols, false));
+            if (n == 4) sb.append(" FOR ").append(render(args.get(3), null, cols, false));
+            return sb.append(')').toString();
+        }
+        return null;
+    }
+
+    /**
+     * XMLSERIALIZE written back as XMLSERIALIZE. It has no other spelling — SQL gives it a syntax
+     * and PostgreSQL declares no function of that name — so the record of the call is read back in
+     * that syntax whether or not the grammar was what built it. Which of CONTENT and DOCUMENT was
+     * asked for and which type the result was wanted as are both part of what it says, and so is
+     * whether the output is laid out: the clause has no default spelling, so a serialisation that
+     * is not indented reads back as NO INDENT rather than as nothing at all.
+     */
+    private static String renderXmlSerialize(FunctionCallExpr fn, ColumnTypes cols) {
+        List<Expression> args = fn.args();
+        int n = args == null ? 0 : args.size();
+        if ((n != 3 && n != 4) || !(args.get(0) instanceof Literal)
+                || !(args.get(2) instanceof Literal)) {
+            return null;
+        }
+        boolean indent = n == 4 && args.get(3) instanceof Literal
+                && "indent".equalsIgnoreCase(((Literal) args.get(3)).value());
+        return "XMLSERIALIZE("
+                + ("document".equalsIgnoreCase(((Literal) args.get(0)).value())
+                        ? "DOCUMENT " : "CONTENT ")
+                + render(args.get(1), null, cols, false)
+                + " AS " + formatType(parseTypeName(((Literal) args.get(2)).value()))
+                + (indent ? " INDENT" : " NO INDENT") + ")";
+    }
+
+    /** A function's name written so that reading it back names the function again, part by part. */
+    private static String quoteFunctionName(String name) {
+        if (name == null || name.indexOf('.') < 0) return quoteIdentifier(name);
+        StringBuilder sb = new StringBuilder();
+        for (String part : name.split("\\.", -1)) {
+            if (sb.length() > 0) sb.append('.');
+            sb.append(quoteIdentifier(part));
+        }
+        return sb.toString();
+    }
+
+    /** A function name stripped of a schema every search path reaches without being told to. */
+    private static String unqualify(String name) {
+        if (name == null) return null;
+        if (name.startsWith("pg_catalog.")) return name.substring("pg_catalog.".length());
+        if (name.startsWith("public.")) return name.substring("public.".length());
+        return name;
+    }
+
     private static List<PgType> argumentTargets(FunctionCallExpr fn, String name, ColumnTypes cols) {
         int n = fn.args().size();
         List<PgType> targets = new ArrayList<PgType>(Collections.<PgType>nCopies(n, null));
@@ -813,13 +1120,17 @@ public final class RuleDeparser {
             }
             return targets;
         }
-        if (TEXT_FUNCS.contains(name) || TEXT_TO_INT_FUNCS.contains(name)) {
-            PgType text = PgType.of(DataType.TEXT);
-            for (int i = 0; i < n; i++) {
-                PgType at = typeOf(fn.args().get(i), cols);
-                int cat = category(at);
-                if (at == null || cat == CAT_STRING) targets.set(i, text);
-            }
+        PgType text = PgType.of(DataType.TEXT);
+        boolean allText = TEXT_FUNCS.contains(name) || TEXT_TO_INT_FUNCS.contains(name);
+        for (int i = 0; i < n; i++) {
+            // A parameter declared text takes a string constant as text, and PG's deparse shows
+            // the coercion that resolution inserted -- date_trunc('month', ts) reads back as
+            // date_trunc('month'::text, ts). Which parameters those are is read off the signatures
+            // PostgreSQL declares for the name, so a position one of them declares text
+            // is read as text; a name it declares nothing for is left alone.
+            if (!allText && !BuiltinFunctionSignatures.someSignatureTakesTextAt(name, n, i)) continue;
+            PgType at = typeOf(fn.args().get(i), cols);
+            if (at == null || category(at) == CAT_STRING) targets.set(i, text);
         }
         return targets;
     }
@@ -836,8 +1147,13 @@ public final class RuleDeparser {
                 return "DEFAULT";
             case BOOLEAN:
                 return "true".equalsIgnoreCase(lit.value()) ? "true" : "false";
-            case BIT_STRING:
-                return "B'" + lit.value() + "'";
+            case BIT_STRING: {
+                // The B in front of the quotes is grammar rather than value: what is stored is a
+                // constant of the bit type, and a conversion to another one stands in front of it.
+                PgType bit = PgType.of(DataType.BIT);
+                if (target == null || target.sameAs(bit)) return constant(lit.value(), bit);
+                return "(" + constant(lit.value(), bit) + ")::" + formatType(target);
+            }
             case STRING: {
                 // An untyped literal is folded into a constant of the target type at
                 // parse-analysis time, so it is printed in the target type's own form.
@@ -895,7 +1211,12 @@ public final class RuleDeparser {
 
     /** Renders a literal's text the way the target type's output function would. */
     private static String canonicalise(String raw, PgType type) {
-        if (raw == null || type == null || type.dt == null) return raw;
+        if (raw == null || type == null) return raw;
+        // An array is read and written element by element, by the readers a cast to the array
+        // type goes through, so a default written '{ 1, 2 }' is reported as the '{1,2}' reading
+        // the value again would produce.
+        if (type.elem != null) return ViewDeparser.arrayText(raw, type.elem);
+        if (type.dt == null) return raw;
         try {
             switch (type.dt) {
                 case NUMERIC:
@@ -909,9 +1230,17 @@ public final class RuleDeparser {
                     return new BigInteger(raw.trim()).toString();
                 case TIME:
                 case TIMETZ:
-                    return canonicaliseTime(raw.trim());
+                    return canonicaliseTime(raw.trim(), type.dt);
                 case BYTEA:
                     return raw.startsWith("\\x") ? raw : "\\x" + hex(raw);
+                case JSONB: {
+                    // A jsonb constant keeps the value it was read as rather than the text it was
+                    // written in, so it is printed back the way the type's own output writes it —
+                    // one space after each colon, and each object's keys in the order jsonb holds
+                    // them. json keeps its text, which is why only jsonb is answered here.
+                    Object stored = TypeCoercion.coerce(raw, DataType.JSONB);
+                    return stored == null ? raw : TypeCoercion.toString(stored);
+                }
                 default:
                     return raw;
             }
@@ -920,11 +1249,14 @@ public final class RuleDeparser {
         }
     }
 
-    private static String canonicaliseTime(String s) {
-        // PG's time output is always hh:mm:ss[.ffffff].
-        int colons = 0;
-        for (int i = 0; i < s.length(); i++) if (s.charAt(i) == ':') colons++;
-        return colons == 1 ? s + ":00" : s;
+    /**
+     * PostgreSQL's time output is always hh:mm:ss[.ffffff], and which reading a spelling names is
+     * for the type's own reader to say: counting the colons wrote a default of '3:4' back as
+     * '3:4:00', which is no time at all, and one of '10:30+02' as '10:30+02:00'.
+     */
+    private static String canonicaliseTime(String s, DataType type) {
+        Object value = TypeCoercion.coerce(s, type);
+        return value == null ? s : TypeCoercion.toString(value);
     }
 
     private static String hex(String s) {
@@ -1025,29 +1357,18 @@ public final class RuleDeparser {
                 }
             }
         }
-        if (safe && RESERVED_WORDS.contains(name)) safe = false;
+        // Every word the grammar knows has to be quoted, not only the ones it reserves outright:
+        // a name spelled like one of the constructs that take an argument list — substring, time,
+        // xmlelement — reads back as that construct unless the quotes say it is a name. The list
+        // this used to carry left those out, so a column called "time" was written down as one
+        // nothing could read again.
+        if (safe && com.memgres.engine.parser.PgKeywords.isKeywordOrReserved(name)) safe = false;
         return safe ? name : "\"" + name.replace("\"", "\"\"") + "\"";
     }
 
     private static boolean isLowerAlpha(char c) {
         return c >= 'a' && c <= 'z';
     }
-
-    private static final Set<String> RESERVED_WORDS = new HashSet<String>(Arrays.asList(
-            "all", "analyse", "analyze", "and", "any", "array", "as", "asc", "asymmetric",
-            "authorization", "between", "binary", "both", "case", "cast", "check", "collate",
-            "collation", "column", "concurrently", "constraint", "create", "cross",
-            "current_catalog", "current_date", "current_role", "current_schema",
-            "current_time", "current_timestamp", "current_user", "default", "deferrable",
-            "desc", "distinct", "do", "else", "end", "except", "false", "fetch", "for",
-            "foreign", "freeze", "from", "full", "grant", "group", "having", "ilike", "in",
-            "initially", "inner", "intersect", "into", "is", "isnull", "join", "lateral",
-            "leading", "left", "like", "limit", "localtime", "localtimestamp", "natural",
-            "not", "notnull", "null", "offset", "on", "only", "or", "order", "outer",
-            "overlaps", "placing", "primary", "references", "returning", "right", "select",
-            "session_user", "similar", "some", "symmetric", "table", "tablesample", "then",
-            "to", "trailing", "true", "union", "unique", "user", "using", "variadic",
-            "verbose", "when", "where", "window", "with"));
 
     // ------------------------------------------------------------------
     // Type names
@@ -1176,6 +1497,12 @@ public final class RuleDeparser {
                 return t.typmod > 0 ? "character(" + (t.typmod - 4) + ")" : "bpchar";
             case NAME:
                 return "name";
+            case BIT:
+                // An unadorned bit means bit(1) to the grammar, so the name is written in quotes
+                // for the text to read back as the type it names.
+                return "\"bit\"";
+            case VARBIT:
+                return "bit varying";
             case BOOLEAN:
                 return "boolean";
             case DATE:

@@ -946,8 +946,10 @@ class FunctionEvaluator {
         // Reject DEFAULT as a function argument; PG gives 42601 (syntax error)
         for (Expression arg : fn.args()) {
             if (arg instanceof Literal && ((Literal) arg).literalType() == Literal.LiteralType.DEFAULT) {
-                Literal lit = (Literal) arg;
-                throw new MemgresException("DEFAULT is not allowed in this context", "42601");
+                MemgresException misplaced =
+                        new MemgresException("DEFAULT is not allowed in this context", "42601");
+                misplaced.setPositionToken("DEFAULT");
+                throw misplaced;
             }
         }
 

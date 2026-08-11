@@ -872,16 +872,22 @@ public final class AlterTableStmt implements Statement {
         public static final class SetType implements AlterColumnAction {
         public final String typeName;
         public final Expression usingExpr;
+        /** The COLLATE clause as written, which only the executor is in a position to judge. */
+        public final String collation;
 
-        public SetType(String typeName, Expression usingExpr) {
+        public SetType(String typeName, Expression usingExpr, String collation) {
             this.typeName = typeName;
             this.usingExpr = usingExpr;
+            this.collation = collation;
         }
 
-        public SetType(String typeName) { this(typeName, null); }
+        public SetType(String typeName, Expression usingExpr) { this(typeName, usingExpr, null); }
+
+        public SetType(String typeName) { this(typeName, null, null); }
 
         public String typeName() { return typeName; }
         public Expression usingExpr() { return usingExpr; }
+        public String collation() { return collation; }
 
         @Override
         public boolean equals(Object o) {
@@ -889,17 +895,19 @@ public final class AlterTableStmt implements Statement {
             if (o == null || getClass() != o.getClass()) return false;
             SetType that = (SetType) o;
             return java.util.Objects.equals(typeName, that.typeName)
-                && java.util.Objects.equals(usingExpr, that.usingExpr);
+                && java.util.Objects.equals(usingExpr, that.usingExpr)
+                && java.util.Objects.equals(collation, that.collation);
         }
 
         @Override
         public int hashCode() {
-            return java.util.Objects.hash(typeName, usingExpr);
+            return java.util.Objects.hash(typeName, usingExpr, collation);
         }
 
         @Override
         public String toString() {
-            return "SetType[typeName=" + typeName + ", " + "usingExpr=" + usingExpr + "]";
+            return "SetType[typeName=" + typeName + ", " + "usingExpr=" + usingExpr + ", "
+                + "collation=" + collation + "]";
         }
     }
         public static final class SetDefault implements AlterColumnAction {
