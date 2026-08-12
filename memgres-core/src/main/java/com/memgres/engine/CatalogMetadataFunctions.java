@@ -190,7 +190,12 @@ class CatalogMetadataFunctions {
                     int rOid = executor.systemCatalog.getOid("rule:"
                             + (rule.getSchema() == null ? "public" : rule.getSchema())
                             + "." + rule.getTable() + ":" + rule.getName());
-                    if (rOid == ruleOid) return rule.getDefinition();
+                    if (rOid == ruleOid) {
+                        // A relation the reader's search path reaches is written without its
+                        // schema, which is what the deparser this stands in for does.
+                        return CatalogStubBuilder.ruleDefinitionAsRead(rule.getDefinition(),
+                                executor.searchPathSchemas());
+                    }
                 }
                 return null;
             }

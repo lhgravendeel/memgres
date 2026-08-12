@@ -1110,6 +1110,7 @@ class DdlObjectExecutor {
         pgFunc.setSetClauses(stmt.setClauses());
         pgFunc.setOwner(executor.sessionUser());
         pgFunc.setAtomicBody(stmt.atomicBody);
+        pgFunc.setSqlStandardBody(stmt.sqlStandardBody);
         if (stmt.parallel() != null) pgFunc.setParallel(stmt.parallel());
         // A cost nobody wrote is the language's own: 1 for the languages whose calls are compiled
         // in, 100 for an interpreted one. Taking 100 for all of them made every SQL function claim
@@ -3712,9 +3713,31 @@ class DdlObjectExecutor {
                     "schema \"" + stmt.name() + "\" does not exist, skipping", null);
         }
         if (schema != null) {
+            // What hangs from the schema is worked out before anything is taken away, because it
+            // is both what RESTRICT refuses for and what CASCADE reports having removed.
+            List<SchemaDependent> hanging = schemaDependents(schema, stmt.name());
+            if (!stmt.cascade() && !hanging.isEmpty()) {
+                List<String> lines = new ArrayList<>();
+                for (SchemaDependent d : hanging) lines.add(d.because);
+                MemgresException refusal = new MemgresException("cannot drop schema " + stmt.name()
+                        + " because other objects depend on it", "2BP01");
+                refusal.setDetail(dependencyDetail(lines));
+                refusal.setHint("Use DROP ... CASCADE to drop the dependent objects too.");
+                throw refusal;
+            }
+            List<Session.UndoEntry> restore = new ArrayList<>();
+            Set<String> registryBack = new HashSet<>(
+                    executor.database.getSchemaObjects(stmt.name().toLowerCase()));
             if (stmt.cascade()) {
+                dropOutsideSchemaDependents(stmt.name(), hanging, restore);
                 List<String> tableNames = new ArrayList<>(schema.getTables().keySet());
                 for (String tName : tableNames) {
+                    Table dropped = schema.getTable(tName);
+                    if (dropped != null) {
+                        restore.add(new Session.DropTableUndo(stmt.name(), tName, dropped,
+                                executor.database.getTriggersForTable(stmt.name(), tName),
+                                executor.database.snapshotRulesGoingWith(stmt.name(), tName)));
+                    }
                     executor.database.getAllTriggers().remove(tName.toLowerCase());
                 }
                 for (String tName : tableNames) {
@@ -3750,9 +3773,10 @@ class DdlObjectExecutor {
                 }
                 tableNames.forEach(schema::removeTable);
                 // A rule goes with the relation it is written on, and these relations have just
-                // gone.
+                // gone -- and so does a rule written on a relation elsewhere whose actions name
+                // one of them, which is what CASCADE was asked for.
                 for (String tName : tableNames) {
-                    executor.database.dropRulesOn(droppedSchemaName, tName);
+                    executor.database.dropRulesGoingWith(droppedSchemaName, tName);
                 }
 
                 String schemaName = stmt.name().toLowerCase();
@@ -3765,14 +3789,23 @@ class DdlObjectExecutor {
                     switch (objType) {
                         // Only this schema's type goes: the same name may be another schema's.
                         case "enum":
+                            restore.add(new Session.DropEnumTypeUndo(schemaName, objName,
+                                    executor.database.getCustomEnums()
+                                            .get(TypeNamespace.key(schemaName, objName))));
                             executor.database.getCustomEnums()
                                     .remove(TypeNamespace.key(schemaName, objName));
                             break;
                         case "composite":
+                            restore.add(new Session.DropCompositeTypeUndo(schemaName, objName,
+                                    executor.database.getCompositeTypes()
+                                            .get(TypeNamespace.key(schemaName, objName))));
                             executor.database.getCompositeTypes()
                                     .remove(TypeNamespace.key(schemaName, objName));
                             break;
                         case "range":
+                            restore.add(new Session.DropRangeTypeUndo(schemaName, objName,
+                                    executor.database.getRangeTypes()
+                                            .get(TypeNamespace.key(schemaName, objName))));
                             executor.database.getRangeTypes()
                                     .remove(TypeNamespace.key(schemaName, objName));
                             break;
@@ -3780,32 +3813,396 @@ class DdlObjectExecutor {
                             executor.database.getShellTypes()
                                     .remove(TypeNamespace.key(schemaName, objName));
                             break;
-                        case "sequence":
+                        case "sequence": {
                             // This schema's sequence of that name, not another schema's.
+                            Sequence going = executor.database.getSequence(schemaName, objName);
+                            if (going != null) {
+                                restore.add(new Session.DropSequenceUndo(going.qualifiedName(), going));
+                            }
                             executor.database.removeSequence(schemaName, objName);
                             break;
+                        }
                         case "domain":
+                            restore.add(new Session.DropDomainUndo(schemaName, objName,
+                                    executor.database.getDomains()
+                                            .get(TypeNamespace.key(schemaName, objName))));
                             executor.database.getDomains()
                                     .remove(TypeNamespace.key(schemaName, objName));
                             break;
                         case "index":
                             executor.database.removeIndex(schemaName, objName);
                             break;
-                        case "function":
+                        case "function": {
                             // Only this schema's copy goes; the same name may exist elsewhere.
+                            List<PgFunction> going = new ArrayList<>(
+                                    executor.database.getFunctionOverloads(schemaName, objName));
+                            if (!going.isEmpty()) {
+                                restore.add(new Session.DropFunctionUndo(schemaName, objName, going));
+                            }
                             executor.database.removeFunction(schemaName, objName);
                             break;
-                        case "view":
+                        }
+                        case "view": {
+                            // A view is a relation like any other: it carries rules of its own,
+                            // and a rule elsewhere that writes to it or reads it cannot outlive it.
+                            Database.ViewDef going = executor.database.getView(schemaName, objName);
+                            if (going != null) {
+                                restore.add(new Session.DropViewUndo(objName, going,
+                                        executor.database.getTriggersForTable(schemaName, objName),
+                                        executor.database.snapshotRulesGoingWith(schemaName, objName)));
+                            }
+                            executor.database.dropRulesGoingWith(schemaName, objName);
                             executor.database.removeView(schemaName, objName);
                             break;
+                        }
                     }
                 }
                 executor.database.removeSchemaObjects(schemaName);
-            } else if (!schema.getTables().isEmpty()) {
-                throw new MemgresException("cannot drop schema " + stmt.name() + " because other objects depend on it");
+                // PostgreSQL says what CASCADE took with the schema, as it does for every other
+                // drop -- a script that meant to remove one schema has no other way of learning
+                // it removed a view in another.
+                List<String> cascaded = new ArrayList<>();
+                for (SchemaDependent d : hanging) cascaded.add(d.described);
+                noticeDropCascades(executor, cascaded);
             }
             executor.database.removeSchema(stmt.name());
             executor.database.removeObjectOwner("schema:" + stmt.name());
+            // A rolled-back DROP SCHEMA never happened, so the schema comes back holding
+            // everything it held: PostgreSQL rolls a catalogue change back whole, and without this
+            // the relations, their rows and the rules written on them stayed gone for good.
+            executor.recordUndo(new Session.DropSchemaUndo(schema, registryBack, restore));
+        }
+    }
+
+    /** One object that goes when a schema does, as PostgreSQL names it and as it explains it. */
+    private static final class SchemaDependent {
+        /** How the cascade report names it: {@code table s.t}. */
+        final String described;
+        /** Why it is in the way: {@code table s.t depends on schema s}. */
+        final String because;
+        /** The schema of a view outside the dropped one, which CASCADE has to remove itself. */
+        final String outsideSchema;
+        /** The bare name of that view, or null when this line stands for something else. */
+        final String outsideView;
+        /** The relation carrying a policy outside the dropped schema, or null. */
+        final Table policyTable;
+        final RlsPolicy policy;
+
+        SchemaDependent(String described, String because) {
+            this(described, because, null, null, null, null);
+        }
+
+        SchemaDependent(String described, String because, String outsideSchema, String outsideView,
+                        Table policyTable, RlsPolicy policy) {
+            this.described = described;
+            this.because = because;
+            this.outsideSchema = outsideSchema;
+            this.outsideView = outsideView;
+            this.policyTable = policyTable;
+            this.policy = policy;
+        }
+    }
+
+    /** One object a schema holds, with the OID that says when it was created. */
+    private static final class SchemaMember {
+        final int oid;
+        final String kind;
+        final String name;
+        /** The name as PostgreSQL writes it in a dependency line, schema-qualified where needed. */
+        final String shown;
+
+        SchemaMember(int oid, String kind, String name, String shown) {
+            this.oid = oid;
+            this.kind = kind;
+            this.name = name;
+            this.shown = shown;
+        }
+
+        String described() { return kind + " " + shown; }
+    }
+
+    /**
+     * Everything that goes when a schema does, in the order PostgreSQL reports it.
+     *
+     * <p>A schema is what its objects hang from, so every relation, type and routine in it depends
+     * on it: that is what RESTRICT refuses for and what CASCADE takes away. An index is not among
+     * them, because an index hangs from the relation it is on rather than from the schema. Each of
+     * them is followed at once by whatever outside the schema hangs from that one, which is the
+     * order PostgreSQL walks its dependency catalogue in.
+     */
+    private List<SchemaDependent> schemaDependents(Schema schema, String schemaName) {
+        List<String> visible = executor.searchPathSchemas();
+        List<SchemaMember> members = schemaMembers(schema, schemaName, visible);
+        List<SchemaDependent> out = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        for (SchemaMember m : members) {
+            out.add(new SchemaDependent(m.described(),
+                    m.described() + " depends on schema " + schemaName));
+            appendDependentsOf(out, schemaName, m.kind, schemaName, m.name, m.shown, visible, seen);
+        }
+        return out;
+    }
+
+    /**
+     * The objects a schema holds, in creation order. The relations are the ones the schema itself
+     * carries; everything else is read out of the register that records which schema an object was
+     * created in, which keeps an entry for an object that has since been dropped -- so what the
+     * database still holds is what is asked, not what the register remembers.
+     */
+    private List<SchemaMember> schemaMembers(Schema schema, String schemaName,
+                                             List<String> visible) {
+        List<SchemaMember> found = new ArrayList<>();
+        for (Table t : schema.getTables().values()) {
+            found.add(relationMember(visible, schemaName, "table", t.getName()));
+        }
+        List<String> entries = new ArrayList<>(
+                executor.database.getSchemaObjects(schemaName.toLowerCase()));
+        Collections.sort(entries);
+        for (String entry : entries) {
+            int colon = entry.indexOf(':');
+            if (colon < 0) continue;
+            String kind = entry.substring(0, colon);
+            String name = entry.substring(colon + 1);
+            String typeKey = TypeNamespace.key(schemaName, name);
+            if ("view".equals(kind)) {
+                Database.ViewDef v = executor.database.getView(schemaName, name);
+                if (v == null) continue;
+                found.add(relationMember(visible, schemaName,
+                        v.materialized() ? "materialized view" : "view", v.name()));
+            } else if ("sequence".equals(kind)) {
+                Sequence seq = executor.database.getSequence(schemaName, name);
+                if (seq == null) continue;
+                found.add(relationMember(visible, schemaName, "sequence", seq.getName()));
+            } else if (ForeignTables.OBJECT_TYPE.equals(kind)) {
+                if (!ForeignTables.existsIn(executor.database, schemaName, name)) continue;
+                found.add(relationMember(visible, schemaName, "foreign table", name));
+            } else if ("function".equals(kind)) {
+                // A routine is identified by its argument types, so every overload of the name is
+                // an object of its own and PostgreSQL names each with the arguments it takes.
+                for (PgFunction f : executor.database.getFunctionOverloads(schemaName, name)) {
+                    found.add(new SchemaMember(executor.systemCatalog.getOid("proc:" + f.getName()),
+                            f.isProcedure() ? "procedure" : "function", name,
+                            RelationNamespace.shownName(visible, schemaName, name)
+                                    + "(" + routineArgumentTypes(f) + ")"));
+                }
+            } else if (isTypeKind(kind, typeKey)) {
+                // Enums, composites, ranges, shells and domains are all types, and PostgreSQL
+                // calls each of them a type when it says what depends on what.
+                found.add(new SchemaMember(executor.systemCatalog.getOid("type:" + typeKey),
+                        "type", name, RelationNamespace.shownName(visible, schemaName, name)));
+            }
+        }
+        Collections.sort(found, new java.util.Comparator<SchemaMember>() {
+            @Override
+            public int compare(SchemaMember a, SchemaMember b) {
+                return Integer.compare(a.oid, b.oid);
+            }
+        });
+        return found;
+    }
+
+    /** Whether the register's entry still names a type this database holds. */
+    private boolean isTypeKind(String kind, String typeKey) {
+        if ("enum".equals(kind)) return executor.database.getCustomEnums().containsKey(typeKey);
+        if ("composite".equals(kind)) return executor.database.getCompositeTypes().containsKey(typeKey);
+        if ("range".equals(kind)) return executor.database.getRangeTypes().containsKey(typeKey);
+        if ("shell".equals(kind)) return executor.database.getShellTypes().contains(typeKey);
+        if ("domain".equals(kind)) return executor.database.getDomains().containsKey(typeKey);
+        return false;
+    }
+
+    private SchemaMember relationMember(List<String> visible, String schemaName, String kind,
+                                        String name) {
+        return new SchemaMember(executor.systemCatalog.getOid("rel:" + schemaName + "." + name),
+                kind, name, RelationNamespace.shownName(visible, schemaName, name));
+    }
+
+    /**
+     * A routine's argument types as PostgreSQL writes them when it names the routine. An output
+     * parameter is not part of what identifies the routine, so it is not written here either.
+     */
+    private static String routineArgumentTypes(PgFunction f) {
+        StringBuilder sb = new StringBuilder();
+        if (f.getParams() == null) return "";
+        for (PgFunction.Param p : f.getParams()) {
+            if (p.mode() != null && ("OUT".equalsIgnoreCase(p.mode())
+                    || "TABLE".equalsIgnoreCase(p.mode()))) {
+                continue;
+            }
+            if (sb.length() > 0) sb.append(", ");
+            sb.append(DataType.canonicalName(p.typeName()));
+        }
+        return sb.toString();
+    }
+
+    /**
+     * What outside a schema hangs from one object inside it: a view that reads the relation or
+     * calls the routine, whatever reads that view in turn, a row security policy whose expressions
+     * name either, a column declared as the type, and a column default drawing on the sequence.
+     *
+     * <p>A view or a policy inside the schema is left out: it hangs from the schema itself and is
+     * already reported there, which is where PostgreSQL reports it.
+     */
+    private void appendDependentsOf(List<SchemaDependent> out, String schemaName, String ownerKind,
+                                    String ownerSchema, String ownerName, String ownerShown,
+                                    List<String> visible, Set<String> seen) {
+        String on = " depends on " + ownerKind + " " + ownerShown;
+        if (!"type".equals(ownerKind) && !"function".equals(ownerKind)
+                && !"procedure".equals(ownerKind)) {
+            for (Database.ViewDef v : ViewDependencies.directDependentViews(
+                    executor.database, executor.systemCatalog, ownerSchema, ownerName)) {
+                String vs = v.schemaName() != null ? v.schemaName() : "public";
+                if (vs.equalsIgnoreCase(schemaName)) continue;
+                if (!seen.add("view:" + vs.toLowerCase() + "." + v.name().toLowerCase())) continue;
+                String kind = v.materialized() ? "materialized view" : "view";
+                String shown = RelationNamespace.shownName(visible, vs, v.name());
+                out.add(new SchemaDependent(kind + " " + shown, kind + " " + shown + on,
+                        vs, v.name(), null, null));
+                appendDependentsOf(out, schemaName, kind, vs, v.name(), shown, visible, seen);
+            }
+        }
+        if ("function".equals(ownerKind) || "procedure".equals(ownerKind)) {
+            for (Object[] caller : viewsCalling(schemaName, ownerName)) {
+                String vs = (String) caller[0];
+                Database.ViewDef v = (Database.ViewDef) caller[1];
+                if (!seen.add("view:" + vs.toLowerCase() + "." + v.name().toLowerCase())) continue;
+                String kind = v.materialized() ? "materialized view" : "view";
+                String shown = RelationNamespace.shownName(visible, vs, v.name());
+                out.add(new SchemaDependent(kind + " " + shown, kind + " " + shown + on,
+                        vs, v.name(), null, null));
+                appendDependentsOf(out, schemaName, kind, vs, v.name(), shown, visible, seen);
+            }
+        }
+        for (Object[] holder : policiesDependingOn(schemaName, ownerKind, ownerSchema, ownerName)) {
+            String ts = (String) holder[0];
+            Table t = (Table) holder[1];
+            RlsPolicy p = (RlsPolicy) holder[2];
+            if (!seen.add("policy:" + ts.toLowerCase() + "." + t.getName().toLowerCase()
+                    + ":" + p.getName().toLowerCase())) {
+                continue;
+            }
+            String shown = "policy " + p.getName() + " on table "
+                    + RelationNamespace.shownName(visible, ts, t.getName());
+            out.add(new SchemaDependent(shown, shown + on, null, null, t, p));
+        }
+        if ("type".equals(ownerKind)) {
+            for (String column : columnsDeclaredAsType(TypeNamespace.key(ownerSchema, ownerName))) {
+                if (!seen.add("column:" + column.toLowerCase())) continue;
+                out.add(new SchemaDependent(column, column + on));
+            }
+        }
+        if ("sequence".equals(ownerKind)) {
+            Sequence seq = executor.database.getSequence(ownerSchema, ownerName);
+            if (seq == null) return;
+            for (SequenceDependent dep : findSequenceDependents(seq)) {
+                String shown = "default value for column " + dep.columnName() + " of table "
+                        + dep.tableRef(visible);
+                if (!seen.add("default:" + shown.toLowerCase())) continue;
+                out.add(new SchemaDependent(shown, shown + on));
+            }
+        }
+    }
+
+    /**
+     * The stored views whose query calls a routine of this name in this schema, each beside the
+     * schema it lives in. PostgreSQL records a view's dependency on every routine its query calls,
+     * so a view outside the schema cannot outlive a routine inside it.
+     */
+    private List<Object[]> viewsCalling(String schemaName, String routineName) {
+        List<Object[]> found = new ArrayList<>();
+        for (Database.ViewDef v : executor.database.getViews().values()) {
+            String vs = v.schemaName() != null ? v.schemaName() : "public";
+            if (vs.equalsIgnoreCase(schemaName)) continue;
+            if (!calls(v.query(), vs, schemaName, routineName)) continue;
+            found.add(new Object[]{vs, v});
+        }
+        Collections.sort(found, new java.util.Comparator<Object[]>() {
+            @Override
+            public int compare(Object[] a, Object[] b) {
+                return Integer.compare(oidOfView(a), oidOfView(b));
+            }
+        });
+        return found;
+    }
+
+    private int oidOfView(Object[] entry) {
+        return executor.systemCatalog.getOid("rel:" + entry[0] + "."
+                + ((Database.ViewDef) entry[1]).name());
+    }
+
+    /** Whether a parsed tree calls the routine {@code schemaName.routineName}. */
+    private static boolean calls(Object tree, String home, String schemaName, String routineName) {
+        if (tree == null || routineName == null) return false;
+        final String wanted = routineName.toLowerCase();
+        final String schema = schemaName == null ? "public" : schemaName.toLowerCase();
+        final String where = home == null ? "public" : home.toLowerCase();
+        final boolean[] found = new boolean[1];
+        AstWalk.forEach(tree, node -> {
+            if (found[0] || !(node instanceof FunctionCallExpr)) return;
+            String written = ((FunctionCallExpr) node).name();
+            if (written == null) return;
+            String bare = RelationNamespace.bareName(written).toLowerCase();
+            if (!bare.equals(wanted)) return;
+            int dot = written.lastIndexOf('.');
+            if (dot > 0) {
+                if (written.substring(0, dot).equalsIgnoreCase(schema)) found[0] = true;
+                return;
+            }
+            // Written bare, the name resolved through the search path when the definition was
+            // stored, which reaches public and the schema the definition itself lives in.
+            if (schema.equals("public") || schema.equals(where)) found[0] = true;
+        });
+        return found[0];
+    }
+
+    /**
+     * The row security policies outside the schema whose USING or WITH CHECK expression names this
+     * object. PostgreSQL records what a policy's expressions read, so a policy on a relation
+     * elsewhere goes when the relation or the routine it reads does.
+     */
+    private List<Object[]> policiesDependingOn(String schemaName, String ownerKind,
+                                               String ownerSchema, String ownerName) {
+        List<Object[]> found = new ArrayList<>();
+        boolean routine = "function".equals(ownerKind) || "procedure".equals(ownerKind);
+        if (!routine && "type".equals(ownerKind)) return found;
+        for (Map.Entry<String, Schema> se : executor.database.getSchemas().entrySet()) {
+            if (se.getKey().equalsIgnoreCase(schemaName)) continue;
+            for (Table t : se.getValue().getTables().values()) {
+                for (RlsPolicy p : t.getRlsPolicies()) {
+                    boolean hit = routine
+                            ? calls(p.getUsingExpr(), se.getKey(), ownerSchema, ownerName)
+                                    || calls(p.getWithCheckExpr(), se.getKey(), ownerSchema, ownerName)
+                            : ViewDependencies.reads(p.getUsingExpr(), se.getKey(), ownerSchema, ownerName)
+                                    || ViewDependencies.reads(p.getWithCheckExpr(), se.getKey(),
+                                            ownerSchema, ownerName);
+                    if (hit) found.add(new Object[]{se.getKey(), t, p});
+                }
+            }
+        }
+        return found;
+    }
+
+    /**
+     * Take away the views and policies outside the schema that hang from something inside it, so
+     * that CASCADE means what PostgreSQL means by it. A view left behind read a relation that was
+     * no longer there and a policy left behind silenced every row of the relation it was on.
+     */
+    private void dropOutsideSchemaDependents(String schemaName, List<SchemaDependent> hanging,
+                                             List<Session.UndoEntry> restore) {
+        for (SchemaDependent d : hanging) {
+            if (d.policy != null && d.policyTable != null) {
+                restore.add(new Session.DropPolicyUndo(d.policyTable, d.policy));
+                d.policyTable.getRlsPolicies().remove(d.policy);
+            }
+            if (d.outsideView == null) continue;
+            Database.ViewDef going = executor.database.getView(d.outsideSchema, d.outsideView);
+            if (going == null) continue;
+            restore.add(new Session.DropViewUndo(d.outsideView, going,
+                    executor.database.getTriggersForTable(d.outsideSchema, d.outsideView),
+                    executor.database.snapshotRulesGoingWith(d.outsideSchema, d.outsideView)));
+            executor.database.dropRulesGoingWith(d.outsideSchema, d.outsideView);
+            executor.database.removeView(d.outsideSchema, d.outsideView);
+            executor.database.removeObjectOwner("view:" + d.outsideSchema + "." + d.outsideView);
         }
     }
 

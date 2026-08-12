@@ -32,10 +32,10 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Four things a statement has to get right about the values it reads and writes: where a VIRTUAL
+ * Five things a statement has to get right about the values it reads and writes: where a VIRTUAL
  * generated column is worked out, what the DEFAULT keyword resolves to, which row a subquery reads
- * the enclosing query's columns from, and what a statement that had to wait for another session
- * still sees.
+ * the enclosing query's columns from, what a relation given a column alias list still knows its
+ * columns to be, and what a statement that had to wait for another session still sees.
  *
  * <p>None held. A derived table, a view body and a WITH item were read without the enclosing
  * query's qualification, so a generation expression ran for rows the statement had already
@@ -47,8 +47,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * accepted as a no-op whenever no row reached the evaluator, and a statement wrong in two ways at
  * once was reported for whichever fault the reading did not reach first. A subquery resolved a name
  * its own FROM clause has not got against the query around it in a WHERE clause but not in a select
- * list. And a blocked UPDATE or DELETE re-read every relation but its target with a fresh snapshot
- * after the wait, while UPDATE ... FROM and DELETE ... USING never waited and never re-judged at all.
+ * list. A relation given a column alias list forgot what its columns were, so a generated column the
+ * list renamed answered NULL instead of its value, on the stored-table, view and derived-table forms
+ * alike and in the statements that write. And a blocked UPDATE or DELETE re-read every relation but
+ * its target with a fresh snapshot after the wait, while UPDATE ... FROM and DELETE ... USING never
+ * waited and never re-judged at all.
  *
  * <p>Every expectation here was read off PostgreSQL 18 before it was written down.
  */
@@ -2230,6 +2233,533 @@ class WriteVisibilityAndDefaultsTest {
                 + " (SELECT s.z FROM (SELECT o.i AS z FROM sqw5_l_x x) s) ORDER BY 1"));
     }
 
+    // ------------------------------------------------------------ a column alias list renames the
+    // ------------------------------------------------------------ reference, not the column behind it
+
+    // A FROM item may give a relation's columns names of its own. PostgreSQL renames the references
+    // to them and nothing else, so a generated column reached through such a list still answers with
+    // the value its generation expression works out — and that expression is still written in the
+    // names the relation underneath answers to. The VIRTUAL expression used below is 10/a, which
+    // raises 22012 for the row a = 0, so a statement that answers at all is one that reached the
+    // expression for the rows it read the column of and for no others.
+
+    @Test
+    void aRenamedVirtualGeneratedColumnAnswersWithTheValueItsExpressionWorksOut() throws Exception {
+        exec("CREATE TABLE wal_a_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wal_a_g (a,k) VALUES (5,'five'),(0,'zero')");
+
+        assertEquals("2", scalar("SELECT s.z FROM wal_a_g s(x,y,z) WHERE s.x = 5"));
+        assertEquals("2", scalar("SELECT z FROM wal_a_g s(x,y,z) WHERE x = 5"));
+        assertEquals("2", scalar("SELECT s.z FROM wal_a_g AS s (x, y, z) WHERE s.x = 5"));
+        // a star reads every column under the name the list gave it
+        assertEquals("5|five|2", rows("SELECT * FROM wal_a_g s(x,y,z) WHERE s.x = 5"));
+        assertEquals("5|five|2", rows("SELECT s.* FROM wal_a_g s(x,y,z) WHERE s.x = 5"));
+        assertEquals("z", labelOf("SELECT s.z FROM wal_a_g s(x,y,z) WHERE s.x = 5"));
+        // the column beside it is unaffected
+        assertEquals("five", scalar("SELECT s.y FROM wal_a_g s(x,y,z) WHERE s.x = 5"));
+    }
+
+    @Test
+    void aRenamedStoredGeneratedColumnIsTheValueTheRowHolds() throws Exception {
+        exec("CREATE TABLE wal_b_s (a int, k text, g int GENERATED ALWAYS AS (a*2) STORED)");
+        exec("INSERT INTO wal_b_s (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wal_b_h (a int, k text, g int GENERATED ALWAYS AS (a*10) STORED)");
+        exec("INSERT INTO wal_b_h (a,k) VALUES (1,'one'),(2,'two'),(3,'three')");
+
+        assertEquals("0,10", column("SELECT s.z FROM wal_b_s s(x,y,z) ORDER BY 1"));
+        assertEquals("1|one|10 / 2|two|20 / 3|three|30",
+                rows("SELECT s.x, s.y, s.z FROM wal_b_h s(x,y,z) ORDER BY s.x"));
+    }
+
+    @Test
+    void anAliasListShorterThanTheRelationLeavesTheRestTheirOwnNames() throws Exception {
+        exec("CREATE TABLE wal_c_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wal_c_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wal_c_t (a int, k text, g text GENERATED ALWAYS AS (k || '!') VIRTUAL,"
+                + " h int GENERATED ALWAYS AS (a*3) STORED)");
+        exec("INSERT INTO wal_c_t (a,k) VALUES (1,'one'),(2,'two')");
+        exec("CREATE VIEW wal_c_tv AS SELECT * FROM wal_c_t");
+
+        assertEquals("2", scalar("SELECT s.g FROM wal_c_g s(x) WHERE s.x = 5"));
+        assertEquals("five", scalar("SELECT s.k FROM wal_c_g s(x) WHERE s.x = 5"));
+        assertEquals("5|five|2", rows("SELECT * FROM wal_c_g s(x) WHERE s.x = 5"));
+        assertEquals("1|one|one!|3 / 2|two|two!|6", rows("SELECT * FROM wal_c_t s(x) ORDER BY 1"));
+        assertEquals("1|one|one!|3 / 2|two|two!|6",
+                rows("SELECT s.x, s.k, s.g, s.h FROM wal_c_t s(x) ORDER BY 1"));
+        assertEquals("1|one|one! / 2|two|two!",
+                rows("SELECT s.x, s.k, s.g FROM wal_c_tv s(x) ORDER BY 1"));
+        assertEquals("1|one|one! / 2|two|two!",
+                rows("SELECT s.x, s.k, s.g FROM (SELECT * FROM wal_c_t) s(x) ORDER BY 1"));
+        // a WITH item's own list may be shorter than the query under it too
+        assertEquals("0,5", column("WITH c(p,q) AS (SELECT * FROM wal_c_g) SELECT p FROM c ORDER BY 1"));
+    }
+
+    @Test
+    void anAliasListNamingMoreColumnsThanTheRelationHasIsRefused() throws Exception {
+        exec("CREATE TABLE wal_d_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wal_d_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE VIEW wal_d_v AS SELECT * FROM wal_d_g");
+        exec("CREATE MATERIALIZED VIEW wal_d_m AS SELECT * FROM wal_d_g WHERE a = 5");
+
+        String overTable = "SELECT s.z FROM wal_d_g s(x,y,z,w) WHERE s.x = 5";
+        assertEquals("42P10", stateOf(overTable));
+        assertEquals("table \"s\" has 3 columns available but 4 columns specified", messageOf(overTable));
+        assertEquals("42P10", stateOf("SELECT s.z FROM wal_d_v s(x,y,z,w)"));
+        assertEquals("42P10", stateOf("SELECT s.z FROM wal_d_m s(x,y,z,w)"));
+        assertEquals("42P10", stateOf("SELECT s.z FROM (SELECT * FROM wal_d_g) s(x,y,z,w)"));
+        assertEquals("42P10", stateOf("WITH c AS (SELECT * FROM wal_d_g) SELECT s.z FROM c s(x,y,z,w)"));
+        assertEquals("table \"s\" has 3 columns available but 4 columns specified",
+                messageOf("WITH c AS (SELECT * FROM wal_d_g) SELECT s.z FROM c s(x,y,z,w)"));
+
+        // the count is the relation's own, whatever the relation is
+        String overValues = "SELECT s.b FROM (VALUES (1,'a')) s(b,c,d)";
+        assertEquals("42P10", stateOf(overValues));
+        assertEquals("table \"s\" has 2 columns available but 3 columns specified", messageOf(overValues));
+        String overCall = "SELECT s.n FROM generate_series(1,3) s(n,o)";
+        assertEquals("42P10", stateOf(overCall));
+        assertEquals("table \"s\" has 1 columns available but 2 columns specified", messageOf(overCall));
+        String overOrdinality = "SELECT s.o FROM generate_series(1,3) WITH ORDINALITY s(n,o,p)";
+        assertEquals("42P10", stateOf(overOrdinality));
+        assertEquals("table \"s\" has 2 columns available but 3 columns specified",
+                messageOf(overOrdinality));
+
+        // a WITH item's own list is refused as the item it is
+        String overItem = "WITH c(p,q,r,s) AS (SELECT * FROM wal_d_g) SELECT p FROM c";
+        assertEquals("42P10", stateOf(overItem));
+        assertEquals("WITH query \"c\" has 3 columns available but 4 columns specified",
+                messageOf(overItem));
+    }
+
+    @Test
+    void theNameAnAliasListRenamedAwayIsGone() throws Exception {
+        exec("CREATE TABLE wal_e_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wal_e_g (a,k) VALUES (5,'five'),(0,'zero')");
+
+        String stored = "SELECT s.a FROM wal_e_g s(x,y,z) WHERE s.x = 5";
+        assertEquals("42703", stateOf(stored));
+        assertEquals("column s.a does not exist", messageOf(stored));
+        String generated = "SELECT s.z FROM wal_e_g s(x,y,z) WHERE s.x = 5 AND s.g = 2";
+        assertEquals("42703", stateOf(generated));
+        assertEquals("column s.g does not exist", messageOf(generated));
+    }
+
+    @Test
+    void anAliasListMayGiveOneColumnTheNameAnotherColumnHad() throws Exception {
+        exec("CREATE TABLE wal_f_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wal_f_g (a,k) VALUES (5,'five'),(0,'zero')");
+
+        // s(g,a,k) over (a,k,g): the generated column is called k here, and the expression under it
+        // is still written in the relation's own names
+        assertEquals("2", scalar("SELECT s.k FROM wal_f_g s(g,a,k) WHERE s.g = 5"));
+        assertEquals("five", scalar("SELECT s.a FROM wal_f_g s(g,a,k) WHERE s.g = 5"));
+    }
+
+    @Test
+    void aViewBehindAnAliasListAnswersWithItsValue() throws Exception {
+        exec("CREATE TABLE wal_g_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wal_g_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE VIEW wal_g_v AS SELECT * FROM wal_g_g");
+        exec("CREATE TABLE wal_g_h (a int, k text, g int GENERATED ALWAYS AS (a*10) VIRTUAL)");
+        exec("INSERT INTO wal_g_h (a,k) VALUES (1,'one'),(2,'two'),(3,'three')");
+        exec("CREATE VIEW wal_g_hv AS SELECT * FROM wal_g_h");
+
+        assertEquals("2", scalar("SELECT z FROM wal_g_v AS s(x,y,z) WHERE x = 5"));
+        assertEquals("five", scalar("SELECT y FROM wal_g_v AS s(x,y,z) WHERE x = 5"));
+        assertEquals("0,5", column("SELECT x FROM wal_g_v AS s(x,y,z) ORDER BY 1"));
+        assertEquals("2", scalar("SELECT s.z FROM wal_g_v s(x,y,z) WHERE s.y = 'five'"));
+        assertEquals("1|one|10 / 2|two|20 / 3|three|30",
+                rows("SELECT s.x, s.y, s.z FROM wal_g_hv s(x,y,z) ORDER BY s.x"));
+    }
+
+    @Test
+    void aMaterializedViewBehindAnAliasListAnswersWithItsValue() throws Exception {
+        exec("CREATE TABLE wal_h_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wal_h_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE MATERIALIZED VIEW wal_h_m AS SELECT * FROM wal_h_g WHERE a = 5");
+        exec("CREATE TABLE wal_h_s (a int, k text, g int GENERATED ALWAYS AS (a*2) STORED)");
+        exec("INSERT INTO wal_h_s (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE MATERIALIZED VIEW wal_h_sm AS SELECT * FROM wal_h_s");
+        exec("CREATE TABLE wal_h_h (a int, k text, g int GENERATED ALWAYS AS (a*10) VIRTUAL)");
+        exec("INSERT INTO wal_h_h (a,k) VALUES (1,'one'),(2,'two'),(3,'three')");
+        exec("CREATE MATERIALIZED VIEW wal_h_hm AS SELECT * FROM wal_h_h");
+
+        assertEquals("2", scalar("SELECT s.z FROM wal_h_m s(x,y,z) WHERE s.x = 5"));
+        assertEquals("2", scalar("SELECT s.z FROM wal_h_m s(x,y,z) WHERE s.y = 'five'"));
+        assertEquals("0,10", column("SELECT s.z FROM wal_h_sm s(x,y,z) ORDER BY 1"));
+        assertEquals("1|one|10 / 2|two|20 / 3|three|30",
+                rows("SELECT s.x, s.y, s.z FROM wal_h_hm s(x,y,z) ORDER BY s.x"));
+    }
+
+    @Test
+    void aWithItemBehindAnAliasListAnswersWithItsValue() throws Exception {
+        exec("CREATE TABLE wal_i_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wal_i_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wal_i_h (a int, k text, g int GENERATED ALWAYS AS (a*10) VIRTUAL)");
+        exec("INSERT INTO wal_i_h (a,k) VALUES (1,'one'),(2,'two'),(3,'three')");
+
+        assertEquals("2", scalar("WITH c AS (SELECT * FROM wal_i_g) SELECT s.z FROM c s(x,y,z) WHERE s.x = 5"));
+        assertEquals("2", scalar("WITH c AS (SELECT * FROM wal_i_g) SELECT s.z FROM c s(x,y,z)"
+                + " WHERE s.y = 'five'"));
+        // an item that names its own columns, renamed again by the reference
+        assertEquals("2", scalar("WITH c(p,q,r) AS (SELECT * FROM wal_i_g) SELECT s.z FROM c s(x,y,z)"
+                + " WHERE s.x = 5"));
+        // and read under the names the item itself gave them
+        assertEquals("2", scalar("WITH c(p,q,r) AS (SELECT * FROM wal_i_g) SELECT r FROM c WHERE p = 5"));
+        assertEquals("five", scalar("WITH c(p,q,r) AS (SELECT * FROM wal_i_g) SELECT q FROM c WHERE p = 5"));
+        // an item kept apart is computed before the query reading it is planned
+        assertEquals("2", scalar("WITH c AS MATERIALIZED (SELECT * FROM wal_i_g WHERE a = 5)"
+                + " SELECT s.z FROM c s(x,y,z)"));
+        assertEquals("10,20,30",
+                column("WITH c AS (SELECT * FROM wal_i_h) SELECT s.z FROM c s(x,y,z) ORDER BY 1"));
+    }
+
+    @Test
+    void aDerivedTableBehindAnAliasListAnswersWithItsValue() throws Exception {
+        exec("CREATE TABLE wal_j_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wal_j_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE VIEW wal_j_v AS SELECT * FROM wal_j_g");
+        exec("CREATE TABLE wal_j_h (a int, k text, g int GENERATED ALWAYS AS (a*10) VIRTUAL)");
+        exec("INSERT INTO wal_j_h (a,k) VALUES (1,'one'),(2,'two'),(3,'three')");
+
+        assertEquals("2", scalar("SELECT s.z FROM (SELECT * FROM wal_j_g) s(x,y,z) WHERE s.x = 5"));
+        assertEquals("2", scalar("SELECT s.z FROM (SELECT * FROM wal_j_g) s(x,y,z) WHERE s.y = 'five'"));
+        // one derived table over another, each with a list of its own
+        assertEquals("2", scalar("SELECT s.z FROM (SELECT * FROM (SELECT * FROM wal_j_g) t(p,q,r))"
+                + " s(x,y,z) WHERE s.x = 5"));
+        assertEquals("2", scalar("SELECT s.z FROM (SELECT * FROM wal_j_v) s(x,y,z) WHERE s.x = 5"));
+        // a select list that already renamed the column, and one that moved it
+        assertEquals("2", scalar("SELECT s.z FROM (SELECT a, k, g AS gg FROM wal_j_g) s(x,y,z) WHERE s.x = 5"));
+        assertEquals("5", scalar("SELECT s.z FROM (SELECT g, k, a FROM wal_j_g) s(x,y,z) WHERE s.z = 5"));
+        assertEquals("2", scalar("SELECT s.x FROM (SELECT g, k, a FROM wal_j_g) s(x,y,z) WHERE s.z = 5"));
+        // both arms of a set operation answer to the names the list gave
+        assertEquals("2,2", column("SELECT s.z FROM (SELECT * FROM wal_j_g WHERE a = 5"
+                + " UNION ALL SELECT * FROM wal_j_g WHERE a = 5) s(x,y,z)"));
+        assertEquals("10,20,30", column("SELECT s.z FROM (SELECT * FROM wal_j_h) s(x,y,z) ORDER BY 1"));
+    }
+
+    @Test
+    void aValuesListAndASetReturningFunctionBehindAnAliasList() throws Exception {
+        assertEquals("2|b", rows("SELECT s.b, s.c FROM (VALUES (1,'a'),(2,'b')) s(b,c) WHERE s.b = 2"));
+        assertEquals("1,2,3", column("SELECT s.n FROM generate_series(1,3) WITH ORDINALITY s(n,o) ORDER BY 1"));
+        assertEquals("1,2,3", column("SELECT s.o FROM generate_series(1,3) WITH ORDINALITY s(n,o) ORDER BY 1"));
+        assertEquals("10,20", column("SELECT s.v FROM unnest(ARRAY[10,20]) s(v) ORDER BY 1"));
+        assertEquals("10|1 / 20|2",
+                rows("SELECT s.v, s.o FROM unnest(ARRAY[10,20]) WITH ORDINALITY s(v,o) ORDER BY 1"));
+    }
+
+    @Test
+    void aJoinReachesTheRenamedColumn() throws Exception {
+        exec("CREATE TABLE wal_l_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wal_l_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wal_l_o (a int, note text)");
+        exec("INSERT INTO wal_l_o VALUES (5,'x'),(0,'y')");
+        exec("CREATE TABLE wal_l_h (a int, k text, g int GENERATED ALWAYS AS (a*10) VIRTUAL)");
+        exec("INSERT INTO wal_l_h (a,k) VALUES (1,'one'),(2,'two'),(3,'three')");
+        exec("CREATE TABLE wal_l_p (a int, note text)");
+        exec("INSERT INTO wal_l_p VALUES (1,'p1'),(9,'p9')");
+
+        assertEquals("2", scalar("SELECT s.z FROM wal_l_o o JOIN wal_l_g s(x,y,z) ON o.a = s.x WHERE o.a = 5"));
+        assertEquals("2", scalar("SELECT s.z FROM wal_l_o o LEFT JOIN wal_l_g s(x,y,z) ON o.a = s.x"
+                + " WHERE o.a = 5"));
+        assertEquals("2", scalar("SELECT s.z FROM wal_l_g s(x,y,z) RIGHT JOIN wal_l_o o ON o.a = s.x"
+                + " WHERE o.a = 5"));
+        assertEquals("5|2", rows("SELECT o.a, s.z FROM wal_l_o o FULL JOIN wal_l_g s(x,y,z) ON o.a = s.x"
+                + " WHERE o.a = 5"));
+        assertEquals("2", scalar("SELECT s.z FROM wal_l_o o, wal_l_g s(x,y,z) WHERE s.x = o.a AND o.a = 5"));
+        assertEquals("2", scalar("SELECT s.z FROM wal_l_o o CROSS JOIN LATERAL"
+                + " (SELECT * FROM wal_l_g WHERE a = o.a) s(x,y,z) WHERE o.a = 5"));
+        assertEquals("2", scalar("SELECT s.z FROM wal_l_o o,"
+                + " LATERAL (SELECT * FROM wal_l_g WHERE a = o.a) s(x,y,z) WHERE o.a = 5"));
+        // a parenthesised join may wear a list of its own
+        assertEquals("5|2", rows("SELECT j.x, j.z FROM"
+                + " (wal_l_g JOIN wal_l_o ON wal_l_g.a = wal_l_o.a) j(x,y,z,w,u) WHERE j.x = 5"));
+        assertEquals("10", column("SELECT j.z FROM"
+                + " (wal_l_h JOIN wal_l_p ON wal_l_h.a = wal_l_p.a) j(x,y,z,w,q) ORDER BY 1"));
+        // each side of a join may wear one
+        assertEquals("p1|10", rows("SELECT b.note, s.z FROM wal_l_p b(a,note)"
+                + " JOIN wal_l_h s(x,y,z) ON b.a = s.x ORDER BY b.a"));
+        // a list takes the join column's name away, so a natural join finds nothing to join on
+        assertEquals("10,10,20,20,30,30",
+                column("SELECT s.z FROM wal_l_h s(x,y,z) NATURAL JOIN wal_l_p ORDER BY 1"));
+    }
+
+    @Test
+    void theRenamedColumnIsWorkedOutForTheRowsTheQualificationKept() throws Exception {
+        exec("CREATE TABLE wal_m_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wal_m_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wal_m_o (a int, note text)");
+        exec("INSERT INTO wal_m_o VALUES (5,'x'),(0,'y')");
+
+        // the qualification may name the renamed column itself
+        assertEquals("2", scalar("SELECT s.z FROM wal_m_g s(x,y,z) WHERE s.x = 5 AND s.z = 2"));
+        // and then it reaches every row, because nothing else decided them first
+        assertEquals("22012", stateOf("SELECT s.z FROM wal_m_g s(x,y,z) WHERE s.z = 2"));
+        assertEquals("division by zero", messageOf("SELECT s.z FROM wal_m_g s(x,y,z) WHERE s.z = 2"));
+        assertEquals("22012", stateOf("SELECT o.note FROM wal_m_o o WHERE EXISTS"
+                + " (SELECT 1 FROM wal_m_g s(x,y,z) WHERE s.x = o.a AND s.z = 2)"));
+        // a LIMIT settles which rows there are before the enclosing qualification
+        assertEquals("22012", stateOf("SELECT s.z FROM (SELECT * FROM wal_m_g LIMIT 2) s(x,y,z)"
+                + " WHERE s.x = 5"));
+        assertEquals("22012", stateOf("SELECT s.z FROM (SELECT * FROM wal_m_g ORDER BY a DESC LIMIT 1)"
+                + " s(x,y,z)"));
+        // an ORDER BY ... LIMIT above the list qualifies nothing
+        assertEquals("22012", stateOf("SELECT s.z FROM wal_m_g s(x,y,z) ORDER BY s.x DESC LIMIT 1"));
+        // and nor does a join with nothing to restrict the aliased relation
+        assertEquals("22012", stateOf("SELECT o.a, s.z FROM wal_m_o o"
+                + " LEFT JOIN wal_m_g s(x,y,z) ON o.a = s.x ORDER BY o.a"));
+
+        // a write that names the renamed column raises where the expression does, and stores nothing
+        assertEquals("22012", stateOf("UPDATE wal_m_o p SET note = 'q' FROM wal_m_g s(x,y,z)"
+                + " WHERE s.x = p.a AND s.z = 2"));
+        assertEquals("0|y / 5|x", rows("SELECT a, note FROM wal_m_o ORDER BY a"));
+    }
+
+    @Test
+    void aColumnNothingNamesIsNotWorkedOut() throws Exception {
+        exec("CREATE TABLE wal_n_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wal_n_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wal_n_o (a int, note text)");
+        exec("INSERT INTO wal_n_o VALUES (5,'x'),(0,'y')");
+
+        assertEquals(2L, num("SELECT count(*) FROM wal_n_g s(x,y,z)"));
+        assertEquals("x", scalar("SELECT o.note FROM wal_n_o o WHERE o.a IN"
+                + " (SELECT s.x FROM wal_n_g s(x,y,z) WHERE s.x = 5)"));
+    }
+
+    @Test
+    void aQualificationOfAnyShapeReachesTheRelationUnderTheAliasList() throws Exception {
+        exec("CREATE TABLE wal_o_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wal_o_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wal_o_o (a int, note text)");
+        exec("INSERT INTO wal_o_o VALUES (5,'x'),(0,'y')");
+
+        assertEquals("2", scalar("SELECT s.z FROM wal_o_g s(x,y,z) WHERE s.x > 0"));
+        assertEquals("2", scalar("SELECT s.z FROM wal_o_g s(x,y,z) WHERE s.y = 'five'"));
+        assertEquals("2", scalar("SELECT s.z FROM wal_o_g s(x,y,z) WHERE s.x = (SELECT 5)"));
+        assertEquals("2", scalar("SELECT s.z FROM wal_o_g s(x,y,z) WHERE s.x = abs(-5)"));
+        assertEquals("2", scalar("SELECT s.z FROM wal_o_g s(x,y,z) WHERE s.x IN (5)"));
+        assertEquals("2", scalar("SELECT s.z FROM wal_o_g s(x,y,z) WHERE s.y LIKE 'f%'"));
+        assertEquals("2", scalar("SELECT s.z FROM wal_o_g s(x,y,z) WHERE s.x = 5 OR s.y = 'nope'"));
+        assertEquals("2", scalar("SELECT s.z FROM wal_o_g s(x,y,z) WHERE NOT (s.x = 0)"));
+        assertEquals("2", scalar("SELECT s.z FROM wal_o_g s(x,y,z) WHERE s.x = 5 AND 10/s.x = 2"));
+        assertEquals("2", scalar("SELECT s.z FROM wal_o_g s(x,y,z) WHERE s.x = 5 FOR UPDATE"));
+        assertEquals("2", scalar("SELECT s.z FROM ONLY wal_o_g s(x,y,z) WHERE s.x = 5"));
+        assertEquals("2|1", rows("SELECT s.z, count(*) FROM wal_o_g s(x,y,z) WHERE s.x = 5 GROUP BY s.z"));
+        assertEquals("2", scalar("SELECT s.z FROM wal_o_g s(x,y,z) WHERE s.x = 5"
+                + " UNION SELECT s.z FROM wal_o_g s(x,y,z) WHERE s.x = 5"));
+        assertEquals("2", scalar("SELECT (SELECT max(s.z) FROM wal_o_g s(x,y,z) WHERE s.x = o.a)"
+                + " FROM wal_o_o o WHERE o.a = 5"));
+        // a qualification written into the join condition reaches it as well
+        assertEquals("2", scalar("SELECT s.z FROM wal_o_o o LEFT JOIN wal_o_g s(x,y,z)"
+                + " ON o.a = s.x AND s.x = 5 WHERE o.a = 5"));
+    }
+
+    @Test
+    void theRenamedColumnMayBeComparedGroupedOrderedAndAggregated() throws Exception {
+        exec("CREATE TABLE wal_p_h (a int, k text, g int GENERATED ALWAYS AS (a*10) VIRTUAL)");
+        exec("INSERT INTO wal_p_h (a,k) VALUES (1,'one'),(2,'two'),(3,'three')");
+        exec("CREATE TABLE wal_p_t (a int, k text, g text GENERATED ALWAYS AS (k || '!') VIRTUAL,"
+                + " h int GENERATED ALWAYS AS (a*3) STORED)");
+        exec("INSERT INTO wal_p_t (a,k) VALUES (1,'one'),(2,'two')");
+
+        assertEquals("20", scalar("SELECT s.z FROM wal_p_h s(x,y,z) WHERE s.z = 20"));
+        assertEquals("2|20", rows("SELECT s.x, s.z FROM wal_p_h s(x,y,z) WHERE s.y = 'two'"));
+        assertEquals(60L, num("SELECT sum(s.z) FROM wal_p_h s(x,y,z)"));
+        assertEquals("one|10 / three|30 / two|20",
+                rows("SELECT s.y, max(s.z) FROM wal_p_h s(x,y,z) GROUP BY s.y ORDER BY 1"));
+        assertEquals("30", scalar("SELECT s.z FROM wal_p_h s(x,y,z) ORDER BY s.z DESC LIMIT 1"));
+        assertEquals("1|10 / 2|20 / 3|30", rows("SELECT s.x, s.g FROM wal_p_h s(x) ORDER BY s.x"));
+
+        // a generated column of another type, and a STORED one beside it
+        assertEquals("one!|3 / two!|6", rows("SELECT s.z, s.w FROM wal_p_t s(x,y,z,w) ORDER BY s.x"));
+        assertEquals("two!", scalar("SELECT s.z FROM wal_p_t s(x,y,z,w) WHERE s.z = 'two!'"));
+        assertEquals("two|two!", rows("SELECT s.y, s.z FROM wal_p_t s(x,y,z,w)"
+                + " GROUP BY s.y, s.z HAVING s.z > 'one!' ORDER BY 1"));
+        assertEquals("two!,one!", column("SELECT s.z FROM wal_p_t s(x,y,z,w) ORDER BY s.z DESC"));
+    }
+
+    @Test
+    void anOuterJoinsUnmatchedRowHasNoValueUnderTheAliasList() throws Exception {
+        exec("CREATE TABLE wal_q_h (a int, k text, g int GENERATED ALWAYS AS (a*10) VIRTUAL)");
+        exec("INSERT INTO wal_q_h (a,k) VALUES (1,'one'),(2,'two'),(3,'three')");
+        exec("CREATE TABLE wal_q_hs (a int, k text, g int GENERATED ALWAYS AS (a*10) STORED)");
+        exec("INSERT INTO wal_q_hs (a,k) VALUES (1,'one'),(2,'two'),(3,'three')");
+        exec("CREATE TABLE wal_q_p (a int, note text)");
+        exec("INSERT INTO wal_q_p VALUES (1,'p1'),(9,'p9')");
+        exec("CREATE TABLE wal_q_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wal_q_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wal_q_o (a int, note text)");
+        exec("INSERT INTO wal_q_o VALUES (5,'x'),(0,'y')");
+
+        assertEquals("1|10 / 9|NULL", rows("SELECT p.a, s.z FROM wal_q_p p"
+                + " LEFT JOIN wal_q_h s(x,y,z) ON p.a = s.x ORDER BY p.a"));
+        assertEquals("1|10 / 9|NULL", rows("SELECT p.a, s.z FROM wal_q_p p"
+                + " LEFT JOIN wal_q_hs s(x,y,z) ON p.a = s.x ORDER BY p.a"));
+        // the padded row has nothing to work the expression out from, so it does not raise
+        assertEquals("2 / NULL", rows("SELECT s.z FROM wal_q_o o"
+                + " LEFT JOIN wal_q_g s(x,y,z) ON o.a = s.x AND o.a = 5 ORDER BY 1"));
+    }
+
+    @Test
+    void aViewMayBeDefinedOverARelationWearingAnAliasList() throws Exception {
+        exec("CREATE TABLE wal_r_h (a int, k text, g int GENERATED ALWAYS AS (a*10) VIRTUAL)");
+        exec("INSERT INTO wal_r_h (a,k) VALUES (1,'one'),(2,'two'),(3,'three')");
+        exec("CREATE VIEW wal_r_w AS SELECT s.x, s.z FROM wal_r_h s(x,y,z)");
+
+        assertEquals("1|10 / 2|20 / 3|30", rows("SELECT * FROM wal_r_w ORDER BY 1"));
+    }
+
+    // ------------------------------------------------------------ a list on a relation a writing
+    // ------------------------------------------------------------ statement brings in beside its target
+
+    @Test
+    void updateFromReadsTheRenamedColumnOfTheRelationItBringsIn() throws Exception {
+        exec("CREATE TABLE wal_s_h (a int, k text, g int GENERATED ALWAYS AS (a*10) VIRTUAL)");
+        exec("INSERT INTO wal_s_h (a,k) VALUES (1,'one'),(2,'two'),(3,'three')");
+        exec("CREATE TABLE wal_s_hs (a int, k text, g int GENERATED ALWAYS AS (a*10) STORED)");
+        exec("INSERT INTO wal_s_hs (a,k) VALUES (1,'one'),(2,'two'),(3,'three')");
+        exec("CREATE VIEW wal_s_hv AS SELECT * FROM wal_s_h");
+        exec("CREATE MATERIALIZED VIEW wal_s_hm AS SELECT * FROM wal_s_h");
+        exec("CREATE TABLE wal_s_p (a int, note text)");
+        exec("INSERT INTO wal_s_p VALUES (1,'p1'),(9,'p9')");
+
+        assertEquals(1, update("UPDATE wal_s_p p SET note = s.z::text"
+                + " FROM wal_s_h s(x,y,z) WHERE s.x = p.a"));
+        assertEquals("1|10 / 9|p9", rows("SELECT a, note FROM wal_s_p ORDER BY a"));
+
+        assertEquals(1, update("UPDATE wal_s_p p SET note = 's' || s.z::text"
+                + " FROM wal_s_hs s(x,y,z) WHERE s.x = p.a"));
+        assertEquals("1|s10 / 9|p9", rows("SELECT a, note FROM wal_s_p ORDER BY a"));
+
+        assertEquals(1, update("UPDATE wal_s_p p SET note = 'd' || s.z::text"
+                + " FROM (SELECT * FROM wal_s_h) s(x,y,z) WHERE s.x = p.a"));
+        assertEquals("1|d10 / 9|p9", rows("SELECT a, note FROM wal_s_p ORDER BY a"));
+
+        assertEquals(1, update("UPDATE wal_s_p p SET note = 'v' || s.z::text"
+                + " FROM wal_s_hv s(x,y,z) WHERE s.x = p.a"));
+        assertEquals("1|v10 / 9|p9", rows("SELECT a, note FROM wal_s_p ORDER BY a"));
+
+        assertEquals(1, update("UPDATE wal_s_p p SET note = 'm' || s.z::text"
+                + " FROM wal_s_hm s(x,y,z) WHERE s.x = p.a"));
+        assertEquals("1|m10 / 9|p9", rows("SELECT a, note FROM wal_s_p ORDER BY a"));
+
+        assertEquals(1, update("WITH c AS (SELECT * FROM wal_s_h) UPDATE wal_s_p p"
+                + " SET note = 'w' || s.z::text FROM c s(x,y,z) WHERE s.x = p.a"));
+        assertEquals("1|w10 / 9|p9", rows("SELECT a, note FROM wal_s_p ORDER BY a"));
+
+        assertEquals(1, update("UPDATE wal_s_p p SET note = s.c"
+                + " FROM (VALUES (1,'vv')) s(b,c) WHERE s.b = p.a"));
+        assertEquals("1|vv / 9|p9", rows("SELECT a, note FROM wal_s_p ORDER BY a"));
+
+        assertEquals(1, update("UPDATE wal_s_p p SET note = s.o::text"
+                + " FROM generate_series(1,1) WITH ORDINALITY s(n,o) WHERE s.n = p.a"));
+        assertEquals("1|1 / 9|p9", rows("SELECT a, note FROM wal_s_p ORDER BY a"));
+
+        // the assigned value reads the same way in a RETURNING list
+        assertEquals("1|z10", rows("UPDATE wal_s_p p SET note = 'z' || s.z::text"
+                + " FROM wal_s_h s(x,y,z) WHERE s.x = p.a RETURNING p.a, p.note"));
+    }
+
+    @Test
+    void deleteUsingReadsTheRenamedColumnOfTheRelationItBringsIn() throws Exception {
+        exec("CREATE TABLE wal_t_h (a int, k text, g int GENERATED ALWAYS AS (a*10) VIRTUAL)");
+        exec("INSERT INTO wal_t_h (a,k) VALUES (1,'one'),(2,'two'),(3,'three')");
+        exec("CREATE TABLE wal_t_hs (a int, k text, g int GENERATED ALWAYS AS (a*10) STORED)");
+        exec("INSERT INTO wal_t_hs (a,k) VALUES (1,'one'),(2,'two'),(3,'three')");
+        exec("CREATE VIEW wal_t_hv AS SELECT * FROM wal_t_h");
+        exec("CREATE MATERIALIZED VIEW wal_t_hm AS SELECT * FROM wal_t_h");
+        exec("CREATE TABLE wal_t_d (a int, note text)");
+        exec("INSERT INTO wal_t_d VALUES (1,'p1'),(2,'p2'),(3,'p3'),(9,'p9')");
+
+        assertEquals(1, update("DELETE FROM wal_t_d p USING wal_t_h s(x,y,z)"
+                + " WHERE s.x = p.a AND s.z = 30"));
+        assertEquals("1|p1 / 2|p2 / 9|p9", rows("SELECT a, note FROM wal_t_d ORDER BY a"));
+
+        assertEquals(1, update("DELETE FROM wal_t_d p USING (SELECT * FROM wal_t_h) s(x,y,z)"
+                + " WHERE s.x = p.a AND s.z = 20"));
+        assertEquals("1|p1 / 9|p9", rows("SELECT a, note FROM wal_t_d ORDER BY a"));
+
+        assertEquals(1, update("WITH c AS (SELECT * FROM wal_t_h) DELETE FROM wal_t_d p"
+                + " USING c s(x,y,z) WHERE s.x = p.a AND s.z = 10"));
+        assertEquals("9|p9", rows("SELECT a, note FROM wal_t_d ORDER BY a"));
+
+        exec("INSERT INTO wal_t_d VALUES (1,'p1'),(2,'p2'),(3,'p3')");
+
+        assertEquals(1, update("DELETE FROM wal_t_d p USING wal_t_hv s(x,y,z)"
+                + " WHERE s.x = p.a AND s.z = 10"));
+        assertEquals("2|p2 / 3|p3 / 9|p9", rows("SELECT a, note FROM wal_t_d ORDER BY a"));
+
+        assertEquals(1, update("DELETE FROM wal_t_d p USING wal_t_hm s(x,y,z)"
+                + " WHERE s.x = p.a AND s.z = 20"));
+        assertEquals("3|p3 / 9|p9", rows("SELECT a, note FROM wal_t_d ORDER BY a"));
+
+        assertEquals(1, update("DELETE FROM wal_t_d p USING wal_t_hs s(x,y,z)"
+                + " WHERE s.x = p.a AND s.z = 30"));
+        assertEquals("9|p9", rows("SELECT a, note FROM wal_t_d ORDER BY a"));
+    }
+
+    @Test
+    void mergeReadsTheRenamedColumnOfTheRelationItBringsIn() throws Exception {
+        exec("CREATE TABLE wal_u_h (a int, k text, g int GENERATED ALWAYS AS (a*10) VIRTUAL)");
+        exec("INSERT INTO wal_u_h (a,k) VALUES (1,'one'),(2,'two'),(3,'three')");
+        exec("CREATE TABLE wal_u_hs (a int, k text, g int GENERATED ALWAYS AS (a*10) STORED)");
+        exec("INSERT INTO wal_u_hs (a,k) VALUES (1,'one'),(2,'two'),(3,'three')");
+        exec("CREATE VIEW wal_u_hv AS SELECT * FROM wal_u_h");
+        exec("CREATE MATERIALIZED VIEW wal_u_hm AS SELECT * FROM wal_u_h");
+        exec("CREATE TABLE wal_u_p (a int, note text)");
+        exec("INSERT INTO wal_u_p VALUES (1,'p1'),(9,'p9')");
+
+        assertEquals(1, update("MERGE INTO wal_u_p p USING wal_u_h s(x,y,z) ON p.a = s.x"
+                + " WHEN MATCHED THEN UPDATE SET note = 'm' || s.z::text"));
+        assertEquals("1|m10 / 9|p9", rows("SELECT a, note FROM wal_u_p ORDER BY a"));
+
+        assertEquals(1, update("MERGE INTO wal_u_p p USING (SELECT * FROM wal_u_h) s(x,y,z)"
+                + " ON p.a = s.x WHEN MATCHED THEN UPDATE SET note = 'd' || s.z::text"));
+        assertEquals("1|d10 / 9|p9", rows("SELECT a, note FROM wal_u_p ORDER BY a"));
+
+        assertEquals(1, update("WITH c AS (SELECT * FROM wal_u_h) MERGE INTO wal_u_p p"
+                + " USING c s(x,y,z) ON p.a = s.x WHEN MATCHED THEN UPDATE SET note = 'c' || s.z::text"));
+        assertEquals("1|c10 / 9|p9", rows("SELECT a, note FROM wal_u_p ORDER BY a"));
+
+        assertEquals(1, update("MERGE INTO wal_u_p p USING wal_u_hv s(x,y,z) ON p.a = s.x"
+                + " WHEN MATCHED THEN UPDATE SET note = 'v' || s.z::text"));
+        assertEquals("1|v10 / 9|p9", rows("SELECT a, note FROM wal_u_p ORDER BY a"));
+
+        assertEquals(1, update("MERGE INTO wal_u_p p USING wal_u_hm s(x,y,z) ON p.a = s.x"
+                + " WHEN MATCHED THEN UPDATE SET note = 'w' || s.z::text"));
+        assertEquals("1|w10 / 9|p9", rows("SELECT a, note FROM wal_u_p ORDER BY a"));
+
+        assertEquals(1, update("MERGE INTO wal_u_p p USING wal_u_hs s(x,y,z) ON p.a = s.x"
+                + " WHEN MATCHED THEN UPDATE SET note = 's' || s.z::text"));
+        assertEquals("1|s10 / 9|p9", rows("SELECT a, note FROM wal_u_p ORDER BY a"));
+
+        assertEquals(1, update("MERGE INTO wal_u_p p USING (VALUES (9,'vv')) s(b,c) ON p.a = s.b"
+                + " WHEN MATCHED THEN UPDATE SET note = s.c"));
+        assertEquals("1|s10 / 9|vv", rows("SELECT a, note FROM wal_u_p ORDER BY a"));
+
+        // the insert arm reads it too
+        assertEquals(2, update("MERGE INTO wal_u_p p USING wal_u_h s(x,y,z) ON p.a = s.x"
+                + " WHEN NOT MATCHED THEN INSERT (a, note) VALUES (s.x, 'n' || s.z::text)"));
+        assertEquals("1|s10 / 2|n20 / 3|n30 / 9|vv", rows("SELECT a, note FROM wal_u_p ORDER BY a"));
+    }
+
+    @Test
+    void insertSelectReadsTheRenamedColumn() throws Exception {
+        exec("CREATE TABLE wal_v_h (a int, k text, g int GENERATED ALWAYS AS (a*10) VIRTUAL)");
+        exec("INSERT INTO wal_v_h (a,k) VALUES (1,'one'),(2,'two'),(3,'three')");
+        exec("CREATE VIEW wal_v_hv AS SELECT * FROM wal_v_h");
+        exec("CREATE TABLE wal_v_i (a int, note text)");
+
+        assertEquals(1, update("INSERT INTO wal_v_i SELECT s.x, s.z::text"
+                + " FROM wal_v_h s(x,y,z) WHERE s.x = 3"));
+        assertEquals(1, update("INSERT INTO wal_v_i SELECT s.x, s.z::text"
+                + " FROM wal_v_hv s(x,y,z) WHERE s.x = 2"));
+        assertEquals(1, update("INSERT INTO wal_v_i SELECT s.b, s.c FROM (VALUES (7,'seven')) s(b,c)"));
+        assertEquals(1, update("INSERT INTO wal_v_i SELECT s.n, s.o::text"
+                + " FROM generate_series(5,5) WITH ORDINALITY s(n,o)"));
+        assertEquals("2|20 / 3|30 / 5|1 / 7|seven", rows("SELECT a, note FROM wal_v_i ORDER BY a"));
+    }
+
     // ------------------------------------------------------------ two sessions at once
 
     /** What a statement run on a session of its own answered, and whether it had to wait. */
@@ -2324,5 +2854,1221 @@ class WriteVisibilityAndDefaultsTest {
             pool.shutdownNow();
         }
         return answer;
+    }
+
+    // ------------------------------------------------------------ what a WITH item the query
+    // ------------------------------------------------------------ keeps apart holds
+
+    // An item PostgreSQL keeps apart from the query reading it — written MATERIALIZED, named twice,
+    // holding a volatile call — is computed in full before that query is planned. What it holds is
+    // its own select list, and a star there stands for every column of the relation underneath, the
+    // VIRTUAL generated one included, whether or not the query above ever names it. The generation
+    // expression below is 10/a over a relation holding a row with a = 0, so each case is really
+    // asking which rows it was worked out for.
+
+    @Test
+    void anItemTheQueryKeepsApartWorksOutWhatItsOwnStarExposes() throws Exception {
+        exec("CREATE TABLE wki_a_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wki_a_g (a,k) VALUES (5,'five'),(0,'zero')");
+
+        String counted = "WITH c AS MATERIALIZED (SELECT * FROM wki_a_g) SELECT count(*) FROM c";
+        assertEquals("22012", stateOf(counted));
+        assertEquals("division by zero", messageOf(counted));
+        // the query names a stored column, or none at all, and the star still exposes the other
+        assertEquals("22012", stateOf("WITH c AS MATERIALIZED (SELECT * FROM wki_a_g)"
+                + " SELECT k FROM c ORDER BY k"));
+        assertEquals("22012", stateOf("WITH c AS MATERIALIZED (SELECT * FROM wki_a_g)"
+                + " SELECT a FROM c ORDER BY a"));
+        assertEquals("22012", stateOf("WITH c AS MATERIALIZED (SELECT * FROM wki_a_g)"
+                + " SELECT g FROM c WHERE a = 5"));
+        // a qualification written above an item kept apart reaches nothing below it
+        assertEquals("22012", stateOf("WITH c AS MATERIALIZED (SELECT * FROM wki_a_g)"
+                + " SELECT count(*) FROM c WHERE a = 5"));
+        // the item's own column names change nothing about what it holds
+        assertEquals("22012", stateOf("WITH c(x,y,z) AS MATERIALIZED (SELECT * FROM wki_a_g)"
+                + " SELECT count(*) FROM c"));
+    }
+
+    @Test
+    void aDerivedTableAViewAndAFurtherItemUnderAKeptApartItemArePulledIntoIt() throws Exception {
+        exec("CREATE TABLE wki_b_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wki_b_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE VIEW wki_b_v AS SELECT * FROM wki_b_g");
+        exec("CREATE TABLE wki_b_o (a int, note text)");
+        exec("INSERT INTO wki_b_o VALUES (5,'x'),(0,'y')");
+
+        assertEquals("22012", stateOf("WITH c AS MATERIALIZED (SELECT * FROM (SELECT * FROM wki_b_g) s)"
+                + " SELECT count(*) FROM c"));
+        assertEquals("22012", stateOf("WITH c AS MATERIALIZED (SELECT * FROM wki_b_v)"
+                + " SELECT count(*) FROM c"));
+        // and a further item reading the one kept apart holds what that one holds
+        assertEquals("22012", stateOf("WITH c AS MATERIALIZED (SELECT * FROM wki_b_g),"
+                + " d AS (SELECT * FROM c) SELECT count(*) FROM d"));
+        // whatever the query above puts between itself and the item
+        assertEquals("22012", stateOf("WITH c AS MATERIALIZED (SELECT * FROM wki_b_g)"
+                + " SELECT count(*) FROM (SELECT * FROM c) t"));
+        assertEquals("22012", stateOf("WITH c AS MATERIALIZED (SELECT * FROM wki_b_g)"
+                + " SELECT count(*) FROM c LEFT JOIN wki_b_o o ON o.a = c.a"));
+        assertEquals("22012", stateOf("WITH c AS MATERIALIZED (SELECT * FROM wki_b_g)"
+                + " SELECT count(*) FROM c UNION ALL SELECT count(*) FROM wki_b_o"));
+    }
+
+    @Test
+    void aStarOnOneArmOfASetOperationIsTheWholeOperationsStar() throws Exception {
+        exec("CREATE TABLE wki_c_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wki_c_g (a,k) VALUES (5,'five'),(0,'zero')");
+
+        assertEquals("22012", stateOf("WITH c AS MATERIALIZED (SELECT * FROM wki_c_g WHERE a = 5"
+                + " UNION ALL SELECT * FROM wki_c_g WHERE a = 0) SELECT count(*) FROM c"));
+        assertEquals(2L, num("WITH c AS MATERIALIZED (SELECT * FROM wki_c_g WHERE a = 5"
+                + " UNION ALL SELECT * FROM wki_c_g WHERE a = 5) SELECT count(*) FROM c"));
+    }
+
+    @Test
+    void anItemThatNamesItsColumnsHoldsOnlyThose() throws Exception {
+        exec("CREATE TABLE wki_d_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wki_d_g (a,k) VALUES (5,'five'),(0,'zero')");
+
+        assertEquals(2L, num("WITH c AS MATERIALIZED (SELECT a, k FROM wki_d_g) SELECT count(*) FROM c"));
+        assertEquals("five,zero", column("WITH c AS MATERIALIZED (SELECT a, k FROM wki_d_g)"
+                + " SELECT k FROM c ORDER BY k"));
+        assertEquals("5", scalar("WITH c AS MATERIALIZED (SELECT a, k FROM wki_d_g)"
+                + " SELECT c.a FROM c WHERE c.a = 5"));
+        assertEquals(1L, num("WITH c AS MATERIALIZED (SELECT a, k FROM wki_d_g)"
+                + " SELECT count(*) FROM c WHERE a = 0"));
+        // an aggregate is one value and reads nothing of the row
+        assertEquals("2", scalar("WITH c AS MATERIALIZED (SELECT count(*) AS n FROM wki_d_g)"
+                + " SELECT n FROM c"));
+        // and what the item does name, it works out
+        assertEquals("22012", stateOf("WITH c AS MATERIALIZED (SELECT g FROM wki_d_g)"
+                + " SELECT count(*) FROM c"));
+    }
+
+    @Test
+    void theItemsOwnQualificationSettlesTheRowsItHolds() throws Exception {
+        exec("CREATE TABLE wki_e_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wki_e_g (a,k) VALUES (5,'five'),(0,'zero')");
+
+        assertEquals(1L, num("WITH c AS MATERIALIZED (SELECT * FROM wki_e_g WHERE a = 5)"
+                + " SELECT count(*) FROM c"));
+        assertEquals("2", scalar("WITH c AS MATERIALIZED (SELECT * FROM wki_e_g WHERE a = 5)"
+                + " SELECT g FROM c"));
+        assertEquals(1L, num("WITH c AS MATERIALIZED (SELECT g FROM wki_e_g WHERE a = 5)"
+                + " SELECT count(*) FROM c"));
+        assertEquals(1L, num("WITH c AS MATERIALIZED (SELECT DISTINCT a, k, g FROM wki_e_g WHERE a = 5)"
+                + " SELECT count(*) FROM c"));
+        // the expression written out by hand is the item's own to work out, over its own rows
+        assertEquals(1L, num("WITH c AS MATERIALIZED (SELECT a, k, 10/a AS h FROM wki_e_g WHERE a = 5)"
+                + " SELECT count(*) FROM c"));
+    }
+
+    @Test
+    void aStarInsideTheItemsOwnQualificationBelongsToThatSubquery() throws Exception {
+        exec("CREATE TABLE wki_f_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wki_f_g (a,k) VALUES (5,'five'),(0,'zero')");
+
+        // EXISTS asks for no column at all, so the star under it exposes nothing to work out
+        assertEquals(2L, num("WITH c AS MATERIALIZED"
+                + " (SELECT a FROM wki_f_g WHERE EXISTS (SELECT * FROM wki_f_g z))"
+                + " SELECT count(*) FROM c"));
+    }
+
+    @Test
+    void anItemTheQueryPullsUpTakesTheReadingQuerysDemandInstead() throws Exception {
+        exec("CREATE TABLE wki_g_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wki_g_g (a,k) VALUES (5,'five'),(0,'zero')");
+
+        assertEquals(2L, num("WITH c AS NOT MATERIALIZED (SELECT * FROM wki_g_g) SELECT count(*) FROM c"));
+        assertEquals(2L, num("WITH c AS (SELECT * FROM wki_g_g) SELECT count(*) FROM c"));
+        assertEquals(2L, num("WITH RECURSIVE c AS (SELECT * FROM wki_g_g) SELECT count(*) FROM c"));
+        assertEquals("2", scalar("WITH c AS (SELECT * FROM wki_g_g) SELECT g FROM c WHERE a = 5"));
+        // named twice it is kept apart, and written NOT MATERIALIZED it is pulled into both places
+        assertEquals("22012", stateOf("WITH c AS (SELECT * FROM wki_g_g) SELECT count(*) FROM c, c c2"));
+        assertEquals("22012", stateOf("WITH c AS MATERIALIZED (SELECT * FROM wki_g_g)"
+                + " SELECT count(*) FROM c, c c2"));
+        assertEquals(4L, num("WITH c AS NOT MATERIALIZED (SELECT * FROM wki_g_g)"
+                + " SELECT count(*) FROM c, c c2"));
+        // a volatile call keeps it apart however it is written; a stable one does not
+        assertEquals("22012", stateOf("WITH c AS (SELECT random(), * FROM wki_g_g) SELECT count(*) FROM c"));
+        assertEquals("22012", stateOf("WITH c AS NOT MATERIALIZED (SELECT random(), * FROM wki_g_g)"
+                + " SELECT count(*) FROM c"));
+        assertEquals("22012", stateOf("WITH c AS (SELECT * FROM wki_g_g WHERE random() < 2)"
+                + " SELECT count(*) FROM c"));
+        assertEquals("2", scalar("WITH c AS (SELECT now()::text AS n, * FROM wki_g_g)"
+                + " SELECT g FROM c WHERE a = 5"));
+        assertEquals("2", scalar("WITH c AS (SELECT * FROM wki_g_g), d AS (SELECT * FROM c)"
+                + " SELECT g FROM d WHERE a = 5"));
+    }
+
+    @Test
+    void anItemNobodyReadsIsNotComputedAndARelationWithNoGeneratedColumnIsUntouched()
+            throws Exception {
+        exec("CREATE TABLE wki_h_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wki_h_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wki_h_o (a int, note text)");
+        exec("INSERT INTO wki_h_o VALUES (5,'x'),(0,'y')");
+
+        assertEquals(2L, num("WITH c AS MATERIALIZED (SELECT * FROM wki_h_g)"
+                + " SELECT count(*) FROM wki_h_o"));
+        assertEquals(2L, num("WITH c AS MATERIALIZED (SELECT * FROM wki_h_o) SELECT count(*) FROM c"));
+        assertEquals(1L, num("WITH c AS MATERIALIZED (SELECT * FROM wki_h_o)"
+                + " SELECT count(*) FROM c WHERE a = 5"));
+    }
+
+    // Keeping an item apart decides only WHICH rows the column is worked out for; it never changes a
+    // value. The generation expression below cannot raise, so every reading has to carry the same one.
+
+    @Test
+    void keepingAnItemApartNeverChangesTheValueTheColumnCarries() throws Exception {
+        exec("CREATE TABLE wki_i_h (a int, k text, g int GENERATED ALWAYS AS (a*10) VIRTUAL)");
+        exec("INSERT INTO wki_i_h VALUES (1,'one'),(2,'two'),(3,'three')");
+        exec("CREATE TABLE wki_i_q (a int, note text)");
+        exec("INSERT INTO wki_i_q VALUES (1,'p1'),(9,'p9')");
+
+        assertEquals("1|10 / 2|20 / 3|30", rows("WITH c AS MATERIALIZED (SELECT * FROM wki_i_h)"
+                + " SELECT a, g FROM c ORDER BY a"));
+        assertEquals("2|20", rows("WITH c AS MATERIALIZED (SELECT * FROM wki_i_h)"
+                + " SELECT a, g FROM c WHERE a = 2"));
+        assertEquals("1|10 / 2|20 / 3|30", rows("WITH c AS NOT MATERIALIZED (SELECT * FROM wki_i_h)"
+                + " SELECT a, g FROM c ORDER BY a"));
+        assertEquals("1|10 / 2|20 / 3|30", rows("WITH c(x,y,z) AS MATERIALIZED (SELECT * FROM wki_i_h)"
+                + " SELECT x, z FROM c ORDER BY x"));
+        assertEquals("3|60", rows("WITH c AS MATERIALIZED (SELECT * FROM wki_i_h)"
+                + " SELECT count(*), sum(g) FROM c"));
+        assertEquals("1|10", rows("WITH c AS MATERIALIZED (SELECT * FROM wki_i_h)"
+                + " SELECT c.a, c.g FROM c JOIN wki_i_q q ON q.a = c.a"));
+    }
+
+    // ------------------------------------------------------------ a qualification reaches through a
+    // ------------------------------------------------------------ chain of derived relations
+
+    @Test
+    void aQualificationReachesThroughADerivedTableOverADerivedTable() throws Exception {
+        exec("CREATE TABLE wdc_a_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wdc_a_g (a,k) VALUES (5,'five'),(0,'zero')");
+
+        assertEquals("2", scalar("SELECT t.g FROM (SELECT * FROM (SELECT * FROM wdc_a_g) s) t"
+                + " WHERE t.a = 5"));
+        assertEquals("2", scalar("SELECT t.g FROM (SELECT * FROM (SELECT * FROM"
+                + " (SELECT * FROM wdc_a_g) r) s) t WHERE t.a = 5"));
+        assertEquals("five", scalar("SELECT t.k FROM (SELECT * FROM (SELECT * FROM wdc_a_g) s) t"
+                + " WHERE t.a = 5"));
+        assertEquals("5|2", rows("SELECT t.a, t.g FROM (SELECT * FROM (SELECT * FROM wdc_a_g) s) t"
+                + " WHERE t.k = 'five'"));
+        assertEquals("2", scalar("SELECT t.g FROM (SELECT * FROM (SELECT * FROM wdc_a_g) s) t"
+                + " WHERE t.a = 5 AND t.g = 2"));
+        assertEquals(2L, num("SELECT max(t.g) FROM (SELECT * FROM (SELECT * FROM wdc_a_g) s) t"
+                + " WHERE t.a = 5"));
+        assertEquals(2L, num("SELECT count(*) FROM (SELECT * FROM (SELECT * FROM wdc_a_g) s) t"));
+        // a qualification written at either level of the chain reaches the same scan
+        assertEquals("2", scalar("SELECT t.g FROM (SELECT * FROM (SELECT * FROM wdc_a_g) s"
+                + " WHERE s.a = 5) t"));
+        assertEquals("2", scalar("SELECT t.g FROM (SELECT * FROM (SELECT * FROM wdc_a_g) s"
+                + " WHERE s.k = 'five') t"));
+    }
+
+    @Test
+    void aQualificationReachesThroughADerivedTableOverAView() throws Exception {
+        exec("CREATE TABLE wdc_b_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wdc_b_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE VIEW wdc_b_v AS SELECT * FROM wdc_b_g");
+        exec("CREATE VIEW wdc_b_v2 AS SELECT * FROM wdc_b_v");
+
+        assertEquals("2", scalar("SELECT s.g FROM (SELECT * FROM wdc_b_v) s WHERE s.a = 5"));
+        assertEquals("2", scalar("SELECT s.g FROM (SELECT * FROM wdc_b_v2) s WHERE s.a = 5"));
+        assertEquals("2", scalar("SELECT s.g FROM wdc_b_v2 s WHERE s.a = 5"));
+        assertEquals("2", scalar("SELECT v.g FROM wdc_b_v2 v WHERE v.k = 'five'"));
+        assertEquals("five", scalar("SELECT s.k FROM (SELECT * FROM wdc_b_v) s WHERE s.a = 5"));
+        assertEquals(2L, num("SELECT count(*) FROM (SELECT * FROM wdc_b_v) s"));
+        assertEquals("2", scalar("SELECT s.g FROM (SELECT * FROM wdc_b_v WHERE a = 5) s"));
+    }
+
+    @Test
+    void aChainNothingNarrowsIsWorkedOutForEveryRowOfIt() throws Exception {
+        exec("CREATE TABLE wdc_c_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wdc_c_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE VIEW wdc_c_v AS SELECT * FROM wdc_c_g");
+
+        String chain = "SELECT t.g FROM (SELECT * FROM (SELECT * FROM wdc_c_g) s) t";
+        assertEquals("22012", stateOf(chain));
+        assertEquals("division by zero", messageOf(chain));
+        // a LIMIT settles which rows the relation has before the qualification above is read
+        assertEquals("22012", stateOf("SELECT t.g FROM (SELECT * FROM (SELECT * FROM wdc_c_g LIMIT 2) s) t"
+                + " WHERE t.a = 5"));
+        assertEquals("22012", stateOf("SELECT s.g FROM (SELECT * FROM wdc_c_v) s"));
+    }
+
+    @Test
+    void aChainKeepsTheValueTheColumnCarries() throws Exception {
+        exec("CREATE TABLE wdc_d_h (a int, k text, g int GENERATED ALWAYS AS (a*10) VIRTUAL)");
+        exec("INSERT INTO wdc_d_h VALUES (1,'one'),(2,'two'),(3,'three')");
+        exec("CREATE VIEW wdc_d_hv AS SELECT * FROM wdc_d_h");
+
+        assertEquals("1|10 / 2|20 / 3|30", rows("SELECT t.a, t.g FROM"
+                + " (SELECT * FROM (SELECT * FROM wdc_d_h) s) t ORDER BY t.a"));
+        assertEquals("2|20", rows("SELECT t.a, t.g FROM (SELECT * FROM (SELECT * FROM wdc_d_h) s) t"
+                + " WHERE t.a = 2"));
+        assertEquals("1|10 / 2|20 / 3|30", rows("SELECT s.a, s.g FROM (SELECT * FROM wdc_d_hv) s"
+                + " ORDER BY s.a"));
+        assertEquals("2|20 / 3|30", rows("SELECT s.a, s.g FROM (SELECT * FROM wdc_d_hv) s"
+                + " WHERE s.a > 1 ORDER BY s.a"));
+    }
+
+    // ------------------------------------------------------------ a plain part of a qualification is
+    // ------------------------------------------------------------ read before a part holding a query
+
+    // PostgreSQL orders the parts of a qualification by what each costs to evaluate and stops at the
+    // first that is false. A part holding a sub-query is a plan of its own and costs more than any
+    // comparison of values the row already carries, so the plain parts decide the row first and the
+    // sub-query never runs for a row they reject — whichever order the two were written in.
+
+    @Test
+    void aPlainPartOfAQualificationIsReadBeforeAPartHoldingASubquery() throws Exception {
+        exec("CREATE TABLE wcp_a_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wcp_a_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wcp_a_o (a int, note text)");
+        exec("INSERT INTO wcp_a_o VALUES (5,'x'),(0,'y')");
+
+        assertEquals("5", scalar("SELECT o.a FROM wcp_a_o o WHERE EXISTS"
+                + " (SELECT 1 FROM wcp_a_g s WHERE s.a = o.a AND s.g = 2) AND o.a = 5"));
+        assertEquals("5", scalar("SELECT o.a FROM wcp_a_o o WHERE o.a = 5 AND EXISTS"
+                + " (SELECT 1 FROM wcp_a_g s WHERE s.a = o.a AND s.g = 2)"));
+        assertEquals("5|x", rows("SELECT o.a, o.note FROM wcp_a_o o WHERE EXISTS"
+                + " (SELECT 1 FROM wcp_a_g s WHERE s.a = o.a AND s.g = 2) AND o.a = 5"));
+        assertEquals("5", scalar("SELECT o.a FROM wcp_a_o o WHERE NOT EXISTS"
+                + " (SELECT 1 FROM wcp_a_g s WHERE s.a = o.a AND s.g = 3) AND o.a = 5"));
+        // a sub-query standing as a value costs as much as one standing as a predicate
+        assertEquals("5", scalar("SELECT o.a FROM wcp_a_o o WHERE"
+                + " (SELECT max(s.g) FROM wcp_a_g s WHERE s.a = o.a) = 2 AND o.a = 5"));
+        assertEquals("5", scalar("SELECT o.a FROM wcp_a_o o WHERE"
+                + " (SELECT 1 FROM wcp_a_g s WHERE s.a = o.a AND s.g = 2) = 1 AND o.a = 5"));
+        assertEquals("5", scalar("SELECT o.a FROM wcp_a_o o WHERE"
+                + " (SELECT count(*) FROM wcp_a_g s WHERE s.a = o.a AND s.g = 2) = 1 AND o.a = 5"));
+    }
+
+    @Test
+    void theReadingIsTheSameBesideMorePartsAndAboveAGroupingOrASort() throws Exception {
+        exec("CREATE TABLE wcp_b_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wcp_b_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wcp_b_o (a int, note text)");
+        exec("INSERT INTO wcp_b_o VALUES (5,'x'),(0,'y')");
+
+        assertEquals("5", scalar("SELECT o.a FROM wcp_b_o o WHERE EXISTS"
+                + " (SELECT 1 FROM wcp_b_g s WHERE s.a = o.a AND s.g = 2)"
+                + " AND o.a = 5 AND o.note = 'x'"));
+        assertEquals("5", scalar("SELECT o.a FROM wcp_b_o o WHERE o.a = 5 AND o.note = 'x'"
+                + " AND EXISTS (SELECT 1 FROM wcp_b_g s WHERE s.a = o.a AND s.g = 2)"));
+        assertEquals("5", scalar("SELECT o.a FROM wcp_b_o o WHERE o.note = 'x' AND EXISTS"
+                + " (SELECT 1 FROM wcp_b_g s WHERE s.a = o.a AND s.g = 2) AND o.a = 5"));
+        assertEquals(1L, num("SELECT count(*) FROM wcp_b_o o WHERE EXISTS"
+                + " (SELECT 1 FROM wcp_b_g s WHERE s.a = o.a AND s.g = 2) AND o.a = 5"));
+        assertEquals("5", scalar("SELECT o.a FROM wcp_b_o o WHERE EXISTS"
+                + " (SELECT 1 FROM wcp_b_g s WHERE s.a = o.a AND s.g = 2) AND o.a = 5 GROUP BY o.a"));
+        assertEquals("5", scalar("SELECT o.a FROM wcp_b_o o WHERE EXISTS"
+                + " (SELECT 1 FROM wcp_b_g s WHERE s.a = o.a AND s.g = 2) AND o.a = 5 ORDER BY o.a"));
+    }
+
+    @Test
+    void aSecondRelationBesideItAndAJoinDoNotChangeTheReading() throws Exception {
+        exec("CREATE TABLE wcp_c_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wcp_c_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wcp_c_o (a int, note text)");
+        exec("INSERT INTO wcp_c_o VALUES (5,'x'),(0,'y')");
+
+        assertEquals("5", scalar("SELECT o.a FROM wcp_c_o o, wcp_c_o p WHERE EXISTS"
+                + " (SELECT 1 FROM wcp_c_g s WHERE s.a = o.a AND s.g = 2) AND o.a = 5 AND p.a = 5"));
+        assertEquals("5", scalar("SELECT o.a FROM wcp_c_o o JOIN wcp_c_o p ON p.a = o.a WHERE EXISTS"
+                + " (SELECT 1 FROM wcp_c_g s WHERE s.a = o.a AND s.g = 2) AND o.a = 5"));
+    }
+
+    @Test
+    void withNothingDecidingTheRowFirstTheSubqueryRunsForEveryRow() throws Exception {
+        exec("CREATE TABLE wcp_d_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wcp_d_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wcp_d_o (a int, note text)");
+        exec("INSERT INTO wcp_d_o VALUES (5,'x'),(0,'y')");
+
+        String alone = "SELECT o.a FROM wcp_d_o o WHERE EXISTS"
+                + " (SELECT 1 FROM wcp_d_g s WHERE s.a = o.a AND s.g = 2)";
+        assertEquals("22012", stateOf(alone));
+        assertEquals("division by zero", messageOf(alone));
+        // one side of an OR is not a part that has to hold, so it decides nothing first
+        assertEquals("22012", stateOf("SELECT o.a FROM wcp_d_o o WHERE EXISTS"
+                + " (SELECT 1 FROM wcp_d_g s WHERE s.a = o.a AND s.g = 2) OR o.a = 5"));
+    }
+
+    @Test
+    void aSubqueryThatWouldRaiseIsNotRunForARowTheOtherPartsRejected() throws Exception {
+        exec("CREATE TABLE wcp_e_o (a int, note text)");
+        exec("INSERT INTO wcp_e_o VALUES (5,'x'),(0,'y')");
+        exec("CREATE TABLE wcp_e_n (a int)");
+        exec("INSERT INTO wcp_e_n VALUES (5),(0),(7),(9)");
+
+        assertEquals("(no rows)", scalar("SELECT o.a FROM wcp_e_o o WHERE EXISTS (SELECT 1/0)"
+                + " AND o.a = 99"));
+        assertEquals("(no rows)", scalar("SELECT o.a FROM wcp_e_o o WHERE o.a = 99"
+                + " AND EXISTS (SELECT 1/0)"));
+        assertEquals("7,9", column("SELECT n.a FROM wcp_e_n n WHERE EXISTS (SELECT 1/(n.a-5))"
+                + " AND n.a > 5 ORDER BY n.a"));
+        assertEquals("7,9", column("SELECT n.a FROM wcp_e_n n WHERE n.a > 5"
+                + " AND EXISTS (SELECT 1/(n.a-5)) ORDER BY n.a"));
+        assertEquals("7,9", column("SELECT n.a FROM wcp_e_n n WHERE EXISTS (SELECT 1/(n.a-5))"
+                + " AND n.a IN (7,9) ORDER BY n.a"));
+        assertEquals("7,9", column("SELECT n.a FROM wcp_e_n n WHERE EXISTS (SELECT 1/(n.a-5))"
+                + " AND n.a <> 5 AND n.a <> 0 ORDER BY n.a"));
+        assertEquals("7", column("SELECT n.a FROM wcp_e_n n WHERE n.a > 5"
+                + " AND EXISTS (SELECT 1/(n.a-5)) AND n.a < 9"));
+        assertEquals("", column("SELECT n.a FROM wcp_e_n n WHERE NOT EXISTS (SELECT 1/(n.a-5))"
+                + " AND n.a > 5 ORDER BY n.a"));
+    }
+
+    @Test
+    void aPartThatRaisesIsNotMadeCheapByASubqueryStandingBesideIt() throws Exception {
+        exec("CREATE TABLE wcp_f_o (a int, note text)");
+        exec("INSERT INTO wcp_f_o VALUES (5,'x'),(0,'y')");
+        exec("CREATE TABLE wcp_f_n (a int)");
+        exec("INSERT INTO wcp_f_n VALUES (5),(0),(7),(9)");
+
+        assertEquals("22012", stateOf("SELECT n.a FROM wcp_f_n n WHERE EXISTS"
+                + " (SELECT 1 FROM wcp_f_o z WHERE z.a = n.a) AND 10/n.a = 2"));
+    }
+
+    // ------------------------------------------------------------ a LATERAL item is narrowed by
+    // ------------------------------------------------------------ the query that reads it
+
+    // PostgreSQL pulls a LATERAL item up into the query reading it, so a comparison written inside
+    // the item stands beside that query's own: (SELECT * FROM g z WHERE z.a = o.a) read as s says
+    // s.a = o.a, and beside o.a = 5 that says s.a = 5 — a restriction on the item's own scan, which
+    // decides the item's rows before a generation expression of one of them is reached.
+
+    @Test
+    void aJoinConditionNamingTheGeneratedColumnReadsOnlyTheRowsTheConstantKept() throws Exception {
+        exec("CREATE TABLE wlt_a_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wlt_a_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wlt_a_o (a int, note text)");
+        exec("INSERT INTO wlt_a_o VALUES (5,'x'),(0,'y')");
+
+        assertEquals("2", scalar("SELECT s.g FROM wlt_a_o o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlt_a_g z WHERE z.a = o.a) s ON s.g = 2 WHERE o.a = 5"));
+        assertEquals("2", scalar("SELECT s.g FROM wlt_a_o o JOIN LATERAL"
+                + " (SELECT * FROM wlt_a_g z WHERE z.a = o.a) s ON s.g = 2 WHERE o.a = 5"));
+        assertEquals("2", scalar("SELECT s.g FROM wlt_a_o o, LATERAL"
+                + " (SELECT * FROM wlt_a_g z WHERE z.a = o.a) s WHERE s.g = 2 AND o.a = 5"));
+        // the select list need not name the column the condition reads
+        assertEquals("five", scalar("SELECT s.k FROM wlt_a_o o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlt_a_g z WHERE z.a = o.a) s ON s.g = 2 WHERE o.a = 5"));
+        assertEquals("5", scalar("SELECT o.a FROM wlt_a_o o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlt_a_g z WHERE z.a = o.a) s ON s.g = 2 WHERE o.a = 5"));
+        // an item writing its columns out is read the same way
+        assertEquals("2", scalar("SELECT s.g FROM wlt_a_o o, LATERAL (SELECT z.a, z.k, z.g"
+                + " FROM wlt_a_g z WHERE z.a = o.a) s WHERE o.a = 5 AND s.g = 2"));
+    }
+
+    @Test
+    void anOuterRowTheLateralItemAnswersNothingForIsPaddedWithNulls() throws Exception {
+        exec("CREATE TABLE wlt_b_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wlt_b_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wlt_b_p (a int, m int)");
+        exec("INSERT INTO wlt_b_p VALUES (5,50),(0,0),(9,90)");
+
+        assertEquals("9|NULL", rows("SELECT p.a, s.g FROM wlt_b_p p LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlt_b_g z WHERE z.a = p.a) s ON s.g = 2 WHERE p.a = 9"));
+        assertEquals("5|2", rows("SELECT p.a, s.g FROM wlt_b_p p LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlt_b_g z WHERE z.a = p.a) s ON s.g = 2 WHERE p.a = 5"));
+        // a restriction over another column of the outer relation narrows it just as well
+        assertEquals("2", scalar("SELECT s.g FROM wlt_b_p p, LATERAL"
+                + " (SELECT * FROM wlt_b_g z WHERE z.a = p.a) s WHERE p.m = 50"));
+    }
+
+    @Test
+    void whereNoConstantReachesTheLateralItemItsExpressionIsReached() throws Exception {
+        exec("CREATE TABLE wlt_c_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wlt_c_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wlt_c_o (a int, note text)");
+        exec("INSERT INTO wlt_c_o VALUES (5,'x'),(0,'y')");
+
+        // no equality ties note to the item, so nothing about a is carried into it
+        String byNote = "SELECT s.g FROM wlt_c_o o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlt_c_g z WHERE z.a = o.a) s ON s.g = 2 WHERE o.note = 'x'";
+        assertEquals("22012", stateOf(byNote));
+        assertEquals("division by zero", messageOf(byNote));
+        // nor does a comparison that is not an equality
+        assertEquals("22012", stateOf("SELECT s.g FROM wlt_c_o o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlt_c_g z WHERE z.a = o.a) s ON s.g = 2 WHERE o.a > 4"));
+        // nor a query that restricts nothing at all
+        assertEquals("22012", stateOf("SELECT s.g FROM wlt_c_o o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlt_c_g z WHERE z.a = o.a) s ON true"));
+        // and where the constant keeps the row the expression cannot be worked out for, it raises
+        assertEquals("22012", stateOf("SELECT s.g FROM wlt_c_o o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlt_c_g z WHERE z.a = o.a) s ON s.g = 2 WHERE o.a = 0"));
+    }
+
+    @Test
+    void aQueryThatNeverNamesTheColumnReadsEveryRowOfTheLateralItem() throws Exception {
+        exec("CREATE TABLE wlt_d_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wlt_d_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wlt_d_o (a int, note text)");
+        exec("INSERT INTO wlt_d_o VALUES (5,'x'),(0,'y')");
+
+        assertEquals("five,zero", column("SELECT s.k FROM wlt_d_o o, LATERAL"
+                + " (SELECT * FROM wlt_d_g z WHERE z.a = o.a) s ORDER BY s.k"));
+        assertEquals(2L, num("SELECT count(*) FROM wlt_d_o o, LATERAL"
+                + " (SELECT * FROM wlt_d_g z WHERE z.a = o.a) s"));
+    }
+
+    @Test
+    void aLateralItemKeepsTheValueTheColumnCarries() throws Exception {
+        exec("CREATE TABLE wlt_e_h (a int, k text, g int GENERATED ALWAYS AS (a*10) VIRTUAL)");
+        exec("INSERT INTO wlt_e_h VALUES (1,'one'),(2,'two'),(3,'three')");
+        exec("CREATE TABLE wlt_e_q (a int, note text)");
+        exec("INSERT INTO wlt_e_q VALUES (1,'p1'),(9,'p9')");
+
+        assertEquals("1|10 / 9|NULL", rows("SELECT o.a, s.g FROM wlt_e_q o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlt_e_h z WHERE z.a = o.a) s ON true ORDER BY o.a"));
+        assertEquals("1|10 / 9|NULL", rows("SELECT o.a, s.g FROM wlt_e_q o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlt_e_h z WHERE z.a = o.a) s ON s.g = 10 ORDER BY o.a"));
+        assertEquals("1|10", rows("SELECT o.a, s.g FROM wlt_e_q o, LATERAL"
+                + " (SELECT * FROM wlt_e_h z WHERE z.a = o.a) s ORDER BY o.a"));
+    }
+
+    // ------------------------------------------------------------ a derived relation a write brings
+    // ------------------------------------------------------------ in under a column alias list
+
+    @Test
+    void anUpdateReadsTheRenamedGeneratedColumnOfADerivedRelationItBringsIn() throws Exception {
+        exec("CREATE TABLE wbr_a_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wbr_a_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wbr_a_w (a int, note text)");
+        exec("INSERT INTO wbr_a_w VALUES (5,'x'),(0,'y')");
+
+        assertEquals(1, update("UPDATE wbr_a_w o SET note = s.z::text"
+                + " FROM (SELECT * FROM wbr_a_g) s(x,y,z) WHERE s.x = o.a AND o.a = 5"));
+        assertEquals("0|y / 5|2", rows("SELECT a, note FROM wbr_a_w ORDER BY a"));
+
+        // a stored column under the list is read whatever narrows the relation
+        assertEquals(1, update("UPDATE wbr_a_w o SET note = s.y"
+                + " FROM (SELECT * FROM wbr_a_g) s(x,y,z) WHERE s.x = o.a AND o.a = 5"));
+        assertEquals("0|y / 5|five", rows("SELECT a, note FROM wbr_a_w ORDER BY a"));
+
+        // the relation narrows itself, or is narrowed through another of its columns
+        assertEquals(1, update("UPDATE wbr_a_w o SET note = 'i' || s.z::text"
+                + " FROM (SELECT * FROM wbr_a_g WHERE a = 5) s(x,y,z) WHERE s.x = o.a"));
+        assertEquals("0|y / 5|i2", rows("SELECT a, note FROM wbr_a_w ORDER BY a"));
+        assertEquals(1, update("UPDATE wbr_a_w o SET note = 'k' || s.z::text"
+                + " FROM (SELECT * FROM wbr_a_g) s(x,y,z) WHERE s.x = o.a AND s.y = 'five'"));
+        assertEquals("0|y / 5|k2", rows("SELECT a, note FROM wbr_a_w ORDER BY a"));
+
+        // and the written value reads the same way in a RETURNING list
+        assertEquals("5|2", rows("UPDATE wbr_a_w o SET note = s.z::text"
+                + " FROM (SELECT * FROM wbr_a_g) s(x,y,z) WHERE s.x = o.a AND o.a = 5"
+                + " RETURNING o.a, o.note"));
+    }
+
+    @Test
+    void withNothingNarrowingItTheWriteReachesEveryRowOfTheDerivedRelation() throws Exception {
+        exec("CREATE TABLE wbr_b_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wbr_b_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wbr_b_w (a int, note text)");
+        exec("INSERT INTO wbr_b_w VALUES (5,'x'),(0,'y')");
+
+        String whole = "UPDATE wbr_b_w o SET note = s.z::text"
+                + " FROM (SELECT * FROM wbr_b_g) s(x,y,z) WHERE s.x = o.a";
+        assertEquals("22012", stateOf(whole));
+        assertEquals("division by zero", messageOf(whole));
+        assertEquals("0|y / 5|x", rows("SELECT a, note FROM wbr_b_w ORDER BY a"));
+        // a column the list renamed that nothing has to work out is read for every paired row
+        assertEquals(2, update("UPDATE wbr_b_w o SET note = s.y"
+                + " FROM (SELECT * FROM wbr_b_g) s(x,y,z) WHERE s.x = o.a"));
+        assertEquals("0|zero / 5|five", rows("SELECT a, note FROM wbr_b_w ORDER BY a"));
+    }
+
+    @Test
+    void aDeleteUsingAndAnInsertSelectReadTheRenamedColumnTheSameWay() throws Exception {
+        exec("CREATE TABLE wbr_c_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wbr_c_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wbr_c_w (a int, note text)");
+        exec("INSERT INTO wbr_c_w VALUES (5,'x'),(0,'y')");
+
+        assertEquals("5|2", rows("DELETE FROM wbr_c_w o USING (SELECT * FROM wbr_c_g) s(x,y,z)"
+                + " WHERE s.x = o.a AND o.a = 5 RETURNING o.a, s.z"));
+        assertEquals("0|y", rows("SELECT a, note FROM wbr_c_w ORDER BY a"));
+
+        exec("INSERT INTO wbr_c_w VALUES (5,'x')");
+        assertEquals(1, update("DELETE FROM wbr_c_w o USING (SELECT * FROM wbr_c_g) s(x,y,z)"
+                + " WHERE s.x = o.a AND o.a = 5 AND s.z = 2"));
+        assertEquals("0|y", rows("SELECT a, note FROM wbr_c_w ORDER BY a"));
+
+        assertEquals(1, update("INSERT INTO wbr_c_w (a, note) SELECT s.x, s.z::text"
+                + " FROM (SELECT * FROM wbr_c_g) s(x,y,z) WHERE s.x = 5"));
+        assertEquals("0|y / 5|2", rows("SELECT a, note FROM wbr_c_w ORDER BY a"));
+    }
+
+    // ------------------------------------------------------------ what a MERGE works out of the
+    // ------------------------------------------------------------ generated column it assigns
+
+    @Test
+    void aMergeAssigningTheSourcesGeneratedColumnReadsOnlyTheRowsTheJoinKept() throws Exception {
+        exec("CREATE TABLE wbr_d_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wbr_d_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wbr_d_m (a int, note text)");
+        exec("INSERT INTO wbr_d_m VALUES (5,'x'),(0,'y')");
+
+        assertEquals(1, update("MERGE INTO wbr_d_m o USING wbr_d_g t ON o.a = t.a AND o.a = 5"
+                + " WHEN MATCHED THEN UPDATE SET note = t.g::text"));
+        assertEquals("0|y / 5|2", rows("SELECT a, note FROM wbr_d_m ORDER BY a"));
+
+        // the constant written on the source's own column narrows it the same way
+        assertEquals(1, update("MERGE INTO wbr_d_m o USING wbr_d_g t ON o.a = t.a AND t.a = 5"
+                + " WHEN MATCHED THEN UPDATE SET note = 't' || t.g::text"));
+        assertEquals("0|y / 5|t2", rows("SELECT a, note FROM wbr_d_m ORDER BY a"));
+
+        // as does a source query that narrows itself, and a column alias list over one
+        assertEquals(1, update("MERGE INTO wbr_d_m o USING (SELECT * FROM wbr_d_g WHERE a = 5) t"
+                + " ON o.a = t.a WHEN MATCHED THEN UPDATE SET note = 'q' || t.g::text"));
+        assertEquals("0|y / 5|q2", rows("SELECT a, note FROM wbr_d_m ORDER BY a"));
+        assertEquals(1, update("MERGE INTO wbr_d_m o USING (SELECT * FROM wbr_d_g) t(x,y,z)"
+                + " ON o.a = t.x AND o.a = 5 WHEN MATCHED THEN UPDATE SET note = 'l' || t.z::text"));
+        assertEquals("0|y / 5|l2", rows("SELECT a, note FROM wbr_d_m ORDER BY a"));
+
+        // an arm's own condition names it, and a RETURNING list reads it
+        assertEquals(1, update("MERGE INTO wbr_d_m o USING wbr_d_g t ON o.a = t.a AND o.a = 5"
+                + " WHEN MATCHED AND t.g = 2 THEN UPDATE SET note = 'hit'"));
+        assertEquals("0|y / 5|hit", rows("SELECT a, note FROM wbr_d_m ORDER BY a"));
+        assertEquals("5|2", rows("MERGE INTO wbr_d_m o USING wbr_d_g t ON o.a = t.a AND o.a = 5"
+                + " WHEN MATCHED THEN UPDATE SET note = t.g::text RETURNING o.a, o.note"));
+
+        // and the arm that deletes reaches it no more than the arm that assigns
+        assertEquals(1, update("MERGE INTO wbr_d_m o USING wbr_d_g t ON o.a = t.a AND o.a = 5"
+                + " WHEN MATCHED THEN DELETE"));
+        assertEquals("0|y", rows("SELECT a, note FROM wbr_d_m ORDER BY a"));
+    }
+
+    @Test
+    void withNothingNarrowingTheJoinAMergeWorksOutEveryRowOfItsSource() throws Exception {
+        exec("CREATE TABLE wbr_e_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wbr_e_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wbr_e_m (a int, note text)");
+        exec("INSERT INTO wbr_e_m VALUES (5,'x'),(0,'y')");
+
+        String whole = "MERGE INTO wbr_e_m o USING wbr_e_g t ON o.a = t.a"
+                + " WHEN MATCHED THEN UPDATE SET note = t.g::text";
+        assertEquals("22012", stateOf(whole));
+        assertEquals("division by zero", messageOf(whole));
+        assertEquals("0|y / 5|x", rows("SELECT a, note FROM wbr_e_m ORDER BY a"));
+        // a column the statement does not have to work out is read for every paired row
+        assertEquals(2, update("MERGE INTO wbr_e_m o USING wbr_e_g t ON o.a = t.a"
+                + " WHEN MATCHED THEN UPDATE SET note = t.k"));
+        assertEquals("0|zero / 5|five", rows("SELECT a, note FROM wbr_e_m ORDER BY a"));
+    }
+
+    // ------------------------------------------------------------ what the relation a statement
+    // ------------------------------------------------------------ writes may wear
+
+    // A column alias list renames what a query reads, and a DELETE or an UPDATE reads the relation's
+    // own columns, so PostgreSQL's grammar stops at the parenthesis.
+
+    @Test
+    void anAliasListOnADeleteTargetIsRefusedAsASyntaxError() throws Exception {
+        exec("CREATE TABLE wwt_a_d (a int, note text)");
+        exec("INSERT INTO wwt_a_d VALUES (5,'x'),(0,'y')");
+
+        String[] refused = {
+                "DELETE FROM wwt_a_d AS d(p,q) WHERE p = 99",
+                "DELETE FROM wwt_a_d d(p,q) WHERE p = 99",
+                "DELETE FROM wwt_a_d AS d (p) WHERE d.a = 99",
+                "DELETE FROM wwt_a_d (p,q)",
+        };
+        for (String sql : refused) {
+            assertEquals("42601", stateOf(sql), sql);
+            assertEquals("syntax error at or near \"(\"", messageOf(sql), sql);
+        }
+        // none of them wrote anything, and an alias on its own is still read
+        assertEquals(2L, num("SELECT count(*) FROM wwt_a_d"));
+        assertEquals(0, update("DELETE FROM wwt_a_d AS d WHERE d.a = 99"));
+        assertEquals(2L, num("SELECT count(*) FROM wwt_a_d"));
+    }
+
+    @Test
+    void anAliasListOnAnUpdateTargetIsRefusedAsASyntaxError() throws Exception {
+        exec("CREATE TABLE wwt_b_u (a int, note text)");
+        exec("INSERT INTO wwt_b_u VALUES (5,'x'),(0,'y')");
+
+        String sql = "UPDATE wwt_b_u AS u(p,q) SET note = 'z' WHERE p = 99";
+        assertEquals("42601", stateOf(sql));
+        assertEquals("syntax error at or near \"(\"", messageOf(sql));
+        assertEquals("0|y / 5|x", rows("SELECT a, note FROM wwt_b_u ORDER BY a"));
+        assertEquals(0, update("UPDATE wwt_b_u AS u SET note = 'z' WHERE u.a = 99"));
+    }
+
+    // A parenthesised join stays a join rather than becoming a relation, so a list that over-names it
+    // is refused by that name; everything else that may wear one PostgreSQL calls a table.
+
+    @Test
+    void anOverlongListOverAParenthesisedJoinNamesAJoinExpression() throws Exception {
+        exec("CREATE TABLE wwt_c_o (a int, note text)");
+        exec("INSERT INTO wwt_c_o VALUES (5,'x'),(0,'y')");
+        exec("CREATE TABLE wwt_c_p (a int, m int)");
+        exec("INSERT INTO wwt_c_p VALUES (5,50),(0,0),(9,90)");
+
+        String usingJoin = "SELECT * FROM (wwt_c_o JOIN wwt_c_p USING (a)) AS j(c1,c2,c3,c4)";
+        assertEquals("42P10", stateOf(usingJoin));
+        assertEquals("join expression \"j\" has 3 columns available but 4 columns specified",
+                messageOf(usingJoin));
+        String crossJoin = "SELECT * FROM (wwt_c_o CROSS JOIN wwt_c_p) AS j(c1,c2,c3,c4,c5)";
+        assertEquals("42P10", stateOf(crossJoin));
+        assertEquals("join expression \"j\" has 4 columns available but 5 columns specified",
+                messageOf(crossJoin));
+        String leftJoin = "SELECT * FROM (wwt_c_o LEFT JOIN wwt_c_p ON wwt_c_o.a = wwt_c_p.a)"
+                + " AS j(c1,c2,c3,c4,c5)";
+        assertEquals("42P10", stateOf(leftJoin));
+        assertEquals("join expression \"j\" has 4 columns available but 5 columns specified",
+                messageOf(leftJoin));
+        String naturalJoin = "SELECT * FROM (wwt_c_o NATURAL JOIN wwt_c_p) AS j(c1,c2,c3,c4)";
+        assertEquals("42P10", stateOf(naturalJoin));
+        assertEquals("join expression \"j\" has 3 columns available but 4 columns specified",
+                messageOf(naturalJoin));
+
+        // a stored relation, a query, a VALUES list and a call are all called a table
+        assertEquals("table \"j\" has 2 columns available but 3 columns specified",
+                messageOf("SELECT * FROM wwt_c_o AS j(c1,c2,c3)"));
+        assertEquals("table \"j\" has 2 columns available but 3 columns specified",
+                messageOf("SELECT * FROM (SELECT * FROM wwt_c_o) AS j(c1,c2,c3)"));
+        assertEquals("table \"j\" has 2 columns available but 3 columns specified",
+                messageOf("SELECT * FROM (VALUES (1,2)) AS j(c1,c2,c3)"));
+        assertEquals("table \"j\" has 1 columns available but 2 columns specified",
+                messageOf("SELECT * FROM generate_series(1,2) AS j(c1,c2)"));
+    }
+
+    @Test
+    void aListTheJoinExpressionHasRoomForIsRead() throws Exception {
+        exec("CREATE TABLE wwt_d_o (a int, note text)");
+        exec("INSERT INTO wwt_d_o VALUES (5,'x'),(0,'y')");
+        exec("CREATE TABLE wwt_d_p (a int, m int)");
+        exec("INSERT INTO wwt_d_p VALUES (5,50),(0,0),(9,90)");
+
+        assertEquals("0|y|0 / 5|x|50", rows("SELECT j.c1, j.c2, j.c3"
+                + " FROM (wwt_d_o JOIN wwt_d_p USING (a)) AS j(c1,c2,c3) ORDER BY c1"));
+    }
+
+    // ------------------------------------------------------------ a sub-select compared with IN or
+    // ------------------------------------------------------------ = ANY is read as one join
+
+    // PostgreSQL pulls a sub-select written x IN (SELECT c FROM t) or x = ANY (SELECT c FROM t)
+    // among the parts that must all hold up into the statement holding it and reads the two as one
+    // join, which puts c and x in one class. Beside x = 5 that says c = 5, and PostgreSQL puts that
+    // restriction on t's own scan — so a row of t the join could never have kept is decided before
+    // anything costly is read of it. The generation expression below is 10/a over a relation holding
+    // a row with a = 0, so each case is really asking which rows it was worked out for.
+
+    @Test
+    void anInSubSelectTakesTheConstantTheRestOfTheQualificationPinsTheColumnTo() throws Exception {
+        exec("CREATE TABLE wqj_a_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wqj_a_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wqj_a_o (a int, note text)");
+        exec("INSERT INTO wqj_a_o VALUES (5,'x'),(0,'y')");
+        exec("CREATE TABLE wqj_a_p (a int)");
+        exec("INSERT INTO wqj_a_p VALUES (5)");
+
+        assertEquals("5", scalar("SELECT o.a FROM wqj_a_o o"
+                + " WHERE o.a IN (SELECT s.a FROM wqj_a_g s WHERE s.g = 2) AND o.a = 5"));
+        // written the other way round it says the same thing
+        assertEquals("5", scalar("SELECT o.a FROM wqj_a_o o"
+                + " WHERE o.a = 5 AND o.a IN (SELECT s.a FROM wqj_a_g s WHERE s.g = 2)"));
+        // the constant may stand on either side of the comparison that pins the column
+        assertEquals("5", scalar("SELECT o.a FROM wqj_a_o o"
+                + " WHERE o.a IN (SELECT s.a FROM wqj_a_g s WHERE s.g = 2) AND 5 = o.a"));
+        assertEquals("5", scalar("SELECT o.a FROM wqj_a_o o"
+                + " WHERE o.a IN (SELECT s.a FROM wqj_a_g s WHERE s.g = 2)"
+                + " AND o.a = 5 AND o.note = 'x'"));
+        // a name compared with another that is itself compared with a constant is compared with that
+        // constant, so the restriction survives a join
+        assertEquals("5", scalar("SELECT o.a FROM wqj_a_o o, wqj_a_p p WHERE o.a = p.a"
+                + " AND o.a IN (SELECT s.a FROM wqj_a_g s WHERE s.g = 2) AND p.a = 5"));
+    }
+
+    @Test
+    void anyAndSomeOverASubSelectAreReadAsTheSameJoinAsIn() throws Exception {
+        exec("CREATE TABLE wqj_b_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wqj_b_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wqj_b_o (a int, note text)");
+        exec("INSERT INTO wqj_b_o VALUES (5,'x'),(0,'y')");
+
+        assertEquals("5", scalar("SELECT o.a FROM wqj_b_o o"
+                + " WHERE o.a = ANY (SELECT s.a FROM wqj_b_g s WHERE s.g = 2) AND o.a = 5"));
+        assertEquals("5", scalar("SELECT o.a FROM wqj_b_o o"
+                + " WHERE o.a = SOME (SELECT s.a FROM wqj_b_g s WHERE s.g = 2) AND o.a = 5"));
+        // a list of values and a sub-select comparing itself with the row above need nothing derived
+        assertEquals("5", scalar("SELECT o.a FROM wqj_b_o o"
+                + " WHERE o.a IN (VALUES (5),(6)) AND o.a = 5"));
+        assertEquals("5", scalar("SELECT o.a FROM wqj_b_o o"
+                + " WHERE o.a IN (SELECT s.a FROM wqj_b_g s WHERE s.a = o.a AND s.g = 2)"
+                + " AND o.a = 5"));
+        // a part the plain comparisons never reach runs for no row at all
+        assertEquals("(no rows)", scalar("SELECT o.a FROM wqj_b_o o WHERE NOT EXISTS"
+                + " (SELECT 1 FROM wqj_b_g s WHERE s.a = o.a AND s.g = 2) AND o.a = 99"));
+    }
+
+    @Test
+    void theRestrictionReachesThroughTheSubSelectsOwnShape() throws Exception {
+        exec("CREATE TABLE wqj_c_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wqj_c_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wqj_c_o (a int, note text)");
+        exec("INSERT INTO wqj_c_o VALUES (5,'x'),(0,'y')");
+
+        // ordering the sub-select's rows, or answering each of them once, chooses between none
+        assertEquals("5", scalar("SELECT o.a FROM wqj_c_o o"
+                + " WHERE o.a IN (SELECT s.a FROM wqj_c_g s WHERE s.g = 2 ORDER BY s.a)"
+                + " AND o.a = 5"));
+        assertEquals("5", scalar("SELECT o.a FROM wqj_c_o o"
+                + " WHERE o.a IN (SELECT DISTINCT s.a FROM wqj_c_g s WHERE s.g = 2) AND o.a = 5"));
+        // a grouped sub-select is named by what it grouped on
+        assertEquals("5", scalar("SELECT o.a FROM wqj_c_o o"
+                + " WHERE o.a IN (SELECT s.a FROM wqj_c_g s WHERE s.g = 2 GROUP BY s.a)"
+                + " AND o.a = 5"));
+        // the restriction is on what the sub-select answers with, whatever that is
+        assertEquals("5", scalar("SELECT o.a FROM wqj_c_o o"
+                + " WHERE o.a IN (SELECT s.a + 0 FROM wqj_c_g s WHERE s.g = 2) AND o.a = 5"));
+    }
+
+    @Test
+    void nothingIsDerivedWhereTheQualificationPinsTheColumnToNoConstant() throws Exception {
+        exec("CREATE TABLE wqj_d_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wqj_d_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wqj_d_o (a int, note text)");
+        exec("INSERT INTO wqj_d_o VALUES (5,'x'),(0,'y')");
+
+        String alone = "SELECT o.a FROM wqj_d_o o"
+                + " WHERE o.a IN (SELECT s.a FROM wqj_d_g s WHERE s.g = 2)";
+        assertEquals("22012", stateOf(alone));
+        assertEquals("division by zero", messageOf(alone));
+        // a list of constants and an inequality pin the column to nothing
+        assertEquals("22012", stateOf("SELECT o.a FROM wqj_d_o o"
+                + " WHERE o.a IN (SELECT s.a FROM wqj_d_g s WHERE s.g = 2) AND o.a IN (5,6)"));
+        assertEquals("22012", stateOf("SELECT o.a FROM wqj_d_o o"
+                + " WHERE o.a IN (SELECT s.a FROM wqj_d_g s WHERE s.g = 2) AND o.a > 4"));
+        // an aggregate answers for every row the sub-select read, so no restriction reaches the
+        // scan under it
+        assertEquals("22012", stateOf("SELECT o.a FROM wqj_d_o o"
+                + " WHERE o.a IN (SELECT max(s.a) FROM wqj_d_g s WHERE s.g = 2) AND o.a = 5"));
+    }
+
+    @Test
+    void aSubSelectTheStatementDoesNotReadAsAJoinIsWorkedOutInFull() throws Exception {
+        exec("CREATE TABLE wqj_e_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wqj_e_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wqj_e_o (a int, note text)");
+        exec("INSERT INTO wqj_e_o VALUES (5,'x'),(0,'y')");
+
+        assertEquals("22012", stateOf("SELECT o.a FROM wqj_e_o o"
+                + " WHERE o.a NOT IN (SELECT s.a FROM wqj_e_g s WHERE s.g = 2) AND o.a = 5"));
+        assertEquals("22012", stateOf("SELECT o.a FROM wqj_e_o o"
+                + " WHERE NOT (o.a IN (SELECT s.a FROM wqj_e_g s WHERE s.g = 2)) AND o.a = 5"));
+        assertEquals("22012", stateOf("SELECT o.a FROM wqj_e_o o"
+                + " WHERE o.a < ANY (SELECT s.a FROM wqj_e_g s WHERE s.g = 2) AND o.a = 5"));
+        // a scalar sub-select is one value the statement works out whichever order the two parts
+        // were written in
+        assertEquals("22012", stateOf("SELECT o.a FROM wqj_e_o o"
+                + " WHERE (SELECT max(s.g) FROM wqj_e_g s) = 2 AND o.a = 5"));
+        assertEquals("22012", stateOf("SELECT o.a FROM wqj_e_o o"
+                + " WHERE o.a = 5 AND (SELECT max(s.g) FROM wqj_e_g s) = 2"));
+        // one side of an OR does not decide the row, so neither is read first
+        assertEquals("22012", stateOf("SELECT o.a FROM wqj_e_o o WHERE o.a = 99"
+                + " OR EXISTS (SELECT 1 FROM wqj_e_g s WHERE s.a = o.a AND s.g = 2)"));
+        assertEquals("22012", stateOf("SELECT o.a FROM wqj_e_o o"
+                + " WHERE CASE WHEN o.a = 5 THEN (SELECT count(*) FROM wqj_e_g s WHERE s.g = 2)"
+                + " ELSE 0 END > 0 AND o.a = 5"));
+    }
+
+    // A statement that writes reads its qualification the same way one that only reads does.
+
+    @Test
+    void anUpdateAndADeleteReadThePlainPartsBeforeThePartHoldingAQuery() throws Exception {
+        exec("CREATE TABLE wqj_f_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wqj_f_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wqj_f_o (a int, note text)");
+        exec("INSERT INTO wqj_f_o VALUES (5,'x'),(0,'y')");
+
+        assertEquals(1, update("UPDATE wqj_f_o o SET note = 'z'"
+                + " WHERE EXISTS (SELECT 1 FROM wqj_f_g s WHERE s.a = o.a AND s.g = 2)"
+                + " AND o.a = 5"));
+        assertEquals("0|y / 5|z", rows("SELECT a, note FROM wqj_f_o ORDER BY a"));
+        // a part the plain comparisons never reach runs for no row, whichever way it is written
+        assertEquals(0, update("DELETE FROM wqj_f_o o"
+                + " WHERE EXISTS (SELECT 1 FROM wqj_f_g s WHERE s.a = o.a AND s.g = 2)"
+                + " AND o.a = 99"));
+        assertEquals(0, update("DELETE FROM wqj_f_o o"
+                + " WHERE NOT EXISTS (SELECT 1 FROM wqj_f_g s WHERE s.a = o.a AND s.g = 2)"
+                + " AND o.a = 99"));
+        assertEquals(0, update("UPDATE wqj_f_o o SET note = 'q' WHERE o.a = 99"
+                + " AND EXISTS (SELECT 1 FROM wqj_f_g s WHERE s.a = o.a AND s.g = 2)"));
+        assertEquals(2L, num("SELECT count(*) FROM wqj_f_o"));
+        assertEquals(1, update("DELETE FROM wqj_f_o o WHERE o.a = 5"
+                + " AND EXISTS (SELECT 1 FROM wqj_f_g s WHERE s.a = o.a AND s.g = 2)"));
+        assertEquals("0|y", rows("SELECT a, note FROM wqj_f_o ORDER BY a"));
+    }
+
+    @Test
+    void aWriteTakesTheRestrictionItsOwnQualificationDerivesForASubSelect() throws Exception {
+        exec("CREATE TABLE wqj_g_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wqj_g_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wqj_g_o (a int, note text)");
+        exec("INSERT INTO wqj_g_o VALUES (5,'x'),(0,'y')");
+
+        assertEquals("5|p", rows("UPDATE wqj_g_o o SET note = 'p'"
+                + " WHERE o.a IN (SELECT s.a FROM wqj_g_g s WHERE s.g = 2) AND o.a = 5"
+                + " RETURNING o.a, o.note"));
+        assertEquals(1, update("UPDATE wqj_g_o o SET note = 'n' WHERE 5 = o.a"
+                + " AND o.a IN (SELECT s.a FROM wqj_g_g s WHERE s.g = 2)"));
+        assertEquals(1, update("UPDATE wqj_g_o o SET note = 'v'"
+                + " WHERE o.a = ANY (SELECT s.a FROM wqj_g_g s WHERE s.g = 2) AND o.a = 5"));
+        assertEquals("0|y / 5|v", rows("SELECT a, note FROM wqj_g_o ORDER BY a"));
+        assertEquals(0, update("DELETE FROM wqj_g_o o"
+                + " WHERE o.a = ANY (SELECT s.a FROM wqj_g_g s WHERE s.g = 2) AND o.a = 99"));
+        assertEquals("5|v", rows("DELETE FROM wqj_g_o o"
+                + " WHERE o.a IN (SELECT s.a FROM wqj_g_g s WHERE s.g = 2) AND o.a = 5"
+                + " RETURNING o.a, o.note"));
+        assertEquals("0|y", rows("SELECT a, note FROM wqj_g_o ORDER BY a"));
+    }
+
+    @Test
+    void aWriteAskingForTheRowTheExpressionRaisesForStillRaises() throws Exception {
+        exec("CREATE TABLE wqj_h_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wqj_h_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wqj_h_o (a int, note text)");
+        exec("INSERT INTO wqj_h_o VALUES (5,'x'),(0,'y')");
+
+        String deleteZero = "DELETE FROM wqj_h_o o"
+                + " WHERE o.a IN (SELECT s.a FROM wqj_h_g s WHERE s.g = 2) AND o.a = 0";
+        assertEquals("22012", stateOf(deleteZero));
+        assertEquals("division by zero", messageOf(deleteZero));
+        // and so does a write that pins the column to no constant at all
+        assertEquals("22012", stateOf("UPDATE wqj_h_o o SET note = 'r'"
+                + " WHERE o.a IN (SELECT s.a FROM wqj_h_g s WHERE s.g = 2)"));
+        assertEquals("22012", stateOf("DELETE FROM wqj_h_o o"
+                + " WHERE EXISTS (SELECT 1 FROM wqj_h_g s WHERE s.a = o.a AND s.g = 2)"));
+        assertEquals("22012", stateOf("UPDATE wqj_h_o o SET note = 'e'"
+                + " WHERE o.a NOT IN (SELECT s.a FROM wqj_h_g s WHERE s.g = 2) AND o.a = 5"));
+        assertEquals("22012", stateOf("DELETE FROM wqj_h_o o"
+                + " WHERE (SELECT max(s.g) FROM wqj_h_g s) = 2 AND o.a = 5"));
+        // none of them wrote anything
+        assertEquals("0|y / 5|x", rows("SELECT a, note FROM wqj_h_o ORDER BY a"));
+    }
+
+    // Reading a sub-select as a join decides only WHICH rows the column is worked out for; it never
+    // changes a value. The generation expression below cannot raise, so every answer has to stand.
+
+    @Test
+    void readingASubSelectAsAJoinNeverChangesWhichRowsTheStatementAnswersWith() throws Exception {
+        exec("CREATE TABLE wqj_i_h (a int, k text, g int GENERATED ALWAYS AS (a*10) VIRTUAL)");
+        exec("INSERT INTO wqj_i_h VALUES (1,'one'),(2,'two'),(3,'three')");
+        exec("CREATE TABLE wqj_i_o (a int, note text)");
+        exec("INSERT INTO wqj_i_o VALUES (1,'x'),(2,'y'),(3,'z')");
+
+        assertEquals("2|y", rows("SELECT o.a, o.note FROM wqj_i_o o"
+                + " WHERE o.a IN (SELECT s.a FROM wqj_i_h s WHERE s.g = 20) AND o.a = 2"));
+        assertEquals("2,3", column("SELECT o.a FROM wqj_i_o o"
+                + " WHERE o.a IN (SELECT s.a FROM wqj_i_h s WHERE s.g > 10) ORDER BY o.a"));
+        assertEquals("1,2,3", column("SELECT o.a FROM wqj_i_o o"
+                + " WHERE o.a = ANY (SELECT s.a FROM wqj_i_h s) ORDER BY o.a"));
+        // a constant the sub-select can answer nothing for keeps no row
+        assertEquals("(no rows)", scalar("SELECT o.a FROM wqj_i_o o"
+                + " WHERE o.a IN (SELECT s.a FROM wqj_i_h s WHERE s.g = 20) AND o.a = 3"));
+    }
+
+    // ------------------------------------------------------------ a chain of derived relations,
+    // ------------------------------------------------------------ however each level writes its list
+
+    // PostgreSQL pulls a whole chain of derived tables up into the query reading it, so the WHERE
+    // written at the top qualifies the scan at the bottom — and it does that however each level
+    // writes its select list: a bare star, a star written with the relation before it, or the
+    // columns named one by one.
+
+    @Test
+    void aStarWrittenWithTheRelationBeforeItCarriesTheQualificationDown() throws Exception {
+        exec("CREATE TABLE wcl_a_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wcl_a_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE VIEW wcl_a_v AS SELECT * FROM wcl_a_g");
+
+        assertEquals("2", scalar("SELECT s.g FROM (SELECT s2.* FROM wcl_a_g s2) s WHERE s.a = 5"));
+        assertEquals("2", scalar("SELECT s.g FROM (SELECT s2.* FROM (SELECT * FROM wcl_a_g) s2) s"
+                + " WHERE s.a = 5"));
+        assertEquals("2", scalar("SELECT s.g FROM (SELECT s2.* FROM (SELECT s3.* FROM wcl_a_g s3) s2) s"
+                + " WHERE s.a = 5"));
+        assertEquals("2", scalar("SELECT s.g FROM (SELECT v.* FROM wcl_a_v v) s WHERE s.a = 5"));
+        assertEquals("2", scalar("SELECT s.g FROM (SELECT * FROM (SELECT v.* FROM wcl_a_v v) s2) s"
+                + " WHERE s.a = 5"));
+        // whichever column the qualification names, and whatever stands above the chain
+        assertEquals("2", scalar("SELECT s.g FROM (SELECT s2.* FROM wcl_a_g s2) s WHERE s.k = 'five'"));
+        assertEquals(2L, num("SELECT max(s.g) FROM (SELECT s2.* FROM wcl_a_g s2) s WHERE s.a = 5"));
+        assertEquals("2", scalar("SELECT s.g FROM (SELECT s2.* FROM wcl_a_g s2) s WHERE s.a = 5 LIMIT 1"));
+        // a qualification written at the chain's own level reaches the same scan
+        assertEquals("2", scalar("SELECT s.g FROM (SELECT s2.* FROM wcl_a_g s2 WHERE s2.a = 5) s"));
+    }
+
+    @Test
+    void anExplicitTargetListAtTheBottomOfAChainCarriesItDownToo() throws Exception {
+        exec("CREATE TABLE wcl_b_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wcl_b_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE VIEW wcl_b_v AS SELECT * FROM wcl_b_g");
+        exec("CREATE TABLE wcl_b_o (a int, note text)");
+        exec("INSERT INTO wcl_b_o VALUES (5,'x'),(0,'y')");
+
+        assertEquals("2", scalar("SELECT s.g FROM (SELECT a, k, g FROM wcl_b_g) s WHERE s.a = 5"));
+        assertEquals("2", scalar("SELECT s.g FROM (SELECT s2.a, s2.k, s2.g FROM wcl_b_g s2) s"
+                + " WHERE s.a = 5"));
+        assertEquals("2", scalar("SELECT s.g FROM (SELECT * FROM (SELECT a, k, g FROM wcl_b_g) s2) s"
+                + " WHERE s.a = 5"));
+        assertEquals("2", scalar("SELECT s.g FROM (SELECT a, k, g FROM (SELECT * FROM wcl_b_g) s2) s"
+                + " WHERE s.a = 5"));
+        // the order the list writes the columns in is its own business
+        assertEquals("2", scalar("SELECT s.g FROM (SELECT * FROM (SELECT a, g, k FROM wcl_b_g) s2) s"
+                + " WHERE s.a = 5"));
+        assertEquals("2", scalar("SELECT s.g FROM (SELECT a, k, g FROM wcl_b_v) s WHERE s.a = 5"));
+        assertEquals("2", scalar("SELECT t.g FROM"
+                + " (SELECT s.* FROM (SELECT * FROM (SELECT a, k, g FROM wcl_b_g) r) s) t"
+                + " WHERE t.a = 5"));
+        // and a join above the chain narrows it just as well
+        assertEquals("2", scalar("SELECT s.g FROM (SELECT a, k, g FROM wcl_b_g) s"
+                + " JOIN wcl_b_o o ON o.a = s.a WHERE o.a = 5"));
+        assertEquals("2", scalar("SELECT s.g FROM (SELECT s2.* FROM wcl_b_g s2) s"
+                + " JOIN wcl_b_o o ON o.a = s.a WHERE s.a = 5"));
+        assertEquals("2", scalar("SELECT s.g FROM (SELECT a, k, g FROM wcl_b_g WHERE a = 5) s"));
+    }
+
+    @Test
+    void whatALevelOfAChainNamesIsItsOwnRelationsColumns() throws Exception {
+        exec("CREATE TABLE wcl_c_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wcl_c_g (a,k) VALUES (5,'five'),(0,'zero')");
+
+        // the level names g of its own relation, and a query that never asks for it never has it
+        // worked out
+        assertEquals("5,0", column("SELECT s.a FROM (SELECT a, k, g FROM wcl_c_g) s ORDER BY s.a DESC"));
+        assertEquals(2L, num("SELECT count(*) FROM (SELECT a, k, g FROM wcl_c_g) s"));
+        assertEquals(2L, num("SELECT count(*) FROM (SELECT * FROM (SELECT a, k, g FROM wcl_c_g) s2) s"));
+        assertEquals(2L, num("SELECT count(*) FROM (SELECT s2.* FROM wcl_c_g s2) s"));
+        assertEquals("five", scalar("SELECT s.k FROM (SELECT * FROM (SELECT a, k, g FROM wcl_c_g) s2) s"
+                + " WHERE s.a = 5"));
+        // a column the chain does not expose is not a column of the relation above
+        String hidden = "SELECT s.g FROM (SELECT * FROM (SELECT a, k FROM wcl_c_g) s2) s"
+                + " WHERE s.a = 5";
+        assertEquals("42703", stateOf(hidden));
+        assertEquals("column s.g does not exist", messageOf(hidden));
+    }
+
+    @Test
+    void withNothingNarrowingItEveryRowOfTheChainIsWorkedOut() throws Exception {
+        exec("CREATE TABLE wcl_d_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wcl_d_g (a,k) VALUES (5,'five'),(0,'zero')");
+
+        String qualifiedStar = "SELECT s.g FROM (SELECT s2.* FROM wcl_d_g s2) s";
+        assertEquals("22012", stateOf(qualifiedStar));
+        assertEquals("division by zero", messageOf(qualifiedStar));
+        assertEquals("22012", stateOf("SELECT s.g FROM (SELECT a, k, g FROM wcl_d_g) s"));
+        // a qualification naming the generated column is a scan qualification, and deciding it
+        // works the column out for every row scanned
+        assertEquals("22012", stateOf("SELECT s.k FROM (SELECT s2.* FROM wcl_d_g s2) s WHERE s.g = 2"));
+        assertEquals("22012", stateOf("SELECT s.k FROM (SELECT a, k, g FROM wcl_d_g) s WHERE s.g = 2"));
+        // one side of an OR does not decide the row, so neither is read first
+        assertEquals("22012", stateOf("SELECT s.g FROM (SELECT s2.* FROM wcl_d_g s2) s"
+                + " WHERE s.a = 5 OR s.g = 2"));
+        assertEquals("22012", stateOf("SELECT s.g FROM (SELECT a, k, g FROM wcl_d_g) s"
+                + " WHERE s.a = 5 OR s.g = 2"));
+        assertEquals("22012", stateOf("SELECT s.g FROM (SELECT a, k, g FROM wcl_d_g) s"
+                + " WHERE s.a = 5 OR s.a = 0"));
+        // a LIMIT settles which rows the relation has before the qualification above is read
+        assertEquals("22012", stateOf("SELECT s.g FROM (SELECT s2.* FROM wcl_d_g s2 LIMIT 2) s"
+                + " WHERE s.a = 5"));
+        assertEquals("22012", stateOf("SELECT s.g FROM (SELECT a, k, g FROM wcl_d_g LIMIT 2) s"
+                + " WHERE s.a = 5"));
+        // an OR of parts that all restrict is still one restriction
+        assertEquals("2", scalar("SELECT s.g FROM (SELECT s2.* FROM wcl_d_g s2) s"
+                + " WHERE s.a = 5 OR s.a = 5"));
+        assertEquals("2", scalar("SELECT s.g FROM (SELECT a, k, g FROM wcl_d_g) s"
+                + " WHERE s.a = 5 OR s.a = 5"));
+    }
+
+    @Test
+    void aChainWrittenEitherWayKeepsTheValueTheColumnCarries() throws Exception {
+        exec("CREATE TABLE wcl_e_h (a int, k text, g int GENERATED ALWAYS AS (a*10) VIRTUAL)");
+        exec("INSERT INTO wcl_e_h VALUES (1,'one'),(2,'two'),(3,'three')");
+
+        assertEquals("2|20", rows("SELECT s.a, s.g FROM (SELECT s2.* FROM wcl_e_h s2) s"
+                + " WHERE s.a = 2"));
+        assertEquals("1|10 / 2|20 / 3|30", rows("SELECT s.a, s.g FROM (SELECT a, k, g FROM wcl_e_h) s"
+                + " ORDER BY s.a"));
+        assertEquals("2|20 / 3|30", rows("SELECT s.a, s.g FROM"
+                + " (SELECT * FROM (SELECT a, k, g FROM wcl_e_h) s2) s WHERE s.a > 1 ORDER BY s.a"));
+    }
+
+    // ------------------------------------------------------------ an OR whose parts say the same
+    // ------------------------------------------------------------ thing narrows a LATERAL item
+
+    // PostgreSQL factors an OR whose branches are the same comparison back into that comparison, so
+    // it restricts exactly what one branch restricts — and a restriction on the outer relation
+    // reaches a LATERAL item tied to it by an equality.
+
+    @Test
+    void anOrOfIdenticalComparisonsNarrowsALateralItemAsOneOfThemWould() throws Exception {
+        exec("CREATE TABLE wid_a_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wid_a_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wid_a_o (a int)");
+        exec("INSERT INTO wid_a_o VALUES (5)");
+
+        assertEquals("2", scalar("SELECT s.g FROM wid_a_o o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wid_a_g z WHERE z.a = o.a) s ON s.g = 2"
+                + " WHERE o.a = 5 OR o.a = 5"));
+        assertEquals("5|2", rows("SELECT o.a, s.g FROM wid_a_o o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wid_a_g z WHERE z.a = o.a) s ON s.g = 2"
+                + " WHERE o.a = 5 OR o.a = 5"));
+        assertEquals("2", scalar("SELECT s.g FROM wid_a_o o JOIN LATERAL"
+                + " (SELECT * FROM wid_a_g z WHERE z.a = o.a) s ON s.g = 2"
+                + " WHERE o.a = 5 OR o.a = 5"));
+        assertEquals("2", scalar("SELECT s.g FROM wid_a_o o, LATERAL"
+                + " (SELECT * FROM wid_a_g z WHERE z.a = o.a) s"
+                + " WHERE (o.a = 5 OR o.a = 5) AND s.g = 2"));
+        // however many branches say it, and beside a part that says it again
+        assertEquals("2", scalar("SELECT s.g FROM wid_a_o o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wid_a_g z WHERE z.a = o.a) s ON s.g = 2"
+                + " WHERE o.a = 5 OR o.a = 5 OR o.a = 5"));
+        assertEquals("2", scalar("SELECT s.g FROM wid_a_o o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wid_a_g z WHERE z.a = o.a) s ON s.g = 2"
+                + " WHERE (o.a = 5 OR o.a = 5) AND o.a = 5"));
+        // the select list need not name the column the condition reads, and an item writing its
+        // columns out is read the same way
+        assertEquals("five", scalar("SELECT s.k FROM wid_a_o o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wid_a_g z WHERE z.a = o.a) s ON s.g = 2"
+                + " WHERE o.a = 5 OR o.a = 5"));
+        assertEquals("2", scalar("SELECT s.g FROM wid_a_o o LEFT JOIN LATERAL"
+                + " (SELECT z.a, z.k, z.g FROM wid_a_g z WHERE z.a = o.a) s ON s.g = 2"
+                + " WHERE o.a = 5 OR o.a = 5"));
+    }
+
+    @Test
+    void anOrOfIdenticalComparisonsKeepsTheValueTheColumnCarries() throws Exception {
+        exec("CREATE TABLE wid_b_h (a int, k text, g int GENERATED ALWAYS AS (a*10) VIRTUAL)");
+        exec("INSERT INTO wid_b_h VALUES (1,'one'),(2,'two'),(3,'three')");
+        exec("CREATE TABLE wid_b_o (a int, note text)");
+        exec("INSERT INTO wid_b_o VALUES (1,'x'),(2,'y'),(3,'z')");
+
+        assertEquals("2|20", rows("SELECT o.a, s.g FROM wid_b_o o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wid_b_h z WHERE z.a = o.a) s ON s.g = 20"
+                + " WHERE o.a = 2 OR o.a = 2"));
+        // the same factoring reads a stored relation and a derived one
+        assertEquals("10", scalar("SELECT g FROM wid_b_h WHERE a = 1 OR a = 1"));
+        assertEquals("20", scalar("SELECT s.g FROM (SELECT * FROM wid_b_h) s WHERE s.a = 2 OR s.a = 2"));
+    }
+
+    // ------------------------------------------------------------ a kept-apart item the query
+    // ------------------------------------------------------------ above never asks for a row
+
+    // PostgreSQL computes a MATERIALIZED item when the query above first asks it for a row. A
+    // qualification that is false before any row is read, and a LIMIT of none, mean it is never
+    // asked and never runs — but a qualification that has to be decided row by row is a row asked
+    // for, and then the item is computed in full.
+
+    @Test
+    void aKeptApartItemTheQueryCanAnswerWithoutIsNeverComputed() throws Exception {
+        exec("CREATE TABLE wna_a_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wna_a_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wna_a_o (a int, note text)");
+        exec("INSERT INTO wna_a_o VALUES (5,'x'),(0,'y')");
+
+        assertEquals(0L, num("WITH c AS MATERIALIZED (SELECT * FROM wna_a_g)"
+                + " SELECT count(*) FROM c WHERE false"));
+        assertEquals(0L, num("WITH c AS MATERIALIZED (SELECT * FROM wna_a_g)"
+                + " SELECT count(*) FROM c WHERE 1=0"));
+        assertEquals("(no rows)", scalar("WITH c AS MATERIALIZED (SELECT * FROM wna_a_g)"
+                + " SELECT count(*) FROM c LIMIT 0"));
+        assertEquals("(no rows)", scalar("WITH c AS MATERIALIZED (SELECT * FROM wna_a_g)"
+                + " SELECT count(*) FROM c LIMIT 0 OFFSET 0"));
+        assertEquals("(no rows)", scalar("WITH c AS MATERIALIZED (SELECT * FROM wna_a_g)"
+                + " SELECT c.k FROM c WHERE false"));
+        assertEquals("(no rows)", scalar("WITH c AS MATERIALIZED (SELECT * FROM wna_a_g)"
+                + " SELECT c.k FROM c WHERE 1=0 ORDER BY c.k"));
+        assertEquals("(no rows)", scalar("WITH c AS MATERIALIZED (SELECT * FROM wna_a_g)"
+                + " SELECT c.a FROM c WHERE false ORDER BY c.a"));
+        // an aggregate over no row is still one answer
+        assertEquals("(no rows)", scalar("WITH c AS MATERIALIZED (SELECT * FROM wna_a_g)"
+                + " SELECT max(c.a) FROM c WHERE false LIMIT 0"));
+        // and whatever the query puts between itself and the item
+        assertEquals(0L, num("WITH c AS MATERIALIZED (SELECT * FROM wna_a_g)"
+                + " SELECT count(*) FROM c JOIN wna_a_o o ON o.a = c.a WHERE false"));
+        assertEquals(0L, num("WITH c AS MATERIALIZED (SELECT * FROM wna_a_g)"
+                + " SELECT count(*) FROM c CROSS JOIN c c2 WHERE false"));
+    }
+
+    @Test
+    void aQualificationDecidedRowByRowIsARowAskedFor() throws Exception {
+        exec("CREATE TABLE wna_b_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wna_b_g (a,k) VALUES (5,'five'),(0,'zero')");
+
+        String byColumn = "WITH c AS MATERIALIZED (SELECT * FROM wna_b_g)"
+                + " SELECT count(*) FROM c WHERE c.a = 5";
+        assertEquals("22012", stateOf(byColumn));
+        assertEquals("division by zero", messageOf(byColumn));
+        assertEquals("22012", stateOf("WITH c AS MATERIALIZED (SELECT * FROM wna_b_g)"
+                + " SELECT count(*) FROM c"));
+        assertEquals("22012", stateOf("WITH c AS MATERIALIZED (SELECT * FROM wna_b_g)"
+                + " SELECT count(*) FROM c WHERE c.a = 5 OR c.g = 2"));
+        // a qualification that keeps no row still asks for one when it is NULL rather than false
+        assertEquals(0L, num("WITH c AS MATERIALIZED (SELECT * FROM wna_b_g)"
+                + " SELECT count(*) FROM c WHERE null"));
+    }
+
+    @Test
+    void aLimitInsideAKeptApartItemStopsTheScanUnderIt() throws Exception {
+        exec("CREATE TABLE wna_c_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wna_c_g (a,k) VALUES (5,'five'),(0,'zero')");
+
+        assertEquals(1L, num("WITH c AS MATERIALIZED (SELECT * FROM wna_c_g LIMIT 1)"
+                + " SELECT count(*) FROM c"));
+        assertEquals(1L, num("WITH c AS MATERIALIZED (SELECT * FROM wna_c_g LIMIT 1 OFFSET 0)"
+                + " SELECT count(*) FROM c"));
+        assertEquals("5|five|2", rows("WITH c AS MATERIALIZED (SELECT * FROM wna_c_g LIMIT 1)"
+                + " SELECT c.a, c.k, c.g FROM c"));
+        assertEquals("five", scalar("WITH c AS MATERIALIZED (SELECT * FROM wna_c_g LIMIT 1)"
+                + " SELECT c.k FROM c"));
+        assertEquals(1L, num("WITH c AS MATERIALIZED (SELECT * FROM wna_c_g LIMIT 1)"
+                + " SELECT count(*) FROM c WHERE c.a = 5"));
+        assertEquals(1L, num("SELECT count(*) FROM (SELECT * FROM wna_c_g LIMIT 1) s"));
+        assertEquals(1L, num("SELECT count(*) FROM (SELECT * FROM wna_c_g LIMIT 1) s WHERE s.a = 5"));
+        // the same limit read straight off the relation
+        assertEquals("2", scalar("SELECT g FROM wna_c_g LIMIT 1"));
+        assertEquals("five", scalar("SELECT k FROM wna_c_g LIMIT 1"));
+        assertEquals("5|five|2", rows("SELECT * FROM wna_c_g LIMIT 1"));
+        assertEquals("2", scalar("SELECT g FROM wna_c_g LIMIT 1 OFFSET 0"));
+    }
+
+    @Test
+    void aLimitThatReachesTheRowIsNoLimitAndASortIsGivenEveryRowFirst() throws Exception {
+        exec("CREATE TABLE wna_d_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wna_d_g (a,k) VALUES (5,'five'),(0,'zero')");
+
+        String sorted = "WITH c AS MATERIALIZED (SELECT * FROM wna_d_g ORDER BY a LIMIT 1)"
+                + " SELECT count(*) FROM c";
+        assertEquals("22012", stateOf(sorted));
+        assertEquals("division by zero", messageOf(sorted));
+        assertEquals("22012", stateOf("SELECT * FROM wna_d_g ORDER BY a LIMIT 1"));
+        assertEquals("22012", stateOf("SELECT DISTINCT * FROM wna_d_g LIMIT 1"));
+        assertEquals("22012", stateOf("SELECT * FROM wna_d_g LIMIT 2"));
+        assertEquals("22012", stateOf("WITH c AS MATERIALIZED (SELECT * FROM wna_d_g LIMIT 2)"
+                + " SELECT count(*) FROM c"));
+        // an OFFSET reads the rows it skips
+        assertEquals("22012", stateOf("WITH c AS MATERIALIZED (SELECT * FROM wna_d_g OFFSET 1)"
+                + " SELECT count(*) FROM c"));
+        // an item naming only the stored columns is untouched by any of it
+        assertEquals(2L, num("WITH c AS MATERIALIZED (SELECT a, k FROM wna_d_g)"
+                + " SELECT count(*) FROM c"));
+    }
+
+    @Test
+    void aKeptApartItemKeepsTheValueTheColumnCarries() throws Exception {
+        exec("CREATE TABLE wna_e_h (a int, k text, g int GENERATED ALWAYS AS (a*10) VIRTUAL)");
+        exec("INSERT INTO wna_e_h VALUES (1,'one'),(2,'two'),(3,'three')");
+
+        assertEquals("1|10 / 2|20 / 3|30", rows("WITH c AS MATERIALIZED (SELECT * FROM wna_e_h)"
+                + " SELECT c.a, c.g FROM c ORDER BY c.a"));
+        assertEquals("1|10", rows("WITH c AS MATERIALIZED (SELECT * FROM wna_e_h LIMIT 1)"
+                + " SELECT c.a, c.g FROM c"));
     }
 }

@@ -25,6 +25,10 @@ class SelectSetOpExecutor {
         // pushed down into it belongs to every arm and not only to the first arm to take it.
         String derivedAs = executor.fromResolver.derivedRelation;
         List<Expression> derivedQuals = executor.fromResolver.derivedQualification;
+        // The names that query answers to the relation's columns by are the relation's, so they
+        // belong to every arm as well: an arm read without them answers to names of its own that
+        // nothing above it wrote.
+        List<String> derivedCols = executor.fromResolver.derivedColumnAliases;
         // If the left side has CTEs, they should be available to both sides
         if (stmt.left() instanceof SelectStmt && ((SelectStmt) stmt.left()).withClauses() != null && !((SelectStmt) stmt.left()).withClauses().isEmpty()) {
             SelectStmt sel = (SelectStmt) stmt.left();
@@ -43,6 +47,7 @@ class SelectSetOpExecutor {
             QueryResult leftResult = executor.executeStatement(stripped);
             executor.fromResolver.derivedRelation = derivedAs;
             executor.fromResolver.derivedQualification = derivedQuals;
+            executor.fromResolver.derivedColumnAliases = derivedCols;
             executor.fromResolver.derivedSetOperation = derivedAs != null;
             QueryResult rightResult = executor.executeStatement(stmt.right());
             executor.fromResolver.derivedSetOperation = false;
@@ -58,6 +63,7 @@ class SelectSetOpExecutor {
         QueryResult leftResult = executor.executeStatement(stmt.left());
         executor.fromResolver.derivedRelation = derivedAs;
         executor.fromResolver.derivedQualification = derivedQuals;
+        executor.fromResolver.derivedColumnAliases = derivedCols;
         executor.fromResolver.derivedSetOperation = derivedAs != null;
         QueryResult rightResult = executor.executeStatement(stmt.right());
         executor.fromResolver.derivedSetOperation = false;

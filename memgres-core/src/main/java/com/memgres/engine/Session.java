@@ -243,6 +243,24 @@ public class Session {
     public void incrementCommandId() { commandId++; }
     /** Whether the command now running has taken the counter's current value for a write. */
     private boolean commandIdUsed = false;
+    /** How many command identifiers beyond the first the statement now running has taken. */
+    private int extraCommandIds = 0;
+
+    /**
+     * Note that the statement now running writes {@code rows} catalogue rows rather than one.
+     *
+     * <p>PostgreSQL takes a command identifier for each row a statement writes into the
+     * catalogue, so a statement that retires a relation spends several: the relation, its
+     * composite type and that type's array type all go, and a view has its rewrite rule beside
+     * them. cmin reports the counter as it stood when a row version was written, so a transaction
+     * that spends fewer of them than PostgreSQL does reads a lower number from that point on for
+     * every row it goes on to write.
+     */
+    public void noteCatalogRowsWritten(int rows) {
+        if (rows <= 0) return;
+        commandIdUsed = true;
+        if (rows - 1 > extraCommandIds) extraCommandIds = rows - 1;
+    }
     /**
      * Note that the statement now running has written something, so the counter belongs to it.
      *
@@ -560,6 +578,21 @@ public class Session {
      *  Returns the inserted row Object[] for atomicity tracking (null if BEFORE trigger skipped). */
     public Object[] executeCopyFromRow(com.memgres.engine.parser.ast.CopyStmt stmt, java.util.List<String> values) {
         return executor.dmlExecutor.executeCopyFromRow(stmt, values);
+    }
+
+    /** Open a COPY FROM: the relation's BEFORE statement triggers, once, before its first row. */
+    public void beginCopyFrom(com.memgres.engine.parser.ast.CopyStmt stmt) {
+        executor.dmlExecutor.beginCopyFrom(stmt);
+    }
+
+    /** Close it: the AFTER row triggers it held back, and then its AFTER statement triggers. */
+    public void finishCopyFrom() {
+        executor.dmlExecutor.finishCopyFrom();
+    }
+
+    /** Forget a COPY that ended without finishing; its rows have gone back out again. */
+    public void discardCopyFrom() {
+        executor.dmlExecutor.discardCopyFrom();
     }
 
     /** Split an optionally schema-qualified name into {schema, table}. */
@@ -2692,6 +2725,26 @@ public class Session {
         if (paired != null) paired.remove(liveRow);
     }
 
+    /** True while every relation this transaction reads comes from the snapshot it began with. */
+    public boolean readsFromSnapshot() { return writesReadFromSnapshot(); }
+
+    /**
+     * The stored row each row of this session's snapshot of {@code schemaTable} was taken from.
+     *
+     * <p>A snapshot holds copies of the values, and anything that has to act on the row itself --
+     * taking a lock on it, asking what has become of it -- needs the row those values were read
+     * from. See {@link #rrSnapshotLive}, which is this the other way round.
+     */
+    public Map<Object[], Object[]> storedRowsBehindSnapshot(String schemaTable) {
+        Map<Object[], Object[]> paired = rrSnapshotLive.get(schemaTable);
+        if (paired == null || paired.isEmpty()) return Collections.emptyMap();
+        Map<Object[], Object[]> behind = new IdentityHashMap<>();
+        for (Map.Entry<Object[], Object[]> entry : paired.entrySet()) {
+            behind.put(entry.getValue(), entry.getKey());
+        }
+        return behind;
+    }
+
     /** True while this transaction's writes must be judged against the snapshot it reads from. */
     private boolean writesReadFromSnapshot() {
         if (status != TransactionStatus.IN_TRANSACTION || !rrSnapshotTaken) return false;
@@ -2899,8 +2952,7 @@ public class Session {
 
     /**
      * Every committed row {@code storage} holds itself, as images in its own column layout.
-     * {@code from} takes the stored row each image was read from, or null for a row that only
-     * another session's uncommitted delete still keeps alive.
+     * {@code from} takes the stored row each image was read from.
      */
     private void collectOwnCommittedRows(Table storage, List<Object[]> images,
                                          List<Object[]> from, List<Table> storedIn) {
@@ -2936,7 +2988,13 @@ public class Session {
             Object[] src = oldValues != null ? oldValues : deletedRow;
             Object[] image = Arrays.copyOf(src, src.length);
             images.add(image);
-            from.add(null);
+            // A row another session's uncommitted delete keeps alive is one of the relation's
+            // rows to everybody but that session, and this snapshot was read from it as much as
+            // from any other. Which stored row an image came from is the only thing that can
+            // later say what became of it -- taken away for good, or handed back by a rollback --
+            // so leaving it out let a write pass silently over a row PostgreSQL still owed this
+            // transaction, and say nothing at all about one another transaction took away.
+            from.add(deletedRow);
             // A statement written against this relation may have deleted a row one of the
             // relations below it holds, and while the delete is uncommitted the row is still
             // theirs: where it lives and which relation it belongs to are answered from there.
@@ -3593,8 +3651,9 @@ public class Session {
         // statement is a transaction of its own and every one of them starts again from zero.
         if (commandIdUsed) {
             commandIdUsed = false;
-            commandId++;
+            commandId += 1 + extraCommandIds;
         }
+        extraCommandIds = 0;
         if (stmtScopeOutsideTransaction && status != TransactionStatus.IN_TRANSACTION) {
             commandId = 0;
         }
@@ -4222,12 +4281,24 @@ public class Session {
         public final String tableName;
         public final List<Object[]> rows;
         public final long serialCounter;
+        /**
+         * How far the relation had numbered its tuples. A TRUNCATE that is rolled back leaves
+         * PostgreSQL's old file in place, so the rows come back at the line pointers they always
+         * had and the row written after them takes the next one.
+         */
+        public final long tupleIdCounter;
 
         public TruncateUndo(String schema, String tableName, List<Object[]> rows, long serialCounter) {
+            this(schema, tableName, rows, serialCounter, -1L);
+        }
+
+        public TruncateUndo(String schema, String tableName, List<Object[]> rows, long serialCounter,
+                            long tupleIdCounter) {
             this.schema = schema;
             this.tableName = tableName;
             this.rows = rows;
             this.serialCounter = serialCounter;
+            this.tupleIdCounter = tupleIdCounter;
         }
 
         @Override
@@ -4240,6 +4311,7 @@ public class Session {
                 table.insertRow(row);
             }
             table.resetSerialCounter(serialCounter);
+            if (tupleIdCounter >= 0) table.resetTupleIdCounter(tupleIdCounter);
         }
 
         public String schema() { return schema; }
@@ -4388,6 +4460,175 @@ public class Session {
         @Override
         public String toString() {
             return "CreateSchemaUndo[schemaName=" + schemaName + "]";
+        }
+    }
+
+    /**
+     * Undo a DROP SCHEMA by putting the schema back with everything it held.
+     *
+     * <p>DDL is transactional in PostgreSQL, so a schema a rolled-back transaction dropped never
+     * went anywhere: its relations still hold their rows, the rules written on them still fire and
+     * a query that names it still answers. Without this the whole schema stayed gone for good, and
+     * so did every view and policy elsewhere that CASCADE took with it. What the drop removed is
+     * put back in the order it was taken, so the schema is there again before its relations are.
+     */
+    public static final class DropSchemaUndo implements UndoEntry {
+        public final Schema schema;
+        /** The register entries saying which objects the schema was recorded as holding. */
+        public final Set<String> registered;
+        /** What each of those objects amounts to, in the order the drop removed them. */
+        public final List<UndoEntry> contents;
+
+        public DropSchemaUndo(Schema schema, Set<String> registered, List<UndoEntry> contents) {
+            this.schema = schema;
+            this.registered = registered;
+            this.contents = contents;
+        }
+
+        @Override
+        public void undo(Database db) {
+            db.restoreSchema(schema);
+            if (registered != null && schema != null) {
+                for (String entry : registered) {
+                    int colon = entry.indexOf(':');
+                    if (colon < 0) continue;
+                    db.registerSchemaObject(schema.getName(), entry.substring(0, colon),
+                            entry.substring(colon + 1));
+                }
+            }
+            if (contents == null) return;
+            for (int i = contents.size() - 1; i >= 0; i--) contents.get(i).undo(db);
+        }
+
+        @Override
+        public String toString() {
+            return "DropSchemaUndo[schema=" + (schema == null ? null : schema.getName()) + "]";
+        }
+    }
+
+    /**
+     * Undo a drop that took a type away. The five kinds live in maps of their own, so each says
+     * which map it came out of; a type whose transaction rolled back is a type nobody dropped, and
+     * every column declared with it goes on reading it.
+     */
+    public static final class DropEnumTypeUndo implements UndoEntry {
+        public final String schema;
+        public final String typeName;
+        public final CustomEnum type;
+
+        public DropEnumTypeUndo(String schema, String typeName, CustomEnum type) {
+            this.schema = schema;
+            this.typeName = typeName;
+            this.type = type;
+        }
+
+        @Override
+        public void undo(Database db) {
+            if (type != null) db.addCustomEnum(type);
+        }
+
+        @Override
+        public String toString() {
+            return "DropEnumTypeUndo[typeName=" + typeName + "]";
+        }
+    }
+
+    /** Undo a drop that took a composite type away. */
+    public static final class DropCompositeTypeUndo implements UndoEntry {
+        public final String schema;
+        public final String typeName;
+        public final List<com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField> fields;
+
+        public DropCompositeTypeUndo(String schema, String typeName,
+                                     List<com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField> fields) {
+            this.schema = schema;
+            this.typeName = typeName;
+            this.fields = fields;
+        }
+
+        @Override
+        public void undo(Database db) {
+            if (fields != null) db.addCompositeType(schema, typeName, fields);
+        }
+
+        @Override
+        public String toString() {
+            return "DropCompositeTypeUndo[typeName=" + typeName + "]";
+        }
+    }
+
+    /** Undo a drop that took a range type away. */
+    public static final class DropRangeTypeUndo implements UndoEntry {
+        public final String schema;
+        public final String typeName;
+        public final String subtype;
+
+        public DropRangeTypeUndo(String schema, String typeName, String subtype) {
+            this.schema = schema;
+            this.typeName = typeName;
+            this.subtype = subtype;
+        }
+
+        @Override
+        public void undo(Database db) {
+            if (subtype != null) db.addRangeType(schema, typeName, subtype);
+        }
+
+        @Override
+        public String toString() {
+            return "DropRangeTypeUndo[typeName=" + typeName + "]";
+        }
+    }
+
+    /** Undo a drop that took a domain away. */
+    public static final class DropDomainUndo implements UndoEntry {
+        public final String schema;
+        public final String typeName;
+        public final DomainType domain;
+
+        public DropDomainUndo(String schema, String typeName, DomainType domain) {
+            this.schema = schema;
+            this.typeName = typeName;
+            this.domain = domain;
+        }
+
+        @Override
+        public void undo(Database db) {
+            if (domain != null) db.addDomain(domain);
+        }
+
+        @Override
+        public String toString() {
+            return "DropDomainUndo[typeName=" + typeName + "]";
+        }
+    }
+
+    /**
+     * Undo a drop that took a row security policy off a relation the statement never named. A
+     * policy left off leaves the relation showing every row to everyone, which is the opposite of
+     * what it was written for.
+     */
+    public static final class DropPolicyUndo implements UndoEntry {
+        public final Table table;
+        public final RlsPolicy policy;
+
+        public DropPolicyUndo(Table table, RlsPolicy policy) {
+            this.table = table;
+            this.policy = policy;
+        }
+
+        @Override
+        public void undo(Database db) {
+            if (table == null || policy == null) return;
+            for (RlsPolicy there : table.getRlsPolicies()) {
+                if (there.getName().equalsIgnoreCase(policy.getName())) return;
+            }
+            table.getRlsPolicies().add(policy);
+        }
+
+        @Override
+        public String toString() {
+            return "DropPolicyUndo[policy=" + (policy == null ? null : policy.getName()) + "]";
         }
     }
 

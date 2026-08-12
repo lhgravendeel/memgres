@@ -12,9 +12,11 @@ import com.memgres.engine.parser.ast.Expression;
 class DmlTriggerHelper {
 
     private final AstExecutor executor;
+    private final DmlPartitionHelper partitionHelper;
 
     DmlTriggerHelper(AstExecutor executor) {
         this.executor = executor;
+        this.partitionHelper = new DmlPartitionHelper(executor);
     }
 
     /** True while the session is replaying replicated changes rather than originating them. */
@@ -91,11 +93,19 @@ class DmlTriggerHelper {
                 PgFunction function = executor.database.getFunction(trigger.getFunctionName());
                 if (function != null) {
                     PlpgsqlExecutor plExec = new PlpgsqlExecutor(executor, executor.database, executor.session);
+                    // A copy of a partitioned table's trigger may not carry the row out of the
+                    // partition the insert was routed to, so what such a copy was handed is kept
+                    // to tell a row it left alone from one it rewrote.
+                    Object[] rowAsHandedOver = handedDownForInsertIntoPartition(trigger, timing, event, table)
+                            && newRow != null ? Arrays.copyOf(newRow, newRow.length) : null;
                     Object[] result = plExec.executeTriggerFunction(function, newRow, oldRow, table, trigger);
                     if (result == null) {
                         // BEFORE/INSTEAD OF row trigger returned NULL: skip the operation on
                         // this row and suppress any remaining triggers (PostgreSQL semantics)
                         return null;
+                    }
+                    if (rowAsHandedOver != null && !Arrays.equals(rowAsHandedOver, result)) {
+                        partitionHelper.checkTriggerKeptRowInPartition(table, trigger, result);
                     }
                     // A DELETE has no NEW row to hand on to the next trigger; what the function
                     // returned says only whether the row still goes.
@@ -106,6 +116,19 @@ class DmlTriggerHelper {
         // A DELETE answers with the row it was asked about: there is no NEW row for it to report,
         // and returning null would read as "skip this row".
         return event == PgTrigger.Event.DELETE ? oldRow : newRow;
+    }
+
+    /**
+     * Whether this is a copy a partitioned table handed one of its partitions, firing for an insert
+     * into that partition -- the one place where rewriting the row can carry it out of the relation
+     * PostgreSQL had already settled on for it. An UPDATE is a different matter: a row whose key an
+     * UPDATE changes is meant to move, and PostgreSQL moves it.
+     */
+    private static boolean handedDownForInsertIntoPartition(PgTrigger trigger, PgTrigger.Timing timing,
+                                                            PgTrigger.Event event, Table table) {
+        return timing == PgTrigger.Timing.BEFORE && event == PgTrigger.Event.INSERT
+                && trigger.getClonedFromTable() != null
+                && table != null && table.getPartitionParent() != null;
     }
 
     /**

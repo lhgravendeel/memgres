@@ -43,6 +43,18 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * statement was dropping as a reason to refuse. A cast of NULL reached a type the search path
  * does not reach, and a composite was not held to the shape it declares.
  *
+ * <p>And a drop of a schema reached every rule whose action named a relation of a name the schema
+ * held, wherever that relation really was. A rule was taken off a relation in a schema still
+ * standing, and the relation it had sat on could not be written to at all.
+ *
+ * <p>What the drop of a schema itself answered was unreliable in the same way. A schema still
+ * holding something was refused without saying which SQLSTATE, what stood in the way or what to
+ * do about it; CASCADE said nothing of what it took and did not reach past the schema to a view,
+ * a policy or a column default elsewhere that depended on one of the schema's relations; and a
+ * drop rolled back did not put back what it had taken. A rule's action was read again every time
+ * it fired rather than settled when the rule was written, and the stored definition was printed
+ * without regard to the reading session's search path.
+ *
  * <p>Every expectation here was read off PostgreSQL 18 before it was written down.
  */
 class CatalogueTextAndRuleLifecycleTest {
@@ -3394,5 +3406,1006 @@ class CatalogueTextAndRuleLifecycleTest {
                 + " || '/' || format_type(a.atttypid, a.atttypmod), ' ' ORDER BY a.attnum)"
                 + " FROM pg_attribute a JOIN pg_type t ON t.typrelid = a.attrelid"
                 + " WHERE t.typname = '" + typeName + "' AND a.attnum > 0");
+    }
+
+    // ------------------------------------------------------------ a schema drop reaches only its own relations' rules
+
+    /**
+     * A rule depends on the relations its actions name, and a relation belongs to a schema, so
+     * dropping a schema takes away exactly the rules that named something in it. A relation of
+     * the same name in a schema that is still there is nothing to them, and the relation such a
+     * rule sits on goes on taking writes.
+     */
+    @Test
+    void dropSchemaCascadeLeavesTheRuleOfASameNamedRelationInAnotherSchema() throws Exception {
+        exec("CREATE SCHEMA crx_n");
+        exec("CREATE TABLE public.crx_dep (i int)");
+        exec("CREATE TABLE public.crx_keep (i int)");
+        exec("CREATE TABLE crx_n.crx_dep (i int)");
+        exec("CREATE TABLE crx_n.crx_keep (i int)");
+        exec("CREATE RULE crx_rk AS ON INSERT TO public.crx_keep DO ALSO"
+                + " INSERT INTO public.crx_dep VALUES (new.i)");
+        exec("INSERT INTO public.crx_keep VALUES (1)");
+        assertEquals(1, num("SELECT count(*) FROM public.crx_dep"));
+        assertEquals(0, num("SELECT count(*) FROM crx_n.crx_dep"));
+
+        exec("DROP SCHEMA crx_n CASCADE");
+        assertEquals("public/crx_keep/crx_rk",
+                scalar("SELECT schemaname || '/' || tablename || '/' || rulename FROM pg_rules"
+                        + " WHERE rulename = 'crx_rk'"));
+        // The relation the rule sits on still takes the write, and the rule still fires.
+        assertEquals(1, update("INSERT INTO public.crx_keep VALUES (2)"));
+        assertEquals("1,2", column("SELECT i FROM public.crx_keep ORDER BY i"));
+        assertEquals("1,2", column("SELECT i FROM public.crx_dep ORDER BY i"));
+        assertEquals("t", scalar("SELECT relhasrules FROM pg_class c"
+                + " JOIN pg_namespace n ON n.oid = c.relnamespace"
+                + " WHERE c.relname = 'crx_keep' AND n.nspname = 'public'"));
+        // And it still stands in the way of dropping what its action names.
+        assertEquals("2BP01", stateOf("DROP TABLE public.crx_dep"));
+        assertEquals("rule crx_rk on table crx_keep depends on table crx_dep",
+                detailOf("DROP TABLE public.crx_dep"));
+    }
+
+    /** Every write path of the surviving relation reaches it, and the rule fires on each. */
+    @Test
+    void theSurvivingRelationTakesEveryWriteAfterTheDrop() throws Exception {
+        exec("CREATE SCHEMA crx_w");
+        exec("CREATE TABLE public.crx_wd (i int)");
+        exec("CREATE TABLE public.crx_wk (i int)");
+        exec("CREATE TABLE crx_w.crx_wd (i int)");
+        exec("CREATE TABLE crx_w.crx_wk (i int)");
+        exec("CREATE RULE crx_rw AS ON INSERT TO public.crx_wk DO ALSO"
+                + " INSERT INTO public.crx_wd VALUES (new.i)");
+        exec("DROP SCHEMA crx_w CASCADE");
+
+        assertEquals(1, update("INSERT INTO public.crx_wk VALUES (1)"));
+        assertEquals(2, update("INSERT INTO public.crx_wk VALUES (2), (3)"));
+        assertEquals(1, update("INSERT INTO public.crx_wk SELECT 4"));
+        assertEquals("1,2,3,4", column("SELECT i FROM public.crx_wk ORDER BY i"));
+        assertEquals("1,2,3,4", column("SELECT i FROM public.crx_wd ORDER BY i"));
+
+        // An UPDATE and a DELETE have no rule of their own here, and change only the relation.
+        assertEquals(1, update("UPDATE public.crx_wk SET i = i * 10 WHERE i = 1"));
+        assertEquals(1, update("DELETE FROM public.crx_wk WHERE i = 3"));
+        assertEquals("2,4,10", column("SELECT i FROM public.crx_wk ORDER BY i"));
+        assertEquals("1,2,3,4", column("SELECT i FROM public.crx_wd ORDER BY i"));
+
+        // The row a RETURNING write hands back is the row it stored.
+        assertEquals("5", scalar("INSERT INTO public.crx_wk VALUES (5) RETURNING i"));
+        assertEquals(5, num("SELECT count(*) FROM public.crx_wd"));
+    }
+
+    /**
+     * Which rules go is decided one action at a time: the rule that named the dropped schema goes
+     * and the rule beside it on the same relation stays, still firing on every write.
+     */
+    @Test
+    void theRuleWhoseActionNamedTheDroppedSchemaGoesAndItsNeighbourStays() throws Exception {
+        exec("CREATE SCHEMA crx_m");
+        exec("CREATE TABLE crx_m.crx_ml (i int)");
+        exec("CREATE TABLE public.crx_ml (i int)");
+        exec("CREATE TABLE public.crx_mt (i int)");
+        exec("CREATE RULE crx_r1 AS ON INSERT TO public.crx_mt DO ALSO"
+                + " INSERT INTO crx_m.crx_ml VALUES (new.i)");
+        exec("CREATE RULE crx_r2 AS ON INSERT TO public.crx_mt DO ALSO"
+                + " INSERT INTO public.crx_ml VALUES (new.i + 100)");
+        exec("INSERT INTO public.crx_mt VALUES (1)");
+        assertEquals(1, num("SELECT count(*) FROM crx_m.crx_ml"));
+        assertEquals(1, num("SELECT count(*) FROM public.crx_ml"));
+
+        exec("DROP SCHEMA crx_m CASCADE");
+        assertEquals("crx_r2", column("SELECT rulename FROM pg_rules"
+                + " WHERE rulename IN ('crx_r1','crx_r2') ORDER BY 1"));
+        exec("INSERT INTO public.crx_mt VALUES (2)");
+        assertEquals("1,2", column("SELECT i FROM public.crx_mt ORDER BY i"));
+        assertEquals("101,102", column("SELECT i FROM public.crx_ml ORDER BY i"));
+
+        // The name the drop freed can be written again, and the new rule fires.
+        exec("CREATE RULE crx_r1 AS ON INSERT TO public.crx_mt DO ALSO"
+                + " INSERT INTO public.crx_ml VALUES (new.i + 200)");
+        exec("INSERT INTO public.crx_mt VALUES (3)");
+        assertEquals("101,102,103,203", column("SELECT i FROM public.crx_ml ORDER BY i"));
+    }
+
+    /**
+     * A rule written on a relation inside the dropped schema goes with that relation, and the
+     * relation of the same name outside it keeps the rule of its own.
+     */
+    @Test
+    void aRuleInsideTheDroppedSchemaGoesAndTheSameNamedRelationOutsideKeepsIts() throws Exception {
+        exec("CREATE SCHEMA crx_i");
+        exec("CREATE TABLE crx_i.src (i int)");
+        exec("CREATE TABLE public.crx_src (i int)");
+        exec("CREATE TABLE public.crx_out (i int)");
+        exec("CREATE RULE crx_ri AS ON INSERT TO crx_i.src DO ALSO"
+                + " INSERT INTO public.crx_out VALUES (new.i)");
+        exec("CREATE RULE crx_rp AS ON INSERT TO public.crx_src DO ALSO"
+                + " INSERT INTO public.crx_out VALUES (new.i + 100)");
+        exec("INSERT INTO crx_i.src VALUES (1)");
+        exec("INSERT INTO public.crx_src VALUES (2)");
+        assertEquals("1,102", column("SELECT i FROM public.crx_out ORDER BY i"));
+        assertEquals("crx_i/src/crx_ri,public/crx_src/crx_rp",
+                column("SELECT schemaname || '/' || tablename || '/' || rulename FROM pg_rules"
+                        + " WHERE rulename IN ('crx_ri','crx_rp') ORDER BY 1"));
+
+        exec("DROP SCHEMA crx_i CASCADE");
+        assertEquals("public/crx_src/crx_rp",
+                column("SELECT schemaname || '/' || tablename || '/' || rulename FROM pg_rules"
+                        + " WHERE rulename IN ('crx_ri','crx_rp') ORDER BY 1"));
+        exec("INSERT INTO public.crx_src VALUES (3)");
+        assertEquals("2,3", column("SELECT i FROM public.crx_src ORDER BY i"));
+        assertEquals("1,102,103", column("SELECT i FROM public.crx_out ORDER BY i"));
+        // The rule that stayed still holds the relation its action names.
+        assertEquals("2BP01", stateOf("DROP TABLE public.crx_out"));
+    }
+
+    /** An action that only reads a relation in the dropped schema takes the rule with it too. */
+    @Test
+    void anActionThatOnlyReadsTheDroppedSchemaTakesItsRuleAway() throws Exception {
+        exec("CREATE SCHEMA crx_z");
+        exec("CREATE TABLE crx_z.rd (i int)");
+        exec("CREATE TABLE public.crx_rd (i int)");
+        exec("CREATE TABLE public.crx_zs (i int)");
+        exec("CREATE TABLE public.crx_zl (i int)");
+        exec("CREATE RULE crx_rrd AS ON INSERT TO public.crx_zs DO ALSO"
+                + " INSERT INTO public.crx_zl SELECT count(*) FROM crx_z.rd");
+        exec("INSERT INTO public.crx_zs VALUES (1)");
+        assertEquals(1, num("SELECT count(*) FROM public.crx_zl"));
+
+        exec("DROP SCHEMA crx_z CASCADE");
+        assertEquals(0, num("SELECT count(*) FROM pg_rules WHERE rulename = 'crx_rrd'"));
+        // The relation the rule sat on takes the write, and nothing is written for the rule.
+        assertEquals(1, update("INSERT INTO public.crx_zs VALUES (2)"));
+        assertEquals(2, num("SELECT count(*) FROM public.crx_zs"));
+        assertEquals(1, num("SELECT count(*) FROM public.crx_zl"));
+    }
+
+    /**
+     * RESTRICT is refused while the schema holds a relation, and reaches no rule either way: the
+     * rule on the relation of the same name elsewhere is untouched by the refusal and by the drop
+     * of the emptied schema that follows it.
+     */
+    @Test
+    void restrictReachesNoRuleWhetherItIsRefusedOrCarriedOut() throws Exception {
+        exec("CREATE SCHEMA crx_r");
+        exec("CREATE TABLE crx_r.crx_rdp (i int)");
+        exec("CREATE TABLE public.crx_rdp (i int)");
+        exec("CREATE TABLE public.crx_rkp (i int)");
+        exec("CREATE RULE crx_rr AS ON INSERT TO public.crx_rkp DO ALSO"
+                + " INSERT INTO public.crx_rdp VALUES (new.i)");
+        assertEquals("cannot drop schema crx_r because other objects depend on it",
+                messageOf("DROP SCHEMA crx_r RESTRICT"));
+        assertEquals(1, num("SELECT count(*) FROM pg_rules WHERE rulename = 'crx_rr'"));
+        assertEquals(1, num("SELECT count(*) FROM pg_tables WHERE schemaname = 'crx_r'"));
+        exec("INSERT INTO public.crx_rkp VALUES (1)");
+        assertEquals(1, num("SELECT count(*) FROM public.crx_rdp"));
+
+        // With the relation out of the way the schema goes, and the rule stays where it was.
+        exec("DROP TABLE crx_r.crx_rdp");
+        exec("DROP SCHEMA crx_r RESTRICT");
+        assertEquals(0, num("SELECT count(*) FROM pg_namespace WHERE nspname = 'crx_r'"));
+        assertEquals("public/crx_rkp/crx_rr",
+                scalar("SELECT schemaname || '/' || tablename || '/' || rulename FROM pg_rules"
+                        + " WHERE rulename = 'crx_rr'"));
+        exec("INSERT INTO public.crx_rkp VALUES (2)");
+        assertEquals(2, num("SELECT count(*) FROM public.crx_rkp"));
+        assertEquals(2, num("SELECT count(*) FROM public.crx_rdp"));
+    }
+
+    /** A drop rolled back leaves the rule where it was, and the relation still takes writes. */
+    @Test
+    void aRolledBackSchemaDropLeavesTheRuleAndTheRelationWritable() throws Exception {
+        exec("CREATE SCHEMA crx_g");
+        exec("CREATE TABLE public.crx_gd (i int)");
+        exec("CREATE TABLE public.crx_gk (i int)");
+        exec("CREATE TABLE crx_g.crx_gd (i int)");
+        exec("CREATE RULE crx_rg AS ON INSERT TO public.crx_gk DO ALSO"
+                + " INSERT INTO public.crx_gd VALUES (new.i)");
+        exec("BEGIN");
+        exec("DROP SCHEMA crx_g CASCADE");
+        exec("INSERT INTO public.crx_gk VALUES (1)");
+        assertEquals(1, num("SELECT count(*) FROM public.crx_gk"));
+        assertEquals(1, num("SELECT count(*) FROM public.crx_gd"));
+        exec("ROLLBACK");
+
+        assertEquals("public/crx_gk/crx_rg",
+                scalar("SELECT schemaname || '/' || tablename || '/' || rulename FROM pg_rules"
+                        + " WHERE rulename = 'crx_rg'"));
+        exec("INSERT INTO public.crx_gk VALUES (2)");
+        // Only the row written after the rollback is there, on the relation and through the rule.
+        assertEquals("2", column("SELECT i FROM public.crx_gk ORDER BY i"));
+        assertEquals("2", column("SELECT i FROM public.crx_gd ORDER BY i"));
+        exec("DROP SCHEMA IF EXISTS crx_g CASCADE");
+    }
+
+    /** What pg_rules holds for the rule the drop left alone, schema and definition and all. */
+    @Test
+    void pgRulesStillNamesTheSchemaOfTheRelationTheSurvivingRuleIsOn() throws Exception {
+        exec("RESET search_path");
+        exec("CREATE SCHEMA crx_d");
+        exec("CREATE TABLE public.crx_dd (i int)");
+        exec("CREATE TABLE public.crx_dk (i int)");
+        exec("CREATE TABLE crx_d.crx_dd (i int)");
+        exec("CREATE RULE crx_rd AS ON INSERT TO crx_dk DO ALSO INSERT INTO crx_dd VALUES (new.i)");
+
+        exec("DROP SCHEMA crx_d CASCADE");
+        assertEquals("public", scalar("SELECT schemaname FROM pg_rules WHERE rulename = 'crx_rd'"));
+        assertEquals("crx_dk", scalar("SELECT tablename FROM pg_rules WHERE rulename = 'crx_rd'"));
+        assertEquals("CREATE RULE crx_rd AS\n"
+                        + "    ON INSERT TO public.crx_dk DO  INSERT INTO crx_dd (i)\n"
+                        + "  VALUES (new.i);",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'crx_rd'"));
+        // The relation the rule is filed under is the one in the schema that was not dropped.
+        assertEquals("public/crx_dk",
+                scalar("SELECT n.nspname || '/' || c.relname FROM pg_rewrite r"
+                        + " JOIN pg_class c ON c.oid = r.ev_class"
+                        + " JOIN pg_namespace n ON n.oid = c.relnamespace"
+                        + " WHERE r.rulename = 'crx_rd'"));
+        exec("INSERT INTO public.crx_dk VALUES (1)");
+        assertEquals(1, num("SELECT count(*) FROM public.crx_dd"));
+    }
+
+    /**
+     * Two schemas holding relations of the same names each keep their own rule, and a drop of one
+     * leaves the other's rule firing -- even where one schema's name starts with the other's.
+     */
+    @Test
+    void eachSchemaKeepsTheRuleOnItsOwnRelationOfTheName() throws Exception {
+        exec("CREATE SCHEMA crx_ss");
+        exec("CREATE SCHEMA crx_ss2");
+        exec("CREATE TABLE crx_ss.t (i int)");
+        exec("CREATE TABLE crx_ss.l (i int)");
+        exec("CREATE TABLE crx_ss2.t (i int)");
+        exec("CREATE TABLE crx_ss2.l (i int)");
+        exec("CREATE RULE crx_rs AS ON INSERT TO crx_ss.t DO ALSO"
+                + " INSERT INTO crx_ss.l VALUES (new.i)");
+        exec("CREATE RULE crx_rs2 AS ON INSERT TO crx_ss2.t DO ALSO"
+                + " INSERT INTO crx_ss2.l VALUES (new.i + 20)");
+        assertEquals("crx_ss/t/crx_rs,crx_ss2/t/crx_rs2",
+                column("SELECT schemaname || '/' || tablename || '/' || rulename FROM pg_rules"
+                        + " WHERE rulename IN ('crx_rs','crx_rs2') ORDER BY 1"));
+
+        exec("DROP SCHEMA crx_ss CASCADE");
+        assertEquals("crx_ss2/t/crx_rs2",
+                column("SELECT schemaname || '/' || tablename || '/' || rulename FROM pg_rules"
+                        + " WHERE rulename IN ('crx_rs','crx_rs2') ORDER BY 1"));
+        exec("INSERT INTO crx_ss2.t VALUES (1)");
+        assertEquals(1, num("SELECT count(*) FROM crx_ss2.t"));
+        assertEquals("21", column("SELECT i FROM crx_ss2.l ORDER BY i"));
+    }
+
+    /** A view is a relation like any other, and the rule on the view of the same name stays. */
+    @Test
+    void theRuleOnASameNamedViewInAnotherSchemaStaysAndTheViewTakesWrites() throws Exception {
+        exec("CREATE SCHEMA crx_vs");
+        exec("CREATE TABLE public.crx_vb (i int)");
+        exec("CREATE VIEW public.crx_vw AS SELECT i FROM public.crx_vb");
+        exec("CREATE RULE crx_rvw AS ON INSERT TO public.crx_vw DO INSTEAD"
+                + " INSERT INTO public.crx_vb VALUES (new.i)");
+        exec("CREATE TABLE crx_vs.crx_vb (i int)");
+        exec("CREATE VIEW crx_vs.crx_vw AS SELECT i FROM crx_vs.crx_vb");
+        exec("CREATE RULE crx_rvw AS ON INSERT TO crx_vs.crx_vw DO INSTEAD"
+                + " INSERT INTO crx_vs.crx_vb VALUES (new.i + 50)");
+        exec("INSERT INTO public.crx_vw VALUES (1)");
+        exec("INSERT INTO crx_vs.crx_vw VALUES (2)");
+        assertEquals(1, num("SELECT count(*) FROM public.crx_vb"));
+        assertEquals(1, num("SELECT count(*) FROM crx_vs.crx_vb"));
+
+        exec("DROP SCHEMA crx_vs CASCADE");
+        assertEquals("public/crx_vw/crx_rvw",
+                column("SELECT schemaname || '/' || tablename || '/' || rulename FROM pg_rules"
+                        + " WHERE rulename = 'crx_rvw' ORDER BY 1"));
+        // The view still takes the write its rule turns into one on the table under it.
+        exec("INSERT INTO public.crx_vw VALUES (3)");
+        assertEquals("1,3", column("SELECT i FROM public.crx_vb ORDER BY i"));
+        assertEquals(2, num("SELECT count(*) FROM public.crx_vw"));
+    }
+
+    /** The rules that name a view in the dropped schema go with it, wherever they were written. */
+    @Test
+    void everyRuleThatNamedAViewInTheDroppedSchemaGoesWithIt() throws Exception {
+        exec("CREATE SCHEMA crx_c");
+        exec("CREATE TABLE crx_c.base (i int)");
+        exec("CREATE VIEW crx_c.vw AS SELECT * FROM crx_c.base");
+        exec("CREATE TABLE public.crx_o3 (i int)");
+        exec("CREATE TABLE public.crx_o3l (i int)");
+        exec("CREATE RULE crx_rv AS ON INSERT TO crx_c.vw DO INSTEAD"
+                + " INSERT INTO crx_c.base VALUES (new.i)");
+        exec("CREATE RULE crx_rdv AS ON INSERT TO public.crx_o3 DO ALSO"
+                + " INSERT INTO public.crx_o3l SELECT count(*) FROM crx_c.vw");
+        exec("INSERT INTO crx_c.vw VALUES (1)");
+        assertEquals(1, num("SELECT count(*) FROM crx_c.base"));
+
+        exec("DROP SCHEMA crx_c CASCADE");
+        assertEquals(0, num("SELECT count(*) FROM pg_rules"
+                + " WHERE rulename IN ('crx_rv','crx_rdv')"));
+        exec("INSERT INTO public.crx_o3 VALUES (1)");
+        assertEquals(1, num("SELECT count(*) FROM public.crx_o3"));
+        assertEquals(0, num("SELECT count(*) FROM public.crx_o3l"));
+        // Nothing depends on the relation the rule read into any more, so it drops on its own.
+        exec("DROP TABLE public.crx_o3");
+    }
+
+    /**
+     * A rule action names a relation the way any other statement does, so with two schemas on the
+     * search path holding the name it writes into the one ahead -- and goes when that one goes.
+     */
+    @Test
+    void anActionNamesTheRelationInTheSchemaAheadOnTheSearchPath() throws Exception {
+        exec("CREATE SCHEMA crx_p2");
+        exec("CREATE TABLE crx_p2.crx_dp (i int)");
+        exec("CREATE TABLE public.crx_dp (i int)");
+        exec("CREATE TABLE public.crx_kp (i int)");
+        exec("SET search_path = crx_p2, public");
+        try {
+            exec("CREATE RULE crx_ru AS ON INSERT TO public.crx_kp DO ALSO"
+                    + " INSERT INTO crx_dp VALUES (new.i)");
+            exec("INSERT INTO public.crx_kp VALUES (1)");
+            assertEquals(0, num("SELECT count(*) FROM public.crx_dp"));
+            assertEquals(1, num("SELECT count(*) FROM crx_p2.crx_dp"));
+
+            exec("DROP SCHEMA crx_p2 CASCADE");
+            assertEquals(0, num("SELECT count(*) FROM pg_rules WHERE rulename = 'crx_ru'"));
+            // The relation the rule sat on still takes the write, and nothing follows it.
+            assertEquals(1, update("INSERT INTO public.crx_kp VALUES (2)"));
+            assertEquals(2, num("SELECT count(*) FROM public.crx_kp"));
+            assertEquals(0, num("SELECT count(*) FROM public.crx_dp"));
+        } finally {
+            exec("RESET search_path");
+        }
+    }
+
+    /** The other way round: the schema behind public on the path is nothing to the action. */
+    @Test
+    void theSchemaBehindPublicOnTheSearchPathIsNothingToTheAction() throws Exception {
+        exec("CREATE SCHEMA crx_p3");
+        exec("CREATE TABLE crx_p3.crx_qd (i int)");
+        exec("CREATE TABLE public.crx_qd (i int)");
+        exec("CREATE TABLE public.crx_qk (i int)");
+        exec("SET search_path = public, crx_p3");
+        try {
+            exec("CREATE RULE crx_rq3 AS ON INSERT TO public.crx_qk DO ALSO"
+                    + " INSERT INTO crx_qd VALUES (new.i)");
+            exec("INSERT INTO public.crx_qk VALUES (1)");
+            assertEquals(1, num("SELECT count(*) FROM public.crx_qd"));
+            assertEquals(0, num("SELECT count(*) FROM crx_p3.crx_qd"));
+
+            exec("DROP SCHEMA crx_p3 CASCADE");
+            assertEquals("public/crx_qk/crx_rq3",
+                    scalar("SELECT schemaname || '/' || tablename || '/' || rulename FROM pg_rules"
+                            + " WHERE rulename = 'crx_rq3'"));
+            exec("INSERT INTO public.crx_qk VALUES (2)");
+            assertEquals(2, num("SELECT count(*) FROM public.crx_qk"));
+            assertEquals(2, num("SELECT count(*) FROM public.crx_qd"));
+        } finally {
+            exec("RESET search_path");
+        }
+    }
+
+    /** The rules on the other write paths are left alone the same way, and still fire. */
+    @Test
+    void anUpdateAndADeleteRuleSurviveTheDropOfASameNamedRelationsSchema() throws Exception {
+        exec("CREATE SCHEMA crx_u");
+        exec("CREATE TABLE public.crx_ud (i int)");
+        exec("CREATE TABLE public.crx_uk (i int)");
+        exec("CREATE TABLE crx_u.crx_ud (i int)");
+        exec("CREATE RULE crx_ru1 AS ON UPDATE TO public.crx_uk DO ALSO"
+                + " INSERT INTO public.crx_ud VALUES (new.i)");
+        exec("CREATE RULE crx_ru2 AS ON DELETE TO public.crx_uk DO ALSO"
+                + " INSERT INTO public.crx_ud VALUES (old.i * -1)");
+        exec("INSERT INTO public.crx_uk VALUES (5)");
+
+        exec("DROP SCHEMA crx_u CASCADE");
+        assertEquals("crx_ru1,crx_ru2", column("SELECT rulename FROM pg_rules"
+                + " WHERE rulename IN ('crx_ru1','crx_ru2') ORDER BY 1"));
+        assertEquals(1, update("UPDATE public.crx_uk SET i = 6"));
+        assertEquals(1, update("DELETE FROM public.crx_uk"));
+        assertEquals("-6,6", column("SELECT i FROM public.crx_ud ORDER BY i"));
+        assertEquals(0, num("SELECT count(*) FROM public.crx_uk"));
+    }
+
+    /** A rule with no action to name a relation with is left alone, and goes on refusing. */
+    @Test
+    void aRuleThatDoesInsteadNothingGoesOnRefusingTheWrite() throws Exception {
+        exec("CREATE SCHEMA crx_nn");
+        exec("CREATE TABLE crx_nn.crx_nk (i int)");
+        exec("CREATE TABLE public.crx_nk (i int)");
+        exec("CREATE RULE crx_rn AS ON INSERT TO public.crx_nk DO INSTEAD NOTHING");
+
+        exec("DROP SCHEMA crx_nn CASCADE");
+        assertEquals("public/crx_nk/crx_rn",
+                scalar("SELECT schemaname || '/' || tablename || '/' || rulename FROM pg_rules"
+                        + " WHERE rulename = 'crx_rn'"));
+        assertEquals(0, update("INSERT INTO public.crx_nk VALUES (1)"));
+        assertEquals(0, num("SELECT count(*) FROM public.crx_nk"));
+
+        // Once the rule is gone the write lands, which is how we know it was the rule refusing.
+        exec("DROP RULE crx_rn ON public.crx_nk");
+        assertEquals(1, update("INSERT INTO public.crx_nk VALUES (2)"));
+        assertEquals(1, num("SELECT count(*) FROM public.crx_nk"));
+    }
+
+    // ------------------------------------------------------------ what a schema drop refuses for, and how it says so
+
+    /**
+     * A schema is what everything in it hangs from, so a DROP SCHEMA that would take something
+     * with it is refused unless CASCADE says to take it: SQLSTATE 2BP01, a message naming the
+     * schema, a DETAIL naming what depends on it and a HINT saying what to write instead.
+     */
+    @Test
+    void aSchemaHoldingARelationIsNotDroppedAndTheRefusalCarriesEveryField() throws Exception {
+        exec("CREATE SCHEMA sdr_a");
+        exec("CREATE TABLE sdr_a.r (i int)");
+        exec("INSERT INTO sdr_a.r VALUES (1)");
+        assertEquals("2BP01", stateOf("DROP SCHEMA sdr_a RESTRICT"));
+        assertEquals("cannot drop schema sdr_a because other objects depend on it",
+                messageOf("DROP SCHEMA sdr_a RESTRICT"));
+        assertEquals("table sdr_a.r depends on schema sdr_a", detailOf("DROP SCHEMA sdr_a RESTRICT"));
+        assertEquals("Use DROP ... CASCADE to drop the dependent objects too.",
+                hintOf("DROP SCHEMA sdr_a RESTRICT"));
+
+        // RESTRICT is the default, so the bare statement is refused with the same four fields.
+        assertEquals("2BP01", stateOf("DROP SCHEMA sdr_a"));
+        assertEquals("cannot drop schema sdr_a because other objects depend on it",
+                messageOf("DROP SCHEMA sdr_a"));
+        assertEquals("table sdr_a.r depends on schema sdr_a", detailOf("DROP SCHEMA sdr_a"));
+        assertEquals("Use DROP ... CASCADE to drop the dependent objects too.",
+                hintOf("DROP SCHEMA sdr_a"));
+
+        // The refusal changed nothing: the schema is there and so is its row.
+        assertEquals(1, num("SELECT count(*) FROM pg_namespace WHERE nspname = 'sdr_a'"));
+        assertEquals(1, num("SELECT count(*) FROM sdr_a.r"));
+        exec("DROP SCHEMA sdr_a CASCADE");
+        assertEquals(0, num("SELECT count(*) FROM pg_namespace WHERE nspname = 'sdr_a'"));
+    }
+
+    /** Every object the schema holds is named in the DETAIL, in the order they were created. */
+    @Test
+    void everyObjectTheSchemaHoldsIsNamedInTheDetailInCreationOrder() throws Exception {
+        exec("CREATE SCHEMA sdr_b");
+        exec("CREATE TABLE sdr_b.zt (i int)");
+        exec("CREATE TABLE sdr_b.at (i int)");
+        exec("CREATE VIEW sdr_b.zv AS SELECT i FROM sdr_b.zt");
+        exec("CREATE SEQUENCE sdr_b.asq");
+        // Creation order, not name order, and each line says what kind of object it is.
+        assertEquals("table sdr_b.zt depends on schema sdr_b\n"
+                        + "table sdr_b.at depends on schema sdr_b\n"
+                        + "view sdr_b.zv depends on schema sdr_b\n"
+                        + "sequence sdr_b.asq depends on schema sdr_b",
+                detailOf("DROP SCHEMA sdr_b RESTRICT"));
+        exec("DROP SCHEMA sdr_b CASCADE");
+    }
+
+    /** A sequence, a type or a function of its own stands in the way just as a table does. */
+    @Test
+    void aSchemaHoldingOnlyASequenceOrATypeOrAFunctionIsStillARefusal() throws Exception {
+        exec("CREATE SCHEMA sdr_c");
+        exec("CREATE SEQUENCE sdr_c.sq");
+        assertEquals("2BP01", stateOf("DROP SCHEMA sdr_c RESTRICT"));
+        assertEquals("sequence sdr_c.sq depends on schema sdr_c",
+                detailOf("DROP SCHEMA sdr_c RESTRICT"));
+
+        exec("DROP SEQUENCE sdr_c.sq");
+        exec("CREATE TYPE sdr_c.e AS ENUM ('a')");
+        assertEquals("2BP01", stateOf("DROP SCHEMA sdr_c RESTRICT"));
+        assertEquals("type sdr_c.e depends on schema sdr_c", detailOf("DROP SCHEMA sdr_c RESTRICT"));
+
+        exec("DROP TYPE sdr_c.e");
+        exec("CREATE FUNCTION sdr_c.f(a int) RETURNS int AS 'SELECT a' LANGUAGE sql");
+        assertEquals("2BP01", stateOf("DROP SCHEMA sdr_c RESTRICT"));
+        // A function is named with the types of its arguments, spelled as PostgreSQL spells them.
+        assertEquals("function sdr_c.f(integer) depends on schema sdr_c",
+                detailOf("DROP SCHEMA sdr_c RESTRICT"));
+
+        // With nothing left to hang from it the schema drops without CASCADE.
+        exec("DROP FUNCTION sdr_c.f(int)");
+        exec("DROP SCHEMA sdr_c RESTRICT");
+        assertEquals(0, num("SELECT count(*) FROM pg_namespace WHERE nspname = 'sdr_c'"));
+    }
+
+    /** A hundred dependents are named and the rest are counted, in the refusal and the notice. */
+    @Test
+    void pastAHundredDependentsTheRestAreCountedRatherThanNamed() throws Exception {
+        exec("CREATE SCHEMA sdr_d");
+        for (int i = 1; i <= 105; i++) {
+            exec(String.format("CREATE TABLE sdr_d.t%03d (i int)", i));
+        }
+        String[] blocking = detailOf("DROP SCHEMA sdr_d RESTRICT").split("\n", -1);
+        assertEquals(101, blocking.length);
+        assertEquals("table sdr_d.t001 depends on schema sdr_d", blocking[0]);
+        assertEquals("table sdr_d.t100 depends on schema sdr_d", blocking[99]);
+        assertEquals("and 5 other objects (see server log for list)", blocking[100]);
+
+        String[] notice = noticeOf("DROP SCHEMA sdr_d CASCADE");
+        // The count in the message is the whole number taken; the DETAIL is the one that is cut.
+        assertEquals("drop cascades to 105 other objects", notice[0]);
+        String[] lines = notice[1].split("\n", -1);
+        assertEquals(101, lines.length);
+        assertEquals("drop cascades to table sdr_d.t001", lines[0]);
+        assertEquals("drop cascades to table sdr_d.t100", lines[99]);
+        assertEquals("and 5 other objects (see server log for list)", lines[100]);
+    }
+
+    // ------------------------------------------------------------ what a schema drop takes, and what it says it took
+
+    /**
+     * CASCADE says what it took: nothing at all for an empty schema, the one object by name when
+     * there is one, and a count with the names under DETAIL when there are several.
+     */
+    @Test
+    void cascadeNamesOneObjectAndCountsSeveralWithTheirNamesUnderDetail() throws Exception {
+        exec("CREATE SCHEMA sdr_e");
+        assertNull(noticeOf("DROP SCHEMA sdr_e CASCADE")[0],
+                "an empty schema takes nothing with it, so there is nothing to say");
+
+        exec("CREATE SCHEMA sdr_f");
+        exec("CREATE TABLE sdr_f.t (i int)");
+        String[] one = noticeOf("DROP SCHEMA sdr_f CASCADE");
+        assertEquals("drop cascades to table sdr_f.t", one[0]);
+        assertNull(one[1], "a single object is named in the message, so no DETAIL is sent");
+
+        exec("CREATE SCHEMA sdr_g");
+        exec("CREATE TABLE sdr_g.zt (i int)");
+        exec("CREATE TABLE sdr_g.at (i int)");
+        exec("CREATE VIEW sdr_g.zv AS SELECT i FROM sdr_g.zt");
+        exec("CREATE SEQUENCE sdr_g.asq");
+        String[] many = noticeOf("DROP SCHEMA sdr_g CASCADE");
+        assertEquals("drop cascades to 4 other objects", many[0]);
+        assertEquals("drop cascades to table sdr_g.zt\n"
+                + "drop cascades to table sdr_g.at\n"
+                + "drop cascades to view sdr_g.zv\n"
+                + "drop cascades to sequence sdr_g.asq", many[1]);
+    }
+
+    /**
+     * A view outside the schema that reads a relation inside it depends on that relation, so it
+     * blocks the drop without CASCADE and goes with it under CASCADE -- and so does whatever
+     * reads that view. A view that read nothing of the schema's is left alone and goes on
+     * answering.
+     */
+    @Test
+    void cascadeReachesAViewOutsideTheSchemaAndTheViewThatReadsThatOne() throws Exception {
+        exec("CREATE SCHEMA sdr_h");
+        exec("CREATE TABLE sdr_h.t (i int)");
+        exec("CREATE VIEW public.sdr_hv AS SELECT i FROM sdr_h.t");
+        exec("CREATE VIEW public.sdr_hv2 AS SELECT i FROM public.sdr_hv");
+        exec("CREATE TABLE public.sdr_hk (i int)");
+        exec("CREATE VIEW public.sdr_hkv AS SELECT i FROM public.sdr_hk");
+
+        assertEquals("2BP01", stateOf("DROP SCHEMA sdr_h RESTRICT"));
+        // The walk goes from the schema to its relation and on to what depends on that.
+        assertEquals("table sdr_h.t depends on schema sdr_h\n"
+                        + "view sdr_hv depends on table sdr_h.t\n"
+                        + "view sdr_hv2 depends on view sdr_hv",
+                detailOf("DROP SCHEMA sdr_h RESTRICT"));
+
+        String[] notice = noticeOf("DROP SCHEMA sdr_h CASCADE");
+        assertEquals("drop cascades to 3 other objects", notice[0]);
+        assertEquals("drop cascades to table sdr_h.t\n"
+                + "drop cascades to view sdr_hv\n"
+                + "drop cascades to view sdr_hv2", notice[1]);
+        assertEquals(0, num("SELECT count(*) FROM pg_views WHERE viewname = 'sdr_hv'"));
+        assertEquals(0, num("SELECT count(*) FROM pg_views WHERE viewname = 'sdr_hv2'"));
+
+        assertEquals(1, num("SELECT count(*) FROM pg_views WHERE viewname = 'sdr_hkv'"));
+        exec("INSERT INTO public.sdr_hk VALUES (7)");
+        assertEquals("7", scalar("SELECT i FROM public.sdr_hkv"));
+        exec("DROP VIEW public.sdr_hkv");
+        exec("DROP TABLE public.sdr_hk");
+    }
+
+    /**
+     * A row security policy outside the schema whose expression reads a relation inside it goes
+     * the same way, and the relation the policy was on is left standing.
+     */
+    @Test
+    void cascadeReachesAPolicyOutsideTheSchemaAndLeavesItsRelationStanding() throws Exception {
+        exec("CREATE SCHEMA sdr_i");
+        exec("CREATE TABLE sdr_i.t (i int)");
+        exec("CREATE TABLE public.sdr_it (i int)");
+        exec("CREATE POLICY sdr_ip ON sdr_it USING (i IN (SELECT i FROM sdr_i.t))");
+        exec("CREATE TABLE public.sdr_iu (i int)");
+        exec("CREATE POLICY sdr_iq ON sdr_iu USING (i > 0)");
+
+        assertEquals("2BP01", stateOf("DROP SCHEMA sdr_i RESTRICT"));
+        assertEquals("table sdr_i.t depends on schema sdr_i\n"
+                        + "policy sdr_ip on table sdr_it depends on table sdr_i.t",
+                detailOf("DROP SCHEMA sdr_i RESTRICT"));
+
+        String[] notice = noticeOf("DROP SCHEMA sdr_i CASCADE");
+        assertEquals("drop cascades to 2 other objects", notice[0]);
+        assertEquals("drop cascades to table sdr_i.t\n"
+                + "drop cascades to policy sdr_ip on table sdr_it", notice[1]);
+        assertEquals(0, num("SELECT count(*) FROM pg_policies WHERE policyname = 'sdr_ip'"));
+        // The relation the policy was on stays, and so does a policy that read nothing of the
+        // schema's.
+        assertEquals(1, num("SELECT count(*) FROM pg_tables WHERE tablename = 'sdr_it'"));
+        assertEquals(1, num("SELECT count(*) FROM pg_policies WHERE policyname = 'sdr_iq'"));
+        exec("DROP TABLE public.sdr_it");
+        exec("DROP TABLE public.sdr_iu");
+    }
+
+    /**
+     * A column default outside the schema that calls a sequence inside it is a dependent of its
+     * own, named as a default rather than as the relation it sits on.
+     */
+    @Test
+    void cascadeReachesTheDefaultOfAColumnOnARelationOutsideTheSchema() throws Exception {
+        exec("CREATE SCHEMA sdr_j");
+        exec("CREATE SEQUENCE sdr_j.sq");
+        exec("CREATE TABLE public.sdr_jd (i int, j int DEFAULT nextval('sdr_j.sq'))");
+        exec("INSERT INTO public.sdr_jd (i) VALUES (1)");
+        assertEquals("1", scalar("SELECT j FROM public.sdr_jd WHERE i = 1"));
+
+        assertEquals("2BP01", stateOf("DROP SCHEMA sdr_j RESTRICT"));
+        assertEquals("sequence sdr_j.sq depends on schema sdr_j\n"
+                        + "default value for column j of table sdr_jd depends on sequence sdr_j.sq",
+                detailOf("DROP SCHEMA sdr_j RESTRICT"));
+
+        // Rolled back, the sequence is back and the default outside goes on drawing from it.
+        exec("BEGIN");
+        String[] notice = noticeOf("DROP SCHEMA sdr_j CASCADE");
+        assertEquals("drop cascades to 2 other objects", notice[0]);
+        assertEquals("drop cascades to sequence sdr_j.sq\n"
+                + "drop cascades to default value for column j of table sdr_jd", notice[1]);
+        exec("ROLLBACK");
+        assertEquals(1, num("SELECT count(*) FROM pg_namespace WHERE nspname = 'sdr_j'"));
+        exec("INSERT INTO public.sdr_jd (i) VALUES (2)");
+        assertEquals("2", scalar("SELECT j FROM public.sdr_jd WHERE i = 2"));
+        exec("DROP TABLE public.sdr_jd");
+        exec("DROP SCHEMA sdr_j CASCADE");
+    }
+
+    /** IF EXISTS on a schema that is not there says what it skipped; without it, 3F000. */
+    @Test
+    void ifExistsOnAMissingSchemaSaysWhatItSkippedAndTheBareDropRaises() throws Exception {
+        String[] notice = noticeOf("DROP SCHEMA IF EXISTS sdr_nothere CASCADE");
+        assertEquals("schema \"sdr_nothere\" does not exist, skipping", notice[0]);
+        assertNull(notice[1]);
+        assertEquals("3F000", stateOf("DROP SCHEMA sdr_nothere"));
+        assertEquals("schema \"sdr_nothere\" does not exist", messageOf("DROP SCHEMA sdr_nothere"));
+        assertNull(detailOf("DROP SCHEMA sdr_nothere"));
+        assertNull(hintOf("DROP SCHEMA sdr_nothere"));
+    }
+
+    // ------------------------------------------------------------ a schema drop that is rolled back never happened
+
+    /**
+     * A drop rolled back puts the schema back holding what it held: its relations, the rows in
+     * them, the view over them and the rules on them, which go on firing and go on standing in
+     * the way of dropping what their actions name.
+     */
+    @Test
+    void aRolledBackDropPutsBackTheSchemaItsRelationsItsRowsAndItsRules() throws Exception {
+        exec("CREATE SCHEMA sdr_k");
+        exec("CREATE TABLE sdr_k.t (i int)");
+        exec("CREATE TABLE sdr_k.l (m text)");
+        exec("CREATE SEQUENCE sdr_k.sq");
+        exec("CREATE VIEW sdr_k.v AS SELECT i FROM sdr_k.t");
+        exec("CREATE RULE sdr_kr AS ON INSERT TO sdr_k.t DO ALSO INSERT INTO sdr_k.l VALUES ('z')");
+        exec("INSERT INTO sdr_k.t VALUES (1)");
+        assertEquals(1, num("SELECT count(*) FROM sdr_k.l"));
+
+        exec("BEGIN");
+        exec("DROP SCHEMA sdr_k CASCADE");
+        assertEquals(0, num("SELECT count(*) FROM pg_namespace WHERE nspname = 'sdr_k'"));
+        exec("ROLLBACK");
+
+        assertEquals(1, num("SELECT count(*) FROM pg_namespace WHERE nspname = 'sdr_k'"));
+        assertEquals(1, num("SELECT count(*) FROM pg_rules WHERE rulename = 'sdr_kr'"));
+        assertEquals(1, num("SELECT count(*) FROM sdr_k.t"));
+        assertEquals(1, num("SELECT count(*) FROM sdr_k.l"));
+        assertEquals(1, num("SELECT count(*) FROM sdr_k.v"));
+
+        // The rule the drop took goes on firing.
+        exec("INSERT INTO sdr_k.t VALUES (2)");
+        assertEquals(2, num("SELECT count(*) FROM sdr_k.t"));
+        assertEquals(2, num("SELECT count(*) FROM sdr_k.l"));
+        // And it goes on holding the relation its action names.
+        assertEquals("2BP01", stateOf("DROP TABLE sdr_k.l"));
+        assertEquals("rule sdr_kr on table sdr_k.t depends on table sdr_k.l",
+                detailOf("DROP TABLE sdr_k.l"));
+        assertEquals("CREATE RULE sdr_kr AS\n"
+                        + "    ON INSERT TO sdr_k.t DO  INSERT INTO sdr_k.l (m)\n"
+                        + "  VALUES ('z'::text);",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'sdr_kr'"));
+        // The sequence is back at the place it was never moved from.
+        assertEquals("1", scalar("SELECT nextval('sdr_k.sq')"));
+        exec("DROP SCHEMA sdr_k CASCADE");
+    }
+
+    /**
+     * The keys and the indexes behind them come back too, and a sequence comes back at the place
+     * it had reached rather than at the beginning.
+     */
+    @Test
+    void aRolledBackDropPutsBackTheKeysTheIndexesAndTheSequencesPlace() throws Exception {
+        exec("CREATE SCHEMA sdr_l");
+        exec("CREATE TABLE sdr_l.k (i int PRIMARY KEY, m text UNIQUE)");
+        exec("CREATE SEQUENCE sdr_l.sq");
+        exec("INSERT INTO sdr_l.k VALUES (1, 'a')");
+        assertEquals("1", scalar("SELECT nextval('sdr_l.sq')"));
+        assertEquals("2", scalar("SELECT nextval('sdr_l.sq')"));
+
+        exec("BEGIN");
+        exec("DROP SCHEMA sdr_l CASCADE");
+        exec("ROLLBACK");
+
+        assertEquals("3", scalar("SELECT nextval('sdr_l.sq')"));
+        assertEquals("23505", stateOf("INSERT INTO sdr_l.k VALUES (1, 'b')"));
+        assertEquals("duplicate key value violates unique constraint \"k_pkey\"",
+                messageOf("INSERT INTO sdr_l.k VALUES (1, 'b')"));
+        assertEquals("23505", stateOf("INSERT INTO sdr_l.k VALUES (2, 'a')"));
+        assertEquals("duplicate key value violates unique constraint \"k_m_key\"",
+                messageOf("INSERT INTO sdr_l.k VALUES (2, 'a')"));
+        exec("INSERT INTO sdr_l.k VALUES (2, 'b')");
+        assertEquals(2, num("SELECT count(*) FROM sdr_l.k"));
+        assertEquals(2, num("SELECT count(*) FROM pg_indexes WHERE schemaname = 'sdr_l'"));
+        exec("DROP SCHEMA sdr_l CASCADE");
+    }
+
+    /** What CASCADE reached outside the schema comes back with it, and works again. */
+    @Test
+    void aRolledBackDropPutsBackWhatCascadeReachedOutsideTheSchema() throws Exception {
+        exec("CREATE SCHEMA sdr_m");
+        exec("CREATE TABLE sdr_m.t (i int)");
+        exec("CREATE VIEW public.sdr_mv AS SELECT i FROM sdr_m.t");
+        exec("CREATE TABLE public.sdr_mt (i int)");
+        exec("CREATE POLICY sdr_mp ON sdr_mt USING (i IN (SELECT i FROM sdr_m.t))");
+
+        exec("BEGIN");
+        exec("DROP SCHEMA sdr_m CASCADE");
+        exec("ROLLBACK");
+
+        assertEquals(1, num("SELECT count(*) FROM pg_namespace WHERE nspname = 'sdr_m'"));
+        assertEquals(1, num("SELECT count(*) FROM pg_views WHERE viewname = 'sdr_mv'"));
+        assertEquals(1, num("SELECT count(*) FROM pg_policies WHERE policyname = 'sdr_mp'"));
+        exec("INSERT INTO sdr_m.t VALUES (3)");
+        assertEquals("3", scalar("SELECT i FROM public.sdr_mv"));
+        exec("DROP SCHEMA sdr_m CASCADE");
+        exec("DROP TABLE public.sdr_mt");
+    }
+
+    /** A schema that held nothing is put back by a rollback the same way. */
+    @Test
+    void aRolledBackDropOfAnEmptySchemaPutsItBackToo() throws Exception {
+        exec("CREATE SCHEMA sdr_n");
+        exec("BEGIN");
+        exec("DROP SCHEMA sdr_n");
+        exec("ROLLBACK");
+        assertEquals(1, num("SELECT count(*) FROM pg_namespace WHERE nspname = 'sdr_n'"));
+        exec("DROP SCHEMA sdr_n");
+        assertEquals(0, num("SELECT count(*) FROM pg_namespace WHERE nspname = 'sdr_n'"));
+    }
+
+    /**
+     * A savepoint undoes the drop and no more: the writes made after it are committed with the
+     * rest of the transaction, and a drop the transaction does commit is done.
+     */
+    @Test
+    void rollingBackToASavepointPutsTheSchemaBackAndTheTransactionGoesOn() throws Exception {
+        exec("CREATE SCHEMA sdr_o");
+        exec("CREATE TABLE sdr_o.t (i int)");
+        exec("INSERT INTO sdr_o.t VALUES (9)");
+
+        exec("BEGIN");
+        exec("SAVEPOINT s1");
+        exec("DROP SCHEMA sdr_o CASCADE");
+        exec("ROLLBACK TO SAVEPOINT s1");
+        exec("INSERT INTO sdr_o.t VALUES (10)");
+        exec("COMMIT");
+
+        assertEquals(1, num("SELECT count(*) FROM pg_namespace WHERE nspname = 'sdr_o'"));
+        assertEquals(2, num("SELECT count(*) FROM sdr_o.t"));
+
+        exec("BEGIN");
+        exec("DROP SCHEMA sdr_o CASCADE");
+        exec("COMMIT");
+        assertEquals(0, num("SELECT count(*) FROM pg_namespace WHERE nspname = 'sdr_o'"));
+    }
+
+    /** A refused drop inside a transaction block aborts it, and leaves the schema where it was. */
+    @Test
+    void aRefusedDropInsideATransactionBlockAbortsIt() throws Exception {
+        exec("CREATE SCHEMA sdr_p");
+        exec("CREATE TABLE sdr_p.t (i int)");
+        exec("BEGIN");
+        assertEquals("2BP01", stateOf("DROP SCHEMA sdr_p RESTRICT"));
+        assertEquals("25P02", stateOf("SELECT 1"));
+        exec("ROLLBACK");
+        assertEquals(1, num("SELECT count(*) FROM pg_namespace WHERE nspname = 'sdr_p'"));
+        assertEquals(1, num("SELECT count(*) FROM pg_tables WHERE schemaname = 'sdr_p'"));
+        exec("DROP SCHEMA sdr_p CASCADE");
+    }
+
+    // ------------------------------------------------------------ a rule's action names its relation when the rule is written
+
+    /**
+     * A rule's action is analysed when the rule is written, so the relation it writes to is the
+     * one the path reached then -- however the path stands when the rule fires.
+     */
+    @Test
+    void aRuleActionNamesItsRelationWhenTheRuleIsWrittenAndNotWhenItFires() throws Exception {
+        exec("RESET search_path");
+        exec("CREATE SCHEMA sdr_q");
+        exec("CREATE TABLE sdr_q.d (m text)");
+        exec("CREATE TABLE public.sdr_qs (i int)");
+        exec("SET search_path = sdr_q, public");
+        try {
+            exec("CREATE RULE sdr_qr AS ON INSERT TO public.sdr_qs DO ALSO"
+                    + " INSERT INTO d VALUES ('x')");
+            // Read by the session that wrote it, the action's relation is written bare, because
+            // the schema holding it is on that session's path.
+            assertEquals("CREATE RULE sdr_qr AS\n"
+                            + "    ON INSERT TO public.sdr_qs DO  INSERT INTO d (m)\n"
+                            + "  VALUES ('x'::text);",
+                    scalar("SELECT definition FROM pg_rules WHERE rulename = 'sdr_qr'"));
+
+            exec("SET search_path = public");
+            assertEquals("CREATE RULE sdr_qr AS\n"
+                            + "    ON INSERT TO public.sdr_qs DO  INSERT INTO sdr_q.d (m)\n"
+                            + "  VALUES ('x'::text);",
+                    scalar("SELECT definition FROM pg_rules WHERE rulename = 'sdr_qr'"));
+
+            exec("CREATE TABLE public.sdr_qd (m text)");
+            exec("INSERT INTO public.sdr_qs VALUES (1)");
+            assertEquals(1, num("SELECT count(*) FROM sdr_q.d"));
+            assertEquals(0, num("SELECT count(*) FROM public.sdr_qd"));
+            exec("DROP TABLE public.sdr_qd");
+            exec("DROP TABLE public.sdr_qs CASCADE");
+            exec("DROP SCHEMA sdr_q CASCADE");
+        } finally {
+            exec("RESET search_path");
+        }
+    }
+
+    /**
+     * The other way round: a relation of the name appearing later in a schema ahead on the path
+     * is nothing to a rule already written, whose action goes on writing where it always did.
+     */
+    @Test
+    void aRelationOfTheNameThatAppearsLaterIsNothingToARuleAlreadyWritten() throws Exception {
+        exec("RESET search_path");
+        exec("CREATE TABLE public.sdr_rd (m text)");
+        exec("CREATE TABLE public.sdr_rk (i int)");
+        exec("CREATE RULE sdr_rr AS ON INSERT TO public.sdr_rk DO ALSO"
+                + " INSERT INTO sdr_rd VALUES ('t')");
+        exec("CREATE SCHEMA sdr_r");
+        exec("CREATE TABLE sdr_r.sdr_rd (m text)");
+        exec("SET search_path = sdr_r, public");
+        try {
+            exec("INSERT INTO public.sdr_rk VALUES (1)");
+            assertEquals(1, num("SELECT count(*) FROM public.sdr_rd"));
+            assertEquals(0, num("SELECT count(*) FROM sdr_r.sdr_rd"));
+        } finally {
+            exec("RESET search_path");
+        }
+        // And with the schema that shared the name gone, the rule fires exactly as before.
+        exec("DROP SCHEMA sdr_r CASCADE");
+        exec("INSERT INTO public.sdr_rk VALUES (2)");
+        assertEquals(2, num("SELECT count(*) FROM public.sdr_rd"));
+        exec("DROP TABLE public.sdr_rk CASCADE");
+        exec("DROP TABLE public.sdr_rd CASCADE");
+    }
+
+    /**
+     * The stored definition is printed for the session reading it: a relation whose schema is on
+     * that session's path is written without it, through either reader.
+     */
+    @Test
+    void theDefinitionWritesTheActionsRelationTheReadersSearchPathCallsFor() throws Exception {
+        exec("RESET search_path");
+        exec("CREATE SCHEMA sdr_s");
+        exec("CREATE TABLE sdr_s.l (m text)");
+        exec("CREATE TABLE public.sdr_sk (i int)");
+        exec("CREATE RULE sdr_sr AS ON INSERT TO public.sdr_sk DO ALSO"
+                + " INSERT INTO sdr_s.l VALUES ('q')");
+        String qualified = "CREATE RULE sdr_sr AS\n"
+                + "    ON INSERT TO public.sdr_sk DO  INSERT INTO sdr_s.l (m)\n"
+                + "  VALUES ('q'::text);";
+        assertEquals(qualified, scalar("SELECT definition FROM pg_rules WHERE rulename = 'sdr_sr'"));
+        assertEquals(qualified, scalar("SELECT pg_get_ruledef(r.oid) FROM pg_rewrite r"
+                + " WHERE r.rulename = 'sdr_sr'"));
+
+        exec("SET search_path = sdr_s, public");
+        try {
+            String bare = "CREATE RULE sdr_sr AS\n"
+                    + "    ON INSERT TO public.sdr_sk DO  INSERT INTO l (m)\n"
+                    + "  VALUES ('q'::text);";
+            assertEquals(bare, scalar("SELECT definition FROM pg_rules WHERE rulename = 'sdr_sr'"));
+            assertEquals(bare, scalar("SELECT pg_get_ruledef(r.oid) FROM pg_rewrite r"
+                    + " WHERE r.rulename = 'sdr_sr'"));
+        } finally {
+            exec("RESET search_path");
+        }
+        // What the definition is printed as is nothing to where the action writes.
+        exec("INSERT INTO public.sdr_sk VALUES (1)");
+        assertEquals(1, num("SELECT count(*) FROM sdr_s.l"));
+        exec("DROP TABLE public.sdr_sk CASCADE");
+        exec("DROP SCHEMA sdr_s CASCADE");
+    }
+
+    /**
+     * Two sessions reading the same rule at the same time each get the qualification their own
+     * search path calls for, and neither reading settles anything for the other.
+     */
+    @Test
+    void twoSessionsReadTheSameRuleThroughTheirOwnSearchPaths() throws Exception {
+        exec("RESET search_path");
+        exec("CREATE SCHEMA sdr_two");
+        exec("CREATE TABLE sdr_two.l (m text)");
+        exec("CREATE TABLE public.sdr_twok (i int)");
+        exec("CREATE RULE sdr_twor AS ON INSERT TO public.sdr_twok DO ALSO"
+                + " INSERT INTO sdr_two.l VALUES ('t')");
+        String read = "SELECT definition FROM pg_rules WHERE rulename = 'sdr_twor'";
+        String bare = "CREATE RULE sdr_twor AS\n"
+                + "    ON INSERT TO public.sdr_twok DO  INSERT INTO l (m)\n"
+                + "  VALUES ('t'::text);";
+        String qualified = "CREATE RULE sdr_twor AS\n"
+                + "    ON INSERT TO public.sdr_twok DO  INSERT INTO sdr_two.l (m)\n"
+                + "  VALUES ('t'::text);";
+        try (Connection other = otherSession()) {
+            exec("SET search_path = sdr_two, public");
+            execOn(other, "SET search_path = public");
+            assertEquals(bare, scalar(read));
+            assertEquals(qualified, scalarOn(other, read));
+            // The other session moves its own path and only its own answer moves.
+            execOn(other, "SET search_path = sdr_two");
+            assertEquals(bare, scalarOn(other, read));
+            assertEquals(bare, scalar(read));
+        } finally {
+            exec("RESET search_path");
+        }
+        exec("DROP TABLE public.sdr_twok CASCADE");
+        exec("DROP SCHEMA sdr_two CASCADE");
+    }
+
+    /**
+     * public is on every session's path, so a rule written with that qualifier reads back without
+     * it -- the stored definition is the tree the server analysed, not the text that was typed.
+     */
+    @Test
+    void aRuleWrittenWithTheQualifierPublicReadsBackWithoutIt() throws Exception {
+        exec("RESET search_path");
+        exec("CREATE TABLE public.sdr_td (i int)");
+        exec("CREATE TABLE public.sdr_tk (i int)");
+        exec("CREATE RULE sdr_tr AS ON INSERT TO public.sdr_tk DO ALSO"
+                + " INSERT INTO public.sdr_td VALUES (new.i)");
+        assertEquals("CREATE RULE sdr_tr AS\n"
+                        + "    ON INSERT TO public.sdr_tk DO  INSERT INTO sdr_td (i)\n"
+                        + "  VALUES (new.i);",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'sdr_tr'"));
+        exec("INSERT INTO public.sdr_tk VALUES (5)");
+        assertEquals("5", scalar("SELECT i FROM public.sdr_td"));
+        exec("DROP TABLE public.sdr_tk CASCADE");
+        exec("DROP TABLE public.sdr_td CASCADE");
+    }
+
+    /** The number of rows a write reports having changed. */
+    private static int update(String sql) throws SQLException {
+        try (Statement st = conn.createStatement()) {
+            return st.executeUpdate(sql);
+        }
+    }
+
+    /** A session of its own, so its search path is nobody else's. */
+    private static Connection otherSession() throws SQLException {
+        Connection other = DriverManager.getConnection(
+                memgres.getJdbcUrl() + "?preferQueryMode=simple",
+                memgres.getUser(), memgres.getPassword());
+        other.setAutoCommit(true);
+        return other;
+    }
+
+    private static void execOn(Connection c, String sql) throws SQLException {
+        try (Statement st = c.createStatement()) {
+            st.execute(sql);
+        }
+    }
+
+    private static String scalarOn(Connection c, String sql) throws SQLException {
+        try (Statement st = c.createStatement(); ResultSet rs = st.executeQuery(sql)) {
+            return rs.next() ? rs.getString(1) : "(no rows)";
+        }
     }
 }

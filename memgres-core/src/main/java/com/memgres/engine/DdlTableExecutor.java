@@ -148,6 +148,12 @@ class DdlTableExecutor {
                     }
                 }
                 for (Column col : parent.getColumns()) {
+                    // A NOT NULL written NO INHERIT answers for the declaring relation's rows and
+                    // no others, so the column reaches the child with nothing on it: the child
+                    // takes a row PostgreSQL lets it take, and holds no constraint for it.
+                    if (!col.isNullable() && parent.isNotNullNoInherit(col.getName())) {
+                        col = col.withNullable(true);
+                    }
                     Column existing = null;
                     int existingIdx = -1;
                     for (int ci = 0; ci < inheritedColumns.size(); ci++) {
@@ -463,6 +469,20 @@ class DdlTableExecutor {
                 }
             }
 
+            // Restating an inherited column adds to it and never loosens it: a child cannot be
+            // less strict than the relation it takes its rows from, so PostgreSQL keeps the NOT
+            // NULL a parent declares whatever the child's own column list leaves out. The rule
+            // stays the parent's -- only the parent may withdraw it -- and a child that says NOT
+            // NULL as well declares a second one of its own beside it.
+            if (!notNull) {
+                for (Table inheritParent : parentTables) {
+                    if (CatalogConstraintBuilder.declaresNotNull(inheritParent, def.name())) {
+                        notNull = true;
+                        break;
+                    }
+                }
+            }
+
             // A DEFAULT and a generation expression are both evaluated for one row at a time, with
             // no other row in sight; PostgreSQL names each context in its own words.
             executor.selectExecutor.placementCheck.rejectStoredDefinition(
@@ -553,6 +573,24 @@ class DdlTableExecutor {
         validateGeneratedColumns(stmt.columns(), columns);
         rejectKeysOnVirtualColumns(stmt, columns);
 
+        // A NOT NULL written NO INHERIT is a rule about this relation's rows alone, and one taken
+        // from a parent is a rule the relation holds on that parent's behalf: PostgreSQL refuses
+        // the definition rather than merge the two. It settles the not-null constraints after it
+        // has read every column definition, so a fault in any of those is what the writer is told
+        // about first.
+        for (ColumnDef notInherited : stmt.columns()) {
+            if (!notInherited.notNullNoInherit()) continue;
+            for (Table inheritParent : parentTables) {
+                if (!CatalogConstraintBuilder.declaresNotNull(inheritParent, notInherited.name())) {
+                    continue;
+                }
+                MemgresException conflict = PgErrors.datatypeMismatch(
+                        "cannot define not-null constraint with NO INHERIT on column \""
+                                + notInherited.name() + "\"").suppressPosition();
+                conflict.setDetail("The column has an inherited not-null constraint.");
+                throw conflict;
+            }
+        }
         // A partitioned parent holds no rows of its own, so there is nothing for UNLOGGED to
         // mean; PostgreSQL refuses the combination outright rather than silently ignoring it.
         if (stmt.unlogged() && stmt.partitionBy() != null) {
@@ -577,6 +615,12 @@ class DdlTableExecutor {
         for (Table parent : parentTables) {
             table.setParentTable(parent);
             parent.addChild(table);
+        }
+
+        // A NOT NULL written NO INHERIT answers for this relation's rows alone, and nothing
+        // declared under it later takes it: PostgreSQL hands the column down bare.
+        for (ColumnDef def : stmt.columns()) {
+            if (def.notNullNoInherit()) table.markNotNullNoInherit(def.name());
         }
 
         // What the child's own column list named is the child's own, and the rest it holds only
@@ -1905,6 +1949,17 @@ class DdlTableExecutor {
                     // script told only of the first dependent learns of the rest by dropping that
                     // one and being refused again.
                     List<String> dependents = new ArrayList<>();
+                    // A relation carries a composite type of its own name, and a routine that
+                    // answers with rows of the relation is recorded against that type rather than
+                    // against the relation. PostgreSQL reports those first, ahead of everything
+                    // recorded against the relation itself, and its line says which of the two the
+                    // dependency is on.
+                    for (PgFunction fn : executor.database.getFunctions().values()) {
+                        if (functionReturnsRowsOf(fn, name)) {
+                            dependents.add("function " + functionSignature(fn)
+                                    + " depends on type " + visibleName(schemaName, name));
+                        }
+                    }
                     // Check FK dependencies: any table in any schema referencing this table
                     for (Schema s : executor.database.getSchemas().values()) {
                         for (Table otherTable : s.getTables().values()) {
@@ -1949,6 +2004,19 @@ class DdlTableExecutor {
                         dependents.add("rule " + rule[0] + " on table " + visibleName(rule[2], rule[1])
                                 + " depends on table " + visibleName(schemaName, name));
                     }
+                    // A routine whose body PostgreSQL parsed where the routine was defined -- a
+                    // SQL-standard body, written BEGIN ATOMIC or RETURN -- left a dependency on
+                    // every relation that body names, and those come last in what the refusal
+                    // reports. The text of a PL/pgSQL body, or of a SQL body written as a string,
+                    // is resolved when the routine is called and records nothing at all, so a
+                    // relation it merely mentions -- through %ROWTYPE, %TYPE, or by name -- is not
+                    // something standing in the way of the drop.
+                    for (PgFunction fn : executor.database.getFunctions().values()) {
+                        if (parsedBodyNames(fn, name)) {
+                            dependents.add("function " + functionSignature(fn)
+                                    + " depends on table " + visibleName(schemaName, name));
+                        }
+                    }
                     if (!dependents.isEmpty()) {
                         MemgresException e = new MemgresException(
                                 DdlObjectExecutor.cannotDropMessage(severalNamed,
@@ -1956,38 +2024,6 @@ class DdlTableExecutor {
                         e.setDetail(DdlObjectExecutor.dependencyDetail(dependents));
                         e.setHint("Use DROP ... CASCADE to drop the dependent objects too.");
                         throw e;
-                    }
-                    // Check function dependencies (%ROWTYPE, %TYPE, RETURNS table_type, SETOF table_type)
-                    for (PgFunction fn : executor.database.getFunctions().values()) {
-                        String body = fn.getBody();
-                        String retType = fn.getReturnType();
-                        boolean depends = false;
-                        if (retType != null) {
-                            String rt = retType.toLowerCase().replace("setof ", "").trim();
-                            if (rt.equals(name.toLowerCase())) depends = true;
-                        }
-                        if (!depends && body != null) {
-                            String lBody = body.toLowerCase();
-                            if (lBody.contains(name.toLowerCase() + "%rowtype")
-                                    || lBody.contains(name.toLowerCase() + ".")) {
-                                // Check for %ROWTYPE or %TYPE references in DECLARE
-                                java.util.regex.Matcher m = java.util.regex.Pattern.compile(
-                                        "\\b" + java.util.regex.Pattern.quote(name.toLowerCase()) + "\\s*(%rowtype|\\.[a-z_][a-z0-9_]*\\s*%type)",
-                                        java.util.regex.Pattern.CASE_INSENSITIVE).matcher(body);
-                                if (m.find()) depends = true;
-                            }
-                        }
-                        // A BEGIN ATOMIC body is parsed at definition time and records a real
-                        // dependency, unlike a string body which is only resolved when called
-                        if (!depends && fn.isAtomicBody() && sqlFunctionDependsOnTable(fn, name)) {
-                            depends = true;
-                        }
-                        if (depends) {
-                            throw new MemgresException(
-                                    "cannot drop table " + name + " because other objects depend on it\n"
-                                    + "  Detail: function " + fn.getName() + " depends on table " + name,
-                                    "2BP01");
-                        }
                     }
                 } else {
                     // CASCADE names what it took with it, so a script that meant to drop one
@@ -2043,15 +2079,27 @@ class DdlTableExecutor {
                         Table child = descendants.get(d);
                         dropSingleTable(findSchemaNameOf(child, schemaName), child.getName(), true, true);
                     }
-                    // CASCADE: also drop dependent functions (e.g., BEGIN ATOMIC bodies referencing this table)
+                    // CASCADE takes away exactly what the refusal above names and nothing else: a
+                    // routine recorded against the relation's composite type, which PostgreSQL
+                    // lists ahead of everything, and one whose parsed body names the relation,
+                    // which it lists last. Reading a body's text for the relation's name took away
+                    // every routine that so much as mentioned it -- a PL/pgSQL function that reads
+                    // the relation is not something PostgreSQL recorded anything about, and it
+                    // stays where it is.
                     List<String> funcsToDrop = new ArrayList<>();
+                    List<String> byType = new ArrayList<>();
                     for (PgFunction fn : executor.database.getFunctions().values()) {
-                        if (sqlFunctionDependsOnTable(fn, name)) {
-                            funcsToDrop.add(fn.getName());
-                        }
+                        if (!functionReturnsRowsOf(fn, name)) continue;
+                        funcsToDrop.add(fn.getName());
+                        byType.add("function " + functionSignature(fn));
+                    }
+                    cascaded.addAll(0, byType);
+                    for (PgFunction fn : executor.database.getFunctions().values()) {
+                        if (functionReturnsRowsOf(fn, name) || !parsedBodyNames(fn, name)) continue;
+                        funcsToDrop.add(fn.getName());
+                        cascaded.add("function " + functionSignature(fn));
                     }
                     for (String f : funcsToDrop) {
-                        cascaded.add("function " + f + "()");
                         executor.database.removeFunction(f);
                     }
                     // A rule that writes to this relation is refused above without CASCADE, so
@@ -2198,26 +2246,53 @@ class DdlTableExecutor {
     }
 
     /**
-     * Check if a SQL-language function body references the given table name.
-     * Covers RETURNS type, SETOF type, and FROM/INTO/UPDATE/DELETE table references in the body.
+     * Whether the routine answers with rows of this relation.
+     *
+     * <p>Every relation carries a type of its own name, and RETURNS &lt;relation&gt; and RETURNS
+     * SETOF &lt;relation&gt; are written in that type. PostgreSQL records the dependency against the
+     * type rather than against the relation, and says so in the line it refuses the drop with.
      */
-    private boolean sqlFunctionDependsOnTable(PgFunction fn, String tableName) {
-        String lName = tableName.toLowerCase();
+    private static boolean functionReturnsRowsOf(PgFunction fn, String tableName) {
         String retType = fn.getReturnType();
-        if (retType != null) {
-            String rt = retType.toLowerCase().replace("setof ", "").trim();
-            if (rt.equals(lName)) return true;
-        }
+        if (retType == null) return false;
+        return retType.toLowerCase().replace("setof ", "").trim().equals(tableName.toLowerCase());
+    }
+
+    /**
+     * Whether the relation is named by a body PostgreSQL parsed when the routine was defined.
+     *
+     * <p>A SQL-standard body -- BEGIN ATOMIC ... END, or RETURN expr -- is parsed then, so what it
+     * names is recorded and the relation cannot go without taking the routine with it. Any other
+     * body is text until the routine is called: nothing in the catalogue records what it mentions,
+     * and PostgreSQL neither refuses the drop for it nor takes the routine away with CASCADE.
+     */
+    private static boolean parsedBodyNames(PgFunction fn, String tableName) {
+        if (!fn.isAtomicBody() && !fn.isSqlStandardBody()) return false;
         String body = fn.getBody();
-        if (body != null) {
-            String lBody = body.toLowerCase();
-            // Check for table reference: FROM table, INTO table, UPDATE table, etc.
-            if (java.util.regex.Pattern.compile("\\b" + java.util.regex.Pattern.quote(lName) + "\\b",
-                    java.util.regex.Pattern.CASE_INSENSITIVE).matcher(body).find()) {
-                return true;
+        if (body == null) return false;
+        return java.util.regex.Pattern.compile(
+                "\\b" + java.util.regex.Pattern.quote(tableName.toLowerCase()) + "\\b",
+                java.util.regex.Pattern.CASE_INSENSITIVE).matcher(body).find();
+    }
+
+    /**
+     * The routine written the way PostgreSQL writes it where a dependency names one: its name and
+     * the types it is called with, each spelled as the type's own name rather than as the
+     * declaration wrote it. An OUT parameter is no part of how a routine is called and is left out.
+     */
+    private static String functionSignature(PgFunction fn) {
+        StringBuilder sb = new StringBuilder(fn.getName());
+        sb.append('(');
+        boolean first = true;
+        if (fn.getParams() != null) {
+            for (PgFunction.Param p : fn.getParams()) {
+                if ("OUT".equalsIgnoreCase(p.mode())) continue;
+                if (!first) sb.append(", ");
+                first = false;
+                sb.append(CatalogMetadataFunctions.normalizePgTypeName(p.typeName()));
             }
         }
-        return false;
+        return sb.append(')').toString();
     }
 
     // ---- TRUNCATE ----
@@ -2245,10 +2320,12 @@ class DdlTableExecutor {
                 done.add(child);
                 String childSchema = se.getKey();
                 executor.recordUndo(new Session.TruncateUndo(childSchema, child.getName(),
-                        new ArrayList<>(child.getRows()), child.getSerialCounter()));
+                        new ArrayList<>(child.getRows()), child.getSerialCounter(),
+                        child.getTupleIdCounter()));
                 List<PgTrigger> childTriggers = executor.database.getTriggersForTable(child.getName());
                 fireTruncateStatementTriggers(childTriggers, PgTrigger.Timing.BEFORE, child);
                 child.deleteAll();
+                child.resetTupleIdCounter(0);
                 if (executor.session != null) {
                     executor.session.clearRRSnapshotForTable(childSchema + "." + child.getName());
                 }
@@ -2398,7 +2475,8 @@ class DdlTableExecutor {
                         for (Table target : truncateTargets) {
                             String targetSchema = target == table ? schemaName : findSchemaNameOf(target, schemaName);
                             executor.recordUndo(new Session.TruncateUndo(targetSchema, target.getName(),
-                                    new ArrayList<>(target.getRows()), target.getSerialCounter()));
+                                    new ArrayList<>(target.getRows()), target.getSerialCounter(),
+                                    target.getTupleIdCounter()));
                         }
                         // Fire BEFORE TRUNCATE statement-level triggers
                         List<PgTrigger> triggers = executor.database.getTriggersForTable(bareName);
@@ -2414,6 +2492,9 @@ class DdlTableExecutor {
                         }
                         for (Table target : truncateTargets) {
                             totalCount += target.deleteAll();
+                            // TRUNCATE gives the relation a new file, so the next row written
+                            // into it lives at the first line pointer again.
+                            target.resetTupleIdCounter(0);
                             // C9: Sync RR snapshot — own TRUNCATE must be visible to itself
                             if (executor.session != null) {
                                 String targetSchema = target == table ? schemaName : findSchemaNameOf(target, schemaName);
@@ -2536,14 +2617,37 @@ class DdlTableExecutor {
 
         int rowCount = 0;
         if (stmt.withData()) {
+            // The rows go in under a command identifier of their own. PostgreSQL moves the
+            // counter on once the relation's catalogue rows are written, so that the routine
+            // filling the relation can see the relation it is filling, and it does that whether
+            // or not the query turned out to have any rows. A definition that asks for no data
+            // never opens the relation and spends nothing beyond the one every write takes.
+            if (executor.session != null) executor.session.noteCatalogRowsWritten(2);
             for (Object[] row : result.getRows()) {
                 Object[] copy = row.clone();
                 table.insertRow(copy);
                 executor.recordUndo(new Session.InsertUndo(schemaName, table.getName(), copy));
+                recordCreatedRowIdentity(schemaName, table, copy);
                 rowCount++;
             }
         }
 
         return QueryResult.command(QueryResult.Type.SELECT_INTO, rowCount);
+    }
+
+    /**
+     * Give a row the query wrote at creation time the place it holds in the new relation.
+     *
+     * <p>PostgreSQL fills the relation through the routine an INSERT writes through, so these rows
+     * take line pointers one after another and the relation goes on from where they left off: the
+     * row written after them lands beyond them rather than on top of the first, and a tuple id
+     * still names one row once some of them have been deleted. Where such a row sat was recorded
+     * nowhere, so it was counted off by its position instead and the relation went on handing out
+     * line pointers from one.
+     */
+    private void recordCreatedRowIdentity(String schemaName, Table table, Object[] row) {
+        if (executor.session == null || executor.database == null) return;
+        executor.database.setRowInsertMeta(schemaName + "." + table.getName(), table, row,
+                executor.session.getTransactionId(), executor.session.getCommandId() + 1);
     }
 }

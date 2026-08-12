@@ -135,23 +135,90 @@ class DmlPartitionHelper {
      * statement wrote to.
      */
     void checkPartitionConstraint(Table leaf, Object[] row) {
-        if (leaf == null || row == null || leaf.getPartitionParent() == null) return;
+        if (belongsIn(leaf, row)) return;
+        MemgresException ex = new MemgresException("new row for relation \""
+                + leaf.getName() + "\" violates partition constraint", "23514");
+        ex.setTable(leaf.getName());
+        ex.setSchema(leaf.getSchemaName());
+        ex.setDetail("Failing row contains ("
+                + executor.constraintValidator.formatRow(leaf, row) + ").");
+        throw ex;
+    }
+
+    /**
+     * Whether every bound above this relation claims the row, which is the whole of the partition
+     * constraint PostgreSQL states for a partition. A relation that is no partition holds anything.
+     */
+    private boolean belongsIn(Table leaf, Object[] row) {
+        if (leaf == null || row == null || leaf.getPartitionParent() == null) return true;
         Table child = leaf;
         Object[] childRow = row;
         for (Table parent = child.getPartitionParent(); parent != null;
                 parent = child.getPartitionParent()) {
             Object value = partitionKey(parent, child, childRow);
-            if (value != NO_KEY && !claimedBy(parent, child, value)) {
-                MemgresException ex = new MemgresException("new row for relation \""
-                        + leaf.getName() + "\" violates partition constraint", "23514");
-                ex.setTable(leaf.getName());
-                ex.setDetail("Failing row contains ("
-                        + executor.constraintValidator.formatRow(leaf, row) + ").");
-                throw ex;
-            }
+            if (value != NO_KEY && !claimedBy(parent, child, value)) return false;
             childRow = child.rowToParent(childRow);
             child = parent;
         }
+        return true;
+    }
+
+    /**
+     * Refuse a copy of a partitioned table's row trigger that has just carried the row out of the
+     * partition it fired on.
+     *
+     * <p>PostgreSQL settles which partition an inserted row belongs to before any row trigger of
+     * that partition runs, so nothing a copy of the partitioned table's trigger does to the key can
+     * send the row elsewhere: it is already bound for the relation whose copy is running. Rather
+     * than write the row where the rewritten key points, PostgreSQL stops at the trigger that moved
+     * it and names the partition the row was on its way to. A trigger written on the partition
+     * itself is no copy and is not reported this way — the row it moved simply fails the bound of
+     * the partition it was headed for.
+     */
+    void checkTriggerKeptRowInPartition(Table leaf, PgTrigger trigger, Object[] row) {
+        if (belongsIn(leaf, row)) return;
+        MemgresException ex = new MemgresException("moving row to another partition during a"
+                + " BEFORE FOR EACH ROW trigger is not supported", "0A000");
+        ex.setDetail("Before executing trigger \"" + trigger.getName() + "\", the row was to be in"
+                + " partition \"" + leaf.getSchemaName() + "." + leaf.getName() + "\".");
+        throw ex;
+    }
+
+    /**
+     * Which partition stores an inserted row, once its BEFORE row triggers have had it.
+     *
+     * <p>PostgreSQL routes a row to its partition before those triggers run, so the partition is
+     * settled by the values the statement wrote and a trigger that rewrites the key does not send
+     * the row anywhere else: what the trigger leaves has to belong where the row it was handed was
+     * already going. Routing a second time on the rewritten key stored the row in whatever
+     * partition the new key named, and that partition's own AFTER triggers fired for a relation the
+     * write had never been routed to.
+     *
+     * @param settled where routing sent the row before the triggers ran, or the relation the
+     *     statement named when nothing had bound the row to a partition yet
+     */
+    Table settledPartition(Table table, Table settled, Object[] row) {
+        return settled == null || settled == table ? routeToPartition(table, row) : settled;
+    }
+
+    /**
+     * Where a row an INSERT is about to write is bound for.
+     *
+     * <p>PostgreSQL settles this before it runs a single row trigger, and before it routes the row
+     * it tests the bound of the relation the statement actually named: a partitioned table that is
+     * itself a partition either holds the row or the write is refused there and then, under that
+     * relation's name rather than under the name of a partition below it. Everything under that
+     * relation is settled by routing, so a row no partition of it will take is refused before any
+     * trigger has had the chance to rewrite the key into one that fits.
+     *
+     * <p>A relation with no partitions of its own routes nowhere, and PostgreSQL tests its bound
+     * only once its row triggers have finished with the row -- which is what lets a trigger on a
+     * partition written to directly settle a key the statement left outside its bound.
+     */
+    Table routeForInsert(Table table, Object[] row) {
+        if (table.getPartitionStrategy() == null) return table;
+        checkPartitionConstraint(table, row);
+        return routeToPartition(table, row);
     }
 
     /** Route an INSERT row to the correct partition, or return the table itself if not partitioned. */

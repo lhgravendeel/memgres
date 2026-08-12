@@ -438,7 +438,8 @@ final class StatementAnalyzer {
         if (columns != null && aliases != null && aliases.size() > columns.size()) {
             // PostgreSQL points at nothing for this one: the fault is the shape of the clause
             // rather than any one word in it.
-            throw new MemgresException("table \"" + itemName(item) + "\" has " + columns.size()
+            throw new MemgresException(FromResolver.aliasedItemNoun(item) + " \"" + itemName(item)
+                    + "\" has " + columns.size()
                     + " columns available but " + aliases.size() + " columns specified", "42P10")
                     .suppressPosition();
         }

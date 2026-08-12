@@ -26,6 +26,12 @@ public final class CreateFunctionStmt implements Statement {
     public final double cost;                 // COST value (-1 means use default)
     public final double rows;                 // ROWS value (-1 means use default)
     public boolean atomicBody;                // true if body was defined via BEGIN ATOMIC
+    /**
+     * Whether the body was written as a SQL-standard one -- BEGIN ATOMIC ... END, or RETURN expr.
+     * PostgreSQL parses one of those where the routine is defined, and only a body it parsed leaves
+     * a recorded dependency on the relations that body names.
+     */
+    public boolean sqlStandardBody;
     public String supportFunction;            // SUPPORT function name (null if not specified)
     /**
      * Whether the definition said what to run at all. An empty body is a body — the one that runs

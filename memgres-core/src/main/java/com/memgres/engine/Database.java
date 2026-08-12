@@ -711,19 +711,38 @@ public class Database {
         return tableRowMeta.computeIfAbsent(tableKey, k -> new IdentityHashMap<>());
     }
 
-    // Per-table ctid counter for generating unique tuple IDs
-    private final Map<String, AtomicLong> tableCtidCounters = new ConcurrentHashMap<>();
-
-    /** Record xmin/cmin metadata for a newly inserted row. */
-    public void setRowInsertMeta(String tableKey, Object[] row, long xmin, long cmin) {
-        long ctid = tableCtidCounters.computeIfAbsent(tableKey, k -> new AtomicLong(0)).incrementAndGet();
+    /**
+     * Record xmin/cmin metadata for a newly inserted row.
+     *
+     * <p>The line pointer comes from the relation that stores the row rather than from a counter
+     * held under its name: a name PostgreSQL has used before says nothing about where the
+     * relation now standing under it puts its tuples, because that relation has a file of its own
+     * and numbers from one again. A counter left behind under a name nothing answers to any more
+     * was also a counter nothing could ever reach.
+     */
+    public void setRowInsertMeta(String tableKey, Table storage, Object[] row, long xmin, long cmin) {
+        long ctid = storage.nextTupleId();
         getRowMeta(tableKey).put(row, new long[]{xmin, 0, cmin, 0, ctid});
     }
 
     /** Update xmin metadata for an updated row (new ctid). */
-    public void setRowUpdateMeta(String tableKey, Object[] row, long xmin, long cmin) {
-        long ctid = tableCtidCounters.computeIfAbsent(tableKey, k -> new AtomicLong(0)).incrementAndGet();
+    public void setRowUpdateMeta(String tableKey, Table storage, Object[] row, long xmin, long cmin) {
+        long ctid = storage.nextTupleId();
         getRowMeta(tableKey).put(row, new long[]{xmin, 0, cmin, 0, ctid});
+    }
+
+    /**
+     * Record which transaction deleted a row.
+     *
+     * <p>PostgreSQL's DELETE does not take the version away: it writes the deleting transaction's
+     * id into that version's xmax and leaves it where it stands, which is what makes
+     * {@code DELETE ... RETURNING xmax} answer the id rather than zero. The mark stays whatever
+     * becomes of the transaction, so a row a rolled-back DELETE puts back still names the
+     * transaction that tried to remove it.
+     */
+    public void setRowDeleteMeta(String tableKey, Object[] row, long xmax) {
+        long[] meta = getRowMeta(tableKey).get(row);
+        if (meta != null && meta.length > 1) meta[1] = xmax;
     }
 
     /** Remove row metadata (on delete). */
@@ -2631,6 +2650,25 @@ public class Database {
     }
 
     /**
+     * Drop every rule that goes when this relation goes: the ones written on it, and the ones
+     * written on some other relation whose actions name it.
+     *
+     * <p>PostgreSQL records what a rule's actions name as a dependency of the rule itself, which is
+     * why a DROP of one of those relations is refused without CASCADE and deletes the rule with
+     * CASCADE. A rule left standing reached for a relation that was no longer there, so the
+     * relation the rule sits on could not be written to at all -- a relation in one schema became
+     * unwritable because some other schema had been dropped, and the write that found out lost its
+     * row. The relation a rule sits on belongs to a schema, so only the rules that named this one
+     * go; another schema's relation of the same name is nothing to them.
+     */
+    public void dropRulesGoingWith(String schema, String table) {
+        for (String[] dependent : rulesDependingOn(schema, table)) {
+            removeRule(dependent[2], dependent[0], dependent[1]);
+        }
+        dropRulesOn(schema, table);
+    }
+
+    /**
      * Everything some rules amount to, so that a DROP which is rolled back brings them back with
      * it. PostgreSQL deletes the rules along with what they belong to and restores both together;
      * keeping only the relation left it standing without the rules it was written with, and they
@@ -2658,6 +2696,38 @@ public class Database {
             if (ruleInSchema(r, schema)) carried.add(r);
         }
         return snapshotOf(carried);
+    }
+
+    /**
+     * What {@link #dropRulesGoingWith} is about to take away, or null where there is nothing.
+     *
+     * <p>PostgreSQL rolls a catalogue change back whole, so a drop that took both the rules a
+     * relation carried and the rules elsewhere that named it has to bring both back together.
+     */
+    public RuleSnapshot snapshotRulesGoingWith(String schema, String table) {
+        List<StoredRule> carried = new ArrayList<>();
+        for (String[] dependent : rulesDependingOn(schema, table)) {
+            StoredRule rule = findRule(dependent[2], dependent[0], dependent[1]);
+            if (rule != null && !carried.contains(rule)) carried.add(rule);
+        }
+        List<StoredRule> underName = relationRules.get(table.toLowerCase());
+        if (underName != null) {
+            for (StoredRule r : underName) {
+                if (ruleInSchema(r, schema) && !carried.contains(r)) carried.add(r);
+            }
+        }
+        return snapshotOf(carried);
+    }
+
+    /**
+     * Put a schema back exactly as it was, for a DROP SCHEMA that has been rolled back.
+     *
+     * <p>The schema object holds its relations and what another session's still-open transaction
+     * may see of them, so the rollback restores the object the drop took away rather than building
+     * a fresh one under the name and losing that with it.
+     */
+    public void restoreSchema(Schema schema) {
+        if (schema != null) schemas.put(schema.getName(), schema);
     }
 
     /**

@@ -215,6 +215,13 @@ class PgWireCopyHandler {
             throw refusal;
         }
 
+        // PostgreSQL opens the copy before it fires anything, so the relation's BEFORE statement
+        // triggers run here rather than while the statement was still being judged: one that
+        // refuses the copy is reported after the client has been told to send its data, and copy
+        // mode is never entered, so what it sends on the strength of the CopyInResponse is read
+        // and thrown away.
+        session.beginCopyFrom(copyStmt);
+
         inCopyFromMode = true;
         activeCopyStmt = copyStmt;
         copyBuffer = new ByteArrayOutputStream();
@@ -332,6 +339,16 @@ class PgWireCopyHandler {
                 sendNotice(ctx, copySkippedCount == 1
                         ? "1 row was skipped due to data type incompatibility"
                         : copySkippedCount + " rows were skipped due to data type incompatibility");
+            }
+            // A COPY is one statement, so what it still owes once its last row has gone in is owed
+            // once: every AFTER row trigger it held back, and then the relation's AFTER statement
+            // triggers over everything it wrote. A refusal from either is the statement's refusal
+            // and takes the rows back out with it.
+            try {
+                session.finishCopyFrom();
+            } catch (RuntimeException endOfCopy) {
+                rollbackCopyRows(insertedRows);
+                throw endOfCopy;
             }
             PgWireHandler.sendCommandComplete(ctx, "COPY " + copyRowCount);
         } catch (MemgresException e) {
@@ -662,6 +679,8 @@ class PgWireCopyHandler {
     }
 
     private void resetCopyState() {
+        // A copy that ended without finishing owes nothing: its rows have gone back out again.
+        session.discardCopyFrom();
         inCopyFromMode = false;
         activeCopyStmt = null;
         copyBuffer = null;

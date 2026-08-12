@@ -459,6 +459,76 @@ public class AstExecutor {
     }
 
     /**
+     * How many rows a statement of this shape writes into the catalogue.
+     *
+     * <p>PostgreSQL spends a command identifier on each of them, so a statement that takes a
+     * relation down spends more than one: dropping a table retires the relation, its composite
+     * type and that type's array type, and dropping a view retires its rewrite rule beside those
+     * three. Creating a view writes the relation and the rule; creating a sequence writes the
+     * relation and the row holding its state. A name nothing answers to costs nothing, which is
+     * why DROP ... IF EXISTS over a relation that is not there leaves the counter alone. Zero
+     * here leaves the statement to the rule that a write takes exactly one.
+     */
+    private int catalogRowsWrittenBy(Statement stmt) {
+        if (stmt instanceof CreateViewStmt) {
+            return ((CreateViewStmt) stmt).materialized ? 0 : 2;
+        }
+        if (stmt instanceof CreateSequenceStmt) {
+            CreateSequenceStmt create = (CreateSequenceStmt) stmt;
+            if (create.ifNotExists() && database.getSequence(create.name()) != null) return 0;
+            return 2;
+        }
+        if (stmt instanceof DropTableStmt) {
+            DropTableStmt drop = (DropTableStmt) stmt;
+            int relations = relationsBehind(drop.schema(), drop.name());
+            for (String also : drop.additionalTables()) relations += relationsBehind(null, also);
+            return 3 * relations;
+        }
+        if (stmt instanceof DropStmt) {
+            int rows = 0;
+            for (DropStmt one : DropStmt.allOf((DropStmt) stmt)) {
+                if (one.objectType() != DropStmt.ObjectType.VIEW) continue;
+                if (database.getView(one.schema(), one.name()) != null) rows += 4;
+            }
+            return rows;
+        }
+        return 0;
+    }
+
+    /**
+     * How many relations a DROP TABLE of this name takes down: the relation itself and, where it
+     * is partitioned, every partition below it, because those go with it.
+     */
+    private int relationsBehind(String schema, String name) {
+        if (name == null) return 0;
+        String bare = name;
+        String where = schema;
+        int dot = bare.indexOf('.');
+        if (where == null && dot > 0) {
+            where = bare.substring(0, dot);
+            bare = bare.substring(dot + 1);
+        }
+        Table found = null;
+        if (where != null) {
+            Schema holder = database.getSchema(where.toLowerCase());
+            found = holder == null ? null : holder.getTable(bare.toLowerCase());
+        } else {
+            for (String path : relationSearchPath()) {
+                Schema holder = database.getSchema(path);
+                found = holder == null ? null : holder.getTable(bare.toLowerCase());
+                if (found != null) break;
+            }
+        }
+        return found == null ? 0 : countWithPartitions(found);
+    }
+
+    private static int countWithPartitions(Table relation) {
+        int total = 1;
+        for (Table partition : relation.getPartitions()) total += countWithPartitions(partition);
+        return total;
+    }
+
+    /**
      * H37: extract the DateStyle field order ("MDY"/"DMY"/"YMD") from the session GUC.
      * The stored value is normalized (e.g. "ISO, DMY"); default is "MDY".
      */
@@ -496,6 +566,7 @@ public class AstExecutor {
         // so a write consumes one whether or not any row turned out to match: an UPDATE that found
         // nothing still moves the counter that the next statement's cmin reports.
         if (writesRows(stmt)) session.noteCommandIdUsed();
+        session.noteCatalogRowsWritten(catalogRowsWrittenBy(stmt));
         boolean failed = true;
         try {
             QueryResult result = executeStatementInner(stmt);

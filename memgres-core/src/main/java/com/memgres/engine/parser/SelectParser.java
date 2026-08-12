@@ -1598,7 +1598,8 @@ class SelectParser {
                     // Build a synthetic SelectStmt that selects everything from the inner FROM item
                     SelectStmt syntheticSelect = new SelectStmt(
                             false, Cols.listOf(new SelectStmt.SelectTarget(new WildcardExpr(), null)),
-                            Cols.listOf(inner), null, null, null, null, null, null);
+                            Cols.listOf(inner), null, null, null, null, null, null)
+                            .asJoinExpression();
                     return new SelectStmt.SubqueryFrom(syntheticSelect, parenAlias, lateral, columnAliases);
                 }
                 return inner;

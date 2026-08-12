@@ -172,7 +172,7 @@ $fn$;
 SELECT s05_with_default() AS value;
 
 -------------------------------------------------------------------------------
--- S06: declaration %TYPE / %ROWTYPE create catalog dependencies
+-- S06: a declaration naming a relation creates no catalog dependency
 -------------------------------------------------------------------------------
 CREATE TABLE s06_items (
   id integer PRIMARY KEY,
@@ -199,10 +199,14 @@ INSERT INTO s06_items(id, title) VALUES (1, 'dep-ok');
 -- end-expected
 SELECT s06_uses_rowtype() AS value;
 
--- expect-error
+-- A PL/pgSQL routine's body is text the catalog does not read, so nothing written in it -- a
+-- %ROWTYPE declaration as much as a query -- is recorded as depending on the relation it names.
+-- RESTRICT therefore has nothing to refuse, and the routine is left pointing at a relation that
+-- is no longer there, which is what the call below finds out at run time.
 DROP TABLE s06_items RESTRICT;
 
-DROP TABLE s06_items CASCADE;
+-- expect-error: 42P01
+SELECT s06_uses_rowtype();
 
 -------------------------------------------------------------------------------
 -- S07: plain body-only reference may not block DROP ... RESTRICT the same way

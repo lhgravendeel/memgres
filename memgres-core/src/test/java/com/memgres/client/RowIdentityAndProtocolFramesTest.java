@@ -1596,4 +1596,997 @@ class RowIdentityAndProtocolFramesTest {
             run(c, "DROP TABLE pbf_x");
         }
     }
+
+    // ------------------------------------------------------------ helpers for the sections below
+
+    /** The SQLSTATE a statement raises on a session of its own, or "OK" when it does not raise. */
+    private static String stateOn(Connection c, String sql) {
+        try {
+            run(c, sql);
+            return "OK";
+        } catch (SQLException e) {
+            return e.getSQLState();
+        }
+    }
+
+    /** The primary message of a server error, without the severity or the position. */
+    private static String primary(SQLException e) {
+        if (e instanceof org.postgresql.util.PSQLException
+                && ((org.postgresql.util.PSQLException) e).getServerErrorMessage() != null) {
+            return ((org.postgresql.util.PSQLException) e).getServerErrorMessage().getMessage();
+        }
+        return e.getMessage();
+    }
+
+    /**
+     * A reader at {@code level} takes its snapshot, a second session writes the row the reader is
+     * about to lock, and the lock is issued while that write is still uncommitted. Returns what
+     * the lock answered once the writer finished -- its rows, or "ERR[sqlstate] message" -- having
+     * first established that the lock really waited for the writer rather than answering off the
+     * snapshot's own copy of the row.
+     */
+    private static String whileAnotherSessionHolds(String level, String snapshot, String write,
+            boolean writerCommits, String lock) throws Exception {
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try (Connection reader = session(); Connection writer = session()) {
+            run(reader, "BEGIN ISOLATION LEVEL " + level);
+            rows(reader, snapshot);
+            run(writer, "BEGIN", write);
+            Future<String> waiting = pool.submit(new Callable<String>() {
+                @Override
+                public String call() {
+                    try {
+                        return String.join(",", rows(reader, lock));
+                    } catch (SQLException e) {
+                        return "ERR[" + e.getSQLState() + "] " + primary(e);
+                    }
+                }
+            });
+            Thread.sleep(400);
+            assertFalse(waiting.isDone(), "the lock did not wait for the writer");
+            run(writer, writerCommits ? "COMMIT" : "ROLLBACK");
+            String answer = waiting.get(20, TimeUnit.SECONDS);
+            run(reader, "ROLLBACK");
+            return answer;
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    /**
+     * The same shape for a lock that is not supposed to wait at all, so it is asked in the
+     * foreground while the writer still holds the row. The writer then takes its write back.
+     */
+    private static String withoutWaitingFor(String level, String snapshot, String write,
+            String lock) throws SQLException {
+        try (Connection reader = session(); Connection writer = session()) {
+            run(reader, "BEGIN ISOLATION LEVEL " + level);
+            rows(reader, snapshot);
+            run(writer, "BEGIN", write);
+            String answer = promptly(reader, lock);
+            run(writer, "ROLLBACK");
+            run(reader, "ROLLBACK");
+            return answer;
+        }
+    }
+
+    /** A statement asked with a deadline, so a lock that waits fails rather than hangs. */
+    private static String promptly(Connection c, String sql) {
+        try (Statement s = c.createStatement()) {
+            s.setQueryTimeout(10);
+            try (ResultSet rs = s.executeQuery(sql)) {
+                List<String> got = new ArrayList<>();
+                int n = rs.getMetaData().getColumnCount();
+                while (rs.next()) {
+                    StringBuilder sb = new StringBuilder();
+                    for (int i = 1; i <= n; i++) {
+                        if (i > 1) sb.append('|');
+                        sb.append(rs.getString(i));
+                    }
+                    got.add(sb.toString());
+                }
+                return got.isEmpty() ? "(no rows)" : String.join(",", got);
+            }
+        } catch (SQLException e) {
+            return "ERR[" + e.getSQLState() + "] " + primary(e);
+        }
+    }
+
+    // ============================================================ The line pointers a relation
+    // hands out are its own, and begin at one
+
+    @Test
+    void aRelationCreatedUnderAUsedNameNumbersItsTuplesFromOne() throws SQLException {
+        try (Connection c = session()) {
+            run(c, "CREATE TABLE lpr_a (i int)", "INSERT INTO lpr_a VALUES (1),(2)");
+            assertEquals(List.of("(0,1)|1", "(0,2)|2"),
+                    rows(c, "SELECT ctid::text, i FROM lpr_a ORDER BY i"));
+            // The file belongs to the relation, not to the name: a new relation has a new file.
+            run(c, "DROP TABLE lpr_a", "CREATE TABLE lpr_a (i int)",
+                    "INSERT INTO lpr_a VALUES (1),(2)");
+            assertEquals(List.of("(0,1)|1", "(0,2)|2"),
+                    rows(c, "SELECT ctid::text, i FROM lpr_a ORDER BY i"));
+            // The same inside one transaction: the name reaches a different relation afterwards.
+            run(c, "BEGIN", "DROP TABLE lpr_a", "CREATE TABLE lpr_a (i int)",
+                    "INSERT INTO lpr_a VALUES (7)", "COMMIT");
+            assertEquals(List.of("(0,1)|7"), rows(c, "SELECT ctid::text, i FROM lpr_a ORDER BY i"));
+            run(c, "DROP TABLE lpr_a");
+        }
+    }
+
+    @Test
+    void aDropThatIsRolledBackLeavesTheNumberingWhereItWas() throws SQLException {
+        try (Connection c = session()) {
+            run(c, "CREATE TABLE lpr_b (i int)", "INSERT INTO lpr_b VALUES (1),(2)",
+                    "BEGIN", "DROP TABLE lpr_b", "ROLLBACK", "INSERT INTO lpr_b VALUES (3)");
+            assertEquals(List.of("(0,1)|1", "(0,2)|2", "(0,3)|3"),
+                    rows(c, "SELECT ctid::text, i FROM lpr_b ORDER BY i"));
+            run(c, "DROP TABLE lpr_b");
+            // A drop and a re-create rolled back together leave the first relation's file, and its
+            // numbering, exactly where they were -- the place (0,1) is not handed out twice.
+            run(c, "CREATE TABLE lpr_c (i int)", "INSERT INTO lpr_c VALUES (1),(2)",
+                    "BEGIN", "DROP TABLE lpr_c", "CREATE TABLE lpr_c (i int)",
+                    "INSERT INTO lpr_c VALUES (9)");
+            assertEquals(List.of("(0,1)|9"), rows(c, "SELECT ctid::text, i FROM lpr_c ORDER BY i"));
+            run(c, "ROLLBACK", "INSERT INTO lpr_c VALUES (3)");
+            assertEquals(List.of("(0,1)|1", "(0,2)|2", "(0,3)|3"),
+                    rows(c, "SELECT ctid::text, i FROM lpr_c ORDER BY i"));
+            run(c, "DROP TABLE lpr_c");
+        }
+    }
+
+    @Test
+    void aRenameAndAMoveToAnotherSchemaCarryTheNumberingAlong() throws SQLException {
+        exec("CREATE TABLE lpr_d (i int)");
+        exec("INSERT INTO lpr_d VALUES (1),(2)");
+        exec("ALTER TABLE lpr_d RENAME TO lpr_d2");
+        exec("INSERT INTO lpr_d2 VALUES (3)");
+        assertEquals(List.of("(0,1)|1", "(0,2)|2", "(0,3)|3"),
+                rows("SELECT ctid::text, i FROM lpr_d2 ORDER BY i"));
+        exec("CREATE SCHEMA lpr_s");
+        exec("ALTER TABLE lpr_d2 SET SCHEMA lpr_s");
+        exec("INSERT INTO lpr_s.lpr_d2 VALUES (4)");
+        assertEquals(List.of("(0,1)|1", "(0,2)|2", "(0,3)|3", "(0,4)|4"),
+                rows("SELECT ctid::text, i FROM lpr_s.lpr_d2 ORDER BY i"));
+        exec("DROP TABLE lpr_s.lpr_d2");
+        exec("DROP SCHEMA lpr_s");
+    }
+
+    @Test
+    void twoRelationsOfOneNameInTwoSchemasNumberTheirTuplesApart() throws SQLException {
+        exec("CREATE SCHEMA lpr_t");
+        exec("CREATE TABLE lpr_e (i int)");
+        exec("CREATE TABLE lpr_t.lpr_e (i int)");
+        exec("INSERT INTO lpr_e VALUES (1),(2),(3)");
+        exec("INSERT INTO lpr_t.lpr_e VALUES (1)");
+        // Dropping one leaves the other's numbering exactly where it stood.
+        exec("DROP TABLE lpr_e");
+        exec("INSERT INTO lpr_t.lpr_e VALUES (2)");
+        assertEquals(List.of("(0,1)|1", "(0,2)|2"),
+                rows("SELECT ctid::text, i FROM lpr_t.lpr_e ORDER BY i"));
+        exec("CREATE TABLE lpr_e (i int)");
+        exec("INSERT INTO lpr_e VALUES (7)");
+        assertEquals(List.of("(0,1)|7"), rows("SELECT ctid::text, i FROM lpr_e ORDER BY i"));
+        exec("DROP TABLE lpr_e");
+        exec("DROP SCHEMA lpr_t CASCADE");
+    }
+
+    @Test
+    void aPartitionedRelationReCreatedUnderTheSameNameBeginsAtOne() throws SQLException {
+        exec("CREATE TABLE lpr_f (i int) PARTITION BY RANGE (i)");
+        exec("CREATE TABLE lpr_f0 PARTITION OF lpr_f FOR VALUES FROM (0) TO (100)");
+        exec("INSERT INTO lpr_f VALUES (1),(2)");
+        exec("DROP TABLE lpr_f");
+        exec("CREATE TABLE lpr_f (i int) PARTITION BY RANGE (i)");
+        exec("CREATE TABLE lpr_f0 PARTITION OF lpr_f FOR VALUES FROM (0) TO (100)");
+        exec("INSERT INTO lpr_f VALUES (3),(4)");
+        assertEquals(List.of("(0,1)|3", "(0,2)|4"),
+                rows("SELECT ctid::text, i FROM lpr_f ORDER BY i"));
+        exec("DROP TABLE lpr_f");
+    }
+
+    @Test
+    void truncateHandsTheRelationANewFileAndADeleteOfEveryRowDoesNot() throws SQLException {
+        try (Connection c = session()) {
+            run(c, "CREATE TABLE lpr_g (i int)", "INSERT INTO lpr_g VALUES (1),(2)",
+                    "TRUNCATE lpr_g", "INSERT INTO lpr_g VALUES (3),(4)");
+            assertEquals(List.of("(0,1)|3", "(0,2)|4"),
+                    rows(c, "SELECT ctid::text, i FROM lpr_g ORDER BY i"));
+            run(c, "BEGIN", "TRUNCATE lpr_g", "ROLLBACK", "INSERT INTO lpr_g VALUES (5)");
+            assertEquals(List.of("(0,1)|3", "(0,2)|4", "(0,3)|5"),
+                    rows(c, "SELECT ctid::text, i FROM lpr_g ORDER BY i"));
+            // A DELETE of every row leaves the file alone, so the numbering goes on.
+            run(c, "DELETE FROM lpr_g", "INSERT INTO lpr_g VALUES (6)");
+            assertEquals(List.of("(0,4)|6"), rows(c, "SELECT ctid::text, i FROM lpr_g ORDER BY i"));
+            run(c, "DROP TABLE lpr_g");
+        }
+    }
+
+    // ============================================================ A write refused after its row
+    // was written has already spent the place
+
+    @Test
+    void aWriteRefusedByAnIndexHasAlreadySpentItsLinePointer() throws SQLException {
+        exec("CREATE TABLE lpr_h (i int PRIMARY KEY)");
+        exec("INSERT INTO lpr_h VALUES (1)");
+        assertEquals("23505", stateOf("INSERT INTO lpr_h VALUES (1)"));
+        exec("INSERT INTO lpr_h VALUES (2)");
+        assertEquals(List.of("(0,1)|1", "(0,3)|2"),
+                rows("SELECT ctid::text, i FROM lpr_h ORDER BY i"));
+        // Every row the statement had already written took a place as well.
+        assertEquals("23505", stateOf("INSERT INTO lpr_h VALUES (5),(1),(6)"));
+        exec("INSERT INTO lpr_h VALUES (3)");
+        assertEquals(List.of("(0,1)|1", "(0,3)|2", "(0,6)|3"),
+                rows("SELECT ctid::text, i FROM lpr_h ORDER BY i"));
+        exec("DROP TABLE lpr_h");
+        // An INSERT ... SELECT is the same write in another spelling.
+        exec("CREATE TABLE lpr_j (i int PRIMARY KEY)");
+        exec("CREATE TABLE lpr_js (i int)");
+        exec("INSERT INTO lpr_j VALUES (1)");
+        exec("INSERT INTO lpr_js VALUES (5),(1),(6)");
+        assertEquals("23505", stateOf("INSERT INTO lpr_j SELECT i FROM lpr_js ORDER BY i"));
+        exec("INSERT INTO lpr_j VALUES (9)");
+        assertEquals(List.of("(0,1)|1", "(0,3)|9"),
+                rows("SELECT ctid::text, i FROM lpr_j ORDER BY i"));
+        exec("DROP TABLE lpr_j");
+        exec("DROP TABLE lpr_js");
+    }
+
+    @Test
+    void aWriteRefusedForAMissingParentRowHasAlreadySpentItsLinePointer() throws SQLException {
+        exec("CREATE TABLE lpr_kp (i int PRIMARY KEY)");
+        exec("INSERT INTO lpr_kp VALUES (1)");
+        exec("CREATE TABLE lpr_k (i int REFERENCES lpr_kp(i))");
+        exec("INSERT INTO lpr_k VALUES (1)");
+        assertEquals("23503", stateOf("INSERT INTO lpr_k VALUES (9)"));
+        exec("INSERT INTO lpr_k VALUES (1)");
+        assertEquals(List.of("(0,1)|1", "(0,3)|1"),
+                rows("SELECT ctid::text, i FROM lpr_k ORDER BY ctid"));
+        exec("DROP TABLE lpr_k");
+        exec("DROP TABLE lpr_kp");
+    }
+
+    @Test
+    void aReferenceLeftToTheEndOfTheTransactionSpendsThePlaceJustTheSame() throws SQLException {
+        try (Connection c = session()) {
+            run(c, "CREATE TABLE lpr_mp (i int PRIMARY KEY)", "INSERT INTO lpr_mp VALUES (1)",
+                    "CREATE TABLE lpr_m (i int REFERENCES lpr_mp(i) DEFERRABLE INITIALLY DEFERRED)",
+                    "INSERT INTO lpr_m VALUES (1)",
+                    "BEGIN", "INSERT INTO lpr_m VALUES (9)");
+            // The row was written when the statement ran; only the reference waited.
+            assertEquals("23503", stateOn(c, "COMMIT"));
+            run(c, "INSERT INTO lpr_m VALUES (1)");
+            assertEquals(List.of("(0,1)|1", "(0,3)|1"),
+                    rows(c, "SELECT ctid::text, i FROM lpr_m ORDER BY ctid"));
+            run(c, "DROP TABLE lpr_m", "DROP TABLE lpr_mp");
+        }
+    }
+
+    @Test
+    void aPartitionsOwnIndexAndAMergeInsertSpendThePlaceTheRowSatOn() throws SQLException {
+        exec("CREATE TABLE lpr_n (i int PRIMARY KEY) PARTITION BY RANGE (i)");
+        exec("CREATE TABLE lpr_n0 PARTITION OF lpr_n FOR VALUES FROM (0) TO (100)");
+        exec("INSERT INTO lpr_n VALUES (1)");
+        assertEquals("23505", stateOf("INSERT INTO lpr_n VALUES (1)"));
+        exec("INSERT INTO lpr_n VALUES (2)");
+        assertEquals(List.of("(0,1)|1", "(0,3)|2"),
+                rows("SELECT ctid::text, i FROM lpr_n ORDER BY i"));
+        exec("DROP TABLE lpr_n");
+
+        exec("CREATE TABLE lpr_p (i int PRIMARY KEY, s text)");
+        exec("CREATE TABLE lpr_ps (i int, s text)");
+        exec("INSERT INTO lpr_p VALUES (1,'a')");
+        exec("INSERT INTO lpr_ps VALUES (1,'b')");
+        assertEquals("23505", stateOf("MERGE INTO lpr_p t USING lpr_ps u ON t.i = u.i + 100"
+                + " WHEN NOT MATCHED THEN INSERT VALUES (u.i, u.s)"));
+        exec("INSERT INTO lpr_p VALUES (2,'c')");
+        assertEquals(List.of("(0,1)|1", "(0,3)|2"),
+                rows("SELECT ctid::text, i FROM lpr_p ORDER BY i"));
+        exec("DROP TABLE lpr_p");
+        exec("DROP TABLE lpr_ps");
+
+        // An exclusion constraint is read off an index too, so it is found after the write.
+        exec("CREATE TABLE lpr_q (i int, EXCLUDE (i WITH =))");
+        exec("INSERT INTO lpr_q VALUES (1)");
+        assertEquals("23P01", stateOf("INSERT INTO lpr_q VALUES (1)"));
+        exec("INSERT INTO lpr_q VALUES (2)");
+        assertEquals(List.of("(0,1)|1", "(0,3)|2"),
+                rows("SELECT ctid::text, i FROM lpr_q ORDER BY i"));
+        exec("DROP TABLE lpr_q");
+    }
+
+    @Test
+    void anAfterTriggerSpendsThePlaceAndABeforeTriggerDoesNot() throws SQLException {
+        exec("CREATE FUNCTION lpr_raise() RETURNS trigger AS $$ BEGIN"
+                + " IF NEW.i = 99 THEN RAISE EXCEPTION 'refused by the trigger'; END IF;"
+                + " RETURN NEW; END $$ LANGUAGE plpgsql");
+        // An AFTER trigger runs once the row is in the relation.
+        exec("CREATE TABLE lpr_r (i int)");
+        exec("CREATE TRIGGER lpr_r_after AFTER INSERT ON lpr_r"
+                + " FOR EACH ROW EXECUTE FUNCTION lpr_raise()");
+        exec("INSERT INTO lpr_r VALUES (1)");
+        assertEquals("P0001", stateOf("INSERT INTO lpr_r VALUES (99)"));
+        exec("INSERT INTO lpr_r VALUES (2)");
+        assertEquals(List.of("(0,1)|1", "(0,3)|2"),
+                rows("SELECT ctid::text, i FROM lpr_r ORDER BY i"));
+        exec("DROP TABLE lpr_r");
+        // A BEFORE trigger runs first, so the row never reached the relation.
+        exec("CREATE TABLE lpr_u (i int)");
+        exec("CREATE TRIGGER lpr_u_before BEFORE INSERT ON lpr_u"
+                + " FOR EACH ROW EXECUTE FUNCTION lpr_raise()");
+        exec("INSERT INTO lpr_u VALUES (1)");
+        assertEquals("P0001", stateOf("INSERT INTO lpr_u VALUES (99)"));
+        exec("INSERT INTO lpr_u VALUES (2)");
+        assertEquals(List.of("(0,1)|1", "(0,2)|2"),
+                rows("SELECT ctid::text, i FROM lpr_u ORDER BY i"));
+        exec("DROP TABLE lpr_u");
+        exec("DROP FUNCTION lpr_raise()");
+    }
+
+    @Test
+    void aWriteRefusedBeforeItReachedTheRelationSpendsNothing() throws SQLException {
+        exec("CREATE TABLE lpr_v (i int NOT NULL CHECK (i > 0))");
+        exec("INSERT INTO lpr_v VALUES (1)");
+        assertEquals("23502", stateOf("INSERT INTO lpr_v VALUES (NULL)"));
+        assertEquals("23514", stateOf("INSERT INTO lpr_v VALUES (-1)"));
+        assertEquals("22P02", stateOf("INSERT INTO lpr_v VALUES ('x')"));
+        exec("INSERT INTO lpr_v VALUES (2)");
+        assertEquals(List.of("(0,1)|1", "(0,2)|2"),
+                rows("SELECT ctid::text, i FROM lpr_v ORDER BY i"));
+        exec("DROP TABLE lpr_v");
+        // A row that belongs in no partition never reached a relation either.
+        exec("CREATE TABLE lpr_w (i int) PARTITION BY RANGE (i)");
+        exec("CREATE TABLE lpr_w0 PARTITION OF lpr_w FOR VALUES FROM (0) TO (10)");
+        exec("INSERT INTO lpr_w VALUES (1)");
+        assertEquals("23514", stateOf("INSERT INTO lpr_w VALUES (50)"));
+        exec("INSERT INTO lpr_w VALUES (2)");
+        assertEquals(List.of("(0,1)|1", "(0,2)|2"),
+                rows("SELECT ctid::text, i FROM lpr_w ORDER BY i"));
+        exec("DROP TABLE lpr_w");
+        // A generation expression is worked out before the row is written.
+        exec("CREATE TABLE lpr_x (i int, j int GENERATED ALWAYS AS (10 / i) STORED)");
+        exec("INSERT INTO lpr_x VALUES (1)");
+        assertEquals("22012", stateOf("INSERT INTO lpr_x VALUES (0)"));
+        exec("INSERT INTO lpr_x VALUES (2)");
+        assertEquals(List.of("(0,1)|1", "(0,2)|2"),
+                rows("SELECT ctid::text, i FROM lpr_x ORDER BY i"));
+        exec("DROP TABLE lpr_x");
+    }
+
+    @Test
+    void whatTheTransactionBecomesDoesNotGiveThePlaceBack() throws SQLException {
+        try (Connection c = session()) {
+            run(c, "CREATE TABLE lpr_y (i int PRIMARY KEY)", "INSERT INTO lpr_y VALUES (1)",
+                    "BEGIN", "SAVEPOINT sp");
+            assertEquals("23505", stateOn(c, "INSERT INTO lpr_y VALUES (1)"));
+            run(c, "ROLLBACK TO SAVEPOINT sp", "INSERT INTO lpr_y VALUES (2)", "COMMIT");
+            assertEquals(List.of("(0,1)|1", "(0,3)|2"),
+                    rows(c, "SELECT ctid::text, i FROM lpr_y ORDER BY i"));
+            run(c, "DROP TABLE lpr_y");
+            // A row a whole transaction takes back leaves its place spent as well.
+            run(c, "CREATE TABLE lpr_z (i int PRIMARY KEY)", "INSERT INTO lpr_z VALUES (1)",
+                    "BEGIN", "INSERT INTO lpr_z VALUES (2)", "ROLLBACK",
+                    "INSERT INTO lpr_z VALUES (3)");
+            assertEquals(List.of("(0,1)|1", "(0,3)|3"),
+                    rows(c, "SELECT ctid::text, i FROM lpr_z ORDER BY i"));
+            run(c, "DROP TABLE lpr_z");
+        }
+    }
+
+    @Test
+    void anUpdateWritesItsNewVersionElsewhereAndARefusedOneSpendsThatPlace() throws SQLException {
+        exec("CREATE TABLE lpr_aa (i int UNIQUE)");
+        exec("INSERT INTO lpr_aa VALUES (1),(2)");
+        assertEquals("23505", stateOf("UPDATE lpr_aa SET i = 1 WHERE i = 2"));
+        exec("INSERT INTO lpr_aa VALUES (3)");
+        assertEquals(List.of("(0,1)|1", "(0,2)|2", "(0,4)|3"),
+                rows("SELECT ctid::text, i FROM lpr_aa ORDER BY i"));
+        exec("UPDATE lpr_aa SET i = i * 10 WHERE i = 1");
+        exec("INSERT INTO lpr_aa VALUES (4)");
+        assertEquals(List.of("(0,2)|2", "(0,4)|3", "(0,6)|4", "(0,5)|10"),
+                rows("SELECT ctid::text, i FROM lpr_aa ORDER BY i"));
+        exec("DROP TABLE lpr_aa");
+    }
+
+    @Test
+    void onConflictPassesOverARowForNothingAndRewritesOneSomewhereElse() throws SQLException {
+        exec("CREATE TABLE lpr_ab (i int PRIMARY KEY, s text)");
+        exec("INSERT INTO lpr_ab VALUES (1,'a')");
+        exec("INSERT INTO lpr_ab VALUES (1,'b') ON CONFLICT DO NOTHING");
+        exec("INSERT INTO lpr_ab VALUES (2,'c')");
+        assertEquals(List.of("(0,1)|1|a", "(0,2)|2|c"),
+                rows("SELECT ctid::text, i, s FROM lpr_ab ORDER BY i"));
+        exec("INSERT INTO lpr_ab VALUES (1,'d') ON CONFLICT (i) DO UPDATE SET s = 'e'");
+        exec("INSERT INTO lpr_ab VALUES (3,'f')");
+        assertEquals(List.of("(0,3)|1|e", "(0,2)|2|c", "(0,4)|3|f"),
+                rows("SELECT ctid::text, i, s FROM lpr_ab ORDER BY i"));
+        exec("DROP TABLE lpr_ab");
+    }
+
+    // ============================================================ Who removed the row
+
+    @Test
+    void deleteReturningXmaxNamesTheDeletingTransaction() throws SQLException {
+        exec("CREATE TABLE xmk_a (i int)");
+        exec("INSERT INTO xmk_a VALUES (1),(2),(3),(4)");
+        // A row nobody has removed is marked with nobody.
+        assertEquals(List.of("1|0", "2|0", "3|0", "4|0"),
+                rows("SELECT i, xmax::text FROM xmk_a ORDER BY i"));
+        assertEquals(List.of("1|t"), rows("DELETE FROM xmk_a WHERE i = 1"
+                + " RETURNING i, xmax = pg_current_xact_id()::text::xid AS mine"));
+        // Every row one DELETE takes is marked by the same transaction.
+        assertEquals(List.of("2|t", "3|t"), rows("DELETE FROM xmk_a WHERE i IN (2,3)"
+                + " RETURNING i, xmax = pg_current_xact_id()::text::xid AS mine"));
+        // A DELETE read through a modifying WITH item is marked the same way.
+        assertEquals(List.of("4|t"),
+                rows("WITH d AS (DELETE FROM xmk_a WHERE i = 4 RETURNING i, xmax)"
+                        + " SELECT i, xmax = pg_current_xact_id()::text::xid AS mine FROM d"));
+        exec("DROP TABLE xmk_a");
+    }
+
+    @Test
+    void insertAndUpdateReturningXmaxAnswerZero() throws SQLException {
+        // The control for the DELETE above: what an INSERT and an UPDATE report is the version
+        // they wrote, whose xmax is nobody's yet.
+        exec("CREATE TABLE xmk_b (i int)");
+        assertEquals(List.of("5|0"), rows("INSERT INTO xmk_b VALUES (5) RETURNING i, xmax::text"));
+        assertEquals(List.of("20|0"),
+                rows("UPDATE xmk_b SET i = 20 WHERE i = 5 RETURNING i, xmax::text"));
+        try (Connection c = session()) {
+            run(c, "BEGIN");
+            assertEquals(List.of("6|0"),
+                    rows(c, "INSERT INTO xmk_b VALUES (6) RETURNING i, xmax::text"));
+            assertEquals(List.of("21|0"),
+                    rows(c, "UPDATE xmk_b SET i = 21 WHERE i = 20 RETURNING i, xmax::text"));
+            run(c, "COMMIT");
+        }
+        assertEquals(List.of("6|f", "21|f"),
+                rows("SELECT i, xmax::text <> '0' AS marked FROM xmk_b ORDER BY i"));
+        exec("DROP TABLE xmk_b");
+    }
+
+    @Test
+    void theMarkStaysOnTheVersionARolledBackDeletePutBack() throws SQLException {
+        try (Connection c = session()) {
+            run(c, "CREATE TABLE xmk_c (i int)", "INSERT INTO xmk_c VALUES (1),(2)",
+                    "BEGIN", "DELETE FROM xmk_c WHERE i = 1", "ROLLBACK");
+            assertEquals(List.of("1|t", "2|f"),
+                    rows(c, "SELECT i, xmax::text <> '0' AS marked FROM xmk_c ORDER BY i"));
+            run(c, "DROP TABLE xmk_c");
+        }
+    }
+
+    @Test
+    void aRowRemovedThroughAParentIsMarkedWhereItLives() throws SQLException {
+        exec("CREATE TABLE xmk_dp (i int, s text)");
+        exec("CREATE TABLE xmk_dc (extra int) INHERITS (xmk_dp)");
+        exec("INSERT INTO xmk_dp VALUES (1,'a')");
+        exec("INSERT INTO xmk_dc VALUES (2,'b',7)");
+        assertEquals(List.of("1|t"), rows("DELETE FROM xmk_dp WHERE i = 1"
+                + " RETURNING i, xmax = pg_current_xact_id()::text::xid AS mine"));
+        // The child's row, taken through the parent.
+        assertEquals(List.of("2|t"), rows("DELETE FROM xmk_dp WHERE i = 2"
+                + " RETURNING i, xmax = pg_current_xact_id()::text::xid AS mine"));
+        exec("INSERT INTO xmk_dc VALUES (3,'c',8)");
+        assertEquals(List.of("3|t"), rows("DELETE FROM xmk_dc WHERE i = 3"
+                + " RETURNING i, xmax = pg_current_xact_id()::text::xid AS mine"));
+        exec("DROP TABLE xmk_dc");
+        exec("DROP TABLE xmk_dp");
+
+        exec("CREATE TABLE xmk_e (i int, s text) PARTITION BY RANGE (i)");
+        exec("CREATE TABLE xmk_e0 PARTITION OF xmk_e FOR VALUES FROM (0) TO (100)");
+        exec("INSERT INTO xmk_e VALUES (1,'a'),(2,'b'),(3,'c')");
+        assertEquals(List.of("1|t"), rows("DELETE FROM xmk_e WHERE i = 1"
+                + " RETURNING i, xmax = pg_current_xact_id()::text::xid AS mine"));
+        assertEquals(List.of("2|t"), rows("DELETE FROM xmk_e0 WHERE i = 2"
+                + " RETURNING i, xmax = pg_current_xact_id()::text::xid AS mine"));
+        assertEquals(List.of("3|0"),
+                rows("UPDATE xmk_e SET s = 'z' WHERE i = 3 RETURNING i, xmax::text"));
+        exec("DROP TABLE xmk_e");
+    }
+
+    // ============================================================ The command identifiers a
+    // statement takes
+
+    @Test
+    void cminCountsTheCatalogueRowsADdlStatementWrote() throws SQLException {
+        try (Connection c = session()) {
+            run(c, "BEGIN");
+            try {
+                run(c, "CREATE TABLE cid_a (i int)", "CREATE TABLE cid_a1 (i int)",
+                        "INSERT INTO cid_a VALUES (1)",
+                        "DROP TABLE cid_a1", "INSERT INTO cid_a VALUES (2)",
+                        "CREATE VIEW cid_av AS SELECT 1 AS x", "INSERT INTO cid_a VALUES (3)",
+                        "DROP VIEW cid_av", "INSERT INTO cid_a VALUES (4)",
+                        "CREATE SEQUENCE cid_as", "INSERT INTO cid_a VALUES (5)",
+                        "DROP SEQUENCE cid_as", "INSERT INTO cid_a VALUES (6)",
+                        "CREATE TABLE cid_a2 (i int)", "INSERT INTO cid_a VALUES (7)",
+                        "ALTER TABLE cid_a2 ADD COLUMN j int", "INSERT INTO cid_a VALUES (8)",
+                        // A DROP over a name nothing answers to writes no catalogue row at all.
+                        "DROP TABLE IF EXISTS cid_nothere", "INSERT INTO cid_a VALUES (9)");
+                assertEquals(
+                        List.of("1|2", "2|6", "3|9", "4|14", "5|17", "6|19", "7|21", "8|23",
+                                "9|24"),
+                        rows(c, "SELECT i, cmin::text FROM cid_a ORDER BY i"));
+            } finally {
+                run(c, "ROLLBACK");
+            }
+        }
+    }
+
+    @Test
+    void aStatementThatReadsTakesNoCommandIdentifierAndOneThatWritesTakesOne() throws SQLException {
+        try (Connection c = session()) {
+            run(c, "BEGIN");
+            try {
+                // A write that touched no row still took an identifier; a read took none.
+                run(c, "CREATE TABLE cid_b (i int)", "INSERT INTO cid_b VALUES (1)",
+                        "SELECT 1", "INSERT INTO cid_b VALUES (2)",
+                        "UPDATE cid_b SET i = i WHERE false", "INSERT INTO cid_b VALUES (3)",
+                        "DELETE FROM cid_b WHERE false", "INSERT INTO cid_b VALUES (4)");
+                assertEquals(List.of("1|1", "2|2", "3|4", "4|6"),
+                        rows(c, "SELECT i, cmin::text FROM cid_b ORDER BY i"));
+            } finally {
+                run(c, "ROLLBACK");
+            }
+        }
+    }
+
+    @Test
+    void aCommandIdentifierARolledBackSavepointSpentIsNotHandedOutAgain() throws SQLException {
+        try (Connection c = session()) {
+            run(c, "BEGIN", "CREATE TABLE cid_c (i int)", "INSERT INTO cid_c VALUES (1)",
+                    "SAVEPOINT sp", "INSERT INTO cid_c VALUES (2)", "ROLLBACK TO SAVEPOINT sp",
+                    "INSERT INTO cid_c VALUES (3)");
+            assertEquals(List.of("1|1", "3|3"),
+                    rows(c, "SELECT i, cmin::text FROM cid_c ORDER BY i"));
+            run(c, "COMMIT");
+            // The identifier is written on the version, so it reads the same afterwards.
+            assertEquals(List.of("1|1", "3|3"),
+                    rows(c, "SELECT i, cmin::text FROM cid_c ORDER BY i"));
+            run(c, "DROP TABLE cid_c");
+        }
+    }
+
+    @Test
+    void cminAndCmaxOfAVersionThisTransactionWroteAreTheSameCommand() throws SQLException {
+        try (Connection c = session()) {
+            run(c, "BEGIN", "CREATE TABLE cid_d (i int)", "INSERT INTO cid_d VALUES (1)",
+                    "UPDATE cid_d SET i = 2");
+            assertEquals(List.of("2|2|2"),
+                    rows(c, "SELECT i, cmin::text, cmax::text FROM cid_d ORDER BY i"));
+            run(c, "INSERT INTO cid_d VALUES (3)");
+            assertEquals(List.of("2|2|2", "3|3|3"),
+                    rows(c, "SELECT i, cmin::text, cmax::text FROM cid_d ORDER BY i"));
+            run(c, "COMMIT", "DROP TABLE cid_d");
+        }
+    }
+
+    // ============================================================ Locking a row a second session
+    // is writing
+
+    @Test
+    void forUpdateAtSerializableWaitsForAConcurrentWriterAndThenRefuses() throws Exception {
+        exec("CREATE TABLE flk_a (i int, s text)");
+        exec("INSERT INTO flk_a VALUES (1,'a'),(2,'a')");
+        assertEquals("ERR[40001] could not serialize access due to concurrent update",
+                whileAnotherSessionHolds("SERIALIZABLE", "SELECT count(*) FROM flk_a",
+                        "UPDATE flk_a SET s = 'b' WHERE i = 2", true,
+                        "SELECT i, s FROM flk_a WHERE i = 2 FOR UPDATE"));
+        // FOR SHARE is refused on the same ground.
+        assertEquals("ERR[40001] could not serialize access due to concurrent update",
+                whileAnotherSessionHolds("SERIALIZABLE", "SELECT count(*) FROM flk_a",
+                        "UPDATE flk_a SET s = 'c' WHERE i = 2", true,
+                        "SELECT i, s FROM flk_a WHERE i = 2 FOR SHARE"));
+        exec("DROP TABLE flk_a");
+    }
+
+    @Test
+    void forUpdateAtSerializableWaitsForAnUncommittedCrossPartitionMove() throws Exception {
+        exec("CREATE TABLE flk_b (i int, s text) PARTITION BY LIST (s)");
+        exec("CREATE TABLE flk_b_a PARTITION OF flk_b FOR VALUES IN ('a')");
+        exec("CREATE TABLE flk_b_b PARTITION OF flk_b FOR VALUES IN ('b')");
+        exec("INSERT INTO flk_b VALUES (1,'a'),(2,'a')");
+        // The move takes the row out of one partition and writes it into another; the lock must
+        // still be taken on the row rather than on the snapshot's own copy of it.
+        assertEquals("ERR[40001] could not serialize access due to concurrent update",
+                whileAnotherSessionHolds("SERIALIZABLE", "SELECT count(*) FROM flk_b",
+                        "UPDATE flk_b SET s = 'b' WHERE i = 2", true,
+                        "SELECT i, s FROM flk_b WHERE i = 2 FOR UPDATE"));
+        assertEquals(List.of("1|flk_b_a|a", "2|flk_b_b|b"),
+                rows("SELECT i, tableoid::regclass::text, s FROM flk_b ORDER BY i"));
+        exec("DROP TABLE flk_b");
+    }
+
+    @Test
+    void forUpdateAtRepeatableReadWaitsForAConcurrentDeleteAndThenRefuses() throws Exception {
+        exec("CREATE TABLE flk_c (i int, s text)");
+        exec("INSERT INTO flk_c VALUES (1,'a'),(2,'a')");
+        assertEquals("ERR[40001] could not serialize access due to concurrent update",
+                whileAnotherSessionHolds("REPEATABLE READ", "SELECT count(*) FROM flk_c",
+                        "DELETE FROM flk_c WHERE i = 2", true,
+                        "SELECT i, s FROM flk_c WHERE i = 2 FOR UPDATE"));
+        exec("DROP TABLE flk_c");
+    }
+
+    @Test
+    void forUpdateAtReadCommittedWaitsAndThenLocksTheVersionTheWriterLeft() throws Exception {
+        exec("CREATE TABLE flk_d (i int, s text)");
+        exec("INSERT INTO flk_d VALUES (1,'a'),(2,'a')");
+        // A statement at READ COMMITTED takes its snapshot afresh, so it follows the writer's
+        // version rather than being refused.
+        assertEquals("2|b",
+                whileAnotherSessionHolds("READ COMMITTED", "SELECT count(*) FROM flk_d",
+                        "UPDATE flk_d SET s = 'b' WHERE i = 2", true,
+                        "SELECT i, s FROM flk_d WHERE i = 2 FOR UPDATE"));
+        exec("DROP TABLE flk_d");
+    }
+
+    @Test
+    void forUpdateThatWaitedForACommittedCrossPartitionMoveIsToldTheTupleMoved() throws Exception {
+        exec("CREATE TABLE flk_e (i int, s text) PARTITION BY LIST (s)");
+        exec("CREATE TABLE flk_e_a PARTITION OF flk_e FOR VALUES IN ('a')");
+        exec("CREATE TABLE flk_e_b PARTITION OF flk_e FOR VALUES IN ('b')");
+        exec("INSERT INTO flk_e VALUES (1,'a'),(2,'a')");
+        // A row is not followed into another partition, so the wording says so.
+        assertEquals("ERR[40001] tuple to be locked was already moved to another partition due to"
+                        + " concurrent update",
+                whileAnotherSessionHolds("READ COMMITTED", "SELECT count(*) FROM flk_e",
+                        "UPDATE flk_e SET s = 'b' WHERE i = 2", true,
+                        "SELECT i, s FROM flk_e WHERE i = 2 FOR UPDATE"));
+        exec("DROP TABLE flk_e");
+    }
+
+    @Test
+    void forUpdateAfterTheWriterAbortsLocksTheRowItWaitedFor() throws Exception {
+        exec("CREATE TABLE flk_f (i int, s text)");
+        exec("INSERT INTO flk_f VALUES (1,'a'),(2,'a')");
+        assertEquals("2|a",
+                whileAnotherSessionHolds("SERIALIZABLE", "SELECT count(*) FROM flk_f",
+                        "UPDATE flk_f SET s = 'b' WHERE i = 2", false,
+                        "SELECT i, s FROM flk_f WHERE i = 2 FOR UPDATE"));
+        assertEquals(List.of("1|a", "2|a"), rows("SELECT i, s FROM flk_f ORDER BY i"));
+        exec("DROP TABLE flk_f");
+    }
+
+    @Test
+    void nowaitAndSkipLockedDoNotWaitForTheWriterAtAll() throws SQLException {
+        exec("CREATE TABLE flk_g (i int, s text)");
+        exec("INSERT INTO flk_g VALUES (1,'a'),(2,'a')");
+        String snapshot = "SELECT count(*) FROM flk_g";
+        String write = "UPDATE flk_g SET s = 'b' WHERE i = 2";
+        assertEquals("ERR[55P03] could not obtain lock on row in relation \"flk_g\"",
+                withoutWaitingFor("SERIALIZABLE", snapshot, write,
+                        "SELECT i, s FROM flk_g WHERE i = 2 FOR UPDATE NOWAIT"));
+        assertEquals("(no rows)",
+                withoutWaitingFor("SERIALIZABLE", snapshot, write,
+                        "SELECT i, s FROM flk_g WHERE i = 2 FOR UPDATE SKIP LOCKED"));
+        // A row the writer never touched is not held against the lock at all.
+        assertEquals("1|a",
+                withoutWaitingFor("SERIALIZABLE", snapshot, write,
+                        "SELECT i, s FROM flk_g WHERE i = 1 FOR UPDATE"));
+        assertEquals(List.of("1|a", "2|a"), rows("SELECT i, s FROM flk_g ORDER BY i"));
+        exec("DROP TABLE flk_g");
+    }
+
+    // ============================================================ The line pointers a relation
+    // built by a query hands out are the relation's own
+
+    @Test
+    void aRelationFilledByAQueryHandsOutTheLinePointersItUsed() throws SQLException {
+        // CREATE TABLE ... AS fills the new relation through the routine an INSERT writes through,
+        // so the rows the query wrote take the places in order and the relation goes on from there
+        // rather than handing the first place out a second time.
+        exec("CREATE TABLE lpr_q1 AS SELECT 8 AS i");
+        exec("INSERT INTO lpr_q1 VALUES (9)");
+        assertEquals(List.of("(0,1)|8", "(0,2)|9"),
+                rows("SELECT ctid::text, i FROM lpr_q1 ORDER BY i"));
+        exec("DROP TABLE lpr_q1");
+
+        exec("CREATE TABLE lpr_q2 AS SELECT g FROM generate_series(1,3) g");
+        exec("INSERT INTO lpr_q2 VALUES (9)");
+        assertEquals(List.of("(0,1)|1", "(0,2)|2", "(0,3)|3", "(0,4)|9"),
+                rows("SELECT ctid::text, g FROM lpr_q2 ORDER BY g"));
+        // A place a delete gave up is not handed out again, and a tuple id names one row.
+        exec("DELETE FROM lpr_q2 WHERE g = 2");
+        exec("INSERT INTO lpr_q2 VALUES (10)");
+        assertEquals(List.of("(0,1)|1", "(0,3)|3", "(0,4)|9", "(0,5)|10"),
+                rows("SELECT ctid::text, g FROM lpr_q2 ORDER BY g"));
+        assertEquals(4L, num("SELECT count(DISTINCT ctid) FROM lpr_q2"));
+        assertEquals("9", scalar("SELECT g FROM lpr_q2 WHERE ctid = '(0,4)'"));
+        exec("DROP TABLE lpr_q2");
+    }
+
+    @Test
+    void aQueryThatWroteNothingLeavesTheFirstPlaceToTheNextRow() throws SQLException {
+        exec("CREATE TABLE lpr_q3 AS SELECT 1 AS a WHERE false");
+        exec("INSERT INTO lpr_q3 VALUES (5)");
+        assertEquals(List.of("(0,1)|5"), rows("SELECT ctid::text, a FROM lpr_q3 ORDER BY a"));
+        exec("DROP TABLE lpr_q3");
+
+        // WITH NO DATA runs the query for its shape only, so no place has been handed out yet.
+        exec("CREATE TABLE lpr_q4 AS SELECT g FROM generate_series(1,3) g WITH NO DATA");
+        assertEquals(0L, num("SELECT count(*) FROM lpr_q4"));
+        exec("INSERT INTO lpr_q4 VALUES (7)");
+        exec("INSERT INTO lpr_q4 VALUES (8)");
+        assertEquals(List.of("(0,1)|7", "(0,2)|8"),
+                rows("SELECT ctid::text, g FROM lpr_q4 ORDER BY g"));
+        exec("DROP TABLE lpr_q4");
+    }
+
+    @Test
+    void selectIntoNumbersItsRowsTheSameWay() throws SQLException {
+        exec("SELECT g INTO lpr_q5 FROM generate_series(1,2) g");
+        exec("INSERT INTO lpr_q5 VALUES (9)");
+        assertEquals(List.of("(0,1)|1", "(0,2)|2", "(0,3)|9"),
+                rows("SELECT ctid::text, g FROM lpr_q5 ORDER BY g"));
+        exec("DELETE FROM lpr_q5 WHERE g = 1");
+        exec("INSERT INTO lpr_q5 VALUES (11)");
+        assertEquals(List.of("(0,2)|2", "(0,3)|9", "(0,4)|11"),
+                rows("SELECT ctid::text, g FROM lpr_q5 ORDER BY g"));
+        exec("DROP TABLE lpr_q5");
+
+        // A SELECT ... INTO whose query wrote nothing leaves the first place to the next row.
+        exec("SELECT g INTO lpr_q6 FROM generate_series(1,2) g WHERE false");
+        exec("INSERT INTO lpr_q6 VALUES (5)");
+        assertEquals(List.of("(0,1)|5"), rows("SELECT ctid::text, g FROM lpr_q6 ORDER BY g"));
+        exec("DROP TABLE lpr_q6");
+    }
+
+    @Test
+    void everyLaterWriteToARelationAQueryBuiltGoesOnFromWhereTheQueryLeftOff()
+            throws SQLException {
+        exec("CREATE TABLE lpr_q7 AS SELECT g FROM generate_series(1,3) g");
+        exec("INSERT INTO lpr_q7 SELECT g FROM generate_series(4,6) g");
+        exec("DELETE FROM lpr_q7 WHERE g IN (2,5)");
+        exec("INSERT INTO lpr_q7 VALUES (7),(8)");
+        assertEquals(List.of("(0,1)|1", "(0,3)|3", "(0,4)|4", "(0,6)|6", "(0,7)|7", "(0,8)|8"),
+                rows("SELECT ctid::text, g FROM lpr_q7 ORDER BY g"));
+        // No two rows answer to one place.
+        assertEquals(List.of("6|6"),
+                rows("SELECT count(*), count(DISTINCT ctid) FROM lpr_q7"));
+        exec("DROP TABLE lpr_q7");
+    }
+
+    @Test
+    void aDeleteByTupleIdAndAnUpdateOverRowsAQueryWrote() throws SQLException {
+        exec("CREATE TABLE lpr_q8 AS SELECT g AS i, 'r' || g AS s FROM generate_series(1,4) g");
+        // The tuple id the query handed the third row is the one that names it to a delete.
+        assertEquals(1, update(conn, "DELETE FROM lpr_q8 WHERE ctid = '(0,3)'"));
+        // An update writes a new version of the row, which lives at a new place.
+        exec("UPDATE lpr_q8 SET s = 'z' WHERE i = 1");
+        exec("INSERT INTO lpr_q8 VALUES (9,'n')");
+        assertEquals(List.of("(0,5)|1|z", "(0,2)|2|r2", "(0,4)|4|r4", "(0,6)|9|n"),
+                rows("SELECT ctid::text, i, s FROM lpr_q8 ORDER BY i"));
+        exec("DROP TABLE lpr_q8");
+    }
+
+    @Test
+    void aPlaceARowInARelationAQueryBuiltGaveUpIsNeverHandedOutAgain() throws SQLException {
+        exec("CREATE TABLE lpr_q9 AS SELECT g FROM generate_series(1,5) g");
+        exec("DELETE FROM lpr_q9");
+        exec("INSERT INTO lpr_q9 VALUES (9)");
+        assertEquals(List.of("(0,6)|9"), rows("SELECT ctid::text, g FROM lpr_q9 ORDER BY g"));
+        exec("DROP TABLE lpr_q9");
+
+        // A write that was rolled back had already spent its place, so the next row skips it.
+        try (Connection c = session()) {
+            run(c, "CREATE TABLE lpr_qa AS SELECT g FROM generate_series(1,2) g",
+                    "BEGIN", "INSERT INTO lpr_qa VALUES (8)", "ROLLBACK",
+                    "INSERT INTO lpr_qa VALUES (9)");
+            assertEquals(List.of("(0,1)|1", "(0,2)|2", "(0,4)|9"),
+                    rows(c, "SELECT ctid::text, g FROM lpr_qa ORDER BY g"));
+            run(c, "DROP TABLE lpr_qa");
+        }
+    }
+
+    @Test
+    void aMaterializedViewNumbersItsRowsFromOneAndARefreshBeginsAgain() throws SQLException {
+        exec("CREATE TABLE lpr_qsrc (i int)");
+        exec("INSERT INTO lpr_qsrc VALUES (1),(2),(3)");
+        exec("CREATE MATERIALIZED VIEW lpr_qmv AS SELECT i FROM lpr_qsrc");
+        assertEquals(List.of("(0,1)|1", "(0,2)|2", "(0,3)|3"),
+                rows("SELECT ctid::text, i FROM lpr_qmv ORDER BY i"));
+        assertEquals(List.of("3|3"),
+                rows("SELECT count(*), count(DISTINCT ctid) FROM lpr_qmv"));
+        assertEquals("2", scalar("SELECT i FROM lpr_qmv WHERE ctid = '(0,2)'"));
+        // A refresh fills the relation again from the first place, so a row the source lost does
+        // not leave a gap behind it.
+        exec("DELETE FROM lpr_qsrc WHERE i = 2");
+        exec("REFRESH MATERIALIZED VIEW lpr_qmv");
+        assertEquals(List.of("(0,1)|1", "(0,2)|3"),
+                rows("SELECT ctid::text, i FROM lpr_qmv ORDER BY i"));
+        exec("INSERT INTO lpr_qsrc VALUES (4),(5)");
+        exec("REFRESH MATERIALIZED VIEW lpr_qmv");
+        assertEquals(List.of("(0,1)|1", "(0,2)|3", "(0,3)|4", "(0,4)|5"),
+                rows("SELECT ctid::text, i FROM lpr_qmv ORDER BY i"));
+        assertEquals(4L, num("SELECT count(DISTINCT ctid) FROM lpr_qmv"));
+        exec("DROP MATERIALIZED VIEW lpr_qmv");
+        exec("DROP TABLE lpr_qsrc");
+    }
+
+    @Test
+    void aMaterializedViewDefinedWithNoDataIsUnpopulatedUntilItIsRefreshed() throws SQLException {
+        exec("CREATE TABLE lpr_qsr2 (i int)");
+        exec("INSERT INTO lpr_qsr2 VALUES (7),(8)");
+        exec("CREATE MATERIALIZED VIEW lpr_qmw AS SELECT i FROM lpr_qsr2 WITH NO DATA");
+        assertEquals("55000", stateOf("SELECT i FROM lpr_qmw"));
+        assertEquals("materialized view \"lpr_qmw\" has not been populated",
+                messageOf("SELECT i FROM lpr_qmw"));
+        assertEquals("Use the REFRESH MATERIALIZED VIEW command.", hintOf("SELECT i FROM lpr_qmw"));
+        // A refresh that asks for no data leaves it unpopulated as well.
+        exec("REFRESH MATERIALIZED VIEW lpr_qmw WITH NO DATA");
+        assertEquals("55000", stateOf("SELECT count(*) FROM lpr_qmw"));
+        // The refresh that does fill it hands its rows the places from the first.
+        exec("REFRESH MATERIALIZED VIEW lpr_qmw");
+        assertEquals(List.of("(0,1)|7", "(0,2)|8"),
+                rows("SELECT ctid::text, i FROM lpr_qmw ORDER BY i"));
+        exec("DROP MATERIALIZED VIEW lpr_qmw");
+        exec("DROP TABLE lpr_qsr2");
+    }
+
+    @Test
+    void aMaterializedViewTakesNoWriteOfItsOwn() throws SQLException {
+        exec("CREATE TABLE lpr_qsr3 (i int)");
+        exec("INSERT INTO lpr_qsr3 VALUES (1),(2)");
+        exec("CREATE MATERIALIZED VIEW lpr_qmx AS SELECT i FROM lpr_qsr3");
+        assertEquals("42809", stateOf("INSERT INTO lpr_qmx VALUES (9)"));
+        assertEquals("42809", stateOf("DELETE FROM lpr_qmx WHERE i = 1"));
+        assertEquals("42809", stateOf("UPDATE lpr_qmx SET i = 3 WHERE i = 1"));
+        assertEquals("cannot change materialized view \"lpr_qmx\"",
+                messageOf("DELETE FROM lpr_qmx WHERE i = 1"));
+        // TRUNCATE is refused because a materialized view is not a table.
+        assertEquals("\"lpr_qmx\" is not a table", messageOf("TRUNCATE lpr_qmx"));
+        assertEquals(List.of("(0,1)|1", "(0,2)|2"),
+                rows("SELECT ctid::text, i FROM lpr_qmx ORDER BY i"));
+        exec("DROP MATERIALIZED VIEW lpr_qmx");
+        exec("DROP TABLE lpr_qsr3");
+    }
+
+    @Test
+    void aRelationBuiltFromAMaterializedViewNumbersItsOwnRowsFromOne() throws SQLException {
+        exec("CREATE TABLE lpr_qsr4 (i int)");
+        exec("INSERT INTO lpr_qsr4 VALUES (1),(2)");
+        exec("CREATE MATERIALIZED VIEW lpr_qmy AS SELECT i FROM lpr_qsr4");
+        exec("CREATE TABLE lpr_qb AS SELECT i FROM lpr_qmy");
+        exec("INSERT INTO lpr_qb VALUES (9)");
+        assertEquals(List.of("(0,1)|1", "(0,2)|2", "(0,3)|9"),
+                rows("SELECT ctid::text, i FROM lpr_qb ORDER BY i"));
+        exec("DROP TABLE lpr_qb");
+        exec("DROP MATERIALIZED VIEW lpr_qmy");
+        exec("DROP TABLE lpr_qsr4");
+    }
+
+    @Test
+    void truncateHandsARelationAQueryBuiltANewFile() throws SQLException {
+        exec("CREATE TABLE lpr_qc AS SELECT g FROM generate_series(1,2) g");
+        exec("TRUNCATE lpr_qc");
+        exec("INSERT INTO lpr_qc VALUES (5)");
+        assertEquals(List.of("(0,1)|5"), rows("SELECT ctid::text, g FROM lpr_qc ORDER BY g"));
+        exec("DROP TABLE lpr_qc");
+    }
+
+    @Test
+    void aRelationAQueryBuiltInAnotherSchemaOrAsATemporaryOneCountsTheSame() throws SQLException {
+        exec("CREATE SCHEMA lpr_qs");
+        exec("CREATE TABLE lpr_qs.lpr_qd AS SELECT g FROM generate_series(1,2) g");
+        exec("INSERT INTO lpr_qs.lpr_qd VALUES (9)");
+        assertEquals(List.of("(0,1)|1", "(0,2)|2", "(0,3)|9"),
+                rows("SELECT ctid::text, g FROM lpr_qs.lpr_qd ORDER BY g"));
+        exec("DROP SCHEMA lpr_qs CASCADE");
+
+        try (Connection c = session()) {
+            run(c, "CREATE TEMP TABLE lpr_qe AS SELECT g FROM generate_series(1,2) g",
+                    "INSERT INTO lpr_qe VALUES (9)");
+            assertEquals(List.of("(0,1)|1", "(0,2)|2", "(0,3)|9"),
+                    rows(c, "SELECT ctid::text, g FROM lpr_qe ORDER BY g"));
+            run(c, "DROP TABLE lpr_qe");
+        }
+    }
+
+    @Test
+    void aRelationTheTransactionNeverLeftBehindBeginsAtOne() throws SQLException {
+        try (Connection c = session()) {
+            run(c, "BEGIN", "CREATE TABLE lpr_qf AS SELECT 1 AS a",
+                    "INSERT INTO lpr_qf VALUES (2)");
+            assertEquals(List.of("(0,1)|1", "(0,2)|2"),
+                    rows(c, "SELECT ctid::text, a FROM lpr_qf ORDER BY a"));
+            // The relation went with the abort, so the name reaches a file of its own afterwards.
+            run(c, "ROLLBACK", "CREATE TABLE lpr_qf AS SELECT 5 AS a",
+                    "INSERT INTO lpr_qf VALUES (6)");
+            assertEquals(List.of("(0,1)|5", "(0,2)|6"),
+                    rows(c, "SELECT ctid::text, a FROM lpr_qf ORDER BY a"));
+            run(c, "DROP TABLE lpr_qf");
+        }
+    }
+
+    @Test
+    void rowsAQueryWroteWithTheSameValuesStillHavePlacesOfTheirOwn() throws SQLException {
+        exec("CREATE TABLE lpr_qg AS SELECT 1 AS a UNION ALL SELECT 1");
+        exec("INSERT INTO lpr_qg VALUES (1)");
+        assertEquals(List.of("(0,1)|1", "(0,2)|1", "(0,3)|1"),
+                rows("SELECT ctid::text, a FROM lpr_qg ORDER BY ctid"));
+        assertEquals(3L, num("SELECT count(DISTINCT ctid) FROM lpr_qg"));
+        exec("DROP TABLE lpr_qg");
+    }
+
+    @Test
+    void thePlacesGoOutInTheOrderTheQueryProducedTheRows() throws SQLException {
+        exec("CREATE TABLE lpr_qh AS WITH c AS (SELECT g FROM generate_series(1,3) g)"
+                + " SELECT g FROM c ORDER BY g DESC");
+        exec("INSERT INTO lpr_qh VALUES (9)");
+        assertEquals(List.of("(0,1)|3", "(0,2)|2", "(0,3)|1", "(0,4)|9"),
+                rows("SELECT ctid::text, g FROM lpr_qh ORDER BY ctid"));
+        exec("DROP TABLE lpr_qh");
+
+        exec("CREATE TABLE lpr_qi AS SELECT g FROM generate_series(1,10) g ORDER BY g LIMIT 3");
+        exec("INSERT INTO lpr_qi VALUES (9)");
+        assertEquals(List.of("(0,1)|1", "(0,2)|2", "(0,3)|3", "(0,4)|9"),
+                rows("SELECT ctid::text, g FROM lpr_qi ORDER BY ctid"));
+        exec("DROP TABLE lpr_qi");
+    }
+
+    @Test
+    void theTupleIdsTheQueryReadAreValuesAndNotThePlacesTheNewRowsTake() throws SQLException {
+        exec("CREATE TABLE lpr_qj (i int)");
+        exec("INSERT INTO lpr_qj VALUES (1),(2),(3)");
+        exec("DELETE FROM lpr_qj WHERE i = 1");
+        exec("CREATE TABLE lpr_qk AS SELECT ctid::text AS oldplace, i FROM lpr_qj");
+        exec("INSERT INTO lpr_qk VALUES ('x', 9)");
+        assertEquals(List.of("(0,1)|(0,2)|2", "(0,2)|(0,3)|3", "(0,3)|x|9"),
+                rows("SELECT ctid::text, oldplace, i FROM lpr_qk ORDER BY i"));
+        exec("DROP TABLE lpr_qk");
+        exec("DROP TABLE lpr_qj");
+    }
+
+    @Test
+    void twoRelationsBuiltByQueriesCountTheirPlacesApart() throws SQLException {
+        exec("CREATE TABLE lpr_ql AS SELECT g FROM generate_series(1,2) g");
+        exec("CREATE TABLE lpr_qm AS SELECT g FROM generate_series(1,3) g");
+        exec("INSERT INTO lpr_ql VALUES (9)");
+        exec("INSERT INTO lpr_qm VALUES (9)");
+        assertEquals(List.of("(0,1)|1", "(0,2)|2", "(0,3)|9"),
+                rows("SELECT ctid::text, g FROM lpr_ql ORDER BY g"));
+        assertEquals(List.of("(0,1)|1", "(0,2)|2", "(0,3)|3", "(0,4)|9"),
+                rows("SELECT ctid::text, g FROM lpr_qm ORDER BY g"));
+        exec("DROP TABLE lpr_ql");
+        exec("DROP TABLE lpr_qm");
+    }
+
+    @Test
+    void aRelationAPreparedStatementBuiltCountsTheSame() throws SQLException {
+        exec("PREPARE lpr_qp AS SELECT 3 AS a");
+        exec("CREATE TABLE lpr_qn AS EXECUTE lpr_qp");
+        exec("INSERT INTO lpr_qn VALUES (4)");
+        assertEquals(List.of("(0,1)|3", "(0,2)|4"),
+                rows("SELECT ctid::text, a FROM lpr_qn ORDER BY a"));
+        exec("DROP TABLE lpr_qn");
+        exec("DEALLOCATE lpr_qp");
+    }
+
+    @Test
+    void theRowsAQueryWroteCarryTheCommandIdentifierAfterTheStatementsOwn() throws SQLException {
+        // The counter moves on once the relation's catalogue rows are written, so the rows go in
+        // under the identifier after the one the statement began with.
+        exec("CREATE TABLE lpr_qo AS SELECT g FROM generate_series(1,2) g");
+        assertEquals(List.of("1|1|1|0", "2|1|1|0"),
+                rows("SELECT g, cmin::text, cmax::text, xmax::text FROM lpr_qo ORDER BY g"));
+        // The INSERT is a transaction of its own, so it starts the counter again.
+        exec("INSERT INTO lpr_qo VALUES (7)");
+        assertEquals(List.of("1|1", "2|1", "7|0"),
+                rows("SELECT g, cmin::text FROM lpr_qo ORDER BY g"));
+        exec("DROP TABLE lpr_qo");
+
+        // Inside one transaction the statement spends two identifiers, so the statement after it
+        // reads one more than a plain CREATE TABLE would have left.
+        try (Connection c = session()) {
+            run(c, "CREATE TABLE lpr_qr (a int)", "BEGIN", "INSERT INTO lpr_qr VALUES (0)",
+                    "CREATE TABLE lpr_qt AS SELECT 7 AS b", "INSERT INTO lpr_qr VALUES (1)");
+            assertEquals(List.of("0|0", "1|3"),
+                    rows(c, "SELECT a, cmin::text FROM lpr_qr ORDER BY a"));
+            assertEquals(List.of("7|2|(0,1)"),
+                    rows(c, "SELECT b, cmin::text, ctid::text FROM lpr_qt"));
+            run(c, "COMMIT", "DROP TABLE lpr_qt", "DROP TABLE lpr_qr");
+        }
+    }
 }

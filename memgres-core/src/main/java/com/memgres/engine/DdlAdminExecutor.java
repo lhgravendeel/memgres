@@ -626,7 +626,8 @@ class DdlAdminExecutor {
         // relation or a column an action names that is not there is reported by the CREATE RULE
         // that wrote it instead of by whoever writes to the relation next.
         List<String> dependsOn = checkRuleActions(s, on);
-        String joined = String.join(Database.RULE_ACTION_SEPARATOR, s.commands());
+        String joined = String.join(Database.RULE_ACTION_SEPARATOR,
+                actionsBoundToTheirSchemas(s.commands()));
         // DO ALSO NOTHING and DO NOTHING are rules that do nothing, not rules whose action is the
         // word NOTHING. Registering the word made the next write try to run it as a statement.
         if ("NOTHING".equalsIgnoreCase(joined.trim())) joined = "";
@@ -659,6 +660,91 @@ class DdlAdminExecutor {
                     + RelationNamespace.bareName(relation));
         }
         return out;
+    }
+
+    /**
+     * The rule's actions, each writing to the relation it named at the moment the rule was written.
+     *
+     * <p>PostgreSQL analyses an action when the rule is written and records the relation itself, so
+     * a name written without a schema means whatever the search path reached then and goes on
+     * meaning it however the path stands when the rule fires. Memgres runs an action from the text
+     * it was written as, so the schema is put into that text here; an action written in a shape the
+     * qualifier cannot be placed in is left exactly as it was and resolves as it did before.
+     */
+    private List<String> actionsBoundToTheirSchemas(List<String> commands) {
+        List<String> out = new ArrayList<>();
+        for (String command : commands) out.add(actionBoundToItsSchema(command));
+        return out;
+    }
+
+    private String actionBoundToItsSchema(String command) {
+        String written;
+        try {
+            com.memgres.engine.parser.ast.Statement parsed =
+                    com.memgres.engine.parser.Parser.parse(command);
+            if (parsed instanceof InsertStmt) {
+                if (((InsertStmt) parsed).schema() != null) return command;
+                written = ((InsertStmt) parsed).table();
+            } else if (parsed instanceof UpdateStmt) {
+                if (((UpdateStmt) parsed).schema() != null) return command;
+                written = ((UpdateStmt) parsed).table();
+            } else if (parsed instanceof DeleteStmt) {
+                if (((DeleteStmt) parsed).schema() != null) return command;
+                written = ((DeleteStmt) parsed).table();
+            } else {
+                return command;
+            }
+        } catch (RuntimeException notParsed) {
+            return command;
+        }
+        if (written == null || written.indexOf('.') >= 0) return command;
+        String schema = executor.relationSchemaOf(null, written);
+        if (schema == null) return command;
+        // The relation a write names is the first one its text names, so the first whole word that
+        // spells it is the one the schema goes in front of.
+        int at = firstWholeWord(command, written);
+        if (at < 0) return command;
+        String bound = command.substring(0, at) + schema + "." + command.substring(at);
+        // Only a rewrite that reads back as the same statement against the same relation is kept:
+        // anything this could not place exactly goes on being resolved when the rule fires.
+        try {
+            com.memgres.engine.parser.ast.Statement reparsed =
+                    com.memgres.engine.parser.Parser.parse(bound);
+            String reboundSchema = reparsed instanceof InsertStmt ? ((InsertStmt) reparsed).schema()
+                    : reparsed instanceof UpdateStmt ? ((UpdateStmt) reparsed).schema()
+                    : reparsed instanceof DeleteStmt ? ((DeleteStmt) reparsed).schema() : null;
+            String reboundTable = reparsed instanceof InsertStmt ? ((InsertStmt) reparsed).table()
+                    : reparsed instanceof UpdateStmt ? ((UpdateStmt) reparsed).table()
+                    : reparsed instanceof DeleteStmt ? ((DeleteStmt) reparsed).table() : null;
+            if (!schema.equalsIgnoreCase(reboundSchema) || !written.equalsIgnoreCase(reboundTable)) {
+                return command;
+            }
+        } catch (RuntimeException notParsed) {
+            return command;
+        }
+        return bound;
+    }
+
+    /**
+     * Where {@code word} stands in {@code text} as a word of its own, or -1. A name inside quotes
+     * is left alone: a qualifier written in front of the opening quote would be read as part of
+     * the quoted name rather than as the schema it is.
+     */
+    private static int firstWholeWord(String text, String word) {
+        String lower = text.toLowerCase();
+        String wanted = word.toLowerCase();
+        for (int at = lower.indexOf(wanted); at >= 0; at = lower.indexOf(wanted, at + 1)) {
+            char before = at == 0 ? ' ' : text.charAt(at - 1);
+            int after = at + wanted.length();
+            char next = after >= text.length() ? ' ' : text.charAt(after);
+            if (before == '"' || next == '"') continue;
+            if (Character.isLetterOrDigit(before) || before == '_' || before == '.'
+                    || Character.isLetterOrDigit(next) || next == '_' || next == '.') {
+                continue;
+            }
+            return at;
+        }
+        return -1;
     }
 
     /**
@@ -741,10 +827,15 @@ class DdlAdminExecutor {
             } else {
                 for (Column c : target.getColumns()) columnNames.add(c.getName());
             }
-            // A relation the action wrote a schema for is written back with it: PostgreSQL
-            // qualifies a name the search path does not reach, which is what one was written for.
+            // PostgreSQL settles which relation an action writes to when the rule is written, and
+            // then prints it without its schema wherever the reader's search path reaches it. So
+            // the schema the name resolved to is what is stored, and the reading takes it off
+            // again -- how the definition reads is the reader's search path's business, not the
+            // writer's, and echoing the qualification as written answered for neither.
+            String actionSchema = ins.schema() != null ? ins.schema()
+                    : executor.relationSchemaOf(null, ins.table());
             StringBuilder sb = new StringBuilder("INSERT INTO ")
-                    .append(ins.schema() == null ? "" : ins.schema() + ".")
+                    .append(actionSchema == null ? "" : actionSchema + ".")
                     .append(ins.table()).append(" (");
             for (int i = 0; i < columnNames.size(); i++) {
                 if (i > 0) sb.append(", ");

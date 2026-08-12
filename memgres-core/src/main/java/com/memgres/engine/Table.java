@@ -33,6 +33,13 @@ public class Table {
     private final List<DroppedAttribute> droppedAttributes = new CopyOnWriteArrayList<>();
     private volatile List<Object[]> rows = new ArrayList<>();
     private final AtomicLong serialCounter = new AtomicLong(1);
+    /**
+     * The line pointers this relation has handed out. Where a tuple sits is a property of the
+     * relation's own file rather than of the name it stands under, so a rename or a move to
+     * another schema carries the numbering with it, while a relation created after another was
+     * dropped begins a file of its own and starts again at one.
+     */
+    private final AtomicLong tupleIdCounter = new AtomicLong(0);
     private final List<StoredConstraint> constraints = new CopyOnWriteArrayList<>();
     /**
      * The name a column's NOT NULL constraint answers to, keyed by column. Every NOT NULL column
@@ -60,6 +67,13 @@ public class Table {
      * its own name that it may withdraw.
      */
     private final java.util.Set<String> inheritedNotNullColumns =
+            java.util.concurrent.ConcurrentHashMap.<String>newKeySet();
+    /**
+     * The columns whose NOT NULL was declared NO INHERIT. Such a rule is about this relation's own
+     * rows and nobody else's: PostgreSQL hands the column down without it, and a descendant that
+     * declares NOT NULL for itself counts no parent for it.
+     */
+    private final java.util.Set<String> noInheritNotNullColumns =
             java.util.concurrent.ConcurrentHashMap.<String>newKeySet();
     private final ReentrantLock writeLock = new ReentrantLock();
 
@@ -683,6 +697,8 @@ public class Table {
             }
             inheritedColumns.remove(columnName.toLowerCase());
             inheritedNotNullColumns.remove(columnName.toLowerCase());
+            noInheritNotNullColumns.remove(columnName.toLowerCase());
+            noInheritNotNullColumns.remove(columnName.toLowerCase());
             inheritedNotNullNames.remove(columnName.toLowerCase());
             retainedNotNullInheritCounts.remove(columnName.toLowerCase());
             columnsChanged();
@@ -882,6 +898,25 @@ public class Table {
         // relation's own rather than one it was still holding on a parent's behalf.
         if (nullable) inheritedNotNullColumns.remove(columnName.toLowerCase());
         columnsChanged();
+    }
+
+    /** The line pointer the next tuple written into this relation takes. */
+    public long nextTupleId() {
+        return tupleIdCounter.incrementAndGet();
+    }
+
+    /** How many line pointers this relation has handed out. */
+    public long getTupleIdCounter() {
+        return tupleIdCounter.get();
+    }
+
+    /**
+     * Number the relation's tuples from {@code value} again. TRUNCATE gives the relation a new
+     * file, so the row written after it lives at the first line pointer once more; a TRUNCATE
+     * that is rolled back leaves the old file in place, and with it the numbering it had reached.
+     */
+    public void resetTupleIdCounter(long value) {
+        tupleIdCounter.set(value);
     }
 
     public long getSerialCounter() {
@@ -1190,6 +1225,22 @@ public class Table {
 
     private String[] definedColumnTypes;
 
+    /**
+     * The relation this one stands in front of, when a FROM item's alias list renamed its columns;
+     * null for every other relation.
+     *
+     * <p>PostgreSQL renames the references to a relation's columns and not the expressions stored
+     * with them, so a VIRTUAL generated column reached through such a list still carries a
+     * generation expression written in the names the relation underneath answers to. The rows are
+     * that relation's own and its columns sit in the same places, so the expression is worked out
+     * against it while the query above writes the new names.
+     */
+    public Table getColumnsRenamedFrom() { return columnsRenamedFrom; }
+
+    public void setColumnsRenamedFrom(Table renamed) { this.columnsRenamedFrom = renamed; }
+
+    private Table columnsRenamedFrom;
+
     public boolean isFunctionResult() { return functionResult; }
     public void setFunctionResult(boolean functionResult) { this.functionResult = functionResult; }
 
@@ -1290,6 +1341,21 @@ public class Table {
     /** True when this relation's own definition declared the column NOT NULL. */
     public boolean isNotNullLocal(String column) {
         return column != null && !inheritedNotNullColumns.contains(column.toLowerCase());
+    }
+
+    /**
+     * Records that the column's NOT NULL was declared NO INHERIT, which is a rule about this
+     * relation's rows alone. PostgreSQL hands nothing of it down: a child takes the column with no
+     * NOT NULL on it at all, and one that declares NOT NULL for itself holds a rule it owns
+     * outright rather than one it shares with the relation above.
+     */
+    public void markNotNullNoInherit(String column) {
+        if (column != null) noInheritNotNullColumns.add(column.toLowerCase());
+    }
+
+    /** True when this relation's NOT NULL on the column stops here rather than being handed down. */
+    public boolean isNotNullNoInherit(String column) {
+        return column != null && noInheritNotNullColumns.contains(column.toLowerCase());
     }
 
     /**

@@ -293,8 +293,11 @@ class CatalogConstraintBuilder {
                         for (Table direct : t.getDirectParents()) {
                             if (declaresNotNull(direct, c.getName())) coninhcount++;
                         }
-                        boolean notNullIsLocal = coninhcount == 0
-                                || (t.getPartitionParent() == null && t.isNotNullLocal(c.getName()));
+                        // A partition takes its columns from the partitioned table and holds
+                        // that table's rule on them, but one that declared NOT NULL for itself
+                        // holds its own: PostgreSQL leaves that constraint the partition's even
+                        // after the partitioned table declares the rule too.
+                        boolean notNullIsLocal = coninhcount == 0 || t.isNotNullLocal(c.getName());
                         String conname = notNullConstraintName(t, c.getName());
                         table.insertRow(new Object[]{
                                 oids.oid(constraintKey(schemaEntry.getKey(), t.getName(), conname)),
@@ -309,7 +312,7 @@ class CatalogConstraintBuilder {
                                 notNullIsLocal, 0,
                                 " ", " ",
                                 " " /*confmatchtype*/, null, null, null, null, coninhcount,
-                                false,
+                                t.isNotNullNoInherit(c.getName()),
                                 true, // conenforced
                                 null, null, false, 0, 0, 1
                         });
@@ -516,11 +519,16 @@ class CatalogConstraintBuilder {
         return false;
     }
 
-    /** True when this relation has the column and declares it NOT NULL. */
+    /**
+     * True when this relation declares the column NOT NULL for everything below it as well. A rule
+     * written NO INHERIT is about the declaring relation's own rows: PostgreSQL hands the column
+     * down without it, so nothing underneath holds it and nothing underneath counts it.
+     */
     static boolean declaresNotNull(Table table, String column) {
         if (table == null || column == null) return false;
         int idx = table.getColumnIndex(column);
-        return idx >= 0 && !table.getColumns().get(idx).isNullable();
+        return idx >= 0 && !table.getColumns().get(idx).isNullable()
+                && !table.isNotNullNoInherit(column);
     }
 
     /**

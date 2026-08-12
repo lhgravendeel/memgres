@@ -2100,9 +2100,18 @@ class FromFunctionResolver {
      * is ordinary: the ones past the list keep their own names.
      */
     static List<Column> applyColumnAliases(List<Column> columns, List<String> aliases, String relation) {
+        return applyColumnAliases(columns, aliases, relation, "table");
+    }
+
+    /**
+     * The same, for a FROM item PostgreSQL names by something other than a relation -- a
+     * parenthesised join, which it calls a join expression.
+     */
+    static List<Column> applyColumnAliases(List<Column> columns, List<String> aliases,
+                                           String relation, String noun) {
         if (aliases == null) return columns;
         if (relation != null && aliases.size() > columns.size()) {
-            throw new MemgresException("table \"" + relation + "\" has " + columns.size()
+            throw new MemgresException(noun + " \"" + relation + "\" has " + columns.size()
                     + " columns available but " + aliases.size() + " columns specified", "42P10").suppressPosition();
         }
         List<Column> result = new ArrayList<>(columns);

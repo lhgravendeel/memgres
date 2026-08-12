@@ -398,6 +398,13 @@ class DmlParser {
                 && parser.isKeywordValidAsBareAlias()) {
             alias = parser.readIdentifier();
         }
+        // PostgreSQL gives the relation a DELETE writes an alias and nothing else: a column alias
+        // list renames what a query reads, and this statement reads the relation's own columns. Its
+        // grammar therefore stops at the parenthesis, and so does this -- read and dropped, the list
+        // took the WHERE clause down with it and the statement deleted every row.
+        if (parser.check(TokenType.LEFT_PAREN)) {
+            throw new ParseException("syntax error at or near \"(\"", parser.peek());
+        }
 
         // USING clause
         List<SelectStmt.FromItem> using = null;

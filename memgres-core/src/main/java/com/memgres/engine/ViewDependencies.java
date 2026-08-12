@@ -23,8 +23,14 @@ final class ViewDependencies {
 
     private ViewDependencies() {}
 
-    /** True when {@code query} reads the relation {@code schemaName.relName}. */
-    static boolean reads(Statement query, String viewSchema, String schemaName, String relName) {
+    /**
+     * True when {@code query} reads the relation {@code schemaName.relName}.
+     *
+     * <p>A whole statement is the usual thing to ask about, but a row security policy's USING and
+     * WITH CHECK are expressions on their own and read relations the same way, so what is walked
+     * is any parsed tree rather than a statement in particular.
+     */
+    static boolean reads(Object query, String viewSchema, String schemaName, String relName) {
         if (query == null || relName == null) return false;
         final String wanted = relName.toLowerCase();
         final Set<String> cteNames = new HashSet<String>();
@@ -65,6 +71,22 @@ final class ViewDependencies {
      */
     static List<String> directDependents(Database db, OidSupplier oids,
                                          String schemaName, String relName) {
+        List<String> out = new ArrayList<String>();
+        for (Database.ViewDef v : directDependentViews(db, oids, schemaName, relName)) {
+            out.add(v.name());
+        }
+        return out;
+    }
+
+    /**
+     * The same, as the stored definitions themselves.
+     *
+     * <p>Two schemas may each hold a view of one name, and a name on its own cannot say which of
+     * them read the relation: a caller that has to act on the dependent -- drop it, or say which
+     * schema it is in -- needs the definition it found rather than the name it answers to.
+     */
+    static List<Database.ViewDef> directDependentViews(Database db, OidSupplier oids,
+                                                       String schemaName, String relName) {
         List<Object[]> found = new ArrayList<Object[]>();
         for (Map.Entry<String, Database.ViewDef> e : db.getViews().entrySet()) {
             Database.ViewDef v = e.getValue();
@@ -75,7 +97,7 @@ final class ViewDependencies {
             if (!reads(v.query(), v.schemaName(), schemaName, relName)) continue;
             String vs = v.schemaName() != null ? v.schemaName() : "public";
             int oid = oids == null ? 0 : oids.oid("rel:" + vs + "." + v.name());
-            found.add(new Object[]{Integer.valueOf(oid), v.name()});
+            found.add(new Object[]{Integer.valueOf(oid), v});
         }
         java.util.Collections.sort(found, new java.util.Comparator<Object[]>() {
             @Override
@@ -83,8 +105,8 @@ final class ViewDependencies {
                 return Integer.compare((Integer) a[0], (Integer) b[0]);
             }
         });
-        List<String> out = new ArrayList<String>();
-        for (Object[] entry : found) out.add((String) entry[1]);
+        List<Database.ViewDef> out = new ArrayList<Database.ViewDef>();
+        for (Object[] entry : found) out.add((Database.ViewDef) entry[1]);
         return out;
     }
 

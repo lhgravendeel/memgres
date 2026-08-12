@@ -3352,4 +3352,1007 @@ class InheritedDeclarationsAndIndexesTest {
                         + " WHERE conname LIKE 'zzx2\\_dom%'"));
         exec("DROP DOMAIN zzx2_dom");
     }
+
+    // ------------------------------------------------------------ A NOT NULL a child holds because its parent declares it
+
+    /** attname/attnotnull/attislocal/attinhcount for every live column of a relation. */
+    private static String attsOf(String relation) throws SQLException {
+        return scalar("SELECT string_agg(a.attname||'/'||a.attnotnull::text||'/'"
+                + "||a.attislocal::text||'/'||a.attinhcount::text, ',' ORDER BY a.attnum)"
+                + " FROM pg_attribute a JOIN pg_class cl ON a.attrelid = cl.oid"
+                + " WHERE cl.relname = '" + relation + "' AND a.attnum > 0"
+                + " AND NOT a.attisdropped");
+    }
+
+    /** The same, for several relations at once, each value prefixed with the relation's name. */
+    private static String attsAcross(String relations) throws SQLException {
+        return scalar("SELECT string_agg(cl.relname||':'||a.attname||'/'||a.attnotnull::text||'/'"
+                + "||a.attislocal::text||'/'||a.attinhcount::text, ',' ORDER BY cl.relname,"
+                + " a.attnum) FROM pg_attribute a JOIN pg_class cl ON a.attrelid = cl.oid"
+                + " WHERE cl.relname IN (" + relations + ") AND a.attnum > 0"
+                + " AND NOT a.attisdropped");
+    }
+
+    /** conname/conislocal/coninhcount for every NOT NULL constraint a relation holds. */
+    private static String notNullsOf(String relation) throws SQLException {
+        return scalar("SELECT string_agg(c.conname||'/'||c.conislocal::text||'/'"
+                + "||c.coninhcount::text, ',' ORDER BY c.conname)"
+                + " FROM pg_constraint c JOIN pg_class cl ON c.conrelid = cl.oid"
+                + " WHERE cl.relname = '" + relation + "' AND c.contype = 'n'");
+    }
+
+    /** The same, for several relations at once, each value prefixed with the relation's name. */
+    private static String notNullsAcross(String relations) throws SQLException {
+        return scalar("SELECT string_agg(cl.relname||':'||c.conname||'/'||c.conislocal::text||'/'"
+                + "||c.coninhcount::text, ',' ORDER BY cl.relname, c.conname)"
+                + " FROM pg_constraint c JOIN pg_class cl ON c.conrelid = cl.oid"
+                + " WHERE cl.relname IN (" + relations + ") AND c.contype = 'n'");
+    }
+
+    /** conname/conislocal/coninhcount/connoinherit for every NOT NULL a relation holds. */
+    private static String notNullsWithReachOf(String relation) throws SQLException {
+        return scalar("SELECT string_agg(c.conname||'/'||c.conislocal::text||'/'"
+                + "||c.coninhcount::text||'/'||c.connoinherit::text, ',' ORDER BY c.conname)"
+                + " FROM pg_constraint c JOIN pg_class cl ON c.conrelid = cl.oid"
+                + " WHERE cl.relname = '" + relation + "' AND c.contype = 'n'");
+    }
+
+    @Test
+    void aChildThatRelistsAColumnWithoutNotNullStillHoldsTheParentsRule() throws Exception {
+        exec("CREATE TABLE zzy8b1_p (i int NOT NULL, j int NOT NULL, k int)");
+        exec("CREATE TABLE zzy8b1_c (i int NOT NULL, j int, k int NOT NULL) INHERITS (zzy8b1_p)");
+
+        // j was listed without NOT NULL and keeps the parent's rule all the same: a child cannot
+        // be less strict than the relation its rows also belong to.
+        assertEquals("i/true/true/1,j/true/true/1,k/true/true/1", attsOf("zzy8b1_c"));
+        // The restated one is the child's own and counts the parent too; the one only taken
+        // answers to the parent's name; the one nobody above declares counts nobody.
+        assertEquals("zzy8b1_c_i_not_null/n/true/1/false,zzy8b1_c_k_not_null/n/true/0/false,"
+                        + "zzy8b1_p_j_not_null/n/false/1/false",
+                scalar("SELECT string_agg(c.conname||'/'||c.contype::text||'/'"
+                        + "||c.conislocal::text||'/'||c.coninhcount::text||'/'"
+                        + "||c.connoinherit::text, ',' ORDER BY c.conname) FROM pg_constraint c"
+                        + " JOIN pg_class cl ON c.conrelid = cl.oid"
+                        + " WHERE cl.relname = 'zzy8b1_c' AND c.contype = 'n'"));
+
+        // The rule is enforced, and the refusal names the column and the relation written to.
+        assertEquals("23502", stateOf("INSERT INTO zzy8b1_c (i, k) VALUES (1, 1)"));
+        assertEquals("null value in column \"j\" of relation \"zzy8b1_c\""
+                        + " violates not-null constraint",
+                messageOf("INSERT INTO zzy8b1_c (i, k) VALUES (1, 1)"));
+        assertEquals("Failing row contains (1, null, 1).",
+                detailOf("INSERT INTO zzy8b1_c (i, k) VALUES (1, 1)"));
+        assertEquals("j", fieldsOf("INSERT INTO zzy8b1_c (i, k) VALUES (1, 1)").getColumn());
+        assertEquals("0", scalar("SELECT count(*) FROM zzy8b1_c"));
+
+        // It is about every row the relation holds, not only the ones written into it.
+        exec("INSERT INTO zzy8b1_c (i, j, k) VALUES (1, 2, 3)");
+        assertEquals("23502", stateOf("UPDATE zzy8b1_c SET j = NULL"));
+        assertEquals("Failing row contains (1, null, 3).",
+                detailOf("UPDATE zzy8b1_c SET j = NULL"));
+        assertEquals("2", scalar("SELECT j FROM zzy8b1_c"));
+
+        exec("DROP TABLE zzy8b1_c");
+        exec("DROP TABLE zzy8b1_p");
+    }
+
+    @Test
+    void theRuleAParentDeclaresIsRefusedToTheChildWhicheverWayItIsAskedFor() throws Exception {
+        exec("CREATE TABLE zzy8b1_rp (i int NOT NULL, j int NOT NULL, k int)");
+        exec("CREATE TABLE zzy8b1_rc (i int NOT NULL, j int, k int NOT NULL)"
+                + " INHERITS (zzy8b1_rp)");
+
+        assertEquals("42P16", stateOf("ALTER TABLE zzy8b1_rc ALTER COLUMN j DROP NOT NULL"));
+        assertEquals("cannot drop inherited constraint \"zzy8b1_rp_j_not_null\""
+                        + " of relation \"zzy8b1_rc\"",
+                messageOf("ALTER TABLE zzy8b1_rc ALTER COLUMN j DROP NOT NULL"));
+        // The child declared this one for itself, and is still refused while the parent declares
+        // it too -- named by the constraint the child holds, not by the parent's.
+        assertEquals("cannot drop inherited constraint \"zzy8b1_rc_i_not_null\""
+                        + " of relation \"zzy8b1_rc\"",
+                messageOf("ALTER TABLE zzy8b1_rc ALTER COLUMN i DROP NOT NULL"));
+        // The named spelling of the drop answers the same way.
+        assertEquals("42P16",
+                stateOf("ALTER TABLE zzy8b1_rc DROP CONSTRAINT zzy8b1_rp_j_not_null"));
+        assertEquals("cannot drop inherited constraint \"zzy8b1_rp_j_not_null\""
+                        + " of relation \"zzy8b1_rc\"",
+                messageOf("ALTER TABLE zzy8b1_rc DROP CONSTRAINT zzy8b1_rp_j_not_null"));
+
+        // Nobody above declares k, so that one is the child's to withdraw.
+        exec("ALTER TABLE zzy8b1_rc ALTER COLUMN k DROP NOT NULL");
+        assertEquals("zzy8b1_rc_i_not_null/true/1,zzy8b1_rp_j_not_null/false/1",
+                notNullsOf("zzy8b1_rc"));
+
+        exec("DROP TABLE zzy8b1_rc");
+        exec("DROP TABLE zzy8b1_rp");
+    }
+
+    @Test
+    void theCountIsOnePerParentThatDeclaresTheColumnNotNull() throws Exception {
+        exec("CREATE TABLE zzy8b1_q0 (i int NOT NULL, j int NOT NULL, k int)");
+        exec("CREATE TABLE zzy8b1_q1 (i int NOT NULL, j int, k int NOT NULL)");
+        exec("CREATE TABLE zzy8b1_qc (i int, j int NOT NULL, k int)"
+                + " INHERITS (zzy8b1_q0, zzy8b1_q1)");
+
+        // i is declared by both parents and counts two; j and k by one each. The name is the
+        // first parent's, and the one the child declared is the child's own.
+        assertEquals("i/true/true/2,j/true/true/2,k/true/true/2", attsOf("zzy8b1_qc"));
+        assertEquals("zzy8b1_q0_i_not_null/false/2,zzy8b1_q1_k_not_null/false/1,"
+                + "zzy8b1_qc_j_not_null/true/1", notNullsOf("zzy8b1_qc"));
+
+        // A grandchild that re-lists them all takes each rule under the name it already has.
+        exec("CREATE TABLE zzy8b1_qg (i int, j int, k int) INHERITS (zzy8b1_qc)");
+        assertEquals("i/true/true/1,j/true/true/1,k/true/true/1", attsOf("zzy8b1_qg"));
+        assertEquals("zzy8b1_q0_i_not_null/false/1,zzy8b1_q1_k_not_null/false/1,"
+                + "zzy8b1_qc_j_not_null/false/1", notNullsOf("zzy8b1_qg"));
+
+        // Two generations down, k is still refused.
+        assertEquals("23502", stateOf("INSERT INTO zzy8b1_qg (i, j) VALUES (1, 1)"));
+        assertEquals("null value in column \"k\" of relation \"zzy8b1_qg\""
+                        + " violates not-null constraint",
+                messageOf("INSERT INTO zzy8b1_qg (i, j) VALUES (1, 1)"));
+        exec("INSERT INTO zzy8b1_qg (i, j, k) VALUES (1, 1, 1)");
+        assertEquals("1", scalar("SELECT count(*) FROM zzy8b1_qg"));
+        assertEquals("1", scalar("SELECT count(*) FROM zzy8b1_q0"));
+        assertEquals("1", scalar("SELECT count(*) FROM zzy8b1_q1"));
+
+        // The child declared j itself, and one parent declares it too.
+        assertEquals("cannot drop inherited constraint \"zzy8b1_qc_j_not_null\""
+                        + " of relation \"zzy8b1_qc\"",
+                messageOf("ALTER TABLE zzy8b1_qc ALTER COLUMN j DROP NOT NULL"));
+        // The grandchild is refused under the name the rule has carried since it was made.
+        assertEquals("cannot drop inherited constraint \"zzy8b1_q1_k_not_null\""
+                        + " of relation \"zzy8b1_qg\"",
+                messageOf("ALTER TABLE zzy8b1_qg ALTER COLUMN k DROP NOT NULL"));
+
+        exec("DROP TABLE zzy8b1_qg");
+        exec("DROP TABLE zzy8b1_qc");
+        exec("DROP TABLE zzy8b1_q0");
+        exec("DROP TABLE zzy8b1_q1");
+    }
+
+    @Test
+    void writingNullOnTheChildDoesNotTakeTheParentsRuleOff() throws Exception {
+        exec("CREATE TABLE zzy8b1_np (i int NOT NULL, j int NOT NULL, k int)");
+        exec("CREATE TABLE zzy8b1_nc (i int NULL, j int NULL, k int NULL)"
+                + " INHERITS (zzy8b1_np)");
+
+        assertEquals("i/true/true/1,j/true/true/1,k/false/true/1", attsOf("zzy8b1_nc"));
+        assertEquals("zzy8b1_np_i_not_null/false/1,zzy8b1_np_j_not_null/false/1",
+                notNullsOf("zzy8b1_nc"));
+
+        assertEquals("23502", stateOf("INSERT INTO zzy8b1_nc (i, k) VALUES (1, 1)"));
+        assertEquals("null value in column \"j\" of relation \"zzy8b1_nc\""
+                        + " violates not-null constraint",
+                messageOf("INSERT INTO zzy8b1_nc (i, k) VALUES (1, 1)"));
+        assertEquals("0", scalar("SELECT count(*) FROM zzy8b1_nc"));
+
+        exec("DROP TABLE zzy8b1_nc");
+        exec("DROP TABLE zzy8b1_np");
+    }
+
+    @Test
+    void aRuleWrittenNoInheritIsAboutTheDeclaringRelationsRowsAlone() throws Exception {
+        exec("CREATE TABLE zzy8b1_xp (i int NOT NULL NO INHERIT, j int NOT NULL)");
+        exec("CREATE TABLE zzy8b1_xc () INHERITS (zzy8b1_xp)");
+        exec("CREATE TABLE zzy8b1_xr (i int, j int) INHERITS (zzy8b1_xp)");
+
+        assertEquals("zzy8b1_xp_i_not_null/true/0/true,zzy8b1_xp_j_not_null/true/0/false",
+                notNullsWithReachOf("zzy8b1_xp"));
+        // Neither the child that took the column nor the one that listed it holds the rule.
+        assertEquals("i/false/false/1,j/true/false/1", attsOf("zzy8b1_xc"));
+        assertEquals("i/false/true/1,j/true/true/1", attsOf("zzy8b1_xr"));
+        assertEquals("zzy8b1_xp_j_not_null/false/1", notNullsOf("zzy8b1_xc"));
+        assertEquals("zzy8b1_xp_j_not_null/false/1", notNullsOf("zzy8b1_xr"));
+
+        // The descendants take the null the declaring relation is refused.
+        exec("INSERT INTO zzy8b1_xc (j) VALUES (1)");
+        exec("INSERT INTO zzy8b1_xr (j) VALUES (1)");
+        assertEquals("1", scalar("SELECT count(*) FROM zzy8b1_xc WHERE i IS NULL"));
+        assertEquals("1", scalar("SELECT count(*) FROM zzy8b1_xr WHERE i IS NULL"));
+        assertEquals("23502", stateOf("INSERT INTO zzy8b1_xp (j) VALUES (1)"));
+        assertEquals("null value in column \"i\" of relation \"zzy8b1_xp\""
+                        + " violates not-null constraint",
+                messageOf("INSERT INTO zzy8b1_xp (j) VALUES (1)"));
+        // The rule written without NO INHERIT is enforced on the child all the same.
+        assertEquals("null value in column \"j\" of relation \"zzy8b1_xc\""
+                        + " violates not-null constraint",
+                messageOf("INSERT INTO zzy8b1_xc (i) VALUES (1)"));
+
+        exec("DROP TABLE zzy8b1_xr");
+        exec("DROP TABLE zzy8b1_xc");
+        exec("DROP TABLE zzy8b1_xp");
+    }
+
+    @Test
+    void aChildBesideANoInheritParentOwnsTheRuleItDeclaredOutright() throws Exception {
+        exec("CREATE TABLE zzy8b1_yp (i int NOT NULL NO INHERIT, j int)");
+        exec("CREATE TABLE zzy8b1_yc (i int NOT NULL, j int) INHERITS (zzy8b1_yp)");
+
+        // The parent's rule reaches nobody, so the child counts no parent for its own.
+        assertEquals("zzy8b1_yc_i_not_null/true/0/false", notNullsWithReachOf("zzy8b1_yc"));
+        exec("ALTER TABLE zzy8b1_yc ALTER COLUMN i DROP NOT NULL");
+        assertNull(notNullsOf("zzy8b1_yc"));
+        assertEquals("i/false/true/1,j/false/true/1", attsOf("zzy8b1_yc"));
+
+        exec("INSERT INTO zzy8b1_yc (j) VALUES (1)");
+        assertEquals("1", scalar("SELECT count(*) FROM zzy8b1_yc"));
+
+        exec("DROP TABLE zzy8b1_yc");
+        exec("DROP TABLE zzy8b1_yp");
+    }
+
+    @Test
+    void aRuleTheParentTakesOnLaterIsCountedByTheChildThatDeclaredItFirst() throws Exception {
+        exec("CREATE TABLE zzy8b1_gp (i int NOT NULL, k int)");
+        exec("CREATE TABLE zzy8b1_gc (k int NOT NULL) INHERITS (zzy8b1_gp)");
+
+        // Nobody above declares k, so the child's own rule counts no parent.
+        assertEquals("zzy8b1_gc_k_not_null/true/0,zzy8b1_gp_i_not_null/false/1",
+                notNullsOf("zzy8b1_gc"));
+
+        exec("ALTER TABLE zzy8b1_gp ALTER COLUMN k SET NOT NULL");
+        assertEquals("zzy8b1_gc:zzy8b1_gc_k_not_null/true/1,"
+                        + "zzy8b1_gc:zzy8b1_gp_i_not_null/false/1,"
+                        + "zzy8b1_gp:zzy8b1_gp_i_not_null/true/0,"
+                        + "zzy8b1_gp:zzy8b1_gp_k_not_null/true/0",
+                notNullsAcross("'zzy8b1_gp','zzy8b1_gc'"));
+        assertEquals("cannot drop inherited constraint \"zzy8b1_gc_k_not_null\""
+                        + " of relation \"zzy8b1_gc\"",
+                messageOf("ALTER TABLE zzy8b1_gc ALTER COLUMN k DROP NOT NULL"));
+
+        // The parent letting go again leaves the child's own rule standing and enforced.
+        exec("ALTER TABLE zzy8b1_gp ALTER COLUMN k DROP NOT NULL");
+        assertEquals("zzy8b1_gc:zzy8b1_gc_k_not_null/true/0,"
+                        + "zzy8b1_gc:zzy8b1_gp_i_not_null/false/1,"
+                        + "zzy8b1_gp:zzy8b1_gp_i_not_null/true/0",
+                notNullsAcross("'zzy8b1_gp','zzy8b1_gc'"));
+        assertEquals("null value in column \"k\" of relation \"zzy8b1_gc\""
+                        + " violates not-null constraint",
+                messageOf("INSERT INTO zzy8b1_gc (i) VALUES (1)"));
+        exec("INSERT INTO zzy8b1_gp (i) VALUES (1)");
+        assertEquals("0", scalar("SELECT count(*) FROM zzy8b1_gc"));
+        assertEquals("1", scalar("SELECT count(*) FROM zzy8b1_gp"));
+
+        exec("DROP TABLE zzy8b1_gc");
+        exec("DROP TABLE zzy8b1_gp");
+    }
+
+    @Test
+    void aParentLettingGoLeavesStandingWhatTheDescendantDeclaredItself() throws Exception {
+        exec("CREATE TABLE zzy8b1_dp (i int NOT NULL, j int NOT NULL, k int)");
+        exec("CREATE TABLE zzy8b1_dc (i int NOT NULL, j int, k int NOT NULL)"
+                + " INHERITS (zzy8b1_dp)");
+        exec("CREATE TABLE zzy8b1_dg () INHERITS (zzy8b1_dc)");
+
+        // The drop takes away the one count the parent contributed and no more: the child
+        // declared this rule itself, so it stands, and the grandchild goes on taking it.
+        exec("ALTER TABLE zzy8b1_dp ALTER COLUMN i DROP NOT NULL");
+        assertEquals("zzy8b1_dc:i/true/true/1,zzy8b1_dc:j/true/true/1,zzy8b1_dc:k/true/true/1,"
+                        + "zzy8b1_dg:i/true/false/1,zzy8b1_dg:j/true/false/1,"
+                        + "zzy8b1_dg:k/true/false/1,zzy8b1_dp:i/false/true/0,"
+                        + "zzy8b1_dp:j/true/true/0,zzy8b1_dp:k/false/true/0",
+                attsAcross("'zzy8b1_dp','zzy8b1_dc','zzy8b1_dg'"));
+        assertEquals("zzy8b1_dc:zzy8b1_dc_i_not_null/true/0,"
+                        + "zzy8b1_dc:zzy8b1_dc_k_not_null/true/0,"
+                        + "zzy8b1_dc:zzy8b1_dp_j_not_null/false/1,"
+                        + "zzy8b1_dg:zzy8b1_dc_i_not_null/false/1,"
+                        + "zzy8b1_dg:zzy8b1_dc_k_not_null/false/1,"
+                        + "zzy8b1_dg:zzy8b1_dp_j_not_null/false/1,"
+                        + "zzy8b1_dp:zzy8b1_dp_j_not_null/true/0",
+                notNullsAcross("'zzy8b1_dp','zzy8b1_dc','zzy8b1_dg'"));
+
+        // The parent takes the null it no longer refuses; the descendants go on refusing it.
+        exec("INSERT INTO zzy8b1_dp (j) VALUES (1)");
+        assertEquals("null value in column \"i\" of relation \"zzy8b1_dc\""
+                        + " violates not-null constraint",
+                messageOf("INSERT INTO zzy8b1_dc (j, k) VALUES (1, 1)"));
+        assertEquals("null value in column \"i\" of relation \"zzy8b1_dg\""
+                        + " violates not-null constraint",
+                messageOf("INSERT INTO zzy8b1_dg (j, k) VALUES (1, 1)"));
+
+        // Nothing above declares it any more, so the child may withdraw it, and that reaches
+        // the grandchild.
+        exec("ALTER TABLE zzy8b1_dc ALTER COLUMN i DROP NOT NULL");
+        assertEquals("zzy8b1_dc:zzy8b1_dc_k_not_null/true/0,"
+                        + "zzy8b1_dc:zzy8b1_dp_j_not_null/false/1,"
+                        + "zzy8b1_dg:zzy8b1_dc_k_not_null/false/1,"
+                        + "zzy8b1_dg:zzy8b1_dp_j_not_null/false/1",
+                notNullsAcross("'zzy8b1_dc','zzy8b1_dg'"));
+        exec("INSERT INTO zzy8b1_dg (j, k) VALUES (1, 1)");
+        assertEquals("1", scalar("SELECT count(*) FROM zzy8b1_dg"));
+
+        exec("DROP TABLE zzy8b1_dg");
+        exec("DROP TABLE zzy8b1_dc");
+        exec("DROP TABLE zzy8b1_dp");
+    }
+
+    @Test
+    void onlyLeavesTheFirstGenerationHoldingTheRuleUnderTheNameItHas() throws Exception {
+        exec("CREATE TABLE zzy8b1_op (i int NOT NULL, j int NOT NULL, k int)");
+        exec("CREATE TABLE zzy8b1_oc (i int NOT NULL, j int, k int NOT NULL)"
+                + " INHERITS (zzy8b1_op)");
+        exec("CREATE TABLE zzy8b1_og () INHERITS (zzy8b1_oc)");
+
+        exec("ALTER TABLE ONLY zzy8b1_op ALTER COLUMN j DROP NOT NULL");
+        exec("ALTER TABLE ONLY zzy8b1_op ALTER COLUMN i DROP NOT NULL");
+
+        // j is the child's own from now on, and keeps the name the parent gave it. Only the
+        // first generation is told anything: the grandchild goes on taking both from the child.
+        assertEquals("zzy8b1_oc:i/true/true/1,zzy8b1_oc:j/true/true/1,zzy8b1_oc:k/true/true/1,"
+                        + "zzy8b1_og:i/true/false/1,zzy8b1_og:j/true/false/1,"
+                        + "zzy8b1_og:k/true/false/1,zzy8b1_op:i/false/true/0,"
+                        + "zzy8b1_op:j/false/true/0,zzy8b1_op:k/false/true/0",
+                attsAcross("'zzy8b1_op','zzy8b1_oc','zzy8b1_og'"));
+        assertEquals("zzy8b1_oc:zzy8b1_oc_i_not_null/true/0,"
+                        + "zzy8b1_oc:zzy8b1_oc_k_not_null/true/0,"
+                        + "zzy8b1_oc:zzy8b1_op_j_not_null/true/0,"
+                        + "zzy8b1_og:zzy8b1_oc_i_not_null/false/1,"
+                        + "zzy8b1_og:zzy8b1_oc_k_not_null/false/1,"
+                        + "zzy8b1_og:zzy8b1_op_j_not_null/false/1",
+                notNullsAcross("'zzy8b1_op','zzy8b1_oc','zzy8b1_og'"));
+        assertEquals("null value in column \"j\" of relation \"zzy8b1_oc\""
+                        + " violates not-null constraint",
+                messageOf("INSERT INTO zzy8b1_oc (i, k) VALUES (1, 1)"));
+        assertEquals("null value in column \"j\" of relation \"zzy8b1_og\""
+                        + " violates not-null constraint",
+                messageOf("INSERT INTO zzy8b1_og (i, k) VALUES (1, 1)"));
+
+        // The child owns it now, and withdrawing it reaches the grandchild.
+        exec("ALTER TABLE zzy8b1_oc ALTER COLUMN j DROP NOT NULL");
+        assertEquals("zzy8b1_oc:zzy8b1_oc_i_not_null/true/0,"
+                        + "zzy8b1_oc:zzy8b1_oc_k_not_null/true/0,"
+                        + "zzy8b1_og:zzy8b1_oc_i_not_null/false/1,"
+                        + "zzy8b1_og:zzy8b1_oc_k_not_null/false/1",
+                notNullsAcross("'zzy8b1_oc','zzy8b1_og'"));
+        exec("INSERT INTO zzy8b1_og (i, k) VALUES (1, 1)");
+        assertEquals("1", scalar("SELECT count(*) FROM zzy8b1_og"));
+
+        exec("DROP TABLE zzy8b1_og");
+        exec("DROP TABLE zzy8b1_oc");
+        exec("DROP TABLE zzy8b1_op");
+    }
+
+    @Test
+    void aRuleMadeTheChildsByOnlySurvivesLeavingTheHierarchy() throws Exception {
+        exec("CREATE TABLE zzy8b1_wp (i int, j int NOT NULL)");
+        exec("CREATE TABLE zzy8b1_wc (i int, j int) INHERITS (zzy8b1_wp)");
+
+        exec("ALTER TABLE ONLY zzy8b1_wp ALTER COLUMN j DROP NOT NULL");
+        assertEquals("zzy8b1_wp_j_not_null/true/0", notNullsOf("zzy8b1_wc"));
+        // Leaving the hierarchy leaves the rule, and the name it was given, standing.
+        exec("ALTER TABLE zzy8b1_wc NO INHERIT zzy8b1_wp");
+        assertEquals("zzy8b1_wp_j_not_null/true/0", notNullsOf("zzy8b1_wc"));
+        assertEquals("null value in column \"j\" of relation \"zzy8b1_wc\""
+                        + " violates not-null constraint",
+                messageOf("INSERT INTO zzy8b1_wc (i) VALUES (1)"));
+
+        exec("ALTER TABLE zzy8b1_wc ALTER COLUMN j DROP NOT NULL");
+        assertNull(notNullsOf("zzy8b1_wc"));
+        exec("INSERT INTO zzy8b1_wc (i) VALUES (1)");
+        assertEquals("1", scalar("SELECT count(*) FROM zzy8b1_wc"));
+
+        exec("DROP TABLE zzy8b1_wc");
+        exec("DROP TABLE zzy8b1_wp");
+    }
+
+    @Test
+    void theNamedSpellingOfTheDropAnswersTheSameWayOnlyAndAll() throws Exception {
+        exec("CREATE TABLE zzy8b1_np2 (i int NOT NULL, j int NOT NULL, k int)");
+        exec("CREATE TABLE zzy8b1_nc2 (i int NOT NULL, j int, k int NOT NULL)"
+                + " INHERITS (zzy8b1_np2)");
+        exec("CREATE TABLE zzy8b1_ng2 () INHERITS (zzy8b1_nc2)");
+
+        exec("ALTER TABLE ONLY zzy8b1_np2 DROP CONSTRAINT zzy8b1_np2_j_not_null");
+        assertEquals("zzy8b1_nc2:zzy8b1_nc2_i_not_null/true/1,"
+                        + "zzy8b1_nc2:zzy8b1_nc2_k_not_null/true/0,"
+                        + "zzy8b1_nc2:zzy8b1_np2_j_not_null/true/0,"
+                        + "zzy8b1_ng2:zzy8b1_nc2_i_not_null/false/1,"
+                        + "zzy8b1_ng2:zzy8b1_nc2_k_not_null/false/1,"
+                        + "zzy8b1_ng2:zzy8b1_np2_j_not_null/false/1,"
+                        + "zzy8b1_np2:zzy8b1_np2_i_not_null/true/0",
+                notNullsAcross("'zzy8b1_np2','zzy8b1_nc2','zzy8b1_ng2'"));
+
+        // Without ONLY it reaches the descendants and leaves their own standing.
+        exec("ALTER TABLE zzy8b1_np2 DROP CONSTRAINT zzy8b1_np2_i_not_null");
+        assertEquals("zzy8b1_nc2:zzy8b1_nc2_i_not_null/true/0,"
+                        + "zzy8b1_nc2:zzy8b1_nc2_k_not_null/true/0,"
+                        + "zzy8b1_nc2:zzy8b1_np2_j_not_null/true/0,"
+                        + "zzy8b1_ng2:zzy8b1_nc2_i_not_null/false/1,"
+                        + "zzy8b1_ng2:zzy8b1_nc2_k_not_null/false/1,"
+                        + "zzy8b1_ng2:zzy8b1_np2_j_not_null/false/1",
+                notNullsAcross("'zzy8b1_np2','zzy8b1_nc2','zzy8b1_ng2'"));
+        assertEquals("zzy8b1_nc2:i/true,zzy8b1_nc2:j/true,zzy8b1_nc2:k/true,"
+                        + "zzy8b1_ng2:i/true,zzy8b1_ng2:j/true,zzy8b1_ng2:k/true,"
+                        + "zzy8b1_np2:i/false,zzy8b1_np2:j/false,zzy8b1_np2:k/false",
+                scalar("SELECT string_agg(cl.relname||':'||a.attname||'/'||a.attnotnull::text,"
+                        + " ',' ORDER BY cl.relname, a.attnum) FROM pg_attribute a"
+                        + " JOIN pg_class cl ON a.attrelid = cl.oid WHERE cl.relname IN"
+                        + " ('zzy8b1_np2','zzy8b1_nc2','zzy8b1_ng2') AND a.attnum > 0"
+                        + " AND NOT a.attisdropped"));
+
+        assertEquals("null value in column \"j\" of relation \"zzy8b1_ng2\""
+                        + " violates not-null constraint",
+                messageOf("INSERT INTO zzy8b1_ng2 (i, k) VALUES (1, 1)"));
+        exec("INSERT INTO zzy8b1_np2 (i) VALUES (1)");
+        assertEquals("1", scalar("SELECT count(*) FROM zzy8b1_np2"));
+
+        exec("DROP TABLE zzy8b1_ng2");
+        exec("DROP TABLE zzy8b1_nc2");
+        exec("DROP TABLE zzy8b1_np2");
+    }
+
+    @Test
+    void alterTableInheritAsksTheChildToBeNoLessStrictAlready() throws Exception {
+        exec("CREATE TABLE zzy8b1_ip (i int NOT NULL, j int NOT NULL, k int)");
+        exec("CREATE TABLE zzy8b1_ic (i int NOT NULL, j int, k int NOT NULL)");
+        exec("INSERT INTO zzy8b1_ic (i, k) VALUES (1, 1)");
+
+        // The INHERITS clause merges the parent's rule in; ALTER TABLE ... INHERIT refuses
+        // instead, because the table it is being pointed at may already hold nulls in j.
+        assertEquals("42804", stateOf("ALTER TABLE zzy8b1_ic INHERIT zzy8b1_ip"));
+        assertEquals("column \"j\" in child table \"zzy8b1_ic\" must be marked NOT NULL",
+                messageOf("ALTER TABLE zzy8b1_ic INHERIT zzy8b1_ip"));
+        // The refusal leaves the relation as it found it.
+        assertEquals("i/true/true/0,j/false/true/0,k/true/true/0", attsOf("zzy8b1_ic"));
+        assertEquals(0, num("SELECT count(*)::int FROM pg_inherits h"
+                + " JOIN pg_class cl ON cl.oid = h.inhrelid WHERE cl.relname = 'zzy8b1_ic'"));
+
+        exec("DELETE FROM zzy8b1_ic");
+        exec("ALTER TABLE zzy8b1_ic ALTER COLUMN j SET NOT NULL");
+        exec("ALTER TABLE zzy8b1_ic INHERIT zzy8b1_ip");
+        assertEquals("zzy8b1_ic_i_not_null/true/1,zzy8b1_ic_j_not_null/true/1,"
+                + "zzy8b1_ic_k_not_null/true/0", notNullsOf("zzy8b1_ic"));
+        assertEquals("i/true/true/1,j/true/true/1,k/true/true/1", attsOf("zzy8b1_ic"));
+
+        // What it declared for itself is now a rule a parent declares as well.
+        assertEquals("cannot drop inherited constraint \"zzy8b1_ic_j_not_null\""
+                        + " of relation \"zzy8b1_ic\"",
+                messageOf("ALTER TABLE zzy8b1_ic ALTER COLUMN j DROP NOT NULL"));
+        exec("ALTER TABLE zzy8b1_ic NO INHERIT zzy8b1_ip");
+        assertEquals("zzy8b1_ic_i_not_null/true/0,zzy8b1_ic_j_not_null/true/0,"
+                + "zzy8b1_ic_k_not_null/true/0", notNullsOf("zzy8b1_ic"));
+        exec("ALTER TABLE zzy8b1_ic ALTER COLUMN j DROP NOT NULL");
+        assertEquals("zzy8b1_ic_i_not_null/true/0,zzy8b1_ic_k_not_null/true/0",
+                notNullsOf("zzy8b1_ic"));
+
+        exec("DROP TABLE zzy8b1_ic");
+        exec("DROP TABLE zzy8b1_ip");
+    }
+
+    @Test
+    void aParentThatTakesTheRuleOnLaterReachesEveryChildItHas() throws Exception {
+        exec("CREATE TABLE zzy8b1_sp (i int, j int)");
+        exec("CREATE TABLE zzy8b1_sc (i int, j int) INHERITS (zzy8b1_sp)");
+        exec("INSERT INTO zzy8b1_sc (j) VALUES (1)");
+
+        // The rows of every descendant are read before the rule is taken on.
+        assertEquals("23502", stateOf("ALTER TABLE zzy8b1_sp ALTER COLUMN i SET NOT NULL"));
+        assertEquals("column \"i\" of relation \"zzy8b1_sc\" contains null values",
+                messageOf("ALTER TABLE zzy8b1_sp ALTER COLUMN i SET NOT NULL"));
+
+        exec("DELETE FROM zzy8b1_sc");
+        exec("ALTER TABLE zzy8b1_sp ALTER COLUMN i SET NOT NULL");
+        assertEquals("zzy8b1_sc:zzy8b1_sp_i_not_null/false/1,"
+                        + "zzy8b1_sp:zzy8b1_sp_i_not_null/true/0",
+                notNullsAcross("'zzy8b1_sp','zzy8b1_sc'"));
+        assertEquals("zzy8b1_sc:i/true/true/1,zzy8b1_sc:j/false/true/1,"
+                        + "zzy8b1_sp:i/true/true/0,zzy8b1_sp:j/false/true/0",
+                attsAcross("'zzy8b1_sp','zzy8b1_sc'"));
+        assertEquals("null value in column \"i\" of relation \"zzy8b1_sc\""
+                        + " violates not-null constraint",
+                messageOf("INSERT INTO zzy8b1_sc (j) VALUES (1)"));
+        assertEquals("cannot drop inherited constraint \"zzy8b1_sp_i_not_null\""
+                        + " of relation \"zzy8b1_sc\"",
+                messageOf("ALTER TABLE zzy8b1_sc ALTER COLUMN i DROP NOT NULL"));
+
+        // ONLY takes the rule on for the relation it names and for nobody below.
+        exec("ALTER TABLE ONLY zzy8b1_sp ALTER COLUMN j SET NOT NULL");
+        assertEquals("zzy8b1_sc:zzy8b1_sp_i_not_null/false/1,"
+                        + "zzy8b1_sp:zzy8b1_sp_i_not_null/true/0,"
+                        + "zzy8b1_sp:zzy8b1_sp_j_not_null/true/0",
+                notNullsAcross("'zzy8b1_sp','zzy8b1_sc'"));
+
+        exec("DROP TABLE zzy8b1_sc");
+        exec("DROP TABLE zzy8b1_sp");
+    }
+
+    @Test
+    void aPartitionDeclaresNothingOfItsOwnAndIsRefusedInWordsOfItsOwn() throws Exception {
+        exec("CREATE TABLE zzy8b1_pt (i int NOT NULL, j int NOT NULL, k int)"
+                + " PARTITION BY RANGE (i)");
+        exec("CREATE TABLE zzy8b1_pa PARTITION OF zzy8b1_pt FOR VALUES FROM (1) TO (10)");
+
+        // A partition has no column list of its own, so nothing about it is local.
+        assertEquals("i/true/false/1,j/true/false/1,k/false/false/1", attsOf("zzy8b1_pa"));
+        assertEquals("zzy8b1_pt_i_not_null/false/1/false,zzy8b1_pt_j_not_null/false/1/false",
+                notNullsWithReachOf("zzy8b1_pa"));
+
+        // A partition is refused in words of its own, naming the column rather than the rule.
+        assertEquals("42P16", stateOf("ALTER TABLE zzy8b1_pa ALTER COLUMN j DROP NOT NULL"));
+        assertEquals("column \"j\" is marked NOT NULL in parent table",
+                messageOf("ALTER TABLE zzy8b1_pa ALTER COLUMN j DROP NOT NULL"));
+        assertEquals("cannot drop inherited constraint \"zzy8b1_pt_j_not_null\""
+                        + " of relation \"zzy8b1_pa\"",
+                messageOf("ALTER TABLE zzy8b1_pa DROP CONSTRAINT zzy8b1_pt_j_not_null"));
+
+        assertEquals("null value in column \"j\" of relation \"zzy8b1_pa\""
+                        + " violates not-null constraint",
+                messageOf("INSERT INTO zzy8b1_pa (i) VALUES (1)"));
+        // Written through the partitioned table, the refusal names the partition it landed in.
+        assertEquals("null value in column \"j\" of relation \"zzy8b1_pa\""
+                        + " violates not-null constraint",
+                messageOf("INSERT INTO zzy8b1_pt (i) VALUES (1)"));
+        assertEquals("0", scalar("SELECT count(*) FROM zzy8b1_pa"));
+
+        exec("DROP TABLE zzy8b1_pt");
+    }
+
+    @Test
+    void attachPartitionAsksTheTableToBeNoLessStrictAlready() throws Exception {
+        exec("CREATE TABLE zzy8b1_qt (i int NOT NULL, j int NOT NULL, k int)"
+                + " PARTITION BY RANGE (i)");
+        exec("CREATE TABLE zzy8b1_qb (i int NOT NULL, j int, k int NOT NULL)");
+        exec("INSERT INTO zzy8b1_qb (i, k) VALUES (11, 1)");
+
+        assertEquals("42804", stateOf("ALTER TABLE zzy8b1_qt ATTACH PARTITION zzy8b1_qb"
+                + " FOR VALUES FROM (10) TO (20)"));
+        assertEquals("column \"j\" in child table \"zzy8b1_qb\" must be marked NOT NULL",
+                messageOf("ALTER TABLE zzy8b1_qt ATTACH PARTITION zzy8b1_qb"
+                        + " FOR VALUES FROM (10) TO (20)"));
+        assertEquals("i/true/true/0,j/false/true/0,k/true/true/0", attsOf("zzy8b1_qb"));
+        assertEquals(0, num("SELECT count(*)::int FROM pg_inherits h"
+                + " JOIN pg_class cl ON cl.oid = h.inhrelid WHERE cl.relname = 'zzy8b1_qb'"));
+
+        exec("DELETE FROM zzy8b1_qb");
+        exec("ALTER TABLE zzy8b1_qb ALTER COLUMN j SET NOT NULL");
+        exec("ALTER TABLE zzy8b1_qt ATTACH PARTITION zzy8b1_qb FOR VALUES FROM (10) TO (20)");
+
+        // What it declared is now recorded as coming from the partitioned table.
+        assertEquals("zzy8b1_qb_i_not_null/false/1,zzy8b1_qb_j_not_null/false/1,"
+                + "zzy8b1_qb_k_not_null/true/0", notNullsOf("zzy8b1_qb"));
+        assertEquals("i/true/false/1,j/true/false/1,k/true/false/1", attsOf("zzy8b1_qb"));
+        assertEquals("column \"j\" is marked NOT NULL in parent table",
+                messageOf("ALTER TABLE zzy8b1_qb ALTER COLUMN j DROP NOT NULL"));
+
+        // k is the partition's alone, and that one it may withdraw.
+        exec("ALTER TABLE zzy8b1_qb ALTER COLUMN k DROP NOT NULL");
+        assertEquals("zzy8b1_qb_i_not_null/false/1,zzy8b1_qb_j_not_null/false/1",
+                notNullsOf("zzy8b1_qb"));
+
+        // Withdrawn from the partitioned table, every rule it holds is its own again.
+        exec("ALTER TABLE zzy8b1_qt DETACH PARTITION zzy8b1_qb");
+        assertEquals("zzy8b1_qb_i_not_null/true/0,zzy8b1_qb_j_not_null/true/0",
+                notNullsOf("zzy8b1_qb"));
+        assertEquals("i/true/true/0,j/true/true/0,k/false/true/0", attsOf("zzy8b1_qb"));
+
+        exec("DROP TABLE zzy8b1_qb");
+        exec("DROP TABLE zzy8b1_qt");
+    }
+
+    @Test
+    void aPrimaryKeyOnTheChildIsADeclarationOfItsOwn() throws Exception {
+        exec("CREATE TABLE zzy8b1_kp (i int NOT NULL, j int NOT NULL, k int)");
+        exec("CREATE TABLE zzy8b1_kc (j int PRIMARY KEY) INHERITS (zzy8b1_kp)");
+
+        assertEquals("i/true/false/1,j/true/true/1,k/false/false/1", attsOf("zzy8b1_kc"));
+        assertEquals("zzy8b1_kc_j_not_null/n/true/1,zzy8b1_kc_pkey/p/true/0,"
+                        + "zzy8b1_kp_i_not_null/n/false/1",
+                scalar("SELECT string_agg(c.conname||'/'||c.contype::text||'/'"
+                        + "||c.conislocal::text||'/'||c.coninhcount::text, ',' ORDER BY c.conname)"
+                        + " FROM pg_constraint c JOIN pg_class cl ON c.conrelid = cl.oid"
+                        + " WHERE cl.relname = 'zzy8b1_kc'"));
+
+        assertEquals("null value in column \"j\" of relation \"zzy8b1_kc\""
+                        + " violates not-null constraint",
+                messageOf("INSERT INTO zzy8b1_kc (i) VALUES (1)"));
+
+        exec("DROP TABLE zzy8b1_kc");
+        exec("DROP TABLE zzy8b1_kp");
+    }
+
+    // ------------------------------------------------------------ A NOT NULL a parent takes on under a name of its own is every descendant's
+
+    /** Runs a body inside one transaction and takes it all back again. */
+    private static void rolledBack(SqlBody body) throws Exception {
+        conn.setAutoCommit(false);
+        try {
+            body.run();
+            conn.rollback();
+        } finally {
+            conn.setAutoCommit(true);
+        }
+    }
+
+    /** A body of statements a test hands to {@link #rolledBack}. */
+    private interface SqlBody {
+        void run() throws Exception;
+    }
+
+    @Test
+    void aNamedNotNullAddedToAParentIsTheRuleOfEveryRelationBeneathIt() throws Exception {
+        exec("CREATE TABLE zzy9nn_gp (i int, j int)");
+        exec("CREATE TABLE zzy9nn_gc (i int, j int) INHERITS (zzy9nn_gp)");
+        exec("CREATE TABLE zzy9nn_gg () INHERITS (zzy9nn_gc)");
+        exec("CREATE TABLE zzy9nn_gs (i int, j int) INHERITS (zzy9nn_gp)");
+        exec("ALTER TABLE zzy9nn_gp ADD CONSTRAINT zzy9nn_gn NOT NULL i");
+
+        // The grandchild and the second child hold it too, each under the name it was made with.
+        assertEquals("zzy9nn_gc:zzy9nn_gn/false/1,zzy9nn_gg:zzy9nn_gn/false/1,"
+                        + "zzy9nn_gp:zzy9nn_gn/true/0,zzy9nn_gs:zzy9nn_gn/false/1",
+                notNullsAcross("'zzy9nn_gp','zzy9nn_gc','zzy9nn_gg','zzy9nn_gs'"));
+        assertEquals("zzy9nn_gc:i/true/true/1,zzy9nn_gc:j/false/true/1,"
+                        + "zzy9nn_gg:i/true/false/1,zzy9nn_gg:j/false/false/1,"
+                        + "zzy9nn_gp:i/true/true/0,zzy9nn_gp:j/false/true/0,"
+                        + "zzy9nn_gs:i/true/true/1,zzy9nn_gs:j/false/true/1",
+                attsAcross("'zzy9nn_gp','zzy9nn_gc','zzy9nn_gg','zzy9nn_gs'"));
+
+        // And the rule is enforced two generations down and on the side branch.
+        assertEquals("23502", stateOf("INSERT INTO zzy9nn_gg (j) VALUES (1)"));
+        assertEquals("null value in column \"i\" of relation \"zzy9nn_gg\""
+                        + " violates not-null constraint",
+                messageOf("INSERT INTO zzy9nn_gg (j) VALUES (1)"));
+        assertEquals("null value in column \"i\" of relation \"zzy9nn_gs\""
+                        + " violates not-null constraint",
+                messageOf("INSERT INTO zzy9nn_gs (j) VALUES (1)"));
+        exec("INSERT INTO zzy9nn_gg (i, j) VALUES (1, 1)");
+        assertEquals("1", scalar("SELECT count(*) FROM zzy9nn_gp"));
+
+        // It is the parent's to withdraw, so the grandchild is sent back to the parent...
+        assertEquals("42P16", stateOf("ALTER TABLE zzy9nn_gg ALTER COLUMN i DROP NOT NULL"));
+        assertEquals("cannot drop inherited constraint \"zzy9nn_gn\" of relation \"zzy9nn_gg\"",
+                messageOf("ALTER TABLE zzy9nn_gg ALTER COLUMN i DROP NOT NULL"));
+        // ...and withdrawing it reaches every relation it had reached.
+        exec("ALTER TABLE zzy9nn_gp DROP CONSTRAINT zzy9nn_gn");
+        assertNull(notNullsAcross("'zzy9nn_gp','zzy9nn_gc','zzy9nn_gg','zzy9nn_gs'"));
+        exec("INSERT INTO zzy9nn_gg (j) VALUES (2)");
+        assertEquals("2", scalar("SELECT count(*) FROM zzy9nn_gg"));
+
+        exec("DROP TABLE zzy9nn_gg");
+        exec("DROP TABLE zzy9nn_gs");
+        exec("DROP TABLE zzy9nn_gc");
+        exec("DROP TABLE zzy9nn_gp");
+    }
+
+    @Test
+    void theRowsBeneathDecideWhetherANamedNotNullCanBeDeclaredAtAll() throws Exception {
+        exec("CREATE TABLE zzy9nn_wp (i int, j int)");
+        exec("CREATE TABLE zzy9nn_wc (i int, j int) INHERITS (zzy9nn_wp)");
+        exec("INSERT INTO zzy9nn_wc (j) VALUES (5)");
+
+        // The rows of every descendant are read before the rule is stored, and the refusal
+        // names the relation whose rows are in the way.
+        assertEquals("23502",
+                stateOf("ALTER TABLE zzy9nn_wp ADD CONSTRAINT zzy9nn_wn NOT NULL i"));
+        assertEquals("column \"i\" of relation \"zzy9nn_wc\" contains null values",
+                messageOf("ALTER TABLE zzy9nn_wp ADD CONSTRAINT zzy9nn_wn NOT NULL i"));
+        // ONLY asks for a rule the relations below would not take on, which PostgreSQL will not
+        // store either -- and it says so without a hint.
+        assertEquals("42P16",
+                stateOf("ALTER TABLE ONLY zzy9nn_wp ADD CONSTRAINT zzy9nn_wn NOT NULL i"));
+        assertEquals("constraint must be added to child tables too",
+                messageOf("ALTER TABLE ONLY zzy9nn_wp ADD CONSTRAINT zzy9nn_wn NOT NULL i"));
+        assertNull(hintOf("ALTER TABLE ONLY zzy9nn_wp ADD CONSTRAINT zzy9nn_wn NOT NULL i"));
+        assertNull(notNullsAcross("'zzy9nn_wp','zzy9nn_wc'"));
+
+        exec("DELETE FROM zzy9nn_wc");
+        exec("ALTER TABLE zzy9nn_wp ADD CONSTRAINT zzy9nn_wn NOT NULL i");
+        // A column that already refuses a null has nothing left to hand down, so ONLY is taken
+        // there -- and adds nothing: the hierarchy still holds the one rule already made.
+        exec("ALTER TABLE ONLY zzy9nn_wp ADD CONSTRAINT zzy9nn_wn2 NOT NULL i");
+        assertEquals("zzy9nn_wc:zzy9nn_wn/false/1,zzy9nn_wp:zzy9nn_wn/true/0",
+                notNullsAcross("'zzy9nn_wp','zzy9nn_wc'"));
+
+        assertEquals("null value in column \"i\" of relation \"zzy9nn_wc\""
+                        + " violates not-null constraint",
+                messageOf("INSERT INTO zzy9nn_wc (j) VALUES (5)"));
+        exec("INSERT INTO zzy9nn_wc (i, j) VALUES (1, 5)");
+        assertEquals("1", scalar("SELECT count(*) FROM zzy9nn_wp"));
+
+        exec("DROP TABLE zzy9nn_wc");
+        exec("DROP TABLE zzy9nn_wp");
+    }
+
+    @Test
+    void aNamedNotNullOnAPartitionedTableReachesTheLeafUnderASubPartition() throws Exception {
+        exec("CREATE TABLE zzy9nn_pp (i int, j int) PARTITION BY RANGE (i)");
+        exec("CREATE TABLE zzy9nn_p1 PARTITION OF zzy9nn_pp FOR VALUES FROM (0) TO (10)"
+                + " PARTITION BY RANGE (i)");
+        exec("CREATE TABLE zzy9nn_p2 PARTITION OF zzy9nn_p1 FOR VALUES FROM (0) TO (5)");
+        exec("ALTER TABLE zzy9nn_pp ADD CONSTRAINT zzy9nn_pn NOT NULL j");
+
+        assertEquals("zzy9nn_p1:zzy9nn_pn/false/1,zzy9nn_p2:zzy9nn_pn/false/1,"
+                        + "zzy9nn_pp:zzy9nn_pn/true/0",
+                notNullsAcross("'zzy9nn_pp','zzy9nn_p1','zzy9nn_p2'"));
+
+        // The row is refused in the leaf it was routed to, and that leaf is the one named.
+        assertEquals("23502", stateOf("INSERT INTO zzy9nn_pp (i) VALUES (1)"));
+        assertEquals("null value in column \"j\" of relation \"zzy9nn_p2\""
+                        + " violates not-null constraint",
+                messageOf("INSERT INTO zzy9nn_pp (i) VALUES (1)"));
+        exec("INSERT INTO zzy9nn_pp (i, j) VALUES (1, 1)");
+        assertEquals("1", scalar("SELECT count(*) FROM zzy9nn_p2"));
+
+        exec("DROP TABLE zzy9nn_pp");
+    }
+
+    // ------------------------------------------------------------ A change to a NOT NULL that is rolled back leaves the hierarchy as it was
+
+    @Test
+    void aRolledBackDropNotNullLeavesEveryRelationRefusingTheNullAgain() throws Exception {
+        exec("CREATE TABLE zzy9nn_rp (i int NOT NULL, j int)");
+        exec("CREATE TABLE zzy9nn_rc (i int, j int) INHERITS (zzy9nn_rp)");
+
+        rolledBack(() -> {
+            exec("ALTER TABLE zzy9nn_rp ALTER COLUMN i DROP NOT NULL");
+            // Inside the transaction the child has let go of it too, and takes the null.
+            assertNull(notNullsAcross("'zzy9nn_rp','zzy9nn_rc'"));
+            exec("INSERT INTO zzy9nn_rc (j) VALUES (99)");
+            assertEquals("1", scalar("SELECT count(*) FROM zzy9nn_rc"));
+        });
+
+        assertEquals("zzy9nn_rc:zzy9nn_rp_i_not_null/false/1,"
+                        + "zzy9nn_rp:zzy9nn_rp_i_not_null/true/0",
+                notNullsAcross("'zzy9nn_rp','zzy9nn_rc'"));
+        assertEquals("i/true/true/1,j/false/true/1", attsOf("zzy9nn_rc"));
+        assertEquals("0", scalar("SELECT count(*) FROM zzy9nn_rc"));
+        assertEquals("23502", stateOf("INSERT INTO zzy9nn_rc (j) VALUES (1)"));
+        assertEquals("null value in column \"i\" of relation \"zzy9nn_rc\""
+                        + " violates not-null constraint",
+                messageOf("INSERT INTO zzy9nn_rc (j) VALUES (1)"));
+
+        // The named spelling of the drop is undone the same way.
+        rolledBack(() -> exec("ALTER TABLE zzy9nn_rp DROP CONSTRAINT zzy9nn_rp_i_not_null"));
+        assertEquals("zzy9nn_rc:zzy9nn_rp_i_not_null/false/1,"
+                        + "zzy9nn_rp:zzy9nn_rp_i_not_null/true/0",
+                notNullsAcross("'zzy9nn_rp','zzy9nn_rc'"));
+        assertEquals("23502", stateOf("INSERT INTO zzy9nn_rc (j) VALUES (1)"));
+
+        // ...and so is a savepoint rolled back inside a transaction that goes on to commit.
+        conn.setAutoCommit(false);
+        try {
+            java.sql.Savepoint sp = conn.setSavepoint("zzy9nn_s");
+            exec("ALTER TABLE zzy9nn_rp ALTER COLUMN i DROP NOT NULL");
+            assertNull(notNullsAcross("'zzy9nn_rp','zzy9nn_rc'"));
+            conn.rollback(sp);
+            conn.commit();
+        } finally {
+            conn.setAutoCommit(true);
+        }
+        assertEquals("zzy9nn_rc:zzy9nn_rp_i_not_null/false/1,"
+                        + "zzy9nn_rp:zzy9nn_rp_i_not_null/true/0",
+                notNullsAcross("'zzy9nn_rp','zzy9nn_rc'"));
+        assertEquals("23502", stateOf("INSERT INTO zzy9nn_rc (j) VALUES (1)"));
+        assertEquals("0", scalar("SELECT count(*) FROM zzy9nn_rc"));
+
+        exec("DROP TABLE zzy9nn_rc");
+        exec("DROP TABLE zzy9nn_rp");
+    }
+
+    @Test
+    void aRolledBackSetNotNullLeavesTheColumnTakingANullAgain() throws Exception {
+        exec("CREATE TABLE zzy9nn_sp (i int, j int)");
+        exec("CREATE TABLE zzy9nn_sc (i int, j int) INHERITS (zzy9nn_sp)");
+
+        rolledBack(() -> {
+            exec("ALTER TABLE zzy9nn_sp ALTER COLUMN i SET NOT NULL");
+            assertEquals("zzy9nn_sc:zzy9nn_sp_i_not_null/false/1,"
+                            + "zzy9nn_sp:zzy9nn_sp_i_not_null/true/0",
+                    notNullsAcross("'zzy9nn_sp','zzy9nn_sc'"));
+        });
+
+        assertNull(notNullsAcross("'zzy9nn_sp','zzy9nn_sc'"));
+        assertEquals("i/false/true/1,j/false/true/1", attsOf("zzy9nn_sc"));
+        exec("INSERT INTO zzy9nn_sc (j) VALUES (1)");
+        assertEquals("1", scalar("SELECT count(*) FROM zzy9nn_sc"));
+
+        // A rolled-back ADD CONSTRAINT is undone on the child as well.
+        rolledBack(() -> exec("ALTER TABLE zzy9nn_sp ADD CONSTRAINT zzy9nn_sn NOT NULL j"));
+        assertNull(notNullsAcross("'zzy9nn_sp','zzy9nn_sc'"));
+        exec("INSERT INTO zzy9nn_sc (i) VALUES (2)");
+        assertEquals("2", scalar("SELECT count(*) FROM zzy9nn_sc"));
+
+        exec("DROP TABLE zzy9nn_sc");
+        exec("DROP TABLE zzy9nn_sp");
+    }
+
+    // ------------------------------------------------------------ A NOT NULL two parents declare, and the name it answers to when one lets go
+
+    @Test
+    void aMergedNotNullKeepsTheNameItWasMadeWithWhenOneParentLetsGo() throws Exception {
+        exec("CREATE TABLE zzy9nn_z1 (i int NOT NULL)");
+        exec("CREATE TABLE zzy9nn_z2 (i int NOT NULL)");
+        exec("CREATE TABLE zzy9nn_z0 () INHERITS (zzy9nn_z1, zzy9nn_z2)");
+
+        assertEquals("zzy9nn_z1_i_not_null/false/2", notNullsOf("zzy9nn_z0"));
+        exec("ALTER TABLE zzy9nn_z1 ALTER COLUMN i DROP NOT NULL");
+        // The count falls by one; the name is still the one the constraint was created with.
+        assertEquals("zzy9nn_z1_i_not_null/false/1", notNullsOf("zzy9nn_z0"));
+        assertEquals("i/true/false/2", attsOf("zzy9nn_z0"));
+
+        // The other parent goes on declaring it, so the child may not withdraw it, and is
+        // refused under the name the rule has carried since it was made.
+        assertEquals("42P16", stateOf("ALTER TABLE zzy9nn_z0 ALTER COLUMN i DROP NOT NULL"));
+        assertEquals("cannot drop inherited constraint \"zzy9nn_z1_i_not_null\""
+                        + " of relation \"zzy9nn_z0\"",
+                messageOf("ALTER TABLE zzy9nn_z0 ALTER COLUMN i DROP NOT NULL"));
+        assertEquals("null value in column \"i\" of relation \"zzy9nn_z0\""
+                        + " violates not-null constraint",
+                messageOf("INSERT INTO zzy9nn_z0 VALUES (NULL)"));
+        exec("INSERT INTO zzy9nn_z1 VALUES (NULL)");
+
+        // With the last parent letting go, nothing is left on the child at all.
+        exec("ALTER TABLE zzy9nn_z2 ALTER COLUMN i DROP NOT NULL");
+        assertNull(notNullsOf("zzy9nn_z0"));
+        exec("INSERT INTO zzy9nn_z0 VALUES (NULL)");
+        assertEquals("1", scalar("SELECT count(*) FROM zzy9nn_z0"));
+
+        exec("DROP TABLE zzy9nn_z0");
+        exec("DROP TABLE zzy9nn_z1");
+        exec("DROP TABLE zzy9nn_z2");
+    }
+
+    // ------------------------------------------------------------ A partition's own NOT NULL, and the rule a table takes on when it is attached
+
+    @Test
+    void aPartitionThatDeclaredNotNullFirstHoldsARuleOfItsOwnAfterwards() throws Exception {
+        exec("CREATE TABLE zzy9nn_mp (i int, j int) PARTITION BY RANGE (i)");
+        exec("CREATE TABLE zzy9nn_ma PARTITION OF zzy9nn_mp FOR VALUES FROM (0) TO (10)");
+        exec("ALTER TABLE zzy9nn_ma ALTER COLUMN j SET NOT NULL");
+
+        // The partitioned table declares nothing, and the row is refused all the same.
+        assertEquals("zzy9nn_ma:zzy9nn_ma_j_not_null/true/0",
+                notNullsAcross("'zzy9nn_mp','zzy9nn_ma'"));
+        assertEquals("null value in column \"j\" of relation \"zzy9nn_ma\""
+                        + " violates not-null constraint",
+                messageOf("INSERT INTO zzy9nn_mp (i) VALUES (1)"));
+
+        // The partitioned table taking it on adds a count and leaves the rule the partition's.
+        exec("ALTER TABLE zzy9nn_mp ALTER COLUMN j SET NOT NULL");
+        assertEquals("zzy9nn_ma:zzy9nn_ma_j_not_null/true/1,"
+                        + "zzy9nn_mp:zzy9nn_mp_j_not_null/true/0",
+                notNullsAcross("'zzy9nn_mp','zzy9nn_ma'"));
+        assertEquals("i/false/false/1,j/true/false/1", attsOf("zzy9nn_ma"));
+        // While the partitioned table declares it, the partition is refused in words of its own.
+        assertEquals("42P16", stateOf("ALTER TABLE zzy9nn_ma ALTER COLUMN j DROP NOT NULL"));
+        assertEquals("column \"j\" is marked NOT NULL in parent table",
+                messageOf("ALTER TABLE zzy9nn_ma ALTER COLUMN j DROP NOT NULL"));
+
+        // The partitioned table letting go takes away the count, not the rule.
+        exec("ALTER TABLE zzy9nn_mp ALTER COLUMN j DROP NOT NULL");
+        assertEquals("zzy9nn_ma:zzy9nn_ma_j_not_null/true/0",
+                notNullsAcross("'zzy9nn_mp','zzy9nn_ma'"));
+        assertEquals("null value in column \"j\" of relation \"zzy9nn_ma\""
+                        + " violates not-null constraint",
+                messageOf("INSERT INTO zzy9nn_mp (i) VALUES (1)"));
+        assertEquals("null value in column \"j\" of relation \"zzy9nn_ma\""
+                        + " violates not-null constraint",
+                messageOf("INSERT INTO zzy9nn_ma (i) VALUES (2)"));
+
+        // It is the partition's own, so the partition may withdraw it now.
+        exec("ALTER TABLE zzy9nn_ma ALTER COLUMN j DROP NOT NULL");
+        assertNull(notNullsOf("zzy9nn_ma"));
+        exec("INSERT INTO zzy9nn_mp (i) VALUES (3)");
+        assertEquals("1", scalar("SELECT count(*) FROM zzy9nn_ma"));
+
+        exec("DROP TABLE zzy9nn_mp");
+    }
+
+    @Test
+    void aTableAttachedToAPartitionedTableHoldsItsRuleUnderTheNameItAlreadyHad()
+            throws Exception {
+        exec("CREATE TABLE zzy9nn_qp (i int, j int NOT NULL) PARTITION BY RANGE (i)");
+        exec("CREATE TABLE zzy9nn_q1 PARTITION OF zzy9nn_qp FOR VALUES FROM (0) TO (10)");
+        exec("CREATE TABLE zzy9nn_q2 (i int, j int NOT NULL)");
+        exec("ALTER TABLE zzy9nn_qp ATTACH PARTITION zzy9nn_q2 FOR VALUES FROM (10) TO (20)");
+
+        // The attached table keeps the name it made the rule with and stops owning it; the
+        // partition created below the partitioned table answers to that table's name.
+        assertEquals("zzy9nn_q1:zzy9nn_qp_j_not_null/false/1,"
+                        + "zzy9nn_q2:zzy9nn_q2_j_not_null/false/1,"
+                        + "zzy9nn_qp:zzy9nn_qp_j_not_null/true/0",
+                notNullsAcross("'zzy9nn_qp','zzy9nn_q1','zzy9nn_q2'"));
+        assertEquals("null value in column \"j\" of relation \"zzy9nn_q2\""
+                        + " violates not-null constraint",
+                messageOf("INSERT INTO zzy9nn_qp (i) VALUES (11)"));
+
+        // A table with no such rule cannot join a hierarchy that has one.
+        exec("CREATE TABLE zzy9nn_q3 (i int, j int)");
+        assertEquals("42804", stateOf("ALTER TABLE zzy9nn_qp ATTACH PARTITION zzy9nn_q3"
+                + " FOR VALUES FROM (20) TO (30)"));
+        assertEquals("column \"j\" in child table \"zzy9nn_q3\" must be marked NOT NULL",
+                messageOf("ALTER TABLE zzy9nn_qp ATTACH PARTITION zzy9nn_q3"
+                        + " FOR VALUES FROM (20) TO (30)"));
+
+        // Detached, the rule is the table's own again, under the name it always answered to,
+        // and it goes on being enforced until the table itself withdraws it.
+        exec("ALTER TABLE zzy9nn_qp DETACH PARTITION zzy9nn_q2");
+        assertEquals("zzy9nn_q2_j_not_null/true/0", notNullsOf("zzy9nn_q2"));
+        assertEquals("null value in column \"j\" of relation \"zzy9nn_q2\""
+                        + " violates not-null constraint",
+                messageOf("INSERT INTO zzy9nn_q2 (i) VALUES (11)"));
+        exec("ALTER TABLE zzy9nn_q2 ALTER COLUMN j DROP NOT NULL");
+        exec("INSERT INTO zzy9nn_q2 (i) VALUES (11)");
+        assertEquals("1", scalar("SELECT count(*) FROM zzy9nn_q2"));
+
+        exec("DROP TABLE zzy9nn_q3");
+        exec("DROP TABLE zzy9nn_q2");
+        exec("DROP TABLE zzy9nn_qp");
+    }
+
+    @Test
+    void aTableBelongsToOnePartitionedTableOnly() throws Exception {
+        exec("CREATE TABLE zzy9nn_pt (i int) PARTITION BY RANGE (i)");
+        exec("CREATE TABLE zzy9nn_pu (i int) PARTITION BY RANGE (i)");
+        exec("CREATE TABLE zzy9nn_pb (i int)");
+        exec("ALTER TABLE zzy9nn_pt ATTACH PARTITION zzy9nn_pb FOR VALUES FROM (0) TO (10)");
+
+        assertEquals("42809", stateOf("ALTER TABLE zzy9nn_pt ATTACH PARTITION zzy9nn_pb"
+                + " FOR VALUES FROM (10) TO (20)"));
+        assertEquals("\"zzy9nn_pb\" is already a partition",
+                messageOf("ALTER TABLE zzy9nn_pt ATTACH PARTITION zzy9nn_pb"
+                        + " FOR VALUES FROM (10) TO (20)"));
+        assertEquals("\"zzy9nn_pb\" is already a partition",
+                messageOf("ALTER TABLE zzy9nn_pu ATTACH PARTITION zzy9nn_pb"
+                        + " FOR VALUES FROM (0) TO (10)"));
+
+        exec("DROP TABLE zzy9nn_pu");
+        exec("DROP TABLE zzy9nn_pt");
+    }
+
+    // ------------------------------------------------------------ A NOT NULL written NO INHERIT beside one taken from a parent
+
+    @Test
+    void aNoInheritNotNullCannotStandBesideOneTakenFromAParent() throws Exception {
+        exec("CREATE TABLE zzy9nn_hp (i int NOT NULL, j int)");
+        exec("CREATE TABLE zzy9nn_hq (i int, j int)");
+
+        String create = "CREATE TABLE zzy9nn_hc (i int NOT NULL NO INHERIT, j int)"
+                + " INHERITS (zzy9nn_hp)";
+        assertEquals("42804", stateOf(create));
+        assertEquals("cannot define not-null constraint with NO INHERIT on column \"i\"",
+                messageOf(create));
+        assertEquals("The column has an inherited not-null constraint.", detailOf(create));
+        assertEquals(0, num("SELECT count(*)::int FROM pg_class WHERE relname = 'zzy9nn_hc'"));
+
+        // Only where the parent hands that column's rule down: NO INHERIT elsewhere is taken.
+        exec("CREATE TABLE zzy9nn_h1 (i int NOT NULL NO INHERIT, j int) INHERITS (zzy9nn_hq)");
+        exec("CREATE TABLE zzy9nn_h2 (j int NOT NULL NO INHERIT) INHERITS (zzy9nn_hp)");
+        assertEquals("zzy9nn_h2_j_not_null/true/0/true,zzy9nn_hp_i_not_null/false/1/false",
+                notNullsWithReachOf("zzy9nn_h2"));
+        // Both rules are enforced on the relation that holds them.
+        assertEquals("null value in column \"i\" of relation \"zzy9nn_h2\""
+                        + " violates not-null constraint",
+                messageOf("INSERT INTO zzy9nn_h2 (j) VALUES (1)"));
+        assertEquals("null value in column \"j\" of relation \"zzy9nn_h2\""
+                        + " violates not-null constraint",
+                messageOf("INSERT INTO zzy9nn_h2 (i) VALUES (1)"));
+        exec("INSERT INTO zzy9nn_h2 (i, j) VALUES (1, 1)");
+        assertEquals("1", scalar("SELECT count(*) FROM zzy9nn_h2"));
+
+        // The same contradiction reached by ALTER TABLE ... INHERIT, which leaves the relation
+        // outside the hierarchy it was refused.
+        exec("CREATE TABLE zzy9nn_hd (i int NOT NULL NO INHERIT, j int)");
+        assertEquals("42P17", stateOf("ALTER TABLE zzy9nn_hd INHERIT zzy9nn_hp"));
+        assertEquals("constraint \"zzy9nn_hd_i_not_null\" conflicts with non-inherited"
+                        + " constraint on child table \"zzy9nn_hd\"",
+                messageOf("ALTER TABLE zzy9nn_hd INHERIT zzy9nn_hp"));
+        assertEquals(0, num("SELECT count(*)::int FROM pg_inherits h"
+                + " JOIN pg_class cl ON cl.oid = h.inhrelid WHERE cl.relname = 'zzy9nn_hd'"));
+
+        // A parent that declares nothing of the kind is joined without complaint.
+        exec("ALTER TABLE zzy9nn_hd INHERIT zzy9nn_hq");
+        assertEquals("zzy9nn_hd_i_not_null/true/0/true", notNullsWithReachOf("zzy9nn_hd"));
+        assertEquals("null value in column \"i\" of relation \"zzy9nn_hd\""
+                        + " violates not-null constraint",
+                messageOf("INSERT INTO zzy9nn_hd (j) VALUES (1)"));
+        exec("INSERT INTO zzy9nn_hd (i) VALUES (1)");
+        assertEquals("1", scalar("SELECT count(*) FROM zzy9nn_hd"));
+
+        exec("DROP TABLE zzy9nn_hd");
+        exec("DROP TABLE zzy9nn_h2");
+        exec("DROP TABLE zzy9nn_h1");
+        exec("DROP TABLE zzy9nn_hq");
+        exec("DROP TABLE zzy9nn_hp");
+    }
 }

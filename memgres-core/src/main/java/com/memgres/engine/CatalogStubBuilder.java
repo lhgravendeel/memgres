@@ -2504,7 +2504,7 @@ class CatalogStubBuilder {
         return table;
     }
 
-    Table buildPgRulesView() {
+    Table buildPgRulesView(Session session) {
         List<Column> cols = Cols.listOf(
                 col("schemaname", DataType.NAME),
                 col("tablename", DataType.NAME),
@@ -2512,15 +2512,46 @@ class CatalogStubBuilder {
                 col("definition", DataType.TEXT)
         );
         Table table = new Table("pg_rules", cols);
+        List<String> visible = readersSearchPath(session);
         for (Database.StoredRule rule : database.getRuleEntries()) {
             // A rule is on a relation, and the relation is in a schema: naming public for every
             // one of them described a rule on a relation the reader could not find.
             table.insertRow(new Object[]{
                     rule.getSchema() == null ? "public" : rule.getSchema(),
-                    rule.getTable(), rule.getName(), rule.getDefinition()
+                    rule.getTable(), rule.getName(),
+                    ruleDefinitionAsRead(rule.getDefinition(), visible)
             });
         }
         return table;
+    }
+
+    /**
+     * A rule's definition as this session reads it.
+     *
+     * <p>PostgreSQL deparses a rule when it is asked for, and writes a relation without its schema
+     * wherever the reader's search path reaches it -- so the same rule reads one way to a session
+     * that has the schema on its path and another way to a session that has not. The relation an
+     * action writes to is stored with the schema it resolved to when the rule was written, and
+     * what is dropped here is only the qualifier the reader does not need.
+     */
+    static String ruleDefinitionAsRead(String definition, List<String> visible) {
+        if (definition == null || visible == null) return definition;
+        String read = definition;
+        for (String schema : visible) {
+            read = read.replace("INSERT INTO " + schema + ".", "INSERT INTO ");
+        }
+        return read;
+    }
+
+    /** The schemas a session's names resolve through, lower case, as every other reader has it. */
+    static List<String> readersSearchPath(Session session) {
+        java.util.LinkedHashSet<String> path = new java.util.LinkedHashSet<>();
+        path.add("pg_catalog");
+        if (session != null) {
+            for (String s : session.getEffectiveSearchPath(false)) path.add(s.toLowerCase());
+        }
+        path.add("public");
+        return new java.util.ArrayList<>(path);
     }
 
     Table buildPgStatStatements() {

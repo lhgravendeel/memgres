@@ -179,7 +179,7 @@ class DmlExecutor {
             String tableKey = resolveTableSchemaKey(schema, table);
             long xmin = executor.session.getTransactionId();
             long cmin = executor.session.getCommandId();
-            executor.database.setRowInsertMeta(tableKey, row, xmin, cmin);
+            executor.database.setRowInsertMeta(tableKey, table, row, xmin, cmin);
         }
     }
 
@@ -189,7 +189,7 @@ class DmlExecutor {
             String tableKey = resolveTableSchemaKey(schema, table);
             long xmin = executor.session.getTransactionId();
             long cmin = executor.session.getCommandId();
-            executor.database.setRowUpdateMeta(tableKey, row, xmin, cmin);
+            executor.database.setRowUpdateMeta(tableKey, table, row, xmin, cmin);
         }
         // The row now holds what this statement wrote, so a relation reading it through columns of
         // its own has to be shown the same values.
@@ -324,21 +324,26 @@ class DmlExecutor {
                 pending = executor.constraintValidator
                         .findUncommittedUniqueConflict(targetTable, storedRow, null);
                 if (pending == null) {
-                    // Routing settles the bounds below the relation the statement named; the
-                    // bounds above it are its own partition constraint, and the row has to pass
-                    // them whether or not it was routed further down. A partition that is itself
-                    // partitioned has both: a row written into it routes to one of its own
-                    // partitions and still has to belong in it.
-                    partitionHelper.checkPartitionConstraint(checkTable, row);
-                    if (targetTable != checkTable) {
-                        // The row is stored in the partition and the partition carries a copy of
-                        // every constraint it inherited, so PostgreSQL names the partition rather
-                        // than the partitioned table the statement wrote to. Checking the leaf
-                        // first is what makes its copy the one that raises; the parent is checked
-                        // after it, for anything the leaf has no copy of.
-                        executor.constraintValidator.validateConstraints(targetTable, storedRow, null);
+                    // The bound the row has to pass is the one of the relation it is stored in,
+                    // and it carries every bound above that relation with it. Testing the relation
+                    // the statement named instead left the bounds between it and the partition the
+                    // row was routed to untested, and named a relation the row was only passing
+                    // through when the row failed one of the bounds they share.
+                    partitionHelper.checkPartitionConstraint(targetTable, storedRow);
+                    try {
+                        if (targetTable != checkTable) {
+                            // The row is stored in the partition and the partition carries a copy
+                            // of every constraint it inherited, so PostgreSQL names the partition
+                            // rather than the partitioned table the statement wrote to. Checking
+                            // the leaf first is what makes its copy the one that raises; the
+                            // parent is checked after it, for anything the leaf has no copy of.
+                            executor.constraintValidator.validateConstraints(targetTable, storedRow, null);
+                        }
+                        executor.constraintValidator.validateConstraints(checkTable, row, null);
+                    } catch (MemgresException refused) {
+                        spendTupleIdOnFailedWrite(targetTable, refused);
+                        throw refused;
                     }
-                    executor.constraintValidator.validateConstraints(checkTable, row, null);
                     targetTable.insertRow(storedRow);
                     return;
                 }
@@ -346,6 +351,48 @@ class DmlExecutor {
                 targetTable.getWriteLock().unlock();
             }
             awaitPendingInsert(targetTable, pending);
+        }
+    }
+
+    /**
+     * The line pointer a statement that failed after writing its row has already spent.
+     *
+     * <p>PostgreSQL writes the row into the relation before it maintains that relation's indexes
+     * and before it asks whether a referenced row exists, so a duplicate key, a conflicting
+     * exclusion key or a missing parent is found with the tuple already in place. The line
+     * pointer it took is not handed back: the next row written into that relation gets the one
+     * after it. Everything settled before the write -- a NOT NULL, a CHECK, a partition bound, a
+     * value that will not convert -- costs the relation nothing.
+     */
+    private void spendTupleIdOnFailedWrite(Table storage, MemgresException failure) {
+        if (storage == null) return;
+        String state = failure.getSqlState();
+        if ("23505".equals(state) || "23503".equals(state) || "23P01".equals(state)) {
+            storage.nextTupleId();
+        }
+    }
+
+    /**
+     * Write the deleting transaction's id into the xmax of every row this statement takes.
+     *
+     * <p>A row read through a partitioned table or an inheritance parent belongs to the relation
+     * that stores it, and that is where its system columns are kept, so the mark goes on under
+     * that relation's name rather than under the one the statement wrote.
+     */
+    private void markRowsDeletedBy(Table table, Map<Object[], Table> rowOwner,
+                                   Collection<Object[]> rows) {
+        if (executor.session == null || executor.database == null || rows.isEmpty()) return;
+        long xmax = executor.session.getTransactionId();
+        Map<Table, String> keys = new IdentityHashMap<Table, String>();
+        for (Object[] row : rows) {
+            Table storage = rowOwner == null ? null : rowOwner.get(row);
+            if (storage == null) storage = table;
+            String key = keys.get(storage);
+            if (key == null) {
+                key = resolveTableSchemaKey(null, storage);
+                keys.put(storage, key);
+            }
+            executor.database.setRowDeleteMeta(key, row, xmax);
         }
     }
 
@@ -783,6 +830,7 @@ class DmlExecutor {
         // Non-conflicting rows return NEW.*, conflicting (skipped) rows return nothing
 
         List<PgTrigger> triggers = enabledTriggers(rowTriggersFor(table, stmt.table()));
+        Map<Table, List<PgTrigger>> insertRowTriggers = rowTriggersByRelation(table, triggers);
         // Check for INSTEAD OF triggers (on views)
         boolean hasInsteadOfInsert = triggers.stream().anyMatch(
                 t -> t.getTiming() == PgTrigger.Timing.INSTEAD_OF && t.getEvent() == PgTrigger.Event.INSERT);
@@ -837,7 +885,7 @@ class DmlExecutor {
         }
         // When the table has row triggers, snapshot target rows so a trigger raising
         // mid-statement rolls the whole INSERT back (PostgreSQL statement atomicity).
-        Map<Table, List<Object[]>> insSnapshot = triggers.isEmpty() ? null
+        Map<Table, List<Object[]>> insSnapshot = !anyRowTriggers(insertRowTriggers) ? null
                 : snapshotTargetTables(collectTargetTables(table));
         try {
         int valueRowIdx = -1;
@@ -988,10 +1036,15 @@ class DmlExecutor {
                 continue;
             }
 
-            // BEFORE INSERT triggers (use leaf partition for correct TG_TABLE_NAME)
-            Table beforeTrigTable = table;
-            try { beforeTrigTable = partitionHelper.routeToPartition(table, row); } catch (Exception ignored) {}
-            row = triggerHelper.executeTriggers(triggers, PgTrigger.Timing.BEFORE, PgTrigger.Event.INSERT, row, null, beforeTrigTable);
+            // A row trigger is a trigger of the relation the row is stored in, so the partition
+            // the row routes to is the one whose triggers fire and the one they are told about.
+            // Routing comes first for the other reason too: a row no partition will take is
+            // refused where PostgreSQL refuses it, before any trigger has been given the chance to
+            // rewrite the key into one that fits.
+            Table beforeTrigTable = partitionHelper.routeForInsert(table, row);
+            row = triggerHelper.executeTriggers(
+                    rowTriggersIn(insertRowTriggers, beforeTrigTable, triggers),
+                    PgTrigger.Timing.BEFORE, PgTrigger.Event.INSERT, row, null, beforeTrigTable);
             if (row == null) {
                 // BEFORE trigger returned NULL: skip this row (not inserted, not counted, no RETURNING)
                 continue;
@@ -1094,7 +1147,7 @@ class DmlExecutor {
                 // that were previously routed to that same partition. The constraint-target
                 // validation above intentionally stays against the parent's declared
                 // constraints; the partition carries its own copy (see createPartitionOfTable).
-                Table conflictTable = partitionHelper.routeToPartition(table, row);
+                Table conflictTable = partitionHelper.settledPartition(table, beforeTrigTable, row);
                 // A row another session has inserted but not committed may yet be rolled back, so
                 // there is no telling whether it is a conflict: PostgreSQL makes the second
                 // inserter wait for that transaction to end and only then decides between the
@@ -1169,8 +1222,11 @@ class DmlExecutor {
                             Object val = executor.evalExpr(set.value(), conflictCtx);
                             newRow[colIdx] = validationHelper.storedValue(val, setCol);
                         }
-                        // The conflict path is an UPDATE, so it fires UPDATE row triggers.
-                        newRow = triggerHelper.executeTriggers(triggers, PgTrigger.Timing.BEFORE,
+                        // The conflict path is an UPDATE, so it fires the UPDATE row triggers of
+                        // the relation the row it conflicted with is stored in.
+                        newRow = triggerHelper.executeTriggers(
+                                rowTriggersIn(insertRowTriggers, conflictTable, triggers),
+                                PgTrigger.Timing.BEFORE,
                                 PgTrigger.Event.UPDATE, newRow, oldRow, conflictTable, conflictUpdCols);
                         if (newRow == null) continue;   // BEFORE trigger suppressed the row
                         computeGeneratedColumns(conflictTable, newRow);
@@ -1192,7 +1248,14 @@ class DmlExecutor {
                             throw e;
                         }
                         recordUpdateUndo(stmt.schema(), conflictTable.getName(), conflictRow, oldRow);
-                        triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER,
+                        // The conflict path is an UPDATE, and PostgreSQL puts the version it
+                        // writes somewhere else in the relation: the row RETURNING reads back
+                        // lives at a new ctid, and the row written after it takes the next one.
+                        recordRowUpdateMeta(conflictTable == table ? stmt.schema() : null,
+                                conflictTable, conflictRow);
+                        triggerHelper.executeTriggers(
+                                rowTriggersIn(insertRowTriggers, conflictTable, triggers),
+                                PgTrigger.Timing.AFTER,
                                 PgTrigger.Event.UPDATE, conflictRow, oldRow, conflictTable, conflictUpdCols);
                         if (stmt.returning() != null && !stmt.returning().isEmpty()) {
                             returningRows.add(evalReturning(stmt.returning(), conflictTable, stmt.alias(), conflictRow, oldRow, conflictRow));
@@ -1222,7 +1285,7 @@ class DmlExecutor {
 
             // Validate constraints and insert atomically under table write lock
             // to prevent concurrent INSERTs from both passing unique checks.
-            Table targetTable = partitionHelper.routeToPartition(table, row);
+            Table targetTable = partitionHelper.settledPartition(table, beforeTrigTable, row);
             // An ATTACHed partition may order its columns differently from the parent.
             Object[] storedRow = targetTable == table ? row : targetTable.rowFromParent(row);
             validateAndInsertWaiting(table, row, targetTable, storedRow);
@@ -1247,7 +1310,8 @@ class DmlExecutor {
         // Fire queued AFTER ROW triggers (use leaf partition table for correct TG_TABLE_NAME)
         for (int i = 0; i < afterRowTriggerNewRows.size(); i++) {
             Table trigTable = afterRowTriggerTables.get(i);
-            triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.INSERT, afterRowTriggerNewRows.get(i), null, trigTable);
+            triggerHelper.executeTriggers(rowTriggersIn(insertRowTriggers, trigTable, triggers),
+                    PgTrigger.Timing.AFTER, PgTrigger.Event.INSERT, afterRowTriggerNewRows.get(i), null, trigTable);
         }
 
         // Fire statement-level AFTER triggers with transition tables
@@ -1547,10 +1611,20 @@ class DmlExecutor {
             }
         }
 
-        // Fire BEFORE INSERT triggers
-        List<PgTrigger> triggers = enabledTriggers(executor.database.getTriggersForTable(stmt.table()));
-        if (triggers != null && !triggers.isEmpty()) {
-            Object[] modified = triggerHelper.executeTriggers(triggers, PgTrigger.Timing.BEFORE, PgTrigger.Event.INSERT, row, null, table);
+        // A row trigger is a trigger of the relation the row is stored in, so a COPY into a
+        // partitioned table fires the triggers of the partition the row routes to -- the copies it
+        // was given of the parent's and whatever was written on the partition itself -- and tells
+        // them the partition's name. Where the row is bound is settled here and settled for good:
+        // a trigger that rewrites the key does not send the row to another partition, and a row no
+        // partition will take is refused before any trigger runs.
+        Table beforeCopyTable = partitionHelper.routeForInsert(table, row);
+        // Triggers are held under the bare relation name, so the relation's own name is what finds
+        // them: a COPY that wrote the schema out looked for them under "schema.relation" and found
+        // none, and every trigger of a relation named that way was silently skipped.
+        List<PgTrigger> triggers = enabledTriggers(
+                executor.database.getTriggersForTable(beforeCopyTable.getName()));
+        if (!triggers.isEmpty()) {
+            Object[] modified = triggerHelper.executeTriggers(triggers, PgTrigger.Timing.BEFORE, PgTrigger.Event.INSERT, row, null, beforeCopyTable);
             if (modified == null) return null; // BEFORE trigger returned null = skip row
             row = modified;
         }
@@ -1558,20 +1632,119 @@ class DmlExecutor {
         // A partitioned table stores nothing of its own: every row belongs to one of its leaves,
         // and one that belongs to none is refused rather than left sitting on the parent, where
         // nothing but a per-partition query would ever show it had gone astray.
-        Table targetTable = partitionHelper.routeToPartition(table, row);
+        Table targetTable = partitionHelper.settledPartition(table, beforeCopyTable, row);
         // An ATTACHed partition may order its columns differently from the parent.
         Object[] storedRow = targetTable == table ? row : targetTable.rowFromParent(row);
         validateAndInsertWaiting(table, row, targetTable, storedRow);
         recordCopyInsert(stmt, table, targetTable, row, storedRow);
 
-        // Fire AFTER INSERT triggers
-        if (triggers != null && !triggers.isEmpty()) {
-            triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.INSERT, row, null, targetTable);
+        // PostgreSQL holds every AFTER row trigger of a COPY back until the statement has stored
+        // its last row, so what this row owes is queued rather than run here -- against the
+        // partition it really went to, because a BEFORE trigger may have rewritten the key and sent
+        // it somewhere else. Running each row's AFTER as the row went let that trigger read a
+        // relation the statement had not finished writing.
+        List<PgTrigger> afterCopyTriggers = targetTable == beforeCopyTable ? triggers
+                : enabledTriggers(executor.database.getTriggersForTable(targetTable.getName()));
+        if (!afterCopyTriggers.isEmpty()) {
+            copyAfterRowTriggers.add(afterCopyTriggers);
+            copyAfterRowTables.add(targetTable);
+            copyAfterRowNewRows.add(Arrays.copyOf(row, row.length));
         }
+        // A transition table of the statement's AFTER trigger holds every row the copy wrote.
+        if (copyCollectsRows) copyWrittenRows.add(Arrays.copyOf(row, row.length));
 
         // The rollback set matches rows by identity, so what is handed back has to be the array
         // that was actually stored — for a routed row that is the leaf's copy, not the parent's.
         return storedRow;
+    }
+
+    /**
+     * What a COPY FROM has fired, what it still owes, and the rows it wrote.
+     *
+     * <p>PostgreSQL runs a COPY as one statement: the relation's FOR EACH STATEMENT triggers fire
+     * once around the whole of it, and every AFTER row trigger waits for the last row rather than
+     * following its own. A connection has one COPY open at a time and this is the connection's
+     * executor, so the statement's own record lives here for as long as the copy does.
+     */
+    private Table copyStatementTable;
+    private List<PgTrigger> copyStatementTriggers;
+    private boolean copyCollectsRows;
+    private final List<List<PgTrigger>> copyAfterRowTriggers = new ArrayList<List<PgTrigger>>();
+    private final List<Table> copyAfterRowTables = new ArrayList<Table>();
+    private final List<Object[]> copyAfterRowNewRows = new ArrayList<Object[]>();
+    private final List<Object[]> copyWrittenRows = new ArrayList<Object[]>();
+
+    /**
+     * Open a COPY FROM: the relation's BEFORE statement triggers fire once, before any row.
+     *
+     * <p>PostgreSQL opens the copy first and fires them second, so one of them that refuses the
+     * statement is reported after the client has already been told to send its data.
+     */
+    void beginCopyFrom(CopyStmt stmt) {
+        discardCopyFrom();
+        Table table = copyRelationOf(stmt);
+        List<PgTrigger> declared = enabledTriggers(
+                executor.database.getTriggersForTable(table.getName()));
+        // Only a transition table reads the written rows back, so nothing is kept when no AFTER
+        // statement trigger of this relation declared one.
+        boolean collects = false;
+        for (PgTrigger trigger : declared) {
+            if (trigger.isForEachStatement()
+                    && trigger.getTiming() == PgTrigger.Timing.AFTER
+                    && trigger.getEvent() == PgTrigger.Event.INSERT
+                    && trigger.getNewTransitionTable() != null) {
+                collects = true;
+            }
+        }
+        triggerHelper.fireStatementTriggers(declared, PgTrigger.Timing.BEFORE,
+                PgTrigger.Event.INSERT, table, null, null);
+        copyStatementTable = table;
+        copyStatementTriggers = declared;
+        copyCollectsRows = collects;
+    }
+
+    /**
+     * Close it: every AFTER row trigger the copy queued, in the order the rows were read, and then
+     * the relation's AFTER statement triggers over everything the copy wrote.
+     */
+    void finishCopyFrom() {
+        Table table = copyStatementTable;
+        if (table == null) return;
+        List<PgTrigger> declared = copyStatementTriggers;
+        List<List<PgTrigger>> owedTriggers = new ArrayList<List<PgTrigger>>(copyAfterRowTriggers);
+        List<Table> owedTables = new ArrayList<Table>(copyAfterRowTables);
+        List<Object[]> owedRows = new ArrayList<Object[]>(copyAfterRowNewRows);
+        List<Object[]> written = new ArrayList<Object[]>(copyWrittenRows);
+        discardCopyFrom();
+        for (int i = 0; i < owedRows.size(); i++) {
+            triggerHelper.executeTriggers(owedTriggers.get(i), PgTrigger.Timing.AFTER,
+                    PgTrigger.Event.INSERT, owedRows.get(i), null, owedTables.get(i));
+        }
+        triggerHelper.fireStatementTriggers(declared, PgTrigger.Timing.AFTER,
+                PgTrigger.Event.INSERT, table, written, null);
+    }
+
+    /** Forget a copy that ended without reaching the end of its statement. */
+    void discardCopyFrom() {
+        copyStatementTable = null;
+        copyStatementTriggers = null;
+        copyCollectsRows = false;
+        copyAfterRowTriggers.clear();
+        copyAfterRowTables.clear();
+        copyAfterRowNewRows.clear();
+        copyWrittenRows.clear();
+    }
+
+    /** The relation a COPY names, with an explicit schema qualifier honoured. */
+    private Table copyRelationOf(CopyStmt stmt) {
+        String copySchema = "public";
+        String copyTableName = stmt.table();
+        if (copyTableName.contains(".")) {
+            int dot = copyTableName.indexOf('.');
+            copySchema = copyTableName.substring(0, dot);
+            copyTableName = copyTableName.substring(dot + 1);
+        }
+        return executor.resolveTable(copySchema, copyTableName, stmt.table().contains("."));
     }
 
     private void fillDefaults(Table table, Object[] row) {
@@ -1997,6 +2170,7 @@ class DmlExecutor {
         // Validate RETURNING columns exist before processing rows
         validateReturning(stmt.returning(), table);
         List<PgTrigger> triggers = enabledTriggers(rowTriggersFor(table, stmt.table()));
+        Map<Table, List<PgTrigger>> updateRowTriggers = rowTriggersByRelation(table, triggers);
         // INSTEAD OF UPDATE triggers on a view: the trigger performs the actual work; the virtual
         // view table's rows are only used to evaluate WHERE and populate OLD/NEW for the trigger.
         boolean hasInsteadOfUpdate = triggers.stream().anyMatch(
@@ -2112,7 +2286,7 @@ class DmlExecutor {
 
         // When the table has row triggers, snapshot target rows so a trigger raising
         // mid-statement rolls the whole UPDATE back (PostgreSQL statement atomicity).
-        Map<Table, List<Object[]>> updSnapshot = triggers.isEmpty() ? null
+        Map<Table, List<Object[]>> updSnapshot = !anyRowTriggers(updateRowTriggers) ? null
                 : snapshotTargetTables(collectTargetTables(table));
         try {
         boolean fromUpdateHasVirtual = hasVirtualColumns(table);
@@ -2188,8 +2362,7 @@ class DmlExecutor {
             int updatedCount = 0;
             List<Object[]> fromOldRows = new ArrayList<>();
             List<Object[]> fromNewRows = new ArrayList<>();
-            List<Object[]> fromAfterOld = new ArrayList<>();
-            List<Object[]> fromAfterNew = new ArrayList<>();
+            List<PendingAfterRow> fromAfterRows = new ArrayList<PendingAfterRow>();
             for (int i = 0; i < matchedRows.size(); i++) {
                 Object[] row = matchedRows.get(i);
                 if (updated.contains(row)) continue; // Each row updated at most once
@@ -2201,7 +2374,13 @@ class DmlExecutor {
                 }
                 updated.add(row);
                 Object[] oldRow = Arrays.copyOf(row, row.length);
-                Object[] newRow = triggerHelper.executeTriggers(triggers, PgTrigger.Timing.BEFORE, PgTrigger.Event.UPDATE, row, oldRow, table, updatedColumnNames);
+                // A row trigger is a trigger of the relation the row is stored in, so a write
+                // through a partitioned table fires the partition's own triggers beside the copies
+                // it was given of the parent's, and tells them the partition's name.
+                Table fromOwner = updateRowOwner.get(row);
+                Table fromFiresOn = fromOwner != null ? fromOwner : table;
+                List<PgTrigger> fromRowTriggers = rowTriggersIn(updateRowTriggers, fromOwner, triggers);
+                Object[] newRow = triggerHelper.executeTriggers(fromRowTriggers, PgTrigger.Timing.BEFORE, PgTrigger.Event.UPDATE, row, oldRow, fromFiresOn, updatedColumnNames);
                 if (newRow == null) {
                     continue;
                 }
@@ -2225,37 +2404,57 @@ class DmlExecutor {
                     }
                 }
                 computeGeneratedColumns(table, newRow);
-                executor.constraintValidator.validateConstraints(table, newRow, row);
+                try {
+                    executor.constraintValidator.validateConstraints(table, newRow, row);
+                } catch (MemgresException refused) {
+                    spendTupleIdOnFailedWrite(fromOwner != null ? fromOwner : table, refused);
+                    throw refused;
+                }
                 validationHelper.validateDomainChecks(newRow, table);
                 // A statement that names a partition may not move a row out of that partition's
                 // bound: the row was never offered to the partitioned table, so PostgreSQL
                 // refuses the update rather than re-routing it.
                 partitionHelper.checkPartitionConstraint(table, newRow);
                 Object[] fromWritten;
-                Table fromOwner = updateRowOwner.get(row);
                 Table fromMovedTo = partitionRowMovesTo(table, fromOwner, newRow);
                 if (fromMovedTo != null) {
-                    fromWritten = moveRowAcrossPartitions(fromOwner, fromMovedTo, row, oldRow, newRow);
+                    Object[] fromArriving = beforeRowChangesPartition(updateRowTriggers, triggers,
+                            fromRowTriggers, fromFiresOn, fromMovedTo, oldRow, newRow);
+                    if (fromArriving == PARTITION_MOVE_REFUSED) continue;
+                    if (fromArriving == null) {
+                        takeRowOutOfPartition(fromFiresOn, row, oldRow, false);
+                        fromAfterRows.add(new PendingAfterRow(
+                                PgTrigger.Event.DELETE, fromFiresOn, null, oldRow));
+                        continue;
+                    }
+                    fromWritten = moveRowAcrossPartitions(fromOwner, fromMovedTo, row, oldRow, fromArriving);
+                    fromAfterRows.add(new PendingAfterRow(
+                            PgTrigger.Event.DELETE, fromFiresOn, null, oldRow));
+                    fromAfterRows.add(new PendingAfterRow(PgTrigger.Event.INSERT, fromMovedTo,
+                            Arrays.copyOf(fromWritten, fromWritten.length), null));
                 } else {
                     recordUpdateUndo(stmt.schema(), stmt.table(), row, oldRow);
                     Table fromStorage = fromOwner != null ? fromOwner : table;
                     fromStorage.updateRowInPlace(row, oldRow, newRow);
                     recordRowUpdateMeta(fromStorage == table ? stmt.schema() : null, fromStorage, row);
                     fromWritten = row;
+                    fromAfterRows.add(new PendingAfterRow(PgTrigger.Event.UPDATE, fromFiresOn,
+                            Arrays.copyOf(fromWritten, fromWritten.length), oldRow));
                 }
                 updatedCount++;
                 executor.constraintValidator.handleFkOnUpdate(table, oldRow, fromWritten);
                 fromOldRows.add(oldRow);
                 fromNewRows.add(Arrays.copyOf(fromWritten, fromWritten.length));
-                fromAfterOld.add(oldRow);
-                fromAfterNew.add(Arrays.copyOf(fromWritten, fromWritten.length));
                 if (stmt.returning() != null && !stmt.returning().isEmpty()) {
                     returningRows.add(evalReturning(stmt.returning(), table, stmt.alias(), fromWritten, oldRow, fromWritten, matchedFromContexts.get(i)));
                 }
             }
             // Fire queued AFTER ROW triggers
-            for (int i = 0; i < fromAfterNew.size(); i++) {
-                triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.UPDATE, fromAfterNew.get(i), fromAfterOld.get(i), table, updatedColumnNames);
+            for (PendingAfterRow pending : fromAfterRows) {
+                triggerHelper.executeTriggers(
+                        rowTriggersIn(updateRowTriggers, pending.relation, triggers),
+                        PgTrigger.Timing.AFTER, pending.event, pending.newRow, pending.oldRow,
+                        pending.relation, updatedColumnNames);
             }
             int count = updatedCount;
             // Fire statement-level AFTER UPDATE triggers with transition tables
@@ -2295,14 +2494,18 @@ class DmlExecutor {
             rows = filterByCurrentOf(cof, table, rows);
         } else if (stmt.where() != null) {
             final List<Object[]> scanned = rows;
-            rows = matchAgainstCommittedRows(table, scanned, row -> {
+            // A scan a statement writes through reads its qualification the way any other scan
+            // does: the parts cheapest first, and a sub-select among them under all of them.
+            final Expression updateQualification = SelectExecutor.readCheapestFirst(stmt.where());
+            rows = readQualified(stmt.where(), () ->
+                    matchAgainstCommittedRows(table, scanned, row -> {
                 Object[] evalRow = updateHasVirtual
                         && !qualificationRejects(table, updateAlias, row, updateDecided)
                         ? computeVirtualColumns(table, row, updateFilters) : row;
-                return executor.isTruthy(executor.evalExpr(stmt.where(),
+                return executor.isTruthy(executor.evalExpr(updateQualification,
                         viewAwareCtx(table, updateAlias, evalRow, updateRowOwner.get(row))));
             }, () -> executor.filterByViewQuals(viewQuals, table,
-                    rescanTargets(updateTargets, updateRowOwner)));
+                    rescanTargets(updateTargets, updateRowOwner))));
         }
 
         // A qualified INSTEAD rule has already spoken for the rows its WHERE holds for.
@@ -2333,8 +2536,7 @@ class DmlExecutor {
         int updatedCount = 0;
         List<Object[]> simpleOldRows = new ArrayList<>();
         List<Object[]> simpleNewRows = new ArrayList<>();
-        List<Object[]> simpleAfterOld = new ArrayList<>();
-        List<Object[]> simpleAfterNew = new ArrayList<>();
+        List<PendingAfterRow> simpleAfterRows = new ArrayList<PendingAfterRow>();
         for (Object[] row : rows) {
             Object[] oldRow = Arrays.copyOf(row, row.length);
 
@@ -2369,15 +2571,26 @@ class DmlExecutor {
                 }
             }
 
+            // A row trigger is a trigger of the relation the row is stored in, so a write through
+            // a partitioned table fires the partition's own triggers beside the copies it was given
+            // of the parent's, in name order with them, and tells them the partition's name.
+            Table owner = updateRowOwner.get(row);
+            Table firesOn = owner != null ? owner : table;
+            List<PgTrigger> rowTriggers = rowTriggersIn(updateRowTriggers, owner, triggers);
             // BEFORE UPDATE triggers (see NEW with SET-applied values, can further modify NEW)
-            newRow = triggerHelper.executeTriggers(triggers, PgTrigger.Timing.BEFORE, PgTrigger.Event.UPDATE, newRow, oldRow, table, updatedColumnNames);
+            newRow = triggerHelper.executeTriggers(rowTriggers, PgTrigger.Timing.BEFORE, PgTrigger.Event.UPDATE, newRow, oldRow, firesOn, updatedColumnNames);
             if (newRow == null) {
                 continue;
             }
 
             computeGeneratedColumns(table, newRow);
             validationHelper.enforceViewCheckOption(viewCheckExprs, table, newRow);
-            executor.constraintValidator.validateConstraints(table, newRow, row);
+            try {
+                executor.constraintValidator.validateConstraints(table, newRow, row);
+            } catch (MemgresException refused) {
+                spendTupleIdOnFailedWrite(owner != null ? owner : table, refused);
+                throw refused;
+            }
             validationHelper.validateDomainChecks(newRow, table);
             // A statement that names a partition may not move a row out of that partition's
             // bound: the row was never offered to the partitioned table, so PostgreSQL refuses
@@ -2387,10 +2600,22 @@ class DmlExecutor {
             // The row a statement leaves behind: the one it wrote where it stood, or the new one
             // the partition the values now belong in holds.
             Object[] writtenRow;
-            Table owner = updateRowOwner.get(row);
             Table movedTo = partitionRowMovesTo(table, owner, newRow);
             if (movedTo != null) {
-                writtenRow = moveRowAcrossPartitions(owner, movedTo, row, oldRow, newRow);
+                Object[] arriving = beforeRowChangesPartition(updateRowTriggers, triggers,
+                        rowTriggers, firesOn, movedTo, oldRow, newRow);
+                if (arriving == PARTITION_MOVE_REFUSED) continue;
+                if (arriving == null) {
+                    takeRowOutOfPartition(firesOn, row, oldRow, false);
+                    simpleAfterRows.add(new PendingAfterRow(
+                            PgTrigger.Event.DELETE, firesOn, null, oldRow));
+                    continue;
+                }
+                writtenRow = moveRowAcrossPartitions(owner, movedTo, row, oldRow, arriving);
+                simpleAfterRows.add(new PendingAfterRow(
+                        PgTrigger.Event.DELETE, firesOn, null, oldRow));
+                simpleAfterRows.add(new PendingAfterRow(PgTrigger.Event.INSERT, movedTo,
+                        Arrays.copyOf(writtenRow, writtenRow.length), null));
             } else {
                 recordUpdateUndo(stmt.schema(), stmt.table(), row, oldRow);
                 // A row read through an inheritance parent is stored in the child, and that is
@@ -2400,6 +2625,8 @@ class DmlExecutor {
                 storage.updateRowInPlace(row, oldRow, newRow);
                 recordRowUpdateMeta(storage == table ? stmt.schema() : null, storage, row);
                 writtenRow = row;
+                simpleAfterRows.add(new PendingAfterRow(PgTrigger.Event.UPDATE, firesOn,
+                        Arrays.copyOf(writtenRow, writtenRow.length), oldRow));
             }
             updatedCount++;
             executor.constraintValidator.handleFkOnUpdate(table, oldRow, writtenRow);
@@ -2407,8 +2634,6 @@ class DmlExecutor {
             // Queue AFTER ROW triggers
             simpleOldRows.add(oldRow);
             simpleNewRows.add(Arrays.copyOf(writtenRow, writtenRow.length));
-            simpleAfterOld.add(oldRow);
-            simpleAfterNew.add(Arrays.copyOf(writtenRow, writtenRow.length));
 
             if (stmt.returning() != null && !stmt.returning().isEmpty()) {
                 returningRows.add(evalReturning(stmt.returning(), table, updateAlias,
@@ -2417,8 +2642,11 @@ class DmlExecutor {
         }
 
         // Fire queued AFTER ROW triggers
-        for (int i = 0; i < simpleAfterNew.size(); i++) {
-            triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.UPDATE, simpleAfterNew.get(i), simpleAfterOld.get(i), table, updatedColumnNames);
+        for (PendingAfterRow pending : simpleAfterRows) {
+            triggerHelper.executeTriggers(
+                    rowTriggersIn(updateRowTriggers, pending.relation, triggers),
+                    PgTrigger.Timing.AFTER, pending.event, pending.newRow, pending.oldRow,
+                    pending.relation, updatedColumnNames);
         }
 
         // Fire statement-level AFTER UPDATE triggers with transition tables
@@ -2673,6 +2901,7 @@ class DmlExecutor {
                             && waitFor.hasUncommittedWork(key), table.getName());
             waited = true;
             rejectIfMovedToAnotherPartition(waitFor, table, blockedRow);
+            rejectIfWaitedForDeletedRow(waitFor, key, table, blockedRow);
             if (rescan != null) scan = rescan.get();
         }
     }
@@ -2691,6 +2920,32 @@ class DmlExecutor {
         if (!mover.movedRowToAnotherPartition(row)) return;
         if (relationOrDescendantHolds(table, row)) return;
         throw movedToAnotherPartition(executor.session);
+    }
+
+    /**
+     * Refuse a statement whose row the transaction it waited for deleted and committed.
+     *
+     * <p>A transaction reading from a snapshot was shown this row and waited its turn to write
+     * it, and what it waited for was the row being taken away. PostgreSQL has no version of it
+     * left that belongs to that snapshot, so it ends the transaction rather than let the
+     * statement report that it wrote nothing -- which is all it could otherwise say about a row
+     * it was entitled to write and no longer has. A transaction that reads each statement afresh
+     * stands differently: by the time it looks again the row really is gone, nothing was taken
+     * from it, and there is nothing to tell it.
+     */
+    private void rejectIfWaitedForDeletedRow(Session deleter, String key, Table table,
+                                             Object[] row) {
+        if (row == null || executor.session == null) return;
+        if (!executor.session.readsFromSnapshot()) return;
+        // A transaction still holding its delete has taken nothing away yet: the row is there for
+        // everybody else, and this wait ended for some other reason.
+        if (deleter != null && deleter.isInTransaction()) return;
+        // A row this transaction was never shown is not one it lost. PostgreSQL's scan would
+        // never have reached it, so its going is nothing to end a statement over.
+        if (!executor.session.isVisibleInRRSnapshot(key, row)) return;
+        if (relationOrDescendantHolds(table, row)) return;
+        throw new MemgresException(
+                "could not serialize access due to concurrent delete", "40001");
     }
 
     /** Whether this relation, or one of the relations that store rows for it, holds a row. */
@@ -3175,7 +3430,11 @@ class DmlExecutor {
             final List<Object[]> deleteScan = allRows;
             final Map<Object[], Table> deleteOwner = rowOwner;
             final List<Table> deleteTables = tablesToScan;
-            toDelete.addAll(matchAgainstCommittedRows(table, allRows, row -> {
+            // The same order any other scan reads its qualification in: the parts cheapest first,
+            // and a sub-select among them under all of them.
+            final Expression deleteQualification = SelectExecutor.readCheapestFirst(stmt.where());
+            toDelete.addAll(readQualified(stmt.where(), () ->
+                    matchAgainstCommittedRows(table, deleteScan, row -> {
                 // A DELETE with no WHERE takes every row, and takes the same path as any other so
                 // that its row and statement triggers fire, its transition table is built and a
                 // BEFORE trigger's veto is honoured.
@@ -3183,7 +3442,7 @@ class DmlExecutor {
                 Object[] evalRow = deleteHasVirtual
                         && !qualificationRejects(table, stmt.alias(), row, deleteDecided)
                         ? computeVirtualColumns(table, row, deleteFilters) : row;
-                return executor.isTruthy(executor.evalExpr(stmt.where(),
+                return executor.isTruthy(executor.evalExpr(deleteQualification,
                         viewAwareCtx(table, stmt.alias(), evalRow, rowOwner.get(row))));
             }, () -> {
                 // A wait has ended, so the table may hold rows that were not there when it began.
@@ -3198,7 +3457,7 @@ class DmlExecutor {
                 }
                 // The rows the view shows are still the only ones this statement may reach.
                 return executor.filterByViewQuals(viewQuals, table, deleteScan);
-            }));
+            })));
         }
 
         // A qualified INSTEAD rule has already spoken for the rows its WHERE holds for; the
@@ -3236,18 +3495,30 @@ class DmlExecutor {
 
         // Fire BEFORE DELETE triggers (for DELETE, OLD = deleted row, NEW = null)
         List<PgTrigger> triggers = enabledTriggers(rowTriggersFor(table, table.getName()));
+        // A row trigger is a trigger of the relation the row is stored in, so a delete through a
+        // partitioned table fires the partition's own triggers and tells them its name.
+        Map<Table, List<PgTrigger>> deleteRowTriggers = rowTriggersByRelation(table, triggers);
 
         // Fire BEFORE STATEMENT triggers
         triggerHelper.fireStatementTriggers(triggers, PgTrigger.Timing.BEFORE, PgTrigger.Event.DELETE, table, null, null);
 
-        if (!triggers.isEmpty()) {
+        if (anyRowTriggers(deleteRowTriggers)) {
             Set<Object[]> skipRows = Collections.newSetFromMap(new IdentityHashMap<>());
             for (Object[] row : new ArrayList<>(toDelete)) {
-                Object[] result = triggerHelper.executeTriggers(triggers, PgTrigger.Timing.BEFORE, PgTrigger.Event.DELETE, null, row, table);
+                Table firesOn = rowOwner.get(row);
+                if (firesOn == null) firesOn = table;
+                Object[] result = triggerHelper.executeTriggers(
+                        rowTriggersIn(deleteRowTriggers, rowOwner.get(row), triggers),
+                        PgTrigger.Timing.BEFORE, PgTrigger.Event.DELETE, null, row, firesOn);
                 if (result == null) skipRows.add(row);
             }
             toDelete.removeAll(skipRows);
         }
+
+        // PostgreSQL marks each version with the transaction that deleted it and leaves it where
+        // it stands, so RETURNING -- which reads the row the statement found -- answers that
+        // transaction's id for xmax. The mark is made before RETURNING is read.
+        markRowsDeletedBy(table, rowOwner, toDelete);
 
         List<Object[]> deletedRows = new ArrayList<>();
         List<Object[]> returningRows = new ArrayList<>();
@@ -3268,8 +3539,12 @@ class DmlExecutor {
         }
         // Capture old rows for transition tables before deletion
         List<Object[]> oldRowsForTransition = new ArrayList<>();
+        // The relation each row was stored in, so its AFTER trigger fires as that relation's.
+        List<Table> deletedFrom = new ArrayList<Table>();
         for (Object[] row : toDelete) {
             oldRowsForTransition.add(Arrays.copyOf(row, row.length));
+            Table storedIn = rowOwner.get(row);
+            deletedFrom.add(storedIn != null ? storedIn : table);
         }
         deletedRows.addAll(toDelete);
         // Record undo (and run the RR write-write conflict check) before the physical
@@ -3277,7 +3552,7 @@ class DmlExecutor {
         recordDeleteUndo(stmt.schema(), stmt.table(), deletedRows);
         // When the table has row triggers, snapshot target rows so an AFTER-trigger raising
         // mid-statement rolls the whole DELETE back (PostgreSQL statement atomicity).
-        Map<Table, List<Object[]>> delSnapshot = triggers.isEmpty() ? null
+        Map<Table, List<Object[]>> delSnapshot = !anyRowTriggers(deleteRowTriggers) ? null
                 : snapshotTargetTables(tablesToScan);
         int deleted;
         try {
@@ -3288,9 +3563,12 @@ class DmlExecutor {
         deleted = deletedRows.size();
 
         // Fire queued AFTER DELETE row triggers
-        if (!triggers.isEmpty()) {
-            for (Object[] row : oldRowsForTransition) {
-                triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.DELETE, null, row, table);
+        if (anyRowTriggers(deleteRowTriggers)) {
+            for (int i = 0; i < oldRowsForTransition.size(); i++) {
+                Table firesOn = deletedFrom.get(i);
+                triggerHelper.executeTriggers(rowTriggersIn(deleteRowTriggers, firesOn, triggers),
+                        PgTrigger.Timing.AFTER, PgTrigger.Event.DELETE, null,
+                        oldRowsForTransition.get(i), firesOn);
             }
         }
 
@@ -3318,6 +3596,232 @@ class DmlExecutor {
 
     QueryResult executeMerge(MergeStmt stmt) {
         return withCteScope(stmt.withClauses(), () -> executeMergeInner(stmt));
+    }
+
+    /**
+     * The rows a MERGE pairs its source against, as the transactions that have committed left them.
+     *
+     * <p>PostgreSQL settles a MERGE's target the way it settles the target of an UPDATE or a
+     * DELETE. A row another transaction has written and not committed stands at the values it held
+     * before that write, a row it has inserted is not there for a source row to pair with at all,
+     * and a row it has deleted without committing still is. Reading the relation as it stands
+     * instead let an in-flight change decide what the arms did: a source row was inserted against a
+     * key another session was about to give back, and passed over for one it had only just taken.
+     *
+     * <p>A row this statement would write and another transaction is part-way through writing is
+     * waited for, and the scan is read again once that transaction settles, so what the arms do
+     * with the row is decided on the version it left behind -- which is what PostgreSQL re-reads
+     * when a wait of its own ends. Rows nobody is writing come back as the relation stores them, so
+     * an arm writes where the row really lives.
+     *
+     * @param owners filled with the relation storing each row, which for a partitioned or an
+     *     inherited target is one of the relations below the one the statement named
+     * @param asCommitted filled for the rows whose committed version is not the one stored
+     * @param stayUnpaired filled with the rows the join paired with nothing before a wait
+     * @param writes whether the MERGE would write a target row, judged on its committed version
+     * @param pairs whether any source row pairs with a target row, judged the same way
+     */
+    private List<Object[]> readMergeTargetAsCommitted(Table table, List<Table> scanTables,
+                                                      Map<Object[], Table> owners,
+                                                      Map<Object[], Object[]> asCommitted,
+                                                      Set<Object[]> stayUnpaired,
+                                                      java.util.function.Predicate<Object[]> writes,
+                                                      java.util.function.Predicate<Object[]> pairs) {
+        Session me = executor.session;
+        List<Object[]> scan = rescanTargets(scanTables, owners);
+        if (me == null) return scan;
+        final String key = executor.constraintValidator.uncommittedKey(table);
+        boolean waited = false;
+        while (true) {
+            // The wait below can end without the row having moved. Polling the cancel token here
+            // means a statement_timeout or a client cancel still ends this loop if it does.
+            StatementCancel.check();
+            asCommitted.clear();
+            Set<Object[]> notCommitted = Collections.newSetFromMap(new IdentityHashMap<Object[], Boolean>());
+            Map<Object[], Object[]> otherOld = new IdentityHashMap<>();
+            Map<Object[], Session> owner = new IdentityHashMap<>();
+            List<Object[]> hiddenByOther = new ArrayList<>();
+            for (Session other : executor.database.getActiveSessions()) {
+                if (other == me || !other.isInTransaction()) continue;
+                // A transaction that has already failed is not waited for: its rows can never
+                // become permanent, so PostgreSQL treats them as dead the instant the statement
+                // errored, and waiting is how two sessions that broke each other's statement wait
+                // for one another with no way out.
+                boolean doomed = other.isDoomed();
+                for (Object[] r : other.getUncommittedInserts(key)) {
+                    notCommitted.add(r);
+                    if (!doomed) owner.put(r, other);
+                }
+                for (Map.Entry<Object[], Object[]> e : other.getUncommittedUpdates(key).entrySet()) {
+                    otherOld.put(e.getKey(), e.getValue());
+                    if (!doomed) owner.put(e.getKey(), other);
+                }
+                if (doomed) continue;
+                for (Object[] r : other.getUncommittedDeletes(key)) {
+                    owner.put(r, other);
+                    hiddenByOther.add(r);
+                }
+            }
+            // Nobody else is part-way through writing this relation, so the scan already holds it
+            // as the committed transactions have left it and no arm need be weighed against a row
+            // to find out whether there is anything to wait for.
+            if (notCommitted.isEmpty() && otherOld.isEmpty() && hiddenByOther.isEmpty()) return scan;
+            List<Object[]> visible = new ArrayList<>();
+            Set<Object[]> seen = Collections.newSetFromMap(new IdentityHashMap<Object[], Boolean>());
+            for (Object[] row : scan) {
+                seen.add(row);
+                if (notCommitted.contains(row)) continue;
+                Object[] committed = otherOld.containsKey(row) ? otherOld.get(row) : row;
+                if (committed == null) continue;
+                if (committed != row) asCommitted.put(row, committed);
+                visible.add(row);
+            }
+            // A row another transaction has deleted without committing is gone from the scan and is
+            // still one of the relation's rows to everybody else, so a source row pairs with it.
+            for (Object[] row : hiddenByOther) {
+                if (!seen.contains(row)) visible.add(row);
+            }
+            Session blocker = null;
+            Object[] blockedRow = null;
+            for (Object[] row : visible) {
+                if (!writes.test(mergeRowAsCommitted(asCommitted, row))) continue;
+                Session own = owner.get(row);
+                if (own != null) { blocker = own; blockedRow = row; break; }
+            }
+            if (blocker == null) return visible;
+            // PostgreSQL settles the join once, against the relation as the statement found it, and
+            // when a wait ends it asks only whether the row still pairs with the source row it was
+            // paired with. A row that paired with none is therefore paired with none for the rest of
+            // the statement, however the transaction being waited for leaves it: the WHEN NOT
+            // MATCHED BY SOURCE arm is the one that runs for it either way.
+            for (Object[] row : visible) {
+                if (!pairs.test(mergeRowAsCommitted(asCommitted, row))) stayUnpaired.add(row);
+            }
+            // Taken while the transaction being waited for still holds its write, so each image
+            // holds the version this statement is entitled to read rather than the one it waits
+            // for, and kept for as long as the statement runs. Nothing is taken until a wait is
+            // really about to happen.
+            if (!waited) me.readImagesForStatement(key, table);
+            final Session waitFor = blocker;
+            executor.database.awaitConcurrentWrite(me, waitFor,
+                    () -> waitFor.isInTransaction() && !waitFor.isDoomed()
+                            && waitFor.hasUncommittedWork(key), table.getName());
+            waited = true;
+            rejectIfMergeRowMoved(waitFor, table, blockedRow);
+            rejectIfMergeRowDeleted(table, blockedRow);
+            scan = rescanTargets(scanTables, owners);
+        }
+    }
+
+    /** The version of a target row a MERGE reads: the one the committed transactions left. */
+    private static Object[] mergeRowAsCommitted(Map<Object[], Object[]> asCommitted, Object[] row) {
+        if (asCommitted.isEmpty()) return row;
+        Object[] committed = asCommitted.get(row);
+        return committed != null ? committed : row;
+    }
+
+    /**
+     * Refuse a MERGE whose row the transaction it waited for moved into another partition.
+     *
+     * <p>PostgreSQL will not follow a row across relations: the version the other transaction wrote
+     * lives in a partition this statement never aimed at, so there is nothing left where the lock
+     * was taken and the statement ends rather than passing silently over a row it was entitled to
+     * act on. A MERGE says so in the same words whatever it reads from, a transaction on a snapshot
+     * included: what ended it is the tuple having gone somewhere it does not look, not a write it
+     * lost.
+     */
+    private void rejectIfMergeRowMoved(Session mover, Table table, Object[] row) {
+        if (row == null || mover == null || executor.session == null) return;
+        if (!mover.movedRowToAnotherPartition(row)) return;
+        if (relationOrDescendantHolds(table, row)) return;
+        throw new MemgresException("tuple to be locked was already moved to another partition"
+                + " due to concurrent update", "40001");
+    }
+
+    /**
+     * Refuse a MERGE reading from a snapshot whose row the transaction it waited for deleted.
+     *
+     * <p>No version of that row is left for an arm to write, and PostgreSQL will not let a
+     * transaction that was shown the row carry on as though it had never been there: the source
+     * row it paired with would take the NOT MATCHED arm and insert a key the relation held until a
+     * moment ago. A transaction that reads each statement afresh stands differently -- by the time
+     * it looks again the row really is gone, and its source row is genuinely unpaired -- so this is
+     * the one thing a MERGE ends over where an ordinary read of the relation would not.
+     */
+    private void rejectIfMergeRowDeleted(Table table, Object[] row) {
+        if (row == null || executor.session == null) return;
+        String isolation = executor.session.getEffectiveIsolationLevel();
+        if (!"repeatable read".equals(isolation) && !"serializable".equals(isolation)) return;
+        if (relationOrDescendantHolds(table, row)) return;
+        throw new MemgresException(
+                "could not serialize access due to concurrent delete", "40001");
+    }
+
+    /**
+     * Whether a MERGE would write a target row: some source row pairs with it and the first WHEN
+     * MATCHED arm that applies acts, or none pairs with it and the first WHEN NOT MATCHED BY SOURCE
+     * arm that applies acts.
+     *
+     * <p>PostgreSQL takes no lock for a row it will not write, so a DO NOTHING arm and an arm whose
+     * condition the row fails leave the row to be read and nothing more -- there is no transaction
+     * to wait for on account of it.
+     */
+    private boolean mergeWritesTargetRow(MergeStmt stmt, Table targetTable, String targetAlias,
+                                         List<RowContext> sourceRows, Object[] targetRow,
+                                         boolean targetHasVirtual, Set<String> targetReads) {
+        Object[] evalRow = targetHasVirtual
+                ? computeVirtualColumns(targetTable, targetRow, targetReads) : targetRow;
+        RowContext targetCtx = viewAwareCtx(targetTable, targetAlias, evalRow);
+        for (RowContext sourceCtx : sourceRows) {
+            RowContext combined = targetCtx.merge(sourceCtx);
+            if (!executor.isTruthy(executor.evalExpr(stmt.onCondition(), combined))) continue;
+            for (MergeStmt.WhenClause clause : stmt.whenClauses()) {
+                if (!(clause instanceof MergeStmt.WhenMatched)) continue;
+                MergeStmt.WhenMatched wm = (MergeStmt.WhenMatched) clause;
+                if (wm.andCondition() != null
+                        && !executor.isTruthy(executor.evalExpr(wm.andCondition(), combined))) {
+                    continue;
+                }
+                return wm.isDelete() || (wm.setClauses() != null && !wm.setClauses().isEmpty());
+            }
+            return false;
+        }
+        for (MergeStmt.WhenClause clause : stmt.whenClauses()) {
+            if (!(clause instanceof MergeStmt.WhenNotMatchedBySource)) continue;
+            MergeStmt.WhenNotMatchedBySource ws = (MergeStmt.WhenNotMatchedBySource) clause;
+            if (ws.andCondition() != null
+                    && !executor.isTruthy(executor.evalExpr(ws.andCondition(), targetCtx))) {
+                continue;
+            }
+            return ws.isDelete() || (ws.setClauses() != null && !ws.setClauses().isEmpty());
+        }
+        return false;
+    }
+
+    /**
+     * Take the row lock a MERGE's arm holds over the row it is about to write.
+     *
+     * <p>PostgreSQL locks a row it writes through a MERGE exactly as it locks one it writes through
+     * an UPDATE or a DELETE, so a concurrent FOR UPDATE NOWAIT reports that it could not have it. An
+     * arm that writes nothing takes nothing: a DO NOTHING arm leaves the row free.
+     */
+    private void lockMergeRow(Table targetTable, Object[] targetRow) {
+        lockRowsForDml(targetTable, Collections.singletonList(targetRow));
+    }
+
+    /** Whether any source row pairs with a target row under the MERGE's ON condition. */
+    private boolean mergeSourcePairsWith(MergeStmt stmt, Table targetTable, String targetAlias,
+                                         List<RowContext> sourceRows, Object[] targetRow,
+                                         boolean targetHasVirtual, Set<String> targetReads) {
+        Object[] evalRow = targetHasVirtual
+                ? computeVirtualColumns(targetTable, targetRow, targetReads) : targetRow;
+        RowContext targetCtx = viewAwareCtx(targetTable, targetAlias, evalRow);
+        for (RowContext sourceCtx : sourceRows) {
+            if (executor.isTruthy(executor.evalExpr(stmt.onCondition(), targetCtx.merge(sourceCtx)))) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** PostgreSQL's wording for a WHEN clause that follows an unconditional one; it carries no position. */
@@ -3407,6 +3911,14 @@ class DmlExecutor {
         }
 
         List<PgTrigger> triggers = enabledTriggers(rowTriggersFor(targetTable, stmt.targetTable()));
+        // A row trigger is a trigger of the relation the row is stored in, so a MERGE against a
+        // partitioned table fires the triggers of the partition each row lives in or goes to.
+        Map<Table, List<PgTrigger>> mergeRowTriggers = rowTriggersByRelation(targetTable, triggers);
+        // Which columns the statement assigns is settled over the whole of it, arm by arm, because
+        // that is how PostgreSQL settles it: a trigger written UPDATE OF fires for every row an arm
+        // wrote as soon as any arm names one of the columns it was written for, and not only for
+        // the rows written by the arm that named it.
+        Set<String> mergeAssignedCols = mergeAssignedColumns(stmt);
         // PostgreSQL fires the BEFORE STATEMENT trigger of every action the MERGE could perform,
         // before a single row is read -- both the INSERT and the UPDATE trigger of a two-armed
         // MERGE, whether or not a row ends up taking each arm.
@@ -3445,17 +3957,37 @@ class DmlExecutor {
         RowContext mergeNullSourceCtx = nullSourceContext(mergeSourceSample);
         String mergeSrcAlias = mergeSourceAlias(stmt.source());
 
+        final boolean mergeTargetHasVirtual = hasVirtualColumns(targetTable);
+        // A VIRTUAL generated column is not stored: PostgreSQL rewrites a reference to one into its
+        // generation expression, so a MERGE works out the ones it names and no others.
+        final Set<String> mergeTargetReads = mergeTargetHasVirtual
+                ? columnsNamed(targetTable, targetAlias, stmt.onCondition(), stmt.whenClauses(),
+                        stmt.returning())
+                : null;
         // The rows of a partitioned relation live in its leaves, so the scan that pairs source rows
         // with target rows has to walk them the way UPDATE and DELETE do. Reading the parent alone
         // left every MATCHED arm inert and turned every source row into an INSERT.
         List<Table> scanTables = collectTargetTables(targetTable);
         Map<Object[], Table> mergeRowOwner = new IdentityHashMap<>();
-        List<Object[]> originalTargetRows = new ArrayList<>();
-        for (Table part : scanTables) {
-            for (Object[] partRow : part.getRows()) {
-                originalTargetRows.add(partRow);
-                mergeRowOwner.put(partRow, part);
-            }
+        // Which version of each row this statement is entitled to read, where that is not the one
+        // the relation stores because another transaction is part-way through writing it.
+        Map<Object[], Object[]> mergeAsCommitted = new IdentityHashMap<>();
+        // Target rows the join paired with nothing, kept out of it for the rest of the statement.
+        Set<Object[]> mergeStayUnpaired = Collections.newSetFromMap(new IdentityHashMap<Object[], Boolean>());
+        List<Object[]> originalTargetRows = readMergeTargetAsCommitted(targetTable, scanTables,
+                mergeRowOwner, mergeAsCommitted, mergeStayUnpaired,
+                row -> mergeWritesTargetRow(stmt, targetTable, targetAlias, sourceRows, row,
+                        mergeTargetHasVirtual, mergeTargetReads),
+                row -> mergeSourcePairsWith(stmt, targetTable, targetAlias, sourceRows, row,
+                        mergeTargetHasVirtual, mergeTargetReads));
+        // A transaction reading from a snapshot was shown a row that another transaction has since
+        // deleted and committed. There is no version of it left for an arm to write, and passing
+        // over it would take the arm's action for the source row instead -- inserting a key the
+        // relation is about to hold again -- so PostgreSQL ends the statement.
+        if (executor.session != null && scanTables.size() == 1) {
+            executor.session.checkRRConcurrentDelete(schemaName + "." + stmt.targetTable(),
+                    targetTable, image -> mergeWritesTargetRow(stmt, targetTable, targetAlias,
+                            sourceRows, image, mergeTargetHasVirtual, mergeTargetReads));
         }
 
         // Row-level security decides what the join may see as much as what it may write: a row no
@@ -3495,14 +4027,12 @@ class DmlExecutor {
         List<Object[]> mergeUpdatedOld = new ArrayList<>();
         List<Object[]> mergeUpdatedNew = new ArrayList<>();
         List<Object[]> mergeDeletedOld = new ArrayList<>();
+        // Every AFTER row trigger the arms earn, held back until the statement has finished
+        // writing: PostgreSQL runs the whole of a MERGE and only then runs what it queued, so a
+        // trigger that reads the target reads what the statement left there rather than what
+        // stood there part-way through the scan.
+        List<MergeAfterRow> mergeAfterRows = new ArrayList<MergeAfterRow>();
 
-        boolean mergeTargetHasVirtual = hasVirtualColumns(targetTable);
-        // A VIRTUAL generated column is not stored: PostgreSQL rewrites a reference to one into its
-        // generation expression, so a MERGE works out the ones it names and no others.
-        Set<String> mergeTargetReads = mergeTargetHasVirtual
-                ? columnsNamed(targetTable, targetAlias, stmt.onCondition(), stmt.whenClauses(),
-                        stmt.returning())
-                : null;
         // What each kind of arm reads of the source. An arm's condition, its assignments and the
         // statement's RETURNING all stand above the join, so a VIRTUAL generated column of the
         // source is worked out for the source rows that arm runs for and for no others. Working
@@ -3523,8 +4053,10 @@ class DmlExecutor {
             // Find matching target rows for this source row using the original snapshot
             List<Object[]> matchedTargetRows = new ArrayList<>();
             for (Object[] targetRow : originalTargetRows) {
+                if (mergeStayUnpaired.contains(targetRow)) continue;
+                Object[] asRead = mergeRowAsCommitted(mergeAsCommitted, targetRow);
                 Object[] evalRow = mergeTargetHasVirtual
-                        ? computeVirtualColumns(targetTable, targetRow, mergeTargetReads) : targetRow;
+                        ? computeVirtualColumns(targetTable, asRead, mergeTargetReads) : asRead;
                 RowContext targetCtx = viewAwareCtx(targetTable, targetAlias, evalRow);
                 RowContext combined = targetCtx.merge(sourceCtx);
                 if (executor.isTruthy(executor.evalExpr(stmt.onCondition(), combined))) {
@@ -3547,8 +4079,9 @@ class DmlExecutor {
                 // WHEN MATCHED clauses
                 for (Object[] targetRow : matchedTargetRows) {
                     if (processedTargetRows.contains(targetRow)) continue;
+                    Object[] asRead = mergeRowAsCommitted(mergeAsCommitted, targetRow);
                     Object[] evalRow = mergeTargetHasVirtual
-                            ? computeVirtualColumns(targetTable, targetRow, mergeTargetReads) : targetRow;
+                            ? computeVirtualColumns(targetTable, asRead, mergeTargetReads) : asRead;
                     RowContext targetCtx = viewAwareCtx(targetTable, targetAlias, evalRow);
                     RowContext combined = targetCtx.merge(sourceCtx);
 
@@ -3561,6 +4094,20 @@ class DmlExecutor {
                             }
                             if (wm.isDelete()) {
                                 requireMergeRowVisible(mergeRlsActive, targetTable, targetRow, "DELETE", targetAlias);
+                                lockMergeRow(targetTable, targetRow);
+                                // A row this arm deletes is deleted the way a DELETE of its own
+                                // would delete it, so the DELETE row triggers of the relation that
+                                // stores it fire for it. A BEFORE DELETE that answers with nothing
+                                // keeps the row where it is: nothing is deleted and nothing counted.
+                                Table deletedIn = mergeRowOwner.get(targetRow);
+                                if (deletedIn == null) deletedIn = targetTable;
+                                if (triggerHelper.executeTriggers(
+                                        rowTriggersIn(mergeRowTriggers, deletedIn, triggers),
+                                        PgTrigger.Timing.BEFORE, PgTrigger.Event.DELETE, null,
+                                        targetRow, deletedIn) == null) {
+                                    processedTargetRows.add(targetRow);
+                                    break;
+                                }
                                 // DELETE — collect RETURNING before marking for deletion
                                 if (hasReturning) {
                                     executor.currentMergeAction = "DELETE";
@@ -3570,28 +4117,33 @@ class DmlExecutor {
                                 executor.constraintValidator.handleFkOnDelete(targetTable, targetRow);
                                 rowsToDelete.add(targetRow);
                                 mergeDeletedOld.add(Arrays.copyOf(targetRow, targetRow.length));
+                                mergeAfterRows.add(new MergeAfterRow(PgTrigger.Event.DELETE, deletedIn,
+                                        null, Arrays.copyOf(targetRow, targetRow.length), null));
                                 processedTargetRows.add(targetRow);
                                 affectedTargetRows.add(targetRow);
                                 mergeCount++;
                             } else if (wm.setClauses() != null && !wm.setClauses().isEmpty()) {
                                 requireMergeRowVisible(mergeRlsActive, targetTable, targetRow, "UPDATE", targetAlias);
+                                lockMergeRow(targetTable, targetRow);
                                 // UPDATE — evaluate all SET RHS against original row snapshot onto a
                                 // working copy, then let BEFORE triggers see/modify it before committing.
                                 Object[] oldRow = Arrays.copyOf(targetRow, targetRow.length);
                                 Object[] newRow = Arrays.copyOf(targetRow, targetRow.length);
-                                Set<String> updCols = new HashSet<>();
-                                for (InsertStmt.SetClause set : wm.setClauses()) {
-                                    updCols.add(set.column().toLowerCase());
-                                }
+                                Set<String> updCols = mergeAssignedCols;
                                 // The assignment machinery the UPDATE path uses, so a MERGE resolves
                                 // a view's renamed columns and understands SET col = DEFAULT too.
                                 applySetClauses(wm.setClauses(), targetTable, newRow, combined);
                                 if (mergeRlsActive) {
                                     enforceRlsWithCheck(targetTable, newRow, "UPDATE");
                                 }
-                                // Fire BEFORE UPDATE row triggers: PG fires them per matched row.
-                                // They may modify NEW or return NULL to skip the row entirely.
-                                newRow = triggerHelper.executeTriggers(triggers, PgTrigger.Timing.BEFORE, PgTrigger.Event.UPDATE, newRow, oldRow, targetTable, updCols);
+                                // Fire BEFORE UPDATE row triggers: PG fires them per matched row,
+                                // as triggers of the relation that row is stored in. They may
+                                // modify NEW or return NULL to skip the row entirely.
+                                Table matchedIn = mergeRowOwner.get(targetRow);
+                                if (matchedIn == null) matchedIn = targetTable;
+                                List<PgTrigger> matchedTriggers =
+                                        rowTriggersIn(mergeRowTriggers, matchedIn, triggers);
+                                newRow = triggerHelper.executeTriggers(matchedTriggers, PgTrigger.Timing.BEFORE, PgTrigger.Event.UPDATE, newRow, oldRow, matchedIn, updCols);
                                 if (newRow == null) {
                                     // BEFORE trigger suppressed this row: no update, not counted.
                                     processedTargetRows.add(targetRow);
@@ -3607,10 +4159,16 @@ class DmlExecutor {
                                 executor.constraintValidator.validateConstraints(targetTable, newRow, targetRow);
                                 validationHelper.validateDomainChecks(newRow, targetTable);
                                 Object[] writtenRow = writeMergeUpdate(stmt, targetTable, mergeRowOwner,
-                                        targetRow, oldRow, newRow);
+                                        targetRow, oldRow, newRow, mergeRowTriggers, triggers,
+                                        mergeAfterRows, updCols);
+                                // The assignment moved the row to another partition and one of the
+                                // two relations' own row triggers stopped it going, so there is
+                                // nothing left to count or to report for it.
+                                if (writtenRow == null || writtenRow == PARTITION_MOVE_REFUSED) {
+                                    processedTargetRows.add(targetRow);
+                                    break;
+                                }
                                 executor.constraintValidator.handleFkOnUpdate(targetTable, oldRow, writtenRow);
-                                // Fire AFTER UPDATE triggers for MERGE
-                                triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.UPDATE, writtenRow, oldRow, targetTable, updCols);
                                 // Collect RETURNING after update (uses new values)
                                 if (hasReturning) {
                                     executor.currentMergeAction = "UPDATE";
@@ -3644,8 +4202,9 @@ class DmlExecutor {
                     if (matchedBySourceRows.contains(targetRow)) continue;
                     if (processedTargetRows.contains(targetRow)) continue;
                     if (rowsToDelete.contains(targetRow)) continue;
+                    Object[] asRead = mergeRowAsCommitted(mergeAsCommitted, targetRow);
                     Object[] evalRow = mergeTargetHasVirtual
-                            ? computeVirtualColumns(targetTable, targetRow, mergeTargetReads) : targetRow;
+                            ? computeVirtualColumns(targetTable, asRead, mergeTargetReads) : asRead;
                     RowContext targetCtx = viewAwareCtx(targetTable, targetAlias, evalRow);
                     for (MergeStmt.WhenClause clause : stmt.whenClauses()) {
                         if (clause instanceof MergeStmt.WhenNotMatchedBySource) {
@@ -3658,6 +4217,19 @@ class DmlExecutor {
                             RowContext nullSourceCtx = mergeNullSourceCtx;
                             if (wnmbs.isDelete()) {
                                 requireMergeRowVisible(mergeRlsActive, targetTable, targetRow, "DELETE", targetAlias);
+                                lockMergeRow(targetTable, targetRow);
+                                // The DELETE row triggers of the relation that stores the row, as
+                                // for the arm above: a BEFORE DELETE that answers with nothing
+                                // keeps the row and this arm has done nothing to it.
+                                Table goneFrom = mergeRowOwner.get(targetRow);
+                                if (goneFrom == null) goneFrom = targetTable;
+                                if (triggerHelper.executeTriggers(
+                                        rowTriggersIn(mergeRowTriggers, goneFrom, triggers),
+                                        PgTrigger.Timing.BEFORE, PgTrigger.Event.DELETE, null,
+                                        targetRow, goneFrom) == null) {
+                                    processedTargetRows.add(targetRow);
+                                    break;
+                                }
                                 if (hasReturning) {
                                     executor.currentMergeAction = "DELETE";
                                     returningRows.add(evalMergeReturning(stmt.returning(), targetTable, targetAlias,
@@ -3666,21 +4238,26 @@ class DmlExecutor {
                                 executor.constraintValidator.handleFkOnDelete(targetTable, targetRow);
                                 rowsToDelete.add(targetRow);
                                 mergeDeletedOld.add(Arrays.copyOf(targetRow, targetRow.length));
+                                mergeAfterRows.add(new MergeAfterRow(PgTrigger.Event.DELETE, goneFrom,
+                                        null, Arrays.copyOf(targetRow, targetRow.length), null));
                                 mergeCount++;
                             } else if (wnmbs.setClauses() != null && !wnmbs.setClauses().isEmpty()) {
                                 requireMergeRowVisible(mergeRlsActive, targetTable, targetRow, "UPDATE", targetAlias);
+                                lockMergeRow(targetTable, targetRow);
                                 Object[] oldRow = Arrays.copyOf(targetRow, targetRow.length);
                                 Object[] newRow = Arrays.copyOf(targetRow, targetRow.length);
-                                Set<String> updCols = new HashSet<>();
-                                for (InsertStmt.SetClause set : wnmbs.setClauses()) {
-                                    updCols.add(set.column().toLowerCase());
-                                }
+                                Set<String> updCols = mergeAssignedCols;
                                 applySetClauses(wnmbs.setClauses(), targetTable, newRow, targetCtx);
                                 if (mergeRlsActive) {
                                     enforceRlsWithCheck(targetTable, newRow, "UPDATE");
                                 }
-                                // Fire BEFORE UPDATE row triggers (may modify NEW or skip via NULL).
-                                newRow = triggerHelper.executeTriggers(triggers, PgTrigger.Timing.BEFORE, PgTrigger.Event.UPDATE, newRow, oldRow, targetTable, updCols);
+                                // Fire BEFORE UPDATE row triggers (may modify NEW or skip via
+                                // NULL), as triggers of the relation the row is stored in.
+                                Table bySourceIn = mergeRowOwner.get(targetRow);
+                                if (bySourceIn == null) bySourceIn = targetTable;
+                                List<PgTrigger> bySourceTriggers =
+                                        rowTriggersIn(mergeRowTriggers, bySourceIn, triggers);
+                                newRow = triggerHelper.executeTriggers(bySourceTriggers, PgTrigger.Timing.BEFORE, PgTrigger.Event.UPDATE, newRow, oldRow, bySourceIn, updCols);
                                 if (newRow == null) {
                                     // BEFORE trigger suppressed this row: no update, not counted.
                                     processedTargetRows.add(targetRow);
@@ -3695,9 +4272,13 @@ class DmlExecutor {
                                 executor.constraintValidator.validateConstraints(targetTable, newRow, targetRow);
                                 validationHelper.validateDomainChecks(newRow, targetTable);
                                 Object[] writtenRow = writeMergeUpdate(stmt, targetTable, mergeRowOwner,
-                                        targetRow, oldRow, newRow);
+                                        targetRow, oldRow, newRow, mergeRowTriggers, triggers,
+                                        mergeAfterRows, updCols);
+                                if (writtenRow == null || writtenRow == PARTITION_MOVE_REFUSED) {
+                                    processedTargetRows.add(targetRow);
+                                    break;
+                                }
                                 executor.constraintValidator.handleFkOnUpdate(targetTable, oldRow, writtenRow);
-                                triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.UPDATE, writtenRow, oldRow, targetTable, updCols);
                                 if (hasReturning) {
                                     executor.currentMergeAction = "UPDATE";
                                     returningRows.add(evalMergeReturning(stmt.returning(), targetTable, targetAlias,
@@ -3754,9 +4335,13 @@ class DmlExecutor {
                             }
                         }
                         computeGeneratedColumns(targetTable, newRow);
-                        // Fire BEFORE INSERT row triggers: PG fires them per inserted row.
-                        // They may modify NEW or return NULL to skip the row entirely.
-                        newRow = triggerHelper.executeTriggers(triggers, PgTrigger.Timing.BEFORE, PgTrigger.Event.INSERT, newRow, null, targetTable);
+                        // Fire BEFORE INSERT row triggers: PG fires them per inserted row, as
+                        // triggers of the partition the row routes to. They may modify NEW or
+                        // return NULL to skip the row entirely.
+                        Table insertInto = partitionHelper.routeForInsert(targetTable, newRow);
+                        newRow = triggerHelper.executeTriggers(
+                                rowTriggersIn(mergeRowTriggers, insertInto, triggers),
+                                PgTrigger.Timing.BEFORE, PgTrigger.Event.INSERT, newRow, null, insertInto);
                         if (newRow == null) {
                             // BEFORE trigger suppressed this row: not inserted, not counted.
                             break;
@@ -3769,27 +4354,50 @@ class DmlExecutor {
                             enforceRlsWithCheck(targetTable, newRow, "INSERT");
                         }
                         validationHelper.validateEnumValues(newRow, targetTable);
-                        Table routedTable = partitionHelper.routeToPartition(targetTable, newRow);
-                        routedTable.getWriteLock().lock();
-                        try {
-                            // A partition is stored as an ordinary table whose bound nothing else
-                            // on this path consults, so a MERGE naming one is tested against it.
-                            partitionHelper.checkPartitionConstraint(routedTable, newRow);
-                            executor.constraintValidator.validateConstraints(targetTable, newRow, null);
-                            validationHelper.validateDomainChecks(newRow, targetTable);
-                            routedTable.insertRow(newRow);
+                        Table routedTable =
+                                partitionHelper.settledPartition(targetTable, insertInto, newRow);
+                        // A key another session holds but has not committed is not taken yet and
+                        // may never be: PostgreSQL waits for that transaction to settle rather than
+                        // deciding against a row nobody may end up holding, and then reports the
+                        // duplicate or stores the row on what it finds. The wait cannot be taken
+                        // under the relation's lock, because rolling that transaction back needs it.
+                        while (true) {
+                            StatementCancel.check();
+                            ConstraintValidator.PendingUniqueConflict pending;
+                            routedTable.getWriteLock().lock();
                             try {
-                                executor.constraintValidator.validateConstraints(routedTable, newRow, newRow);
-                            } catch (MemgresException e) {
-                                routedTable.removeRow(newRow);
-                                throw e;
+                                pending = executor.constraintValidator
+                                        .findUncommittedUniqueConflict(routedTable, newRow, null);
+                                if (pending == null) {
+                                    // A partition is stored as an ordinary table whose bound nothing
+                                    // else on this path consults, so a MERGE naming one is tested
+                                    // against it.
+                                    partitionHelper.checkPartitionConstraint(routedTable, newRow);
+                                    try {
+                                        executor.constraintValidator.validateConstraints(targetTable, newRow, null);
+                                    } catch (MemgresException refused) {
+                                        spendTupleIdOnFailedWrite(routedTable, refused);
+                                        throw refused;
+                                    }
+                                    validationHelper.validateDomainChecks(newRow, targetTable);
+                                    routedTable.insertRow(newRow);
+                                    try {
+                                        executor.constraintValidator.validateConstraints(routedTable, newRow, newRow);
+                                    } catch (MemgresException e) {
+                                        routedTable.removeRow(newRow);
+                                        throw e;
+                                    }
+                                }
+                            } finally {
+                                routedTable.getWriteLock().unlock();
                             }
-                        } finally {
-                            routedTable.getWriteLock().unlock();
+                            if (pending == null) break;
+                            awaitPendingInsert(routedTable, pending);
                         }
                         recordRowMeta(stmt.schema(), routedTable, newRow);
                         rowsToInsert.add(newRow);
-                        triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.INSERT, newRow, null, targetTable);
+                        mergeAfterRows.add(new MergeAfterRow(PgTrigger.Event.INSERT, routedTable,
+                                Arrays.copyOf(newRow, newRow.length), null, null));
                         if (hasReturning) {
                             executor.currentMergeAction = "INSERT";
                             returningRows.add(evalMergeReturning(stmt.returning(), targetTable, targetAlias,
@@ -3810,8 +4418,14 @@ class DmlExecutor {
                         deletedRows.add(row);
                     }
                 }
-                // Record undo (and run the RR conflict check) before mutating.
-                recordDeleteUndo(stmt.schema(), stmt.targetTable(), deletedRows);
+                // Record undo before mutating. What an arm deletes is not weighed against the
+                // snapshot a transaction reads from, for the reason writeMergeUpdate gives.
+                mergeWritesRowItMatched = true;
+                try {
+                    recordDeleteUndo(stmt.schema(), stmt.targetTable(), deletedRows);
+                } finally {
+                    mergeWritesRowItMatched = false;
+                }
                 for (Table part : scanTables) {
                     part.deleteRows(rowsToDelete);
                 }
@@ -3829,6 +4443,15 @@ class DmlExecutor {
                     throw e;
                 }
                 recordInsertUndo(stmt.schema(), routedTable.getName(), newRow);
+            }
+
+            // Everything the arms queued, in the order the rows were written and with the writing
+            // all done -- which is where PostgreSQL runs the AFTER row triggers of a statement.
+            for (MergeAfterRow pending : mergeAfterRows) {
+                triggerHelper.executeTriggers(
+                        rowTriggersIn(mergeRowTriggers, pending.relation, triggers),
+                        PgTrigger.Timing.AFTER, pending.event, pending.newRow, pending.oldRow,
+                        pending.relation, pending.assigned);
             }
 
             // The AFTER STATEMENT trigger of each action the arms could perform, holding the rows
@@ -4055,24 +4678,116 @@ class DmlExecutor {
     }
 
     /**
-     * Write a MERGE's UPDATE arm through the table that actually holds the row. When the target is
-     * partitioned and the assignment moves the row out of its partition's bounds, PostgreSQL moves
-     * the row: updating it where it lay left it in a partition its values no longer belong to.
+     * Write a MERGE's UPDATE arm through the table that actually holds the row, and queue the AFTER
+     * row trigger the write earns.
+     *
+     * <p>When the target is partitioned and the assignment moves the row out of its partition's
+     * bounds, PostgreSQL does not carry the write out as an update at all. It deletes the row from
+     * the partition that held it and inserts it into the one its values now belong to, and the row
+     * triggers of the two partitions see exactly that: the source's BEFORE DELETE and then the
+     * destination's BEFORE INSERT before anything is written, their AFTER halves once the statement
+     * is over, and no AFTER UPDATE for the row on either relation.
+     *
+     * <p>A transaction reading from a snapshot writes here without being weighed against it. A row
+     * another transaction has updated and committed since is one PostgreSQL's MERGE re-reads rather
+     * than one it refuses: the arm runs against the version that transaction left behind. Only a
+     * row that has been deleted leaves it with nothing to write, and that is the one case it ends
+     * the statement over.
+     *
+     * @return the row as it now stands, {@code null} when the destination's BEFORE INSERT refused
+     *     it and it is only deleted, or {@link #PARTITION_MOVE_REFUSED} when the source's BEFORE
+     *     DELETE kept it where it was and nothing happened to it at all
      */
     private Object[] writeMergeUpdate(MergeStmt stmt, Table targetTable, Map<Object[], Table> owners,
-                                      Object[] targetRow, Object[] oldRow, Object[] newRow) {
+                                      Object[] targetRow, Object[] oldRow, Object[] newRow,
+                                      Map<Table, List<PgTrigger>> byRelation,
+                                      List<PgTrigger> declared, List<MergeAfterRow> queued,
+                                      Set<String> assigned) {
         Table owner = owners.get(targetRow);
         if (owner == null) owner = targetTable;
         Table movedTo = partitionRowMovesTo(targetTable, owner, newRow);
+        Object[] arriving = null;
         if (movedTo != null) {
-            Object[] movedRow = moveRowAcrossPartitions(owner, movedTo, targetRow, oldRow, newRow);
-            owners.put(movedRow, movedTo);
-            return movedRow;
+            arriving = beforeRowChangesPartition(byRelation, declared,
+                    rowTriggersIn(byRelation, owner, declared), owner, movedTo, oldRow, newRow);
+            if (arriving == PARTITION_MOVE_REFUSED) return PARTITION_MOVE_REFUSED;
         }
-        recordUpdateUndo(stmt.schema(), stmt.targetTable(), targetRow, oldRow);
-        owner.updateRowInPlace(targetRow, oldRow, newRow);
-        recordRowUpdateMeta(owner == targetTable ? stmt.schema() : null, owner, targetRow);
-        return targetRow;
+        mergeWritesRowItMatched = true;
+        try {
+            if (movedTo != null && arriving == null) {
+                takeRowOutOfPartition(owner, targetRow, oldRow, false);
+                queued.add(new MergeAfterRow(PgTrigger.Event.DELETE, owner, null, oldRow, null));
+                return null;
+            }
+            if (movedTo != null) {
+                Object[] movedRow = moveRowAcrossPartitions(owner, movedTo, targetRow, oldRow, arriving);
+                owners.put(movedRow, movedTo);
+                queued.add(new MergeAfterRow(PgTrigger.Event.DELETE, owner, null, oldRow, null));
+                queued.add(new MergeAfterRow(PgTrigger.Event.INSERT, movedTo,
+                        Arrays.copyOf(movedRow, movedRow.length), null, null));
+                return movedRow;
+            }
+            recordUpdateUndo(stmt.schema(), stmt.targetTable(), targetRow, oldRow);
+            owner.updateRowInPlace(targetRow, oldRow, newRow);
+            recordRowUpdateMeta(owner == targetTable ? stmt.schema() : null, owner, targetRow);
+            queued.add(new MergeAfterRow(PgTrigger.Event.UPDATE, owner,
+                    Arrays.copyOf(targetRow, targetRow.length), oldRow, assigned));
+            return targetRow;
+        } finally {
+            mergeWritesRowItMatched = false;
+        }
+    }
+
+    /**
+     * Every column any of a MERGE's arms assigns.
+     *
+     * <p>PostgreSQL works out the columns a statement assigns once, for the statement, and judges
+     * every UPDATE OF trigger of the relation against that one set. A MERGE assigns from more than
+     * one arm, and what decides whether such a trigger fires for a row is what the statement
+     * assigns rather than what the arm that happened to write that row assigned.
+     */
+    private static Set<String> mergeAssignedColumns(MergeStmt stmt) {
+        Set<String> assigned = new HashSet<String>();
+        for (MergeStmt.WhenClause clause : stmt.whenClauses()) {
+            List<InsertStmt.SetClause> sets = null;
+            if (clause instanceof MergeStmt.WhenMatched) {
+                sets = ((MergeStmt.WhenMatched) clause).setClauses();
+            } else if (clause instanceof MergeStmt.WhenNotMatchedBySource) {
+                sets = ((MergeStmt.WhenNotMatchedBySource) clause).setClauses();
+            }
+            if (sets == null) continue;
+            for (InsertStmt.SetClause set : sets) assigned.add(set.column().toLowerCase());
+        }
+        return assigned;
+    }
+
+    /** True while a MERGE writes a row one of its arms matched. See {@link #writeMergeUpdate}. */
+    private boolean mergeWritesRowItMatched;
+
+    /**
+     * One AFTER row trigger a MERGE's arm has earned, and the relation it is owed on.
+     *
+     * <p>PostgreSQL holds the AFTER row triggers of a statement back until the statement has
+     * finished writing, so a MERGE runs all of its arms and only then runs what they queued, in the
+     * order the rows were written and whichever arm wrote each of them. What the statement assigns
+     * travels with the entry because that is what a trigger written UPDATE OF is judged by; a
+     * delete and an insert are owed nothing of the sort and carry none.
+     */
+    private static final class MergeAfterRow {
+        final PgTrigger.Event event;
+        final Table relation;
+        final Object[] newRow;
+        final Object[] oldRow;
+        final Set<String> assigned;
+
+        MergeAfterRow(PgTrigger.Event event, Table relation, Object[] newRow, Object[] oldRow,
+                      Set<String> assigned) {
+            this.event = event;
+            this.relation = relation;
+            this.newRow = newRow;
+            this.oldRow = oldRow;
+            this.assigned = assigned;
+        }
     }
 
     /**
@@ -4105,6 +4820,61 @@ class DmlExecutor {
      */
     private Object[] moveRowAcrossPartitions(Table from, Table to, Object[] row,
                                              Object[] oldRow, Object[] newRow) {
+        return moveRowAcrossPartitions(from, to, row, oldRow, newRow, true);
+    }
+
+    /** Told apart from a refusal by identity, so a trigger returning nothing keeps its meaning. */
+    private static final Object[] PARTITION_MOVE_REFUSED = new Object[0];
+
+    /**
+     * The row triggers a change of partition runs before anything is written, and the row they
+     * leave for the destination to store.
+     *
+     * <p>PostgreSQL does not carry a row that has changed partition out as an update. It deletes
+     * the row from the partition that held it and inserts it into the one its values now belong
+     * to, and the row triggers of the two partitions see exactly that -- the source's BEFORE
+     * DELETE and then the destination's BEFORE INSERT, with no AFTER UPDATE for the row at all.
+     * A BEFORE DELETE that returns NULL leaves the row where it was and the move never happens;
+     * a BEFORE INSERT that returns NULL leaves the row deleted and stored nowhere, because by
+     * then the delete has been carried out.
+     *
+     * @return the row the destination is to store, {@code null} when the destination refused it
+     *     and the row is only to be deleted, or {@link #PARTITION_MOVE_REFUSED} when the source
+     *     kept it and nothing at all is to happen
+     */
+    private Object[] beforeRowChangesPartition(Map<Table, List<PgTrigger>> byRelation,
+                                               List<PgTrigger> declared,
+                                               List<PgTrigger> sourceTriggers, Table from, Table to,
+                                               Object[] oldRow, Object[] newRow) {
+        if (triggerHelper.executeTriggers(sourceTriggers, PgTrigger.Timing.BEFORE,
+                PgTrigger.Event.DELETE, null, oldRow, from) == null) {
+            return PARTITION_MOVE_REFUSED;
+        }
+        return triggerHelper.executeTriggers(rowTriggersIn(byRelation, to, declared),
+                PgTrigger.Timing.BEFORE, PgTrigger.Event.INSERT, newRow, null, to);
+    }
+
+    /**
+     * Make the version of a row that stood in the partition it is leaving dead.
+     *
+     * <p>The version being made dead is the one that stood there before the statement ran: that is
+     * what a session which may not see the write is entitled to read, and what an abort has to
+     * leave behind. One of the update paths applies the assignments to the stored row itself, so
+     * the row is put back as it was before it is filed away as deleted.
+     *
+     * @param moved whether the row is on its way to another partition rather than simply going: a
+     *     session waiting to lock a row that moved is told that it moved, while one waiting on a
+     *     row a trigger refused to let the destination have finds it deleted like any other
+     */
+    private void takeRowOutOfPartition(Table from, Object[] row, Object[] oldRow, boolean moved) {
+        System.arraycopy(oldRow, 0, row, 0, Math.min(row.length, oldRow.length));
+        recordDeleteUndo(from.getSchemaName(), from.getName(), Collections.singletonList(row));
+        if (moved && executor.session != null) executor.session.noteRowMovedToAnotherPartition(row);
+        from.deleteRow(row);
+    }
+
+    private Object[] moveRowAcrossPartitions(Table from, Table to, Object[] row,
+                                             Object[] oldRow, Object[] newRow, boolean moved) {
         // The destination is a relation with rules of its own: its constraints and its bound
         // decide whether it may hold this row, and PostgreSQL names it in the error. Both are
         // settled before the row leaves its old home, or a refused update would delete the row
@@ -4112,14 +4882,7 @@ class DmlExecutor {
         Object[] movedRow = to.rowFromParent(Arrays.copyOf(newRow, newRow.length));
         partitionHelper.checkPartitionConstraint(to, movedRow);
         executor.constraintValidator.validateConstraints(to, movedRow, null);
-        // The version being made dead is the one that stood there before the statement ran: that
-        // is what a session which may not see the write is entitled to read, and what an abort has
-        // to leave behind. One of the update paths applies the assignments to the stored row
-        // itself, so the row is put back as it was before it is filed away as deleted.
-        System.arraycopy(oldRow, 0, row, 0, Math.min(row.length, oldRow.length));
-        recordDeleteUndo(from.getSchemaName(), from.getName(), Collections.singletonList(row));
-        if (executor.session != null) executor.session.noteRowMovedToAnotherPartition(row);
-        from.deleteRow(row);
+        takeRowOutOfPartition(from, row, oldRow, moved);
         to.insertRow(movedRow);
         recordRowMeta(to.getSchemaName(), to, movedRow);
         recordInsertUndo(to.getSchemaName(), to.getName(), movedRow);
@@ -4271,6 +5034,71 @@ class DmlExecutor {
         return own;
     }
 
+    /**
+     * The row triggers every relation that can store a row for this statement's target carries.
+     *
+     * <p>PostgreSQL fires a FOR EACH ROW trigger as a trigger of the relation the row is really
+     * stored in. A partition is given a copy of every row trigger written on the partitioned table
+     * above it, so what fires for a write through the parent is the copy, beside whatever was
+     * written on the partition itself and in name order with it; an inheritance child is given no
+     * copy at all and fires only its own. Reading the named relation's own list for every row
+     * therefore never reached a partition's own triggers -- an audit, a computed column, a refusal,
+     * all of them skipped for exactly the statements people write -- and named the parent inside
+     * the ones it did reach. A FOR EACH STATEMENT trigger is a different matter: it belongs to the
+     * relation the statement named, which is the list the caller keeps.
+     */
+    private Map<Table, List<PgTrigger>> rowTriggersByRelation(Table table, List<PgTrigger> declared) {
+        Map<Table, List<PgTrigger>> byRelation = new IdentityHashMap<Table, List<PgTrigger>>();
+        if (table == null) return byRelation;
+        byRelation.put(table, declared);
+        List<Table> storage = new ArrayList<Table>();
+        DmlPartitionHelper.collectRelationAndDescendants(table, storage);
+        for (Table relation : storage) {
+            if (relation == table) continue;
+            byRelation.put(relation, enabledTriggers(
+                    executor.database.getTriggersForTable(relation.getName())));
+        }
+        return byRelation;
+    }
+
+    /** The row triggers of the relation a row is stored in, or the target's own for anything else. */
+    private List<PgTrigger> rowTriggersIn(Map<Table, List<PgTrigger>> byRelation, Table storage,
+                                          List<PgTrigger> declared) {
+        if (storage == null) return declared;
+        List<PgTrigger> here = byRelation.get(storage);
+        return here == null ? declared : here;
+    }
+
+    /** Whether any relation this statement can write to carries a trigger at all. */
+    private boolean anyRowTriggers(Map<Table, List<PgTrigger>> byRelation) {
+        for (List<PgTrigger> list : byRelation.values()) {
+            if (!list.isEmpty()) return true;
+        }
+        return false;
+    }
+
+    /**
+     * One AFTER row trigger the statement still owes, and the relation it is owed on.
+     *
+     * <p>PostgreSQL holds every AFTER row trigger back until the statement has finished writing.
+     * A row that changed partition is owed two of them -- the delete on the partition it left and
+     * the insert on the one it reached -- and no AFTER UPDATE at all, because a move is not an
+     * update on either relation.
+     */
+    private static final class PendingAfterRow {
+        final PgTrigger.Event event;
+        final Table relation;
+        final Object[] newRow;
+        final Object[] oldRow;
+
+        PendingAfterRow(PgTrigger.Event event, Table relation, Object[] newRow, Object[] oldRow) {
+            this.event = event;
+            this.relation = relation;
+            this.newRow = newRow;
+            this.oldRow = oldRow;
+        }
+    }
+
     /** Deep-copy every row of each given table so the statement can be rolled back. */
     private Map<Table, List<Object[]>> snapshotTargetTables(List<Table> tables) {
         Map<Table, List<Object[]>> snapshot = new IdentityHashMap<>();
@@ -4326,7 +5154,12 @@ class DmlExecutor {
     Object evalGeneratedColumn(Table table, Object[] row, Column col) {
         Expression expr = col.getGeneratedExprAst();
         if (expr == null) return null;
-        Object value = executor.evalExpr(expr, new RowContext(table, null, row));
+        // A FROM item's alias list renames the references to a relation's columns and not the
+        // expressions stored with them, so the expression of a column reached through one is still
+        // written in the names the relation underneath answers to.
+        Table named = table.getColumnsRenamedFrom();
+        Object value = executor.evalExpr(expr,
+                new RowContext(named != null ? named : table, null, row));
         return TypeCoercion.coerceForStorage(value, col);
     }
 
@@ -4974,6 +5807,23 @@ class DmlExecutor {
             }
         }
         return false;
+    }
+
+    /**
+     * Choose the rows a writing statement acts on with its qualification standing over the scan.
+     *
+     * <p>A sub-select written in the qualification is read as a join with the relation being
+     * written, the way it is in a query that only reads, so what the rest of the qualification
+     * says about the column the two are joined on restricts the sub-select's own scan.
+     */
+    private List<Object[]> readQualified(Expression qualification,
+                                         java.util.function.Supplier<List<Object[]>> read) {
+        executor.fromResolver.enterQualification(qualification);
+        try {
+            return read.get();
+        } finally {
+            executor.fromResolver.exitQualification();
+        }
     }
 
     /**
@@ -5680,7 +6530,7 @@ class DmlExecutor {
         // modified by a concurrent committed transaction after our snapshot, raise 40001.
         // Mirrors the check on the UPDATE path (recordUpdateUndo). Must run before the
         // undo is recorded (callers invoke this before the physical delete).
-        if (executor.session != null) {
+        if (executor.session != null && !mergeWritesRowItMatched) {
             for (Object[] row : rows) {
                 executor.session.checkRRWriteConflict(schemaName + "." + table, row);
             }
@@ -5696,7 +6546,7 @@ class DmlExecutor {
         String schemaName = schema != null ? schema : executor.defaultSchema();
         // M7: RR write-write conflict detection — if the row was modified by a committed
         // transaction after our snapshot, raise 40001
-        if (executor.session != null) {
+        if (executor.session != null && !mergeWritesRowItMatched) {
             executor.session.checkRRWriteConflict(schemaName + "." + table, oldValues);
         }
         executor.recordUndo(new Session.UpdateUndo(schemaName, table, row, oldValues));

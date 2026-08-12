@@ -464,6 +464,8 @@ class FromJoinExecutor {
                 // that did not exist.
                 Table virtualTable = new Table(alias, FromFunctionResolver.applyColumnAliases(
                         new ArrayList<>(subResult.getColumns()), sqf.columnAliases()));
+                FromResolver.renamesColumnsOf(virtualTable, alias, subResult.getColumns(),
+                        sqf.columnAliases());
                 boolean matched = false;
                 // A VIRTUAL generated column the sub-select left for this relation to work out is
                 // worked out here, because the join condition and the query's WHERE may read it.

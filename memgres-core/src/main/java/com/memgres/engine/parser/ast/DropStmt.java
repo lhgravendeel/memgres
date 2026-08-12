@@ -88,6 +88,14 @@ public final class DropStmt implements Statement {
     public String schema() { return schema; }
     public java.util.List<DropStmt> more() { return more; }
 
+    /** This drop and the further ones the same statement names, in the order they were written. */
+    public static java.util.List<DropStmt> allOf(DropStmt first) {
+        java.util.List<DropStmt> all = new java.util.ArrayList<DropStmt>();
+        all.add(first);
+        if (first.more() != null) all.addAll(first.more());
+        return all;
+    }
+
     @Override
     public boolean equals(Object o) {
         if (this == o) return true;

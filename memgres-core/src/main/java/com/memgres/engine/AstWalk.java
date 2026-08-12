@@ -72,6 +72,26 @@ final class AstWalk {
         findFirst(root, node -> { action.accept(node); return false; });
     }
 
+    /**
+     * The same, stopping at every node {@code apart} holds: such a node is itself handed to
+     * {@code action}, and what it stands over is not walked at all. A null predicate stops
+     * nowhere, which is {@link #forEach}.
+     */
+    static void forEachOutside(Object root, Predicate<Object> apart,
+                               java.util.function.Consumer<Object> action) {
+        if (root == null) return;
+        Set<Object> seen = Collections.newSetFromMap(new IdentityHashMap<Object, Boolean>());
+        Deque<Object> queue = new ArrayDeque<>();
+        queue.add(root);
+        while (!queue.isEmpty()) {
+            Object node = queue.poll();
+            if (!seen.add(node)) continue;
+            action.accept(node);
+            if (apart != null && apart.test(node)) continue;
+            forEachChild(node, child -> queue.add(child));
+        }
+    }
+
     /** Apply {@code action} to each direct AST child of a node (one level, no recursion). */
     static void forEachChild(Object node, java.util.function.Consumer<Object> action) {
         if (node == null) return;

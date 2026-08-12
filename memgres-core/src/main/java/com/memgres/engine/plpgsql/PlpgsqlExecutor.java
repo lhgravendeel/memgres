@@ -790,11 +790,14 @@ public class PlpgsqlExecutor {
             for (int i = 0; i < table.getColumns().size(); i++)
                 oldMap.put(table.getColumns().get(i).getName().toLowerCase(), oldRow[i]);
         }
-        // A row-level DELETE trigger has no NEW row: PostgreSQL leaves it unassigned, so RETURN NEW
-        // returns nothing and the row is skipped, while RETURN OLD lets the delete go ahead.
+        // A row-level DELETE trigger has no NEW row. PostgreSQL leaves NEW as the null record, so
+        // reading a column of it answers NULL -- which is what a body shared by an INSERT and a
+        // DELETE trigger writes -- while RETURN NEW still returns nothing and skips the row, and
+        // RETURN OLD lets the delete go ahead. Leaving the record out altogether made every
+        // mention of NEW.col a column that could not be resolved.
         boolean deleteRowTrigger = trigger != null && !trigger.isForEachStatement()
                 && trigger.getEvent() == PgTrigger.Event.DELETE;
-        scope.declare("new", deleteRowTrigger ? null : newMap);
+        scope.declare("new", deleteRowTrigger ? new LinkedHashMap<String, Object>() : newMap);
         scope.declare("old", oldMap);
         scope.declare("found", false);
 
@@ -802,6 +805,9 @@ public class PlpgsqlExecutor {
             scope.declare("tg_op", trigger.getEvent().name());
             scope.declare("tg_name", trigger.getName());
             scope.declare("tg_table_name", table.getName());
+            // The name PostgreSQL kept from before schemas, which reads the same relation as
+            // TG_TABLE_NAME does and is still what plenty of trigger bodies are written against.
+            scope.declare("tg_relname", table.getName());
             scope.declare("tg_table_schema", "public");
             scope.declare("tg_when", trigger.getTiming().name());
             scope.declare("tg_level", trigger.isForEachStatement() ? "STATEMENT" : "ROW");
@@ -820,6 +826,7 @@ public class PlpgsqlExecutor {
             scope.declare("tg_op", "INSERT");
             scope.declare("tg_name", "");
             scope.declare("tg_table_name", table.getName());
+            scope.declare("tg_relname", table.getName());
             scope.declare("tg_table_schema", "public");
             scope.declare("tg_when", "BEFORE");
             scope.declare("tg_level", "ROW");

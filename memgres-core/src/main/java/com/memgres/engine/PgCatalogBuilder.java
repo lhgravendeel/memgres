@@ -364,7 +364,7 @@ public class PgCatalogBuilder {
             case "pg_matviews":
                 return stubs.buildPgMatviews();
             case "pg_rules":
-                return stubs.buildPgRulesView();
+                return stubs.buildPgRulesView(session);
             case "pg_seclabels":
                 return stubs.buildPgSeclabels();
             case "pg_init_privs":

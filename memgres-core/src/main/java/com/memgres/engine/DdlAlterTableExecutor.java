@@ -644,6 +644,11 @@ class DdlAlterTableExecutor {
                 // The named spelling of DROP NOT NULL answers to the same rule as the column
                 // spelling: the constraint belongs to whichever relation declared it.
                 rejectDropNotNullUnderParent(table, notNullColumn, stmt.table(), true);
+                recordNotNullUndo(table, notNullColumn);
+                // What each child holds is settled while this relation still declares the rule, so
+                // the name it answers to is still the one the constraint was created with.
+                pinRetainedNotNullNames(table, notNullColumn);
+                if (stmt.only()) makeNotNullLocalOnChildren(table, notNullColumn);
                 // Dropping the constraint is what makes the column nullable again.
                 table.alterColumnNullable(notNullColumn, true);
                 table.setNotNullConstraintName(notNullColumn, null);
@@ -789,6 +794,7 @@ class DdlAlterTableExecutor {
             // rule to the child behind the writer's back, so a child that would enforce less than
             // its parent is refused rather than attached.
             requireInheritedChecks(parentTable, table);
+            rejectNoInheritAgainstParent(parentTable, table);
             table.setParentTable(parentTable);
             parentTable.addChild(table);
         } else if (action instanceof AlterTableStmt.NoInherit) {
@@ -814,10 +820,10 @@ class DdlAlterTableExecutor {
             adoptInheritedNotNulls(table, parentTable);
         } else if (action instanceof AlterTableStmt.DisableTrigger) {
             AlterTableStmt.DisableTrigger dt = (AlterTableStmt.DisableTrigger) action;
-            setTriggerEnabled(table, dt.triggerName(), "D");
+            setTriggerEnabled(table, dt.triggerName(), "D", stmt.only());
         } else if (action instanceof AlterTableStmt.EnableTrigger) {
             AlterTableStmt.EnableTrigger et = (AlterTableStmt.EnableTrigger) action;
-            setTriggerEnabled(table, et.triggerName(), et.state());
+            setTriggerEnabled(table, et.triggerName(), et.state(), stmt.only());
         } else if (action instanceof AlterTableStmt.SetRuleEnabled) {
             AlterTableStmt.SetRuleEnabled sr = (AlterTableStmt.SetRuleEnabled) action;
             if (!executor.database.setRuleEnabledState(table.getSchemaName(), sr.ruleName(),
@@ -1341,6 +1347,22 @@ class DdlAlterTableExecutor {
     }
 
     /**
+     * The same rule for the constraint spelling of the request, which reaches further: an
+     * inheritance child would break a rule its parent alone carried as surely as a partition
+     * would, and PostgreSQL refuses ONLY there too where the column spelling accepts it. It sends
+     * no hint for this one -- the writer named a constraint rather than the keyword the hint would
+     * have told them to leave out.
+     */
+    private static void rejectOnlyNotNullConstraint(Table table, AlterTableStmt stmt,
+                                                    List<String> columns) {
+        if (!stmt.only() || columns == null || childRelations(table).isEmpty()) return;
+        for (String column : columns) {
+            int idx = table.getColumnIndex(column);
+            if (idx >= 0 && table.getColumns().get(idx).isNullable()) throw onlyOnParent(false);
+        }
+    }
+
+    /**
      * A partition always carries its parent's constraints, so a constraint declared NO INHERIT on
      * a partitioned table asks for something the hierarchy cannot express. Ordinary inheritance
      * can express it, and PostgreSQL accepts it there.
@@ -1406,9 +1428,123 @@ class DdlAlterTableExecutor {
     private static void clearNotNullOnDescendants(Table table, String column) {
         for (Table child : childRelations(table)) {
             if (child.getColumnIndex(column) < 0) continue;
+            // A relation that declared the rule for itself, or takes it from another parent as
+            // well, holds a constraint this drop does not reach: PostgreSQL takes away the one
+            // count the parent contributed and leaves the constraint standing on whatever is
+            // left. Everything below it goes on taking the rule from there, so the walk stops.
+            if (retainsNotNullWithoutParent(child, column)) continue;
             child.alterColumnNullable(column, true);
             child.setNotNullConstraintName(column, null);
+            // Nothing is left for a name to belong to, so the one written down goes with it: a
+            // rule declared here afterwards is a new constraint and takes a new name.
+            child.pinInheritedNotNullName(column, null);
             clearNotNullOnDescendants(child, column);
+        }
+    }
+
+    /**
+     * True when this relation goes on refusing a null after the parent it took the rule from has
+     * stopped: its own definition declared it, another parent still declares it, or a parent that
+     * dropped the column left a count behind that nothing can withdraw. A partition that said
+     * NOT NULL for itself declared it as surely as an inheritance child does, and PostgreSQL
+     * leaves it standing there when the partitioned table stops.
+     */
+    private static boolean retainsNotNullWithoutParent(Table child, String column) {
+        if (child.isNotNullLocal(column)) return true;
+        if (child.retainedNotNullInheritCount(column) > 0) return true;
+        for (Table parent : child.getDirectParents()) {
+            if (CatalogConstraintBuilder.declaresNotNull(parent, column)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Write down the name each relation below this one holds the column's NOT NULL under, for
+     * those that go on holding it once this relation has stopped declaring it.
+     *
+     * <p>PostgreSQL names a constraint when it is created and never names it again, so a relation
+     * that took the rule from two parents answers to the name the first of them gave it for as
+     * long as it holds the rule at all. Reading the name afresh from the parent that is left
+     * renames a constraint PostgreSQL renames nowhere, so it is written down here -- while the
+     * parent that gave it still declares the rule and the name can still be read off it.
+     */
+    private static void pinRetainedNotNullNames(Table table, String column) {
+        for (Table child : childRelations(table)) {
+            int idx = child.getColumnIndex(column);
+            if (idx < 0 || child.getColumns().get(idx).isNullable()) continue;
+            // A relation that declared the rule itself answers to its own name whatever happens
+            // above it, and everything below it goes on reading that one.
+            if (child.isNotNullLocal(column)) continue;
+            if (retainsNotNullBesides(child, table, column)) {
+                child.pinInheritedNotNullName(column,
+                        CatalogConstraintBuilder.notNullConstraintName(child, column));
+            } else {
+                pinRetainedNotNullNames(child, column);
+            }
+        }
+    }
+
+    /** True when the relation goes on refusing a null once the named parent has stopped. */
+    private static boolean retainsNotNullBesides(Table child, Table leaving, String column) {
+        if (child.retainedNotNullInheritCount(column) > 0) return true;
+        for (Table parent : child.getDirectParents()) {
+            if (parent != leaving
+                    && CatalogConstraintBuilder.declaresNotNull(parent, column)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Write down what a column's NOT NULL is, here and on everything below, before the statement
+     * changes it.
+     *
+     * <p>PostgreSQL undoes a DDL statement as completely as it undoes a write, so a transaction
+     * that declared the rule -- or withdrew it -- and then rolled back leaves the hierarchy
+     * refusing exactly the nulls it refused before. Each relation keeps its own copy of the
+     * column list and its own record of whose rule the NOT NULL on it is, so every relation the
+     * statement can reach has to be remembered rather than only the one it named.
+     */
+    private void recordNotNullUndo(Table table, String column) {
+        recordOneNotNullUndo(table, column);
+        for (Table descendant : descendantRelations(table)) {
+            recordOneNotNullUndo(descendant, column);
+        }
+    }
+
+    private void recordOneNotNullUndo(Table table, String column) {
+        int idx = table.getColumnIndex(column);
+        if (idx < 0) return;
+        // Only a name the writer chose is worth putting back: the default spelling is derived
+        // from the relation and the column, and a rollback restores both of those anyway.
+        String held = table.notNullConstraintName(column);
+        if (held != null && held.equals(table.defaultNotNullConstraintName(column))) held = null;
+        executor.recordUndo(new NotNullUndo(table.getSchemaName(), table.getName(), column,
+                table.getColumns().get(idx).isNullable(), held, table.isNotNullLocal(column),
+                table.inheritedNotNullName(column)));
+    }
+
+    /**
+     * ONLY leaves every child holding the rule, and each of them holds it for itself from then on:
+     * the relation that declared it has stopped, so there is nobody left it could be held for. The
+     * name stays where it was -- PostgreSQL names a constraint once and never names it again -- and
+     * a child that takes the same rule from another parent as well is left exactly as it was,
+     * because it is still holding that one for somebody.
+     */
+    private static void makeNotNullLocalOnChildren(Table parent, String column) {
+        for (Table child : childRelations(parent)) {
+            int idx = child.getColumnIndex(column);
+            if (idx < 0 || child.getColumns().get(idx).isNullable()) continue;
+            boolean handedDownStill = false;
+            for (Table above : child.getDirectParents()) {
+                if (above != parent && CatalogConstraintBuilder.declaresNotNull(above, column)) {
+                    handedDownStill = true;
+                    break;
+                }
+            }
+            if (handedDownStill) continue;
+            child.setNotNullConstraintName(column,
+                    CatalogConstraintBuilder.notNullConstraintName(child, column));
+            child.markNotNullLocal(column);
         }
     }
 
@@ -1430,11 +1566,11 @@ class DdlAlterTableExecutor {
                 throw new MemgresException("column \"" + column
                         + "\" is marked NOT NULL in parent table", "42P16");
             }
-            throw cannotDropInheritedNotNull(partitionParent, column, tableName);
+            throw cannotDropInheritedNotNull(table, column, tableName);
         }
         for (Table parent : table.getInheritParents()) {
             if (!columnRequiresNotNull(parent, column)) continue;
-            throw cannotDropInheritedNotNull(parent, column, tableName);
+            throw cannotDropInheritedNotNull(table, column, tableName);
         }
         // A parent that dropped the column withdrew nothing from the relations that kept it, so
         // the rule is still one of theirs to hold rather than theirs to withdraw, and there is no
@@ -1447,15 +1583,15 @@ class DdlAlterTableExecutor {
     }
 
     /**
-     * The refusal PostgreSQL gives for an inherited NOT NULL, naming the constraint the descendant
-     * holds: a constraint taken from a parent keeps the name the relation that declared it gave
-     * it, which is the first relation up the chain whose own definition said NOT NULL rather than
-     * the last -- a relation that restates the rule declares a constraint of its own, and that is
-     * the one everything below it holds.
+     * The refusal PostgreSQL gives for an inherited NOT NULL, naming the constraint the relation
+     * the statement named is holding rather than the parent's: a relation that restated the rule
+     * holds one of its own, under its own name, and is still refused permission to drop it while a
+     * parent goes on declaring it too. Only where it declared nothing is the name the parent's,
+     * which is what the walk up the chain answers with anyway.
      */
-    private static MemgresException cannotDropInheritedNotNull(Table parent, String column,
+    private static MemgresException cannotDropInheritedNotNull(Table relation, String column,
                                                                String tableName) {
-        String conname = CatalogConstraintBuilder.notNullConstraintName(parent, column);
+        String conname = CatalogConstraintBuilder.notNullConstraintName(relation, column);
         return new MemgresException("cannot drop inherited constraint \"" + conname
                 + "\" of relation \"" + tableName + "\"", "42P16").suppressPosition();
     }
@@ -1483,11 +1619,16 @@ class DdlAlterTableExecutor {
         return null;
     }
 
-    /** True when this relation has the column and declares it NOT NULL. */
+    /**
+     * True when this relation declares the column NOT NULL on behalf of everything below it. A
+     * rule written NO INHERIT answers for the declaring relation's own rows, so a descendant that
+     * declared NOT NULL for itself holds it outright and may withdraw it.
+     */
     private static boolean columnRequiresNotNull(Table table, String column) {
         if (table == null || column == null) return false;
         int idx = table.getColumnIndex(column);
-        return idx >= 0 && !table.getColumns().get(idx).isNullable();
+        return idx >= 0 && !table.getColumns().get(idx).isNullable()
+                && !table.isNotNullNoInherit(column);
     }
 
     /**
@@ -1573,6 +1714,24 @@ class DdlAlterTableExecutor {
         throw PgErrors.datatypeMismatch("column \"" + parentCol.getName()
                 + "\" in child table \"" + childName + "\" must be marked NOT NULL")
                 .suppressPosition();
+    }
+
+    /**
+     * A NOT NULL written NO INHERIT says the rule is about this relation's own rows and travels
+     * to nobody; a NOT NULL taken from a parent is one rule the relation holds on the parent's
+     * behalf. The two cannot both be true of one column, so PostgreSQL refuses to join the
+     * hierarchy rather than merge them, and names the constraint the child already carries.
+     */
+    private static void rejectNoInheritAgainstParent(Table parent, Table child) {
+        for (Column parentCol : parent.getColumns()) {
+            String column = parentCol.getName();
+            if (!CatalogConstraintBuilder.declaresNotNull(parent, column)) continue;
+            if (child.getColumnIndex(column) < 0 || !child.isNotNullNoInherit(column)) continue;
+            throw PgErrors.invalidObjectState("constraint \""
+                    + CatalogConstraintBuilder.notNullConstraintName(child, column)
+                    + "\" conflicts with non-inherited constraint on child table \""
+                    + child.getName() + "\"").suppressPosition();
+        }
     }
 
     /**
@@ -2361,6 +2520,7 @@ class DdlAlterTableExecutor {
         } else if (alterCol.action() instanceof AlterTableStmt.SetNotNull) {
             rejectOnlyNotNullOnPartitioned(table, stmt, alterCol.column());
             requireColumnHasNoNulls(table, alterCol.column(), stmt.table());
+            recordNotNullUndo(table, alterCol.column());
             // A partitioned parent stores no rows of its own, and an inheritance child's rows are
             // the parent's rows too, so the data that decides whether the rule can hold at all
             // lives below: PostgreSQL scans the descendants and names the one at fault.
@@ -2392,6 +2552,11 @@ class DdlAlterTableExecutor {
             // The rule belongs to whichever relation declared it, so a descendant is sent to that
             // one rather than allowed to weaken what the parent answers for.
             rejectDropNotNullUnderParent(table, alterCol.column(), stmt.table(), false);
+            recordNotNullUndo(table, alterCol.column());
+            // What each child holds is settled while this relation still declares the rule, so the
+            // name it answers to is still the one the constraint was created with.
+            pinRetainedNotNullNames(table, alterCol.column());
+            if (stmt.only()) makeNotNullLocalOnChildren(table, alterCol.column());
             table.alterColumnNullable(alterCol.column(), true);
             // The constraint is gone, and a later SET NOT NULL makes a new one under the
             // default name rather than resurrecting the name this one carried.
@@ -3304,7 +3469,7 @@ class DdlAlterTableExecutor {
             throw onlyOnParent(false);
         }
         if (addedType == TableConstraint.ConstraintType.NOT_NULL) {
-            rejectOnlyNotNullOnPartitioned(table, stmt, null);
+            rejectOnlyNotNullConstraint(table, stmt, addConstraint.constraint().columns());
         }
         if (addedType == TableConstraint.ConstraintType.FOREIGN_KEY
                 && stmt.only() && isPartitioned(table)) {
@@ -3331,7 +3496,15 @@ class DdlAlterTableExecutor {
                             throw PgErrors.columnContainsNulls(colName, "relation", stmt.table());
                         }
                     }
+                    // A partitioned parent stores no rows of its own, and an inheritance child's
+                    // rows are the parent's rows too, so the data that decides whether the rule
+                    // can hold at all lives below: PostgreSQL scans the descendants and names the
+                    // one at fault.
+                    for (Table descendant : descendantRelations(table)) {
+                        requireColumnHasNoNulls(descendant, colName, descendant.getName());
+                    }
                 }
+                recordNotNullUndo(table, colName);
                 // A column that is already NOT NULL keeps the constraint it has: PostgreSQL
                 // merges the new declaration into it and never creates the written name, so
                 // DROP CONSTRAINT on that name is 42704 there and must be here too.
@@ -3341,6 +3514,9 @@ class DdlAlterTableExecutor {
                 if (!alreadyNotNull && addConstraint.constraint().name() != null) {
                     table.setNotNullConstraintName(colName, addConstraint.constraint().name());
                 }
+                // Each descendant keeps its own copy of the column list, so the flag has to reach
+                // them or this relation forbids a null its own descendants go on taking.
+                setColumnsNotNull(table, Collections.singletonList(colName));
             }
             return;
         }
@@ -3474,6 +3650,7 @@ class DdlAlterTableExecutor {
             if (sc.getType() == StoredConstraint.Type.PRIMARY_KEY) {
                 // PG: ADD PRIMARY KEY marks the key columns NOT NULL (attnotnull /
                 // information_schema.columns.is_nullable = 'NO'), on the table and its partitions.
+                for (String keyCol : sc.getColumns()) recordNotNullUndo(table, keyCol);
                 setColumnsNotNull(table, sc.getColumns());
             }
             propagateConstraintToChildren(table, sc);
@@ -3828,8 +4005,8 @@ class DdlAlterTableExecutor {
         Table partition = executor.resolveTable(partSchemaName, attach.partitionName());
         rejectInheritanceCycle(partition, table, attach.partitionName(), stmt.table());
         if (table.getPartitions().contains(partition)) {
-            throw new MemgresException("table \"" + attach.partitionName()
-                    + "\" is already a partition of \"" + stmt.table() + "\"", "42809");
+            throw PgErrors.wrongObjectType("\"" + attach.partitionName()
+                    + "\" is already a partition");
         }
         // A table can belong to one parent only; attaching it a second time would give it two
         // routing paths, and detaching either would leave the other pointing at nothing.
@@ -3856,6 +4033,19 @@ class DdlAlterTableExecutor {
         // belong to the new partition, so the default's constraint no longer holds for them.
         validateDefaultPartitionRows(table, partition, attach.partitionName());
         partition.setPartitionParent(table);
+        // The rule on each of these columns stops being the attached table's own: PostgreSQL
+        // records it as the partitioned table's from now on, so the partition may no longer
+        // withdraw it and the partitioned table letting go takes it away. Only conislocal moves --
+        // the constraint goes on answering to the name it was created with, so that name is
+        // written down before the link that would have derived a different one is made.
+        for (Column parentCol : table.getColumns()) {
+            String col = parentCol.getName();
+            if (parentCol.isNullable() || partition.getColumnIndex(col) < 0) continue;
+            if (!partition.isNotNullLocal(col)) continue;
+            partition.pinInheritedNotNullName(col,
+                    CatalogConstraintBuilder.notNullConstraintName(partition, col));
+            partition.markNotNullInherited(col);
+        }
         partition.setParentColumnRemap(buildParentColumnRemap(table, partition));
         table.addPartition(partition);
         // An index on a partitioned table is a rule about every partition, so a table joining the
@@ -4101,8 +4291,25 @@ class DdlAlterTableExecutor {
         return parentRow;
     }
 
-    private void setTriggerEnabled(Table table, String triggerName, String state) {
-        List<PgTrigger> triggers = executor.database.getTriggersForTable(table.getName());
+    /**
+     * Turn a trigger off or on, down the whole partition tree unless ONLY was written.
+     *
+     * <p>A partition carries a copy of every row trigger written on the partitioned table above it,
+     * and it is the copy that fires for a write. PostgreSQL therefore puts each copy into the state
+     * the original was put into, so that turning a trigger off on the partitioned table really
+     * turns it off; only ONLY leaves the copies as they were, and a partition named on its own
+     * still settles its own copy alone.
+     */
+    private void setTriggerEnabled(Table table, String triggerName, String state, boolean onlyThis) {
+        List<PgTrigger> triggers = new ArrayList<>(
+                executor.database.getTriggersForTable(table.getName()));
+        if (!onlyThis) {
+            for (Table partition : partitionsBelow(table)) {
+                for (PgTrigger t : executor.database.getTriggersForTable(partition.getName())) {
+                    if (t.getClonedFromTable() != null) triggers.add(t);
+                }
+            }
+        }
         // ALL and USER are group selectors, not names, and match nothing without complaint.
         if ("ALL".equalsIgnoreCase(triggerName) || "USER".equalsIgnoreCase(triggerName)) {
             for (PgTrigger t : triggers) {
@@ -4122,6 +4329,16 @@ class DdlAlterTableExecutor {
             throw new MemgresException("trigger \"" + triggerName + "\" for table \""
                     + table.getName() + "\" does not exist", "42704");
         }
+    }
+
+    /** Every partition under a relation, however deep the partitioning goes. */
+    private List<Table> partitionsBelow(Table table) {
+        List<Table> below = new ArrayList<>();
+        for (Table partition : table.getPartitions()) {
+            below.add(partition);
+            below.addAll(partitionsBelow(partition));
+        }
+        return below;
     }
 
     /**
