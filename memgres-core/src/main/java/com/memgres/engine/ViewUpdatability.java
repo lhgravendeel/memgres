@@ -56,6 +56,10 @@ final class ViewUpdatability {
             "Views that do not select from a single table or view are not automatically updatable.";
     static final String DETAIL_NOT_COLUMN =
             "View columns that are not columns of their base relation are not updatable.";
+    // Not a fault of the view's own shape: a rule that stands in for the write only for the rows
+    // its qualification holds leaves the rest of the statement with nothing to be rewritten onto.
+    static final String DETAIL_CONDITIONAL_RULE =
+            "Views with conditional DO INSTEAD rules are not automatically updatable.";
 
     /** How deep a chain of views over views is followed before it is called a loop. */
     private static final int MAX_VIEW_DEPTH = 100;

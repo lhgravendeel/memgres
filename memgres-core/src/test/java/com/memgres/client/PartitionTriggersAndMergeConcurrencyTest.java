@@ -9,7 +9,11 @@ import org.postgresql.core.BaseConnection;
 import org.postgresql.util.PSQLException;
 import org.postgresql.util.ServerErrorMessage;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.io.StringReader;
+import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.ResultSet;
@@ -25,6 +29,7 @@ import java.util.concurrent.TimeoutException;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -2290,8 +2295,8 @@ class PartitionTriggersAndMergeConcurrencyTest {
         exec("CREATE TABLE pkr_c1 PARTITION OF pkr_c FOR VALUES FROM (10) TO (20)");
 
         // A COPY reaches the partitions the way an INSERT does, so the same two reports come out
-        // of it. PostgreSQL carries the failing row in the error's DETAIL and memgres sends none
-        // for a COPY, so it is the state and the message that are read back here.
+        // of it. Here it is the state and the message that are read back; the whole field set a
+        // refused COPY carries is read further down.
         exec("CREATE TRIGGER pkr_a_move BEFORE INSERT ON pkr_c0"
                 + " FOR EACH ROW EXECUTE FUNCTION pkr_bump()");
         assertEquals("23514/new row for relation \"pkr_c0\" violates partition constraint",
@@ -2327,5 +2332,2206 @@ class PartitionTriggersAndMergeConcurrencyTest {
             }
             return "EX " + e;
         }
+    }
+
+    // ============================================================ what a COPY says when it will
+    // not take a row
+
+    /** The trigger functions the COPY refusal tests below are written with. */
+    private static void copyRefusalFunctions() throws SQLException {
+        exec("CREATE OR REPLACE FUNCTION crf_bump() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN"
+                + " NEW.k := NEW.k + 10; RETURN NEW; END $$");
+        exec("CREATE OR REPLACE FUNCTION crf_raise() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN"
+                + " RAISE EXCEPTION 'no'; END $$");
+    }
+
+    /**
+     * What a COPY FROM STDIN answers: the rows it stored, or the whole field set of the error it
+     * raised -- the state, the primary message, the DETAIL and the field the protocol calls Where,
+     * which a client prints as CONTEXT.
+     */
+    private static String copyFields(String sql, String data) {
+        return copyFields(sql, data.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static String copyFields(String sql, byte[] data) {
+        try {
+            CopyManager copies = new CopyManager(conn.unwrap(BaseConnection.class));
+            return "rows=" + copies.copyIn(sql, new ByteArrayInputStream(data));
+        } catch (Exception e) {
+            if (!(e instanceof PSQLException)
+                    || ((PSQLException) e).getServerErrorMessage() == null) {
+                return "EX " + e;
+            }
+            ServerErrorMessage m = ((PSQLException) e).getServerErrorMessage();
+            return m.getSQLState() + "/" + m.getMessage() + "/" + m.getDetail() + "/" + m.getWhere();
+        }
+    }
+
+    /** A PGCOPY stream of rows of int4, for the binary copies below. */
+    private static byte[] binaryRows(int[][] rows) throws Exception {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        out.write(new byte[] {'P', 'G', 'C', 'O', 'P', 'Y', '\n', (byte) 0xFF, '\r', '\n', 0});
+        out.write(new byte[] {0, 0, 0, 0});
+        out.write(new byte[] {0, 0, 0, 0});
+        for (int[] row : rows) {
+            out.write(new byte[] {0, (byte) row.length});
+            for (int v : row) {
+                out.write(new byte[] {0, 0, 0, 4});
+                out.write(new byte[] {
+                        (byte) (v >> 24), (byte) (v >> 16), (byte) (v >> 8), (byte) v});
+            }
+        }
+        out.write(new byte[] {(byte) 0xFF, (byte) 0xFF});
+        return out.toByteArray();
+    }
+
+    /**
+     * A refused row is answered with more than a message: the row itself stands in the error's
+     * DETAIL, and the CONTEXT names the relation, the line of the input the copy had reached and
+     * that line as the sender wrote it -- for a sender of thousands of lines the only way to tell
+     * which one was refused.
+     */
+    @Test
+    void aRefusedRowCarriesTheFailingRowAndTheLineOfTheInputItCameFrom() throws Exception {
+        exec("CREATE TABLE crf_c (i int, k int, CONSTRAINT crf_c_ck CHECK (k < 10))");
+        String broken = "23514/new row for relation \"crf_c\" violates check constraint"
+                + " \"crf_c_ck\"";
+
+        assertEquals(broken + "/Failing row contains (1, 15)./COPY crf_c, line 1: \"1\t15\"",
+                copyFields("COPY crf_c FROM STDIN", "1\t15\n"));
+        // A line that was taken is still a line, so the one after it is line 2.
+        assertEquals(broken + "/Failing row contains (2, 15)./COPY crf_c, line 2: \"2\t15\"",
+                copyFields("COPY crf_c FROM STDIN", "1\t5\n2\t15\n"));
+        // So is a header, which is why the first row of a CSV HEADER copy is line 2.
+        assertEquals(broken + "/Failing row contains (1, 15)./COPY crf_c, line 2: \"1,15\"",
+                copyFields("COPY crf_c FROM STDIN WITH (FORMAT csv, HEADER)", "i,k\n1,15\n"));
+        assertEquals(broken + "/Failing row contains (2, 15)./COPY crf_c, line 3: \"2,15\"",
+                copyFields("COPY crf_c FROM STDIN WITH (FORMAT csv, HEADER)", "i,k\n1,5\n2,15\n"));
+        // The DETAIL is the row as the relation holds it and the CONTEXT the line as it was sent,
+        // so a column list that reorders the fields shows in the one and not in the other.
+        assertEquals(broken + "/Failing row contains (9, 15)./COPY crf_c, line 1: \"15\t9\"",
+                copyFields("COPY crf_c (k,i) FROM STDIN", "15\t9\n"));
+        // The relation is named as it is stored, not as the statement wrote it.
+        assertEquals(broken + "/Failing row contains (1, 15)./COPY crf_c, line 1: \"1\t15\"",
+                copyFields("COPY public.crf_c FROM STDIN", "1\t15\n"));
+
+        // Nothing a refused copy read is left behind, not even the lines it had taken.
+        assertEquals(0, num("SELECT count(*) FROM crf_c"));
+        exec("DROP TABLE crf_c");
+    }
+
+    /** A column with nothing in it is the word null in the failing row. */
+    @Test
+    void aNotNullRefusalWritesTheEmptyColumnAsNullInTheFailingRow() throws Exception {
+        exec("CREATE TABLE crf_n (i int, k int NOT NULL)");
+        String broken = "23502/null value in column \"k\" of relation \"crf_n\""
+                + " violates not-null constraint";
+
+        assertEquals(broken + "/Failing row contains (1, null)./COPY crf_n, line 1: \"1\t\\N\"",
+                copyFields("COPY crf_n FROM STDIN", "1\t\\N\n"));
+        assertEquals(broken + "/Failing row contains (3, null)./COPY crf_n, line 2: \"3\t\\N\"",
+                copyFields("COPY crf_n FROM STDIN", "1\t2\n3\t\\N\n"));
+        // An empty CSV field is the same nothing, and the header is still line 1.
+        assertEquals(broken + "/Failing row contains (1, null)./COPY crf_n, line 2: \"1,\"",
+                copyFields("COPY crf_n FROM STDIN WITH (FORMAT csv, HEADER)", "i,k\n1,\n"));
+        exec("DROP TABLE crf_n");
+    }
+
+    /**
+     * A value a type's own reader will not take names the column and the value rather than the
+     * line: the value is what the sender has to correct. The text quoted back is the one the
+     * reader was handed, so an escape has been resolved and a CSV quote taken off by then.
+     */
+    @Test
+    void aValueTheTypesReaderRefusesNamesTheColumnAndTheValueAndCarriesNoDetail() throws Exception {
+        exec("CREATE TABLE crf_b (i int, k int)");
+
+        assertEquals("22P02/invalid input syntax for type integer: \"abc\""
+                        + "/null/COPY crf_b, line 1, column k: \"abc\"",
+                copyFields("COPY crf_b FROM STDIN", "1\tabc\n"));
+        assertEquals("22P02/invalid input syntax for type integer: \"xyz\""
+                        + "/null/COPY crf_b, line 2, column i: \"xyz\"",
+                copyFields("COPY crf_b FROM STDIN", "1\t2\nxyz\t3\n"));
+        assertEquals("22P02/invalid input syntax for type integer: \"abc\""
+                        + "/null/COPY crf_b, line 2, column k: \"abc\"",
+                copyFields("COPY crf_b FROM STDIN WITH (FORMAT csv, HEADER)", "i,k\n1,abc\n"));
+        assertEquals("22P02/invalid input syntax for type integer: \"a,b\""
+                        + "/null/COPY crf_b, line 1, column k: \"a,b\"",
+                copyFields("COPY crf_b FROM STDIN WITH (FORMAT csv)", "1,\"a,b\"\n"));
+        // An empty line has one empty field, and it is the first column's reader that says so.
+        assertEquals("22P02/invalid input syntax for type integer: \"\""
+                        + "/null/COPY crf_b, line 2, column i: \"\"",
+                copyFields("COPY crf_b FROM STDIN", "1\t2\n\n"));
+        exec("DROP TABLE crf_b");
+    }
+
+    /** A line of the wrong width is the line's own complaint, so the line is what is quoted. */
+    @Test
+    void aLineOfTheWrongWidthIsQuotedWholeAndCarriesNoDetail() throws Exception {
+        exec("CREATE TABLE crf_w (i int, k int)");
+        assertEquals("22P04/missing data for column \"k\"/null/COPY crf_w, line 1: \"1\"",
+                copyFields("COPY crf_w FROM STDIN", "1\n"));
+        assertEquals("22P04/extra data after last expected column"
+                        + "/null/COPY crf_w, line 1: \"1\t2\t3\"",
+                copyFields("COPY crf_w FROM STDIN", "1\t2\t3\n"));
+        assertEquals("22P04/missing data for column \"k\"/null/COPY crf_w, line 2: \"1\"",
+                copyFields("COPY crf_w FROM STDIN", "1\t2\n1\n"));
+        exec("DROP TABLE crf_w");
+    }
+
+    /**
+     * A unique index says which line the row came from and not what was on it: the copy stores
+     * its rows in batches and maintains the index as a batch goes in, by which time the line it
+     * came from has been read over.
+     */
+    @Test
+    void aDuplicateKeyNamesTheLineButNotTheTextThatWasOnIt() throws Exception {
+        exec("CREATE TABLE crf_u (i int PRIMARY KEY, k int)");
+        String broken = "23505/duplicate key value violates unique constraint \"crf_u_pkey\"";
+
+        assertEquals(broken + "/Key (i)=(1) already exists./COPY crf_u, line 2",
+                copyFields("COPY crf_u FROM STDIN", "1\t1\n1\t2\n"));
+        // A row that was already stored is met on the line that collides with it.
+        exec("INSERT INTO crf_u VALUES (7,7)");
+        assertEquals(broken + "/Key (i)=(7) already exists./COPY crf_u, line 1",
+                copyFields("COPY crf_u FROM STDIN", "7\t9\n"));
+        exec("DROP TABLE crf_u");
+    }
+
+    /** A row no partition will take: the partition key is the DETAIL and the line the CONTEXT. */
+    @Test
+    void aRowNoPartitionWillTakeCarriesThePartitionKeyAndTheLine() throws Exception {
+        exec("CREATE TABLE crf_r (i int, k int) PARTITION BY RANGE (k)");
+        exec("CREATE TABLE crf_r0 PARTITION OF crf_r FOR VALUES FROM (0) TO (10)");
+        String none = "23514/no partition of relation \"crf_r\" found for row"
+                + "/Partition key of the failing row contains (k) = (50).";
+
+        assertEquals(none + "/COPY crf_r, line 1: \"1\t50\"",
+                copyFields("COPY crf_r FROM STDIN", "1\t50\n"));
+        assertEquals(none + "/COPY crf_r, line 2: \"2\t50\"",
+                copyFields("COPY crf_r FROM STDIN", "1\t5\n2\t50\n"));
+        assertEquals(none + "/COPY crf_r, line 2: \"1,50\"",
+                copyFields("COPY crf_r FROM STDIN WITH (FORMAT csv, HEADER)", "i,k\n1,50\n"));
+        assertEquals(0, num("SELECT count(*) FROM crf_r"));
+        exec("DROP TABLE crf_r");
+    }
+
+    /**
+     * A BEFORE row trigger that rewrites the key out of the partition the row was routed to. The
+     * error carries the second kind of DETAIL line a partitioned relation raises -- the trigger
+     * that rewrote the row and the partition the row was going to -- and the CONTEXT names the
+     * relation the statement was written against, which is the parent when the copy went through
+     * it.
+     */
+    @Test
+    void aTriggerThatMovesTheRowNamesThePartitionItWasBoundForAndTheLineItCameFrom()
+            throws Exception {
+        copyRefusalFunctions();
+        exec("CREATE TABLE crf_m (i int, k int) PARTITION BY RANGE (k)");
+        exec("CREATE TABLE crf_m0 PARTITION OF crf_m FOR VALUES FROM (0) TO (10)");
+        exec("CREATE TABLE crf_m1 PARTITION OF crf_m FOR VALUES FROM (10) TO (20)");
+        exec("CREATE TRIGGER crf_move BEFORE INSERT ON crf_m"
+                + " FOR EACH ROW EXECUTE FUNCTION crf_bump()");
+        String moved = "0A000/moving row to another partition during a BEFORE FOR EACH ROW"
+                + " trigger is not supported";
+        String toM0 = "/Before executing trigger \"crf_move\", the row was to be in partition"
+                + " \"public.crf_m0\".";
+
+        assertEquals(moved + toM0 + "/COPY crf_m, line 1: \"3\t5\"",
+                copyFields("COPY crf_m FROM STDIN", "3\t5\n"));
+        assertEquals(moved + toM0 + "/COPY crf_m0, line 1: \"4\t6\"",
+                copyFields("COPY crf_m0 FROM STDIN", "4\t6\n"));
+        // The partition named is the one the row was bound for, not the one it was rewritten into.
+        assertEquals(moved
+                        + "/Before executing trigger \"crf_move\", the row was to be in partition"
+                        + " \"public.crf_m1\"./COPY crf_m, line 1: \"5\t11\"",
+                copyFields("COPY crf_m FROM STDIN", "5\t11\n6\t5\n"));
+        // A header is a line here too.
+        assertEquals(moved + toM0 + "/COPY crf_m, line 2: \"7,5\"",
+                copyFields("COPY crf_m FROM STDIN WITH (FORMAT csv, HEADER)", "i,k\n7,5\n"));
+        assertEquals(0, num("SELECT count(*) FROM crf_m"));
+        exec("DROP TABLE crf_m CASCADE");
+    }
+
+    /**
+     * A leaf's own constraint reached through the parent: the message names the leaf that refused
+     * the row and the CONTEXT the relation the copy was written against.
+     */
+    @Test
+    void aLeafsOwnConstraintIsNamedByTheLeafAndTheLineByTheCopy() throws Exception {
+        copyRefusalFunctions();
+        exec("CREATE TABLE crf_g (i int, k int) PARTITION BY RANGE (k)");
+        exec("CREATE TABLE crf_g0 PARTITION OF crf_g FOR VALUES FROM (0) TO (10)");
+        exec("ALTER TABLE crf_g0 ADD CONSTRAINT crf_g0_ck CHECK (i < 100)");
+        String broken = "23514/new row for relation \"crf_g0\" violates check constraint"
+                + " \"crf_g0_ck\"/Failing row contains (500, 5).";
+
+        assertEquals(broken + "/COPY crf_g, line 1: \"500\t5\"",
+                copyFields("COPY crf_g FROM STDIN", "500\t5\n"));
+        assertEquals(broken + "/COPY crf_g0, line 1: \"500\t5\"",
+                copyFields("COPY crf_g0 FROM STDIN", "500\t5\n"));
+        exec("DROP TABLE crf_g CASCADE");
+
+        // A trigger of the partition's own runs once the row is already bound to it, so the row it
+        // leaves behind breaks that partition's bound rather than moving anywhere. The DETAIL is
+        // the row the trigger made and the CONTEXT the line as it was sent.
+        exec("CREATE TABLE crf_t (i int, k int) PARTITION BY RANGE (k)");
+        exec("CREATE TABLE crf_t0 PARTITION OF crf_t FOR VALUES FROM (0) TO (10)");
+        exec("CREATE TRIGGER crf_move BEFORE INSERT ON crf_t0"
+                + " FOR EACH ROW EXECUTE FUNCTION crf_bump()");
+        assertEquals("23514/new row for relation \"crf_t0\" violates partition constraint"
+                        + "/Failing row contains (1, 15)./COPY crf_t, line 1: \"1\t5\"",
+                copyFields("COPY crf_t FROM STDIN", "1\t5\n"));
+        exec("DROP TABLE crf_t CASCADE");
+    }
+
+    /**
+     * A trigger that raises stands its own frame in front of the copy's, the way PostgreSQL
+     * stacks the frames of everything running on a statement's behalf.
+     */
+    @Test
+    void aTriggerThatRaisesStandsItsOwnFrameInFrontOfTheCopys() throws Exception {
+        copyRefusalFunctions();
+        exec("CREATE TABLE crf_rb (i int)");
+        exec("CREATE TRIGGER crf_b BEFORE INSERT ON crf_rb"
+                + " FOR EACH ROW EXECUTE FUNCTION crf_raise()");
+        assertEquals("P0001/no/null/PL/pgSQL function crf_raise() line 1 at RAISE\n"
+                        + "COPY crf_rb, line 1: \"1\"",
+                copyFields("COPY crf_rb FROM STDIN", "1\n2\n"));
+        exec("DROP TABLE crf_rb CASCADE");
+    }
+
+    /** Binary data has no text a sender could be shown, so the line is counted and not quoted. */
+    @Test
+    void aBinaryCopyCountsTheLineAndQuotesNothingOfIt() throws Exception {
+        exec("CREATE TABLE crf_bn (i int, k int, CONSTRAINT crf_bn_ck CHECK (k < 10))");
+        String broken = "23514/new row for relation \"crf_bn\" violates check constraint"
+                + " \"crf_bn_ck\"";
+
+        assertEquals(broken + "/Failing row contains (1, 15)./COPY crf_bn, line 1",
+                copyFields("COPY crf_bn FROM STDIN WITH (FORMAT binary)",
+                        binaryRows(new int[][] {{1, 15}})));
+        assertEquals(broken + "/Failing row contains (2, 15)./COPY crf_bn, line 2",
+                copyFields("COPY crf_bn FROM STDIN WITH (FORMAT binary)",
+                        binaryRows(new int[][] {{1, 5}, {2, 15}})));
+        // A stream that is not a copy at all was refused before any row was read, so there is no
+        // line to name and nothing to carry in a DETAIL.
+        assertEquals("22P04/COPY file signature not recognized/null/null",
+                copyFields("COPY crf_bn FROM STDIN WITH (FORMAT binary)",
+                        "garbage".getBytes(StandardCharsets.UTF_8)));
+        exec("DROP TABLE crf_bn");
+    }
+
+    /**
+     * The rows of a COPY FROM STDIN never reach the server inside the statement. The lines that
+     * follow it in a script, and the {@code \.} that ends them, are read by the client and turned
+     * into the copy's own messages; a server handed one of them as SQL answers for the first word
+     * of it. A copy the sender never writes to is refused where the data would have gone, and the
+     * refusal names the line the server was waiting for -- PostgreSQL counts a line as it starts
+     * on it, so a copy nothing was sent to is waiting on line 1.
+     */
+    @Test
+    void theRowsOfACopyFromStdinNeverReachTheServerInsideTheStatement() throws Exception {
+        exec("CREATE TABLE crf_in (i int, k int)");
+
+        ServerErrorMessage text = fieldsOf("COPY crf_in FROM stdin;\n1\t2\n3\t4\n\\.\n");
+        assertEquals("42601", text.getSQLState());
+        assertEquals("syntax error at or near \"1\"", text.getMessage());
+        ServerErrorMessage csv =
+                fieldsOf("COPY crf_in (i,k) FROM STDIN WITH (FORMAT csv);\n5,6\n\\.\n");
+        assertEquals("42601", csv.getSQLState());
+        assertEquals("syntax error at or near \"5\"", csv.getMessage());
+        assertEquals(0, num("SELECT count(*) FROM crf_in"));
+
+        ServerErrorMessage nothingSent = fieldsOf("COPY crf_in FROM STDIN");
+        assertEquals("57014", nothingSent.getSQLState());
+        assertEquals("COPY from stdin failed:"
+                + " COPY commands are only supported using the CopyManager API.",
+                nothingSent.getMessage());
+        assertEquals("COPY crf_in, line 1", nothingSent.getWhere());
+
+        // The relation and the column list are settled before the copy is opened at all.
+        assertEquals("42P01", stateOf("COPY crf_nosuch FROM STDIN"));
+        assertEquals("42703", stateOf("COPY crf_in (i,nosuch) FROM STDIN"));
+        assertEquals(0, num("SELECT count(*) FROM crf_in"));
+        exec("DROP TABLE crf_in");
+    }
+
+    // ============================================================ what a MERGE arm sees while it
+    // runs
+
+    /** The trigger functions the MERGE arm tests below are written with. */
+    private static void mergeArmFunctions() throws SQLException {
+        exec("CREATE OR REPLACE FUNCTION mar_note() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN"
+                + " INSERT INTO ptg_log(m) VALUES (TG_WHEN || ' ' || TG_OP || ' ' || OLD.i"
+                + "  || ' left=' || (SELECT count(*) FROM mar_d));"
+                + " IF TG_WHEN = 'BEFORE' THEN RETURN OLD; END IF; RETURN NULL; END $$");
+        exec("CREATE OR REPLACE FUNCTION mar_sum() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN"
+                + " INSERT INTO ptg_log(m) VALUES (TG_WHEN || ' ' || TG_OP || ' ' || OLD.i"
+                + "  || ' sum=' || (SELECT coalesce(sum(v),0) FROM mar_d));"
+                + " IF TG_WHEN = 'BEFORE' THEN RETURN NEW; END IF; RETURN NULL; END $$");
+    }
+
+    /** The three rows the arm tests below are run over, with nothing logged yet. */
+    private static void mergeArmTarget() throws SQLException {
+        exec("TRUNCATE mar_d");
+        exec("INSERT INTO mar_d VALUES (1,10),(2,20),(3,30)");
+        exec("DELETE FROM ptg_log");
+    }
+
+    /**
+     * A row goes out of the relation where the arm acts on it rather than when the statement ends,
+     * so the BEFORE half of the row after it is told the one before has gone: over a two-row arm
+     * the first row's trigger reads three rows and the second's reads two. Both AFTER halves run
+     * once the statement has finished writing, so both read the one row it left behind.
+     */
+    @Test
+    void aMergeDeleteArmTakesEachRowOutBeforeTheNextRowsBeforeHalfRuns() throws SQLException {
+        exec("CREATE TABLE mar_d (i int PRIMARY KEY, v int)");
+        exec("CREATE TABLE mar_ds (i int, v int)");
+        exec("INSERT INTO mar_ds VALUES (1,100),(2,200)");
+        mergeArmFunctions();
+        exec("CREATE TRIGGER mar_d_b BEFORE DELETE ON mar_d"
+                + " FOR EACH ROW EXECUTE FUNCTION mar_note()");
+        exec("CREATE TRIGGER mar_d_a AFTER DELETE ON mar_d"
+                + " FOR EACH ROW EXECUTE FUNCTION mar_note()");
+
+        mergeArmTarget();
+        assertEquals(2, update("MERGE INTO mar_d t USING mar_ds u ON t.i = u.i"
+                + " WHEN MATCHED THEN DELETE"));
+        assertEquals("BEFORE DELETE 1 left=3,BEFORE DELETE 2 left=2,"
+                + "AFTER DELETE 1 left=1,AFTER DELETE 2 left=1", firings());
+        assertEquals("3|30", rows("SELECT i, v FROM mar_d ORDER BY i"));
+
+        exec("DROP TABLE mar_d CASCADE");
+        exec("DROP TABLE mar_ds");
+    }
+
+    /** The plain DELETE path counts down the same way, however many rows it takes. */
+    @Test
+    void aPlainDeleteTakesEachRowOutBeforeTheNextRowsBeforeHalfRuns() throws SQLException {
+        exec("CREATE TABLE mar_d (i int PRIMARY KEY, v int)");
+        mergeArmFunctions();
+        exec("CREATE TRIGGER mar_d_b BEFORE DELETE ON mar_d"
+                + " FOR EACH ROW EXECUTE FUNCTION mar_note()");
+        exec("CREATE TRIGGER mar_d_a AFTER DELETE ON mar_d"
+                + " FOR EACH ROW EXECUTE FUNCTION mar_note()");
+
+        mergeArmTarget();
+        assertEquals(3, update("DELETE FROM mar_d WHERE i <= 3"));
+        assertEquals("BEFORE DELETE 1 left=3,BEFORE DELETE 2 left=2,BEFORE DELETE 3 left=1,"
+                + "AFTER DELETE 1 left=0,AFTER DELETE 2 left=0,AFTER DELETE 3 left=0", firings());
+
+        // The rows the WHERE leaves out are there for every half to count, before and after.
+        exec("TRUNCATE mar_d");
+        exec("INSERT INTO mar_d VALUES (1,10),(2,20),(3,30),(4,40),(5,50),(6,60)");
+        exec("DELETE FROM ptg_log");
+        assertEquals(4, update("DELETE FROM mar_d WHERE i <= 4"));
+        assertEquals("BEFORE DELETE 1 left=6,BEFORE DELETE 2 left=5,BEFORE DELETE 3 left=4,"
+                + "BEFORE DELETE 4 left=3,AFTER DELETE 1 left=2,AFTER DELETE 2 left=2,"
+                + "AFTER DELETE 3 left=2,AFTER DELETE 4 left=2", firings());
+
+        exec("DROP TABLE mar_d CASCADE");
+    }
+
+    /**
+     * An UPDATE arm's BEFORE half reads the rows the statement has already written, and its AFTER
+     * halves the relation the whole statement left behind -- which the plain UPDATE path answers
+     * the same way.
+     */
+    @Test
+    void anUpdateArmsBeforeHalfReadsWhatTheStatementHasAlreadyWritten() throws SQLException {
+        exec("CREATE TABLE mar_d (i int PRIMARY KEY, v int)");
+        exec("CREATE TABLE mar_ds (i int, v int)");
+        exec("INSERT INTO mar_ds VALUES (1,100),(2,200)");
+        mergeArmFunctions();
+        exec("CREATE TRIGGER mar_d_b BEFORE UPDATE ON mar_d"
+                + " FOR EACH ROW EXECUTE FUNCTION mar_sum()");
+        exec("CREATE TRIGGER mar_d_a AFTER UPDATE ON mar_d"
+                + " FOR EACH ROW EXECUTE FUNCTION mar_sum()");
+
+        mergeArmTarget();
+        assertEquals(2, update("MERGE INTO mar_d t USING mar_ds u ON t.i = u.i"
+                + " WHEN MATCHED THEN UPDATE SET v = t.v + 1000"));
+        assertEquals("BEFORE UPDATE 1 sum=60,BEFORE UPDATE 2 sum=1060,"
+                + "AFTER UPDATE 1 sum=2060,AFTER UPDATE 2 sum=2060", firings());
+        assertEquals("1|1010,2|1020,3|30", rows("SELECT i, v FROM mar_d ORDER BY i"));
+
+        mergeArmTarget();
+        assertEquals(2, update("UPDATE mar_d SET v = v + 1000 WHERE i <= 2"));
+        assertEquals("BEFORE UPDATE 1 sum=60,BEFORE UPDATE 2 sum=1060,"
+                + "AFTER UPDATE 1 sum=2060,AFTER UPDATE 2 sum=2060", firings());
+        assertEquals("1|1010,2|1020,3|30", rows("SELECT i, v FROM mar_d ORDER BY i"));
+
+        exec("DROP TABLE mar_d CASCADE");
+        exec("DROP TABLE mar_ds");
+    }
+
+    /**
+     * A RETURNING clause of a write that brings in a second relation stands in the scope of both,
+     * so a bare column name they both hold answers to neither. PostgreSQL reads the clause while
+     * it analyses the statement, so the refusal is owed whether or not a row would have been
+     * written and whichever arm would have written it.
+     */
+    @Test
+    void aBareReturningNameBothRelationsHoldIsRefused() throws SQLException {
+        exec("CREATE TABLE mar_k (i int PRIMARY KEY, v text)");
+        exec("CREATE TABLE mar_ks (i int, v text)");
+        exec("CREATE TABLE mar_ke (i int, v text)");
+        exec("CREATE TABLE mar_kd (j int, w text)");
+        exec("INSERT INTO mar_k VALUES (1,'a'),(2,'b'),(3,'c')");
+        exec("INSERT INTO mar_ks VALUES (1,'x'),(2,'y'),(4,'z')");
+        exec("INSERT INTO mar_kd VALUES (1,'x'),(2,'y')");
+
+        for (String statement : new String[] {
+                "MERGE INTO mar_k t USING mar_ks u ON t.i = u.i"
+                        + " WHEN MATCHED THEN DELETE RETURNING i, v",
+                "MERGE INTO mar_k t USING mar_ks u ON t.i = u.i"
+                        + " WHEN MATCHED THEN UPDATE SET v = u.v RETURNING i, v",
+                "MERGE INTO mar_k t USING mar_ks u ON t.i = u.i"
+                        + " WHEN NOT MATCHED THEN INSERT VALUES (u.i, u.v) RETURNING i, v",
+                "MERGE INTO mar_k t USING mar_ks u ON t.i = u.i"
+                        + " WHEN NOT MATCHED BY SOURCE THEN UPDATE SET v = 'q' RETURNING i, v",
+                // an arm that writes nothing, and an ON condition that pairs nothing
+                "MERGE INTO mar_k t USING mar_ks u ON t.i = u.i"
+                        + " WHEN MATCHED THEN DO NOTHING RETURNING i",
+                "MERGE INTO mar_k t USING mar_ks u ON t.i = u.i AND t.i > 100"
+                        + " WHEN MATCHED THEN DELETE RETURNING i",
+                // a source holding no row at all
+                "MERGE INTO mar_k t USING mar_ke u ON t.i = u.i"
+                        + " WHEN MATCHED THEN DELETE RETURNING i",
+                // a source that is a query of its own, a VALUES list, the target read again
+                "MERGE INTO mar_k t USING (SELECT i, v FROM mar_ks) u ON t.i = u.i"
+                        + " WHEN MATCHED THEN DO NOTHING RETURNING i",
+                "MERGE INTO mar_k t USING (VALUES (1,'x')) AS u(i,v) ON t.i = u.i"
+                        + " WHEN MATCHED THEN DO NOTHING RETURNING i",
+                "MERGE INTO mar_k t USING mar_k u ON t.i = u.i"
+                        + " WHEN MATCHED THEN DO NOTHING RETURNING i",
+                // a name under an operator, and one beside a clause the statement did settle
+                "MERGE INTO mar_k t USING mar_ks u ON t.i = u.i"
+                        + " WHEN MATCHED THEN DELETE RETURNING i + 1",
+                "MERGE INTO mar_k t USING mar_ks u ON t.i = u.i"
+                        + " WHEN MATCHED THEN DELETE RETURNING merge_action(), i",
+                // and the ordinary UPDATE and DELETE paths, which are read the same way
+                "UPDATE mar_k t SET v = 'p' FROM mar_ks u WHERE t.i = u.i RETURNING i, v",
+                "UPDATE mar_k t SET v = 'p' FROM mar_ks u"
+                        + " WHERE t.i = u.i AND t.i > 100 RETURNING i",
+                "UPDATE mar_k t SET v = 'p' FROM mar_ke u WHERE t.i = u.i RETURNING i",
+                "DELETE FROM mar_k t USING mar_ks u WHERE t.i = u.i RETURNING i, v",
+                "DELETE FROM mar_k t USING mar_ks u WHERE t.i = u.i AND t.i > 100 RETURNING i",
+                "DELETE FROM mar_k t USING mar_ke u WHERE t.i = u.i RETURNING i"}) {
+            ServerErrorMessage m = fieldsOf(statement);
+            assertEquals("42702", m.getSQLState(), statement);
+            assertEquals("column reference \"i\" is ambiguous", m.getMessage(), statement);
+        }
+        assertEquals("column reference \"v\" is ambiguous",
+                messageOf("MERGE INTO mar_k t USING mar_ks u ON t.i = u.i"
+                        + " WHEN MATCHED THEN DELETE RETURNING v"));
+
+        // Nothing any of the refusals wrote or took away.
+        assertEquals("1|a,2|b,3|c", rows("SELECT i, v FROM mar_k ORDER BY i"));
+
+        // What the rule does not reach: a second relation holding neither name, a name written out
+        // against one of the two, and a star, which stands for the columns of both in turn.
+        assertEquals("", rows("MERGE INTO mar_k t USING mar_kd d ON t.i = d.j"
+                + " WHEN MATCHED THEN DO NOTHING RETURNING i"));
+        assertEquals("", rows("DELETE FROM mar_k t USING mar_kd d"
+                + " WHERE t.i = d.j AND t.i > 100 RETURNING i"));
+        assertEquals("1|x|1|a,2|y|2|b", rows("MERGE INTO mar_k t USING mar_ks u ON t.i = u.i"
+                + " WHEN MATCHED THEN DELETE RETURNING *"));
+        assertEquals("3|c", rows("DELETE FROM mar_k WHERE i = 3 RETURNING i, v"));
+        assertEquals(0, num("SELECT count(*) FROM mar_k"));
+
+        exec("DROP TABLE mar_k");
+        exec("DROP TABLE mar_ks");
+        exec("DROP TABLE mar_ke");
+        exec("DROP TABLE mar_kd");
+    }
+
+    // ============================================================ what a refusal writes the row as
+
+    /**
+     * Every value PostgreSQL prints inside a DETAIL is written by the column's own output function
+     * -- the string a query would have returned for it. An array reads in braces, a boolean as one
+     * letter, a bytea in hex, a timestamp with a space between its date and its time, a numeric to
+     * the scale it was declared with. A row printed any other way names a row nothing could be
+     * looked up by.
+     */
+    @Test
+    void aFailingRowInADetailIsWrittenTheWayAQueryWouldHaveReturnedIt() throws SQLException {
+        exec("CREATE TABLE frd_ck (i int, a int[], CONSTRAINT frd_ck_ck CHECK (i < 10))");
+        assertEquals("new row for relation \"frd_ck\" violates check constraint \"frd_ck_ck\"",
+                messageOf("INSERT INTO frd_ck VALUES (50, '{1,2}')"));
+        assertEquals("Failing row contains (50, {1,2}).",
+                detailOf("INSERT INTO frd_ck VALUES (50, '{1,2}')"));
+        assertEquals("Failing row contains (50, {}).",
+                detailOf("INSERT INTO frd_ck VALUES (50, '{}')"));
+        assertEquals("Failing row contains (50, null).",
+                detailOf("INSERT INTO frd_ck VALUES (50, NULL)"));
+        assertEquals("Failing row contains (50, {{1,2},{3,4}}).",
+                detailOf("INSERT INTO frd_ck VALUES (50, '{{1,2},{3,4}}')"));
+        // A column the statement never named is nothing, and reads as the word null.
+        assertEquals("Failing row contains (50, null).",
+                detailOf("INSERT INTO frd_ck (i) VALUES (50)"));
+        assertEquals(0, num("SELECT count(*) FROM frd_ck"));
+        exec("DROP TABLE frd_ck");
+
+        // Every other type whose Java rendering is not PostgreSQL's, in one row.
+        exec("CREATE TABLE frd_wt (i int, b bool, y bytea, t time, d date, s timestamp,"
+                + " f float8, r real, n numeric, a text[], CONSTRAINT frd_wt_ck CHECK (i < 10))");
+        assertEquals("Failing row contains (50, t, \\x0102, 03:04:00, 2020-01-02,"
+                        + " 2020-01-02 03:04:05, 1, 2, 1.50, {a,\"b c\"}).",
+                detailOf("INSERT INTO frd_wt VALUES (50, true, '\\x0102', '03:04:00',"
+                        + " '2020-01-02', '2020-01-02 03:04:05', 1.0, 2.0, 1.50, '{a,\"b c\"}')"));
+        exec("DROP TABLE frd_wt");
+
+        // A NOT NULL prints the row the same way, and the column that has nothing in it as null.
+        exec("CREATE TABLE frd_nn (i int, a int[], k int NOT NULL)");
+        assertEquals("null value in column \"k\" of relation \"frd_nn\""
+                        + " violates not-null constraint",
+                messageOf("INSERT INTO frd_nn VALUES (1, '{3,4}', NULL)"));
+        assertEquals("Failing row contains (1, {3,4}, null).",
+                detailOf("INSERT INTO frd_nn VALUES (1, '{3,4}', NULL)"));
+        exec("DROP TABLE frd_nn");
+
+        // So does a partition's own bound, met by writing straight at the partition.
+        exec("CREATE TABLE frd_pp (i int, a int[]) PARTITION BY RANGE (i)");
+        exec("CREATE TABLE frd_pp0 PARTITION OF frd_pp FOR VALUES FROM (0) TO (10)");
+        assertEquals("new row for relation \"frd_pp0\" violates partition constraint",
+                messageOf("INSERT INTO frd_pp0 VALUES (50, '{1,2}')"));
+        assertEquals("Failing row contains (50, {1,2}).",
+                detailOf("INSERT INTO frd_pp0 VALUES (50, '{1,2}')"));
+        exec("DROP TABLE frd_pp CASCADE");
+
+        // And so does a view's check option, over the row it would have written.
+        exec("CREATE TABLE frd_vt (i int, a int[])");
+        exec("CREATE VIEW frd_vv AS SELECT * FROM frd_vt WHERE i < 10 WITH CHECK OPTION");
+        assertEquals("44000", stateOf("INSERT INTO frd_vv VALUES (50, '{1,2}')"));
+        assertEquals("new row violates check option for view \"frd_vv\"",
+                messageOf("INSERT INTO frd_vv VALUES (50, '{1,2}')"));
+        assertEquals("Failing row contains (50, {1,2}).",
+                detailOf("INSERT INTO frd_vv VALUES (50, '{1,2}')"));
+        assertEquals(0, num("SELECT count(*) FROM frd_vt"));
+        exec("DROP VIEW frd_vv");
+        exec("DROP TABLE frd_vt");
+    }
+
+    /**
+     * A key inside a DETAIL is written by the same hand as a row: an index's key, a foreign key's,
+     * an exclusion constraint's, and the partition key of a row no partition will take. A key over
+     * several columns names all of them in one list and writes each value with its own column's
+     * output function.
+     */
+    @Test
+    void aKeyInADetailIsWrittenTheSameWayARowIs() throws SQLException {
+        exec("CREATE TABLE frd_ux (a int[] PRIMARY KEY)");
+        exec("INSERT INTO frd_ux VALUES ('{1,2}')");
+        assertEquals("duplicate key value violates unique constraint \"frd_ux_pkey\"",
+                messageOf("INSERT INTO frd_ux VALUES ('{1,2}')"));
+        assertEquals("Key (a)=({1,2}) already exists.",
+                detailOf("INSERT INTO frd_ux VALUES ('{1,2}')"));
+        exec("DROP TABLE frd_ux");
+
+        exec("CREATE TABLE frd_kk (b bool, y bytea, s timestamp, n numeric, f float8, a text[],"
+                + " PRIMARY KEY (b,y,s,n,f,a))");
+        String row = "(true, '\\x0102', '2020-01-02 03:04:05', 1.50, 1.0, '{a,\"b c\"}')";
+        exec("INSERT INTO frd_kk VALUES " + row);
+        assertEquals("Key (b, y, s, n, f, a)=(t, \\x0102, 2020-01-02 03:04:05, 1.50, 1,"
+                        + " {a,\"b c\"}) already exists.",
+                detailOf("INSERT INTO frd_kk VALUES " + row));
+        exec("DROP TABLE frd_kk");
+
+        exec("CREATE TABLE frd_fp (b bool, a int[], PRIMARY KEY (b,a))");
+        exec("CREATE TABLE frd_fc (b bool, a int[], FOREIGN KEY (b,a) REFERENCES frd_fp)");
+        assertEquals("insert or update on table \"frd_fc\" violates foreign key constraint"
+                        + " \"frd_fc_b_a_fkey\"",
+                messageOf("INSERT INTO frd_fc VALUES (false, '{7,8}')"));
+        assertEquals("Key (b, a)=(f, {7,8}) is not present in table \"frd_fp\".",
+                detailOf("INSERT INTO frd_fc VALUES (false, '{7,8}')"));
+        exec("DROP TABLE frd_fc");
+        exec("DROP TABLE frd_fp");
+
+        exec("CREATE TABLE frd_ex (a int[], EXCLUDE (a WITH =))");
+        exec("INSERT INTO frd_ex VALUES ('{1,2}')");
+        assertEquals("23P01", stateOf("INSERT INTO frd_ex VALUES ('{1,2}')"));
+        assertEquals("conflicting key value violates exclusion constraint \"frd_ex_a_excl\"",
+                messageOf("INSERT INTO frd_ex VALUES ('{1,2}')"));
+        assertEquals("Key (a)=({1,2}) conflicts with existing key (a)=({1,2}).",
+                detailOf("INSERT INTO frd_ex VALUES ('{1,2}')"));
+        exec("DROP TABLE frd_ex");
+
+        exec("CREATE TABLE frd_pa (a int[], k int) PARTITION BY RANGE (a)");
+        exec("CREATE TABLE frd_pa0 PARTITION OF frd_pa FOR VALUES FROM ('{0}') TO ('{9}')");
+        assertEquals("no partition of relation \"frd_pa\" found for row",
+                messageOf("INSERT INTO frd_pa VALUES ('{50,2}', 1)"));
+        assertEquals("Partition key of the failing row contains (a) = ({50,2}).",
+                detailOf("INSERT INTO frd_pa VALUES ('{50,2}', 1)"));
+        exec("DROP TABLE frd_pa CASCADE");
+    }
+
+    /**
+     * A COPY writes the same DETAIL the statement that stores the row does. The DETAIL is the row
+     * as the relation holds it and the CONTEXT the line as the sender wrote it, so the two are the
+     * same values in two spellings: the copy's own for the input, the columns' own for the row.
+     */
+    @Test
+    void aCopyWritesTheFailingRowTheWayTheColumnsDoAndTheLineTheWayItWasSent() throws Exception {
+        exec("CREATE TABLE frd_cc (i int, a int[], CONSTRAINT frd_cc_ck CHECK (i < 10))");
+        String broken = "23514/new row for relation \"frd_cc\" violates check constraint"
+                + " \"frd_cc_ck\"";
+        assertEquals(broken + "/Failing row contains (50, {1,2})./COPY frd_cc, line 1:"
+                        + " \"50\t{1,2}\"",
+                copyFields("COPY frd_cc FROM STDIN", "50\t{1,2}\n"));
+        assertEquals(broken + "/Failing row contains (50, {1,2})./COPY frd_cc, line 1:"
+                        + " \"50,\"{1,2}\"\"",
+                copyFields("COPY frd_cc FROM STDIN WITH (FORMAT csv)", "50,\"{1,2}\"\n"));
+        exec("DROP TABLE frd_cc");
+
+        exec("CREATE TABLE frd_cw (i int, b bool, y bytea, t time, d date, s timestamp,"
+                + " f float8, r real, n numeric, a text[], CONSTRAINT frd_cw_ck CHECK (i < 10))");
+        assertEquals("23514/new row for relation \"frd_cw\" violates check constraint"
+                        + " \"frd_cw_ck\""
+                        + "/Failing row contains (50, t, \\x0102, 03:04:00, 2020-01-02,"
+                        + " 2020-01-02 03:04:05, 1, 2, 1.50, {a,\"b c\"})."
+                        + "/COPY frd_cw, line 1: \"50\tt\t\\\\x0102\t03:04:00\t2020-01-02"
+                        + "\t2020-01-02 03:04:05\t1.0\t2.0\t1.50\t{a,\"b c\"}\"",
+                copyFields("COPY frd_cw FROM STDIN", "50\tt\t\\\\x0102\t03:04:00\t2020-01-02"
+                        + "\t2020-01-02 03:04:05\t1.0\t2.0\t1.50\t{a,\"b c\"}\n"));
+        exec("DROP TABLE frd_cw");
+
+        exec("CREATE TABLE frd_cn (i int, a int[], k int NOT NULL)");
+        assertEquals("23502/null value in column \"k\" of relation \"frd_cn\""
+                        + " violates not-null constraint"
+                        + "/Failing row contains (1, {3,4}, null)."
+                        + "/COPY frd_cn, line 1: \"1\t{3,4}\t\\N\"",
+                copyFields("COPY frd_cn FROM STDIN", "1\t{3,4}\t\\N\n"));
+        exec("DROP TABLE frd_cn");
+
+        // A key the index maintains over a batch names the line and no longer the text on it.
+        exec("CREATE TABLE frd_cu (a int[] PRIMARY KEY)");
+        assertEquals("23505/duplicate key value violates unique constraint \"frd_cu_pkey\""
+                        + "/Key (a)=({1,2}) already exists./COPY frd_cu, line 2",
+                copyFields("COPY frd_cu FROM STDIN", "{1,2}\n{1,2}\n"));
+        exec("DROP TABLE frd_cu");
+
+        exec("CREATE TABLE frd_ce (a int[], EXCLUDE (a WITH =))");
+        assertEquals("23P01/conflicting key value violates exclusion constraint"
+                        + " \"frd_ce_a_excl\""
+                        + "/Key (a)=({3,4}) conflicts with existing key (a)=({3,4})."
+                        + "/COPY frd_ce, line 2",
+                copyFields("COPY frd_ce FROM STDIN", "{3,4}\n{3,4}\n"));
+        exec("DROP TABLE frd_ce");
+
+        // A foreign key is checked once the copy has finished reading, so it names no line at all.
+        exec("CREATE TABLE frd_cp (a int[] PRIMARY KEY)");
+        exec("CREATE TABLE frd_cf (a int[] REFERENCES frd_cp)");
+        assertEquals("23503/insert or update on table \"frd_cf\" violates foreign key constraint"
+                        + " \"frd_cf_a_fkey\""
+                        + "/Key (a)=({9,8}) is not present in table \"frd_cp\"./null",
+                copyFields("COPY frd_cf FROM STDIN", "{9,8}\n"));
+        exec("DROP TABLE frd_cf");
+        exec("DROP TABLE frd_cp");
+
+        exec("CREATE TABLE frd_cr (a int[], k int) PARTITION BY RANGE (a)");
+        exec("CREATE TABLE frd_cr0 PARTITION OF frd_cr FOR VALUES FROM ('{0}') TO ('{9}')");
+        assertEquals("23514/no partition of relation \"frd_cr\" found for row"
+                        + "/Partition key of the failing row contains (a) = ({50,2})."
+                        + "/COPY frd_cr, line 1: \"{50,2}\t1\"",
+                copyFields("COPY frd_cr FROM STDIN", "{50,2}\t1\n"));
+        assertEquals(0, num("SELECT count(*) FROM frd_cr"));
+        exec("DROP TABLE frd_cr CASCADE");
+    }
+
+    /**
+     * A row no partition will take names the relation in the error's own schema and table fields,
+     * the way a constraint of the relation's own does -- a client that branches on those fields is
+     * told nothing by the message. The relation named is the one the write was addressed to.
+     */
+    @Test
+    void aRoutingFailureNamesItsRelationInTheErrorsSchemaAndTableFields() throws Exception {
+        exec("CREATE TABLE frd_sr (i int, k int) PARTITION BY RANGE (k)");
+        exec("CREATE TABLE frd_sr0 PARTITION OF frd_sr FOR VALUES FROM (0) TO (10)");
+
+        ServerErrorMessage written = fieldsOf("INSERT INTO frd_sr VALUES (1, 50)");
+        assertEquals("23514", written.getSQLState());
+        assertEquals("no partition of relation \"frd_sr\" found for row", written.getMessage());
+        assertEquals("Partition key of the failing row contains (k) = (50).", written.getDetail());
+        assertEquals("public", written.getSchema());
+        assertEquals("frd_sr", written.getTable());
+        assertNull(written.getConstraint());
+        assertNull(written.getColumn());
+
+        ServerErrorMessage copied = copyErrorOf("COPY frd_sr FROM STDIN", "1\t50\n");
+        assertEquals("23514", copied.getSQLState());
+        assertEquals("no partition of relation \"frd_sr\" found for row", copied.getMessage());
+        assertEquals("Partition key of the failing row contains (k) = (50).", copied.getDetail());
+        assertEquals("public", copied.getSchema());
+        assertEquals("frd_sr", copied.getTable());
+        assertNull(copied.getConstraint());
+        assertEquals("COPY frd_sr, line 1: \"1\t50\"", copied.getWhere());
+
+        // A copy written against the partition is refused by the partition's own bound, which
+        // names the partition in the same two fields.
+        ServerErrorMessage leaf = copyErrorOf("COPY frd_sr0 FROM STDIN", "1\t50\n");
+        assertEquals("new row for relation \"frd_sr0\" violates partition constraint",
+                leaf.getMessage());
+        assertEquals("public", leaf.getSchema());
+        assertEquals("frd_sr0", leaf.getTable());
+
+        // The fields a constraint of the relation's own fills, for comparison.
+        exec("CREATE TABLE frd_sc (i int, k int NOT NULL, CONSTRAINT frd_sc_ck CHECK (i < 10))");
+        ServerErrorMessage check = copyErrorOf("COPY frd_sc FROM STDIN", "50\t1\n");
+        assertEquals("public", check.getSchema());
+        assertEquals("frd_sc", check.getTable());
+        assertEquals("frd_sc_ck", check.getConstraint());
+        assertNull(check.getColumn());
+
+        ServerErrorMessage notNull = copyErrorOf("COPY frd_sc FROM STDIN", "1\t\\N\n");
+        assertEquals("public", notNull.getSchema());
+        assertEquals("frd_sc", notNull.getTable());
+        assertNull(notNull.getConstraint());
+        assertEquals("k", notNull.getColumn());
+
+        exec("DROP TABLE frd_sc");
+        exec("DROP TABLE frd_sr CASCADE");
+    }
+
+    /**
+     * A CSV field whose closing quote the sender never wrote.
+     *
+     * <p>PostgreSQL counts a newline carried through a quoted field as a line of its own, but only
+     * once it has learned what a line terminator looks like in this input -- which it does from the
+     * first one it reads outside quotes. An input whose only newline sits inside the unterminated
+     * field is therefore still line 1, while the same field on the second line of an input is line
+     * 3. What is quoted back is everything the reader took, embedded newlines and all.
+     */
+    @Test
+    void anUnterminatedQuotedCsvFieldNamesTheLineItRanOutOn() throws Exception {
+        exec("CREATE TABLE frd_q (i int, k text)");
+        String broken = "22P04/unterminated CSV quoted field/null/COPY frd_q, line ";
+
+        assertEquals(broken + "1: \"1,\"abc\"", unterminated("1,\"abc"));
+        assertEquals(broken + "1: \"1,\"abc\n\"", unterminated("1,\"abc\n"));
+        assertEquals(broken + "1: \"1,\"abc\n\n\"", unterminated("1,\"abc\n\n"));
+        assertEquals(broken + "1: \"1,\"\"", unterminated("1,\""));
+        assertEquals(broken + "1: \"1,\"a\nb\nc\"", unterminated("1,\"a\nb\nc"));
+        // A quote opened inside an unquoted field is an unterminated field too.
+        assertEquals(broken + "1: \"1,ab\"cd\n\"", unterminated("1,ab\"cd\n"));
+        // A line that was read whole is a line, so the next one is line 2 -- and the newline the
+        // field then carries away is a line of its own on top of it.
+        assertEquals(broken + "2: \"2,\"abc\"", unterminated("1,ok\n2,\"abc"));
+        assertEquals(broken + "3: \"2,\"abc\n\"", unterminated("1,ok\n2,\"abc\n"));
+        assertEquals(broken + "4: \"3,\"abc\n\"", unterminated("1,a\n2,b\n3,\"abc\n"));
+        // A header is a line like any other, so the first row of a HEADER copy is line 2.
+        assertEquals(broken + "3: \"1,\"abc\n\"",
+                copyFields("COPY frd_q FROM STDIN WITH (FORMAT csv, HEADER)", "i,k\n1,\"abc\n"));
+
+        // Nothing any of the refusals read is left behind, and a field the sender did close is
+        // taken as it stands.
+        assertEquals(0, num("SELECT count(*) FROM frd_q"));
+        assertEquals("rows=1", copyFields("COPY frd_q FROM STDIN WITH (FORMAT csv)", "1,\"abc\"\n"));
+        assertEquals("1|abc", rows("SELECT i, k FROM frd_q"));
+        exec("DROP TABLE frd_q");
+    }
+
+    private static String unterminated(String data) {
+        return copyFields("COPY frd_q FROM STDIN WITH (FORMAT csv)", data);
+    }
+
+    /**
+     * STDIN and STDOUT are one thing to PostgreSQL's grammar -- the absence of a file name -- and
+     * the direction is read from the FROM or the TO alone. So {@code FROM STDOUT} opens a copy in
+     * and reads the client's rows, and {@code TO STDIN} opens a copy out and writes to it.
+     */
+    @Test
+    void theDirectionOfACopyIsReadFromTheFromOrTheToAlone() throws Exception {
+        exec("CREATE TABLE frd_d (i int, k int)");
+
+        // A copy in, however the statement spelled the stream.
+        assertEquals("rows=1", copyFields("COPY frd_d FROM STDOUT", "1\t2\n"));
+        assertEquals("rows=1",
+                copyFields("COPY frd_d FROM STDOUT WITH (FORMAT csv)", "3,4\n"));
+        assertEquals("rows=1", copyFields("COPY frd_d (i,k) FROM STDOUT", "5\t6\n"));
+        assertEquals("1|2,3|4,5|6", rows("SELECT i, k FROM frd_d ORDER BY i"));
+
+        // A copy out, however the statement spelled the stream.
+        assertEquals("3 rows: 1\t2\n3\t4\n5\t6\n", copyOutOf("COPY frd_d TO STDOUT"));
+        assertEquals("3 rows: 1\t2\n3\t4\n5\t6\n", copyOutOf("COPY frd_d TO STDIN"));
+        assertEquals("3 rows: 1,2\n3,4\n5,6\n",
+                copyOutOf("COPY frd_d TO STDIN WITH (FORMAT csv)"));
+        assertEquals("3 rows: 2\n4\n6\n", copyOutOf("COPY frd_d (k) TO STDIN"));
+        assertEquals("3 rows: 1\n3\n5\n",
+                copyOutOf("COPY (SELECT i FROM frd_d ORDER BY i) TO STDIN"));
+
+        // A row a copy out is to leave behind is the query's to leave behind: the clause a copy in
+        // reads its rows through is not a clause a copy out has.
+        assertEquals("42601", stateOf("COPY frd_d TO STDOUT WHERE i < 5"));
+        assertEquals("WHERE clause not allowed with COPY TO",
+                messageOf("COPY frd_d TO STDOUT WHERE i < 5"));
+
+        // A plain statement cannot send a copy's data, so the client gives up on the copy the
+        // moment the server asks for it -- and it asks just the same when the statement said
+        // STDOUT. The server names the line it was waiting for.
+        for (String sql : new String[] {"COPY frd_d FROM STDIN", "COPY frd_d FROM STDOUT",
+                "COPY frd_d FROM STDOUT WITH (FORMAT csv)", "COPY frd_d (i,k) FROM STDOUT"}) {
+            ServerErrorMessage m = fieldsOf(sql);
+            assertEquals("57014", m.getSQLState(), sql);
+            assertEquals("COPY from stdin failed:"
+                    + " COPY commands are only supported using the CopyManager API.",
+                    m.getMessage(), sql);
+            assertEquals("COPY frd_d, line 1", m.getWhere(), sql);
+        }
+
+        // A copy out handed to a plain statement is refused on the client side, before a row of it
+        // has been read -- so there is no server error at all to read fields off.
+        for (String sql : new String[] {"COPY frd_d TO STDOUT", "COPY frd_d TO STDIN",
+                "COPY frd_d TO STDIN WITH (FORMAT csv)", "COPY (SELECT 1) TO STDIN"}) {
+            SQLException e = assertThrows(SQLException.class, () -> exec(sql), sql);
+            assertEquals("0A000", e.getSQLState(), sql);
+            assertNull(((PSQLException) e).getServerErrorMessage(), sql);
+            assertEquals("COPY commands are only supported using the CopyManager API.",
+                    e.getMessage(), sql);
+        }
+
+        // A query is a thing to read out of and never one to write into, and that is the grammar's
+        // answer rather than the direction word's.
+        assertEquals("42601", stateOf("COPY (SELECT 1) FROM STDIN"));
+        assertEquals("syntax error at or near \"FROM\"", messageOf("COPY (SELECT 1) FROM STDIN"));
+        assertEquals(3, num("SELECT count(*) FROM frd_d"));
+        exec("DROP TABLE frd_d");
+    }
+
+    /** The whole field set of the error a COPY FROM STDIN raises. */
+    private static ServerErrorMessage copyErrorOf(String sql, String data) {
+        try {
+            CopyManager copies = new CopyManager(conn.unwrap(BaseConnection.class));
+            copies.copyIn(sql, new ByteArrayInputStream(data.getBytes(StandardCharsets.UTF_8)));
+        } catch (Exception e) {
+            assertTrue(e instanceof PSQLException, "expected a server error from: " + sql);
+            ServerErrorMessage m = ((PSQLException) e).getServerErrorMessage();
+            assertTrue(m != null, "expected a server error from: " + sql);
+            return m;
+        }
+        throw new AssertionError("the copy was not refused: " + sql);
+    }
+
+    /** The rows a COPY TO wrote, and the text it wrote them as. */
+    private static String copyOutOf(String sql) throws Exception {
+        CopyManager copies = new CopyManager(conn.unwrap(BaseConnection.class));
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        long rows = copies.copyOut(sql, out);
+        return rows + " rows: " + new String(out.toByteArray(), StandardCharsets.UTF_8);
+    }
+
+    // ============================================================ what a RETURNING list resolves
+
+    /**
+     * A write that brings in a second relation reads its RETURNING list in the scope of both, so a
+     * bare name only the second relation holds answers to that relation. A name both hold answers
+     * to neither and a name neither holds is reported missing -- and PostgreSQL owes those two
+     * answers whether or not the statement would have written a row.
+     */
+    @Test
+    void aBareReturningNameOnlyTheSecondRelationHoldsResolvesToThatRelation() throws SQLException {
+        returningTargets();
+
+        assertEquals("1|p,2|q", rows("UPDATE rtn_x t SET v='z' FROM rtn_xs u"
+                + " WHERE t.i = u.j RETURNING i, w"));
+        // written out against the relation it comes from, the same name answers the same
+        assertEquals("1|p,2|q", rows("UPDATE rtn_x t SET v='y' FROM rtn_xs u"
+                + " WHERE t.i = u.j RETURNING i, u.w"));
+        assertEquals("1|1,2|2", rows("UPDATE rtn_x t SET v='y' FROM rtn_xs u"
+                + " WHERE t.i = u.j RETURNING i, j"));
+        // a name under an operator is a name
+        assertEquals("1|p!,2|q!", rows("UPDATE rtn_x t SET v='z' FROM rtn_xs u"
+                + " WHERE t.i = u.j RETURNING i, w || '!'"));
+        // two second relations, each supplying its own
+        assertEquals("1|p|P,2|q|Q", rows("UPDATE rtn_x t SET v='z' FROM rtn_xs u, rtn_xt s"
+                + " WHERE t.i = u.j AND t.i = s.k RETURNING i, w, y"));
+        // a pairing that reaches no row still answers with the clause's own columns
+        assertEquals("", rows("UPDATE rtn_x t SET v='y' FROM rtn_xs u WHERE false RETURNING i, w"));
+
+        // A name both relations hold answers to neither.
+        assertEquals("42702", stateOf("UPDATE rtn_x t SET v='y' FROM rtn_xs u"
+                + " WHERE t.i = u.j RETURNING i, c"));
+        assertEquals("column reference \"c\" is ambiguous",
+                messageOf("UPDATE rtn_x t SET v='y' FROM rtn_xs u"
+                        + " WHERE t.i = u.j RETURNING i, c"));
+        // A name neither holds is reported, whether or not a row would have been written.
+        for (String statement : new String[] {
+                "UPDATE rtn_x t SET v='y' FROM rtn_xs u WHERE t.i = u.j RETURNING i, nosuch",
+                "UPDATE rtn_x t SET v='y' FROM rtn_xs u WHERE false RETURNING i, nosuch",
+                "UPDATE rtn_x SET v='z' RETURNING nosuch",
+                "INSERT INTO rtn_x VALUES (9,'n','L9') RETURNING i, nosuch"}) {
+            assertEquals("42703", stateOf(statement), statement);
+            assertEquals("column \"nosuch\" does not exist", messageOf(statement), statement);
+        }
+
+        // DELETE reads the relation of its USING clause exactly as UPDATE reads its FROM.
+        assertEquals("1|p,2|q", rows("DELETE FROM rtn_x t USING rtn_xs u"
+                + " WHERE t.i = u.j RETURNING i, w"));
+        exec("INSERT INTO rtn_x VALUES (1,'a','L1'),(2,'b','L2')");
+        assertEquals("42702", stateOf("DELETE FROM rtn_x t USING rtn_xs u"
+                + " WHERE t.i = u.j RETURNING i, c"));
+        assertEquals("3|c", rows("SELECT i, v FROM rtn_x WHERE i = 3"));
+        dropReturningTargets();
+    }
+
+    /**
+     * A second relation supplies its names however it was written: a query of its own, a VALUES
+     * list, a set-returning call. What such an item does not hold is reported missing just as a
+     * table's missing column is, and an item that produces no row supplies its names all the same.
+     */
+    @Test
+    void aDerivedItemAValuesListAndACallSupplyTheirNamesToTheReturningList() throws SQLException {
+        returningTargets();
+
+        assertEquals("1|p,2|q", rows("UPDATE rtn_x t SET v='z' FROM (SELECT j, w FROM rtn_xs) u"
+                + " WHERE t.i = u.j RETURNING i, w"));
+        assertEquals("1|k", rows("UPDATE rtn_x t SET v='z' FROM (VALUES (1,'k')) u(j,w)"
+                + " WHERE t.i = u.j RETURNING i, w"));
+        assertEquals("1|1,2|2", rows("UPDATE rtn_x t SET v='z' FROM generate_series(1,2) g"
+                + " WHERE t.i = g RETURNING i, g"));
+        assertEquals("1|1,2|2", rows("DELETE FROM rtn_x t USING (SELECT j FROM rtn_xs) u"
+                + " WHERE t.i = u.j RETURNING i, j"));
+        exec("INSERT INTO rtn_x VALUES (1,'a','L1'),(2,'b','L2')");
+
+        for (String statement : new String[] {
+                "UPDATE rtn_x t SET v='z' FROM (SELECT j, w FROM rtn_xs) u"
+                        + " WHERE t.i = u.j RETURNING i, nosuch",
+                "UPDATE rtn_x t SET v='z' FROM (SELECT j, w FROM rtn_xs WHERE false) u"
+                        + " WHERE t.i = u.j RETURNING i, nosuch"}) {
+            assertEquals("42703", stateOf(statement), statement);
+            assertEquals("column \"nosuch\" does not exist", messageOf(statement), statement);
+        }
+        dropReturningTargets();
+    }
+
+    /**
+     * MERGE reads its source the same way, in every arm: the arm that updates, the one that
+     * deletes, the one that inserts, and the one that acts on a target row no source row paired
+     * with -- which reads the source's columns as nothing at all.
+     */
+    @Test
+    void aMergeSourceSuppliesItsNamesToTheReturningListOfEveryArm() throws SQLException {
+        returningTargets();
+
+        assertEquals("1|p,2|q", rows("MERGE INTO rtn_x t USING rtn_xs u ON t.i = u.j"
+                + " WHEN MATCHED THEN UPDATE SET v='m' RETURNING i, w"));
+        assertEquals("1|1,2|2", rows("MERGE INTO rtn_x t USING rtn_xs u ON t.i = u.j"
+                + " WHEN MATCHED THEN UPDATE SET v='m' RETURNING i, j"));
+        assertEquals("3|null", rows("MERGE INTO rtn_x t USING rtn_xs u ON t.i = u.j"
+                + " WHEN NOT MATCHED BY SOURCE THEN UPDATE SET v='s' RETURNING i, w"));
+        assertEquals("4|r", rows("MERGE INTO rtn_x t USING rtn_xs u ON t.i = u.j"
+                + " WHEN NOT MATCHED THEN INSERT VALUES (u.j, u.w) RETURNING i, w"));
+        // an arm that writes nothing answers with the clause's own columns
+        assertEquals("", rows("MERGE INTO rtn_x t USING rtn_xs u ON t.i = u.j"
+                + " WHEN MATCHED THEN DO NOTHING RETURNING i, w"));
+        assertEquals("1|p,2|q,4|r", rows("MERGE INTO rtn_x t USING rtn_xs u ON t.i = u.j"
+                + " WHEN MATCHED THEN DELETE RETURNING i, w"));
+        assertEquals("3|s|L3", rows("SELECT i, v, c FROM rtn_x ORDER BY i"));
+
+        // A source written as a query of its own or as a VALUES list supplies its names too.
+        exec("INSERT INTO rtn_x VALUES (1,'a','L1'),(2,'b','L2')");
+        assertEquals("1|p,2|q", rows("MERGE INTO rtn_x t USING (SELECT j, w FROM rtn_xs) u"
+                + " ON t.i = u.j WHEN MATCHED THEN UPDATE SET v='m' RETURNING i, w"));
+        assertEquals("1|k", rows("MERGE INTO rtn_x t USING (VALUES (1,'k')) u(j,w)"
+                + " ON t.i = u.j WHEN MATCHED THEN UPDATE SET v='n' RETURNING i, w"));
+
+        // The controls, in the arm that would have written.
+        assertEquals("42702", stateOf("MERGE INTO rtn_x t USING rtn_xs u ON t.i = u.j"
+                + " WHEN MATCHED THEN UPDATE SET v='m' RETURNING i, c"));
+        assertEquals("column reference \"c\" is ambiguous",
+                messageOf("MERGE INTO rtn_x t USING rtn_xs u ON t.i = u.j"
+                        + " WHEN MATCHED THEN UPDATE SET v='m' RETURNING i, c"));
+        assertEquals("42703", stateOf("MERGE INTO rtn_x t USING rtn_xs u ON t.i = u.j"
+                + " WHEN MATCHED THEN UPDATE SET v='m' RETURNING i, nosuch"));
+        assertEquals("column \"nosuch\" does not exist",
+                messageOf("MERGE INTO rtn_x t USING rtn_xs u ON t.i = u.j"
+                        + " WHEN MATCHED THEN UPDATE SET v='m' RETURNING i, nosuch"));
+        // A source that is not a relation at all is reported ahead of the missing name.
+        assertEquals("42P01", stateOf("MERGE INTO rtn_x t USING rtn_nosuch u ON t.i = u.j"
+                + " WHEN MATCHED THEN UPDATE SET v='m' RETURNING nosuch"));
+        assertEquals("relation \"rtn_nosuch\" does not exist",
+                messageOf("MERGE INTO rtn_x t USING rtn_nosuch u ON t.i = u.j"
+                        + " WHEN MATCHED THEN UPDATE SET v='m' RETURNING nosuch"));
+
+        assertEquals("1|n|L1,2|m|L2,3|s|L3", rows("SELECT i, v, c FROM rtn_x ORDER BY i"));
+        dropReturningTargets();
+    }
+
+    /** A target and two relations beside it: one sharing a column name with the target, one not. */
+    private static void returningTargets() throws SQLException {
+        exec("CREATE TABLE rtn_x (i int PRIMARY KEY, v text, c text)");
+        exec("CREATE TABLE rtn_xs (j int, w text, c text)");
+        exec("CREATE TABLE rtn_xt (k int, y text)");
+        exec("INSERT INTO rtn_x VALUES (1,'a','L1'),(2,'b','L2'),(3,'c','L3')");
+        exec("INSERT INTO rtn_xs VALUES (1,'p','R1'),(2,'q','R2'),(4,'r','R4')");
+        exec("INSERT INTO rtn_xt VALUES (1,'P'),(2,'Q')");
+    }
+
+    private static void dropReturningTargets() throws SQLException {
+        exec("DROP TABLE rtn_x");
+        exec("DROP TABLE rtn_xs");
+        exec("DROP TABLE rtn_xt");
+    }
+
+    // ============================================================ what an arbiter predicate implies
+
+    private static final String NO_ARBITER =
+            "there is no unique or exclusion constraint matching the ON CONFLICT specification";
+
+    /**
+     * A predicate written beside a conflict target names a partial index, and PostgreSQL takes the
+     * index only when the index's own predicate follows from the one written. It asks that of the
+     * two predicates as the planner leaves them, so the proof reaches through the forms one clause
+     * can be written in: a NOT is the comparison it negates, BETWEEN is the conjunction it stands
+     * for and IN the disjunction.
+     */
+    @Test
+    void aPredicateWrittenAnotherWayRoundReachesTheSameIndex() throws SQLException {
+        exec("CREATE TABLE arb_a (i int, f boolean, s text)");
+        exec("CREATE UNIQUE INDEX arb_a_u ON arb_a (i) WHERE i > 0");
+        exec("INSERT INTO arb_a VALUES (1,true,'a')");
+
+        for (String predicate : new String[] {
+                "NOT (i <= 0)",
+                "i BETWEEN 1 AND 10",
+                "i IN (1,5)",
+                "i = 1",
+                "i >= 1",
+                "i > 5 OR i > 2",
+                "i > 0 AND s = 'x'",
+                "i > 0 AND i BETWEEN 1 AND 10"}) {
+            exec("INSERT INTO arb_a VALUES (1,true,'b') ON CONFLICT (i) WHERE " + predicate
+                    + " DO NOTHING");
+        }
+        assertEquals("1|t|a", rows("SELECT i, f, s FROM arb_a"));
+
+        // and a predicate that admits a row the index does not hold reaches nothing
+        for (String predicate : new String[] {
+                "NOT (i < 0)",
+                "NOT (i BETWEEN -5 AND 0)",
+                "i BETWEEN -5 AND 10",
+                "i IN (0,5)",
+                "i NOT IN (0,-1)",
+                "i > 0 OR s = 'x'",
+                "i > 0 AND false",
+                "true"}) {
+            String sql = "INSERT INTO arb_a VALUES (1,true,'b') ON CONFLICT (i) WHERE " + predicate
+                    + " DO NOTHING";
+            assertEquals("42P10", stateOf(sql), sql);
+            assertEquals(NO_ARBITER, messageOf(sql), sql);
+        }
+        assertEquals(1, num("SELECT count(*) FROM arb_a"));
+        exec("DROP TABLE arb_a");
+    }
+
+    /**
+     * A test against a boolean constant is the operand it tests, so an index over a bare boolean
+     * column is reached by every way of writing that the column holds. A boolean test is not the
+     * operand: it answers where the operand is null, which is a row the index does not hold.
+     */
+    @Test
+    void aBooleanComparedWithTrueIsTheOperandItCompares() throws SQLException {
+        exec("CREATE TABLE arb_b (i int, f boolean)");
+        exec("CREATE UNIQUE INDEX arb_b_u ON arb_b (i) WHERE f");
+        exec("INSERT INTO arb_b VALUES (1,true)");
+
+        for (String predicate : new String[] {
+                "f", "f = true", "true = f", "f <> false", "NOT (f = false)", "NOT NOT f",
+                "f AND i > 0"}) {
+            exec("INSERT INTO arb_b VALUES (1,true) ON CONFLICT (i) WHERE " + predicate
+                    + " DO NOTHING");
+        }
+        for (String predicate : new String[] {"f IS TRUE", "f IS NOT NULL", "NOT f"}) {
+            String sql = "INSERT INTO arb_b VALUES (1,true) ON CONFLICT (i) WHERE " + predicate
+                    + " DO NOTHING";
+            assertEquals("42P10", stateOf(sql), sql);
+            assertEquals(NO_ARBITER, messageOf(sql), sql);
+        }
+        assertEquals(1, num("SELECT count(*) FROM arb_b"));
+        exec("DROP TABLE arb_b");
+    }
+
+    /**
+     * A strict operator or function answers nothing where its argument is null, so a clause written
+     * over one of them proves the argument has a value -- which is what an index over IS NOT NULL
+     * asks for. COALESCE, NULLIF and CASE answer for a row whose column is null, so a clause
+     * written over one of them says nothing about the column.
+     */
+    @Test
+    void aStrictCallProvesItsArgumentHasAValue() throws SQLException {
+        exec("CREATE TABLE arb_d (i int, s text)");
+        exec("CREATE UNIQUE INDEX arb_d_u ON arb_d (i) WHERE s IS NOT NULL");
+        exec("INSERT INTO arb_d VALUES (1,'x')");
+
+        for (String predicate : new String[] {
+                "length(s) > 0",
+                "upper(s) = 'X'",
+                "substr(s,1,1) = 'x'",
+                "s || 'y' = 'xy'",
+                "s LIKE 'a%'",
+                "s::int > 0",
+                "NOT (s = 'q')",
+                "NOT (s IS NULL)",
+                "s IN ('a','b')",
+                "s BETWEEN 'a' AND 'z'",
+                "length(s) > 0 OR s = 'q'",
+                "length(s) > 0 AND i > 0"}) {
+            exec("INSERT INTO arb_d VALUES (1,'y') ON CONFLICT (i) WHERE " + predicate
+                    + " DO NOTHING");
+        }
+        for (String predicate : new String[] {
+                "coalesce(s,'y') = 'x'",
+                "nullif(s,'q') = 'x'",
+                "CASE WHEN s = 'x' THEN true ELSE false END",
+                "s IS NULL",
+                "i > 0"}) {
+            String sql = "INSERT INTO arb_d VALUES (1,'y') ON CONFLICT (i) WHERE " + predicate
+                    + " DO NOTHING";
+            assertEquals("42P10", stateOf(sql), sql);
+            assertEquals(NO_ARBITER, messageOf(sql), sql);
+        }
+        assertEquals("1|x", rows("SELECT i, s FROM arb_d"));
+        exec("DROP TABLE arb_d");
+
+        // A boolean column holding for a row is a row where it has a value; a NOT over it is no
+        // strict thing at all, and neither is a boolean test.
+        exec("CREATE TABLE arb_e (i int, f boolean)");
+        exec("CREATE UNIQUE INDEX arb_e_u ON arb_e (i) WHERE f IS NOT NULL");
+        exec("INSERT INTO arb_e VALUES (1,true)");
+        exec("INSERT INTO arb_e VALUES (1,true) ON CONFLICT (i) WHERE f DO NOTHING");
+        for (String predicate : new String[] {"NOT f", "f IS TRUE"}) {
+            String sql = "INSERT INTO arb_e VALUES (1,true) ON CONFLICT (i) WHERE " + predicate
+                    + " DO NOTHING";
+            assertEquals("42P10", stateOf(sql), sql);
+            assertEquals(NO_ARBITER, messageOf(sql), sql);
+        }
+        assertEquals(1, num("SELECT count(*) FROM arb_e"));
+        exec("DROP TABLE arb_e");
+    }
+
+    /**
+     * A bound proves an inequality where it rules the value out, and a bound over text is a bound
+     * like any other. An index whose predicate is a disjunction is reached by whatever entails
+     * either branch of it.
+     */
+    @Test
+    void aBoundProvesAnInequalityWhereItRulesTheValueOut() throws SQLException {
+        exec("CREATE TABLE arb_c (i int)");
+        exec("CREATE UNIQUE INDEX arb_c_u ON arb_c (i) WHERE i <> 0");
+        exec("INSERT INTO arb_c VALUES (1)");
+        for (String predicate : new String[] {"i <> 0", "i > 0", "i >= 1", "i < 0", "i = 1"}) {
+            exec("INSERT INTO arb_c VALUES (1) ON CONFLICT (i) WHERE " + predicate + " DO NOTHING");
+        }
+        for (String predicate : new String[] {"i > -1", "i >= 0"}) {
+            String sql = "INSERT INTO arb_c VALUES (1) ON CONFLICT (i) WHERE " + predicate
+                    + " DO NOTHING";
+            assertEquals("42P10", stateOf(sql), sql);
+            assertEquals(NO_ARBITER, messageOf(sql), sql);
+        }
+        assertEquals(1, num("SELECT count(*) FROM arb_c"));
+        exec("DROP TABLE arb_c");
+
+        exec("CREATE TABLE arb_g (i int, s text)");
+        exec("CREATE UNIQUE INDEX arb_g_u ON arb_g (i) WHERE s > 'a'");
+        exec("INSERT INTO arb_g VALUES (1,'x')");
+        for (String predicate : new String[] {"s > 'b'", "s >= 'b'", "s = 'b'", "s > 'aa'",
+                "s BETWEEN 'b' AND 'z'", "s IN ('b','c')", "NOT (s <= 'a')"}) {
+            exec("INSERT INTO arb_g VALUES (1,'y') ON CONFLICT (i) WHERE " + predicate
+                    + " DO NOTHING");
+        }
+        for (String predicate : new String[] {"s < 'b'", "s = 'a'", "s >= 'a'"}) {
+            String sql = "INSERT INTO arb_g VALUES (1,'y') ON CONFLICT (i) WHERE " + predicate
+                    + " DO NOTHING";
+            assertEquals("42P10", stateOf(sql), sql);
+            assertEquals(NO_ARBITER, messageOf(sql), sql);
+        }
+        assertEquals("1|x", rows("SELECT i, s FROM arb_g"));
+        exec("DROP TABLE arb_g");
+
+        exec("CREATE TABLE arb_f (i int)");
+        exec("CREATE UNIQUE INDEX arb_f_u ON arb_f (i) WHERE i > 0 OR i < -10");
+        exec("INSERT INTO arb_f VALUES (1)");
+        for (String predicate : new String[] {"i > 5", "i < -20", "i > 0 OR i < -10",
+                "i BETWEEN 1 AND 10"}) {
+            exec("INSERT INTO arb_f VALUES (1) ON CONFLICT (i) WHERE " + predicate + " DO NOTHING");
+        }
+        String neither = "INSERT INTO arb_f VALUES (1) ON CONFLICT (i) WHERE i > -5 DO NOTHING";
+        assertEquals("42P10", stateOf(neither));
+        assertEquals(NO_ARBITER, messageOf(neither));
+        assertEquals(1, num("SELECT count(*) FROM arb_f"));
+        exec("DROP TABLE arb_f");
+    }
+
+    /**
+     * Every part of the index's predicate has to be proved, and an index with no predicate at all
+     * has nothing to prove -- so it takes any predicate and the predicate decides nothing about
+     * which rows collide. A partial index, on the other hand, goes on refusing a conflict target
+     * written with no predicate beside it.
+     */
+    @Test
+    void everyPartOfTheIndexesPredicateHasToBeProvedAndAnIndexWithNoneTakesAnything()
+            throws SQLException {
+        exec("CREATE TABLE arb_i (i int, k int, s text)");
+        exec("CREATE UNIQUE INDEX arb_i_u ON arb_i (i) WHERE i > 0 AND s IS NOT NULL");
+        exec("INSERT INTO arb_i VALUES (1,1,'a')");
+        exec("INSERT INTO arb_i VALUES (1,2,'b') ON CONFLICT (i) WHERE i > 5 AND s = 'x'"
+                + " DO NOTHING");
+        exec("INSERT INTO arb_i VALUES (1,2,'b')"
+                + " ON CONFLICT (i) WHERE length(s) > 0 AND i BETWEEN 2 AND 3 DO NOTHING");
+        for (String predicate : new String[] {"i > 5", "s IS NOT NULL"}) {
+            String sql = "INSERT INTO arb_i VALUES (1,2,'b') ON CONFLICT (i) WHERE " + predicate
+                    + " DO NOTHING";
+            assertEquals("42P10", stateOf(sql), sql);
+            assertEquals(NO_ARBITER, messageOf(sql), sql);
+        }
+        assertEquals(1, num("SELECT count(*) FROM arb_i"));
+        exec("DROP TABLE arb_i");
+
+        exec("CREATE TABLE arb_j (i int PRIMARY KEY, k int)");
+        exec("INSERT INTO arb_j VALUES (1,1)");
+        exec("INSERT INTO arb_j VALUES (1,2) ON CONFLICT (i) WHERE false DO NOTHING");
+        exec("INSERT INTO arb_j VALUES (1,3) ON CONFLICT (i) WHERE k > 0 DO NOTHING");
+        assertEquals(1, update("INSERT INTO arb_j VALUES (1,4)"
+                + " ON CONFLICT (i) WHERE i IN (1,5) DO UPDATE SET k = 9"));
+        assertEquals("1|9", rows("SELECT i, k FROM arb_j"));
+        exec("DROP TABLE arb_j");
+
+        exec("CREATE TABLE arb_k (i int, k int)");
+        exec("CREATE UNIQUE INDEX arb_k_u ON arb_k (i) WHERE i > 0");
+        exec("INSERT INTO arb_k VALUES (1,1)");
+        for (String target : new String[] {"(i)", "(i) WHERE false", "(i) WHERE k > 0"}) {
+            String sql = "INSERT INTO arb_k VALUES (1,2) ON CONFLICT " + target + " DO NOTHING";
+            assertEquals("42P10", stateOf(sql), sql);
+            assertEquals(NO_ARBITER, messageOf(sql), sql);
+        }
+        assertEquals(1, num("SELECT count(*) FROM arb_k"));
+        exec("DROP TABLE arb_k");
+    }
+
+    /**
+     * The calls an arbiter predicate holds are resolved where the statement stands, and the
+     * predicate is read and never evaluated -- so a call that names nothing is refused whatever it
+     * would have answered, and a call that names something stands whatever it would have answered.
+     * Which fault is reported follows from where it was written: the arguments before the name,
+     * the predicate left to right, the target's own columns before the predicate and the action
+     * after it.
+     */
+    @Test
+    void aCallInAnArbiterPredicateIsResolvedWhereTheStatementStands() throws SQLException {
+        exec("CREATE TABLE arb_h (i int PRIMARY KEY, s text)");
+        exec("INSERT INTO arb_h VALUES (1,'a')");
+
+        String missing = "INSERT INTO arb_h VALUES (1,'b')"
+                + " ON CONFLICT (i) WHERE nosuchfunc(i) > 0 DO NOTHING";
+        assertEquals("42883", stateOf(missing));
+        assertEquals("function nosuchfunc(integer) does not exist", messageOf(missing));
+        assertEquals("No function matches the given name and argument types."
+                + " You might need to add explicit type casts.", hintOf(missing));
+
+        assertEquals("function nosuchfunc() does not exist",
+                messageOf("INSERT INTO arb_h VALUES (1,'b')"
+                        + " ON CONFLICT (i) WHERE nosuchfunc() > 0 DO NOTHING"));
+        assertEquals("function nosuchfunc(unknown) does not exist",
+                messageOf("INSERT INTO arb_h VALUES (1,'b')"
+                        + " ON CONFLICT (i) WHERE nosuchfunc('lit') > 0 DO NOTHING"));
+        assertEquals("function pg_catalog.nosuchfunc(integer) does not exist",
+                messageOf("INSERT INTO arb_h VALUES (1,'b')"
+                        + " ON CONFLICT (i) WHERE pg_catalog.nosuchfunc(i) > 0 DO NOTHING"));
+        // A name that exists but not for these arguments is refused the same way.
+        assertEquals("function length(integer) does not exist",
+                messageOf("INSERT INTO arb_h VALUES (1,'b')"
+                        + " ON CONFLICT (i) WHERE length(i) > 0 DO NOTHING"));
+        // A name that is a schema's to answer for is answered by the schema.
+        String qualified = "INSERT INTO arb_h VALUES (1,'b')"
+                + " ON CONFLICT (i) WHERE nosuchschema.nosuchfunc(i) > 0 DO NOTHING";
+        assertEquals("3F000", stateOf(qualified));
+        assertEquals("schema \"nosuchschema\" does not exist", messageOf(qualified));
+        assertNull(hintOf(qualified));
+
+        // The arguments are read before the name is looked for, and the predicate left to right.
+        String inside = "INSERT INTO arb_h VALUES (1,'b')"
+                + " ON CONFLICT (i) WHERE nosuchfunc(nosuchcol) > 0 DO NOTHING";
+        assertEquals("42703", stateOf(inside));
+        assertEquals("column \"nosuchcol\" does not exist", messageOf(inside));
+        assertEquals("42703", stateOf("INSERT INTO arb_h VALUES (1,'b')"
+                + " ON CONFLICT (i) WHERE nosuchcol > 0 AND nosuchfunc(i) > 0 DO NOTHING"));
+        assertEquals("42883", stateOf("INSERT INTO arb_h VALUES (1,'b')"
+                + " ON CONFLICT (i) WHERE nosuchfunc(i) > 0 AND nosuchcol > 0 DO NOTHING"));
+
+        // The target's own columns are read first, and the action after the predicate.
+        assertEquals("42703", stateOf("INSERT INTO arb_h VALUES (1,'b')"
+                + " ON CONFLICT (nosuchcol) WHERE nosuchfunc(i) > 0 DO NOTHING"));
+        assertEquals("42883", stateOf("INSERT INTO arb_h VALUES (1,'b')"
+                + " ON CONFLICT (i) WHERE nosuchfunc(i) > 0 DO UPDATE SET s = nosuchcol"));
+        // And the call is refused whether or not any index would have arbitrated.
+        assertEquals("42883", stateOf("INSERT INTO arb_h VALUES (1,'b')"
+                + " ON CONFLICT (s) WHERE nosuchfunc(i) > 0 DO NOTHING"));
+
+        // A call that does name a function stands: the predicate is read, never evaluated.
+        exec("INSERT INTO arb_h VALUES (1,'b') ON CONFLICT (i) WHERE random() > 0.5 DO NOTHING");
+        assertEquals("1|a", rows("SELECT i, s FROM arb_h"));
+        exec("DROP TABLE arb_h");
+    }
+
+    // ------------------------------------------------------------ helpers for a snapshot's writes
+
+    /** What a statement is refused with when the row it meant to write was written under it. */
+    private static final String CONCURRENT_UPDATE =
+            "ERR[40001] ERROR: could not serialize access due to concurrent update";
+
+    /** And what it is refused with when the row was taken away instead. */
+    private static final String CONCURRENT_DELETE =
+            "ERR[40001] ERROR: could not serialize access due to concurrent delete";
+
+    /** One row, holding the value every qualification below is written against. */
+    private static void qualifiedTarget(String name) throws SQLException {
+        exec("CREATE TABLE " + name + " (i int PRIMARY KEY, v int)");
+        exec("INSERT INTO " + name + " VALUES (22,5)");
+    }
+
+    /**
+     * The same as {@link #underSnapshotWhileAnotherSessionHolds}, for an actor that is expected to
+     * answer while the other session is still holding: the row it waits for is not one it writes.
+     * That it answered at all is what is read here, and the other session has not finished, so a
+     * statement that had waited for it could not have answered whatever else the machine was busy
+     * with.
+     */
+    private static String underSnapshotWithoutWaiting(String level, String snapshotQuery,
+            String holding, String finish, String statement) throws Exception {
+        try (Connection holder = openSession(); Connection actor = openSession()) {
+            execOn(holder, "BEGIN");
+            execOn(holder, holding);
+            execOn(actor, "BEGIN ISOLATION LEVEL " + level);
+            execOn(actor, snapshotQuery);
+            Future<String> pending = pool.submit(() -> answerOf(actor, statement));
+            String answer = answerWithin(pending);
+            execOn(holder, finish);
+            try {
+                execOn(actor, "COMMIT");
+            } catch (SQLException ignored) {
+                // an aborted transaction ends either way
+            }
+            return answer;
+        }
+    }
+
+    /**
+     * The same again for an actor with no statement before its write, so the snapshot the write is
+     * judged against is the one the write itself fixed.
+     */
+    private static String underASnapshotTheWriteFixesItself(String level, String holding,
+            String finish, String statement) throws Exception {
+        try (Connection holder = openSession(); Connection actor = openSession()) {
+            execOn(holder, "BEGIN");
+            execOn(holder, holding);
+            execOn(actor, "BEGIN ISOLATION LEVEL " + level);
+            Future<String> pending = pool.submit(() -> answerOf(actor, statement));
+            Thread.sleep(BLOCKED_MS);
+            assertFalse(pending.isDone(),
+                    "answered while another session still held the row: " + statement);
+            execOn(holder, finish);
+            String answer = answerWithin(pending);
+            try {
+                execOn(actor, "COMMIT");
+            } catch (SQLException ignored) {
+                // an aborted transaction ends either way
+            }
+            return answer;
+        }
+    }
+
+    // ============================================================ a write reading from a snapshot,
+    // and the row another session wrote under it
+
+    @Test
+    void aWriteIsRefusedTheRowAConcurrentUpdateSteeredOutOfItsQualification() throws Exception {
+        qualifiedTarget("swq_a1");
+        // The version this transaction may act on answers the qualification and the version the
+        // other session committed does not. PostgreSQL will not let the statement report that it
+        // wrote nothing over a row that was taken from it, so it ends the transaction instead.
+        assertEquals(CONCURRENT_UPDATE, underSnapshotWhileAnotherSessionHolds(
+                "REPEATABLE READ", "SELECT count(*) FROM swq_a1",
+                "UPDATE swq_a1 SET v = -1 WHERE i = 22", "COMMIT",
+                "UPDATE swq_a1 SET v = 9 WHERE i = 22 AND v > 0"));
+        assertEquals("22|-1", rows("SELECT i, v FROM swq_a1"));
+        exec("DROP TABLE swq_a1");
+    }
+
+    @Test
+    void aDeleteIsRefusedThatRowInTheSameWordsAsAnUpdate() throws Exception {
+        qualifiedTarget("swq_a2");
+        // It is the row's version that moved and not the row that went, so PostgreSQL says
+        // "concurrent update" here as well.
+        assertEquals(CONCURRENT_UPDATE, underSnapshotWhileAnotherSessionHolds(
+                "REPEATABLE READ", "SELECT count(*) FROM swq_a2",
+                "UPDATE swq_a2 SET v = -1 WHERE i = 22", "COMMIT",
+                "DELETE FROM swq_a2 WHERE i = 22 AND v > 0"));
+        assertEquals("22|-1", rows("SELECT i, v FROM swq_a2"));
+        exec("DROP TABLE swq_a2");
+    }
+
+    @Test
+    void aSerializableWriteIsRefusedThatRowTheSameWay() throws Exception {
+        qualifiedTarget("swq_a3");
+        assertEquals(CONCURRENT_UPDATE, underSnapshotWhileAnotherSessionHolds(
+                "SERIALIZABLE", "SELECT count(*) FROM swq_a3",
+                "UPDATE swq_a3 SET v = -1 WHERE i = 22", "COMMIT",
+                "UPDATE swq_a3 SET v = 9 WHERE i = 22 AND v > 0"));
+        exec("DROP TABLE swq_a3");
+
+        qualifiedTarget("swq_a4");
+        assertEquals(CONCURRENT_UPDATE, underSnapshotWhileAnotherSessionHolds(
+                "SERIALIZABLE", "SELECT count(*) FROM swq_a4",
+                "UPDATE swq_a4 SET v = -1 WHERE i = 22", "COMMIT",
+                "DELETE FROM swq_a4 WHERE i = 22 AND v > 0"));
+        exec("DROP TABLE swq_a4");
+    }
+
+    @Test
+    void aWriteNamingNoQualificationAtAllIsRefusedThatRowToo() throws Exception {
+        qualifiedTarget("swq_a5");
+        // The refusal is owed to the row's version having moved, not to what the qualification
+        // made of it, so a statement carrying none at all is refused just the same.
+        assertEquals(CONCURRENT_UPDATE, underSnapshotWhileAnotherSessionHolds(
+                "REPEATABLE READ", "SELECT count(*) FROM swq_a5",
+                "UPDATE swq_a5 SET v = -1 WHERE i = 22", "COMMIT",
+                "UPDATE swq_a5 SET v = 9"));
+        assertEquals("22|-1", rows("SELECT i, v FROM swq_a5"));
+        exec("DROP TABLE swq_a5");
+    }
+
+    @Test
+    void neitherRowIsWrittenWhenOneOfTheTwoWasSteeredOutOfTheQualification() throws Exception {
+        qualifiedTarget("swq_a6");
+        exec("INSERT INTO swq_a6 VALUES (23,5)");
+        // The statement is refused whole: the row the other session never touched is not written
+        // either, which is what a statement that quietly passed the lost row over would have done.
+        assertEquals(CONCURRENT_UPDATE, underSnapshotWhileAnotherSessionHolds(
+                "REPEATABLE READ", "SELECT count(*) FROM swq_a6",
+                "UPDATE swq_a6 SET v = -1 WHERE i = 22", "COMMIT",
+                "UPDATE swq_a6 SET v = 9 WHERE v > 0"));
+        assertEquals("22|-1,23|5", rows("SELECT i, v FROM swq_a6 ORDER BY i"));
+        exec("DROP TABLE swq_a6");
+    }
+
+    @Test
+    void theRefusalIsOwedWithNothingLeftToWaitForEither() throws Exception {
+        qualifiedTarget("swq_a7");
+        // The other session's transaction was over before this statement began, so nothing blocks
+        // -- and what this transaction is entitled to act on is still the version it was shown.
+        assertEquals(CONCURRENT_UPDATE, underSnapshotAfterAnotherSessionCommitted(
+                "REPEATABLE READ", "SELECT count(*) FROM swq_a7",
+                "UPDATE swq_a7 SET v = -1 WHERE i = 22",
+                "UPDATE swq_a7 SET v = 9 WHERE i = 22 AND v > 0"));
+        exec("UPDATE swq_a7 SET v = 5 WHERE i = 22");
+        assertEquals(CONCURRENT_UPDATE, underSnapshotAfterAnotherSessionCommitted(
+                "REPEATABLE READ", "SELECT count(*) FROM swq_a7",
+                "UPDATE swq_a7 SET v = -1 WHERE i = 22",
+                "DELETE FROM swq_a7 WHERE i = 22 AND v > 0"));
+        exec("UPDATE swq_a7 SET v = 5 WHERE i = 22");
+        assertEquals(CONCURRENT_UPDATE, underSnapshotAfterAnotherSessionCommitted(
+                "SERIALIZABLE", "SELECT count(*) FROM swq_a7",
+                "UPDATE swq_a7 SET v = -1 WHERE i = 22",
+                "UPDATE swq_a7 SET v = 9 WHERE i = 22 AND v > 0"));
+        assertEquals("22|-1", rows("SELECT i, v FROM swq_a7"));
+        exec("DROP TABLE swq_a7");
+    }
+
+    @Test
+    void aRowOfAPartitionedRelationIsRefusedWhicheverRelationTheStatementNames() throws Exception {
+        exec("CREATE TABLE swq_p1 (i int, v int) PARTITION BY RANGE (i)");
+        exec("CREATE TABLE swq_p1a PARTITION OF swq_p1 FOR VALUES FROM (0) TO (10)");
+        exec("CREATE TABLE swq_p1b PARTITION OF swq_p1 FOR VALUES FROM (10) TO (20)");
+        exec("INSERT INTO swq_p1 VALUES (2,5)");
+        assertEquals(CONCURRENT_UPDATE, underSnapshotWhileAnotherSessionHolds(
+                "REPEATABLE READ", "SELECT count(*) FROM swq_p1",
+                "UPDATE swq_p1 SET v = -1 WHERE i = 2", "COMMIT",
+                "UPDATE swq_p1 SET v = 9 WHERE i = 2 AND v > 0"));
+        assertEquals("2|-1", rows("SELECT i, v FROM swq_p1"));
+
+        // The same written against the partition the row is really stored in.
+        exec("UPDATE swq_p1 SET v = 5 WHERE i = 2");
+        assertEquals(CONCURRENT_UPDATE, underSnapshotWhileAnotherSessionHolds(
+                "REPEATABLE READ", "SELECT count(*) FROM swq_p1a",
+                "UPDATE swq_p1a SET v = -1 WHERE i = 2", "COMMIT",
+                "UPDATE swq_p1a SET v = 9 WHERE i = 2 AND v > 0"));
+
+        // And a row the other session moved into the other partition, which is the same rule read
+        // through a second relation.
+        exec("UPDATE swq_p1 SET v = 5 WHERE i = 2");
+        assertEquals(CONCURRENT_UPDATE, underSnapshotWhileAnotherSessionHolds(
+                "REPEATABLE READ", "SELECT count(*) FROM swq_p1",
+                "UPDATE swq_p1 SET i = 12 WHERE i = 2", "COMMIT",
+                "UPDATE swq_p1 SET v = 9 WHERE i = 2 AND v > 0"));
+        assertEquals("12|5", rows("SELECT i, v FROM swq_p1"));
+        exec("DROP TABLE swq_p1 CASCADE");
+    }
+
+    @Test
+    void aRowReachedThroughAnInheritanceParentIsRefusedTheSameWay() throws Exception {
+        exec("CREATE TABLE swq_h1 (i int, v int)");
+        exec("CREATE TABLE swq_h1c (extra text) INHERITS (swq_h1)");
+        exec("INSERT INTO swq_h1c VALUES (3,5,'x')");
+        // The child carries a column its parent never declared, and the row is still the row.
+        assertEquals(CONCURRENT_UPDATE, underSnapshotWhileAnotherSessionHolds(
+                "REPEATABLE READ", "SELECT count(*) FROM swq_h1",
+                "UPDATE swq_h1 SET v = -1 WHERE i = 3", "COMMIT",
+                "UPDATE swq_h1 SET v = 9 WHERE i = 3 AND v > 0"));
+        assertEquals("3|-1|x", rows("SELECT i, v, extra FROM swq_h1c"));
+        exec("DROP TABLE swq_h1c");
+        exec("DROP TABLE swq_h1");
+    }
+
+    @Test
+    void aWriteJoinedToAnotherRelationIsRefusedItsOwnTargetRow() throws Exception {
+        exec("CREATE TABLE swq_j1 (i int PRIMARY KEY, v int)");
+        exec("CREATE TABLE swq_j1f (i int, w int)");
+        exec("INSERT INTO swq_j1 VALUES (1,5)");
+        exec("INSERT INTO swq_j1f VALUES (1,100)");
+        assertEquals(CONCURRENT_UPDATE, underSnapshotWhileAnotherSessionHolds(
+                "REPEATABLE READ", "SELECT count(*) FROM swq_j1",
+                "UPDATE swq_j1 SET v = -1 WHERE i = 1", "COMMIT",
+                "UPDATE swq_j1 SET v = swq_j1f.w FROM swq_j1f"
+                        + " WHERE swq_j1f.i = swq_j1.i AND swq_j1.v > 0"));
+        assertEquals("1|-1", rows("SELECT i, v FROM swq_j1"));
+
+        exec("UPDATE swq_j1 SET v = 5 WHERE i = 1");
+        assertEquals(CONCURRENT_UPDATE, underSnapshotWhileAnotherSessionHolds(
+                "REPEATABLE READ", "SELECT count(*) FROM swq_j1",
+                "UPDATE swq_j1 SET v = -1 WHERE i = 1", "COMMIT",
+                "DELETE FROM swq_j1 USING swq_j1f"
+                        + " WHERE swq_j1f.i = swq_j1.i AND swq_j1.v > 0"));
+        assertEquals("1|-1", rows("SELECT i, v FROM swq_j1"));
+        exec("DROP TABLE swq_j1");
+        exec("DROP TABLE swq_j1f");
+    }
+
+    @Test
+    void whicheverStatementFixedTheSnapshotTheRefusalIsTheSame() throws Exception {
+        qualifiedTarget("swq_s1");
+        exec("INSERT INTO swq_s1 VALUES (24,5)");
+        // Reading the rows themselves rather than counting them.
+        assertEquals(CONCURRENT_UPDATE, underSnapshotWhileAnotherSessionHolds(
+                "REPEATABLE READ", "SELECT i, v FROM swq_s1 ORDER BY i",
+                "UPDATE swq_s1 SET v = -1 WHERE i = 22", "COMMIT",
+                "UPDATE swq_s1 SET v = 9 WHERE i = 22 AND v > 0"));
+
+        // Locking a row the write never reaches.
+        exec("UPDATE swq_s1 SET v = 5 WHERE i = 22");
+        assertEquals(CONCURRENT_UPDATE, underSnapshotWhileAnotherSessionHolds(
+                "REPEATABLE READ", "SELECT i FROM swq_s1 WHERE i = 24 FOR UPDATE",
+                "UPDATE swq_s1 SET v = -1 WHERE i = 22", "COMMIT",
+                "UPDATE swq_s1 SET v = 9 WHERE i = 22 AND v > 0"));
+        assertEquals("22|-1,24|5", rows("SELECT i, v FROM swq_s1 ORDER BY i"));
+        exec("DROP TABLE swq_s1");
+    }
+
+    @Test
+    void aQualificationReadingASecondRelationIsStillRefusedForItsTargetRow() throws Exception {
+        qualifiedTarget("swq_s2");
+        exec("CREATE TABLE swq_s2u (i int, w int)");
+        exec("INSERT INTO swq_s2u VALUES (22,1)");
+        // The other session writes both relations. The subquery is read from the snapshot as it
+        // always was; the refusal is owed to the target row and to nothing the subquery saw.
+        assertEquals(CONCURRENT_UPDATE, underSnapshotWhileAnotherSessionHolds(
+                "REPEATABLE READ", "SELECT count(*) FROM swq_s2",
+                "UPDATE swq_s2 SET v = -1 WHERE i = 22", "COMMIT",
+                "UPDATE swq_s2 SET v = 9 WHERE i = 22 AND v > 0"
+                        + " AND EXISTS (SELECT 1 FROM swq_s2u WHERE swq_s2u.i = swq_s2.i"
+                        + " AND w > 0)"));
+        assertEquals("22|-1", rows("SELECT i, v FROM swq_s2"));
+        exec("DROP TABLE swq_s2");
+        exec("DROP TABLE swq_s2u");
+    }
+
+    @Test
+    void theTransactionTheRefusedWriteStoodInTakesNothingFurther() throws Exception {
+        qualifiedTarget("swq_e1");
+        try (Connection holder = openSession(); Connection actor = openSession()) {
+            execOn(holder, "BEGIN");
+            execOn(holder, "UPDATE swq_e1 SET v = -1 WHERE i = 22");
+            execOn(actor, "BEGIN ISOLATION LEVEL REPEATABLE READ");
+            execOn(actor, "SELECT count(*) FROM swq_e1");
+            Future<String> pending = pool.submit(
+                    () -> answerOf(actor, "UPDATE swq_e1 SET v = 9 WHERE i = 22 AND v > 0"));
+            Thread.sleep(BLOCKED_MS);
+            assertFalse(pending.isDone(), "answered while the other session still held the row");
+            execOn(holder, "COMMIT");
+            assertEquals(CONCURRENT_UPDATE, answerWithin(pending));
+            assertTrue(answerOf(actor, "SELECT count(*) FROM swq_e1").startsWith("ERR[25P02] "),
+                    "the transaction was left able to run another statement");
+            execOn(actor, "ROLLBACK");
+            assertEquals("1;", answerOf(actor, "SELECT count(*) FROM swq_e1"));
+        }
+        assertEquals("22|-1", rows("SELECT i, v FROM swq_e1"));
+        exec("DROP TABLE swq_e1");
+    }
+
+    // ============================================================ what that refusal lets through
+
+    @Test
+    void aBlockerThatRollsBackLeavesTheRowToBeWrittenAfterAll() throws Exception {
+        qualifiedTarget("swq_b1");
+        // The other session's write never happened, so the version this transaction was shown is
+        // still the relation's own and the qualification still holds for it.
+        assertEquals("[1 rows]", underSnapshotWhileAnotherSessionHolds(
+                "REPEATABLE READ", "SELECT count(*) FROM swq_b1",
+                "UPDATE swq_b1 SET v = -1 WHERE i = 22", "ROLLBACK",
+                "UPDATE swq_b1 SET v = 9 WHERE i = 22 AND v > 0"));
+        assertEquals("22|9", rows("SELECT i, v FROM swq_b1"));
+        exec("DROP TABLE swq_b1");
+
+        qualifiedTarget("swq_b2");
+        assertEquals("[1 rows]", underSnapshotWhileAnotherSessionHolds(
+                "SERIALIZABLE", "SELECT count(*) FROM swq_b2",
+                "UPDATE swq_b2 SET v = -1 WHERE i = 22", "ROLLBACK",
+                "DELETE FROM swq_b2 WHERE i = 22 AND v > 0"));
+        assertEquals("", rows("SELECT i, v FROM swq_b2"));
+        exec("DROP TABLE swq_b2");
+    }
+
+    @Test
+    void aQualificationTheCommittedVersionStillSatisfiesIsRefusedAllTheSame() throws Exception {
+        qualifiedTarget("swq_b3");
+        // The version moved, whatever it moved to: this write would have found a row to act on
+        // either way, and it is still not the row this transaction was shown.
+        assertEquals(CONCURRENT_UPDATE, underSnapshotWhileAnotherSessionHolds(
+                "REPEATABLE READ", "SELECT count(*) FROM swq_b3",
+                "UPDATE swq_b3 SET v = 7 WHERE i = 22", "COMMIT",
+                "UPDATE swq_b3 SET v = 9 WHERE i = 22 AND v > 0"));
+        assertEquals("22|7", rows("SELECT i, v FROM swq_b3"));
+        exec("DROP TABLE swq_b3");
+    }
+
+    @Test
+    void readCommittedReReadsTheRowAndFindsItNoLongerQualifies() throws Exception {
+        qualifiedTarget("swq_k1");
+        // A transaction that reads each statement afresh has no snapshot to judge a write by: it
+        // reads what the row has become, finds the qualification does not hold, and says so.
+        assertEquals("[0 rows]", underSnapshotWhileAnotherSessionHolds(
+                "READ COMMITTED", "SELECT count(*) FROM swq_k1",
+                "UPDATE swq_k1 SET v = -1 WHERE i = 22", "COMMIT",
+                "UPDATE swq_k1 SET v = 9 WHERE i = 22 AND v > 0"));
+        assertEquals("22|-1", rows("SELECT i, v FROM swq_k1"));
+
+        exec("UPDATE swq_k1 SET v = 5 WHERE i = 22");
+        assertEquals("[0 rows]", underSnapshotWhileAnotherSessionHolds(
+                "READ COMMITTED", "SELECT count(*) FROM swq_k1",
+                "UPDATE swq_k1 SET v = -1 WHERE i = 22", "COMMIT",
+                "DELETE FROM swq_k1 WHERE i = 22 AND v > 0"));
+        assertEquals("22|-1", rows("SELECT i, v FROM swq_k1"));
+
+        exec("UPDATE swq_k1 SET v = 5 WHERE i = 22");
+        assertEquals("[0 rows]", underSnapshotAfterAnotherSessionCommitted(
+                "READ COMMITTED", "SELECT count(*) FROM swq_k1",
+                "UPDATE swq_k1 SET v = -1 WHERE i = 22",
+                "UPDATE swq_k1 SET v = 9 WHERE i = 22 AND v > 0"));
+        exec("DROP TABLE swq_k1");
+    }
+
+    @Test
+    void readCommittedWritesTheVersionTheOtherSessionCommittedWhenItStillQualifies()
+            throws Exception {
+        qualifiedTarget("swq_k2");
+        assertEquals("[1 rows]", underSnapshotWhileAnotherSessionHolds(
+                "READ COMMITTED", "SELECT count(*) FROM swq_k2",
+                "UPDATE swq_k2 SET v = 7 WHERE i = 22", "COMMIT",
+                "UPDATE swq_k2 SET v = 9 WHERE i = 22 AND v > 0"));
+        assertEquals("22|9", rows("SELECT i, v FROM swq_k2"));
+        exec("DROP TABLE swq_k2");
+    }
+
+    @Test
+    void aVersionTheQualificationNeverHeldForIsNoRowToBeRefusedOver() throws Exception {
+        exec("CREATE TABLE swq_v1 (i int PRIMARY KEY, v int)");
+        exec("INSERT INTO swq_v1 VALUES (22,-1)");
+        // The version this transaction may act on is the one holding -1, which its qualification
+        // never held for. There is no row for it to be refused over, whatever the other session
+        // has since committed -- and no row for it to wait on, either.
+        assertEquals("[0 rows]", underSnapshotAfterAnotherSessionCommitted(
+                "REPEATABLE READ", "SELECT count(*) FROM swq_v1",
+                "UPDATE swq_v1 SET v = 5 WHERE i = 22",
+                "UPDATE swq_v1 SET v = 9 WHERE i = 22 AND v > 0"));
+        assertEquals("22|5", rows("SELECT i, v FROM swq_v1"));
+
+        exec("UPDATE swq_v1 SET v = -1 WHERE i = 22");
+        assertEquals("[0 rows]", underSnapshotAfterAnotherSessionCommitted(
+                "REPEATABLE READ", "SELECT count(*) FROM swq_v1",
+                "UPDATE swq_v1 SET v = 5 WHERE i = 22",
+                "DELETE FROM swq_v1 WHERE i = 22 AND v > 0"));
+        assertEquals("22|5", rows("SELECT i, v FROM swq_v1"));
+
+        exec("UPDATE swq_v1 SET v = -1 WHERE i = 22");
+        assertEquals("[0 rows]", underSnapshotWithoutWaiting(
+                "REPEATABLE READ", "SELECT count(*) FROM swq_v1",
+                "UPDATE swq_v1 SET v = 5 WHERE i = 22", "COMMIT",
+                "UPDATE swq_v1 SET v = 9 WHERE i = 22 AND v > 0"));
+        assertEquals("22|5", rows("SELECT i, v FROM swq_v1"));
+        exec("DROP TABLE swq_v1");
+    }
+
+    @Test
+    void aWriteThatNeverReachesTheOtherSessionsRowIsNeitherBlockedNorRefused() throws Exception {
+        qualifiedTarget("swq_v2");
+        exec("INSERT INTO swq_v2 VALUES (23,5)");
+        assertEquals("[1 rows]", underSnapshotWithoutWaiting(
+                "REPEATABLE READ", "SELECT count(*) FROM swq_v2",
+                "UPDATE swq_v2 SET v = -1 WHERE i = 23", "COMMIT",
+                "UPDATE swq_v2 SET v = 9 WHERE i = 22 AND v > 0"));
+        assertEquals("22|9,23|-1", rows("SELECT i, v FROM swq_v2 ORDER BY i"));
+        exec("DROP TABLE swq_v2");
+    }
+
+    @Test
+    void twoSnapshotsWritingDifferentRowsBothKeepTheirWrites() throws Exception {
+        exec("CREATE TABLE swq_v3 (i int PRIMARY KEY, v int)");
+        exec("INSERT INTO swq_v3 VALUES (1,1),(2,2)");
+        try (Connection one = openSession(); Connection two = openSession()) {
+            execOn(one, "BEGIN ISOLATION LEVEL REPEATABLE READ");
+            execOn(one, "SELECT count(*) FROM swq_v3");
+            execOn(two, "BEGIN ISOLATION LEVEL REPEATABLE READ");
+            execOn(two, "SELECT count(*) FROM swq_v3");
+            // Neither waits for the other and neither is refused: they write different rows.
+            assertEquals("[1 rows]", answerOf(one, "UPDATE swq_v3 SET v = 11 WHERE i = 1"));
+            assertEquals("[1 rows]", answerOf(two, "UPDATE swq_v3 SET v = 22 WHERE i = 2"));
+            execOn(one, "COMMIT");
+            execOn(two, "COMMIT");
+        }
+        assertEquals("1|11,2|22", rows("SELECT i, v FROM swq_v3 ORDER BY i"));
+        exec("DROP TABLE swq_v3");
+    }
+
+    @Test
+    void aTransactionGoesOnReadingItsOwnSnapshotWhileAnotherSessionWritesAndCommits()
+            throws Exception {
+        exec("CREATE TABLE swq_v4 (i int PRIMARY KEY, v int)");
+        exec("INSERT INTO swq_v4 VALUES (1,11),(2,22)");
+        try (Connection other = openSession(); Connection actor = openSession()) {
+            execOn(actor, "BEGIN ISOLATION LEVEL REPEATABLE READ");
+            assertEquals("1|11;2|22;", answerOf(actor, "SELECT i, v FROM swq_v4 ORDER BY i"));
+            execOn(other, "INSERT INTO swq_v4 VALUES (3,33)");
+            execOn(other, "UPDATE swq_v4 SET v = 99 WHERE i = 1");
+            // What the other session committed is nothing to this transaction until it ends.
+            assertEquals("1|11;2|22;", answerOf(actor, "SELECT i, v FROM swq_v4 ORDER BY i"));
+            execOn(actor, "COMMIT");
+            assertEquals("1|99;2|22;3|33;",
+                    answerOf(actor, "SELECT i, v FROM swq_v4 ORDER BY i"));
+        }
+        exec("DROP TABLE swq_v4");
+    }
+
+    @Test
+    void aRowThisTransactionSteeredOutOfItsOwnQualificationIsOnlyPassedOver() throws Exception {
+        qualifiedTarget("swq_v5");
+        try (Connection actor = openSession()) {
+            execOn(actor, "BEGIN ISOLATION LEVEL REPEATABLE READ");
+            execOn(actor, "SELECT count(*) FROM swq_v5");
+            // The row's version has moved, and it moved by this transaction's own hand: it reads
+            // it as it left it, and there is nothing here to refuse.
+            assertEquals("[1 rows]", answerOf(actor, "UPDATE swq_v5 SET v = -1 WHERE i = 22"));
+            assertEquals("[0 rows]",
+                    answerOf(actor, "UPDATE swq_v5 SET v = 9 WHERE i = 22 AND v > 0"));
+            assertEquals("[0 rows]",
+                    answerOf(actor, "DELETE FROM swq_v5 WHERE i = 22 AND v > 0"));
+            assertEquals("[1 rows]",
+                    answerOf(actor, "UPDATE swq_v5 SET v = 8 WHERE i = 22 AND v < 0"));
+            execOn(actor, "COMMIT");
+        }
+        assertEquals("22|8", rows("SELECT i, v FROM swq_v5"));
+        exec("DROP TABLE swq_v5");
+    }
+
+    // ============================================================ a row the snapshot was never
+    // shown, and a snapshot the write fixed itself
+
+    @Test
+    void aRowCommittedAfterTheSnapshotIsPassedOverWithoutWaitingForTheSessionHoldingIt()
+            throws Exception {
+        qualifiedTarget("swq_n1");
+        try (Connection committer = openSession(); Connection holder = openSession();
+                Connection actor = openSession()) {
+            execOn(actor, "BEGIN ISOLATION LEVEL REPEATABLE READ");
+            execOn(actor, "SELECT count(*) FROM swq_n1");
+            execOn(committer, "INSERT INTO swq_n1 VALUES (23,5)");
+            execOn(holder, "BEGIN");
+            execOn(holder, "DELETE FROM swq_n1 WHERE i = 23");
+            try {
+                // Row 23 is not in this transaction's snapshot, so its scan never reaches it and
+                // whatever becomes of the other session's delete is nothing to it. Both of these
+                // answer while that session is still holding the row, which is what says they
+                // never waited for it.
+                Future<String> pending = pool.submit(
+                        () -> answerOf(actor, "UPDATE swq_n1 SET v = 10 WHERE i = 23"));
+                assertEquals("[0 rows]", answerWithin(pending));
+
+                Future<String> alsoPending = pool.submit(
+                        () -> answerOf(actor, "DELETE FROM swq_n1 WHERE i = 23"));
+                assertEquals("[0 rows]", answerWithin(alsoPending));
+            } finally {
+                execOn(holder, "ROLLBACK");
+            }
+            execOn(actor, "COMMIT");
+        }
+        assertEquals("22|5,23|5", rows("SELECT i, v FROM swq_n1 ORDER BY i"));
+        exec("DROP TABLE swq_n1");
+    }
+
+    @Test
+    void theSameRowHeldByAnUpdateRatherThanADeleteIsPassedOverTheSameWay() throws Exception {
+        qualifiedTarget("swq_n2");
+        try (Connection committer = openSession(); Connection holder = openSession();
+                Connection actor = openSession()) {
+            execOn(actor, "BEGIN ISOLATION LEVEL REPEATABLE READ");
+            execOn(actor, "SELECT count(*) FROM swq_n2");
+            execOn(committer, "INSERT INTO swq_n2 VALUES (23,5)");
+            execOn(holder, "BEGIN");
+            execOn(holder, "UPDATE swq_n2 SET v = -1 WHERE i = 23");
+            try {
+                // It answers while the other session is still holding, so it never waited for it.
+                Future<String> pending = pool.submit(
+                        () -> answerOf(actor, "UPDATE swq_n2 SET v = 10 WHERE i = 23"));
+                assertEquals("[0 rows]", answerWithin(pending));
+            } finally {
+                execOn(holder, "ROLLBACK");
+            }
+            execOn(actor, "COMMIT");
+        }
+        exec("DROP TABLE swq_n2");
+    }
+
+    @Test
+    void readCommittedDoesReachThatRowAndWaitsForTheSessionHoldingIt() throws Exception {
+        qualifiedTarget("swq_n3");
+        try (Connection committer = openSession(); Connection holder = openSession();
+                Connection actor = openSession()) {
+            execOn(actor, "BEGIN");
+            execOn(actor, "SELECT count(*) FROM swq_n3");
+            execOn(committer, "INSERT INTO swq_n3 VALUES (23,5)");
+            execOn(holder, "BEGIN");
+            execOn(holder, "DELETE FROM swq_n3 WHERE i = 23");
+            Future<String> pending = pool.submit(
+                    () -> answerOf(actor, "UPDATE swq_n3 SET v = 10 WHERE i = 23"));
+            try {
+                Thread.sleep(BLOCKED_MS);
+                assertFalse(pending.isDone(), "answered without waiting for the row it writes");
+            } finally {
+                execOn(holder, "ROLLBACK");
+            }
+            assertEquals("[1 rows]", answerWithin(pending));
+            execOn(actor, "COMMIT");
+        }
+        assertEquals("22|5,23|10", rows("SELECT i, v FROM swq_n3 ORDER BY i"));
+        exec("DROP TABLE swq_n3");
+    }
+
+    @Test
+    void aWriteThatFixedItsOwnSnapshotIsRefusedTheRowAConcurrentDeleteTookAway()
+            throws Exception {
+        qualifiedTarget("swq_f1");
+        // Nothing ran in this transaction before the write, so the snapshot the write is judged
+        // against is the one the write itself fixed -- and it is judged against it all the same.
+        assertEquals(CONCURRENT_DELETE, underASnapshotTheWriteFixesItself(
+                "REPEATABLE READ", "DELETE FROM swq_f1 WHERE i = 22", "COMMIT",
+                "UPDATE swq_f1 SET v = 10 WHERE i = 22"));
+        assertEquals("", rows("SELECT i, v FROM swq_f1"));
+
+        exec("INSERT INTO swq_f1 VALUES (22,5)");
+        assertEquals(CONCURRENT_DELETE, underASnapshotTheWriteFixesItself(
+                "SERIALIZABLE", "DELETE FROM swq_f1 WHERE i = 22", "COMMIT",
+                "DELETE FROM swq_f1 WHERE i = 22"));
+
+        // And with the concurrent writer replacing the row rather than taking it away.
+        exec("INSERT INTO swq_f1 VALUES (22,5)");
+        assertEquals(CONCURRENT_UPDATE, underASnapshotTheWriteFixesItself(
+                "REPEATABLE READ", "UPDATE swq_f1 SET v = -1 WHERE i = 22", "COMMIT",
+                "UPDATE swq_f1 SET v = 9 WHERE i = 22 AND v > 0"));
+        assertEquals("22|-1", rows("SELECT i, v FROM swq_f1"));
+        exec("DROP TABLE swq_f1");
+    }
+
+    @Test
+    void aWriteThatFixedItsOwnSnapshotIsNotRefusedAtReadCommittedOrAfterARollback()
+            throws Exception {
+        qualifiedTarget("swq_f2");
+        assertEquals("[0 rows]", underASnapshotTheWriteFixesItself(
+                "READ COMMITTED", "DELETE FROM swq_f2 WHERE i = 22", "COMMIT",
+                "UPDATE swq_f2 SET v = 10 WHERE i = 22"));
+        assertEquals("", rows("SELECT i, v FROM swq_f2"));
+
+        exec("INSERT INTO swq_f2 VALUES (22,5)");
+        assertEquals("[1 rows]", underASnapshotTheWriteFixesItself(
+                "REPEATABLE READ", "DELETE FROM swq_f2 WHERE i = 22", "ROLLBACK",
+                "UPDATE swq_f2 SET v = 10 WHERE i = 22"));
+        assertEquals("22|10", rows("SELECT i, v FROM swq_f2"));
+        exec("DROP TABLE swq_f2");
+    }
+
+    // ------------------------------------------------------------ helpers for the raw protocol
+
+    /** A raw protocol session, opened and authenticated. */
+    private static RawWireClient rawSession() throws IOException {
+        RawWireClient c = new RawWireClient(memgres.getPort());
+        c.startup(memgres.getUser(), "memgres");
+        return c;
+    }
+
+    /** Parse, Bind, Describe Portal, Execute and Sync, pipelined in one batch. */
+    private static void askOverExtended(RawWireClient c, String sql) throws IOException {
+        c.write(RawWireClient.parse(sql));
+        c.write(RawWireClient.bind());
+        c.write(RawWireClient.describePortal());
+        c.write(RawWireClient.execute());
+        c.write(RawWireClient.sync());
+    }
+
+    /**
+     * Everything the server said, as one string. It ends in {@code <waiting>} once the server has
+     * fallen silent, so a message the client was never sent shows as a message that is not there
+     * and a message it was sent twice shows as one written twice.
+     */
+    private static String frames(RawWireClient c) {
+        return String.join(" ", c.readUntilQuiet());
+    }
+
+    /** The reply to one statement, read up to and including its ReadyForQuery. */
+    private static String readToReady(RawWireClient c) {
+        StringBuilder said = new StringBuilder();
+        try {
+            while (true) {
+                RawWireClient.Msg m = c.read();
+                if (said.length() > 0) said.append(' ');
+                if (m == null) {
+                    said.append("<closed>");
+                    break;
+                }
+                said.append(m);
+                if (m.type == 'Z') break;
+            }
+        } catch (IOException e) {
+            if (said.length() > 0) said.append(' ');
+            said.append("<waiting>");
+        }
+        return said.toString();
+    }
+
+    /** Run a statement on the raw session in simple query mode and read through its reply. */
+    private static void queryOn(RawWireClient c, String sql) throws IOException {
+        c.write(RawWireClient.query(sql));
+        readToReady(c);
+    }
+
+    /** How many times one string is written inside another. */
+    private static int occurrences(String said, String part) {
+        int seen = 0;
+        for (int at = said.indexOf(part); at >= 0; at = said.indexOf(part, at + part.length())) {
+            seen++;
+        }
+        return seen;
+    }
+
+    private static void lockedRow(String name) throws SQLException {
+        exec("CREATE TABLE " + name + " (i int PRIMARY KEY, s text)");
+        exec("INSERT INTO " + name + " VALUES (1,'a')");
+    }
+
+    private static void movingRow(String name) throws SQLException {
+        exec("CREATE TABLE " + name + " (i int, s text) PARTITION BY RANGE (i)");
+        exec("CREATE TABLE " + name + "a PARTITION OF " + name + " FOR VALUES FROM (0) TO (10)");
+        exec("CREATE TABLE " + name + "b PARTITION OF " + name + " FOR VALUES FROM (10) TO (20)");
+        exec("INSERT INTO " + name + " VALUES (2,'a')");
+    }
+
+    // ============================================================ the frames a refusal arrives in
+
+    @Test
+    void aForUpdateWhoseRowMovedToAnotherPartitionIsRefusedAfterItsRowDescription()
+            throws Exception {
+        movingRow("dpr_m1");
+        try (Connection writer = openSession(); RawWireClient c = rawSession()) {
+            execOn(writer, "BEGIN");
+            execOn(writer, "UPDATE dpr_m1 SET i = 12 WHERE i = 2");
+            askOverExtended(c, "SELECT * FROM dpr_m1 WHERE i = 2 FOR UPDATE");
+            Thread.sleep(BLOCKED_MS);
+            execOn(writer, "COMMIT");
+            // The portal's shape is settled without running the statement, so the row description
+            // stands in front of the refusal rather than being lost with it.
+            assertEquals("1 2 T E[40001] tuple to be locked was already moved to another partition"
+                    + " due to concurrent update Z[I] <waiting>", frames(c));
+        }
+        assertEquals("12|a", rows("SELECT i, s FROM dpr_m1"));
+        exec("DROP TABLE dpr_m1 CASCADE");
+    }
+
+    @Test
+    void theBlockARefusedLockStoodInIsLeftAbortedAtEveryIsolationLevel() throws Exception {
+        movingRow("dpr_m2");
+        String[][] levels = {
+            {"READ COMMITTED", "tuple to be locked was already moved to another partition"
+                    + " due to concurrent update"},
+            {"REPEATABLE READ", "could not serialize access due to concurrent update"},
+            {"SERIALIZABLE", "could not serialize access due to concurrent update"},
+        };
+        for (String[] level : levels) {
+            try (Connection writer = openSession(); RawWireClient c = rawSession()) {
+                queryOn(c, "BEGIN ISOLATION LEVEL " + level[0]);
+                queryOn(c, "SELECT count(*) FROM dpr_m2");
+                execOn(writer, "BEGIN");
+                execOn(writer, "UPDATE dpr_m2 SET i = 12 WHERE i = 2");
+                askOverExtended(c, "SELECT * FROM dpr_m2 WHERE i = 2 FOR UPDATE");
+                Thread.sleep(BLOCKED_MS);
+                execOn(writer, "COMMIT");
+                // The refusal ends the block the statement stood in, so the ReadyForQuery that
+                // follows says the block is aborted rather than open.
+                assertEquals("1 2 T E[40001] " + level[1] + " Z[E] <waiting>", frames(c),
+                        level[0]);
+                queryOn(c, "ROLLBACK");
+            }
+            exec("UPDATE dpr_m2 SET i = 2 WHERE i = 12");
+        }
+        assertEquals("2|a", rows("SELECT i, s FROM dpr_m2"));
+        exec("DROP TABLE dpr_m2 CASCADE");
+    }
+
+    @Test
+    void aLockTimeoutIsReportedAfterTheRowDescriptionAndNotBeforeIt() throws Exception {
+        lockedRow("dpr_l1");
+        try (Connection writer = openSession(); RawWireClient c = rawSession()) {
+            execOn(writer, "BEGIN");
+            execOn(writer, "UPDATE dpr_l1 SET s = 'x' WHERE i = 1");
+            queryOn(c, "SET lock_timeout = '400ms'");
+            askOverExtended(c, "SELECT * FROM dpr_l1 WHERE i = 1 FOR UPDATE");
+            assertEquals("1 2 T E[55P03] canceling statement due to lock timeout Z[I] <waiting>",
+                    frames(c));
+            execOn(writer, "ROLLBACK");
+        }
+        assertEquals("1|a", rows("SELECT i, s FROM dpr_l1"));
+        exec("DROP TABLE dpr_l1");
+    }
+
+    @Test
+    void aNowaitRefusalIsReportedAfterTheRowDescriptionToo() throws Exception {
+        lockedRow("dpr_l2");
+        try (Connection writer = openSession(); RawWireClient c = rawSession()) {
+            execOn(writer, "BEGIN");
+            execOn(writer, "UPDATE dpr_l2 SET s = 'y' WHERE i = 1");
+            askOverExtended(c, "SELECT * FROM dpr_l2 WHERE i = 1 FOR UPDATE NOWAIT");
+            assertEquals("1 2 T E[55P03] could not obtain lock on row in relation \"dpr_l2\""
+                    + " Z[I] <waiting>", frames(c));
+            execOn(writer, "ROLLBACK");
+        }
+        assertEquals("1|a", rows("SELECT i, s FROM dpr_l2"));
+        exec("DROP TABLE dpr_l2");
+    }
+
+    @Test
+    void describingAPortalUnderALockIsRefusedNothingBecauseItRunsNothing() throws Exception {
+        lockedRow("dpr_l3");
+        try (Connection writer = openSession(); RawWireClient c = rawSession()) {
+            execOn(writer, "BEGIN");
+            execOn(writer, "UPDATE dpr_l3 SET s = 'w' WHERE i = 1");
+            queryOn(c, "SET lock_timeout = '400ms'");
+            // A client that describes a portal and does not run it hears nothing of the lock: the
+            // shape of the answer is settled without the statement being carried out.
+            c.write(RawWireClient.parse("SELECT * FROM dpr_l3 WHERE i = 1 FOR UPDATE"));
+            c.write(RawWireClient.bind());
+            c.write(RawWireClient.describePortal());
+            c.write(RawWireClient.sync());
+            assertEquals("1 2 T Z[I] <waiting>", frames(c));
+            execOn(writer, "ROLLBACK");
+        }
+        assertEquals("1|a", rows("SELECT i, s FROM dpr_l3"));
+        exec("DROP TABLE dpr_l3");
+    }
+
+    @Test
+    void aMergeRefusedTheRowThatMovedSaysSoAfterTheShapeOfItsAnswer() throws Exception {
+        movingRow("dpr_m3");
+        try (Connection writer = openSession(); RawWireClient c = rawSession()) {
+            execOn(writer, "BEGIN");
+            execOn(writer, "UPDATE dpr_m3 SET i = 12 WHERE i = 2");
+            askOverExtended(c, "MERGE INTO dpr_m3 t USING (SELECT 2 AS i) u ON t.i = u.i"
+                    + " WHEN MATCHED THEN UPDATE SET s = 'm'");
+            Thread.sleep(BLOCKED_MS);
+            execOn(writer, "COMMIT");
+            // A MERGE answers no rows, so what stands in front of the refusal is NoData.
+            assertEquals("1 2 n E[40001] tuple to be locked was already moved to another partition"
+                    + " due to concurrent update Z[I] <waiting>", frames(c));
+        }
+        assertEquals("12|a", rows("SELECT i, s FROM dpr_m3"));
+        exec("DROP TABLE dpr_m3 CASCADE");
+    }
+
+    // ============================================================ a described statement runs once
+
+    @Test
+    void theStatementADescribedPortalStandsForIsCarriedOutExactlyOnce() throws Exception {
+        exec("CREATE TABLE dpr_o1 (i int PRIMARY KEY, s text)");
+        exec("CREATE SEQUENCE dpr_o1seq");
+        exec("INSERT INTO dpr_o1 VALUES (1,'a')");
+        try (RawWireClient c = rawSession()) {
+            // A write with nothing to return: one row written, and one CommandComplete for it.
+            askOverExtended(c, "INSERT INTO dpr_o1 VALUES (9,'z')");
+            assertEquals("1 2 n C[INSERT 0 1] Z[I] <waiting>", frames(c));
+            assertEquals("1|a,9|z", rows("SELECT i, s FROM dpr_o1 ORDER BY i"));
+
+            // A write whose effect would read differently had it been carried out twice.
+            askOverExtended(c, "UPDATE dpr_o1 SET s = s || '!' WHERE i = 1");
+            assertEquals("1 2 n C[UPDATE 1] Z[I] <waiting>", frames(c));
+            assertEquals("a!", scalar("SELECT s FROM dpr_o1 WHERE i = 1"));
+
+            // And a read that leaves a mark of its own behind.
+            askOverExtended(c, "SELECT nextval('dpr_o1seq')");
+            assertEquals("1 2 T D C[SELECT 1] Z[I] <waiting>", frames(c));
+            assertEquals(1, num("SELECT last_value FROM dpr_o1seq"));
+
+            askOverExtended(c, "DELETE FROM dpr_o1 WHERE i = 9 RETURNING i");
+            assertEquals("1 2 T D C[DELETE 1] Z[I] <waiting>", frames(c));
+            assertEquals("1|a!", rows("SELECT i, s FROM dpr_o1 ORDER BY i"));
+        }
+        exec("DROP TABLE dpr_o1");
+        exec("DROP SEQUENCE dpr_o1seq");
+    }
+
+    @Test
+    void aRefusalTheStatementRanIntoIsReportedOnceAndLeavesTheRelationAsItWas() throws Exception {
+        lockedRow("dpr_o2");
+        try (RawWireClient c = rawSession()) {
+            // The RETURNING list names a column the relation has not. Whether that is reported
+            // while the statement is read or while it is run is a difference of its own; what it
+            // may not be is reported twice, or swallowed and the write carried out anyway.
+            askOverExtended(c, "INSERT INTO dpr_o2 VALUES (9,'z') RETURNING nosuchcol");
+            String said = frames(c);
+            assertEquals(1, occurrences(said, "E[42703] column \"nosuchcol\" does not exist"),
+                    said);
+            assertTrue(said.endsWith("Z[I] <waiting>"), said);
+            assertEquals("1|a", rows("SELECT i, s FROM dpr_o2"));
+
+            // The same for a RETURNING expression that cannot be worked out.
+            askOverExtended(c, "INSERT INTO dpr_o2 VALUES (9,'z') RETURNING i / 0");
+            said = frames(c);
+            assertEquals(1, occurrences(said, "E[22012] division by zero"), said);
+            assertTrue(said.endsWith("Z[I] <waiting>"), said);
+            assertEquals("1|a", rows("SELECT i, s FROM dpr_o2"));
+        }
+        exec("DROP TABLE dpr_o2");
+    }
+
+    @Test
+    void aWriteRefusedForTheRowItWroteIsRefusedAfterTheShapeOfItsAnswer() throws Exception {
+        lockedRow("dpr_o3");
+        try (RawWireClient c = rawSession()) {
+            String duplicate = "E[23505] duplicate key value violates unique constraint"
+                    + " \"dpr_o3_pkey\"";
+            askOverExtended(c, "INSERT INTO dpr_o3 VALUES (1,'b')");
+            assertEquals("1 2 n " + duplicate + " Z[I] <waiting>", frames(c));
+            askOverExtended(c, "INSERT INTO dpr_o3 VALUES (1,'b') RETURNING i");
+            assertEquals("1 2 T " + duplicate + " Z[I] <waiting>", frames(c));
+            assertEquals("1|a", rows("SELECT i, s FROM dpr_o3"));
+        }
+        exec("DROP TABLE dpr_o3");
     }
 }

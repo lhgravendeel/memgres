@@ -645,6 +645,17 @@ public class RowContext {
     }
 
     /**
+     * The same, for a definition stored against one relation — a CHECK, a generation expression,
+     * an index predicate. PostgreSQL writes the suggestion qualified there too, with the name of
+     * the relation the definition belongs to, because that is the only relation in scope.
+     */
+    static String suggestClosestColumnOn(String typo, Table table) {
+        String name = table == null ? null : closestColumn(typo, table);
+        return name == null ? null : "Perhaps you meant to reference the column \""
+                + table.getName() + "." + name + "\".";
+    }
+
+    /**
      * The hint for a name no relation in scope answers to, naming every relation that has a near
      * miss and qualifying each with the name that relation is known by.
      *

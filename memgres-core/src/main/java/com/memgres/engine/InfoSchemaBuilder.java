@@ -768,7 +768,8 @@ public class InfoSchemaBuilder {
             String dataType;
             if (isArrayType) {
                 dataType = "ARRAY";
-            } else if (isUserTable && col.getCompositeTypeName() != null) {
+            } else if (isUserTable
+                    && (col.getCompositeTypeName() != null || col.getRangeTypeName() != null)) {
                 dataType = "USER-DEFINED";
             } else {
                 dataType = CatalogHelper.pgTypeName(dt);
@@ -802,6 +803,11 @@ public class InfoSchemaBuilder {
                     // H14: composite column — udt_name is the composite type name
                     udtSchema = TypeNamespace.schemaOfKey(col.getCompositeTypeName());
                     udtName = TypeNamespace.nameOfKey(col.getCompositeTypeName());
+                } else if (col.getRangeTypeName() != null) {
+                    // A range is a type of the reader's own, so the column is described by that
+                    // type's name and not by the text its values are carried as.
+                    udtSchema = TypeNamespace.schemaOfKey(col.getRangeTypeName());
+                    udtName = TypeNamespace.nameOfKey(col.getRangeTypeName());
                 }
                 // H14: DOMAIN columns keep the BASE type udt_name (e.g. int4);
                 // the domain identity is carried by the domain_* fields below.

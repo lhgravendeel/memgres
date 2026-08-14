@@ -81,6 +81,12 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
         QueryResult suspendedResult;
         int suspendedOffset;
         QueryResult describeResult;
+        /**
+         * What the run Describe made of this portal's statement was refused with. PostgreSQL runs
+         * a statement once, so that refusal is the portal's answer and Execute reports it; asking
+         * again put the statement to a question whose circumstances the first run had used up.
+         */
+        RuntimeException describeFailure;
         boolean rowDescriptionSent;
         boolean describeAttempted;
         /**
@@ -1119,6 +1125,9 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
             if (result.cachedResult() != null) {
                 portal.describeResult = result.cachedResult();
             }
+            if (result.failure() != null) {
+                portal.describeFailure = result.failure();
+            }
         }
     }
 
@@ -1304,6 +1313,22 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                 result = portal.describeResult;
                 portal.describeResult = null;
                 source = "cached";
+            } else if (portal.describeFailure != null) {
+                // The statement has already run, and that run refused it. PostgreSQL runs it once
+                // and reports the refusal here, so this is where it is reported: running it over
+                // asked a question whose circumstances had moved on, and a statement that had lost
+                // a race with another session won the re-run and answered as though it had never
+                // been refused at all.
+                RuntimeException refused = portal.describeFailure;
+                portal.describeFailure = null;
+                // A refused statement leaves a block fit for nothing but its own end. That was
+                // undone after the describing run so the statement's shape could still be worked
+                // out, and it takes effect here, where the refusal is reported.
+                if (session != null
+                        && session.getStatus() == Session.TransactionStatus.IN_TRANSACTION) {
+                    session.restoreStatus(Session.TransactionStatus.FAILED);
+                }
+                throw refused;
             } else {
                 source = "fresh";
                 String[] stmts = commandsIn(portal.sql());
@@ -1775,6 +1800,20 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
 
     /** Send an error with full diagnostic fields from a MemgresException. */
     static void sendErrorWithDetails(ChannelHandlerContext ctx, MemgresException ex, boolean isExtended) {
+        sendErrorWithDetails(ctx, ex, isExtended, null);
+    }
+
+    /**
+     * The same, and with it what the server was doing when it raised: the field a client prints
+     * as CONTEXT.
+     *
+     * <p>PostgreSQL sends it whenever the error came out of something reading on the client's
+     * behalf rather than out of the statement text, which is what a COPY is: the relation, the
+     * line of the input reached and the line itself are the only way a sender of thousands of
+     * lines can tell which one the server would not take.
+     */
+    static void sendErrorWithDetails(ChannelHandlerContext ctx, MemgresException ex,
+                                     boolean isExtended, String context) {
         ByteBuf buf = ctx.alloc().buffer();
         buf.writeByte('E');
         int lengthIdx = buf.writerIndex();
@@ -1798,6 +1837,14 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
         if (ex.getPosition() > 0) {
             buf.writeByte('P');
             PgWireValueFormatter.writeCString(buf, String.valueOf(ex.getPosition()));
+        }
+        // Where the caller named no context of its own, the error's stands: PostgreSQL reports
+        // the frames of whatever was running on the statement's behalf -- a PL/pgSQL function, a
+        // trigger -- whether or not a COPY was reading when it raised.
+        String where = context != null ? context : ex.getPgContext();
+        if (where != null) {
+            buf.writeByte('W');
+            PgWireValueFormatter.writeCString(buf, where);
         }
         if (ex.getSchema() != null) {
             buf.writeByte('s');

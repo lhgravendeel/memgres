@@ -4381,6 +4381,1807 @@ class CatalogueTextAndRuleLifecycleTest {
         exec("DROP TABLE public.sdr_td CASCADE");
     }
 
+    // ------------------------------------------------------------ what a rule says it does
+
+    /**
+     * A DELETE action is deparsed from the tree it was analysed into: the schema comes off
+     * wherever the reader's search path reaches the relation, and a column written bare comes
+     * back under the relation it was resolved to, because the action's range table holds OLD and
+     * NEW beside that relation.
+     */
+    @Test
+    void aDeleteActionIsDeparsedRatherThanEchoed() throws Exception {
+        exec("CREATE TABLE ctr_k (i int, j int, s text)");
+        exec("CREATE TABLE ctr_d (i int, j int, s text)");
+
+        exec("CREATE RULE ctr_r1 AS ON DELETE TO ctr_k DO ALSO"
+                + " DELETE FROM public.ctr_d WHERE i = old.i");
+        assertEquals("CREATE RULE ctr_r1 AS\n"
+                        + "    ON DELETE TO public.ctr_k DO  DELETE FROM ctr_d\n"
+                        + "  WHERE (ctr_d.i = old.i);",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctr_r1'"));
+
+        // ONLY is kept; an alias is kept and the AS that introduced it is not.
+        exec("CREATE RULE ctr_r2 AS ON DELETE TO ctr_k DO ALSO"
+                + " DELETE FROM ONLY ctr_d AS z WHERE z.i = old.i");
+        assertEquals("CREATE RULE ctr_r2 AS\n"
+                        + "    ON DELETE TO public.ctr_k DO  DELETE FROM ONLY ctr_d z\n"
+                        + "  WHERE (z.i = old.i);",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctr_r2'"));
+
+        // An action with no qualification has no line after the relation.
+        exec("CREATE RULE ctr_r3 AS ON DELETE TO ctr_k DO ALSO DELETE FROM ctr_d");
+        assertEquals("CREATE RULE ctr_r3 AS\n"
+                        + "    ON DELETE TO public.ctr_k DO  DELETE FROM ctr_d;",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctr_r3'"));
+
+        // IN becomes = ANY (ARRAY[...]), as everywhere else the analysed tree is printed.
+        exec("CREATE RULE ctr_r4 AS ON DELETE TO ctr_k DO ALSO"
+                + " DELETE FROM ctr_d WHERE i IN (1,2) AND s IS NULL");
+        assertEquals("CREATE RULE ctr_r4 AS\n"
+                        + "    ON DELETE TO public.ctr_k DO  DELETE FROM ctr_d\n"
+                        + "  WHERE ((ctr_d.i = ANY (ARRAY[1, 2])) AND (ctr_d.s IS NULL));",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctr_r4'"));
+
+        // pg_get_ruledef reads the same text pg_rules does.
+        assertEquals(scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctr_r1'"),
+                scalar("SELECT pg_get_ruledef(oid) FROM pg_rewrite WHERE rulename = 'ctr_r1'"));
+
+        exec("DROP TABLE ctr_k CASCADE");
+        exec("DROP TABLE ctr_d CASCADE");
+    }
+
+    @Test
+    void anUpdateActionIsDeparsedRatherThanEchoed() throws Exception {
+        exec("CREATE TABLE ctr_uk (i int, j int, s text)");
+        exec("CREATE TABLE ctr_ud (i int, j int, s text)");
+
+        // The assignments stand on one line, each value printed in the type its column read it
+        // as; the qualification begins a line of its own.
+        exec("CREATE RULE ctr_u1 AS ON UPDATE TO ctr_uk DO ALSO"
+                + " UPDATE ctr_ud SET j = new.j, s = 'x' WHERE i = old.i AND s <> 'q'");
+        assertEquals("CREATE RULE ctr_u1 AS\n"
+                        + "    ON UPDATE TO public.ctr_uk DO  UPDATE ctr_ud"
+                        + " SET j = new.j, s = 'x'::text\n"
+                        + "  WHERE ((ctr_ud.i = old.i) AND (ctr_ud.s <> 'q'::text));",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctr_u1'"));
+
+        // An assignment reading the column it sets reads it under the relation's name.
+        exec("CREATE RULE ctr_u2 AS ON UPDATE TO ctr_uk DO ALSO UPDATE ctr_ud SET j = j + 1");
+        assertEquals("CREATE RULE ctr_u2 AS\n"
+                        + "    ON UPDATE TO public.ctr_uk DO  UPDATE ctr_ud SET j = (ctr_ud.j + 1);",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctr_u2'"));
+
+        // A call in an assignment reads its argument under the relation's name too.
+        exec("CREATE RULE ctr_u3 AS ON UPDATE TO ctr_uk DO ALSO"
+                + " UPDATE ctr_ud SET s = upper(s) WHERE i = old.i");
+        assertEquals("CREATE RULE ctr_u3 AS\n"
+                        + "    ON UPDATE TO public.ctr_uk DO  UPDATE ctr_ud SET s = upper(ctr_ud.s)\n"
+                        + "  WHERE (ctr_ud.i = old.i);",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctr_u3'"));
+
+        // DEFAULT stands as the word it is.
+        exec("CREATE RULE ctr_u4 AS ON UPDATE TO ctr_uk DO ALSO"
+                + " UPDATE ctr_ud SET j = DEFAULT WHERE i = old.i");
+        assertEquals("CREATE RULE ctr_u4 AS\n"
+                        + "    ON UPDATE TO public.ctr_uk DO  UPDATE ctr_ud SET j = DEFAULT\n"
+                        + "  WHERE (ctr_ud.i = old.i);",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctr_u4'"));
+
+        // A row the event has is read under its own name wherever an assignment puts it.
+        exec("CREATE RULE ctr_u5 AS ON DELETE TO ctr_uk DO ALSO"
+                + " UPDATE ctr_ud SET s = old.s, j = old.j WHERE i = old.i");
+        assertEquals("CREATE RULE ctr_u5 AS\n"
+                        + "    ON DELETE TO public.ctr_uk DO  UPDATE ctr_ud"
+                        + " SET s = old.s, j = old.j\n"
+                        + "  WHERE (ctr_ud.i = old.i);",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctr_u5'"));
+
+        exec("DROP TABLE ctr_uk CASCADE");
+        exec("DROP TABLE ctr_ud CASCADE");
+    }
+
+    @Test
+    void anActionInASchemaTheReaderDoesNotReachKeepsItsQualifier() throws Exception {
+        exec("CREATE SCHEMA ctr_sc");
+        exec("CREATE TABLE ctr_sc.ctr_c (i int, j int)");
+        exec("CREATE TABLE ctr_sk (i int, j int)");
+
+        // The relation the action resolved to is what is recorded, so a schema the reader's
+        // search path does not reach stays in front of it -- and the columns are still written
+        // under the relation's bare name.
+        exec("CREATE RULE ctr_s1 AS ON DELETE TO ctr_sk DO ALSO"
+                + " DELETE FROM ctr_sc.ctr_c WHERE i = old.i");
+        assertEquals("CREATE RULE ctr_s1 AS\n"
+                        + "    ON DELETE TO public.ctr_sk DO  DELETE FROM ctr_sc.ctr_c\n"
+                        + "  WHERE (ctr_c.i = old.i);",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctr_s1'"));
+
+        // The relation the rule is on is qualified by the same rule, and pg_rules reports the
+        // schema holding it.
+        exec("CREATE RULE ctr_s2 AS ON DELETE TO ctr_sc.ctr_c DO ALSO"
+                + " DELETE FROM public.ctr_sk WHERE i = old.i");
+        assertEquals("ctr_sc|ctr_c|CREATE RULE ctr_s2 AS\n"
+                        + "    ON DELETE TO ctr_sc.ctr_c DO  DELETE FROM ctr_sk\n"
+                        + "  WHERE (ctr_sk.i = old.i);",
+                scalar("SELECT schemaname || '|' || tablename || '|' || definition"
+                        + " FROM pg_rules WHERE rulename = 'ctr_s2'"));
+
+        exec("DROP TABLE ctr_sk CASCADE");
+        exec("DROP TABLE ctr_sc.ctr_c CASCADE");
+        exec("DROP SCHEMA ctr_sc");
+    }
+
+    @Test
+    void nothingIsWrittenWithoutTheSpaceAStatementBringsWithIt() throws Exception {
+        exec("CREATE TABLE ctr_nk (i int, j int, s text)");
+
+        // NOTHING is not a statement, so it does not carry the leading space a deparsed
+        // statement does: DO NOTHING, where an action gives DO  DELETE FROM.
+        exec("CREATE RULE ctr_n1 AS ON DELETE TO ctr_nk DO ALSO NOTHING");
+        assertEquals("CREATE RULE ctr_n1 AS\n    ON DELETE TO public.ctr_nk DO NOTHING;",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctr_n1'"));
+
+        exec("CREATE RULE ctr_n2 AS ON UPDATE TO ctr_nk DO INSTEAD NOTHING");
+        assertEquals("CREATE RULE ctr_n2 AS\n    ON UPDATE TO public.ctr_nk DO INSTEAD NOTHING;",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctr_n2'"));
+
+        exec("DROP TABLE ctr_nk CASCADE");
+    }
+
+    /**
+     * A rule's own qualification begins a line of its own and is resolved against the rows the
+     * event has: an INSERT has only the new row, a DELETE only the old one, and an UPDATE both.
+     */
+    @Test
+    void aRuleQualificationReadsTheRowsItsEventHas() throws Exception {
+        exec("CREATE TABLE ctr_qk (i int, j int, s text)");
+
+        exec("CREATE RULE ctr_q1 AS ON INSERT TO ctr_qk WHERE i > 5 DO ALSO NOTHING");
+        assertEquals("CREATE RULE ctr_q1 AS\n    ON INSERT TO public.ctr_qk\n"
+                        + "   WHERE (new.i > 5) DO NOTHING;",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctr_q1'"));
+
+        exec("CREATE RULE ctr_q2 AS ON DELETE TO ctr_qk WHERE s = 'p' DO ALSO NOTHING");
+        assertEquals("CREATE RULE ctr_q2 AS\n    ON DELETE TO public.ctr_qk\n"
+                        + "   WHERE (old.s = 'p'::text) DO NOTHING;",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctr_q2'"));
+
+        exec("CREATE RULE ctr_q3 AS ON UPDATE TO ctr_qk WHERE new.i > old.i DO ALSO NOTHING");
+        assertEquals("CREATE RULE ctr_q3 AS\n    ON UPDATE TO public.ctr_qk\n"
+                        + "   WHERE (new.i > old.i) DO NOTHING;",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctr_q3'"));
+
+        // BETWEEN is written as the pair of comparisons it stands for, here too.
+        exec("CREATE RULE ctr_q4 AS ON INSERT TO ctr_qk"
+                + " WHERE new.s IS NOT NULL AND new.j BETWEEN 1 AND 3 DO INSTEAD NOTHING");
+        assertEquals("CREATE RULE ctr_q4 AS\n    ON INSERT TO public.ctr_qk\n"
+                        + "   WHERE ((new.s IS NOT NULL) AND ((new.j >= 1) AND (new.j <= 3)))"
+                        + " DO INSTEAD NOTHING;",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctr_q4'"));
+
+        exec("DROP TABLE ctr_qk CASCADE");
+    }
+
+    @Test
+    void severalActionsAreParenthesisedAndEachClosedByItsOwnSemicolon() throws Exception {
+        exec("CREATE TABLE ctr_mk (i int, j int)");
+        exec("CREATE TABLE ctr_md (i int, j int)");
+
+        exec("CREATE RULE ctr_m1 AS ON DELETE TO ctr_mk DO ALSO ("
+                + "DELETE FROM ctr_md WHERE i = old.i;"
+                + " UPDATE ctr_md SET j = 0 WHERE i = old.i)");
+        assertEquals("CREATE RULE ctr_m1 AS\n"
+                        + "    ON DELETE TO public.ctr_mk DO ( DELETE FROM ctr_md\n"
+                        + "  WHERE (ctr_md.i = old.i);\n"
+                        + " UPDATE ctr_md SET j = 0\n"
+                        + "  WHERE (ctr_md.i = old.i);\n"
+                        + ");",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctr_m1'"));
+
+        exec("DROP TABLE ctr_mk CASCADE");
+        exec("DROP TABLE ctr_md CASCADE");
+    }
+
+    @Test
+    void aReturningListBeginsALineAndWritesEachItemOnOneOfItsOwn() throws Exception {
+        exec("CREATE TABLE ctr_gk (i int, j int, s text)");
+        exec("CREATE TABLE ctr_gd (i int, j int, s text)");
+        exec("CREATE VIEW ctr_gv AS SELECT i, j, s FROM ctr_gk");
+
+        exec("CREATE RULE ctr_g1 AS ON DELETE TO ctr_gv DO INSTEAD"
+                + " DELETE FROM ctr_gd WHERE i = old.i RETURNING i, j, s");
+        assertEquals("CREATE RULE ctr_g1 AS\n"
+                        + "    ON DELETE TO public.ctr_gv DO INSTEAD  DELETE FROM ctr_gd\n"
+                        + "  WHERE (ctr_gd.i = old.i)\n"
+                        + "  RETURNING ctr_gd.i,\n"
+                        + "    ctr_gd.j,\n"
+                        + "    ctr_gd.s;",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctr_g1'"));
+
+        // A star is not kept as a star: what was analysed is the list of columns it stood for,
+        // and that is the list read back.
+        exec("CREATE RULE ctr_g2 AS ON UPDATE TO ctr_gv DO INSTEAD"
+                + " UPDATE ctr_gd SET j = new.j WHERE i = old.i RETURNING *");
+        assertEquals("CREATE RULE ctr_g2 AS\n"
+                        + "    ON UPDATE TO public.ctr_gv DO INSTEAD  UPDATE ctr_gd SET j = new.j\n"
+                        + "  WHERE (ctr_gd.i = old.i)\n"
+                        + "  RETURNING ctr_gd.i,\n"
+                        + "    ctr_gd.j,\n"
+                        + "    ctr_gd.s;",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctr_g2'"));
+
+        // An INSERT action's returning list is written the same way, and a label the item
+        // already answers to is not written out again.
+        exec("CREATE RULE ctr_g3 AS ON INSERT TO ctr_gv DO INSTEAD"
+                + " INSERT INTO ctr_gd VALUES (new.i, new.j, new.s) RETURNING i, j AS jj, s");
+        assertEquals("CREATE RULE ctr_g3 AS\n"
+                        + "    ON INSERT TO public.ctr_gv DO INSTEAD  INSERT INTO ctr_gd (i, j, s)\n"
+                        + "  VALUES (new.i, new.j, new.s)\n"
+                        + "  RETURNING ctr_gd.i,\n"
+                        + "    ctr_gd.j AS jj,\n"
+                        + "    ctr_gd.s;",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctr_g3'"));
+
+        // A returning list is only allowed where the rewrite can hand it back. PostgreSQL sends
+        // no DETAIL and no HINT with that refusal.
+        assertEquals("0A000", stateOf("CREATE RULE ctr_g4 AS ON DELETE TO ctr_gk DO ALSO"
+                + " DELETE FROM ctr_gd WHERE i = old.i RETURNING i"));
+        assertEquals("RETURNING lists are not supported in non-INSTEAD rules",
+                messageOf("CREATE RULE ctr_g4 AS ON DELETE TO ctr_gk DO ALSO"
+                        + " DELETE FROM ctr_gd WHERE i = old.i RETURNING i"));
+        assertNull(hintOf("CREATE RULE ctr_g4 AS ON DELETE TO ctr_gk DO ALSO"
+                + " DELETE FROM ctr_gd WHERE i = old.i RETURNING i"));
+        // The same action without the list, and the same list under DO INSTEAD on the view, are
+        // both still taken: what is refused is the pair.
+        exec("CREATE RULE ctr_g5 AS ON DELETE TO ctr_gk DO ALSO"
+                + " DELETE FROM ctr_gd WHERE i = old.i");
+        assertEquals("CREATE RULE ctr_g5 AS\n"
+                        + "    ON DELETE TO public.ctr_gk DO  DELETE FROM ctr_gd\n"
+                        + "  WHERE (ctr_gd.i = old.i);",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctr_g5'"));
+
+        exec("DROP VIEW ctr_gv");
+        exec("DROP TABLE ctr_gk CASCADE");
+        exec("DROP TABLE ctr_gd CASCADE");
+    }
+
+    /**
+     * A view's own ON SELECT rule is that view's query, deparsed the same way an action is. It is
+     * reached through pg_rewrite, because pg_rules leaves _RETURN out.
+     */
+    @Test
+    void aViewsOwnSelectRuleIsThatViewsQueryAndPgRulesLeavesItOut() throws Exception {
+        exec("CREATE TABLE ctr_vk (i int, j int, s text)");
+        exec("CREATE VIEW ctr_vv AS SELECT i, s FROM ctr_vk WHERE j > 1 ORDER BY i");
+
+        assertEquals("CREATE RULE \"_RETURN\" AS\n"
+                        + "    ON SELECT TO public.ctr_vv DO INSTEAD  SELECT i,\n"
+                        + "    s\n"
+                        + "   FROM ctr_vk\n"
+                        + "  WHERE (j > 1)\n"
+                        + "  ORDER BY i;",
+                scalar("SELECT pg_get_ruledef(oid) FROM pg_rewrite"
+                        + " WHERE rulename = '_RETURN' AND ev_class = 'ctr_vv'::regclass"));
+        assertEquals(0, num("SELECT count(*) FROM pg_rules WHERE rulename = '_RETURN'"));
+        assertEquals(0, num("SELECT count(*) FROM pg_rules WHERE tablename = 'ctr_vv'"));
+
+        exec("DROP VIEW ctr_vv");
+        exec("DROP TABLE ctr_vk CASCADE");
+    }
+
+    // ------------------------------------------------------------ what relation a policy is put on
+
+    /**
+     * A qualifier in front of the relation names the schema that holds it. Reading the whole name
+     * as one left the statement looking for a relation called after the schema, and the relation
+     * that was named was never reached.
+     */
+    @Test
+    void aPolicyIsPutOnASchemaQualifiedRelation() throws Exception {
+        exec("CREATE TABLE ctp_t (i int, j int)");
+
+        exec("CREATE POLICY ctp_p ON public.ctp_t USING (true)");
+        assertEquals("public|ctp_t|ctp_p|PERMISSIVE|{public}|ALL|true|null",
+                scalar("SELECT schemaname || '|' || tablename || '|' || policyname || '|'"
+                        + " || permissive || '|' || roles::text || '|' || cmd || '|' || qual"
+                        + " || '|' || coalesce(with_check, 'null')"
+                        + " FROM pg_policies WHERE policyname = 'ctp_p'"));
+
+        exec("ALTER POLICY ctp_p ON public.ctp_t USING (i > 1)");
+        assertEquals("(i > 1)",
+                scalar("SELECT qual FROM pg_policies WHERE policyname = 'ctp_p'"));
+
+        exec("DROP POLICY ctp_p ON public.ctp_t");
+        assertEquals(0, num("SELECT count(*) FROM pg_policies WHERE tablename = 'ctp_t'"));
+
+        exec("DROP TABLE ctp_t");
+    }
+
+    /**
+     * pg_policies reports the schema the relation is in, because a policy belongs to the relation
+     * rather than to its name -- so a relation the search path does not reach is reported under
+     * the schema that was written to reach it.
+     */
+    @Test
+    void aPolicyReachesARelationTheSearchPathDoesNot() throws Exception {
+        exec("CREATE SCHEMA ctp_s");
+        exec("CREATE TABLE ctp_s.ctp_u (i int, j int)");
+
+        exec("CREATE POLICY ctp_q ON ctp_s.ctp_u FOR SELECT USING (i > 0)");
+        assertEquals("ctp_s|ctp_u|ctp_q|SELECT|(i > 0)",
+                scalar("SELECT schemaname || '|' || tablename || '|' || policyname || '|'"
+                        + " || cmd || '|' || qual FROM pg_policies WHERE policyname = 'ctp_q'"));
+
+        exec("ALTER POLICY ctp_q ON ctp_s.ctp_u RENAME TO ctp_q2");
+        assertEquals("ctp_s|ctp_u|ctp_q2",
+                scalar("SELECT schemaname || '|' || tablename || '|' || policyname"
+                        + " FROM pg_policies WHERE policyname LIKE 'ctp_q%'"));
+
+        exec("DROP POLICY ctp_q2 ON ctp_s.ctp_u");
+        assertEquals(0, num("SELECT count(*) FROM pg_policies WHERE schemaname = 'ctp_s'"));
+
+        // An INSERT policy has a WITH CHECK and no USING, and the qualifier reaches it too.
+        exec("CREATE POLICY ctp_r ON ctp_s.ctp_u FOR INSERT WITH CHECK (j > 2)");
+        assertEquals("ctp_s|ctp_u|INSERT|null|(j > 2)",
+                scalar("SELECT schemaname || '|' || tablename || '|' || cmd || '|'"
+                        + " || coalesce(qual, 'null') || '|' || with_check"
+                        + " FROM pg_policies WHERE policyname = 'ctp_r'"));
+        exec("DROP POLICY ctp_r ON ctp_s.ctp_u");
+
+        // A quoted qualifier names the same schema an unquoted one does, and RESTRICTIVE, the
+        // command and both expressions are kept beside it.
+        exec("CREATE POLICY ctp_rr ON \"ctp_s\".\"ctp_u\" AS RESTRICTIVE"
+                + " FOR UPDATE TO PUBLIC USING (i > 1) WITH CHECK (i > 2)");
+        assertEquals("ctp_s|ctp_u|RESTRICTIVE|{public}|UPDATE|(i > 1)|(i > 2)",
+                scalar("SELECT schemaname || '|' || tablename || '|' || permissive || '|'"
+                        + " || roles::text || '|' || cmd || '|' || qual || '|' || with_check"
+                        + " FROM pg_policies WHERE policyname = 'ctp_rr'"));
+        exec("ALTER POLICY ctp_rr ON ctp_s.ctp_u USING (i > 5) WITH CHECK (i > 6)");
+        assertEquals("ctp_s|(i > 5)|(i > 6)",
+                scalar("SELECT schemaname || '|' || qual || '|' || with_check"
+                        + " FROM pg_policies WHERE policyname = 'ctp_rr'"));
+
+        // IF EXISTS reaches the qualified relation the way the plain form does.
+        exec("DROP POLICY IF EXISTS ctp_rr ON ctp_s.ctp_u");
+        assertEquals(0, num("SELECT count(*) FROM pg_policies WHERE schemaname = 'ctp_s'"));
+
+        exec("DROP TABLE ctp_s.ctp_u");
+        exec("DROP SCHEMA ctp_s");
+    }
+
+    /**
+     * A policy written without a qualifier goes on the relation the search path reaches, so two
+     * relations of one name in two schemas keep their own policies.
+     */
+    @Test
+    void twoRelationsOfOneNameInTwoSchemasKeepTheirOwnPolicies() throws Exception {
+        exec("CREATE SCHEMA ctp_n");
+        exec("CREATE TABLE ctp_n.ctp_a (i int, j int)");
+        exec("CREATE TABLE public.ctp_a (i int, j int)");
+
+        exec("CREATE POLICY ctp_pa ON ctp_a USING (i > 0)");
+        assertEquals("public|ctp_a|(i > 0)",
+                scalar("SELECT schemaname || '|' || tablename || '|' || qual"
+                        + " FROM pg_policies WHERE policyname = 'ctp_pa'"));
+
+        exec("CREATE POLICY ctp_pb ON ctp_n.ctp_a USING (j > 0)");
+        assertEquals("ctp_n|ctp_a|(j > 0)",
+                scalar("SELECT schemaname || '|' || tablename || '|' || qual"
+                        + " FROM pg_policies WHERE policyname = 'ctp_pb'"));
+
+        assertEquals(1, num("SELECT count(*) FROM pg_policies"
+                + " WHERE schemaname = 'public' AND tablename = 'ctp_a'"));
+        assertEquals(1, num("SELECT count(*) FROM pg_policies"
+                + " WHERE schemaname = 'ctp_n' AND tablename = 'ctp_a'"));
+
+        // Each drop reaches only the relation its own qualifier names.
+        exec("DROP POLICY ctp_pb ON ctp_n.ctp_a");
+        assertEquals("ctp_pa", scalar("SELECT policyname FROM pg_policies"
+                + " WHERE tablename = 'ctp_a'"));
+        exec("DROP POLICY ctp_pa ON public.ctp_a");
+
+        exec("DROP TABLE ctp_n.ctp_a");
+        exec("DROP TABLE public.ctp_a");
+        exec("DROP SCHEMA ctp_n");
+    }
+
+    @Test
+    void whatAQualifiedPolicyRelationIsRefusedFor() throws Exception {
+        exec("CREATE SCHEMA ctp_es");
+        exec("CREATE TABLE ctp_es.ctp_eu (i int)");
+        exec("CREATE VIEW ctp_es.ctp_ew AS SELECT 1 AS i");
+
+        // A qualifier naming no schema is a missing schema, not a missing relation.
+        assertEquals("3F000",
+                stateOf("CREATE POLICY ctp_z ON ctp_nosuch.ctp_eu USING (true)"));
+        assertEquals("schema \"ctp_nosuch\" does not exist",
+                messageOf("CREATE POLICY ctp_z ON ctp_nosuch.ctp_eu USING (true)"));
+        assertNull(hintOf("CREATE POLICY ctp_z ON ctp_nosuch.ctp_eu USING (true)"));
+
+        // A relation the named schema does not hold is reported under the whole name.
+        assertEquals("42P01",
+                stateOf("CREATE POLICY ctp_z ON ctp_es.ctp_nope USING (true)"));
+        assertEquals("relation \"ctp_es.ctp_nope\" does not exist",
+                messageOf("CREATE POLICY ctp_z ON ctp_es.ctp_nope USING (true)"));
+
+        // A view carries no row security, and it is named without its schema there.
+        assertEquals("42809", stateOf("CREATE POLICY ctp_z ON ctp_es.ctp_ew USING (true)"));
+        assertEquals("\"ctp_ew\" is not a table",
+                messageOf("CREATE POLICY ctp_z ON ctp_es.ctp_ew USING (true)"));
+
+        // ALTER and DROP name the relation without its schema when the policy is missing, and
+        // report the schema and the relation the way CREATE does when those are what is missing.
+        assertEquals("42704", stateOf("ALTER POLICY ctp_z ON ctp_es.ctp_eu USING (true)"));
+        assertEquals("policy \"ctp_z\" for table \"ctp_eu\" does not exist",
+                messageOf("ALTER POLICY ctp_z ON ctp_es.ctp_eu USING (true)"));
+        assertEquals("42704", stateOf("DROP POLICY ctp_z ON ctp_es.ctp_eu"));
+        assertEquals("policy \"ctp_z\" for table \"ctp_eu\" does not exist",
+                messageOf("DROP POLICY ctp_z ON ctp_es.ctp_eu"));
+        assertEquals("3F000", stateOf("ALTER POLICY ctp_z ON ctp_nosuch.ctp_eu USING (true)"));
+        assertEquals("schema \"ctp_nosuch\" does not exist",
+                messageOf("ALTER POLICY ctp_z ON ctp_nosuch.ctp_eu USING (true)"));
+        assertEquals("42P01", stateOf("ALTER POLICY ctp_z ON ctp_es.ctp_nope USING (true)"));
+        assertEquals("relation \"ctp_es.ctp_nope\" does not exist",
+                messageOf("ALTER POLICY ctp_z ON ctp_es.ctp_nope USING (true)"));
+        assertEquals("42P01", stateOf("DROP POLICY ctp_z ON ctp_es.ctp_nope"));
+        assertEquals("relation \"ctp_es.ctp_nope\" does not exist",
+                messageOf("DROP POLICY ctp_z ON ctp_es.ctp_nope"));
+
+        // A name already taken on that relation is refused under the relation's bare name.
+        exec("CREATE POLICY ctp_a1 ON ctp_es.ctp_eu USING (i > 7)");
+        exec("CREATE POLICY ctp_a2 ON ctp_es.ctp_eu USING (i > 8)");
+        assertEquals("42710", stateOf("ALTER POLICY ctp_a1 ON ctp_es.ctp_eu RENAME TO ctp_a2"));
+        assertEquals("policy \"ctp_a2\" for table \"ctp_eu\" already exists",
+                messageOf("ALTER POLICY ctp_a1 ON ctp_es.ctp_eu RENAME TO ctp_a2"));
+
+        // IF EXISTS is silent for a policy that is not there and for a schema that is not, and
+        // the plain form still raises for the schema.
+        exec("DROP POLICY IF EXISTS ctp_z ON ctp_es.ctp_eu");
+        exec("DROP POLICY IF EXISTS ctp_z ON ctp_nosuch.ctp_eu");
+        assertEquals("3F000", stateOf("DROP POLICY ctp_z ON ctp_nosuch.ctp_eu"));
+
+        // What was refused took nothing with it: both policies still stand and the qualified
+        // relation still takes a new one.
+        assertEquals(2, num("SELECT count(*) FROM pg_policies WHERE schemaname = 'ctp_es'"));
+        exec("CREATE POLICY ctp_a3 ON ctp_es.ctp_eu FOR SELECT USING (i > 9)");
+        assertEquals("ctp_es|ctp_eu|SELECT|(i > 9)",
+                scalar("SELECT schemaname || '|' || tablename || '|' || cmd || '|' || qual"
+                        + " FROM pg_policies WHERE policyname = 'ctp_a3'"));
+
+        exec("DROP POLICY ctp_a1 ON ctp_es.ctp_eu");
+        exec("DROP POLICY ctp_a2 ON ctp_es.ctp_eu");
+        exec("DROP POLICY ctp_a3 ON ctp_es.ctp_eu");
+        exec("DROP VIEW ctp_es.ctp_ew");
+        exec("DROP TABLE ctp_es.ctp_eu");
+        exec("DROP SCHEMA ctp_es");
+    }
+
+    // ------------------------------------------------------------ a query inside an action is deparsed too
+
+    /**
+     * An action that only reads is laid out exactly as a stored query is: the select list one item
+     * to a line, every clause keyword starting a line of its own, and every column written under
+     * the relation it resolved to -- because the range table an action is analysed against holds
+     * OLD and NEW beside whatever the action reads, so no column of an action is ever left bare.
+     */
+    @Test
+    void anActionThatOnlyReadsIsWrittenOutTheWayAStoredQueryIs() throws Exception {
+        exec("CREATE TABLE ctrqry_k (i int, j int, s text)");
+        exec("CREATE TABLE ctrqry_d (i int, j int, s text)");
+        exec("CREATE TABLE ctrqry_t (i int, s text, n numeric)");
+
+        exec("CREATE RULE ctrqry_r01 AS ON UPDATE TO ctrqry_t DO ALSO"
+                + " SELECT i, s FROM ctrqry_t WHERE i = old.i ORDER BY i");
+        assertEquals("CREATE RULE ctrqry_r01 AS\n"
+                        + "    ON UPDATE TO public.ctrqry_t DO  SELECT ctrqry_t.i,\n"
+                        + "    ctrqry_t.s\n"
+                        + "   FROM ctrqry_t\n"
+                        + "  WHERE (ctrqry_t.i = old.i)\n"
+                        + "  ORDER BY ctrqry_t.i;",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctrqry_r01'"));
+
+        // A constant with no name of its own is published under the placeholder, because a reader
+        // of an action that stands on its own does see the names its columns answer to.
+        exec("CREATE RULE ctrqry_r04 AS ON UPDATE TO ctrqry_t DO ALSO SELECT 1");
+        assertEquals("CREATE RULE ctrqry_r04 AS\n"
+                        + "    ON UPDATE TO public.ctrqry_t DO  SELECT 1 AS \"?column?\";",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctrqry_r04'"));
+
+        // A star is settled into the columns it stood for when the rule is written.
+        exec("CREATE RULE ctrqry_r12 AS ON UPDATE TO ctrqry_t DO ALSO SELECT * FROM ctrqry_k k");
+        assertEquals("CREATE RULE ctrqry_r12 AS\n"
+                        + "    ON UPDATE TO public.ctrqry_t DO  SELECT k.i,\n"
+                        + "    k.j,\n"
+                        + "    k.s\n"
+                        + "   FROM ctrqry_k k;",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctrqry_r12'"));
+
+        // A call is published under its own name, which is the name a reader would see.
+        exec("CREATE RULE ctrqry_r14 AS ON UPDATE TO ctrqry_t DO ALSO"
+                + " SELECT count(*) FROM ctrqry_k");
+        assertEquals("CREATE RULE ctrqry_r14 AS\n"
+                        + "    ON UPDATE TO public.ctrqry_t DO  SELECT count(*) AS count\n"
+                        + "   FROM ctrqry_k;",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctrqry_r14'"));
+
+        // Two relations read side by side each go on a line of their own.
+        exec("CREATE RULE ctrqry_r15 AS ON UPDATE TO ctrqry_t DO ALSO"
+                + " SELECT k.i, d.j FROM ctrqry_k k, ctrqry_d d WHERE k.i = d.i");
+        assertEquals("CREATE RULE ctrqry_r15 AS\n"
+                        + "    ON UPDATE TO public.ctrqry_t DO  SELECT k.i,\n"
+                        + "    d.j\n"
+                        + "   FROM ctrqry_k k,\n"
+                        + "    ctrqry_d d\n"
+                        + "  WHERE (k.i = d.i);",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctrqry_r15'"));
+
+        // A join is bracketed once, with its condition bracketed again.
+        exec("CREATE RULE ctrqry_r16 AS ON UPDATE TO ctrqry_t DO ALSO"
+                + " SELECT k.i FROM ctrqry_k k JOIN ctrqry_d d ON k.i = d.i");
+        assertEquals("CREATE RULE ctrqry_r16 AS\n"
+                        + "    ON UPDATE TO public.ctrqry_t DO  SELECT k.i\n"
+                        + "   FROM (ctrqry_k k\n"
+                        + "     JOIN ctrqry_d d ON ((k.i = d.i)));",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctrqry_r16'"));
+
+        // The arms of a set operation are laid out under the operator, and only the first shows
+        // the names it gives its columns.
+        exec("CREATE RULE ctrqry_r17 AS ON UPDATE TO ctrqry_t DO ALSO"
+                + " SELECT i FROM ctrqry_k UNION ALL SELECT j FROM ctrqry_d");
+        assertEquals("CREATE RULE ctrqry_r17 AS\n"
+                        + "    ON UPDATE TO public.ctrqry_t DO  SELECT ctrqry_k.i\n"
+                        + "   FROM ctrqry_k\n"
+                        + "UNION ALL\n"
+                        + " SELECT ctrqry_d.j\n"
+                        + "   FROM ctrqry_d;",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctrqry_r17'"));
+
+        // INSTEAD stands before the action and the space where ALSO would have been is still there.
+        exec("CREATE RULE ctrqry_r19 AS ON UPDATE TO ctrqry_t DO INSTEAD SELECT i FROM ctrqry_k");
+        assertEquals("CREATE RULE ctrqry_r19 AS\n"
+                        + "    ON UPDATE TO public.ctrqry_t DO INSTEAD  SELECT ctrqry_k.i\n"
+                        + "   FROM ctrqry_k;",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctrqry_r19'"));
+
+        // A WITH item is written out at the level its body belongs to.
+        exec("CREATE RULE ctrqry_r20 AS ON UPDATE TO ctrqry_t DO ALSO"
+                + " WITH c AS (SELECT i FROM ctrqry_k) SELECT i FROM c");
+        assertEquals("CREATE RULE ctrqry_r20 AS\n"
+                        + "    ON UPDATE TO public.ctrqry_t DO  WITH c AS (\n"
+                        + "         SELECT ctrqry_k.i\n"
+                        + "           FROM ctrqry_k\n"
+                        + "        )\n"
+                        + " SELECT c.i\n"
+                        + "   FROM c;",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctrqry_r20'"));
+
+        // So is a query read as a relation.
+        exec("CREATE RULE ctrqry_r21 AS ON UPDATE TO ctrqry_t DO ALSO"
+                + " SELECT x.i FROM (SELECT i FROM ctrqry_k) x");
+        assertEquals("CREATE RULE ctrqry_r21 AS\n"
+                        + "    ON UPDATE TO public.ctrqry_t DO  SELECT x.i\n"
+                        + "   FROM ( SELECT ctrqry_k.i\n"
+                        + "           FROM ctrqry_k) x;",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctrqry_r21'"));
+
+        // DISTINCT stands where it was written.
+        exec("CREATE RULE ctrqry_r22 AS ON UPDATE TO ctrqry_t DO ALSO"
+                + " SELECT DISTINCT i FROM ctrqry_k");
+        assertEquals("CREATE RULE ctrqry_r22 AS\n"
+                        + "    ON UPDATE TO public.ctrqry_t DO  SELECT DISTINCT ctrqry_k.i\n"
+                        + "   FROM ctrqry_k;",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctrqry_r22'"));
+
+        // GROUP BY and HAVING each begin a line, and HAVING one column further out.
+        exec("CREATE RULE ctrqry_r23 AS ON UPDATE TO ctrqry_t DO ALSO"
+                + " SELECT i FROM ctrqry_k GROUP BY i HAVING count(*) > 1");
+        assertEquals("CREATE RULE ctrqry_r23 AS\n"
+                        + "    ON UPDATE TO public.ctrqry_t DO  SELECT ctrqry_k.i\n"
+                        + "   FROM ctrqry_k\n"
+                        + "  GROUP BY ctrqry_k.i\n"
+                        + " HAVING (count(*) > 1);",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctrqry_r23'"));
+
+        // A constant in the query's qualification carries the type its column read it as.
+        exec("CREATE RULE ctrqry_r26 AS ON UPDATE TO ctrqry_t DO ALSO"
+                + " SELECT i FROM ctrqry_k WHERE s = 'a'");
+        assertEquals("CREATE RULE ctrqry_r26 AS\n"
+                        + "    ON UPDATE TO public.ctrqry_t DO  SELECT ctrqry_k.i\n"
+                        + "   FROM ctrqry_k\n"
+                        + "  WHERE (ctrqry_k.s = 'a'::text);",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctrqry_r26'"));
+
+        exec("DROP TABLE ctrqry_t CASCADE");
+        exec("DROP TABLE ctrqry_d CASCADE");
+        exec("DROP TABLE ctrqry_k CASCADE");
+    }
+
+    /**
+     * An INSERT whose rows come from a query lists the columns it writes and lays the query out
+     * one step further in than the statement holding it.
+     */
+    @Test
+    void anInsertReadsItsRowsFromAQueryWrittenUnderTheColumnsItWrites() throws Exception {
+        exec("CREATE TABLE ctrqry_k (i int, j int, s text)");
+        exec("CREATE TABLE ctrqry_d (i int, j int, s text)");
+        exec("CREATE TABLE ctrqry_t (i int, s text, n numeric)");
+
+        exec("CREATE RULE ctrqry_r03 AS ON INSERT TO ctrqry_t DO ALSO"
+                + " INSERT INTO ctrqry_d SELECT i, j, s FROM ctrqry_k WHERE i = new.i");
+        assertEquals("CREATE RULE ctrqry_r03 AS\n"
+                        + "    ON INSERT TO public.ctrqry_t DO  INSERT INTO ctrqry_d (i, j, s)"
+                        + "  SELECT ctrqry_k.i,\n"
+                        + "            ctrqry_k.j,\n"
+                        + "            ctrqry_k.s\n"
+                        + "           FROM ctrqry_k\n"
+                        + "          WHERE (ctrqry_k.i = new.i);",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctrqry_r03'"));
+
+        // Including the star an INSERT reads its rows through.
+        exec("CREATE RULE ctrqry_r13 AS ON INSERT TO ctrqry_t DO ALSO"
+                + " INSERT INTO ctrqry_d SELECT * FROM ctrqry_k");
+        assertEquals("CREATE RULE ctrqry_r13 AS\n"
+                        + "    ON INSERT TO public.ctrqry_t DO  INSERT INTO ctrqry_d (i, j, s)"
+                        + "  SELECT ctrqry_k.i,\n"
+                        + "            ctrqry_k.j,\n"
+                        + "            ctrqry_k.s\n"
+                        + "           FROM ctrqry_k;",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctrqry_r13'"));
+
+        // The columns the INSERT was written with are the columns it is read back with.
+        exec("CREATE RULE ctrqry_r24 AS ON INSERT TO ctrqry_t DO ALSO"
+                + " INSERT INTO ctrqry_d (i, s) SELECT i, s FROM ctrqry_k WHERE s = 'c'");
+        assertEquals("CREATE RULE ctrqry_r24 AS\n"
+                        + "    ON INSERT TO public.ctrqry_t DO  INSERT INTO ctrqry_d (i, s)"
+                        + "  SELECT ctrqry_k.i,\n"
+                        + "            ctrqry_k.s\n"
+                        + "           FROM ctrqry_k\n"
+                        + "          WHERE (ctrqry_k.s = 'c'::text);",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctrqry_r24'"));
+
+        // An INSERT naming one column reads one column out of the query it is given, and that
+        // column keeps the name the call gives it.
+        exec("CREATE RULE ctrqry_r25 AS ON INSERT TO ctrqry_t DO ALSO"
+                + " INSERT INTO ctrqry_d (j) SELECT count(*) FROM ctrqry_k");
+        assertEquals("CREATE RULE ctrqry_r25 AS\n"
+                        + "    ON INSERT TO public.ctrqry_t DO  INSERT INTO ctrqry_d (j)"
+                        + "  SELECT count(*) AS count\n"
+                        + "           FROM ctrqry_k;",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctrqry_r25'"));
+
+        exec("DROP TABLE ctrqry_t CASCADE");
+        exec("DROP TABLE ctrqry_d CASCADE");
+        exec("DROP TABLE ctrqry_k CASCADE");
+    }
+
+    /** An UPDATE action reading a second relation writes that relation on a line of its own. */
+    @Test
+    void anUpdateWritesTheRelationsItReadsBesideTheOneItWritesTo() throws Exception {
+        exec("CREATE TABLE ctrqry_k (i int, j int, s text)");
+        exec("CREATE TABLE ctrqry_d (i int, j int, s text)");
+        exec("CREATE TABLE ctrqry_t (i int, s text, n numeric)");
+
+        exec("CREATE RULE ctrqry_r02 AS ON UPDATE TO ctrqry_t DO ALSO"
+                + " UPDATE ctrqry_d SET j = z.j FROM ctrqry_k z WHERE z.i = ctrqry_d.i");
+        assertEquals("CREATE RULE ctrqry_r02 AS\n"
+                        + "    ON UPDATE TO public.ctrqry_t DO  UPDATE ctrqry_d SET j = z.j\n"
+                        + "   FROM ctrqry_k z\n"
+                        + "  WHERE (z.i = ctrqry_d.i);",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctrqry_r02'"));
+
+        // Both aliases are kept and neither AS that introduced one is.
+        exec("CREATE RULE ctrqry_r27 AS ON UPDATE TO ctrqry_t DO ALSO"
+                + " UPDATE ctrqry_d d SET j = k.j FROM ctrqry_k k WHERE k.i = d.i AND d.j > 0");
+        assertEquals("CREATE RULE ctrqry_r27 AS\n"
+                        + "    ON UPDATE TO public.ctrqry_t DO  UPDATE ctrqry_d d SET j = k.j\n"
+                        + "   FROM ctrqry_k k\n"
+                        + "  WHERE ((k.i = d.i) AND (d.j > 0));",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctrqry_r27'"));
+
+        // An UPDATE may read a relation its qualification never names.
+        exec("CREATE RULE ctrqry_r30 AS ON UPDATE TO ctrqry_t DO ALSO"
+                + " UPDATE ctrqry_d SET j = 1 FROM ctrqry_k");
+        assertEquals("CREATE RULE ctrqry_r30 AS\n"
+                        + "    ON UPDATE TO public.ctrqry_t DO  UPDATE ctrqry_d SET j = 1\n"
+                        + "   FROM ctrqry_k;",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctrqry_r30'"));
+
+        exec("DROP TABLE ctrqry_t CASCADE");
+        exec("DROP TABLE ctrqry_d CASCADE");
+        exec("DROP TABLE ctrqry_k CASCADE");
+    }
+
+    /**
+     * A query standing inside an action's qualification is written out where it stands, one step
+     * further in than the statement holding it, and keeps the sub-link it was analysed into.
+     */
+    @Test
+    void aQueryStandingInsideAnActionKeepsTheSubLinkItWas() throws Exception {
+        exec("CREATE TABLE ctrqry_k (i int, j int, s text)");
+        exec("CREATE TABLE ctrqry_d (i int, j int, s text)");
+        exec("CREATE TABLE ctrqry_t (i int, s text, n numeric)");
+
+        // IN over a query is left the sub-link it was, where IN over a value list becomes = ANY.
+        exec("CREATE RULE ctrqry_r05 AS ON UPDATE TO ctrqry_t DO ALSO"
+                + " DELETE FROM ctrqry_d WHERE i IN (SELECT i FROM ctrqry_k WHERE j > 0)");
+        assertEquals("CREATE RULE ctrqry_r05 AS\n"
+                        + "    ON UPDATE TO public.ctrqry_t DO  DELETE FROM ctrqry_d\n"
+                        + "  WHERE (ctrqry_d.i IN ( SELECT ctrqry_k.i\n"
+                        + "           FROM ctrqry_k\n"
+                        + "          WHERE (ctrqry_k.j > 0)));",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctrqry_r05'"));
+
+        // NOT IN over a query is that same sub-link with a NOT around it.
+        exec("CREATE RULE ctrqry_r06 AS ON UPDATE TO ctrqry_t DO ALSO"
+                + " DELETE FROM ctrqry_d WHERE i NOT IN (SELECT i FROM ctrqry_k WHERE s = 'b')");
+        assertEquals("CREATE RULE ctrqry_r06 AS\n"
+                        + "    ON UPDATE TO public.ctrqry_t DO  DELETE FROM ctrqry_d\n"
+                        + "  WHERE (NOT (ctrqry_d.i IN ( SELECT ctrqry_k.i\n"
+                        + "           FROM ctrqry_k\n"
+                        + "          WHERE (ctrqry_k.s = 'b'::text))));",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctrqry_r06'"));
+
+        // EXISTS is bracketed twice: once for the sub-link and once for the query inside it.
+        exec("CREATE RULE ctrqry_r07 AS ON UPDATE TO ctrqry_t DO ALSO DELETE FROM ctrqry_d"
+                + " WHERE EXISTS (SELECT 1 FROM ctrqry_k WHERE ctrqry_k.i = ctrqry_d.i)");
+        assertEquals("CREATE RULE ctrqry_r07 AS\n"
+                        + "    ON UPDATE TO public.ctrqry_t DO  DELETE FROM ctrqry_d\n"
+                        + "  WHERE (EXISTS ( SELECT 1\n"
+                        + "           FROM ctrqry_k\n"
+                        + "          WHERE (ctrqry_k.i = ctrqry_d.i)));",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctrqry_r07'"));
+
+        // A query standing where a value is wanted is written the same way, and its column keeps
+        // the name the call gives it because nothing outside the sub-link reads it.
+        exec("CREATE RULE ctrqry_r08 AS ON UPDATE TO ctrqry_t DO ALSO"
+                + " UPDATE ctrqry_d SET j = (SELECT max(i) FROM ctrqry_k)");
+        assertEquals("CREATE RULE ctrqry_r08 AS\n"
+                        + "    ON UPDATE TO public.ctrqry_t DO  UPDATE ctrqry_d SET j ="
+                        + " ( SELECT max(ctrqry_k.i) AS max\n"
+                        + "           FROM ctrqry_k);",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctrqry_r08'"));
+
+        // Equality against ANY of a query is the one sub-link PostgreSQL writes back as IN.
+        exec("CREATE RULE ctrqry_r09 AS ON UPDATE TO ctrqry_t DO ALSO"
+                + " DELETE FROM ctrqry_d WHERE i = ANY (SELECT i FROM ctrqry_k)");
+        assertEquals("CREATE RULE ctrqry_r09 AS\n"
+                        + "    ON UPDATE TO public.ctrqry_t DO  DELETE FROM ctrqry_d\n"
+                        + "  WHERE (ctrqry_d.i IN ( SELECT ctrqry_k.i\n"
+                        + "           FROM ctrqry_k));",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctrqry_r09'"));
+
+        // ALL keeps the spelling it was written with.
+        exec("CREATE RULE ctrqry_r10 AS ON UPDATE TO ctrqry_t DO ALSO"
+                + " DELETE FROM ctrqry_d WHERE i <> ALL (SELECT i FROM ctrqry_k)");
+        assertEquals("CREATE RULE ctrqry_r10 AS\n"
+                        + "    ON UPDATE TO public.ctrqry_t DO  DELETE FROM ctrqry_d\n"
+                        + "  WHERE (ctrqry_d.i <> ALL ( SELECT ctrqry_k.i\n"
+                        + "           FROM ctrqry_k));",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctrqry_r10'"));
+
+        // So does ANY under any operator but equality.
+        exec("CREATE RULE ctrqry_r11 AS ON UPDATE TO ctrqry_t DO ALSO"
+                + " DELETE FROM ctrqry_d WHERE i > ANY (SELECT i FROM ctrqry_k)");
+        assertEquals("CREATE RULE ctrqry_r11 AS\n"
+                        + "    ON UPDATE TO public.ctrqry_t DO  DELETE FROM ctrqry_d\n"
+                        + "  WHERE (ctrqry_d.i > ANY ( SELECT ctrqry_k.i\n"
+                        + "           FROM ctrqry_k));",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctrqry_r11'"));
+
+        exec("DROP TABLE ctrqry_t CASCADE");
+        exec("DROP TABLE ctrqry_d CASCADE");
+        exec("DROP TABLE ctrqry_k CASCADE");
+    }
+
+    /** Each of several actions is written out in turn, and a reading one the same as any other. */
+    @Test
+    void severalReadingActionsAreParenthesisedAndEachIsWrittenOut() throws Exception {
+        exec("CREATE TABLE ctrqry_k (i int, j int, s text)");
+        exec("CREATE TABLE ctrqry_t (i int, s text, n numeric)");
+
+        exec("CREATE RULE ctrqry_r18 AS ON UPDATE TO ctrqry_t DO ALSO (SELECT 1; SELECT 2)");
+        assertEquals("CREATE RULE ctrqry_r18 AS\n"
+                        + "    ON UPDATE TO public.ctrqry_t DO ( SELECT 1 AS \"?column?\";\n"
+                        + " SELECT 2 AS \"?column?\";\n"
+                        + ");",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctrqry_r18'"));
+
+        exec("CREATE RULE ctrqry_r31 AS ON UPDATE TO ctrqry_t DO ALSO"
+                + " (SELECT i FROM ctrqry_k WHERE i = old.i; SELECT count(*) FROM ctrqry_k)");
+        assertEquals("CREATE RULE ctrqry_r31 AS\n"
+                        + "    ON UPDATE TO public.ctrqry_t DO ( SELECT ctrqry_k.i\n"
+                        + "   FROM ctrqry_k\n"
+                        + "  WHERE (ctrqry_k.i = old.i);\n"
+                        + " SELECT count(*) AS count\n"
+                        + "   FROM ctrqry_k;\n"
+                        + ");",
+                scalar("SELECT definition FROM pg_rules WHERE rulename = 'ctrqry_r31'"));
+
+        exec("DROP TABLE ctrqry_t CASCADE");
+        exec("DROP TABLE ctrqry_k CASCADE");
+    }
+
+    // ------------------------------------------------------------ what a rule and a policy are refused for
+
+    /**
+     * A rule's RETURNING list describes the relation the rule is on, and a view's columns are its
+     * own rather than those of the relation the action writes to.
+     */
+    @Test
+    void aReturningListIsMatchedAgainstTheRelationTheRuleIsOn() throws Exception {
+        exec("CREATE TABLE ctrbad_wd (i int, j int, k int)");
+        exec("CREATE VIEW ctrbad_wv AS SELECT i, j, k FROM ctrbad_wd");
+
+        // Two entries where the view has three columns is too few, four is too many. PostgreSQL
+        // sends neither a DETAIL nor a HINT with either.
+        assertEquals("42P17", stateOf("CREATE RULE ctrbad_wr1 AS ON DELETE TO ctrbad_wv DO INSTEAD"
+                + " DELETE FROM ctrbad_wd WHERE i = old.i RETURNING i, j"));
+        assertEquals("RETURNING list has too few entries",
+                messageOf("CREATE RULE ctrbad_wr1 AS ON DELETE TO ctrbad_wv DO INSTEAD"
+                        + " DELETE FROM ctrbad_wd WHERE i = old.i RETURNING i, j"));
+        assertNull(detailOf("CREATE RULE ctrbad_wr1 AS ON DELETE TO ctrbad_wv DO INSTEAD"
+                + " DELETE FROM ctrbad_wd WHERE i = old.i RETURNING i, j"));
+        assertNull(hintOf("CREATE RULE ctrbad_wr1 AS ON DELETE TO ctrbad_wv DO INSTEAD"
+                + " DELETE FROM ctrbad_wd WHERE i = old.i RETURNING i, j"));
+
+        assertEquals("42P17", stateOf("CREATE RULE ctrbad_wr3 AS ON DELETE TO ctrbad_wv DO INSTEAD"
+                + " DELETE FROM ctrbad_wd WHERE i = old.i RETURNING i, j, k, 1"));
+        assertEquals("RETURNING list has too many entries",
+                messageOf("CREATE RULE ctrbad_wr3 AS ON DELETE TO ctrbad_wv DO INSTEAD"
+                        + " DELETE FROM ctrbad_wd WHERE i = old.i RETURNING i, j, k, 1"));
+
+        // One entry per column of the view is taken, and nothing the refusals named was written.
+        exec("CREATE RULE ctrbad_wr2 AS ON DELETE TO ctrbad_wv DO INSTEAD"
+                + " DELETE FROM ctrbad_wd WHERE i = old.i RETURNING i, j, k");
+        assertEquals("ctrbad_wr2",
+                column("SELECT rulename FROM pg_rules WHERE tablename = 'ctrbad_wv'"
+                        + " ORDER BY rulename"));
+
+        exec("DROP VIEW ctrbad_wv");
+        exec("DROP TABLE ctrbad_wd");
+    }
+
+    /**
+     * The relation the action writes to may be wider than the view the rule is on, and it is the
+     * view that decides: the entries are matched to its columns one by one, by type.
+     */
+    @Test
+    void aReturningListIsMatchedToTheViewsColumnsOneByOneByType() throws Exception {
+        exec("CREATE TABLE ctrbad_td (i int, s text, k int)");
+        exec("CREATE VIEW ctrbad_vd AS SELECT i, s FROM ctrbad_td");
+
+        // A star stands for the columns of the relation the action writes to, and there are more
+        // of them than the view has.
+        assertEquals("42P17", stateOf("CREATE RULE ctrbad_y2 AS ON DELETE TO ctrbad_vd DO INSTEAD"
+                + " DELETE FROM ctrbad_td WHERE i = old.i RETURNING *"));
+        assertEquals("RETURNING list has too many entries",
+                messageOf("CREATE RULE ctrbad_y2 AS ON DELETE TO ctrbad_vd DO INSTEAD"
+                        + " DELETE FROM ctrbad_td WHERE i = old.i RETURNING *"));
+        assertEquals("RETURNING list has too few entries",
+                messageOf("CREATE RULE ctrbad_y4 AS ON UPDATE TO ctrbad_vd DO INSTEAD"
+                        + " UPDATE ctrbad_td SET s = new.s WHERE i = old.i RETURNING i"));
+
+        assertEquals("42P17", stateOf("CREATE RULE ctrbad_y1 AS ON DELETE TO ctrbad_vd DO INSTEAD"
+                + " DELETE FROM ctrbad_td WHERE i = old.i RETURNING i, k"));
+        assertEquals("RETURNING list's entry 2 has different type from column \"s\"",
+                messageOf("CREATE RULE ctrbad_y1 AS ON DELETE TO ctrbad_vd DO INSTEAD"
+                        + " DELETE FROM ctrbad_td WHERE i = old.i RETURNING i, k"));
+        assertEquals("RETURNING list entry has type integer, but column has type text.",
+                detailOf("CREATE RULE ctrbad_y1 AS ON DELETE TO ctrbad_vd DO INSTEAD"
+                        + " DELETE FROM ctrbad_td WHERE i = old.i RETURNING i, k"));
+        assertNull(hintOf("CREATE RULE ctrbad_y1 AS ON DELETE TO ctrbad_vd DO INSTEAD"
+                + " DELETE FROM ctrbad_td WHERE i = old.i RETURNING i, k"));
+
+        // OLD and NEW are the view's own rows, so a list written from them fits it.
+        exec("CREATE RULE ctrbad_y3 AS ON DELETE TO ctrbad_vd DO INSTEAD"
+                + " DELETE FROM ctrbad_td WHERE i = old.i RETURNING old.i, old.s");
+        exec("CREATE RULE ctrbad_y5 AS ON INSERT TO ctrbad_vd DO INSTEAD"
+                + " INSERT INTO ctrbad_td VALUES (new.i, new.s) RETURNING i, s");
+        assertEquals("ctrbad_y3,ctrbad_y5",
+                column("SELECT rulename FROM pg_rules WHERE tablename = 'ctrbad_vd'"
+                        + " ORDER BY rulename"));
+
+        exec("DROP VIEW ctrbad_vd");
+        exec("DROP TABLE ctrbad_td");
+    }
+
+    /**
+     * An UPDATE event carries the row as it was and the row as it will be, so a column written in
+     * the rule's own qualification with no row named in front of it answers to both at once.
+     */
+    @Test
+    void aBareColumnInAnUpdateRulesQualificationIsAmbiguous() throws Exception {
+        exec("CREATE TABLE ctrbad_qt (i int, s text)");
+
+        assertEquals("42702", stateOf("CREATE RULE ctrbad_q1 AS ON UPDATE TO ctrbad_qt"
+                + " WHERE i <> 0 DO ALSO NOTHING"));
+        assertEquals("column reference \"i\" is ambiguous",
+                messageOf("CREATE RULE ctrbad_q1 AS ON UPDATE TO ctrbad_qt"
+                        + " WHERE i <> 0 DO ALSO NOTHING"));
+        assertNull(detailOf("CREATE RULE ctrbad_q1 AS ON UPDATE TO ctrbad_qt"
+                + " WHERE i <> 0 DO ALSO NOTHING"));
+        assertNull(hintOf("CREATE RULE ctrbad_q1 AS ON UPDATE TO ctrbad_qt"
+                + " WHERE i <> 0 DO ALSO NOTHING"));
+
+        assertEquals("column reference \"s\" is ambiguous",
+                messageOf("CREATE RULE ctrbad_q8 AS ON UPDATE TO ctrbad_qt"
+                        + " WHERE s <> 'x' DO INSTEAD NOTHING"));
+        assertEquals("column reference \"i\" is ambiguous",
+                messageOf("CREATE RULE ctrbad_q9 AS ON UPDATE TO ctrbad_qt"
+                        + " WHERE i <> 0 AND old.s = 'a' DO ALSO NOTHING"));
+        // inside a call as much as beside a comparison
+        assertEquals("column reference \"s\" is ambiguous",
+                messageOf("CREATE RULE ctrbad_qa AS ON UPDATE TO ctrbad_qt"
+                        + " WHERE upper(s) = 'A' DO ALSO NOTHING"));
+        // resolved before it is asked to be a boolean
+        assertEquals("column reference \"i\" is ambiguous",
+                messageOf("CREATE RULE ctrbad_q5 AS ON UPDATE TO ctrbad_qt"
+                        + " WHERE i DO ALSO NOTHING"));
+        // the qualification is read before the actions are
+        assertEquals("column reference \"i\" is ambiguous",
+                messageOf("CREATE RULE ctrbad_q6 AS ON UPDATE TO ctrbad_qt WHERE i <> 0 DO ALSO"
+                        + " INSERT INTO ctrbad_nn VALUES (1)"));
+        // a system column stands in both rows too
+        assertEquals("column reference \"xmin\" is ambiguous",
+                messageOf("CREATE RULE ctrbad_qx AS ON UPDATE TO ctrbad_qt"
+                        + " WHERE xmin IS NOT NULL DO ALSO NOTHING"));
+
+        // A name no row holds is missing rather than ambiguous, and naming a row settles which.
+        assertEquals("42703", stateOf("CREATE RULE ctrbad_q4 AS ON UPDATE TO ctrbad_qt"
+                + " WHERE nosuchcol <> 0 DO ALSO NOTHING"));
+        assertEquals("column \"nosuchcol\" does not exist",
+                messageOf("CREATE RULE ctrbad_q4 AS ON UPDATE TO ctrbad_qt"
+                        + " WHERE nosuchcol <> 0 DO ALSO NOTHING"));
+        assertEquals("42703", stateOf("CREATE RULE ctrbad_q7 AS ON UPDATE TO ctrbad_qt"
+                + " WHERE old.nosuch = 1 AND i = 1 DO ALSO NOTHING"));
+        assertEquals("column old.nosuch does not exist",
+                messageOf("CREATE RULE ctrbad_q7 AS ON UPDATE TO ctrbad_qt"
+                        + " WHERE old.nosuch = 1 AND i = 1 DO ALSO NOTHING"));
+
+        // An INSERT carries only the new row and a DELETE only the old one, so the same column
+        // written there is that row's; a query inside the qualification reads its own FROM.
+        exec("CREATE RULE ctrbad_q2 AS ON UPDATE TO ctrbad_qt WHERE old.i <> 0 DO ALSO NOTHING");
+        exec("CREATE RULE ctrbad_q3 AS ON INSERT TO ctrbad_qt WHERE i <> 0 DO ALSO NOTHING");
+        exec("CREATE RULE ctrbad_qb AS ON DELETE TO ctrbad_qt WHERE i <> 0 DO ALSO NOTHING");
+        exec("CREATE RULE ctrbad_qc AS ON UPDATE TO ctrbad_qt"
+                + " WHERE (SELECT count(*) FROM ctrbad_qt) > 0 DO ALSO NOTHING");
+        exec("CREATE RULE ctrbad_qd AS ON UPDATE TO ctrbad_qt"
+                + " WHERE EXISTS (SELECT 1 FROM ctrbad_qt z WHERE z.i = i) DO ALSO NOTHING");
+        assertEquals("ctrbad_q2,ctrbad_q3,ctrbad_qb,ctrbad_qc,ctrbad_qd",
+                column("SELECT rulename FROM pg_rules WHERE tablename = 'ctrbad_qt'"
+                        + " ORDER BY rulename"));
+
+        // A rule on a view is read the same way: both of its rows are the view's.
+        exec("CREATE VIEW ctrbad_qw AS SELECT i, s FROM ctrbad_qt");
+        assertEquals("42702", stateOf("CREATE RULE ctrbad_w1 AS ON UPDATE TO ctrbad_qw"
+                + " WHERE i <> 0 DO ALSO NOTHING"));
+        assertEquals("column reference \"i\" is ambiguous",
+                messageOf("CREATE RULE ctrbad_w1 AS ON UPDATE TO ctrbad_qw"
+                        + " WHERE i <> 0 DO ALSO NOTHING"));
+
+        exec("DROP VIEW ctrbad_qw");
+        exec("DROP TABLE ctrbad_qt CASCADE");
+    }
+
+    /**
+     * A policy decides which of a relation's rows a role may see, and only a table has rows of its
+     * own to decide about. The relation is named without its schema in that refusal, and a name
+     * that reaches nothing at all is a missing relation instead.
+     */
+    @Test
+    void aPolicyGoesOnATableAndOnNoOtherKindOfRelation() throws Exception {
+        exec("CREATE TABLE ctrbad_pp (i int, s text)");
+        exec("CREATE SEQUENCE ctrbad_sq");
+        exec("CREATE VIEW ctrbad_pv AS SELECT i FROM ctrbad_pp");
+        exec("CREATE MATERIALIZED VIEW ctrbad_pm AS SELECT i FROM ctrbad_pp");
+        exec("CREATE INDEX ctrbad_pi ON ctrbad_pp (i)");
+        exec("CREATE TYPE ctrbad_ct AS (a int, b text)");
+
+        assertEquals("42809", stateOf("CREATE POLICY ctrbad_po ON ctrbad_sq USING (true)"));
+        assertEquals("\"ctrbad_sq\" is not a table",
+                messageOf("CREATE POLICY ctrbad_po ON ctrbad_sq USING (true)"));
+        assertNull(detailOf("CREATE POLICY ctrbad_po ON ctrbad_sq USING (true)"));
+        assertNull(hintOf("CREATE POLICY ctrbad_po ON ctrbad_sq USING (true)"));
+
+        assertEquals("42809", stateOf("CREATE POLICY ctrbad_po ON ctrbad_pv USING (true)"));
+        assertEquals("\"ctrbad_pv\" is not a table",
+                messageOf("CREATE POLICY ctrbad_po ON ctrbad_pv USING (true)"));
+        assertEquals("42809", stateOf("CREATE POLICY ctrbad_po ON ctrbad_pm USING (true)"));
+        assertEquals("\"ctrbad_pm\" is not a table",
+                messageOf("CREATE POLICY ctrbad_po ON ctrbad_pm USING (true)"));
+        assertEquals("42809", stateOf("CREATE POLICY ctrbad_po ON ctrbad_pi USING (true)"));
+        assertEquals("\"ctrbad_pi\" is not a table",
+                messageOf("CREATE POLICY ctrbad_po ON ctrbad_pi USING (true)"));
+        assertEquals("42809", stateOf("CREATE POLICY ctrbad_po ON ctrbad_ct USING (true)"));
+        assertEquals("\"ctrbad_ct\" is not a table",
+                messageOf("CREATE POLICY ctrbad_po ON ctrbad_ct USING (true)"));
+
+        // A name that reaches nothing is a missing relation, whatever kind was wanted.
+        assertEquals("42P01", stateOf("CREATE POLICY ctrbad_po ON ctrbad_nn USING (true)"));
+        assertEquals("relation \"ctrbad_nn\" does not exist",
+                messageOf("CREATE POLICY ctrbad_po ON ctrbad_nn USING (true)"));
+
+        // A table takes one, and none of the refusals above left anything behind.
+        exec("CREATE POLICY ctrbad_po ON ctrbad_pp USING (true)");
+        assertEquals(1, num("SELECT count(*) FROM pg_policies WHERE policyname = 'ctrbad_po'"));
+
+        exec("DROP POLICY ctrbad_po ON ctrbad_pp");
+        exec("DROP TYPE ctrbad_ct");
+        exec("DROP INDEX ctrbad_pi");
+        exec("DROP MATERIALIZED VIEW ctrbad_pm");
+        exec("DROP VIEW ctrbad_pv");
+        exec("DROP SEQUENCE ctrbad_sq");
+        exec("DROP TABLE ctrbad_pp");
+
+        // A partitioned table and a partition of it each take one of their own.
+        exec("CREATE TABLE ctrbad_pt (id int, a int) PARTITION BY RANGE (id)");
+        exec("CREATE TABLE ctrbad_p1 PARTITION OF ctrbad_pt FOR VALUES FROM (0) TO (10)");
+        exec("CREATE POLICY ctrbad_pq ON ctrbad_pt USING (true)");
+        exec("CREATE POLICY ctrbad_pr ON ctrbad_p1 USING (true)");
+        assertEquals(2, num("SELECT count(*) FROM pg_policies"
+                + " WHERE policyname IN ('ctrbad_pq','ctrbad_pr')"));
+
+        exec("DROP POLICY ctrbad_pq ON ctrbad_pt");
+        exec("DROP POLICY ctrbad_pr ON ctrbad_p1");
+        exec("DROP TABLE ctrbad_pt");
+    }
+
+    /**
+     * DROP POLICY names one policy. The comma is a syntax error, so it is refused before any
+     * relation in the list is looked for and nothing of the list is taken down.
+     */
+    @Test
+    void dropPolicyNamesOnePolicyAndNotAListOfThem() throws Exception {
+        exec("CREATE TABLE ctrbad_dp (i int, s text)");
+        exec("CREATE POLICY ctrbad_x1 ON ctrbad_dp USING (true)");
+        exec("CREATE POLICY ctrbad_x2 ON ctrbad_dp USING (true)");
+
+        assertEquals("42601", stateOf("DROP POLICY ctrbad_x1 ON ctrbad_dp, ctrbad_x2 ON ctrbad_dp"));
+        assertEquals("syntax error at or near \",\"",
+                messageOf("DROP POLICY ctrbad_x1 ON ctrbad_dp, ctrbad_x2 ON ctrbad_dp"));
+        assertNull(detailOf("DROP POLICY ctrbad_x1 ON ctrbad_dp, ctrbad_x2 ON ctrbad_dp"));
+        assertNull(hintOf("DROP POLICY ctrbad_x1 ON ctrbad_dp, ctrbad_x2 ON ctrbad_dp"));
+
+        assertEquals("42601", stateOf("DROP POLICY ctrbad_x1 ON ctrbad_dp, ctrbad_x2"));
+        assertEquals("syntax error at or near \",\"",
+                messageOf("DROP POLICY ctrbad_x1 ON ctrbad_dp, ctrbad_x2"));
+        assertEquals("42601",
+                stateOf("DROP POLICY IF EXISTS ctrbad_x1 ON ctrbad_dp, ctrbad_x2 ON ctrbad_dp"));
+        assertEquals("syntax error at or near \",\"",
+                messageOf("DROP POLICY IF EXISTS ctrbad_x1 ON ctrbad_dp, ctrbad_x2 ON ctrbad_dp"));
+
+        // The comma is refused before the relation is looked for, so a relation that is not there
+        // is not what is reported.
+        assertEquals("42601", stateOf("DROP POLICY ctrbad_x1 ON ctrbad_nn, ctrbad_x2 ON ctrbad_nn"));
+        assertEquals("syntax error at or near \",\"",
+                messageOf("DROP POLICY ctrbad_x1 ON ctrbad_nn, ctrbad_x2 ON ctrbad_nn"));
+
+        // Nothing of the list was taken down, and each policy still drops on its own.
+        assertEquals(2, num("SELECT count(*) FROM pg_policies WHERE tablename = 'ctrbad_dp'"));
+        exec("DROP POLICY ctrbad_x1 ON ctrbad_dp");
+        exec("DROP POLICY ctrbad_x2 ON ctrbad_dp");
+        assertEquals(0, num("SELECT count(*) FROM pg_policies WHERE tablename = 'ctrbad_dp'"));
+
+        exec("DROP TABLE ctrbad_dp");
+    }
+
+    /**
+     * A view carrying an INSTEAD rule that speaks only for some of its rows cannot be written
+     * through at all: the rows the rule does not claim would have to be written to the view itself.
+     * The refusal names the event, and PostgreSQL sends a DETAIL and a HINT with it.
+     */
+    @Test
+    void aViewCarryingOnlyAConditionalInsteadRuleCannotBeWrittenThrough() throws Exception {
+        exec("CREATE TABLE ctrbad_bs (id int, a int, b text)");
+        exec("INSERT INTO ctrbad_bs VALUES (1, 10, 'x'), (2, 20, 'y')");
+        exec("CREATE VIEW ctrbad_cv AS SELECT id, a, b FROM ctrbad_bs");
+        exec("CREATE RULE ctrbad_cr AS ON UPDATE TO ctrbad_cv WHERE old.id = 1 DO INSTEAD"
+                + " UPDATE ctrbad_bs SET a = new.a WHERE id = old.id");
+
+        assertEquals("55000", stateOf("UPDATE ctrbad_cv SET a = DEFAULT"));
+        assertEquals("cannot update view \"ctrbad_cv\"", messageOf("UPDATE ctrbad_cv SET a = DEFAULT"));
+        assertEquals("Views with conditional DO INSTEAD rules are not automatically updatable.",
+                detailOf("UPDATE ctrbad_cv SET a = DEFAULT"));
+        assertEquals("To enable updating the view, provide an INSTEAD OF UPDATE trigger or an"
+                        + " unconditional ON UPDATE DO INSTEAD rule.",
+                hintOf("UPDATE ctrbad_cv SET a = DEFAULT"));
+
+        assertEquals("55000", stateOf("UPDATE ctrbad_cv SET a = 99"));
+        assertEquals("cannot update view \"ctrbad_cv\"", messageOf("UPDATE ctrbad_cv SET a = 99"));
+        // ahead of the RETURNING list a conditional rule cannot answer
+        assertEquals("cannot update view \"ctrbad_cv\"",
+                messageOf("UPDATE ctrbad_cv SET a = 1 RETURNING id"));
+        assertEquals("Views with conditional DO INSTEAD rules are not automatically updatable.",
+                detailOf("UPDATE ctrbad_cv SET a = 1 RETURNING id"));
+        // nothing was written
+        assertEquals("1|10|x,2|20|y",
+                column("SELECT id || '|' || a || '|' || b FROM ctrbad_bs ORDER BY id"));
+
+        // The event the rule is on is the only one refused: a DELETE the view carries no rule for
+        // is still rewritten onto the relation behind it.
+        assertEquals(1, update("DELETE FROM ctrbad_cv WHERE id = 2"));
+        assertEquals("1|10|x",
+                column("SELECT id || '|' || a || '|' || b FROM ctrbad_bs ORDER BY id"));
+
+        // The catalogue does not read the rule: it answers for the view's shape alone.
+        assertEquals(28, num("SELECT pg_relation_is_updatable('ctrbad_cv'::regclass, false)"));
+        assertEquals("YES|YES", scalar("SELECT is_updatable || '|' || is_insertable_into"
+                + " FROM information_schema.views WHERE table_name = 'ctrbad_cv'"));
+
+        // An INSERT and a DELETE are refused the same way once the rule is theirs.
+        exec("CREATE RULE ctrbad_ci AS ON INSERT TO ctrbad_cv WHERE new.id = 1 DO INSTEAD"
+                + " INSERT INTO ctrbad_bs VALUES (new.id, new.a, new.b)");
+        assertEquals("55000", stateOf("INSERT INTO ctrbad_cv VALUES (7, 70, 'q')"));
+        assertEquals("cannot insert into view \"ctrbad_cv\"",
+                messageOf("INSERT INTO ctrbad_cv VALUES (7, 70, 'q')"));
+        assertEquals("Views with conditional DO INSTEAD rules are not automatically updatable.",
+                detailOf("INSERT INTO ctrbad_cv VALUES (7, 70, 'q')"));
+        assertEquals("To enable inserting into the view, provide an INSTEAD OF INSERT trigger or"
+                        + " an unconditional ON INSERT DO INSTEAD rule.",
+                hintOf("INSERT INTO ctrbad_cv VALUES (7, 70, 'q')"));
+
+        exec("CREATE RULE ctrbad_cd AS ON DELETE TO ctrbad_cv WHERE old.id = 1 DO INSTEAD"
+                + " DELETE FROM ctrbad_bs WHERE id = old.id");
+        assertEquals("55000", stateOf("DELETE FROM ctrbad_cv WHERE id = 1"));
+        assertEquals("cannot delete from view \"ctrbad_cv\"",
+                messageOf("DELETE FROM ctrbad_cv WHERE id = 1"));
+        assertEquals("Views with conditional DO INSTEAD rules are not automatically updatable.",
+                detailOf("DELETE FROM ctrbad_cv WHERE id = 1"));
+        assertEquals("To enable deleting from the view, provide an INSTEAD OF DELETE trigger or"
+                        + " an unconditional ON DELETE DO INSTEAD rule.",
+                hintOf("DELETE FROM ctrbad_cv WHERE id = 1"));
+        assertEquals("1|10|x",
+                column("SELECT id || '|' || a || '|' || b FROM ctrbad_bs ORDER BY id"));
+
+        // A rule that runs beside the statement rather than in place of it leaves the view as
+        // writable as it was, so taking the conditional INSTEAD rule off makes the write go again.
+        exec("CREATE RULE ctrbad_ca AS ON UPDATE TO ctrbad_cv WHERE old.id = 1 DO ALSO"
+                + " INSERT INTO ctrbad_bs VALUES (9, 9, 'z')");
+        exec("DROP RULE ctrbad_cr ON ctrbad_cv");
+        assertEquals(2, update("UPDATE ctrbad_cv SET a = 5"));
+        assertEquals("1|5|x,9|5|z",
+                column("SELECT id || '|' || a || '|' || b FROM ctrbad_bs ORDER BY id, b"));
+
+        exec("DROP VIEW ctrbad_cv");
+        exec("DROP TABLE ctrbad_bs");
+    }
+
+    /** A conditional INSTEAD rule on a table is not touched by any of this. */
+    @Test
+    void aConditionalInsteadRuleOnATableClaimsOnlyTheRowsItMatches() throws Exception {
+        exec("CREATE TABLE ctrbad_tb (id int, a int)");
+        exec("CREATE TABLE ctrbad_tl (id int, a int)");
+        exec("INSERT INTO ctrbad_tb VALUES (1, 1), (2, 2)");
+        exec("CREATE RULE ctrbad_tr AS ON UPDATE TO ctrbad_tb WHERE old.id = 1 DO INSTEAD"
+                + " INSERT INTO ctrbad_tl VALUES (old.id, new.a)");
+
+        assertEquals(1, update("UPDATE ctrbad_tb SET a = 8"));
+        assertEquals("1|1,2|8", column("SELECT id || '|' || a FROM ctrbad_tb ORDER BY id"));
+        assertEquals("1|8", column("SELECT id || '|' || a FROM ctrbad_tl ORDER BY id"));
+
+        exec("DROP TABLE ctrbad_tb");
+        exec("DROP TABLE ctrbad_tl");
+    }
+
+    // ------------------------------------------------------------ one creation sequence, whatever the kind
+
+    /**
+     * PostgreSQL numbers every catalogue row from one sequence at the moment the row is written,
+     * so a dependency list holding more than one kind of object reads in the order the objects
+     * were made -- not the relations first and everything else after them by name. A type and a
+     * routine take their place by their own CREATE just as a relation does.
+     */
+    @Test
+    void aSchemaHoldingEveryKindNamesItsObjectsInOneCreationOrder() throws Exception {
+        exec("CREATE SCHEMA dseq_a");
+        exec("CREATE TABLE dseq_a.zt (i int)");
+        exec("CREATE TABLE dseq_a.at (i int)");
+        exec("CREATE VIEW dseq_a.zv AS SELECT i FROM dseq_a.zt");
+        exec("CREATE SEQUENCE dseq_a.asq");
+        exec("CREATE TYPE dseq_a.ze AS ENUM ('a')");
+        exec("CREATE DOMAIN dseq_a.zd AS int");
+        exec("CREATE TYPE dseq_a.zc AS (a int)");
+        exec("CREATE FUNCTION dseq_a.zf() RETURNS int LANGUAGE sql AS 'SELECT 1'");
+        exec("CREATE MATERIALIZED VIEW dseq_a.zm AS SELECT i FROM dseq_a.zt");
+
+        assertEquals("2BP01", stateOf("DROP SCHEMA dseq_a"));
+        assertEquals("cannot drop schema dseq_a because other objects depend on it",
+                messageOf("DROP SCHEMA dseq_a"));
+        assertEquals("table dseq_a.zt depends on schema dseq_a\n"
+                        + "table dseq_a.at depends on schema dseq_a\n"
+                        + "view dseq_a.zv depends on schema dseq_a\n"
+                        + "sequence dseq_a.asq depends on schema dseq_a\n"
+                        + "type dseq_a.ze depends on schema dseq_a\n"
+                        + "type dseq_a.zd depends on schema dseq_a\n"
+                        + "type dseq_a.zc depends on schema dseq_a\n"
+                        + "function dseq_a.zf() depends on schema dseq_a\n"
+                        + "materialized view dseq_a.zm depends on schema dseq_a",
+                detailOf("DROP SCHEMA dseq_a"));
+        assertEquals("Use DROP ... CASCADE to drop the dependent objects too.",
+                hintOf("DROP SCHEMA dseq_a"));
+
+        // What CASCADE reports it took is the same list in the same order.
+        String[] notice = noticeOf("DROP SCHEMA dseq_a CASCADE");
+        assertEquals("drop cascades to 9 other objects", notice[0]);
+        assertEquals("drop cascades to table dseq_a.zt\n"
+                        + "drop cascades to table dseq_a.at\n"
+                        + "drop cascades to view dseq_a.zv\n"
+                        + "drop cascades to sequence dseq_a.asq\n"
+                        + "drop cascades to type dseq_a.ze\n"
+                        + "drop cascades to type dseq_a.zd\n"
+                        + "drop cascades to type dseq_a.zc\n"
+                        + "drop cascades to function dseq_a.zf()\n"
+                        + "drop cascades to materialized view dseq_a.zm",
+                notice[1]);
+        assertEquals(0, num("SELECT count(*) FROM pg_namespace WHERE nspname = 'dseq_a'"));
+    }
+
+    /**
+     * Each overload of a name is a routine of its own with a catalogue row of its own, so it takes
+     * its place by when it was written rather than beside the other overloads of its name.
+     */
+    @Test
+    void everyOverloadOfANameTakesItsOwnPlaceInThatOrder() throws Exception {
+        exec("CREATE SCHEMA dseq_b");
+        exec("CREATE TABLE dseq_b.t1 (i int)");
+        exec("CREATE FUNCTION dseq_b.f1() RETURNS int LANGUAGE sql AS 'SELECT 1'");
+        exec("CREATE FUNCTION dseq_b.f1(a int) RETURNS int LANGUAGE sql AS 'SELECT a'");
+        exec("CREATE TYPE dseq_b.e1 AS ENUM ('a')");
+        exec("CREATE FUNCTION dseq_b.f1(a text) RETURNS int LANGUAGE sql AS 'SELECT 3'");
+
+        // The type stands between the second overload and the third, because that is when it was
+        // made; the overloads are not gathered together under their shared name.
+        assertEquals("table dseq_b.t1 depends on schema dseq_b\n"
+                        + "function dseq_b.f1() depends on schema dseq_b\n"
+                        + "function dseq_b.f1(integer) depends on schema dseq_b\n"
+                        + "type dseq_b.e1 depends on schema dseq_b\n"
+                        + "function dseq_b.f1(text) depends on schema dseq_b",
+                detailOf("DROP SCHEMA dseq_b"));
+
+        String[] notice = noticeOf("DROP SCHEMA dseq_b CASCADE");
+        assertEquals("drop cascades to 5 other objects", notice[0]);
+        assertEquals("drop cascades to table dseq_b.t1\n"
+                        + "drop cascades to function dseq_b.f1()\n"
+                        + "drop cascades to function dseq_b.f1(integer)\n"
+                        + "drop cascades to type dseq_b.e1\n"
+                        + "drop cascades to function dseq_b.f1(text)",
+                notice[1]);
+    }
+
+    /**
+     * A view and a row security policy that both hang from one routine are two rows of the same
+     * dependency catalogue, and PostgreSQL walks it in the order the rows were numbered: which is
+     * reported first is which was created first, not which kind it is.
+     */
+    @Test
+    void aPolicyWrittenBeforeAViewIsNamedBeforeIt() throws Exception {
+        exec("CREATE SCHEMA dseq_c");
+        exec("CREATE FUNCTION dseq_c.f() RETURNS int LANGUAGE sql AS 'SELECT 1'");
+        exec("CREATE TABLE dseq_ct (i int)");
+        exec("CREATE POLICY dseq_cp ON dseq_ct USING (i = dseq_c.f())");
+        exec("CREATE VIEW dseq_cv AS SELECT dseq_c.f() AS a");
+
+        assertEquals("function dseq_c.f() depends on schema dseq_c\n"
+                        + "policy dseq_cp on table dseq_ct depends on function dseq_c.f()\n"
+                        + "view dseq_cv depends on function dseq_c.f()",
+                detailOf("DROP SCHEMA dseq_c"));
+
+        String[] notice = noticeOf("DROP SCHEMA dseq_c CASCADE");
+        assertEquals("drop cascades to 3 other objects", notice[0]);
+        assertEquals("drop cascades to function dseq_c.f()\n"
+                        + "drop cascades to policy dseq_cp on table dseq_ct\n"
+                        + "drop cascades to view dseq_cv",
+                notice[1]);
+        // The relation the policy sat on is left standing.
+        assertEquals(1, num("SELECT count(*) FROM pg_tables WHERE tablename = 'dseq_ct'"));
+        exec("DROP TABLE dseq_ct");
+    }
+
+    /** The other way round, to show the order is the objects' own and not their kinds'. */
+    @Test
+    void aViewWrittenBeforeAPolicyIsNamedBeforeIt() throws Exception {
+        exec("CREATE SCHEMA dseq_d");
+        exec("CREATE FUNCTION dseq_d.f() RETURNS int LANGUAGE sql AS 'SELECT 1'");
+        exec("CREATE TABLE dseq_dt (i int)");
+        exec("CREATE VIEW dseq_dv AS SELECT dseq_d.f() AS a");
+        exec("CREATE POLICY dseq_dp ON dseq_dt USING (i = dseq_d.f())");
+
+        assertEquals("function dseq_d.f() depends on schema dseq_d\n"
+                        + "view dseq_dv depends on function dseq_d.f()\n"
+                        + "policy dseq_dp on table dseq_dt depends on function dseq_d.f()",
+                detailOf("DROP SCHEMA dseq_d"));
+
+        String[] notice = noticeOf("DROP SCHEMA dseq_d CASCADE");
+        assertEquals("drop cascades to 3 other objects", notice[0]);
+        assertEquals("drop cascades to function dseq_d.f()\n"
+                        + "drop cascades to view dseq_dv\n"
+                        + "drop cascades to policy dseq_dp on table dseq_dt",
+                notice[1]);
+        exec("DROP TABLE dseq_dt");
+    }
+
+    /**
+     * Several routines answering with rows of one relation are recorded against that relation's
+     * row type, and are reported in the order they were written -- neither by name nor in whatever
+     * order they happen to be held.
+     */
+    @Test
+    void severalRoutinesOverOneRowTypeAreNamedInCreationOrder() throws Exception {
+        exec("CREATE TABLE dseq_e (i int)");
+        exec("CREATE FUNCTION dseq_zg() RETURNS SETOF dseq_e LANGUAGE sql AS 'SELECT * FROM dseq_e'");
+        exec("CREATE FUNCTION dseq_ma() RETURNS SETOF dseq_e LANGUAGE sql AS 'SELECT * FROM dseq_e'");
+        exec("CREATE FUNCTION dseq_ab() RETURNS SETOF dseq_e LANGUAGE sql AS 'SELECT * FROM dseq_e'");
+        exec("CREATE FUNCTION dseq_qq() RETURNS SETOF dseq_e LANGUAGE sql AS 'SELECT * FROM dseq_e'");
+
+        assertEquals("2BP01", stateOf("DROP TABLE dseq_e"));
+        assertEquals("function dseq_zg() depends on type dseq_e\n"
+                        + "function dseq_ma() depends on type dseq_e\n"
+                        + "function dseq_ab() depends on type dseq_e\n"
+                        + "function dseq_qq() depends on type dseq_e",
+                detailOf("DROP TABLE dseq_e"));
+
+        String[] notice = noticeOf("DROP TABLE dseq_e CASCADE");
+        assertEquals("drop cascades to 4 other objects", notice[0]);
+        assertEquals("drop cascades to function dseq_zg()\n"
+                        + "drop cascades to function dseq_ma()\n"
+                        + "drop cascades to function dseq_ab()\n"
+                        + "drop cascades to function dseq_qq()",
+                notice[1]);
+        assertEquals(0, num("SELECT count(*) FROM pg_proc WHERE proname = 'dseq_zg'"));
+        assertEquals(0, num("SELECT count(*) FROM pg_proc WHERE proname = 'dseq_qq'"));
+    }
+
+    /**
+     * What the row type reaches is walked before what the relation itself reaches, and each of the
+     * two runs in its own creation order: the routines written over the row type first, whichever
+     * of them was made when, and then the views on the relation.
+     */
+    @Test
+    void theRoutinesOverTheRowTypeComeBeforeTheViewsOnTheRelation() throws Exception {
+        exec("CREATE TABLE dseq_m1 (i int, j int)");
+        exec("CREATE VIEW dseq_mv1 AS SELECT i FROM dseq_m1");
+        exec("CREATE FUNCTION dseq_mz() RETURNS SETOF dseq_m1 LANGUAGE sql AS 'SELECT * FROM dseq_m1'");
+        exec("CREATE VIEW dseq_mv2 AS SELECT j FROM dseq_m1");
+        exec("CREATE FUNCTION dseq_mb(r dseq_m1) RETURNS int LANGUAGE sql AS 'SELECT 1'");
+
+        assertEquals("function dseq_mz() depends on type dseq_m1\n"
+                        + "function dseq_mb(dseq_m1) depends on type dseq_m1\n"
+                        + "view dseq_mv1 depends on table dseq_m1\n"
+                        + "view dseq_mv2 depends on table dseq_m1",
+                detailOf("DROP TABLE dseq_m1"));
+
+        String[] notice = noticeOf("DROP TABLE dseq_m1 CASCADE");
+        assertEquals("drop cascades to 4 other objects", notice[0]);
+        assertEquals("drop cascades to function dseq_mz()\n"
+                        + "drop cascades to function dseq_mb(dseq_m1)\n"
+                        + "drop cascades to view dseq_mv1\n"
+                        + "drop cascades to view dseq_mv2",
+                notice[1]);
+        assertEquals(0, num("SELECT count(*) FROM pg_views WHERE viewname = 'dseq_mv1'"));
+        assertEquals(0, num("SELECT count(*) FROM pg_proc WHERE proname = 'dseq_mz'"));
+    }
+
+    // ------------------------------------------------------------ what depends on a relation's row type
+
+    /**
+     * A relation carries a composite type of its own name, and a routine that takes one of those
+     * rows as an argument depends on the type. PostgreSQL says so in as many words -- "depends on
+     * type", not "depends on table" -- and refuses the plain DROP TABLE until CASCADE says to take
+     * the routine too.
+     */
+    @Test
+    void aRoutineTakingTheRowTypeAsAnArgumentBlocksAPlainDropTable() throws Exception {
+        exec("CREATE TABLE dtyp_t1 (a int, b text)");
+        exec("CREATE FUNCTION dtyp_f1(r dtyp_t1) RETURNS int LANGUAGE sql AS 'SELECT 1'");
+
+        assertEquals("2BP01", stateOf("DROP TABLE dtyp_t1"));
+        assertEquals("cannot drop table dtyp_t1 because other objects depend on it",
+                messageOf("DROP TABLE dtyp_t1"));
+        assertEquals("function dtyp_f1(dtyp_t1) depends on type dtyp_t1",
+                detailOf("DROP TABLE dtyp_t1"));
+        assertEquals("Use DROP ... CASCADE to drop the dependent objects too.",
+                hintOf("DROP TABLE dtyp_t1"));
+
+        // RESTRICT is the default, and IF EXISTS says nothing about what depends on the relation.
+        assertEquals("2BP01", stateOf("DROP TABLE dtyp_t1 RESTRICT"));
+        assertEquals("2BP01", stateOf("DROP TABLE IF EXISTS dtyp_t1"));
+        assertEquals("function dtyp_f1(dtyp_t1) depends on type dtyp_t1",
+                detailOf("DROP TABLE IF EXISTS dtyp_t1"));
+
+        // Nothing was taken by the refusal.
+        assertEquals(1, num("SELECT count(*) FROM pg_proc WHERE proname = 'dtyp_f1'"));
+        assertEquals(1, num("SELECT count(*) FROM pg_class WHERE relname = 'dtyp_t1'"));
+
+        assertEquals("drop cascades to function dtyp_f1(dtyp_t1)",
+                noticeOf("DROP TABLE dtyp_t1 CASCADE")[0]);
+        assertEquals(0, num("SELECT count(*) FROM pg_proc WHERE proname = 'dtyp_f1'"));
+        assertEquals(0, num("SELECT count(*) FROM pg_class WHERE relname = 'dtyp_t1'"));
+    }
+
+    /**
+     * Answering with the row type, answering with SETOF it, taking it, taking an array of them,
+     * taking it with a default, and a procedure taking it: all six are written in terms of the
+     * type. What the array type reaches is named first and against the array type; the rest follow
+     * in the order they were created.
+     */
+    @Test
+    void everyWayARoutineIsWrittenInTermsOfTheRowTypeStandsInTheWay() throws Exception {
+        exec("CREATE TABLE dtyp_t2 (a int, b text)");
+        exec("CREATE FUNCTION dtyp_ret(x int) RETURNS dtyp_t2 LANGUAGE sql AS 'SELECT 1, ''a'''");
+        exec("CREATE FUNCTION dtyp_setof(x int) RETURNS SETOF dtyp_t2 LANGUAGE sql"
+                + " AS 'SELECT 1, ''a'''");
+        exec("CREATE FUNCTION dtyp_arg(r dtyp_t2) RETURNS int LANGUAGE sql AS 'SELECT 1'");
+        exec("CREATE FUNCTION dtyp_arr(r dtyp_t2[]) RETURNS int LANGUAGE sql AS 'SELECT 1'");
+        exec("CREATE FUNCTION dtyp_def(r dtyp_t2 DEFAULT NULL) RETURNS int LANGUAGE sql"
+                + " AS 'SELECT 1'");
+        exec("CREATE PROCEDURE dtyp_proc(r dtyp_t2) LANGUAGE sql AS 'SELECT 1'");
+
+        assertEquals("2BP01", stateOf("DROP TABLE dtyp_t2"));
+        assertEquals("function dtyp_arr(dtyp_t2[]) depends on type dtyp_t2[]\n"
+                        + "function dtyp_ret(integer) depends on type dtyp_t2\n"
+                        + "function dtyp_setof(integer) depends on type dtyp_t2\n"
+                        + "function dtyp_arg(dtyp_t2) depends on type dtyp_t2\n"
+                        + "function dtyp_def(dtyp_t2) depends on type dtyp_t2\n"
+                        + "function dtyp_proc(dtyp_t2) depends on type dtyp_t2",
+                detailOf("DROP TABLE dtyp_t2"));
+
+        String[] notice = noticeOf("DROP TABLE dtyp_t2 CASCADE");
+        assertEquals("drop cascades to 6 other objects", notice[0]);
+        assertEquals("drop cascades to function dtyp_arr(dtyp_t2[])\n"
+                        + "drop cascades to function dtyp_ret(integer)\n"
+                        + "drop cascades to function dtyp_setof(integer)\n"
+                        + "drop cascades to function dtyp_arg(dtyp_t2)\n"
+                        + "drop cascades to function dtyp_def(dtyp_t2)\n"
+                        + "drop cascades to function dtyp_proc(dtyp_t2)",
+                notice[1]);
+        assertEquals(0, num("SELECT count(*) FROM pg_proc WHERE proname IN"
+                + " ('dtyp_ret','dtyp_setof','dtyp_arg','dtyp_arr','dtyp_def','dtyp_proc')"));
+    }
+
+    /**
+     * A routine that reaches the relation both ways -- answering with its row type and naming the
+     * relation in a body PostgreSQL parses -- is one object, and it is named once, against the
+     * relation. What the row type reaches is still walked first.
+     */
+    @Test
+    void aRoutineReachingTheRelationBothWaysIsNamedAgainstTheRelation() throws Exception {
+        exec("CREATE TABLE dtyp_td (id int, k int)");
+        exec("CREATE FUNCTION dtyp_x1() RETURNS dtyp_td LANGUAGE sql AS 'SELECT 1, 2'");
+        exec("CREATE FUNCTION dtyp_x2(n int) RETURNS bigint LANGUAGE sql"
+                + " BEGIN ATOMIC SELECT count(*) FROM dtyp_td WHERE id = n; END");
+        exec("CREATE FUNCTION dtyp_x3() RETURNS dtyp_td LANGUAGE sql"
+                + " BEGIN ATOMIC SELECT id, k FROM dtyp_td; END");
+        exec("CREATE FUNCTION dtyp_x4(r dtyp_td) RETURNS int LANGUAGE sql AS 'SELECT 1'");
+
+        assertEquals("2BP01", stateOf("DROP TABLE dtyp_td"));
+        assertEquals("function dtyp_x1() depends on type dtyp_td\n"
+                        + "function dtyp_x4(dtyp_td) depends on type dtyp_td\n"
+                        + "function dtyp_x2(integer) depends on table dtyp_td\n"
+                        + "function dtyp_x3() depends on table dtyp_td",
+                detailOf("DROP TABLE dtyp_td"));
+
+        String[] notice = noticeOf("DROP TABLE dtyp_td CASCADE");
+        assertEquals("drop cascades to 4 other objects", notice[0]);
+        assertEquals("drop cascades to function dtyp_x1()\n"
+                        + "drop cascades to function dtyp_x4(dtyp_td)\n"
+                        + "drop cascades to function dtyp_x2(integer)\n"
+                        + "drop cascades to function dtyp_x3()",
+                notice[1]);
+        assertEquals(0, num("SELECT count(*) FROM pg_proc WHERE proname IN"
+                + " ('dtyp_x1','dtyp_x2','dtyp_x3','dtyp_x4')"));
+    }
+
+    /**
+     * A dependent routine in another schema is named with the schema whatever the search path
+     * reaches, and only the overload written in terms of the type is taken.
+     */
+    @Test
+    void aDependentRoutineInAnotherSchemaIsNamedWithIt() throws Exception {
+        exec("CREATE SCHEMA dtyp_s3");
+        exec("CREATE TABLE dtyp_t3 (a int, b text)");
+        exec("CREATE FUNCTION dtyp_s3.dtyp_g3(r dtyp_t3) RETURNS int LANGUAGE sql AS 'SELECT 1'");
+        exec("CREATE FUNCTION dtyp_g3(r int) RETURNS int LANGUAGE sql AS 'SELECT 2'");
+
+        assertEquals("function dtyp_s3.dtyp_g3(dtyp_t3) depends on type dtyp_t3",
+                detailOf("DROP TABLE dtyp_t3"));
+        assertEquals("drop cascades to function dtyp_s3.dtyp_g3(dtyp_t3)",
+                noticeOf("DROP TABLE dtyp_t3 CASCADE")[0]);
+
+        // The overload written over int was no dependent, so it is still there and still answers.
+        assertEquals(1, num("SELECT count(*) FROM pg_proc WHERE proname = 'dtyp_g3'"));
+        assertEquals("2", scalar("SELECT dtyp_g3(5)"));
+        exec("DROP FUNCTION dtyp_g3(int)");
+        exec("DROP SCHEMA dtyp_s3 CASCADE");
+    }
+
+    /**
+     * A composite type of its own stands in the way the same way a relation's row type does, and
+     * an aggregate declared over it is a dependent beside the routine it takes its state from. A
+     * routine of two arguments is written with no space after the comma.
+     */
+    @Test
+    void anAggregateOverATypeStandsInTheWayBesideTheRoutinesOverIt() throws Exception {
+        exec("CREATE TYPE dtyp_c3 AS (x int, y text)");
+        exec("CREATE FUNCTION dtyp_h3(r dtyp_c3) RETURNS int LANGUAGE sql AS 'SELECT 1'");
+        exec("CREATE FUNCTION dtyp_st3(s int, r dtyp_c3) RETURNS int LANGUAGE sql AS 'SELECT 1'");
+        exec("CREATE AGGREGATE dtyp_ag3(dtyp_c3) (SFUNC = dtyp_st3, STYPE = int, INITCOND = '0')");
+
+        assertEquals("2BP01", stateOf("DROP TYPE dtyp_c3"));
+        assertEquals("cannot drop type dtyp_c3 because other objects depend on it",
+                messageOf("DROP TYPE dtyp_c3"));
+        assertEquals("function dtyp_h3(dtyp_c3) depends on type dtyp_c3\n"
+                        + "function dtyp_st3(integer,dtyp_c3) depends on type dtyp_c3\n"
+                        + "function dtyp_ag3(dtyp_c3) depends on type dtyp_c3",
+                detailOf("DROP TYPE dtyp_c3"));
+
+        String[] notice = noticeOf("DROP TYPE dtyp_c3 CASCADE");
+        assertEquals("drop cascades to 3 other objects", notice[0]);
+        assertEquals("drop cascades to function dtyp_h3(dtyp_c3)\n"
+                        + "drop cascades to function dtyp_st3(integer,dtyp_c3)\n"
+                        + "drop cascades to function dtyp_ag3(dtyp_c3)",
+                notice[1]);
+        assertEquals(0, num("SELECT count(*) FROM pg_proc WHERE proname IN"
+                + " ('dtyp_h3','dtyp_st3','dtyp_ag3')"));
+    }
+
+    /**
+     * What is not written in terms of the row type is no dependency at all: a routine over the
+     * column types, one whose unparsed body merely names the relation, and one answering with a
+     * bare record all leave the plain DROP TABLE to be carried out as it always was.
+     */
+    @Test
+    void aPlainDropTableGoesOnSucceedingWhereNothingNamesTheRowType() throws Exception {
+        exec("CREATE TABLE dtyp_k1 (a int, b text)");
+        exec("CREATE FUNCTION dtyp_kf1(x int) RETURNS int LANGUAGE sql AS 'SELECT x'");
+        exec("CREATE FUNCTION dtyp_kf2(x text) RETURNS text LANGUAGE sql AS 'SELECT x'");
+        exec("CREATE FUNCTION dtyp_kf3() RETURNS bigint LANGUAGE sql"
+                + " AS 'SELECT count(*) FROM dtyp_k1'");
+        exec("CREATE FUNCTION dtyp_kf4() RETURNS SETOF record LANGUAGE sql AS 'SELECT 1, 2'");
+
+        exec("DROP TABLE dtyp_k1");
+        assertEquals(0, num("SELECT count(*) FROM pg_class WHERE relname = 'dtyp_k1'"));
+        assertEquals(4, num("SELECT count(*) FROM pg_proc WHERE proname IN"
+                + " ('dtyp_kf1','dtyp_kf2','dtyp_kf3','dtyp_kf4')"));
+        assertEquals("7", scalar("SELECT dtyp_kf1(7)"));
+        exec("DROP FUNCTION dtyp_kf1(int)");
+        exec("DROP FUNCTION dtyp_kf2(text)");
+        exec("DROP FUNCTION dtyp_kf3()");
+        exec("DROP FUNCTION dtyp_kf4()");
+
+        // The routine dropped first takes the dependency with it.
+        exec("CREATE TABLE dtyp_k2 (a int, b text)");
+        exec("CREATE FUNCTION dtyp_kg(r dtyp_k2) RETURNS int LANGUAGE sql AS 'SELECT 1'");
+        exec("DROP FUNCTION dtyp_kg(dtyp_k2)");
+        exec("DROP TABLE dtyp_k2");
+        assertEquals(0, num("SELECT count(*) FROM pg_class WHERE relname = 'dtyp_k2'"));
+
+        // One relation's row type is nothing to another relation's drop.
+        exec("CREATE TABLE dtyp_k3 (a int, b text)");
+        exec("CREATE TABLE dtyp_k4 (a int, b text)");
+        exec("CREATE FUNCTION dtyp_kh(r dtyp_k4) RETURNS int LANGUAGE sql AS 'SELECT 1'");
+        exec("DROP TABLE dtyp_k3");
+        assertEquals(0, num("SELECT count(*) FROM pg_class WHERE relname = 'dtyp_k3'"));
+        exec("DROP TABLE dtyp_k4 CASCADE");
+
+        // Nothing but the drop is held up: the relation still takes TRUNCATE and ALTER.
+        exec("CREATE TABLE dtyp_k5 (a int, b text)");
+        exec("CREATE FUNCTION dtyp_ki(r dtyp_k5) RETURNS int LANGUAGE sql AS 'SELECT 1'");
+        exec("TRUNCATE dtyp_k5");
+        exec("ALTER TABLE dtyp_k5 ADD COLUMN c int");
+        assertEquals("a,b,c", column("SELECT column_name FROM information_schema.columns"
+                + " WHERE table_name = 'dtyp_k5' ORDER BY ordinal_position"));
+        exec("DROP TABLE dtyp_k5 CASCADE");
+    }
+
+    // ------------------------------------------------------------ what a cascade takes, not only what it names
+
+    /** DROP TYPE ... CASCADE takes away the column declared as the type, and the index over it. */
+    @Test
+    void dropTypeCascadeTakesTheColumnItNamedAndTheIndexOverIt() throws Exception {
+        exec("CREATE TYPE dtyp_e1 AS ENUM ('a','b')");
+        exec("CREATE TABLE dtyp_u1 (k int, c dtyp_e1, d int)");
+        exec("CREATE INDEX dtyp_ix1 ON dtyp_u1 (c)");
+
+        assertEquals("2BP01", stateOf("DROP TYPE dtyp_e1 RESTRICT"));
+        assertEquals("column c of table dtyp_u1 depends on type dtyp_e1",
+                detailOf("DROP TYPE dtyp_e1"));
+        assertEquals("drop cascades to column c of table dtyp_u1",
+                noticeOf("DROP TYPE dtyp_e1 CASCADE")[0]);
+
+        // The column is gone from the relation, and the two that were not declared as the type
+        // keep their places; the index over the column went with it.
+        assertEquals("k,d", column("SELECT column_name FROM information_schema.columns"
+                + " WHERE table_name = 'dtyp_u1' ORDER BY ordinal_position"));
+        assertEquals(0, num("SELECT count(*) FROM pg_class WHERE relname = 'dtyp_ix1'"));
+        exec("DROP TABLE dtyp_u1");
+    }
+
+    /** A typed table has no shape of its own once the type has gone, so CASCADE takes it whole. */
+    @Test
+    void dropTypeCascadeTakesATypedTableWholeAndOnlyTheColumnElsewhere() throws Exception {
+        exec("CREATE TYPE dtyp_c5 AS (x int, y text)");
+        exec("CREATE TABLE dtyp_of5 OF dtyp_c5");
+        exec("CREATE TABLE dtyp_u5 (k int, c dtyp_c5, d int)");
+
+        assertEquals("table dtyp_of5 depends on type dtyp_c5\n"
+                        + "column c of table dtyp_u5 depends on type dtyp_c5",
+                detailOf("DROP TYPE dtyp_c5"));
+
+        String[] notice = noticeOf("DROP TYPE dtyp_c5 CASCADE");
+        assertEquals("drop cascades to 2 other objects", notice[0]);
+        assertEquals("drop cascades to table dtyp_of5\n"
+                + "drop cascades to column c of table dtyp_u5", notice[1]);
+
+        assertEquals(0, num("SELECT count(*) FROM pg_class WHERE relname = 'dtyp_of5'"));
+        assertEquals("k,d", column("SELECT column_name FROM information_schema.columns"
+                + " WHERE table_name = 'dtyp_u5' ORDER BY ordinal_position"));
+        exec("DROP TABLE dtyp_u5");
+    }
+
+    /**
+     * A domain is a type like any other, and the refusal calls it one whichever spelling the DROP
+     * was written with: the column declared as it and the routine written over it both go.
+     */
+    @Test
+    void dropDomainCascadeTakesTheColumnAndTheRoutineOverIt() throws Exception {
+        exec("CREATE DOMAIN dtyp_dm AS int CHECK (VALUE > 0)");
+        exec("CREATE TABLE dtyp_ud (k int, c dtyp_dm, d int)");
+        exec("CREATE FUNCTION dtyp_fd(r dtyp_dm) RETURNS int LANGUAGE sql AS 'SELECT 1'");
+
+        assertEquals("2BP01", stateOf("DROP DOMAIN dtyp_dm"));
+        assertEquals("cannot drop type dtyp_dm because other objects depend on it",
+                messageOf("DROP DOMAIN dtyp_dm"));
+        assertEquals("column c of table dtyp_ud depends on type dtyp_dm\n"
+                        + "function dtyp_fd(dtyp_dm) depends on type dtyp_dm",
+                detailOf("DROP DOMAIN dtyp_dm"));
+
+        String[] notice = noticeOf("DROP DOMAIN dtyp_dm CASCADE");
+        assertEquals("drop cascades to 2 other objects", notice[0]);
+        assertEquals("drop cascades to column c of table dtyp_ud\n"
+                + "drop cascades to function dtyp_fd(dtyp_dm)", notice[1]);
+
+        assertEquals("k,d", column("SELECT column_name FROM information_schema.columns"
+                + " WHERE table_name = 'dtyp_ud' ORDER BY ordinal_position"));
+        assertEquals(0, num("SELECT count(*) FROM pg_proc WHERE proname = 'dtyp_fd'"));
+        exec("DROP TABLE dtyp_ud");
+    }
+
+    /**
+     * A schema drop reaches whatever hangs from the types and the sequences it holds, wherever
+     * that is: the column outside declared as the type, the routine outside written over it, and
+     * the default outside drawing on the sequence. What hangs from each is named straight after
+     * it, and the type comes before the sequence because it was made first.
+     */
+    @Test
+    void dropSchemaCascadeTakesTheColumnTheRoutineAndTheDefaultOutsideIt() throws Exception {
+        exec("CREATE SCHEMA dtyp_s2");
+        exec("CREATE TYPE dtyp_s2.dtyp_e2 AS ENUM ('a','b')");
+        exec("CREATE SEQUENCE dtyp_s2.dtyp_q2");
+        exec("CREATE TABLE dtyp_u2 (k int DEFAULT nextval('dtyp_s2.dtyp_q2'),"
+                + " c dtyp_s2.dtyp_e2, d int)");
+        exec("CREATE INDEX dtyp_ix2 ON dtyp_u2 (c)");
+        exec("CREATE FUNCTION dtyp_fa2(r dtyp_s2.dtyp_e2) RETURNS int LANGUAGE sql AS 'SELECT 1'");
+
+        assertEquals("2BP01", stateOf("DROP SCHEMA dtyp_s2"));
+        assertEquals("type dtyp_s2.dtyp_e2 depends on schema dtyp_s2\n"
+                        + "column c of table dtyp_u2 depends on type dtyp_s2.dtyp_e2\n"
+                        + "function dtyp_fa2(dtyp_s2.dtyp_e2) depends on type dtyp_s2.dtyp_e2\n"
+                        + "sequence dtyp_s2.dtyp_q2 depends on schema dtyp_s2\n"
+                        + "default value for column k of table dtyp_u2"
+                        + " depends on sequence dtyp_s2.dtyp_q2",
+                detailOf("DROP SCHEMA dtyp_s2"));
+
+        String[] notice = noticeOf("DROP SCHEMA dtyp_s2 CASCADE");
+        assertEquals("drop cascades to 5 other objects", notice[0]);
+        assertEquals("drop cascades to type dtyp_s2.dtyp_e2\n"
+                + "drop cascades to column c of table dtyp_u2\n"
+                + "drop cascades to function dtyp_fa2(dtyp_s2.dtyp_e2)\n"
+                + "drop cascades to sequence dtyp_s2.dtyp_q2\n"
+                + "drop cascades to default value for column k of table dtyp_u2", notice[1]);
+
+        // Each of the five is really gone: the column, the index over it, the routine, and the
+        // default the column outside the schema was drawing from the sequence.
+        assertEquals("k,d", column("SELECT column_name FROM information_schema.columns"
+                + " WHERE table_name = 'dtyp_u2' ORDER BY ordinal_position"));
+        assertNull(scalar("SELECT column_default FROM information_schema.columns"
+                + " WHERE table_name = 'dtyp_u2' AND column_name = 'k'"));
+        assertEquals(0, num("SELECT count(*) FROM pg_class WHERE relname = 'dtyp_ix2'"));
+        assertEquals(0, num("SELECT count(*) FROM pg_proc WHERE proname = 'dtyp_fa2'"));
+        exec("DROP TABLE dtyp_u2");
+    }
+
+    /**
+     * A column of a relation the schema is taking with it is covered by the relation's own line,
+     * so the list names it once as a relation and not again as a column.
+     */
+    @Test
+    void aColumnOfARelationTheSchemaTakesIsNotNamedTwice() throws Exception {
+        exec("CREATE SCHEMA dtyp_sa");
+        exec("CREATE TYPE dtyp_sa.dtyp_ea AS ENUM ('a')");
+        exec("CREATE TABLE dtyp_sa.dtyp_ta (k int, c dtyp_sa.dtyp_ea)");
+        exec("CREATE FUNCTION dtyp_sa.dtyp_fa(r dtyp_sa.dtyp_ea) RETURNS int LANGUAGE sql"
+                + " AS 'SELECT 1'");
+
+        assertEquals("type dtyp_sa.dtyp_ea depends on schema dtyp_sa\n"
+                        + "table dtyp_sa.dtyp_ta depends on schema dtyp_sa\n"
+                        + "function dtyp_sa.dtyp_fa(dtyp_sa.dtyp_ea) depends on schema dtyp_sa",
+                detailOf("DROP SCHEMA dtyp_sa"));
+
+        String[] notice = noticeOf("DROP SCHEMA dtyp_sa CASCADE");
+        assertEquals("drop cascades to 3 other objects", notice[0]);
+        assertEquals("drop cascades to type dtyp_sa.dtyp_ea\n"
+                + "drop cascades to table dtyp_sa.dtyp_ta\n"
+                + "drop cascades to function dtyp_sa.dtyp_fa(dtyp_sa.dtyp_ea)", notice[1]);
+        assertEquals(0, num("SELECT count(*) FROM pg_namespace WHERE nspname = 'dtyp_sa'"));
+    }
+
+    // ------------------------------------------------------------ a cascade rolled back never happened
+
+    /** A rolled-back DROP TABLE ... CASCADE gives the routine back, and only the overload it took. */
+    @Test
+    void aRolledBackDropTableCascadeGivesBackOnlyTheOverloadItTook() throws Exception {
+        exec("CREATE TABLE dtyp_t7 (a int, b text)");
+        exec("CREATE FUNCTION dtyp_f7(r dtyp_t7) RETURNS int LANGUAGE sql AS 'SELECT 1'");
+        exec("CREATE FUNCTION dtyp_f7(r int) RETURNS int LANGUAGE sql AS 'SELECT 2'");
+
+        exec("BEGIN");
+        exec("DROP TABLE dtyp_t7 CASCADE");
+        assertEquals(1, num("SELECT count(*) FROM pg_proc WHERE proname = 'dtyp_f7'"));
+        exec("ROLLBACK");
+        assertEquals(2, num("SELECT count(*) FROM pg_proc WHERE proname = 'dtyp_f7'"));
+        assertEquals(1, num("SELECT count(*) FROM pg_class WHERE relname = 'dtyp_t7'"));
+        assertEquals("2", scalar("SELECT dtyp_f7(5)"));
+
+        // Carried out for real, it takes the one overload written over the row type and no other.
+        exec("DROP TABLE dtyp_t7 CASCADE");
+        assertEquals(1, num("SELECT count(*) FROM pg_proc WHERE proname = 'dtyp_f7'"));
+        assertEquals("2", scalar("SELECT dtyp_f7(5)"));
+        exec("DROP FUNCTION dtyp_f7(int)");
+    }
+
+    /** A rolled-back DROP TYPE ... CASCADE gives the column back holding what it held. */
+    @Test
+    void aRolledBackDropTypeCascadeGivesBackTheColumnAndItsRows() throws Exception {
+        exec("CREATE TYPE dtyp_e8 AS ENUM ('a','b')");
+        exec("CREATE TABLE dtyp_u8 (k int, c dtyp_e8, d int)");
+        exec("INSERT INTO dtyp_u8 VALUES (1,'a',3)");
+
+        exec("BEGIN");
+        exec("DROP TYPE dtyp_e8 CASCADE");
+        assertEquals("k,d", column("SELECT column_name FROM information_schema.columns"
+                + " WHERE table_name = 'dtyp_u8' ORDER BY ordinal_position"));
+        exec("ROLLBACK");
+
+        assertEquals("k,c,d", column("SELECT column_name FROM information_schema.columns"
+                + " WHERE table_name = 'dtyp_u8' ORDER BY ordinal_position"));
+        assertEquals("a", scalar("SELECT c FROM dtyp_u8 WHERE k = 1"));
+        // The type is back too, and goes on being a type the column can be written through.
+        assertEquals(1, num("SELECT count(*) FROM pg_type WHERE typname = 'dtyp_e8'"));
+        exec("INSERT INTO dtyp_u8 VALUES (2,'b',4)");
+        assertEquals("b", scalar("SELECT c FROM dtyp_u8 WHERE k = 2"));
+        exec("DROP TABLE dtyp_u8");
+        exec("DROP TYPE dtyp_e8");
+    }
+
+    /** A rolled-back DROP SEQUENCE ... CASCADE leaves the default drawing on it. */
+    @Test
+    void aRolledBackDropSequenceCascadeLeavesTheDefaultDrawingOnIt() throws Exception {
+        exec("CREATE SEQUENCE dtyp_q9");
+        exec("CREATE TABLE dtyp_u9 (i int, j int DEFAULT nextval('dtyp_q9'))");
+        exec("INSERT INTO dtyp_u9 (i) VALUES (1)");
+
+        exec("BEGIN");
+        assertEquals("drop cascades to default value for column j of table dtyp_u9",
+                noticeOf("DROP SEQUENCE dtyp_q9 CASCADE")[0]);
+        exec("ROLLBACK");
+
+        exec("INSERT INTO dtyp_u9 (i) VALUES (2)");
+        assertEquals("2", scalar("SELECT j FROM dtyp_u9 WHERE i = 2"));
+        exec("DROP TABLE dtyp_u9");
+        exec("DROP SEQUENCE dtyp_q9");
+    }
+
     /** The number of rows a write reports having changed. */
     private static int update(String sql) throws SQLException {
         try (Statement st = conn.createStatement()) {

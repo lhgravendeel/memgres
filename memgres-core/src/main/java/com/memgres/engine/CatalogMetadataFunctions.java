@@ -116,7 +116,12 @@ class CatalogMetadataFunctions {
                                             CatalogConstraintBuilder.constraintKey(
                                                     schemaName, tbl.getName(), conname));
                                     if (nnOid == coid) {
-                                        return "NOT NULL " + RuleDeparser.quoteIdentifier(c.getName());
+                                        // A constraint whose rows were never read says so in its
+                                        // own definition, the same way a CHECK declared that way
+                                        // does: the clause is part of what the constraint is.
+                                        return "NOT NULL " + RuleDeparser.quoteIdentifier(c.getName())
+                                                + (tbl.isNotNullValidated(c.getName())
+                                                        ? "" : " NOT VALID");
                                     }
                                 }
                             }

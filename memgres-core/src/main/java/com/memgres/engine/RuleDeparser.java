@@ -74,12 +74,24 @@ public final class RuleDeparser {
         final String custom;   // enum / domain / composite type name (dt is null)
         final DataType elem;   // element type when this is an array type
         final int typmod;      // -1 when none
+        /**
+         * The type a domain is built over, and null for everything else. No operator and no
+         * function is written over a domain: PostgreSQL resolves both over the type underneath and
+         * records the coercion down to it, which is the cast that shows up in a definition holding
+         * a domain-typed column.
+         */
+        final DataType domainBase;
 
         private PgType(DataType dt, String custom, DataType elem, int typmod) {
+            this(dt, custom, elem, typmod, null);
+        }
+
+        private PgType(DataType dt, String custom, DataType elem, int typmod, DataType domainBase) {
             this.dt = dt;
             this.custom = custom;
             this.elem = elem;
             this.typmod = typmod;
+            this.domainBase = domainBase;
         }
 
         public static PgType of(DataType dt) {
@@ -92,6 +104,11 @@ public final class RuleDeparser {
 
         public static PgType custom(String name) {
             return new PgType(null, name, null, -1);
+        }
+
+        /** A domain, carrying the type its values are really of beside its own name. */
+        public static PgType domain(String name, DataType base) {
+            return new PgType(null, name, null, -1, base);
         }
 
         public static PgType arrayOf(DataType elem) {
@@ -151,6 +168,63 @@ public final class RuleDeparser {
         }
     }
 
+    /**
+     * The lookup a rule action's expressions are read against, which also carries the name the
+     * relation being written answers to.
+     *
+     * <p>PostgreSQL analyses a rule action as the rule is written, and the range table it builds
+     * for it holds OLD and NEW beside the relation the action writes to. More than one entry there
+     * means every column is printed under the entry it came from, so a column written with no
+     * qualifier of its own comes back under the relation's name -- or under its alias, which is
+     * the only name the analysed query knows the relation by.
+     */
+    private static final class RuleTarget implements ColumnTypes {
+        private final String relation;
+        private final ColumnTypes columns;
+        /** Where a query standing inside the expression reads its own relations, or null. */
+        private final Database database;
+        private final String schema;
+        /** Whether this is an action, the only part of a rule that may hold a query inside it. */
+        private final boolean action;
+
+        RuleTarget(String relation, ColumnTypes columns) {
+            this(relation, columns, null, null, false);
+        }
+
+        RuleTarget(String relation, ColumnTypes columns, Database database, String schema,
+                   boolean action) {
+            this.relation = relation;
+            this.columns = columns;
+            this.database = database;
+            this.schema = schema;
+            this.action = action;
+        }
+
+        @Override
+        public PgType typeOf(String columnName) {
+            return columns.typeOf(columnName);
+        }
+    }
+
+    /**
+     * Column-type lookup for an expression of a rule, read against {@code target} and printed with
+     * every unqualified column under {@code relation}.
+     */
+    public static ColumnTypes forRuleTarget(String relation, Table target) {
+        return new RuleTarget(relation, forTable(target));
+    }
+
+    /**
+     * The same lookup for an expression of a rule's action. An action, unlike the rule's own
+     * qualification, may hold a whole query inside it, and PostgreSQL writes that query out laid
+     * out under the clause it stands in rather than echoing the text it was written as -- which
+     * takes the relations the query reads, and so the database it was written against.
+     */
+    public static ColumnTypes forRuleAction(String relation, Table target, Database database,
+                                            String schema) {
+        return new RuleTarget(relation, forTable(target), database, schema, true);
+    }
+
     /** A lookup that resolves nothing; casts are then never inserted. */
     public static final ColumnTypes NO_COLUMNS = new ColumnTypes() {
         @Override
@@ -162,7 +236,7 @@ public final class RuleDeparser {
     static PgType fromColumn(Column c) {
         if (c.getArrayElementType() != null) return PgType.arrayOf(c.getArrayElementType());
         if (c.getEnumTypeName() != null) return PgType.custom(c.getEnumTypeName());
-        if (c.getDomainTypeName() != null) return PgType.custom(c.getDomainTypeName());
+        if (c.getDomainTypeName() != null) return PgType.domain(c.getDomainTypeName(), c.getType());
         if (c.getCompositeTypeName() != null) return PgType.custom(c.getCompositeTypeName());
         return PgType.of(c.getType());
     }
@@ -301,6 +375,11 @@ public final class RuleDeparser {
         if (e instanceof UnaryExpr) {
             UnaryExpr u = (UnaryExpr) e;
             if (u.op() == UnaryExpr.UnaryOp.NOT) return PgType.of(DataType.BOOLEAN);
+            if (u.op() == UnaryExpr.UnaryOp.NEGATE || u.op() == UnaryExpr.UnaryOp.POSITIVE) {
+                // A sign resolves over the type underneath a domain, so what it answers with is
+                // that type: the reading down has already happened inside it.
+                return withoutDomain(typeOf(u.operand(), cols));
+            }
             return typeOf(u.operand(), cols);
         }
         if (e instanceof IsNullExpr || e instanceof IsBooleanExpr
@@ -454,6 +533,12 @@ public final class RuleDeparser {
      */
     private static PgType[] operandTargets(BinaryExpr.BinOp op, PgType lt, PgType rt) {
         if (lt == null && rt == null) return new PgType[]{null, null};
+        // A domain has no operators of its own. PostgreSQL resolves the operator over the type the
+        // domain is built on, so the domain's value is read down to that type and the reading is
+        // what the definition comes back holding: CHECK (a > 1) over a domain of integer reads
+        // back as CHECK (((a)::integer > 1)).
+        lt = withoutDomain(lt);
+        rt = withoutDomain(rt);
         // An untyped literal takes the type of its sibling before resolution runs.
         if (lt == null) lt = rt;
         PgType json = jsonOperandTarget(op, lt, rt);
@@ -491,6 +576,14 @@ public final class RuleDeparser {
         if (num != null) return num;
 
         return new PgType[]{lt, rt};
+    }
+
+    /**
+     * The type a domain's values really are, for the resolution a domain does not itself take part
+     * in, and the type unchanged for everything else.
+     */
+    private static PgType withoutDomain(PgType t) {
+        return t != null && t.domainBase != null ? PgType.of(t.domainBase) : t;
     }
 
     /**
@@ -705,7 +798,9 @@ public final class RuleDeparser {
             ColumnRef r = (ColumnRef) e;
             String col = "value".equalsIgnoreCase(r.column()) && cols instanceof DomainValue
                     ? "VALUE" : quoteIdentifier(r.column());
-            return (r.table() != null ? quoteIdentifier(r.table()) + "." : "") + col;
+            String qualifier = r.table() != null ? r.table()
+                    : cols instanceof RuleTarget ? ((RuleTarget) cols).relation : null;
+            return (qualifier != null ? quoteIdentifier(qualifier) + "." : "") + col;
         }
         if (e instanceof CastExpr) {
             CastExpr c = (CastExpr) e;
@@ -761,9 +856,13 @@ public final class RuleDeparser {
                     }
                     return "(NOT " + render(u.operand(), PgType.of(DataType.BOOLEAN), cols, false) + ")";
                 case NEGATE:
-                    return "(- " + render(u.operand(), null, cols, false) + ")";
+                    // A sign is an operator too, and is resolved over the type underneath a domain
+                    // the same way a comparison is.
+                    return "(- " + render(u.operand(), withoutDomain(typeOf(u.operand(), cols)),
+                            cols, false) + ")";
                 case POSITIVE:
-                    return "(+ " + render(u.operand(), null, cols, false) + ")";
+                    return "(+ " + render(u.operand(), withoutDomain(typeOf(u.operand(), cols)),
+                            cols, false) + ")";
                 case BIT_NOT:
                     return "(~ " + render(u.operand(), null, cols, false) + ")";
                 default:
@@ -785,6 +884,11 @@ public final class RuleDeparser {
         if (e instanceof BetweenExpr) {
             return renderBetween((BetweenExpr) e, cols);
         }
+        // A query standing inside a rule's action is written out rather than echoed, laid out
+        // under the clause it stands in. Nothing else this deparser writes has a clause to lay one
+        // out under, so nothing else reaches this.
+        String insideAction = renderRuleSubLink(e, cols);
+        if (insideAction != null) return insideAction;
         if (e instanceof InExpr) {
             return renderIn((InExpr) e, cols);
         }
@@ -897,7 +1001,7 @@ public final class RuleDeparser {
 
     /** PG rewrites IN (list) into {@code = ANY (ARRAY[...])}. */
     private static String renderIn(InExpr in, ColumnTypes cols) {
-        PgType lt = typeOf(in.expr(), cols);
+        PgType lt = withoutDomain(typeOf(in.expr(), cols));
         // Every item of the list is read as the one type the list settles on together with the
         // value being tested, and the comparison is resolved over that type. That is what puts a
         // conversion on the value tested and another on the array of items: a character varying
@@ -925,6 +1029,63 @@ public final class RuleDeparser {
             sb.append(items);
         }
         return sb.append("))").toString();
+    }
+
+    /**
+     * The indentation a rule action's clauses have reached by the time one of them writes an
+     * expression: PostgreSQL moves in one step for the statement itself and back out again for
+     * every clause keyword, so every expression of an action stands one step in.
+     */
+    private static final int ACTION_CLAUSE_INDENT = 8;
+
+    /**
+     * A query standing inside a rule's action, or null where the expression holds none.
+     *
+     * <p>PostgreSQL leaves a sub-link the sub-link it was: only a value list becomes a comparison
+     * against an array, so {@code IN (SELECT ...)} comes back as it was written while
+     * {@code IN (1, 2)} comes back as {@code = ANY (ARRAY[1, 2])}. Equality against ANY of a query
+     * is the one shape it does rewrite, into the IN the grammar has for it; every other operator,
+     * and ALL, keeps the spelling it was written with. The query inside is written without the
+     * names it gives its columns, because nothing outside the sub-link reads them.
+     */
+    private static String renderRuleSubLink(Expression e, ColumnTypes cols) {
+        if (!(cols instanceof RuleTarget)) return null;
+        RuleTarget rule = (RuleTarget) cols;
+        if (!rule.action || rule.database == null) return null;
+        if (e instanceof com.memgres.engine.parser.ast.SubqueryExpr) {
+            return "(" + insideAction(
+                    ((com.memgres.engine.parser.ast.SubqueryExpr) e).subquery(), rule) + ")";
+        }
+        if (e instanceof com.memgres.engine.parser.ast.ExistsExpr) {
+            return "(EXISTS (" + insideAction(
+                    ((com.memgres.engine.parser.ast.ExistsExpr) e).subquery(), rule) + "))";
+        }
+        if (e instanceof com.memgres.engine.parser.ast.AnyAllExpr) {
+            com.memgres.engine.parser.ast.AnyAllExpr any =
+                    (com.memgres.engine.parser.ast.AnyAllExpr) e;
+            boolean asIn = !any.isAll() && any.op() == BinaryExpr.BinOp.EQUAL;
+            return "(" + render(any.left(), null, cols, false)
+                    + (asIn ? " IN (" : " " + operatorText(any.op())
+                            + (any.isAll() ? " ALL (" : " ANY ("))
+                    + insideAction(any.subquery(), rule) + "))";
+        }
+        if (!(e instanceof InExpr)) return null;
+        List<Expression> values = ((InExpr) e).values();
+        if (values == null || values.size() != 1
+                || !(values.get(0) instanceof com.memgres.engine.parser.ast.SubqueryExpr)) {
+            return null;
+        }
+        String body = "(" + render(((InExpr) e).expr(), null, cols, false) + " IN ("
+                + insideAction(((com.memgres.engine.parser.ast.SubqueryExpr) values.get(0))
+                        .subquery(), rule) + "))";
+        return ((InExpr) e).negated() ? "(NOT " + body + ")" : body;
+    }
+
+    /** One such query, written against the relations it reads. */
+    private static String insideAction(com.memgres.engine.parser.ast.Statement query,
+                                       RuleTarget rule) {
+        return ViewDeparser.ruleQuery(query, ACTION_CLAUSE_INDENT, false,
+                ViewDeparser.columnTypesOf(rule.database, query, rule.schema));
     }
 
     private static String renderArrayOperand(Expression arr, PgType elemTarget, ColumnTypes cols) {
@@ -1129,7 +1290,7 @@ public final class RuleDeparser {
             // PostgreSQL declares for the name, so a position one of them declares text
             // is read as text; a name it declares nothing for is left alone.
             if (!allText && !BuiltinFunctionSignatures.someSignatureTakesTextAt(name, n, i)) continue;
-            PgType at = typeOf(fn.args().get(i), cols);
+            PgType at = withoutDomain(typeOf(fn.args().get(i), cols));
             if (at == null || category(at) == CAT_STRING) targets.set(i, text);
         }
         return targets;

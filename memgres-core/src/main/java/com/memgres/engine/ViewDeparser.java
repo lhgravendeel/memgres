@@ -87,15 +87,63 @@ public final class ViewDeparser {
     }
 
     /**
+     * A query standing inside a rule, the way pg_get_ruledef writes one.
+     *
+     * <p>PostgreSQL analyses a rule against a range table holding OLD and NEW beside whatever the
+     * action itself reads, and a query reading more than one relation writes the relation in front
+     * of every column -- which is why an action names it where a view over one relation does not.
+     * The layout begins at {@code startIndent} because a query feeding an INSERT, or standing
+     * inside a clause, is written one step further in than the statement holding it.
+     *
+     * @param namesVisible whether a reader sees the names this query gives its columns: true of an
+     *                     action standing on its own, false of one nothing outside it reads
+     */
+    public static String ruleQuery(Statement stmt, int startIndent, boolean namesVisible,
+                                   SqlUnparser.ColumnTypes types) {
+        if (!(stmt instanceof SelectStmt) && !(stmt instanceof SetOpStmt)) {
+            return " " + SqlUnparser.toSql(stmt);
+        }
+        ViewDeparser deparser = new ViewDeparser(false, 0, types, null);
+        deparser.queryDef(stmt, startIndent, true, namesVisible, null);
+        return deparser.out.toString();
+    }
+
+    /**
+     * The relations a rule's UPDATE action reads beside the one it writes to, each on the line a
+     * query's FROM would put it on: PostgreSQL lays an action out exactly as it lays a query out.
+     */
+    public static String ruleFromClause(List<SelectStmt.FromItem> items) {
+        ViewDeparser deparser = new ViewDeparser(false, 0, null, null);
+        deparser.indentLevel = STD;
+        deparser.nested = true;
+        deparser.qualify = true;
+        List<String> names = new ArrayList<String>();
+        collectItemNames(items, names);
+        deparser.scopeRelations = names;
+        deparser.scopeAliases = deparser.assignNames(names);
+        deparser.fromClause(items);
+        return deparser.out.toString();
+    }
+
+    /**
      * The declared types of the columns a stored query reads, so a constant that still had no
      * type of its own when the query was written is printed as the one PostgreSQL resolved it to.
      * Every relation the query names is gathered, sub-selects and CTE bodies included; a column of
      * anything else is left unanswered and printed as it was written.
      */
     public static SqlUnparser.ColumnTypes columnTypesOf(Database database, Database.ViewDef view) {
+        return columnTypesOf(database, view.query(),
+                view.schemaName() == null ? "public" : view.schemaName());
+    }
+
+    /**
+     * The same lookup for a query that belongs to no view: the body of a rule's action, which is
+     * kept as the statement it was written as rather than as a relation of its own.
+     */
+    public static SqlUnparser.ColumnTypes columnTypesOf(Database database, Statement query,
+                                                        String schemaName) {
         final java.util.Map<String, Table> byName = new java.util.LinkedHashMap<String, Table>();
-        collectQueryRelations(database, view.query(),
-                view.schemaName() == null ? "public" : view.schemaName(), byName);
+        collectQueryRelations(database, query, schemaName, byName);
         return new SqlUnparser.ColumnTypes() {
             @Override
             public String typeOf(String relation, String column) {
@@ -623,7 +671,10 @@ public final class ViewDeparser {
     }
 
     private void fromClause(SelectStmt select) {
-        List<SelectStmt.FromItem> from = select.from();
+        fromClause(select.from());
+    }
+
+    private void fromClause(List<SelectStmt.FromItem> from) {
         if (from == null || from.isEmpty()) return;
         for (int i = 0; i < from.size(); i++) {
             if (i == 0) {

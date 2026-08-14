@@ -1,6 +1,7 @@
 package com.memgres.engine;
 
 import com.memgres.engine.parser.ast.ArraySubqueryExpr;
+import com.memgres.engine.parser.ast.BinaryExpr;
 import com.memgres.engine.parser.ast.CastExpr;
 import com.memgres.engine.parser.ast.ColumnRef;
 import com.memgres.engine.parser.ast.ExistsExpr;
@@ -167,7 +168,11 @@ public final class DdlDefinitionChecks {
             DataType dt = DataType.fromPgName(baseTypeName(((CastExpr) expr).typeName()));
             boolean isArray = ((CastExpr) expr).typeName() != null
                     && ((CastExpr) expr).typeName().replaceAll("\\(.*\\)", "").trim().endsWith("[]");
-            return dt == null || isArray ? null : dt.toRegtypeDisplay();
+            if (dt == null) return null;
+            // An array is a type in its own right, and PostgreSQL names it as one where a column
+            // cannot take it: a default of integer[] on an integer column is a mismatch and not a
+            // value to be read.
+            return isArray ? dt.toRegtypeDisplay() + "[]" : dt.toRegtypeDisplay();
         }
         if (expr instanceof UnaryExpr && ((UnaryExpr) expr).op() == UnaryExpr.UnaryOp.NEGATE) {
             return defaultExpressionTypeName(((UnaryExpr) expr).operand(), value);
@@ -633,9 +638,14 @@ public final class DdlDefinitionChecks {
                                               java.util.List<Column> declared) {
         if (resolved == null) return;
         requireUntypedLiteralReadableAs(expr, resolved.dataType());
+        // An array is a type of its own, and PostgreSQL asks the same question of it as of any
+        // other: there is a coercion from one array to another exactly where there is one between
+        // their element types, and none at all from a lone value to an array. Skipping every
+        // column that held an array left integer[] taking a DEFAULT of 1.
+        String arrayType = builtinArrayTypeName(resolved.dataType());
         if (expr == null || resolved.dataType() == null || resolved.enumTypeName() != null
                 || resolved.compositeTypeName() != null
-                || resolved.arrayElementType() != null) {
+                || (resolved.arrayElementType() != null && arrayType == null)) {
             return;
         }
         String exprType = plainExpressionTypeName(expr, declared);
@@ -646,12 +656,25 @@ public final class DdlDefinitionChecks {
         // reader would have spelled it -- bare where the search path reaches the domain, qualified
         // where it does not -- because that is how PostgreSQL prints any type name.
         String columnType = resolved.domainTypeName() != null ? resolved.domainDisplayName()
+                : arrayType != null ? arrayType
                 : resolved.dataType().toRegtypeDisplay();
         MemgresException e = PgErrors.datatypeMismatch("column \"" + columnName + "\" is of type "
                 + columnType
                 + " but default expression is of type " + exprType);
         e.setHint("You will need to rewrite or cast the expression.");
         throw e;
+    }
+
+    /**
+     * An array type spelled the way PostgreSQL spells it in a message -- the element type's own
+     * name with brackets after it -- and null for anything that is not one of the array types this
+     * engine models. The name pg_type carries for an array is its internal one, {@code _int4},
+     * which is not what a complaint about the column would say; and the declared width is left
+     * off, because PostgreSQL names the array type rather than the column's modifier.
+     */
+    private static String builtinArrayTypeName(DataType arrayType) {
+        DataType element = DataType.elementOf(arrayType);
+        return element == null ? null : element.toRegtypeDisplay() + "[]";
     }
 
     /**
@@ -696,7 +719,37 @@ public final class DdlDefinitionChecks {
         // as decide whether a WHERE is a condition, so one reading of an expression serves both.
         // It stays one-sided -- silence where the type is not certain leaves the definition
         // standing, which is what a wrong answer here would not.
-        return BooleanContext.typeOf(expr, BooleanContext.Types.none());
+        String settled = BooleanContext.typeOf(expr, BooleanContext.Types.none());
+        return settled != null ? settled : untypedOperandsTypeName(expr);
+    }
+
+    /**
+     * The type PostgreSQL settles on where nothing an expression is written over carries one.
+     *
+     * <p>A string literal written bare is of type {@code unknown}, so an operator or a call over
+     * nothing but those has no argument to take its type from; PostgreSQL resolves each of them to
+     * text, the preferred type of the string category. That is why {@code 'a' || 'b'} and
+     * {@code coalesce('a','b')} are text rather than untyped, and why an integer column will take
+     * neither of them. Where one operand does carry a type the answer is that type's business:
+     * {@code 'a' || '{1}'::int[]} reads the literal as an array instead of making the pair text.
+     */
+    private static String untypedOperandsTypeName(Expression expr) {
+        if (expr instanceof BinaryExpr) {
+            BinaryExpr bin = (BinaryExpr) expr;
+            if (bin.op() != BinaryExpr.BinOp.CONCAT) return null;
+            return isUntypedLiteral(bin.left()) && isUntypedLiteral(bin.right()) ? "text" : null;
+        }
+        if (!(expr instanceof FunctionCallExpr)) return null;
+        FunctionCallExpr call = (FunctionCallExpr) expr;
+        String name = call.name() == null ? "" : call.name().toLowerCase();
+        if (!name.equals("coalesce") && !name.equals("greatest") && !name.equals("least")) {
+            return null;
+        }
+        if (call.args() == null || call.args().isEmpty()) return null;
+        for (Expression arg : call.args()) {
+            if (!isUntypedLiteral(arg)) return null;
+        }
+        return "text";
     }
 
     /**

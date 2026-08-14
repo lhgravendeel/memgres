@@ -237,9 +237,15 @@ class SelectExecutor {
      * <p>Two columns compared for equality, one of which is compared with a written constant,
      * stand in one class: {@code s.a = o.a AND o.a = 5} says {@code s.a = 5} as surely as it says
      * either of the two, and PostgreSQL puts that restriction on s's own scan -- which decides the
-     * row before a VIRTUAL generated column of it is reached. Only the WHERE is read: an outer
-     * join's condition settles which rows are paired rather than which rows there are, so nothing
-     * is carried across one.
+     * row before a VIRTUAL generated column of it is reached.
+     *
+     * <p>A join's condition is read with the WHERE as far as a part of it settles which rows there
+     * are. An inner join answers the pairs its condition holds of and no others, and a row of the
+     * side an outer join does not preserve that the condition rejects is paired with nothing and
+     * carried by no row the query answers -- so a part about that side alone restricts its scan
+     * exactly as a WHERE clause does. A part about the side an outer join does preserve is not one:
+     * that side answers a row whatever the condition says, padded with nulls. Neither is a part
+     * comparing the two sides, so nothing is carried across an outer join.
      *
      * <p>A LATERAL item's own comparison with the row beside it stands in the same class, because
      * PostgreSQL pulls the item up into this query: {@code (SELECT * FROM t z WHERE z.a = o.a)}
@@ -249,13 +255,76 @@ class SelectExecutor {
      */
     private List<Expression> scanRestrictions(SelectStmt stmt) {
         List<Expression> parts = FromResolver.conjunctsOf(stmt.where());
+        joinScanRestrictions(stmt.from(), parts);
         // A sub-select the statement above reads as one join with itself is restricted by what
         // that statement's own equalities say about the column the two are joined on.
         parts.addAll(executor.fromResolver.restrictionsPushedInto(stmt));
         List<Expression> equated = new ArrayList<>(parts);
-        FromResolver.lateralCorrelations(stmt.from(), equated);
+        executor.fromResolver.lateralCorrelations(stmt.from(), equated);
+        // What the statement holding this query has already settled about the row standing beside
+        // this scan stands in the same class: it is one query with this one, and its plain parts
+        // are read before the part this one is written in.
+        equated.addAll(executor.fromResolver.enclosingEqualities(
+                FromResolver.exposedNamesOf(stmt.from())));
         parts.addAll(DmlExecutor.impliedEqualities(equated));
         return parts;
+    }
+
+    /**
+     * The parts of a FROM clause's join conditions that settle which rows a scan under it has.
+     *
+     * <p>An inner join answers the pairs its condition holds of and no others, so every part of
+     * that condition decides which rows there are. An outer join answers a row of the side it
+     * preserves whatever its condition says, so nothing about that side is taken from it; a row of
+     * the other side the condition rejects is paired with nothing and carried by no row the query
+     * answers, which is what makes a part about that side alone a restriction on its own scan. That
+     * is what leaves {@code o LEFT JOIN t s ON s.a = 5 AND s.g = 2} readable over a relation whose
+     * {@code 10/a} raises where a is zero.
+     */
+    private static void joinScanRestrictions(List<SelectStmt.FromItem> fromItems,
+                                             List<Expression> out) {
+        if (fromItems == null) return;
+        for (SelectStmt.FromItem item : fromItems) joinScanRestrictions(item, out);
+    }
+
+    private static void joinScanRestrictions(SelectStmt.FromItem item, List<Expression> out) {
+        if (!(item instanceof SelectStmt.JoinFrom)) return;
+        SelectStmt.JoinFrom join = (SelectStmt.JoinFrom) item;
+        joinScanRestrictions(join.left(), out);
+        joinScanRestrictions(join.right(), out);
+        SelectStmt.JoinType type = join.joinType();
+        if (type == SelectStmt.JoinType.INNER || type == SelectStmt.JoinType.CROSS) {
+            out.addAll(FromResolver.conjunctsOf(join.on()));
+            return;
+        }
+        SelectStmt.FromItem gated = null;
+        if (type == SelectStmt.JoinType.LEFT || type == SelectStmt.JoinType.NATURAL_LEFT) {
+            gated = join.right();
+        } else if (type == SelectStmt.JoinType.RIGHT || type == SelectStmt.JoinType.NATURAL_RIGHT) {
+            gated = join.left();
+        }
+        if (gated == null) return;
+        Set<String> notPreserved =
+                FromResolver.exposedNamesOf(Collections.singletonList(gated));
+        for (Expression part : FromResolver.conjunctsOf(join.on())) {
+            if (speaksOnlyOfThese(part, notPreserved)) out.add(part);
+        }
+    }
+
+    /** Whether every relation a condition names is one of these, and it names at least one. */
+    private static boolean speaksOnlyOfThese(Expression part, Set<String> relations) {
+        final boolean[] named = {false};
+        final boolean[] only = {true};
+        AstWalk.forEach(part, node -> {
+            if (!(node instanceof ColumnRef)) return;
+            String table = ((ColumnRef) node).table();
+            if (table == null || !relations.contains(table.toLowerCase())) {
+                only[0] = false;
+            } else {
+                named[0] = true;
+            }
+        });
+        return only[0] && named[0];
     }
 
     /**
@@ -296,6 +365,15 @@ class SelectExecutor {
             read = new BinaryExpr(read, BinaryExpr.BinOp.AND, ordered.get(i));
         }
         return read;
+    }
+
+    /**
+     * The relation a name written without one in this query's qualification stands for, where the
+     * query reads only one and there is nothing else it could have meant.
+     */
+    static String loneRelationOf(SelectStmt stmt) {
+        Set<String> read = FromResolver.exposedNamesOf(stmt.from());
+        return read.size() == 1 ? read.iterator().next() : null;
     }
 
     /**
@@ -573,11 +651,11 @@ class SelectExecutor {
         }
         List<Expression> ordered = new ArrayList<>();
         for (Expression part : qualification) {
-            if (!readsAny(part, generated)) ordered.add(part);
+            if (!costsAGenerationExpression(part, generated)) ordered.add(part);
         }
         int stored = ordered.size();
         for (Expression part : qualification) {
-            if (readsAny(part, generated)) ordered.add(part);
+            if (costsAGenerationExpression(part, generated)) ordered.add(part);
         }
         List<RowContext> kept = new ArrayList<>();
         for (RowContext ctx : contexts) {
@@ -619,6 +697,17 @@ class SelectExecutor {
         Object[] row = new Object[sources.size()];
         for (int i = 0; i < row.length; i++) row[i] = sources.get(i).valueIn(ctx.getBindings());
         return row;
+    }
+
+    /**
+     * Whether reading one part of a qualification costs a generation expression.
+     *
+     * <p>A part that reads false out of what is written in it alone costs nothing, whatever it
+     * names: it is false for every row there is, so PostgreSQL settles it while it plans and the
+     * expression it seems to read is never worked out.
+     */
+    private boolean costsAGenerationExpression(Expression part, Set<String> generated) {
+        return readsAny(part, generated) && !executor.fromResolver.settledFalse(part);
     }
 
     /** Whether a qualification names any of these columns. */
@@ -963,6 +1052,12 @@ class SelectExecutor {
         // rows it is built from are a relation's just the same.
         QueryLevelScope scope;
         List<RowContext> contexts;
+        // What the FROM clause exposes, for a clause that produced no rows to read it off. It is
+        // described while this query is still the one its relations are being read for: a WITH item
+        // PostgreSQL keeps apart is computed when the query above first asks it for a row, and a
+        // description taken afterwards is a reader that asks for one on nobody's behalf.
+        List<RowContext.TableBinding> describedEmpty = null;
+        List<RowContext.OutCol> describedEmptyOutput = null;
         SelectStmt priorQualifying = executor.fromResolver.qualifyingQuery;
         List<Expression> priorPushed = executor.fromResolver.qualifyingPushed;
         executor.fromResolver.qualifyingQuery = stmt;
@@ -973,7 +1068,9 @@ class SelectExecutor {
         executor.dmlExecutor.enterColumnDemand(() -> columnsRead(stmt),
                 () -> columnsFiltered(stmt),
                 () -> scanRestrictions(stmt),
-                () -> FromResolver.exposedNamesOf(stmt.from()));
+                () -> FromResolver.exposedNamesOf(stmt.from()),
+                () -> executor.fromResolver.readAsJoinAbove(stmt),
+                () -> executor.fromResolver.settledByOneRowOf(stmt));
         try {
             if (hasDataModifyingCte(stmt)) {
                 scope = null;
@@ -994,6 +1091,11 @@ class SelectExecutor {
 
             contexts = executor.fromResolver.resolveFromClause(
                     stmt.from(), stmt.where(), stmt.having(), stmt);
+            if (contexts.isEmpty()) {
+                describedEmpty = executor.fromResolver.resolveTableBindings(stmt.from());
+                describedEmptyOutput =
+                        executor.fromResolver.resolveClauseOutput(stmt.from(), describedEmpty);
+            }
         } finally {
             executor.dmlExecutor.exitColumnDemand();
             executor.fromResolver.qualifyingQuery = priorQualifying;
@@ -1011,8 +1113,8 @@ class SelectExecutor {
             baseOutput = contexts.get(0).outputColumnsOrDefault();
             everyRelation = true;
         } else {
-            baseBindings = executor.fromResolver.resolveTableBindings(stmt.from());
-            baseOutput = executor.fromResolver.resolveClauseOutput(stmt.from(), baseBindings);
+            baseBindings = describedEmpty;
+            baseOutput = describedEmptyOutput;
             everyRelation = baseBindings.size() == FromResolver.relationCount(stmt.from());
         }
         // Reading a relation takes a lock on it, and reading it FOR UPDATE takes a stronger one.
@@ -1216,7 +1318,7 @@ class SelectExecutor {
             final Expression qualification = readCheapestFirst(stmt.where());
             // A sub-select written among the parts stands under the whole qualification, because
             // PostgreSQL reads the two as one query and what the other parts say reaches its scan.
-            executor.fromResolver.enterQualification(stmt.where());
+            executor.fromResolver.enterQualification(stmt.where(), loneRelationOf(stmt));
             try {
                 contexts = contexts.stream()
                         .filter(ctx -> executor.isTruthy(executor.evalExpr(qualification, ctx)))

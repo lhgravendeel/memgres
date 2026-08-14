@@ -366,15 +366,29 @@ class DdlAdminExecutor {
     // ---- CREATE POLICY ----
 
     QueryResult executeCreatePolicy(CreatePolicyStmt stmt) {
+        // A qualifier on the relation says which schema holds it, and a schema that is not there
+        // is what PostgreSQL reports rather than the relation being missing from it.
+        SchemaQualifier.requireSchema(executor.database, executor.session, stmt.schema());
         // A view has no row security, so a policy on one would be recorded and never applied —
         // and a reader of the schema would conclude the view is protected when it is not.
-        if (executor.database.hasView(stmt.table())) {
+        if (stmt.schema() != null ? executor.database.hasView(stmt.schema(), stmt.table())
+                : executor.database.hasView(stmt.table())) {
             throw PgErrors.wrongObjectType("\"" + stmt.table() + "\" is not a table");
         }
-        Table table = executor.resolveTable("public", stmt.table());
+        // The same holds of every other kind of relation a name can reach. A sequence, an index
+        // and a composite type each own a row of pg_class, and none of them has rows of its own
+        // for a policy to decide about; a foreign table's rows are somebody else's to guard.
+        String relationKind = RelationNamespace.kindOf(executor.database,
+                executor.relationSchemaOf(stmt.schema(), stmt.table()), stmt.table());
+        if (relationKind != null && !RelationNamespace.TABLE.equals(relationKind)) {
+            throw PgErrors.wrongObjectType("\"" + stmt.table() + "\" is not a table");
+        }
+        Table table = executor.resolveTable(policySchema(stmt.schema()), stmt.table(),
+                stmt.schema() != null);
         // A policy decides which of the relation's rows a role can see, so writing one is the
         // owner's to do — a role holding only SELECT could otherwise grant itself every row.
-        executor.requireTableOwner(executor.defaultSchema(), stmt.table());
+        executor.requireTableOwner(
+                stmt.schema() != null ? stmt.schema() : executor.defaultSchema(), stmt.table());
         for (RlsPolicy existing : table.getRlsPolicies()) {
             if (existing.getName().equalsIgnoreCase(stmt.name())) {
                 throw new MemgresException("policy \"" + stmt.name() + "\" for table \""
@@ -399,7 +413,24 @@ class DdlAdminExecutor {
         check.check(stmt.withCheckExpr(), executor.selectExecutor);
         table.addRlsPolicy(new RlsPolicy(stmt.name(), stmt.command(),
                 stmt.usingExpr(), stmt.withCheckExpr(), stmt.roles(), stmt.policyType()));
+        // PostgreSQL numbers a pg_policy row when the policy is created, and a refusal listing
+        // what hangs from one object walks its dependency catalogue in that order -- so a policy
+        // written before a view is reported ahead of it and one written after is reported behind
+        // it. Nothing minted a number for a policy at all, so every one of them came last.
+        String policyHome = executor.database.schemaNameOf(table);
+        if (policyHome != null) {
+            executor.identity().policyCreated(policyHome, table.getName(), stmt.name());
+        }
         return QueryResult.message(QueryResult.Type.SET, "CREATE POLICY");
+    }
+
+    /**
+     * The schema a policy's relation is looked for in. A policy belongs to its relation rather
+     * than to the relation's name, so two schemas may each hold a relation of one name and each
+     * carry policies of its own; a name written bare is looked for where it always was.
+     */
+    private static String policySchema(String writtenSchema) {
+        return writtenSchema != null ? writtenSchema : "public";
     }
 
     // ---- ALTER POLICY ----
@@ -408,9 +439,14 @@ class DdlAdminExecutor {
     private static final String PUBLIC_ROLE = "public";
 
     QueryResult executeAlterPolicy(AlterPolicyStmt stmt) {
-        Table table = executor.resolveTable("public", stmt.table());
+        // A qualifier on the relation says which schema holds it, and a schema that is not there
+        // is what PostgreSQL reports rather than the relation being missing from it.
+        SchemaQualifier.requireSchema(executor.database, executor.session, stmt.schema());
+        Table table = executor.resolveTable(policySchema(stmt.schema()), stmt.table(),
+                stmt.schema() != null);
         // Changing what a policy admits is as much the owner's to do as writing one.
-        executor.requireTableOwner(executor.defaultSchema(), stmt.table());
+        executor.requireTableOwner(
+                stmt.schema() != null ? stmt.schema() : executor.defaultSchema(), stmt.table());
         RlsPolicy found = null;
         for (RlsPolicy p : table.getRlsPolicies()) {
             if (p.getName().equalsIgnoreCase(stmt.name())) { found = p; break; }
@@ -763,7 +799,9 @@ class DdlAdminExecutor {
         boolean nothing = commands.isEmpty()
                 || (commands.size() == 1 && "NOTHING".equals(commands.get(0)));
         if (nothing) {
-            return sb.append(" DO ").append(instead ? "INSTEAD " : " ").append("NOTHING;").toString();
+            // NOTHING is not a statement, so it does not carry the space a deparsed statement
+            // brings with it: PostgreSQL writes DO NOTHING where an action gives DO  DELETE FROM.
+            return sb.append(" DO ").append(instead ? "INSTEAD " : "").append("NOTHING;").toString();
         }
         List<String> written = new ArrayList<>();
         for (String command : commands) written.add(normaliseRuleAction(command));
@@ -792,7 +830,14 @@ class DdlAdminExecutor {
             Expression parsed = new com.memgres.engine.parser.Parser(
                     new com.memgres.engine.parser.Lexer(s.whereClause()).tokenize()).parseExpression();
             Table on = executor.resolveTable(ruleSchema(s), s.table(), s.schema() != null);
-            return lowerRowAliases(RuleDeparser.deparse(parsed, RuleDeparser.forTable(on)));
+            // A qualification is resolved against the rows the event has: an INSERT has only the
+            // new row and a DELETE only the old one, so a column written bare there is that row's
+            // and PostgreSQL writes it back under that row's name. An UPDATE has both rows, which
+            // is why a bare column there names neither and is refused as ambiguous.
+            String row = "INSERT".equals(s.event()) ? "NEW"
+                    : "DELETE".equals(s.event()) ? "OLD" : null;
+            return lowerRowAliases(RuleDeparser.deparse(parsed, row == null
+                    ? RuleDeparser.forTable(on) : RuleDeparser.forRuleTarget(row, on)));
         } catch (RuntimeException e) {
             return s.whereClause();
         }
@@ -809,15 +854,29 @@ class DdlAdminExecutor {
     /**
      * One rule action as {@code pg_get_ruledef} writes it. PostgreSQL deparses the analysed
      * statement rather than echoing the text: an INSERT gets its target column list written out
-     * and each value printed in the column's own type. Anything this engine cannot rewrite that
+     * and each value printed in the column's own type, and an UPDATE or a DELETE gets every column
+     * printed under the relation it was resolved to. Anything this engine cannot rewrite that
      * way is echoed as it was written, which is what the whole definition used to be.
      */
     private String normaliseRuleAction(String action) {
         try {
             com.memgres.engine.parser.ast.Statement parsed =
                     com.memgres.engine.parser.Parser.parse(action);
+            if (parsed instanceof UpdateStmt) {
+                return normaliseUpdateAction((UpdateStmt) parsed, action);
+            }
+            if (parsed instanceof DeleteStmt) {
+                return normaliseDeleteAction((DeleteStmt) parsed, action);
+            }
+            // An action that only reads is a query like any other, and PostgreSQL writes it out the
+            // way it writes a view's: laid out, with the relation in front of every column, because
+            // a rule is analysed against a range table holding OLD and NEW beside what it reads.
+            if (parsed instanceof SelectStmt || parsed instanceof SetOpStmt) {
+                return normaliseSelectAction(parsed, action);
+            }
             if (!(parsed instanceof InsertStmt)) return action;
             InsertStmt ins = (InsertStmt) parsed;
+            if (ins.selectStmt() != null) return normaliseInsertSelectAction(ins, action);
             if (ins.values() == null || ins.values().isEmpty()) return action;
             Table target = executor.resolveTable(
                     ins.schema() == null ? executor.defaultSchema() : ins.schema(), ins.table());
@@ -858,9 +917,243 @@ class DdlAdminExecutor {
                 }
                 sb.append(')');
             }
+            appendActionTail(sb, null, ins.returning(), target,
+                    ins.alias() != null ? ins.alias() : ins.table());
             return lowerRowAliases(sb.toString());
         } catch (RuntimeException e) {
             return action;
+        }
+    }
+
+    /**
+     * A rule action that only reads, as {@code pg_get_ruledef} writes it. A clause the deparser
+     * has nothing to say for is not one to write half of: such an action is echoed as it was
+     * written, which is what every reading action used to be.
+     */
+    private String normaliseSelectAction(Statement query, String action) {
+        if (query instanceof SelectStmt) {
+            SelectStmt select = (SelectStmt) query;
+            if (select.lockClause() != null) return action;
+            if (select.groupingSets() != null && !select.groupingSets().isEmpty()) return action;
+        }
+        Statement settled = withStarsSettled(query);
+        return lowerRowAliases(withoutLeadingSpace(ViewDeparser.ruleQuery(settled, 0, true,
+                ViewDeparser.columnTypesOf(executor.database, settled, executor.defaultSchema()))));
+    }
+
+    /**
+     * An INSERT whose rows come from a query, as {@code pg_get_ruledef} writes it: the columns
+     * being written listed out, and the query deparsed under them. The query's own column names go
+     * unwritten, because an INSERT reads the rows it is given by position and never by name.
+     */
+    private String normaliseInsertSelectAction(InsertStmt ins, String action) {
+        if (ins.onConflict() != null) return action;
+        if (ins.withClauses() != null && !ins.withClauses().isEmpty()) return action;
+        Table target = executor.resolveTable(
+                ins.schema() == null ? executor.defaultSchema() : ins.schema(), ins.table());
+        Statement source = withStarsSettled(ins.selectStmt());
+        List<String> columnNames = new ArrayList<>();
+        if (ins.columns() != null && !ins.columns().isEmpty()) {
+            columnNames.addAll(ins.columns());
+        } else {
+            // Written with no column list, an INSERT writes the relation's first columns, as many
+            // of them as the query hands it. A query whose width the text does not settle -- a
+            // star this could not read -- stands for all of them.
+            int width = SelectStmt.writtenWidth(source);
+            for (Column c : target.getColumns()) {
+                if (width >= 0 && columnNames.size() >= width) break;
+                columnNames.add(c.getName());
+            }
+        }
+        String actionSchema = ins.schema() != null ? ins.schema()
+                : executor.relationSchemaOf(null, ins.table());
+        StringBuilder sb = new StringBuilder("INSERT INTO ")
+                .append(actionSchema == null ? "" : actionSchema + ".")
+                .append(ins.table()).append(" (");
+        for (int i = 0; i < columnNames.size(); i++) {
+            if (i > 0) sb.append(", ");
+            sb.append(columnNames.get(i));
+        }
+        sb.append(") ").append(ViewDeparser.ruleQuery(source, ACTION_CLAUSE_INDENT, false,
+                ViewDeparser.columnTypesOf(executor.database, source, executor.defaultSchema())));
+        appendActionTail(sb, null, ins.returning(), target,
+                ins.alias() != null ? ins.alias() : ins.table());
+        return lowerRowAliases(sb.toString());
+    }
+
+    /**
+     * A star in a rule action written out as the columns it stood for.
+     *
+     * <p>PostgreSQL settles what a star means when the rule is written and records those columns,
+     * so the definition goes on naming them however the relation changes afterwards. A star this
+     * cannot settle -- one over anything but a plain relation, or over a relation that is not
+     * there -- is left the star it was, and the action goes on being read that way.
+     */
+    private Statement withStarsSettled(Statement query) {
+        if (!(query instanceof SelectStmt)) return query;
+        SelectStmt select = (SelectStmt) query;
+        List<SelectStmt.SelectTarget> targets = select.targets();
+        List<SelectStmt.FromItem> from = select.from();
+        if (targets == null || from == null || from.isEmpty()) return query;
+        boolean anyStar = false;
+        for (SelectStmt.SelectTarget item : targets) {
+            if (item.expr() instanceof WildcardExpr) { anyStar = true; break; }
+        }
+        if (!anyStar) return query;
+        List<String> names = new ArrayList<>();
+        List<Table> relations = new ArrayList<>();
+        for (SelectStmt.FromItem item : from) {
+            if (!(item instanceof SelectStmt.TableRef)) return query;
+            SelectStmt.TableRef ref = (SelectStmt.TableRef) item;
+            if (ref.columnAliases() != null && !ref.columnAliases().isEmpty()) return query;
+            Table relation;
+            try {
+                relation = executor.resolveTable(
+                        ref.schema() == null ? executor.defaultSchema() : ref.schema(), ref.table());
+            } catch (RuntimeException notThere) {
+                return query;
+            }
+            if (relation == null) return query;
+            names.add(ref.alias() != null ? ref.alias() : ref.table());
+            relations.add(relation);
+        }
+        List<SelectStmt.SelectTarget> settled = new ArrayList<>();
+        for (SelectStmt.SelectTarget item : targets) {
+            if (!(item.expr() instanceof WildcardExpr)) { settled.add(item); continue; }
+            String over = ((WildcardExpr) item.expr()).table();
+            boolean stood = false;
+            for (int i = 0; i < names.size(); i++) {
+                if (over != null && !over.equalsIgnoreCase(names.get(i))) continue;
+                stood = true;
+                for (Column c : relations.get(i).getColumns()) {
+                    settled.add(new SelectStmt.SelectTarget(
+                            new ColumnRef(names.get(i), c.getName()), null));
+                }
+            }
+            if (!stood) return query;
+        }
+        return new SelectStmt(select.distinct(), select.distinctOn(), settled, select.from(),
+                select.where(), select.groupBy(), select.having(), select.windowDefs(),
+                select.orderBy(), select.limit(), select.offset(), select.withClauses(),
+                select.groupingSets(), select.lockClause(), select.withTies());
+    }
+
+    /**
+     * The indentation a rule action's clauses have reached by the time one of them writes a query:
+     * PostgreSQL moves in one step for the statement itself, so everything inside it stands there.
+     */
+    private static final int ACTION_CLAUSE_INDENT = 8;
+
+    /**
+     * A deparsed statement without the space PostgreSQL writes in front of every one of them. The
+     * rule writes that space itself, in the place ALSO would have stood.
+     */
+    private static String withoutLeadingSpace(String written) {
+        return written.startsWith(" ") ? written.substring(1) : written;
+    }
+
+    /**
+     * An UPDATE action as {@code pg_get_ruledef} writes it.
+     *
+     * <p>A relation the action reads beside the one it writes to stands on a line of its own, the
+     * way a query's FROM does; a column written without a qualifier is still read against the
+     * relation being written, which is where an assignment's own column comes from.
+     */
+    private String normaliseUpdateAction(UpdateStmt upd, String action) {
+        if (upd.withClauses() != null && !upd.withClauses().isEmpty()) return action;
+        if (upd.setClauses() == null || upd.setClauses().isEmpty()) return action;
+        Table target = executor.resolveTable(
+                upd.schema() == null ? executor.defaultSchema() : upd.schema(), upd.table());
+        String named = upd.alias() != null ? upd.alias() : upd.table();
+        RuleDeparser.ColumnTypes types = RuleDeparser.forRuleAction(named, target,
+                executor.database, executor.defaultSchema());
+        StringBuilder sb = new StringBuilder("UPDATE ");
+        if (upd.only()) sb.append("ONLY ");
+        sb.append(actionRelation(upd.schema(), upd.table(), upd.alias())).append(" SET ");
+        for (int i = 0; i < upd.setClauses().size(); i++) {
+            InsertStmt.SetClause set = upd.setClauses().get(i);
+            // An assignment naming part of a value is written back with the brackets or the field
+            // that named it, which this cannot put back, so it is left as it was written.
+            if (set.subField() != null || set.subscripts() != null) return action;
+            if (i > 0) sb.append(", ");
+            int at = target.getColumnIndex(set.column());
+            RuleDeparser.PgType want = at < 0 ? null
+                    : RuleDeparser.fromColumn(target.getColumns().get(at));
+            sb.append(set.column()).append(" = ")
+                    .append(RuleDeparser.deparseValue(set.value(), want, types));
+        }
+        if (upd.from() != null && !upd.from().isEmpty()) {
+            sb.append(ViewDeparser.ruleFromClause(upd.from()));
+        }
+        appendActionTail(sb, upd.where(), upd.returning(), target, named);
+        return lowerRowAliases(sb.toString());
+    }
+
+    /** A DELETE action as {@code pg_get_ruledef} writes it. */
+    private String normaliseDeleteAction(DeleteStmt del, String action) {
+        if (del.using() != null && !del.using().isEmpty()) return action;
+        if (del.withClauses() != null && !del.withClauses().isEmpty()) return action;
+        Table target = executor.resolveTable(
+                del.schema() == null ? executor.defaultSchema() : del.schema(), del.table());
+        StringBuilder sb = new StringBuilder("DELETE FROM ");
+        if (del.only()) sb.append("ONLY ");
+        sb.append(actionRelation(del.schema(), del.table(), del.alias()));
+        appendActionTail(sb, del.where(), del.returning(), target,
+                del.alias() != null ? del.alias() : del.table());
+        return lowerRowAliases(sb.toString());
+    }
+
+    /**
+     * The relation an action writes to, under the schema it resolved to and beside the alias it
+     * was given. PostgreSQL settles which relation the action names as the rule is written and
+     * then prints it without its schema wherever the reader's search path reaches it, so the
+     * schema is what is stored and the reading takes it off again. The alias is kept because it is
+     * the name the action's own columns are written under; the AS that introduced it is not, since
+     * what was analysed is the alias rather than the word.
+     */
+    private String actionRelation(String writtenSchema, String table, String alias) {
+        String schema = writtenSchema != null ? writtenSchema
+                : executor.relationSchemaOf(null, table);
+        return (schema == null ? "" : schema + ".") + table + (alias == null ? "" : " " + alias);
+    }
+
+    /**
+     * The clauses that close a rule action. PostgreSQL indents a deparsed rule even where it is
+     * not asked to print prettily, so a qualification and a returning list each begin a line of
+     * their own and every returning item after the first stands on a line of its own too.
+     */
+    private void appendActionTail(StringBuilder sb, Expression where,
+                                  List<SelectStmt.SelectTarget> returning,
+                                  Table target, String named) {
+        RuleDeparser.ColumnTypes types = RuleDeparser.forRuleAction(named, target,
+                executor.database, executor.defaultSchema());
+        if (where != null) {
+            sb.append("\n  WHERE ").append(RuleDeparser.deparse(where, types));
+        }
+        if (returning == null || returning.isEmpty()) return;
+        List<String> items = new ArrayList<>();
+        for (SelectStmt.SelectTarget item : returning) {
+            // A star is not kept as a star: what was analysed is the list of columns it stood for,
+            // and that list is what is read back.
+            if (item.expr() instanceof WildcardExpr) {
+                for (Column c : target.getColumns()) {
+                    items.add(RuleDeparser.quoteIdentifier(named) + "."
+                            + RuleDeparser.quoteIdentifier(c.getName()));
+                }
+                continue;
+            }
+            // A label the item would answer to anyway is not written out again: PostgreSQL writes
+            // AS only where the name asked for differs from the one the expression carries.
+            String label = item.alias();
+            if (label != null && item.expr() instanceof ColumnRef
+                    && label.equals(((ColumnRef) item.expr()).column())) {
+                label = null;
+            }
+            String written = RuleDeparser.deparse(item.expr(), types);
+            items.add(label == null ? written : written + " AS " + label);
+        }
+        for (int i = 0; i < items.size(); i++) {
+            sb.append(i == 0 ? "\n  RETURNING " : ",\n    ").append(items.get(i));
         }
     }
 
@@ -928,6 +1221,16 @@ class DdlAdminExecutor {
         // for no action -- so a bare column of the ruled relation is one of its own.
         if (on != null && !executor.database.hasView(s.table())) {
             rejectMissingRuleColumns(qualification, ruleColumnScope(qualification, on, true));
+        }
+        // An UPDATE carries the row as it was and the row as it will be, and a qualification reads
+        // both of them by name alone, so a column written there with no row in front of it answers
+        // to both at once and PostgreSQL will not choose between them. An INSERT has only the new
+        // row and a DELETE only the old one, which is why the same column is read there.
+        if ("UPDATE".equals(s.event())) {
+            // A system column is one every row of a table carries, so it stands in both of them
+            // as well; a view's rows carry none, and a name written there is simply missing.
+            rejectAmbiguousRowColumn(qualification, ruledRelationColumns(s, on),
+                    !executor.database.hasView(s.table()));
         }
         // A call in the qualification is resolved there and then as well, by name and argument
         // list together, so a name nothing answers to is a function that does not exist. Naming
@@ -1538,16 +1841,22 @@ class DdlAdminExecutor {
             throw PgErrors.notImplemented(
                     "RETURNING lists are not supported in non-INSTEAD rules");
         }
-        List<Column> entries = returningEntryColumns(returning, actionSchema, actionTable, on);
-        if (on == null || entries == null) return true;
-        List<Column> wanted = on.getColumns();
+        // The list has to describe the relation the rule is on, and a view's columns are its own
+        // rather than those of the relation this resolves the view to.
+        List<Column> wanted = ruledRelationColumns(s, on);
+        List<Column> entries = returningEntryColumns(returning, actionSchema, actionTable, wanted);
+        if (wanted == null || entries == null) return true;
         if (entries.size() != wanted.size()) {
             throw new MemgresException("RETURNING list has too "
                     + (entries.size() < wanted.size() ? "few" : "many") + " entries", "42P17");
         }
         for (int i = 0; i < entries.size(); i++) {
-            // An entry whose type this cannot name is left unjudged rather than guessed at.
-            if (entries.get(i) == null) continue;
+            // An entry whose type this cannot name is left unjudged rather than guessed at, and a
+            // column of a view the query behind it settled no type for cannot be judged against.
+            if (entries.get(i) == null || entries.get(i).getType() == null
+                    || wanted.get(i).getType() == null) {
+                continue;
+            }
             String gave = CatalogHelper.pgTypeName(entries.get(i).getType());
             String needs = CatalogHelper.pgTypeName(wanted.get(i).getType());
             if (gave.equals(needs)) continue;
@@ -1566,9 +1875,12 @@ class DdlAdminExecutor {
      * entry is an expression this cannot name a type for. A star is expanded against the relation
      * the action writes to, because that is what settles how many entries the list really has.
      * Null where the list holds something whose width cannot be worked out here.
+     *
+     * @param ruled the columns of the relation the rule is on, which OLD and NEW stand for
      */
     private List<Column> returningEntryColumns(List<SelectStmt.SelectTarget> returning,
-                                               String actionSchema, String actionTable, Table on) {
+                                               String actionSchema, String actionTable,
+                                               List<Column> ruled) {
         Table target;
         try {
             target = actionTable == null ? null : executor.resolveTable(
@@ -1589,18 +1901,69 @@ class DdlAdminExecutor {
             }
             if (entry.expr() instanceof ColumnRef) {
                 ColumnRef ref = (ColumnRef) entry.expr();
-                Table from = target;
                 if (ref.table() != null && ("old".equalsIgnoreCase(ref.table())
                         || "new".equalsIgnoreCase(ref.table()))) {
-                    from = on;
+                    entries.add(namedColumn(ruled, ref.column()));
+                    continue;
                 }
-                int index = from == null ? -1 : from.getColumnIndex(ref.column());
-                entries.add(index >= 0 ? from.getColumns().get(index) : null);
+                int index = target.getColumnIndex(ref.column());
+                entries.add(index >= 0 ? target.getColumns().get(index) : null);
                 continue;
             }
             entries.add(null);
         }
         return entries;
+    }
+
+    /** The column of this list that answers to a name, or null when none does. */
+    private static Column namedColumn(List<Column> columns, String name) {
+        if (columns == null || name == null) return null;
+        for (Column column : columns) {
+            if (name.equalsIgnoreCase(column.getName())) return column;
+        }
+        return null;
+    }
+
+    /**
+     * The columns the relation a rule is on answers with. A view's are its own rather than those
+     * of the relation behind it: PostgreSQL resolves what a rule hands back, and what its
+     * qualification names, against the view's own column list, while the relation a view resolves
+     * to here is the one underneath it, whose columns may be named and typed differently. Null
+     * where this cannot say what they are, which leaves whatever is judged against them unjudged.
+     */
+    private List<Column> ruledRelationColumns(CreateRuleStmt s, Table on) {
+        Database.ViewDef view = executor.database.getView(ruleSchema(s), s.table());
+        if (view == null) return on == null ? null : on.getColumns();
+        List<Column> columns = view.cachedColumns();
+        return columns == null || columns.isEmpty() ? null : columns;
+    }
+
+    /**
+     * Refuses a column an UPDATE rule's qualification names without saying which of its two rows
+     * it belongs to. Both rows are in scope there, so such a name answers to a column of each of
+     * them at once and PostgreSQL refuses rather than pick one. A name written inside a sub-select
+     * of the qualification is left alone: it reads from the relations that sub-select names.
+     */
+    private static void rejectAmbiguousRowColumn(Expression qualification, List<Column> ruled,
+                                                 boolean rowsCarrySystemColumns) {
+        if (qualification == null || ruled == null) return;
+        final List<ColumnRef> bare = new ArrayList<>();
+        AstWalk.forEachOutside(qualification,
+                node -> node instanceof com.memgres.engine.parser.ast.Statement,
+                node -> {
+                    if (node instanceof ColumnRef && ((ColumnRef) node).table() == null) {
+                        bare.add((ColumnRef) node);
+                    }
+                });
+        for (ColumnRef ref : bare) {
+            if (namedColumn(ruled, ref.column()) == null
+                    && !(rowsCarrySystemColumns
+                            && DdlDefinitionChecks.isSystemColumnName(ref.column()))) {
+                continue;
+            }
+            throw new MemgresException(
+                    "column reference \"" + ref.column() + "\" is ambiguous", "42702");
+        }
     }
 
     /** Whether one of these relations holds a column of that name. */

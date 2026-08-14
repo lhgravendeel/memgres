@@ -34,6 +34,7 @@ import static com.memgres.client.RawWireClient.sync;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -2587,6 +2588,510 @@ class RowIdentityAndProtocolFramesTest {
             assertEquals(List.of("7|2|(0,1)"),
                     rows(c, "SELECT b, cmin::text, ctid::text FROM lpr_qt"));
             run(c, "COMMIT", "DROP TABLE lpr_qt", "DROP TABLE lpr_qr");
+        }
+    }
+
+    // ------------------------------------------------------------ helpers for the sections below
+
+    /** The fields of the error a statement raises on a session of its own. */
+    private static org.postgresql.util.ServerErrorMessage fieldsOn(Connection c, String sql) {
+        SQLException thrown = assertThrows(SQLException.class, () -> run(c, sql),
+                "expected an error from: " + sql);
+        assertTrue(thrown instanceof org.postgresql.util.PSQLException,
+                "expected a server error from: " + sql);
+        return ((org.postgresql.util.PSQLException) thrown).getServerErrorMessage();
+    }
+
+    /**
+     * A write issued on one session while a second session holds the row it names, so it blocks.
+     * The holder finishes with {@code finish}, and what the write answered once it got through is
+     * returned -- "[n rows]" or "ERR[sqlstate] message". Every wait carries a deadline, so a write
+     * that never gets through fails the test rather than hanging it.
+     */
+    private static String blockedBy(Connection blocked, String write, Connection holder,
+            String finish) throws Exception {
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try {
+            Future<String> waiting = pool.submit(new Callable<String>() {
+                @Override
+                public String call() {
+                    try (Statement s = blocked.createStatement()) {
+                        s.setQueryTimeout(20);
+                        return "[" + s.executeUpdate(write) + " rows]";
+                    } catch (SQLException e) {
+                        return "ERR[" + e.getSQLState() + "] " + primary(e);
+                    }
+                }
+            });
+            Thread.sleep(400);
+            assertFalse(waiting.isDone(), "the write did not wait for the other session");
+            run(holder, finish);
+            return waiting.get(20, TimeUnit.SECONDS);
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    /** The fixture the rollback tests are written against: a keyed relation and its journal. */
+    private static void journalled(Connection c, String name) throws SQLException {
+        run(c, "CREATE TABLE " + name + " (i int PRIMARY KEY, s text)",
+                "CREATE TABLE " + name + "_log (i int, tag text)",
+                "CREATE FUNCTION " + name + "_note() RETURNS trigger AS $$ BEGIN INSERT INTO "
+                        + name + "_log VALUES (NEW.i, 'ins'); RETURN NEW; END $$ LANGUAGE plpgsql",
+                "CREATE TRIGGER " + name + "_tr AFTER INSERT ON " + name
+                        + " FOR EACH ROW EXECUTE FUNCTION " + name + "_note()",
+                "INSERT INTO " + name + " VALUES (2,'base')");
+    }
+
+    private static void dropJournalled(Connection c, String name) throws SQLException {
+        run(c, "DROP TRIGGER " + name + "_tr ON " + name, "DROP FUNCTION " + name + "_note()",
+                "DROP TABLE " + name, "DROP TABLE " + name + "_log");
+    }
+
+    // ============================================================ What a ROLLBACK undoes
+
+    @Test
+    void aRollbackTakesBackTheRowAStatementThatSucceededWroteBeforeTheFailingOne()
+            throws SQLException {
+        try (Connection c = session()) {
+            journalled(c, "rbu_a");
+            // The journal holds what the insert before the block wrote, and goes on holding it.
+            assertEquals(List.of("2|ins"), rows(c, "SELECT i, tag FROM rbu_a_log ORDER BY i"));
+            run(c, "BEGIN");
+            try {
+                run(c, "INSERT INTO rbu_a VALUES (9,'nine')");
+                org.postgresql.util.ServerErrorMessage e =
+                        fieldsOn(c, "INSERT INTO rbu_a VALUES (1,'a'),(2,'b'),(3,'c')");
+                assertEquals("23505", e.getSQLState());
+                assertEquals("duplicate key value violates unique constraint \"rbu_a_pkey\"",
+                        e.getMessage());
+                assertEquals("Key (i)=(2) already exists.", e.getDetail());
+                assertNull(e.getHint(), "a duplicate key carries no hint");
+            } finally {
+                run(c, "ROLLBACK");
+            }
+            // Nothing of the transaction is left: not the row the first statement wrote, and not
+            // what its trigger wrote into the other relation.
+            assertEquals(List.of("1"), rows(c, "SELECT count(*) FROM rbu_a"));
+            assertEquals(List.of("2|base"), rows(c, "SELECT i, s FROM rbu_a ORDER BY i"));
+            assertEquals(List.of("2|ins"), rows(c, "SELECT i, tag FROM rbu_a_log ORDER BY i"));
+            dropJournalled(c, "rbu_a");
+        }
+    }
+
+    @Test
+    void aTransactionThatCommitsKeepsEveryWriteItMade() throws SQLException {
+        try (Connection c = session()) {
+            journalled(c, "rbu_b");
+            run(c, "BEGIN", "INSERT INTO rbu_b VALUES (30,'p')", "INSERT INTO rbu_b VALUES (31,'q')",
+                    "UPDATE rbu_b SET s = 'r' WHERE i = 30", "DELETE FROM rbu_b WHERE i = 31",
+                    "COMMIT");
+            assertEquals(List.of("2|base", "30|r"), rows(c, "SELECT i, s FROM rbu_b ORDER BY i"));
+            assertEquals(List.of("2|ins", "30|ins", "31|ins"),
+                    rows(c, "SELECT i, tag FROM rbu_b_log ORDER BY i"));
+            dropJournalled(c, "rbu_b");
+        }
+    }
+
+    @Test
+    void aStatementOutsideAnyBlockKeepsTheRowItWroteAndAFailingOneLeavesNothing()
+            throws SQLException {
+        try (Connection c = session()) {
+            journalled(c, "rbu_c");
+            run(c, "INSERT INTO rbu_c VALUES (42,'m')");
+            assertEquals(List.of("2|base", "42|m"), rows(c, "SELECT i, s FROM rbu_c ORDER BY i"));
+            assertEquals(List.of("2|ins", "42|ins"),
+                    rows(c, "SELECT i, tag FROM rbu_c_log ORDER BY i"));
+            // A statement is a transaction of its own, so the row it wrote before it was refused
+            // goes back with it -- and so does the journal entry its trigger made.
+            assertEquals("23505", stateOn(c, "INSERT INTO rbu_c VALUES (40,'k'),(2,'dup'),(41,'l')"));
+            assertEquals(List.of("2|base", "42|m"), rows(c, "SELECT i, s FROM rbu_c ORDER BY i"));
+            assertEquals(List.of("2|ins", "42|ins"),
+                    rows(c, "SELECT i, tag FROM rbu_c_log ORDER BY i"));
+            dropJournalled(c, "rbu_c");
+        }
+    }
+
+    @Test
+    void aSavepointRolledBackToTakesBackWhatFollowedItAndAReleasedOneKeepsIt() throws SQLException {
+        try (Connection c = session()) {
+            run(c, "CREATE TABLE rbu_d (i int PRIMARY KEY, s text)",
+                    "INSERT INTO rbu_d VALUES (2,'base')");
+            run(c, "BEGIN");
+            try {
+                run(c, "INSERT INTO rbu_d VALUES (20,'x')", "SAVEPOINT sp1",
+                        "INSERT INTO rbu_d VALUES (21,'y')");
+                assertEquals("23505",
+                        stateOn(c, "INSERT INTO rbu_d VALUES (22,'f'),(2,'dup'),(23,'g')"));
+                run(c, "ROLLBACK TO SAVEPOINT sp1");
+                // What the savepoint covered is gone; what came before it is still the
+                // transaction's.
+                assertEquals(List.of("2", "20"), rows(c, "SELECT i FROM rbu_d ORDER BY i"));
+                run(c, "INSERT INTO rbu_d VALUES (24,'z')", "SAVEPOINT sp2",
+                        "INSERT INTO rbu_d VALUES (25,'w')", "RELEASE SAVEPOINT sp2");
+                assertEquals(List.of("2", "20", "24", "25"),
+                        rows(c, "SELECT i FROM rbu_d ORDER BY i"));
+            } finally {
+                run(c, "ROLLBACK");
+            }
+            // A release settles nothing: the outer ROLLBACK takes the released work back too.
+            assertEquals(List.of("1"), rows(c, "SELECT count(*) FROM rbu_d"));
+            assertEquals(List.of("2|base"), rows(c, "SELECT i, s FROM rbu_d ORDER BY i"));
+            run(c, "DROP TABLE rbu_d");
+        }
+    }
+
+    @Test
+    void aCommitOfATransactionAnErrorHasAbortedTakesNothingWithIt() throws SQLException {
+        try (Connection c = session()) {
+            journalled(c, "rbu_e");
+            run(c, "BEGIN", "INSERT INTO rbu_e VALUES (9,'nine')");
+            assertEquals("23505", stateOn(c, "INSERT INTO rbu_e VALUES (1,'a'),(2,'b'),(3,'c')"));
+            run(c, "COMMIT");
+            assertEquals(List.of("2"), rows(c, "SELECT i FROM rbu_e ORDER BY i"));
+            assertEquals(List.of("2"), rows(c, "SELECT i FROM rbu_e_log ORDER BY i"));
+            dropJournalled(c, "rbu_e");
+        }
+    }
+
+    @Test
+    void aSavepointTakenBeforeTheFailureLetsTheRestOfTheTransactionCommit() throws SQLException {
+        try (Connection c = session()) {
+            journalled(c, "rbu_f");
+            run(c, "BEGIN", "INSERT INTO rbu_f VALUES (9,'nine')", "SAVEPOINT s1");
+            assertEquals("23505", stateOn(c, "INSERT INTO rbu_f VALUES (1,'a'),(2,'b'),(3,'c')"));
+            run(c, "ROLLBACK TO SAVEPOINT s1", "INSERT INTO rbu_f VALUES (10,'ten')", "COMMIT");
+            assertEquals(List.of("2", "9", "10"), rows(c, "SELECT i FROM rbu_f ORDER BY i"));
+            assertEquals(List.of("2", "9", "10"), rows(c, "SELECT i FROM rbu_f_log ORDER BY i"));
+            dropJournalled(c, "rbu_f");
+        }
+    }
+
+    @Test
+    void aRolledBackUpdateLeavesEveryRowAtTheLinePointerItAlwaysHad() throws SQLException {
+        try (Connection c = session()) {
+            run(c, "CREATE TABLE rbu_g (i int PRIMARY KEY, s text)",
+                    "CREATE FUNCTION rbu_g_stop() RETURNS trigger AS $$ BEGIN IF NEW.s = 'no'"
+                            + " THEN RAISE EXCEPTION 'no'; END IF; RETURN NEW; END $$"
+                            + " LANGUAGE plpgsql",
+                    "INSERT INTO rbu_g VALUES (1,'a'),(2,'b'),(3,'c')",
+                    "CREATE TRIGGER rbu_g_tr BEFORE UPDATE ON rbu_g FOR EACH ROW"
+                            + " EXECUTE FUNCTION rbu_g_stop()");
+            run(c, "BEGIN");
+            try {
+                run(c, "UPDATE rbu_g SET s = 'x' WHERE i = 1", "INSERT INTO rbu_g VALUES (4,'d')");
+                assertEquals("P0001",
+                        stateOn(c, "UPDATE rbu_g SET s = CASE WHEN i = 3 THEN 'no' ELSE 'y' END"));
+            } finally {
+                run(c, "ROLLBACK");
+            }
+            // An abort renumbers nothing: the version each row had is live again, at the line
+            // pointer it always had, still naming the transaction that wrote it.
+            assertEquals(List.of("3"), rows(c, "SELECT count(*) FROM rbu_g"));
+            assertEquals(List.of("1|a|(0,1)|t", "2|b|(0,2)|t", "3|c|(0,3)|t"),
+                    rows(c, "SELECT i, s, ctid, xmin::text <> '0' FROM rbu_g ORDER BY i"));
+            run(c, "DROP TRIGGER rbu_g_tr ON rbu_g", "DROP FUNCTION rbu_g_stop()",
+                    "DROP TABLE rbu_g");
+        }
+    }
+
+    // ============================================================ What a second session sees of a
+    // statement that failed and was taken back
+
+    @Test
+    void aRowAStatementThatFailedWroteIsNeverVisibleToAnotherSession() throws SQLException {
+        try (Connection writer = session(); Connection reader = session()) {
+            journalled(writer, "rbu_h");
+            run(writer, "BEGIN");
+            try {
+                run(writer, "INSERT INTO rbu_h VALUES (9,'nine')");
+                assertEquals("2", promptly(reader, "SELECT i FROM rbu_h ORDER BY i"));
+                assertEquals("23505",
+                        stateOn(writer, "INSERT INTO rbu_h VALUES (1,'a'),(2,'dup'),(3,'c')"));
+                // The failed statement's undo does not hand the other session the uncommitted row
+                // its transaction had written before it.
+                assertEquals("2", promptly(reader, "SELECT i FROM rbu_h ORDER BY i"));
+                assertEquals("1", promptly(reader, "SELECT count(*) FROM rbu_h_log"));
+            } finally {
+                run(writer, "ROLLBACK");
+            }
+            assertEquals("2", promptly(writer, "SELECT i FROM rbu_h ORDER BY i"));
+            assertEquals("2", promptly(reader, "SELECT i FROM rbu_h ORDER BY i"));
+            assertEquals("1", promptly(reader, "SELECT count(*) FROM rbu_h_log"));
+            dropJournalled(writer, "rbu_h");
+        }
+    }
+
+    @Test
+    void aWriteThatWaitedForTheAbortedTransactionActsOnTheRowItWaitedFor() throws Exception {
+        try (Connection holder = session(); Connection waiter = session()) {
+            run(holder, "CREATE TABLE rbu_i (i int PRIMARY KEY, s text)",
+                    "INSERT INTO rbu_i VALUES (1,'one')");
+            run(holder, "BEGIN", "INSERT INTO rbu_i VALUES (9,'nine')");
+            assertEquals("23505",
+                    stateOn(holder, "INSERT INTO rbu_i VALUES (2,'a'),(1,'dup'),(3,'c')"));
+            run(holder, "ROLLBACK");
+            // A write still waits for a row a second session is holding, and still gets through
+            // when that session takes its own write back.
+            run(holder, "BEGIN", "UPDATE rbu_i SET s = 'x' WHERE i = 1");
+            assertEquals("[1 rows]", blockedBy(waiter, "UPDATE rbu_i SET s = 'y' WHERE i = 1",
+                    holder, "ROLLBACK"));
+            // The waiter's write stands on the row it waited for, and the aborted transaction left
+            // nothing beside it.
+            assertEquals(List.of("1|y"), rows(holder, "SELECT i, s FROM rbu_i ORDER BY i"));
+            assertEquals(List.of("1|y"), rows(waiter, "SELECT i, s FROM rbu_i ORDER BY i"));
+            run(holder, "DROP TABLE rbu_i");
+        }
+    }
+
+    // ============================================================ What a row remembers through a
+    // rename
+
+    @Test
+    void aRenameLeavesEveryRowsPlaceItsWriterAndItsCommandIdentifierAlone() throws SQLException {
+        try (Connection c = session()) {
+            run(c, "CREATE TABLE rid_a (i int, s text)",
+                    "INSERT INTO rid_a VALUES (1,'a'),(2,'b'),(3,'c')",
+                    "DELETE FROM rid_a WHERE i = 2", "UPDATE rid_a SET s = 'cc' WHERE i = 3");
+            // The update wrote a fourth version, which sits after the three the insert wrote.
+            assertEquals(List.of("1|(0,1)|t|0|f|rid_a", "3|(0,4)|t|0|f|rid_a"),
+                    rows(c, "SELECT i, ctid, xmin::text <> '0', xmax, cmin::text <> '0',"
+                            + " tableoid::regclass::text FROM rid_a ORDER BY i"));
+            run(c, "ALTER TABLE rid_a RENAME TO rid_a2");
+            // A rename rewrites no tuple: every one of the six answers as it did, and only the
+            // name the relation goes by has moved.
+            assertEquals(List.of("1|(0,1)|t|0|f|rid_a2", "3|(0,4)|t|0|f|rid_a2"),
+                    rows(c, "SELECT i, ctid, xmin::text <> '0', xmax, cmin::text <> '0',"
+                            + " tableoid::regclass::text FROM rid_a2 ORDER BY i"));
+            run(c, "DROP TABLE rid_a2");
+        }
+    }
+
+    @Test
+    void aMoveToAnotherSchemaAndARenameOfTheSchemaLeaveThemAloneToo() throws SQLException {
+        try (Connection c = session()) {
+            run(c, "CREATE TABLE rid_b (i int, s text)",
+                    "INSERT INTO rid_b VALUES (1,'a'),(2,'b'),(3,'c')",
+                    "DELETE FROM rid_b WHERE i = 2", "UPDATE rid_b SET s = 'cc' WHERE i = 3",
+                    "CREATE SCHEMA rid_sc", "ALTER TABLE rid_b SET SCHEMA rid_sc");
+            assertEquals(List.of("1|(0,1)|t|0|f|rid_sc.rid_b", "3|(0,4)|t|0|f|rid_sc.rid_b"),
+                    rows(c, "SELECT i, ctid, xmin::text <> '0', xmax, cmin::text <> '0',"
+                            + " tableoid::regclass::text FROM rid_sc.rid_b ORDER BY i"));
+            run(c, "ALTER SCHEMA rid_sc RENAME TO rid_sc2");
+            assertEquals(List.of("1|(0,1)|t|0|f|rid_sc2.rid_b", "3|(0,4)|t|0|f|rid_sc2.rid_b"),
+                    rows(c, "SELECT i, ctid, xmin::text <> '0', xmax, cmin::text <> '0',"
+                            + " tableoid::regclass::text FROM rid_sc2.rid_b ORDER BY i"));
+            // The relation goes on numbering from where it left off, and every place is its own.
+            run(c, "INSERT INTO rid_sc2.rid_b VALUES (4,'d')");
+            assertEquals(List.of("1|(0,1)|t", "3|(0,4)|t", "4|(0,5)|t"),
+                    rows(c, "SELECT i, ctid, xmin::text <> '0' FROM rid_sc2.rid_b ORDER BY i"));
+            assertEquals(List.of("3"), rows(c, "SELECT count(DISTINCT ctid) FROM rid_sc2.rid_b"));
+            assertEquals(List.of("3"), rows(c, "SELECT i FROM rid_sc2.rid_b WHERE ctid = '(0,4)'"));
+            run(c, "DROP SCHEMA rid_sc2 CASCADE");
+        }
+    }
+
+    @Test
+    void aRenameInsideTheTransactionThatWroteTheRowsKeepsTheirCommandIdentifiers()
+            throws SQLException {
+        try (Connection c = session()) {
+            run(c, "BEGIN", "CREATE TABLE rid_c (i int)", "INSERT INTO rid_c VALUES (1)",
+                    "INSERT INTO rid_c VALUES (2)", "ALTER TABLE rid_c RENAME TO rid_c2");
+            assertEquals(List.of("1|(0,1)|t|1", "2|(0,2)|t|2"),
+                    rows(c, "SELECT i, ctid, xmin::text <> '0', cmin FROM rid_c2 ORDER BY i"));
+            run(c, "COMMIT");
+            assertEquals(List.of("1|(0,1)|t", "2|(0,2)|t"),
+                    rows(c, "SELECT i, ctid, xmin::text <> '0' FROM rid_c2 ORDER BY i"));
+            run(c, "DROP TABLE rid_c2");
+        }
+    }
+
+    @Test
+    void aRenameThatIsRolledBackLeavesTheRowsAnsweringUnderTheNameTheyHad() throws SQLException {
+        try (Connection c = session()) {
+            run(c, "CREATE TABLE rid_d (i int)", "INSERT INTO rid_d VALUES (1),(2),(3)",
+                    "DELETE FROM rid_d WHERE i = 1");
+            run(c, "BEGIN", "ALTER TABLE rid_d RENAME TO rid_d2");
+            assertEquals(List.of("2|(0,2)|t", "3|(0,3)|t"),
+                    rows(c, "SELECT i, ctid, xmin::text <> '0' FROM rid_d2 ORDER BY i"));
+            run(c, "ROLLBACK");
+            assertEquals(List.of("2|(0,2)|t", "3|(0,3)|t"),
+                    rows(c, "SELECT i, ctid, xmin::text <> '0' FROM rid_d ORDER BY i"));
+            // A relation made again under a name that has been used before starts clean.
+            run(c, "DROP TABLE rid_d", "CREATE TABLE rid_d (i int)",
+                    "INSERT INTO rid_d VALUES (7),(8)");
+            assertEquals(List.of("7|(0,1)|t", "8|(0,2)|t"),
+                    rows(c, "SELECT i, ctid, xmin::text <> '0' FROM rid_d ORDER BY i"));
+            run(c, "DROP TABLE rid_d");
+        }
+    }
+
+    @Test
+    void aRenamedInheritanceChildStillNamesItselfThroughItsParent() throws SQLException {
+        try (Connection c = session()) {
+            run(c, "CREATE TABLE rid_e (i int)", "INSERT INTO rid_e VALUES (7),(8)",
+                    "CREATE TABLE rid_ek (j int) INHERITS (rid_e)",
+                    "INSERT INTO rid_ek VALUES (9, 90)", "ALTER TABLE rid_ek RENAME TO rid_ek2");
+            assertEquals(List.of("7|(0,1)|t|rid_e", "8|(0,2)|t|rid_e", "9|(0,1)|t|rid_ek2"),
+                    rows(c, "SELECT i, ctid, xmin::text <> '0', tableoid::regclass::text"
+                            + " FROM rid_e ORDER BY i"));
+            assertEquals(List.of("9|(0,1)|t"),
+                    rows(c, "SELECT i, ctid, xmin::text <> '0' FROM rid_ek2 ORDER BY i"));
+            run(c, "DROP TABLE rid_ek2", "DROP TABLE rid_e");
+        }
+    }
+
+    @Test
+    void aSnapshotTakenBeforeARenameGoesOnAnsweringWithThePlacesItHad() throws SQLException {
+        try (Connection c = session()) {
+            run(c, "CREATE TABLE rid_f (i int, s text)",
+                    "INSERT INTO rid_f VALUES (1,'a'),(2,'b'),(3,'c')",
+                    "UPDATE rid_f SET s = 'bb' WHERE i = 2",
+                    "BEGIN ISOLATION LEVEL REPEATABLE READ");
+            List<String> before =
+                    rows(c, "SELECT i, ctid, xmin::text <> '0' FROM rid_f ORDER BY i");
+            assertEquals(List.of("1|(0,1)|t", "2|(0,4)|t", "3|(0,3)|t"), before);
+            run(c, "ALTER TABLE rid_f RENAME TO rid_f2");
+            assertEquals(before, rows(c, "SELECT i, ctid, xmin::text <> '0' FROM rid_f2 ORDER BY i"));
+            run(c, "COMMIT");
+            assertEquals(before, rows(c, "SELECT i, ctid, xmin::text <> '0' FROM rid_f2 ORDER BY i"));
+            run(c, "DROP TABLE rid_f2");
+        }
+    }
+
+    // ============================================================ What a definition's shape costs
+    // in command identifiers
+
+    @Test
+    void cminCountsTheToastTableAColumnsWidthEarnedTheDefinition() throws SQLException {
+        try (Connection c = session()) {
+            run(c, "BEGIN");
+            try {
+                // A relation whose widest row would not fit in a quarter of a page is given a
+                // TOAST table, which is four identifiers more: varchar(501) still fits and
+                // varchar(502) does not.
+                run(c, "CREATE TABLE csz_a (i int)",
+                        "CREATE TABLE csz_a1 (i int)", "INSERT INTO csz_a VALUES (1)",
+                        "CREATE TABLE csz_a2 (t text)", "INSERT INTO csz_a VALUES (2)",
+                        "CREATE TABLE csz_a3 (v varchar(10))", "INSERT INTO csz_a VALUES (3)",
+                        "CREATE TABLE csz_a4 (n numeric)", "INSERT INTO csz_a VALUES (4)",
+                        "CREATE TABLE csz_a5 (n numeric(5,2))", "INSERT INTO csz_a VALUES (5)",
+                        "CREATE TABLE csz_a6 (v varchar(501))", "INSERT INTO csz_a VALUES (6)",
+                        "CREATE TABLE csz_a7 (v varchar(502))", "INSERT INTO csz_a VALUES (7)",
+                        "CREATE TABLE csz_a8 (a int[])", "INSERT INTO csz_a VALUES (8)",
+                        "CREATE TABLE csz_a9 (u uuid)", "INSERT INTO csz_a VALUES (9)");
+                assertEquals(
+                        List.of("1|2", "2|8", "3|10", "4|16", "5|18", "6|20", "7|26", "8|32",
+                                "9|34"),
+                        rows(c, "SELECT i, cmin::text FROM csz_a ORDER BY i"));
+            } finally {
+                run(c, "ROLLBACK");
+            }
+        }
+    }
+
+    @Test
+    void cminCountsTheKeysDefaultsAndSequencesADefinitionWrote() throws SQLException {
+        try (Connection c = session()) {
+            run(c, "BEGIN");
+            try {
+                // Two CHECKs cost what one costs, and so do two defaults and two NOT NULLs: each
+                // group is written in one stretch. A default and a NOT NULL are written apart, so
+                // together they cost two.
+                run(c, "CREATE TABLE csz_b (i int)",
+                        "CREATE TABLE csz_b1 (i int primary key)", "INSERT INTO csz_b VALUES (1)",
+                        "CREATE TABLE csz_b2 (i int unique)", "INSERT INTO csz_b VALUES (2)",
+                        "CREATE TABLE csz_b3 (i int check (i > 0), j int check (j > 0))",
+                        "INSERT INTO csz_b VALUES (3)",
+                        "CREATE TABLE csz_b4 (i int default 1, j int default 2)",
+                        "INSERT INTO csz_b VALUES (4)",
+                        "CREATE TABLE csz_b5 (i int not null, j int not null)",
+                        "INSERT INTO csz_b VALUES (5)",
+                        "CREATE TABLE csz_b6 (i int not null default 1)",
+                        "INSERT INTO csz_b VALUES (6)",
+                        "CREATE TABLE csz_b7 (i int primary key, j int unique)",
+                        "INSERT INTO csz_b VALUES (7)",
+                        "CREATE TABLE csz_b8 (t text primary key)", "INSERT INTO csz_b VALUES (8)",
+                        "CREATE TABLE csz_b9 (i serial)", "INSERT INTO csz_b VALUES (9)",
+                        "CREATE TABLE csz_b10 (i int generated always as identity)",
+                        "INSERT INTO csz_b VALUES (10)",
+                        "CREATE TABLE csz_b11 (i int, exclude (i with =))",
+                        "INSERT INTO csz_b VALUES (11)");
+                assertEquals(
+                        List.of("1|5", "2|9", "3|12", "4|15", "5|18", "6|22", "7|29", "8|38",
+                                "9|45", "10|51", "11|55"),
+                        rows(c, "SELECT i, cmin::text FROM csz_b ORDER BY i"));
+            } finally {
+                run(c, "ROLLBACK");
+            }
+        }
+    }
+
+    @Test
+    void cminCountsWhatAForeignKeyAndAnInheritedDefinitionCost() throws SQLException {
+        try (Connection c = session()) {
+            run(c, "CREATE TABLE csz_cr (i int primary key)", "CREATE TABLE csz_cs (i int)");
+            run(c, "BEGIN");
+            try {
+                // A key writes its row and the triggers that enforce it, and marks the relation it
+                // points at as carrying triggers -- which the second key pointing at the same
+                // relation no longer has to do. What a table takes from its parents is written
+                // where its own constraints are, so INHERITS costs what a CHECK costs and the two
+                // together cost one.
+                run(c, "CREATE TABLE csz_c (i int)",
+                        "CREATE TABLE csz_c1 (i int references csz_cr(i))",
+                        "INSERT INTO csz_c VALUES (1)",
+                        "CREATE TABLE csz_c2 (i int references csz_cr(i),"
+                                + " j int references csz_cr(i))",
+                        "INSERT INTO csz_c VALUES (2)",
+                        "CREATE TABLE csz_c3 () INHERITS (csz_cs)", "INSERT INTO csz_c VALUES (3)",
+                        "CREATE TABLE csz_c4 (j int check (j > 0)) INHERITS (csz_cs)",
+                        "INSERT INTO csz_c VALUES (4)",
+                        "CREATE TABLE csz_c5 (j int default 1) INHERITS (csz_cs)",
+                        "INSERT INTO csz_c VALUES (5)");
+                assertEquals(List.of("1|8", "2|19", "3|22", "4|25", "5|29"),
+                        rows(c, "SELECT i, cmin::text FROM csz_c ORDER BY i"));
+            } finally {
+                run(c, "ROLLBACK");
+            }
+            run(c, "DROP TABLE csz_cs CASCADE", "DROP TABLE csz_cr");
+        }
+    }
+
+    @Test
+    void theFirstTemporaryRelationASessionMakesWritesTheSchemaItLivesIn() throws SQLException {
+        try (Connection c = session()) {
+            run(c, "BEGIN");
+            try {
+                // The schema a session's temporary relations live in comes into being with the
+                // first of them, and is written as any other schema is. The second temporary
+                // relation finds it already there.
+                run(c, "CREATE TABLE csz_d (i int)",
+                        "CREATE TEMP TABLE csz_d1 (i int)", "INSERT INTO csz_d VALUES (1)",
+                        "CREATE TEMP TABLE csz_d2 (i int)", "INSERT INTO csz_d VALUES (2)",
+                        "CREATE TEMP TABLE csz_d3 (t text)", "INSERT INTO csz_d VALUES (3)");
+                assertEquals(List.of("1|4", "2|6", "3|12"),
+                        rows(c, "SELECT i, cmin::text FROM csz_d ORDER BY i"));
+            } finally {
+                run(c, "ROLLBACK");
+            }
+        }
+    }
+
+    @Test
+    void aTemporaryRelationInASessionThatAlreadyHasItsSchemaCostsWhatAnyRelationCosts()
+            throws SQLException {
+        try (Connection c = session()) {
+            run(c, "CREATE TEMP TABLE csz_e0 (i int)");
+            run(c, "BEGIN");
+            try {
+                run(c, "CREATE TABLE csz_e (i int)", "CREATE TEMP TABLE csz_e1 (i int)",
+                        "INSERT INTO csz_e VALUES (1)");
+                assertEquals(List.of("1|2"), rows(c, "SELECT i, cmin::text FROM csz_e ORDER BY i"));
+            } finally {
+                run(c, "ROLLBACK");
+            }
+            run(c, "DROP TABLE csz_e0");
         }
     }
 }

@@ -2539,6 +2539,10 @@ class CatalogStubBuilder {
         String read = definition;
         for (String schema : visible) {
             read = read.replace("INSERT INTO " + schema + ".", "INSERT INTO ");
+            read = read.replace("DELETE FROM ONLY " + schema + ".", "DELETE FROM ONLY ");
+            read = read.replace("DELETE FROM " + schema + ".", "DELETE FROM ");
+            read = read.replace("UPDATE ONLY " + schema + ".", "UPDATE ONLY ");
+            read = read.replace("UPDATE " + schema + ".", "UPDATE ");
         }
         return read;
     }

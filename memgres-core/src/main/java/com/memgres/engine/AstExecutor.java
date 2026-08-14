@@ -461,46 +461,115 @@ public class AstExecutor {
     /**
      * How many rows a statement of this shape writes into the catalogue.
      *
-     * <p>PostgreSQL spends a command identifier on each of them, so a statement that takes a
-     * relation down spends more than one: dropping a table retires the relation, its composite
-     * type and that type's array type, and dropping a view retires its rewrite rule beside those
-     * three. Creating a view writes the relation and the rule; creating a sequence writes the
-     * relation and the row holding its state. A name nothing answers to costs nothing, which is
-     * why DROP ... IF EXISTS over a relation that is not there leaves the counter alone. Zero
-     * here leaves the statement to the rule that a write takes exactly one.
+     * <p>PostgreSQL spends a command identifier on each stretch of them it has to make visible
+     * before it can go on, so a statement that takes a relation down spends more than one:
+     * dropping a table retires the relation, its composite type and that type's array type, and
+     * dropping a view retires its rewrite rule beside those three. Creating a view writes the
+     * relation and the rule; creating a sequence writes the relation and the row holding its
+     * state. A name nothing answers to costs nothing, which is why DROP ... IF EXISTS over a
+     * relation that is not there leaves the counter alone. Zero here leaves the statement to the
+     * rule that a write takes exactly one, and to whatever counts it where more is known: what a
+     * definition costs depends on the columns and constraints it turned out to have, so CREATE
+     * TABLE and CREATE MATERIALIZED VIEW are counted where those are in hand.
+     *
+     * @see CommandIdCost
      */
     private int catalogRowsWrittenBy(Statement stmt) {
         if (stmt instanceof CreateViewStmt) {
             return ((CreateViewStmt) stmt).materialized ? 0 : 2;
+        }
+        if (stmt instanceof RefreshMaterializedViewStmt) {
+            Database.ViewDef view = database.getView(((RefreshMaterializedViewStmt) stmt).name());
+            if (view == null || !view.materialized()) return 0;
+            return CommandIdCost.forRefreshedMaterializedView(view.cachedColumns());
         }
         if (stmt instanceof CreateSequenceStmt) {
             CreateSequenceStmt create = (CreateSequenceStmt) stmt;
             if (create.ifNotExists() && database.getSequence(create.name()) != null) return 0;
             return 2;
         }
+        if (stmt instanceof CreateIndexStmt) {
+            CreateIndexStmt create = (CreateIndexStmt) stmt;
+            if (create.ifNotExists()
+                    && database.resolveIndexName(relationSearchPath(), create.name()) != null) {
+                return 0;
+            }
+            return 2;
+        }
+        if (stmt instanceof TruncateStmt) {
+            TruncateStmt truncate = (TruncateStmt) stmt;
+            int rows = 0;
+            for (String written : truncate.tables()) {
+                Table found = relationNamed(null, written);
+                if (found == null) continue;
+                rows += CommandIdCost.forTruncatedRelation(
+                        database, database.schemaNameOf(found), found);
+                // RESTART IDENTITY rewrites the sequence behind each of the relation's own
+                // columns, and each of those is a row of its own.
+                if (truncate.restartIdentity()) rows += CommandIdCost.sequencesBehind(found);
+            }
+            return rows;
+        }
         if (stmt instanceof DropTableStmt) {
             DropTableStmt drop = (DropTableStmt) stmt;
-            int relations = relationsBehind(drop.schema(), drop.name());
-            for (String also : drop.additionalTables()) relations += relationsBehind(null, also);
-            return 3 * relations;
+            int rows = relationsBehind(drop.schema(), drop.name());
+            for (String also : drop.additionalTables()) rows += relationsBehind(null, also);
+            return rows;
         }
         if (stmt instanceof DropStmt) {
             int rows = 0;
-            for (DropStmt one : DropStmt.allOf((DropStmt) stmt)) {
-                if (one.objectType() != DropStmt.ObjectType.VIEW) continue;
-                if (database.getView(one.schema(), one.name()) != null) rows += 4;
-            }
+            for (DropStmt one : DropStmt.allOf((DropStmt) stmt)) rows += retiringCost(one);
             return rows;
         }
         return 0;
     }
 
+    /** What retiring one object named by a DROP costs; nothing when no object answers to it. */
+    private int retiringCost(DropStmt one) {
+        if (one.objectType() == DropStmt.ObjectType.VIEW) {
+            return database.getView(one.schema(), one.name()) == null ? 0
+                    : CommandIdCost.forDroppedView(null, false);
+        }
+        if (one.objectType() == DropStmt.ObjectType.MATERIALIZED_VIEW) {
+            Database.ViewDef view = database.getView(one.schema(), one.name());
+            return view == null || !view.materialized() ? 0
+                    : CommandIdCost.forDroppedView(view.cachedColumns(), true);
+        }
+        if (one.objectType() == DropStmt.ObjectType.INDEX) {
+            return database.resolveIndexName(relationSearchPath(), one.name()) == null ? 0 : 1;
+        }
+        if (one.objectType() == DropStmt.ObjectType.DOMAIN) {
+            return database.isDomain(one.name()) ? 2 : 0;
+        }
+        if (one.objectType() == DropStmt.ObjectType.TYPE) {
+            // A composite type is one more row than the others: the relation standing for its
+            // shape goes with the type and its array type.
+            if (database.isCompositeType(one.name())) return 3;
+            if (database.isCustomEnum(one.name()) || database.isRangeType(one.name())) return 2;
+            return database.isDomain(one.name()) ? 2 : 0;
+        }
+        return 0;
+    }
+
     /**
-     * How many relations a DROP TABLE of this name takes down: the relation itself and, where it
-     * is partitioned, every partition below it, because those go with it.
+     * What a DROP TABLE of this name spends: the relation and, where it is partitioned, every
+     * partition below it, because those go with it.
      */
     private int relationsBehind(String schema, String name) {
-        if (name == null) return 0;
+        return retiringCost(relationNamed(schema, name));
+    }
+
+    private int retiringCost(Table relation) {
+        if (relation == null) return 0;
+        int rows = CommandIdCost.forDroppedRelation(
+                database, database.schemaNameOf(relation), relation);
+        for (Table partition : relation.getPartitions()) rows += retiringCost(partition);
+        return rows;
+    }
+
+    /** The relation a written name stands for, or null when nothing answers to it. */
+    private Table relationNamed(String schema, String name) {
+        if (name == null) return null;
         String bare = name;
         String where = schema;
         int dot = bare.indexOf('.');
@@ -508,24 +577,16 @@ public class AstExecutor {
             where = bare.substring(0, dot);
             bare = bare.substring(dot + 1);
         }
-        Table found = null;
         if (where != null) {
             Schema holder = database.getSchema(where.toLowerCase());
-            found = holder == null ? null : holder.getTable(bare.toLowerCase());
-        } else {
-            for (String path : relationSearchPath()) {
-                Schema holder = database.getSchema(path);
-                found = holder == null ? null : holder.getTable(bare.toLowerCase());
-                if (found != null) break;
-            }
+            return holder == null ? null : holder.getTable(bare.toLowerCase());
         }
-        return found == null ? 0 : countWithPartitions(found);
-    }
-
-    private static int countWithPartitions(Table relation) {
-        int total = 1;
-        for (Table partition : relation.getPartitions()) total += countWithPartitions(partition);
-        return total;
+        for (String path : relationSearchPath()) {
+            Schema holder = database.getSchema(path);
+            Table found = holder == null ? null : holder.getTable(bare.toLowerCase());
+            if (found != null) return found;
+        }
+        return null;
     }
 
     /**
@@ -588,13 +649,27 @@ public class AstExecutor {
         // statement so far is dropped on either side of it rather than read again.
         boolean mayChangeCatalog = !(stmt instanceof SelectStmt) && !(stmt instanceof SetOpStmt);
         if (!mayChangeCatalog) return executeReadOrWrite(stmt);
+        // A statement run inside another one -- a trigger body, a function body, a data-modifying
+        // WITH item -- reads the database again, but PostgreSQL goes on answering the statement
+        // around it out of the snapshot that statement began with: an InitPlan it has already run
+        // keeps the answer it gave. Handing those answers back afterwards is what keeps a row
+        // trigger that writes from changing what the write it belongs to reports.
+        java.util.Map<SubqueryExpr, ScalarSubqueryValue> enclosing = statementsRunning > 0
+                ? new java.util.IdentityHashMap<SubqueryExpr, ScalarSubqueryValue>(scalarSubqueries)
+                : null;
+        statementsRunning++;
         dropStatementCaches();
         try {
             return executeReadOrWrite(stmt);
         } finally {
+            statementsRunning--;
             dropStatementCaches();
+            if (enclosing != null) scalarSubqueries.putAll(enclosing);
         }
     }
+
+    /** How many statements of this session are part-way through, so nesting can be told apart. */
+    private int statementsRunning;
 
     /** The key sets built for correlated EXISTS subqueries of the statement now running. */
     private final java.util.IdentityHashMap<ExistsExpr, ExistsKeyIndex> existsIndexes =

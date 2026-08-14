@@ -31,21 +31,20 @@ public final class TypeCoercion {
 
     /**
      * Whether a value of the named PostgreSQL type can be assigned to a column of the target type
-     * without being cast explicitly. PostgreSQL's assignment casts stay inside a type category —
-     * any number to any number, any string to any string — and additionally reach every type from
-     * a string, since every type has a text representation to read back. Going the other way, out
-     * of a category into one that is not string, needs an explicit cast.
+     * without being cast explicitly. PostgreSQL looks for a cast registered in {@code pg_cast} as
+     * implicit or assignment, and where there is none it will still read the value through the
+     * types' own text forms — but only <em>into</em> a string type, which is the one direction it
+     * allows without a registered cast. That is why {@code text DEFAULT 1} stands and
+     * {@code integer DEFAULT 'a'||'b'} does not, and why a category rule was too coarse: a
+     * timestamp and an interval are both date/time types with no cast between them.
      *
      * <p>A type name this engine does not recognise is left alone: guessing would refuse
      * definitions PostgreSQL accepts.
      */
     public static boolean assignableFrom(String sourceTypeName, DataType target) {
         DataType source = DataType.fromPgName(sourceTypeName);
-        if (source == null || target == null || source == target) return true;
-        TypeCategory from = categoryOf(source);
-        TypeCategory to = categoryOf(target);
-        if (from == TypeCategory.UNKNOWN || to == TypeCategory.UNKNOWN) return true;
-        return from == to || to == TypeCategory.STRING;
+        if (source == null || target == null) return true;
+        return CastLegality.assignable(source, target);
     }
 
     public static TypeCategory categoryOf(DataType type) {
@@ -316,6 +315,13 @@ public final class TypeCoercion {
             case VARCHAR:
             case CHAR:
             case TEXT:
+                // A boolean reaching a string type goes through the cast PostgreSQL registered
+                // between the two, which spells the value out in full; the single letter is what
+                // boolean's own output function writes, and that is reached only inside an array
+                // or a composite, where the letter is what PostgreSQL writes too. Storing the
+                // letter left a varchar column answering t where PostgreSQL answers true, and let
+                // character(1) hold a value four characters wide.
+                if (value instanceof Boolean) return ((Boolean) value) ? "true" : "false";
                 return toString(value);
             case BOOLEAN:
                 return toBoolean(value);

@@ -40,6 +40,18 @@ public class Table {
      * dropped begins a file of its own and starts again at one.
      */
     private final AtomicLong tupleIdCounter = new AtomicLong(0);
+    /**
+     * What each row's system columns answer: the transaction that wrote it, the one that removed
+     * it, the command each of those was, and the line pointer it sits at, kept against the row
+     * itself.
+     *
+     * <p>None of that belongs to the name the relation stands under. PostgreSQL renames a relation,
+     * and moves one between schemas, without rewriting a tuple, so afterwards a row still names
+     * the transaction that inserted it and still sits where it always sat. Held under the written
+     * name instead, the whole book became unreachable the moment the name changed, and the book a
+     * dropped relation left behind stayed for as long as the server ran.
+     */
+    private final Map<Object[], long[]> rowMeta = new java.util.IdentityHashMap<>();
     private final List<StoredConstraint> constraints = new CopyOnWriteArrayList<>();
     /**
      * The name a column's NOT NULL constraint answers to, keyed by column. Every NOT NULL column
@@ -74,6 +86,15 @@ public class Table {
      * declares NOT NULL for itself counts no parent for it.
      */
     private final java.util.Set<String> noInheritNotNullColumns =
+            java.util.concurrent.ConcurrentHashMap.<String>newKeySet();
+    /**
+     * The columns whose NOT NULL was declared NOT VALID and has not been validated since. Every
+     * constraint PostgreSQL keeps carries that flag, and a NOT NULL is one constraint per column,
+     * so this is where the column's own copy of it lives. The rule itself is in force either way --
+     * every row written from now on is held to it -- and the flag says only whether the rows
+     * already stored have been read, which is what VALIDATE CONSTRAINT goes back to do.
+     */
+    private final java.util.Set<String> notValidatedNotNullColumns =
             java.util.concurrent.ConcurrentHashMap.<String>newKeySet();
     private final ReentrantLock writeLock = new ReentrantLock();
 
@@ -701,6 +722,7 @@ public class Table {
             noInheritNotNullColumns.remove(columnName.toLowerCase());
             inheritedNotNullNames.remove(columnName.toLowerCase());
             retainedNotNullInheritCounts.remove(columnName.toLowerCase());
+            notValidatedNotNullColumns.remove(columnName.toLowerCase());
             columnsChanged();
             List<Object[]> current = rows;
             List<Object[]> newRows = new ArrayList<>(current.size());
@@ -832,6 +854,9 @@ public class Table {
             if (inheritedNotNullColumns.remove(oldName.toLowerCase())) {
                 inheritedNotNullColumns.add(newName.toLowerCase());
             }
+            if (notValidatedNotNullColumns.remove(oldName.toLowerCase())) {
+                notValidatedNotNullColumns.add(newName.toLowerCase());
+            }
             columnsChanged();
             // Keep constraints attached to the column under its new name
             for (StoredConstraint sc : constraints) {
@@ -896,7 +921,10 @@ public class Table {
         columns.set(idx, columns.get(idx).withNullable(nullable));
         // The constraint goes with the flag, so a NOT NULL declared here afterwards is this
         // relation's own rather than one it was still holding on a parent's behalf.
-        if (nullable) inheritedNotNullColumns.remove(columnName.toLowerCase());
+        if (nullable) {
+            inheritedNotNullColumns.remove(columnName.toLowerCase());
+            notValidatedNotNullColumns.remove(columnName.toLowerCase());
+        }
         columnsChanged();
     }
 
@@ -908,6 +936,11 @@ public class Table {
     /** How many line pointers this relation has handed out. */
     public long getTupleIdCounter() {
         return tupleIdCounter.get();
+    }
+
+    /** What this relation's rows answer for xmin, xmax, cmin, cmax and ctid. */
+    public Map<Object[], long[]> getRowMeta() {
+        return rowMeta;
     }
 
     /**
@@ -1356,6 +1389,25 @@ public class Table {
     /** True when this relation's NOT NULL on the column stops here rather than being handed down. */
     public boolean isNotNullNoInherit(String column) {
         return column != null && noInheritNotNullColumns.contains(column.toLowerCase());
+    }
+
+    /**
+     * Records that the column's NOT NULL was declared NOT VALID: the rows already stored were not
+     * read, so PostgreSQL leaves the constraint standing over every write from now on and waits
+     * for VALIDATE CONSTRAINT to go back over what is there.
+     */
+    public void markNotNullNotValidated(String column) {
+        if (column != null) notValidatedNotNullColumns.add(column.toLowerCase());
+    }
+
+    /** Records that the rows already stored have been read and none of them holds a null. */
+    public void markNotNullValidated(String column) {
+        if (column != null) notValidatedNotNullColumns.remove(column.toLowerCase());
+    }
+
+    /** Whether the rows already stored have been held to the column's NOT NULL. */
+    public boolean isNotNullValidated(String column) {
+        return column == null || !notValidatedNotNullColumns.contains(column.toLowerCase());
     }
 
     /**

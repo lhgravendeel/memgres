@@ -62,7 +62,7 @@ final class IndexKeyDescription {
         sb.append(")=(");
         for (int i = 0; values != null && i < values.length; i++) {
             if (i > 0) sb.append(", ");
-            sb.append(values[i] == null ? "null" : values[i]);
+            sb.append(ErrorValueText.of(values[i]));
         }
         return sb.append(')').append(ending).toString();
     }

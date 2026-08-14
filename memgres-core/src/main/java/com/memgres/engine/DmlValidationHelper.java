@@ -118,37 +118,68 @@ class DmlValidationHelper {
                     String base = d.getBaseTypeName();
                     d = base == null ? null : executor.database.getDomain(base);
                 }
-                for (DomainType domain : chain) {
-                    if (row[i] == null && domain.isNotNull()) {
-                        MemgresException ex = new MemgresException("domain "
-                                + domainDisplay(domain.getName())
-                                + " does not allow null values", "23502");
-                        ex.setDatatype(domain.getName());
-                        throw ex;
-                    }
-                    // A domain CHECK still runs for NULL: CHECK (VALUE IS NOT NULL) rejects it
-                    Table tempTable = new Table("_domain_check",
-                            Cols.listOf(new Column("value", domain.getBaseType(), true, false, null)));
-                    RowContext tempCtx = new RowContext(tempTable, null, new Object[]{row[i]});
-                    // Check the original (unnamed) CHECK constraint
-                    // In PG, a CHECK that returns NULL does NOT violate; only explicit false violates
-                    if (domain.getParsedCheck() != null) {
-                        Object result = executor.evalExpr(domain.getParsedCheck(), tempCtx);
-                        if (result != null && !executor.isTruthy(result)) {
-                            throw domainCheckViolation(domainName, domain.getName() + "_check");
+                // An array of a domain holds one of the domain's values in every element, and
+                // PostgreSQL builds each of them as a value of the domain -- so the domain's rules
+                // are every element's rules, down through the dimensions. A null array holds no
+                // value of the domain at all, and a domain built over an array is itself one value.
+                for (Object held : domainValuesIn(row[i], col, domainName)) {
+                    for (DomainType domain : chain) {
+                        if (held == null && domain.isNotNull()) {
+                            MemgresException ex = new MemgresException("domain "
+                                    + domainDisplay(domain.getName())
+                                    + " does not allow null values", "23502");
+                            ex.setDatatype(domain.getName());
+                            throw ex;
                         }
-                    }
-                    // Check named constraints added via ALTER DOMAIN ADD CONSTRAINT
-                    for (DomainType.NamedConstraint nc : domain.getNamedConstraints()) {
-                        if (nc.parsedCheck() != null) {
-                            Object result = executor.evalExpr(nc.parsedCheck(), tempCtx);
+                        // A domain CHECK still runs for NULL: CHECK (VALUE IS NOT NULL) rejects it
+                        Table tempTable = new Table("_domain_check",
+                                Cols.listOf(new Column("value", domain.getBaseType(), true, false, null)));
+                        RowContext tempCtx = new RowContext(tempTable, null, new Object[]{held});
+                        // Check the original (unnamed) CHECK constraint
+                        // In PG, a CHECK that returns NULL does NOT violate; only explicit false violates
+                        if (domain.getParsedCheck() != null) {
+                            Object result = executor.evalExpr(domain.getParsedCheck(), tempCtx);
                             if (result != null && !executor.isTruthy(result)) {
-                                throw domainCheckViolation(domainName, nc.name());
+                                throw domainCheckViolation(domainName, domain.getName() + "_check");
+                            }
+                        }
+                        // Check named constraints added via ALTER DOMAIN ADD CONSTRAINT
+                        for (DomainType.NamedConstraint nc : domain.getNamedConstraints()) {
+                            if (nc.parsedCheck() != null) {
+                                Object result = executor.evalExpr(nc.parsedCheck(), tempCtx);
+                                if (result != null && !executor.isTruthy(result)) {
+                                    throw domainCheckViolation(domainName, nc.name());
+                                }
                             }
                         }
                     }
                 }
             }
+        }
+    }
+
+    /**
+     * The values a column's domain has to be satisfied by. One for an ordinary column, and for a
+     * column whose domain is itself built over an array; every element, however many dimensions
+     * deep, for a column declared as an array of the domain; and none at all where such a column
+     * holds no array, since a null array is not a value of the domain.
+     */
+    private List<Object> domainValuesIn(Object value, Column col, String domainName) {
+        DomainType domain = executor.database.getDomain(domainName);
+        boolean arrayOfTheDomain = col.getArrayElementType() != null
+                && (domain == null || domain.getArrayElementType() == null);
+        if (!arrayOfTheDomain) return Collections.singletonList(value);
+        List<Object> held = new ArrayList<Object>();
+        PgArray array = value == null ? null : PgArray.from(value);
+        if (array != null) collectDomainValues(array, held);
+        return held;
+    }
+
+    /** Every element of an array, walking into the arrays a multidimensional one is written as. */
+    private void collectDomainValues(List<?> elements, List<Object> out) {
+        for (Object element : elements) {
+            if (element instanceof List<?>) collectDomainValues((List<?>) element, out);
+            else out.add(element);
         }
     }
 
@@ -381,7 +412,7 @@ class DmlValidationHelper {
         StringBuilder failing = new StringBuilder();
         for (int i = 0; i < row.length; i++) {
             if (i > 0) failing.append(", ");
-            failing.append(row[i] == null ? "null" : row[i].toString());
+            failing.append(ErrorValueText.of(row[i]));
         }
         MemgresException ex = new MemgresException(
                 "new row violates check option for view \"" + viewName + "\"", "44000");

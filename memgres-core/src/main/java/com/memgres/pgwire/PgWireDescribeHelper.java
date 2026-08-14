@@ -96,6 +96,30 @@ class PgWireDescribeHelper {
         return upper.contains("LIMIT") || upper.contains("FETCH");
     }
 
+    /** The statement as a metadata run takes it: no trailing semicolon, no trailing comment. */
+    private static String tidiedForMetadata(String sql) {
+        return sql.replaceAll(";\\s*$", "").trim().replaceAll("--[^\\n]*$", "").trim();
+    }
+
+    /** The same with the row-locking clause taken off, so reading it takes no lock. */
+    private static String withoutRowLocking(String sql) {
+        return tidiedForMetadata(sql).replaceAll("(?i)\\bFOR\\s+(UPDATE|NO\\s+KEY\\s+UPDATE"
+                + "|SHARE|KEY\\s+SHARE)(\\s+(SKIP\\s+LOCKED|NOWAIT|OF\\s+\\w+))*", "").trim();
+    }
+
+    /**
+     * Whether working the statement's shape out by running it again would park it on the same
+     * lock a second time. A wait the row-locking clause caused would not: that clause is taken
+     * off first. A statement that waits for anything else -- one that locks by calling a
+     * function -- still says so, and running it again put two blocked sessions back on each
+     * other, so every deadlock between them was detected, eaten by the Describe that found it,
+     * and immediately formed anew.
+     */
+    private static boolean wouldWaitAgain(String sql, Throwable failure) {
+        return lockWaitSqlState(failure) != null
+                && withoutRowLocking(sql).equals(tidiedForMetadata(sql));
+    }
+
     private static String sqlStateOf(Exception e) {
         if (e instanceof MemgresException) {
             String state = ((MemgresException) e).getSqlState();
@@ -238,6 +262,11 @@ class PgWireDescribeHelper {
             return new DescribePortalResult(false, null);
         }
 
+        // Describing a portal here means running the statement, and PostgreSQL runs a statement
+        // once: whatever that run was refused with is the answer this portal has, carried back so
+        // that Execute reports it rather than asking the question a second time.
+        RuntimeException probeFailure = null;
+
         // DML with RETURNING
         String upper = stripLeadingComments(sql).toUpperCase();
         boolean isDmlReturning = upper.contains("RETURNING") && (upper.startsWith("INSERT") || upper.startsWith("UPDATE") || upper.startsWith("DELETE") || upper.startsWith("MERGE"));
@@ -267,6 +296,7 @@ class PgWireDescribeHelper {
                 return new DescribePortalResult(false, result);
             } catch (Exception e) {
                 LOG.warn("[PROTO] Describe Portal DML exec failed: {} | {}", e.getMessage(), sqlSnip);
+                if (e instanceof RuntimeException) probeFailure = (RuntimeException) e;
             }
         }
 
@@ -314,16 +344,14 @@ class PgWireDescribeHelper {
             return new DescribePortalResult(false, null);
         }
 
-        // Note on policy: unlike describeStatement (which probes with $N params replaced by
-        // NULL, so a probe failure can be spurious/unrepresentative of the real bound values —
-        // that mismatch is exactly Bug 3's NPE-swallowed-to-NoData scenario), describePortal
-        // probes by executing the SQL with the *real* bound parameter values already known from
-        // Bind. So if this probe fails, the subsequent real Execute (same SQL, same real values)
-        // will fail identically and surface the actual ErrorResponse there — falling back to
-        // NoData here is safe (no row-vs-no-row mismatch can occur) and, empirically, throwing
-        // here instead caused a regression: it discards the pipelined Execute message, which
-        // otherwise doubles as the autocommit-safe recovery for the transient FAILED status this
-        // probe leaves behind (see Session.execute()'s IN_TRANSACTION -> FAILED transition).
+        // Note on policy: unlike describeStatement, which probes with $N replaced by NULL and can
+        // therefore be refused for the substitution rather than for the statement, this probe runs
+        // the statement with the values Bind already carried, so what refuses the probe refuses the
+        // statement. That refusal is kept and reported at Execute rather than thrown from here:
+        // PostgreSQL settles a portal's shape without running it and so refuses no Describe at all,
+        // and throwing discards the pipelined Execute, which is also what recovers the transient
+        // FAILED status this probe leaves behind (see Session.execute()'s IN_TRANSACTION -> FAILED
+        // transition).
         if (isSafeToDescribe(sql)) {
             Session.TransactionStatus savedStatusPortal = session.getStatus();
             try {
@@ -338,24 +366,26 @@ class PgWireDescribeHelper {
                 LOG.warn("[PROTO] Describe Portal FAILED: {} | {}", e.getMessage(), sqlSnip);
                 LOG.debug("Full exception:", e);
                 session.restoreStatus(savedStatusPortal);
-                String lockState = lockWaitSqlState(e);
-                if (lockState != null) {
-                    throw new DescribeExecutionFailedException(lockState, e.getMessage());
-                }
+                // The refusal is kept rather than reported here or dropped. PostgreSQL settles a
+                // portal's shape without running it, so it never refuses a Describe for something
+                // the statement came to while running, and it reports that at Execute. Dropping it
+                // left the statement to be run again with the collision that caused it gone -- the
+                // writer this run had waited for having committed in the meantime -- so a lock
+                // that could not be taken, a deadlock and a row moved out from under a FOR UPDATE
+                // all came back to the client as though nothing had happened.
+                if (e instanceof RuntimeException) probeFailure = (RuntimeException) e;
                 // Fallback: re-execute with LIMIT 0 to get column metadata without side effects
                 String upper2 = stripLeadingComments(sql).toUpperCase();
-                if (upper2.startsWith("SELECT")) {
+                if (upper2.startsWith("SELECT") && !wouldWaitAgain(sql, e)) {
                     Session.TransactionStatus savedFallback = session.getStatus();
                     try {
-                        String metaSql = sql.replaceAll(";\\s*$", "").trim()
-                                .replaceAll("--[^\\n]*$", "").trim();
-                        metaSql = metaSql.replaceAll("(?i)\\bFOR\\s+(UPDATE|NO\\s+KEY\\s+UPDATE|SHARE|KEY\\s+SHARE)(\\s+(SKIP\\s+LOCKED|NOWAIT|OF\\s+\\w+))*", "").trim();
+                        String metaSql = withoutRowLocking(sql);
                         if (!alreadyBounded(metaSql)) metaSql = metaSql + " LIMIT 0";
                         QueryResult metaResult = session.execute(metaSql, paramValues);
                         if (metaResult.getType() == QueryResult.Type.SELECT || !metaResult.getColumns().isEmpty()) {
                             sendRowDescription(ctx, metaResult);
                             if (Memgres.logAllStatements) LOG.info("[PROTO] Describe Portal → RowDesc (fallback LIMIT 0, {} cols) {}", metaResult.getColumns().size(), sqlSnip);
-                            return new DescribePortalResult(true, null);
+                            return new DescribePortalResult(true, null, probeFailure);
                         }
                     } catch (Exception fallbackEx) {
                         LOG.debug("[PROTO] Describe Portal fallback also failed: {}", fallbackEx.getMessage());
@@ -369,26 +399,39 @@ class PgWireDescribeHelper {
         if (cols != null) {
             sendRowDescription(ctx, QueryResult.select(cols, Cols.listOf()));
             if (Memgres.logAllStatements) LOG.info("[PROTO] Describe Portal → RowDesc (infer, {} cols) {}", cols.size(), sqlSnip);
-            return new DescribePortalResult(true, null);
+            return new DescribePortalResult(true, null, probeFailure);
         }
 
         if (Memgres.logAllStatements) LOG.info("[PROTO] Describe Portal → NoData: {}", sqlSnip);
         sendNoData(ctx);
-        return new DescribePortalResult(false, null);
+        return new DescribePortalResult(false, null, probeFailure);
     }
 
     /** Result from describePortal: whether RowDescription was sent, and the cached result (if query was executed). */
         public static final class DescribePortalResult {
         public final boolean rowDescSent;
         public final QueryResult cachedResult;
+        /**
+         * What the run this Describe made of the statement was refused with, where it was refused
+         * at all. PostgreSQL runs a statement once and answers with what that one run came to, so
+         * a refusal belongs to the portal exactly as a row does.
+         */
+        public final RuntimeException failure;
 
         public DescribePortalResult(boolean rowDescSent, QueryResult cachedResult) {
+            this(rowDescSent, cachedResult, null);
+        }
+
+        public DescribePortalResult(boolean rowDescSent, QueryResult cachedResult,
+                                    RuntimeException failure) {
             this.rowDescSent = rowDescSent;
             this.cachedResult = cachedResult;
+            this.failure = failure;
         }
 
         public boolean rowDescSent() { return rowDescSent; }
         public QueryResult cachedResult() { return cachedResult; }
+        public RuntimeException failure() { return failure; }
 
         @Override
         public boolean equals(Object o) {
@@ -396,17 +439,18 @@ class PgWireDescribeHelper {
             if (o == null || getClass() != o.getClass()) return false;
             DescribePortalResult that = (DescribePortalResult) o;
             return rowDescSent == that.rowDescSent
-                && java.util.Objects.equals(cachedResult, that.cachedResult);
+                && java.util.Objects.equals(cachedResult, that.cachedResult)
+                && java.util.Objects.equals(failure, that.failure);
         }
 
         @Override
         public int hashCode() {
-            return java.util.Objects.hash(rowDescSent, cachedResult);
+            return java.util.Objects.hash(rowDescSent, cachedResult, failure);
         }
 
         @Override
         public String toString() {
-            return "DescribePortalResult[rowDescSent=" + rowDescSent + ", " + "cachedResult=" + cachedResult + "]";
+            return "DescribePortalResult[rowDescSent=" + rowDescSent + ", " + "cachedResult=" + cachedResult + ", " + "failure=" + failure + "]";
         }
     }
 

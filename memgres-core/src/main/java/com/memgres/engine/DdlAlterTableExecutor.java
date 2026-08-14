@@ -960,6 +960,10 @@ class DdlAlterTableExecutor {
         DdlDefinitionChecks.validateDefaultExpression(def.defaultExpr());
         executor.selectExecutor.placementCheck.rejectStoredDefinition(
                 def.defaultExpr(), "DEFAULT expressions", null);
+        // A DEFAULT is read with no row in scope, so the only thing in it to resolve is the calls
+        // it makes -- and PostgreSQL resolves those where the default is written rather than at
+        // the first insert that takes it.
+        StoredExprNames.read(ddl, def.defaultExpr(), null, null, false, false);
         // A child that lacks one of its parent's columns cannot stand in for the parent, so PG
         // refuses to add a column to a parent alone.
         if (stmt.only() && !childRelations(table).isEmpty()) {
@@ -1068,6 +1072,7 @@ class DdlAlterTableExecutor {
             }
             try {
                 Expression genParsed = com.memgres.engine.parser.Parser.parseExpression(genExpr);
+                StoredExprNames.read(ddl, genParsed, table, def.name(), false, true);
                 ddl.validateExprColumnRefs(genParsed, table, def.name(), false, true);
                 // What the expression produces has to be a value the column can hold, and
                 // PostgreSQL settles that where the column is defined rather than at the first row
@@ -1717,6 +1722,37 @@ class DdlAlterTableExecutor {
     }
 
     /**
+     * A child holds its parent's rows, so a column of it is filled the way the parent's is: a
+     * value the writer supplies where the parent takes one, and an expression the relation works
+     * out where the parent works one out. PostgreSQL will not merge the two, because a child that
+     * computed a column the parent stores would answer differently for the same row read through
+     * either relation, so it says which of the two the child is missing rather than adopting the
+     * parent's expression. Two generated columns are left to disagree about the expression itself
+     * -- each relation computes its own rows -- but not about when it is computed.
+     */
+    private static void requireSameGeneration(Column parentCol, Column childCol) {
+        if (parentCol.isGenerated() == childCol.isGenerated()
+                && (!parentCol.isGenerated() || parentCol.isVirtual() == childCol.isVirtual())) {
+            return;
+        }
+        if (parentCol.isGenerated() && childCol.isGenerated()) {
+            MemgresException ex = PgErrors.datatypeMismatch("column \"" + parentCol.getName()
+                    + "\" inherits from generated column of different kind");
+            ex.setDetail("Parent column is " + generationKind(parentCol)
+                    + ", child column is " + generationKind(childCol) + ".");
+            throw ex.suppressPosition();
+        }
+        throw PgErrors.datatypeMismatch("column \"" + parentCol.getName() + "\" in child table must"
+                + (parentCol.isGenerated() ? "" : " not") + " be a generated column")
+                .suppressPosition();
+    }
+
+    /** How PostgreSQL names the two kinds of generated column when it reports them. */
+    private static String generationKind(Column column) {
+        return column.isVirtual() ? "VIRTUAL" : "STORED";
+    }
+
+    /**
      * A NOT NULL written NO INHERIT says the rule is about this relation's own rows and travels
      * to nobody; a NOT NULL taken from a parent is one rule the relation holds on the parent's
      * behalf. The two cannot both be true of one column, so PostgreSQL refuses to join the
@@ -1841,6 +1877,7 @@ class DdlAlterTableExecutor {
                         + "\" has different type for column \"" + pc.getName() + "\"");
             }
             requireNotNullWhereParentIs(pc, child.getColumns().get(idx), childName);
+            requireSameGeneration(pc, child.getColumns().get(idx));
         }
     }
 
@@ -2535,6 +2572,10 @@ class DdlAlterTableExecutor {
             if (!stmt.only()) {
                 setColumnsNotNull(table, Collections.singletonList(alterCol.column()));
             }
+            // The rows have just been read, so a constraint that had been left waiting for them is
+            // not waiting any longer: PostgreSQL marks it validated rather than making the writer
+            // ask for the same scan twice.
+            markNotNullValidated(table, alterCol.column(), !stmt.only());
         } else if (alterCol.action() instanceof AlterTableStmt.DropNotNull) {
             Column nullable = requireColumn(table, alterCol.column(), stmt.table());
             // Identity fills the column for every row, so there is no nullability to drop.
@@ -2748,6 +2789,7 @@ class DdlAlterTableExecutor {
         }
         try {
             Expression parsed = com.memgres.engine.parser.Parser.parseExpression(action.expression());
+            StoredExprNames.read(ddl, parsed, table, column, false, true);
             ddl.validateExprColumnRefs(parsed, table, column, false, true);
         } catch (MemgresException me) {
             throw me;
@@ -2814,6 +2856,7 @@ class DdlAlterTableExecutor {
         // reach, so they resolve. Left unresolved, the expression was only ever evaluated per row,
         // which meant a retype of an empty table took a USING clause naming nothing at all.
         if (setType.usingExpr() != null) {
+            StoredExprNames.read(ddl, setType.usingExpr(), table, null, true, true);
             ddl.validateExprColumnRefs(setType.usingExpr(), table, null, true, true);
         }
         // PostgreSQL settles which column is being retyped before it settles what it is being
@@ -2910,21 +2953,31 @@ class DdlAlterTableExecutor {
         boolean isArrayType = setType.typeName().replaceAll("\\(.*\\)", "").trim().endsWith("[]");
         DataType dt = DataType.fromPgName(baseType);
         String newEnumTypeName = null;
+        String newDomainTypeName = null;
+        String newCompositeTypeName = null;
+        String newRangeTypeName = null;
+        String newTypeDisplayName = null;
         DataType newArrayElementType = null;
         if (dt == null) {
-            if (executor.database.isCustomEnum(baseType)) {
-                dt = DataType.ENUM;
-                // Carry the enum identity (and array-ness) into the retyped column, same as
-                // CREATE TABLE / ADD COLUMN via resolveColumnType — without these the retyped
-                // column advertised the unresolvable ENUM placeholder OID 0 (enumTypeName null),
-                // and "enum_type[]" was indistinguishable from a scalar enum column.
-                newEnumTypeName = baseType;
-                if (isArrayType) {
-                    newArrayElementType = DataType.ENUM;
-                }
-            } else {
-                throw new MemgresException("type \"" + baseType + "\" does not exist", "42704");
-            }
+            // PostgreSQL keeps one namespace of types, and the name a retype writes comes out of
+            // it exactly as the name a written column definition does: a domain, an enum, a
+            // composite and a range are each a type a column may be given. Settled here by a
+            // shorter reader that had been taught only the enums, every other user-defined name
+            // was reported as a type nothing answers to. The enum identity, and the array-ness
+            // that goes with it, come from that reader too -- without them the retyped column
+            // advertised the unresolvable ENUM placeholder OID.
+            DdlExecutor.ResolvedType resolved = ddl.resolveColumnType(setType.typeName(), null);
+            dt = resolved.dataType();
+            newEnumTypeName = resolved.enumTypeName();
+            newDomainTypeName = resolved.domainTypeName();
+            newCompositeTypeName = resolved.compositeTypeName();
+            newRangeTypeName = resolved.rangeTypeName();
+            newArrayElementType = resolved.arrayElementType();
+            // What PostgreSQL calls the type in a complaint is the type's own name, written the
+            // way this session would write it, and never the representation its values are kept
+            // in: a column refused a composite is told the composite's name.
+            newTypeDisplayName = newDomainTypeName != null
+                    ? resolved.domainDisplayName() : resolved.userTypeDisplayName();
         }
         int colIdx = table.getColumnIndex(alterCol.column());
         if (colIdx < 0) {
@@ -2948,6 +3001,22 @@ class DdlAlterTableExecutor {
             }
         }
         DataType currentType = table.getColumns().get(colIdx).getType();
+        // An enum, a composite and a range are types in their own right, whatever this engine
+        // keeps their values in, and PostgreSQL has no assignment cast into any of them: the only
+        // column a retype may give one to without a USING clause is a column already of that very
+        // type. Judged by the representation alone -- text for a composite and for a range -- a
+        // text column and a column of some other one of them looked like the same type, and the
+        // retype went through in silence.
+        String heldUserType = newCompositeTypeName != null
+                ? table.getColumns().get(colIdx).getCompositeTypeName()
+                : newRangeTypeName != null ? table.getColumns().get(colIdx).getRangeTypeName()
+                : newEnumTypeName != null ? table.getColumns().get(colIdx).getEnumTypeName() : null;
+        String wantedUserType = newCompositeTypeName != null ? newCompositeTypeName
+                : newRangeTypeName != null ? newRangeTypeName : newEnumTypeName;
+        if (setType.usingExpr() == null && wantedUserType != null
+                && !wantedUserType.equalsIgnoreCase(heldUserType)) {
+            throw retypeNeedsUsing(alterCol.column(), newTypeDisplayName, isArrayType);
+        }
         if (setType.usingExpr() == null && currentType != null && dt != null && currentType != dt) {
             TypeCoercion.TypeCategory fromCat = TypeCoercion.categoryOf(currentType);
             TypeCoercion.TypeCategory toCat = TypeCoercion.categoryOf(dt);
@@ -2957,11 +3026,9 @@ class DdlAlterTableExecutor {
             // string type to anything else (text->integer, text->date, varchar->enum, ...) are
             // explicit-only and must fail with 42804.
             if (fromCat != toCat && toCat != TypeCoercion.TypeCategory.STRING) {
-                String targetName = newEnumTypeName != null ? newEnumTypeName : dt.toRegtypeDisplay();
-                if (isArrayType) targetName += "[]";
-                throw new MemgresException("column \"" + alterCol.column() + "\" cannot be cast automatically to type "
-                        + targetName + "\n  Hint: You might need to specify \"USING "
-                        + alterCol.column() + "::" + targetName + "\".", "42804");
+                throw retypeNeedsUsing(alterCol.column(),
+                        newTypeDisplayName != null ? newTypeDisplayName : dt.toRegtypeDisplay(),
+                        isArrayType);
             }
         }
         // Check for view dependencies. Which views really read the column is read off their parse
@@ -2996,13 +3063,20 @@ class DdlAlterTableExecutor {
         }
         int convIdx = table.getColumnIndex(alterCol.column());
         Column oldCol = table.getColumns().get(convIdx);
-        rejectDefaultThatCannotBeCast(oldCol, currentType, dt, isArrayType, newEnumTypeName);
+        rejectDefaultThatCannotBeCast(oldCol, currentType, dt, isArrayType, newTypeDisplayName);
         // The new column is built first and used only to coerce, so nothing is written until
         // every rule already declared over the column has been checked against what the rewrite
         // would produce: PostgreSQL rolls the whole statement back and the old values have to
         // still be there afterwards.
         Column newCol = oldCol.withType(dt, newPrecision, newScale, newEnumTypeName, newArrayElementType);
         newCol.setIntervalQualifier(DataType.intervalQualifier(setType.typeName()));
+        // The column becomes a column of that type, not of the representation underneath it: the
+        // catalogue names the domain or the composite from here on, a DROP of the type finds the
+        // column depending on it, and every value written afterwards is held to the domain's own
+        // rules.
+        newCol.setDomainTypeName(newDomainTypeName);
+        newCol.setCompositeTypeName(newCompositeTypeName);
+        newCol.setRangeTypeName(newRangeTypeName);
         int rowCount = table.getRows().size();
         Object[] convertedValues = new Object[rowCount];
         for (int ri = 0; ri < rowCount; ri++) {
@@ -3015,6 +3089,18 @@ class DdlAlterTableExecutor {
             }
             convertedValues[ri] = raw != null ? TypeCoercion.coerceForStorage(raw, newCol) : null;
         }
+        // A value that reaches a domain has to satisfy the domain, whichever statement put it
+        // there: PostgreSQL runs the domain's constraints over every rewritten row and refuses the
+        // ALTER for one the domain would not have taken, rather than leaving the column holding a
+        // value no INSERT could have written into it.
+        if (newDomainTypeName != null) {
+            DmlValidationHelper domainChecks = new DmlValidationHelper(executor);
+            Table oneColumn = new Table("_retype_domain_check",
+                    com.memgres.engine.util.Cols.listOf(newCol));
+            for (int ri = 0; ri < rowCount; ri++) {
+                domainChecks.validateDomainChecks(new Object[]{convertedValues[ri]}, oneColumn);
+            }
+        }
         // The indexes are rebuilt from the new values, so a conversion that maps two rows onto
         // one value breaks a unique index, and one that yields a null breaks NOT NULL.
         rejectRewriteThatBreaksColumn(table, alterCol.column(), convertedValues,
@@ -3023,6 +3109,9 @@ class DdlAlterTableExecutor {
         for (int ri = 0; ri < rowCount; ri++) oldValues[ri] = table.getRows().get(ri)[convIdx];
         table.alterColumnType(alterCol.column(), dt, newPrecision, newScale, newEnumTypeName, newArrayElementType);
         table.getColumns().get(convIdx).setIntervalQualifier(DataType.intervalQualifier(setType.typeName()));
+        table.getColumns().get(convIdx).setDomainTypeName(newDomainTypeName);
+        table.getColumns().get(convIdx).setCompositeTypeName(newCompositeTypeName);
+        table.getColumns().get(convIdx).setRangeTypeName(newRangeTypeName);
         for (int ri = 0; ri < rowCount; ri++) {
             table.getRows().get(ri)[convIdx] = convertedValues[ri];
         }
@@ -3035,6 +3124,9 @@ class DdlAlterTableExecutor {
             table.alterColumnType(alterCol.column(), oldCol.getType(), oldCol.getPrecision(),
                     oldCol.getScale(), oldCol.getEnumTypeName(), oldCol.getArrayElementType());
             table.getColumns().get(convIdx).setIntervalQualifier(oldCol.getIntervalQualifier());
+            table.getColumns().get(convIdx).setDomainTypeName(oldCol.getDomainTypeName());
+            table.getColumns().get(convIdx).setCompositeTypeName(oldCol.getCompositeTypeName());
+            table.getColumns().get(convIdx).setRangeTypeName(oldCol.getRangeTypeName());
             throw e;
         }
     }
@@ -3064,16 +3156,30 @@ class DdlAlterTableExecutor {
      * type, is automatic; out of a string type into anything else is not.
      */
     private void rejectDefaultThatCannotBeCast(Column col, DataType currentType, DataType dt,
-                                               boolean isArrayType, String newEnumTypeName) {
+                                               boolean isArrayType, String userTypeName) {
         if (col.getDefaultValue() == null) return;
         if (currentType == null || dt == null || currentType == dt) return;
         TypeCoercion.TypeCategory fromCat = TypeCoercion.categoryOf(currentType);
         TypeCoercion.TypeCategory toCat = TypeCoercion.categoryOf(dt);
         if (fromCat == toCat || toCat == TypeCoercion.TypeCategory.STRING) return;
-        String targetName = newEnumTypeName != null ? newEnumTypeName : dt.toRegtypeDisplay();
+        String targetName = userTypeName != null ? userTypeName : dt.toRegtypeDisplay();
         if (isArrayType) targetName += "[]";
         throw new MemgresException("default for column \"" + col.getName()
                 + "\" cannot be cast automatically to type " + targetName, "42804");
+    }
+
+    /**
+     * What PostgreSQL says when the type a column is being changed to is not one the old values
+     * reach by an assignment cast. The hint is part of it: the conversion the writer meant is
+     * still available, and USING is where it goes.
+     */
+    private static MemgresException retypeNeedsUsing(String column, String targetType,
+                                                     boolean isArrayType) {
+        String targetName = isArrayType ? targetType + "[]" : targetType;
+        return new MemgresException("column \"" + column
+                + "\" cannot be cast automatically to type " + targetName
+                + "\n  Hint: You might need to specify \"USING "
+                + column + "::" + targetName + "\".", "42804");
     }
 
     /**
@@ -3146,6 +3252,9 @@ class DdlAlterTableExecutor {
             DdlDefinitionChecks.validateDefaultExpression(setDefault.expr());
             executor.selectExecutor.placementCheck.rejectStoredDefinition(
                     setDefault.expr(), "DEFAULT expressions", null);
+            // The calls a default makes are resolved where it is written, as they are wherever
+            // else PostgreSQL stores an expression.
+            StoredExprNames.read(ddl, setDefault.expr(), null, null, false, false);
             // The default has to be a value the column can hold, or every insert that relies on
             // it fails on a statement that never mentions the column.
             if (DdlDefinitionChecks.isEvaluableAtDefinitionTime(setDefault.expr())) {
@@ -3491,6 +3600,11 @@ class DdlAlterTableExecutor {
                 // every row written from now on and only VALIDATE CONSTRAINT looks back.
                 int colIdx = table.getColumnIndex(colName);
                 if (colIdx >= 0 && !addConstraint.notValid()) {
+                    // A rule the relation already carries but has never held its rows to is not
+                    // one a second declaration may quietly stand on: PostgreSQL refuses to fold a
+                    // validated declaration into an unvalidated constraint and says which
+                    // constraint is in the way, because VALIDATE CONSTRAINT is what settles it.
+                    rejectMergeIntoNotValidNotNull(table, colName, stmt.table());
                     for (Object[] row : table.getRows()) {
                         if (row[colIdx] == null) {
                             throw PgErrors.columnContainsNulls(colName, "relation", stmt.table());
@@ -3510,6 +3624,15 @@ class DdlAlterTableExecutor {
                 // DROP CONSTRAINT on that name is 42704 there and must be here too.
                 boolean alreadyNotNull = colIdx >= 0
                         && !table.getColumns().get(colIdx).isNullable();
+                // NOT VALID is recorded against the constraint the statement creates, and a
+                // declaration that only restates a rule the relation already carries creates
+                // none: PostgreSQL leaves the constraint standing there as validated as it was.
+                // The relations below hold the same constraint, so they hold the same answer, and
+                // which of them the rule is reaching for the first time has to be read off the
+                // hierarchy before the flag is set anywhere.
+                List<Table> takingTheRule = addConstraint.notValid() && !alreadyNotNull
+                        ? relationsTakingNotNull(table, colName)
+                        : Collections.<Table>emptyList();
                 table.alterColumnNullable(colName, false);
                 if (!alreadyNotNull && addConstraint.constraint().name() != null) {
                     table.setNotNullConstraintName(colName, addConstraint.constraint().name());
@@ -3517,6 +3640,9 @@ class DdlAlterTableExecutor {
                 // Each descendant keeps its own copy of the column list, so the flag has to reach
                 // them or this relation forbids a null its own descendants go on taking.
                 setColumnsNotNull(table, Collections.singletonList(colName));
+                for (Table taking : takingTheRule) {
+                    taking.markNotNullNotValidated(colName);
+                }
             }
             return;
         }
@@ -3528,6 +3654,12 @@ class DdlAlterTableExecutor {
                 throw PgErrors.notImplemented(
                         "set-returning functions are not allowed in check constraints");
             }
+            // What the predicate is refused for is decided by where the faults are written, not
+            // by the order these checks run in: PostgreSQL settles each name and each call at the
+            // node it stands at, so a column nothing answers to written ahead of a sub-query is
+            // what it complains about.
+            StoredExprNames.read(ddl, addConstraint.constraint().checkExpr(), table, null,
+                    true, true);
             executor.selectExecutor.placementCheck.rejectStoredDefinition(
                     addConstraint.constraint().checkExpr(), "check constraints", "check constraint");
             // Every name in the predicate is resolved against the relation the constraint is
@@ -3639,6 +3771,12 @@ class DdlAlterTableExecutor {
                 // constraint must include every partition key column. Validate before adding
                 // to (or propagating onto) the table, matching creation-time ordering.
                 DdlTableExecutor.validatePartitionKeyCoverage(table, sc);
+                // A primary key is a NOT NULL that has been validated, so it cannot be built over
+                // a NOT NULL whose rows were never read: PostgreSQL refuses ahead of the scan and
+                // names the constraint standing in the way rather than a row.
+                if (sc.getType() == StoredConstraint.Type.PRIMARY_KEY) {
+                    rejectKeyOverNotValidNotNull(table, sc.getColumns(), stmt.table());
+                }
                 // PG validates existing data while building the unique index: duplicates abort
                 // with 23505, and NULLs in a new PRIMARY KEY column abort with 23502.
                 if (!sc.isNotEnforced()) {
@@ -3911,7 +4049,7 @@ class DdlAlterTableExecutor {
         detail.append(")=(");
         for (int ci = 0; ci < fkIndices.length; ci++) {
             if (ci > 0) detail.append(", ");
-            detail.append(fkIndices[ci] >= 0 ? row[fkIndices[ci]] : null);
+            detail.append(ErrorValueText.of(fkIndices[ci] >= 0 ? row[fkIndices[ci]] : null));
         }
         detail.append(") is not present in table \"").append(sc.getReferencesTable()).append("\".");
         return detail.toString();
@@ -3982,6 +4120,16 @@ class DdlAlterTableExecutor {
                                             AlterTableStmt stmt) {
         StoredConstraint sc = table.getConstraint(vc.constraintName());
         if (sc == null) {
+            // A NOT NULL is a constraint with a name of its own, and validating it means reading
+            // the rows its declaration was allowed to skip. It is kept on the column rather than
+            // in the relation's constraint list, so the name is matched against the columns --
+            // without which every NOT NULL, validated or not, answered that no such constraint
+            // exists and the ones declared NOT VALID could never be validated at all.
+            String notNullColumn = notNullColumnNamed(table, vc.constraintName());
+            if (notNullColumn != null) {
+                validateNotNullData(table, notNullColumn);
+                return;
+            }
             throw new MemgresException("constraint \"" + vc.constraintName() + "\" of relation \"" + stmt.table() + "\" does not exist", "42704");
         }
         if (sc.isConvalidated()) {
@@ -3990,11 +4138,127 @@ class DdlAlterTableExecutor {
         // Validate existing data
         if (sc.getType() == StoredConstraint.Type.CHECK && sc.getCheckExpr() != null) {
             validateCheckConstraintData(sc, table);
+            // A partitioned parent stores no rows of its own and an inheritance child's rows are
+            // the parent's rows too, so the rows that settle the rule live below. A NO INHERIT
+            // constraint is about this relation's own rows and stops here.
+            if (!sc.isNoInherit()) {
+                for (Table descendant : descendantRelations(table)) {
+                    validateCheckConstraintData(sc, descendant);
+                }
+            }
         }
         if (sc.getType() == StoredConstraint.Type.FOREIGN_KEY && sc.getReferencesTable() != null) {
             validateForeignKeyData(sc, table, stmt.table());
         }
+        executor.recordUndo(new ConstraintValidationUndo(table.getSchemaName(), table.getName(),
+                sc.getName(), null));
         sc.setConvalidated(true);
+        // Everything below holds a copy of the same constraint, and the rows just read were
+        // theirs: PostgreSQL validates the copies along with the original, so a validation on the
+        // relation that declared the rule settles it for the whole hierarchy. Validating on a
+        // descendant settles only that descendant's, which is why the walk goes one way.
+        if (!sc.isNoInherit()) {
+            for (Table descendant : descendantRelations(table)) {
+                StoredConstraint held = descendant.getConstraint(sc.getName());
+                if (held == null || held.isConvalidated()) continue;
+                executor.recordUndo(new ConstraintValidationUndo(descendant.getSchemaName(),
+                        descendant.getName(), held.getName(), null));
+                held.setConvalidated(true);
+            }
+        }
+    }
+
+    /**
+     * Read the rows a NOT NULL declared NOT VALID was allowed to skip, and record that they have
+     * been read. PostgreSQL names the relation the offending row is really in, which for a
+     * partitioned table or an inheritance parent is one of the relations below it.
+     */
+    private void validateNotNullData(Table table, String column) {
+        if (table.isNotNullValidated(column)) return;
+        requireColumnHasNoNulls(table, column, table.getName());
+        for (Table descendant : descendantRelations(table)) {
+            requireColumnHasNoNulls(descendant, column, descendant.getName());
+        }
+        markNotNullValidated(table, column, true);
+    }
+
+    /**
+     * Records that the rows behind a column's NOT NULL have been read, on the relation and -- when
+     * the statement was not about that relation alone -- on everything below it, which holds the
+     * same constraint and was scanned along with it.
+     */
+    private void markNotNullValidated(Table table, String column, boolean withDescendants) {
+        markOneNotNullValidated(table, column);
+        if (!withDescendants) return;
+        for (Table descendant : descendantRelations(table)) {
+            markOneNotNullValidated(descendant, column);
+        }
+    }
+
+    private void markOneNotNullValidated(Table table, String column) {
+        if (table.getColumnIndex(column) < 0 || table.isNotNullValidated(column)) return;
+        executor.recordUndo(new ConstraintValidationUndo(table.getSchemaName(), table.getName(),
+                null, column));
+        table.markNotNullValidated(column);
+    }
+
+    /** The relation and everything below it that a NOT NULL is about to reach for the first time. */
+    private static List<Table> relationsTakingNotNull(Table table, String column) {
+        List<Table> out = new ArrayList<>();
+        if (takesNotNullNow(table, column)) out.add(table);
+        for (Table descendant : descendantRelations(table)) {
+            if (takesNotNullNow(descendant, column)) out.add(descendant);
+        }
+        return out;
+    }
+
+    private static boolean takesNotNullNow(Table table, String column) {
+        int idx = table.getColumnIndex(column);
+        return idx >= 0 && table.getColumns().get(idx).isNullable();
+    }
+
+    /**
+     * A second NOT NULL declaration cannot quietly stand on one whose rows were never read: the
+     * new one says the column holds no nulls and the constraint already there says nobody has
+     * looked. PostgreSQL names the constraint in the way and points at the statement that settles
+     * it, rather than merging the two and reporting the column as validated.
+     */
+    private static void rejectMergeIntoNotValidNotNull(Table table, String column,
+                                                       String relationName) {
+        if (!notValidNotNull(table, column)) return;
+        MemgresException e = new MemgresException("incompatible NOT VALID constraint \""
+                + CatalogConstraintBuilder.notNullConstraintName(table, column)
+                + "\" on relation \"" + relationName + "\"", "55000");
+        e.setHint("You might need to validate it using ALTER TABLE ... VALIDATE CONSTRAINT.");
+        throw e;
+    }
+
+    /**
+     * A primary key carries a validated NOT NULL of its own, so PostgreSQL will not build one over
+     * a NOT NULL whose rows nobody has read: it says which constraint is in the way, on which
+     * column, and what would settle it.
+     */
+    private static void rejectKeyOverNotValidNotNull(Table table, List<String> columns,
+                                                     String relationName) {
+        if (columns == null) return;
+        for (String column : columns) {
+            if (!notValidNotNull(table, column)) continue;
+            MemgresException e = new MemgresException(
+                    "cannot create primary key on column \"" + column + "\"", "55000");
+            e.setDetail("The constraint \""
+                    + CatalogConstraintBuilder.notNullConstraintName(table, column)
+                    + "\" on column \"" + column + "\" of table \"" + relationName
+                    + "\", marked NOT VALID, is incompatible with a primary key.");
+            e.setHint("You might need to validate it using ALTER TABLE ... VALIDATE CONSTRAINT.");
+            throw e;
+        }
+    }
+
+    /** True when the column carries a NOT NULL whose rows have not been read. */
+    private static boolean notValidNotNull(Table table, String column) {
+        int idx = table.getColumnIndex(column);
+        return idx >= 0 && !table.getColumns().get(idx).isNullable()
+                && !table.isNotNullValidated(column);
     }
 
     private void executeAttachPartition(AlterTableStmt.AttachPartition attach, Table table,
@@ -4207,6 +4471,7 @@ class DdlAlterTableExecutor {
                         .suppressPosition();
             }
             requireNotNullWhereParentIs(pp, match, partName);
+            requireSameGeneration(pp, match);
         }
     }
 

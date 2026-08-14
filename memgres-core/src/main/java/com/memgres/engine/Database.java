@@ -706,9 +706,29 @@ public class Database {
     // Key: row identity (Object[]), Value: [xmin, xmax, cmin, cmax]
     private final Map<String, Map<Object[], long[]>> tableRowMeta = new ConcurrentHashMap<>();
 
-    /** Get or create the row metadata map for a given table key (schema.table). */
+    /**
+     * What the rows of the relation this name reaches answer for their system columns.
+     *
+     * <p>The book belongs to the relation rather than to the name, because that is what PostgreSQL
+     * leaves untouched when a relation is renamed or moved to another schema: the rows go on
+     * naming the transaction that inserted them and sitting where they always sat, so xmin and
+     * cmin still answer after an ALTER TABLE that only changed what the relation is called. A name
+     * no relation answers to -- one built for a query, one whose relation has been dropped -- keeps
+     * a book of its own, which is what every name had before.
+     */
     public Map<Object[], long[]> getRowMeta(String tableKey) {
+        Table storage = relationNamed(tableKey);
+        if (storage != null) return storage.getRowMeta();
         return tableRowMeta.computeIfAbsent(tableKey, k -> new IdentityHashMap<>());
+    }
+
+    /** The relation a {@code schema.table} key names, or null when nothing answers to it. */
+    private Table relationNamed(String tableKey) {
+        if (tableKey == null) return null;
+        int dot = tableKey.indexOf('.');
+        if (dot < 0) return null;
+        Schema schema = schemas.get(tableKey.substring(0, dot));
+        return schema == null ? null : schema.getTable(tableKey.substring(dot + 1));
     }
 
     /**
@@ -747,7 +767,9 @@ public class Database {
 
     /** Remove row metadata (on delete). */
     public void removeRowMeta(String tableKey, Object[] row) {
-        Map<Object[], long[]> meta = tableRowMeta.get(tableKey);
+        Table storage = relationNamed(tableKey);
+        Map<Object[], long[]> meta = storage != null ? storage.getRowMeta()
+                : tableRowMeta.get(tableKey);
         if (meta != null) meta.remove(row);
     }
 
@@ -1417,7 +1439,36 @@ public class Database {
         List<PgFunction> overloads = functionOverloads.computeIfAbsent(key, k -> new ArrayList<>());
         overloads.add(function);
         functions.put(key, function); // last-added wins for simple name lookup
+        // The number is handed out here rather than at the first question about the routine,
+        // because PostgreSQL assigns an OID when the object is created: everything ordered by OID
+        // -- what a schema holds, what depends on a type -- then comes back in the order the
+        // objects were made rather than in the order some map happened to be walked.
+        objectIdentity.oid("proc:" + function.getName());
         markUncommittedObject(function, CURRENT_VIEWER.get());
+    }
+
+    /**
+     * Every routine the database holds, overloads included. {@link #getFunctions} answers with one
+     * routine per name, which is enough to call one but not to say what depends on a type: two
+     * overloads of a name are two objects, and only the one declared in terms of the type stands
+     * in the way of dropping it.
+     */
+    public List<PgFunction> getAllFunctionOverloads() {
+        List<PgFunction> all = new ArrayList<>();
+        for (List<PgFunction> overloads : functionOverloads.values()) {
+            for (PgFunction f : overloads) {
+                if (visibleOne(f) != null) all.add(f);
+            }
+        }
+        return all;
+    }
+
+    /**
+     * Take away exactly this routine, leaving every other overload of its name standing. Removing
+     * by name alone took away overloads nothing depended on.
+     */
+    public void removeFunctionOverload(PgFunction function) {
+        removeMatchingOverloads(function.getName(), f -> f == function);
     }
 
     /** Returns the single function with this name, or the first overload if multiple exist. */

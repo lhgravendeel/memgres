@@ -1267,16 +1267,36 @@ class DdlTableParser {
         return false;
     }
 
+    /** The words that open a query, which PostgreSQL's grammar cannot read as a key element. */
+    private static final java.util.Set<String> QUERY_OPENING_WORDS =
+            Cols.setOf("SELECT", "TABLE", "WITH");
+
+    /**
+     * A partition key element is a column name, a call, or an expression in parentheses of its
+     * own, and a query is none of the three. The pair of parentheses a sub-query is written with
+     * is the pair the element has already spent, so {@code (SELECT ...)} written as a key stops at
+     * the word that opens the query, and only {@code ((SELECT ...))} reaches the analysis that
+     * refuses a sub-query in a partition key for what it is.
+     */
+    private void rejectQueryAsPartitionElement() {
+        Token t = parser.peek();
+        if (t.type() == TokenType.KEYWORD && QUERY_OPENING_WORDS.contains(t.value())) {
+            throw ParseException.at(t);
+        }
+    }
+
     /**
      * Read a partition key element. This can be a simple column name or an expression
      * like date_trunc('month', col). We capture raw SQL text, handling nested parens.
      */
     private String readPartitionElement() {
         StringBuilder sb = new StringBuilder();
+        rejectQueryAsPartitionElement();
         // Handle expression wrapped in parens, e.g., (lower(s))
         if (parser.check(TokenType.LEFT_PAREN)) {
             sb.append("(");
             parser.advance(); // consume (
+            rejectQueryAsPartitionElement();
             int depth = 1;
             while (!parser.isAtEnd() && depth > 0) {
                 Token t = parser.peek();

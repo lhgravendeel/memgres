@@ -221,14 +221,8 @@ class ConstraintValidator {
         validateConstraints(table, row, excludeRow, null);
     }
 
-    /**
-     * @param decided a constraint the caller has already settled for this row, or null. A
-     *     referential action checks its own key against the referenced table as that table will be
-     *     once the statement is over; checking it again here, without knowing which rows are going
-     *     away, reports a key that nothing was going to reference.
-     */
-    void validateConstraints(Table table, Object[] row, Object[] excludeRow, StoredConstraint decided) {
-        // 1. NOT NULL enforcement
+    /** A column declared NOT NULL takes no row that leaves it empty. */
+    private void requireNotNullColumns(Table table, Object[] row) {
         for (int i = 0; i < table.getColumns().size(); i++) {
             Column col = table.getColumns().get(i);
             if (!col.isNullable() && row[i] == null) {
@@ -246,6 +240,36 @@ class ConstraintValidator {
                 throw ex;
             }
         }
+    }
+
+    /**
+     * What a proposed row has to pass before an ON CONFLICT arbiter is asked about it.
+     *
+     * <p>PostgreSQL judges the row against the columns that may not be null and against the
+     * relation's CHECK constraints while it still holds only what the statement wrote, and only
+     * then looks for a conflicting row -- so a row the arbiter would have skipped is refused for
+     * what it holds all the same, and DO UPDATE never runs for it. The unique constraint the
+     * arbiter is itself about, and the foreign keys PostgreSQL fires as triggers, are asked
+     * afterwards and are left where they are.
+     */
+    void validateBeforeConflictArbitration(Table table, Object[] row) {
+        requireNotNullColumns(table, row);
+        for (StoredConstraint sc : table.getConstraints()) {
+            if (sc.isNotEnforced() || sc.getType() != StoredConstraint.Type.CHECK) continue;
+            if (checkIsCurrentlyDeferred(sc)) continue;
+            validateCheck(table, row, sc);
+        }
+    }
+
+    /**
+     * @param decided a constraint the caller has already settled for this row, or null. A
+     *     referential action checks its own key against the referenced table as that table will be
+     *     once the statement is over; checking it again here, without knowing which rows are going
+     *     away, reports a key that nothing was going to reference.
+     */
+    void validateConstraints(Table table, Object[] row, Object[] excludeRow, StoredConstraint decided) {
+        // 1. NOT NULL enforcement
+        requireNotNullColumns(table, row);
 
         // 2. Constraint checks
         for (StoredConstraint sc : table.getConstraints()) {
@@ -942,7 +966,7 @@ class ConstraintValidator {
         detailSb.append(")=(");
         for (int i = 0; i < fkColIndices.length; i++) {
             if (i > 0) detailSb.append(", ");
-            detailSb.append(fkVals[i]);
+            detailSb.append(ErrorValueText.of(fkVals[i]));
         }
         detailSb.append(") is not present in table \"").append(sc.getReferencesTable()).append("\".");
         ex.setDetail(detailSb.toString());
@@ -1089,7 +1113,7 @@ class ConstraintValidator {
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < colIndices.length; i++) {
             if (i > 0) sb.append(", ");
-            sb.append(row[colIndices[i]]);
+            sb.append(ErrorValueText.of(row[colIndices[i]]));
         }
         return sb.toString();
     }
@@ -2054,7 +2078,7 @@ class ConstraintValidator {
                     && columns.get(i).isVirtual() && columns.get(i).isGenerated()) {
                 sb.append("virtual");
             } else {
-                sb.append(row[i] == null ? "null" : row[i].toString());
+                sb.append(ErrorValueText.of(row[i]));
             }
         }
         return sb.toString();

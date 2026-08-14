@@ -430,7 +430,8 @@ class CatalogSecurityBuilder {
                     // A policy's OID is minted under its own name, not handed out in row order,
                     // so it stays the same across rebuilds and pg_description can point at it.
                     table.insertRow(new Object[]{
-                            oids.oid("pol:" + schemaName + "." + t.getName() + "." + policy.getName()),
+                            oids.oid(ObjectIdentity.policyKey(schemaName, t.getName(),
+                                    policy.getName())),
                             policy.getName(), relOid, cmdChar,
                             permissive, rolesText, qualText, withCheckText, 1
                     });

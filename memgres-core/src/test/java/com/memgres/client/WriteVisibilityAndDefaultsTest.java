@@ -4071,4 +4071,2085 @@ class WriteVisibilityAndDefaultsTest {
         assertEquals("1|10", rows("WITH c AS MATERIALIZED (SELECT * FROM wna_e_h LIMIT 1)"
                 + " SELECT c.a, c.g FROM c"));
     }
+
+    // ------------------------------------------------------------ what a predicate written beside
+    // ------------------------------------------------------------ a conflict target names
+
+    // A predicate written beside a conflict target names an index, it does not describe one.
+    // PostgreSQL asks that the index's own predicate be implied by what was written, so an index
+    // with no predicate of its own is reached by any predicate at all and a partial index only by a
+    // predicate that entails its own. Which rows then collide is the arbiter index's own predicate;
+    // the one written is read to settle which index arbitrates and says nothing about what it holds.
+
+    /** The refusal a conflict target draws when no index answers for it. */
+    private static final String NO_ARBITER =
+            "there is no unique or exclusion constraint matching the ON CONFLICT specification";
+
+    @Test
+    void anIndexThatIsNotPartialIsReachedByWhateverPredicateWasWritten() throws Exception {
+        exec("CREATE TABLE woc_a (i int PRIMARY KEY, k int)");
+        exec("INSERT INTO woc_a VALUES (1,1)");
+
+        exec("INSERT INTO woc_a VALUES (1,2) ON CONFLICT (i) WHERE i > 0 DO NOTHING");
+        exec("INSERT INTO woc_a VALUES (1,3) ON CONFLICT (i) WHERE k > 0 DO NOTHING");
+        exec("INSERT INTO woc_a VALUES (1,4) ON CONFLICT (i) WHERE false DO NOTHING");
+        assertEquals("1|1", rows("SELECT i, k FROM woc_a ORDER BY i"));
+
+        // and the predicate decides nothing about which rows collide: the index does that
+        assertEquals(1, update("INSERT INTO woc_a VALUES (1,5)"
+                + " ON CONFLICT (i) WHERE i > 0 DO UPDATE SET k = 9"));
+        assertEquals("1|9", rows("SELECT i, k FROM woc_a ORDER BY i"));
+
+        // a row that collides with nothing is written, predicate or no predicate
+        assertEquals(1, update("INSERT INTO woc_a VALUES (2,1)"
+                + " ON CONFLICT (i) WHERE i > 0 DO UPDATE SET k = 9"));
+        assertEquals("1|9 / 2|1", rows("SELECT i, k FROM woc_a ORDER BY i"));
+
+        // the target written as an expression reaches the same index
+        exec("INSERT INTO woc_a VALUES (1,6) ON CONFLICT ((i)) WHERE i > 0 DO NOTHING");
+        assertEquals("1|9 / 2|1", rows("SELECT i, k FROM woc_a ORDER BY i"));
+    }
+
+    @Test
+    void aTargetNamingSomethingTheIndexDoesNotIsStillRefused() throws Exception {
+        exec("CREATE TABLE woc_b (i int PRIMARY KEY, k int)");
+        exec("INSERT INTO woc_b VALUES (1,1)");
+
+        String expr = "INSERT INTO woc_b VALUES (1,2) ON CONFLICT ((i+0)) WHERE i > 0 DO NOTHING";
+        assertEquals("42P10", stateOf(expr));
+        assertEquals(NO_ARBITER, messageOf(expr));
+
+        String other = "INSERT INTO woc_b VALUES (1,3) ON CONFLICT (k) WHERE i > 0 DO NOTHING";
+        assertEquals("42P10", stateOf(other));
+        assertEquals(NO_ARBITER, messageOf(other));
+
+        // the neighbouring target, naming the index's own column, is accepted
+        exec("INSERT INTO woc_b VALUES (1,4) ON CONFLICT (i) WHERE i > 0 DO NOTHING");
+        assertEquals("1|1", rows("SELECT i, k FROM woc_b ORDER BY i"));
+    }
+
+    @Test
+    void aPartialIndexIsReachedByAPredicateThatEntailsItsOwn() throws Exception {
+        exec("CREATE TABLE woc_c (i int, k int, s text)");
+        exec("CREATE UNIQUE INDEX woc_c_u ON woc_c (i) WHERE i > 0");
+        exec("INSERT INTO woc_c VALUES (1,1,'a')");
+
+        String[] reaching = {
+                // the index's own predicate, and predicates narrower than it
+                "i > 0",
+                "i > 5",
+                "i >= 1",
+                "i = 5",
+                "i > 0 AND k > 0",
+                "i > 0 AND i IS NOT NULL",
+                // and the same predicate spelled otherwise
+                "woc_c.i > 0",
+                "0 < i",
+                "i > 0::int",
+                "(i > 0)",
+                "i > 0 AND true",
+        };
+        for (int n = 0; n < reaching.length; n++) {
+            exec("INSERT INTO woc_c VALUES (1," + (n + 2) + ",'b')"
+                    + " ON CONFLICT (i) WHERE " + reaching[n] + " DO NOTHING");
+        }
+        // every one of them found the row already there and wrote nothing
+        assertEquals("1|1|a", rows("SELECT i, k, s FROM woc_c ORDER BY i, k"));
+
+        // the action the target carries makes no difference to which index it reaches
+        assertEquals(1, update("INSERT INTO woc_c VALUES (1,99,'b')"
+                + " ON CONFLICT (i) WHERE i > 0 DO UPDATE SET s = 'up'"));
+        assertEquals("1|1|up", rows("SELECT i, k, s FROM woc_c ORDER BY i, k"));
+    }
+
+    @Test
+    void aPredicateAdmittingRowsThePartialIndexDoesNotHoldReachesNothing() throws Exception {
+        exec("CREATE TABLE woc_d (i int, k int, s text)");
+        exec("CREATE UNIQUE INDEX woc_d_u ON woc_d (i) WHERE i > 0");
+        exec("INSERT INTO woc_d VALUES (1,1,'a')");
+
+        String[] refused = {
+                "i > -5",
+                "i >= 0",
+                "i = 0",
+                "k > 0",
+                "i > 0 OR k > 0",
+                "true",
+                "i IS NOT NULL",
+                // a false constant takes the whole conjunction with it, and what is left proves nothing
+                "false",
+                "i > 0 AND false",
+        };
+        for (int n = 0; n < refused.length; n++) {
+            String sql = "INSERT INTO woc_d VALUES (1," + (n + 2) + ",'b')"
+                    + " ON CONFLICT (i) WHERE " + refused[n] + " DO NOTHING";
+            assertEquals("42P10", stateOf(sql), sql);
+            assertEquals(NO_ARBITER, messageOf(sql), sql);
+        }
+        // and no predicate at all reaches no partial index
+        String none = "INSERT INTO woc_d VALUES (1,50,'b') ON CONFLICT (i) DO NOTHING";
+        assertEquals("42P10", stateOf(none));
+        assertEquals(NO_ARBITER, messageOf(none));
+
+        // none of them wrote anything, and the predicate the index was built for still answers
+        assertEquals("1|1|a", rows("SELECT i, k, s FROM woc_d ORDER BY i, k"));
+        exec("INSERT INTO woc_d VALUES (1,51,'b') ON CONFLICT (i) WHERE i > 0 DO NOTHING");
+        assertEquals("1|1|a", rows("SELECT i, k, s FROM woc_d ORDER BY i, k"));
+    }
+
+    @Test
+    void theDoUpdateFormIsRefusedAndAcceptedOnTheSameGrounds() throws Exception {
+        exec("CREATE TABLE woc_e (i int, k int, s text)");
+        exec("CREATE UNIQUE INDEX woc_e_u ON woc_e (i) WHERE i > 0");
+        exec("INSERT INTO woc_e VALUES (1,1,'a')");
+
+        String wider = "INSERT INTO woc_e VALUES (1,2,'b')"
+                + " ON CONFLICT (i) WHERE i >= 0 DO UPDATE SET s = 'up'";
+        assertEquals("42P10", stateOf(wider));
+        assertEquals(NO_ARBITER, messageOf(wider));
+
+        String bare = "INSERT INTO woc_e VALUES (1,3,'b') ON CONFLICT (i) DO UPDATE SET s = 'up'";
+        assertEquals("42P10", stateOf(bare));
+        assertEquals(NO_ARBITER, messageOf(bare));
+
+        String elsewhere = "INSERT INTO woc_e VALUES (1,4,'b')"
+                + " ON CONFLICT (i) WHERE k > 0 DO UPDATE SET s = 'up'";
+        assertEquals("42P10", stateOf(elsewhere));
+        assertEquals(NO_ARBITER, messageOf(elsewhere));
+
+        assertEquals("1|1|a", rows("SELECT i, k, s FROM woc_e ORDER BY i, k"));
+        assertEquals(1, update("INSERT INTO woc_e VALUES (1,5,'b')"
+                + " ON CONFLICT (i) WHERE i > 0 DO UPDATE SET s = EXCLUDED.s"));
+        assertEquals("1|1|b", rows("SELECT i, k, s FROM woc_e ORDER BY i, k"));
+    }
+
+    @Test
+    void aRelationCarryingNoUniqueIndexIsReachedByNothingButAnEmptyTarget() throws Exception {
+        exec("CREATE TABLE woc_f (i int, k int)");
+        exec("INSERT INTO woc_f VALUES (1,1)");
+
+        String predicated = "INSERT INTO woc_f VALUES (1,2)"
+                + " ON CONFLICT (i) WHERE i > 0 DO UPDATE SET k = 5";
+        assertEquals("42P10", stateOf(predicated));
+        assertEquals(NO_ARBITER, messageOf(predicated));
+
+        String bare = "INSERT INTO woc_f VALUES (1,3) ON CONFLICT (i) DO NOTHING";
+        assertEquals("42P10", stateOf(bare));
+        assertEquals(NO_ARBITER, messageOf(bare));
+
+        // a conflict clause with no target at all asks for no index
+        exec("INSERT INTO woc_f VALUES (1,4) ON CONFLICT DO NOTHING");
+        assertEquals("1|1 / 1|4", rows("SELECT i, k FROM woc_f ORDER BY i, k"));
+    }
+
+    @Test
+    void aComparisonEntailsThatItsOperandHasAValue() throws Exception {
+        exec("CREATE TABLE woc_g (i int, k int)");
+        exec("CREATE UNIQUE INDEX woc_g_u ON woc_g (i) WHERE i IS NOT NULL");
+        exec("INSERT INTO woc_g VALUES (1,1)");
+
+        exec("INSERT INTO woc_g VALUES (1,2) ON CONFLICT (i) WHERE i > 0 DO NOTHING");
+        exec("INSERT INTO woc_g VALUES (1,3) ON CONFLICT (i) WHERE i IS NOT NULL DO NOTHING");
+        exec("INSERT INTO woc_g VALUES (1,4) ON CONFLICT (i) WHERE i = 1 DO NOTHING");
+
+        // but only about the expression it compares
+        String elsewhere = "INSERT INTO woc_g VALUES (1,5)"
+                + " ON CONFLICT (i) WHERE k IS NOT NULL DO NOTHING";
+        assertEquals("42P10", stateOf(elsewhere));
+        assertEquals(NO_ARBITER, messageOf(elsewhere));
+        assertEquals("1|1", rows("SELECT i, k FROM woc_g ORDER BY k"));
+    }
+
+    @Test
+    void anEqualityOverATextColumnEntailsItTooAndAnIsNullEntailsNothing() throws Exception {
+        exec("CREATE TABLE woc_h (i int, k int, s text)");
+        exec("CREATE UNIQUE INDEX woc_h_u ON woc_h (i) WHERE s IS NOT NULL");
+        exec("INSERT INTO woc_h VALUES (1,1,'a')");
+
+        exec("INSERT INTO woc_h VALUES (1,2,'b') ON CONFLICT (i) WHERE s = 'a' DO NOTHING");
+        exec("INSERT INTO woc_h VALUES (1,3,'b') ON CONFLICT (i) WHERE s <> 'a' DO NOTHING");
+        exec("INSERT INTO woc_h VALUES (1,4,'b') ON CONFLICT (i) WHERE s IS NOT NULL DO NOTHING");
+
+        String isNull = "INSERT INTO woc_h VALUES (1,5,'b') ON CONFLICT (i) WHERE s IS NULL DO NOTHING";
+        assertEquals("42P10", stateOf(isNull));
+        assertEquals(NO_ARBITER, messageOf(isNull));
+
+        // the row that collides is the one the index holds, not the one the predicate describes
+        assertEquals(1, update("INSERT INTO woc_h VALUES (1,6,'b')"
+                + " ON CONFLICT (i) WHERE s = 'a' DO UPDATE SET k = 8"));
+        assertEquals("1|8|a", rows("SELECT i, k, s FROM woc_h ORDER BY i"));
+    }
+
+    @Test
+    void everyPartOfTheIndexPredicateHasToBeEntailedInWhateverOrderItIsWritten() throws Exception {
+        exec("CREATE TABLE woc_i (i int, k int, s text)");
+        exec("CREATE UNIQUE INDEX woc_i_u ON woc_i (i) WHERE s = 'a' AND k > 0");
+        exec("INSERT INTO woc_i VALUES (1,1,'a')");
+
+        exec("INSERT INTO woc_i VALUES (1,1,'a') ON CONFLICT (i) WHERE s = 'a' AND k > 0 DO NOTHING");
+        exec("INSERT INTO woc_i VALUES (1,1,'a') ON CONFLICT (i) WHERE k > 0 AND s = 'a' DO NOTHING");
+        exec("INSERT INTO woc_i VALUES (1,1,'a')"
+                + " ON CONFLICT (i) WHERE s = 'a' AND k > 5 AND i > 0 DO NOTHING");
+
+        String half = "INSERT INTO woc_i VALUES (1,1,'a') ON CONFLICT (i) WHERE s = 'a' DO NOTHING";
+        assertEquals("42P10", stateOf(half));
+        assertEquals(NO_ARBITER, messageOf(half));
+
+        String wrongCase = "INSERT INTO woc_i VALUES (1,1,'a')"
+                + " ON CONFLICT (i) WHERE s = 'A' AND k > 0 DO NOTHING";
+        assertEquals("42P10", stateOf(wrongCase));
+        assertEquals(NO_ARBITER, messageOf(wrongCase));
+
+        assertEquals(1L, num("SELECT count(*) FROM woc_i"));
+    }
+
+    @Test
+    void whatTheArbiterIndexHoldsIsWhatCollides() throws Exception {
+        exec("CREATE TABLE woc_j (i int, k int, s text)");
+        exec("CREATE UNIQUE INDEX woc_j_u ON woc_j (i) WHERE s = 'a'");
+        exec("INSERT INTO woc_j VALUES (1,1,'a')");
+
+        // a row the index would not hold collides with nothing there
+        exec("INSERT INTO woc_j VALUES (1,2,'b') ON CONFLICT (i) WHERE s = 'a' DO NOTHING");
+        exec("INSERT INTO woc_j VALUES (1,3,'a') ON CONFLICT (i) WHERE s = 'a' DO NOTHING");
+        assertEquals(1, update("INSERT INTO woc_j VALUES (1,4,'a')"
+                + " ON CONFLICT (i) WHERE s = 'a' DO UPDATE SET k = 99"));
+        assertEquals("1|2|b / 1|99|a", rows("SELECT i, k, s FROM woc_j ORDER BY k"));
+    }
+
+    @Test
+    void aPredicateNarrowerThanTheIndexsDoesNotNarrowWhatTheIndexHolds() throws Exception {
+        exec("CREATE TABLE woc_k (i int, k int, s text)");
+        exec("CREATE UNIQUE INDEX woc_k_u ON woc_k (i) WHERE s = 'a'");
+        exec("INSERT INTO woc_k VALUES (1,-1,'a')");
+
+        // the stored row has k = -1, which the written predicate would have excluded
+        assertEquals(1, update("INSERT INTO woc_k VALUES (1,50,'a')"
+                + " ON CONFLICT (i) WHERE s = 'a' AND k > 0 DO UPDATE SET k = 77"));
+        assertEquals("1|77|a", rows("SELECT i, k, s FROM woc_k ORDER BY i, k"));
+    }
+
+    @Test
+    void anExpressionTargetIsSettledTheSameWay() throws Exception {
+        exec("CREATE TABLE woc_l (i int, s text, k int)");
+        exec("CREATE UNIQUE INDEX woc_l_u ON woc_l (lower(s)) WHERE k > 0");
+        exec("INSERT INTO woc_l VALUES (1,'a',1)");
+
+        exec("INSERT INTO woc_l VALUES (2,'A',2) ON CONFLICT ((lower(s))) WHERE k > 0 DO NOTHING");
+        exec("INSERT INTO woc_l VALUES (3,'A',3) ON CONFLICT ((lower(s))) WHERE k > 5 DO NOTHING");
+
+        String wider = "INSERT INTO woc_l VALUES (4,'A',4)"
+                + " ON CONFLICT ((lower(s))) WHERE k > -1 DO NOTHING";
+        assertEquals("42P10", stateOf(wider));
+        assertEquals(NO_ARBITER, messageOf(wider));
+
+        String none = "INSERT INTO woc_l VALUES (5,'A',5) ON CONFLICT ((lower(s))) DO NOTHING";
+        assertEquals("42P10", stateOf(none));
+        assertEquals(NO_ARBITER, messageOf(none));
+
+        assertEquals(1L, num("SELECT count(*) FROM woc_l"));
+    }
+
+    @Test
+    void anExpressionIndexThatIsNotPartialTakesAPredicateAndTakesNone() throws Exception {
+        exec("CREATE TABLE woc_m (i int, s text, k int)");
+        exec("CREATE UNIQUE INDEX woc_m_u ON woc_m (lower(s))");
+        exec("INSERT INTO woc_m VALUES (1,'a',1)");
+
+        exec("INSERT INTO woc_m VALUES (2,'A',2) ON CONFLICT ((lower(s))) WHERE k > 0 DO NOTHING");
+        exec("INSERT INTO woc_m VALUES (3,'A',3) ON CONFLICT ((lower(s))) DO NOTHING");
+        assertEquals(1L, num("SELECT count(*) FROM woc_m"));
+    }
+
+    @Test
+    void theArbiterPredicateIsResolvedAgainstTheRelationBeingWritten() throws Exception {
+        exec("CREATE TABLE woc_n (i int PRIMARY KEY, k int)");
+        exec("INSERT INTO woc_n VALUES (1,1)");
+
+        String missing = "INSERT INTO woc_n VALUES (1,2)"
+                + " ON CONFLICT (i) WHERE nosuchcol > 0 DO NOTHING";
+        assertEquals("42703", stateOf(missing));
+        assertEquals("column \"nosuchcol\" does not exist", messageOf(missing));
+
+        String stranger = "INSERT INTO woc_n VALUES (1,2) ON CONFLICT (i) WHERE zzz.i > 0 DO NOTHING";
+        assertEquals("42P01", stateOf(stranger));
+        assertEquals("missing FROM-clause entry for table \"zzz\"", messageOf(stranger));
+
+        // EXCLUDED is the row the action reads, and an index predicate is no action
+        String excluded = "INSERT INTO woc_n VALUES (1,2)"
+                + " ON CONFLICT (i) WHERE excluded.i > 0 DO NOTHING";
+        assertEquals("42P01", stateOf(excluded));
+        assertEquals("missing FROM-clause entry for table \"excluded\"", messageOf(excluded));
+
+        String qualified = "INSERT INTO woc_n VALUES (1,2)"
+                + " ON CONFLICT (i) WHERE woc_n.nosuchcol > 0 DO NOTHING";
+        assertEquals("42703", stateOf(qualified));
+        assertEquals("column woc_n.nosuchcol does not exist", messageOf(qualified));
+
+        // an index predicate is judged against one row, with no query around it for a nested one
+        String nested = "INSERT INTO woc_n VALUES (1,2) ON CONFLICT (i) WHERE (SELECT true) DO NOTHING";
+        assertEquals("0A000", stateOf(nested));
+        assertEquals("cannot use subquery in index predicate", messageOf(nested));
+
+        // every relation carries the system columns whether or not anybody declared them
+        exec("INSERT INTO woc_n VALUES (1,2) ON CONFLICT (i) WHERE ctid IS NOT NULL DO NOTHING");
+        assertEquals("1|1", rows("SELECT i, k FROM woc_n"));
+    }
+
+    @Test
+    void theRelationIsInTheStatementUnderTheNameTheStatementGaveIt() throws Exception {
+        exec("CREATE TABLE woc_o (i int PRIMARY KEY, k int)");
+        exec("INSERT INTO woc_o VALUES (1,1)");
+
+        exec("INSERT INTO woc_o AS z VALUES (1,2) ON CONFLICT (i) WHERE z.i > 0 DO NOTHING");
+
+        String byRelation = "INSERT INTO woc_o AS z VALUES (1,2)"
+                + " ON CONFLICT (i) WHERE woc_o.i > 0 DO NOTHING";
+        assertEquals("42P01", stateOf(byRelation));
+        assertEquals("invalid reference to FROM-clause entry for table \"woc_o\"",
+                messageOf(byRelation));
+        assertEquals("Perhaps you meant to reference the table alias \"z\".", hintOf(byRelation));
+        assertEquals("1|1", rows("SELECT i, k FROM woc_o"));
+    }
+
+    @Test
+    void theTargetsOwnColumnsAreReadBeforeThePredicateBesideThem() throws Exception {
+        exec("CREATE TABLE woc_p (i int PRIMARY KEY, k int)");
+        exec("INSERT INTO woc_p VALUES (1,1)");
+
+        String badTarget = "INSERT INTO woc_p VALUES (1,2)"
+                + " ON CONFLICT (nosuchcol) WHERE i > 0 DO NOTHING";
+        assertEquals("42703", stateOf(badTarget));
+        assertEquals("column \"nosuchcol\" does not exist", messageOf(badTarget));
+
+        // a target that names a column carrying no index is read all the same, and the predicate
+        // beside it is what the complaint is about
+        String badPredicate = "INSERT INTO woc_p VALUES (1,2)"
+                + " ON CONFLICT (k) WHERE nosuchcol > 0 DO NOTHING";
+        assertEquals("42703", stateOf(badPredicate));
+        assertEquals("column \"nosuchcol\" does not exist", messageOf(badPredicate));
+        assertEquals("1|1", rows("SELECT i, k FROM woc_p"));
+    }
+
+    @Test
+    void aTargetNamesAnIndexsColumnsInWhateverOrderItWritesThem() throws Exception {
+        exec("CREATE TABLE woc_q (i int, k int, UNIQUE (i,k))");
+        exec("INSERT INTO woc_q VALUES (1,2)");
+        exec("INSERT INTO woc_q VALUES (1,2) ON CONFLICT (k,i) DO NOTHING");
+        exec("INSERT INTO woc_q VALUES (1,2) ON CONFLICT (k,i) WHERE i > 0 DO NOTHING");
+
+        String partial = "INSERT INTO woc_q VALUES (1,2) ON CONFLICT (i) WHERE i > 0 DO NOTHING";
+        assertEquals("42P10", stateOf(partial));
+        assertEquals(NO_ARBITER, messageOf(partial));
+        assertEquals(1L, num("SELECT count(*) FROM woc_q"));
+
+        exec("CREATE TABLE woc_r (i int, k int)");
+        exec("CREATE UNIQUE INDEX woc_r_u ON woc_r (i, k) WHERE i > 0");
+        exec("INSERT INTO woc_r VALUES (1,2)");
+        exec("INSERT INTO woc_r VALUES (1,2) ON CONFLICT (k,i) WHERE i > 0 DO NOTHING");
+        exec("INSERT INTO woc_r VALUES (1,2) ON CONFLICT (i,k) WHERE i > 0 DO NOTHING");
+
+        String none = "INSERT INTO woc_r VALUES (1,2) ON CONFLICT (i,k) DO NOTHING";
+        assertEquals("42P10", stateOf(none));
+        assertEquals(NO_ARBITER, messageOf(none));
+        assertEquals(1L, num("SELECT count(*) FROM woc_r"));
+    }
+
+    @Test
+    void whereMoreThanOneIndexCouldAnswerEachIsJudgedOnItsOwnPredicate() throws Exception {
+        exec("CREATE TABLE woc_s (i int, k int)");
+        exec("CREATE UNIQUE INDEX woc_s_p ON woc_s (i) WHERE i > 0");
+        exec("CREATE UNIQUE INDEX woc_s_f ON woc_s (i)");
+        exec("INSERT INTO woc_s VALUES (1,1)");
+
+        // the index with no predicate of its own answers for all three
+        exec("INSERT INTO woc_s VALUES (1,2) ON CONFLICT (i) WHERE i > 0 DO NOTHING");
+        exec("INSERT INTO woc_s VALUES (1,3) ON CONFLICT (i) DO NOTHING");
+        exec("INSERT INTO woc_s VALUES (1,4) ON CONFLICT (i) WHERE i > 5 DO NOTHING");
+        assertEquals(1L, num("SELECT count(*) FROM woc_s"));
+
+        exec("CREATE TABLE woc_t (i int, k int)");
+        exec("CREATE UNIQUE INDEX woc_t_1 ON woc_t (i) WHERE i > 0");
+        exec("CREATE UNIQUE INDEX woc_t_2 ON woc_t (i) WHERE i > 10");
+        exec("INSERT INTO woc_t VALUES (20,1)");
+
+        exec("INSERT INTO woc_t VALUES (20,2) ON CONFLICT (i) WHERE i > 0 DO NOTHING");
+        exec("INSERT INTO woc_t VALUES (20,3) ON CONFLICT (i) WHERE i > 10 DO NOTHING");
+        exec("INSERT INTO woc_t VALUES (20,4) ON CONFLICT (i) WHERE i > 30 DO NOTHING");
+        assertEquals(1L, num("SELECT count(*) FROM woc_t"));
+    }
+
+    @Test
+    void aUniqueConstraintsIndexAnswersAndOnConstraintTakesNoPredicate() throws Exception {
+        exec("CREATE TABLE woc_u (i int, k int, s text, CONSTRAINT woc_u_uq UNIQUE (i))");
+        exec("INSERT INTO woc_u VALUES (1,1,'a')");
+        exec("INSERT INTO woc_u VALUES (1,2,'b') ON CONFLICT (i) WHERE i > 0 DO NOTHING");
+
+        // the predicate is no filter on the row that collides
+        assertEquals(1, update("INSERT INTO woc_u VALUES (1,3,'b')"
+                + " ON CONFLICT (i) WHERE s = 'zzz' DO UPDATE SET k = 7"));
+        assertEquals("1|7|a", rows("SELECT i, k, s FROM woc_u ORDER BY i"));
+
+        exec("INSERT INTO woc_u VALUES (1,4,'b') ON CONFLICT ON CONSTRAINT woc_u_uq DO NOTHING");
+
+        // a constraint is named, not inferred, so there is no predicate to write beside it
+        String withWhere = "INSERT INTO woc_u VALUES (1,5,'b')"
+                + " ON CONFLICT ON CONSTRAINT woc_u_uq WHERE i > 0 DO NOTHING";
+        assertEquals("42601", stateOf(withWhere));
+        assertEquals("syntax error at or near \"WHERE\"", messageOf(withWhere));
+        assertEquals(1L, num("SELECT count(*) FROM woc_u"));
+    }
+
+    // The predicate is read to settle which index arbitrates and is never evaluated, so it is held
+    // to none of what CREATE INDEX holds an index predicate to.
+
+    @Test
+    void whatCreateIndexRefusesStandsBesideAConflictTarget() throws Exception {
+        exec("CREATE TABLE woc_v (i int PRIMARY KEY, k int)");
+        exec("INSERT INTO woc_v VALUES (1,1)");
+
+        String notBoolean = "CREATE INDEX woc_v_x ON woc_v (k) WHERE i";
+        assertEquals("42804", stateOf(notBoolean));
+        assertEquals("argument of WHERE must be type boolean, not type integer",
+                messageOf(notBoolean));
+
+        String mutable = "CREATE INDEX woc_v_y ON woc_v (k) WHERE random() > 0.5";
+        assertEquals("42P17", stateOf(mutable));
+        assertEquals("functions in index predicate must be marked IMMUTABLE", messageOf(mutable));
+
+        // both stand beside the target, because the index with no predicate answers whatever
+        // was written
+        exec("INSERT INTO woc_v VALUES (1,2) ON CONFLICT (i) WHERE i DO NOTHING");
+        assertEquals(1, update("INSERT INTO woc_v VALUES (1,3)"
+                + " ON CONFLICT (i) WHERE random() > 0.5 DO UPDATE SET k = 55"));
+        assertEquals("1|55", rows("SELECT i, k FROM woc_v ORDER BY i"));
+    }
+
+    @Test
+    void overAPartialIndexThatSamePredicateProvesNothing() throws Exception {
+        exec("CREATE TABLE woc_w (i int, k int)");
+        exec("CREATE UNIQUE INDEX woc_w_u ON woc_w (i) WHERE i > 0");
+        exec("INSERT INTO woc_w VALUES (1,1)");
+
+        String notBoolean = "INSERT INTO woc_w VALUES (1,2) ON CONFLICT (i) WHERE i DO NOTHING";
+        assertEquals("42P10", stateOf(notBoolean));
+        assertEquals(NO_ARBITER, messageOf(notBoolean));
+        assertEquals(1L, num("SELECT count(*) FROM woc_w"));
+    }
+
+    @Test
+    void returningAnswersForTheRowTheActionWroteAndForNoneWhereItWroteNothing() throws Exception {
+        exec("CREATE TABLE woc_x (i int, k int)");
+        exec("CREATE UNIQUE INDEX woc_x_u ON woc_x (i) WHERE k > 0");
+        exec("INSERT INTO woc_x VALUES (1,1)");
+
+        assertEquals("1|5", rows("INSERT INTO woc_x VALUES (1,2)"
+                + " ON CONFLICT (i) WHERE k > 0 DO UPDATE SET k = 5 RETURNING i, k"));
+        assertEquals("", rows("INSERT INTO woc_x VALUES (1,3)"
+                + " ON CONFLICT (i) WHERE k > 0 DO NOTHING RETURNING i, k"));
+        assertEquals("1|5", rows("SELECT i, k FROM woc_x ORDER BY i, k"));
+    }
+
+    // ------------------------------------------------------------ what DEFAULT means through a
+    // ------------------------------------------------------------ view carrying a rule
+
+    // DEFAULT assigned through a view is the view's own column default, because PostgreSQL
+    // substitutes it while it rewrites the write and the relation the statement named is the one
+    // that answers. A rule stands in place of that rewrite, so NEW carries what the view declares
+    // and nothing at all where the view declares none — the relation underneath is never asked. It
+    // is asked when the write does reach it.
+
+    @Test
+    void defaultAssignedThroughAViewCarryingAnInsteadRuleIsTheViewsOwn() throws Exception {
+        exec("CREATE TABLE wvd_a (id int, a text DEFAULT 'BASE')");
+        exec("INSERT INTO wvd_a VALUES (1,'o')");
+        exec("CREATE VIEW wvd_av AS SELECT * FROM wvd_a");
+        exec("ALTER VIEW wvd_av ALTER COLUMN a SET DEFAULT 'VIEWD'");
+        exec("CREATE RULE wvd_ar AS ON UPDATE TO wvd_av"
+                + " DO INSTEAD UPDATE wvd_a SET a = NEW.a WHERE id = OLD.id");
+
+        exec("UPDATE wvd_av SET a = DEFAULT");
+        assertEquals("1|VIEWD", rows("SELECT id, a FROM wvd_a"));
+    }
+
+    @Test
+    void whereTheViewDeclaresNoDefaultOfItsOwnNothingDoes() throws Exception {
+        exec("CREATE TABLE wvd_b (id int, a text DEFAULT 'BASE')");
+        exec("INSERT INTO wvd_b VALUES (1,'o')");
+        exec("CREATE VIEW wvd_bv AS SELECT * FROM wvd_b");
+        exec("CREATE RULE wvd_br AS ON UPDATE TO wvd_bv"
+                + " DO INSTEAD UPDATE wvd_b SET a = NEW.a WHERE id = OLD.id");
+
+        exec("UPDATE wvd_bv SET a = DEFAULT");
+        assertEquals("1|NULL", rows("SELECT id, a FROM wvd_b"));
+    }
+
+    @Test
+    void anInsertRuleReadsTheViewsDefaultForTheKeywordAndForAColumnLeftOutAlike() throws Exception {
+        exec("CREATE TABLE wvd_c (id int, a text DEFAULT 'BASE')");
+        exec("CREATE VIEW wvd_cv AS SELECT * FROM wvd_c");
+        exec("ALTER VIEW wvd_cv ALTER COLUMN a SET DEFAULT 'VIEWD'");
+        exec("CREATE RULE wvd_cr AS ON INSERT TO wvd_cv"
+                + " DO INSTEAD INSERT INTO wvd_c VALUES (NEW.id, NEW.a)");
+
+        exec("INSERT INTO wvd_cv (id, a) VALUES (1, DEFAULT)");
+        exec("INSERT INTO wvd_cv (id) VALUES (2)");
+        // a row of a many-row VALUES reads it the same way, and a literal stands
+        exec("INSERT INTO wvd_cv (id, a) VALUES (3, DEFAULT), (4, 'lit')");
+        assertEquals("1|VIEWD / 2|VIEWD / 3|VIEWD / 4|lit",
+                rows("SELECT id, a FROM wvd_c ORDER BY id"));
+    }
+
+    @Test
+    void anInsertRuleOfAViewThatDeclaresNoDefaultWritesNothingForTheColumn() throws Exception {
+        exec("CREATE TABLE wvd_d (id int, a text DEFAULT 'BASE')");
+        exec("CREATE VIEW wvd_dv AS SELECT * FROM wvd_d");
+        exec("CREATE RULE wvd_dr AS ON INSERT TO wvd_dv"
+                + " DO INSTEAD INSERT INTO wvd_d VALUES (NEW.id, NEW.a)");
+
+        exec("INSERT INTO wvd_dv (id) VALUES (1)");
+        assertEquals("1|NULL", rows("SELECT id, a FROM wvd_d"));
+    }
+
+    @Test
+    void aColumnTheViewDeclaresADefaultForAndOneItDoesNotInOneWrite() throws Exception {
+        exec("CREATE TABLE wvd_e (id int, a text DEFAULT 'BASE', b text DEFAULT 'BB')");
+        exec("INSERT INTO wvd_e VALUES (1,'o','p')");
+        exec("CREATE VIEW wvd_ev AS SELECT * FROM wvd_e");
+        exec("ALTER VIEW wvd_ev ALTER COLUMN a SET DEFAULT 'VA'");
+        exec("CREATE RULE wvd_er AS ON UPDATE TO wvd_ev"
+                + " DO INSTEAD UPDATE wvd_e SET a = NEW.a, b = NEW.b WHERE id = OLD.id");
+
+        exec("UPDATE wvd_ev SET a = DEFAULT, b = DEFAULT");
+        assertEquals("1|VA|NULL", rows("SELECT id, a, b FROM wvd_e"));
+    }
+
+    @Test
+    void theViewsDefaultIsWhateverExpressionItWasGivenAndDropDefaultLeavesNone() throws Exception {
+        exec("CREATE TABLE wvd_f (id int, a text DEFAULT 'BASE')");
+        exec("CREATE TABLE wvd_fl (id int, a text)");
+        exec("CREATE VIEW wvd_fv AS SELECT * FROM wvd_f");
+        exec("ALTER VIEW wvd_fv ALTER COLUMN a SET DEFAULT 'x' || 'y'");
+        exec("CREATE RULE wvd_fr AS ON INSERT TO wvd_fv"
+                + " DO INSTEAD INSERT INTO wvd_fl VALUES (NEW.id, NEW.a)");
+
+        exec("INSERT INTO wvd_fv (id) VALUES (1)");
+        exec("ALTER VIEW wvd_fv ALTER COLUMN a DROP DEFAULT");
+        exec("INSERT INTO wvd_fv (id) VALUES (2)");
+        assertEquals("1|xy / 2|NULL", rows("SELECT id, a FROM wvd_fl ORDER BY id"));
+    }
+
+    @Test
+    void defaultValuesAsksTheViewForEveryColumnAndTheRelationForNone() throws Exception {
+        exec("CREATE TABLE wvd_g (id int DEFAULT 9, a text DEFAULT 'BASE')");
+        exec("CREATE TABLE wvd_gl (id int, a text)");
+        exec("CREATE VIEW wvd_gv AS SELECT * FROM wvd_g");
+        exec("ALTER VIEW wvd_gv ALTER COLUMN a SET DEFAULT 'VA'");
+        exec("CREATE RULE wvd_gr AS ON INSERT TO wvd_gv"
+                + " DO INSTEAD INSERT INTO wvd_gl VALUES (NEW.id, NEW.a)");
+
+        exec("INSERT INTO wvd_gv DEFAULT VALUES");
+        assertEquals("NULL|VA", rows("SELECT id, a FROM wvd_gl"));
+    }
+
+    @Test
+    void aDoAlsoRuleReadsTheSameNewAndTheWriteGoesOnToTheRelationUnderneath() throws Exception {
+        exec("CREATE TABLE wvd_h (id int, a text DEFAULT 'BASE')");
+        exec("CREATE TABLE wvd_hl (id int, a text)");
+        exec("INSERT INTO wvd_h VALUES (1,'o')");
+        exec("CREATE VIEW wvd_hv AS SELECT * FROM wvd_h");
+        exec("ALTER VIEW wvd_hv ALTER COLUMN a SET DEFAULT 'VIEWD'");
+        exec("CREATE RULE wvd_hr AS ON UPDATE TO wvd_hv"
+                + " DO ALSO INSERT INTO wvd_hl VALUES (OLD.id, NEW.a)");
+
+        exec("UPDATE wvd_hv SET a = DEFAULT");
+        assertEquals("1|VIEWD", rows("SELECT id, a FROM wvd_h"));
+        assertEquals("1|VIEWD", rows("SELECT id, a FROM wvd_hl"));
+    }
+
+    @Test
+    void theWriteThatWentOnToTheRelationTookThatRelationsOwnDefault() throws Exception {
+        exec("CREATE TABLE wvd_i (id int, a text DEFAULT 'BASE')");
+        exec("CREATE TABLE wvd_il (id int, a text)");
+        exec("CREATE VIEW wvd_iv AS SELECT * FROM wvd_i");
+        exec("CREATE RULE wvd_ir AS ON INSERT TO wvd_iv"
+                + " DO ALSO INSERT INTO wvd_il VALUES (NEW.id, NEW.a)");
+
+        exec("INSERT INTO wvd_iv (id) VALUES (1)");
+        assertEquals("1|BASE", rows("SELECT id, a FROM wvd_i"));
+        // the rule read what the view had to give, which was nothing
+        assertEquals("1|NULL", rows("SELECT id, a FROM wvd_il"));
+    }
+
+    @Test
+    void aRuleOfTheRelationTheViewWasRewrittenOntoReadsWhatThatWriteFilledIn() throws Exception {
+        exec("CREATE TABLE wvd_j (id int, a text DEFAULT 'BASE')");
+        exec("CREATE TABLE wvd_jl (id int, a text)");
+        exec("CREATE VIEW wvd_jv AS SELECT * FROM wvd_j");
+        exec("CREATE RULE wvd_jr AS ON INSERT TO wvd_j"
+                + " DO ALSO INSERT INTO wvd_jl VALUES (NEW.id, NEW.a)");
+
+        exec("INSERT INTO wvd_jv (id) VALUES (1)");
+        assertEquals("1|BASE", rows("SELECT id, a FROM wvd_j"));
+        assertEquals("1|BASE", rows("SELECT id, a FROM wvd_jl"));
+
+        // and the view's own default is substituted before that write is made, so it reaches the
+        // relation's rule too
+        exec("CREATE TABLE wvd_k (id int, a text DEFAULT 'BASE')");
+        exec("CREATE TABLE wvd_kl (id int, a text)");
+        exec("CREATE VIEW wvd_kv AS SELECT * FROM wvd_k");
+        exec("ALTER VIEW wvd_kv ALTER COLUMN a SET DEFAULT 'VIEWD'");
+        exec("CREATE RULE wvd_kr AS ON INSERT TO wvd_k"
+                + " DO ALSO INSERT INTO wvd_kl VALUES (NEW.id, NEW.a)");
+
+        exec("INSERT INTO wvd_kv (id) VALUES (1)");
+        assertEquals("1|VIEWD", rows("SELECT id, a FROM wvd_k"));
+        assertEquals("1|VIEWD", rows("SELECT id, a FROM wvd_kl"));
+    }
+
+    @Test
+    void anInsteadOfTriggerTakesTheWriteInPlaceOfTheRewriteAndReadsTheSameNew() throws Exception {
+        exec("CREATE TABLE wvd_l (id int, a text DEFAULT 'BASE')");
+        exec("INSERT INTO wvd_l VALUES (1,'o')");
+        exec("CREATE VIEW wvd_lv AS SELECT * FROM wvd_l");
+        exec("ALTER VIEW wvd_lv ALTER COLUMN a SET DEFAULT 'VIEWD'");
+        exec("CREATE FUNCTION wvd_lf() RETURNS trigger AS $$ BEGIN"
+                + " UPDATE wvd_l SET a = NEW.a WHERE id = OLD.id; RETURN NEW; END $$ LANGUAGE plpgsql");
+        exec("CREATE TRIGGER wvd_lt INSTEAD OF UPDATE ON wvd_lv"
+                + " FOR EACH ROW EXECUTE FUNCTION wvd_lf()");
+
+        exec("UPDATE wvd_lv SET a = DEFAULT");
+        assertEquals("1|VIEWD", rows("SELECT id, a FROM wvd_l"));
+    }
+
+    @Test
+    void aDeleteHasNoAssignmentToMakeSoNoDefaultReachesAnythingThroughOne() throws Exception {
+        exec("CREATE TABLE wvd_m (id int, a text DEFAULT 'BASE')");
+        exec("CREATE TABLE wvd_ml (id int, a text)");
+        exec("INSERT INTO wvd_m VALUES (1,'o')");
+        exec("CREATE VIEW wvd_mv AS SELECT * FROM wvd_m");
+        exec("ALTER VIEW wvd_mv ALTER COLUMN a SET DEFAULT 'VIEWD'");
+        exec("CREATE RULE wvd_mr AS ON DELETE TO wvd_mv"
+                + " DO INSTEAD INSERT INTO wvd_ml VALUES (OLD.id, OLD.a)");
+
+        exec("DELETE FROM wvd_mv WHERE id = 1");
+        assertEquals("1|o", rows("SELECT id, a FROM wvd_m"));
+        assertEquals("1|o", rows("SELECT id, a FROM wvd_ml"));
+    }
+
+    @Test
+    void aDoInsteadNothingRuleWritesNothingAtAll() throws Exception {
+        exec("CREATE TABLE wvd_n (id int, a text DEFAULT 'BASE')");
+        exec("CREATE VIEW wvd_nv AS SELECT * FROM wvd_n");
+        exec("ALTER VIEW wvd_nv ALTER COLUMN a SET DEFAULT 'VA'");
+        exec("CREATE RULE wvd_nr AS ON INSERT TO wvd_nv DO INSTEAD NOTHING");
+
+        exec("INSERT INTO wvd_nv (id) VALUES (1)");
+        assertEquals(0L, num("SELECT count(*) FROM wvd_n"));
+    }
+
+    @Test
+    void aWriteThatNamesTheRelationItselfNeverGoesNearTheView() throws Exception {
+        exec("CREATE TABLE wvd_o (id int, a text DEFAULT 'BASE')");
+        exec("CREATE TABLE wvd_ol (id int, a text)");
+        exec("INSERT INTO wvd_o VALUES (1,'o')");
+        exec("CREATE VIEW wvd_ov AS SELECT * FROM wvd_o");
+        exec("ALTER VIEW wvd_ov ALTER COLUMN a SET DEFAULT 'VIEWD'");
+        exec("CREATE RULE wvd_or AS ON UPDATE TO wvd_o"
+                + " DO ALSO INSERT INTO wvd_ol VALUES (OLD.id, NEW.a)");
+
+        exec("UPDATE wvd_o SET a = DEFAULT");
+        assertEquals("1|BASE", rows("SELECT id, a FROM wvd_o"));
+        assertEquals("1|BASE", rows("SELECT id, a FROM wvd_ol"));
+    }
+
+    @Test
+    void theRelationThatAnswersIsTheOneTheStatementNamed() throws Exception {
+        exec("CREATE TABLE wvd_p (id int, a text DEFAULT 'BASE')");
+        exec("INSERT INTO wvd_p VALUES (1,'o')");
+        exec("CREATE VIEW wvd_pv AS SELECT * FROM wvd_p");
+        exec("ALTER VIEW wvd_pv ALTER COLUMN a SET DEFAULT 'VIEWD'");
+        exec("CREATE VIEW wvd_pv2 AS SELECT * FROM wvd_pv");
+        exec("CREATE RULE wvd_pr AS ON UPDATE TO wvd_pv"
+                + " DO INSTEAD UPDATE wvd_p SET a = NEW.a WHERE id = OLD.id");
+
+        // the statement named wvd_pv2, which declares no default of its own
+        exec("UPDATE wvd_pv2 SET a = DEFAULT");
+        assertEquals("1|NULL", rows("SELECT id, a FROM wvd_p"));
+    }
+
+    @Test
+    void aRulesOwnReturningAnswersForTheWriteTheRuleMade() throws Exception {
+        exec("CREATE TABLE wvd_q (id int, a text DEFAULT 'BASE')");
+        exec("INSERT INTO wvd_q VALUES (1,'o')");
+        exec("CREATE VIEW wvd_qv AS SELECT * FROM wvd_q");
+        exec("ALTER VIEW wvd_qv ALTER COLUMN a SET DEFAULT 'VIEWD'");
+        exec("CREATE RULE wvd_qr AS ON UPDATE TO wvd_qv"
+                + " DO INSTEAD UPDATE wvd_q SET a = NEW.a WHERE id = OLD.id"
+                + " RETURNING wvd_q.id, wvd_q.a");
+
+        assertEquals("1|VIEWD", rows("UPDATE wvd_qv SET a = DEFAULT RETURNING id, a"));
+        assertEquals("1|VIEWD", rows("SELECT id, a FROM wvd_q"));
+    }
+
+    @Test
+    void aConflictClauseIsRefusedOnARelationARuleStandsFor() throws Exception {
+        exec("CREATE TABLE wvd_r (id int PRIMARY KEY, a text DEFAULT 'BASE')");
+        exec("CREATE TABLE wvd_rl (id int, a text)");
+        exec("CREATE VIEW wvd_rv AS SELECT * FROM wvd_r");
+        exec("ALTER VIEW wvd_rv ALTER COLUMN a SET DEFAULT 'VA'");
+        exec("CREATE RULE wvd_rr AS ON INSERT TO wvd_rv"
+                + " DO INSTEAD INSERT INTO wvd_rl VALUES (NEW.id, NEW.a)");
+
+        String conflict = "INSERT INTO wvd_rv (id) VALUES (1) ON CONFLICT (id) DO NOTHING";
+        assertEquals("0A000", stateOf(conflict));
+        assertEquals("INSERT with ON CONFLICT clause cannot be used with table that has"
+                + " INSERT or UPDATE rules", messageOf(conflict));
+        assertEquals(0L, num("SELECT count(*) FROM wvd_rl"));
+
+        // the same write without the conflict clause reads the view's default as ever
+        exec("INSERT INTO wvd_rv (id) VALUES (1)");
+        assertEquals("1|VA", rows("SELECT id, a FROM wvd_rl"));
+    }
+
+    // ------------------------------------------------------------ the two regimes PostgreSQL runs
+    // ------------------------------------------------------------ a LATERAL item under
+
+    // Pulled up into the query reading it, the item is an ordinary join, and a constant reaches its
+    // own scan only through an equivalence class: beside (SELECT * FROM g z WHERE z.a = o.a) read as
+    // s, o.a = 5 says s.a = 5, while o.note = 'x' says nothing about s at all. A LIMIT or an OFFSET
+    // written inside the item stops that pullup; PostgreSQL then leaves the item a query of its own
+    // and runs it once per row of the relation beside it, after that relation's own scan filter, so
+    // any restriction on that relation is enough. The generation expression below is 10/a over a
+    // relation holding a row with a = 0, so each case is really asking which rows it ran for.
+
+    @Test
+    void anOrNarrowsALateralItemOnlyWhereEveryBranchIsTheSameComparison() throws Exception {
+        exec("CREATE TABLE wlr_a_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wlr_a_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wlr_a_o (a int, note text)");
+        exec("INSERT INTO wlr_a_o VALUES (5,'x'),(0,'y')");
+        String item = " FROM wlr_a_o o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlr_a_g z WHERE z.a = o.a) s ON s.g = 2 WHERE ";
+
+        // an equality carries the constant across into the item's own scan
+        assertEquals("2", scalar("SELECT s.g" + item + "o.a = 5"));
+        // nothing carries one here, so the item's expression is worked out for every row it holds
+        String byNote = "SELECT s.g" + item + "o.note = 'x'";
+        assertEquals("22012", stateOf(byNote));
+        assertEquals("division by zero", messageOf(byNote));
+
+        // an OR says only what every one of its branches says, whichever branch turns out to hold,
+        // so branches that are the same comparison put one value in the class
+        assertEquals("2", scalar("SELECT s.g" + item + "o.a = 5 OR o.a = 5"));
+        assertEquals("five", scalar("SELECT s.k" + item + "o.a = 5 OR o.a = 5"));
+        assertEquals("2", scalar("SELECT s.g" + item + "(o.a = 5 OR o.a = 5) OR o.a = 5"));
+        // and branches naming different constants, or comparing differently, put none
+        assertEquals("22012", stateOf("SELECT s.g" + item + "o.a = 5 OR o.a = 6"));
+        assertEquals("22012", stateOf("SELECT s.g" + item + "o.a = 5 OR o.a = 0"));
+        assertEquals("22012", stateOf("SELECT s.g" + item + "o.a = 5 OR o.a > 4"));
+        assertEquals("22012", stateOf("SELECT s.g" + item + "o.a = 5 OR o.a IS NULL"));
+        assertEquals("22012", stateOf("SELECT s.g" + item + "o.a = 5 OR o.note = 'x'"));
+        assertEquals("22012", stateOf("SELECT s.g" + item + "o.note = 'x' OR o.note = 'x'"));
+        assertEquals("22012", stateOf("SELECT s.g" + item + "o.a IN (5) OR o.a IN (6)"));
+
+        // the part the branches have in common is what the OR says, however each is written out and
+        // in whichever order
+        assertEquals("2", scalar("SELECT s.g" + item
+                + "(o.a = 5 AND o.note = 'x') OR (o.a = 5 AND o.note = 'q')"));
+        assertEquals("2", scalar("SELECT s.g" + item
+                + "(o.a = 5 AND o.note = 'x') OR (o.note = 'q' AND o.a = 5)"));
+        assertEquals("2", scalar("SELECT s.g" + item + "o.a = 5 OR (o.a = 5 AND o.note = 'x')"));
+
+        // the same item written after a comma, with the join condition among the parts that must
+        // all hold
+        assertEquals("2", scalar("SELECT s.g FROM wlr_a_o o, LATERAL"
+                + " (SELECT * FROM wlr_a_g z WHERE z.a = o.a) s"
+                + " WHERE (o.a = 5 OR o.a = 5) AND s.g = 2"));
+    }
+
+    @Test
+    void whatAnOrSaysDoesNotDependOnHowManyRowsTheRelationBesideTheItemHolds() throws Exception {
+        exec("CREATE TABLE wlr_f_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wlr_f_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wlr_f_o1 (a int, note text)");
+        exec("INSERT INTO wlr_f_o1 VALUES (5,'x')");
+        exec("CREATE TABLE wlr_f_o3 (a int, note text)");
+        exec("INSERT INTO wlr_f_o3 VALUES (5,'x'),(0,'y'),(0,'z')");
+
+        // one row beside the item
+        assertEquals("2", scalar("SELECT s.g FROM wlr_f_o1 o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlr_f_g z WHERE z.a = o.a) s ON s.g = 2 WHERE o.a = 5 OR o.a = 5"));
+        assertEquals("2", scalar("SELECT s.g FROM wlr_f_o1 o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlr_f_g z WHERE z.a = o.a) s ON s.g = 2 WHERE o.a = 5"));
+        // three
+        assertEquals("2", scalar("SELECT s.g FROM wlr_f_o3 o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlr_f_g z WHERE z.a = o.a) s ON s.g = 2 WHERE o.a = 5 OR o.a = 5"));
+        assertEquals("2", scalar("SELECT s.g FROM wlr_f_o3 o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlr_f_g z WHERE z.a = o.a) s ON s.g = 2"
+                + " WHERE o.a IN (5) OR o.a IN (5)"));
+    }
+
+    @Test
+    void aOneElementInListIsTheEqualityPostgresqlReadsItAs() throws Exception {
+        exec("CREATE TABLE wlr_b_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wlr_b_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wlr_b_o (a int, note text)");
+        exec("INSERT INTO wlr_b_o VALUES (5,'x'),(0,'y')");
+        exec("CREATE TABLE wlr_b_u (a int, note text)");
+        exec("INSERT INTO wlr_b_u VALUES (5,'x'),(0,'y')");
+        String item = " FROM wlr_b_o o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlr_b_g z WHERE z.a = o.a) s ON s.g = 2 WHERE ";
+
+        // PostgreSQL reads x IN (5) as x = 5 while it reads the statement, so it puts 5 in the
+        // column's class exactly as the written equality does, on either side of the operator
+        assertEquals("2", scalar("SELECT s.g" + item + "o.a IN (5)"));
+        assertEquals("2", scalar("SELECT s.g" + item + "o.a IN (5) AND o.note = 'x'"));
+        assertEquals("2", scalar("SELECT s.g" + item + "5 = o.a"));
+        assertEquals("2", scalar("SELECT s.g" + item + "o.a = 5 AND o.note = 'x'"));
+        assertEquals("2", scalar("SELECT s.g" + item + "o.note = 'x' AND o.a = 5"));
+
+        // a longer list is a comparison against an array, which says nothing about one value; nor
+        // does NOT IN, nor the ANY spelling
+        assertEquals("22012", stateOf("SELECT s.g" + item + "o.a IN (5, 6)"));
+        assertEquals("22012", stateOf("SELECT s.g" + item + "o.a NOT IN (5)"));
+        assertEquals("22012", stateOf("SELECT s.g" + item + "o.a = ANY (ARRAY[5])"));
+
+        // the same one-element list wherever a restriction reaches a scan: a relation read on its
+        // own, a derived table, and the extra relation of a statement that writes
+        assertEquals("2", scalar("SELECT s.g FROM wlr_b_g s WHERE s.a IN (5)"));
+        assertEquals("2", scalar("SELECT s.g FROM wlr_b_g s WHERE s.a IN (5) AND s.g = 2"));
+        assertEquals("2", scalar("SELECT s.g FROM (SELECT * FROM wlr_b_g) s WHERE s.a IN (5)"));
+        assertEquals(1, update("UPDATE wlr_b_u SET note = 'w' FROM wlr_b_g t"
+                + " WHERE t.a = wlr_b_u.a AND wlr_b_u.a IN (5) AND t.g = 2"));
+        assertEquals("0|y / 5|w", rows("SELECT a, note FROM wlr_b_u ORDER BY a"));
+        assertEquals(1, update("DELETE FROM wlr_b_o USING wlr_b_g t"
+                + " WHERE t.a = wlr_b_o.a AND wlr_b_o.a IN (5) AND t.g = 2"));
+        assertEquals("0|y", rows("SELECT a, note FROM wlr_b_o ORDER BY a"));
+    }
+
+    @Test
+    void theItemsOwnComparisonAndItsQualifiedStarAreReadHoweverTheyAreWritten() throws Exception {
+        exec("CREATE TABLE wlr_c_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wlr_c_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wlr_c_o (a int, note text)");
+        exec("INSERT INTO wlr_c_o VALUES (5,'x'),(0,'y')");
+
+        // a name written without its relation is the item's own, resolved against the relation
+        // nearest it
+        assertEquals("2", scalar("SELECT s.g FROM wlr_c_o o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlr_c_g z WHERE a = o.a) s ON s.g = 2 WHERE o.a = 5"));
+        assertEquals("2", scalar("SELECT s.g FROM wlr_c_o o, LATERAL"
+                + " (SELECT * FROM wlr_c_g z WHERE a = o.a) s WHERE 5 = o.a AND s.g = 2"));
+        // a star written with the relation before it exposes the same columns a bare one does
+        assertEquals("2", scalar("SELECT s.g FROM wlr_c_o o LEFT JOIN LATERAL"
+                + " (SELECT z.* FROM wlr_c_g z WHERE z.a = o.a) s ON s.g = 2 WHERE o.a = 5"));
+        assertEquals("2", scalar("SELECT s.g FROM wlr_c_o o, LATERAL"
+                + " (SELECT z.* FROM wlr_c_g z WHERE z.a = o.a) s WHERE o.a IN (5) AND s.g = 2"));
+        assertEquals("five|2", rows("SELECT s.k, s.g FROM wlr_c_o o LEFT JOIN LATERAL"
+                + " (SELECT z.* FROM wlr_c_g z WHERE z.a = o.a) s ON true WHERE o.a = 5"));
+        // and in the regime a LIMIT puts the item in
+        assertEquals("2", scalar("SELECT s.g FROM wlr_c_o o LEFT JOIN LATERAL"
+                + " (SELECT z.* FROM wlr_c_g z WHERE z.a = o.a LIMIT 1) s ON s.g = 2"
+                + " WHERE o.note = 'x'"));
+    }
+
+    @Test
+    void aLimitOrOffsetInsideTheItemRunsItOncePerRowTheOuterScanKept() throws Exception {
+        exec("CREATE TABLE wlr_d_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wlr_d_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wlr_d_o (a int, note text)");
+        exec("INSERT INTO wlr_d_o VALUES (5,'x'),(0,'y')");
+        String limited = " FROM wlr_d_o o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlr_d_g z WHERE z.a = o.a LIMIT 1) s ON s.g = 2";
+
+        // a LIMIT or an OFFSET settles which rows the item holds before the query reading it is
+        // planned, so the item is run once per row of the relation beside it, after that relation's
+        // own scan filter -- and then any restriction on that relation is enough, including one no
+        // equality carries into the item
+        assertEquals("2", scalar("SELECT s.g" + limited + " WHERE o.a = 5"));
+        assertEquals("2", scalar("SELECT s.g" + limited + " WHERE o.note = 'x'"));
+        assertEquals("2", scalar("SELECT s.g" + limited + " WHERE o.a > 4"));
+        assertEquals("2", scalar("SELECT s.g" + limited + " WHERE o.note <> 'y'"));
+        assertEquals("2", scalar("SELECT s.g" + limited + " WHERE o.a IN (5)"));
+        assertEquals("2", scalar("SELECT s.g" + limited + " WHERE o.note = 'x' OR o.note = 'x'"));
+        assertEquals("2", scalar("SELECT s.g FROM wlr_d_o o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlr_d_g z WHERE z.a = o.a OFFSET 0) s ON s.g = 2"
+                + " WHERE o.note = 'x'"));
+        assertEquals("2", scalar("SELECT s.g FROM wlr_d_o o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlr_d_g z WHERE z.a = o.a OFFSET 0) s ON s.g = 2 WHERE o.a > 4"));
+        assertEquals("2", scalar("SELECT s.g FROM wlr_d_o o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlr_d_g z WHERE z.a = o.a OFFSET 0 LIMIT 1) s ON s.g = 2"
+                + " WHERE o.note = 'x'"));
+        assertEquals("2", scalar("SELECT s.g FROM wlr_d_o o, LATERAL"
+                + " (SELECT * FROM wlr_d_g z WHERE z.a = o.a LIMIT 1) s"
+                + " WHERE o.note = 'x' AND s.g = 2"));
+        assertEquals("2", scalar("SELECT s.g FROM wlr_d_o o CROSS JOIN LATERAL"
+                + " (SELECT * FROM wlr_d_g z WHERE z.a = o.a LIMIT 1) s"
+                + " WHERE o.note = 'x' AND s.g = 2"));
+
+        // with nothing restricting that relation the item is run for every row of it; so it is for
+        // a restriction that holds of both rows, and for one that is no restriction on that
+        // relation alone
+        assertEquals("22012", stateOf("SELECT s.g" + limited));
+        assertEquals("22012", stateOf("SELECT s.g" + limited + " WHERE o.note = 'x' OR o.note = 'y'"));
+        assertEquals("22012", stateOf("SELECT s.g" + limited + " WHERE o.note = 'x' OR s.g = 2"));
+    }
+
+    @Test
+    void everyRowTheQueryKeepsStillCarriesTheValueOfAnItemKeptApart() throws Exception {
+        exec("CREATE TABLE wlr_e_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wlr_e_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wlr_e_o (a int, note text)");
+        exec("INSERT INTO wlr_e_o VALUES (5,'x'),(0,'y')");
+
+        // leaving a row's generated column unworked-out may never decide what the query answers, so
+        // every row the query does keep still carries its value
+        assertEquals("5|five|2", rows("SELECT s.a, s.k, s.g FROM wlr_e_o o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlr_e_g z WHERE z.a = o.a LIMIT 1) s ON true WHERE o.a = 5"));
+        assertEquals("5|2", rows("SELECT o.a, s.g FROM wlr_e_o o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlr_e_g z WHERE z.a > 0 ORDER BY z.a LIMIT 1) s ON true"
+                + " WHERE o.note = 'x'"));
+        assertEquals("5|2", rows("SELECT o.a, s.g FROM wlr_e_o o, LATERAL"
+                + " (SELECT * FROM wlr_e_g z WHERE z.a = 5 LIMIT 1) s WHERE o.note = 'x'"));
+        assertEquals(1L, num("SELECT count(*) FROM wlr_e_o o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlr_e_g z WHERE z.a = o.a LIMIT 1) s ON true"
+                + " WHERE o.note = 'x'"));
+        assertEquals(1L, num("SELECT count(*) FROM wlr_e_o o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlr_e_g z WHERE z.a = o.a LIMIT 1) s ON true WHERE o.a = 5"));
+        assertEquals(1L, num("SELECT count(*) FROM wlr_e_o o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlr_e_g z WHERE z.a = o.a) s ON s.g = 2 WHERE o.a = 5"));
+        // the row beside the item is the padded side of a join above it: an output row either
+        // carries that row, and the restriction is false of it, or does not carry it at all
+        assertEquals("2", scalar("SELECT s.g FROM wlr_e_o q LEFT JOIN (wlr_e_o o JOIN LATERAL"
+                + " (SELECT * FROM wlr_e_g z WHERE z.a = o.a LIMIT 1) s ON s.g = 2)"
+                + " ON q.a = o.a WHERE o.note = 'x'"));
+    }
+
+    // ------------------------------------------------------------ what is never asked of a WITH
+    // ------------------------------------------------------------ item the query keeps apart
+
+    // An item PostgreSQL keeps apart is computed in full when the query above first asks it for a
+    // row. A query whose qualification cannot admit a row never asks, and then the item does not
+    // run at all: a VIRTUAL generated column of the relation under it is never worked out, and a
+    // generation expression that raises for one of its rows raises nothing. Whether the item is
+    // asked is settled by the whole qualification rather than by any one part: the parts must all
+    // hold, so one of them false before a row is read leaves the rest nothing to decide, while what
+    // stands under an OR is not such a part. Nothing under a query that is never asked runs either.
+
+    @Test
+    void anItemTheQueryAsksForARowIsComputedInFullHoweverLittleIsReadOfIt() throws Exception {
+        exec("CREATE TABLE wnu_a_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wnu_a_g (a,k) VALUES (5,'five'),(0,'zero')");
+        String kept = "WITH c AS MATERIALIZED (SELECT * FROM wnu_a_g) ";
+
+        String counted = kept + "SELECT count(*) FROM c";
+        assertEquals("22012", stateOf(counted));
+        assertEquals("division by zero", messageOf(counted));
+        assertEquals("22012", stateOf(kept + "SELECT count(*) FROM c WHERE c.a = 5"));
+        assertEquals("22012", stateOf(kept + "SELECT count(*) FROM c WHERE true"));
+        assertEquals("22012", stateOf(kept + "SELECT count(*) FROM c WHERE true AND c.a = 5"));
+        assertEquals("22012", stateOf(kept + "SELECT count(*) FROM c LIMIT 1"));
+        assertEquals("22012", stateOf(kept + "SELECT count(*) FROM c OFFSET 1"));
+        assertEquals("22012", stateOf(
+                "WITH c(p,q,r) AS MATERIALIZED (SELECT * FROM wnu_a_g) SELECT count(*) FROM c"));
+        // a HAVING clause that keeps the group asks as surely as a WHERE that keeps the row
+        assertEquals("22012", stateOf(kept + "SELECT count(*) FROM c HAVING true"));
+        assertEquals("22012", stateOf(kept + "SELECT count(*) FROM c HAVING count(*) > 99"));
+        // what stands under an OR is read beside what the other side says, row by row, so a branch
+        // that is false is no reason not to ask
+        assertEquals("22012", stateOf(kept + "SELECT count(*) FROM c WHERE false OR c.a = 5"));
+        // an item named more than once is kept apart too, and the whole query asks it
+        assertEquals("22012",
+                stateOf("WITH c AS (SELECT * FROM wnu_a_g) SELECT count(*) FROM c x, c y"));
+    }
+
+    @Test
+    void aQualificationThatCannotAdmitARowLeavesTheItemUnasked() throws Exception {
+        exec("CREATE TABLE wnu_b_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wnu_b_g (a,k) VALUES (5,'five'),(0,'zero')");
+        String kept = "WITH c AS MATERIALIZED (SELECT * FROM wnu_b_g) ";
+
+        assertEquals(0L, num(kept + "SELECT count(*) FROM c WHERE false"));
+        // the parts must all hold, so one of them false leaves the rest nothing to decide, wherever
+        // in the list it is written
+        assertEquals(0L, num(kept + "SELECT count(*) FROM c WHERE false AND c.a = 5"));
+        assertEquals(0L, num(kept + "SELECT count(*) FROM c WHERE c.a = 5 AND false"));
+        assertEquals(0L, num(kept + "SELECT count(*) FROM c WHERE c.a = 5 AND false AND c.k = 'five'"));
+        assertEquals(0L, num(kept + "SELECT count(*) FROM c WHERE c.a = 5 AND c.k = 'five' AND false"));
+        assertEquals(0L, num(kept + "SELECT count(*) FROM c WHERE false AND false"));
+        // the generated column itself is no more asked for than any other
+        assertEquals(0L, num(kept + "SELECT count(*) FROM c WHERE false AND c.g = 2"));
+        assertEquals(0L, num(kept + "SELECT count(*) FROM c WHERE c.g = 2 AND false"));
+        // however the constant is spelled
+        assertEquals(0L, num(kept + "SELECT count(*) FROM c WHERE 1 = 0"));
+        assertEquals(0L, num(kept + "SELECT count(*) FROM c WHERE 1 = 2"));
+        assertEquals(0L, num(kept + "SELECT count(*) FROM c WHERE NULL"));
+        assertEquals(0L, num(kept + "SELECT count(*) FROM c WHERE NOT true"));
+        assertEquals(0L, num(kept + "SELECT count(*) FROM c WHERE (false)"));
+        assertEquals(0L, num(kept + "SELECT count(*) FROM c WHERE NOT (1 = 1)"));
+        assertEquals(0L, num(kept + "SELECT count(*) FROM c WHERE 1 = 0 AND c.a = 5"));
+        assertEquals(0L, num(kept + "SELECT count(*) FROM c WHERE NULL AND c.a = 5"));
+        assertEquals(0L, num(kept + "SELECT count(*) FROM c WHERE NOT true AND c.a = 5"));
+        assertEquals(0L, num(kept + "SELECT count(*) FROM c WHERE false AND (c.a = 5 OR c.a = 0)"));
+        // a row count above it changes nothing about what the qualification admits
+        assertEquals(0L, num(kept + "SELECT count(*) FROM c WHERE false LIMIT 1"));
+        assertEquals(0L, num(kept + "SELECT count(*) FROM c WHERE false OFFSET 0"));
+        // and an aggregate over no rows at all answers for none of them
+        assertEquals("NULL", rows(kept + "SELECT max(c.a) FROM c WHERE false"));
+        assertEquals("", rows(kept + "SELECT c.a, c.k FROM c WHERE false"));
+
+        // a row count of none asks for nothing either
+        assertEquals("", column(kept + "SELECT a FROM c LIMIT 0"));
+
+        // the names the item or the FROM item gives its columns change nothing
+        assertEquals(0L, num(kept + "SELECT count(*) FROM c s(p,q,r) WHERE false"));
+        assertEquals(0L, num("WITH c(p,q,r) AS MATERIALIZED (SELECT * FROM wnu_b_g)"
+                + " SELECT count(*) FROM c WHERE false"));
+        assertEquals(0L, num("WITH c(p,q,r) AS MATERIALIZED (SELECT * FROM wnu_b_g)"
+                + " SELECT count(*) FROM c WHERE false AND p = 5"));
+
+        // an item named more than once is asked by neither reference, and a select list is read
+        // only for the rows the qualification let through
+        assertEquals(0L, num(
+                "WITH c AS (SELECT * FROM wnu_b_g) SELECT count(*) FROM c x, c y WHERE false"));
+        assertEquals(0L, num("WITH c AS (SELECT * FROM wnu_b_g)"
+                + " SELECT count(*) FROM c x, c y WHERE false AND x.a = 5"));
+        assertEquals("", column(kept + "SELECT (SELECT count(*) FROM c) FROM c WHERE false"));
+
+        // a sub-select over the item, qualified inside it or outside it
+        assertEquals(0L, num("SELECT count(*) FROM (WITH c AS MATERIALIZED"
+                + " (SELECT * FROM wnu_b_g) SELECT * FROM c WHERE false) x"));
+        assertEquals(0L, num("SELECT count(*) FROM (WITH c AS MATERIALIZED"
+                + " (SELECT * FROM wnu_b_g) SELECT * FROM c) x WHERE false"));
+    }
+
+    @Test
+    void aChainOfItemsKeptApartIsUnreadFromTheTopDown() throws Exception {
+        exec("CREATE TABLE wnu_c_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wnu_c_g (a,k) VALUES (5,'five'),(0,'zero')");
+
+        String two = "WITH c AS MATERIALIZED (SELECT * FROM wnu_c_g),"
+                + " d AS MATERIALIZED (SELECT * FROM c) ";
+        assertEquals("22012", stateOf(two + "SELECT count(*) FROM d"));
+        assertEquals("22012", stateOf(two + "SELECT count(*) FROM d WHERE false OR d.a = 5"));
+        assertEquals(0L, num(two + "SELECT count(*) FROM d WHERE false"));
+        assertEquals(0L, num(two + "SELECT count(*) FROM d WHERE false AND d.a = 5"));
+        assertEquals(0L, num(two + "SELECT count(*) FROM d WHERE d.a = 5 AND false"));
+        assertEquals("", column(two + "SELECT a FROM d LIMIT 0"));
+
+        String three = two + ", e AS MATERIALIZED (SELECT * FROM d) ";
+        assertEquals("22012", stateOf(three + "SELECT count(*) FROM e"));
+        assertEquals(0L, num(three + "SELECT count(*) FROM e WHERE false"));
+
+        String four = three + ", f AS MATERIALIZED (SELECT * FROM e) ";
+        assertEquals("22012", stateOf(four + "SELECT count(*) FROM f"));
+        assertEquals(0L, num(four + "SELECT count(*) FROM f WHERE false"));
+
+        // whichever links of the chain PostgreSQL would otherwise pull up
+        String keptUnderInlined = "WITH c AS MATERIALIZED (SELECT * FROM wnu_c_g),"
+                + " d AS NOT MATERIALIZED (SELECT * FROM c) ";
+        assertEquals("22012", stateOf(keptUnderInlined + "SELECT count(*) FROM d"));
+        assertEquals(0L, num(keptUnderInlined + "SELECT count(*) FROM d WHERE false"));
+
+        String inlinedUnderKept = "WITH c AS NOT MATERIALIZED (SELECT * FROM wnu_c_g),"
+                + " d AS MATERIALIZED (SELECT * FROM c) ";
+        assertEquals("22012", stateOf(inlinedUnderKept + "SELECT count(*) FROM d"));
+        assertEquals(0L, num(inlinedUnderKept + "SELECT count(*) FROM d WHERE false"));
+    }
+
+    // ------------------------------------------------------------ what a pulled-up LATERAL item's
+    // ------------------------------------------------------------ own scan is narrowed by
+
+    // Pulled up into the query reading it, the item stops being a query of its own: the relation it
+    // stands in front of is one of that query's own relations and is scanned once, so a
+    // qualification speaking of the item alone filters that scan and is read for every row the scan
+    // visits. The item's comparison with the row beside it says which rows pair rather than which
+    // rows there are, so it does not narrow that scan — however few rows the relation beside it
+    // happens to hold. The generation expression below is 10/a over a relation holding a row with
+    // a = 0, so each case is really asking which rows it was worked out for.
+
+    @Test
+    void aPulledUpItemIsReadOverEveryRowUnderItHoweverFewRowsStandBesideIt() throws Exception {
+        exec("CREATE TABLE wlk_a_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wlk_a_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wlk_a_o1 (a int, note text)");
+        exec("INSERT INTO wlk_a_o1 VALUES (5,'x')");
+        String one = " FROM wlk_a_o1 o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlk_a_g z WHERE z.a = o.a) s ON s.g = 2";
+
+        // one row stands beside the item, and it is the row that pairs with a = 5; the scan under
+        // the item still visits the row a is zero in
+        assertEquals("22012", stateOf("SELECT s.g" + one + " WHERE o.note = 'x'"));
+        assertEquals("division by zero", messageOf("SELECT s.g" + one + " WHERE o.note = 'x'"));
+        assertEquals("22012", stateOf("SELECT s.g" + one));
+        assertEquals("22012", stateOf("SELECT s.k" + one + " WHERE o.note = 'x'"));
+        assertEquals("22012", stateOf("SELECT count(*)" + one));
+        assertEquals("22012", stateOf("SELECT s.g FROM wlk_a_o1 o, LATERAL"
+                + " (SELECT * FROM wlk_a_g z WHERE z.a = o.a) s WHERE o.note = 'x' AND s.g = 2"));
+        assertEquals("22012", stateOf("SELECT s.g FROM wlk_a_o1 o CROSS JOIN LATERAL"
+                + " (SELECT * FROM wlk_a_g z WHERE z.a = o.a) s WHERE s.g = 2"));
+
+        // the item's own comparison reads the same written the other way round, and whatever the
+        // operator
+        assertEquals("22012", stateOf("SELECT s.g FROM wlk_a_o1 o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlk_a_g z WHERE o.a = z.a) s ON s.g = 2 WHERE o.note = 'x'"));
+        assertEquals("22012", stateOf("SELECT s.g FROM wlk_a_o1 o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlk_a_g z WHERE z.a > o.a) s ON s.g = 2 WHERE o.note = 'x'"));
+        // an item read beside another item, which is a row beside it just the same
+        assertEquals("22012", stateOf("SELECT s2.g FROM wlk_a_o1 o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlk_a_g z WHERE z.a = o.a) s ON true LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlk_a_g z2 WHERE z2.a = s.a) s2 ON s2.g = 2"));
+    }
+
+    @Test
+    void aConstantCarriedOntoTheItemNarrowsThatScanAndACommaJoinReadsTheSame() throws Exception {
+        exec("CREATE TABLE wlk_b_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wlk_b_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wlk_b_o1 (a int, note text)");
+        exec("INSERT INTO wlk_b_o1 VALUES (5,'x')");
+
+        // a constant an equivalence class carries onto the relation, and a join qualification about
+        // the item alone, in either order
+        assertEquals("2", scalar("SELECT s.g FROM wlk_b_o1 o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlk_b_g z WHERE z.a = o.a) s ON s.g = 2 WHERE o.a = 5"));
+        assertEquals("2", scalar("SELECT s.g FROM wlk_b_o1 o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlk_b_g z WHERE z.a = o.a) s ON s.a = 5 AND s.g = 2"));
+        assertEquals("2", scalar("SELECT s.g FROM wlk_b_o1 o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlk_b_g z WHERE z.a = o.a) s ON s.g = 2 AND s.a = 5"));
+        // a comparison the item makes with anything but the row beside it
+        assertEquals("2", scalar("SELECT s.g FROM wlk_b_o1 o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlk_b_g z WHERE z.a = o.a AND z.k = 'five') s ON s.g = 2"
+                + " WHERE o.note = 'x'"));
+        assertEquals("2", scalar("SELECT s.g FROM wlk_b_o1 o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlk_b_g z WHERE z.a = o.a AND z.a = 5) s ON s.g = 2"
+                + " WHERE o.note = 'x'"));
+        // an item that pairs with nothing at all is narrowed by its own comparisons alone
+        assertEquals("2", scalar("SELECT s.g FROM wlk_b_o1 o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlk_b_g z WHERE z.a = 5) s ON s.g = 2 WHERE o.note = 'x'"));
+        assertEquals("2", scalar("SELECT s.g FROM wlk_b_o1 o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlk_b_g z WHERE z.a > 0) s ON s.g = 2 WHERE o.note = 'x'"));
+
+        // a reference in the select list is not a filter on that scan: it stands above the join and
+        // is worked out for the rows the query kept
+        assertEquals("2", scalar("SELECT s.g FROM wlk_b_o1 o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlk_b_g z WHERE z.a = o.a) s ON true WHERE o.note = 'x'"));
+        assertEquals("five", scalar("SELECT s.k FROM wlk_b_o1 o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlk_b_g z WHERE z.a = o.a) s ON true WHERE o.note = 'x'"));
+        // and a LIMIT keeps the item apart, where any restriction on the row beside it is enough
+        assertEquals("2", scalar("SELECT s.g FROM wlk_b_o1 o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlk_b_g z WHERE z.a = o.a LIMIT 1) s ON s.g = 2"
+                + " WHERE o.note = 'x'"));
+    }
+
+    @Test
+    void anOrOfAnEqualityAndAOneElementListSaysWhatThatOneComparisonSays() throws Exception {
+        exec("CREATE TABLE wlk_c_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wlk_c_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wlk_c_o (a int, note text)");
+        exec("INSERT INTO wlk_c_o VALUES (5,'x'),(0,'y')");
+        exec("CREATE TABLE wlk_c_u (a int, note text)");
+        exec("INSERT INTO wlk_c_u VALUES (5,'x'),(0,'y')");
+        String item = " FROM wlk_c_o o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlk_c_g z WHERE z.a = o.a) s ON s.g = 2 WHERE ";
+
+        // PostgreSQL reads x IN (5) as x = 5 while it reads the statement, so the two branches are
+        // one branch and what the OR says is what that branch says
+        assertEquals("2", scalar("SELECT s.g" + item + "o.a = 5 OR o.a IN (5)"));
+        assertEquals("2", scalar("SELECT s.g" + item + "o.a IN (5) OR o.a = 5"));
+        assertEquals("2", scalar("SELECT s.g" + item + "(o.a = 5 AND o.note = 'x') OR o.a IN (5)"));
+        assertEquals("five", scalar("SELECT s.k" + item + "o.a = 5 OR o.a IN (5)"));
+        assertEquals("2", scalar("SELECT s.g FROM wlk_c_o o JOIN LATERAL"
+                + " (SELECT * FROM wlk_c_g z WHERE z.a = o.a) s ON s.g = 2"
+                + " WHERE o.a = 5 OR o.a IN (5)"));
+        assertEquals("2", scalar("SELECT s.g FROM wlk_c_o o, LATERAL"
+                + " (SELECT * FROM wlk_c_g z WHERE z.a = o.a) s"
+                + " WHERE (o.a = 5 OR o.a IN (5)) AND s.g = 2"));
+
+        // branches naming different constants say nothing about one value, nor does a one-element
+        // list beside a longer one, nor the same comparison written the other way round
+        assertEquals("22012", stateOf("SELECT s.g" + item + "o.a = 5 OR o.a IN (6)"));
+        assertEquals("22012", stateOf("SELECT s.g" + item + "o.a IN (5) OR o.a IN (5, 6)"));
+        assertEquals("22012", stateOf("SELECT s.g" + item + "o.a = 5 OR 5 = o.a"));
+        assertEquals("22012", stateOf("SELECT s.g" + item + "o.a = 5 OR o.a = 6"));
+
+        // the same reading wherever a restriction reaches a scan: a derived table, and the extra
+        // relation of a statement that writes
+        assertEquals("2", scalar("SELECT s.g FROM (SELECT * FROM wlk_c_g) s"
+                + " WHERE (s.a = 5 OR s.a IN (5)) AND s.g = 2"));
+        assertEquals(1, update("UPDATE wlk_c_u SET note = 'w' FROM wlk_c_g t"
+                + " WHERE t.a = wlk_c_u.a AND (wlk_c_u.a = 5 OR wlk_c_u.a IN (5)) AND t.g = 2"));
+        assertEquals("0|y / 5|w", rows("SELECT a, note FROM wlk_c_u ORDER BY a"));
+        assertEquals(1, update("DELETE FROM wlk_c_u USING wlk_c_g t"
+                + " WHERE t.a = wlk_c_u.a AND (wlk_c_u.a = 5 OR wlk_c_u.a IN (5)) AND t.g = 2"));
+        assertEquals("0|y", rows("SELECT a, note FROM wlk_c_u ORDER BY a"));
+    }
+
+    // ------------------------------------------------------------ everything that settles an
+    // ------------------------------------------------------------ item's own rows keeps it apart
+
+    // A LIMIT or an OFFSET is not the only thing that stops the pullup. Anything settling which of
+    // the item's rows there are, or in what order, before the query above is planned keeps the two
+    // apart: a DISTINCT, a sort, a grouping, a set operation, a locking clause, a WITH item of its
+    // own, and a window call, a set-returning call or a volatile one in its select list. Such an
+    // item is run once per row of the relation beside it, after that relation's own scan filter, so
+    // a row that filter discards never has the item run for it at all.
+
+    @Test
+    void aDistinctASortAGroupingOrASetOperationKeepsTheItemApart() throws Exception {
+        exec("CREATE TABLE wlk_d_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wlk_d_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wlk_d_o (a int, note text)");
+        exec("INSERT INTO wlk_d_o VALUES (5,'x'),(0,'y')");
+        String left = "SELECT s.g FROM wlk_d_o o LEFT JOIN LATERAL (";
+        String beside = " s ON s.g = 2 WHERE o.note = 'x'";
+
+        assertEquals("2", scalar(left + "SELECT DISTINCT * FROM wlk_d_g z WHERE z.a = o.a)"
+                + beside));
+        assertEquals("2", scalar(left + "SELECT * FROM wlk_d_g z WHERE z.a = o.a ORDER BY z.a)"
+                + beside));
+        assertEquals("2", scalar(left + "SELECT z.a, z.k, max(z.g) AS g FROM wlk_d_g z"
+                + " WHERE z.a = o.a GROUP BY z.a, z.k)" + beside));
+        assertEquals("2", scalar(left + "SELECT * FROM wlk_d_g z WHERE z.a = o.a"
+                + " GROUP BY z.a, z.k, z.g)" + beside));
+        assertEquals("2", scalar(left + "SELECT z.a, z.k, max(z.g) AS g FROM wlk_d_g z"
+                + " WHERE z.a = o.a GROUP BY z.a, z.k HAVING count(*) > 0)" + beside));
+        assertEquals("2", scalar(left + "SELECT DISTINCT ON (z.a) z.a, z.k, z.g FROM wlk_d_g z"
+                + " WHERE z.a = o.a)" + beside));
+        assertEquals("2", scalar(left + "SELECT * FROM wlk_d_g z WHERE z.a = o.a UNION"
+                + " SELECT * FROM wlk_d_g z2 WHERE z2.a = o.a)" + beside));
+        assertEquals("2", scalar(left + "SELECT * FROM wlk_d_g z WHERE z.a = o.a EXCEPT"
+                + " SELECT * FROM wlk_d_g z2 WHERE z2.a = 99)" + beside));
+        assertEquals("2", scalar(left + "SELECT * FROM wlk_d_g z WHERE z.a = o.a INTERSECT"
+                + " SELECT * FROM wlk_d_g z2 WHERE z2.a = o.a)" + beside));
+        // a UNION ALL answers with both arms' rows, and the query keeps both
+        assertEquals("2 / 2", rows(left + "SELECT * FROM wlk_d_g z WHERE z.a = o.a UNION ALL"
+                + " SELECT * FROM wlk_d_g z2 WHERE z2.a = o.a)" + beside));
+        // the same item after a comma, and one narrowed by a constant instead
+        assertEquals("2", scalar("SELECT s.g FROM wlk_d_o o, LATERAL"
+                + " (SELECT DISTINCT * FROM wlk_d_g z WHERE z.a = o.a) s"
+                + " WHERE o.note = 'x' AND s.g = 2"));
+        assertEquals("2", scalar("SELECT s.g FROM wlk_d_o o CROSS JOIN LATERAL"
+                + " (SELECT DISTINCT * FROM wlk_d_g z WHERE z.a = o.a) s"
+                + " WHERE o.note = 'x' AND s.g = 2"));
+        assertEquals("2", scalar(left + "SELECT DISTINCT * FROM wlk_d_g z WHERE z.a = o.a)"
+                + " s ON s.g = 2 WHERE o.a = 5"));
+        assertEquals("2", scalar(left + "SELECT DISTINCT * FROM wlk_d_g z WHERE z.a = o.a)"
+                + " s ON s.g = 2 WHERE o.note <> 'y'"));
+    }
+
+    @Test
+    void aLockingClauseAnItemOfItsOwnOrACallInTheSelectListKeepsItApartToo() throws Exception {
+        exec("CREATE TABLE wlk_e_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wlk_e_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wlk_e_o (a int, note text)");
+        exec("INSERT INTO wlk_e_o VALUES (5,'x'),(0,'y')");
+        String left = "SELECT s.g FROM wlk_e_o o LEFT JOIN LATERAL (";
+        String beside = " s ON s.g = 2 WHERE o.note = 'x'";
+
+        assertEquals("2", scalar(left + "SELECT * FROM wlk_e_g z WHERE z.a = o.a FOR UPDATE)"
+                + beside));
+        assertEquals("2", scalar(left + "SELECT * FROM wlk_e_g z WHERE z.a = o.a FOR SHARE)"
+                + beside));
+        // a WITH item of its own, written MATERIALIZED or not
+        assertEquals("2", scalar(left + "WITH q AS MATERIALIZED"
+                + " (SELECT * FROM wlk_e_g z WHERE z.a = o.a) SELECT * FROM q)" + beside));
+        assertEquals("2", scalar(left + "WITH q AS (SELECT * FROM wlk_e_g z WHERE z.a = o.a)"
+                + " SELECT * FROM q)" + beside));
+        // a window call, a set-returning call or a volatile one in the select list
+        assertEquals("2", scalar(left + "SELECT z.a, z.k, z.g, row_number() OVER () AS r"
+                + " FROM wlk_e_g z WHERE z.a = o.a)" + beside));
+        assertEquals("2", scalar(left + "SELECT z.a, z.k, z.g, generate_series(1,1) AS r"
+                + " FROM wlk_e_g z WHERE z.a = o.a)" + beside));
+        assertEquals("2", scalar(left + "SELECT z.a, z.k, z.g, random() AS r"
+                + " FROM wlk_e_g z WHERE z.a = o.a)" + beside));
+    }
+
+    @Test
+    void anItemKeptApartIsRunForEveryRowTheRelationBesideItStillHolds() throws Exception {
+        exec("CREATE TABLE wlk_f_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wlk_f_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wlk_f_o (a int, note text)");
+        exec("INSERT INTO wlk_f_o VALUES (5,'x'),(0,'y')");
+        String left = "SELECT s.g FROM wlk_f_o o LEFT JOIN LATERAL (";
+
+        // with nothing restricting the relation beside it, such an item is run for every row of it;
+        // so it is for a restriction that holds of both rows, and for one that is not a restriction
+        // on that relation alone
+        String unrestricted = left + "SELECT DISTINCT * FROM wlk_f_g z WHERE z.a = o.a) s ON s.g = 2";
+        assertEquals("22012", stateOf(unrestricted));
+        assertEquals("division by zero", messageOf(unrestricted));
+        assertEquals("22012", stateOf(left + "SELECT * FROM wlk_f_g z WHERE z.a = o.a ORDER BY z.a)"
+                + " s ON s.g = 2"));
+        assertEquals("22012", stateOf(left + "SELECT * FROM wlk_f_g z WHERE z.a = o.a UNION ALL"
+                + " SELECT * FROM wlk_f_g z2 WHERE z2.a = o.a) s ON s.g = 2"));
+        assertEquals("22012", stateOf(left + "WITH q AS MATERIALIZED"
+                + " (SELECT * FROM wlk_f_g z WHERE z.a = o.a) SELECT * FROM q) s ON s.g = 2"));
+        assertEquals("22012", stateOf(left + "SELECT DISTINCT * FROM wlk_f_g z WHERE z.a = o.a)"
+                + " s ON s.g = 2 WHERE o.note = 'x' OR o.note = 'y'"));
+        assertEquals("22012", stateOf(left + "SELECT DISTINCT * FROM wlk_f_g z WHERE z.a = o.a)"
+                + " s ON s.g = 2 WHERE o.note = 'x' OR s.g = 2"));
+
+        // what the query keeps is still answered beside an item nobody asked for a row
+        assertEquals(0L, num("SELECT count(*) FROM wlk_f_o o LEFT JOIN LATERAL"
+                + " (SELECT DISTINCT * FROM wlk_f_g z WHERE z.a = o.a) s ON true"
+                + " WHERE o.note = 'q'"));
+        assertEquals("5|five", rows("SELECT o.a, s.k FROM wlk_f_o o LEFT JOIN LATERAL"
+                + " (SELECT DISTINCT * FROM wlk_f_g z WHERE z.a = o.a) s ON true"
+                + " WHERE o.note = 'x'"));
+        assertEquals("5|5|five|2", rows("SELECT o.a, s.a, s.k, s.g FROM wlk_f_o o LEFT JOIN LATERAL"
+                + " (SELECT DISTINCT * FROM wlk_f_g z WHERE z.a = o.a) s ON true"
+                + " WHERE o.note = 'x'"));
+    }
+
+    @Test
+    void anAliasListOnTheItemRenamesWhatItsOwnComparisonSpeaksOf() throws Exception {
+        exec("CREATE TABLE wlk_g_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wlk_g_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wlk_g_o (a int, note text)");
+        exec("INSERT INTO wlk_g_o VALUES (5,'x'),(0,'y')");
+
+        // the list renames the columns the item exposes one for one from the left, so a comparison
+        // written inside the item speaks above under the name standing where its column stands:
+        // beside o.a = 5, (SELECT * FROM g z WHERE z.a = o.a) read as s(u,v,w) says s.u = 5
+        assertEquals("2", scalar("SELECT s.w FROM wlk_g_o o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlk_g_g z WHERE z.a = o.a) s(u,v,w) ON s.w = 2 WHERE o.a = 5"));
+        assertEquals("five", scalar("SELECT s.v FROM wlk_g_o o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlk_g_g z WHERE z.a = o.a) s(u,v,w) ON s.w = 2 WHERE o.a = 5"));
+        assertEquals("2", scalar("SELECT s.z FROM wlk_g_o o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlk_g_g z WHERE z.a = o.a) s(x,y,z) ON s.z = 2"
+                + " WHERE o.a IN (5)"));
+        assertEquals("2", scalar("SELECT s.w FROM wlk_g_o o LEFT JOIN LATERAL"
+                + " (SELECT z.a, z.k, z.g FROM wlk_g_g z WHERE z.a = o.a) s(u,v,w) ON s.w = 2"
+                + " WHERE o.a = 5"));
+        assertEquals("2", scalar("SELECT s.w FROM wlk_g_o o, LATERAL"
+                + " (SELECT * FROM wlk_g_g z WHERE z.a = o.a) s(u,v,w) WHERE o.a = 5 AND s.w = 2"));
+        // a list shorter than the relation leaves the columns past it their own names
+        assertEquals("2", scalar("SELECT s.g FROM wlk_g_o o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlk_g_g z WHERE z.a = o.a) s(u,v) ON s.g = 2 WHERE o.a = 5"));
+
+        // the renamed column is still worked out for every row the query keeps — a renaming that
+        // suppressed the working-out would answer NULL, which is worse than the error
+        assertEquals("5|five|2", rows("SELECT s.u, s.v, s.w FROM wlk_g_o o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlk_g_g z WHERE z.a = o.a) s(u,v,w) ON true WHERE o.a = 5"));
+
+        // with no constant carried onto the item the renaming changes nothing, and a list on an
+        // item PostgreSQL keeps apart is read as it was
+        assertEquals("22012", stateOf("SELECT s.w FROM wlk_g_o o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlk_g_g z WHERE z.a = o.a) s(u,v,w) ON s.w = 2"
+                + " WHERE o.note = 'x'"));
+        assertEquals("2", scalar("SELECT s.w FROM wlk_g_o o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlk_g_g z WHERE z.a = o.a LIMIT 1) s(u,v,w) ON s.w = 2"
+                + " WHERE o.note = 'x'"));
+        assertEquals("2", scalar("SELECT s.w FROM wlk_g_o o LEFT JOIN LATERAL"
+                + " (SELECT DISTINCT * FROM wlk_g_g z WHERE z.a = o.a) s(u,v,w) ON s.w = 2"
+                + " WHERE o.note = 'x'"));
+    }
+
+    @Test
+    void aQualificationThatCarriesNoConstantIntoTheScanStillRaises() throws Exception {
+        exec("CREATE TABLE wlk_h_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wlk_h_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wlk_h_o (a int, note text)");
+        exec("INSERT INTO wlk_h_o VALUES (5,'x'),(0,'y')");
+
+        assertEquals("22012", stateOf("SELECT g FROM wlk_h_g WHERE g = 2"));
+        assertEquals("division by zero", messageOf("SELECT g FROM wlk_h_g WHERE g = 2"));
+        assertEquals("22012", stateOf("SELECT g FROM wlk_h_g"));
+        assertEquals("22012", stateOf("SELECT s.g FROM wlk_h_o o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlk_h_g z WHERE z.a = o.a) s ON true"));
+        assertEquals("22012", stateOf("SELECT s.g FROM wlk_h_o o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wlk_h_g z WHERE z.a = o.a) s ON s.g = 2 WHERE o.note = 'x'"));
+    }
+
+    // ------------------------------------------------------------ what a statement that writes
+    // ------------------------------------------------------------ never asks of an item kept apart
+
+    // An item PostgreSQL keeps apart is computed when the statement reading it first asks it for a
+    // row. A statement whose qualification is decided against before a row is read never asks: it
+    // writes nothing, the item does not run, and a VIRTUAL generated column of the relation under it
+    // is never worked out. An UPDATE's FROM clause, a DELETE's USING clause and a MERGE's source are
+    // read for such a statement as a query's FROM clause is read for a query. Whether the
+    // qualification is settled that early is read off the whole written expression rather than off
+    // any one part of it: the parts of an AND must all hold, so one of them false settles the whole
+    // of it, while a branch of an OR holds on its own, so an OR is settled only where every branch
+    // is.
+
+    @Test
+    void anOrIsSettledBeforeARowIsReadOnlyWhereEveryBranchIs() throws Exception {
+        exec("CREATE TABLE wwa_a_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wwa_a_g (a,k) VALUES (5,'five'),(0,'zero')");
+        String kept = "WITH c AS MATERIALIZED (SELECT * FROM wwa_a_g) ";
+
+        assertEquals(0L, num(kept + "SELECT count(*) FROM c WHERE false AND c.a = 5 OR false"));
+        assertEquals(0L, num(kept + "SELECT count(*) FROM c WHERE false OR false"));
+        assertEquals(0L, num(kept
+                + "SELECT count(*) FROM c WHERE false AND c.a = 5 OR false AND c.k = 'x'"));
+        assertEquals(0L, num(kept + "SELECT count(*) FROM c WHERE (false OR false) AND c.a = 5"));
+        assertEquals(0L, num(kept + "SELECT count(*) FROM c WHERE false OR (false AND c.a = 5)"));
+        assertEquals(0L, num(kept
+                + "SELECT count(*) FROM c WHERE false AND c.a = 5 OR c.a = 5 AND false"));
+        assertEquals(0L, num(kept + "SELECT count(*) FROM c WHERE 1 = 0 OR 2 = 0"));
+        assertEquals(0L, num(kept + "SELECT count(*) FROM c WHERE NULL OR false"));
+        assertEquals(0L, num(kept + "SELECT count(*) FROM c WHERE NULL AND c.a = 5 OR false"));
+        assertEquals(0L, num(kept + "SELECT count(*) FROM c WHERE false = true"));
+        assertEquals(0L, num(kept + "SELECT count(*) FROM c WHERE 'f'::bool"));
+        // a part beside a branch holding a call still settles that branch
+        assertEquals(0L, num(kept + "SELECT count(*) FROM c WHERE random() < 0 AND false"));
+
+        // a branch nothing can be read out of leaves the OR unsettled, and then the item is asked
+        // for a row and computed in full
+        assertEquals("22012", stateOf(kept + "SELECT count(*) FROM c WHERE false OR c.a = 5"));
+        assertEquals("division by zero",
+                messageOf(kept + "SELECT count(*) FROM c WHERE false OR c.a = 5"));
+        assertEquals("22012",
+                stateOf(kept + "SELECT count(*) FROM c WHERE c.a = 5 OR false AND c.a = 5"));
+        assertEquals("22012", stateOf(kept + "SELECT count(*) FROM c WHERE false OR random() < 0"));
+        // NOT is not read through: what it stands over is settled false, so the whole is true
+        assertEquals("22012", stateOf(kept + "SELECT count(*) FROM c WHERE NOT (false OR false)"));
+        assertEquals("22012",
+                stateOf(kept + "SELECT count(*) FROM c WHERE NOT (c.a = 5 AND false)"));
+        // and with no qualification at all
+        assertEquals("22012", stateOf(kept + "SELECT count(*) FROM c"));
+    }
+
+    @Test
+    void aPartFalseWhateverTheRowSaysDecidesTheRowBeforeTheExpressionIsWorkedOut() throws Exception {
+        exec("CREATE TABLE wwa_b_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wwa_b_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE VIEW wwa_b_v AS SELECT * FROM wwa_b_g");
+
+        assertEquals(0L, num("SELECT count(*) FROM wwa_b_g WHERE false AND g = 2 OR false"));
+        assertEquals(0L, num("SELECT count(*) FROM wwa_b_g WHERE g = 2 AND false OR false"));
+        assertEquals(0L,
+                num("SELECT count(*) FROM wwa_b_g WHERE false AND g = 2 OR g = 2 AND false"));
+        assertEquals(0L, num("SELECT count(*) FROM wwa_b_v WHERE false AND g = 2 OR false"));
+        assertEquals(0L, num(
+                "SELECT count(*) FROM (SELECT * FROM wwa_b_g) s WHERE false AND s.g = 2 OR false"));
+        assertEquals("", column("SELECT a FROM wwa_b_g WHERE false AND g = 2 OR false"));
+        assertEquals(0L, num("SELECT count(*) FROM wwa_b_g WHERE false AND g = 2"));
+        // a qualification only a row can settle is read row by row, as it always was
+        assertEquals("22012", stateOf("SELECT count(*) FROM wwa_b_g WHERE false OR g = 2"));
+        // a statement that writes reads its own qualification the same way
+        assertEquals(0, update("UPDATE wwa_b_g SET k = 'z' WHERE false AND g = 2 OR false"));
+        assertEquals(0, update("DELETE FROM wwa_b_g WHERE false AND g = 2 OR false"));
+        assertEquals("five,zero", column("SELECT k FROM wwa_b_g ORDER BY a DESC"));
+    }
+
+    @Test
+    void anUpdateThatWritesNothingAsksItsFromClauseForNothing() throws Exception {
+        exec("CREATE TABLE wwa_c_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wwa_c_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wwa_c_o (a int, note text)");
+        exec("INSERT INTO wwa_c_o VALUES (5,'x'),(0,'y')");
+        String kept = "WITH c AS MATERIALIZED (SELECT * FROM wwa_c_g) ";
+
+        assertEquals(0, update(kept + "UPDATE wwa_c_o SET note = 'z' FROM c WHERE false"));
+        assertEquals(0, update(kept + "UPDATE wwa_c_o SET note = 'z' FROM c WHERE false AND c.a = 5"));
+        assertEquals(0, update(kept
+                + "UPDATE wwa_c_o SET note = 'z' FROM c WHERE false AND c.a = 5 OR false"));
+        assertEquals(0, update(kept + "UPDATE wwa_c_o SET note = 'z' FROM c WHERE 1 = 0"));
+        assertEquals(0, update(kept + "UPDATE wwa_c_o SET note = 'z' FROM c WHERE NULL"));
+        // what the assignment reads of the item changes nothing: it is worked out for the rows the
+        // statement wrote, and it wrote none
+        assertEquals(0, update(kept + "UPDATE wwa_c_o SET note = c.k FROM c WHERE false"));
+        assertEquals(0, update(kept + "UPDATE wwa_c_o SET note = c.g::text FROM c WHERE false"));
+        assertEquals("", rows(kept
+                + "UPDATE wwa_c_o SET note = 'z' FROM c WHERE false RETURNING wwa_c_o.a"));
+        // a query inside the clause is read for the same statement, and so is an item read by an
+        // item
+        assertEquals(0, update(kept
+                + "UPDATE wwa_c_o SET note = 'z' FROM (SELECT count(*) AS n FROM c) s WHERE false"));
+        assertEquals(0, update("WITH c AS MATERIALIZED (SELECT * FROM wwa_c_g),"
+                + " d AS MATERIALIZED (SELECT * FROM c)"
+                + " UPDATE wwa_c_o SET note = 'z' FROM d WHERE false"));
+        assertEquals("0|y / 5|x", rows("SELECT a, note FROM wwa_c_o ORDER BY a"));
+
+        // a qualification that admits no row only because of what it reads of a row is read row by
+        // row, so the item is asked
+        assertEquals("22012", stateOf(kept + "UPDATE wwa_c_o SET note = 'z' FROM c"));
+        assertEquals("division by zero",
+                messageOf(kept + "UPDATE wwa_c_o SET note = 'z' FROM c"));
+        assertEquals("22012", stateOf(kept + "UPDATE wwa_c_o SET note = 'z' FROM c WHERE c.a = 99"));
+        assertEquals("22012",
+                stateOf(kept + "UPDATE wwa_c_o SET note = 'z' FROM c WHERE wwa_c_o.a = 99"));
+        assertEquals("22012",
+                stateOf(kept + "UPDATE wwa_c_o SET note = 'z' FROM c WHERE false OR c.a = 5"));
+        assertEquals("0|y / 5|x", rows("SELECT a, note FROM wwa_c_o ORDER BY a"));
+    }
+
+    @Test
+    void anInnerJoinInThatClauseIsSettledWithItAndAnOuterJoinIsNot() throws Exception {
+        exec("CREATE TABLE wwa_d_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wwa_d_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wwa_d_o (a int, note text)");
+        exec("INSERT INTO wwa_d_o VALUES (5,'x'),(0,'y')");
+        exec("CREATE TABLE wwa_d_w (i int, s text)");
+        String kept = "WITH c AS MATERIALIZED (SELECT * FROM wwa_d_g) ";
+
+        assertEquals(0, update(kept + "UPDATE wwa_d_o SET note = 'z' FROM c, wwa_d_w w WHERE false"));
+        assertEquals(0, update(kept + "UPDATE wwa_d_o SET note = 'z' FROM c JOIN wwa_d_w w ON false"));
+        // the side an outer join preserves is read whatever its condition says
+        assertEquals("22012",
+                stateOf(kept + "UPDATE wwa_d_o SET note = 'z' FROM c LEFT JOIN wwa_d_w w ON false"));
+        assertEquals("0|y / 5|x", rows("SELECT a, note FROM wwa_d_o ORDER BY a"));
+    }
+
+    @Test
+    void aDeleteThatDeletesNothingAsksItsUsingClauseForNothing() throws Exception {
+        exec("CREATE TABLE wwa_e_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wwa_e_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wwa_e_o (a int, note text)");
+        exec("INSERT INTO wwa_e_o VALUES (5,'x'),(0,'y')");
+        exec("CREATE VIEW wwa_e_v AS SELECT * FROM wwa_e_g");
+        String kept = "WITH c AS MATERIALIZED (SELECT * FROM wwa_e_g) ";
+
+        assertEquals(0, update(kept + "DELETE FROM wwa_e_o USING c WHERE false"));
+        assertEquals(0, update(kept + "DELETE FROM wwa_e_o USING c WHERE false AND c.a = 5"));
+        assertEquals(0, update(kept + "DELETE FROM wwa_e_o USING c WHERE false AND c.a = 5 OR false"));
+        assertEquals(0, update(kept + "DELETE FROM wwa_e_o USING c WHERE NULL"));
+        assertEquals("", rows(kept + "DELETE FROM wwa_e_o USING c WHERE false RETURNING wwa_e_o.a"));
+        // a derived table, a view and the relation itself are asked for nothing either, even where
+        // the qualification names the generated column beside the false part
+        assertEquals(0, update(
+                "DELETE FROM wwa_e_o USING (SELECT * FROM wwa_e_g) s WHERE false AND s.g = 2"));
+        assertEquals(0, update("DELETE FROM wwa_e_o USING wwa_e_v WHERE false AND wwa_e_v.g = 2"));
+        assertEquals(0, update("DELETE FROM wwa_e_o USING wwa_e_g WHERE false AND wwa_e_g.g = 2"));
+        assertEquals("0|y / 5|x", rows("SELECT a, note FROM wwa_e_o ORDER BY a"));
+
+        assertEquals("22012", stateOf(kept + "DELETE FROM wwa_e_o USING c WHERE c.a = 99"));
+        assertEquals("22012", stateOf(kept + "DELETE FROM wwa_e_o USING c"));
+        assertEquals("22012",
+                stateOf("DELETE FROM wwa_e_o USING (SELECT * FROM wwa_e_g) s WHERE s.g = 2"));
+        assertEquals("22012", stateOf("DELETE FROM wwa_e_o USING wwa_e_v WHERE wwa_e_v.g = 2"));
+        assertEquals("0|y / 5|x", rows("SELECT a, note FROM wwa_e_o ORDER BY a"));
+    }
+
+    @Test
+    void anInsertReadsItsQueryTheWayAnyOtherQueryIsRead() throws Exception {
+        exec("CREATE TABLE wwa_f_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wwa_f_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wwa_f_w (i int, s text)");
+        String kept = "WITH c AS MATERIALIZED (SELECT * FROM wwa_f_g) ";
+
+        assertEquals(0, update(kept + "INSERT INTO wwa_f_w SELECT a, k FROM c WHERE false"));
+        assertEquals(0, update(kept
+                + "INSERT INTO wwa_f_w SELECT a, k FROM c WHERE false AND c.a = 5 OR false"));
+        assertEquals(0L, num("SELECT count(*) FROM wwa_f_w"));
+        assertEquals("22012", stateOf(kept + "INSERT INTO wwa_f_w SELECT a, k FROM c WHERE c.a = 99"));
+        assertEquals("22012", stateOf(kept + "INSERT INTO wwa_f_w SELECT a, k FROM c"));
+        assertEquals(0L, num("SELECT count(*) FROM wwa_f_w"));
+    }
+
+    @Test
+    void aMergeThatPairsNothingAsksItsSourceForNothing() throws Exception {
+        exec("CREATE TABLE wwa_g_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wwa_g_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wwa_g_o (a int, note text)");
+        exec("INSERT INTO wwa_g_o VALUES (5,'x'),(0,'y')");
+        String kept = "WITH c AS MATERIALIZED (SELECT * FROM wwa_g_g) ";
+
+        assertEquals(0, update(kept
+                + "MERGE INTO wwa_g_o o USING c ON false WHEN MATCHED THEN UPDATE SET note = 'z'"));
+        assertEquals(0, update(kept + "MERGE INTO wwa_g_o o USING c ON o.a = c.a AND false"
+                + " WHEN MATCHED THEN UPDATE SET note = 'z'"));
+        // an arm that does nothing asks nothing of the join
+        assertEquals(0, update(kept + "MERGE INTO wwa_g_o o USING c ON o.a = c.a AND false"
+                + " WHEN MATCHED THEN UPDATE SET note = 'z' WHEN NOT MATCHED THEN DO NOTHING"));
+        assertEquals(0, update(kept
+                + "MERGE INTO wwa_g_o o USING c ON false WHEN MATCHED THEN DO NOTHING"));
+        assertEquals(0, update(kept
+                + "MERGE INTO wwa_g_o o USING c ON false WHEN MATCHED THEN DELETE"));
+        // a source narrowed to no rows before the statement reads it pairs with nothing too
+        assertEquals(0, update("MERGE INTO wwa_g_o o USING (SELECT * FROM wwa_g_g WHERE false) s"
+                + " ON o.a = s.a WHEN MATCHED THEN UPDATE SET note = 'p'"));
+        assertEquals("0|y / 5|x", rows("SELECT a, note FROM wwa_g_o ORDER BY a"));
+
+        // an arm written WHEN NOT MATCHED acts on a source row that paired with nothing, so every
+        // row of the source is read whatever the condition says
+        assertEquals("22012", stateOf(kept + "MERGE INTO wwa_g_o o USING c ON false"
+                + " WHEN NOT MATCHED THEN INSERT (a, note) VALUES (c.a, 'n')"));
+        assertEquals("22012", stateOf(kept + "MERGE INTO wwa_g_o o USING c ON o.a = c.a"
+                + " WHEN MATCHED THEN UPDATE SET note = 'z'"));
+        assertEquals("0|y / 5|x", rows("SELECT a, note FROM wwa_g_o ORDER BY a"));
+    }
+
+    @Test
+    void anArmForATargetRowNoSourceRowPairedWithStillRunsOverTheWholeTarget() throws Exception {
+        exec("CREATE TABLE wwa_h_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wwa_h_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wwa_h_o (a int, note text)");
+        exec("INSERT INTO wwa_h_o VALUES (5,'x'),(0,'y')");
+        String kept = "WITH c AS MATERIALIZED (SELECT * FROM wwa_h_g) ";
+
+        assertEquals(2, update(kept + "MERGE INTO wwa_h_o o USING c ON false"
+                + " WHEN NOT MATCHED BY SOURCE THEN UPDATE SET note = 's'"));
+        assertEquals("0|s / 5|s", rows("SELECT a, note FROM wwa_h_o ORDER BY a"));
+        // an arm that does nothing does not make the source the preserved side either
+        assertEquals(2, update(kept + "MERGE INTO wwa_h_o o USING c ON false"
+                + " WHEN NOT MATCHED THEN DO NOTHING"
+                + " WHEN NOT MATCHED BY SOURCE THEN UPDATE SET note = 'q'"));
+        assertEquals("0|q / 5|q", rows("SELECT a, note FROM wwa_h_o ORDER BY a"));
+        // one arm that acts on an unpaired source row is enough to have every row of the source
+        // read, whatever the other arms say and whatever condition is written on it
+        assertEquals("22012", stateOf(kept + "MERGE INTO wwa_h_o o USING c ON false"
+                + " WHEN NOT MATCHED THEN INSERT (a, note) VALUES (c.a, 'n')"
+                + " WHEN NOT MATCHED BY SOURCE THEN UPDATE SET note = 'r'"));
+        assertEquals("22012", stateOf(kept + "MERGE INTO wwa_h_o o USING c ON false"
+                + " WHEN NOT MATCHED AND c.a = 99 THEN INSERT (a, note) VALUES (c.a, 'n')"));
+        assertEquals("0|q / 5|q", rows("SELECT a, note FROM wwa_h_o ORDER BY a"));
+        assertEquals(2, update(kept
+                + "MERGE INTO wwa_h_o o USING c ON false WHEN NOT MATCHED BY SOURCE THEN DELETE"));
+        assertEquals(0L, num("SELECT count(*) FROM wwa_h_o"));
+    }
+
+    // ------------------------------------------------------------ every spelling of a
+    // ------------------------------------------------------------ qualification that holds a query
+
+    // PostgreSQL orders the parts of a qualification by what each costs to work out and stops at the
+    // first that is false, so a part holding a query — EXISTS, IN, = ANY, <> ALL, a scalar
+    // sub-select — is read after every plain comparison standing beside it. It also stops reading the
+    // sub-select itself at the row that settles what it was asked: EXISTS and NOT EXISTS at the first
+    // row answered at all, ALL at the first row the comparison fails of. An ANY comparison is not
+    // read that way — every row of the sub-select is read into a table of values and the comparison
+    // answered out of that — which is why IN reaches a row EXISTS stopped in front of. What the
+    // sub-select says about the row it is compared with is the condition of the join the two are read
+    // as rather than a filter on its own scan; what does narrow that scan is the constant an
+    // equivalence class carries onto it, o.a = 5 beside s.a = o.a saying s.a = 5.
+
+    @Test
+    void allOfASubSelectStopsAtTheFirstRowTheComparisonFailsOf() throws Exception {
+        exec("CREATE TABLE wqh_a_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wqh_a_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wqh_a_o (a int, note text)");
+        exec("INSERT INTO wqh_a_o VALUES (5,'x'),(0,'y')");
+        String all = " WHERE o.a <> ALL (SELECT s.a FROM wqh_a_g s WHERE s.g = 2)";
+
+        // the row in front of the sub-select fails the comparison, so the row behind it — the one
+        // 10/a raises for — is never read
+        assertEquals("", column("SELECT o.a FROM wqh_a_o o" + all + " AND o.a = 5"));
+        assertEquals("", column("SELECT o.a FROM wqh_a_o o" + all + " AND o.a > 4"));
+        assertEquals("", column("SELECT o.a FROM wqh_a_o o" + all + " AND o.a IN (5,6)"));
+
+        // with no row of the statement rejected first the comparison holds of the row in front, and
+        // the row behind it is read after all
+        assertEquals("22012", stateOf("SELECT o.a FROM wqh_a_o o" + all));
+        assertEquals("division by zero", messageOf("SELECT o.a FROM wqh_a_o o" + all));
+        assertEquals(null, detailOf("SELECT o.a FROM wqh_a_o o" + all));
+        assertEquals(null, hintOf("SELECT o.a FROM wqh_a_o o" + all));
+    }
+
+    @Test
+    void anUncorrelatedExistsIsAnsweredByTheFirstRowTheSubSelectHolds() throws Exception {
+        exec("CREATE TABLE wqh_b_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wqh_b_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wqh_b_o (a int, note text)");
+        exec("INSERT INTO wqh_b_o VALUES (5,'x'),(0,'y')");
+
+        assertEquals("5", scalar("SELECT o.a FROM wqh_b_o o"
+                + " WHERE o.a = 5 AND EXISTS (SELECT 1 FROM wqh_b_g s WHERE s.g = 2)"));
+        // the order the two parts are written in says nothing about the order they are read in
+        assertEquals("5", scalar("SELECT o.a FROM wqh_b_o o"
+                + " WHERE EXISTS (SELECT 1 FROM wqh_b_g s WHERE s.g = 2) AND o.a = 5"));
+        // and neither does what the sub-select's own select list names
+        assertEquals("5", scalar("SELECT o.a FROM wqh_b_o o"
+                + " WHERE o.a = 5 AND EXISTS (SELECT s.a FROM wqh_b_g s WHERE s.g = 2)"));
+        assertEquals("5", scalar("SELECT o.a FROM wqh_b_o o WHERE o.a = 5"
+                + " AND EXISTS (SELECT 1 FROM wqh_b_g s WHERE s.a > 0 AND s.g = 2)"));
+        assertEquals("5", scalar("SELECT o.a FROM wqh_b_o o WHERE o.a = 5"
+                + " AND EXISTS (SELECT 1 FROM wqh_b_g s WHERE s.g = 2 AND true)"));
+        assertEquals("5", scalar("SELECT o.a FROM wqh_b_o o WHERE o.a = 5"
+                + " AND EXISTS (SELECT 1 FROM wqh_b_g s WHERE s.g = 2 LIMIT 1)"));
+        assertEquals("(no rows)", scalar("SELECT o.a FROM wqh_b_o o"
+                + " WHERE o.a = 9 AND EXISTS (SELECT 1 FROM wqh_b_g s WHERE s.g = 2)"));
+
+        // the sub-select is read no further whatever else the statement holds beside it
+        assertEquals("5,0", column("SELECT o.a FROM wqh_b_o o"
+                + " WHERE EXISTS (SELECT 1 FROM wqh_b_g s WHERE s.g = 2)"));
+    }
+
+    @Test
+    void anAnyComparisonIsAnsweredOutOfEveryRowTheSubSelectHolds() throws Exception {
+        exec("CREATE TABLE wqh_c_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wqh_c_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wqh_c_o (a int, note text)");
+        exec("INSERT INTO wqh_c_o VALUES (5,'x'),(0,'y')");
+
+        // every row goes into a table of values before the comparison is answered, so the row EXISTS
+        // stopped in front of is reached however plainly the answer is settled by the first
+        assertEquals("22012", stateOf("SELECT o.a FROM wqh_c_o o"
+                + " WHERE o.a = 5 AND 5 IN (SELECT s.a FROM wqh_c_g s WHERE s.g = 2)"));
+        assertEquals("22012", stateOf("SELECT o.a FROM wqh_c_o o"
+                + " WHERE o.a = 5 AND 5 = ANY (SELECT s.a FROM wqh_c_g s WHERE s.g = 2)"));
+        assertEquals("22012", stateOf("SELECT o.a FROM wqh_c_o o"
+                + " WHERE o.a = 5 AND 1 IN (SELECT 1 FROM wqh_c_g s WHERE s.g = 2)"));
+        // NOT IN is that comparison standing under a NOT, and is read the same way
+        assertEquals("22012", stateOf("SELECT o.a FROM wqh_c_o o"
+                + " WHERE o.a NOT IN (SELECT s.a FROM wqh_c_g s WHERE s.g = 2) AND o.a = 5"));
+        assertEquals("division by zero", messageOf("SELECT o.a FROM wqh_c_o o"
+                + " WHERE o.a = 5 AND 5 IN (SELECT s.a FROM wqh_c_g s WHERE s.g = 2)"));
+    }
+
+    @Test
+    void aSetOperationInsideTheSubSelectTakesTheRestriction() throws Exception {
+        exec("CREATE TABLE wqh_d_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wqh_d_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wqh_d_o (a int, note text)");
+        exec("INSERT INTO wqh_d_o VALUES (5,'x'),(0,'y')");
+
+        // a set operation answers with the rows of both its queries, so the restriction the
+        // statement's own equality derives stands on each of their scans
+        assertEquals("5", scalar("SELECT o.a FROM wqh_d_o o WHERE o.a IN"
+                + " (SELECT s.a FROM wqh_d_g s WHERE s.g = 2 UNION SELECT 7) AND o.a = 5"));
+        assertEquals("5", scalar("SELECT o.a FROM wqh_d_o o WHERE o.a IN"
+                + " (SELECT s.a FROM wqh_d_g s WHERE s.g = 2 UNION ALL SELECT 7) AND o.a = 5"));
+
+        // with nothing pinning the column of the statement above, nothing is carried in
+        assertEquals("22012", stateOf("SELECT o.a FROM wqh_d_o o WHERE o.a IN"
+                + " (SELECT s.a FROM wqh_d_g s WHERE s.g = 2 UNION SELECT 7)"));
+    }
+
+    @Test
+    void aDerivedTableInsideTheSubSelectTakesTheRestriction() throws Exception {
+        exec("CREATE TABLE wqh_e_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wqh_e_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wqh_e_o (a int, note text)");
+        exec("INSERT INTO wqh_e_o VALUES (5,'x'),(0,'y')");
+
+        // the restriction reaches the relation the sub-select's own derived table is built from,
+        // because the whole chain is pulled up into the one query at once
+        assertEquals("5", scalar("SELECT o.a FROM wqh_e_o o WHERE o.a IN"
+                + " (SELECT t.a FROM (SELECT * FROM wqh_e_g) t WHERE t.g = 2) AND o.a = 5"));
+        assertEquals("5", scalar("SELECT o.a FROM wqh_e_o o WHERE o.a = 5 AND o.a IN"
+                + " (SELECT t.a FROM (SELECT * FROM wqh_e_g) t WHERE t.g = 2)"));
+        assertEquals("5", scalar("SELECT o.a FROM wqh_e_o o WHERE o.a = 5 AND EXISTS"
+                + " (SELECT 1 FROM (SELECT * FROM wqh_e_g) s WHERE s.a = o.a AND s.g = 2)"));
+        // the relation standing on both sides of the comparison is no different
+        assertEquals("5", scalar("SELECT a FROM wqh_e_g t1 WHERE a = 5"
+                + " AND EXISTS (SELECT 1 FROM wqh_e_g t2 WHERE t2.a = t1.a AND t2.g = 2)"));
+        // a scalar sub-select is run once for each row of the statement above with that row's values
+        // standing in it, so what it compares with them is a filter on its own scan
+        assertEquals("5", scalar("SELECT o.a FROM wqh_e_o o"
+                + " WHERE (SELECT max(s.g) FROM wqh_e_g s WHERE s.a = o.a) = 2 AND o.a = 5"));
+
+        // and with nothing pinning the column, nothing narrows the scan
+        assertEquals("22012", stateOf("SELECT o.a FROM wqh_e_o o WHERE o.a IN"
+                + " (SELECT t.a FROM (SELECT * FROM wqh_e_g) t WHERE t.g = 2)"));
+    }
+
+    @Test
+    void aComparisonWithTheRowAboveIsAJoinConditionAndNotAFilterOnTheSubSelectsScan()
+            throws Exception {
+        exec("CREATE TABLE wqh_f_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wqh_f_g (a,k) VALUES (5,'five'),(0,'zero'),(2,'two')");
+        exec("CREATE TABLE wqh_f_o (a int, note text)");
+        exec("INSERT INTO wqh_f_o VALUES (5,'x'),(2,'y')");
+
+        // no row of the statement above selects the row where a is 0, and the row is reached all the
+        // same: the comparison settles which rows pair, not which rows there are
+        assertEquals("22012", stateOf("SELECT o.note FROM wqh_f_o o WHERE EXISTS"
+                + " (SELECT 1 FROM (SELECT * FROM wqh_f_g) s WHERE s.a = o.a AND s.g = 2)"));
+        assertEquals("division by zero", messageOf("SELECT o.note FROM wqh_f_o o WHERE EXISTS"
+                + " (SELECT 1 FROM (SELECT * FROM wqh_f_g) s WHERE s.a = o.a AND s.g = 2)"));
+        assertEquals("22012", stateOf("SELECT o.note FROM wqh_f_o o WHERE EXISTS"
+                + " (SELECT 1 FROM wqh_f_g s WHERE s.a = o.a AND s.g = 2)"));
+        assertEquals("22012", stateOf("SELECT o.note FROM wqh_f_o o WHERE NOT EXISTS"
+                + " (SELECT 1 FROM wqh_f_g s WHERE s.a = o.a AND s.g = 2)"));
+        assertEquals("22012", stateOf("SELECT o.note FROM wqh_f_o o WHERE o.a IN"
+                + " (SELECT s.a FROM wqh_f_g s WHERE s.a = o.a AND s.g = 2)"));
+        // the order the two are written in inside the sub-select says nothing either
+        assertEquals("22012", stateOf("SELECT o.note FROM wqh_f_o o WHERE EXISTS"
+                + " (SELECT 1 FROM wqh_f_g s WHERE s.g = 2 AND s.a = o.a)"));
+
+        // a plain comparison beside it is read first and settles the row before anything is asked of
+        // the sub-select at all
+        assertEquals("x", scalar("SELECT o.note FROM wqh_f_o o WHERE EXISTS"
+                + " (SELECT 1 FROM wqh_f_g s WHERE s.a = o.a AND s.g = 2) AND o.note = 'x'"));
+        assertEquals("x", scalar("SELECT o.note FROM wqh_f_o o WHERE o.a = 5 AND EXISTS"
+                + " (SELECT 1 FROM wqh_f_g s WHERE s.a = o.a AND s.g = 2)"));
+        assertEquals("x", scalar("SELECT o.note FROM wqh_f_o o WHERE o.a = 5 AND EXISTS"
+                + " (SELECT 1 FROM (SELECT * FROM wqh_f_g) s WHERE s.a = o.a AND s.g = 2)"));
+        assertEquals("y", scalar("SELECT o.note FROM wqh_f_o o WHERE o.a = 2 AND EXISTS"
+                + " (SELECT 1 FROM wqh_f_g s WHERE s.a = o.a AND s.g = 5)"));
+        // an ALL correlated with the row above is narrowed by that correlation alone
+        assertEquals("y", scalar("SELECT o.note FROM wqh_f_o o WHERE o.a <> ALL"
+                + " (SELECT s.a FROM wqh_f_g s WHERE s.a = o.a AND s.g = 2)"));
+        assertEquals("x", scalar("SELECT o.note FROM wqh_f_o o"
+                + " WHERE (SELECT max(s.g) FROM wqh_f_g s WHERE s.a = o.a) = 2"));
+    }
+
+    @Test
+    void theWritePathsThatBringInASecondRelationReadTheQualificationTheSameWay() throws Exception {
+        exec("CREATE TABLE wqh_g_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wqh_g_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wqh_g_o (a int, note text)");
+        exec("INSERT INTO wqh_g_o VALUES (5,'x'),(0,'y')");
+        exec("CREATE TABLE wqh_g_p (a int)");
+        exec("INSERT INTO wqh_g_p VALUES (5),(0)");
+
+        assertEquals(1, update("UPDATE wqh_g_o o SET note='z' FROM wqh_g_p p WHERE p.a = o.a"
+                + " AND EXISTS (SELECT 1 FROM wqh_g_g s WHERE s.a = o.a AND s.g = 2) AND o.a = 5"));
+        assertEquals("0|y / 5|z", rows("SELECT a, note FROM wqh_g_o ORDER BY a"));
+        assertEquals(1, update("DELETE FROM wqh_g_o o USING wqh_g_p p WHERE p.a = o.a"
+                + " AND EXISTS (SELECT 1 FROM wqh_g_g s WHERE s.a = o.a AND s.g = 2) AND o.a = 5"));
+        assertEquals("0|y", rows("SELECT a, note FROM wqh_g_o ORDER BY a"));
+
+        // through the derived table the sub-select reads
+        exec("INSERT INTO wqh_g_o VALUES (5,'x')");
+        assertEquals(1, update("UPDATE wqh_g_o o SET note='q' FROM wqh_g_p p WHERE p.a = o.a"
+                + " AND o.a IN (SELECT t.a FROM (SELECT * FROM wqh_g_g) t WHERE t.g = 2)"
+                + " AND o.a = 5"));
+        assertEquals("0|y / 5|q", rows("SELECT a, note FROM wqh_g_o ORDER BY a"));
+        assertEquals(1, update("DELETE FROM wqh_g_o o USING wqh_g_p p WHERE p.a = o.a"
+                + " AND o.a IN (SELECT t.a FROM (SELECT * FROM wqh_g_g) t WHERE t.g = 2)"
+                + " AND o.a = 5"));
+        assertEquals("0|y", rows("SELECT a, note FROM wqh_g_o ORDER BY a"));
+
+        // and through a set operation
+        exec("INSERT INTO wqh_g_o VALUES (5,'x')");
+        assertEquals(1, update("UPDATE wqh_g_o o SET note='r' FROM wqh_g_p p WHERE p.a = o.a"
+                + " AND o.a IN (SELECT s.a FROM wqh_g_g s WHERE s.g = 2 UNION SELECT 7)"
+                + " AND o.a = 5"));
+        assertEquals("0|y / 5|r", rows("SELECT a, note FROM wqh_g_o ORDER BY a"));
+
+        // with nothing pinning the target's column the sub-select is read whole, and the write is
+        // refused before it wrote anything
+        assertEquals("22012", stateOf("UPDATE wqh_g_o o SET note='s' FROM wqh_g_p p"
+                + " WHERE p.a = o.a AND EXISTS"
+                + " (SELECT 1 FROM wqh_g_g s WHERE s.a = o.a AND s.g = 2)"));
+        assertEquals("22012", stateOf("DELETE FROM wqh_g_o o USING wqh_g_p p"
+                + " WHERE p.a = o.a AND EXISTS"
+                + " (SELECT 1 FROM wqh_g_g s WHERE s.a = o.a AND s.g = 2)"));
+        assertEquals("0|y / 5|r", rows("SELECT a, note FROM wqh_g_o ORDER BY a"));
+    }
+
+    @Test
+    void whatAnAssignmentReadsIsWorkedOutForEveryPairTheJoinAnsweredWith() throws Exception {
+        exec("CREATE TABLE wqh_h_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wqh_h_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wqh_h_o (a int, note text)");
+        exec("INSERT INTO wqh_h_o VALUES (5,'x'),(0,'y')");
+
+        // the new row is built for every pair the join made, not only for the one each target row is
+        // finally written from
+        assertEquals("22012", stateOf("UPDATE wqh_h_o o SET note = g.g::text FROM wqh_h_g g"));
+        assertEquals("0|y / 5|x", rows("SELECT a, note FROM wqh_h_o ORDER BY a"));
+        assertEquals("22012",
+                stateOf("UPDATE wqh_h_o o SET note = g.g::text FROM wqh_h_g g WHERE g.a = o.a"));
+        assertEquals("0|y / 5|x", rows("SELECT a, note FROM wqh_h_o ORDER BY a"));
+
+        // narrowed to the one pair, it is worked out for that pair alone
+        assertEquals(1, update("UPDATE wqh_h_o o SET note = g.g::text FROM wqh_h_g g"
+                + " WHERE g.a = o.a AND o.a = 5"));
+        assertEquals("0|y / 5|2", rows("SELECT a, note FROM wqh_h_o ORDER BY a"));
+
+        // a statement that names no VIRTUAL column of the relation it brought in works none of them
+        // out, however many pairs the join answered with
+        assertEquals(2, update("UPDATE wqh_h_o o SET note = 'u' FROM wqh_h_g g WHERE g.a = o.a"));
+        assertEquals("0|u / 5|u", rows("SELECT a, note FROM wqh_h_o ORDER BY a"));
+        // and a DELETE naming it in its qualification is narrowed the same way
+        assertEquals(1, update("DELETE FROM wqh_h_o o USING wqh_h_g g"
+                + " WHERE g.a = o.a AND o.a = 5 AND g.g = 2"));
+        assertEquals("0|u", rows("SELECT a, note FROM wqh_h_o ORDER BY a"));
+    }
+
+    // ------------------------------------------------------------ an alias list names the column
+    // ------------------------------------------------------------ standing in each place
+
+    // An alias list on a FROM item renames the columns the item exposes one for one from the left, so
+    // what the query above calls a column is read off the PLACE the column stands in and off nothing
+    // else: not off what the item's own select list happened to call it, not off whether the relation
+    // underneath is stored or is a view, and not off how many places one of its columns stands in.
+    // The name is what a restriction is carried up under, and a restriction is what decides a row
+    // before a VIRTUAL generated column of it is reached.
+
+    @Test
+    void anAliasListNamesTheColumnStandingInEachPlaceAndNotTheOneTheSelectListNamed()
+            throws Exception {
+        exec("CREATE TABLE wpc_a_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wpc_a_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wpc_a_o (a int, note text)");
+        exec("INSERT INTO wpc_a_o VALUES (5,'x'),(0,'y')");
+        String renamed = " FROM wpc_a_o o LEFT JOIN LATERAL"
+                + " (SELECT z.a AS aa, z.k, z.g FROM wpc_a_g z WHERE z.a = o.a) s(u,v,w)"
+                + " ON s.w = 2 WHERE o.a = 5";
+
+        // the item's own comparison says s's first column is o.a and o.a = 5 says that column is 5,
+        // which is a restriction on the item's own scan and settles the row 10/a raises for before
+        // the expression is reached — and which column of s that is, is read off the place it stands
+        // in, the select list calling it aa changing nothing above
+        assertEquals("2", scalar("SELECT s.w" + renamed));
+        assertEquals("5|five|2", rows("SELECT s.u, s.v, s.w" + renamed));
+        assertEquals("five", scalar("SELECT s.v" + renamed));
+        assertEquals("2", scalar("SELECT s.w FROM wpc_a_o o, LATERAL"
+                + " (SELECT z.a AS aa, z.k, z.g FROM wpc_a_g z WHERE z.a = o.a) s(u,v,w)"
+                + " WHERE o.a = 5 AND s.w = 2"));
+
+        // with no alias list over it, what the select list called the column IS the name above
+        assertEquals("5", scalar("SELECT s.aa FROM wpc_a_o o LEFT JOIN LATERAL"
+                + " (SELECT z.a AS aa, z.k, z.g FROM wpc_a_g z WHERE z.a = o.a) s"
+                + " ON s.g = 2 WHERE o.a = 5"));
+        assertEquals("2", scalar("SELECT s.g FROM wpc_a_o o LEFT JOIN LATERAL"
+                + " (SELECT z.a AS aa, z.k, z.g FROM wpc_a_g z WHERE z.a = o.a) s"
+                + " ON s.g = 2 WHERE o.a = 5"));
+
+        // a select list that gives its columns each other's names is read by place just the same
+        assertEquals("2", scalar("SELECT s.w FROM wpc_a_o o LEFT JOIN LATERAL"
+                + " (SELECT z.k AS g, z.a AS k, z.g AS a FROM wpc_a_g z WHERE z.a = o.a) s(u,v,w)"
+                + " ON s.w = 2 WHERE o.a = 5"));
+        assertEquals("five|5|2", rows("SELECT s.u, s.v, s.w FROM wpc_a_o o LEFT JOIN LATERAL"
+                + " (SELECT z.k AS g, z.a AS k, z.g AS a FROM wpc_a_g z WHERE z.a = o.a) s(u,v,w)"
+                + " ON s.w = 2 WHERE o.a = 5"));
+        // an item reaching for nothing takes the constant through the join's own condition
+        assertEquals("2", scalar("SELECT s.w FROM wpc_a_o o LEFT JOIN"
+                + " (SELECT z.a AS aa, z.k, z.g FROM wpc_a_g z) s(u,v,w)"
+                + " ON s.u = o.a AND s.w = 2 WHERE o.a = 5"));
+
+        // with nothing carrying a constant onto the item, the renaming changes nothing
+        assertEquals("22012", stateOf("SELECT s.w FROM wpc_a_o o LEFT JOIN LATERAL"
+                + " (SELECT z.a AS aa, z.k, z.g FROM wpc_a_g z WHERE z.a = o.a) s(u,v,w)"
+                + " ON s.w = 2 WHERE o.note = 'x'"));
+        assertEquals("22012", stateOf("SELECT s.g FROM wpc_a_o o LEFT JOIN LATERAL"
+                + " (SELECT z.a AS aa, z.k, z.g FROM wpc_a_g z WHERE z.a = o.a) s"
+                + " ON s.g = 2 WHERE o.note = 'x'"));
+    }
+
+    @Test
+    void anAliasListOverAViewCountsTheViewsOwnColumnOrderThrough() throws Exception {
+        exec("CREATE TABLE wpc_b_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wpc_b_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wpc_b_o (a int, note text)");
+        exec("INSERT INTO wpc_b_o VALUES (5,'x'),(0,'y')");
+        exec("CREATE VIEW wpc_b_v AS SELECT * FROM wpc_b_g");
+        exec("CREATE VIEW wpc_b_v2 AS SELECT z.k, z.a, z.g FROM wpc_b_g z");
+
+        // a view exposes its columns in the order its own definition gives them, and an alias list
+        // stands over that order like any other
+        assertEquals("2", scalar("SELECT s.w FROM wpc_b_o o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wpc_b_v z WHERE z.a = o.a) s(u,v,w) ON s.w = 2 WHERE o.a = 5"));
+        assertEquals("5|five|2", rows("SELECT s.u, s.v, s.w FROM wpc_b_o o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wpc_b_v z WHERE z.a = o.a) s(u,v,w) ON s.w = 2 WHERE o.a = 5"));
+        assertEquals("22012", stateOf("SELECT s.w FROM wpc_b_o o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wpc_b_v z WHERE z.a = o.a) s(u,v,w)"
+                + " ON s.w = 2 WHERE o.note = 'x'"));
+
+        // a view whose body puts the columns in another order puts them in that order above
+        assertEquals("2", scalar("SELECT s.w FROM wpc_b_o o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wpc_b_v2 z WHERE z.a = o.a) s(u,v,w) ON s.w = 2 WHERE o.a = 5"));
+        assertEquals("five|5|2", rows("SELECT s.u, s.v, s.w FROM wpc_b_o o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wpc_b_v2 z WHERE z.a = o.a) s(u,v,w)"
+                + " ON s.w = 2 WHERE o.a = 5"));
+    }
+
+    @Test
+    void aColumnAnItemExposesTwiceStandsInTwoPlacesAndBothCarryTheOneValue() throws Exception {
+        exec("CREATE TABLE wpc_c_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wpc_c_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wpc_c_o (a int, note text)");
+        exec("INSERT INTO wpc_c_o VALUES (5,'x'),(0,'y')");
+        String twice = " FROM wpc_c_o o LEFT JOIN LATERAL"
+                + " (SELECT z.a, z.a, z.g FROM wpc_c_g z WHERE z.a = o.a) s(u,v,w) ON s.w = 2";
+
+        // the list gives each place its own name and both places carry the one column's value, so
+        // what the comparison inside the item says of the first is said of the second as well
+        assertEquals("2", scalar("SELECT s.w" + twice + " WHERE o.a = 5"));
+        assertEquals("5|5|2", rows("SELECT s.u, s.v, s.w" + twice + " WHERE o.a = 5"));
+        assertEquals("5", scalar("SELECT s.u FROM wpc_c_o o LEFT JOIN LATERAL"
+                + " (SELECT z.a, z.a, z.g FROM wpc_c_g z WHERE z.a = o.a) s(u,v,w)"
+                + " ON s.u = 5 WHERE o.a = 5"));
+        assertEquals("22012", stateOf("SELECT s.w" + twice + " WHERE o.note = 'x'"));
+    }
+
+    @Test
+    void aJoinConditionAboutTheSideTheJoinDoesNotPreserveRestrictsThatSidesScan()
+            throws Exception {
+        exec("CREATE TABLE wpc_d_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wpc_d_g (a,k) VALUES (5,'five'),(0,'zero')");
+        exec("CREATE TABLE wpc_d_o1 (a int, note text)");
+        exec("INSERT INTO wpc_d_o1 VALUES (5,'x')");
+
+        // a row of the side an outer join does not preserve that the condition rejects is paired
+        // with nothing and carried by no row the query answers, so a part of the condition about
+        // that side alone decides which of its rows there are, exactly as a WHERE clause does — and
+        // an inner join answers the pairs its condition holds of and no others, so all of it does
+        assertEquals("2", scalar("SELECT s.g FROM wpc_d_o1 o LEFT JOIN LATERAL"
+                + " (SELECT * FROM wpc_d_g z) s ON s.a = 5 AND s.g = 2"));
+        assertEquals("2", scalar("SELECT s.g FROM wpc_d_o1 o LEFT JOIN"
+                + " (SELECT * FROM wpc_d_g z) s ON s.a = 5 AND s.g = 2"));
+        assertEquals("2", scalar("SELECT s.g FROM wpc_d_o1 o LEFT JOIN wpc_d_g s"
+                + " ON s.a = 5 AND s.g = 2"));
+        assertEquals("2", scalar("SELECT s.g FROM wpc_d_o1 o JOIN wpc_d_g s"
+                + " ON s.a = 5 AND s.g = 2"));
+        assertEquals("2", scalar("SELECT s.g FROM wpc_d_o1 o CROSS JOIN wpc_d_g s"
+                + " WHERE s.a = 5 AND s.g = 2"));
+        assertEquals("five", scalar("SELECT s.k FROM wpc_d_o1 o LEFT JOIN wpc_d_g s"
+                + " ON s.a = 5 AND s.g = 2"));
+        assertEquals("2", scalar("SELECT s.g FROM wpc_d_o1 o LEFT JOIN wpc_d_g s"
+                + " ON s.a = 5 AND s.k = 'five'"));
+
+        // the side the join preserves still answers its row, padded with nulls, when the condition
+        // holds of nothing at all
+        assertEquals("x|NULL", rows("SELECT o.note, s.g FROM wpc_d_o1 o LEFT JOIN wpc_d_g s"
+                + " ON s.a = 9 AND s.g = 2"));
+        // and a part about the preserved side says nothing about that side's own rows
+        assertEquals(1L, num("SELECT count(*) FROM wpc_d_o1 o LEFT JOIN wpc_d_g s"
+                + " ON o.note = 'q' AND s.a = 5"));
+
+        // a part naming the generated column restricts nothing, an OR restricts only by what every
+        // one of its branches says, and the side a RIGHT JOIN preserves is the side nothing is taken
+        // about
+        assertEquals("22012", stateOf("SELECT s.g FROM wpc_d_o1 o LEFT JOIN wpc_d_g s ON s.g = 2"));
+        assertEquals("22012", stateOf("SELECT s.g FROM wpc_d_o1 o LEFT JOIN wpc_d_g s"
+                + " ON s.a = 5 OR s.k = 'zero'"));
+        assertEquals("22012", stateOf("SELECT s.g FROM wpc_d_o1 o RIGHT JOIN wpc_d_g s"
+                + " ON s.a = 5 AND s.g = 2"));
+    }
+
+    @Test
+    void aQualificationSettledBeforeARowIsReadLeavesTheItemUncomputed() throws Exception {
+        exec("CREATE TABLE wpc_e_g (a int, k text, g int GENERATED ALWAYS AS (10/a) VIRTUAL)");
+        exec("INSERT INTO wpc_e_g (a,k) VALUES (5,'five'),(0,'zero')");
+        String kept = "WITH c AS MATERIALIZED (SELECT * FROM wpc_e_g)"
+                + " SELECT count(*) FROM c WHERE ";
+
+        // a sub-select with no FROM clause reads no relation, and one reaching out for nothing reads
+        // no row either, so it is settled once before the scan under the qualification is asked for
+        // anything — and a MATERIALIZED item nothing asks a row of is never computed at all
+        assertEquals(0L, num(kept + "(SELECT false)"));
+        assertEquals(0L, num(kept + "(SELECT false) AND c.a = 5"));
+        assertEquals(0L, num(kept + "(SELECT 1) = 2"));
+        assertEquals(0L, num(kept + "EXISTS (SELECT 1 WHERE false)"));
+        assertEquals(0L, num(kept + "NOT EXISTS (SELECT 1)"));
+        // one that settles true settles nothing, and the item is computed in full
+        assertEquals("22012", stateOf(kept + "(SELECT true)"));
+
+        // a call PostgreSQL declares IMMUTABLE is folded while it plans, so a qualification written
+        // out of one is settled before a row is read as surely as a written constant is
+        assertEquals(0L, num(kept + "lower('A') = 'b'"));
+        assertEquals(0L, num(kept + "lower('A') = 'b' OR false"));
+        assertEquals(0L, num(kept + "abs(-1) = 2"));
+        assertEquals(0L, num(kept + "length('abc') = 4"));
+        assertEquals(0L, num(kept + "substr('abc',1,1) = 'z'"));
+        assertEquals(0L, num(kept + "md5('a') = 'x'"));
+        assertEquals(0L, num(kept + "1 + 1 = 3"));
+        assertEquals(0L, num(kept + "upper('a') = 'B' AND c.a = 5"));
+        // one that folds to true settles nothing
+        assertEquals("22012", stateOf(kept + "lower('A') = 'a'"));
+
+        // the same settled qualification over a stored relation
+        assertEquals("(no rows)", scalar("SELECT g FROM wpc_e_g WHERE lower('A') = 'b'"));
+        assertEquals("22012", stateOf("SELECT g FROM wpc_e_g WHERE lower('A') = 'b' OR g = 2"));
+        assertEquals(0L, num("SELECT count(*) FROM wpc_e_g WHERE (SELECT false)"));
+
+        // and over the two write paths that bring in a second relation
+        exec("CREATE TABLE wpc_e_o (a int, note text)");
+        exec("INSERT INTO wpc_e_o VALUES (5,'x'),(0,'y')");
+        assertEquals(0, update("UPDATE wpc_e_o SET note = 'z' FROM wpc_e_g t"
+                + " WHERE t.a = wpc_e_o.a AND lower('A') = 'b'"));
+        assertEquals(0, update("UPDATE wpc_e_o SET note = 'z' FROM wpc_e_g t"
+                + " WHERE t.a = wpc_e_o.a AND (SELECT 1) = 2"));
+        assertEquals(0, update("DELETE FROM wpc_e_o USING wpc_e_g t"
+                + " WHERE t.a = wpc_e_o.a AND (SELECT false)"));
+        assertEquals("0|y / 5|x", rows("SELECT a, note FROM wpc_e_o ORDER BY a"));
+    }
 }

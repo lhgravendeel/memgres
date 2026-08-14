@@ -472,9 +472,14 @@ class DdlExecutor {
             if (table.getColumnIndex(col) < 0 && !col.equalsIgnoreCase(newColName)) {
                 // A name looked for under a relation is reported with the relation, as it was
                 // written and unquoted; one looked for on its own is quoted.
-                throw new MemgresException("column " + (ref.table() == null
+                MemgresException e = new MemgresException("column " + (ref.table() == null
                         ? "\"" + col + "\"" : ref.table() + "." + col)
                         + " does not exist", "42703");
+                // A near miss is offered here as it is for a name written in a query: the one
+                // relation the definition is stored on is the whole of what was in scope, so a
+                // column of it spelled almost the same way is what the writer probably meant.
+                e.setHint(RowContext.suggestClosestColumnOn(col, table));
+                throw e;
             }
         } else if (expr instanceof BinaryExpr) {
             BinaryExpr bin = (BinaryExpr) expr;
@@ -580,6 +585,18 @@ class DdlExecutor {
 
         public String userTypeDisplayName() { return userTypeDisplayName; }
 
+        /**
+         * The range type the written name denoted, and null for every other type. A range's values
+         * are carried as the text they print as, so the representation alone said text and a column
+         * of a reader's own range was indistinguishable from a text one -- the same thing that once
+         * hid a composite.
+         */
+        private String rangeTypeName;
+
+        void setRangeTypeName(String rangeTypeName) { this.rangeTypeName = rangeTypeName; }
+
+        public String rangeTypeName() { return rangeTypeName; }
+
         public DataType dataType() { return dataType; }
         public String enumTypeName() { return enumTypeName; }
         public String domainTypeName() { return domainTypeName; }
@@ -632,6 +649,15 @@ class DdlExecutor {
         // a type in the schema it had just been moved out of.
         String resolvedType = TypeNamespace.resolve(executor.database, executor.session, writtenBase);
         String baseType = resolvedType == null ? writtenBase : resolvedType;
+        // A modifier is something a type's own input function reads, and none of the types a
+        // reader defines has one: a domain's width belongs to the domain and was settled where the
+        // domain was, and an enum, a composite and a range have no width to write. PostgreSQL
+        // refuses the modifier where it is written rather than reading it and dropping it, which
+        // is what left an integer domain carrying a width nothing had ever given it.
+        if (resolvedType != null && !fullTypeName.equals(typeName.trim())) {
+            throw PgErrors.syntax("type modifier is not allowed for type \""
+                    + TypeNamespace.display(executor.database, executor.session, baseType) + "\"");
+        }
         if (!baseType.equals(writtenBase)) {
             fullTypeName = isArray ? baseType + "[]" : baseType;
         }
@@ -692,7 +718,16 @@ class DdlExecutor {
                 domainPrecision = domain.getPrecision();
                 domainScale = domain.getScale();
                 domainInterval = domain.getIntervalQualifier();
-                if (domain.getArrayElementType() != null) arrayElementType = domain.getArrayElementType();
+                if (domain.getArrayElementType() != null) {
+                    arrayElementType = domain.getArrayElementType();
+                } else if (isArray && DataType.arrayOf(dataType) != null) {
+                    // Brackets written after a domain's name make an array of the domain, which is
+                    // a type of its own in PostgreSQL and holds a list of the domain's values. Read
+                    // as the domain itself, the column took one value where a list was written and
+                    // the catalogue named the domain where PostgreSQL names its array.
+                    arrayElementType = dataType;
+                    dataType = DataType.arrayOf(dataType);
+                }
             } else if (resolvedType != null && executor.database.isCompositeType(baseType)) {
                 dataType = DataType.TEXT;
                 compositeTypeName = baseType;
@@ -738,6 +773,7 @@ class DdlExecutor {
 
         ResolvedType resolved = new ResolvedType(dataType, enumTypeName, domainTypeName,
                 compositeTypeName, arrayElementType, domainNotNull);
+        resolved.setRangeTypeName(rangeTypeName);
         resolved.setDomainTypmod(domainPrecision, domainScale, domainInterval);
         // How the reader would have written the domain's name is settled here, while the session
         // whose search path decides it is still in hand. An error raised later has only the stored

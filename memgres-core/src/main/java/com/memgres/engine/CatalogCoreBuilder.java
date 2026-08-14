@@ -289,7 +289,7 @@ class CatalogCoreBuilder {
     }
 
     /** PostgreSQL's typlen for this type: its width in bytes, or -1 for a varlena. */
-    private static short typeLength(DataType dt) {
+    static short typeLength(DataType dt) {
         String[] attrs = typeAttrs(storedTypeName(dt));
         return attrs == null ? (short) -1 : Short.parseShort(attrs[1]);
     }
@@ -301,13 +301,13 @@ class CatalogCoreBuilder {
     }
 
     /** PostgreSQL's typalign: what boundary a value of the type has to start on. */
-    private static String typeAlign(DataType dt) {
+    static String typeAlign(DataType dt) {
         String[] attrs = typeAttrs(storedTypeName(dt));
         return attrs == null ? "i" : attrs[7];
     }
 
     /** PostgreSQL's typstorage: p plain, m main, e external, x extended. */
-    private static String typeStorage(DataType dt) {
+    static String typeStorage(DataType dt) {
         String[] attrs = typeAttrs(storedTypeName(dt));
         return attrs == null ? "p" : attrs[8];
     }
@@ -472,14 +472,29 @@ class CatalogCoreBuilder {
     }
 
     /**
-     * The OID a column declared with a composite type points at. An array of a composite is a type
-     * of its own with an OID of its own, registered beside the composite's, exactly as an array of
-     * any other type is.
+     * The OID a column declared with a user-defined type points at. An array of one is a type of
+     * its own with an OID of its own, registered beside the element's, exactly as an array of any
+     * other type is; a column of {@code e[]} that pointed at {@code e} told format_type the column
+     * held one value where it holds a list of them.
      */
-    private int compositeColumnOid(Column c, int fallback) {
-        String key = TypeNamespace.oidKeyFor(database, c.getCompositeTypeName());
+    private int userTypeColumnOid(Column c, String written, int fallback) {
+        String key = TypeNamespace.oidKeyFor(database, written);
         if (key == null) return fallback;
         return oids.oid(c.getArrayElementType() != null ? key + "[]" : key);
+    }
+
+    /**
+     * The OID a column declared with a domain points at. Brackets after the domain's name make an
+     * array of the domain, which PostgreSQL registers as a type of its own; a domain that is
+     * itself built over an array is one type, and the column points straight at it.
+     */
+    private int domainColumnOid(Column c, int fallback) {
+        String key = TypeNamespace.oidKeyFor(database, c.getDomainTypeName());
+        if (key == null) return fallback;
+        DomainType domain = database.getDomain(c.getDomainTypeName());
+        boolean arrayOfTheDomain = c.getArrayElementType() != null
+                && (domain == null || domain.getArrayElementType() == null);
+        return oids.oid(arrayOfTheDomain ? key + "[]" : key);
     }
 
     private int rowTypeArrayOid(String schemaName, String relName) {
@@ -1086,16 +1101,22 @@ class CatalogCoreBuilder {
                     // The column records the type it was declared with, schema and all, so a
                     // column of a.e points at a.e's OID and not at some other schema's e.
                     if (colType == DataType.ENUM && c.getEnumTypeName() != null) {
-                        atttypid = userTypeOid(c.getEnumTypeName(), atttypid);
+                        atttypid = userTypeColumnOid(c, c.getEnumTypeName(), atttypid);
                     } else if (c.getDomainTypeName() != null) {
-                        atttypid = userTypeOid(c.getDomainTypeName(), atttypid);
+                        atttypid = domainColumnOid(c, atttypid);
+                    } else if (c.getRangeTypeName() != null) {
+                        // A range is a type in its own right, and a column declared as one is a
+                        // column of it. Carrying the value as the text it prints as left the
+                        // column pointing at text's OID, so format_type named text where
+                        // PostgreSQL names the range.
+                        atttypid = userTypeColumnOid(c, c.getRangeTypeName(), atttypid);
                     } else if (c.getCompositeTypeName() != null) {
                         // A composite is a type the same way an enum or a domain is, and a column
                         // declared as one is a column of it. Carrying the value as text left the
                         // column pointing at text's OID, so format_type named text where
                         // PostgreSQL names the composite and a client had no way to learn what
                         // shape the value has.
-                        atttypid = compositeColumnOid(c, atttypid);
+                        atttypid = userTypeColumnOid(c, c.getCompositeTypeName(), atttypid);
                     }
                     // Use column-level overrides if set
                     String effectiveStorage = c.getAttStorageOverride() != null ? c.getAttStorageOverride() : storage;
@@ -1978,6 +1999,29 @@ class CatalogCoreBuilder {
         return table;
     }
 
+    /**
+     * The key a routine's OID is filed under. A name can carry several routines and PostgreSQL
+     * gives each a row of its own: the first of a name answers to the bare key -- which is what
+     * regproc, pg_trigger and pg_description all reach for -- and every further one is told apart
+     * by where it sits among the overloads of that name.
+     */
+    static String routineOidKey(String name, int overloadIndex) {
+        return overloadIndex == 0 ? "proc:" + name : "proc:" + name + "#" + overloadIndex;
+    }
+
+    /**
+     * The same key for a routine the database holds, counted the way the pg_proc rows count it, so
+     * that a number minted when the routine was created is the number its row will carry.
+     */
+    static String routineOidKey(Database database, PgFunction routine) {
+        int at = 0;
+        for (PgFunction other : database.getFunctionOverloads(routine.getName())) {
+            if (other == routine) break;
+            if (other.getName().equals(routine.getName())) at++;
+        }
+        return routineOidKey(routine.getName(), at);
+    }
+
     Table buildPgProc() {
         List<Column> cols = Cols.listOf(
                 colNN("oid", DataType.OID),
@@ -2262,7 +2306,7 @@ class CatalogCoreBuilder {
             double prorows = fn.getRows() > 0 ? fn.getRows() : (retset ? 1000 : 0);
             // Use unique OID key for overloaded functions (append param count)
             int idx = overloadIndex.merge(fn.getName(), 0, (a, b) -> a + 1);
-            String oidKey = idx == 0 ? "proc:" + fn.getName() : "proc:" + fn.getName() + "#" + idx;
+            String oidKey = routineOidKey(fn.getName(), idx);
             table.insertRow(new Object[]{
                     oids.oid(oidKey), fn.getName(), funcNs, fnOwnerOid,
                     langOid, fn.getCost(), prorows, variadicElem, "-", kind,

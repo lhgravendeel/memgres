@@ -452,8 +452,13 @@ class FromJoinExecutor {
         List<RowContext> results = new ArrayList<>();
         SelectStmt.SubqueryFrom sqf = (SelectStmt.SubqueryFrom) join.right();
         boolean isLeft = join.joinType() == SelectStmt.JoinType.LEFT;
+        boolean readWhole = false;
 
         for (RowContext leftCtx : leftContexts) {
+            // An item PostgreSQL keeps apart is run once per row of the relation beside it, and only
+            // for the rows that relation's own scan kept, so it is not run at all for a row the
+            // query has already discarded.
+            if (fromResolver.lateralItemUnasked(sqf, leftCtx)) continue;
             executor.outerContextStack.push(leftCtx);
             try {
                 QueryResult subResult = fromResolver.readLateralSubquery(sqf);
@@ -470,6 +475,13 @@ class FromJoinExecutor {
                 // A VIRTUAL generated column the sub-select left for this relation to work out is
                 // worked out here, because the join condition and the query's WHERE may read it.
                 boolean lateralVirtual = executor.dmlExecutor.hasVirtualColumns(virtualTable);
+                // Pulled up, the item is not a query of its own: the relation underneath is one of
+                // this query's and is scanned once, whatever the item's own comparison with the row
+                // beside it keeps out of the pairing.
+                if (!readWhole) {
+                    readWhole = true;
+                    fromResolver.readLateralItemWhole(sqf, alias, join.on());
+                }
                 for (Object[] row : subResult.getRows()) {
                     RowContext rightCtx = new RowContext(virtualTable, alias, lateralVirtual
                             ? executor.dmlExecutor.computeVirtualColumns(virtualTable, alias, row)

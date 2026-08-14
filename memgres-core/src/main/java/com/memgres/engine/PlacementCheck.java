@@ -190,6 +190,20 @@ final class PlacementCheck {
     }
 
     /**
+     * Every part of an expression in the order PostgreSQL analyses them: a node's own parts before
+     * the node itself, and nothing inside a query nested in it.
+     *
+     * <p>A caller that is looking for a fault of its own beside these hands it here, so that its
+     * fault and one of these are reported in the order the expression was written rather than one
+     * kind of fault always outranking the other.
+     */
+    void forEachAnalysed(Object node, java.util.function.Consumer<Object> action) {
+        if (node == null || node instanceof Statement) return;
+        forEachAnalysedChild(node, child -> forEachAnalysed(child, action));
+        action.accept(node);
+    }
+
+    /**
      * The children of a node in the order PostgreSQL analyses them, which is what decides the
      * message when a clause holds more than one thing it may not hold.
      *

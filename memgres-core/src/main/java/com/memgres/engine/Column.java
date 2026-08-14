@@ -29,6 +29,14 @@ public class Column {
 
     private String compositeTypeName;  // For composite type columns (e.g., "pair")
 
+    /**
+     * The range type this column was declared with, e.g. the {@code r} of {@code CREATE TYPE r AS
+     * RANGE (subtype = int4)}. A range's values are carried as the text they print as, so without
+     * this the column was indistinguishable from a text one and the catalogue named text where
+     * PostgreSQL names the range.
+     */
+    private String rangeTypeName;
+
 
     private final DataType arrayElementType; // For array columns, the element type (e.g., INTEGER for integer[])
     private int tableOid;    // PgWire RowDescription: source table OID (0 if not from a real table)
@@ -119,6 +127,7 @@ public class Column {
         c.attCompression = attCompression;
         c.attHasMissing = attHasMissing;
         c.intervalQualifier = intervalQualifier;
+        c.rangeTypeName = rangeTypeName;
     }
 
     /** Copy of this column with a new name; every other attribute is preserved. */
@@ -169,6 +178,7 @@ public class Column {
                 newPrecision, newScale, generatedExpr, virtual, null, null, newArrayElementType);
         copyRuntimeAttrsTo(c);
         c.intervalQualifier = null;  // the new declaration carries its own qualifier, if any
+        c.rangeTypeName = null;      // and its own type, which the range identity belonged to
         c.parsedDefaultExpr = parsedDefaultExpr;
         return c;
     }
@@ -221,6 +231,9 @@ public class Column {
     public String getCompositeTypeName() { return compositeTypeName; }
     /** ALTER TYPE ... RENAME TO: the column keeps its composite under its new name. */
     public void setCompositeTypeName(String compositeTypeName) { this.compositeTypeName = compositeTypeName; }
+    public String getRangeTypeName() { return rangeTypeName; }
+    /** ALTER TYPE ... RENAME TO: the column keeps its range under its new name. */
+    public void setRangeTypeName(String rangeTypeName) { this.rangeTypeName = rangeTypeName; }
     public DataType getArrayElementType() { return arrayElementType; }
     public int getTableOid() { return tableOid; }
     public void setTableOid(int tableOid) { this.tableOid = tableOid; }

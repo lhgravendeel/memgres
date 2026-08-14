@@ -250,6 +250,11 @@ class DmlPartitionHelper {
         if (matched == null) {
             MemgresException ex = new MemgresException("no partition of relation \""
                     + table.getName() + "\" found for row", "23514");
+            // The relation whose partitions would not take the row is the one PostgreSQL names in
+            // the error's own schema and table fields, so a client reading them rather than the
+            // message knows which write was refused.
+            ex.setTable(table.getName());
+            ex.setSchema(table.getSchemaName());
             ex.setDetail(partitionKeyDetail(partCol, value));
             throw ex;
         }
@@ -279,14 +284,17 @@ class DmlPartitionHelper {
             names.append(')');
         }
         StringBuilder vals = new StringBuilder("(");
-        if (value instanceof List) {
+        // Whether the key is a tuple is settled by how it was declared and not by what the row
+        // holds: a single column of an array type is a list too, and PostgreSQL prints it as the
+        // one value it is rather than as its elements.
+        if (!partCol.contains("(") && partCol.contains(",") && value instanceof List) {
             List<?> tuple = (List<?>) value;
             for (int i = 0; i < tuple.size(); i++) {
                 if (i > 0) vals.append(", ");
-                vals.append(tuple.get(i) == null ? "null" : tuple.get(i));
+                vals.append(ErrorValueText.of(tuple.get(i)));
             }
         } else {
-            vals.append(value == null ? "null" : value);
+            vals.append(ErrorValueText.of(value));
         }
         vals.append(')');
         return "Partition key of the failing row contains " + names + " = " + vals + ".";

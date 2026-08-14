@@ -43,6 +43,18 @@ public class PlpgsqlExecutor {
     // qualification (funcname.x) resolves parameters but never body-DECLAREd variables.
     private java.util.Set<String> currentFunctionParams;
 
+    /** The record NEW was handed to the trigger routine as, or null outside a trigger routine. */
+    private Object triggerNewRecord;
+    /**
+     * Whether the trigger routine has written to NEW at all.
+     *
+     * <p>PostgreSQL decides whether a trigger rewrote the row by whether the routine handed back a
+     * tuple other than the one it was given, and a PL/pgSQL routine builds a new one the moment
+     * anything is assigned to NEW -- so {@code NEW.i := NEW.i} counts as a rewrite although the
+     * row still reads the same, while a routine that only returns NEW does not.
+     */
+    private boolean triggerRowRewritten;
+
     // Control flow signals
     private static class ReturnSignal extends RuntimeException {
         final Object value;
@@ -126,6 +138,7 @@ public class PlpgsqlExecutor {
 
         void set(String name, Object value) {
             String key = resolve(name);
+            noteTriggerRowWrite(this, key, value);
             Scope s = this;
             while (s != null) {
                 if (s.variables.containsKey(key)) {
@@ -797,7 +810,13 @@ public class PlpgsqlExecutor {
         // mention of NEW.col a column that could not be resolved.
         boolean deleteRowTrigger = trigger != null && !trigger.isForEachStatement()
                 && trigger.getEvent() == PgTrigger.Event.DELETE;
-        scope.declare("new", deleteRowTrigger ? new LinkedHashMap<String, Object>() : newMap);
+        Map<String, Object> newRecord = deleteRowTrigger
+                ? new LinkedHashMap<String, Object>() : newMap;
+        // What the routine was handed, so that a write to it can be told from a routine that
+        // handed the same record straight back. See {@link #rewroteTriggerRow()}.
+        this.triggerNewRecord = newRecord;
+        this.triggerRowRewritten = false;
+        scope.declare("new", newRecord);
         scope.declare("old", oldMap);
         scope.declare("found", false);
 
@@ -883,8 +902,7 @@ public class PlpgsqlExecutor {
 
         // Copy NEW map back (skipped for AFTER triggers: modifications to NEW are ignored, as in PG)
         if (!afterTiming && !deleteRowTrigger) {
-            @SuppressWarnings("unchecked")
-            Map<String, Object> finalNew = (Map<String, Object>) scope.get("new");
+            Map<String, Object> finalNew = triggerRecordAsMap(scope.get("new"), table);
             if (finalNew != null && newRow != null) {
                 copyMapToRow(finalNew, newRow, table);
             }
@@ -906,6 +924,56 @@ public class PlpgsqlExecutor {
         } catch (ReturnSignal rs) {
             // event triggers return void
         }
+    }
+
+    /**
+     * Whether the trigger routine that has just run wrote to NEW.
+     *
+     * <p>PostgreSQL asks this of the row a copy of a partitioned table's trigger leaves behind: a
+     * copy that hands back a tuple other than the one it was given has its row re-checked against
+     * the partition it was routed to, and one that hands the same tuple straight back has not.
+     */
+    public boolean rewroteTriggerRow() {
+        return triggerRowRewritten;
+    }
+
+    /**
+     * Note a write to NEW. A whole-record assignment of NEW to itself is not one: PostgreSQL is
+     * left holding the record it started with, and reads that as a routine that changed nothing.
+     */
+    private void noteTriggerRowWrite(Scope scope, String key, Object value) {
+        if (triggerNewRecord == null || !"new".equals(key)) return;
+        if (value == triggerNewRecord) return;
+        if (scope.get(key) != triggerNewRecord) return;
+        triggerRowRewritten = true;
+    }
+
+    /**
+     * The record NEW is left holding, as a map of the relation's own columns.
+     *
+     * <p>A whole-record assignment may hand NEW a row value rather than a record — {@code NEW :=
+     * ROW(...)} builds one — and PostgreSQL reads such a value field by field in the relation's
+     * column order, so the routine goes on as though the record had been written field by field.
+     */
+    private Map<String, Object> triggerRecordAsMap(Object record, Table table) {
+        if (record instanceof Map) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> asRecord = (Map<String, Object>) record;
+            return asRecord;
+        }
+        List<Object> values;
+        if (record instanceof AstExecutor.PgRow) {
+            values = ((AstExecutor.PgRow) record).values();
+        } else if (record instanceof Object[]) {
+            values = java.util.Arrays.asList((Object[]) record);
+        } else {
+            return null;
+        }
+        Map<String, Object> asRecord = new LinkedHashMap<>();
+        for (int i = 0; i < table.getColumns().size() && i < values.size(); i++) {
+            asRecord.put(table.getColumns().get(i).getName().toLowerCase(), values.get(i));
+        }
+        return asRecord;
     }
 
     private void copyMapToRow(Map<String, Object> map, Object[] row, Table table) {
@@ -3112,6 +3180,7 @@ public class PlpgsqlExecutor {
      * "y.a".
      */
     private void assignNestedField(Map<String, Object> map, String fieldPath, Object value) {
+        if (map == triggerNewRecord) triggerRowRewritten = true;
         Map<String, Object> current = map;
         String remaining = fieldPath;
         int dot;

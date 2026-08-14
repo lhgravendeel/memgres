@@ -9,6 +9,8 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.SQLWarning;
+import java.sql.Savepoint;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.List;
@@ -46,6 +48,21 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * qualifier was dropped instead of resolved. A duplicate key reported the wrong sentence and the
  * wrong key list, and an index key could not be written in two of the three forms PostgreSQL's
  * grammar has for one.
+ *
+ * <p>A statement, asked what it leaves behind when it fails, answered for the relation it was
+ * written against and for no other. Everything it set going on the way is part of it: what a
+ * trigger wrote to a second relation, what a rule that trigger fired wrote to a third, what a
+ * function the trigger called wrote anywhere. Outside a transaction block a statement is a
+ * transaction of its own, so all of it goes when the statement is refused, and all of it stands
+ * when the statement succeeds; inside one, the same writes go with ROLLBACK, with ROLLBACK TO
+ * SAVEPOINT and with a PL/pgSQL handler that catches the error and carries on.
+ *
+ * <p>A partition key was asked what may stand in it. A generated column may not: its value is
+ * worked out after the row has been routed, so PostgreSQL refuses it outright. And a copy of a
+ * partitioned table's row trigger may not carry the row out of the partition the insert was routed
+ * to -- where PostgreSQL decides whether the copy rewrote the row by whether the routine handed
+ * back a tuple other than the one it was given, so a PL/pgSQL routine that assigns a column its
+ * own value has rewritten it while one that only returns NEW has not.
  *
  * <p>Every expectation here was read off PostgreSQL 18 before it was written down.
  */
@@ -4354,5 +4371,2953 @@ class InheritedDeclarationsAndIndexesTest {
         exec("DROP TABLE zzy9nn_h1");
         exec("DROP TABLE zzy9nn_hq");
         exec("DROP TABLE zzy9nn_hp");
+    }
+
+    // ------------------------------------------------------------ The type a default has is the type of the whole expression
+
+    /** The type format_type spells for a relation's one column. */
+    private static String typeOfColumn(String relation) throws SQLException {
+        return scalar("SELECT format_type(atttypid, atttypmod) FROM pg_attribute"
+                + " WHERE attrelid = '" + relation + "'::regclass AND attnum > 0"
+                + " AND NOT attisdropped");
+    }
+
+    /** relname/convalidated for every relation holding a constraint of that name. */
+    private static String validatedAcross(String constraint) throws SQLException {
+        return scalar("SELECT string_agg(cl.relname||'/'||c.convalidated::text, ','"
+                + " ORDER BY cl.relname) FROM pg_constraint c"
+                + " JOIN pg_class cl ON cl.oid = c.conrelid"
+                + " WHERE c.conname = '" + constraint + "'");
+    }
+
+    @Test
+    void aDefaultIsMeasuredAgainstTheTypeOfTheWholeExpression() throws Exception {
+        // PostgreSQL coerces a DEFAULT to the column's type in assignment context: a cast pg_cast
+        // records as implicit or assignment, or -- with no cast row at all -- a read through the
+        // value's own text form, which it allows only into a string type. So an operator's result,
+        // a cast's target and a call's return type each decide the answer, not only a literal's.
+        assertEquals("42804", stateOf("CREATE TABLE zzgd7_c1 (b int DEFAULT 'a'||'b')"));
+        assertEquals("column \"b\" is of type integer but default expression is of type text",
+                messageOf("CREATE TABLE zzgd7_c1 (b int DEFAULT 'a'||'b')"));
+        assertEquals("You will need to rewrite or cast the expression.",
+                hintOf("CREATE TABLE zzgd7_c1 (b int DEFAULT 'a'||'b')"));
+
+        assertEquals("column \"b\" is of type integer but default expression is of type integer[]",
+                messageOf("CREATE TABLE zzgd7_c2 (b int DEFAULT '{1,2}'::int[])"));
+        assertEquals("column \"b\" is of type integer but default expression is of type text",
+                messageOf("CREATE TABLE zzgd7_c3 (b int DEFAULT coalesce('a','b'))"));
+        assertEquals("column \"b\" is of type interval but default expression is of type"
+                        + " timestamp with time zone",
+                messageOf("CREATE TABLE zzgd7_c4 (b interval DEFAULT now())"));
+        assertEquals("column \"b\" is of type boolean but default expression is of type text",
+                messageOf("CREATE TABLE zzgd7_c5 (b boolean DEFAULT greatest('a','b'))"));
+        assertEquals("column \"b\" is of type date but default expression is of type integer",
+                messageOf("CREATE TABLE zzgd7_c6 (b date DEFAULT 1)"));
+        assertEquals("column \"a\" is of type integer but default expression is of type boolean",
+                messageOf("CREATE TABLE zzgd7_c7 (a int DEFAULT true)"));
+        assertEquals("column \"a\" is of type boolean but default expression is of type integer",
+                messageOf("CREATE TABLE zzgd7_c8 (a boolean DEFAULT 1)"));
+
+        // None of them left a relation behind.
+        assertEquals(0, num("SELECT count(*)::int FROM pg_class WHERE relname IN ('zzgd7_c1',"
+                + " 'zzgd7_c2','zzgd7_c3','zzgd7_c4','zzgd7_c5','zzgd7_c6','zzgd7_c7','zzgd7_c8')"));
+    }
+
+    @Test
+    void everyAssignmentCastPostgresHasIsStillTakenForADefault() throws Exception {
+        // The assignment casts PostgreSQL does have, and the general rule beside them that a
+        // string type takes any value at all through its own output function.
+        exec("CREATE TABLE zzgd7_ok (a bigint DEFAULT 1, b text DEFAULT 1, c numeric DEFAULT 1,"
+                + " d text DEFAULT now(), e varchar(4) DEFAULT 1,"
+                + " f timestamp DEFAULT current_date, g date DEFAULT now())");
+        exec("INSERT INTO zzgd7_ok DEFAULT VALUES");
+        assertEquals("1/1/1", rowsOf("SELECT a, b, c FROM zzgd7_ok"));
+        assertEquals(7, num("SELECT count(*)::int FROM information_schema.columns"
+                + " WHERE table_name = 'zzgd7_ok'"));
+        exec("DROP TABLE zzgd7_ok");
+
+        exec("CREATE TABLE zzgd7_ok3 (a int DEFAULT 1.7, b smallint DEFAULT 3, c real DEFAULT 1,"
+                + " d char(3) DEFAULT 42, e text DEFAULT current_date,"
+                + " f bigint DEFAULT 2::smallint, g numeric(4,1) DEFAULT 2, h text DEFAULT 1+1,"
+                + " i varchar(30) DEFAULT now()::date, j double precision DEFAULT 1)");
+        exec("INSERT INTO zzgd7_ok3 DEFAULT VALUES");
+        // A numeric reaching an integer column is rounded, and a number reaches a character type
+        // through its own text form, blank-padded where the type is.
+        assertEquals("2/3/1/42 /2/2.0/2/1",
+                rowsOf("SELECT a, b, c, d, f, g, h, j FROM zzgd7_ok3"));
+        exec("DROP TABLE zzgd7_ok3");
+    }
+
+    @Test
+    void aDefaultOfNoTypeOfItsOwnIsReadByTheColumnsInputFunction() throws Exception {
+        exec("CREATE TABLE zzgd7_v (a int DEFAULT 1::bigint, b date DEFAULT '2020-01-01',"
+                + " c interval DEFAULT '1 day', d int DEFAULT '5', e boolean DEFAULT 'yes',"
+                + " f int[] DEFAULT '{1,2}', g int DEFAULT NULL, h numeric DEFAULT 1.5,"
+                + " i text DEFAULT 3.5)");
+        exec("INSERT INTO zzgd7_v DEFAULT VALUES");
+        assertEquals("1/2020-01-01/1 day/5/t/{1,2}/null/1.5/3.5",
+                rowsOf("SELECT a, b, c, d, e, f, g, h, i FROM zzgd7_v"));
+        exec("DROP TABLE zzgd7_v");
+
+        // A literal the column's input function cannot read is refused as a value, not as a type.
+        assertEquals("22P02", stateOf("CREATE TABLE zzgd7_v2 (a int DEFAULT 'x')"));
+        assertEquals("invalid input syntax for type integer: \"x\"",
+                messageOf("CREATE TABLE zzgd7_v2 (a int DEFAULT 'x')"));
+
+        // A default too long for the column is a question about the value, so it is asked when
+        // the row is written and not when the column is declared.
+        exec("CREATE TABLE zzgd7_vv (j varchar(5) DEFAULT 1000000)");
+        assertEquals("22001", stateOf("INSERT INTO zzgd7_vv DEFAULT VALUES"));
+        assertEquals("value too long for type character varying(5)",
+                messageOf("INSERT INTO zzgd7_vv DEFAULT VALUES"));
+        assertEquals(0, num("SELECT count(*)::int FROM zzgd7_vv"));
+        exec("DROP TABLE zzgd7_vv");
+    }
+
+    @Test
+    void theSameRuleWhereTheColumnIsAddedAndWhereTheDefaultIsSetLater() throws Exception {
+        exec("CREATE TABLE zzgd7_a (k int, b1 int, b2 interval)");
+
+        assertEquals("42804", stateOf("ALTER TABLE zzgd7_a ADD COLUMN a1 int DEFAULT 'a'||'b'"));
+        assertEquals("column \"a1\" is of type integer but default expression is of type text",
+                messageOf("ALTER TABLE zzgd7_a ADD COLUMN a1 int DEFAULT 'a'||'b'"));
+        assertEquals("You will need to rewrite or cast the expression.",
+                hintOf("ALTER TABLE zzgd7_a ADD COLUMN a1 int DEFAULT 'a'||'b'"));
+        assertEquals("column \"a2\" is of type integer but default expression is of type integer[]",
+                messageOf("ALTER TABLE zzgd7_a ADD COLUMN a2 int DEFAULT '{1,2}'::int[]"));
+        assertEquals("column \"a3\" is of type integer but default expression is of type text",
+                messageOf("ALTER TABLE zzgd7_a ADD COLUMN a3 int DEFAULT coalesce('a','b')"));
+        assertEquals("column \"a4\" is of type interval but default expression is of type"
+                        + " timestamp with time zone",
+                messageOf("ALTER TABLE zzgd7_a ADD COLUMN a4 interval DEFAULT now()"));
+
+        assertEquals("column \"b1\" is of type integer but default expression is of type text",
+                messageOf("ALTER TABLE zzgd7_a ALTER COLUMN b1 SET DEFAULT 'a'||'b'"));
+        assertEquals("column \"b1\" is of type integer but default expression is of type integer[]",
+                messageOf("ALTER TABLE zzgd7_a ALTER COLUMN b1 SET DEFAULT '{1,2}'::int[]"));
+        assertEquals("column \"b2\" is of type interval but default expression is of type"
+                        + " timestamp with time zone",
+                messageOf("ALTER TABLE zzgd7_a ALTER COLUMN b2 SET DEFAULT now()"));
+
+        // What PostgreSQL takes still stands, and no column a refusal turned away was added.
+        exec("ALTER TABLE zzgd7_a ALTER COLUMN b1 SET DEFAULT 7");
+        exec("ALTER TABLE zzgd7_a ADD COLUMN a5 bigint DEFAULT 1");
+        exec("ALTER TABLE zzgd7_a ADD COLUMN a6 text DEFAULT 1");
+        exec("INSERT INTO zzgd7_a (k) VALUES (1)");
+        assertEquals("1/7/1/1", rowsOf("SELECT k, b1, a5, a6 FROM zzgd7_a"));
+        assertEquals("k,b1,b2,a5,a6",
+                column("SELECT attname FROM pg_attribute WHERE attrelid = 'zzgd7_a'::regclass"
+                        + " AND attnum > 0 AND NOT attisdropped ORDER BY attnum"));
+
+        exec("DROP TABLE zzgd7_a");
+    }
+
+    @Test
+    void aGenerationExpressionIsMeasuredAgainstItsColumnInTheSameWords() throws Exception {
+        // It is the same code that stores a default and a generation expression, so PostgreSQL
+        // words the refusal the same way for both.
+        exec("CREATE TABLE zzgd7_ga (k int)");
+        assertEquals("42804", stateOf("ALTER TABLE zzgd7_ga ADD COLUMN g1 int"
+                + " GENERATED ALWAYS AS ('a'||'b') STORED"));
+        assertEquals("column \"g1\" is of type integer but default expression is of type text",
+                messageOf("ALTER TABLE zzgd7_ga ADD COLUMN g1 int"
+                        + " GENERATED ALWAYS AS ('a'||'b') STORED"));
+        assertEquals("column \"g\" is of type integer but default expression is of type text",
+                messageOf("CREATE TABLE zzgd7_g (a int,"
+                        + " g int GENERATED ALWAYS AS ('a'||'b') STORED)"));
+        exec("DROP TABLE zzgd7_ga");
+
+        // A generation expression PostgreSQL can coerce is taken, and the column holds what the
+        // coercion made of it.
+        exec("CREATE TABLE zzgd7_gv (a int, g bigint GENERATED ALWAYS AS (a * 2) STORED,"
+                + " h text GENERATED ALWAYS AS (a) STORED,"
+                + " i numeric GENERATED ALWAYS AS (a) STORED)");
+        exec("INSERT INTO zzgd7_gv (a) VALUES (4)");
+        assertEquals("4/8/4/4", rowsOf("SELECT a, g, h, i FROM zzgd7_gv"));
+        exec("DROP TABLE zzgd7_gv");
+    }
+
+    // ------------------------------------------------------------ The names a stored expression may use
+
+    @Test
+    void aStoredExpressionMayNameTheRelationBeingDefined() throws Exception {
+        // PostgreSQL stores a reference to the relation rather than the name that was written, so
+        // the qualifier is judged where it is written and never reaches the stored tree.
+        exec("CREATE TABLE zzgd7_q (a int, b int GENERATED ALWAYS AS (zzgd7_q.a * 2) STORED)");
+        exec("INSERT INTO zzgd7_q (a) VALUES (5)");
+        assertEquals("5/10", rowsOf("SELECT a, b FROM zzgd7_q"));
+
+        // The same name reaches the relation in a CHECK, in an index key, in an index predicate
+        // and in a USING clause.
+        exec("CREATE TABLE zzgd7_r (a int, nosuch int, CHECK (zzgd7_r.a > 0))");
+        exec("CREATE INDEX zzgd7_r_i ON zzgd7_r (a) WHERE zzgd7_r.a > 0");
+        exec("CREATE INDEX zzgd7_r_j ON zzgd7_r ((zzgd7_r.a + 1))");
+        exec("ALTER TABLE zzgd7_r ALTER COLUMN a TYPE bigint USING zzgd7_r.a");
+        assertEquals("bigint", scalar("SELECT format_type(atttypid, atttypmod) FROM pg_attribute"
+                + " WHERE attrelid = 'zzgd7_r'::regclass AND attname = 'a'"));
+        exec("INSERT INTO zzgd7_r VALUES (3, 4)");
+        assertEquals("3/4", rowsOf("SELECT a, nosuch FROM zzgd7_r"));
+
+        exec("DROP TABLE zzgd7_r");
+        exec("DROP TABLE zzgd7_q");
+    }
+
+    @Test
+    void aQualifierNamingAnyOtherRelationIsAMissingFromClauseEntry() throws Exception {
+        exec("CREATE TABLE zzgd7_qq (a int)");
+
+        assertEquals("42P01", stateOf("CREATE TABLE zzgd7_q2 (a int,"
+                + " b int GENERATED ALWAYS AS (nosuchrel.a) STORED)"));
+        assertEquals("missing FROM-clause entry for table \"nosuchrel\"",
+                messageOf("CREATE TABLE zzgd7_q2 (a int,"
+                        + " b int GENERATED ALWAYS AS (nosuchrel.a) STORED)"));
+        // Another relation's name, even one that exists, is not in scope either.
+        assertEquals("missing FROM-clause entry for table \"zzgd7_qq\"",
+                messageOf("CREATE TABLE zzgd7_q3 (a int,"
+                        + " b int GENERATED ALWAYS AS (zzgd7_qq.a) STORED)"));
+        // A qualified reference to a generated column is still a generated column.
+        assertEquals("42P17", stateOf("CREATE TABLE zzgd7_q4 (a int,"
+                + " g int GENERATED ALWAYS AS (zzgd7_q4.g) STORED)"));
+        assertEquals("cannot use generated column \"g\" in column generation expression",
+                messageOf("CREATE TABLE zzgd7_q4 (a int,"
+                        + " g int GENERATED ALWAYS AS (zzgd7_q4.g) STORED)"));
+        assertEquals("A generated column cannot reference another generated column.",
+                detailOf("CREATE TABLE zzgd7_q4 (a int,"
+                        + " g int GENERATED ALWAYS AS (zzgd7_q4.g) STORED)"));
+
+        // And every other place a definition is stored reads the qualifier the same way.
+        assertEquals("missing FROM-clause entry for table \"nosuchrel\"",
+                messageOf("CREATE INDEX zzgd7_qq_k ON zzgd7_qq (a) WHERE nosuchrel.a > 0"));
+        assertEquals("missing FROM-clause entry for table \"nosuchrel\"",
+                messageOf("CREATE INDEX zzgd7_qq_l ON zzgd7_qq ((nosuchrel.a + 1))"));
+        assertEquals("missing FROM-clause entry for table \"nosuchrel\"",
+                messageOf("ALTER TABLE zzgd7_qq ADD CONSTRAINT zzgd7_qq_c"
+                        + " CHECK (nosuchrel.a > 0)"));
+        assertEquals("missing FROM-clause entry for table \"nosuchrel\"",
+                messageOf("ALTER TABLE zzgd7_qq ALTER COLUMN a TYPE int USING nosuchrel.a"));
+
+        assertNull(indexDefsOf("zzgd7_qq"));
+        assertNull(constraintsOf("zzgd7_qq"));
+        exec("DROP TABLE zzgd7_qq");
+    }
+
+    @Test
+    void aNameNearlyOneOfTheRelationsOwnIsOfferedInTheHint() throws Exception {
+        // The one relation the definition is stored on is the whole of what was in scope, so
+        // PostgreSQL offers a column of it spelled almost the same way -- qualified, as it writes
+        // every such suggestion.
+        exec("CREATE TABLE zzgd7_h (a int, nosuch int)");
+        String hint = "Perhaps you meant to reference the column \"zzgd7_h.nosuch\".";
+
+        assertEquals("42703",
+                stateOf("ALTER TABLE zzgd7_h ADD CONSTRAINT zzgd7_h_c CHECK (nosuchh > 0)"));
+        assertEquals("column \"nosuchh\" does not exist",
+                messageOf("ALTER TABLE zzgd7_h ADD CONSTRAINT zzgd7_h_c CHECK (nosuchh > 0)"));
+        assertEquals(hint,
+                hintOf("ALTER TABLE zzgd7_h ADD CONSTRAINT zzgd7_h_c CHECK (nosuchh > 0)"));
+        assertEquals(hint, hintOf("ALTER TABLE zzgd7_h ADD COLUMN gg int"
+                + " GENERATED ALWAYS AS (nosuchh) STORED"));
+        assertEquals(hint, hintOf("ALTER TABLE zzgd7_h ALTER COLUMN a TYPE int USING nosuchh"));
+        assertEquals(hint, hintOf("CREATE INDEX zzgd7_h_i ON zzgd7_h (a) WHERE nosuchh > 0"));
+        assertEquals(hint, hintOf("CREATE INDEX zzgd7_h_j ON zzgd7_h ((nosuchh + 1))"));
+
+        // The hint names the relation the statement is defining, even where nothing is stored yet.
+        assertEquals("Perhaps you meant to reference the column \"zzgd7_h2.nosuch\".",
+                hintOf("CREATE TABLE zzgd7_h2 (a int, nosuch int, CHECK (nosuchh > 0))"));
+
+        assertNull(indexDefsOf("zzgd7_h"));
+        exec("DROP TABLE zzgd7_h");
+    }
+
+    @Test
+    void aDefaultMayNameNoColumnAtAllItsOwnRelationsIncluded() throws Exception {
+        assertEquals("0A000", stateOf("CREATE TABLE zzgd7_gt (a int DEFAULT zzgd7_gt.a)"));
+        assertEquals("cannot use column reference in DEFAULT expression",
+                messageOf("CREATE TABLE zzgd7_gt (a int DEFAULT zzgd7_gt.a)"));
+        assertEquals("cannot use column reference in DEFAULT expression",
+                messageOf("CREATE TABLE zzgd7_gu (a int, b int DEFAULT nosuchrel.a)"));
+        assertEquals(0, num("SELECT count(*)::int FROM pg_class"
+                + " WHERE relname IN ('zzgd7_gt','zzgd7_gu')"));
+    }
+
+    // ------------------------------------------------------------ A function a stored expression names has to exist when it is written
+
+    @Test
+    void everyPlaceAnExpressionIsStoredResolvesTheFunctionsItNames() throws Exception {
+        exec("CREATE TABLE zzgd7_f (a int, b text)");
+        String missing = "function nosuchfunc(integer) does not exist";
+
+        assertEquals("42883",
+                stateOf("ALTER TABLE zzgd7_f ADD CONSTRAINT zzgd7_f_c CHECK (nosuchfunc(a) > 0)"));
+        assertEquals(missing,
+                messageOf("ALTER TABLE zzgd7_f ADD CONSTRAINT zzgd7_f_c CHECK (nosuchfunc(a) > 0)"));
+        assertEquals("No function matches the given name and argument types."
+                        + " You might need to add explicit type casts.",
+                hintOf("ALTER TABLE zzgd7_f ADD CONSTRAINT zzgd7_f_c CHECK (nosuchfunc(a) > 0)"));
+
+        assertEquals(missing, messageOf("CREATE TABLE zzgd7_f2 (a int,"
+                + " CHECK (nosuchfunc(a) > 0))"));
+        assertEquals(missing, messageOf("ALTER TABLE zzgd7_f ALTER COLUMN a TYPE int"
+                + " USING nosuchfunc(a)"));
+        assertEquals(missing, messageOf("ALTER TABLE zzgd7_f ADD COLUMN g int"
+                + " GENERATED ALWAYS AS (nosuchfunc(a)) STORED"));
+        assertEquals(missing, messageOf("CREATE TABLE zzgd7_f3 (a int,"
+                + " g int GENERATED ALWAYS AS (nosuchfunc(a)) STORED)"));
+        assertEquals(missing, messageOf("CREATE TABLE zzgd7_f4 (a int DEFAULT nosuchfunc(1))"));
+        assertEquals(missing, messageOf("ALTER TABLE zzgd7_f ADD COLUMN h int"
+                + " DEFAULT nosuchfunc(1)"));
+        assertEquals(missing, messageOf("ALTER TABLE zzgd7_f ALTER COLUMN a"
+                + " SET DEFAULT nosuchfunc(1)"));
+        assertEquals(missing, messageOf("CREATE INDEX zzgd7_f_i ON zzgd7_f (a)"
+                + " WHERE nosuchfunc(a) > 0"));
+        assertEquals(missing, messageOf("CREATE INDEX zzgd7_f_j ON zzgd7_f ((nosuchfunc(a)))"));
+
+        assertNull(constraintsOf("zzgd7_f"));
+        assertNull(indexDefsOf("zzgd7_f"));
+        exec("DROP TABLE zzgd7_f");
+    }
+
+    @Test
+    void theSignatureTheComplaintNamesIsTheOneItLookedFor() throws Exception {
+        // The name is looked up with the argument types that were worked out, so the complaint
+        // says which signature it looked for. A literal written with no type of its own is still
+        // of type unknown and is named as one.
+        exec("CREATE TABLE zzgd7_s (a int, b text)");
+        assertEquals("function nosuchfunc(unknown) does not exist",
+                messageOf("ALTER TABLE zzgd7_s ADD CONSTRAINT z2 CHECK (nosuchfunc('x') > 0)"));
+        assertEquals("function nosuchfunc(integer, unknown) does not exist",
+                messageOf("ALTER TABLE zzgd7_s ADD CONSTRAINT z3 CHECK (nosuchfunc(a,'x') > 0)"));
+        assertEquals("function nosuchfunc() does not exist",
+                messageOf("ALTER TABLE zzgd7_s ADD CONSTRAINT z4 CHECK (nosuchfunc() > 0)"));
+        assertEquals("function pg_catalog.nosuchfunc(integer) does not exist",
+                messageOf("ALTER TABLE zzgd7_s ADD CONSTRAINT z5"
+                        + " CHECK (pg_catalog.nosuchfunc(a) > 0)"));
+        exec("DROP TABLE zzgd7_s");
+    }
+
+    @Test
+    void aCallOfOneArgumentNamingATypeIsReadAsACastWrittenTheOtherWayRound() throws Exception {
+        exec("CREATE TABLE zzgd7_d (a int, b text)");
+        exec("CREATE DOMAIN zzgd7_dom AS int");
+
+        // It is the one argument that makes it a cast; the same name over two arguments, or none,
+        // is a missing function there as anywhere else.
+        exec("ALTER TABLE zzgd7_d ADD CONSTRAINT zzgd7_d_d1 CHECK (zzgd7_dom(a) > 0)");
+        assertEquals("function zzgd7_dom(integer, text) does not exist",
+                messageOf("ALTER TABLE zzgd7_d ADD CONSTRAINT zzgd7_d_d2"
+                        + " CHECK (zzgd7_dom(a, b) > 0)"));
+        assertEquals("function zzgd7_dom() does not exist",
+                messageOf("ALTER TABLE zzgd7_d ADD CONSTRAINT zzgd7_d_d3 CHECK (zzgd7_dom() > 0)"));
+
+        exec("DROP TABLE zzgd7_d");
+        exec("DROP DOMAIN zzgd7_dom");
+    }
+
+    @Test
+    void aFunctionThatExistsIsLeftAloneWhereverADefinitionNamesIt() throws Exception {
+        exec("CREATE TABLE zzgd7_e (a int, b text)");
+        exec("CREATE FUNCTION zzgd7_fn(int) RETURNS int AS 'SELECT $1' LANGUAGE sql IMMUTABLE");
+        exec("ALTER TABLE zzgd7_e ADD CONSTRAINT zzgd7_e_d4 CHECK (zzgd7_fn(a) > 0)");
+        exec("CREATE INDEX zzgd7_e_fi ON zzgd7_e ((zzgd7_fn(a)))");
+        exec("CREATE INDEX zzgd7_e_k ON zzgd7_e (lower(b))");
+        exec("CREATE INDEX zzgd7_e_l ON zzgd7_e (a) WHERE upper(b) > 'A'");
+        exec("ALTER TABLE zzgd7_e ADD CONSTRAINT zzgd7_e_ok CHECK (length(b) < 20)");
+        exec("ALTER TABLE zzgd7_e ADD COLUMN gg text GENERATED ALWAYS AS (upper(b)) STORED");
+        exec("INSERT INTO zzgd7_e (a, b) VALUES (1, 'ab')");
+
+        assertEquals("1/AB", rowsOf("SELECT a, gg FROM zzgd7_e"));
+        assertEquals("zzgd7_e_d4,zzgd7_e_ok",
+                column("SELECT conname FROM pg_constraint"
+                        + " WHERE conrelid = 'zzgd7_e'::regclass ORDER BY 1"));
+
+        exec("DROP TABLE zzgd7_e");
+        exec("DROP FUNCTION zzgd7_fn(int)");
+    }
+
+    // ------------------------------------------------------------ What a CHECK is refused for follows the order it was written in
+
+    @Test
+    void aCheckIsRefusedForTheFirstFaultReadingLeftToRight() throws Exception {
+        // PostgreSQL transforms the expression as it walks it, settling every name and every call
+        // at the node it stands at, so the same two faults the other way round get the other
+        // complaint.
+        exec("CREATE TABLE zzgd7_o (a int, nosuch int)");
+
+        assertEquals("42703", stateOf("ALTER TABLE zzgd7_o ADD CONSTRAINT c1"
+                + " CHECK (nosuchcol > 0 AND (SELECT true))"));
+        assertEquals("column \"nosuchcol\" does not exist",
+                messageOf("ALTER TABLE zzgd7_o ADD CONSTRAINT c1"
+                        + " CHECK (nosuchcol > 0 AND (SELECT true))"));
+        assertEquals("Perhaps you meant to reference the column \"zzgd7_o.nosuch\".",
+                hintOf("ALTER TABLE zzgd7_o ADD CONSTRAINT c1"
+                        + " CHECK (nosuchcol > 0 AND (SELECT true))"));
+        assertEquals("0A000", stateOf("ALTER TABLE zzgd7_o ADD CONSTRAINT c2"
+                + " CHECK ((SELECT true) AND nosuchcol > 0)"));
+        assertEquals("cannot use subquery in check constraint",
+                messageOf("ALTER TABLE zzgd7_o ADD CONSTRAINT c2"
+                        + " CHECK ((SELECT true) AND nosuchcol > 0)"));
+
+        // An aggregate is the same: it is refused where it stands, and a name written before it
+        // is reached first.
+        assertEquals("column \"nosuchcol\" does not exist",
+                messageOf("ALTER TABLE zzgd7_o ADD CONSTRAINT c3"
+                        + " CHECK (nosuchcol > 0 AND count(a) > 0)"));
+        assertEquals("42803", stateOf("ALTER TABLE zzgd7_o ADD CONSTRAINT c4"
+                + " CHECK (count(a) > 0 AND nosuchcol > 0)"));
+        assertEquals("aggregate functions are not allowed in check constraints",
+                messageOf("ALTER TABLE zzgd7_o ADD CONSTRAINT c4"
+                        + " CHECK (count(a) > 0 AND nosuchcol > 0)"));
+
+        // And so is a call naming no function.
+        assertEquals("function nosuchfunc(integer) does not exist",
+                messageOf("ALTER TABLE zzgd7_o ADD CONSTRAINT c5"
+                        + " CHECK (nosuchfunc(a) > 0 AND (SELECT true))"));
+        assertEquals("cannot use subquery in check constraint",
+                messageOf("ALTER TABLE zzgd7_o ADD CONSTRAINT c6"
+                        + " CHECK ((SELECT true) AND nosuchfunc(a) > 0)"));
+        assertEquals("function nosuchfunc(integer) does not exist",
+                messageOf("ALTER TABLE zzgd7_o ADD CONSTRAINT c7"
+                        + " CHECK (nosuchfunc(a) > 0 AND nosuchcol > 0)"));
+        assertEquals("column \"nosuchcol\" does not exist",
+                messageOf("ALTER TABLE zzgd7_o ADD CONSTRAINT c8"
+                        + " CHECK (nosuchcol > 0 AND nosuchfunc(a) > 0)"));
+        // A call's arguments are settled before the call itself.
+        assertEquals("column \"nosuchcol\" does not exist",
+                messageOf("ALTER TABLE zzgd7_o ADD CONSTRAINT c9"
+                        + " CHECK (nosuchfunc(nosuchcol) > 0)"));
+
+        // The same reading in a CREATE TABLE's own CHECK clause.
+        assertEquals("column \"nosuchcol\" does not exist",
+                messageOf("CREATE TABLE zzgd7_o2 (a int, nosuch int,"
+                        + " CHECK (nosuchcol > 0 AND (SELECT true)))"));
+
+        // Nothing that was accepted before is refused now.
+        exec("ALTER TABLE zzgd7_o ADD CONSTRAINT zzgd7_o_ok"
+                + " CHECK (a > 0 AND nosuch IS NOT NULL)");
+        exec("INSERT INTO zzgd7_o VALUES (1, 2)");
+        assertEquals("1/2", rowsOf("SELECT a, nosuch FROM zzgd7_o"));
+        assertEquals("zzgd7_o_ok",
+                column("SELECT conname FROM pg_constraint"
+                        + " WHERE conrelid = 'zzgd7_o'::regclass ORDER BY 1"));
+
+        exec("DROP TABLE zzgd7_o");
+    }
+
+    @Test
+    void aSubqueryIsRefusedInACheckInEveryShapeItHas() throws Exception {
+        exec("CREATE TABLE zzgd7_w (a int)");
+        assertEquals("cannot use subquery in check constraint",
+                messageOf("ALTER TABLE zzgd7_w ADD CONSTRAINT w1 CHECK ((SELECT true))"));
+        assertEquals("cannot use subquery in check constraint",
+                messageOf("ALTER TABLE zzgd7_w ADD CONSTRAINT w2 CHECK (a IN (SELECT 1))"));
+        assertEquals("cannot use subquery in check constraint",
+                messageOf("ALTER TABLE zzgd7_w ADD CONSTRAINT w3 CHECK (EXISTS (SELECT 1))"));
+        assertEquals("cannot use subquery in check constraint",
+                messageOf("CREATE TABLE zzgd7_w2 (a int, CHECK ((SELECT true)))"));
+        assertNull(constraintsOf("zzgd7_w"));
+        exec("DROP TABLE zzgd7_w");
+    }
+
+    // ------------------------------------------------------------ The type a column is changed to is any type, not only a built-in one
+
+    @Test
+    void aColumnMayBeChangedToADomainAndReadsBackAsThatDomain() throws Exception {
+        exec("CREATE DOMAIN zzgd7_dm AS int");
+        exec("CREATE DOMAIN zzgd7_dm2 AS zzgd7_dm");
+        exec("CREATE TABLE zzgd7_t1 (s text)");
+
+        exec("ALTER TABLE zzgd7_t1 ALTER COLUMN s TYPE zzgd7_dm USING s::int");
+        assertEquals("zzgd7_dm", typeOfColumn("zzgd7_t1"));
+        // A domain is transparent for casting, so its base type is reachable again...
+        exec("ALTER TABLE zzgd7_t1 ALTER COLUMN s TYPE int");
+        assertEquals("integer", typeOfColumn("zzgd7_t1"));
+        // ...and an integer column reaches an integer domain with no USING clause, because the
+        // domain's base type is what the assignment cast is judged against.
+        exec("ALTER TABLE zzgd7_t1 ALTER COLUMN s TYPE zzgd7_dm");
+        assertEquals("zzgd7_dm", typeOfColumn("zzgd7_t1"));
+
+        // A domain over a domain is a type of its own, and the column reads back as the one that
+        // was named.
+        exec("ALTER TABLE zzgd7_t1 ALTER COLUMN s TYPE zzgd7_dm2");
+        assertEquals("zzgd7_dm2", typeOfColumn("zzgd7_t1"));
+        exec("DROP TABLE zzgd7_t1");
+
+        // A text column does not reach an integer domain on its own, and PostgreSQL puts the
+        // conversion the writer meant in the hint.
+        exec("CREATE TABLE zzgd7_t4 (s text)");
+        assertEquals("42804", stateOf("ALTER TABLE zzgd7_t4 ALTER COLUMN s TYPE zzgd7_dm"));
+        assertEquals("column \"s\" cannot be cast automatically to type zzgd7_dm",
+                messageOf("ALTER TABLE zzgd7_t4 ALTER COLUMN s TYPE zzgd7_dm"));
+        assertEquals("You might need to specify \"USING s::zzgd7_dm\".",
+                hintOf("ALTER TABLE zzgd7_t4 ALTER COLUMN s TYPE zzgd7_dm"));
+        assertEquals("text", typeOfColumn("zzgd7_t4"));
+
+        exec("DROP TABLE zzgd7_t4");
+        exec("DROP DOMAIN zzgd7_dm2");
+        exec("DROP DOMAIN zzgd7_dm");
+    }
+
+    @Test
+    void aColumnMayBeChangedToACompositeThroughAUsingClause() throws Exception {
+        exec("CREATE TYPE zzgd7_comp AS (x int, y text)");
+        exec("CREATE TYPE zzgd7_comp2 AS (x int)");
+        exec("CREATE TABLE zzgd7_c1 (a text)");
+
+        assertEquals("42804", stateOf("ALTER TABLE zzgd7_c1 ALTER COLUMN a TYPE zzgd7_comp"));
+        assertEquals("column \"a\" cannot be cast automatically to type zzgd7_comp",
+                messageOf("ALTER TABLE zzgd7_c1 ALTER COLUMN a TYPE zzgd7_comp"));
+        assertEquals("You might need to specify \"USING a::zzgd7_comp\".",
+                hintOf("ALTER TABLE zzgd7_c1 ALTER COLUMN a TYPE zzgd7_comp"));
+
+        exec("ALTER TABLE zzgd7_c1 ALTER COLUMN a TYPE zzgd7_comp USING ROW(1, a)::zzgd7_comp");
+        assertEquals("zzgd7_comp", typeOfColumn("zzgd7_c1"));
+        // The column is already that composite, so the retype has nothing to convert.
+        exec("ALTER TABLE zzgd7_c1 ALTER COLUMN a TYPE zzgd7_comp");
+        // Another composite is another type.
+        assertEquals("column \"a\" cannot be cast automatically to type zzgd7_comp2",
+                messageOf("ALTER TABLE zzgd7_c1 ALTER COLUMN a TYPE zzgd7_comp2"));
+        // A composite reaches a string type by an assignment cast, as every type does.
+        exec("ALTER TABLE zzgd7_c1 ALTER COLUMN a TYPE varchar(4)");
+        assertEquals("character varying(4)", typeOfColumn("zzgd7_c1"));
+        exec("DROP TABLE zzgd7_c1");
+
+        // Out of a composite into a number there is no cast at all.
+        exec("CREATE TABLE zzgd7_c2 (a zzgd7_comp)");
+        assertEquals("42804", stateOf("ALTER TABLE zzgd7_c2 ALTER COLUMN a TYPE int"));
+        assertEquals("column \"a\" cannot be cast automatically to type integer",
+                messageOf("ALTER TABLE zzgd7_c2 ALTER COLUMN a TYPE int"));
+        assertEquals("You might need to specify \"USING a::integer\".",
+                hintOf("ALTER TABLE zzgd7_c2 ALTER COLUMN a TYPE int"));
+        exec("ALTER TABLE zzgd7_c2 ALTER COLUMN a TYPE text");
+        assertEquals("text", typeOfColumn("zzgd7_c2"));
+
+        exec("DROP TABLE zzgd7_c2");
+        exec("DROP TYPE zzgd7_comp2");
+        exec("DROP TYPE zzgd7_comp");
+    }
+
+    @Test
+    void oneEnumDoesNotReachAnotherButBothReachAStringType() throws Exception {
+        exec("CREATE TYPE zzgd7_en AS ENUM ('a','b')");
+        exec("CREATE TYPE zzgd7_en2 AS ENUM ('c')");
+        exec("CREATE TABLE zzgd7_e1 (a zzgd7_en)");
+
+        assertEquals("42804", stateOf("ALTER TABLE zzgd7_e1 ALTER COLUMN a TYPE zzgd7_en2"));
+        assertEquals("column \"a\" cannot be cast automatically to type zzgd7_en2",
+                messageOf("ALTER TABLE zzgd7_e1 ALTER COLUMN a TYPE zzgd7_en2"));
+        assertEquals("You might need to specify \"USING a::zzgd7_en2\".",
+                hintOf("ALTER TABLE zzgd7_e1 ALTER COLUMN a TYPE zzgd7_en2"));
+
+        // The enum the column already carries is not a conversion at all.
+        exec("ALTER TABLE zzgd7_e1 ALTER COLUMN a TYPE zzgd7_en");
+        exec("ALTER TABLE zzgd7_e1 ALTER COLUMN a TYPE text");
+        assertEquals("text", typeOfColumn("zzgd7_e1"));
+
+        exec("DROP TABLE zzgd7_e1");
+        exec("DROP TYPE zzgd7_en2");
+        exec("DROP TYPE zzgd7_en");
+    }
+
+    @Test
+    void aRetypeToADomainKeepsTheDefaultTheConstraintAndTheIndex() throws Exception {
+        exec("CREATE DOMAIN zzgd7_pos AS int CHECK (VALUE > 0)");
+        exec("CREATE TABLE zzgd7_k (a int DEFAULT 5)");
+        exec("CREATE INDEX zzgd7_kx ON zzgd7_k (a)");
+        exec("ALTER TABLE zzgd7_k ADD CONSTRAINT zzgd7_kck CHECK (a > 1)");
+        exec("INSERT INTO zzgd7_k VALUES (3)");
+        exec("ALTER TABLE zzgd7_k ALTER COLUMN a TYPE zzgd7_pos");
+
+        assertEquals("zzgd7_pos", typeOfColumn("zzgd7_k"));
+        assertEquals("5", scalar("SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef"
+                + " WHERE adrelid = 'zzgd7_k'::regclass"));
+        assertEquals("CREATE INDEX zzgd7_kx ON public.zzgd7_k USING btree (a)",
+                indexDef("zzgd7_kx"));
+        assertEquals("3", scalar("SELECT a FROM zzgd7_k"));
+
+        // The column is a column of the domain from here on, so what is written into it is held
+        // to the domain's own rules as well as to the relation's.
+        assertEquals("23514", stateOf("INSERT INTO zzgd7_k VALUES (-4)"));
+        assertEquals("value for domain zzgd7_pos violates check constraint \"zzgd7_pos_check\"",
+                messageOf("INSERT INTO zzgd7_k VALUES (-4)"));
+        assertEquals("new row for relation \"zzgd7_k\" violates check constraint \"zzgd7_kck\"",
+                messageOf("INSERT INTO zzgd7_k VALUES (1)"));
+        assertEquals("3", rowsOf("SELECT a FROM zzgd7_k ORDER BY 1"));
+        exec("DROP TABLE zzgd7_k");
+
+        // A row the domain would not have taken stops the retype, and nothing moves.
+        exec("CREATE TABLE zzgd7_k2 (a int)");
+        exec("INSERT INTO zzgd7_k2 VALUES (-2)");
+        assertEquals("23514", stateOf("ALTER TABLE zzgd7_k2 ALTER COLUMN a TYPE zzgd7_pos"));
+        assertEquals("value for domain zzgd7_pos violates check constraint \"zzgd7_pos_check\"",
+                messageOf("ALTER TABLE zzgd7_k2 ALTER COLUMN a TYPE zzgd7_pos"));
+        assertEquals("integer", typeOfColumn("zzgd7_k2"));
+        assertEquals("-2", scalar("SELECT a FROM zzgd7_k2"));
+
+        exec("DROP TABLE zzgd7_k2");
+        exec("DROP DOMAIN zzgd7_pos");
+    }
+
+    @Test
+    void aRetypeToADomainReachesEveryDescendantAndTheColumnDependsOnIt() throws Exception {
+        exec("CREATE DOMAIN zzgd7_hd AS int");
+        exec("CREATE TABLE zzgd7_hp (a text)");
+        exec("CREATE TABLE zzgd7_hc () INHERITS (zzgd7_hp)");
+        exec("ALTER TABLE zzgd7_hp ALTER COLUMN a TYPE zzgd7_hd USING a::int");
+
+        assertEquals("zzgd7_hc/zzgd7_hd,zzgd7_hp/zzgd7_hd",
+                scalar("SELECT string_agg(c.relname||'/'"
+                        + "||format_type(a.atttypid, a.atttypmod), ',' ORDER BY c.relname)"
+                        + " FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid"
+                        + " WHERE c.relname IN ('zzgd7_hp','zzgd7_hc') AND a.attnum > 0"));
+
+        // A column of a domain is a column depending on that domain, however it came to be one.
+        assertEquals("2BP01", stateOf("DROP DOMAIN zzgd7_hd"));
+        assertEquals("cannot drop type zzgd7_hd because other objects depend on it",
+                messageOf("DROP DOMAIN zzgd7_hd"));
+        assertEquals("Use DROP ... CASCADE to drop the dependent objects too.",
+                hintOf("DROP DOMAIN zzgd7_hd"));
+
+        exec("DROP TABLE zzgd7_hc");
+        exec("DROP TABLE zzgd7_hp");
+        exec("DROP DOMAIN zzgd7_hd");
+    }
+
+    @Test
+    void noTypeAReaderDefinedTakesATypeModifier() throws Exception {
+        exec("CREATE DOMAIN zzgd7_md AS int");
+        exec("CREATE TYPE zzgd7_mc AS (x int)");
+        exec("CREATE TYPE zzgd7_me AS ENUM ('a')");
+
+        assertEquals("42601", stateOf("CREATE TABLE zzgd7_m1 (a zzgd7_md(5))"));
+        assertEquals("type modifier is not allowed for type \"zzgd7_md\"",
+                messageOf("CREATE TABLE zzgd7_m1 (a zzgd7_md(5))"));
+        assertEquals("type modifier is not allowed for type \"zzgd7_mc\"",
+                messageOf("CREATE TABLE zzgd7_m2 (a zzgd7_mc(3))"));
+        assertEquals("type modifier is not allowed for type \"zzgd7_me\"",
+                messageOf("CREATE TABLE zzgd7_m3 (a zzgd7_me(3))"));
+
+        exec("CREATE TABLE zzgd7_m4 (a int)");
+        assertEquals("type modifier is not allowed for type \"zzgd7_md\"",
+                messageOf("ALTER TABLE zzgd7_m4 ALTER COLUMN a TYPE zzgd7_md(5)"));
+        assertEquals("type modifier is not allowed for type \"zzgd7_mc\"",
+                messageOf("ALTER TABLE zzgd7_m4 ADD COLUMN b zzgd7_mc(3)"));
+
+        // A type nothing answers to is reported as that, and the column is settled before it is.
+        assertEquals("42704", stateOf("ALTER TABLE zzgd7_m4 ALTER COLUMN a TYPE zzgd7_nosuch"));
+        assertEquals("type \"zzgd7_nosuch\" does not exist",
+                messageOf("ALTER TABLE zzgd7_m4 ALTER COLUMN a TYPE zzgd7_nosuch"));
+        assertEquals("42703", stateOf("ALTER TABLE zzgd7_m4 ALTER COLUMN nosuch TYPE zzgd7_md"));
+        assertEquals("column \"nosuch\" of relation \"zzgd7_m4\" does not exist",
+                messageOf("ALTER TABLE zzgd7_m4 ALTER COLUMN nosuch TYPE zzgd7_md"));
+
+        exec("DROP TABLE zzgd7_m4");
+        exec("DROP TYPE zzgd7_me");
+        exec("DROP TYPE zzgd7_mc");
+        exec("DROP DOMAIN zzgd7_md");
+    }
+
+    // ------------------------------------------------------------ A NOT NULL that is not valid yet
+
+    @Test
+    void aNotNullDeclaredNotValidIsRecordedOnTheRelationAndOnEveryChild() throws Exception {
+        exec("CREATE TABLE zzgd7_np (i int, j int)");
+        exec("CREATE TABLE zzgd7_nc () INHERITS (zzgd7_np)");
+        exec("INSERT INTO zzgd7_np VALUES (1, NULL)");
+        exec("INSERT INTO zzgd7_nc VALUES (2, NULL)");
+        exec("ALTER TABLE zzgd7_np ADD CONSTRAINT zzgd7_nn NOT NULL j NOT VALID");
+
+        assertEquals("zzgd7_nc/zzgd7_nn/n/false/false/1/false/true,"
+                        + "zzgd7_np/zzgd7_nn/n/false/true/0/false/true",
+                scalar("SELECT string_agg(cl.relname||'/'||c.conname||'/'||c.contype::text||'/'"
+                        + "||c.convalidated::text||'/'||c.conislocal::text||'/'"
+                        + "||c.coninhcount::text||'/'||c.connoinherit::text||'/'"
+                        + "||c.conenforced::text, ',' ORDER BY cl.relname)"
+                        + " FROM pg_constraint c JOIN pg_class cl ON cl.oid = c.conrelid"
+                        + " WHERE cl.relname IN ('zzgd7_np','zzgd7_nc')"));
+
+        // The clause is part of what the constraint is, so its definition says so too.
+        assertEquals("NOT NULL j NOT VALID",
+                scalar("SELECT pg_get_constraintdef(oid) FROM pg_constraint"
+                        + " WHERE conname = 'zzgd7_nn' AND conrelid = 'zzgd7_np'::regclass"));
+
+        // NOT VALID defers the rows already there, never the rule itself: the column is marked
+        // NOT NULL on both relations, the two rows stay, and every row written now is held to it.
+        assertEquals("zzgd7_nc/true,zzgd7_np/true",
+                scalar("SELECT string_agg(cl.relname||'/'||a.attnotnull::text, ','"
+                        + " ORDER BY cl.relname) FROM pg_attribute a"
+                        + " JOIN pg_class cl ON cl.oid = a.attrelid"
+                        + " WHERE cl.relname IN ('zzgd7_np','zzgd7_nc') AND a.attname = 'j'"));
+        assertEquals(2, num("SELECT count(*)::int FROM zzgd7_np"));
+        assertEquals("23502", stateOf("INSERT INTO zzgd7_np VALUES (3, NULL)"));
+        assertEquals("null value in column \"j\" of relation \"zzgd7_np\""
+                        + " violates not-null constraint",
+                messageOf("INSERT INTO zzgd7_np VALUES (3, NULL)"));
+        assertEquals("null value in column \"j\" of relation \"zzgd7_nc\""
+                        + " violates not-null constraint",
+                messageOf("INSERT INTO zzgd7_nc VALUES (4, NULL)"));
+
+        exec("DROP TABLE zzgd7_nc");
+        exec("DROP TABLE zzgd7_np");
+    }
+
+    @Test
+    void aRowThatWasAlreadyThereMayStayButMayNotBeWrittenAgain() throws Exception {
+        exec("CREATE TABLE zzgd7_u (i int, j int)");
+        exec("INSERT INTO zzgd7_u VALUES (1, NULL), (2, 5)");
+        exec("ALTER TABLE zzgd7_u ADD CONSTRAINT zzgd7_un NOT NULL j NOT VALID");
+        assertEquals("1/null;2/5", rowsOf("SELECT i, j FROM zzgd7_u ORDER BY i"));
+
+        // Writing the row again is writing a null into the column, so it is refused even where
+        // the statement never named that column.
+        assertEquals("23502", stateOf("UPDATE zzgd7_u SET i = 9 WHERE i = 1"));
+        assertEquals("null value in column \"j\" of relation \"zzgd7_u\""
+                        + " violates not-null constraint",
+                messageOf("UPDATE zzgd7_u SET i = 9 WHERE i = 1"));
+        assertEquals("null value in column \"j\" of relation \"zzgd7_u\""
+                        + " violates not-null constraint",
+                messageOf("UPDATE zzgd7_u SET j = NULL WHERE i = 2"));
+
+        exec("UPDATE zzgd7_u SET j = 3 WHERE i = 1");
+        exec("ALTER TABLE zzgd7_u VALIDATE CONSTRAINT zzgd7_un");
+        assertEquals("zzgd7_u/true", validatedAcross("zzgd7_un"));
+
+        exec("DROP TABLE zzgd7_u");
+    }
+
+    @Test
+    void validateConstraintReadsTheRowsAndNamesTheRelationTheyAreReallyIn() throws Exception {
+        exec("CREATE TABLE zzgd7_vp (i int, j int)");
+        exec("CREATE TABLE zzgd7_vc () INHERITS (zzgd7_vp)");
+        exec("INSERT INTO zzgd7_vc VALUES (2, NULL)");
+        exec("ALTER TABLE zzgd7_vp ADD NOT NULL j NOT VALID");
+
+        assertEquals("zzgd7_vc/false,zzgd7_vp/false", validatedAcross("zzgd7_vp_j_not_null"));
+        assertEquals("23502",
+                stateOf("ALTER TABLE zzgd7_vp VALIDATE CONSTRAINT zzgd7_vp_j_not_null"));
+        assertEquals("column \"j\" of relation \"zzgd7_vc\" contains null values",
+                messageOf("ALTER TABLE zzgd7_vp VALIDATE CONSTRAINT zzgd7_vp_j_not_null"));
+        // Asked of the child, the answer names the child too, because that is where the rows are.
+        assertEquals("column \"j\" of relation \"zzgd7_vc\" contains null values",
+                messageOf("ALTER TABLE zzgd7_vc VALIDATE CONSTRAINT zzgd7_vp_j_not_null"));
+        assertEquals("zzgd7_vc/false,zzgd7_vp/false", validatedAcross("zzgd7_vp_j_not_null"));
+
+        // Validating on the child settles the child's copy alone: the relation that declared the
+        // rule is still waiting for its own rows to be read.
+        exec("UPDATE zzgd7_vc SET j = 7");
+        exec("ALTER TABLE zzgd7_vc VALIDATE CONSTRAINT zzgd7_vp_j_not_null");
+        assertEquals("zzgd7_vc/true,zzgd7_vp/false", validatedAcross("zzgd7_vp_j_not_null"));
+        exec("ALTER TABLE zzgd7_vp VALIDATE CONSTRAINT zzgd7_vp_j_not_null");
+        assertEquals("zzgd7_vc/true,zzgd7_vp/true", validatedAcross("zzgd7_vp_j_not_null"));
+
+        // Validating what has already been validated has nothing to do, and the clause is gone
+        // from the definition.
+        exec("ALTER TABLE zzgd7_vp VALIDATE CONSTRAINT zzgd7_vp_j_not_null");
+        assertEquals("NOT NULL j",
+                scalar("SELECT pg_get_constraintdef(oid) FROM pg_constraint"
+                        + " WHERE conname = 'zzgd7_vp_j_not_null'"
+                        + " AND conrelid = 'zzgd7_vp'::regclass"));
+
+        exec("DROP TABLE zzgd7_vc");
+        exec("DROP TABLE zzgd7_vp");
+    }
+
+    @Test
+    void aPartitionedTableKeepsItsRowsBelowAndThatIsWhereTheScanLooks() throws Exception {
+        exec("CREATE TABLE zzgd7_pp (i int, j int) PARTITION BY RANGE (i)");
+        exec("CREATE TABLE zzgd7_p1 PARTITION OF zzgd7_pp FOR VALUES FROM (1) TO (10)");
+        exec("INSERT INTO zzgd7_pp VALUES (2, NULL)");
+        exec("ALTER TABLE zzgd7_pp ADD CONSTRAINT zzgd7_pn NOT NULL j NOT VALID");
+
+        assertEquals("zzgd7_p1/false/false/1,zzgd7_pp/false/true/0",
+                scalar("SELECT string_agg(cl.relname||'/'||c.convalidated::text||'/'"
+                        + "||c.conislocal::text||'/'||c.coninhcount::text, ',' ORDER BY cl.relname)"
+                        + " FROM pg_constraint c JOIN pg_class cl ON cl.oid = c.conrelid"
+                        + " WHERE c.conname = 'zzgd7_pn'"));
+        assertEquals("23502", stateOf("ALTER TABLE zzgd7_pp VALIDATE CONSTRAINT zzgd7_pn"));
+        assertEquals("column \"j\" of relation \"zzgd7_p1\" contains null values",
+                messageOf("ALTER TABLE zzgd7_pp VALIDATE CONSTRAINT zzgd7_pn"));
+
+        exec("UPDATE zzgd7_pp SET j = 1");
+        exec("ALTER TABLE zzgd7_pp VALIDATE CONSTRAINT zzgd7_pn");
+        assertEquals("zzgd7_p1/true,zzgd7_pp/true", validatedAcross("zzgd7_pn"));
+
+        exec("DROP TABLE zzgd7_pp");
+    }
+
+    @Test
+    void aRelationThatJoinsTheHierarchyAfterwardsTakesTheRuleAsValidated() throws Exception {
+        // A relation created below the one that declared the rule brings no rows with it, so its
+        // own copy holds over everything it stores from the moment it is there.
+        exec("CREATE TABLE zzgd7_zp (i int, j int) PARTITION BY RANGE (i)");
+        exec("ALTER TABLE zzgd7_zp ADD CONSTRAINT zzgd7_zn NOT NULL j NOT VALID");
+        exec("CREATE TABLE zzgd7_z1 PARTITION OF zzgd7_zp FOR VALUES FROM (1) TO (10)");
+        assertEquals("zzgd7_z1/true,zzgd7_zp/false", validatedAcross("zzgd7_zn"));
+        exec("DROP TABLE zzgd7_zp");
+
+        exec("CREATE TABLE zzgd7_yp (i int, j int)");
+        exec("ALTER TABLE zzgd7_yp ADD CONSTRAINT zzgd7_yn NOT NULL j NOT VALID");
+        exec("CREATE TABLE zzgd7_yc () INHERITS (zzgd7_yp)");
+        assertEquals("zzgd7_yc/true,zzgd7_yp/false", validatedAcross("zzgd7_yn"));
+
+        exec("DROP TABLE zzgd7_yc");
+        exec("DROP TABLE zzgd7_yp");
+    }
+
+    @Test
+    void aValidatedNotNullWillNotBeDeclaredOverOneNobodyHasRead() throws Exception {
+        exec("CREATE TABLE zzgd7_b (i int, j int)");
+        exec("ALTER TABLE zzgd7_b ADD CONSTRAINT zzgd7_bn NOT NULL j NOT VALID");
+
+        assertEquals("55000",
+                stateOf("ALTER TABLE zzgd7_b ADD CONSTRAINT zzgd7_bn2 NOT NULL j"));
+        assertEquals("incompatible NOT VALID constraint \"zzgd7_bn\" on relation \"zzgd7_b\"",
+                messageOf("ALTER TABLE zzgd7_b ADD CONSTRAINT zzgd7_bn2 NOT NULL j"));
+        assertEquals("You might need to validate it using ALTER TABLE ... VALIDATE CONSTRAINT.",
+                hintOf("ALTER TABLE zzgd7_b ADD CONSTRAINT zzgd7_bn2 NOT NULL j"));
+
+        // A second NOT VALID declaration merges into the constraint already there, name and all.
+        exec("ALTER TABLE zzgd7_b ADD CONSTRAINT zzgd7_bn3 NOT NULL j NOT VALID");
+        assertEquals("zzgd7_bn/false",
+                scalar("SELECT string_agg(conname||'/'||convalidated::text, ',' ORDER BY conname)"
+                        + " FROM pg_constraint WHERE conrelid = 'zzgd7_b'::regclass"));
+
+        exec("DROP TABLE zzgd7_b");
+    }
+
+    @Test
+    void aPrimaryKeyWillNotBeBuiltOverANotNullNobodyHasRead() throws Exception {
+        exec("CREATE TABLE zzgd7_kk (i int, j int)");
+        exec("INSERT INTO zzgd7_kk VALUES (1, NULL)");
+        exec("ALTER TABLE zzgd7_kk ADD CONSTRAINT zzgd7_kn NOT NULL j NOT VALID");
+
+        assertEquals("55000", stateOf("ALTER TABLE zzgd7_kk ADD PRIMARY KEY (j)"));
+        assertEquals("cannot create primary key on column \"j\"",
+                messageOf("ALTER TABLE zzgd7_kk ADD PRIMARY KEY (j)"));
+        assertEquals("The constraint \"zzgd7_kn\" on column \"j\" of table \"zzgd7_kk\","
+                        + " marked NOT VALID, is incompatible with a primary key.",
+                detailOf("ALTER TABLE zzgd7_kk ADD PRIMARY KEY (j)"));
+        assertEquals("You might need to validate it using ALTER TABLE ... VALIDATE CONSTRAINT.",
+                hintOf("ALTER TABLE zzgd7_kk ADD PRIMARY KEY (j)"));
+        assertEquals("zzgd7_kn/n/false",
+                scalar("SELECT string_agg(conname||'/'||contype::text||'/'||convalidated::text,"
+                        + " ',' ORDER BY conname) FROM pg_constraint"
+                        + " WHERE conrelid = 'zzgd7_kk'::regclass"));
+
+        // SET NOT NULL reads the rows, so it settles what the declaration left open.
+        assertEquals("23502", stateOf("ALTER TABLE zzgd7_kk ALTER COLUMN j SET NOT NULL"));
+        assertEquals("column \"j\" of relation \"zzgd7_kk\" contains null values",
+                messageOf("ALTER TABLE zzgd7_kk ALTER COLUMN j SET NOT NULL"));
+        assertEquals("zzgd7_kk/false", validatedAcross("zzgd7_kn"));
+
+        exec("UPDATE zzgd7_kk SET j = 4");
+        exec("ALTER TABLE zzgd7_kk ALTER COLUMN j SET NOT NULL");
+        assertEquals("zzgd7_kk/true", validatedAcross("zzgd7_kn"));
+
+        exec("DROP TABLE zzgd7_kk");
+    }
+
+    @Test
+    void notValidDoesNotReopenARuleTheColumnHasAlreadyBeenHeldTo() throws Exception {
+        exec("CREATE TABLE zzgd7_hh (i int, j int NOT NULL)");
+        exec("ALTER TABLE zzgd7_hh ADD CONSTRAINT zzgd7_hn NOT NULL j NOT VALID");
+
+        // The declaration creates nothing: the constraint already there keeps its name and stays
+        // as validated as it was.
+        assertEquals("zzgd7_hh_j_not_null/true",
+                scalar("SELECT string_agg(conname||'/'||convalidated::text, ',' ORDER BY conname)"
+                        + " FROM pg_constraint WHERE conrelid = 'zzgd7_hh'::regclass"));
+
+        exec("DROP TABLE zzgd7_hh");
+    }
+
+    @Test
+    void droppingANotValidNotNullTakesTheRuleWithIt() throws Exception {
+        exec("CREATE TABLE zzgd7_dd (i int, j int)");
+        exec("INSERT INTO zzgd7_dd VALUES (1, NULL)");
+        exec("ALTER TABLE zzgd7_dd ADD CONSTRAINT zzgd7_dn NOT NULL j NOT VALID");
+        exec("ALTER TABLE zzgd7_dd DROP CONSTRAINT zzgd7_dn");
+        assertEquals("i/false/true/0,j/false/true/0", attsOf("zzgd7_dd"));
+
+        // And so does DROP NOT NULL written on the column.
+        exec("ALTER TABLE zzgd7_dd ADD CONSTRAINT zzgd7_dn NOT NULL j NOT VALID");
+        exec("ALTER TABLE zzgd7_dd ALTER COLUMN j DROP NOT NULL");
+        assertNull(notNullsOf("zzgd7_dd"));
+        exec("INSERT INTO zzgd7_dd VALUES (2, NULL)");
+        assertEquals(2, num("SELECT count(*)::int FROM zzgd7_dd"));
+
+        exec("DROP TABLE zzgd7_dd");
+    }
+
+    @Test
+    void aValidationThatIsRolledBackLeavesTheRowsUnread() throws Exception {
+        exec("CREATE TABLE zzgd7_rr (i int, j int)");
+        exec("INSERT INTO zzgd7_rr VALUES (1, NULL)");
+        exec("ALTER TABLE zzgd7_rr ADD CONSTRAINT zzgd7_rn NOT NULL j NOT VALID");
+        exec("UPDATE zzgd7_rr SET j = 2");
+
+        rolledBack(() -> {
+            exec("ALTER TABLE zzgd7_rr VALIDATE CONSTRAINT zzgd7_rn");
+            assertEquals("zzgd7_rr/true", validatedAcross("zzgd7_rn"));
+        });
+        assertEquals("zzgd7_rr/false", validatedAcross("zzgd7_rn"));
+
+        // And the declaration itself is undone with the transaction that made it.
+        rolledBack(() -> exec("ALTER TABLE zzgd7_rr ADD CONSTRAINT zzgd7_rn2 NOT NULL i NOT VALID"));
+        assertEquals("i/false/true/0,j/true/true/0", attsOf("zzgd7_rr"));
+
+        exec("DROP TABLE zzgd7_rr");
+    }
+
+    @Test
+    void aCheckDeclaredNotValidIsValidatedOverTheRowsTheRelationStandsFor() throws Exception {
+        exec("CREATE TABLE zzgd7_cp (i int, j int)");
+        exec("CREATE TABLE zzgd7_cc () INHERITS (zzgd7_cp)");
+        exec("INSERT INTO zzgd7_cc VALUES (1, 0)");
+        exec("ALTER TABLE zzgd7_cp ADD CONSTRAINT zzgd7_ck CHECK (j > 0) NOT VALID");
+
+        assertEquals("CHECK ((j > 0)) NOT VALID",
+                scalar("SELECT pg_get_constraintdef(oid) FROM pg_constraint"
+                        + " WHERE conname = 'zzgd7_ck' AND conrelid = 'zzgd7_cp'::regclass"));
+        // The row already there may stay; a row written now is held to the rule.
+        assertEquals("new row for relation \"zzgd7_cc\" violates check constraint \"zzgd7_ck\"",
+                messageOf("INSERT INTO zzgd7_cc VALUES (2, -1)"));
+        assertEquals("23514", stateOf("ALTER TABLE zzgd7_cp VALIDATE CONSTRAINT zzgd7_ck"));
+        assertEquals("check constraint \"zzgd7_ck\" of relation \"zzgd7_cc\""
+                        + " is violated by some row",
+                messageOf("ALTER TABLE zzgd7_cp VALIDATE CONSTRAINT zzgd7_ck"));
+
+        exec("UPDATE zzgd7_cc SET j = 5");
+        exec("ALTER TABLE zzgd7_cp VALIDATE CONSTRAINT zzgd7_ck");
+        assertEquals("zzgd7_cc/true,zzgd7_cp/true", validatedAcross("zzgd7_ck"));
+        assertEquals("CHECK ((j > 0))",
+                scalar("SELECT pg_get_constraintdef(oid) FROM pg_constraint"
+                        + " WHERE conname = 'zzgd7_ck' AND conrelid = 'zzgd7_cp'::regclass"));
+
+        exec("DROP TABLE zzgd7_cc");
+        exec("DROP TABLE zzgd7_cp");
+    }
+
+    @Test
+    void validatingACheckOnAChildSettlesThatChildAlone() throws Exception {
+        exec("CREATE TABLE zzgd7_c3 (i int, j int)");
+        exec("CREATE TABLE zzgd7_c4 () INHERITS (zzgd7_c3)");
+        exec("INSERT INTO zzgd7_c4 VALUES (1, 5)");
+        exec("ALTER TABLE zzgd7_c3 ADD CONSTRAINT zzgd7_ck2 CHECK (j > 0) NOT VALID");
+        exec("ALTER TABLE zzgd7_c4 VALIDATE CONSTRAINT zzgd7_ck2");
+
+        assertEquals("zzgd7_c3/false,zzgd7_c4/true", validatedAcross("zzgd7_ck2"));
+
+        exec("DROP TABLE zzgd7_c4");
+        exec("DROP TABLE zzgd7_c3");
+    }
+    // ------------------------------------------------------------ What a failed statement leaves behind in the relations its triggers wrote to
+
+    /** Creates a log relation, a target and a routine that notes each row and raises on i = 2. */
+    private static void noisyTrigger(String name, String when) throws SQLException {
+        exec("CREATE TABLE " + name + "_log (n int)");
+        exec("CREATE TABLE " + name + "_t (i int)");
+        exec("CREATE FUNCTION " + name + "_note() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN"
+                + " INSERT INTO " + name + "_log VALUES (NEW.i);"
+                + " IF NEW.i = 2 THEN RAISE EXCEPTION 'boom'; END IF; RETURN NEW; END $$");
+        exec("CREATE TRIGGER " + name + "_tr " + when + " INSERT ON " + name + "_t"
+                + " FOR EACH ROW EXECUTE FUNCTION " + name + "_note()");
+    }
+
+    private static void dropNoisyTrigger(String name) throws SQLException {
+        exec("DROP TABLE " + name + "_t CASCADE");
+        exec("DROP TABLE " + name + "_log CASCADE");
+        exec("DROP FUNCTION " + name + "_note() CASCADE");
+    }
+
+    @Test
+    void whatAnAfterTriggerWroteElsewhereGoesWithTheStatementThatFailed() throws Exception {
+        noisyTrigger("zzjt_af", "AFTER");
+
+        // The first row was written and noted before the second row raised.
+        assertEquals("boom", messageOf("INSERT INTO zzjt_af_t VALUES (1),(2),(3)"));
+        assertEquals(0, num("SELECT count(*)::int FROM zzjt_af_t"));
+        assertEquals(0, num("SELECT count(*)::int FROM zzjt_af_log"));
+
+        // The control: a statement that succeeds keeps every write its trigger made.
+        exec("INSERT INTO zzjt_af_t VALUES (7),(8)");
+        assertEquals("7,8", column("SELECT n FROM zzjt_af_log ORDER BY n"));
+        assertEquals(2, num("SELECT count(*)::int FROM zzjt_af_t"));
+
+        // And a later failure takes back only its own statement's writes.
+        assertEquals("P0001", stateOf("INSERT INTO zzjt_af_t VALUES (5),(2)"));
+        assertEquals("7,8", column("SELECT n FROM zzjt_af_log ORDER BY n"));
+        assertEquals(2, num("SELECT count(*)::int FROM zzjt_af_t"));
+
+        dropNoisyTrigger("zzjt_af");
+    }
+
+    @Test
+    void whatABeforeTriggerWroteElsewhereGoesWithTheStatementThatFailed() throws Exception {
+        noisyTrigger("zzjt_bf", "BEFORE");
+
+        assertEquals("boom", messageOf("INSERT INTO zzjt_bf_t VALUES (1),(2),(3)"));
+        assertEquals(0, num("SELECT count(*)::int FROM zzjt_bf_t"));
+        assertEquals(0, num("SELECT count(*)::int FROM zzjt_bf_log"));
+
+        exec("INSERT INTO zzjt_bf_t VALUES (7),(8)");
+        assertEquals("7,8", column("SELECT n FROM zzjt_bf_log ORDER BY n"));
+        assertEquals(2, num("SELECT count(*)::int FROM zzjt_bf_t"));
+
+        assertEquals("P0001", stateOf("INSERT INTO zzjt_bf_t VALUES (5),(2)"));
+        assertEquals("7,8", column("SELECT n FROM zzjt_bf_log ORDER BY n"));
+        assertEquals(2, num("SELECT count(*)::int FROM zzjt_bf_t"));
+
+        dropNoisyTrigger("zzjt_bf");
+    }
+
+    @Test
+    void insideATransactionBlockTheFailedStatementsTriggerWritesGoTooAndNoOthers() throws Exception {
+        noisyTrigger("zzjt_rb", "AFTER");
+        exec("INSERT INTO zzjt_rb_t VALUES (9)");
+
+        conn.setAutoCommit(false);
+        try {
+            assertEquals("P0001", stateOf("INSERT INTO zzjt_rb_t VALUES (1),(2),(3)"));
+            conn.rollback();
+        } finally {
+            conn.setAutoCommit(true);
+        }
+        // Nothing of the failed statement is left, and the row written before the block stands.
+        assertEquals(1, num("SELECT count(*)::int FROM zzjt_rb_t"));
+        assertEquals("9", column("SELECT n FROM zzjt_rb_log ORDER BY n"));
+
+        // The control: a transaction that commits keeps what its triggers wrote.
+        conn.setAutoCommit(false);
+        try {
+            exec("INSERT INTO zzjt_rb_t VALUES (7)");
+            conn.commit();
+        } finally {
+            conn.setAutoCommit(true);
+        }
+        assertEquals("7,9", column("SELECT i FROM zzjt_rb_t ORDER BY i"));
+        assertEquals("7,9", column("SELECT n FROM zzjt_rb_log ORDER BY n"));
+
+        dropNoisyTrigger("zzjt_rb");
+    }
+
+    @Test
+    void rollingBackToASavepointLeavesTheTriggerWritesMadeBeforeIt() throws Exception {
+        noisyTrigger("zzjt_sp", "AFTER");
+
+        conn.setAutoCommit(false);
+        try {
+            exec("INSERT INTO zzjt_sp_t VALUES (5)");
+            Savepoint sp = conn.setSavepoint("zzjt_sp_point");
+            assertEquals("P0001", stateOf("INSERT INTO zzjt_sp_t VALUES (1),(2),(3)"));
+            conn.rollback(sp);
+
+            // The write from the statement before the savepoint is still there.
+            assertEquals(1, num("SELECT count(*)::int FROM zzjt_sp_t"));
+            assertEquals(1, num("SELECT count(*)::int FROM zzjt_sp_log"));
+
+            // And the transaction goes on from there.
+            exec("INSERT INTO zzjt_sp_t VALUES (6)");
+            assertEquals(2, num("SELECT count(*)::int FROM zzjt_sp_log"));
+            conn.commit();
+        } finally {
+            conn.setAutoCommit(true);
+        }
+        assertEquals("5,6", column("SELECT n FROM zzjt_sp_log ORDER BY n"));
+        assertEquals("5,6", column("SELECT i FROM zzjt_sp_t ORDER BY i"));
+
+        dropNoisyTrigger("zzjt_sp");
+    }
+
+    @Test
+    void anExceptionHandlerUndoesTheTriggerWritesOfTheStatementItCaught() throws Exception {
+        noisyTrigger("zzjt_eh", "AFTER");
+        String caught = "DO $$ BEGIN BEGIN INSERT INTO zzjt_eh_t VALUES (1),(2),(3);"
+                + " EXCEPTION WHEN others THEN NULL; END; END $$";
+
+        // Outside a transaction block, with the handler swallowing the error.
+        exec(caught);
+        assertEquals(0, num("SELECT count(*)::int FROM zzjt_eh_t"));
+        assertEquals(0, num("SELECT count(*)::int FROM zzjt_eh_log"));
+
+        // Inside one, where the transaction goes on afterwards and commits.
+        conn.setAutoCommit(false);
+        try {
+            exec("INSERT INTO zzjt_eh_t VALUES (9)");
+            exec(caught);
+            assertEquals(1, num("SELECT count(*)::int FROM zzjt_eh_t"));
+            assertEquals(1, num("SELECT count(*)::int FROM zzjt_eh_log"));
+            conn.commit();
+        } finally {
+            conn.setAutoCommit(true);
+        }
+        assertEquals("9", column("SELECT n FROM zzjt_eh_log ORDER BY n"));
+
+        dropNoisyTrigger("zzjt_eh");
+    }
+
+    @Test
+    void whatAFailedUpdateDeleteAndMergeLeftElsewhereGoesTheSameWay() throws Exception {
+        exec("CREATE TABLE zzjt_ud_log (n int)");
+        exec("CREATE TABLE zzjt_ud_t (i int, v int)");
+        exec("INSERT INTO zzjt_ud_t VALUES (1,10),(2,20),(3,30)");
+        exec("CREATE FUNCTION zzjt_ud_u() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN"
+                + " INSERT INTO zzjt_ud_log VALUES (NEW.i);"
+                + " IF NEW.i = 2 THEN RAISE EXCEPTION 'boom'; END IF; RETURN NEW; END $$");
+        exec("CREATE FUNCTION zzjt_ud_d() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN"
+                + " INSERT INTO zzjt_ud_log VALUES (OLD.i);"
+                + " IF OLD.i = 2 THEN RAISE EXCEPTION 'boom'; END IF; RETURN OLD; END $$");
+
+        exec("CREATE TRIGGER zzjt_ud_au AFTER UPDATE ON zzjt_ud_t"
+                + " FOR EACH ROW EXECUTE FUNCTION zzjt_ud_u()");
+        assertEquals("P0001", stateOf("UPDATE zzjt_ud_t SET v = v + 1"));
+        assertEquals(0, num("SELECT count(*)::int FROM zzjt_ud_log"));
+        assertEquals("10,20,30", column("SELECT v FROM zzjt_ud_t ORDER BY i"));
+
+        // The control for UPDATE: the rows it does reach are noted and kept.
+        exec("UPDATE zzjt_ud_t SET v = v + 1 WHERE i <> 2");
+        assertEquals("1,3", column("SELECT n FROM zzjt_ud_log ORDER BY n"));
+        assertEquals("11,20,31", column("SELECT v FROM zzjt_ud_t ORDER BY i"));
+        exec("DELETE FROM zzjt_ud_log");
+
+        exec("DROP TRIGGER zzjt_ud_au ON zzjt_ud_t");
+        exec("CREATE TRIGGER zzjt_ud_am AFTER UPDATE ON zzjt_ud_t"
+                + " FOR EACH ROW EXECUTE FUNCTION zzjt_ud_u()");
+        assertEquals("P0001", stateOf("MERGE INTO zzjt_ud_t t"
+                + " USING (SELECT 1 AS i UNION SELECT 2) s ON t.i = s.i"
+                + " WHEN MATCHED THEN UPDATE SET v = t.v + 100"));
+        assertEquals(0, num("SELECT count(*)::int FROM zzjt_ud_log"));
+        assertEquals("11,20,31", column("SELECT v FROM zzjt_ud_t ORDER BY i"));
+
+        // The control for MERGE.
+        exec("MERGE INTO zzjt_ud_t t USING (SELECT 1 AS i UNION SELECT 3) s ON t.i = s.i"
+                + " WHEN MATCHED THEN UPDATE SET v = t.v + 100");
+        assertEquals("1,3", column("SELECT n FROM zzjt_ud_log ORDER BY n"));
+        assertEquals("111,20,131", column("SELECT v FROM zzjt_ud_t ORDER BY i"));
+        exec("DELETE FROM zzjt_ud_log");
+        exec("DROP TRIGGER zzjt_ud_am ON zzjt_ud_t");
+
+        exec("CREATE TRIGGER zzjt_ud_ad AFTER DELETE ON zzjt_ud_t"
+                + " FOR EACH ROW EXECUTE FUNCTION zzjt_ud_d()");
+        assertEquals("P0001", stateOf("DELETE FROM zzjt_ud_t"));
+        assertEquals(0, num("SELECT count(*)::int FROM zzjt_ud_log"));
+        assertEquals(3, num("SELECT count(*)::int FROM zzjt_ud_t"));
+
+        // The control for DELETE.
+        exec("DELETE FROM zzjt_ud_t WHERE i <> 2");
+        assertEquals("1,3", column("SELECT n FROM zzjt_ud_log ORDER BY n"));
+        assertEquals(1, num("SELECT count(*)::int FROM zzjt_ud_t"));
+
+        exec("DROP TABLE zzjt_ud_t CASCADE");
+        exec("DROP TABLE zzjt_ud_log CASCADE");
+        exec("DROP FUNCTION zzjt_ud_u() CASCADE");
+        exec("DROP FUNCTION zzjt_ud_d() CASCADE");
+    }
+
+    @Test
+    void whatATriggerWroteThroughARuleGoesWithTheStatementThatFailed() throws Exception {
+        exec("CREATE TABLE zzjt_ru_log (n int)");
+        exec("CREATE TABLE zzjt_ru_via (n int)");
+        exec("CREATE RULE zzjt_ru_r AS ON INSERT TO zzjt_ru_via"
+                + " DO ALSO INSERT INTO zzjt_ru_log VALUES (NEW.n)");
+        exec("CREATE TABLE zzjt_ru_t (i int)");
+        exec("CREATE FUNCTION zzjt_ru_note() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN"
+                + " INSERT INTO zzjt_ru_via VALUES (NEW.i);"
+                + " IF NEW.i = 2 THEN RAISE EXCEPTION 'boom'; END IF; RETURN NEW; END $$");
+        exec("CREATE TRIGGER zzjt_ru_tr BEFORE INSERT ON zzjt_ru_t"
+                + " FOR EACH ROW EXECUTE FUNCTION zzjt_ru_note()");
+
+        // Two relations away from the one the statement named, and it still goes.
+        assertEquals("P0001", stateOf("INSERT INTO zzjt_ru_t VALUES (1),(2),(3)"));
+        assertEquals(0, num("SELECT count(*)::int FROM zzjt_ru_t"));
+        assertEquals(0, num("SELECT count(*)::int FROM zzjt_ru_via"));
+        assertEquals(0, num("SELECT count(*)::int FROM zzjt_ru_log"));
+
+        exec("INSERT INTO zzjt_ru_t VALUES (4),(5)");
+        assertEquals("4,5", column("SELECT n FROM zzjt_ru_via ORDER BY n"));
+        assertEquals("4,5", column("SELECT n FROM zzjt_ru_log ORDER BY n"));
+
+        exec("DROP TABLE zzjt_ru_t CASCADE");
+        exec("DROP TABLE zzjt_ru_via CASCADE");
+        exec("DROP TABLE zzjt_ru_log CASCADE");
+        exec("DROP FUNCTION zzjt_ru_note() CASCADE");
+    }
+
+    @Test
+    void whatATriggerWroteThroughAFunctionItCalledGoesTheSameWay() throws Exception {
+        exec("CREATE TABLE zzjt_fn_log (n int)");
+        exec("CREATE FUNCTION zzjt_fn_w(v int) RETURNS int LANGUAGE plpgsql AS $$ BEGIN"
+                + " INSERT INTO zzjt_fn_log VALUES (v); RETURN v; END $$");
+        exec("CREATE FUNCTION zzjt_fn_note() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN"
+                + " PERFORM zzjt_fn_w(NEW.i);"
+                + " IF NEW.i = 2 THEN RAISE EXCEPTION 'boom'; END IF; RETURN NEW; END $$");
+        exec("CREATE TABLE zzjt_fn_t (i int)");
+        exec("CREATE TRIGGER zzjt_fn_tr AFTER INSERT ON zzjt_fn_t"
+                + " FOR EACH ROW EXECUTE FUNCTION zzjt_fn_note()");
+
+        assertEquals("P0001", stateOf("INSERT INTO zzjt_fn_t VALUES (1),(2),(3)"));
+        assertEquals(0, num("SELECT count(*)::int FROM zzjt_fn_t"));
+        assertEquals(0, num("SELECT count(*)::int FROM zzjt_fn_log"));
+
+        exec("INSERT INTO zzjt_fn_t VALUES (4)");
+        assertEquals("4", column("SELECT n FROM zzjt_fn_log ORDER BY n"));
+
+        exec("DROP TABLE zzjt_fn_t CASCADE");
+        exec("DROP TABLE zzjt_fn_log CASCADE");
+        exec("DROP FUNCTION zzjt_fn_note() CASCADE");
+        exec("DROP FUNCTION zzjt_fn_w(int) CASCADE");
+    }
+
+    @Test
+    void whatAStatementLevelTriggerWroteGoesWithTheStatementThatFailed() throws Exception {
+        exec("CREATE TABLE zzjt_st_log (n int)");
+        exec("CREATE TABLE zzjt_st_t (i int)");
+        exec("CREATE FUNCTION zzjt_st_note() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN"
+                + " INSERT INTO zzjt_st_log VALUES (0); RETURN NULL; END $$");
+        exec("CREATE FUNCTION zzjt_st_raise() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN"
+                + " RAISE EXCEPTION 'boom'; END $$");
+        exec("CREATE TRIGGER zzjt_st_b BEFORE INSERT ON zzjt_st_t"
+                + " FOR EACH STATEMENT EXECUTE FUNCTION zzjt_st_note()");
+        exec("CREATE TRIGGER zzjt_st_a AFTER INSERT ON zzjt_st_t"
+                + " FOR EACH STATEMENT EXECUTE FUNCTION zzjt_st_raise()");
+
+        assertEquals("P0001", stateOf("INSERT INTO zzjt_st_t VALUES (1)"));
+        assertEquals(0, num("SELECT count(*)::int FROM zzjt_st_t"));
+        assertEquals(0, num("SELECT count(*)::int FROM zzjt_st_log"));
+
+        exec("DROP TRIGGER zzjt_st_a ON zzjt_st_t");
+        exec("INSERT INTO zzjt_st_t VALUES (1)");
+        assertEquals(1, num("SELECT count(*)::int FROM zzjt_st_t"));
+        assertEquals(1, num("SELECT count(*)::int FROM zzjt_st_log"));
+
+        exec("DROP TABLE zzjt_st_t CASCADE");
+        exec("DROP TABLE zzjt_st_log CASCADE");
+        exec("DROP FUNCTION zzjt_st_note() CASCADE");
+        exec("DROP FUNCTION zzjt_st_raise() CASCADE");
+    }
+
+    @Test
+    void aTriggersWriteGoesWhenItIsAConstraintThatRefusesALaterRow() throws Exception {
+        exec("CREATE TABLE zzjt_ck_log (n int)");
+        exec("CREATE TABLE zzjt_ck_t (i int CHECK (i < 3))");
+        exec("CREATE FUNCTION zzjt_ck_note() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN"
+                + " INSERT INTO zzjt_ck_log VALUES (NEW.i); RETURN NEW; END $$");
+        exec("CREATE TRIGGER zzjt_ck_tr BEFORE INSERT ON zzjt_ck_t"
+                + " FOR EACH ROW EXECUTE FUNCTION zzjt_ck_note()");
+
+        // The trigger raises nothing; it is the constraint on the third row that refuses,
+        // and the notes the trigger made for the first two go with it.
+        assertEquals("new row for relation \"zzjt_ck_t\" violates check constraint"
+                        + " \"zzjt_ck_t_i_check\"",
+                messageOf("INSERT INTO zzjt_ck_t VALUES (1),(2),(9)"));
+        assertEquals(0, num("SELECT count(*)::int FROM zzjt_ck_t"));
+        assertEquals(0, num("SELECT count(*)::int FROM zzjt_ck_log"));
+
+        exec("INSERT INTO zzjt_ck_t VALUES (1),(2)");
+        assertEquals("1,2", column("SELECT n FROM zzjt_ck_log ORDER BY n"));
+
+        exec("DROP TABLE zzjt_ck_t CASCADE");
+        exec("DROP TABLE zzjt_ck_log CASCADE");
+        exec("DROP FUNCTION zzjt_ck_note() CASCADE");
+    }
+
+    // ------------------------------------------------------------ A copy of a partitioned table's trigger may not carry the row out of the partition it was routed to
+
+    @Test
+    void aCopiedTriggerThatAssignsAColumnItsOwnValueHasRewrittenTheRow() throws Exception {
+        exec("CREATE FUNCTION zzjt_mv_bump() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN"
+                + " NEW.k := NEW.k + 10; RETURN NEW; END $$");
+        exec("CREATE FUNCTION zzjt_mv_same() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN"
+                + " NEW.i := NEW.i; RETURN NEW; END $$");
+        exec("CREATE TABLE zzjt_mv_q (i int, k int) PARTITION BY RANGE (k)");
+        exec("CREATE TABLE zzjt_mv_q0 PARTITION OF zzjt_mv_q FOR VALUES FROM (0) TO (10)");
+        exec("CREATE TABLE zzjt_mv_q1 PARTITION OF zzjt_mv_q FOR VALUES FROM (10) TO (20)");
+        // The trigger on the partition carries the key out of it; the copy of the partitioned
+        // table's trigger then runs and assigns a column its own value.
+        exec("CREATE TRIGGER zzjt_mv_a_move BEFORE INSERT ON zzjt_mv_q0 FOR EACH ROW"
+                + " EXECUTE FUNCTION zzjt_mv_bump()");
+        exec("CREATE TRIGGER zzjt_mv_b_same BEFORE INSERT ON zzjt_mv_q FOR EACH ROW"
+                + " EXECUTE FUNCTION zzjt_mv_same()");
+
+        org.postgresql.util.ServerErrorMessage e =
+                fieldsOf("INSERT INTO zzjt_mv_q VALUES (1, 5)");
+        assertEquals("0A000", e.getSQLState());
+        assertEquals("moving row to another partition during a BEFORE FOR EACH ROW trigger"
+                + " is not supported", e.getMessage());
+        assertEquals("Before executing trigger \"zzjt_mv_b_same\", the row was to be in partition"
+                + " \"public.zzjt_mv_q0\".", e.getDetail());
+        assertEquals(0, num("SELECT count(*)::int FROM zzjt_mv_q"));
+
+        // A row that stays where it was routed is written as usual.
+        exec("INSERT INTO zzjt_mv_q VALUES (2, 12)");
+        assertEquals("2/12", rowsOf("SELECT i, k FROM zzjt_mv_q1"));
+
+        exec("DROP TABLE zzjt_mv_q CASCADE");
+        exec("DROP FUNCTION zzjt_mv_same() CASCADE");
+        exec("DROP FUNCTION zzjt_mv_bump() CASCADE");
+    }
+
+    @Test
+    void whichWritesToNewCountAsARewriteOfTheRowAndWhichDoNot() throws Exception {
+        // PostgreSQL decides whether the copy rewrote the row by whether the routine handed back
+        // a tuple other than the one it was given, and PL/pgSQL builds a new one the moment
+        // anything is assigned into NEW. So a self-assignment is a rewrite (0A000) while a bare
+        // RETURN NEW is not, and the writer is told about the partition constraint instead.
+        exec("CREATE FUNCTION zzjt_wr_bump() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN"
+                + " NEW.k := NEW.k + 10; RETURN NEW; END $$");
+        exec("CREATE FUNCTION zzjt_wr_noop() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN"
+                + " RETURN NEW; END $$");
+        exec("CREATE FUNCTION zzjt_wr_into() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN"
+                + " SELECT NEW.i INTO NEW.i; RETURN NEW; END $$");
+        exec("CREATE FUNCTION zzjt_wr_sub() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN"
+                + " NEW.a[1] := NEW.a[1]; RETURN NEW; END $$");
+        exec("CREATE FUNCTION zzjt_wr_rec() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN"
+                + " SELECT NEW.i, NEW.k, NEW.a INTO NEW; RETURN NEW; END $$");
+        exec("CREATE FUNCTION zzjt_wr_self() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN"
+                + " NEW := NEW; RETURN NEW; END $$");
+        exec("CREATE FUNCTION zzjt_wr_read() RETURNS trigger LANGUAGE plpgsql AS $$"
+                + " DECLARE v int; BEGIN v := NEW.i; RETURN NEW; END $$");
+        exec("CREATE TABLE zzjt_wr_q (i int, k int, a int[]) PARTITION BY RANGE (k)");
+        exec("CREATE TABLE zzjt_wr_q0 PARTITION OF zzjt_wr_q FOR VALUES FROM (0) TO (10)");
+        exec("CREATE TABLE zzjt_wr_q1 PARTITION OF zzjt_wr_q FOR VALUES FROM (10) TO (20)");
+        exec("CREATE TRIGGER zzjt_wr_a_move BEFORE INSERT ON zzjt_wr_q0 FOR EACH ROW"
+                + " EXECUTE FUNCTION zzjt_wr_bump()");
+
+        // Anything assigned into NEW, however little it changes, is a rewrite.
+        assertEquals("0A000", copyVerdict("zzjt_wr_into"));
+        assertEquals("0A000", copyVerdict("zzjt_wr_sub"));
+        assertEquals("0A000", copyVerdict("zzjt_wr_rec"));
+
+        // Reading NEW is not, and neither is handing PostgreSQL back the record it gave.
+        assertEquals("23514", copyVerdict("zzjt_wr_noop"));
+        assertEquals("23514", copyVerdict("zzjt_wr_self"));
+        assertEquals("23514", copyVerdict("zzjt_wr_read"));
+
+        exec("DROP TABLE zzjt_wr_q CASCADE");
+        for (String routine : new String[] {"zzjt_wr_bump", "zzjt_wr_noop", "zzjt_wr_into",
+                "zzjt_wr_sub", "zzjt_wr_rec", "zzjt_wr_self", "zzjt_wr_read"}) {
+            exec("DROP FUNCTION " + routine + "() CASCADE");
+        }
+    }
+
+    /** Fires one routine as a copy of the partitioned table's trigger and reads the refusal back. */
+    private static String copyVerdict(String routine) throws SQLException {
+        exec("CREATE TRIGGER zzjt_wr_b_x BEFORE INSERT ON zzjt_wr_q FOR EACH ROW"
+                + " EXECUTE FUNCTION " + routine + "()");
+        String state = stateOf("INSERT INTO zzjt_wr_q VALUES (1, 5, '{1,2}')");
+        exec("DROP TRIGGER zzjt_wr_b_x ON zzjt_wr_q");
+        return state;
+    }
+
+    @Test
+    void aCopyThatRanBeforeTheRowWasMovedIsNotTheOneBlamed() throws Exception {
+        // The check runs the moment each trigger hands the row back, so a copy that ran while the
+        // row still fitted is past before the trigger declared on the partition moves it -- and
+        // what the writer is told is the plain partition-constraint refusal.
+        exec("CREATE FUNCTION zzjt_or_bump() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN"
+                + " NEW.k := NEW.k + 10; RETURN NEW; END $$");
+        exec("CREATE FUNCTION zzjt_or_selfk() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN"
+                + " NEW.k := NEW.k; RETURN NEW; END $$");
+        exec("CREATE TABLE zzjt_or_q (i int, k int) PARTITION BY RANGE (k)");
+        exec("CREATE TABLE zzjt_or_q0 PARTITION OF zzjt_or_q FOR VALUES FROM (0) TO (10)");
+        exec("CREATE TABLE zzjt_or_q1 PARTITION OF zzjt_or_q FOR VALUES FROM (10) TO (20)");
+        exec("CREATE TRIGGER zzjt_or_a_selfk BEFORE INSERT ON zzjt_or_q FOR EACH ROW"
+                + " EXECUTE FUNCTION zzjt_or_selfk()");
+        exec("CREATE TRIGGER zzjt_or_b_move BEFORE INSERT ON zzjt_or_q0 FOR EACH ROW"
+                + " EXECUTE FUNCTION zzjt_or_bump()");
+
+        org.postgresql.util.ServerErrorMessage e =
+                fieldsOf("INSERT INTO zzjt_or_q VALUES (4, 5)");
+        assertEquals("23514", e.getSQLState());
+        assertEquals("new row for relation \"zzjt_or_q0\" violates partition constraint",
+                e.getMessage());
+        assertEquals("Failing row contains (4, 15).", e.getDetail());
+        assertEquals(0, num("SELECT count(*)::int FROM zzjt_or_q"));
+
+        exec("DROP TABLE zzjt_or_q CASCADE");
+        exec("DROP FUNCTION zzjt_or_selfk() CASCADE");
+        exec("DROP FUNCTION zzjt_or_bump() CASCADE");
+    }
+
+    // ------------------------------------------------------------ What may stand in a partition key
+
+    @Test
+    void aGeneratedColumnMayNotStandInAPartitionKeyWhateverTheStrategy() throws Exception {
+        String stored = "(i int, k int GENERATED ALWAYS AS (i * 2) STORED)";
+        for (String by : new String[] {"RANGE (k)", "LIST (k)", "HASH (k)"}) {
+            String sql = "CREATE TABLE zzjt_pk " + stored + " PARTITION BY " + by;
+            assertEquals("42P17", stateOf(sql), by);
+            assertEquals("cannot use generated column in partition key", messageOf(sql), by);
+            assertEquals("Column \"k\" is a generated column.", detailOf(sql), by);
+        }
+
+        // A virtual generated column is refused for the same reason as a stored one.
+        assertEquals("42P17", stateOf("CREATE TABLE zzjt_pk (i int,"
+                + " k int GENERATED ALWAYS AS (i * 2) VIRTUAL) PARTITION BY RANGE (k)"));
+
+        // In company, and inside an expression, and with the column named in the DETAIL.
+        assertEquals("42P17", stateOf("CREATE TABLE zzjt_pk " + stored
+                + " PARTITION BY RANGE (i, k)"));
+        assertEquals("42P17", stateOf("CREATE TABLE zzjt_pk " + stored
+                + " PARTITION BY RANGE ((k + 1))"));
+        assertEquals("Column \"k\" is a generated column.",
+                detailOf("CREATE TABLE zzjt_pk (i int, k int GENERATED ALWAYS AS (i*2) STORED,"
+                        + " m int) PARTITION BY RANGE ((k + m))"));
+        // Where two of them stand in one expression, the leftmost column is named.
+        assertEquals("Column \"i\" is a generated column.",
+                detailOf("CREATE TABLE zzjt_pk (i int GENERATED ALWAYS AS (1) STORED,"
+                        + " k int GENERATED ALWAYS AS (2) STORED) PARTITION BY RANGE ((k + i))"));
+
+        assertEquals(0, num("SELECT count(*)::int FROM pg_class WHERE relname = 'zzjt_pk'"));
+    }
+
+    @Test
+    void whichFaultAKeyIsRefusedForFollowsTheOrderPostgresReadsItIn() throws Exception {
+        String gen = "(i int, k int GENERATED ALWAYS AS (i * 2) STORED)";
+
+        // The key elements are walked left to right, so whichever stands first is reported.
+        assertEquals("cannot use generated column in partition key",
+                messageOf("CREATE TABLE zzjt_pk " + gen + " PARTITION BY RANGE (k, xmin)"));
+        assertEquals("cannot use system column \"xmin\" in partition key",
+                messageOf("CREATE TABLE zzjt_pk " + gen + " PARTITION BY RANGE (xmin, k)"));
+
+        // A name, an aggregate and a function that is not IMMUTABLE are all settled while the key
+        // list is turned into expressions, which is before any element is looked at as a column.
+        assertEquals("42703", stateOf("CREATE TABLE zzjt_pk " + gen
+                + " PARTITION BY RANGE ((k + nosuch))"));
+        assertEquals("42803", stateOf("CREATE TABLE zzjt_pk (i int,"
+                + " k int GENERATED ALWAYS AS (i*2) STORED) PARTITION BY RANGE (k, (sum(i)))"));
+        assertEquals("42P17", stateOf("CREATE TABLE zzjt_pk (i int,"
+                + " k int GENERATED ALWAYS AS (i*2) STORED)"
+                + " PARTITION BY RANGE ((random()::int), k)"));
+        assertEquals("functions in partition key expression must be marked IMMUTABLE",
+                messageOf("CREATE TABLE zzjt_pk (i int, k int GENERATED ALWAYS AS (i*2) STORED)"
+                        + " PARTITION BY RANGE ((random()::int), k)"));
+
+        // A bare name that does not exist is reported as a partition key's own; the same name
+        // inside an expression is reported the way any expression's is.
+        assertEquals("column \"nosuch\" named in partition key does not exist",
+                messageOf("CREATE TABLE zzjt_pk (i int, k int) PARTITION BY RANGE (nosuch)"));
+        assertEquals("column \"nosuch\" does not exist",
+                messageOf("CREATE TABLE zzjt_pk (i int, k int) PARTITION BY RANGE ((i + nosuch))"));
+
+        assertEquals(0, num("SELECT count(*)::int FROM pg_class WHERE relname = 'zzjt_pk'"));
+    }
+
+    @Test
+    void aGeneratedColumnOutsideTheKeyIsComputedInThePartitionTheRowWasRoutedTo() throws Exception {
+        exec("CREATE TABLE zzjt_gp (i int, k int GENERATED ALWAYS AS (i * 2) STORED, s text)"
+                + " PARTITION BY LIST (s)");
+        exec("CREATE TABLE zzjt_gp_a PARTITION OF zzjt_gp FOR VALUES IN ('a')");
+        exec("INSERT INTO zzjt_gp (i, s) VALUES (3, 'a')");
+
+        assertEquals("3/6/a", rowsOf("SELECT i, k, s FROM zzjt_gp ORDER BY i"));
+        assertEquals("3/6", rowsOf("SELECT i, k FROM zzjt_gp_a ORDER BY i"));
+        assertEquals("LIST (s)", scalar("SELECT pg_get_partkeydef('zzjt_gp'::regclass)"));
+        // The partition holds the column as a generated one of its own.
+        assertEquals("s", scalar("SELECT attgenerated FROM pg_attribute"
+                + " WHERE attrelid = 'zzjt_gp_a'::regclass AND attname = 'k'"));
+
+        exec("DROP TABLE zzjt_gp CASCADE");
+
+        // An identity column and a serial are not generated columns, and may stand in a key.
+        exec("CREATE TABLE zzjt_ip (i int GENERATED ALWAYS AS IDENTITY, k int)"
+                + " PARTITION BY RANGE (i)");
+        assertEquals("RANGE (i)", scalar("SELECT pg_get_partkeydef('zzjt_ip'::regclass)"));
+        exec("DROP TABLE zzjt_ip CASCADE");
+
+        exec("CREATE TABLE zzjt_sq (i serial, k int) PARTITION BY RANGE (i)");
+        assertEquals("RANGE (i)", scalar("SELECT pg_get_partkeydef('zzjt_sq'::regclass)"));
+        exec("DROP TABLE zzjt_sq CASCADE");
+    }
+
+    // ------------------------------------------------------------ What a stored expression may name
+
+    @Test
+    void aCallOverArgumentTypesTheNameIsNotDeclaredOverIsRefusedWhereItIsWritten() throws Exception {
+        // Each of these names a routine PostgreSQL does declare, and none of them is declared over
+        // the argument types the definition writes, so the definition is what is refused.
+        String[][] refused = {
+                {"CREATE TABLE zzsd_c (a int, CHECK (lower(a) > 'x'))",
+                        "function lower(integer) does not exist"},
+                {"CREATE TABLE zzsd_c (a int, CHECK (upper(a) > 'x'))",
+                        "function upper(integer) does not exist"},
+                {"CREATE TABLE zzsd_c (a int, CHECK (length(a) > 0))",
+                        "function length(integer) does not exist"},
+                {"CREATE TABLE zzsd_c (a int, CHECK (substr(a, 1) > 'x'))",
+                        "function substr(integer, integer) does not exist"},
+                {"CREATE TABLE zzsd_c (a int, CHECK (repeat(a, 2) > 'x'))",
+                        "function repeat(integer, integer) does not exist"},
+                {"CREATE TABLE zzsd_c (a int, CHECK (btrim(a) > 'x'))",
+                        "function btrim(integer) does not exist"},
+                // The type the argument has is what the name is resolved with, however it is written.
+                {"CREATE TABLE zzsd_c (a int, CHECK (lower(a + 1) > 'x'))",
+                        "function lower(integer) does not exist"},
+                {"CREATE TABLE zzsd_c (b boolean, CHECK (lower(b) > 'x'))",
+                        "function lower(boolean) does not exist"},
+        };
+        for (String[] one : refused) {
+            org.postgresql.util.ServerErrorMessage e = fieldsOf(one[0]);
+            assertEquals("42883", e.getSQLState(), one[0]);
+            assertEquals(one[1], e.getMessage(), one[0]);
+            assertEquals("No function matches the given name and argument types."
+                    + " You might need to add explicit type casts.", e.getHint(), one[0]);
+        }
+        assertEquals(0, num("SELECT count(*)::int FROM pg_class WHERE relname = 'zzsd_c'"));
+    }
+
+    @Test
+    void everyCallTheNameIsDeclaredOverIsStoredWithTheDefinition() throws Exception {
+        exec("CREATE DOMAIN zzsd_dom AS int CHECK (VALUE > 0)");
+        exec("CREATE TABLE zzsd_ok1 (k text, CHECK (lower(k) <> 'zz'))");
+        exec("CREATE TABLE zzsd_ok2 (a int, CHECK (abs(a) > 0))");
+        exec("CREATE TABLE zzsd_ok3 (a int, CHECK (lower(a::text) > 'x'))");
+        exec("CREATE TABLE zzsd_ok4 (a int, CHECK (lower('x') > 'x'))");
+        exec("CREATE TABLE zzsd_ok5 (a int, CHECK (to_char(a, 'FM999') > 'x'))");
+        exec("CREATE TABLE zzsd_ok6 (a int, k text, CHECK (coalesce(k, 'x') <> ''))");
+        exec("CREATE TABLE zzsd_ok7 (a int, CHECK (greatest(a, 1) > 0))");
+        // A type name written as a call of one argument is a coercion, and is stored as one.
+        exec("CREATE TABLE zzsd_ok8 (a int, CHECK (text(a) > 'x'))");
+        exec("CREATE TABLE zzsd_ok9 (a int, CHECK (int8(a) > 0))");
+        exec("CREATE TABLE zzsd_ok10 (a int, CHECK (zzsd_dom(a) IS NOT NULL))");
+
+        assertEquals(10, num("SELECT count(*)::int FROM information_schema.tables"
+                + " WHERE table_name LIKE 'zzsd\\_ok%'"));
+
+        for (int i = 1; i <= 10; i++) exec("DROP TABLE zzsd_ok" + i);
+        exec("DROP DOMAIN zzsd_dom");
+    }
+
+    @Test
+    void aQualifierIsResolvedAsASchemaBeforeAnythingOfThatNameIsLookedFor() throws Exception {
+        exec("CREATE TABLE zzsd_base (a int, k text)");
+
+        // Wherever the call is written, the schema is what the writer is told about.
+        String[] wherever = {
+                "CREATE TABLE zzsd_q (a int, CHECK (zzsd_nos.nosuchfunc(a) > 0))",
+                "CREATE TABLE zzsd_q (a int, b int GENERATED ALWAYS AS (zzsd_nos.f(a)) STORED)",
+                "CREATE TABLE zzsd_q (a int DEFAULT zzsd_nos.f(1))",
+                "CREATE INDEX zzsd_qi ON zzsd_base (a) WHERE zzsd_nos.f(a) > 0",
+                "ALTER TABLE zzsd_base ALTER COLUMN k TYPE text USING zzsd_nos.f(a)",
+        };
+        for (String sql : wherever) {
+            org.postgresql.util.ServerErrorMessage e = fieldsOf(sql);
+            assertEquals("3F000", e.getSQLState(), sql);
+            assertEquals("schema \"zzsd_nos\" does not exist", e.getMessage(), sql);
+        }
+
+        // The arguments are transformed first, so a column that is not there comes first.
+        assertEquals("42703",
+                stateOf("CREATE TABLE zzsd_q (a int, CHECK (zzsd_nos.f(nosuchcol) > 0))"));
+        assertEquals("column \"nosuchcol\" does not exist",
+                messageOf("CREATE TABLE zzsd_q (a int, CHECK (zzsd_nos.f(nosuchcol) > 0))"));
+
+        // An unquoted qualifier is folded the way every other unquoted name is.
+        assertEquals("schema \"nosuchzzm\" does not exist",
+                messageOf("CREATE TABLE zzsd_q (a int, CHECK (NoSuchZzm.NoFunc(a) > 0))"));
+
+        // A qualifier that does name a schema holds the name to what is really in it.
+        exec("CREATE TABLE zzsd_q1 (a int, CHECK (pg_catalog.abs(a) > 0))");
+        assertEquals("42883",
+                stateOf("CREATE TABLE zzsd_q2 (a int, CHECK (pg_catalog.lower(a) > 'x'))"));
+        assertEquals("function pg_catalog.lower(integer) does not exist",
+                messageOf("CREATE TABLE zzsd_q2 (a int, CHECK (pg_catalog.lower(a) > 'x'))"));
+
+        // A quoted qualifier keeps the case the writer wrote.
+        exec("CREATE SCHEMA \"zzsd_MixEd\"");
+        exec("CREATE FUNCTION \"zzsd_MixEd\".f(int) RETURNS int AS 'SELECT $1' LANGUAGE sql");
+        exec("CREATE TABLE zzsd_q3 (a int, CHECK (\"zzsd_MixEd\".f(a) > 0))");
+
+        assertEquals(0, num("SELECT count(*)::int FROM pg_class WHERE relname = 'zzsd_q'"));
+        exec("DROP TABLE zzsd_q3");
+        exec("DROP FUNCTION \"zzsd_MixEd\".f(int)");
+        exec("DROP SCHEMA \"zzsd_MixEd\"");
+        exec("DROP TABLE zzsd_q1");
+        exec("DROP TABLE zzsd_base");
+    }
+
+    @Test
+    void aNameStandsWhereItIsWrittenInsideACaseAnInListABetweenBoundOrAConstructor()
+            throws Exception {
+        String[] everywhere = {
+                "CHECK (CASE WHEN nosuchcol > 0 THEN true END)",
+                "CHECK (CASE a WHEN nosuchcol THEN true ELSE false END)",
+                "CHECK (CASE WHEN a > 0 THEN nosuchcol > 1 END)",
+                "CHECK (CASE WHEN a > 0 THEN true ELSE nosuchcol > 1 END)",
+                "CHECK (a IN (nosuchcol))",
+                "CHECK (nosuchcol IN (1, 2))",
+                "CHECK (a BETWEEN nosuchcol AND 3)",
+                "CHECK (a BETWEEN 1 AND nosuchcol)",
+                "CHECK (a = ANY (ARRAY[nosuchcol]))",
+                "CHECK ((ROW(nosuchcol, 1)) IS NOT NULL)",
+                "CHECK ((nosuchcol) IS NOT NULL)",
+                // ...beside the places the reader already reached
+                "CHECK (coalesce(nosuchcol, 1) > 0)",
+                "CHECK (nosuchcol::int > 0)",
+                "CHECK (a > nosuchcol)",
+                "CHECK (abs(abs(nosuchcol)) > 0)",
+                "CHECK (nosuchcol LIKE 'x')",
+                "CHECK (nullif(nosuchcol, 1) > 0)",
+                "CHECK (a > (nosuchcol + 1))",
+                "CHECK (a IS NOT NULL AND nosuchcol > 0)",
+        };
+        for (String check : everywhere) {
+            String sql = "CREATE TABLE zzsd_n (a int, " + check + ")";
+            assertEquals("42703", stateOf(sql), sql);
+            assertEquals("column \"nosuchcol\" does not exist", messageOf(sql), sql);
+        }
+        assertEquals(0, num("SELECT count(*)::int FROM pg_class WHERE relname = 'zzsd_n'"));
+    }
+
+    @Test
+    void aCompositeTypeWrittenAsACallOfOneArgumentIsNotACastPostgresPerforms() throws Exception {
+        // A composite has no input function to read another type's value with, so the one-argument
+        // form is a call of a name no routine answers to.
+        exec("CREATE TYPE zzsd_comp AS (x int, y int)");
+
+        org.postgresql.util.ServerErrorMessage e =
+                fieldsOf("CREATE TABLE zzsd_n (a int, CHECK (zzsd_comp(a) IS NOT NULL))");
+        assertEquals("42883", e.getSQLState());
+        assertEquals("function zzsd_comp(integer) does not exist", e.getMessage());
+        assertEquals("No function matches the given name and argument types."
+                + " You might need to add explicit type casts.", e.getHint());
+
+        assertEquals(0, num("SELECT count(*)::int FROM pg_class WHERE relname = 'zzsd_n'"));
+        exec("DROP TYPE zzsd_comp");
+    }
+
+    @Test
+    void everyPlaceAStoredExpressionIsWrittenSettlesItsCallsThere() throws Exception {
+        exec("CREATE TABLE zzsd_p (a int, k text)");
+
+        String[] places = {
+                "CREATE TABLE zzsd_pg (a int, b text GENERATED ALWAYS AS (lower(a)) STORED)",
+                "CREATE TABLE zzsd_pd (a int DEFAULT lower(1))",
+                "CREATE INDEX zzsd_pi ON zzsd_p (a) WHERE lower(a) > 'x'",
+                "CREATE INDEX zzsd_pi ON zzsd_p (lower(a))",
+                "ALTER TABLE zzsd_p ALTER COLUMN k TYPE text USING lower(a)",
+                "ALTER TABLE zzsd_p ADD COLUMN c int DEFAULT lower(1)",
+                "ALTER TABLE zzsd_p ALTER COLUMN a SET DEFAULT lower(1)",
+        };
+        for (String sql : places) {
+            assertEquals("42883", stateOf(sql), sql);
+            assertEquals("function lower(integer) does not exist", messageOf(sql), sql);
+        }
+
+        // And a name written inside a CASE arm reaches every one of them too.
+        String[] arms = {
+                "CREATE TABLE zzsd_pg (a int, b int GENERATED ALWAYS AS"
+                        + " (CASE WHEN nosuchcol > 0 THEN 1 END) STORED)",
+                "CREATE INDEX zzsd_pi ON zzsd_p (a) WHERE CASE WHEN nosuchcol > 0 THEN true END",
+                "CREATE INDEX zzsd_pi ON zzsd_p ((CASE WHEN nosuchcol > 0 THEN 1 END))",
+                "ALTER TABLE zzsd_p ALTER COLUMN k TYPE text USING"
+                        + " (CASE WHEN nosuchcol > 0 THEN 'x' END)",
+                // An IN list written as an index key is an expression, not a call of its own.
+                "CREATE INDEX zzsd_pi ON zzsd_p ((a IN (nosuchcol)))",
+        };
+        for (String sql : arms) {
+            assertEquals("42703", stateOf(sql), sql);
+            assertEquals("column \"nosuchcol\" does not exist", messageOf(sql), sql);
+        }
+
+        assertEquals("a/integer,k/text", scalar("SELECT string_agg(attname||'/'"
+                + "||format_type(atttypid, atttypmod), ',' ORDER BY attnum) FROM pg_attribute"
+                + " WHERE attrelid = 'zzsd_p'::regclass AND attnum > 0"));
+        assertEquals(0, num("SELECT count(*)::int FROM pg_class"
+                + " WHERE relname IN ('zzsd_pg', 'zzsd_pd', 'zzsd_pi')"));
+        exec("DROP TABLE zzsd_p");
+    }
+
+    @Test
+    void anIndexPredicateIsTransformedBeforeItsKeys() throws Exception {
+        exec("CREATE TABLE zzsd_ix (a int, k text)");
+
+        // Both halves are wrong, and the predicate is the half PostgreSQL reads first.
+        assertEquals("column \"nosuchpred\" does not exist",
+                messageOf("CREATE UNIQUE INDEX zzsd_ixi ON zzsd_ix (lower(nosuchkey))"
+                        + " WHERE nosuchpred IS NULL"));
+        assertEquals("column \"nosuchpred\" does not exist",
+                messageOf("CREATE INDEX zzsd_ixi ON zzsd_ix (k) WHERE nosuchpred IS NULL"));
+        assertEquals("column \"nosuchkey\" does not exist",
+                messageOf("CREATE INDEX zzsd_ixi ON zzsd_ix (lower(nosuchkey)) WHERE a > 0"));
+
+        assertEquals(0, num("SELECT count(*)::int FROM pg_class WHERE relname = 'zzsd_ixi'"));
+        exec("DROP TABLE zzsd_ix");
+    }
+
+    @Test
+    void aGeneratedColumnMayNameTheRelationBeingDefinedWithItsSchema() throws Exception {
+        exec("CREATE TABLE zzsd_g1 (a int, b int GENERATED ALWAYS AS (public.zzsd_g1.a + 1) STORED)");
+        exec("INSERT INTO zzsd_g1 VALUES (7)");
+        assertEquals("7/8", rowsOf("SELECT a, b FROM zzsd_g1"));
+
+        exec("CREATE TABLE zzsd_g2 (a int, CHECK (public.zzsd_g2.a > 0))");
+        exec("INSERT INTO zzsd_g2 VALUES (3)");
+        assertEquals("3", rowsOf("SELECT a FROM zzsd_g2"));
+
+        // A relation of that name in another schema is not this one.
+        org.postgresql.util.ServerErrorMessage e = fieldsOf("CREATE TABLE zzsd_g3 (a int,"
+                + " b int GENERATED ALWAYS AS (zzsd_nos.zzsd_g3.a + 1) STORED)");
+        assertEquals("42P01", e.getSQLState());
+        assertEquals("invalid reference to FROM-clause entry for table \"zzsd_g3\"", e.getMessage());
+        assertEquals("There is an entry for table \"zzsd_g3\", but it cannot be referenced from"
+                + " this part of the query.", e.getDetail());
+
+        // A relation created in another schema names that schema, and public is not that schema.
+        exec("CREATE SCHEMA zzsd_s");
+        exec("CREATE TABLE zzsd_s.zzsd_g4 (a int,"
+                + " b int GENERATED ALWAYS AS (zzsd_s.zzsd_g4.a + 1) STORED)");
+        exec("INSERT INTO zzsd_s.zzsd_g4 VALUES (5)");
+        assertEquals("5/6", rowsOf("SELECT a, b FROM zzsd_s.zzsd_g4"));
+        assertEquals("42P01", stateOf("CREATE TABLE zzsd_s.zzsd_g5 (a int,"
+                + " b int GENERATED ALWAYS AS (public.zzsd_g5.a + 1) STORED)"));
+
+        // The column under the full name is still looked for.
+        assertEquals("column zzsd_g6.nosuchcol does not exist",
+                messageOf("CREATE TABLE zzsd_g6 (a int,"
+                        + " b int GENERATED ALWAYS AS (public.zzsd_g6.nosuchcol + 1) STORED)"));
+
+        exec("DROP TABLE zzsd_s.zzsd_g4");
+        exec("DROP SCHEMA zzsd_s");
+        exec("DROP TABLE zzsd_g1");
+        exec("DROP TABLE zzsd_g2");
+    }
+
+    @Test
+    void theCallsThatDoResolveAreStoredAndComputedInEveryOneOfThosePlaces() throws Exception {
+        exec("CREATE TABLE zzsd_r (a int, k text)");
+        exec("INSERT INTO zzsd_r VALUES (3, 'Ab')");
+        exec("CREATE INDEX zzsd_ri1 ON zzsd_r (a) WHERE lower(k) > 'x'");
+        exec("CREATE INDEX zzsd_ri2 ON zzsd_r (lower(k))");
+        exec("CREATE INDEX zzsd_ri3 ON zzsd_r (abs(a))");
+        exec("CREATE INDEX zzsd_ri4 ON zzsd_r ((CASE WHEN a > 0 THEN k ELSE 'z' END))");
+        exec("CREATE INDEX zzsd_ri5 ON zzsd_r (a) WHERE a IN (1, 2, 3)");
+        exec("CREATE INDEX zzsd_ri6 ON zzsd_r (a) WHERE a BETWEEN 1 AND 9");
+        exec("CREATE INDEX zzsd_ri7 ON zzsd_r ((a = ANY (ARRAY[1, 2])))");
+        assertEquals(7, num("SELECT count(*)::int FROM pg_class WHERE relname LIKE 'zzsd\\_ri%'"));
+
+        exec("ALTER TABLE zzsd_r ALTER COLUMN k TYPE text USING lower(k)");
+        assertEquals("3/ab", rowsOf("SELECT a, k FROM zzsd_r"));
+
+        exec("ALTER TABLE zzsd_r ADD COLUMN c text DEFAULT lower('Q')");
+        exec("ALTER TABLE zzsd_r ALTER COLUMN a SET DEFAULT abs(-4)");
+        exec("INSERT INTO zzsd_r (k) VALUES ('z')");
+        assertEquals("3/ab/q;4/z/q", rowsOf("SELECT a, k, c FROM zzsd_r ORDER BY k"));
+        exec("DROP TABLE zzsd_r");
+
+        exec("CREATE TABLE zzsd_rg (a int, k text,"
+                + " b text GENERATED ALWAYS AS (lower(k)) STORED,"
+                + " c int GENERATED ALWAYS AS (abs(a) + 1) STORED,"
+                + " d text GENERATED ALWAYS AS (CASE WHEN a > 0 THEN 'p' ELSE 'n' END) STORED,"
+                + " e text GENERATED ALWAYS AS (lower(a::text)) STORED)");
+        exec("INSERT INTO zzsd_rg (a, k) VALUES (-2, 'Ab')");
+        assertEquals("-2/Ab/ab/3/n/-2", rowsOf("SELECT a, k, b, c, d, e FROM zzsd_rg"));
+        exec("DROP TABLE zzsd_rg");
+
+        exec("CREATE TABLE zzsd_rd (a text DEFAULT lower('Q'), b int DEFAULT abs(-3),"
+                + " c text DEFAULT to_char(5, 'FM999'), d int DEFAULT greatest(1, 2),"
+                + " e text DEFAULT coalesce(NULL, 'x'))");
+        exec("INSERT INTO zzsd_rd DEFAULT VALUES");
+        assertEquals("q/3/5/2/x", rowsOf("SELECT a, b, c, d, e FROM zzsd_rd"));
+        exec("DROP TABLE zzsd_rd");
+    }
+
+    // ------------------------------------------------------------ The type a column reads back as
+
+    @Test
+    void anArrayColumnRefusesADefaultOfAnythingButAnArrayItCanTake() throws Exception {
+        String[][] refused = {
+                {"CREATE TABLE zzsd_a (a int[] DEFAULT 1)",
+                        "column \"a\" is of type integer[] but default expression is of type integer"},
+                {"CREATE TABLE zzsd_a (a int[] DEFAULT true)",
+                        "column \"a\" is of type integer[] but default expression is of type boolean"},
+                {"CREATE TABLE zzsd_a (a int[] DEFAULT now())",
+                        "column \"a\" is of type integer[] but default expression is of type"
+                                + " timestamp with time zone"},
+                {"CREATE TABLE zzsd_a (a int[] DEFAULT '{a}'::text[])",
+                        "column \"a\" is of type integer[] but default expression is of type text[]"},
+                {"CREATE TABLE zzsd_a (a text[] DEFAULT 1)",
+                        "column \"a\" is of type text[] but default expression is of type integer"},
+                {"CREATE TABLE zzsd_a (a text[] DEFAULT 'x'::text)",
+                        "column \"a\" is of type text[] but default expression is of type text"},
+                // The array type is named without the modifier the column was declared with.
+                {"CREATE TABLE zzsd_a (a varchar(5)[] DEFAULT 1)",
+                        "column \"a\" is of type character varying[] but default expression is of"
+                                + " type integer"},
+                {"CREATE TABLE zzsd_a (a bool[] DEFAULT 1)",
+                        "column \"a\" is of type boolean[] but default expression is of type integer"},
+                {"CREATE TABLE zzsd_a (a date[] DEFAULT 1)",
+                        "column \"a\" is of type date[] but default expression is of type integer"},
+                {"CREATE TABLE zzsd_a (a numeric[] DEFAULT 1)",
+                        "column \"a\" is of type numeric[] but default expression is of type integer"},
+                // A generation expression is judged by the same rule and in the same words.
+                {"CREATE TABLE zzsd_a (a int[], b int[] GENERATED ALWAYS AS (1) STORED)",
+                        "column \"b\" is of type integer[] but default expression is of type integer"},
+        };
+        for (String[] one : refused) {
+            org.postgresql.util.ServerErrorMessage e = fieldsOf(one[0]);
+            assertEquals("42804", e.getSQLState(), one[0]);
+            assertEquals(one[1], e.getMessage(), one[0]);
+            assertEquals("You will need to rewrite or cast the expression.", e.getHint(), one[0]);
+        }
+        assertEquals(0, num("SELECT count(*)::int FROM pg_class WHERE relname = 'zzsd_a'"));
+
+        // ...and a column added later, and a default set later, go the same way.
+        exec("CREATE TABLE zzsd_aa (a int)");
+        assertEquals("42804", stateOf("ALTER TABLE zzsd_aa ADD COLUMN b int[] DEFAULT 1"));
+        assertEquals("column \"b\" is of type integer[] but default expression is of type integer",
+                messageOf("ALTER TABLE zzsd_aa ADD COLUMN b int[] DEFAULT 1"));
+        exec("ALTER TABLE zzsd_aa ADD COLUMN b int[] DEFAULT '{1,2}'");
+        assertEquals("42804", stateOf("ALTER TABLE zzsd_aa ALTER COLUMN b SET DEFAULT 5"));
+        exec("DROP TABLE zzsd_aa");
+    }
+
+    @Test
+    void anArrayColumnTakesEveryDefaultWhoseElementsReachItsElementType() throws Exception {
+        exec("CREATE TABLE zzsd_ok (a int[] DEFAULT '{1,2}', b int[] DEFAULT '{1,2}'::int[],"
+                + " c int[] DEFAULT ARRAY[1,2], d text[] DEFAULT ARRAY[1,2],"
+                + " e text[] DEFAULT '{1,2}'::int[], f int8[] DEFAULT '{1}'::int4[],"
+                + " g int[] DEFAULT NULL, h int[] DEFAULT '{}')");
+        exec("INSERT INTO zzsd_ok DEFAULT VALUES");
+        assertEquals("{1,2}/{1,2}/{1,2}/{1,2}/{1,2}/{1}/null/{}",
+                rowsOf("SELECT a, b, c, d, e, f, g, h FROM zzsd_ok"));
+        exec("DROP TABLE zzsd_ok");
+
+        exec("CREATE TABLE zzsd_al (a int)");
+        exec("ALTER TABLE zzsd_al ADD COLUMN b int[] DEFAULT '{1,2}'");
+        exec("ALTER TABLE zzsd_al ADD COLUMN c text[] DEFAULT ARRAY['x']");
+        exec("ALTER TABLE zzsd_al ADD COLUMN d int8[] DEFAULT '{7}'::int4[]");
+        exec("ALTER TABLE zzsd_al ALTER COLUMN b SET DEFAULT ARRAY[5, 6]");
+        exec("INSERT INTO zzsd_al (a) VALUES (1)");
+        assertEquals("1/{5,6}/{x}/{7}", rowsOf("SELECT a, b, c, d FROM zzsd_al"));
+        exec("DROP TABLE zzsd_al");
+
+        exec("CREATE TABLE zzsd_al2 (a int[], b int[] GENERATED ALWAYS AS (a) STORED)");
+        exec("INSERT INTO zzsd_al2 (a) VALUES ('{4,5}')");
+        assertEquals("{4,5}/{4,5}", rowsOf("SELECT a, b FROM zzsd_al2"));
+        exec("DROP TABLE zzsd_al2");
+    }
+
+    @Test
+    void aBooleanReadIntoAStringColumnIsSpelledOutInFull() throws Exception {
+        exec("CREATE TABLE zzsd_b (a varchar, b text, c char(5), d varchar(4), e bool)");
+        exec("INSERT INTO zzsd_b (a,b,c,d,e) VALUES (true, true, true, true, true)");
+
+        assertEquals("true/true/true/t", rowsOf("SELECT a, b, d, e FROM zzsd_b"));
+        // The blank-padded column holds 'true ' and is measured without its padding.
+        assertEquals("4/4/4/4",
+                rowsOf("SELECT length(a), length(b), length(c), length(d) FROM zzsd_b"));
+
+        exec("UPDATE zzsd_b SET a = false, b = false");
+        assertEquals("false/false", rowsOf("SELECT a, b FROM zzsd_b"));
+        exec("DROP TABLE zzsd_b");
+
+        // A DEFAULT of a boolean on a string column reads back the same way.
+        exec("CREATE TABLE zzsd_bd (a varchar DEFAULT true, b text DEFAULT false,"
+                + " c varchar(4) DEFAULT true)");
+        exec("INSERT INTO zzsd_bd DEFAULT VALUES");
+        assertEquals("true/false/true", rowsOf("SELECT a, b, c FROM zzsd_bd"));
+        exec("DROP TABLE zzsd_bd");
+
+        // And so does a retype out of boolean into one.
+        exec("CREATE TABLE zzsd_br (f bool)");
+        exec("INSERT INTO zzsd_br VALUES (true)");
+        exec("ALTER TABLE zzsd_br ALTER COLUMN f TYPE varchar");
+        assertEquals("true", rowsOf("SELECT f FROM zzsd_br"));
+        exec("DROP TABLE zzsd_br");
+
+        // The letter is still what a boolean is written as inside a container, and an explicit
+        // cast still spells it out.
+        assertEquals("{t,f}/true/false",
+                rowsOf("SELECT ARRAY[true,false], true::text, false::text"));
+    }
+
+    @Test
+    void aColumnDeclaredAsARangeIsAColumnOfThatRange() throws Exception {
+        exec("CREATE TYPE zzsd_rng AS RANGE (subtype = int4)");
+        exec("CREATE TABLE zzsd_rt (a zzsd_rng)");
+        exec("INSERT INTO zzsd_rt VALUES ('[1,3)')");
+        assertEquals("[1,3)/1/3", rowsOf("SELECT a, lower(a), upper(a) FROM zzsd_rt"));
+
+        // The catalogue names the range, and reports the layout the range has.
+        assertEquals("a/zzsd_rng/-1/i/x", rowsOf("SELECT attname,"
+                + " format_type(atttypid, atttypmod), attlen, attalign, attstorage"
+                + " FROM pg_attribute WHERE attrelid = 'zzsd_rt'::regclass AND attnum > 0"
+                + " ORDER BY attnum"));
+        assertEquals("zzsd_rng/USER-DEFINED", rowsOf("SELECT udt_name, data_type"
+                + " FROM information_schema.columns WHERE table_name = 'zzsd_rt'"));
+
+        // A column of the range is a column depending on it.
+        org.postgresql.util.ServerErrorMessage e = fieldsOf("DROP TYPE zzsd_rng");
+        assertEquals("2BP01", e.getSQLState());
+        assertEquals("cannot drop type zzsd_rng because other objects depend on it", e.getMessage());
+        assertEquals("column a of table zzsd_rt depends on type zzsd_rng", e.getDetail());
+        assertEquals("Use DROP ... CASCADE to drop the dependent objects too.", e.getHint());
+
+        assertEquals("zzsd_rng", scalar("SELECT format_type(atttypid, atttypmod) FROM pg_attribute"
+                + " WHERE attrelid = 'zzsd_rt'::regclass AND attname = 'a'"));
+        exec("DROP TABLE zzsd_rt");
+        exec("DROP TYPE zzsd_rng");
+    }
+
+    @Test
+    void aTextColumnDoesNotReachAReadersOwnTypeWithoutAUsingClause() throws Exception {
+        exec("CREATE TYPE zzsd_rng AS RANGE (subtype = int4)");
+        exec("CREATE TYPE zzsd_enum AS ENUM ('a', 'b')");
+        exec("CREATE DOMAIN zzsd_dm AS int");
+        exec("CREATE TABLE zzsd_rc (a text, b text, c text)");
+
+        String[][] refused = {
+                {"ALTER TABLE zzsd_rc ALTER COLUMN a TYPE zzsd_rng",
+                        "column \"a\" cannot be cast automatically to type zzsd_rng",
+                        "You might need to specify \"USING a::zzsd_rng\"."},
+                {"ALTER TABLE zzsd_rc ALTER COLUMN b TYPE zzsd_enum",
+                        "column \"b\" cannot be cast automatically to type zzsd_enum",
+                        "You might need to specify \"USING b::zzsd_enum\"."},
+                {"ALTER TABLE zzsd_rc ALTER COLUMN c TYPE zzsd_dm",
+                        "column \"c\" cannot be cast automatically to type zzsd_dm",
+                        "You might need to specify \"USING c::zzsd_dm\"."},
+        };
+        for (String[] one : refused) {
+            org.postgresql.util.ServerErrorMessage e = fieldsOf(one[0]);
+            assertEquals("42804", e.getSQLState(), one[0]);
+            assertEquals(one[1], e.getMessage(), one[0]);
+            assertEquals(one[2], e.getHint(), one[0]);
+        }
+        assertEquals("a/text,b/text,c/text", scalar("SELECT string_agg(attname||'/'"
+                + "||format_type(atttypid, atttypmod), ',' ORDER BY attnum) FROM pg_attribute"
+                + " WHERE attrelid = 'zzsd_rc'::regclass AND attnum > 0"));
+
+        // Told how, it goes.
+        exec("ALTER TABLE zzsd_rc ALTER COLUMN a TYPE zzsd_rng USING a::zzsd_rng");
+        assertEquals("zzsd_rng", scalar("SELECT format_type(atttypid, atttypmod) FROM pg_attribute"
+                + " WHERE attrelid = 'zzsd_rc'::regclass AND attname = 'a'"));
+
+        exec("DROP TABLE zzsd_rc");
+        exec("DROP DOMAIN zzsd_dm");
+        exec("DROP TYPE zzsd_enum");
+        exec("DROP TYPE zzsd_rng");
+    }
+
+    @Test
+    void anArrayOfADomainAnEnumOrARangeReadsBackWithItsBrackets() throws Exception {
+        exec("CREATE TYPE zzsd_rng AS RANGE (subtype = int4)");
+        exec("CREATE TYPE zzsd_enum AS ENUM ('a', 'b', 'c')");
+        exec("CREATE DOMAIN zzsd_dm AS int CHECK (VALUE > 0)");
+        exec("CREATE TABLE zzsd_ua (a zzsd_dm[], b zzsd_enum[], c zzsd_rng[], d int[])");
+
+        assertEquals("a/zzsd_dm[],b/zzsd_enum[],c/zzsd_rng[],d/integer[]",
+                scalar("SELECT string_agg(attname||'/'||format_type(atttypid, atttypmod), ','"
+                        + " ORDER BY attnum) FROM pg_attribute"
+                        + " WHERE attrelid = 'zzsd_ua'::regclass AND attnum > 0"));
+
+        // And the column holds a list of that type's values.
+        exec("INSERT INTO zzsd_ua (a, b) VALUES ('{1,2}', '{a,b}')");
+        assertEquals("{1,2}/{a,b}/1/b/2/2", rowsOf("SELECT a, b, a[1], b[2],"
+                + " array_length(a,1), array_length(b,1) FROM zzsd_ua"));
+        exec("DROP TABLE zzsd_ua");
+
+        // A default, a constructor and a cast all reach one.
+        exec("CREATE TABLE zzsd_ar (a zzsd_dm[] DEFAULT '{1,2}', b zzsd_enum[] DEFAULT '{a,b}',"
+                + " c int[] DEFAULT ARRAY[9])");
+        exec("INSERT INTO zzsd_ar DEFAULT VALUES");
+        assertEquals("{1,2}/{a,b}/{9}", rowsOf("SELECT a, b, c FROM zzsd_ar"));
+        assertEquals("2/2/a",
+                rowsOf("SELECT array_length(a, 1), a[2], b[1] FROM zzsd_ar"));
+        assertEquals(1, num("SELECT count(*)::int FROM zzsd_ar WHERE 1 = ANY (a)"));
+        assertEquals("a;b", rowsOf("SELECT unnest(b) FROM zzsd_ar ORDER BY 1"));
+        exec("INSERT INTO zzsd_ar (a, b, c) VALUES (ARRAY[3, 4]::zzsd_dm[],"
+                + " ARRAY['c']::zzsd_enum[], ARRAY[1])");
+        assertEquals("{3,4}/{c}/{1};{1,2}/{a,b}/{9}",
+                rowsOf("SELECT a, b, c FROM zzsd_ar ORDER BY c"));
+
+        exec("DROP TABLE zzsd_ar");
+        exec("DROP DOMAIN zzsd_dm");
+        exec("DROP TYPE zzsd_enum");
+        exec("DROP TYPE zzsd_rng");
+    }
+
+    @Test
+    void aDomainsOwnRulesAreEveryElementsRules() throws Exception {
+        exec("CREATE DOMAIN zzsd_pos AS int CHECK (VALUE > 0)");
+        exec("CREATE DOMAIN zzsd_nn AS int NOT NULL");
+        exec("CREATE TABLE zzsd_da (a zzsd_pos[], b zzsd_nn[])");
+
+        assertEquals("23514", stateOf("INSERT INTO zzsd_da (a) VALUES ('{-1}')"));
+        assertEquals("value for domain zzsd_pos violates check constraint \"zzsd_pos_check\"",
+                messageOf("INSERT INTO zzsd_da (a) VALUES ('{-1}')"));
+        // Every element, however many dimensions deep.
+        assertEquals("value for domain zzsd_pos violates check constraint \"zzsd_pos_check\"",
+                messageOf("INSERT INTO zzsd_da (a) VALUES ('{{1,2},{3,-4}}')"));
+        assertEquals("23502", stateOf("INSERT INTO zzsd_da (b) VALUES ('{NULL}')"));
+        assertEquals("domain zzsd_nn does not allow null values",
+                messageOf("INSERT INTO zzsd_da (b) VALUES ('{NULL}')"));
+
+        // A null array holds no value of the domain, so there is nothing to judge; a CHECK that
+        // answers NULL does not violate; and an empty array holds nothing either.
+        exec("INSERT INTO zzsd_da (a, b) VALUES ('{1,2}', NULL)");
+        exec("INSERT INTO zzsd_da (a) VALUES ('{NULL}')");
+        exec("INSERT INTO zzsd_da (a) VALUES ('{}')");
+        assertEquals(3, num("SELECT count(*)::int FROM zzsd_da"));
+        assertEquals("{};{1,2};{NULL}", rowsOf("SELECT a FROM zzsd_da ORDER BY 1"));
+
+        exec("DROP TABLE zzsd_da");
+        exec("DROP DOMAIN zzsd_pos");
+        exec("DROP DOMAIN zzsd_nn");
+    }
+
+    @Test
+    void aCheckOverADomainTypedColumnReadsTheColumnDownToTheBaseType() throws Exception {
+        exec("CREATE DOMAIN zzsd_di AS int");
+        exec("CREATE DOMAIN zzsd_dt AS text");
+        exec("CREATE DOMAIN zzsd_dn AS numeric(8,2)");
+        exec("CREATE DOMAIN zzsd_dv AS varchar(5)");
+        exec("CREATE TABLE zzsd_dc (a zzsd_di, b zzsd_dt, c zzsd_dn, d zzsd_dv, e int, f text)");
+
+        String[][] written = {
+                {"zzsd_x1", "CHECK (a > 1)", "CHECK (((a)::integer > 1))"},
+                {"zzsd_x2", "CHECK (b <> 'q')", "CHECK (((b)::text <> 'q'::text))"},
+                {"zzsd_x3", "CHECK (c > 1)", "CHECK (((c)::numeric > (1)::numeric))"},
+                {"zzsd_x4", "CHECK (d <> 'q')", "CHECK (((d)::text <> 'q'::text))"},
+                // No operator, so nothing to read down to.
+                {"zzsd_x5", "CHECK (a IS NOT NULL)", "CHECK ((a IS NOT NULL))"},
+                {"zzsd_x6", "CHECK (a = e)", "CHECK (((a)::integer = e))"},
+                {"zzsd_x7", "CHECK (b = f)", "CHECK (((b)::text = f))"},
+                {"zzsd_x8", "CHECK (a + 1 > 2)", "CHECK ((((a)::integer + 1) > 2))"},
+                {"zzsd_x9", "CHECK (length(b) > 1)", "CHECK ((length((b)::text) > 1))"},
+                {"zzsd_xa", "CHECK (a BETWEEN 1 AND 9)",
+                        "CHECK ((((a)::integer >= 1) AND ((a)::integer <= 9)))"},
+                {"zzsd_xb", "CHECK (b LIKE 'a%')", "CHECK (((b)::text ~~ 'a%'::text))"},
+                {"zzsd_xc", "CHECK (a IN (1, 2))", "CHECK (((a)::integer = ANY (ARRAY[1, 2])))"},
+                {"zzsd_xd", "CHECK (-a < 0)", "CHECK (((- (a)::integer) < 0))"},
+        };
+        for (String[] one : written) {
+            exec("ALTER TABLE zzsd_dc ADD CONSTRAINT " + one[0] + " " + one[1]);
+        }
+        for (String[] one : written) {
+            assertEquals(one[2], scalar("SELECT pg_get_constraintdef(oid) FROM pg_constraint"
+                    + " WHERE conname = '" + one[0] + "'"), one[1]);
+        }
+        // The information schema carries the same text without the CHECK ( ) around it.
+        assertEquals("((b)::text <> 'q'::text)", scalar("SELECT check_clause"
+                + " FROM information_schema.check_constraints"
+                + " WHERE constraint_name = 'zzsd_x2'"));
+
+        exec("DROP TABLE zzsd_dc");
+        exec("DROP DOMAIN zzsd_di");
+        exec("DROP DOMAIN zzsd_dt");
+        exec("DROP DOMAIN zzsd_dn");
+        exec("DROP DOMAIN zzsd_dv");
+    }
+
+    @Test
+    void aRetypeToADomainRewritesTheChecksThatReadTheColumn() throws Exception {
+        exec("CREATE DOMAIN zzsd_pos AS int CHECK (VALUE > 0)");
+        exec("CREATE TABLE zzsd_m (a int, b int, c int, d int, e int, f int, g int, h int)");
+        exec("ALTER TABLE zzsd_m ADD CONSTRAINT zzsd_k1 CHECK (a > 1)");
+        exec("ALTER TABLE zzsd_m ADD CONSTRAINT zzsd_k2 CHECK (b > 1)");
+        exec("ALTER TABLE zzsd_m ADD CONSTRAINT zzsd_k3 CHECK (c > 1)");
+        exec("ALTER TABLE zzsd_m ADD CONSTRAINT zzsd_k4 CHECK (d IS NOT NULL)");
+        exec("ALTER TABLE zzsd_m ADD CONSTRAINT zzsd_k5 CHECK (e + 1 > 2)");
+        exec("ALTER TABLE zzsd_m ADD CONSTRAINT zzsd_k6 CHECK (f > 1 AND g > 2)");
+        exec("ALTER TABLE zzsd_m ADD CONSTRAINT zzsd_k7 CHECK (h > 1)");
+
+        exec("ALTER TABLE zzsd_m ALTER COLUMN a TYPE bigint");
+        exec("ALTER TABLE zzsd_m ALTER COLUMN b TYPE numeric");
+        exec("ALTER TABLE zzsd_m ALTER COLUMN c TYPE zzsd_pos");
+        exec("ALTER TABLE zzsd_m ALTER COLUMN d TYPE zzsd_pos");
+        exec("ALTER TABLE zzsd_m ALTER COLUMN e TYPE zzsd_pos");
+        exec("ALTER TABLE zzsd_m ALTER COLUMN f TYPE zzsd_pos");
+        exec("ALTER TABLE zzsd_m ALTER COLUMN h TYPE smallint");
+
+        // Only the columns that became a domain carry a reading down to the base type; a widening
+        // between built-ins leaves the operator where it was, and the one whose operator gained a
+        // numeric operand puts the conversion on the constant.
+        assertEquals("zzsd_k1=CHECK ((a > 1));"
+                        + "zzsd_k2=CHECK ((b > (1)::numeric));"
+                        + "zzsd_k3=CHECK (((c)::integer > 1));"
+                        + "zzsd_k4=CHECK ((d IS NOT NULL));"
+                        + "zzsd_k5=CHECK ((((e)::integer + 1) > 2));"
+                        + "zzsd_k6=CHECK ((((f)::integer > 1) AND (g > 2)));"
+                        + "zzsd_k7=CHECK ((h > 1))",
+                scalar("SELECT string_agg(conname||'='||pg_get_constraintdef(oid), ';'"
+                        + " ORDER BY conname) FROM pg_constraint"
+                        + " WHERE conrelid = 'zzsd_m'::regclass"));
+        assertEquals("a/bigint,b/numeric,c/zzsd_pos,d/zzsd_pos,e/zzsd_pos,f/zzsd_pos,g/integer,"
+                        + "h/smallint",
+                scalar("SELECT string_agg(attname||'/'||format_type(atttypid, atttypmod), ','"
+                        + " ORDER BY attnum) FROM pg_attribute"
+                        + " WHERE attrelid = 'zzsd_m'::regclass AND attnum > 0"));
+
+        // Both rules are enforced throughout: the domain's own, and then the relation's.
+        exec("INSERT INTO zzsd_m VALUES (2, 2, 2, 2, 2, 2, 3, 2)");
+        assertEquals("value for domain zzsd_pos violates check constraint \"zzsd_pos_check\"",
+                messageOf("INSERT INTO zzsd_m VALUES (2, 2, 0, 2, 2, 2, 3, 2)"));
+        assertEquals("new row for relation \"zzsd_m\" violates check constraint \"zzsd_k3\"",
+                messageOf("INSERT INTO zzsd_m VALUES (2, 2, 1, 2, 2, 2, 3, 2)"));
+
+        // And the reading down goes again when the column stops being a domain.
+        exec("ALTER TABLE zzsd_m ALTER COLUMN c TYPE int");
+        assertEquals("CHECK ((c > 1))", scalar("SELECT pg_get_constraintdef(oid)"
+                + " FROM pg_constraint WHERE conname = 'zzsd_k3'"));
+
+        exec("DROP TABLE zzsd_m");
+        exec("DROP DOMAIN zzsd_pos");
+    }
+
+    // ------------------------------------------------------------ A partition key element that opens a query
+
+    @Test
+    void aKeyElementWrittenWithOnePairOfParenthesesStopsAtTheWordThatOpensIt() throws Exception {
+        // The pair of parentheses a sub-query is written with is the pair the key element has
+        // already spent, so the word that opens the query is a syntax error where it stands.
+        String[][] refused = {
+                {"CREATE TABLE zzsd_pk (i int, k int) PARTITION BY RANGE ((SELECT 1))",
+                        "syntax error at or near \"SELECT\""},
+                {"CREATE TABLE zzsd_pk (i int, k int) PARTITION BY RANGE (SELECT 1)",
+                        "syntax error at or near \"SELECT\""},
+                {"CREATE TABLE zzsd_pk (i int, k int) PARTITION BY RANGE (i, (SELECT 1))",
+                        "syntax error at or near \"SELECT\""},
+                {"CREATE TABLE zzsd_pk (i int, k int) PARTITION BY RANGE ((SELECT 1), i)",
+                        "syntax error at or near \"SELECT\""},
+                {"CREATE TABLE zzsd_pk (i int, k int) PARTITION BY RANGE ((TABLE zzsd_pk))",
+                        "syntax error at or near \"TABLE\""},
+                {"CREATE TABLE zzsd_pk (i int, k int) PARTITION BY RANGE"
+                        + " ((WITH q AS (SELECT 1) SELECT 1 FROM q))",
+                        "syntax error at or near \"WITH\""},
+        };
+        for (String[] one : refused) {
+            assertEquals("42601", stateOf(one[0]), one[0]);
+            assertEquals(one[1], messageOf(one[0]), one[0]);
+        }
+
+        // Two pairs, and the element is an expression the analysis reaches and refuses for what
+        // it is -- under every strategy.
+        String[] doubled = {
+                "CREATE TABLE zzsd_pk (i int, k int) PARTITION BY RANGE (((SELECT 1)))",
+                "CREATE TABLE zzsd_pk (i int, k int) PARTITION BY RANGE (((SELECT 1) + 1))",
+                "CREATE TABLE zzsd_pk (i int, k int) PARTITION BY LIST (((SELECT 1)))",
+                "CREATE TABLE zzsd_pk (i int, k int) PARTITION BY HASH (((SELECT 1)))",
+        };
+        for (String sql : doubled) {
+            assertEquals("0A000", stateOf(sql), sql);
+            assertEquals("cannot use subquery in partition key expression", messageOf(sql), sql);
+        }
+
+        assertEquals(0, num("SELECT count(*)::int FROM pg_class WHERE relname = 'zzsd_pk'"));
+    }
+
+    @Test
+    void theFaultAKeyExpressionIsRefusedForIsWhicheverTheAnalysisReachesFirst() throws Exception {
+        // PostgreSQL analyses a key expression from the leaves outwards, exactly as it analyses
+        // one written in a query.
+        String[][] refused = {
+                {"((sum(i) + nosuch))", "42803",
+                        "aggregate functions are not allowed in partition key expressions"},
+                {"((nosuch + sum(i)))", "42703", "column \"nosuch\" does not exist"},
+                {"((sum(i) + nosuch), nosuch2)", "42803",
+                        "aggregate functions are not allowed in partition key expressions"},
+                {"((row_number() OVER () + nosuch))", "42P20",
+                        "window functions are not allowed in partition key expressions"},
+                {"((row_number() OVER (ORDER BY nosuch)))", "42P20",
+                        "window functions are not allowed in partition key expressions"},
+                {"(((SELECT 1) + nosuch))", "0A000",
+                        "cannot use subquery in partition key expression"},
+                {"((nosuch + (SELECT 1)))", "42703", "column \"nosuch\" does not exist"},
+                // A call's arguments are analysed before the call is placed.
+                {"((sum(nosuch)))", "42703", "column \"nosuch\" does not exist"},
+                {"((abs(i) FILTER (WHERE nosuch)))", "42703", "column \"nosuch\" does not exist"},
+                {"((CASE WHEN nosuch THEN sum(i) END))", "42703",
+                        "column \"nosuch\" does not exist"},
+                {"((CASE WHEN true THEN sum(i) ELSE nosuch END))", "42803",
+                        "aggregate functions are not allowed in partition key expressions"},
+                {"((nosuch + nosuch2))", "42703", "column \"nosuch\" does not exist"},
+                // A system column resolves like any other, so the name that is not there is the
+                // fault wherever it stands beside one.
+                {"((xmin + nosuch))", "42703", "column \"nosuch\" does not exist"},
+                {"((nosuch + xmin))", "42703", "column \"nosuch\" does not exist"},
+                // ...and a name is reached before the key is judged for changing its answer.
+                {"((random()::int + nosuch))", "42703", "column \"nosuch\" does not exist"},
+        };
+        for (String[] one : refused) {
+            String sql = "CREATE TABLE zzsd_pk (i int, k int) PARTITION BY RANGE " + one[0];
+            assertEquals(one[1], stateOf(sql), sql);
+            assertEquals(one[2], messageOf(sql), sql);
+        }
+
+        assertEquals(0, num("SELECT count(*)::int FROM pg_class WHERE relname = 'zzsd_pk'"));
+    }
+
+    @Test
+    void everyExpressionAQueryMayHoldMayAlsoStandInAPartitionKey() throws Exception {
+        String[] keys = {
+                "RANGE (i)", "RANGE ((i))", "RANGE ((i + k))", "LIST (lower(s))", "RANGE (abs(i))",
+                "RANGE (i, k)", "RANGE ((CASE WHEN i > 0 THEN 1 ELSE 2 END))", "LIST ((s || 'x'))",
+                "RANGE ((i::bigint))", "HASH ((i + 1))", "RANGE ((i BETWEEN 1 AND 9))",
+                "LIST ((i IN (1, 2)))", "RANGE ((greatest(i, k)))",
+        };
+        for (int n = 0; n < keys.length; n++) {
+            exec("CREATE TABLE zzsd_key" + n + " (i int, k int, s text) PARTITION BY " + keys[n]);
+        }
+        // ...and a subscript of an array column, which needs a column of its own.
+        exec("CREATE TABLE zzsd_keyx (i int, a int[], s text) PARTITION BY RANGE ((a[1]))");
+
+        assertEquals(keys.length + 1, num("SELECT count(*)::int FROM pg_class"
+                + " WHERE relname LIKE 'zzsd\\_key%' AND relkind = 'p'"));
+        assertEquals("RANGE (i)", scalar("SELECT pg_get_partkeydef('zzsd_key0'::regclass)"));
+        assertEquals("LIST (lower(s))", scalar("SELECT pg_get_partkeydef('zzsd_key3'::regclass)"));
+        assertEquals("RANGE (abs(i))", scalar("SELECT pg_get_partkeydef('zzsd_key4'::regclass)"));
+        assertEquals("RANGE (i, k)", scalar("SELECT pg_get_partkeydef('zzsd_key5'::regclass)"));
+
+        for (int n = 0; n < keys.length; n++) exec("DROP TABLE zzsd_key" + n);
+        exec("DROP TABLE zzsd_keyx");
+    }
+
+    // ------------------------------------------------------------ What a child may generate that its parent does not
+
+    @Test
+    void attachingAPartitionAsksThatAColumnBeGeneratedOnBothSidesOrOnNeither() throws Exception {
+        exec("CREATE TABLE zzsd_gp (i int, k int, s text) PARTITION BY LIST (s)");
+        exec("CREATE TABLE zzsd_gc (i int, k int GENERATED ALWAYS AS (i * 2) STORED, s text)");
+        assertEquals("42804",
+                stateOf("ALTER TABLE zzsd_gp ATTACH PARTITION zzsd_gc FOR VALUES IN ('a')"));
+        assertEquals("column \"k\" in child table must not be a generated column",
+                messageOf("ALTER TABLE zzsd_gp ATTACH PARTITION zzsd_gc FOR VALUES IN ('a')"));
+        exec("DROP TABLE zzsd_gc");
+        exec("DROP TABLE zzsd_gp");
+
+        exec("CREATE TABLE zzsd_gp (i int, k int GENERATED ALWAYS AS (i * 2) STORED, s text)"
+                + " PARTITION BY LIST (s)");
+        exec("CREATE TABLE zzsd_gc (i int, k int, s text)");
+        assertEquals("column \"k\" in child table must be a generated column",
+                messageOf("ALTER TABLE zzsd_gp ATTACH PARTITION zzsd_gc FOR VALUES IN ('a')"));
+        exec("DROP TABLE zzsd_gc");
+        exec("DROP TABLE zzsd_gp");
+
+        // A default is not a generation expression.
+        exec("CREATE TABLE zzsd_gp (i int, k int DEFAULT 7, s text) PARTITION BY LIST (s)");
+        exec("CREATE TABLE zzsd_gc (i int, k int GENERATED ALWAYS AS (i * 2) STORED, s text)");
+        assertEquals("column \"k\" in child table must not be a generated column",
+                messageOf("ALTER TABLE zzsd_gp ATTACH PARTITION zzsd_gc FOR VALUES IN ('a')"));
+        exec("DROP TABLE zzsd_gc");
+        exec("DROP TABLE zzsd_gp");
+
+        // Two generated columns of different kinds are refused for the kind, with both named.
+        exec("CREATE TABLE zzsd_gp (i int, k int GENERATED ALWAYS AS (i * 2) VIRTUAL, s text)"
+                + " PARTITION BY LIST (s)");
+        exec("CREATE TABLE zzsd_gc (i int, k int GENERATED ALWAYS AS (i * 2) STORED, s text)");
+        org.postgresql.util.ServerErrorMessage e =
+                fieldsOf("ALTER TABLE zzsd_gp ATTACH PARTITION zzsd_gc FOR VALUES IN ('a')");
+        assertEquals("42804", e.getSQLState());
+        assertEquals("column \"k\" inherits from generated column of different kind", e.getMessage());
+        assertEquals("Parent column is VIRTUAL, child column is STORED.", e.getDetail());
+        exec("DROP TABLE zzsd_gc");
+        exec("DROP TABLE zzsd_gp");
+    }
+
+    @Test
+    void twoGeneratedColumnsOfTheSameKindMayDisagreeAboutTheExpression() throws Exception {
+        exec("CREATE TABLE zzsd_gp (i int, k int GENERATED ALWAYS AS (i * 2) STORED, s text)"
+                + " PARTITION BY LIST (s)");
+        exec("CREATE TABLE zzsd_gc (i int, k int GENERATED ALWAYS AS (i * 3) STORED, s text)");
+        exec("ALTER TABLE zzsd_gp ATTACH PARTITION zzsd_gc FOR VALUES IN ('a')");
+        assertEquals("(i * 3)", scalar("SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef"
+                + " WHERE adrelid = 'zzsd_gc'::regclass"));
+        exec("DROP TABLE zzsd_gp CASCADE");
+
+        // Two virtual ones of the same kind go the same way, and so do two plain columns and two
+        // columns carrying a DEFAULT, which is not inherited at all.
+        exec("CREATE TABLE zzsd_vp (i int, k int GENERATED ALWAYS AS (i * 2) VIRTUAL, s text)"
+                + " PARTITION BY LIST (s)");
+        exec("CREATE TABLE zzsd_vc (i int, k int GENERATED ALWAYS AS (i * 2) VIRTUAL, s text)");
+        exec("ALTER TABLE zzsd_vp ATTACH PARTITION zzsd_vc FOR VALUES IN ('a')");
+        assertEquals(1, num("SELECT count(*)::int FROM pg_inherits"
+                + " WHERE inhrelid = 'zzsd_vc'::regclass"));
+        exec("DROP TABLE zzsd_vp CASCADE");
+
+        exec("CREATE TABLE zzsd_np (i int, k int, s text) PARTITION BY LIST (s)");
+        exec("CREATE TABLE zzsd_nc (i int, k int, s text)");
+        exec("ALTER TABLE zzsd_np ATTACH PARTITION zzsd_nc FOR VALUES IN ('a')");
+        exec("INSERT INTO zzsd_np VALUES (1, 2, 'a')");
+        assertEquals("1/2/a", rowsOf("SELECT i, k, s FROM zzsd_nc"));
+        exec("DROP TABLE zzsd_np CASCADE");
+
+        exec("CREATE TABLE zzsd_dp (i int, k int DEFAULT 7, s text) PARTITION BY LIST (s)");
+        exec("CREATE TABLE zzsd_dc2 (i int, k int DEFAULT 9, s text)");
+        exec("ALTER TABLE zzsd_dp ATTACH PARTITION zzsd_dc2 FOR VALUES IN ('a')");
+        assertEquals(1, num("SELECT count(*)::int FROM pg_inherits"
+                + " WHERE inhrelid = 'zzsd_dc2'::regclass"));
+        exec("DROP TABLE zzsd_dp CASCADE");
+    }
+
+    @Test
+    void joiningAnInheritanceHierarchyAsksTheSameOfAGeneratedColumn() throws Exception {
+        exec("CREATE TABLE zzsd_ip (i int, k int, s text)");
+        exec("CREATE TABLE zzsd_ic (i int, k int GENERATED ALWAYS AS (i * 2) STORED, s text)");
+        assertEquals("42804", stateOf("ALTER TABLE zzsd_ic INHERIT zzsd_ip"));
+        assertEquals("column \"k\" in child table must not be a generated column",
+                messageOf("ALTER TABLE zzsd_ic INHERIT zzsd_ip"));
+        exec("DROP TABLE zzsd_ic");
+        exec("DROP TABLE zzsd_ip");
+
+        exec("CREATE TABLE zzsd_ip (i int, k int GENERATED ALWAYS AS (i * 2) STORED, s text)");
+        exec("CREATE TABLE zzsd_ic (i int, k int, s text)");
+        assertEquals("column \"k\" in child table must be a generated column",
+                messageOf("ALTER TABLE zzsd_ic INHERIT zzsd_ip"));
+        exec("DROP TABLE zzsd_ic");
+        exec("DROP TABLE zzsd_ip");
+
+        exec("CREATE TABLE zzsd_ip (i int, k int GENERATED ALWAYS AS (i * 2) STORED, s text)");
+        exec("CREATE TABLE zzsd_ic (i int, k int GENERATED ALWAYS AS (i * 2) STORED, s text)");
+        exec("ALTER TABLE zzsd_ic INHERIT zzsd_ip");
+        assertEquals(1, num("SELECT count(*)::int FROM pg_inherits"
+                + " WHERE inhrelid = 'zzsd_ic'::regclass"));
+        exec("ALTER TABLE zzsd_ic NO INHERIT zzsd_ip");
+        exec("DROP TABLE zzsd_ic");
+        exec("DROP TABLE zzsd_ip");
+    }
+
+    // ------------------------------------------------------------ Where the policies and the check option sit
+
+    @Test
+    void aViewsCheckOptionIsAskedAfterTheRowIsStoredAndAfterTheArbiter() throws Exception {
+        exec("CREATE TABLE zzsd_vt (i int PRIMARY KEY, v int CHECK (v < 100),"
+                + " w int NOT NULL DEFAULT 1)");
+        exec("INSERT INTO zzsd_vt (i, v) VALUES (60, 1), (70, 1)");
+        exec("CREATE VIEW zzsd_vv AS SELECT * FROM zzsd_vt WHERE v < 10 WITH CHECK OPTION");
+
+        // A row that duplicates a key is refused for the key, whether or not the view would have
+        // taken it; a row that breaks a CHECK is refused for the CHECK.
+        assertEquals("23505", stateOf("INSERT INTO zzsd_vv (i, v) VALUES (60, 20)"));
+        assertEquals("23505", stateOf("INSERT INTO zzsd_vv (i, v) VALUES (60, 5)"));
+        assertEquals("23514", stateOf("INSERT INTO zzsd_vv (i, v) VALUES (30, 200)"));
+        assertEquals("23502", stateOf("INSERT INTO zzsd_vv (i, v, w) VALUES (30, 20, NULL)"));
+        assertEquals("44000", stateOf("INSERT INTO zzsd_vv (i, v) VALUES (30, 20)"));
+        assertEquals("new row violates check option for view \"zzsd_vv\"",
+                messageOf("INSERT INTO zzsd_vv (i, v) VALUES (30, 20)"));
+
+        assertEquals("23505", stateOf("UPDATE zzsd_vv SET i = 60, v = 20 WHERE i = 70"));
+        assertEquals("23514", stateOf("UPDATE zzsd_vv SET i = 80, v = 200 WHERE i = 70"));
+        assertEquals("44000", stateOf("UPDATE zzsd_vv SET v = 20 WHERE i = 70"));
+
+        // The arbiter comes between: a row it skips is never offered to the view.
+        exec("INSERT INTO zzsd_vv (i, v) VALUES (60, 20) ON CONFLICT (i) DO NOTHING");
+        assertEquals("44000",
+                stateOf("INSERT INTO zzsd_vv (i, v) VALUES (30, 20) ON CONFLICT (i) DO NOTHING"));
+        assertEquals("23514",
+                stateOf("INSERT INTO zzsd_vv (i, v) VALUES (60, 200) ON CONFLICT (i) DO NOTHING"));
+        // ...and the row a conflict clause leaves behind is a row of the view like any other.
+        assertEquals("44000", stateOf("INSERT INTO zzsd_vv (i, v) VALUES (60, 20)"
+                + " ON CONFLICT (i) DO UPDATE SET v = 30"));
+
+        // A row the view does admit is written.
+        exec("INSERT INTO zzsd_vv (i, v) VALUES (30, 5) ON CONFLICT (i) DO NOTHING");
+        assertEquals("30/5/1;60/1/1;70/1/1", rowsOf("SELECT i, v, w FROM zzsd_vt ORDER BY i"));
+
+        exec("DROP VIEW zzsd_vv");
+        exec("DROP TABLE zzsd_vt");
+    }
+
+    @Test
+    void theRowLevelPoliciesAreAskedBeforeTheArbiterAndBeforeTheConstraints() throws Exception {
+        exec("CREATE TABLE zzsd_rl (i int PRIMARY KEY, v int CHECK (v < 100),"
+                + " w int NOT NULL DEFAULT 1)");
+        exec("INSERT INTO zzsd_rl (i, v) VALUES (60, 1), (70, 1)");
+        exec("ALTER TABLE zzsd_rl ENABLE ROW LEVEL SECURITY");
+        exec("ALTER TABLE zzsd_rl FORCE ROW LEVEL SECURITY");
+        exec("CREATE POLICY zzsd_pol ON zzsd_rl FOR ALL USING (true) WITH CHECK (i < 50)");
+        exec("DROP ROLE IF EXISTS zzsd_user");
+        exec("CREATE ROLE zzsd_user LOGIN");
+        exec("GRANT ALL ON zzsd_rl TO zzsd_user");
+        exec("SET ROLE zzsd_user");
+        try {
+            // A row no policy admits is refused even where the arbiter would have skipped it, and
+            // even where a column it holds is one the relation would have refused anyway.
+            String[] refused = {
+                    "INSERT INTO zzsd_rl (i, v) VALUES (60, 1) ON CONFLICT (i) DO NOTHING",
+                    "INSERT INTO zzsd_rl (i, v) VALUES (60, 200) ON CONFLICT (i) DO NOTHING",
+                    "INSERT INTO zzsd_rl (i, v, w) VALUES (60, 1, NULL) ON CONFLICT (i) DO NOTHING",
+                    "INSERT INTO zzsd_rl (i, v) VALUES (60, 1) ON CONFLICT (i) DO UPDATE SET v = 2",
+                    "INSERT INTO zzsd_rl (i, v) VALUES (80, 200)",
+                    "INSERT INTO zzsd_rl (i, v, w) VALUES (80, 1, NULL)",
+                    "UPDATE zzsd_rl SET i = 80, v = 200 WHERE i = 70",
+            };
+            for (String sql : refused) {
+                assertEquals("42501", stateOf(sql), sql);
+                assertEquals("new row violates row-level security policy for table \"zzsd_rl\"",
+                        messageOf(sql), sql);
+            }
+
+            // A row the policies do admit is judged against the relation's own rules next.
+            assertEquals("23514",
+                    stateOf("INSERT INTO zzsd_rl (i, v) VALUES (40, 200)"
+                            + " ON CONFLICT (i) DO NOTHING"));
+            assertEquals("new row for relation \"zzsd_rl\" violates check constraint"
+                            + " \"zzsd_rl_v_check\"",
+                    messageOf("INSERT INTO zzsd_rl (i, v) VALUES (40, 200)"
+                            + " ON CONFLICT (i) DO NOTHING"));
+            exec("INSERT INTO zzsd_rl (i, v) VALUES (40, 5) ON CONFLICT (i) DO NOTHING");
+            assertEquals("40/5/1;60/1/1;70/1/1", rowsOf("SELECT i, v, w FROM zzsd_rl ORDER BY i"));
+        } finally {
+            exec("RESET ROLE");
+        }
+        exec("DROP TABLE zzsd_rl CASCADE");
+        exec("DROP ROLE zzsd_user");
+    }
+
+    // ------------------------------------------------------------ What counts as writing to NEW
+
+    @Test
+    void anExecuteIntoAFieldOfNewAndAWholeRowAssignedToNewAreBothRewrites() throws Exception {
+        // A copy of a partitioned table's row trigger may not carry the row out of the partition
+        // the insert was routed to, and PostgreSQL decides whether the copy rewrote the row by
+        // whether the routine handed back a tuple other than the one it was given.
+        exec("CREATE FUNCTION zzsd_tg_bump() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN"
+                + " NEW.k := NEW.k + 10; RETURN NEW; END $$");
+        exec("CREATE FUNCTION zzsd_tg_exi() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN"
+                + " EXECUTE 'SELECT $1' INTO NEW.i USING NEW.i; RETURN NEW; END $$");
+        exec("CREATE FUNCTION zzsd_tg_exrec() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN"
+                + " EXECUTE 'SELECT $1, $2, $3' INTO NEW USING NEW.i, NEW.k, NEW.a;"
+                + " RETURN NEW; END $$");
+        exec("CREATE FUNCTION zzsd_tg_row() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN"
+                + " NEW := ROW(NEW.i, NEW.k, NEW.a); RETURN NEW; END $$");
+        exec("CREATE FUNCTION zzsd_tg_self() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN"
+                + " NEW := NEW; RETURN NEW; END $$");
+        exec("CREATE TABLE zzsd_tq (i int, k int, a int[]) PARTITION BY RANGE (k)");
+        exec("CREATE TABLE zzsd_tq0 PARTITION OF zzsd_tq FOR VALUES FROM (0) TO (10)");
+        exec("CREATE TABLE zzsd_tq1 PARTITION OF zzsd_tq FOR VALUES FROM (10) TO (20)");
+        exec("CREATE TRIGGER zzsd_tg_a_move BEFORE INSERT ON zzsd_tq0 FOR EACH ROW"
+                + " EXECUTE FUNCTION zzsd_tg_bump()");
+
+        // Writing a field of NEW through EXECUTE, writing the whole record through EXECUTE, and
+        // assigning a whole row to NEW are each a rewrite.
+        assertEquals("0A000", newWriteVerdict("zzsd_tg_exi"));
+        assertEquals("0A000", newWriteVerdict("zzsd_tg_exrec"));
+        assertEquals("0A000", newWriteVerdict("zzsd_tg_row"));
+        // Handing PostgreSQL back the record it gave is not, so the row reaches the partition
+        // constraint the trigger declared on the partition moved it out of.
+        assertEquals("23514", newWriteVerdict("zzsd_tg_self"));
+
+        assertEquals(0, num("SELECT count(*)::int FROM zzsd_tq"));
+        exec("DROP TABLE zzsd_tq CASCADE");
+        for (String routine : new String[] {"zzsd_tg_bump", "zzsd_tg_exi", "zzsd_tg_exrec",
+                "zzsd_tg_row", "zzsd_tg_self"}) {
+            exec("DROP FUNCTION " + routine + "() CASCADE");
+        }
+    }
+
+    /** Fires one routine as a copy of the partitioned table's trigger and reads the verdict back. */
+    private static String newWriteVerdict(String routine) throws SQLException {
+        exec("CREATE TRIGGER zzsd_tg_b_x BEFORE INSERT ON zzsd_tq FOR EACH ROW"
+                + " EXECUTE FUNCTION " + routine + "()");
+        String state = stateOf("INSERT INTO zzsd_tq VALUES (1, 5, '{1,2}')");
+        exec("DROP TRIGGER zzsd_tg_b_x ON zzsd_tq");
+        return state;
+    }
+
+    @Test
+    void bothFormsRunAndLeaveTheRowAsTheyFoundItOnAnOrdinaryRelation() throws Exception {
+        exec("CREATE FUNCTION zzsd_og_exi() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN"
+                + " EXECUTE 'SELECT $1' INTO NEW.i USING NEW.i; RETURN NEW; END $$");
+        exec("CREATE FUNCTION zzsd_og_row() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN"
+                + " NEW := ROW(NEW.i, NEW.k, NEW.a); RETURN NEW; END $$");
+        exec("CREATE FUNCTION zzsd_og_exrec() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN"
+                + " EXECUTE 'SELECT $1, $2, $3' INTO NEW USING NEW.i, NEW.k, NEW.a;"
+                + " RETURN NEW; END $$");
+        exec("CREATE TABLE zzsd_ot (i int, k int, a int[])");
+
+        exec("CREATE TRIGGER zzsd_ox BEFORE INSERT ON zzsd_ot FOR EACH ROW"
+                + " EXECUTE FUNCTION zzsd_og_exi()");
+        exec("INSERT INTO zzsd_ot VALUES (1, 5, '{1,2}')");
+        assertEquals("1/5/{1,2}", rowsOf("SELECT i, k, a FROM zzsd_ot"));
+        exec("DROP TRIGGER zzsd_ox ON zzsd_ot");
+        exec("DELETE FROM zzsd_ot");
+
+        exec("CREATE TRIGGER zzsd_ox BEFORE INSERT ON zzsd_ot FOR EACH ROW"
+                + " EXECUTE FUNCTION zzsd_og_row()");
+        exec("INSERT INTO zzsd_ot VALUES (2, 6, '{3,4}')");
+        assertEquals("2/6/{3,4}", rowsOf("SELECT i, k, a FROM zzsd_ot"));
+        exec("DROP TRIGGER zzsd_ox ON zzsd_ot");
+        exec("DELETE FROM zzsd_ot");
+
+        exec("CREATE TRIGGER zzsd_ox BEFORE INSERT ON zzsd_ot FOR EACH ROW"
+                + " EXECUTE FUNCTION zzsd_og_exrec()");
+        exec("INSERT INTO zzsd_ot VALUES (3, 7, '{5,6}')");
+        assertEquals("3/7/{5,6}", rowsOf("SELECT i, k, a FROM zzsd_ot"));
+
+        exec("DROP TABLE zzsd_ot CASCADE");
+        exec("DROP FUNCTION zzsd_og_exi() CASCADE");
+        exec("DROP FUNCTION zzsd_og_row() CASCADE");
+        exec("DROP FUNCTION zzsd_og_exrec() CASCADE");
+    }
+
+    // ------------------------------------------------------------ Every name one DROP is given is settled before any of them is taken
+
+    /**
+     * Every notice the statement raised, each as its message followed by the lines of its DETAIL
+     * in brackets. A cascade that took more than one object sends only a count in the message and
+     * the list itself in DETAIL, so the two have to be read together.
+     */
+    private static List<String> noticesOf(String sql) throws SQLException {
+        List<String> out = new ArrayList<>();
+        try (Statement st = conn.createStatement()) {
+            st.execute(sql);
+            for (SQLWarning w = st.getWarnings(); w != null; w = w.getNextWarning()) {
+                StringBuilder sb = new StringBuilder(w.getMessage().trim());
+                if (w instanceof org.postgresql.util.PSQLWarning) {
+                    org.postgresql.util.ServerErrorMessage m =
+                            ((org.postgresql.util.PSQLWarning) w).getServerErrorMessage();
+                    if (m != null && m.getDetail() != null) {
+                        sb.append(" [").append(m.getDetail().replace("\n", " | ")).append(']');
+                    }
+                }
+                out.add(sb.toString());
+            }
+        }
+        return out;
+    }
+
+    /**
+     * PostgreSQL settles the whole list of names before it takes any of it, so what a CASCADE
+     * reports is only what the statement did not itself name. A relation another name in the same
+     * list carries off is going anyway, and is neither reported as a cascade nor missed when its
+     * own turn comes.
+     */
+    @Test
+    void aCascadeReportsNothingTheSameStatementNamed() throws Exception {
+        // A table a foreign key points at, taken down beside the table that points at it.
+        exec("CREATE TABLE zzr7gn_np (i int PRIMARY KEY)");
+        exec("CREATE TABLE zzr7gn_nc (i int REFERENCES zzr7gn_np(i))");
+        assertEquals(List.of(), noticesOf("DROP TABLE zzr7gn_np, zzr7gn_nc CASCADE"));
+
+        // An inheritance child the same DROP names.
+        exec("CREATE TABLE zzr7gn_npa (i int)");
+        exec("CREATE TABLE zzr7gn_nch (j int) INHERITS (zzr7gn_npa)");
+        assertEquals(List.of(), noticesOf("DROP TABLE zzr7gn_npa, zzr7gn_nch CASCADE"));
+
+        // A view over a view, both named.
+        exec("CREATE TABLE zzr7gn_nt (i int)");
+        exec("CREATE VIEW zzr7gn_nv1 AS SELECT * FROM zzr7gn_nt");
+        exec("CREATE VIEW zzr7gn_nv2 AS SELECT * FROM zzr7gn_nv1");
+        assertEquals(List.of(), noticesOf("DROP VIEW zzr7gn_nv1, zzr7gn_nv2 CASCADE"));
+
+        // A materialized view over a materialized view, both named.
+        exec("CREATE MATERIALIZED VIEW zzr7gn_nm1 AS SELECT * FROM zzr7gn_nt");
+        exec("CREATE MATERIALIZED VIEW zzr7gn_nm2 AS SELECT * FROM zzr7gn_nm1");
+        assertEquals(List.of(),
+                noticesOf("DROP MATERIALIZED VIEW zzr7gn_nm1, zzr7gn_nm2 CASCADE"));
+
+        // A partition of a partitioned table the list also names, with a reader it does not:
+        // only the reader is reported.
+        exec("CREATE TABLE zzr7gn_nhq (i int) PARTITION BY RANGE (i)");
+        exec("CREATE TABLE zzr7gn_nh1 PARTITION OF zzr7gn_nhq FOR VALUES FROM (0) TO (10)");
+        exec("CREATE VIEW zzr7gn_npv AS SELECT * FROM zzr7gn_nh1");
+        assertEquals(List.of("drop cascades to view zzr7gn_npv"),
+                noticesOf("DROP TABLE zzr7gn_nhq, zzr7gn_nh1 CASCADE"));
+
+        // IF EXISTS has nothing to skip: both names were there when the list was read.
+        exec("CREATE TABLE zzr7gn_nhq (i int) PARTITION BY RANGE (i)");
+        exec("CREATE TABLE zzr7gn_nh1 PARTITION OF zzr7gn_nhq FOR VALUES FROM (0) TO (10)");
+        assertEquals(List.of(), noticesOf("DROP TABLE IF EXISTS zzr7gn_nhq, zzr7gn_nh1"));
+
+        exec("DROP TABLE zzr7gn_nt");
+        assertEquals(0, num("SELECT count(*) FROM pg_class WHERE relname LIKE 'zzr7gn\\_%'"));
+    }
+
+    /**
+     * A cascade names each object it reached once, however many of the statement's names reach
+     * it. Where it took more than one, the message counts them and the DETAIL lists them.
+     */
+    @Test
+    void aCascadeNamesWhatItReachedOnceHoweverManyWaysItReachesIt() throws Exception {
+        // One view reading both tables the statement names is reported once.
+        exec("CREATE TABLE zzr7gn_x1 (i int)");
+        exec("CREATE TABLE zzr7gn_x2 (i int)");
+        exec("CREATE VIEW zzr7gn_xv AS SELECT a.i FROM zzr7gn_x1 a JOIN zzr7gn_x2 b ON a.i = b.i");
+        assertEquals(List.of("drop cascades to view zzr7gn_xv"),
+                noticesOf("DROP TABLE zzr7gn_x1, zzr7gn_x2 CASCADE"));
+
+        // A view reached both down a chain and straight from the second table is reported once,
+        // and two objects taken are counted in the message and listed in DETAIL.
+        exec("CREATE TABLE zzr7gn_y1 (i int)");
+        exec("CREATE TABLE zzr7gn_y2 (i int)");
+        exec("CREATE VIEW zzr7gn_w1 AS SELECT * FROM zzr7gn_y1");
+        exec("CREATE VIEW zzr7gn_w2 AS SELECT a.i FROM zzr7gn_w1 a JOIN zzr7gn_y2 b"
+                + " ON a.i = b.i");
+        assertEquals(List.of("drop cascades to 2 other objects"
+                        + " [drop cascades to view zzr7gn_w1 | drop cascades to view zzr7gn_w2]"),
+                noticesOf("DROP TABLE zzr7gn_y1, zzr7gn_y2 CASCADE"));
+
+        // The same shape from a single name, so the count and the DETAIL are not a list artefact.
+        exec("CREATE TABLE zzr7gn_z1 (i int)");
+        exec("CREATE VIEW zzr7gn_zv1 AS SELECT * FROM zzr7gn_z1");
+        exec("CREATE VIEW zzr7gn_zv2 AS SELECT * FROM zzr7gn_zv1");
+        assertEquals(List.of("drop cascades to 2 other objects"
+                        + " [drop cascades to view zzr7gn_zv1 | drop cascades to view zzr7gn_zv2]"),
+                noticesOf("DROP TABLE zzr7gn_z1 CASCADE"));
+
+        // A materialized view is named by the kind it is, and a foreign key by its constraint.
+        exec("CREATE TABLE zzr7gn_mt (i int)");
+        exec("CREATE MATERIALIZED VIEW zzr7gn_mv AS SELECT * FROM zzr7gn_mt");
+        assertEquals(List.of("drop cascades to materialized view zzr7gn_mv"),
+                noticesOf("DROP TABLE zzr7gn_mt CASCADE"));
+        exec("CREATE TABLE zzr7gn_ep (i int PRIMARY KEY)");
+        exec("CREATE TABLE zzr7gn_ec (i int REFERENCES zzr7gn_ep(i))");
+        assertEquals(List.of("drop cascades to constraint zzr7gn_ec_i_fkey"
+                        + " on table zzr7gn_ec"),
+                noticesOf("DROP TABLE zzr7gn_ep CASCADE"));
+        exec("DROP TABLE zzr7gn_ec");
+
+        // A sequence a column owns names the default the column loses.
+        exec("CREATE TABLE zzr7gn_sq (i serial, j int)");
+        assertEquals(List.of("drop cascades to default value for column i of table zzr7gn_sq"),
+                noticesOf("DROP SEQUENCE zzr7gn_sq_i_seq CASCADE"));
+        exec("DROP TABLE zzr7gn_sq");
+
+        assertEquals(0, num("SELECT count(*) FROM pg_class WHERE relname LIKE 'zzr7gn\\_%'"));
+    }
+
+    /**
+     * A refusal names the relation the dependency really hangs from, which need not be the name
+     * the statement wrote; and a statement that named several says only that it cannot have what
+     * it asked for.
+     */
+    @Test
+    void aRefusalNamesTheRelationTheDependencyReallyHangsFrom() throws Exception {
+        exec("CREATE TABLE zzr7gn_bq (i int) PARTITION BY RANGE (i)");
+        exec("CREATE TABLE zzr7gn_b1 PARTITION OF zzr7gn_bq FOR VALUES FROM (0) TO (10)");
+        exec("CREATE VIEW zzr7gn_bv AS SELECT * FROM zzr7gn_b1");
+
+        // The partition goes because the statement named the table it belongs to, so the refusal
+        // is written against the name in the statement and the DETAIL against the partition.
+        org.postgresql.util.ServerErrorMessage one = fieldsOf("DROP TABLE zzr7gn_bq");
+        assertEquals("2BP01", one.getSQLState());
+        assertEquals("cannot drop table zzr7gn_bq because other objects depend on it",
+                one.getMessage());
+        assertEquals("view zzr7gn_bv depends on table zzr7gn_b1", one.getDetail());
+        assertEquals("Use DROP ... CASCADE to drop the dependent objects too.", one.getHint());
+
+        org.postgresql.util.ServerErrorMessage both =
+                fieldsOf("DROP TABLE zzr7gn_bq, zzr7gn_b1");
+        assertEquals("2BP01", both.getSQLState());
+        assertEquals("cannot drop desired object(s) because other objects depend on them",
+                both.getMessage());
+        assertEquals("view zzr7gn_bv depends on table zzr7gn_b1", both.getDetail());
+        assertEquals("Use DROP ... CASCADE to drop the dependent objects too.", both.getHint());
+
+        exec("DROP TABLE zzr7gn_bq, zzr7gn_b1 CASCADE");
+        assertEquals(0, num("SELECT count(*) FROM pg_class"
+                + " WHERE relname IN ('zzr7gn_bq','zzr7gn_b1','zzr7gn_bv')"));
+
+        // A reader of two names in the list is a dependency of the first of them, once.
+        exec("CREATE TABLE zzr7gn_x1 (i int)");
+        exec("CREATE TABLE zzr7gn_x2 (i int)");
+        exec("CREATE VIEW zzr7gn_xv AS SELECT a.i FROM zzr7gn_x1 a JOIN zzr7gn_x2 b ON a.i = b.i");
+        assertEquals("view zzr7gn_xv depends on table zzr7gn_x1",
+                detailOf("DROP TABLE zzr7gn_x1, zzr7gn_x2"));
+        exec("DROP TABLE zzr7gn_x1, zzr7gn_x2 CASCADE");
+
+        // A foreign key is named as the constraint it is, on the table that declared it.
+        exec("CREATE TABLE zzr7gn_ep (i int PRIMARY KEY)");
+        exec("CREATE TABLE zzr7gn_ec (i int REFERENCES zzr7gn_ep(i))");
+        exec("CREATE TABLE zzr7gn_eo (i int)");
+        assertEquals("cannot drop desired object(s) because other objects depend on them",
+                messageOf("DROP TABLE zzr7gn_ep, zzr7gn_eo"));
+        assertEquals("constraint zzr7gn_ec_i_fkey on table zzr7gn_ec depends on table zzr7gn_ep",
+                detailOf("DROP TABLE zzr7gn_ep, zzr7gn_eo"));
+        assertEquals(3, num("SELECT count(*) FROM pg_class"
+                + " WHERE relname IN ('zzr7gn_ep','zzr7gn_ec','zzr7gn_eo')"));
+        exec("DROP TABLE zzr7gn_ec, zzr7gn_ep, zzr7gn_eo");
+
+        // A sequence a column owns is held by the default that column carries.
+        exec("CREATE TABLE zzr7gn_sq (i serial, j int)");
+        org.postgresql.util.ServerErrorMessage seq = fieldsOf("DROP SEQUENCE zzr7gn_sq_i_seq");
+        assertEquals("2BP01", seq.getSQLState());
+        assertEquals("cannot drop sequence zzr7gn_sq_i_seq because other objects depend on it",
+                seq.getMessage());
+        assertEquals("default value for column i of table zzr7gn_sq"
+                + " depends on sequence zzr7gn_sq_i_seq", seq.getDetail());
+        exec("DROP TABLE zzr7gn_sq");
+        assertEquals(0, num("SELECT count(*) FROM pg_class WHERE relname LIKE 'zzr7gn\\_%'"));
+    }
+
+    /**
+     * A name of a kind the statement was not written for is refused while the list is being read,
+     * before anything goes, with the hint that name's own kind earns. IF EXISTS is no excuse: the
+     * name is there, it is simply not of the kind asked for.
+     */
+    @Test
+    void aNameOfTheWrongKindIsRefusedWithTheHintItsOwnKindEarns() throws Exception {
+        exec("CREATE TABLE zzr7gn_kt (i int)");
+        exec("CREATE VIEW zzr7gn_kv AS SELECT * FROM zzr7gn_kt");
+        exec("CREATE INDEX zzr7gn_ki ON zzr7gn_kt (i)");
+        exec("CREATE TABLE zzr7gn_ks (i serial, j int)");
+
+        org.postgresql.util.ServerErrorMessage view = fieldsOf("DROP TABLE zzr7gn_kt, zzr7gn_kv");
+        assertEquals("42809", view.getSQLState());
+        assertEquals("\"zzr7gn_kv\" is not a table", view.getMessage());
+        assertEquals("Use DROP VIEW to remove a view.", view.getHint());
+        assertNull(view.getDetail());
+
+        org.postgresql.util.ServerErrorMessage table = fieldsOf("DROP VIEW zzr7gn_kv, zzr7gn_kt");
+        assertEquals("42809", table.getSQLState());
+        assertEquals("\"zzr7gn_kt\" is not a view", table.getMessage());
+        assertEquals("Use DROP TABLE to remove a table.", table.getHint());
+
+        org.postgresql.util.ServerErrorMessage index = fieldsOf("DROP TABLE zzr7gn_kt, zzr7gn_ki");
+        assertEquals("42809", index.getSQLState());
+        assertEquals("\"zzr7gn_ki\" is not a table", index.getMessage());
+        assertEquals("Use DROP INDEX to remove an index.", index.getHint());
+
+        assertEquals("\"zzr7gn_kt\" is not an index",
+                messageOf("DROP INDEX zzr7gn_ki, zzr7gn_kt"));
+        assertEquals("Use DROP TABLE to remove a table.",
+                hintOf("DROP INDEX zzr7gn_ki, zzr7gn_kt"));
+
+        org.postgresql.util.ServerErrorMessage sequence =
+                fieldsOf("DROP TABLE zzr7gn_ks, zzr7gn_ks_i_seq");
+        assertEquals("42809", sequence.getSQLState());
+        assertEquals("\"zzr7gn_ks_i_seq\" is not a table", sequence.getMessage());
+        assertEquals("Use DROP SEQUENCE to remove a sequence.", sequence.getHint());
+
+        // IF EXISTS passes over a name that is not there; it does not pass over a name of the
+        // wrong kind.
+        assertEquals("42809", stateOf("DROP TABLE IF EXISTS zzr7gn_nosuch, zzr7gn_kv"));
+        assertEquals("\"zzr7gn_kv\" is not a table",
+                messageOf("DROP TABLE IF EXISTS zzr7gn_nosuch, zzr7gn_kv"));
+        assertEquals("42809", stateOf("DROP VIEW IF EXISTS zzr7gn_kv, zzr7gn_nosuch,"
+                + " zzr7gn_kt"));
+
+        // Nothing went in any of them.
+        assertEquals("zzr7gn_ki,zzr7gn_ks,zzr7gn_ks_i_seq,zzr7gn_kt,zzr7gn_kv",
+                column("SELECT relname FROM pg_class WHERE relname LIKE 'zzr7gn\\_k%'"
+                        + " ORDER BY 1"));
+
+        exec("DROP TABLE zzr7gn_kt CASCADE");
+        exec("DROP TABLE zzr7gn_ks");
+        assertEquals(0, num("SELECT count(*) FROM pg_class WHERE relname LIKE 'zzr7gn\\_%'"));
+    }
+
+    /**
+     * A name that was never there takes the whole statement with it, wherever in the list it
+     * stands and whatever kind of object the statement asks for, and every other name is left
+     * where it was.
+     */
+    @Test
+    void aNameThatWasNeverThereLeavesEveryOtherNameWhereItWas() throws Exception {
+        exec("CREATE TABLE zzr7gn_ga (i int, j int)");
+        exec("CREATE VIEW zzr7gn_gv AS SELECT * FROM zzr7gn_ga");
+        exec("CREATE SEQUENCE zzr7gn_gs");
+        exec("CREATE INDEX zzr7gn_gi ON zzr7gn_ga (i)");
+        exec("CREATE TYPE zzr7gn_ge AS ENUM ('a')");
+
+        org.postgresql.util.ServerErrorMessage last =
+                fieldsOf("DROP TABLE zzr7gn_ga, zzr7gn_nosuch");
+        assertEquals("42P01", last.getSQLState());
+        assertEquals("table \"zzr7gn_nosuch\" does not exist", last.getMessage());
+        assertNull(last.getDetail());
+        assertNull(last.getHint());
+
+        // The same when it stands first, so the answer is not the first name the reader reached.
+        assertEquals("42P01", stateOf("DROP TABLE zzr7gn_nosuch, zzr7gn_ga"));
+        assertEquals("table \"zzr7gn_nosuch\" does not exist",
+                messageOf("DROP TABLE zzr7gn_nosuch, zzr7gn_ga"));
+
+        assertEquals("42P01", stateOf("DROP VIEW zzr7gn_gv, zzr7gn_nosuch"));
+        assertEquals("view \"zzr7gn_nosuch\" does not exist",
+                messageOf("DROP VIEW zzr7gn_gv, zzr7gn_nosuch"));
+
+        assertEquals("42P01", stateOf("DROP SEQUENCE zzr7gn_gs, zzr7gn_nosuch"));
+        assertEquals("sequence \"zzr7gn_nosuch\" does not exist",
+                messageOf("DROP SEQUENCE zzr7gn_gs, zzr7gn_nosuch"));
+
+        // An index and a type answer 42704 rather than 42P01, each about its own kind.
+        assertEquals("42704", stateOf("DROP INDEX zzr7gn_gi, zzr7gn_nosuch"));
+        assertEquals("index \"zzr7gn_nosuch\" does not exist",
+                messageOf("DROP INDEX zzr7gn_gi, zzr7gn_nosuch"));
+
+        assertEquals("42704", stateOf("DROP TYPE zzr7gn_ge, zzr7gn_nosuch"));
+        assertEquals("type \"zzr7gn_nosuch\" does not exist",
+                messageOf("DROP TYPE zzr7gn_ge, zzr7gn_nosuch"));
+
+        assertEquals("zzr7gn_ga,zzr7gn_gi,zzr7gn_gs,zzr7gn_gv",
+                column("SELECT relname FROM pg_class WHERE relname LIKE 'zzr7gn\\_g%'"
+                        + " ORDER BY 1"));
+        assertEquals(1, num("SELECT count(*) FROM pg_type WHERE typname = 'zzr7gn_ge'"));
+
+        exec("DROP TABLE zzr7gn_ga CASCADE");
+        exec("DROP SEQUENCE zzr7gn_gs");
+        exec("DROP TYPE zzr7gn_ge");
+        assertEquals(0, num("SELECT count(*) FROM pg_class WHERE relname LIKE 'zzr7gn\\_%'"));
+    }
+
+    /**
+     * IF EXISTS passes over the name that was never there, says so in a notice naming the kind
+     * the statement asked for, and takes every other name in the list.
+     */
+    @Test
+    void ifExistsPassesOverTheNameThatWasNeverThereAndSaysSo() throws Exception {
+        exec("CREATE TABLE zzr7gn_ia (i int)");
+        assertEquals(List.of("table \"zzr7gn_nosuch\" does not exist, skipping"),
+                noticesOf("DROP TABLE IF EXISTS zzr7gn_nosuch, zzr7gn_ia"));
+        assertEquals(0, num("SELECT count(*) FROM pg_class WHERE relname = 'zzr7gn_ia'"));
+
+        // Every name that was never there earns a notice of its own.
+        assertEquals(List.of("table \"zzr7gn_nosuch\" does not exist, skipping",
+                        "table \"zzr7gn_alsono\" does not exist, skipping"),
+                noticesOf("DROP TABLE IF EXISTS zzr7gn_nosuch, zzr7gn_alsono"));
+
+        // And each statement names the kind it was written for.
+        assertEquals(List.of("view \"zzr7gn_nosuch\" does not exist, skipping"),
+                noticesOf("DROP VIEW IF EXISTS zzr7gn_nosuch"));
+        assertEquals(List.of("sequence \"zzr7gn_nosuch\" does not exist, skipping"),
+                noticesOf("DROP SEQUENCE IF EXISTS zzr7gn_nosuch"));
+        assertEquals(List.of("index \"zzr7gn_nosuch\" does not exist, skipping"),
+                noticesOf("DROP INDEX IF EXISTS zzr7gn_nosuch"));
+        assertEquals(List.of("type \"zzr7gn_nosuch\" does not exist, skipping"),
+                noticesOf("DROP TYPE IF EXISTS zzr7gn_nosuch"));
+
+        assertEquals(0, num("SELECT count(*) FROM pg_class WHERE relname LIKE 'zzr7gn\\_%'"));
+    }
+
+    /**
+     * The whole DROP is one statement, so a transaction that takes it back puts every name it
+     * was given back as it was: the partition still attached, the index still enforcing, the
+     * enum still holding its labels and the sequence still counting from where it stood.
+     */
+    @Test
+    void aRolledBackDropListPutsEveryNameBackAsItWas() throws Exception {
+        exec("CREATE TABLE zzr7gn_ta (i int)");
+        exec("CREATE TABLE zzr7gn_tb (i int)");
+        exec("CREATE TABLE zzr7gn_hq (i int) PARTITION BY RANGE (i)");
+        exec("CREATE TABLE zzr7gn_h1 PARTITION OF zzr7gn_hq FOR VALUES FROM (0) TO (10)");
+        exec("CREATE VIEW zzr7gn_v1 AS SELECT * FROM zzr7gn_ta");
+        exec("CREATE VIEW zzr7gn_v2 AS SELECT * FROM zzr7gn_v1");
+        exec("CREATE SEQUENCE zzr7gn_s1");
+        exec("CREATE SEQUENCE zzr7gn_s2");
+        exec("CREATE TABLE zzr7gn_ix (i int, j int)");
+        exec("CREATE UNIQUE INDEX zzr7gn_i1 ON zzr7gn_ix (i)");
+        exec("CREATE INDEX zzr7gn_i2 ON zzr7gn_ix (j)");
+        exec("CREATE TYPE zzr7gn_e1 AS ENUM ('a','b')");
+        exec("CREATE TYPE zzr7gn_e2 AS ENUM ('c')");
+
+        rolledBack(() -> {
+            exec("DROP VIEW zzr7gn_v1, zzr7gn_v2");
+            exec("DROP TABLE zzr7gn_ta, zzr7gn_tb");
+            exec("DROP TABLE zzr7gn_hq, zzr7gn_h1");
+            exec("DROP SEQUENCE zzr7gn_s1, zzr7gn_s2");
+            exec("DROP INDEX zzr7gn_i1, zzr7gn_i2");
+            exec("DROP TYPE zzr7gn_e1, zzr7gn_e2");
+            // Only the table the indexes were declared on is left standing.
+            assertEquals(1, num("SELECT count(*) FROM pg_class"
+                    + " WHERE relname LIKE 'zzr7gn\\_%'"));
+            assertEquals(0, num("SELECT count(*) FROM pg_type"
+                    + " WHERE typname IN ('zzr7gn_e1','zzr7gn_e2')"));
+        });
+
+        assertEquals("zzr7gn_h1,zzr7gn_hq,zzr7gn_i1,zzr7gn_i2,zzr7gn_ix,zzr7gn_s1,zzr7gn_s2,"
+                        + "zzr7gn_ta,zzr7gn_tb,zzr7gn_v1,zzr7gn_v2",
+                column("SELECT relname FROM pg_class WHERE relname LIKE 'zzr7gn\\_%' ORDER BY 1"));
+
+        // The partition is still a partition of the table it was declared under, and still takes
+        // the rows the partitioned table is written with.
+        assertEquals(1, num("SELECT count(*) FROM pg_inherits"
+                + " WHERE inhrelid = 'zzr7gn_h1'::regclass"));
+        exec("INSERT INTO zzr7gn_hq VALUES (5)");
+        assertEquals(1, num("SELECT count(*) FROM zzr7gn_h1"));
+
+        // The indexes came back with their definitions, and the unique one still refuses a
+        // duplicate.
+        assertEquals("CREATE UNIQUE INDEX zzr7gn_i1 ON public.zzr7gn_ix USING btree (i)",
+                indexDef("zzr7gn_i1"));
+        assertEquals("CREATE INDEX zzr7gn_i2 ON public.zzr7gn_ix USING btree (j)",
+                indexDef("zzr7gn_i2"));
+        exec("INSERT INTO zzr7gn_ix VALUES (1,1)");
+        assertEquals("23505", stateOf("INSERT INTO zzr7gn_ix VALUES (1,2)"));
+        assertEquals(1, num("SELECT count(*) FROM zzr7gn_ix"));
+
+        // The enums came back with their labels, the sequences from where they stood, and the
+        // views still read.
+        assertEquals("a,b,c", column("SELECT enumlabel FROM pg_enum e"
+                + " JOIN pg_type t ON t.oid = e.enumtypid"
+                + " WHERE t.typname LIKE 'zzr7gn\\_e%' ORDER BY 1"));
+        assertEquals("a", scalar("SELECT 'a'::zzr7gn_e1"));
+        assertEquals(1, num("SELECT nextval('zzr7gn_s1')"));
+        assertEquals(0, num("SELECT count(*) FROM zzr7gn_v2"));
+
+        exec("DROP TABLE zzr7gn_ta CASCADE");
+        exec("DROP TABLE zzr7gn_tb");
+        exec("DROP TABLE zzr7gn_hq");
+        exec("DROP TABLE zzr7gn_ix");
+        exec("DROP SEQUENCE zzr7gn_s1, zzr7gn_s2");
+        exec("DROP TYPE zzr7gn_e1, zzr7gn_e2");
+        assertEquals(0, num("SELECT count(*) FROM pg_class WHERE relname LIKE 'zzr7gn\\_%'"));
+    }
+
+    /**
+     * A savepoint holds the whole DROP too: rolling back to one taken before it puts every name
+     * it was given back, and leaves what the transaction did before the savepoint standing.
+     */
+    @Test
+    void aDropListRolledBackToASavepointPutsAllOfItsNamesBack() throws Exception {
+        exec("CREATE TABLE zzr7gn_ka (i int)");
+        exec("CREATE TABLE zzr7gn_kb (i int)");
+        exec("CREATE TABLE zzr7gn_kq (i int) PARTITION BY RANGE (i)");
+        exec("CREATE TABLE zzr7gn_k1 PARTITION OF zzr7gn_kq FOR VALUES FROM (0) TO (10)");
+
+        conn.setAutoCommit(false);
+        try {
+            exec("DROP TABLE zzr7gn_ka");
+            Savepoint sp = conn.setSavepoint("zzr7gn_sp");
+            exec("DROP TABLE zzr7gn_kq, zzr7gn_k1");
+            assertEquals(1, num("SELECT count(*) FROM pg_class"
+                    + " WHERE relname LIKE 'zzr7gn\\_k%'"));
+            conn.rollback(sp);
+            assertEquals("zzr7gn_k1,zzr7gn_kb,zzr7gn_kq",
+                    column("SELECT relname FROM pg_class WHERE relname LIKE 'zzr7gn\\_k%'"
+                            + " ORDER BY 1"));
+            conn.commit();
+        } finally {
+            conn.setAutoCommit(true);
+        }
+
+        // The DROP taken before the savepoint stands; the list rolled back to it does not.
+        assertEquals("zzr7gn_k1,zzr7gn_kb,zzr7gn_kq",
+                column("SELECT relname FROM pg_class WHERE relname LIKE 'zzr7gn\\_k%' ORDER BY 1"));
+        assertEquals(1, num("SELECT count(*) FROM pg_inherits"
+                + " WHERE inhrelid = 'zzr7gn_k1'::regclass"));
+
+        exec("DROP TABLE zzr7gn_kb");
+        exec("DROP TABLE zzr7gn_kq");
+        assertEquals(0, num("SELECT count(*) FROM pg_class WHERE relname LIKE 'zzr7gn\\_%'"));
+    }
+
+    /**
+     * Inside a transaction block a DROP whose list holds a name that was never there takes none
+     * of the names it was given, and the savepoint the block was rolled back to finds them all.
+     */
+    @Test
+    void aDropListThatFailsInsideATransactionBlockTakesNoneOfItsNames() throws Exception {
+        exec("CREATE TABLE zzr7gn_fa (i int)");
+        exec("CREATE TABLE zzr7gn_fb (i int)");
+
+        conn.setAutoCommit(false);
+        try {
+            Savepoint sp = conn.setSavepoint("zzr7gn_fsp");
+            assertEquals("42P01",
+                    stateOf("DROP TABLE zzr7gn_fa, zzr7gn_fb, zzr7gn_nosuch"));
+            conn.rollback(sp);
+            assertEquals("zzr7gn_fa,zzr7gn_fb",
+                    column("SELECT relname FROM pg_class WHERE relname LIKE 'zzr7gn\\_f%'"
+                            + " ORDER BY 1"));
+            conn.commit();
+        } finally {
+            conn.setAutoCommit(true);
+        }
+
+        assertEquals("zzr7gn_fa,zzr7gn_fb",
+                column("SELECT relname FROM pg_class WHERE relname LIKE 'zzr7gn\\_f%' ORDER BY 1"));
+
+        exec("DROP TABLE zzr7gn_fa, zzr7gn_fb");
+        assertEquals(0, num("SELECT count(*) FROM pg_class WHERE relname LIKE 'zzr7gn\\_%'"));
     }
 }

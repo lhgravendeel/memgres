@@ -308,7 +308,10 @@ class CatalogConstraintBuilder {
                                 0,
                                 nnConkey,
                                 null,
-                                false, false, true,
+                                // A NOT NULL declared NOT VALID is a constraint whose rows have
+                                // not been read, and PostgreSQL records that on the relation that
+                                // declared it and on everything holding it from there.
+                                false, false, t.isNotNullValidated(c.getName()),
                                 notNullIsLocal, 0,
                                 " ", " ",
                                 " " /*confmatchtype*/, null, null, null, null, coninhcount,

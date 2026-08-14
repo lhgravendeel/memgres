@@ -924,9 +924,9 @@ public class PlpgsqlParser {
             if (intoVars == null && matchKw("INTO")) {
                 if (matchKw("STRICT")) strict = true;
                 intoVars = new ArrayList<>();
-                intoVars.add(readIdent());
+                intoVars.add(readIntoTarget());
                 while (match(TokenType.COMMA)) {
-                    intoVars.add(readIdent());
+                    intoVars.add(readIntoTarget());
                 }
             } else if (usingExprs.isEmpty() && matchKw("USING")) {
                 // Stop each USING expression at a following INTO so the reversed order works.
@@ -940,6 +940,20 @@ public class PlpgsqlParser {
 
         match(TokenType.SEMICOLON);
         return new PlpgsqlStatement.ExecuteStmt(sqlExpr, usingExprs, intoVars, strict);
+    }
+
+    /**
+     * What an INTO clause writes to, which may be a field of a record rather than a variable of
+     * its own: PostgreSQL takes {@code INTO r.a} wherever it takes {@code INTO r}, and a trigger
+     * routine writing {@code INTO NEW.i} has rewritten the row exactly as an assignment would.
+     */
+    private String readIntoTarget() {
+        StringBuilder target = new StringBuilder(readIdent());
+        while (check(TokenType.DOT)) {
+            advance();
+            target.append('.').append(readIdent());
+        }
+        return target.toString();
     }
 
     // ---- SQL statements ----

@@ -129,6 +129,7 @@ class DdlViewExecutor {
                 rejectDuplicateColumnNames(cols);
                 executor.database.addView(new Database.ViewDef(stmt.name(), viewSchema, query, stmt.orReplace(),
                         true, cols, rows, null, null, stmt.withOptions(), true));
+                noteWhatTheViewCost(cols, true);
             } else {
                 // WITH NO DATA: resolve column metadata but leave the view unpopulated —
                 // any scan must fail with 55000 until REFRESH MATERIALIZED VIEW.
@@ -142,6 +143,7 @@ class DdlViewExecutor {
                 rejectDuplicateColumnNames(cols);
                 executor.database.addView(new Database.ViewDef(stmt.name(), viewSchema, query, stmt.orReplace(),
                         true, cols, Cols.listOf(), null, null, stmt.withOptions(), false));
+                noteWhatTheViewCost(cols, false);
             }
         } else {
             List<Column> resolvedColumns = null;
@@ -182,6 +184,19 @@ class DdlViewExecutor {
             return QueryResult.command(QueryResult.Type.SELECT_INTO, rowCount);
         }
         return QueryResult.message(QueryResult.Type.SET, "CREATE VIEW");
+    }
+
+    /**
+     * A materialized view has storage of its own, so what it costs depends on the columns its
+     * query turned out to have — a wide one is kept out of line, and that is a relation more —
+     * and on whether the statement asked for the rows as well as the definition.
+     *
+     * @see CommandIdCost
+     */
+    private void noteWhatTheViewCost(List<Column> columns, boolean withData) {
+        if (executor.session == null) return;
+        executor.session.noteCatalogRowsWritten(
+                CommandIdCost.forCreatedMaterializedView(columns, withData));
     }
 
     /**

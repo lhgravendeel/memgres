@@ -2852,6 +2852,47 @@ public class Session {
     }
 
     /**
+     * The version of a row this transaction was shown, where a transaction that committed since
+     * has written over it, and null everywhere else.
+     *
+     * <p>A version of a row keeps the place it lives in for as long as it lives, and a version
+     * written over it stands somewhere else: where the copy this transaction reads stood, against
+     * where the row stands now, is what tells a row it is still being shown from one that has
+     * moved on without it. A row this transaction wrote itself has moved on by its own hand and is
+     * its own latest version, so nothing about it is news to it.
+     */
+    public Object[] versionReplacedSinceSnapshot(String schemaTable, Object[] liveRow) {
+        if (database == null || liveRow == null || !writesReadFromSnapshot()) return null;
+        Map<Object[], Object[]> paired = rrSnapshotLive.get(schemaTable);
+        Object[] shown = paired == null ? null : paired.get(liveRow);
+        if (shown == null || shown == liveRow) return null;
+        // Where a row lives belongs to the relation that holds it, which for a row read through a
+        // partitioned table or an inheritance parent is not the relation the statement named.
+        Table storage = snapshotRowStorage(schemaTable, shown);
+        String metaKey = storage == null ? schemaTable : keyOf(storage);
+        long[] wasReading = tupleIdentityOfCopy(metaKey, shown);
+        if (wasReading == null || wasReading.length < 5) return null;
+        long[] nowThere = database.getRowMeta(metaKey).get(liveRow);
+        if (nowThere == null || nowThere.length < 5 || nowThere[4] == wasReading[4]) return null;
+        return wroteRowItself(schemaTable, liveRow) ? null : shown;
+    }
+
+    /** Whether this transaction has written this row itself, under a name it answers to. */
+    private boolean wroteRowItself(String schemaTable, Object[] liveRow) {
+        Set<Object[]> inserted = uncommittedInserts.get(schemaTable);
+        if (inserted != null) {
+            synchronized (inserted) {
+                if (inserted.contains(liveRow)) return true;
+            }
+        }
+        Map<Object[], Object[]> updated = uncommittedUpdates.get(schemaTable);
+        if (updated == null) return false;
+        synchronized (updated) {
+            return updated.containsKey(liveRow);
+        }
+    }
+
+    /**
      * Show a row one relation stores to the snapshot of every relation it is also read through.
      *
      * <p>A partition's rows and an inheritance child's rows are rows of the relation above them
@@ -3605,6 +3646,49 @@ public class Session {
      */
     public void discardUndoForCurrentStatement() {
         discardUndoSince(stmtScopeMark);
+    }
+
+    /**
+     * Forget the row entries this statement recorded for the given relations, and only those.
+     *
+     * <p>PostgreSQL undoes a statement that fails whole: not only what it wrote to the relation it
+     * named but what its triggers, the rules they fired and the functions they called wrote
+     * anywhere else, because the statement is a transaction of its own and none of it happened.
+     * The DML paths restore their own target relations from a snapshot, so replaying the row-by-row
+     * undo for those would write the same rows a second time -- but the relations only a trigger
+     * touched are in no such snapshot, and dropping their entries too left a failed statement's
+     * writes standing in them.
+     */
+    public void discardUndoForRelations(Set<Table> relations) {
+        if (stmtScopeMark < 0 || relations == null || relations.isEmpty()) return;
+        for (int i = undoLog.size() - 1; i >= stmtScopeMark; i--) {
+            Table written = relationWrittenBy(undoLog.get(i));
+            if (written != null && relations.contains(written)) undoLog.remove(i);
+        }
+    }
+
+    /**
+     * The relation an insert, delete or update entry would put rows back into, found the same way
+     * the entry's own undo finds it so that the two can never disagree about which one it is.
+     */
+    private Table relationWrittenBy(UndoEntry entry) {
+        String schemaName;
+        String tableName;
+        if (entry instanceof InsertUndo) {
+            schemaName = ((InsertUndo) entry).schema();
+            tableName = ((InsertUndo) entry).tableName();
+        } else if (entry instanceof DeleteUndo) {
+            schemaName = ((DeleteUndo) entry).schema();
+            tableName = ((DeleteUndo) entry).tableName();
+        } else if (entry instanceof UpdateUndo) {
+            schemaName = ((UpdateUndo) entry).schema();
+            tableName = ((UpdateUndo) entry).tableName();
+        } else {
+            return null;
+        }
+        if (schemaName == null || tableName == null) return null;
+        Schema schema = database.getSchema(schemaName);
+        return schema == null ? null : schema.getTable(tableName);
     }
 
     /** Nesting depth of the statement now running; only the outermost owns the scope. */
@@ -4972,6 +5056,44 @@ public class Session {
         public String toString() {
             return "DropColumnConstraintsUndo[schema=" + schema + ", tableName=" + tableName
                     + ", constraints=" + constraints.size() + "]";
+        }
+    }
+
+    /**
+     * Undo the clearing of a column default that a CASCADE took because the sequence it drew from
+     * was dropped. The column sits on a relation the statement never named, so it is in no
+     * relation's snapshot; without a record of its own a rolled-back drop left the column with no
+     * default and the next INSERT stopped filling it in.
+     */
+    public static final class ColumnDefaultUndo implements UndoEntry {
+        public final String schema;
+        public final String tableName;
+        public final String columnName;
+        public final String defaultValue;
+
+        public ColumnDefaultUndo(String schema, String tableName, String columnName,
+                                 String defaultValue) {
+            this.schema = schema;
+            this.tableName = tableName;
+            this.columnName = columnName;
+            this.defaultValue = defaultValue;
+        }
+
+        @Override
+        public void undo(Database db) {
+            Schema s = db.getSchema(schema);
+            if (s == null) return;
+            Table table = s.getTable(tableName);
+            if (table == null) return;
+            int idx = table.getColumnIndex(columnName);
+            if (idx < 0) return;
+            table.getColumns().get(idx).setDefaultValue(defaultValue);
+        }
+
+        @Override
+        public String toString() {
+            return "ColumnDefaultUndo[schema=" + schema + ", tableName=" + tableName
+                    + ", columnName=" + columnName + "]";
         }
     }
 

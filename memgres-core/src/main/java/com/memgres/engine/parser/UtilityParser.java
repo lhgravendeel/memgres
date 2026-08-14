@@ -155,7 +155,7 @@ class UtilityParser {
         String escape = opts.escape != null ? opts.escape : quote;
 
         CopyStmt stmt = new CopyStmt(table, columns, isFrom, source, opts.format, delimiter,
-                nullString, opts.header, null, subquery, quote, escape, opts.forceQuote,
+                nullString, opts.header, subquery, quote, escape, opts.forceQuote,
                 opts.forceNotNull, opts.forceNull, opts.headerMatch, opts.freeze, opts.encoding,
                 whereClause, opts.onError, opts.defaultString, opts.rejectLimit,
                 opts.logVerbosity);

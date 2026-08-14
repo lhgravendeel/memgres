@@ -1898,8 +1898,13 @@ class FromFunctionResolver {
             return new MemgresException(
                     "structure of query does not match function result type", "42804");
         }
-        return new MemgresException(
+        MemgresException mismatch = new MemgresException(
                 "return type mismatch in function declared to return record", "42P13");
+        // A SQL function's body is the one statement PostgreSQL names by its number, and that is
+        // the whole of what it reports for this. PL/pgSQL's is a stack of frames of its own, so a
+        // routine written in it is left with nothing rather than with a frame it never had.
+        mismatch.setPgContext("SQL function \"" + userFunc.getName() + "\" statement 1");
+        return mismatch;
     }
 
     /**
@@ -1918,7 +1923,6 @@ class FromFunctionResolver {
         // the definition list needs to know what the body actually produced.
         e.setDetail("Number of returned columns (" + produced
                 + ") does not match expected column count (" + declared + ").");
-        e.setPgContext("SQL function \"" + userFunc.getName() + "\" statement 1");
         throw e;
     }
 
@@ -1943,7 +1947,6 @@ class FromFunctionResolver {
                     + " does not match expected type " + DataType.canonicalName(declared)
                     + " in column \"" + def.substring(0, sp).trim()
                     + "\" (position " + (i + 1) + ").");
-            e.setPgContext("SQL function \"" + userFunc.getName() + "\" statement 1");
             throw e;
         }
     }

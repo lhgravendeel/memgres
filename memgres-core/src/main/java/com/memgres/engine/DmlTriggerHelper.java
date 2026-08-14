@@ -104,7 +104,13 @@ class DmlTriggerHelper {
                         // this row and suppress any remaining triggers (PostgreSQL semantics)
                         return null;
                     }
-                    if (rowAsHandedOver != null && !Arrays.equals(rowAsHandedOver, result)) {
+                    // PostgreSQL asks whether the routine handed back a tuple other than the one
+                    // it was given, not whether the values changed: a routine that assigns a
+                    // column its own value has rewritten the row as far as the server is
+                    // concerned, and the copy is refused for carrying it out of the partition.
+                    if (rowAsHandedOver != null
+                            && (plExec.rewroteTriggerRow()
+                                || !Arrays.equals(rowAsHandedOver, result))) {
                         partitionHelper.checkTriggerKeptRowInPartition(table, trigger, result);
                     }
                     // A DELETE has no NEW row to hand on to the next trigger; what the function
