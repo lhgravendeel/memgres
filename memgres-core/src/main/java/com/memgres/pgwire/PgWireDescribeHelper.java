@@ -762,6 +762,22 @@ class PgWireDescribeHelper {
         return null;
     }
 
+    /**
+     * True when an UPDATE's FROM clause or a DELETE's USING clause puts a second relation in the
+     * scope its RETURNING is read in. Read off the statement up to the RETURNING, so a sub-select
+     * on the right of an assignment counts too — that costs a description this could have given
+     * from the text, and never a wrong one.
+     */
+    private static boolean bringsInSecondRelation(String upperBeforeReturning) {
+        if (upperBeforeReturning.startsWith("UPDATE")) {
+            return upperBeforeReturning.contains(" FROM ");
+        }
+        if (upperBeforeReturning.startsWith("DELETE")) {
+            return upperBeforeReturning.contains(" USING ");
+        }
+        return false;
+    }
+
     List<Column> inferReturningColumns(String sql) {
         String upper = stripLeadingComments(sql).toUpperCase();
         String tableName = null;
@@ -823,6 +839,10 @@ class PgWireDescribeHelper {
         if (retIdx < 0) return null;
         String retPart = sql.substring(retIdx + "RETURNING".length()).trim();
         if (retPart.equals("*")) {
+            // A star over a write that brought a second relation in stands for both of them, and
+            // which relations those are is not something reading the text this way can settle:
+            // the statement itself says, as it does for a MERGE whose source is no relation.
+            if (bringsInSecondRelation(upper.substring(0, retIdx))) return null;
             if (!upper.startsWith("MERGE")) return new ArrayList<>(table.getColumns());
             // A MERGE's RETURNING reads over the join the statement walks, and it walks the source
             // first: PostgreSQL answers the source's columns and then the target's. A source that

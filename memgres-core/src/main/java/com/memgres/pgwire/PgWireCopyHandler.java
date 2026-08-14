@@ -276,9 +276,15 @@ class PgWireCopyHandler {
                         ? activeCopyStmt.escape().charAt(0) : quoteC;
 
                 String[] lines;
+                // How many of the input's line terminators each row carried through inside a
+                // quoted field: PostgreSQL numbers the lines it read rather than the rows it made
+                // of them, so a row spanning three lines advances the count by three.
+                long[] carried = null;
                 if (isCsv) {
                     try {
-                        lines = splitCsvLines(data, quoteC, escapeC);
+                        CsvLines split = splitCsvLinesCounted(data, quoteC, escapeC);
+                        lines = split.lines;
+                        carried = split.carried;
                     } catch (UnclosedField unclosed) {
                         copyLineNumber = unclosed.line;
                         copyLineText = unclosed.text;
@@ -295,12 +301,14 @@ class PgWireCopyHandler {
                 }
 
                 boolean first = true;
+                int lineIndex = 0;
                 for (String rawLine : lines) {
                     // CSV lines have terminators already handled in splitCsvLines;
                     // for text, strip a trailing \r (CRLF input).
                     String line = !isCsv && rawLine.endsWith("\r")
                             ? rawLine.substring(0, rawLine.length() - 1) : rawLine;
-                    copyLineNumber++;
+                    copyLineNumber += 1 + (carried != null ? carried[lineIndex] : 0);
+                    lineIndex++;
                     copyLineText = line;
                     if (line.equals("\\.")) break; // end-of-data marker (both formats)
                     if (header && first) {
@@ -475,10 +483,36 @@ class PgWireCopyHandler {
         if (e.getCopyField() != null) {
             sb.append(", ").append(e.getCopyField());
         } else if (copyLineText != null && !lineReadOverBefore(e, relation)) {
-            sb.append(": \"").append(copyLineText).append('"');
+            sb.append(": \"").append(limitPrintoutLength(copyLineText)).append('"');
         }
         return sb.toString();
     }
+
+    /**
+     * The line as PostgreSQL quotes it: whole while it is short, and cut off with an ellipsis once
+     * it is not.
+     *
+     * <p>A sender's line is as long as it cares to make it, and one carrying a few wide columns
+     * pushed the refusal itself off the reader's screen. PostgreSQL cuts at a hundred bytes of the
+     * encoded text and never inside a character, so a line of accented text loses a whole letter
+     * rather than half of one.
+     */
+    private static String limitPrintoutLength(String text) {
+        int bytes = 0;
+        int cut = -1;
+        int i = 0;
+        while (i < text.length()) {
+            int cp = text.codePointAt(i);
+            int width = cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+            if (cut < 0 && bytes + width > MAX_COPY_DATA_DISPLAY) cut = i;
+            bytes += width;
+            i += Character.charCount(cp);
+        }
+        return bytes <= MAX_COPY_DATA_DISPLAY ? text : text.substring(0, cut) + "...";
+    }
+
+    /** How much of a line PostgreSQL is willing to quote, in bytes of the encoded text. */
+    private static final int MAX_COPY_DATA_DISPLAY = 100;
 
     /**
      * True when the line would have been read over before this refusal was raised.
@@ -519,12 +553,117 @@ class PgWireCopyHandler {
             if (col.isGenerated() || namedAmong(written, col.getName())) continue;
             String def = col.getDefaultValue();
             if (def == null) continue;
-            String text = def.toLowerCase().replace(" ", "");
-            for (String call : VOLATILE_DEFAULT_CALLS) {
-                if (text.contains(call + "(")) return true;
+            if (callsAVolatileRoutine(def, 0)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Whether an expression calls anything PostgreSQL records as volatile.
+     *
+     * <p>What a routine is declared is what PostgreSQL believes, so a function the user wrote
+     * VOLATILE counts and the same body written STABLE or IMMUTABLE does not: matching the text
+     * against a list of names recognised the built-ins and nothing else, and a relation defaulted
+     * from a user's own VOLATILE function was buffered when PostgreSQL would not have buffered it.
+     * A function with no volatility of its own is volatile, which is PostgreSQL's default too.
+     */
+    private boolean callsAVolatileRoutine(String expr, int depth) {
+        for (String name : calledNames(expr)) {
+            String bare = name.substring(name.lastIndexOf('.') + 1);
+            if (VOLATILE_DEFAULT_CALLS.contains(bare)) return true;
+            PgFunction routine = session.getDatabase().getFunction(name);
+            if (routine == null) continue;
+            String volatility = routine.getVolatility();
+            // What was declared STABLE or IMMUTABLE is believed however its body reads: PostgreSQL
+            // will not fold a body more volatile than the declaration that covers it, so the
+            // declaration is what is left standing there.
+            if (volatility != null && !"VOLATILE".equalsIgnoreCase(volatility)) continue;
+            String folded = depth < 4 ? foldedSqlBody(routine) : null;
+            if (folded == null || callsAVolatileRoutine(folded, depth + 1)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * The expression a SQL function is folded into where its body is one, or null where it is not.
+     *
+     * <p>PostgreSQL folds such a function into the default before it asks whether the default is
+     * volatile, so what governs there is the body and not the word the declaration used: a function
+     * written VOLATILE whose body is {@code SELECT 7} leaves a constant behind and the copy buffers
+     * as it would for any other constant. A body that goes on to read something is left standing
+     * where it was written, and its declaration is believed.
+     */
+    private static String foldedSqlBody(PgFunction routine) {
+        if (!"sql".equalsIgnoreCase(routine.getLanguage())) return null;
+        String body = routine.getBody();
+        if (body == null) return null;
+        String trimmed = body.trim();
+        while (trimmed.endsWith(";")) trimmed = trimmed.substring(0, trimmed.length() - 1).trim();
+        if (!trimmed.regionMatches(true, 0, "select", 0, 6)) return null;
+        String selectList = trimmed.substring(6).trim();
+        if (selectList.isEmpty() || readsFurther(selectList)) return null;
+        return selectList;
+    }
+
+    /** True where a select list goes on past itself: a FROM, or a second statement behind it. */
+    private static boolean readsFurther(String text) {
+        int depth = 0;
+        boolean inString = false;
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (inString) {
+                if (c == '\'') inString = false;
+            } else if (c == '\'') {
+                inString = true;
+            } else if (c == '(') {
+                depth++;
+            } else if (c == ')') {
+                depth--;
+            } else if (depth == 0) {
+                if (c == ';') return true;
+                if ((c == 'f' || c == 'F') && text.regionMatches(true, i, "from", 0, 4)
+                        && (i == 0 || !isNameChar(text.charAt(i - 1)))
+                        && (i + 4 >= text.length() || !isNameChar(text.charAt(i + 4)))) {
+                    return true;
+                }
             }
         }
         return false;
+    }
+
+    /**
+     * The names an expression's text calls, lowercased and with whatever schema they were written
+     * with. A name is a call where a parenthesis follows it; text inside a string literal is none
+     * of them, so a default whose value happens to spell one is not mistaken for it.
+     */
+    private static List<String> calledNames(String expr) {
+        List<String> names = new ArrayList<>();
+        int i = 0;
+        while (i < expr.length()) {
+            char c = expr.charAt(i);
+            if (c == '\'') {
+                i++;
+                while (i < expr.length() && expr.charAt(i) != '\'') i++;
+                i++;
+                continue;
+            }
+            if (!Character.isLetter(c) && c != '_' && c != '"') {
+                i++;
+                continue;
+            }
+            int start = i;
+            while (i < expr.length() && isNameChar(expr.charAt(i))) i++;
+            int end = i;
+            while (i < expr.length() && Character.isWhitespace(expr.charAt(i))) i++;
+            if (i < expr.length() && expr.charAt(i) == '(') {
+                names.add(expr.substring(start, end).replace("\"", "").toLowerCase());
+            }
+        }
+        return names;
+    }
+
+    private static boolean isNameChar(char c) {
+        return Character.isLetterOrDigit(c) || c == '_' || c == '.' || c == '"' || c == '$';
     }
 
     private static boolean namedAmong(List<String> names, String column) {
@@ -534,7 +673,11 @@ class PgWireCopyHandler {
         return false;
     }
 
-    /** What PostgreSQL records as volatile among the calls a column default is written with. */
+    /**
+     * The built-ins PostgreSQL records as volatile. A routine the user wrote has a declaration to
+     * be asked for its volatility; these have none, so they are known by name. {@code nextval} is
+     * left out on purpose: it is the exception PostgreSQL makes for a serial or identity default.
+     */
     private static final Set<String> VOLATILE_DEFAULT_CALLS = new HashSet<>(Arrays.asList(
             "random", "random_normal", "clock_timestamp", "timeofday", "gen_random_uuid",
             "uuid_generate_v1", "uuid_generate_v4", "uuidv4", "uuidv7", "currval", "setval",
@@ -852,19 +995,32 @@ class PgWireCopyHandler {
                 ? activeCopyStmt.escape().charAt(0) : quoteC;
         long complete = 0;
         boolean inQuote = false;
+        // A quoted field carries the input's terminator through as data, and PostgreSQL still counts
+        // it: the copy is waiting that many lines further on. Which character counts is the one the
+        // input's first terminator outside quotes turned out to be, a carriage return until then —
+        // the same rule the splitter reads its lines by.
+        char embeddedTerminator = '\r';
+        boolean terminatorKnown = false;
+        long quotedTerminators = 0;
         for (int i = 0; i < text.length(); i++) {
             char c = text.charAt(i);
             if (isCsv && inQuote && c == escapeC && i + 1 < text.length()
                     && (text.charAt(i + 1) == quoteC || text.charAt(i + 1) == escapeC)) {
                 i++;
+            } else if (isCsv && inQuote && c == embeddedTerminator) {
+                quotedTerminators++;
             } else if (isCsv && c == quoteC) {
                 inQuote = !inQuote;
             } else if (!inQuote && (c == '\n' || (isCsv && c == '\r'))) {
                 if (c == '\r' && i + 1 < text.length() && text.charAt(i + 1) == '\n') i++;
+                if (!terminatorKnown) {
+                    embeddedTerminator = c;
+                    terminatorKnown = true;
+                }
                 complete++;
             }
         }
-        return complete + 1;
+        return complete + quotedTerminators + 1;
     }
 
     /** How many whole rows a sender's binary stream holds after the header it opened with. */
@@ -1198,7 +1354,30 @@ class PgWireCopyHandler {
      * bare \r act as line terminators outside quotes.
      */
     static String[] splitCsvLines(String data, char quote, char escape) {
+        return splitCsvLinesCounted(data, quote, escape).lines;
+    }
+
+    /** The rows an input holds, and how many lines each of them was written over. */
+    private static final class CsvLines {
+        final String[] lines;
+        final long[] carried;
+
+        CsvLines(String[] lines, long[] carried) {
+            this.lines = lines;
+            this.carried = carried;
+        }
+    }
+
+    /**
+     * Split CSV data into lines, counting the terminators each row carried through a quoted field.
+     *
+     * <p>The count is what the copy has to add to its line number for that row: PostgreSQL numbers
+     * the lines of the input, so a row written over three of them leaves the next row three lines
+     * further on rather than one.
+     */
+    private static CsvLines splitCsvLinesCounted(String data, char quote, char escape) {
         List<String> lines = new ArrayList<>();
+        List<Long> carried = new ArrayList<>();
         StringBuilder current = new StringBuilder();
         boolean inQuote = false;
         // PostgreSQL counts a newline carried through a quoted field as a line of its own, but only
@@ -1209,6 +1388,7 @@ class PgWireCopyHandler {
         char embeddedTerminator = '\r';
         boolean terminatorKnown = false;
         long quotedTerminators = 0;
+        long lineTerminators = 0;
         int i = 0;
         while (i < data.length()) {
             char c = data.charAt(i);
@@ -1219,7 +1399,10 @@ class PgWireCopyHandler {
                     i += 2;
                     continue;
                 }
-                if (c == embeddedTerminator) quotedTerminators++;
+                if (c == embeddedTerminator) {
+                    quotedTerminators++;
+                    lineTerminators++;
+                }
                 if (c == quote) {
                     inQuote = false;
                 }
@@ -1234,6 +1417,8 @@ class PgWireCopyHandler {
                     terminatorKnown = true;
                 }
                 lines.add(current.toString());
+                carried.add(lineTerminators);
+                lineTerminators = 0;
                 current.setLength(0);
                 i++;
             } else {
@@ -1252,8 +1437,11 @@ class PgWireCopyHandler {
         }
         if (current.length() > 0) {
             lines.add(current.toString());
+            carried.add(lineTerminators);
         }
-        return lines.toArray(new String[0]);
+        long[] counts = new long[carried.size()];
+        for (int n = 0; n < counts.length; n++) counts[n] = carried.get(n).longValue();
+        return new CsvLines(lines.toArray(new String[0]), counts);
     }
 
     /**

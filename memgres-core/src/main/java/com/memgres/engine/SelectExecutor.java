@@ -1600,6 +1600,7 @@ class SelectExecutor {
                         }
                     } else {
                         keepRelationAsFound(asOfStatement, b.table(), b.row());
+                        awaitWriterOfRow(b.table(), lockRow);
                         executor.database.lockRowWaiting(tName, lockRow, executor.session, lockMode);
                     }
                     lockedIn.add(tName);
@@ -4302,6 +4303,42 @@ class SelectExecutor {
             if (stored != null) row = stored;
         }
         return executor.database.liveRowForSnapshotCopy(row, executor.session);
+    }
+
+    /**
+     * Wait for the transaction that is part-way through writing the row this query means to lock.
+     *
+     * <p>A row lock is taken in the relation the query named, so it finds nothing to wait for when
+     * the write was made through another name for the same row: an UPDATE that takes a row out of
+     * the partition holding it is written through the partitioned table and locked through the
+     * partition. The query then decided what had become of the row while the transaction that was
+     * moving it had settled nothing, and refused a lock that PostgreSQL grants whenever that
+     * transaction ends up rolling back. PostgreSQL waits for the transaction itself; only once it
+     * is over do the questions below -- is the row still stored, has its version moved on, has it
+     * gone to another partition -- have the answers it decides on.
+     */
+    private void awaitWriterOfRow(Table table, Object[] lockRow) {
+        final Session me = executor.session;
+        if (me == null || table == null || lockRow == null) return;
+        final String key = relationKey(table);
+        Session writing = null;
+        for (Session other : executor.database.getActiveSessions()) {
+            if (other == me) continue;
+            if (writesRow(other, key, lockRow)) { writing = other; break; }
+        }
+        if (writing == null) return;
+        final Session waitFor = writing;
+        executor.database.awaitConcurrentWrite(me, waitFor,
+                () -> writesRow(waitFor, key, lockRow), table.getName());
+    }
+
+    /** Whether a transaction has a write of its own in flight on this row of this relation. */
+    private static boolean writesRow(Session other, String key, Object[] row) {
+        if (!other.isInTransaction() || other.isDoomed()) return false;
+        for (Object[] gone : other.getUncommittedDeletes(key)) {
+            if (gone == row) return true;
+        }
+        return other.getUncommittedUpdates(key).containsKey(row);
     }
 
     /**

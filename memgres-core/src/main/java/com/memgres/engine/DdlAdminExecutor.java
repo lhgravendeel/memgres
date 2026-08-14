@@ -1213,14 +1213,15 @@ class DdlAdminExecutor {
         // OLD and NEW in a qualification are the rows of the relation the rule is on, and their
         // columns are that relation's: PostgreSQL resolves them while it is writing the rule.
         // Leaving them unresolved stored a rule whose WHERE could never be evaluated, and the
-        // relation could not be written to at all from that point on.
-        checkActionRowReferences(qualification,
-                executor.database.hasView(s.table()) ? null : on);
+        // relation could not be written to at all from that point on. The relation's own name is
+        // not one of the names those rows answer to, and writing it was stored unread.
+        checkRuleReferences(qualification, s, on, true);
         // Every other column the qualification names is resolved here too. A qualification reads
         // OLD and NEW unqualified as well as by name -- PostgreSQL puts both in scope for it, and
         // for no action -- so a bare column of the ruled relation is one of its own.
-        if (on != null && !executor.database.hasView(s.table())) {
-            rejectMissingRuleColumns(qualification, ruleColumnScope(qualification, on, true));
+        Table rows = ruledRowSource(s, on);
+        if (rows != null) {
+            rejectMissingRuleColumns(qualification, ruleColumnScope(qualification, rows, true));
         }
         // An UPDATE carries the row as it was and the row as it will be, and a qualification reads
         // both of them by name alone, so a column written there with no row in front of it answers
@@ -1319,7 +1320,7 @@ class DdlAdminExecutor {
                 InsertStmt insert = (InsertStmt) parsed;
                 rejectMissingActionColumns(insert.schema(), insert.table(), insert.columns());
             }
-            checkActionRowReferences(parsed, rowSource);
+            checkRuleReferences(parsed, s, on, false);
             // Every other column the action names is resolved against the relations the action
             // itself holds. OLD and NEW are in scope for an action by name alone, and so is the
             // relation an INSERT writes to, so a bare column of either is not one the action can
@@ -1508,30 +1509,147 @@ class DdlAdminExecutor {
     }
 
     /**
+     * What OLD and NEW hold: the columns of the relation the rule is on. A view's are its own
+     * rather than those of the relation behind it, and what a view resolves to here is that
+     * relation, so the view's column list stands in for it. Null where this cannot say what they
+     * are, which leaves whatever was written on OLD and NEW unjudged.
+     */
+    private Table ruledRowSource(CreateRuleStmt s, Table on) {
+        if (!executor.database.hasView(s.table())) return on;
+        List<Column> columns = ruledRelationColumns(s, on);
+        return columns == null ? null : new Table(s.table(), columns);
+    }
+
+    /**
+     * The names a rule's qualification, or one of its actions, may write in front of a column.
+     *
+     * <p>Inside a rule the relation the rule is on is reachable only as OLD and as NEW: PostgreSQL
+     * puts those two rows in the rule's range table under names of their own, and the relation's
+     * own name is neither of them, so writing it is a reference to a FROM clause that is not there.
+     * Which of the two a qualification reaches follows from the event -- an INSERT has no prior row
+     * and a DELETE no new one -- while an action reaches both, and the one its event has no row for
+     * is refused by name instead. Beside them stand the relations the statement brought with it,
+     * each under the name it was written as or under its alias where it was given one.
+     *
+     * <p>OLD and NEW are the rows of the ruled relation, so what is written on them is judged here
+     * as well: this walks the references in the order they were written, which is the order
+     * PostgreSQL resolves them in and so the order it reports the first one it cannot resolve.
+     */
+    private void checkRuleReferences(Object node, CreateRuleStmt s, Table on,
+                                     boolean qualification) {
+        Table rows = ruledRowSource(s, on);
+        // Null where a FROM item is of a kind this cannot name, and every qualifier that is not
+        // OLD or NEW is then left to be resolved as it was before.
+        Set<String> brought = ruleReachableNames(node);
+        boolean oldInScope = !qualification || !"INSERT".equals(s.event());
+        boolean newInScope = !qualification || !"DELETE".equals(s.event());
+        final List<ColumnRef> refs = new ArrayList<>();
+        AstWalk.forEach(node, n -> {
+            if (n instanceof ColumnRef) refs.add((ColumnRef) n);
+        });
+        for (ColumnRef ref : refs) {
+            if (ref.table() == null || ref.column() == null) continue;
+            boolean priorRow = ref.schema() == null && ref.table().equalsIgnoreCase("old");
+            boolean newRow = ref.schema() == null && ref.table().equalsIgnoreCase("new");
+            boolean reachable = priorRow ? oldInScope
+                    : newRow ? newInScope
+                    : brought == null || brought.contains(ref.table().toLowerCase());
+            if (!reachable) throw unreachableRuleRelation(s, ref, oldInScope);
+            if (priorRow || newRow) rejectMissingRowColumn(ref, rows);
+        }
+    }
+
+    /**
+     * The names a statement or an expression puts in reach of a qualified column: what a FROM
+     * clause holds, under its alias wherever it was given one, what a WITH clause binds, and the
+     * relation a write names, which its own alias stands for once it has one. Null where a FROM
+     * item is of a kind this cannot take a name from, so that nothing is judged against a list
+     * that would be missing one.
+     */
+    private static Set<String> ruleReachableNames(Object node) {
+        final Set<String> named = new LinkedHashSet<>();
+        final boolean[] unnameable = new boolean[1];
+        AstWalk.forEach(node, n -> {
+            if (n instanceof SelectStmt.CommonTableExpr) {
+                addRuleReachableName(named, ((SelectStmt.CommonTableExpr) n).name, null);
+            } else if (n instanceof SelectStmt.TableRef) {
+                addRuleReachableName(named, ((SelectStmt.TableRef) n).table(),
+                        ((SelectStmt.TableRef) n).alias());
+            } else if (n instanceof SelectStmt.SubqueryFrom) {
+                addRuleReachableName(named, null, ((SelectStmt.SubqueryFrom) n).alias());
+            } else if (n instanceof SelectStmt.FunctionFrom) {
+                addRuleReachableName(named, ((SelectStmt.FunctionFrom) n).functionName(),
+                        ((SelectStmt.FunctionFrom) n).alias());
+            } else if (n instanceof InsertStmt) {
+                addRuleReachableName(named, ((InsertStmt) n).table(), ((InsertStmt) n).alias());
+                // EXCLUDED is the row the write could not put down, and a conflict clause reads it
+                // under that name beside the relation being written to.
+                if (((InsertStmt) n).onConflict() != null) named.add("excluded");
+            } else if (n instanceof UpdateStmt) {
+                addRuleReachableName(named, ((UpdateStmt) n).table(), ((UpdateStmt) n).alias());
+            } else if (n instanceof DeleteStmt) {
+                addRuleReachableName(named, ((DeleteStmt) n).table(), ((DeleteStmt) n).alias());
+            } else if (n instanceof SelectStmt.FromItem && !(n instanceof SelectStmt.JoinFrom)) {
+                // A join holds the items it joins and is reached through none of its own, so it
+                // is the only FROM item that puts no name of its own in reach.
+                unnameable[0] = true;
+            }
+        });
+        return unnameable[0] ? null : named;
+    }
+
+    /** One name a FROM item or a write answers to: its alias, or the relation it named. */
+    private static void addRuleReachableName(Set<String> named, String relation, String alias) {
+        String written = alias != null ? alias : relation;
+        if (written != null) named.add(RelationNamespace.bareName(written).toLowerCase());
+    }
+
+    /**
+     * A name a rule wrote in front of a column that nothing it can reach answers to. PostgreSQL
+     * looks through the rule's range table before it calls the name missing altogether: OLD and NEW
+     * are both in it whatever the event, and both of them are the relation the rule is on, so its
+     * own name is found there too and reported as out of reach rather than as absent. Where OLD may
+     * be written it is offered as the name to have written instead.
+     */
+    private MemgresException unreachableRuleRelation(CreateRuleStmt s, ColumnRef ref,
+                                                     boolean oldInScope) {
+        boolean row = ref.schema() == null && (ref.table().equalsIgnoreCase("old")
+                || ref.table().equalsIgnoreCase("new"));
+        // The relation's own name stands for those rows only where it is the relation the rule is
+        // on: another schema's relation of the same name is one the rule never mentioned.
+        String wrote = executor.relationSchemaOf(ref.schema(), ref.table());
+        String holds = ruleSchema(s);
+        boolean ruled = !row && ref.table().equalsIgnoreCase(s.table())
+                && (wrote == null || holds == null || wrote.equalsIgnoreCase(holds));
+        if (!row && !ruled) {
+            return new MemgresException(
+                    "missing FROM-clause entry for table \"" + ref.table() + "\"", "42P01");
+        }
+        MemgresException e = new MemgresException("invalid reference to FROM-clause entry for"
+                + " table \"" + ref.table() + "\"", "42P01");
+        if (ruled && oldInScope) {
+            e.setHint("Perhaps you meant to reference the table alias \"old\".");
+        } else {
+            e.setDetail("There is an entry for table \"" + (row ? ref.table().toLowerCase() : "old")
+                    + "\", but it cannot be referenced from this part of the query.");
+        }
+        return e;
+    }
+
+    /**
      * OLD and NEW in an action or in the rule's own qualification are the rows of the relation the
      * rule is on, so their columns are that relation's columns -- along with the system columns
      * every relation carries.
      */
-    private static void checkActionRowReferences(Object parsed, Table on) {
-        if (on == null) return;
-        Object missing = AstWalk.findFirst(parsed, node -> {
-            if (!(node instanceof ColumnRef)) return false;
-            ColumnRef ref = (ColumnRef) node;
-            if (ref.table() == null || ref.column() == null) return false;
-            if (!ref.table().equalsIgnoreCase("old") && !ref.table().equalsIgnoreCase("new")) {
-                return false;
-            }
-            return !DdlDefinitionChecks.isSystemColumnName(ref.column())
-                    && on.getColumnIndex(ref.column()) < 0;
-        });
-        if (missing == null) return;
-        ColumnRef ref = (ColumnRef) missing;
+    private static void rejectMissingRowColumn(ColumnRef ref, Table rows) {
+        if (rows == null || DdlDefinitionChecks.isSystemColumnName(ref.column())) return;
+        if (rows.getColumnIndex(ref.column()) >= 0) return;
         MemgresException e = new MemgresException("column " + ref.table().toLowerCase() + "."
                 + ref.column() + " does not exist", "42703");
         // OLD and NEW are relations in the rewritten query, so a near miss among the ruled
         // relation's columns is offered under the name the rule wrote rather than bare.
         String hint = RowContext.suggestClosestColumn(ref.column(), Collections.singletonList(
-                new RowContext.TableBinding(on, ref.table().toLowerCase(), null)));
+                new RowContext.TableBinding(rows, ref.table().toLowerCase(), null)));
         if (hint != null) e.setHint(hint);
         throw e;
     }

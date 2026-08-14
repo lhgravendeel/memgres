@@ -716,6 +716,49 @@ public class RowContext {
     }
 
     /**
+     * The same, for a name written under a qualifier that answered to nothing either — the OLD of
+     * a RETURNING clause, which stands for the target's columns and not for those of the relation
+     * a FROM or USING brought in beside it.
+     *
+     * <p>What was written in front of the dot is part of how far the reference is from what is
+     * offered back. PostgreSQL measures the qualifier against each relation's own name and spends
+     * that distance out of the three a suggestion is allowed, so {@code old.j} still reaches
+     * {@code u.j}, spelled exactly as the column is, while {@code old.ww} reaches neither
+     * {@code t.w} nor {@code u.w}: one edit more and the three are gone. Only the closest is
+     * offered, and a second beside it where two are equally close.
+     */
+    static String suggestClosestColumnUnder(String qualifier, String typo,
+                                            List<TableBinding> bindings) {
+        if (qualifier == null || typo == null) return null;
+        String first = null;
+        String second = null;
+        int shortest = FURTHEST_SUGGESTION + 1;
+        for (TableBinding b : bindings) {
+            if (b.table() == null) continue;
+            String relation = b.alias() != null ? b.alias() : b.table().getName();
+            int penalty = editDistance(qualifier, relation);
+            if (penalty > shortest) continue;
+            for (Column col : b.table().getColumns()) {
+                int distance = editDistance(typo, col.getName());
+                if (distance > typo.length() / 2) continue;
+                distance += penalty;
+                String qualified = "\"" + relation + "." + col.getName() + "\"";
+                if (distance < shortest) {
+                    shortest = distance;
+                    first = qualified;
+                    second = null;
+                } else if (distance == shortest && first != null && second == null
+                        && !qualified.equals(first)) {
+                    second = qualified;
+                }
+            }
+        }
+        if (first == null) return null;
+        return "Perhaps you meant to reference the column " + first
+                + (second == null ? "" : " or the column " + second) + ".";
+    }
+
+    /**
      * How far apart two names may be spelled before a suggestion stops being one. PostgreSQL keeps
      * a candidate only while it is within three edits of what was written, so a name that shares a
      * long tail with the written one — {@code op_bytes} against {@code read_bytes} — is no

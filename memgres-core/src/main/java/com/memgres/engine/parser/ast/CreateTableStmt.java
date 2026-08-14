@@ -33,8 +33,28 @@ public final class CreateTableStmt implements Statement {
      */
     private String ofType;
 
+    /**
+     * The schema written on the PARTITION OF parent, and the schema written on each INHERITS
+     * parent -- one entry per parent, null where that name was written bare. A qualifier is a
+     * name of its own rather than part of the relation's: joining the two back together with a
+     * dot would read a quoted identifier that holds one as a qualified name.
+     */
+    private String partitionOfParentSchema;
+    private List<String> inheritsSchemas;
+
     public String ofType() { return ofType; }
     public void setOfType(String ofType) { this.ofType = ofType; }
+
+    public String partitionOfParentSchema() { return partitionOfParentSchema; }
+    public void setPartitionOfParentSchema(String schema) { this.partitionOfParentSchema = schema; }
+
+    /** The schema written on the {@link #inherits()} entry at that position, or null for none. */
+    public String inheritsSchema(int index) {
+        if (inheritsSchemas == null || index < 0 || index >= inheritsSchemas.size()) return null;
+        return inheritsSchemas.get(index);
+    }
+
+    public void setInheritsSchemas(List<String> schemas) { this.inheritsSchemas = schemas; }
 
     public CreateTableStmt(
             String schema,

@@ -597,6 +597,66 @@ public final class DdlDefinitionChecks {
     }
 
     /**
+     * Whether the type a column was declared with holds an array. A type of the reader's own has no
+     * array type in this engine's own list -- an array of an enum is recorded as the enum with an
+     * element type beside it -- so it is the element that answers rather than the type's name.
+     */
+    private static boolean holdsAnArray(DdlExecutor.ResolvedType resolved) {
+        return resolved.arrayElementType() != null || DataType.isArrayType(resolved.dataType());
+    }
+
+    /**
+     * A bare string literal standing for an array is read by array input, which settles the shape
+     * of the value before it looks at anything in it: text that does not begin an array is refused
+     * outright, and what the braces do hold is then read by the element type's own input function,
+     * as far as this engine reads one. Read as a single value of the element type instead, 'x' on
+     * a text[] column was nobody's complaint and the column kept a default no row could take.
+     */
+    private static void requireUntypedLiteralReadableAsArray(Expression expr,
+                                                             DdlExecutor.ResolvedType resolved) {
+        if (!isUntypedLiteral(expr)) return;
+        String written = ((Literal) expr).value();
+        if (written == null) return;
+        DataType element = resolved.arrayElementType() != null ? resolved.arrayElementType()
+                : DataType.elementOf(resolved.dataType());
+        requireArrayElementsReadableAs(ArrayLiteral.parse(written).elements(), element);
+    }
+
+    /** Every element of a literal already read as an array, however many dimensions deep. */
+    private static void requireArrayElementsReadableAs(java.util.List<?> elements,
+                                                       DataType elementType) {
+        if (elementType == null
+                || TypeCoercion.categoryOf(elementType) != TypeCoercion.TypeCategory.NUMERIC) {
+            return;
+        }
+        for (Object element : elements) {
+            if (element instanceof java.util.List<?>) {
+                requireArrayElementsReadableAs((java.util.List<?>) element, elementType);
+            } else if (element != null) {
+                requireNumberReadableAs((String) element, elementType);
+            }
+        }
+    }
+
+    /**
+     * One number read the way its own type reads one. The inexact types also read the three values
+     * that are not numbers at all, which is the whole of what tells them from an integer type here.
+     */
+    private static void requireNumberReadableAs(String written, DataType type) {
+        if ((type == DataType.NUMERIC || type == DataType.REAL
+                || type == DataType.DOUBLE_PRECISION)
+                && NumericLimits.specialNumericOrNull(written) != null) {
+            return;
+        }
+        try {
+            new java.math.BigDecimal(written);
+        } catch (NumberFormatException e) {
+            throw new MemgresException("invalid input syntax for type "
+                    + type.toRegtypeDisplay() + ": \"" + written + "\"", "22P02");
+        }
+    }
+
+    /**
      * A generation expression has to produce a value the column can hold, and PostgreSQL settles
      * that where the column is defined rather than at the first row: it coerces the expression to
      * the column's type in assignment context, and a pair with no such cast is refused. The
@@ -637,7 +697,15 @@ public final class DdlDefinitionChecks {
                                               String columnName,
                                               java.util.List<Column> declared) {
         if (resolved == null) return;
-        requireUntypedLiteralReadableAs(expr, resolved.dataType());
+        // Which input function reads a bare literal is the column's type to say, and an array's
+        // reads the value's shape before it reads anything in it. Reading one as a single value of
+        // the element type asked the wrong reader: it had no objection to 'x' on a text[] column,
+        // and it took the whole of '{{1},{a}}' for one number on an int[][] one.
+        if (holdsAnArray(resolved)) {
+            requireUntypedLiteralReadableAsArray(expr, resolved);
+        } else {
+            requireUntypedLiteralReadableAs(expr, resolved.dataType());
+        }
         // An array is a type of its own, and PostgreSQL asks the same question of it as of any
         // other: there is a coercion from one array to another exactly where there is one between
         // their element types, and none at all from a lone value to an array. Skipping every

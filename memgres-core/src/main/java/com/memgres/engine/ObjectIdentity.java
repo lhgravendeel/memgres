@@ -152,6 +152,32 @@ final class ObjectIdentity {
         // depends on a type -- comes back in the order the objects were made rather than in the
         // order some catalog query happened to walk the schemas.
         oid(key);
+        numberRowType(schema, name);
+    }
+
+    /**
+     * Number the row type of a relation that has one, and the array over it. PostgreSQL writes
+     * three rows for a table or a view and numbers them as it writes them: the relation, then the
+     * array type, then the row type itself, so {@code _t}'s OID is below {@code t}'s and both are
+     * above the relation's. Memgres left them to be minted whenever a catalog query first asked,
+     * which put every row type after every relation and left them in whatever order a hash map
+     * held the tables in. A sequence and an index have no row type — pg_class.reltype is zero for
+     * both — so nothing is numbered for them.
+     */
+    private void numberRowType(String schema, String name) {
+        String kind = RelationNamespace.kindOf(database, schema, bare(name));
+        if (!RelationNamespace.TABLE.equals(kind)
+                && !RelationNamespace.VIEW.equals(kind)
+                && !RelationNamespace.MATVIEW.equals(kind)) {
+            return;
+        }
+        // Spelled exactly as the catalog builder spells it when it writes the pg_type rows, or the
+        // numbers minted here would answer for nothing.
+        String rowType = TypeNamespace.oidKey(schema, bare(name));
+        release(rowType);
+        release(rowType + "[]");
+        oid(rowType + "[]");
+        oid(rowType);
     }
 
     /**
@@ -192,10 +218,6 @@ final class ObjectIdentity {
         for (Iterator<Map.Entry<String, String>> it = typeForward.entrySet().iterator(); it.hasNext(); ) {
             if (it.next().getValue().equals(typeKey(name))) it.remove();
         }
-        // Handed out here for the same reason a relation's is: PostgreSQL numbers a type when it
-        // is created, so a schema that holds a type and a sequence reports them in the order they
-        // were written rather than in the order something first asked about them.
-        oid(typeKey(name));
         forgetCommentsEverywhere("e", name);
         // The numbers are handed out here rather than at the first question about the name, and in
         // the order PostgreSQL writes the rows: a composite's relation first, then the array type,

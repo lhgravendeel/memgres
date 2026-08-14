@@ -761,7 +761,12 @@ public class InfoSchemaBuilder {
             DataType dt = col.getType();
             // PG reports every array column as data_type 'ARRAY' and leaves the element type to
             // udt_name, so the test is the type's arrayness rather than a list of four of them.
-            boolean isArrayType = DataType.isArrayType(dt) || dt == DataType.ACLITEM_ARRAY;
+            // An array of a type the reader defined has no array type in this engine's own list --
+            // it is recorded as the element type with an element type beside it -- so the element
+            // answers for it, and without that an array of an enum was published as the single
+            // USER-DEFINED value its element is.
+            boolean isArrayType = DataType.isArrayType(dt) || dt == DataType.ACLITEM_ARRAY
+                    || col.getArrayElementType() != null;
             // H14: data_type — arrays report "ARRAY", composite types report
             // "USER-DEFINED", but DOMAIN columns report their BASE type (PG puts
             // the domain name in domain_name and the base type in data_type).
@@ -796,7 +801,16 @@ public class InfoSchemaBuilder {
             if (isUserTable) {
                 // udt_schema and udt_name are two columns, so the type the column records is
                 // split into the schema it lives in and the name it answers to there.
-                if (dt == DataType.ENUM && col.getEnumTypeName() != null) {
+                // An array of a type the reader defined is a type of its own, living in the same
+                // schema as its element and named with the underscore in front that every array
+                // type's name carries. Publishing the element's name described the column as
+                // holding one value of it, and an array of a domain was published as the domain's
+                // base type -- neither of which is the type the column has.
+                String userElement = CatalogHelper.arrayOfUserType(database, col);
+                if (userElement != null) {
+                    udtSchema = TypeNamespace.schemaOfKey(userElement);
+                    udtName = "_" + TypeNamespace.nameOfKey(userElement);
+                } else if (dt == DataType.ENUM && col.getEnumTypeName() != null) {
                     udtSchema = TypeNamespace.schemaOfKey(col.getEnumTypeName());
                     udtName = TypeNamespace.nameOfKey(col.getEnumTypeName());
                 } else if (col.getCompositeTypeName() != null) {

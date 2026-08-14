@@ -947,6 +947,14 @@ class DmlExecutor {
             }
         }
 
+        // The rows the statement writes are settled, so a RETURNING clause with a row to report
+        // can have its sub-selects asked before anything is written. See
+        // settleReturningSubqueries; a statement trigger writes under the same command identifier
+        // as the statement, so its writes are no more visible to them than the statement's own.
+        if (ruleSuppressedRows.size() < valueRows.size()) {
+            settleReturningSubqueries(stmt.returning());
+        }
+
         // Fire BEFORE STATEMENT triggers
         triggerHelper.fireStatementTriggers(triggers, PgTrigger.Timing.BEFORE, PgTrigger.Event.INSERT, table, null, null);
 
@@ -1180,7 +1188,7 @@ class DmlExecutor {
                             continue;
                         }
                         sawTargetColumns = true;
-                        if (ArbiterPredicate.infers(stmt.onConflict().whereClause(), sc.getWhereExpr())) {
+                        if (ArbiterPredicate.infers(table, stmt.onConflict().whereClause(), sc.getWhereExpr())) {
                             inferred = true;
                             break;
                         }
@@ -1212,7 +1220,7 @@ class DmlExecutor {
                             if (allMatch) {
                                 // A partial index is reached only by a predicate that entails its
                                 // own, and one that is not partial by any predicate at all.
-                                if (!ArbiterPredicate.infers(stmt.onConflict().whereClause(), sc.getWhereExpr())) {
+                                if (!ArbiterPredicate.infers(table, stmt.onConflict().whereClause(), sc.getWhereExpr())) {
                                     continue;
                                 }
                                 hasMatchingExprIndex = true;
@@ -1235,7 +1243,7 @@ class DmlExecutor {
                                 }
                             }
                             if (allMatch) {
-                                if (!ArbiterPredicate.infers(stmt.onConflict().whereClause(), sc.getWhereExpr())) {
+                                if (!ArbiterPredicate.infers(table, stmt.onConflict().whereClause(), sc.getWhereExpr())) {
                                     continue;
                                 }
                                 hasMatchingExprIndex = true;
@@ -2306,7 +2314,7 @@ class DmlExecutor {
         }
         checkReplicaIdentity(table, stmt.table(), "update");
         // Validate RETURNING columns exist before processing rows
-        validateReturning(stmt.returning(), table, stmt.from());
+        validateReturning(stmt.returning(), table, stmt.alias(), stmt.from());
         rejectAmbiguousReturning(stmt.returning(), table, namesBesideTarget(stmt.from(), null));
         List<PgTrigger> triggers = enabledTriggers(rowTriggersFor(table, stmt.table()));
         Map<Table, List<PgTrigger>> updateRowTriggers = rowTriggersByRelation(table, triggers);
@@ -2515,6 +2523,10 @@ class DmlExecutor {
             // filling these fills those.
             fillJoinedVirtuals(pairedFrom != null ? pairedFrom : matchedFromContexts,
                     stmt.setClauses(), stmt.where(), stmt.returning(), stmt.from());
+            // The rows the join kept are the ones the statement writes, so a RETURNING clause with
+            // a row to report can have its sub-selects asked here — before the first of them is
+            // written. See settleReturningSubqueries.
+            if (!matchedRows.isEmpty()) settleReturningSubqueries(stmt.returning());
             // PostgreSQL's UPDATE takes a FOR UPDATE lock on every row it touches, whether or not
             // it reached them through a join.
             lockRowsForDml(table, matchedRows);
@@ -2691,6 +2703,11 @@ class DmlExecutor {
             rows = filterRowsForWrite(table, rows, "UPDATE", updateAlias,
                     readsTargetRelation(stmt.where(), stmt.returning(), stmt.setClauses()));
         }
+
+        // The rows the scan kept are the ones the statement writes, so a RETURNING clause with a
+        // row to report can have its sub-selects asked here — before the first of them is
+        // written. See settleReturningSubqueries.
+        if (!rows.isEmpty()) settleReturningSubqueries(stmt.returning());
 
         // PG's UPDATE takes a FOR UPDATE lock on every row it touches; a concurrent
         // FOR UPDATE NOWAIT must see it, or queue workers double-process the same row.
@@ -3426,7 +3443,7 @@ class DmlExecutor {
         executor.checkTablePrivilege("DELETE", schemaName, stmt.table());
         checkReplicaIdentity(table, stmt.table(), "delete");
         // Validate RETURNING columns exist before processing rows
-        validateReturning(stmt.returning(), table, stmt.using());
+        validateReturning(stmt.returning(), table, stmt.alias(), stmt.using());
         rejectAmbiguousReturning(stmt.returning(), table, namesBesideTarget(stmt.using(), null));
         boolean hasReturning = stmt.returning() != null && !stmt.returning().isEmpty();
 
@@ -3712,6 +3729,11 @@ class DmlExecutor {
         // to put back if one of them raises (PostgreSQL statement atomicity).
         Map<Table, List<RowImage>> delSnapshot = !anyRowTriggers(deleteRowTriggers) ? null
                 : snapshotTargetTables(tablesToScan);
+
+        // The rows the scan kept are the ones the statement takes out, so a RETURNING clause with
+        // a row to report can have its sub-selects asked here — before the first of them goes.
+        // See settleReturningSubqueries.
+        if (!orderedDelete.isEmpty()) settleReturningSubqueries(stmt.returning());
 
         List<Object[]> deletedRows = new ArrayList<>();
         List<Object[]> returningRows = new ArrayList<>();
@@ -7096,6 +7118,37 @@ class DmlExecutor {
 
     // ---- RETURNING helpers ----
 
+    /**
+     * Ask the sub-selects a RETURNING clause holds while the relations still stand as the
+     * statement found them.
+     *
+     * <p>PostgreSQL reads a RETURNING clause in the snapshot the statement began with, so a
+     * sub-select written there counts the relation as it was before the first row was written and
+     * gives the same answer for every row the statement reports. This engine has no such snapshot:
+     * a sub-select first run part-way through the write reads what the write has done so far,
+     * which is how an INSERT of three rows reported the count as it stood after the first of them.
+     * A sub-select that reads nothing outside itself has one answer for the whole statement and
+     * that answer is kept once given, so asking it here is what puts PostgreSQL's answer in the
+     * place the rows are read from. One that reads the row beside it is left alone: it has no
+     * single answer to settle.
+     *
+     * <p>Called only where the statement has a row to write. PostgreSQL runs such a sub-select
+     * where it builds the first RETURNING row, so a statement that reports none never runs it at
+     * all — a nextval() written there leaves the sequence where it stands.
+     */
+    private void settleReturningSubqueries(List<SelectStmt.SelectTarget> returning) {
+        if (returning == null || returning.isEmpty()) return;
+        for (SelectStmt.SelectTarget target : returning) {
+            // A sub-select nested inside another is that one's to run, and running it here would
+            // ask it outside the scope it reads its names in.
+            AstWalk.forEachOutside(target.expr(), node -> node instanceof SubqueryExpr, node -> {
+                if (!(node instanceof SubqueryExpr)) return;
+                SubqueryExpr sq = (SubqueryExpr) node;
+                if (executor.scalarSubqueryValue(sq) != null) executor.evalExpr(sq, null);
+            });
+        }
+    }
+
     /** Evaluate RETURNING expressions for a single row. */
     private Object[] evalReturning(List<SelectStmt.SelectTarget> returning, Table table, Object[] row) {
         return evalReturning(returning, table, null, row);
@@ -7764,6 +7817,16 @@ class DmlExecutor {
      */
     void validateReturning(List<SelectStmt.SelectTarget> returning, Table table,
                            List<SelectStmt.FromItem> beside) {
+        validateReturning(returning, table, null, beside);
+    }
+
+    /**
+     * The same, told the name the write's target answers to. A name nothing supplies earns advice
+     * about what was probably meant, and the advice names each relation the way the statement
+     * named it — see {@link #returningScope}.
+     */
+    void validateReturning(List<SelectStmt.SelectTarget> returning, Table table, String alias,
+                           List<SelectStmt.FromItem> beside) {
         if (returning == null) return;
         Set<String> besideNames = besideReturningNames(beside);
         for (SelectStmt.SelectTarget target : returning) {
@@ -7793,12 +7856,56 @@ class DmlExecutor {
                         // PostgreSQL quotes a bare name and leaves a qualified one as written; the
                         // unquoted form also defeated the position enrichment, which finds the
                         // token in the statement text by its quotes.
-                        throw new MemgresException("column " + (cr.table() == null
+                        MemgresException missing = new MemgresException("column " + (cr.table() == null
                                 ? "\"" + cr.column() + "\"" : cr.table() + "." + cr.column())
                                 + " does not exist", "42703");
+                        // OLD and NEW are names of the target relation, so a column they have not
+                        // got is looked for across the whole scope the clause is read in, and what
+                        // is found there is offered back under the name its own relation answers
+                        // to. The qualifier counts towards how far off the reference is.
+                        if (cr.table() != null) {
+                            missing.setHint(RowContext.suggestClosestColumnUnder(cr.table(),
+                                    cr.column(), returningScope(table, alias, beside)));
+                        }
+                        throw missing;
                     }
                 }
             }
+        }
+    }
+
+    /**
+     * The relations a RETURNING name that answered to nothing is looked for in: the one being
+     * written, under the name the statement gave it, and then whatever the FROM or USING clause
+     * brought in beside it, in the order they were written.
+     *
+     * <p>OLD and NEW are not among them. They stand for the target's own columns, so a relation
+     * that has not got the name has not got it under either, and PostgreSQL never offers one of
+     * them back. Only a relation named outright is searched, for the reason
+     * {@link #besideReturningNames} gives: what a derived one supplies is not read off the text.
+     */
+    private List<RowContext.TableBinding> returningScope(Table table, String alias,
+                                                         List<SelectStmt.FromItem> beside) {
+        List<RowContext.TableBinding> scope = new ArrayList<>();
+        scope.add(new RowContext.TableBinding(table, alias, (Object[]) null));
+        if (beside != null) {
+            for (SelectStmt.FromItem item : beside) collectBesideRelations(item, scope);
+        }
+        return scope;
+    }
+
+    private void collectBesideRelations(SelectStmt.FromItem item,
+                                        List<RowContext.TableBinding> scope) {
+        if (item instanceof SelectStmt.TableRef) {
+            SelectStmt.TableRef ref = (SelectStmt.TableRef) item;
+            Table joined = executor.selectExecutor.lookupRelationOrNull(ref.schema(), ref.table());
+            if (joined != null) {
+                scope.add(new RowContext.TableBinding(joined, ref.alias(), (Object[]) null));
+            }
+        } else if (item instanceof SelectStmt.JoinFrom) {
+            SelectStmt.JoinFrom join = (SelectStmt.JoinFrom) item;
+            collectBesideRelations(join.left(), scope);
+            collectBesideRelations(join.right(), scope);
         }
     }
 
@@ -7896,12 +8003,25 @@ class DmlExecutor {
      * that relation's own column: PostgreSQL reports the type the column has rather than the type
      * of a name it could not place. The shape is read off a row the second relation produced, which
      * is the row the value itself is read from.
+     *
+     * <p>A star stands for the whole scope the clause is read in, so it answers with the target's
+     * columns and then the second relation's, in the order the statement brought them in. Naming
+     * only the target's described a five-column answer as three and cut the second relation's
+     * values off the row {@link #evalReturning} had already built for it.
      */
     private List<Column> buildReturningColumns(List<SelectStmt.SelectTarget> returning, Table table,
                                                RowContext beside) {
         if (beside == null) return buildReturningColumns(returning, table);
         List<Column> cols = new ArrayList<>();
         for (SelectStmt.SelectTarget target : returning) {
+            if (target.expr() instanceof WildcardExpr
+                    && ((WildcardExpr) target.expr()).table() == null) {
+                cols.addAll(returningStarColumns(table));
+                for (RowContext.TableBinding binding : beside.getBindings()) {
+                    if (binding.table() != null) cols.addAll(binding.table().getColumns());
+                }
+                continue;
+            }
             if (target.alias() == null && target.expr() instanceof ColumnRef) {
                 ColumnRef ref = (ColumnRef) target.expr();
                 Column held = table.getColumnIndex(mapViewColumn(ref.column())) >= 0

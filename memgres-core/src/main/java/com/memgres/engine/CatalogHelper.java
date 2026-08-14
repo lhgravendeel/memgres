@@ -289,6 +289,29 @@ public final class CatalogHelper {
     }
 
     /**
+     * The user-defined type a column holds an array of, and null for a column that holds no such
+     * array.
+     *
+     * <p>An array of a domain, an enum, a composite or a range is a type in its own right in
+     * PostgreSQL, held in the same schema as its element and named with the underscore every array
+     * type's name carries. A column of one records the element type's name with an element type
+     * beside it -- and so does a column declared with a domain that is itself built over an array,
+     * which is a column of that domain and not of an array of it. The domain settles which of the
+     * two the column is, and every catalogue that names the column's type has to ask.
+     */
+    public static String arrayOfUserType(Database database, Column c) {
+        if (c.getArrayElementType() == null) return null;
+        if (c.getDomainTypeName() != null) {
+            DomainType domain = database == null ? null : database.getDomain(c.getDomainTypeName());
+            return domain != null && domain.getArrayElementType() != null
+                    ? null : c.getDomainTypeName();
+        }
+        if (c.getEnumTypeName() != null) return c.getEnumTypeName();
+        if (c.getCompositeTypeName() != null) return c.getCompositeTypeName();
+        return c.getRangeTypeName();
+    }
+
+    /**
      * The type modifier PostgreSQL stores in {@code pg_attribute.atttypmod} for a column: the
      * declaration's width, precision or field qualifier packed the way {@code format_type} and
      * every client that decodes a column width expect to read it back. A column that declared

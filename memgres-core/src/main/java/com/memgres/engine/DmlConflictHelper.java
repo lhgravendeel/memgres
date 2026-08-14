@@ -215,7 +215,7 @@ class DmlConflictHelper {
                         break;
                     }
                 }
-                if (allMatch && !ArbiterPredicate.infers(conflictWhere, sc.getWhereExpr())) continue;
+                if (allMatch && !ArbiterPredicate.infers(table, conflictWhere, sc.getWhereExpr())) continue;
                 if (allMatch) {
                     matchedConstraint = sc;
                     break;
@@ -233,7 +233,7 @@ class DmlConflictHelper {
                         break;
                     }
                 }
-                if (allMatch && !ArbiterPredicate.infers(conflictWhere, sc.getWhereExpr())) continue;
+                if (allMatch && !ArbiterPredicate.infers(table, conflictWhere, sc.getWhereExpr())) continue;
                 if (allMatch) {
                     matchedConstraint = sc;
                     matchedAsPlainColumns = true;

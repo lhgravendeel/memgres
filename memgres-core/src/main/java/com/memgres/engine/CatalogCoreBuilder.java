@@ -1087,8 +1087,15 @@ class CatalogCoreBuilder {
                     // a planner reading them decides how to lay the row out, and reporting -1 for
                     // a fixed-width type says the value is a varlena when it is not. They are read
                     // from the same record pg_type answers from, so the two cannot disagree.
-                    short attlen = typeLength(colType);
-                    String storage = typeStorage(colType);
+                    // An array is a varlena whatever it holds: every array type in PG is -1 wide,
+                    // stored extended and passed by reference. An array of a type the reader
+                    // defined is recorded here as the element type with an element type beside it,
+                    // so reading the layout off the type alone described a column of enums as the
+                    // four-byte value passed by value that one enum is.
+                    boolean holdsArray = DataType.isArrayType(colType)
+                            || c.getArrayElementType() != null;
+                    short attlen = holdsArray ? (short) -1 : typeLength(colType);
+                    String storage = holdsArray ? "x" : typeStorage(colType);
                     // A composite value starts on a double boundary whatever it is made of, which
                     // is what pg_type records for every composite. The column carries the value as
                     // text, and text's alignment is the carrier's rather than the type's.
@@ -1165,7 +1172,7 @@ class CatalogCoreBuilder {
                             c.getAttCompression(),        // attcompression
                             c.isAttHasMissing(), // atthasmissing
                             null,      // attmissingval
-                            byValue(colType), // attbyval
+                            !holdsArray && byValue(colType), // attbyval
                             align  // attalign
                     });
         }

@@ -3666,34 +3666,24 @@ class DdlObjectExecutor {
     }
 
     /**
-     * Dropping a type a column is declared as, or a routine is written in terms of, would leave
-     * that column and that routine naming nothing, so without CASCADE they block the drop and with
-     * it they are taken along.
+     * Dropping a type something is declared as — a column, a composite type's attribute, a domain
+     * written over it, a routine written in terms of it — would leave that thing naming nothing,
+     * so without CASCADE they block the drop and with it they are taken along.
      *
      * <p>What the refusal names and what CASCADE removes are worked out from one list and taken
      * away in one place, because a drop that names a dependent and then leaves it standing is a
      * worse answer than either refusing or removing it.
      */
     private void refuseOrCascadeTypeDependents(DropStmt stmt, String key) {
-        List<TypeUser> users = relationsDeclaredAsType(key);
-        List<TypeDependents.Dependent> routines = TypeDependents.writtenIn(executor.database,
-                executor.systemCatalog, executor.searchPathSchemas(), typeNamed(key));
-        if (users.isEmpty() && routines.isEmpty()) return;
-        String display = TypeNamespace.display(executor.database, executor.session, key);
         List<String> dependents = new ArrayList<>();
-        for (TypeUser user : users) dependents.add(user.described);
-        for (TypeDependents.Dependent d : routines) dependents.add(d.described());
+        List<String> lines = new ArrayList<>();
+        collectTypeDependents(key, new HashSet<>(), dependents, lines);
+        if (dependents.isEmpty()) return;
         if (!stmt.cascade()) {
             // One dependent per line of a single detail. Written as repeated labelled sections
             // only the first of them reached the client and the rest stayed inside the message.
-            List<String> lines = new ArrayList<>();
-            for (TypeUser user : users) {
-                lines.add(user.described + " depends on type " + display);
-            }
-            for (TypeDependents.Dependent d : routines) {
-                lines.add(d.described() + " depends on type " + d.typeShown(display));
-            }
-            MemgresException e = new MemgresException("cannot drop type " + display
+            MemgresException e = new MemgresException("cannot drop type "
+                    + TypeNamespace.display(executor.database, executor.session, key)
                     + " because other objects depend on it", "2BP01");
             e.setDetail(dependencyDetail(lines));
             e.setHint("Use DROP ... CASCADE to drop the dependent objects too.");
@@ -3701,6 +3691,35 @@ class DdlObjectExecutor {
         }
         noticeDropCascades(executor, dependents);
         dropTypeDependents(key, null);
+    }
+
+    /**
+     * Everything a drop of this type would leave naming nothing, in the order PostgreSQL reports
+     * it. A domain written over the type is a type in its own right, so what was written over the
+     * domain is in the way of this drop as well, and PostgreSQL names it straight after the domain
+     * it hangs from rather than at the end of the list. Each line says which of the two types the
+     * dependency is really on, so a reader can tell a direct dependent from one reached through a
+     * domain.
+     *
+     * @param dependents how the cascade notice names each object
+     * @param lines the same objects, each said to depend on the type its declaration reached
+     */
+    private void collectTypeDependents(String key, Set<String> seen, List<String> dependents,
+                                       List<String> lines) {
+        if (!seen.add(key)) return;
+        String display = TypeNamespace.display(executor.database, executor.session, key);
+        for (TypeUser user : declaredAsType(key)) {
+            dependents.add(user.described);
+            lines.add(user.described + " depends on type " + user.typeShown(display));
+            if (user.domainKey() != null) {
+                collectTypeDependents(user.domainKey(), seen, dependents, lines);
+            }
+        }
+        for (TypeDependents.Dependent d : TypeDependents.writtenIn(executor.database,
+                executor.systemCatalog, executor.searchPathSchemas(), typeNamed(key))) {
+            dependents.add(d.described());
+            lines.add(d.described() + " depends on type " + d.typeShown(display));
+        }
     }
 
     /**
@@ -3713,8 +3732,29 @@ class DdlObjectExecutor {
      */
     private void dropTypeDependents(String key, String exceptSchema) {
         List<Session.UndoEntry> undo = new ArrayList<>();
-        for (TypeUser user : relationsDeclaredAsType(key)) {
+        dropTypeDependents(key, exceptSchema, new HashSet<>(), undo);
+        for (Session.UndoEntry entry : undo) executor.recordUndo(entry);
+    }
+
+    /**
+     * The same, following a domain written over the type into what was written over the domain.
+     * The domain cannot outlive the type it stands on, so nothing written over the domain can
+     * outlive it either, and each of those goes before the domain that carried it off.
+     */
+    private void dropTypeDependents(String key, String exceptSchema, Set<String> done,
+                                    List<Session.UndoEntry> undo) {
+        if (!done.add(key)) return;
+        for (TypeUser user : declaredAsType(key)) {
             if (exceptSchema != null && exceptSchema.equalsIgnoreCase(user.schemaName)) continue;
+            if (user.domainKey() != null) {
+                dropTypeDependents(user.domainKey(), exceptSchema, done, undo);
+                takeDomainAway(user.domainKey(), undo);
+                continue;
+            }
+            if (user.compositeKey() != null) {
+                dropCompositeAttribute(user, undo);
+                continue;
+            }
             if (user.column == null) {
                 // A typed table has no shape of its own once the type has gone -- its columns are
                 // the type's -- so the whole relation goes rather than any column of it.
@@ -3725,6 +3765,19 @@ class DdlObjectExecutor {
             if (idx < 0) continue;
             List<Object> held = new ArrayList<>();
             for (Object[] row : user.table.getRows()) held.add(row[idx]);
+            // The constraints written over the column go with it and have to come back with it,
+            // after it: a key constraint is rebuilt over the column's position, so the column has
+            // to be there first. Undo runs in reverse, so this is recorded ahead of the column's
+            // own entry. Without it a rolled-back CASCADE gave the column back unconstrained, and
+            // the unique index over it stopped refusing a duplicate.
+            List<StoredConstraint> doomed = new ArrayList<>();
+            for (StoredConstraint sc : user.table.getConstraints()) {
+                if (sc.dependsOnColumn(user.column.getName())) doomed.add(sc);
+            }
+            if (!doomed.isEmpty()) {
+                undo.add(new Session.DropColumnConstraintsUndo(user.schemaName,
+                        user.table.getName(), doomed));
+            }
             undo.add(new Session.DropColumnUndo(user.schemaName, user.table.getName(),
                     user.column, idx, held));
             user.table.removeColumn(user.column.getName());
@@ -3735,7 +3788,48 @@ class DdlObjectExecutor {
             if (exceptSchema != null && exceptSchema.equalsIgnoreCase(routineSchemaOf(d))) continue;
             TypeDependents.remove(executor.database, d, undo);
         }
-        for (Session.UndoEntry entry : undo) executor.recordUndo(entry);
+    }
+
+    /**
+     * Take the attribute off the composite type, the way ALTER TYPE ... DROP ATTRIBUTE does. The
+     * composite type outlives the drop of the type its attribute was declared as, so the attribute
+     * is not taken out of the list: it keeps its number under a name nobody could have written,
+     * and the attributes after it keep theirs.
+     */
+    private void dropCompositeAttribute(TypeUser user, List<Session.UndoEntry> undo) {
+        List<CreateTypeStmt.CompositeField> fields =
+                executor.database.getCompositeTypes().get(user.compositeKey());
+        if (fields == null) return;
+        // What a type is made of is shared state, so a transaction that rolls back has to find the
+        // attribute list it started with — the same record ALTER TYPE keeps for itself.
+        undo.add(new Session.AlterCompositeTypeUndo(user.compositeKey(), fields));
+        List<CreateTypeStmt.CompositeField> kept = new ArrayList<>();
+        for (int i = 0; i < fields.size(); i++) {
+            CreateTypeStmt.CompositeField f = fields.get(i);
+            kept.add(f.name().equalsIgnoreCase(user.attributeName())
+                    ? new CreateTypeStmt.CompositeField(Database.droppedAttributeName(i + 1),
+                            f.typeName())
+                    : f);
+        }
+        executor.database.replaceCompositeFields(user.compositeKey(), kept);
+    }
+
+    /**
+     * Take a domain away because the type it was written over is going. A domain carried off this
+     * way has to leave exactly what DROP DOMAIN leaves: a record to put it back if the transaction
+     * rolls back, no entry in the schema's register, nothing said about it, and an OID that is
+     * never handed to a domain created later under the same name.
+     */
+    private void takeDomainAway(final String key, List<Session.UndoEntry> undo) {
+        DomainType domain = executor.database.getDomains().get(key);
+        if (domain == null) return;
+        String schema = TypeNamespace.schemaOfKey(key);
+        String bare = TypeNamespace.nameOfKey(key);
+        undo.add(new Session.DropDomainUndo(schema, bare, domain));
+        inStoredTypes(() -> executor.database.getDomains().remove(key));
+        executor.database.unregisterSchemaObject(schema, "domain", bare);
+        executor.database.addComment("type", key, null);
+        executor.identity().typeDropped("d", key);
     }
 
     /** The schema a dependent routine or aggregate lives in. */
@@ -3772,7 +3866,11 @@ class DdlObjectExecutor {
             if (!uses && where != null && word.matcher(where).find()) uses = true;
             if (uses) going.add(entry.getKey());
         }
-        for (String index : going) executor.database.removeIndex(index);
+        for (String index : going) {
+            // The index goes with the column, so a rolled-back drop has to bring both back.
+            executor.recordUndo(new Session.DropIndexUndo(executor.database.snapshotIndex(index)));
+            executor.database.removeIndex(index);
+        }
     }
 
     /**
@@ -3908,37 +4006,70 @@ class DdlObjectExecutor {
         return schema.toLowerCase() + "." + name;
     }
 
-    /** A relation declared as a type, or one of its columns, and how PostgreSQL names it. */
+    /**
+     * One thing declared as a type: a relation, a column of one, an attribute of a composite type,
+     * or a domain written over it — with how PostgreSQL names it where a drop is refused.
+     */
     private static final class TypeUser {
         final String schemaName;
         final Table table;
         /** The column declared as the type, or null when the whole relation is declared OF it. */
         final Column column;
+        /** A composite type's attribute or a domain written over the type, or null. */
+        final TypeDependents.Dependent type;
         final String described;
 
         TypeUser(String schemaName, Table table, Column column, String described) {
+            this(schemaName, table, column, null, described);
+        }
+
+        TypeUser(String schemaName, Table table, Column column, TypeDependents.Dependent type,
+                 String described) {
             this.schemaName = schemaName;
             this.table = table;
             this.column = column;
+            this.type = type;
             this.described = described;
+        }
+
+        /** The composite type this attribute belongs to, or null when this is not one. */
+        String compositeKey() {
+            return type == null ? null : type.compositeKey;
+        }
+
+        /** That attribute's name, or null. */
+        String attributeName() {
+            return type == null ? null : type.attributeName;
+        }
+
+        /** The domain written over the type, or null when this dependent is not a domain. */
+        String domainKey() {
+            return type == null ? null : type.domainKey;
+        }
+
+        /** The type this one was declared as, which for an array declaration is the array type. */
+        String typeShown(String display) {
+            return type == null ? display : type.typeShown(display);
         }
     }
 
     /**
-     * Every table column whose declared type is the type stored under {@code key}, described the
-     * way PostgreSQL describes a column that stands in the way of a drop — {@code column c of
-     * table t}, with the table schema-qualified where the search path does not reach it. A column
-     * records the type it was declared with under the same key, so a column of a.e is not found
-     * by dropping b.e. Each one is kept beside the column itself, so that CASCADE takes away what
-     * the refusal names rather than working the list out a second time.
+     * Everything declared as the type stored under {@code key} — a table column, a table declared
+     * OF it, a composite type's attribute, a domain written over it — described the way PostgreSQL
+     * describes what stands in the way of a drop: {@code column c of table t}, {@code column x of
+     * composite type c}, {@code type d}, each qualified where the search path does not reach it. A
+     * declaration records the type it was written with under the same key, so a column of a.e is
+     * not found by dropping b.e. Each one is kept beside the thing itself, so that CASCADE takes
+     * away what the refusal names rather than working the list out a second time.
      */
-    private List<TypeUser> relationsDeclaredAsType(String key) {
-        // PostgreSQL reports dependencies in the order it recorded them: relations in the order
-        // they were created, and within one relation its columns from the last back to the first.
-        // Walking the schema maps reported them in whatever order those maps happened to hold
-        // them, which for two tables built on the same type was neither order. Each entry is kept
-        // beside the relation's OID -- which follows creation order -- and its attnum, and the
-        // list is put in that order once it is complete.
+    private List<TypeUser> declaredAsType(String key) {
+        // PostgreSQL reports dependencies in the order it recorded them: an array declaration
+        // ahead of everything, because an array type is recorded as depending on its element type;
+        // then relations in the order they were created, and within one relation its columns from
+        // the last back to the first. Walking the schema maps reported them in whatever order
+        // those maps happened to hold them, which for two tables built on the same type was
+        // neither order. Each entry is kept beside the OID of what carries it -- which follows
+        // creation order -- and its attnum, and the list is put in that order once it is complete.
         List<Object[]> found = new ArrayList<>();
         List<String> visible = executor.searchPathSchemas();
         for (Schema schema : executor.database.getSchemas().values()) {
@@ -3950,7 +4081,7 @@ class DdlObjectExecutor {
                 // the type's, so dropping the type would leave the table with no definition at
                 // all. PostgreSQL names the table itself rather than any of its columns.
                 if (sameType(key, t.getOfTypeName())) {
-                    found.add(new Object[]{relOid, 0,
+                    found.add(new Object[]{1, relOid, 0,
                             new TypeUser(schema.getName(), t, null, "table " + shown)});
                 }
                 List<Column> cols = t.getColumns();
@@ -3961,22 +4092,33 @@ class DdlObjectExecutor {
                     if (sameType(key, c.getEnumTypeName()) || sameType(key, c.getCompositeTypeName())
                             || sameType(key, c.getDomainTypeName())
                             || sameType(key, c.getRangeTypeName())) {
-                        found.add(new Object[]{relOid, i + 1, new TypeUser(schema.getName(), t, c,
+                        found.add(new Object[]{1, relOid, i + 1, new TypeUser(schema.getName(), t, c,
                                 "column " + c.getName() + " of table " + shown)});
                     }
                 }
             }
         }
+        // A composite type's attribute and a domain are declared as the type exactly as a column
+        // is, and stand in the way of the drop the same way, so they take their places in this one
+        // list rather than in a second one of their own. Which declarations name a type is settled
+        // where the routines written in terms of it are settled.
+        for (TypeDependents.Dependent d : TypeDependents.typesWrittenIn(executor.database,
+                executor.systemCatalog, visible, typeNamed(key))) {
+            found.add(new Object[]{d.throughArray ? 0 : 1, d.age(), d.attnum(),
+                    new TypeUser(d.typeSchema(), null, null, d, d.described())});
+        }
         java.util.Collections.sort(found, new java.util.Comparator<Object[]>() {
             @Override
             public int compare(Object[] a, Object[] b) {
-                int byRelation = Integer.compare((Integer) a[0], (Integer) b[0]);
+                int byArray = Integer.compare((Integer) a[0], (Integer) b[0]);
+                if (byArray != 0) return byArray;
+                int byRelation = Integer.compare((Integer) a[1], (Integer) b[1]);
                 return byRelation != 0 ? byRelation
-                        : Integer.compare((Integer) b[1], (Integer) a[1]);
+                        : Integer.compare((Integer) b[2], (Integer) a[2]);
             }
         });
         List<TypeUser> users = new ArrayList<>();
-        for (Object[] entry : found) users.add((TypeUser) entry[2]);
+        for (Object[] entry : found) users.add((TypeUser) entry[3]);
         return users;
     }
 
@@ -4412,7 +4554,7 @@ class DdlObjectExecutor {
         }
         if ("type".equals(ownerKind)) {
             String typeKey = TypeNamespace.key(ownerSchema, ownerName);
-            for (TypeUser user : relationsDeclaredAsType(typeKey)) {
+            for (TypeUser user : declaredAsType(typeKey)) {
                 // A column of a relation the schema is taking with it is covered by the relation's
                 // own line, which is the one PostgreSQL reports: a whole relation on the way out
                 // stands for every column of it.
@@ -5894,8 +6036,12 @@ class DdlObjectExecutor {
                 Table partitionedParent = executor.resolveTable(partitionedSchema, s.table());
                 if (partitionedParent.getPartitionStrategy() != null) {
                     for (Table childPartition : partitionedParent.getPartitions()) {
+                        // The copy belongs to the relation it indexes, so it is registered in that
+                        // relation's own schema -- which is not the partitioned table's when the
+                        // partition was created somewhere else.
                         ddl.tableExecutor.copyParentIndex(partitionedParent, childPartition,
-                                partitionedSchema, Database.idxKey(partitionedSchema, s.name()));
+                                childPartition.getSchemaName(),
+                                Database.idxKey(partitionedSchema, s.name()));
                     }
                 }
             } catch (MemgresException ignored) {}

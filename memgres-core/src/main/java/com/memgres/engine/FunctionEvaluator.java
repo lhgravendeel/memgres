@@ -3925,6 +3925,10 @@ class FunctionEvaluator {
         }
         BuiltinCallTypes.requireCallable(name, writtenName, written);
         BuiltinCallTypes.requireReachable(name, writtenName, written);
+        // A signature written over a kind of type takes that kind and nothing else, which the two
+        // above let past: lower is declared over text and over the two kinds of range, and a
+        // boolean reaches none of the three.
+        BuiltinCallTypes.requireDeclaredKind(name, writtenName, written);
         // A call PostgreSQL cannot choose between is refused whether or not an argument was
         // written without a type: to_hex(int2) reaches both to_hex(int4) and to_hex(int8) and is
         // neither, so it is not a call at all. Asking only where an argument was untyped let

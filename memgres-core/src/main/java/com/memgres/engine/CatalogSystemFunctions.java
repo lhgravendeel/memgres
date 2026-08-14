@@ -176,6 +176,12 @@ class CatalogSystemFunctions {
                     }
                     Column colDef = ctx.resolveColumnDef(colRef.table(), colRef.column());
                     if (colDef != null) {
+                        // An array of a type the reader defined is a type of its own, and it is the
+                        // one the column was declared with. Answering with the element's name said
+                        // the column holds one value of that type where it holds a list of them.
+                        String userElement =
+                                CatalogHelper.arrayOfUserType(executor.database, colDef);
+                        if (userElement != null) return typeDisplay(userElement) + "[]";
                         // A domain is a type of its own, and it is the type the column was
                         // declared with — so it is the name, not the base type it is built on and
                         // not the enum or composite that base may itself be.
@@ -199,6 +205,16 @@ class CatalogSystemFunctions {
                     if (ctx != null && sub.base() instanceof ColumnRef) {
                         ColumnRef base = (ColumnRef) sub.base();
                         Column baseDef = ctx.resolveColumnDef(base.table(), base.column());
+                        // The element of an array of a type the reader defined is one value of
+                        // that type, and a range of it is another array of it. Read off the
+                        // representation the values are carried in, an element of an array of
+                        // enums answered with the placeholder name "enum", which is a type
+                        // nothing answers to.
+                        String subElement = baseDef == null ? null
+                                : CatalogHelper.arrayOfUserType(executor.database, baseDef);
+                        if (subElement != null) {
+                            return typeDisplay(subElement) + (sub.isSlice() ? "[]" : "");
+                        }
                         if (baseDef != null && baseDef.getArrayElementType() != null) {
                             return pgTypeDisplayName(sub.isSlice()
                                     ? baseDef.getType() : baseDef.getArrayElementType());

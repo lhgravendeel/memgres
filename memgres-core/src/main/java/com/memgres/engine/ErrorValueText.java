@@ -25,9 +25,14 @@ final class ErrorValueText {
         // A timestamptz is the one value that writer still hands back in Java's shape, because the
         // callers it was written for quote it and never had to agree with PostgreSQL about what is
         // inside the quotes. PostgreSQL separates the date from the time with a space and writes
-        // the zone as an offset from UTC.
+        // the zone as an offset from UTC — and it is the offset the session's TimeZone is on at that
+        // instant, not the one the value happens to be stored with. The reader is being told which
+        // row to go looking for, and a query from the same session reads that moment back in the
+        // session's own zone.
         if (value instanceof OffsetDateTime && written.indexOf('T') >= 0) {
-            return RangeOperations.formatTimestamptz((OffsetDateTime) value);
+            OffsetDateTime instant = (OffsetDateTime) value;
+            return RangeOperations.formatTimestamptz(
+                    instant.atZoneSameInstant(TypeCoercion.sessionZone()).toOffsetDateTime());
         }
         return written;
     }

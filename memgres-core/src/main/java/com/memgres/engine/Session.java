@@ -757,15 +757,12 @@ public class Session {
             resetAutocommitTxId();
             return result;
         } catch (RuntimeException e) {
-            if (status == TransactionStatus.IN_TRANSACTION) {
-                status = TransactionStatus.FAILED;
-            }
             RuntimeException reported = reportedFailure(e, token);
-            // For deadlock (40P01), automatically release this session's row locks so the
-            // waiting session can proceed (mirrors PostgreSQL's automatic victim rollback).
             if (reported instanceof MemgresException
                     && "40P01".equals(((MemgresException) reported).getSqlState())) {
-                database.unlockAllRows(this);
+                abortAfterDeadlock();
+            } else if (status == TransactionStatus.IN_TRANSACTION) {
+                status = TransactionStatus.FAILED;
             }
             throw reported;
         } finally {
@@ -784,6 +781,32 @@ public class Session {
             // The interrupt was ours. Leaving it set would cancel whatever runs next on this thread.
             Thread.interrupted();
         }
+    }
+
+    /**
+     * End the transaction a deadlock was reported to, leaving the session in the failed block.
+     *
+     * <p>PostgreSQL records the victim's abort as it raises the error: from that moment the rows
+     * the transaction wrote are dead, its locks are gone, and the session that was waiting for it
+     * goes on without waiting for a ROLLBACK the client may take its time over. What stays behind
+     * is the transaction block, so every statement after the deadlock is refused with 25P02 until
+     * the client ends it. Releasing the locks and leaving the writes standing was not enough: the
+     * undo of a transaction that ends later puts back rows the session that won the deadlock has
+     * committed over in the meantime.
+     *
+     * <p>A deadlock inside a subtransaction is not this. The savepoint can still be wound back to,
+     * so what the transaction wrote before it is still worth something and is left alone.
+     */
+    private void abortAfterDeadlock() {
+        if (status != TransactionStatus.IN_TRANSACTION || !savepoints.isEmpty()) {
+            if (status == TransactionStatus.IN_TRANSACTION) status = TransactionStatus.FAILED;
+            database.unlockAllRows(this);
+            return;
+        }
+        boolean inBlock = explicitTransactionBlock;
+        rollback();
+        explicitTransactionBlock = inBlock;
+        status = TransactionStatus.FAILED;
     }
 
     /**
@@ -3640,15 +3663,6 @@ public class Session {
     }
 
     /**
-     * Forget everything the statement now running has recorded. Used by a DML path that has put
-     * its target tables back from a snapshot of its own: the entries describe changes that have
-     * already been reversed, and applying them again would write the same rows a second time.
-     */
-    public void discardUndoForCurrentStatement() {
-        discardUndoSince(stmtScopeMark);
-    }
-
-    /**
      * Forget the row entries this statement recorded for the given relations, and only those.
      *
      * <p>PostgreSQL undoes a statement that fails whole: not only what it wrote to the relation it
@@ -4487,15 +4501,35 @@ public class Session {
         public static final class DropSequenceUndo implements UndoEntry {
         public final String seqName;
         public final Sequence seq;
+        /**
+         * The schema the sequence was recorded as belonging to, for a drop that unregistered it
+         * as well. Null when the drop left the registration alone, so that putting the sequence
+         * back does not record one the database never had.
+         */
+        public final String registeredIn;
+        /** The role that owned it, for a drop that forgot the owner too; null when it did not. */
+        public final String ownerRole;
 
         public DropSequenceUndo(String seqName, Sequence seq) {
+            this(seqName, seq, null, null);
+        }
+
+        public DropSequenceUndo(String seqName, Sequence seq, String registeredIn, String ownerRole) {
             this.seqName = seqName;
             this.seq = seq;
+            this.registeredIn = registeredIn;
+            this.ownerRole = ownerRole;
         }
 
         @Override
         public void undo(Database db) {
             db.addSequence(seq);
+            if (registeredIn != null) {
+                db.registerSchemaObject(registeredIn, "sequence", seq.getName());
+            }
+            if (ownerRole != null) {
+                db.setObjectOwner("sequence:" + seq.getName(), ownerRole);
+            }
         }
 
         public String seqName() { return seqName; }
@@ -4661,6 +4695,30 @@ public class Session {
         @Override
         public String toString() {
             return "DropRangeTypeUndo[typeName=" + typeName + "]";
+        }
+    }
+
+    /**
+     * Undo a drop that took an index off a column the drop removed. The index belongs to the
+     * column, so it goes when the column does and comes back when the column does: without a
+     * record of its own the column returned unindexed, which left a unique index no longer
+     * refusing a duplicate and its name free for the next CREATE INDEX to take.
+     */
+    public static final class DropIndexUndo implements UndoEntry {
+        public final Database.IndexSnapshot index;
+
+        public DropIndexUndo(Database.IndexSnapshot index) {
+            this.index = index;
+        }
+
+        @Override
+        public void undo(Database db) {
+            db.restoreIndex(index);
+        }
+
+        @Override
+        public String toString() {
+            return "DropIndexUndo[]";
         }
     }
 

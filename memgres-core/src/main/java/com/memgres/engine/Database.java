@@ -275,6 +275,15 @@ public class Database {
     // Wait-for graph: maps a waiting session to the session it is waiting for (for deadlock detection)
     private final Map<Session, Session> waitingFor = new ConcurrentHashMap<>();
 
+    /**
+     * The order in which the sessions waiting for a row began waiting, one number each, kept for
+     * as long as {@link #waitingFor} holds them. Which session a deadlock over rows is reported to
+     * is decided from it: see {@link #isDeadlockVictim}. A wait for a table or advisory lock is
+     * not entered here, and such a deadlock is still reported to the session that closes the cycle.
+     */
+    private final Map<Session, Long> waitingSince = new ConcurrentHashMap<>();
+    private final AtomicLong waitSeq = new AtomicLong(0);
+
     /** Monotonic acquisition counter so ROLLBACK TO SAVEPOINT can release only newer locks. */
     private final AtomicLong rowLockSeq = new AtomicLong(0);
 
@@ -405,7 +414,7 @@ public class Database {
                     if (session != null) {
                         waitingFor.put(session, holder);
                         registered = true;
-                        if (hasDeadlock(session, holder)) {
+                        if (isDeadlockVictim(session, holder)) {
                             throw new MemgresException("deadlock detected", "40P01");
                         }
                     }
@@ -421,7 +430,7 @@ public class Database {
                 }
             }
         } finally {
-            if (registered) waitingFor.remove(session);
+            if (registered) noteNotWaiting(session);
         }
     }
 
@@ -3134,6 +3143,72 @@ public class Database {
         removeIndexKey(ixKey(name));
     }
 
+    /**
+     * Everything the registry holds about one index, for a drop that may have to be undone.
+     *
+     * <p>An index's definition is spread over a map per property, so what a rollback puts back is
+     * every entry {@link #removeIndexKey} takes away -- an index restored with its columns alone
+     * would come back without the uniqueness that was the point of it.
+     */
+    public static final class IndexSnapshot {
+        private final String key;
+        private final List<String> columns;
+        private final String table;
+        private final Boolean unique;
+        private final String where;
+        private final String method;
+        private final Map<String, String> reloptions;
+        private final List<String> columnOptions;
+        private final List<String> includeColumns;
+        private final Boolean nullsNotDistinct;
+
+        IndexSnapshot(String key, List<String> columns, String table, Boolean unique, String where,
+                      String method, Map<String, String> reloptions, List<String> columnOptions,
+                      List<String> includeColumns, Boolean nullsNotDistinct) {
+            this.key = key;
+            this.columns = columns;
+            this.table = table;
+            this.unique = unique;
+            this.where = where;
+            this.method = method;
+            this.reloptions = reloptions;
+            this.columnOptions = columnOptions;
+            this.includeColumns = includeColumns;
+            this.nullsNotDistinct = nullsNotDistinct;
+        }
+    }
+
+    /** What a drop is about to take away, or null where no index answers to the name. */
+    public IndexSnapshot snapshotIndex(String name) {
+        String key = ixKey(name);
+        List<String> columns = indexColumns.get(key);
+        if (columns == null) return null;
+        return new IndexSnapshot(key, columns, indexTableNames.get(key), indexUniqueFlags.get(key),
+                indexWhereClauses.get(key), indexMethods.get(key), indexReloptions.get(key),
+                indexColumnOptions.get(key), indexIncludeColumns.get(key),
+                indexNullsNotDistinct.get(key));
+    }
+
+    /** Puts an index back exactly as it stood, for a drop that has been rolled back. */
+    public void restoreIndex(IndexSnapshot snapshot) {
+        if (snapshot == null) return;
+        indexColumns.put(snapshot.key, snapshot.columns);
+        if (snapshot.table != null) indexTableNames.put(snapshot.key, snapshot.table);
+        if (snapshot.unique != null) indexUniqueFlags.put(snapshot.key, snapshot.unique);
+        if (snapshot.where != null) indexWhereClauses.put(snapshot.key, snapshot.where);
+        if (snapshot.method != null) indexMethods.put(snapshot.key, snapshot.method);
+        if (snapshot.reloptions != null) indexReloptions.put(snapshot.key, snapshot.reloptions);
+        if (snapshot.columnOptions != null) {
+            indexColumnOptions.put(snapshot.key, snapshot.columnOptions);
+        }
+        if (snapshot.includeColumns != null) {
+            indexIncludeColumns.put(snapshot.key, snapshot.includeColumns);
+        }
+        if (snapshot.nullsNotDistinct != null) {
+            indexNullsNotDistinct.put(snapshot.key, snapshot.nullsNotDistinct);
+        }
+    }
+
     private void removeIndexKey(String key) {
         indexColumns.remove(key);
         indexTableNames.remove(key);
@@ -3433,9 +3508,12 @@ public class Database {
                         // The session that completes the cycle (the last to arrive) is always the
                         // victim — this matches PG's behavior where the deadlock detector aborts
                         // the waiter that triggers detection.
+                        // PostgreSQL in fact refuses the session that has been waiting longest,
+                        // measured on PG 18; the order the waits began in is kept only for waits
+                        // for a row, so a cycle of advisory waits is still decided by arrival.
                         waitingFor.put(session, blocker);
-                        if (advisoryDeadlockVictim(session, blocker) != null) {
-                            waitingFor.remove(session);
+                        if (isDeadlockVictim(session, blocker)) {
+                            noteNotWaiting(session);
                             throw new MemgresException("deadlock detected", "40P01");
                         }
                     }
@@ -3452,7 +3530,7 @@ public class Database {
                     }
                 }
             } finally {
-                if (session != null) waitingFor.remove(session);
+                if (session != null) noteNotWaiting(session);
             }
         }
     }
@@ -3581,26 +3659,6 @@ public class Database {
     }
 
     /**
-     * Walks the wait-for chain starting at {@code blocker}. If it cycles back to
-     * {@code requester} (a deadlock), returns the requester (non-null signals deadlock).
-     * Returns null when there is no deadlock involving {@code requester}.
-     */
-    private Session advisoryDeadlockVictim(Session requester, Session blocker) {
-        Set<Session> visited = new HashSet<>();
-        Session current = blocker;
-        while (current != null) {
-            if (current == requester) return requester;
-            if (!visited.add(current)) return null; // cycle that does not involve the requester
-            current = waitingFor.get(current);
-        }
-        return null;
-    }
-
-    /**
-     * Checks whether following the wait-for chain starting at {@code blocker} eventually leads back to
-     * {@code requester}, indicating a deadlock cycle.
-     */
-    /**
      * Wait for another session's in-flight write to settle, without holding any table lock.
      *
      * <p>A uniqueness check cannot decide anything about a row another session has inserted but
@@ -3618,7 +3676,7 @@ public class Database {
         if (waiter == null || blocker == null) return;
         long timeoutMs = lockWaitBudget(waiter);
         long deadline = timeoutMs == Long.MAX_VALUE ? Long.MAX_VALUE : System.currentTimeMillis() + timeoutMs;
-        waitingFor.put(waiter, blocker);
+        noteWaiting(waiter, blocker);
         try {
             while (stillBlocked.getAsBoolean()) {
                 // A transaction that can no longer commit anything cannot make its write
@@ -3628,7 +3686,7 @@ public class Database {
                 // the row is still in the way: returning here for a blocker they still count
                 // turns their retry loop into a spin that no cancel can reach.
                 if (blocker.isDoomed() || !blocker.isInTransaction()) return;
-                if (hasDeadlock(waiter, blocker)) {
+                if (isDeadlockVictim(waiter, blocker)) {
                     throw new MemgresException("deadlock detected", "40P01");
                 }
                 StatementCancel.check();
@@ -3643,19 +3701,55 @@ public class Database {
                 }
             }
         } finally {
-            waitingFor.remove(waiter);
+            noteNotWaiting(waiter);
         }
     }
 
-    private boolean hasDeadlock(Session requester, Session blocker) {
-        Set<Session> visited = new HashSet<>();
+    /** Record that a session is waiting for another, keeping the order the waits began in. */
+    private void noteWaiting(Session waiter, Session blocker) {
+        if (waiter == null) return;
+        waitingFor.put(waiter, blocker);
+        waitingSince.putIfAbsent(waiter, waitSeq.incrementAndGet());
+    }
+
+    /** Record that a session is no longer waiting. Every removal from the graph goes through here. */
+    private void noteNotWaiting(Session waiter) {
+        if (waiter == null) return;
+        waitingFor.remove(waiter);
+        waitingSince.remove(waiter);
+    }
+
+    /**
+     * Whether the session about to wait is the one the deadlock it would close is reported to.
+     *
+     * <p>False when waiting for {@code blocker} closes no cycle at all, and false when the cycle
+     * holds a session that has been waiting for a row longer than this one. Every backend that
+     * waits arms a {@code deadlock_timeout} of its own, so the one that has been waiting longest
+     * is the one whose timer fires first, runs the detector and is refused; the others are left to
+     * carry on once it has released what it held. Measured on PostgreSQL 18 with two sessions
+     * deadlocking over two rows, either way round: the session that began waiting first is the one
+     * told "deadlock detected", and the other's statement finishes the moment it is.
+     *
+     * <p>A cycle holding a wait whose order is not kept -- for a table or an advisory lock -- is
+     * reported to the session that closes it, which is what every deadlock here was reported to
+     * before rows were told apart.
+     */
+    private boolean isDeadlockVictim(Session requester, Session blocker) {
+        Set<Session> cycle = new HashSet<>();
         Session current = blocker;
-        while (current != null) {
-            if (current == requester) return true;
-            if (!visited.add(current)) return false; // a cycle this session is not part of
+        while (current != null && current != requester) {
+            if (!cycle.add(current)) return false; // a cycle this session is not part of
             current = waitingFor.get(current);
         }
-        return false;
+        if (current == null) return false; // no cycle: the chain ends at a session that is running
+        Long mine = waitingSince.get(requester);
+        if (mine == null) return true;
+        for (Session other : cycle) {
+            Long theirs = waitingSince.get(other);
+            if (theirs == null) return true;
+            if (theirs < mine) return false;
+        }
+        return true;
     }
 
     /**
@@ -3691,27 +3785,28 @@ public class Database {
                     }
                     entries.removeIf(e -> e.session == session);
                     entries.add(new LockEntry(session, mode, rowLockSeq.incrementAndGet()));
-                    waitingFor.remove(session); // no longer waiting
+                    noteNotWaiting(session); // no longer waiting
                     return;
                 }
             }
-            // Lock not available; check for deadlock before waiting
-            if (hasDeadlock(session, blocker)) {
-                waitingFor.remove(session);
+            // Register that this session is waiting for the blocker, and only then ask whether the
+            // wait closes a cycle: which session a deadlock is reported to is decided from how long
+            // each of them has been waiting, so this one has to stand in the graph to be weighed.
+            noteWaiting(session, blocker);
+            if (isDeadlockVictim(session, blocker)) {
+                noteNotWaiting(session);
                 throw new MemgresException("deadlock detected", "40P01");
             }
-            // Register that this session is waiting for the blocker
-            waitingFor.put(session, blocker);
 
             // Check cancellation and timeout
             try {
                 StatementCancel.check();
             } catch (RuntimeException e) {
-                waitingFor.remove(session);
+                noteNotWaiting(session);
                 throw e;
             }
             if (System.currentTimeMillis() >= deadline) {
-                waitingFor.remove(session);
+                noteNotWaiting(session);
                 throw new MemgresException("canceling statement due to lock timeout", "55P03");
             }
 
@@ -3720,7 +3815,7 @@ public class Database {
                 Thread.sleep(pollMs);
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
-                waitingFor.remove(session);
+                noteNotWaiting(session);
                 throw StatementCancel.canceled();
             }
         }
@@ -3745,8 +3840,15 @@ public class Database {
             }
         }
         // Clean up any wait-for entries involving this session
-        waitingFor.remove(session);
-        waitingFor.entrySet().removeIf(e -> e.getValue() == session);
+        noteNotWaiting(session);
+        for (Iterator<Map.Entry<Session, Session>> it = waitingFor.entrySet().iterator();
+                it.hasNext(); ) {
+            Map.Entry<Session, Session> waiting = it.next();
+            if (waiting.getValue() == session) {
+                waitingSince.remove(waiting.getKey());
+                it.remove();
+            }
+        }
     }
 
     /**

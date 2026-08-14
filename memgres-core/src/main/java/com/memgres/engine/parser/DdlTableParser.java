@@ -133,7 +133,15 @@ class DdlTableParser {
 
         // PARTITION OF parent FOR VALUES ...
         if (parser.matchKeywords("PARTITION", "OF")) {
+            // The parent is an ordinary relation reference and may be written under a schema.
+            // Reading only the first name took the qualifier for the whole of it, and a partition
+            // of a table outside the current schema went looking for a relation named after it.
+            String parentSchema = null;
             String parentName = parser.readIdentifier();
+            if (parser.match(TokenType.DOT)) {
+                parentSchema = parentName;
+                parentName = parser.readIdentifier();
+            }
             List<String> bounds = new ArrayList<>();
             if (parser.matchKeyword("DEFAULT")) {
                 bounds.add("DEFAULT");
@@ -187,8 +195,10 @@ class DdlTableParser {
                 subPartCol = subPartColBuf.toString();
                 parser.expect(TokenType.RIGHT_PAREN);
             }
-            return new CreateTableStmt(schema, name, ifNotExists, temporary,
+            CreateTableStmt partition = new CreateTableStmt(schema, name, ifNotExists, temporary,
                     Cols.listOf(), Cols.listOf(), null, subPartBy, subPartCol, parentName, bounds);
+            partition.setPartitionOfParentSchema(parentSchema);
+            return partition;
         }
 
         parser.expect(TokenType.LEFT_PAREN);
@@ -248,11 +258,23 @@ class DdlTableParser {
         parser.expect(TokenType.RIGHT_PAREN);
 
         List<String> inherits = null;
+        // The schema each parent was written under, one entry per parent and null where the name
+        // was written bare. A parent is an ordinary relation reference, so each of them may carry
+        // a qualifier -- and the list would not parse at all without reading one.
+        List<String> inheritsSchemas = null;
         if (parser.matchKeyword("INHERITS")) {
             parser.expect(TokenType.LEFT_PAREN);
             inherits = new ArrayList<>();
+            inheritsSchemas = new ArrayList<>();
             do {
-                inherits.add(parser.readIdentifier());
+                String parentSchema = null;
+                String parentName = parser.readIdentifier();
+                if (parser.match(TokenType.DOT)) {
+                    parentSchema = parentName;
+                    parentName = parser.readIdentifier();
+                }
+                inherits.add(parentName);
+                inheritsSchemas.add(parentSchema);
             } while (parser.match(TokenType.COMMA));
             parser.expect(TokenType.RIGHT_PAREN);
         }
@@ -310,9 +332,11 @@ class DdlTableParser {
             }
         }
 
-        return new CreateTableStmt(schema, name, ifNotExists, temporary, unlogged, columns, constraints,
-                inherits, partitionBy, partitionCol, null, null,
+        CreateTableStmt created = new CreateTableStmt(schema, name, ifNotExists, temporary, unlogged,
+                columns, constraints, inherits, partitionBy, partitionCol, null, null,
                 likeTables.isEmpty() ? null : likeTables, onCommitAction, withOptions);
+        created.setInheritsSchemas(inheritsSchemas);
+        return created;
     }
 
     boolean isTableConstraintStart() {
@@ -1277,11 +1301,19 @@ class DdlTableParser {
      * is the pair the element has already spent, so {@code (SELECT ...)} written as a key stops at
      * the word that opens the query, and only {@code ((SELECT ...))} reaches the analysis that
      * refuses a sub-query in a partition key for what it is.
+     *
+     * <p>VALUES opens a query too, but it is also a word PostgreSQL's grammar reads as a name
+     * wherever a column may stand, so an element beginning with it is a column reference and the
+     * parenthesis after it is what has nowhere to go: a name is not something that may be called.
      */
     private void rejectQueryAsPartitionElement() {
         Token t = parser.peek();
         if (t.type() == TokenType.KEYWORD && QUERY_OPENING_WORDS.contains(t.value())) {
             throw ParseException.at(t);
+        }
+        if (t.type() == TokenType.KEYWORD && "VALUES".equals(t.value())
+                && parser.peekAt(1).type() == TokenType.LEFT_PAREN) {
+            throw ParseException.at(parser.peekAt(1));
         }
     }
 
@@ -1300,6 +1332,13 @@ class DdlTableParser {
             int depth = 1;
             while (!parser.isAtEnd() && depth > 0) {
                 Token t = parser.peek();
+                // One key element is one expression. A comma standing directly inside the element's
+                // own parentheses separates nothing -- PostgreSQL's grammar has no list there and
+                // stops at the comma -- while one further in belongs to a call's argument list and
+                // is read as part of the expression.
+                if (t.type() == TokenType.COMMA && depth == 1) {
+                    throw new MemgresException("syntax error at or near \",\"", "42601");
+                }
                 if (t.type() == TokenType.LEFT_PAREN) depth++;
                 if (t.type() == TokenType.RIGHT_PAREN) {
                     depth--;

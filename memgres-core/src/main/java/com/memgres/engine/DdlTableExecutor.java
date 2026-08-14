@@ -128,9 +128,15 @@ class DdlTableExecutor {
             // constraint per name — so two parents may contribute the same name only when they
             // mean the same thing, or one of the two rules is silently lost.
             Map<String, String> inheritedChecks = new LinkedHashMap<>();
-            for (String parentName : stmt.inherits()) {
-                Table parent = executor.resolveTable(schemaName, parentName);
-                if (!seenParents.add(parent.getName().toLowerCase())) {
+            for (int parentIdx = 0; parentIdx < stmt.inherits().size(); parentIdx++) {
+                String parentName = stmt.inherits().get(parentIdx);
+                Table parent = resolveParentRelation(
+                        stmt.inheritsSchema(parentIdx), parentName, schemaName);
+                // The same relation twice is what PostgreSQL refuses, and two relations of one
+                // name in two schemas are not that: keying on the bare name turned a child of
+                // a.t and b.t away, though its columns merge like any other pair of parents'.
+                if (!seenParents.add(parent.getSchemaName().toLowerCase()
+                        + "." + parent.getName().toLowerCase())) {
                     throw new MemgresException("relation \"" + parentName
                             + "\" would be inherited from more than once", "42P07");
                 }
@@ -398,6 +404,9 @@ class DdlTableExecutor {
                 Sequence seq = buildIdentitySequence(def, dataType, seqName, seqSchema, stmt.name());
                 executor.database.addSequence(seq);
                 executor.database.registerSchemaObject(seqSchema, "sequence", seqName);
+                // PostgreSQL writes the sequence's pg_class row before the table's own, so it is
+                // numbered here rather than left to whenever a catalog query first asked about it.
+                executor.identity().relationCreated(seqSchema, seqName);
                 if (def.identityOptionsWritten()) {
                     if (dataType != DataType.BIGINT && dataType != DataType.INTEGER && dataType != DataType.SMALLINT) {
                         dataType = DataType.INTEGER;
@@ -431,6 +440,10 @@ class DdlTableExecutor {
                 seq.ownedBy(stmt.name(), def.name(), true);
                 executor.database.addSequence(seq);
                 executor.database.registerSchemaObject(schemaName, "sequence", seqName);
+                // Numbered here for the same reason an identity column's is: PostgreSQL writes the
+                // sequence's pg_class row before the table's, so a serial's sequence takes the
+                // lower OID of the two.
+                executor.identity().relationCreated(schemaName, seqName);
                 defaultVal = "nextval('" + seqName + "'::regclass)";
                 notNull = true;
             }
@@ -678,13 +691,12 @@ class DdlTableExecutor {
                     String trimmed = col.trim();
                     if (trimmed.contains("(")) analysePartitionKeyExpression(trimmed, table);
                 }
+                StringBuilder keysAsStored = new StringBuilder();
                 for (String col : partKeys) {
                     String trimmed = col.trim();
-                    // An expression key decides which partition a row lives in, so it has to
-                    // give the same answer every time it is asked. A volatile or stable one
-                    // may route a row to one partition on INSERT and look for it in another.
+                    if (keysAsStored.length() > 0) keysAsStored.append(", ");
                     if (trimmed.contains("(")) {
-                        checkPartitionKeyExpression(trimmed, columns, table);
+                        keysAsStored.append(expressionKeyAsStored(trimmed, columns, table));
                         continue;
                     }
                     // Every relation carries the system columns whether or not the definition
@@ -699,7 +711,9 @@ class DdlTableExecutor {
                         throw new MemgresException("column \"" + trimmed + "\" named in partition key does not exist", "42703");
                     }
                     rejectGeneratedPartitionKeyColumn(table, trimmed);
+                    keysAsStored.append(trimmed);
                 }
+                partCol = keysAsStored.toString();
             }
             table.setPartitionColumn(partCol);
         }
@@ -1058,8 +1072,23 @@ class DdlTableExecutor {
         }
     }
 
+    /**
+     * The relation a CREATE TABLE names as a parent -- the PARTITION OF parent, or one of the
+     * INHERITS list. A written qualifier names the one schema to look in; without one the name is
+     * resolved along the search path, the way every other relation reference is. A qualifier
+     * naming no schema is the schema's own complaint, as it is in every DDL statement that
+     * resolves the schema before it looks for the relation.
+     */
+    private Table resolveParentRelation(String writtenSchema, String parentName, String schemaName) {
+        if (writtenSchema == null) return executor.resolveTable(schemaName, parentName);
+        SchemaQualifier.requireSchema(executor.database, executor.session, writtenSchema);
+        return executor.resolveTable(
+                SchemaQualifier.resolveAlias(executor.session, writtenSchema), parentName, true);
+    }
+
     private QueryResult createPartitionOfTable(CreateTableStmt stmt, Schema schema, String schemaName) {
-        Table parent = executor.resolveTable(schemaName, stmt.partitionOfParent());
+        Table parent = resolveParentRelation(
+                stmt.partitionOfParentSchema(), stmt.partitionOfParent(), schemaName);
         // A table with no partition key has no slots to attach to, so a bound over it describes
         // nothing; accepting it produces a table that holds rows nothing ever routes to.
         if (parent.getPartitionStrategy() == null) {
@@ -1128,8 +1157,9 @@ class DdlTableExecutor {
         // An index on a partitioned table is a rule about the whole hierarchy, so a partition
         // created after it gets its own copy -- the copy CREATE INDEX itself makes for the
         // partitions that already exist. Without this the index reached only the partitions that
-        // happened to be declared first.
-        copyParentIndexes(parent, partition, schemaName, schemaName);
+        // happened to be declared first. The indexes are looked up under the schema the
+        // partitioned table itself lives in, which is not always the one the partition goes into.
+        copyParentIndexes(parent, partition, parent.getSchemaName(), schemaName);
         executor.recordUndo(new Session.CreateTableUndo(schemaName, stmt.name()));
         if (executor.session != null) {
             executor.session.noteCatalogRowsWritten(
@@ -1741,6 +1771,53 @@ class DdlTableExecutor {
     }
 
     /**
+     * What a key element written in parentheses of its own is stored as, once it has been
+     * analysed.
+     *
+     * <p>PostgreSQL reads such an element as an expression and then looks at what the expression
+     * came to. A plain column reference is put back as the column it names — {@code ((i))}
+     * partitions on {@code i}, and pg_get_partkeydef reads the key back as {@code i} — which is
+     * also why a generated column written this way stands where the same column written bare is
+     * refused: the refusal belongs to the path that reads a key element as a name, and an element
+     * in parentheses never takes it. A name no column answers to but the relation itself does is a
+     * reference to the whole row, which stays an expression and is read back as {@code (t.*)}.
+     */
+    private String expressionKeyAsStored(String keyText, List<Column> columns, Table table) {
+        ColumnRef name = parenthesisedKeyName(keyText);
+        int named = name == null ? -1 : table.getColumnIndex(name.column());
+        if (named >= 0) return table.getColumns().get(named).getName();
+        // An expression key decides which partition a row lives in, so it has to give the same
+        // answer every time it is asked. A volatile or stable one may route a row to one
+        // partition on INSERT and look for it in another.
+        checkPartitionKeyExpression(keyText, columns, table);
+        return name != null && isWholeRowReference(name, table)
+                ? "(" + table.getName() + ".*)" : keyText;
+    }
+
+    /** The bare, unqualified name a key element holds, or null where it holds anything else. */
+    private ColumnRef parenthesisedKeyName(String keyText) {
+        Expression keyExpr;
+        try {
+            keyExpr = com.memgres.engine.parser.Parser.parseExpression(keyText);
+        } catch (RuntimeException notAnExpression) {
+            return null; // whatever reads it next reports it
+        }
+        if (!(keyExpr instanceof ColumnRef)) return null;
+        ColumnRef ref = (ColumnRef) keyExpr;
+        return ref.table() == null ? ref : null;
+    }
+
+    /**
+     * Whether a bare name in a key stands for the whole row rather than for a column. PostgreSQL
+     * resolves a name as a column first and as the relation only when no column answers to it, so
+     * a relation a column of its own is named after is partitioned on that column.
+     */
+    private static boolean isWholeRowReference(ColumnRef ref, Table table) {
+        return ref.table() == null && table.getColumnIndex(ref.column()) < 0
+                && table.getName().equalsIgnoreCase(ref.column());
+    }
+
+    /**
      * What PostgreSQL settles about a key expression while it is still analysing the statement,
      * before it has looked at any key against the relation: the names it holds and the calls that
      * may not stand in something evaluated for one row with no query around it.
@@ -1763,7 +1840,11 @@ class DdlTableExecutor {
         });
     }
 
-    /** A key expression reads the row it routes, so every name in it has to be a column. */
+    /**
+     * A key expression reads the row it routes, so every name in it has to be something that row
+     * supplies: one of the relation's columns, or the relation itself, which stands for the row
+     * as a whole.
+     */
     private void rejectUnknownPartitionKeyColumn(Object node, Table table) {
         if (!(node instanceof ColumnRef)) return;
         ColumnRef ref = (ColumnRef) node;
@@ -1771,6 +1852,7 @@ class DdlTableExecutor {
         // A system column resolves like any other, and is refused for being one rather than
         // for not being there.
         if (DdlDefinitionChecks.isSystemColumnName(ref.column())) return;
+        if (isWholeRowReference(ref, table)) return;
         if (table.getColumnIndex(ref.column()) < 0) {
             throw new MemgresException("column \"" + ref.column() + "\" does not exist", "42703");
         }
@@ -2412,6 +2494,16 @@ class DdlTableExecutor {
                     }
                 }
                 if (!belongsHere) continue;
+                // A sequence taken away with its table has to come back with it. DDL is
+                // transactional, so a rolled-back DROP never happened: without a record of its own
+                // the table came back alone, and the serial column's default was left calling
+                // nextval() on a sequence nothing answered to -- every INSERT that relied on the
+                // default then failed the column's NOT NULL.
+                String registeredIn = executor.database.getSchemaObjects(owned.getSchemaName())
+                        .contains("sequence:" + owned.getName().toLowerCase())
+                                ? owned.getSchemaName() : null;
+                executor.recordUndo(new Session.DropSequenceUndo(owned.qualifiedName(), owned,
+                        registeredIn, executor.database.getObjectOwner("sequence:" + owned.getName())));
                 executor.database.removeSequence(owned.getSchemaName(), owned.getName());
                 executor.database.unregisterSchemaObject(owned.getSchemaName(), "sequence", owned.getName());
                 executor.database.removeObjectOwner("sequence:" + owned.getName());

@@ -14,6 +14,7 @@ import com.memgres.engine.parser.ast.UnaryExpr;
 import com.memgres.engine.util.Cols;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.text.Collator;
 import java.util.ArrayList;
 import java.util.List;
@@ -43,6 +44,16 @@ import java.util.Set;
  * and a disjunction is entailed only where every branch of it entails on its own. Anything the
  * proof cannot settle counts as unproved, so an index is left unreached rather than reached on a
  * guess.
+ *
+ * <p>Two constants are put in order the way their own type puts them: text by the collation, which
+ * reads {@code 'a'} before {@code 'A'} and both before {@code 'B'} where the codepoints read none
+ * of that, and a number by its value with the arithmetic over it worked out first, because the
+ * planner has worked it out before the proof ever sees the predicate — {@code i > 1 - 1} and
+ * {@code i > 0} are one predicate. The type each constant's spelling gives it is kept as well: a
+ * constant wider than the column makes the column the side that is cast to reach it, so
+ * {@code i > 0.5} over an integer column compares {@code i::numeric}, which is a different
+ * expression from the {@code i} an index built {@code WHERE i > 0} compares, and neither of them
+ * says anything about the other.
  */
 final class ArbiterPredicate {
 
@@ -73,8 +84,11 @@ final class ArbiterPredicate {
     /**
      * Whether an index carrying this predicate of its own is reached by the one written beside the
      * conflict target.
+     *
+     * @param table the relation both predicates read, whose column types settle which side of a
+     *              comparison the cast between two types falls on
      */
-    static boolean infers(Expression written, Expression indexPredicate) {
+    static boolean infers(Table table, Expression written, Expression indexPredicate) {
         if (indexPredicate == null) return true;
         if (written == null) return false;
         Expression clause = normalized(written);
@@ -85,7 +99,7 @@ final class ArbiterPredicate {
         for (int i = 0; i < clauses.size(); i++) {
             if (isFalse(clauses.get(i))) return false;
         }
-        return implies(clause, normalized(indexPredicate));
+        return implies(table, clause, normalized(indexPredicate));
     }
 
     /** Whether a unique index over these columns is the one the conflict target names. */
@@ -361,38 +375,38 @@ final class ArbiterPredicate {
     }
 
     /** Whether every row the clause holds for is a row the predicate holds for. */
-    private static boolean implies(Expression clause, Expression predicate) {
+    private static boolean implies(Table table, Expression clause, Expression predicate) {
         List<Expression> either = disjuncts(clause);
         if (either.size() > 1) {
             // A row a disjunction holds for is a row one of its branches holds for, and which one
             // is nowhere written down: the predicate follows only where each branch says it alone.
             for (int i = 0; i < either.size(); i++) {
-                if (!implies(either.get(i), predicate)) return false;
+                if (!implies(table, either.get(i), predicate)) return false;
             }
             return true;
         }
         List<Expression> parts = conjuncts(predicate);
         if (parts.size() > 1) {
             for (int i = 0; i < parts.size(); i++) {
-                if (!implies(clause, parts.get(i))) return false;
+                if (!implies(table, clause, parts.get(i))) return false;
             }
             return true;
         }
         List<Expression> alternatives = disjuncts(predicate);
         if (alternatives.size() > 1) {
             for (int i = 0; i < alternatives.size(); i++) {
-                if (implies(clause, alternatives.get(i))) return true;
+                if (implies(table, clause, alternatives.get(i))) return true;
             }
             return false;
         }
         List<Expression> given = conjuncts(clause);
         if (given.size() > 1) {
             for (int i = 0; i < given.size(); i++) {
-                if (implies(given.get(i), predicate)) return true;
+                if (implies(table, given.get(i), predicate)) return true;
             }
             return false;
         }
-        return proves(clause, predicate);
+        return proves(table, clause, predicate);
     }
 
     /** The names PostgreSQL declares strict, whose answer for a null argument is null. */
@@ -455,7 +469,7 @@ final class ArbiterPredicate {
     }
 
     /** Whether one clause on its own entails one part of the index's predicate. */
-    private static boolean proves(Expression clause, Expression predicate) {
+    private static boolean proves(Table table, Expression clause, Expression predicate) {
         if (sameExpression(clause, predicate)) return true;
         // A comparison answers nothing at all where its operand is null, so a row it holds for has
         // a value there: that is the whole proof of IS NOT NULL, which is the predicate a great
@@ -468,12 +482,13 @@ final class ArbiterPredicate {
         if (!(clause instanceof BinaryExpr) || !(predicate instanceof BinaryExpr)) return false;
         Comparison left = Comparison.of((BinaryExpr) clause);
         Comparison right = Comparison.of((BinaryExpr) predicate);
-        if (left == null || right == null || !sameExpression(left.subject, right.subject)) {
+        if (left == null || right == null || !sameExpression(left.subject, right.subject)
+                || !overOneExpression(table, left, right)) {
             return false;
         }
         int test = PROOF[left.strategy - 1][right.strategy - 1];
         if (test == 0) return false;
-        Integer order = compare(right.constant, left.constant);
+        Integer order = compare(right.constant.value, left.constant.value);
         if (order == null) return false;
         switch (test) {
             case LT: return order < 0;
@@ -488,10 +503,10 @@ final class ArbiterPredicate {
     /** One expression compared against one constant, whichever side each was written on. */
     private static final class Comparison {
         private final Expression subject;
-        private final Object constant;
+        private final Constant constant;
         private final int strategy;
 
-        private Comparison(Expression subject, Object constant, int strategy) {
+        private Comparison(Expression subject, Constant constant, int strategy) {
             this.subject = subject;
             this.constant = constant;
             this.strategy = strategy;
@@ -500,7 +515,7 @@ final class ArbiterPredicate {
         static Comparison of(BinaryExpr expr) {
             int strategy = strategyOf(expr.op());
             if (strategy == 0) return null;
-            Object constant = constantOf(expr.right());
+            Constant constant = constantOf(expr.right());
             if (constant != null && constantOf(expr.left()) == null) {
                 return new Comparison(expr.left(), constant, strategy);
             }
@@ -510,6 +525,94 @@ final class ArbiterPredicate {
             if (constant == null || constantOf(expr.right()) != null) return null;
             return new Comparison(expr.right(), constant, commuted(strategy));
         }
+    }
+
+    /** A value a comparison is written against, and how wide the type of its spelling is. */
+    private static final class Constant {
+        private final Object value;
+        private final int width;
+
+        private Constant(Object value, int width) {
+            this.value = value;
+            this.width = width;
+        }
+    }
+
+    /**
+     * How wide a type is among the numbers, which is what settles whether a comparison casts the
+     * column or the constant. A constant PostgreSQL reads as unknown — a string nobody named a type
+     * for — takes the type of whatever it is compared with and so is written below all of them, and
+     * a type that is no number at all cannot be placed beside another.
+     */
+    private static final int UNPLACED_TYPE = -2;
+    private static final int UNKNOWN_TYPE = -1;
+    private static final int INT_TYPE = 0;
+    private static final int NUMERIC_TYPE = 1;
+    private static final int FLOAT_TYPE = 2;
+
+    /**
+     * Whether the two comparisons are written over one expression once their types are settled.
+     * PostgreSQL reads a comparison with the operator its two sides resolve to, and where the
+     * constant is of a wider type than the column it is the column that is cast to reach it: an
+     * index built {@code WHERE i > 0} over an integer column compares {@code i}, a statement
+     * writing {@code i > 0.5} compares {@code i::numeric}, and neither is a bound on the other's
+     * expression. Where the column is the wider of the two the constant is what moves and both
+     * comparisons are over the column itself, which is why every integer bound proves about a
+     * numeric column and each of {@code smallint}, {@code integer} and {@code bigint} proves about
+     * an integer one.
+     */
+    private static boolean overOneExpression(Table table, Comparison left, Comparison right) {
+        if (left.constant.width == right.constant.width) return true;
+        int column = columnWidth(table, left.subject);
+        if (column == UNPLACED_TYPE) return false;
+        return Math.max(column, left.constant.width) == Math.max(column, right.constant.width);
+    }
+
+    /** How wide the column a comparison is written over is, or unplaced where this cannot say. */
+    private static int columnWidth(Table table, Expression subject) {
+        if (table == null || !(subject instanceof ColumnRef)) return UNPLACED_TYPE;
+        String name = ((ColumnRef) subject).column();
+        for (Column column : table.getColumns()) {
+            if (column.getName() != null && column.getName().equalsIgnoreCase(name)) {
+                return typeWidth(column.getType());
+            }
+        }
+        return UNPLACED_TYPE;
+    }
+
+    private static int typeWidth(DataType type) {
+        if (type == null) return UNPLACED_TYPE;
+        switch (type) {
+            case SMALLINT: case INTEGER: case BIGINT:
+            case SMALLSERIAL: case SERIAL: case BIGSERIAL:
+                return INT_TYPE;
+            case NUMERIC: return NUMERIC_TYPE;
+            case REAL: case DOUBLE_PRECISION: return FLOAT_TYPE;
+            default: return UNPLACED_TYPE;
+        }
+    }
+
+    /**
+     * How wide the type a cast names is. A cast to anything but a number is read as the unknown
+     * width: it casts no numeric column, and two constants carrying it stand beside one another
+     * exactly as two constants carrying none do.
+     */
+    private static int typeWidth(String typeName) {
+        if (typeName == null) return UNKNOWN_TYPE;
+        String name = typeName.trim().toLowerCase(Locale.ROOT);
+        int paren = name.indexOf('(');
+        if (paren >= 0) name = name.substring(0, paren).trim();
+        if (name.equals("smallint") || name.equals("int2") || name.equals("int")
+                || name.equals("integer") || name.equals("int4") || name.equals("bigint")
+                || name.equals("int8")) {
+            return INT_TYPE;
+        }
+        if (name.equals("numeric") || name.equals("decimal")) return NUMERIC_TYPE;
+        if (name.equals("real") || name.equals("float4") || name.equals("float")
+                || name.equals("double precision") || name.equals("float8")) {
+            return FLOAT_TYPE;
+        }
+        return UNKNOWN_TYPE;
     }
 
     private static int strategyOf(BinaryExpr.BinOp op) {
@@ -536,26 +639,113 @@ final class ArbiterPredicate {
 
     /**
      * The value an operand stands for without a row to read, or null where it stands for something
-     * only a row can settle. A cast is worked through because PostgreSQL folds one over a constant
-     * away before it ever compares two predicates.
+     * only a row can settle. Arithmetic over constants is worked out here because the planner has
+     * worked it out before the proof sees either predicate, and a cast is worked through because
+     * PostgreSQL folds one over a constant away in the same pass — but the type the cast names is
+     * kept, because that is what settles which side of the comparison a cast falls on.
      */
-    private static Object constantOf(Expression expr) {
-        if (expr instanceof CastExpr) return constantOf(((CastExpr) expr).expr());
+    private static Constant constantOf(Expression expr) {
+        if (expr instanceof CastExpr) {
+            CastExpr cast = (CastExpr) expr;
+            Constant inner = constantOf(cast.expr());
+            if (inner == null) return null;
+            int width = typeWidth(cast.typeName());
+            Object value = inner.value;
+            // A number narrowed to an integer type is rounded away from zero, as PostgreSQL rounds
+            // it, so the bound the comparison carries is the whole one it was narrowed to.
+            if (width == INT_TYPE && value instanceof BigDecimal) {
+                value = ((BigDecimal) value).setScale(0, RoundingMode.HALF_UP);
+            }
+            return new Constant(value, width);
+        }
         if (expr instanceof UnaryExpr) {
             UnaryExpr unary = (UnaryExpr) expr;
-            Object operand = constantOf(unary.operand());
-            if (!(operand instanceof BigDecimal)) return null;
-            if (unary.op() == UnaryExpr.UnaryOp.NEGATE) return ((BigDecimal) operand).negate();
+            Constant operand = constantOf(unary.operand());
+            if (operand == null || !(operand.value instanceof BigDecimal)) return null;
+            if (unary.op() == UnaryExpr.UnaryOp.NEGATE) {
+                return new Constant(((BigDecimal) operand.value).negate(), operand.width);
+            }
             return unary.op() == UnaryExpr.UnaryOp.POSITIVE ? operand : null;
         }
+        if (expr instanceof BinaryExpr) return folded((BinaryExpr) expr);
         if (!(expr instanceof Literal)) return null;
         Literal literal = (Literal) expr;
-        if (literal.literalType() == Literal.LiteralType.INTEGER
-                || literal.literalType() == Literal.LiteralType.FLOAT) {
-            return number(literal.value());
+        if (literal.literalType() == Literal.LiteralType.INTEGER) {
+            BigDecimal value = number(literal.value());
+            return value == null ? null : new Constant(value, INT_TYPE);
         }
-        return literal.literalType() == Literal.LiteralType.STRING ? literal.value() : null;
+        if (literal.literalType() == Literal.LiteralType.FLOAT) {
+            // A number written with a point or an exponent is numeric to PostgreSQL rather than a
+            // float, and numeric is wider than an integer column: it casts one.
+            BigDecimal value = number(literal.value());
+            return value == null ? null : new Constant(value, NUMERIC_TYPE);
+        }
+        return literal.literalType() == Literal.LiteralType.STRING
+                ? new Constant(literal.value(), UNKNOWN_TYPE) : null;
     }
+
+    /**
+     * The value an arithmetic expression over two constants stands for. Integers divide as integers
+     * and throw away what is left over, which is the answer PostgreSQL folds; a division of wider
+     * numbers that does not come out exactly is left unsettled rather than answered to a scale
+     * PostgreSQL did not pick, and so is one by zero, which is no constant at all.
+     */
+    private static Constant folded(BinaryExpr expr) {
+        Constant left = constantOf(expr.left());
+        Constant right = constantOf(expr.right());
+        if (left == null || right == null) return null;
+        if (!(left.value instanceof BigDecimal) || !(right.value instanceof BigDecimal)) return null;
+        if (left.width < INT_TYPE || right.width < INT_TYPE) return null;
+        BigDecimal one = (BigDecimal) left.value;
+        BigDecimal other = (BigDecimal) right.value;
+        int width = Math.max(left.width, right.width);
+        BigDecimal answer;
+        try {
+            switch (expr.op()) {
+                case ADD: answer = one.add(other); break;
+                case SUBTRACT: answer = one.subtract(other); break;
+                case MULTIPLY: answer = one.multiply(other); break;
+                case DIVIDE: answer = width == INT_TYPE
+                        ? one.divideToIntegralValue(other) : one.divide(other); break;
+                case MODULO: answer = one.remainder(other); break;
+                default: return null;
+            }
+        } catch (ArithmeticException e) {
+            return null;
+        }
+        return new Constant(withinItsType(one, other, answer, width), width);
+    }
+
+    /**
+     * The answer an integer fold came to, once it has been held to the width its operands had.
+     *
+     * <p>PostgreSQL works a constant out in the type its operands are, and an integer literal is as
+     * narrow as it fits: two that fit in an {@code integer} are added as integers, and a sum that
+     * does not fit is out of range rather than a step up to a wider type. Folding into a number
+     * with no width at all answered a predicate PostgreSQL never got as far as reading — it raises
+     * while it plans, before the arbiter is looked for — and a statement it refuses was accepted.
+     */
+    private static BigDecimal withinItsType(BigDecimal one, BigDecimal other, BigDecimal answer,
+                                            int width) {
+        if (width != INT_TYPE) return answer;
+        boolean wide = !fitsInteger(one) || !fitsInteger(other);
+        if (!wide && !fitsInteger(answer)) {
+            throw new MemgresException("integer out of range", "22003");
+        }
+        if (wide && answer.abs().compareTo(LONG_LIMIT) > 0) {
+            throw new MemgresException("bigint out of range", "22003");
+        }
+        return answer;
+    }
+
+    /** Whether a whole number is one an {@code integer} holds. */
+    private static boolean fitsInteger(BigDecimal value) {
+        return value.compareTo(INT_FLOOR) >= 0 && value.compareTo(INT_CEILING) <= 0;
+    }
+
+    private static final BigDecimal INT_FLOOR = BigDecimal.valueOf(Integer.MIN_VALUE);
+    private static final BigDecimal INT_CEILING = BigDecimal.valueOf(Integer.MAX_VALUE);
+    private static final BigDecimal LONG_LIMIT = BigDecimal.valueOf(Long.MAX_VALUE);
 
     /** Which of two constants is the greater, or null where nothing here can say. */
     private static Integer compare(Object left, Object right) {
@@ -564,18 +754,33 @@ final class ArbiterPredicate {
         }
         if (left instanceof String && right instanceof String) {
             if (left.equals(right)) return Integer.valueOf(0);
-            // Which of two texts is the greater is the collation's answer, and the predicate names
-            // no collation for this to read: where the orderings it can put them in disagree the
-            // server's own is not among the ones that were asked, so the bound is left unproved
-            // rather than settled by whichever of them answered first.
-            int bytes = ((String) left).compareTo((String) right);
+            // Which of two texts is the greater is the collation's answer, and the collation this
+            // sorts by is a linguistic one: it reads a letter beside the other case of itself and
+            // both before the next letter, so 'a' comes before 'A' and both before 'B', which is
+            // no order the codepoints are in. PostgreSQL falls back on the codepoints only where
+            // the collation calls two spellings alike, which is what keeps its ordering total.
             int words = Collator.getInstance(Locale.ROOT).compare(left, right);
-            if (bytes == 0 || words == 0 || (bytes < 0) != (words < 0)) return null;
+            int bytes = ((String) left).compareTo((String) right);
+            if (lettersAndDigits((String) left) && lettersAndDigits((String) right)) {
+                return Integer.valueOf(words != 0 ? words : bytes);
+            }
+            // Collations agree about letters and digits and part company over what a space or a
+            // punctuation mark weighs, so a text carrying one of those is settled only where the
+            // codepoints answer as the collation did, and is left unproved where they do not.
+            if (words == 0 || (bytes < 0) != (words < 0)) return null;
             return Integer.valueOf(bytes < 0 ? -1 : 1);
         }
         BigDecimal one = left instanceof BigDecimal ? (BigDecimal) left : number((String) left);
         BigDecimal other = right instanceof BigDecimal ? (BigDecimal) right : number((String) right);
         return one == null || other == null ? null : Integer.valueOf(one.compareTo(other));
+    }
+
+    /** Whether a text is made of nothing but letters and digits, which every collation agrees on. */
+    private static boolean lettersAndDigits(String text) {
+        for (int i = 0; i < text.length(); i++) {
+            if (!Character.isLetterOrDigit(text.charAt(i))) return false;
+        }
+        return true;
     }
 
     private static BigDecimal number(String text) {

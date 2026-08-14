@@ -421,7 +421,7 @@ public final class TypeCoercion {
         // away the bounds and the element type, so everything read back out of it was a string.
         if (DataType.isArrayType(type)) {
             PgArray array = PgArray.from(value);
-            if (array != null) return coerceArrayElements(array, DataType.elementOf(type));
+            if (array != null) return coerceArrayElements(array, DataType.elementOf(type), column);
         }
 
         // If value is already the right Java type, no conversion needed
@@ -472,17 +472,38 @@ public final class TypeCoercion {
      * An element the element type refuses is refused here rather than stored as its own spelling.
      */
     static PgArray coerceArrayElements(PgArray array, DataType elementType) {
+        return coerceArrayElements(array, elementType, null);
+    }
+
+    /**
+     * As above, and every element held to the width the column declared as well.
+     *
+     * <p>A modifier written on an array belongs to the elements: varchar(4)[] is an array of
+     * varchar(4), and PostgreSQL holds each element to the four characters exactly as it holds a
+     * scalar column's value to them. Asking the array type for a width found none -- an array type
+     * has no modifier of its own -- so a four-character column took a seven-character element and
+     * kept it.
+     */
+    static PgArray coerceArrayElements(PgArray array, DataType elementType, Column column) {
         if (elementType == null) return array;
-        List<Object> coerced = coerceElementList(array, elementType);
+        // A column that declared no width bounds nothing, and asking is what makes every array
+        // column that has none behave exactly as it did.
+        Column width = column != null && column.getPrecision() != null ? column : null;
+        List<Object> coerced = coerceElementList(array, elementType, width);
         return PgArray.of(coerced, array.lowerBounds(), elementType.getPgName());
     }
 
-    private static List<Object> coerceElementList(List<?> elements, DataType elementType) {
+    private static List<Object> coerceElementList(List<?> elements, DataType elementType,
+                                                  Column width) {
         List<Object> out = new ArrayList<Object>(elements.size());
         for (Object element : elements) {
             if (element == null) out.add(null);
-            else if (element instanceof List<?>) out.add(coerceElementList((List<?>) element, elementType));
-            else out.add(coerce(element, elementType));
+            else if (element instanceof List<?>) {
+                out.add(coerceElementList((List<?>) element, elementType, width));
+            } else {
+                Object one = coerce(element, elementType);
+                out.add(width == null ? one : applyPrecision(one, elementType, width));
+            }
         }
         return out;
     }
