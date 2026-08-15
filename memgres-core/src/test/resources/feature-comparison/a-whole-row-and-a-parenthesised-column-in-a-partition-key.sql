@@ -172,73 +172,6 @@ CREATE TABLE zzt4a_n (i int, k int) PARTITION BY RANGE ((zzt4a_nosuch));
 -- ============================================================================
 -- A parenthesised column reduces to the column
 -- ============================================================================
-CREATE TABLE zzt4a_ga (i int, k int GENERATED ALWAYS AS (i * 2) STORED)
-  PARTITION BY RANGE ((k));
-
--- begin-expected
--- columns: d
--- row: RANGE (k)
--- end-expected
-SELECT pg_get_partkeydef('zzt4a_ga'::regclass) AS d;
-
--- begin-expected
--- columns: strat | natts | attrs
--- row: r | 1 | 2
--- end-expected
-SELECT partstrat AS strat, partnatts AS natts, partattrs::text AS attrs
-  FROM pg_partitioned_table WHERE partrelid = 'zzt4a_ga'::regclass;
-
-DROP TABLE zzt4a_ga;
-
--- A virtual generated column behaves exactly as a stored one does.
-CREATE TABLE zzt4a_gb (i int, k int GENERATED ALWAYS AS (i * 2) VIRTUAL)
-  PARTITION BY LIST ((k));
-
--- begin-expected
--- columns: d
--- row: LIST (k)
--- end-expected
-SELECT pg_get_partkeydef('zzt4a_gb'::regclass) AS d;
-
--- begin-expected
--- columns: strat | natts | attrs
--- row: l | 1 | 2
--- end-expected
-SELECT partstrat AS strat, partnatts AS natts, partattrs::text AS attrs
-  FROM pg_partitioned_table WHERE partrelid = 'zzt4a_gb'::regclass;
-
-DROP TABLE zzt4a_gb;
-
-CREATE TABLE zzt4a_gc (i int, k int GENERATED ALWAYS AS (i * 2) STORED)
-  PARTITION BY HASH ((k));
-
--- begin-expected
--- columns: d
--- row: HASH (k)
--- end-expected
-SELECT pg_get_partkeydef('zzt4a_gc'::regclass) AS d;
-
-DROP TABLE zzt4a_gc;
-
--- In company, and the reduction happens for an ordinary column too.
-CREATE TABLE zzt4a_gg (i int, k int GENERATED ALWAYS AS (i * 2) STORED)
-  PARTITION BY RANGE (i, (k));
-
--- begin-expected
--- columns: d
--- row: RANGE (i, k)
--- end-expected
-SELECT pg_get_partkeydef('zzt4a_gg'::regclass) AS d;
-
--- begin-expected
--- columns: strat | natts | attrs
--- row: r | 2 | 1 2
--- end-expected
-SELECT partstrat AS strat, partnatts AS natts, partattrs::text AS attrs
-  FROM pg_partitioned_table WHERE partrelid = 'zzt4a_gg'::regclass;
-
-DROP TABLE zzt4a_gg;
-
 CREATE TABLE zzt4a_gh (i int, k int) PARTITION BY RANGE ((i));
 
 -- begin-expected
@@ -291,29 +224,37 @@ CREATE TABLE zzt4a_ge (i int, k int GENERATED ALWAYS AS (i * 2) VIRTUAL)
 CREATE TABLE zzt4a_gf (i int, k int GENERATED ALWAYS AS (i * 2) STORED)
   PARTITION BY RANGE ((k + 1));
 
--- ----------------------------------------------------------------------------
--- The row is routed before the generated column is worked out, which is what
--- the refusal above is about: keyed on one, no row can be placed at all
--- ----------------------------------------------------------------------------
-CREATE TABLE zzt4a_gj (i int, k int GENERATED ALWAYS AS (i * 2) STORED)
-  PARTITION BY RANGE ((k));
-CREATE TABLE zzt4a_gj_0 PARTITION OF zzt4a_gj FOR VALUES FROM (0) TO (10);
-
--- i * 2 is 6, which is inside the partition's bounds, and the row is still
--- turned away: at routing time the key has no value yet.
+-- The parentheses decide nothing. An element that comes back to a plain column
+-- is that column, and a generated one is refused whichever way it was written,
+-- under every strategy, and stored or virtual alike.
 -- begin-expected-error
--- sqlstate: 23514
--- message-like: no partition of relation "zzt4a_gj" found for row
+-- sqlstate: 42P17
+-- message-like: cannot use generated column in partition key
 -- end-expected-error
-INSERT INTO zzt4a_gj (i) VALUES (3);
+CREATE TABLE zzt4a_ga (i int, k int GENERATED ALWAYS AS (i * 2) STORED)
+  PARTITION BY RANGE ((k));
 
--- begin-expected
--- columns: n
--- row: 0
--- end-expected
-SELECT count(*)::int AS n FROM zzt4a_gj;
+-- begin-expected-error
+-- sqlstate: 42P17
+-- message-like: cannot use generated column in partition key
+-- end-expected-error
+CREATE TABLE zzt4a_gb (i int, k int GENERATED ALWAYS AS (i * 2) VIRTUAL)
+  PARTITION BY LIST ((k));
 
-DROP TABLE zzt4a_gj;
+-- begin-expected-error
+-- sqlstate: 42P17
+-- message-like: cannot use generated column in partition key
+-- end-expected-error
+CREATE TABLE zzt4a_gc (i int, k int GENERATED ALWAYS AS (i * 2) STORED)
+  PARTITION BY HASH ((k));
+
+-- One ordinary column beside it does not save it either.
+-- begin-expected-error
+-- sqlstate: 42P17
+-- message-like: cannot use generated column in partition key
+-- end-expected-error
+CREATE TABLE zzt4a_gg (i int, k int GENERATED ALWAYS AS (i * 2) STORED)
+  PARTITION BY RANGE (i, (k));
 
 -- ============================================================================
 -- VALUES reads as a column name, so the parenthesis after it is the fault

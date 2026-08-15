@@ -1776,16 +1776,21 @@ class DdlTableExecutor {
      *
      * <p>PostgreSQL reads such an element as an expression and then looks at what the expression
      * came to. A plain column reference is put back as the column it names — {@code ((i))}
-     * partitions on {@code i}, and pg_get_partkeydef reads the key back as {@code i} — which is
-     * also why a generated column written this way stands where the same column written bare is
-     * refused: the refusal belongs to the path that reads a key element as a name, and an element
-     * in parentheses never takes it. A name no column answers to but the relation itself does is a
+     * partitions on {@code i}, and pg_get_partkeydef reads the key back as {@code i} — and it is
+     * then held to everything that column would be held to written bare, the refusal of a
+     * generated one included. A name no column answers to but the relation itself does is a
      * reference to the whole row, which stays an expression and is read back as {@code (t.*)}.
      */
     private String expressionKeyAsStored(String keyText, List<Column> columns, Table table) {
         ColumnRef name = parenthesisedKeyName(keyText);
         int named = name == null ? -1 : table.getColumnIndex(name.column());
-        if (named >= 0) return table.getColumns().get(named).getName();
+        if (named >= 0) {
+            // The element has come back to a plain column, so it is that column's rules that
+            // apply — the parentheses it was written in decide nothing. A generated column is
+            // refused here for the same reason it is refused when written bare.
+            rejectGeneratedPartitionKeyColumn(table, table.getColumns().get(named).getName());
+            return table.getColumns().get(named).getName();
+        }
         // An expression key decides which partition a row lives in, so it has to give the same
         // answer every time it is asked. A volatile or stable one may route a row to one
         // partition on INSERT and look for it in another.

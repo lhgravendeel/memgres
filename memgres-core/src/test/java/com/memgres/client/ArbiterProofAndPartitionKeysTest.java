@@ -614,40 +614,47 @@ class ArbiterProofAndPartitionKeysTest {
     // ------------------------------------------------------------ A parenthesised column reduces to the column
 
     @Test
-    void aParenthesisedGeneratedColumnReducesToTheColumnAndIsTaken() throws Exception {
-        exec("CREATE TABLE zzt4a_ga (i int, k int GENERATED ALWAYS AS (i * 2) STORED)"
-                + " PARTITION BY RANGE ((k))");
-        // PostgreSQL prints a plain column reference as the column, parentheses and all gone.
-        assertEquals("RANGE (k)", scalar("SELECT pg_get_partkeydef('zzt4a_ga'::regclass)"));
-        assertEquals("r/1/2", partKeyOf("zzt4a_ga"));
-
-        // A virtual generated column behaves exactly as a stored one does.
-        exec("CREATE TABLE zzt4a_gb (i int, k int GENERATED ALWAYS AS (i * 2) VIRTUAL)"
-                + " PARTITION BY LIST ((k))");
-        assertEquals("LIST (k)", scalar("SELECT pg_get_partkeydef('zzt4a_gb'::regclass)"));
-        assertEquals("l/1/2", partKeyOf("zzt4a_gb"));
-
-        exec("CREATE TABLE zzt4a_gc (i int, k int GENERATED ALWAYS AS (i * 2) STORED)"
-                + " PARTITION BY HASH ((k))");
-        assertEquals("HASH (k)", scalar("SELECT pg_get_partkeydef('zzt4a_gc'::regclass)"));
-
-        // In company, and the same reduction happens for an ordinary column.
-        exec("CREATE TABLE zzt4a_gg (i int, k int GENERATED ALWAYS AS (i * 2) STORED)"
-                + " PARTITION BY RANGE (i, (k))");
-        assertEquals("RANGE (i, k)", scalar("SELECT pg_get_partkeydef('zzt4a_gg'::regclass)"));
-        assertEquals("r/2/1 2", partKeyOf("zzt4a_gg"));
-
+    void aParenthesisedColumnReducesToTheColumn() throws Exception {
         exec("CREATE TABLE zzt4a_gh (i int, k int) PARTITION BY RANGE ((i))");
+        // PostgreSQL prints a plain column reference as the column, parentheses and all gone.
         assertEquals("RANGE (i)", scalar("SELECT pg_get_partkeydef('zzt4a_gh'::regclass)"));
         assertEquals("r/1/1", partKeyOf("zzt4a_gh"));
 
         exec("CREATE TABLE zzt4a_gi (i int, k int) PARTITION BY RANGE (i, (k))");
         assertEquals("RANGE (i, k)", scalar("SELECT pg_get_partkeydef('zzt4a_gi'::regclass)"));
 
-        for (String t : Arrays.asList("zzt4a_ga", "zzt4a_gb", "zzt4a_gc", "zzt4a_gg",
-                "zzt4a_gh", "zzt4a_gi")) {
+        for (String t : Arrays.asList("zzt4a_gh", "zzt4a_gi")) {
             exec("DROP TABLE " + t);
         }
+    }
+
+    @Test
+    void aParenthesisedGeneratedColumnIsRefusedLikeTheBareOne() throws Exception {
+        // The parentheses decide nothing. An element that comes back to a plain column is that
+        // column, and is held to everything the same column written bare is held to.
+        String stored = "CREATE TABLE zzt4a_ga (i int, k int GENERATED ALWAYS AS (i * 2) STORED)"
+                + " PARTITION BY RANGE ((k))";
+        assertEquals("42P17", stateOf(stored));
+        assertEquals("cannot use generated column in partition key", messageOf(stored));
+        assertEquals("Column \"k\" is a generated column.", detailOf(stored));
+
+        // Stored or virtual, and under every strategy.
+        String virtual = "CREATE TABLE zzt4a_gb (i int, k int GENERATED ALWAYS AS (i * 2) VIRTUAL)"
+                + " PARTITION BY LIST ((k))";
+        assertEquals("42P17", stateOf(virtual));
+        assertEquals("cannot use generated column in partition key", messageOf(virtual));
+
+        String hashed = "CREATE TABLE zzt4a_gc (i int, k int GENERATED ALWAYS AS (i * 2) STORED)"
+                + " PARTITION BY HASH ((k))";
+        assertEquals("42P17", stateOf(hashed));
+
+        // One ordinary column standing beside it does not save it.
+        String company = "CREATE TABLE zzt4a_gg (i int, k int GENERATED ALWAYS AS (i * 2) STORED)"
+                + " PARTITION BY RANGE (i, (k))";
+        assertEquals("42P17", stateOf(company));
+
+        assertEquals(0, num("SELECT count(*)::int FROM pg_class WHERE relname"
+                + " IN ('zzt4a_ga','zzt4a_gb','zzt4a_gc','zzt4a_gg')"));
     }
 
     @Test
@@ -664,8 +671,7 @@ class ArbiterProofAndPartitionKeysTest {
         assertEquals("cannot use generated column in partition key", messageOf(virtual));
         assertEquals("Column \"k\" is a generated column.", detailOf(virtual));
 
-        // A real expression over it is refused under the same sentence: only the element that
-        // reduces to the bare column reaches the reading that takes it.
+        // A real expression over it is refused under the same sentence.
         String expression = "CREATE TABLE zzt4a_gf (i int, k int GENERATED ALWAYS AS (i * 2)"
                 + " STORED) PARTITION BY RANGE ((k + 1))";
         assertEquals("42P17", stateOf(expression));
@@ -674,24 +680,6 @@ class ArbiterProofAndPartitionKeysTest {
 
         assertEquals(0, num("SELECT count(*)::int FROM pg_class WHERE relname"
                 + " IN ('zzt4a_gd','zzt4a_ge','zzt4a_gf')"));
-    }
-
-    @Test
-    void aRowIsRoutedBeforeItsGeneratedColumnIsWorkedOut() throws Exception {
-        exec("CREATE TABLE zzt4a_gj (i int, k int GENERATED ALWAYS AS (i * 2) STORED)"
-                + " PARTITION BY RANGE ((k))");
-        exec("CREATE TABLE zzt4a_gj_0 PARTITION OF zzt4a_gj FOR VALUES FROM (0) TO (10)");
-
-        // i * 2 is 6, inside the partition's bounds, and the row is still turned away: at routing
-        // time the key has no value yet. Which is the whole reason a generated column named as a
-        // key element is refused outright.
-        String insert = "INSERT INTO zzt4a_gj (i) VALUES (3)";
-        assertEquals("23514", stateOf(insert));
-        assertEquals("no partition of relation \"zzt4a_gj\" found for row", messageOf(insert));
-        assertEquals("Partition key of the failing row contains (k) = (null).", detailOf(insert));
-
-        assertEquals(0, num("SELECT count(*)::int FROM zzt4a_gj"));
-        exec("DROP TABLE zzt4a_gj");
     }
 
     // ------------------------------------------------------------ VALUES reads as a column name
