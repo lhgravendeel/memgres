@@ -258,13 +258,27 @@ class CopyFormatFidelityTest {
 
     @Test @Order(32)
     void text_emptyLine_multiColumn_raises22P04() throws Exception {
-        exec("CREATE TABLE ff_el3(id int, val text)");
+        exec("CREATE TABLE ff_el3(a text, val text)");
         SQLException ex = assertThrows(SQLException.class,
-                () -> copyIn("COPY ff_el3 FROM STDIN", "1\ta\n\n"));
+                () -> copyIn("COPY ff_el3 FROM STDIN", "x\ta\n\n"));
         assertEquals("22P04", ex.getSQLState(), "missing data must raise 22P04");
-        assertTrue(ex.getMessage().contains("missing data for column"),
+        assertTrue(ex.getMessage().contains("missing data for column \"val\""),
                 "PG-like message expected, got: " + ex.getMessage());
         exec("DROP TABLE ff_el3");
+    }
+
+    @Test @Order(32)
+    void text_emptyLine_convertsBeforeItCountsColumns() throws Exception {
+        exec("CREATE TABLE ff_el3b(id int, val text)");
+        // PostgreSQL converts each field to its column's type as it reads it, so a short
+        // text line whose first field will not convert reports the conversion failure
+        // (22P02) rather than the missing column behind it.
+        SQLException ex = assertThrows(SQLException.class,
+                () -> copyIn("COPY ff_el3b FROM STDIN", "1\ta\n\n"));
+        assertEquals("22P02", ex.getSQLState(), "the failed conversion is reported first");
+        assertTrue(ex.getMessage().contains("invalid input syntax for type integer: \"\""),
+                "PG-like message expected, got: " + ex.getMessage());
+        exec("DROP TABLE ff_el3b");
     }
 
     @Test @Order(33)

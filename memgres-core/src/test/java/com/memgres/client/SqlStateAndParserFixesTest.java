@@ -317,19 +317,18 @@ class SqlStateAndParserFixesTest {
     // ========================================================================
 
     /**
-     * PG 18: INSERT ... ON CONFLICT (id) WHERE tenant_id = 10 DO UPDATE ...
-     * There is no partial unique index on (id) WHERE tenant_id = 10, so PG
-     * gives 42P10 (invalid_column_reference / no unique constraint matching).
+     * A predicate on ON CONFLICT need not be an index's predicate. PostgreSQL asks that the index
+     * it picks answer for every row the predicate admits, and an index built over all of them —
+     * here the primary key — answers for any predicate at all. The refusal is for a partial index
+     * whose own predicate leaves some of those rows out.
      */
     @Test
-    void on_conflict_where_no_matching_index_gives_42P10() throws SQLException {
+    void on_conflict_where_over_a_plain_unique_index_is_accepted() throws SQLException {
         exec("CREATE TABLE ocp_t(id int PRIMARY KEY, tenant_id int, val text)");
         try {
-            // ON CONFLICT (id) WHERE tenant_id = 10, but no partial unique index exists
-            SQLException ex = assertThrows(SQLException.class,
-                    () -> exec("INSERT INTO ocp_t VALUES (1, 10, 'x') ON CONFLICT (id) WHERE tenant_id = 10 DO UPDATE SET val = EXCLUDED.val"));
-            assertEquals("42P10", ex.getSQLState(),
-                    "ON CONFLICT WHERE with no matching partial index should give 42P10, got " + ex.getSQLState());
+            exec("INSERT INTO ocp_t VALUES (1, 10, 'x') ON CONFLICT (id) WHERE tenant_id = 10 DO UPDATE SET val = EXCLUDED.val");
+            exec("INSERT INTO ocp_t VALUES (1, 10, 'y') ON CONFLICT (id) WHERE tenant_id = 10 DO UPDATE SET val = EXCLUDED.val");
+            assertEquals("y", scalar("SELECT val FROM ocp_t WHERE id = 1"));
         } finally {
             exec("DROP TABLE IF EXISTS ocp_t");
         }

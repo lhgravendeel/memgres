@@ -12,6 +12,11 @@ public final class DropStmt implements Statement {
     public final java.util.List<String> paramTypes;
     /** Explicit schema qualifier, when the statement gave one; null means "search the path". */
     public final String schema;
+    /**
+     * The further objects the same DROP names, each a drop of its own kind, ifExists and
+     * behaviour. Never null; empty when the statement named a single object.
+     */
+    public final java.util.List<DropStmt> more;
 
     public DropStmt(
             ObjectType objectType,
@@ -43,6 +48,19 @@ public final class DropStmt implements Statement {
             java.util.List<String> paramTypes,
             String schema
     ) {
+        this(objectType, name, onTable, ifExists, cascade, paramTypes, schema, null);
+    }
+
+    public DropStmt(
+            ObjectType objectType,
+            String name,
+            String onTable,
+            boolean ifExists,
+            boolean cascade,
+            java.util.List<String> paramTypes,
+            String schema,
+            java.util.List<DropStmt> more
+    ) {
         this.objectType = objectType;
         this.name = name;
         this.onTable = onTable;
@@ -50,6 +68,9 @@ public final class DropStmt implements Statement {
         this.cascade = cascade;
         this.paramTypes = paramTypes;
         this.schema = schema;
+        this.more = more == null
+                ? java.util.Collections.<DropStmt>emptyList()
+                : java.util.Collections.unmodifiableList(new java.util.ArrayList<DropStmt>(more));
     }
 
     public enum ObjectType {
@@ -65,6 +86,15 @@ public final class DropStmt implements Statement {
     public boolean cascade() { return cascade; }
     public java.util.List<String> paramTypes() { return paramTypes; }
     public String schema() { return schema; }
+    public java.util.List<DropStmt> more() { return more; }
+
+    /** This drop and the further ones the same statement names, in the order they were written. */
+    public static java.util.List<DropStmt> allOf(DropStmt first) {
+        java.util.List<DropStmt> all = new java.util.ArrayList<DropStmt>();
+        all.add(first);
+        if (first.more() != null) all.addAll(first.more());
+        return all;
+    }
 
     @Override
     public boolean equals(Object o) {

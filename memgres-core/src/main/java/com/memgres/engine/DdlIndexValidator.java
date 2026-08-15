@@ -3,7 +3,7 @@ package com.memgres.engine;
 import com.memgres.engine.util.Cols;
 
 import java.util.HashMap;
-import java.util.LinkedHashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -89,8 +89,8 @@ final class DdlIndexValidator {
         opclass("btree", "array_ops", null);
         opclass("btree", "bit_ops", "bit");
         opclass("btree", "bool_ops", "boolean");
-        opclass("btree", "bpchar_ops", "text");
-        opclass("btree", "bpchar_pattern_ops", "text");
+        opclass("btree", "bpchar_ops", "character");
+        opclass("btree", "bpchar_pattern_ops", "character");
         opclass("btree", "bytea_ops", "bytea");
         opclass("btree", "char_ops", null);
         opclass("btree", "cidr_ops", "inet");
@@ -134,8 +134,8 @@ final class DdlIndexValidator {
         opclass("hash", "aclitem_ops", null);
         opclass("hash", "array_ops", null);
         opclass("hash", "bool_ops", "boolean");
-        opclass("hash", "bpchar_ops", "text");
-        opclass("hash", "bpchar_pattern_ops", "text");
+        opclass("hash", "bpchar_ops", "character");
+        opclass("hash", "bpchar_pattern_ops", "character");
         opclass("hash", "bytea_ops", "bytea");
         opclass("hash", "char_ops", null);
         opclass("hash", "cid_ops", null);
@@ -176,7 +176,7 @@ final class DdlIndexValidator {
         opclass("gin", "array_ops", null);
         opclass("gin", "bit_ops", "bit");
         opclass("gin", "bool_ops", "boolean");
-        opclass("gin", "bpchar_ops", "text");
+        opclass("gin", "bpchar_ops", "character");
         opclass("gin", "bytea_ops", "bytea");
         opclass("gin", "char_ops", null);
         opclass("gin", "cidr_ops", "cidr");
@@ -211,7 +211,7 @@ final class DdlIndexValidator {
         opclass("gist", "circle_ops", "circle");
         opclass("gist", "gist_bit_ops", "bit");
         opclass("gist", "gist_bool_ops", "boolean");
-        opclass("gist", "gist_bpchar_ops", "text");
+        opclass("gist", "gist_bpchar_ops", "character");
         opclass("gist", "gist_bytea_ops", "bytea");
         opclass("gist", "gist_cash_ops", "money");
         opclass("gist", "gist_cidr_ops", "cidr");
@@ -269,6 +269,21 @@ final class DdlIndexValidator {
     private static final Set<String> STRING_FAMILY = Cols.setOf("text", "character varying", "character");
 
     /**
+     * The value functions SQL spells without an argument list. PostgreSQL's grammar admits them
+     * wherever an index key admits a call, so one written as a key is an expression rather than
+     * the name of a column — and, being no more than stable, it is refused as one.
+     */
+    private static final Set<String> SQL_VALUE_FUNCTIONS = Cols.setOf(
+            "current_date", "current_time", "current_timestamp", "localtime", "localtimestamp",
+            "current_catalog", "current_role", "current_schema", "current_user", "session_user",
+            "user");
+
+    /** True when an index key is one of the value functions written without an argument list. */
+    static boolean isSqlValueFunction(String key) {
+        return key != null && SQL_VALUE_FUNCTIONS.contains(key.toLowerCase());
+    }
+
+    /**
      * Check everything about a CREATE INDEX that PostgreSQL settles before touching the heap.
      *
      * @param table  the relation being indexed, already resolved
@@ -306,14 +321,25 @@ final class DdlIndexValidator {
         }
         if (columns == null) return;
         for (int i = 0; i < columns.size(); i++) {
+            // PostgreSQL resolves a key before it asks anything about how that key is to be
+            // indexed, so a column the relation does not have is reported as a missing column and
+            // not as a fault in the collation, the operator class or the ordering written after
+            // it. The missing column itself is reported by the caller, which knows the relation.
+            if (table != null && !DdlDefinitionChecks.isExpressionKeyElement(columns.get(i))
+                    && table.getColumnIndex(columns.get(i)) < 0) {
+                continue;
+            }
             String opts = columnOptions != null && i < columnOptions.size() ? columnOptions.get(i) : "";
             if (opts == null) opts = "";
             checkCollationExists(database, opts);
             checkCollatable(table, columns.get(i), opts);
-            checkOpclass(table, am, columns.get(i), opts);
+            checkOpclass(database, table, am, columns.get(i), opts);
             checkDefaultOpclass(table, am, columns.get(i), opts);
             if (!amInfo.canOrder) {
-                if (opts.contains("DESC")) {
+                // An ASC written out is refused as surely as a DESC. It asks for the ordering the
+                // method would have used had it any ordering at all, and PostgreSQL judges the
+                // clause by what it says rather than by what it would have come to.
+                if (hasOption(opts, "ASC") || hasOption(opts, "DESC")) {
                     throw PgErrors.notImplemented(
                             "access method \"" + am + "\" does not support ASC/DESC options");
                 }
@@ -323,6 +349,18 @@ final class DdlIndexValidator {
                 }
             }
         }
+    }
+
+    /**
+     * True when the stored options hold this word on its own. A collation or an operator class is
+     * written into the same string, so a substring test would find ASC inside a name that merely
+     * contains those letters.
+     */
+    private static boolean hasOption(String opts, String word) {
+        for (String part : opts.split(" ")) {
+            if (part.equals(word)) return true;
+        }
+        return false;
     }
 
     /** The collations every PostgreSQL carries, whatever the machine's locales happen to be. */
@@ -367,16 +405,34 @@ final class DdlIndexValidator {
     }
 
     /** The opclass named on a column must exist for the access method and accept the column's type. */
-    private static void checkOpclass(Table table, String am, String column, String opts) {
+    private static void checkOpclass(Database database, Table table, String am, String column,
+                                     String opts) {
         String opclassName = null;
+        boolean parameterised = false;
         for (String part : opts.split(" ")) {
             if (part.startsWith("opclass:")) opclassName = part.substring("opclass:".length());
+            else if ("opclassoptions".equals(part)) parameterised = true;
         }
         if (opclassName == null) return;
+        // A written schema is opened before the class inside it is looked for, so naming one that
+        // is not there is reported as the missing schema rather than as a missing class.
+        int dot = opclassName.indexOf('.');
+        if (dot >= 0) {
+            String opclassSchema = opclassName.substring(0, dot);
+            if (!SchemaQualifier.exists(database, null, opclassSchema)) {
+                throw SchemaQualifier.missing(opclassSchema);
+            }
+            opclassName = opclassName.substring(dot + 1);
+        }
         Map<String, String> byName = OPCLASSES.get(am);
         if (byName == null || !byName.containsKey(opclassName.toLowerCase())) {
             throw new MemgresException("operator class \"" + opclassName
                     + "\" does not exist for access method \"" + am + "\"", "42704");
+        }
+        if (parameterised) {
+            // None of the classes PostgreSQL 18 ships for these access methods takes parameters,
+            // and it names the class here without quoting it.
+            throw new MemgresException("operator class " + opclassName + " has no options", "22023");
         }
         String accepts = byName.get(opclassName.toLowerCase());
         if (accepts == null) return;
@@ -386,54 +442,90 @@ final class DdlIndexValidator {
         if (col.getEnumTypeName() != null || col.getCompositeTypeName() != null) return;
         String colType = CatalogHelper.pgTypeName(col.getType());
         if (colType == null || colType.equals(accepts)) return;
-        if (STRING_FAMILY.contains(colType) && STRING_FAMILY.contains(accepts)) return;
+        // text and character varying hold the same values, so a class for either indexes the
+        // other; a blank-padded character does not compare like either of them, and only the
+        // class of its own type takes it -- while its class still takes the two of them.
+        if (STRING_FAMILY.contains(colType) && STRING_FAMILY.contains(accepts)
+                && !"character".equals(colType)) return;
+        // A cidr is an inet that happens to name a network, stored the same way, so the classes
+        // that index an address index it too.
+        if ("cidr".equals(colType) && "inet".equals(accepts)) return;
         throw PgErrors.datatypeMismatch("operator class \"" + opclassName
                 + "\" does not accept data type " + colType);
     }
 
     /**
-     * The types each access method has a default operator class for, in a PostgreSQL 18 with no
+     * The default operator class each access method has for each type, in a PostgreSQL 18 with no
      * contrib extensions installed. Without an opclass the method has no operators to compare
-     * values with, so PostgreSQL refuses the index rather than build one it could never search.
+     * values with, so PostgreSQL refuses the index rather than build one it could never search;
+     * and where a definition names the class the type would have taken anyway, PostgreSQL leaves
+     * it out of the definition it prints back.
      *
      * <p>Measured from {@code pg_opclass} rather than written from memory, and deliberately
      * excluding classes owned by an extension: {@code btree_gin} and {@code btree_gist} add the
      * scalar types to gin and gist, and a server with them installed accepts indexes this engine
      * does not implement.
+     *
+     * <p>A type with no class of its own indexes through the class of a type it is binary-coercible
+     * to, which is why character varying answers text_ops and cidr answers inet_ops.
      */
-    private static final Map<String, Set<String>> DEFAULT_OPCLASS_TYPES = new HashMap<>();
+    private static final Map<String, Map<String, String>> DEFAULT_OPCLASSES = new HashMap<>();
 
-    private static void defaults(String method, String... types) {
-        DEFAULT_OPCLASS_TYPES.put(method, Cols.setOf(types));
+    private static void defaults(String method, String... typeThenClass) {
+        DEFAULT_OPCLASSES.put(method, classesOf(typeThenClass));
+    }
+
+    private static Map<String, String> classesOf(String... typeThenClass) {
+        Map<String, String> byType = new LinkedHashMap<>();
+        for (int i = 0; i + 1 < typeThenClass.length; i += 2) {
+            byType.put(typeThenClass[i], typeThenClass[i + 1]);
+        }
+        return byType;
     }
 
     static {
         // The scalar types, shared by the three methods that index values whole
         String[] scalar = {
-            "\"char\"", "bigint", "bit", "bit varying", "boolean", "bytea", "character",
-            "character varying", "date", "double precision", "inet", "integer", "interval",
-            "macaddr", "macaddr8", "money", "name", "numeric", "oid", "oidvector", "pg_lsn",
-            "real", "smallint", "text", "tid", "time with time zone", "time without time zone",
-            "timestamp with time zone", "timestamp without time zone", "uuid", "xid", "xid8",
-            "jsonb", "tsquery", "tsvector", "record", "cid", "aclitem", "cidr",
+            "\"char\"", "char_ops", "bigint", "int8_ops", "bit", "bit_ops",
+            "bit varying", "varbit_ops", "boolean", "bool_ops", "bytea", "bytea_ops",
+            "character", "bpchar_ops", "character varying", "text_ops", "date", "date_ops",
+            "double precision", "float8_ops", "inet", "inet_ops", "integer", "int4_ops",
+            "interval", "interval_ops", "macaddr", "macaddr_ops", "macaddr8", "macaddr8_ops",
+            "money", "money_ops", "name", "name_ops", "numeric", "numeric_ops", "oid", "oid_ops",
+            "oidvector", "oidvector_ops", "pg_lsn", "pg_lsn_ops", "real", "float4_ops",
+            "smallint", "int2_ops", "text", "text_ops", "tid", "tid_ops",
+            "time with time zone", "timetz_ops", "time without time zone", "time_ops",
+            "timestamp with time zone", "timestamptz_ops",
+            "timestamp without time zone", "timestamp_ops", "uuid", "uuid_ops",
+            "xid", "xid_ops", "xid8", "xid8_ops", "jsonb", "jsonb_ops",
+            "tsquery", "tsquery_ops", "tsvector", "tsvector_ops", "record", "record_ops",
+            "cid", "cid_ops", "aclitem", "aclitem_ops", "cidr", "inet_ops",
         };
         // The polymorphic classes cover a whole family at once: an array, an enum or a range
         // indexes through one of these rather than through a class of its own name.
-        Set<String> btree = new LinkedHashSet<>(Cols.setOf(scalar));
+        Map<String, String> btree = classesOf(scalar);
         btree.remove("cid");
         btree.remove("aclitem");
-        btree.addAll(Cols.setOf("anyarray", "anyenum", "anyrange", "anymultirange"));
-        DEFAULT_OPCLASS_TYPES.put("btree", btree);
-        Set<String> hash = new LinkedHashSet<>(Cols.setOf(scalar));
+        btree.putAll(classesOf("anyarray", "array_ops", "anyenum", "enum_ops",
+                "anyrange", "range_ops", "anymultirange", "multirange_ops"));
+        DEFAULT_OPCLASSES.put("btree", btree);
+        Map<String, String> hash = classesOf(scalar);
         hash.remove("bit");
         hash.remove("bit varying");
         hash.remove("tsquery");
         hash.remove("tsvector");
         hash.remove("oidvector");
         hash.remove("money");
-        hash.addAll(Cols.setOf("anyarray", "anyenum", "anyrange", "anymultirange"));
-        DEFAULT_OPCLASS_TYPES.put("hash", hash);
-        Set<String> brin = new LinkedHashSet<>(Cols.setOf(scalar));
+        hash.putAll(classesOf("anyarray", "array_ops", "anyenum", "enum_ops",
+                "anyrange", "range_ops", "anymultirange", "multirange_ops"));
+        DEFAULT_OPCLASSES.put("hash", hash);
+        // BRIN summarises a range of values rather than storing them, so its class for a type is
+        // named after the summary it keeps: the minimum and maximum for a scalar, and for a value
+        // that spans an interval of its own, the box it fits inside.
+        Map<String, String> brin = new LinkedHashMap<>();
+        for (Map.Entry<String, String> e : classesOf(scalar).entrySet()) {
+            brin.put(e.getKey(), e.getValue().replace("_ops", "_minmax_ops"));
+        }
         brin.remove("boolean");
         brin.remove("jsonb");
         brin.remove("money");
@@ -443,14 +535,28 @@ final class DdlIndexValidator {
         brin.remove("cid");
         brin.remove("aclitem");
         brin.remove("xid");
-        brin.add("box");
-        brin.add("anyrange");
-        DEFAULT_OPCLASS_TYPES.put("brin", brin);
+        brin.put("inet", "inet_inclusion_ops");
+        brin.put("cidr", "inet_inclusion_ops");
+        brin.put("box", "box_inclusion_ops");
+        brin.put("anyrange", "range_inclusion_ops");
+        DEFAULT_OPCLASSES.put("brin", brin);
         // The three methods built for a particular shape of value index far fewer types
-        defaults("gin", "jsonb", "tsvector", "anyarray");
-        defaults("gist", "box", "circle", "point", "polygon", "tsquery", "tsvector",
-                "anyrange", "anymultirange");
-        defaults("spgist", "box", "inet", "point", "polygon", "text", "anyrange");
+        defaults("gin", "jsonb", "jsonb_ops", "tsvector", "tsvector_ops", "anyarray", "array_ops");
+        defaults("gist", "box", "box_ops", "circle", "circle_ops", "point", "point_ops",
+                "polygon", "poly_ops", "tsquery", "tsquery_ops", "tsvector", "tsvector_ops",
+                "anyrange", "range_ops", "anymultirange", "multirange_ops");
+        defaults("spgist", "box", "box_ops", "inet", "inet_ops", "point", "quad_point_ops",
+                "polygon", "poly_ops", "text", "text_ops", "anyrange", "range_ops");
+    }
+
+    /**
+     * The operator class an index key of this type takes when the definition names none, or null
+     * when the method has no default for it. The type name is the one {@link CatalogHelper}
+     * writes, so it is the same name the column's own definition would print.
+     */
+    static String defaultOpclass(String method, String typeName) {
+        Map<String, String> byType = DEFAULT_OPCLASSES.get(method == null ? "btree" : method);
+        return byType == null || typeName == null ? null : byType.get(typeName);
     }
 
     /**
@@ -459,15 +565,14 @@ final class DdlIndexValidator {
      */
     private static void checkDefaultOpclass(Table table, String am, String column, String opts) {
         if (opts.contains("opclass:")) return;   // an explicit class is checked by checkOpclass
-        Set<String> supported = DEFAULT_OPCLASS_TYPES.get(am);
-        if (supported == null) return;
+        if (!DEFAULT_OPCLASSES.containsKey(am)) return;
         int colIdx = table.getColumnIndex(column);
         if (colIdx < 0) return;   // an unknown column is reported by the caller's own check
         Column col = table.getColumns().get(colIdx);
         String colType = indexedTypeName(col);
         // A type this engine cannot name is left alone: refusing a valid index is the worse
         // failure of the two.
-        if (colType == null || supported.contains(colType)) return;
+        if (colType == null || defaultOpclass(am, colType) != null) return;
         MemgresException ex = new MemgresException("data type " + colType
                 + " has no default operator class for access method \"" + am + "\"", "42704");
         ex.setHint("You must specify an operator class for the index"
@@ -479,11 +584,25 @@ final class DdlIndexValidator {
      * The type name to look an operator class up by. Arrays, enums and ranges all index through a
      * polymorphic class, so they are answered by the family they belong to rather than by name.
      */
-    private static String indexedTypeName(Column col) {
+    static String indexedTypeName(Column col) {
         if (col.getArrayElementType() != null) return "anyarray";
         if (col.getEnumTypeName() != null) return "anyenum";
         if (col.getCompositeTypeName() != null || col.getDomainTypeName() != null) return null;
-        String name = CatalogHelper.pgTypeName(col.getType());
+        return polymorphicName(CatalogHelper.pgTypeName(col.getType()));
+    }
+
+    /**
+     * The same name for the type an index expression comes out as. A type this engine cannot
+     * resolve is answered null, which leaves the key's operator class written down as it stands.
+     */
+    static String indexedTypeName(RuleDeparser.PgType type) {
+        if (type == null) return null;
+        if (type.elem != null) return "anyarray";
+        if (type.custom != null || type.dt == null) return null;
+        return polymorphicName(CatalogHelper.pgTypeName(type.dt));
+    }
+
+    private static String polymorphicName(String name) {
         if (name != null && name.endsWith("[]")) return "anyarray";
         if (name != null && (name.endsWith("range") || name.endsWith("multirange"))) {
             return name.endsWith("multirange") ? "anymultirange" : "anyrange";
@@ -633,6 +752,38 @@ final class DdlIndexValidator {
                     checkNumericOption(name, value, option);
             }
         }
+    }
+
+    /**
+     * A storage parameter's value as PostgreSQL stores it. A boolean or an enumerated option keeps
+     * the word that was written but in lower case -- {@code On} is stored as {@code on}, not
+     * canonicalised to {@code true} -- so pg_class.reloptions reads back the way PostgreSQL's
+     * does. The lexer hands keyword tokens over upper-cased, which is how {@code false} arrived as
+     * {@code FALSE}. A parameter this engine does not model is left exactly as it was written.
+     *
+     * <p>A parameter written with no value at all is a flag being turned on: PostgreSQL stores
+     * {@code autovacuum_enabled} as {@code autovacuum_enabled=true}.
+     */
+    static String normalizeRelOptionValue(String kind, String name, String value) {
+        if (value == null) return "true";
+        String trimmed = value.trim();
+        Map<String, RelOption> known = REL_OPTIONS.get(kind == null ? "btree" : kind.toLowerCase());
+        RelOption option = known == null || name == null ? null : known.get(name.toLowerCase());
+        if (option == null) return trimmed;
+        if (option.kind == 'b' || option.kind == 'e') {
+            return trimmed.toLowerCase(java.util.Locale.ROOT);
+        }
+        return trimmed;
+    }
+
+    /** A whole WITH clause, with every value normalised the way the catalogue reports it. */
+    static Map<String, String> normalizeRelOptions(String kind, Map<String, String> options) {
+        if (options == null) return null;
+        Map<String, String> out = new java.util.LinkedHashMap<String, String>();
+        for (Map.Entry<String, String> entry : options.entrySet()) {
+            out.put(entry.getKey(), normalizeRelOptionValue(kind, entry.getKey(), entry.getValue()));
+        }
+        return out;
     }
 
     /** An integer or floating-point storage parameter: it must parse, and it must be in range. */

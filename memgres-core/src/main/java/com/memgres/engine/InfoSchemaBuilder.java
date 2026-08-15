@@ -565,7 +565,8 @@ public class InfoSchemaBuilder {
             if (vd.materialized()) continue;
             if (vd.cachedColumns() == null || vd.cachedColumns().isEmpty()) continue;
             String vSchema = vd.schemaName() != null ? vd.schemaName() : "public";
-            addColumnsForTable(table, vSchema, new Table(vd.name(), vd.cachedColumns()), false);
+            addColumnsForTable(table, vSchema, vd.name(),
+                    new Table(vd.name(), vd.cachedColumns()), false, true);
         }
 
         // Also add pg_catalog virtual table columns so that queries like
@@ -726,12 +727,25 @@ public class InfoSchemaBuilder {
     }
 
     private void addColumnsForTable(Table isTable, String schemaName, Table t, boolean isUserTable) {
-        addColumnsForTable(isTable, schemaName, t.getName(), t, isUserTable);
+        addColumnsForTable(isTable, schemaName, t.getName(), t, isUserTable, isUserTable);
     }
 
-    /** @param relationName the name to list the columns under, which may be an alias of t */
     private void addColumnsForTable(Table isTable, String schemaName, String relationName,
                                     Table t, boolean isUserTable) {
+        addColumnsForTable(isTable, schemaName, relationName, t, isUserTable, isUserTable);
+    }
+
+    /**
+     * @param relationName the name to list the columns under, which may be an alias of t
+     * @param isUserTable  whether this is a table the user made, which settles the columns that
+     *                     only a stored relation has -- nullability, generation, identity
+     * @param userRelation whether the user made this relation at all. A view is not a table but
+     *                     is still the user's, and a default written on one of its columns with
+     *                     ALTER VIEW is published here exactly as a table's is; the catalogues'
+     *                     own relations have no defaults to publish.
+     */
+    private void addColumnsForTable(Table isTable, String schemaName, String relationName,
+                                    Table t, boolean isUserTable, boolean userRelation) {
         List<Object[]> pending = new ArrayList<Object[]>();
         int ordinal = 0;
         for (int i = 0; i < t.getColumns().size(); i++) {
@@ -740,18 +754,27 @@ public class InfoSchemaBuilder {
             // genuine xmin column of type xid, and dropping it here would leave this view
             // one column short of what pg_class and pg_attribute say the relation has.
             if (!isUserTable && CatalogCoreBuilder.isSystemColumn(col)) continue;
-            ordinal++;
+            // A column ALTER TABLE dropped keeps the number it had, so PostgreSQL leaves the hole
+            // here rather than renumbering the columns that outlived it: what this view reports is
+            // the relation's attribute number and not a running count of the rows written.
+            ordinal = t.hasDroppedAttributes() ? t.attnumAt(i) : ordinal + 1;
             DataType dt = col.getType();
             // PG reports every array column as data_type 'ARRAY' and leaves the element type to
             // udt_name, so the test is the type's arrayness rather than a list of four of them.
-            boolean isArrayType = DataType.isArrayType(dt) || dt == DataType.ACLITEM_ARRAY;
+            // An array of a type the reader defined has no array type in this engine's own list --
+            // it is recorded as the element type with an element type beside it -- so the element
+            // answers for it, and without that an array of an enum was published as the single
+            // USER-DEFINED value its element is.
+            boolean isArrayType = DataType.isArrayType(dt) || dt == DataType.ACLITEM_ARRAY
+                    || col.getArrayElementType() != null;
             // H14: data_type — arrays report "ARRAY", composite types report
             // "USER-DEFINED", but DOMAIN columns report their BASE type (PG puts
             // the domain name in domain_name and the base type in data_type).
             String dataType;
             if (isArrayType) {
                 dataType = "ARRAY";
-            } else if (isUserTable && col.getCompositeTypeName() != null) {
+            } else if (isUserTable
+                    && (col.getCompositeTypeName() != null || col.getRangeTypeName() != null)) {
                 dataType = "USER-DEFINED";
             } else {
                 dataType = CatalogHelper.pgTypeName(dt);
@@ -778,13 +801,27 @@ public class InfoSchemaBuilder {
             if (isUserTable) {
                 // udt_schema and udt_name are two columns, so the type the column records is
                 // split into the schema it lives in and the name it answers to there.
-                if (dt == DataType.ENUM && col.getEnumTypeName() != null) {
+                // An array of a type the reader defined is a type of its own, living in the same
+                // schema as its element and named with the underscore in front that every array
+                // type's name carries. Publishing the element's name described the column as
+                // holding one value of it, and an array of a domain was published as the domain's
+                // base type -- neither of which is the type the column has.
+                String userElement = CatalogHelper.arrayOfUserType(database, col);
+                if (userElement != null) {
+                    udtSchema = TypeNamespace.schemaOfKey(userElement);
+                    udtName = "_" + TypeNamespace.nameOfKey(userElement);
+                } else if (dt == DataType.ENUM && col.getEnumTypeName() != null) {
                     udtSchema = TypeNamespace.schemaOfKey(col.getEnumTypeName());
                     udtName = TypeNamespace.nameOfKey(col.getEnumTypeName());
                 } else if (col.getCompositeTypeName() != null) {
                     // H14: composite column — udt_name is the composite type name
                     udtSchema = TypeNamespace.schemaOfKey(col.getCompositeTypeName());
                     udtName = TypeNamespace.nameOfKey(col.getCompositeTypeName());
+                } else if (col.getRangeTypeName() != null) {
+                    // A range is a type of the reader's own, so the column is described by that
+                    // type's name and not by the text its values are carried as.
+                    udtSchema = TypeNamespace.schemaOfKey(col.getRangeTypeName());
+                    udtName = TypeNamespace.nameOfKey(col.getRangeTypeName());
                 }
                 // H14: DOMAIN columns keep the BASE type udt_name (e.g. int4);
                 // the domain identity is carried by the domain_* fields below.
@@ -830,8 +867,12 @@ public class InfoSchemaBuilder {
                 domainName = TypeNamespace.nameOfKey(col.getDomainTypeName());
             }
 
-            // H14: is_nullable — view columns are always YES (PG semantics)
-            String isNullable = isUserTable ? (col.isNullable() ? "YES" : "NO") : "YES";
+            // H14: is_nullable — view columns are always YES (PG semantics). For a table column
+            // PostgreSQL computes it as attnotnull OR the domain's own typnotnull, so a column
+            // merely declared with a NOT NULL domain still reports NO even though attnotnull is
+            // false for it.
+            String isNullable = isUserTable
+                    ? ((!col.isNullable() || domainForbidsNull(col)) ? "NO" : "YES") : "YES";
 
             pending.add(new Object[]{
                     catalogName(),                           // table_catalog
@@ -839,7 +880,7 @@ public class InfoSchemaBuilder {
                     relationName,                           // table_name
                     col.getName(),                          // column_name
                     ordinal,                                // ordinal_position
-                    isUserTable ? CatalogHelper.formatColumnDefault(col) : null, // column_default
+                    userRelation ? CatalogHelper.formatColumnDefault(col) : null, // column_default
                     isNullable,                             // is_nullable
                     dataType,                               // data_type
                     charMaxLen,                             // character_maximum_length
@@ -874,7 +915,7 @@ public class InfoSchemaBuilder {
                     // NO unless the identity sequence was declared CYCLE.
                     "NO",                                   // identity_cycle
                     isUserTable && col.isGenerated() ? "ALWAYS" : "NEVER", // is_generated
-                    isUserTable ? col.getGeneratedExpr() : null, // generation_expression
+                    isUserTable ? CatalogHelper.renderGeneratedExpr(t, col) : null, // generation_expression
                     columnIsUpdatable(schemaName, relationName, col.getName(), isUserTable)
             });
         }
@@ -1365,9 +1406,10 @@ public class InfoSchemaBuilder {
             String vSchema = vd.schemaName() != null ? vd.schemaName() : "public";
             String viewDef = "";
             if (vd.query() != null) {
-                String raw = vd.sourceSQL() != null ? vd.sourceSQL() : SqlUnparser.toSql(vd.query());
-                // M19: information_schema.views.view_definition uses the pretty form (with trailing ;).
-                viewDef = SqlUnparser.prettyViewDef(raw) + ";";
+                // view_definition is pg_get_viewdef(oid) and nothing else, so it is deparsed the
+                // same way rather than reformatted from whatever text a rewrite left behind.
+                viewDef = ViewDeparser.viewDef(vd.query(), false, 0,
+                        ViewDeparser.columnTypesOf(database, vd), null) + ";";
             }
             // PG derives these from pg_relation_is_updatable: is_updatable wants UPDATE and
             // DELETE both, is_insertable_into wants INSERT. Deriving them from the same place
@@ -1513,6 +1555,13 @@ public class InfoSchemaBuilder {
             // A domain constraint belongs to the schema the domain was created in. Filing every
             // one of them under public hid it from the query that names the domain's own schema.
             String dSchema = domainSchema(d);
+            // A domain's NOT NULL is a constraint of the domain's, and PG lists it here with the
+            // clause it stands for. Without the row the two catalogues disagreed: pg_constraint
+            // held zzb4i_dd_not_null and check_constraints did not.
+            if (d.isNotNull()) {
+                table.insertRow(new Object[]{
+                        catalogName(), dSchema, d.getName() + "_not_null", "VALUE IS NOT NULL"});
+            }
             if (d.getParsedCheck() != null) {
                 table.insertRow(new Object[]{
                         catalogName(), dSchema, d.getName() + "_check",
@@ -1527,6 +1576,22 @@ public class InfoSchemaBuilder {
             }
         }
         return table;
+    }
+
+    /**
+     * Whether the domain a column is declared with forbids NULL. A domain over a domain inherits
+     * its base's constraints, so the whole chain has to be walked -- the same walk the write path
+     * makes when it decides whether a value is allowed.
+     */
+    private boolean domainForbidsNull(Column col) {
+        String domainName = col.getDomainTypeName();
+        for (int guard = 0; domainName != null && guard < 64; guard++) {
+            DomainType d = database.getDomain(domainName);
+            if (d == null) return false;
+            if (d.isNotNull()) return true;
+            domainName = d.getBaseTypeName();
+        }
+        return false;
     }
 
     /**
@@ -2111,6 +2176,9 @@ public class InfoSchemaBuilder {
                 : database.getCompositeTypes().entrySet()) {
             String schema = compositeTypeSchema(ct.getKey());
             for (int i = 0; i < ct.getValue().size(); i++) {
+                // An attribute a drop took away keeps its number but describes nothing any more:
+                // PostgreSQL leaves the gap in the identifiers rather than closing it up.
+                if (Database.isDroppedAttribute(ct.getValue().get(i))) continue;
                 table.insertRow(new Object[]{catalog, schema, typeNameOf(ct.getKey()),
                         "USER-DEFINED TYPE", String.valueOf(i + 1)});
             }
@@ -2171,6 +2239,8 @@ public class InfoSchemaBuilder {
             String schema = compositeTypeSchema(ct.getKey());
             List<com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField> fields = ct.getValue();
             for (int i = 0; i < fields.size(); i++) {
+                // An attribute a drop took away holds no collection any more, whatever it held.
+                if (Database.isDroppedAttribute(fields.get(i))) continue;
                 TypeSpec spec = parseTypeSpec(fields.get(i).typeName());
                 if (!spec.isArray || spec.type == null) continue;
                 addElementTypeRow(table, catalog, schema, typeNameOf(ct.getKey()),
@@ -2212,6 +2282,10 @@ public class InfoSchemaBuilder {
             List<com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField> fields = ct.getValue();
             for (int i = 0; i < fields.size(); i++) {
                 com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField f = fields.get(i);
+                // An attribute a drop took away is no longer one of the type's attributes, but it
+                // keeps its number: PostgreSQL leaves the hole in ordinal_position rather than
+                // renumbering the ones that outlived it.
+                if (Database.isDroppedAttribute(f)) continue;
                 TypeSpec spec = parseTypeSpec(f.typeName());
                 TypeFacts facts = spec.type == null || spec.isArray
                         ? null : new TypeFacts(spec.type, spec.precision, spec.scale);
@@ -2563,6 +2637,12 @@ public class InfoSchemaBuilder {
         for (Map.Entry<String, DomainType> entry : database.getDomains().entrySet()) {
             DomainType d = entry.getValue();
             String schema = domainSchema(d);
+            // A domain's NOT NULL is one of its constraints, and PG lists it here beside the
+            // CHECKs, never deferrable.
+            if (d.isNotNull()) {
+                table.insertRow(new Object[]{catalog, schema, d.getName() + "_not_null",
+                        catalog, schema, d.getName(), "NO", "NO"});
+            }
             if (d.getParsedCheck() != null) {
                 table.insertRow(new Object[]{catalog, schema, d.getName() + "_check",
                         catalog, schema, d.getName(), "NO", "NO"});

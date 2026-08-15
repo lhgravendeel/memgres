@@ -87,6 +87,9 @@ class SessionExecutor {
                     } catch (MemgresException e) {
                         throw new MemgresException("relation \"" + objName + "\" does not exist", "42P01");
                     }
+                    // A comment is part of the relation's own definition, and everything a schema
+                    // reader is told about it comes from there, so setting one is the owner's.
+                    executor.requireTableOwner(schemaName, bareName);
                 } else if (objType.equals("VIEW")) {
                     if (!executor.database.hasView(bareName)) {
                         throw new MemgresException("view \"" + objName + "\" does not exist", "42P01");
@@ -318,7 +321,10 @@ class SessionExecutor {
             if (param.equalsIgnoreCase("pg_stat_statements.max")) {
                 throw new MemgresException("unrecognized configuration parameter \"pg_stat_statements.max\"", "42704");
             }
-            if (guc != null && !guc.isKnown(param) && !param.isEmpty() && !param.contains(".")) {
+            // A name with a schema in front of it is a custom parameter, and PostgreSQL has no
+            // such parameter until something sets one: the placeholder is made by the SET, so
+            // reading one nothing has set is as unrecognized as any other name would be.
+            if (guc != null && !guc.isKnown(param) && !param.isEmpty()) {
                 throw new MemgresException("unrecognized configuration parameter \"" + param + "\"", "42704");
             }
             String value = guc != null ? guc.getForDisplay(param) : null;
@@ -1101,12 +1107,20 @@ class SessionExecutor {
                     for (String cn : namesStr.split(",")) {
                         String constraintName = bareConstraintName(cn.trim());
                         StoredConstraint sc = findConstraint(constraintName);
-                        if (sc == null) {
+                        // A constraint trigger is a constraint as well as a trigger: SET
+                        // CONSTRAINTS names it and pg_constraint holds a row for it. It is kept
+                        // among the triggers rather than among a table's stored constraints, so a
+                        // lookup that read only those answered that it does not exist.
+                        PgTrigger constraintTrigger = sc != null ? null
+                                : executor.database.findConstraintTrigger(constraintName);
+                        if (sc == null && constraintTrigger == null) {
                             throw PgErrors.undefinedObject("constraint", constraintName);
                         }
                         // IMMEDIATE is what a non-deferrable constraint already is, so only asking
                         // for DEFERRED is a request it cannot honour.
-                        if (deferred && !sc.isDeferrable()) {
+                        boolean deferrable = sc != null
+                                ? sc.isDeferrable() : constraintTrigger.isDeferrable();
+                        if (deferred && !deferrable) {
                             throw new MemgresException(
                                     "constraint \"" + constraintName + "\" is not deferrable", "42809");
                         }
@@ -1710,6 +1724,12 @@ class SessionExecutor {
                 }
                 // pg_advisory_unlock_all() — release all session-level advisory locks
                 executor.database.advisoryUnlockAll(executor.session);
+                // DISCARD ALL includes DISCARD SEQUENCES, so currval and lastval are undefined
+                // again and no reserved CACHE block is still held.
+                executor.clearSequenceState();
+            } else if (target.equals("SEQUENCES")) {
+                // The sequence state is the session's own: what it drew, and any block it reserved.
+                executor.clearSequenceState();
             } else if (target.equals("PLANS")) {
                 // PG DISCARD PLANS invalidates cached query plans, forcing re-planning on next use.
                 // It does NOT deallocate prepared statements. Since Memgres has no plan cache, this is a no-op.
@@ -3442,16 +3462,20 @@ class SessionExecutor {
             return QueryResult.message(QueryResult.Type.SET, "DROP");
         }
         if (kind.equals("alter_rule")) {
-            if (!executor.database.hasRule(first, second)) {
+            // A written qualifier says which schema holds the relation the rule is on, and
+            // PostgreSQL names the relation without its schema when it reports one missing.
+            String onSchema = executor.relationSchemaOf(null, second);
+            String onTable = RelationNamespace.bareName(second);
+            if (!executor.database.hasRule(onSchema, first, onTable)) {
                 throw new MemgresException("rule \"" + first + "\" for relation \""
-                        + second + "\" does not exist", "42704");
+                        + onTable + "\" does not exist", "42704");
             }
             if (!third.isEmpty()) {
-                if (executor.database.hasRule(third, second)) {
+                if (executor.database.hasRule(onSchema, third, onTable)) {
                     throw new MemgresException("rule \"" + third + "\" for relation \""
-                            + second + "\" already exists", "42710");
+                            + onTable + "\" already exists", "42710");
                 }
-                executor.database.renameRule(first, second, third);
+                executor.database.renameRule(onSchema, first, onTable, third);
             }
             return QueryResult.message(QueryResult.Type.SET, "ALTER RULE");
         }

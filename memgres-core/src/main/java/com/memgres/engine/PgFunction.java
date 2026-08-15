@@ -145,6 +145,16 @@ public class PgFunction {
     public boolean isAtomicBody() { return atomicBody; }
     public void setAtomicBody(boolean atomicBody) { this.atomicBody = atomicBody; }
 
+    /**
+     * Whether the definition wrote a SQL-standard body -- BEGIN ATOMIC ... END, or RETURN expr.
+     * PostgreSQL parses one of those when the routine is defined, which is what leaves a recorded
+     * dependency on every relation the body names; a body written as a string leaves none, because
+     * nothing reads it until the routine is called.
+     */
+    private boolean sqlStandardBody;
+    public boolean isSqlStandardBody() { return sqlStandardBody; }
+    public void setSqlStandardBody(boolean sqlStandardBody) { this.sqlStandardBody = sqlStandardBody; }
+
     private final java.util.concurrent.atomic.AtomicLong callCount = new java.util.concurrent.atomic.AtomicLong(0);
     public long getCallCount() { return callCount.get(); }
     public void incrementCallCount() { callCount.incrementAndGet(); }

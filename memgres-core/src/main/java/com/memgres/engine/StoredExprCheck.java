@@ -118,6 +118,11 @@ final class StoredExprCheck {
                 throw new MemgresException(
                         "missing FROM-clause entry for table \"" + qualifier + "\"", "42P01");
             }
+            // Every relation carries the system columns whether or not anybody declared them, so
+            // NEW.ctid and OLD.tableoid resolve in a trigger's WHEN condition exactly as they do
+            // in a query. Testing only the declared columns reported one of them as a column that
+            // is not there.
+            if (DdlDefinitionChecks.isSystemColumnName(ref.column())) return;
             if (table.getColumnIndex(ref.column()) < 0) {
                 throw new MemgresException("column " + qualifier.toLowerCase(Locale.ROOT) + "."
                         + ref.column() + " does not exist", "42703");

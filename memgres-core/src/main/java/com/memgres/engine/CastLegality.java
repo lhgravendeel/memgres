@@ -28,9 +28,16 @@ final class CastLegality {
     /** The registered pairs, by {@code source * 100000 + target}. */
     private static final Set<Long> REGISTERED = new HashSet<Long>();
 
+    /** The subset PostgreSQL will apply on its own, where a value is assigned rather than cast. */
+    private static final Set<Long> ASSIGNABLE = new HashSet<Long>();
+
     static {
         for (Object[] row : PgCastTable.CASTS) {
             REGISTERED.add(key((Integer) row[0], (Integer) row[1]));
+            String context = (String) row[3];
+            if ("i".equals(context) || "a".equals(context)) {
+                ASSIGNABLE.add(key((Integer) row[0], (Integer) row[1]));
+            }
         }
     }
 
@@ -86,6 +93,59 @@ final class CastLegality {
         }
         return new MemgresException("cannot cast type " + displayName(source) + " to "
                 + displayName(target), "42846");
+    }
+
+    /**
+     * Whether PostgreSQL would put a value of one type where a value of the other is expected — in
+     * a column's DEFAULT, in a generation expression — without being told to cast it.
+     *
+     * <p>Three ways, and only three. A cast registered implicit or assignment is one. Two arrays
+     * are the same question asked of their element types, which is the coercion PostgreSQL builds
+     * over an array rather than over each value in it. And a target in the string category takes
+     * anything at all, because every type has a text form its input function reads back — that is
+     * the one direction allowed with no registered cast, which is why {@code text DEFAULT 1}
+     * stands while {@code integer DEFAULT 'a'::text} does not. {@code "char"} is not a string type
+     * for this purpose: PostgreSQL files it under the internal-use category and it takes only what
+     * pg_cast gives it.
+     *
+     * <p>One-sided in the same way as {@link #refusalFor}: a type this engine does not model, or
+     * one whose values it keeps as something else, is answered yes rather than judged.
+     */
+    static boolean assignable(DataType source, DataType target) {
+        if (source == null || target == null) return true;
+        DataType from = normalise(source);
+        DataType to = normalise(target);
+        if (from == to) return true;
+        if (isUnmodelled(from) || isUnmodelled(to)) return true;
+        if (ASSIGNABLE.contains(key(from.getOid(), to.getOid()))) return true;
+        DataType fromElement = DataType.elementOf(from);
+        DataType toElement = DataType.elementOf(to);
+        if (fromElement != null && toElement != null) return assignable(fromElement, toElement);
+        return isAssignmentStringType(to);
+    }
+
+    /**
+     * The types whose values this engine carries as something else, so that a missing cast row
+     * says nothing about them.
+     */
+    private static boolean isUnmodelled(DataType t) {
+        switch (t) {
+            case ENUM: case RECORD: case VOID: case ANYARRAY:
+            case HSTORE: case HSTORE_ARRAY:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /** PostgreSQL's string category, which is where a value may be read into with no cast at all. */
+    private static boolean isAssignmentStringType(DataType t) {
+        switch (t) {
+            case TEXT: case VARCHAR: case CHAR: case NAME:
+                return true;
+            default:
+                return false;
+        }
     }
 
     /** serial and its siblings are not types of their own as far as a cast is concerned. */

@@ -325,6 +325,24 @@ public final class BuiltinCallTypes {
     }
 
     /**
+     * Refuses a call whose arguments reach no signature of the name, where the signature declares
+     * a kind of type rather than any type at all.
+     *
+     * <p>{@link #requireReachable} lets an argument past every polymorphic position, because most
+     * of them do take anything. {@code anyarray}, {@code anyrange} and {@code anymultirange} do
+     * not: each stands for a type of that kind and for no other, which is the whole of why
+     * {@code lower(boolean)} is a function that does not exist — lower is declared over text and
+     * over the two kinds of range, and a boolean reaches none of the three. {@link
+     * StoredCallSignature} reads that rule for a definition being stored, and a call being run is
+     * answered from the same reading, so the same call is refused wherever it is written.
+     */
+    public static void requireDeclaredKind(String name, String writtenName, int[] argOids) {
+        if (name == null || argOids == null) return;
+        if (StoredCallSignature.mayTake(name, argOids)) return;
+        throw missing(writtenName, argOids);
+    }
+
+    /**
      * PostgreSQL prints the name a call was written with, except where the call was not written
      * as a call at all: {@code (a, b) OVERLAPS (c, d)} is spelled out in the grammar and reported
      * against the function the grammar means, qualified as PostgreSQL qualifies it.

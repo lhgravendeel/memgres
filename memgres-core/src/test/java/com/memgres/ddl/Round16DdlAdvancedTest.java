@@ -249,14 +249,20 @@ class Round16DdlAdvancedTest {
         exec("DROP TABLE IF EXISTS r16_rv CASCADE");
         exec("CREATE TABLE r16_rv (old_name int)");
         exec("CREATE VIEW r16_vw AS SELECT old_name FROM r16_rv");
+        exec("INSERT INTO r16_rv VALUES (7)");
         exec("ALTER TABLE r16_rv RENAME COLUMN old_name TO new_name");
-        // View must continue to work and reference new_name
+        // PostgreSQL 18: renaming the base column rewrites what the view reads, but a view's
+        // own output names are fixed when it is created, so the view still publishes old_name.
         try (Statement s = conn.createStatement();
-             ResultSet rs = s.executeQuery("SELECT new_name FROM r16_vw")) {
-            // Must not throw "column old_name does not exist"
-            while (rs.next()) {
-                rs.getInt(1);
-            }
+             ResultSet rs = s.executeQuery("SELECT old_name FROM r16_vw")) {
+            assertTrue(rs.next());
+            assertEquals(7, rs.getInt(1));
+        }
+        // and the base column's new name is not a column of the view
+        try (Statement s = conn.createStatement()) {
+            SQLException e = assertThrows(SQLException.class,
+                    () -> s.executeQuery("SELECT new_name FROM r16_vw"));
+            assertEquals("42703", e.getSQLState());
         }
     }
 

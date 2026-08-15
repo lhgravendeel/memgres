@@ -253,6 +253,7 @@ class DdlFunctionParser {
                 leakproofRef[0], volatilityRef[0], setClauses.isEmpty() ? null : setClauses,
                 parallelRef[0], costRef[0], rowsRef[0]);
         result.atomicBody = isAtomicBody;
+        result.sqlStandardBody = sqlStandardBody;
         result.supportFunction = supportRef[0];
         result.bodyGiven = body != null;
         result.windowFunction = windowRef[0];

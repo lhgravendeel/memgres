@@ -257,6 +257,26 @@ final class TypeNamespace {
     }
 
     /**
+     * A type name written the way a reader with this session's search path would write it. Unlike
+     * {@link #display} it reaches only the schemas that path really names: PostgreSQL prints a type
+     * qualified whenever the path does not reach it, and a {@code search_path} that leaves public
+     * out leaves public's own types qualified along with everything else's.
+     */
+    static String displayFor(Database db, Session session, String stored) {
+        List<String> path = new java.util.ArrayList<String>();
+        if (session != null) {
+            String temp = session.getTempSchemaName();
+            if (temp != null) path.add(temp.toLowerCase(Locale.ROOT));
+            for (String s : session.getEffectiveSearchPath(false)) {
+                path.add(s.toLowerCase(Locale.ROOT));
+            }
+        } else {
+            path.add("public");
+        }
+        return displayName(db, path, stored);
+    }
+
+    /**
      * PostgreSQL's own hint when a relation's name is taken by a type. It is worth saying, because
      * the reader is looking at a CREATE TABLE and the collision is in a namespace they did not
      * write anything in.

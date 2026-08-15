@@ -804,7 +804,8 @@ class SelectParser {
             }
             ctes.set(last, new SelectStmt.CommonTableExpr(origCte.name(), origCte.columnNames(),
                     origCte.query(), origCte.recursive(), searchCol, searchDepthFirst, searchByColumns,
-                    cycleCol, cyclePathCol, cycleByColumns, cycleMarkValue, cycleMarkDefault));
+                    cycleCol, cyclePathCol, cycleByColumns, cycleMarkValue, cycleMarkDefault,
+                    origCte.materialized()));
         }
     }
 
@@ -935,12 +936,16 @@ class SelectParser {
             }
 
             parser.expectKeyword("AS");
-            // Optional MATERIALIZED / NOT MATERIALIZED inlining hint (PG 12+).
-            // Memgres doesn't exploit the hint for planning, but must accept it.
+            // MATERIALIZED asks for the item to be computed on its own; NOT MATERIALIZED asks for
+            // it to be pulled up into the query that reads it. Written neither way, PostgreSQL
+            // decides from how often the query names it. The word settles what a qualification of
+            // the reading query reaches, so it is carried on the item rather than discarded.
+            Boolean materialized = null;
             if (parser.matchKeyword("NOT")) {
                 parser.expectKeyword("MATERIALIZED");
-            } else {
-                parser.matchKeyword("MATERIALIZED");
+                materialized = Boolean.FALSE;
+            } else if (parser.matchKeyword("MATERIALIZED")) {
+                materialized = Boolean.TRUE;
             }
             parser.expect(TokenType.LEFT_PAREN);
 
@@ -970,7 +975,8 @@ class SelectParser {
 
             parser.expect(TokenType.RIGHT_PAREN);
 
-            ctes.add(new SelectStmt.CommonTableExpr(name, columnNames, cteBody, recursive));
+            ctes.add(new SelectStmt.CommonTableExpr(name, columnNames, cteBody, recursive,
+                    materialized));
             // SEARCH and CYCLE belong to the item just closed, not to the WITH clause, so they
             // are read here — before the comma that starts the next item, which is why
             // "SEARCH ... SET ord, s AS (...)" parses at all.
@@ -1592,7 +1598,8 @@ class SelectParser {
                     // Build a synthetic SelectStmt that selects everything from the inner FROM item
                     SelectStmt syntheticSelect = new SelectStmt(
                             false, Cols.listOf(new SelectStmt.SelectTarget(new WildcardExpr(), null)),
-                            Cols.listOf(inner), null, null, null, null, null, null);
+                            Cols.listOf(inner), null, null, null, null, null, null)
+                            .asJoinExpression();
                     return new SelectStmt.SubqueryFrom(syntheticSelect, parenAlias, lateral, columnAliases);
                 }
                 return inner;
@@ -1744,8 +1751,10 @@ class SelectParser {
                 throw new ParseException("Expected sampling method", parser.peek());
             }
             if (!method.equals("system") && !method.equals("bernoulli")) {
+                // PostgreSQL names the method bare here: what was written is an identifier the
+                // grammar resolves, not a string, so it is not quoted back.
                 throw new com.memgres.engine.MemgresException(
-                    "tablesample method \"" + method + "\" does not exist", "42704");
+                    "tablesample method " + method + " does not exist", "42704");
             }
             parser.expect(TokenType.LEFT_PAREN);
             Expression pctExpr = parser.parseExpression();

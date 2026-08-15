@@ -793,7 +793,16 @@ class ExprSpecialFormParser {
         Expression value = ep.parseExpression();
         ep.expectKeyword("AS");
         String typeName = ep.parseTypeName();
-        boolean indent = ep.matchKeyword("INDENT") || ep.matchIdentifier("INDENT");
+        // Both halves of the clause are spelled out in SQL, and a serialisation that says NO
+        // INDENT is saying something: it is the answer to the same question INDENT answers, so
+        // refusing to read it turned a statement PostgreSQL accepts into a syntax error.
+        boolean indent;
+        if (ep.matchKeyword("NO") || ep.matchIdentifier("NO")) {
+            if (!ep.matchKeyword("INDENT")) ep.matchIdentifier("INDENT");
+            indent = false;
+        } else {
+            indent = ep.matchKeyword("INDENT") || ep.matchIdentifier("INDENT");
+        }
         ep.expect(TokenType.RIGHT_PAREN);
         if (indent) {
             return new FunctionCallExpr("xmlserialize", Cols.listOf(Literal.ofString(mode), value, Literal.ofString(typeName), Literal.ofString("indent")));

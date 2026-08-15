@@ -60,7 +60,7 @@ class DdlObjectExecutor {
             }
             // A type created under a name a dropped type used to answer to is a new type, and
             // takes a new OID -- PostgreSQL never reuses one.
-            executor.identity().typeCreated(TypeNamespace.key(schema, name));
+            executor.identity().typeCreated("e", TypeNamespace.key(schema, name));
             CustomEnum created = new CustomEnum(schema, name, stmt.enumLabels());
             executor.database.addCustomEnum(created);
             executor.database.markUncommittedObject(created, executor.session);
@@ -90,7 +90,7 @@ class DdlObjectExecutor {
             }
             // A type created under a name a dropped type used to answer to is a new type, and
             // takes a new OID -- PostgreSQL never reuses one.
-            executor.identity().typeCreated(TypeNamespace.key(schema, name));
+            executor.identity().typeCreated("r", TypeNamespace.key(schema, name));
             executor.database.addRangeType(schema, name, stmt.rangeSubtype());
             executor.database.registerSchemaObject(schema, "range", name);
             // CREATE TYPE is undone by ROLLBACK like any other DDL; without this the type
@@ -111,7 +111,7 @@ class DdlObjectExecutor {
             for (CreateTypeStmt.CompositeField f : stmt.compositeFields()) {
                 ddl.resolveColumnType(f.typeName(), null);
             }
-            executor.identity().typeCreated(TypeNamespace.key(schema, name));
+            executor.identity().typeCreated("c", TypeNamespace.key(schema, name));
             executor.database.addCompositeType(schema, name, stmt.compositeFields());
             executor.database.registerSchemaObject(schema, "composite", name);
             executor.recordUndo(new Session.CreateCompositeTypeUndo(schema, name));
@@ -211,7 +211,7 @@ class DdlObjectExecutor {
                 // its labels, and whatever was said about it in a comment.
                 String schema = TypeNamespace.schemaOfKey(typeKey);
                 requireTypeNameFree(typeRef(schema, stmt.value()));
-                executor.database.getCustomEnums().remove(typeKey);
+                inStoredTypes(() -> executor.database.getCustomEnums().remove(typeKey));
                 CustomEnum renamed = new CustomEnum(schema, stmt.value(), existing.getLabels());
                 executor.database.addCustomEnum(renamed);
                 executor.database.unregisterSchemaObject(schema, "enum", TypeNamespace.nameOfKey(typeKey));
@@ -228,7 +228,7 @@ class DdlObjectExecutor {
                 String from = TypeNamespace.schemaOfKey(typeKey);
                 String bare = TypeNamespace.nameOfKey(typeKey);
                 TypeNamespace.requireFree(executor.database, stmt.value(), bare);
-                executor.database.getCustomEnums().remove(typeKey);
+                inStoredTypes(() -> executor.database.getCustomEnums().remove(typeKey));
                 existing.setSchemaName(stmt.value());
                 executor.database.addCustomEnum(existing);
                 executor.database.unregisterSchemaObject(from, "enum", bare);
@@ -273,6 +273,18 @@ class DdlObjectExecutor {
         // name however the statement wrote it.
         String typeName = TypeNamespace.nameOfKey(typeKey);
 
+        // What a type is made of is shared state: every value of it and every column declared with
+        // it reads the attribute list, so an attribute added, dropped, renamed or retyped inside a
+        // transaction that rolls back has to leave the list it found -- the same reason ALTER
+        // DOMAIN records what it displaced. RENAME TO and SET SCHEMA move the list whole and have
+        // nothing here to put back.
+        if (stmt.action() == AlterTypeStmt.Action.ADD_ATTRIBUTE
+                || stmt.action() == AlterTypeStmt.Action.DROP_ATTRIBUTE
+                || stmt.action() == AlterTypeStmt.Action.ALTER_ATTRIBUTE_TYPE
+                || stmt.action() == AlterTypeStmt.Action.RENAME_ATTRIBUTE) {
+            executor.recordUndo(new Session.AlterCompositeTypeUndo(typeKey, fields));
+        }
+
         switch (stmt.action()) {
             case ADD_ATTRIBUTE: {
                 if (hasAttribute(fields, stmt.value())) {
@@ -281,8 +293,10 @@ class DdlObjectExecutor {
                 }
                 ddl.resolveColumnType(stmt.newValue(), null);
                 List<CreateTypeStmt.CompositeField> newFields = new ArrayList<>(fields);
+                // After whatever a drop left behind, not in the gap it made: an attribute number
+                // PostgreSQL has handed out once is never handed out again.
                 newFields.add(new CreateTypeStmt.CompositeField(stmt.value(), stmt.newValue()));
-                executor.database.getCompositeTypes().put(typeKey, newFields);
+                executor.database.replaceCompositeFields(typeKey, newFields);
                 break;
             }
             case DROP_ATTRIBUTE: {
@@ -299,12 +313,21 @@ class DdlObjectExecutor {
                             + typeName + "\" does not exist", "42703");
                 }
                 List<CreateTypeStmt.CompositeField> newFields = new ArrayList<>();
-                for (CreateTypeStmt.CompositeField f : fields) {
-                    if (!f.name().equalsIgnoreCase(stmt.value())) {
+                for (int i = 0; i < fields.size(); i++) {
+                    CreateTypeStmt.CompositeField f = fields.get(i);
+                    if (f.name().equalsIgnoreCase(stmt.value())) {
+                        // The attribute is not taken out of the list: PostgreSQL leaves its row
+                        // under a name nobody could have written and marks it dropped, so the
+                        // attributes after it keep their numbers and the next one added takes a
+                        // number of its own. The type it was declared with stays on the row too,
+                        // which is what the modifier goes on being reported from.
+                        newFields.add(new CreateTypeStmt.CompositeField(
+                                Database.droppedAttributeName(i + 1), f.typeName()));
+                    } else {
                         newFields.add(f);
                     }
                 }
-                executor.database.getCompositeTypes().put(typeKey, newFields);
+                executor.database.replaceCompositeFields(typeKey, newFields);
                 break;
             }
             case ALTER_ATTRIBUTE_TYPE: {
@@ -312,6 +335,7 @@ class DdlObjectExecutor {
                     throw new MemgresException("column \"" + stmt.value() + "\" of relation \""
                             + typeName + "\" does not exist", "42703");
                 }
+                refuseAttributeTypeChangeInUse(typeKey, stmt.cascade());
                 List<CreateTypeStmt.CompositeField> newFields = new ArrayList<>();
                 for (CreateTypeStmt.CompositeField f : fields) {
                     if (f.name().equalsIgnoreCase(stmt.value())) {
@@ -320,7 +344,7 @@ class DdlObjectExecutor {
                         newFields.add(f);
                     }
                 }
-                executor.database.getCompositeTypes().put(typeKey, newFields);
+                executor.database.replaceCompositeFields(typeKey, newFields);
                 break;
             }
             case RENAME_ATTRIBUTE: {
@@ -339,13 +363,13 @@ class DdlObjectExecutor {
                         newFields.add(f);
                     }
                 }
-                executor.database.getCompositeTypes().put(typeKey, newFields);
+                executor.database.replaceCompositeFields(typeKey, newFields);
                 break;
             }
             case RENAME_TO: {
                 String schema = TypeNamespace.schemaOfKey(typeKey);
                 requireCompositeRenameTargetFree(typeRef(schema, stmt.value()));
-                executor.database.getCompositeTypes().remove(typeKey);
+                inStoredTypes(() -> executor.database.getCompositeTypes().remove(typeKey));
                 executor.database.addCompositeType(schema, stmt.value(), fields);
                 executor.database.unregisterSchemaObject(
                         schema, "composite", TypeNamespace.nameOfKey(typeKey));
@@ -364,7 +388,7 @@ class DdlObjectExecutor {
                 String from = TypeNamespace.schemaOfKey(typeKey);
                 String bare = TypeNamespace.nameOfKey(typeKey);
                 TypeNamespace.requireFree(executor.database, stmt.value(), bare);
-                executor.database.getCompositeTypes().remove(typeKey);
+                inStoredTypes(() -> executor.database.getCompositeTypes().remove(typeKey));
                 executor.database.addCompositeType(stmt.value(), bare, fields);
                 executor.database.unregisterSchemaObject(from, "composite", bare);
                 executor.database.registerSchemaObject(stmt.value(), "composite", bare);
@@ -378,6 +402,118 @@ class DdlObjectExecutor {
                 break;
         }
         return QueryResult.command(QueryResult.Type.ALTER_TYPE, 0);
+    }
+
+    /**
+     * Refuse an attribute type change while something is holding values of the type.
+     *
+     * <p>A stored value of a composite is laid out by the attribute types the type had when it was
+     * written, so PostgreSQL will not change one under a relation that holds such values: it names
+     * the first column that does and refuses, and CASCADE does not excuse it. A table declared OF
+     * the type is the one case CASCADE is for -- its whole shape is the type's, so the change can
+     * reshape it -- and PostgreSQL says so in the hint. The column check comes first: with both in
+     * the way, it is the column PostgreSQL names.
+     */
+    private void refuseAttributeTypeChangeInUse(String typeKey, boolean cascade) {
+        String shown = TypeNamespace.display(executor.database, executor.session, typeKey);
+        Set<String> holding = typeKeysBuiltOn(typeKey);
+        Table typedTable = null;
+        // Relations in the order they were created, and within one relation its columns from the
+        // first: that is the order PostgreSQL walks the dependencies in, and it names the first it
+        // finds. The relation is named bare, whatever schema it lives in.
+        List<Object[]> found = new ArrayList<>();
+        for (Schema schema : executor.database.getSchemas().values()) {
+            for (Table t : schema.getTables().values()) {
+                if (sameType(typeKey, t.getOfTypeName())) {
+                    if (typedTable == null) typedTable = t;
+                    continue;
+                }
+                int relOid = executor.systemCatalog.getOid(
+                        "rel:" + schema.getName() + "." + t.getName());
+                List<Column> cols = t.getColumns();
+                for (int i = 0; i < cols.size(); i++) {
+                    Column c = cols.get(i);
+                    if (columnHoldsOneOf(holding, c)) {
+                        found.add(new Object[]{Integer.valueOf(relOid), Integer.valueOf(i),
+                                t.getName() + "." + c.getName()});
+                    }
+                }
+            }
+        }
+        if (!found.isEmpty()) {
+            java.util.Collections.sort(found, new java.util.Comparator<Object[]>() {
+                @Override
+                public int compare(Object[] a, Object[] b) {
+                    int byRelation = Integer.compare((Integer) a[0], (Integer) b[0]);
+                    return byRelation != 0 ? byRelation
+                            : Integer.compare((Integer) a[1], (Integer) b[1]);
+                }
+            });
+            throw new MemgresException("cannot alter type \"" + shown + "\" because column \""
+                    + found.get(0)[2] + "\" uses it", "0A000");
+        }
+        if (typedTable != null && !cascade) {
+            MemgresException e = new MemgresException("cannot alter type \"" + shown
+                    + "\" because it is the type of a typed table", "2BP01");
+            e.setHint("Use ALTER ... CASCADE to alter the typed tables too.");
+            throw e;
+        }
+    }
+
+    /**
+     * Every type whose values contain one of this type: the type itself, any composite with an
+     * attribute of one of them, and any domain built over one of them, followed round until
+     * nothing new turns up. A column of any of them holds a value laid out by this type's
+     * attributes, which is why PostgreSQL refuses the change for all of them alike.
+     */
+    private Set<String> typeKeysBuiltOn(String typeKey) {
+        Set<String> keys = new LinkedHashSet<>();
+        keys.add(typeKey);
+        boolean grew = true;
+        while (grew) {
+            grew = false;
+            for (Map.Entry<String, List<CreateTypeStmt.CompositeField>> e
+                    : executor.database.getCompositeTypes().entrySet()) {
+                if (keys.contains(e.getKey()) || e.getValue() == null) continue;
+                for (CreateTypeStmt.CompositeField f : e.getValue()) {
+                    if (keys.contains(TypeNamespace.find(executor.database.typeKeys(),
+                            bareTypeName(f.typeName())))) {
+                        keys.add(e.getKey());
+                        grew = true;
+                        break;
+                    }
+                }
+            }
+            for (Map.Entry<String, DomainType> e : executor.database.getDomains().entrySet()) {
+                if (keys.contains(e.getKey())) continue;
+                String base = e.getValue().getBaseTypeName();
+                if (base != null && keys.contains(TypeNamespace.find(
+                        executor.database.typeKeys(), bareTypeName(base)))) {
+                    keys.add(e.getKey());
+                    grew = true;
+                }
+            }
+        }
+        return keys;
+    }
+
+    /** Whether this column was declared with one of those types, as an array of one or not. */
+    private boolean columnHoldsOneOf(Set<String> keys, Column c) {
+        String declared = c.getCompositeTypeName() != null
+                ? c.getCompositeTypeName() : c.getDomainTypeName();
+        if (declared == null) return false;
+        return keys.contains(TypeNamespace.find(executor.database.typeKeys(),
+                bareTypeName(declared)));
+    }
+
+    /** A written type name with its modifier and its array brackets taken off. */
+    private static String bareTypeName(String written) {
+        if (written == null) return null;
+        String t = written.trim();
+        int paren = t.indexOf('(');
+        if (paren > 0) t = t.substring(0, paren).trim();
+        while (t.endsWith("[]")) t = t.substring(0, t.length() - 2).trim();
+        return t;
     }
 
     /**
@@ -924,6 +1060,9 @@ class DdlObjectExecutor {
                 .filter(p -> !"OUT".equalsIgnoreCase(p.mode()))
                 .map(PgFunction.Param::typeName)
                 .collect(Collectors.toList());
+        // What CREATE OR REPLACE displaces has to be kept: rolling the statement back restores the
+        // definition that was there, and dropping it instead left no routine at all.
+        PgFunction replaced = null;
         List<PgFunction> existingOverloads = executor.database.getFunctionOverloads(funcSchema, stmt.name());
         for (PgFunction existing : existingOverloads) {
             List<String> existingTypes = existing.getParams().stream()
@@ -945,6 +1084,7 @@ class DdlObjectExecutor {
                 if (sameTypes) {
                     if (stmt.orReplace()) {
                         checkReplaceKeepsSignature(existing, stmt, params);
+                        replaced = existing;
                         executor.database.removeFunction(funcSchema, stmt.name(), existingTypes);
                         break;
                     }
@@ -970,6 +1110,7 @@ class DdlObjectExecutor {
         pgFunc.setSetClauses(stmt.setClauses());
         pgFunc.setOwner(executor.sessionUser());
         pgFunc.setAtomicBody(stmt.atomicBody);
+        pgFunc.setSqlStandardBody(stmt.sqlStandardBody);
         if (stmt.parallel() != null) pgFunc.setParallel(stmt.parallel());
         // A cost nobody wrote is the language's own: 1 for the languages whose calls are compiled
         // in, 100 for an interpreted one. Taking 100 for all of them made every SQL function claim
@@ -978,9 +1119,23 @@ class DdlObjectExecutor {
         else pgFunc.setCost(defaultCostForLanguage(stmt.language()));
         if (stmt.rows() >= 0) pgFunc.setRows(stmt.rows());
         executor.database.addFunction(pgFunc);
+        // PostgreSQL numbers a pg_proc row as CREATE FUNCTION writes it, so a list ordered by OID
+        // -- what depends on a schema, what stands in the way of a drop -- reports routines in the
+        // order they were made. Handing the number out only when something first asked about the
+        // name put every routine after every relation, in whatever order the question happened to
+        // walk the catalogue. CREATE OR REPLACE writes over the row that was already there and
+        // keeps its number, which is why a replacement mints nothing.
+        if (replaced == null) {
+            executor.identity().routineCreated(
+                    CatalogCoreBuilder.routineOidKey(executor.database, pgFunc));
+        }
         executor.database.registerSchemaObject(funcSchema, "function", stmt.name());
         executor.database.setObjectOwner("function:" + stmt.name(), executor.sessionUser());
-        executor.recordUndo(new Session.CreateFunctionUndo(stmt.name()));
+        // A routine is identified by its schema and its argument types, so that is what the undo
+        // holds: rolling back one added overload must not take the other overloads of that name,
+        // nor the same name in another schema, with it.
+        executor.recordUndo(new Session.CreateFunctionUndo(funcSchema, stmt.name(),
+                newParamTypes, replaced));
         return QueryResult.command(QueryResult.Type.CREATE_FUNCTION, 0);
     }
 
@@ -2196,6 +2351,18 @@ class DdlObjectExecutor {
     // ---- CREATE TRIGGER ----
 
     QueryResult executeCreateTrigger(CreateTriggerStmt stmt) {
+        // A constraint trigger's grammar has no REFERENCING clause and no OR REPLACE. Neither is a
+        // definition PostgreSQL inspects and rejects: they are sentences the grammar never had,
+        // which is why the first comes back as a syntax error before the relation is opened at all.
+        if (stmt.constraintTrigger()) {
+            if (stmt.newTransitionTable() != null || stmt.oldTransitionTable() != null) {
+                throw PgErrors.syntax("syntax error at or near \"REFERENCING\"");
+            }
+            if (stmt.orReplace()) {
+                throw PgErrors.notImplemented(
+                        "CREATE OR REPLACE CONSTRAINT TRIGGER is not supported");
+            }
+        }
         SchemaQualifier.requireSchema(executor.database, executor.session, stmt.schema());
         String triggerTableSchema = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
         PgTrigger.Timing timing;
@@ -2214,6 +2381,21 @@ class DdlObjectExecutor {
                 break;
         }
         boolean isView = stmt.table() != null && executor.database.hasView(stmt.table());
+        // Which kind of relation was named settles before anything about the trigger does. A
+        // sequence and a materialized view are relations a trigger cannot be attached to at all,
+        // and PostgreSQL refuses each for what it is rather than letting a sequence through as a
+        // table or answering for a materialized view with the rule about views.
+        String relationKind = stmt.table() == null ? null
+                : RelationNamespace.kindOf(executor.database, triggerTableSchema, stmt.table());
+        if (RelationNamespace.SEQUENCE.equals(relationKind)
+                || RelationNamespace.MATVIEW.equals(relationKind)) {
+            MemgresException wrongKind = PgErrors.wrongObjectType(
+                    "relation \"" + stmt.table() + "\" cannot have triggers");
+            wrongKind.setDetail("This operation is not supported for "
+                    + (RelationNamespace.SEQUENCE.equals(relationKind)
+                            ? "sequences." : "materialized views."));
+            throw wrongKind;
+        }
         // PostgreSQL opens the relation before it judges what kind it is, so a trigger named on
         // a relation that is not there is a missing relation — not a table that cannot take an
         // INSTEAD OF trigger, which is what "not a view" was read as.
@@ -2224,13 +2406,20 @@ class DdlObjectExecutor {
             throw PgErrors.wrongObjectType("\"" + stmt.table() + "\" is a table"
                     + "\n  Detail: Tables cannot have INSTEAD OF triggers.");
         }
-        if ((timing == PgTrigger.Timing.BEFORE || timing == PgTrigger.Timing.AFTER) && isView) {
+        // A view has no rows of its own to hand a BEFORE or AFTER trigger one at a time, so those
+        // must be INSTEAD OF — but a statement-level trigger is handed no row at all, and
+        // PostgreSQL accepts it on a view whether or not the view could be written through.
+        if ((timing == PgTrigger.Timing.BEFORE || timing == PgTrigger.Timing.AFTER)
+                && isView && !stmt.forEachStatement()) {
             throw new MemgresException("\"" + stmt.table() + "\" is a view"
                     + "\n  Detail: Views cannot have row-level BEFORE or AFTER triggers.", "42809");
         }
-        // Validate table/view existence (skip for INSTEAD OF on views — resolveTable rejects non-updatable views)
-        if (stmt.table() != null && !(timing == PgTrigger.Timing.INSTEAD_OF && isView)) {
-            executor.resolveTable(triggerTableSchema, stmt.table());
+        // A trigger runs code of the definer's choosing every time the relation is written, so
+        // PostgreSQL asks for the TRIGGER privilege on it — and answers "permission denied" rather
+        // than "must be owner", because a grant is enough. The relation is opened first, so a name
+        // that is not there is still reported as a missing relation.
+        if (stmt.table() != null) {
+            executor.checkTablePrivilege("TRIGGER", triggerTableSchema, stmt.table());
         }
         List<PgTrigger.Event> trigEvents = new ArrayList<>();
         for (String event : stmt.events()) {
@@ -2267,6 +2456,10 @@ class DdlObjectExecutor {
                     stmt.newTransitionTable(), stmt.oldTransitionTable(), stmt.forEachStatement(),
                     stmt.whenClause(), stmt.deferrable, stmt.initiallyDeferred, stmt.functionArgs());
             trigger.setSchemaName(triggerTableSchema);
+            // What the statement said it was: a constraint trigger is a constraint too, and the
+            // catalogue has to be able to say so.
+            trigger.setConstraintTrigger(stmt.constraintTrigger());
+            trigger.setConstraintRelation(stmt.constraintRelation());
             executor.database.addTrigger(trigger);
         }
         return QueryResult.command(QueryResult.Type.CREATE_TRIGGER, 0);
@@ -2279,6 +2472,36 @@ class DdlObjectExecutor {
      */
     private void checkTriggerShape(CreateTriggerStmt stmt, PgTrigger.Timing timing,
                                    List<PgTrigger.Event> events, String schema, boolean isView) {
+        // A view has no rows of its own to truncate, so TRUNCATE is not an event it can carry at
+        // all. PostgreSQL settles that about the relation before it looks at how the trigger fires,
+        // and checking the level first reported a rule the statement never broke.
+        if (isView && events.contains(PgTrigger.Event.TRUNCATE)) {
+            MemgresException viewTruncate =
+                    PgErrors.wrongObjectType("\"" + stmt.table() + "\" is a view");
+            viewTruncate.setDetail("Views cannot have TRUNCATE triggers.");
+            throw viewTruncate;
+        }
+        // A transition table holds the rows a statement wrote, and a view stores none of its own,
+        // so there is nothing for one to be built from.
+        if (isView && (stmt.newTransitionTable() != null || stmt.oldTransitionTable() != null)) {
+            MemgresException viewTransition =
+                    PgErrors.wrongObjectType("\"" + stmt.table() + "\" is a view");
+            viewTransition.setDetail("Triggers on views cannot have transition tables.");
+            throw viewTransition;
+        }
+        // A row trigger with a transition table would have to be shown the rows of every partition
+        // at once, which PostgreSQL does not build: neither a partitioned table nor one of its
+        // partitions may carry one. The relation's kind is judged before how the trigger fires, so
+        // a partitioned table is answered for being one.
+        if (!isView && stmt.table() != null && !stmt.forEachStatement()
+                && (stmt.newTransitionTable() != null || stmt.oldTransitionTable() != null)
+                && executor.resolveTable(schema, stmt.table()).getPartitionStrategy() != null) {
+            MemgresException partitioned = PgErrors.notImplemented(
+                    "\"" + stmt.table() + "\" is a partitioned table");
+            partitioned.setDetail(
+                    "ROW triggers with transition tables are not supported on partitioned tables.");
+            throw partitioned;
+        }
         if (timing == PgTrigger.Timing.INSTEAD_OF) {
             if (stmt.forEachStatement()) {
                 throw PgErrors.notImplemented("INSTEAD OF triggers must be FOR EACH ROW");
@@ -2309,6 +2532,13 @@ class DdlObjectExecutor {
                 throw PgErrors.invalidObjectState(
                         "transition table name can only be specified for an AFTER trigger");
             }
+            // A row of a partition is one row of the partitioned table's statement, and the
+            // transition table belongs to that statement rather than to any one partition.
+            if (!isView && stmt.table() != null && !stmt.forEachStatement()
+                    && executor.resolveTable(schema, stmt.table()).getPartitionParent() != null) {
+                throw PgErrors.notImplemented(
+                        "ROW triggers with transition tables are not supported on partitions");
+            }
             if (stmt.oldTransitionTable() != null
                     && !events.contains(PgTrigger.Event.DELETE) && !events.contains(PgTrigger.Event.UPDATE)) {
                 throw PgErrors.invalidObjectState(
@@ -2327,6 +2557,26 @@ class DdlObjectExecutor {
                             + stmt.table() + "\" already exists", "42710");
                 }
             }
+            // The trigger is about to be cloned onto every partition, so a partition already
+            // carrying one of that name is a collision, and PostgreSQL reports it against the
+            // partition rather than against the relation the statement named.
+            if (!isView && stmt.table() != null && !stmt.forEachStatement()) {
+                rejectTriggerNameInPartitions(executor.resolveTable(schema, stmt.table()),
+                        stmt.name());
+            }
+        }
+    }
+
+    /** A trigger cloned onto the partitions may not collide with one written on a partition. */
+    private void rejectTriggerNameInPartitions(Table on, String name) {
+        for (Table partition : on.getPartitions()) {
+            for (PgTrigger existing : executor.database.getTriggersForTable(partition.getName())) {
+                if (existing.getName().equalsIgnoreCase(name)) {
+                    throw new MemgresException("trigger \"" + name + "\" for relation \""
+                            + partition.getName() + "\" already exists", "42710");
+                }
+            }
+            rejectTriggerNameInPartitions(partition, name);
         }
     }
 
@@ -2504,10 +2754,56 @@ class DdlObjectExecutor {
      */
     static void noticeDropCascades(AstExecutor executor, List<String> objects) {
         if (objects == null || objects.isEmpty() || executor.session == null) return;
-        String text = objects.size() == 1
-                ? "drop cascades to " + objects.get(0)
-                : "drop cascades to " + objects.size() + " other objects";
-        executor.session.addNotice("NOTICE", "00000", text, null);
+        if (objects.size() == 1) {
+            executor.session.addNotice("NOTICE", "00000",
+                    "drop cascades to " + objects.get(0), null);
+            return;
+        }
+        // Past one dependent the message is only a count, so PostgreSQL puts the names under
+        // DETAIL, one "drop cascades to <object>" line each. Without them a script was told four
+        // things had gone and never which four.
+        List<String> lines = new ArrayList<>();
+        for (String object : objects) lines.add("drop cascades to " + object);
+        executor.session.addNotice("NOTICE", "00000",
+                "drop cascades to " + objects.size() + " other objects", null,
+                dependencyDetail(lines));
+    }
+
+    /** How many dependents PostgreSQL names to the client before it stops listing them. */
+    private static final int MAX_REPORTED_DEPENDENTS = 100;
+
+    /**
+     * The DETAIL a drop reports, one dependent to a line.
+     *
+     * <p>PostgreSQL names a hundred of them and no more: past that the client is told how many
+     * were left out and the whole list goes to the server log instead, so that dropping a
+     * relation thousands of objects hang from does not send all of them down the wire.
+     */
+    static String dependencyDetail(List<String> lines) {
+        int shown = Math.min(lines.size(), MAX_REPORTED_DEPENDENTS);
+        StringBuilder detail = new StringBuilder();
+        for (int i = 0; i < shown; i++) {
+            if (i > 0) detail.append('\n');
+            detail.append(lines.get(i));
+        }
+        int hidden = lines.size() - shown;
+        if (hidden > 0) {
+            detail.append("\nand ").append(hidden)
+                    .append(hidden == 1 ? " other object" : " other objects")
+                    .append(" (see server log for list)");
+        }
+        return detail.toString();
+    }
+
+    /**
+     * How PostgreSQL words a drop it will not make. A statement naming one object names it; one
+     * naming several says only that it cannot have what it asked for, because it judged the whole
+     * set at once and what is in the way may be in the way of any of them.
+     */
+    static String cannotDropMessage(boolean severalNamed, String what) {
+        return severalNamed
+                ? "cannot drop desired object(s) because other objects depend on them"
+                : "cannot drop " + what + " because other objects depend on it";
     }
 
     /** IF EXISTS says what to skip, and PostgreSQL says which one it skipped. */
@@ -2518,6 +2814,73 @@ class DdlObjectExecutor {
     }
 
     QueryResult executeDropStmt(DropStmt stmt) {
+        // Every name the statement lists goes, and each of them knows what the others are:
+        // PostgreSQL works out the whole set before it looks for what would be left pointing at
+        // one of them, so an object the same DROP takes down is no reason to refuse.
+        Set<String> together = new HashSet<>();
+        if (!stmt.more().isEmpty()) {
+            together.add(RelationNamespace.bareName(stmt.name()).toLowerCase());
+            for (DropStmt other : stmt.more()) {
+                together.add(RelationNamespace.bareName(other.name()).toLowerCase());
+            }
+        }
+        // Which of the names reach an object is settled here, before any of them goes: a name
+        // whose object another name in the same list takes with it — a view over a view the list
+        // also names, a type another named type was declared from — is gone by the time its own
+        // turn comes. PostgreSQL settles the whole set of names before it deletes any of it and
+        // deletes each object once, so the second name is neither an error nor something to
+        // report as skipped.
+        Set<String> wasThere = new HashSet<>();
+        for (DropStmt one : DropStmt.allOf(stmt)) {
+            if (dropTargetPresent(one)) wasThere.add(dropTargetIdentity(one));
+        }
+        // A name the list gives twice stands for one object, and PostgreSQL drops it once rather
+        // than reporting the second as missing.
+        Set<String> named = new HashSet<>();
+        named.add(dropTargetIdentity(stmt));
+        QueryResult result = executeDropOne(stmt, together);
+        for (DropStmt other : stmt.more()) {
+            if (!named.add(dropTargetIdentity(other))) continue;
+            if (wasThere.contains(dropTargetIdentity(other)) && !dropTargetPresent(other)) continue;
+            result = executeDropOne(other, together);
+        }
+        return result;
+    }
+
+    /**
+     * Whether the object one name in a DROP list stands for is still there, asked the way that
+     * kind's own drop asks it. Only the kinds a drop in the same statement can reach are answered
+     * for; anything else is taken to be where it was, so its own turn judges it as it always did.
+     */
+    private boolean dropTargetPresent(DropStmt stmt) {
+        switch (stmt.objectType()) {
+            case VIEW:
+            case MATERIALIZED_VIEW:
+                return executor.database.getView(stmt.name()) != null;
+            case TYPE:
+            case DOMAIN:
+                return TypeNamespace.resolveParts(executor.database, executor.session,
+                        stmt.schema(), stmt.name()) != null;
+            default:
+                return true;
+        }
+    }
+
+    /**
+     * What one name in a DROP list stands for: the schema it reaches and the name itself, so that
+     * a relation written bare and the same relation written with the schema that holds it are the
+     * one object. A signature is part of the identity where the kind has one.
+     */
+    private String dropTargetIdentity(DropStmt stmt) {
+        String written = stmt.schema() != null ? stmt.schema()
+                : SchemaQualifier.qualifierOf(stmt.name());
+        String schema = written != null ? written : executor.defaultSchema();
+        return stmt.objectType() + ":" + schema.toLowerCase() + "."
+                + RelationNamespace.bareName(stmt.name()).toLowerCase()
+                + (stmt.paramTypes() == null ? "" : stmt.paramTypes().toString().toLowerCase());
+    }
+
+    private QueryResult executeDropOne(DropStmt stmt, Set<String> together) {
         // A DROP that names a schema of its own is looking in that schema, so a schema which is
         // not there is what is missing — PostgreSQL reports 3F000 rather than naming an object
         // it never went looking for. SCHEMA and EXTENSION name no schema of their own.
@@ -2529,7 +2892,7 @@ class DdlObjectExecutor {
         switch (stmt.objectType()) {
             case VIEW:
             case MATERIALIZED_VIEW:
-                dropView(stmt);
+                dropView(stmt, together);
                 break;
             case SEQUENCE:
                 dropSequence(stmt);
@@ -2571,7 +2934,13 @@ class DdlObjectExecutor {
                 // A column declared as the domain depends on it exactly as one declared as an
                 // enum depends on that, and blocks the drop the same way.
                 refuseOrCascadeTypeDependents(stmt, key);
-                executor.database.getDomains().remove(key);
+                // DDL is transactional, so a drop whose statement or transaction rolls back never
+                // happened. Without a record of what went, a rolled-back DROP DOMAIN left the
+                // domain gone for good, and a DROP DOMAIN whose second name reached nothing had
+                // already taken the first.
+                executor.recordUndo(new Session.DropDomainUndo(TypeNamespace.schemaOfKey(key),
+                        TypeNamespace.nameOfKey(key), executor.database.getDomains().get(key)));
+                inStoredTypes(() -> executor.database.getDomains().remove(key));
                 executor.database.unregisterSchemaObject(TypeNamespace.schemaOfKey(key),
                         "domain", TypeNamespace.nameOfKey(key));
                 executor.database.addComment("type", key, null);
@@ -2716,7 +3085,7 @@ class DdlObjectExecutor {
         return holder != null ? holder : executor.defaultSchema();
     }
 
-    private void dropView(DropStmt stmt) {
+    private void dropView(DropStmt stmt, Set<String> together) {
         // A materialized view is a different kind of object from a view, and dropping one by the
         // wrong name would destroy stored data on what is usually a typo.
         Database.ViewDef existing = executor.database.getView(stmt.name());
@@ -2749,36 +3118,57 @@ class DdlObjectExecutor {
                     + stmt.name() + "\"");
         }
         Database.ViewDef oldView = executor.database.getView(stmt.name());
-        if (oldView != null) {
-            executor.recordUndo(new Session.DropViewUndo(stmt.name(), oldView));
-        }
         String dropViewSchema = (oldView != null && oldView.schemaName() != null)
                 ? oldView.schemaName() : executor.defaultSchema();
+        if (oldView != null) {
+            executor.recordUndo(new Session.DropViewUndo(stmt.name(), oldView,
+                    executor.database.getTriggersForTable(dropViewSchema,
+                            RelationNamespace.bareName(stmt.name())),
+                    executor.database.snapshotRulesOn(dropViewSchema,
+                            RelationNamespace.bareName(stmt.name()))));
+        }
         // A view is a relation like any other: what reads it depends on it, so dropping it
         // blocks on those readers and CASCADE takes them with it.
         String bareViewName = RelationNamespace.bareName(stmt.name());
         List<String> viewDependents = oldView == null || stmt.cascade() ? Cols.listOf()
-                : ViewDependencies.dependencyLines(executor.database, dropViewSchema, bareViewName,
+                : ViewDependencies.dependencyLines(executor.database, executor.systemCatalog,
+                        dropViewSchema, bareViewName,
                         wantMaterialized ? "materialized view" : "view",
-                        executor.searchPathSchemas());
+                        executor.searchPathSchemas(), together);
         if (!viewDependents.isEmpty()) {
-            MemgresException e = new MemgresException("cannot drop "
-                    + (wantMaterialized ? "materialized view " : "view ") + bareViewName
-                    + " because other objects depend on it", "2BP01");
-            e.setDetail(String.join("\n", viewDependents));
+            MemgresException e = new MemgresException(cannotDropMessage(together.size() > 1,
+                    (wantMaterialized ? "materialized view " : "view ") + bareViewName), "2BP01");
+            e.setDetail(dependencyDetail(viewDependents));
             e.setHint("Use DROP ... CASCADE to drop the dependent objects too.");
             throw e;
         }
         if (oldView != null && stmt.cascade()) {
             List<String> cascaded = new ArrayList<>();
             for (String dependent : ViewDependencies.cascadeDependents(
-                    executor.database, dropViewSchema, bareViewName)) {
-                cascaded.add("view " + RelationNamespace.bareName(dependent));
+                    executor.database, executor.systemCatalog, dropViewSchema, bareViewName)) {
+                // A relation the same DROP names is not something the cascade reached:
+                // PostgreSQL settles the whole set of names first and reports only what it had to
+                // take besides. A materialized view is named by the kind it really is, because
+                // that is the kind PostgreSQL recorded it under.
+                Database.ViewDef going = executor.database.getView(dependent);
+                if (!together.contains(RelationNamespace.bareName(dependent).toLowerCase())) {
+                    cascaded.add((going != null && going.materialized()
+                            ? "materialized view " : "view ")
+                            + RelationNamespace.bareName(dependent));
+                }
                 executor.database.removeView(dependent);
             }
             noticeDropCascades(executor, cascaded);
         }
         executor.database.removeObjectOwner("view:" + dropViewSchema + "." + stmt.name());
+        // A trigger belongs to the relation it watches, so an INSTEAD OF trigger goes with the
+        // view. Leaving it registered kept the dependency it records on its function alive, and
+        // the function could then never be dropped -- for a trigger on a relation that was gone.
+        executor.database.removeTriggersForTable(dropViewSchema, bareViewName);
+        // A rule belongs to the relation it is written on, and a view is a relation like any
+        // other. Leaving one registered kept pg_rules describing a rule on a relation that was no
+        // longer there, and a table created under the name afterwards inherited it.
+        executor.database.dropRulesOn(dropViewSchema, bareViewName);
         executor.database.removeView(stmt.name());
     }
 
@@ -2825,7 +3215,7 @@ class DdlObjectExecutor {
                 lines.add("default value for column " + dep.columnName() + " of table "
                         + dep.tableRef(visibleSchemas) + " depends on sequence " + shown);
             }
-            e.setDetail(String.join("\n", lines));
+            e.setDetail(dependencyDetail(lines));
             e.setHint("Use DROP ... CASCADE to drop the dependent objects too.");
             throw e;
         }
@@ -2837,9 +3227,7 @@ class DdlObjectExecutor {
                         + dep.tableRef(visibleSchemas));
             }
             noticeDropCascades(executor, cascaded);
-            for (SequenceDependent dep : dependents) {
-                dep.column.setDefaultValue(null);
-            }
+            clearSequenceDefaults(found);
         }
         executor.recordUndo(new Session.DropSequenceUndo(found.qualifiedName(), found));
         executor.database.removeSequence(seqSchema, bareSeqName);
@@ -2878,18 +3266,39 @@ class DdlObjectExecutor {
      * sequence's own schema let the drop succeed and left the default pointing at nothing.
      */
     private List<SequenceDependent> findSequenceDependents(Sequence seq) {
-        List<SequenceDependent> result = new ArrayList<>();
+        // PostgreSQL reports these in the order it recorded them: the tables in the order they
+        // were created, and within one table its columns from the first to the last. Walking the
+        // schema maps reported them in whatever order those maps happened to hold them, which for
+        // three tables drawing on one sequence was neither. Each column is kept beside its
+        // relation's OID -- which follows creation order -- and its position, and the list is put
+        // in that order once it is complete.
+        List<Object[]> found = new ArrayList<>();
         for (java.util.Map.Entry<String, Schema> se : executor.database.getSchemas().entrySet()) {
             for (Table tbl : se.getValue().getTables().values()) {
-                for (Column col : tbl.getColumns()) {
+                int relOid = executor.systemCatalog.getOid(
+                        "rel:" + se.getKey() + "." + tbl.getName());
+                List<Column> cols = tbl.getColumns();
+                for (int i = 0; i < cols.size(); i++) {
+                    Column col = cols.get(i);
                     String written = Sequence.nameInDefault(col.getDefaultValue());
                     if (written == null) continue;
                     if (executor.database.getSequenceFor(se.getKey(), written) == seq) {
-                        result.add(new SequenceDependent(se.getKey(), tbl, col));
+                        found.add(new Object[]{relOid, i,
+                                new SequenceDependent(se.getKey(), tbl, col)});
                     }
                 }
             }
         }
+        java.util.Collections.sort(found, new java.util.Comparator<Object[]>() {
+            @Override
+            public int compare(Object[] a, Object[] b) {
+                int byRelation = Integer.compare((Integer) a[0], (Integer) b[0]);
+                return byRelation != 0 ? byRelation
+                        : Integer.compare((Integer) a[1], (Integer) b[1]);
+            }
+        });
+        List<SequenceDependent> result = new ArrayList<>();
+        for (Object[] entry : found) result.add((SequenceDependent) entry[2]);
         return result;
     }
 
@@ -2960,16 +3369,101 @@ class DdlObjectExecutor {
             return;
         }
         String storedTable = executor.database.getIndexTable(indexKey);
+        // What the index enforced on its table goes with it, and comes back with it: a unique
+        // index is recorded twice over, once as an index and once as the rule its table is
+        // checked against, and putting back only the first left a unique index that let a
+        // duplicate through.
+        Table indexOwner = null;
+        List<StoredConstraint> enforced = new ArrayList<>();
         if (storedTable != null) {
             try {
                 int dotIdx = storedTable.indexOf('.');
                 String schema = dotIdx >= 0 ? storedTable.substring(0, dotIdx) : "public";
                 String tableName = dotIdx >= 0 ? storedTable.substring(dotIdx + 1) : storedTable;
                 Table t = executor.resolveTable(schema, tableName);
+                for (StoredConstraint sc : t.getConstraints()) {
+                    if (sc.getName() != null && sc.getName().equalsIgnoreCase(bareIndexName)) {
+                        enforced.add(sc);
+                    }
+                }
+                indexOwner = t;
                 t.getConstraints().removeIf(sc -> sc.getName().equalsIgnoreCase(bareIndexName));
             } catch (MemgresException ignored) {}
         }
+        // DDL is transactional, so a drop whose statement or transaction rolls back never
+        // happened. Without a record of what went, a rolled-back DROP INDEX left the index gone
+        // for good, and a DROP INDEX whose second name reached nothing had already taken the
+        // first.
+        executor.recordUndo(new DroppedIndexUndo(executor.database, indexKey, indexOwner, enforced));
         executor.database.removeIndex(indexSchema, bareIndexName);
+    }
+
+    /**
+     * Undo a DROP INDEX. PostgreSQL rolls a catalogue change back whole, so an index a
+     * rolled-back statement dropped is back on its table, still unique, still partial and still
+     * built the way it was written; everything the drop cleared is read off the database as it
+     * stands and put back under the same key.
+     */
+    private static final class DroppedIndexUndo implements Session.UndoEntry {
+        private final String schema;
+        private final String name;
+        private final List<String> columns;
+        private final String table;
+        private final boolean unique;
+        private final String method;
+        private final String whereClause;
+        private final Map<String, String> reloptions;
+        private final List<String> columnOptions;
+        private final List<String> includeColumns;
+        private final boolean nullsNotDistinct;
+        private final Table owner;
+        private final List<StoredConstraint> enforced;
+
+        DroppedIndexUndo(Database db, String indexKey, Table owner,
+                         List<StoredConstraint> enforced) {
+            this.owner = owner;
+            this.enforced = enforced == null ? null : new ArrayList<>(enforced);
+            this.schema = Database.idxSchema(indexKey);
+            this.name = Database.idxName(indexKey);
+            List<String> cols = db.getIndexColumns(indexKey);
+            this.columns = cols == null ? null : new ArrayList<>(cols);
+            this.table = db.getIndexTable(indexKey);
+            this.unique = db.isUniqueIndex(indexKey);
+            this.method = db.getIndexMethod(indexKey);
+            this.whereClause = db.getIndexWhereClause(indexKey);
+            Map<String, String> opts = db.getIndexReloptions(indexKey);
+            this.reloptions = opts == null ? null : new LinkedHashMap<>(opts);
+            List<String> colOpts = db.getIndexColumnOptions(indexKey);
+            this.columnOptions = colOpts == null ? null : new ArrayList<>(colOpts);
+            List<String> incl = db.getIndexIncludeColumns(indexKey);
+            this.includeColumns = incl == null ? null : new ArrayList<>(incl);
+            this.nullsNotDistinct = db.isIndexNullsNotDistinct(indexKey);
+        }
+
+        @Override
+        public void undo(Database db) {
+            if (columns == null) return;
+            db.addIndex(schema, name, columns);
+            db.addIndexMeta(schema, name, table, unique, method, whereClause);
+            if (reloptions != null) db.setIndexReloptions(schema + "." + name, reloptions);
+            db.setIndexColumnOptions(schema, name, columnOptions);
+            db.setIndexIncludeColumns(schema, name, includeColumns);
+            db.setIndexNullsNotDistinct(schema, name, nullsNotDistinct);
+            if (owner != null && enforced != null) {
+                for (StoredConstraint sc : enforced) {
+                    boolean back = false;
+                    for (StoredConstraint held : owner.getConstraints()) {
+                        if (held == sc) { back = true; break; }
+                    }
+                    if (!back) owner.addConstraint(sc);
+                }
+            }
+        }
+
+        @Override
+        public String toString() {
+            return "DroppedIndexUndo[name=" + schema + "." + name + "]";
+        }
     }
 
     private void dropFunction(DropStmt stmt) {
@@ -2987,14 +3481,87 @@ class DdlObjectExecutor {
                     + "(" + pgArgumentList(stmt.paramTypes()) + ")");
             return;
         }
+        // A trigger runs its function every time the relation it sits on is written, so the
+        // function is not the definer's alone to drop: PostgreSQL refuses while a trigger depends
+        // on it, names the trigger, and takes the trigger along when CASCADE is written.
+        refuseOrCascadeTriggerDependents(stmt);
         if (stmt.paramTypes() != null) {
             executor.database.removeFunction(schema, stmt.name(), stmt.paramTypes());
         } else {
             executor.database.removeFunction(schema, stmt.name());
         }
+        // DDL is transactional, so a DROP whose transaction rolls back never happened. Only the
+        // overloads that actually went are recorded: a DROP by signature leaves the rest standing,
+        // and putting those back would resurrect routines nobody dropped.
+        List<PgFunction> survivors = executor.database.getFunctionOverloads(schema, stmt.name());
+        List<PgFunction> removed = new ArrayList<>();
+        for (PgFunction candidate : candidates) {
+            boolean survives = false;
+            for (PgFunction s : survivors) {
+                if (s == candidate) { survives = true; break; }
+            }
+            if (!survives) removed.add(candidate);
+        }
+        if (!removed.isEmpty()) {
+            executor.recordUndo(new Session.DropFunctionUndo(schema, stmt.name(), removed));
+        }
         if (executor.database.getFunctionOverloads(stmt.name()).isEmpty()) {
             executor.database.removeObjectOwner("function:" + stmt.name());
         }
+    }
+
+    /**
+     * The triggers that execute a function being dropped. PostgreSQL records the dependency when
+     * the trigger is created, so the function cannot go while a trigger is still there to call it
+     * -- the trigger would fire into nothing and the write it was watching would go through in
+     * silence -- and CASCADE drops the trigger with it.
+     */
+    private void refuseOrCascadeTriggerDependents(DropStmt stmt) {
+        // A trigger's function takes no arguments, so a DROP that names any is naming a different
+        // overload and no trigger depends on that one.
+        if (stmt.paramTypes() != null && !stmt.paramTypes().isEmpty()) return;
+        List<PgTrigger> dependents = new ArrayList<>();
+        for (List<PgTrigger> onOneRelation : executor.database.getAllTriggers().values()) {
+            for (PgTrigger t : onOneRelation) {
+                // A partition's copy of a trigger goes with the trigger it was cloned from, so it
+                // is not a dependent of its own.
+                if (t.getClonedFromTable() != null || t.getFunctionName() == null) continue;
+                if (RelationNamespace.bareName(t.getFunctionName()).equalsIgnoreCase(stmt.name())) {
+                    dependents.add(t);
+                }
+            }
+        }
+        if (dependents.isEmpty()) return;
+        String written = stmt.name() + "(" + pgArgumentList(stmt.paramTypes()) + ")";
+        if (!stmt.cascade()) {
+            List<String> lines = new ArrayList<>();
+            for (PgTrigger t : dependents) {
+                lines.add(triggerOnRelation(t) + " depends on function " + written);
+            }
+            MemgresException e = new MemgresException("cannot drop function " + written
+                    + " because other objects depend on it", "2BP01");
+            e.setDetail(dependencyDetail(lines));
+            e.setHint("Use DROP ... CASCADE to drop the dependent objects too.");
+            throw e;
+        }
+        List<String> cascaded = new ArrayList<>();
+        for (PgTrigger t : dependents) {
+            cascaded.add(triggerOnRelation(t));
+            executor.database.removeTrigger(t.getName(), t.getTableName());
+        }
+        noticeDropCascades(executor, cascaded);
+    }
+
+    /**
+     * A trigger named the way PostgreSQL names it when it reports a dependency, which says what
+     * kind of relation the trigger watches. An INSTEAD OF trigger sits on a view, and calling that
+     * a table named an object of a kind the database does not hold under that name.
+     */
+    private String triggerOnRelation(PgTrigger t) {
+        String relation = RelationNamespace.bareName(t.getTableName());
+        Database.ViewDef view = executor.database.getView(relation);
+        String kind = view == null ? "table" : (view.materialized() ? "materialized view" : "view");
+        return "trigger " + t.getName() + " on " + kind + " " + relation;
     }
 
     /**
@@ -3053,58 +3620,305 @@ class DdlObjectExecutor {
 
     private void dropTrigger(DropStmt stmt) {
         if (stmt.onTable() != null) {
-            List<PgTrigger> tableTriggers = executor.database.getTriggersForTable(stmt.onTable());
-            boolean found = false;
+            // The relation may be written with the schema that holds it, and the trigger registry
+            // is keyed by the relation's bare name. PostgreSQL names the relation as it was
+            // written when it is not there, and without its schema when the trigger is not.
+            String written = stmt.onTable();
+            String onSchema = executor.relationSchemaOf(null, written);
+            String onTable = RelationNamespace.bareName(written);
+            List<PgTrigger> tableTriggers = executor.database.getTriggersForTable(onSchema, onTable);
+            PgTrigger named = null;
             for (PgTrigger t : tableTriggers) {
-                if (t.getName().equalsIgnoreCase(stmt.name())) { found = true; break; }
+                if (t.getName().equalsIgnoreCase(stmt.name())) { named = t; break; }
             }
+            // A partition's copy of its parent's trigger is the parent's to drop: dropping the
+            // copy alone would leave the partition out of a trigger the partitioned table still
+            // declares, so PostgreSQL refuses it and names the drop that takes both. CASCADE does
+            // not soften it, because the copy is not an object that depends on the original but
+            // part of it.
+            if (named != null && named.getClonedFromTable() != null) {
+                MemgresException required = new MemgresException("cannot drop trigger " + stmt.name()
+                        + " on table " + onTable + " because trigger " + stmt.name()
+                        + " on table " + named.getClonedFromTable() + " requires it", "2BP01");
+                required.setHint("You can drop trigger " + stmt.name() + " on table "
+                        + named.getClonedFromTable() + " instead.");
+                throw required;
+            }
+            boolean found = named != null;
             if (!found) {
                 // A trigger is named by its relation, so a relation that is not there is what is
                 // missing — PostgreSQL names that rather than the trigger it never looked for.
-                boolean relationThere = ddl.resolveTableOrNull(stmt.onTable()) != null
-                        || executor.database.hasView(stmt.onTable());
+                boolean relationThere =
+                        RelationNamespace.kindOf(executor.database, onSchema, onTable) != null;
                 if (!stmt.ifExists()) {
                     if (!relationThere) {
                         throw new MemgresException(
-                                "relation \"" + stmt.onTable() + "\" does not exist", "42P01");
+                                "relation \"" + written + "\" does not exist", "42P01");
                     }
-                    throw new MemgresException("trigger \"" + stmt.name() + "\" for table \"" + stmt.onTable() + "\" does not exist", "42704");
+                    throw new MemgresException("trigger \"" + stmt.name() + "\" for table \"" + onTable + "\" does not exist", "42704");
                 }
                 noticeSkipped(relationThere
-                        ? "trigger \"" + stmt.name() + "\" for relation \"" + stmt.onTable() + "\""
-                        : "relation \"" + stmt.onTable() + "\"");
+                        ? "trigger \"" + stmt.name() + "\" for relation \"" + onTable + "\""
+                        : "relation \"" + written + "\"");
             }
-            executor.database.removeTrigger(stmt.name(), stmt.onTable());
+            executor.database.removeTrigger(stmt.name(), onTable);
         }
     }
 
     /**
-     * Dropping a type a column is declared as would leave that column pointing at nothing, so
-     * without CASCADE the columns block the drop and with it they are taken along.
+     * Dropping a type something is declared as — a column, a composite type's attribute, a domain
+     * written over it, a routine written in terms of it — would leave that thing naming nothing,
+     * so without CASCADE they block the drop and with it they are taken along.
+     *
+     * <p>What the refusal names and what CASCADE removes are worked out from one list and taken
+     * away in one place, because a drop that names a dependent and then leaves it standing is a
+     * worse answer than either refusing or removing it.
      */
     private void refuseOrCascadeTypeDependents(DropStmt stmt, String key) {
-        List<String> dependents = columnsDeclaredAsType(key);
+        List<String> dependents = new ArrayList<>();
+        List<String> lines = new ArrayList<>();
+        collectTypeDependents(key, new HashSet<>(), dependents, lines);
         if (dependents.isEmpty()) return;
-        String display = TypeNamespace.display(executor.database, executor.session, key);
         if (!stmt.cascade()) {
             // One dependent per line of a single detail. Written as repeated labelled sections
             // only the first of them reached the client and the rest stayed inside the message.
-            List<String> lines = new ArrayList<>();
-            for (String d : dependents) {
-                lines.add(d + " depends on type " + display);
-            }
-            MemgresException e = new MemgresException("cannot drop type " + display
+            MemgresException e = new MemgresException("cannot drop type "
+                    + TypeNamespace.display(executor.database, executor.session, key)
                     + " because other objects depend on it", "2BP01");
-            e.setDetail(String.join("\n", lines));
+            e.setDetail(dependencyDetail(lines));
             e.setHint("Use DROP ... CASCADE to drop the dependent objects too.");
             throw e;
         }
         noticeDropCascades(executor, dependents);
+        dropTypeDependents(key, null);
+    }
+
+    /**
+     * Everything a drop of this type would leave naming nothing, in the order PostgreSQL reports
+     * it. A domain written over the type is a type in its own right, so what was written over the
+     * domain is in the way of this drop as well, and PostgreSQL names it straight after the domain
+     * it hangs from rather than at the end of the list. Each line says which of the two types the
+     * dependency is really on, so a reader can tell a direct dependent from one reached through a
+     * domain.
+     *
+     * @param dependents how the cascade notice names each object
+     * @param lines the same objects, each said to depend on the type its declaration reached
+     */
+    private void collectTypeDependents(String key, Set<String> seen, List<String> dependents,
+                                       List<String> lines) {
+        if (!seen.add(key)) return;
+        String display = TypeNamespace.display(executor.database, executor.session, key);
+        for (TypeUser user : declaredAsType(key)) {
+            dependents.add(user.described);
+            lines.add(user.described + " depends on type " + user.typeShown(display));
+            if (user.domainKey() != null) {
+                collectTypeDependents(user.domainKey(), seen, dependents, lines);
+            }
+        }
+        for (TypeDependents.Dependent d : TypeDependents.writtenIn(executor.database,
+                executor.systemCatalog, executor.searchPathSchemas(), typeNamed(key))) {
+            dependents.add(d.described());
+            lines.add(d.described() + " depends on type " + d.typeShown(display));
+        }
+    }
+
+    /**
+     * Take away everything written in terms of a type, which is what CASCADE means wherever a type
+     * is dropped -- named by DROP TYPE, or carried off by the schema that holds it. Both statements
+     * come here so that the same dependent meets the same end whichever of them asked.
+     *
+     * @param exceptSchema a schema whose own objects are going anyway, so that a schema drop does
+     *                     not take a column off a relation it is about to remove entirely
+     */
+    private void dropTypeDependents(String key, String exceptSchema) {
+        List<Session.UndoEntry> undo = new ArrayList<>();
+        dropTypeDependents(key, exceptSchema, new HashSet<>(), undo);
+        for (Session.UndoEntry entry : undo) executor.recordUndo(entry);
+    }
+
+    /**
+     * The same, following a domain written over the type into what was written over the domain.
+     * The domain cannot outlive the type it stands on, so nothing written over the domain can
+     * outlive it either, and each of those goes before the domain that carried it off.
+     */
+    private void dropTypeDependents(String key, String exceptSchema, Set<String> done,
+                                    List<Session.UndoEntry> undo) {
+        if (!done.add(key)) return;
+        for (TypeUser user : declaredAsType(key)) {
+            if (exceptSchema != null && exceptSchema.equalsIgnoreCase(user.schemaName)) continue;
+            if (user.domainKey() != null) {
+                dropTypeDependents(user.domainKey(), exceptSchema, done, undo);
+                takeDomainAway(user.domainKey(), undo);
+                continue;
+            }
+            if (user.compositeKey() != null) {
+                dropCompositeAttribute(user, undo);
+                continue;
+            }
+            if (user.column == null) {
+                // A typed table has no shape of its own once the type has gone -- its columns are
+                // the type's -- so the whole relation goes rather than any column of it.
+                ddl.tableExecutor.dropSingleTable(user.schemaName, user.table.getName(), true, true);
+                continue;
+            }
+            int idx = user.table.getColumnIndex(user.column.getName());
+            if (idx < 0) continue;
+            List<Object> held = new ArrayList<>();
+            for (Object[] row : user.table.getRows()) held.add(row[idx]);
+            // The constraints written over the column go with it and have to come back with it,
+            // after it: a key constraint is rebuilt over the column's position, so the column has
+            // to be there first. Undo runs in reverse, so this is recorded ahead of the column's
+            // own entry. Without it a rolled-back CASCADE gave the column back unconstrained, and
+            // the unique index over it stopped refusing a duplicate.
+            List<StoredConstraint> doomed = new ArrayList<>();
+            for (StoredConstraint sc : user.table.getConstraints()) {
+                if (sc.dependsOnColumn(user.column.getName())) doomed.add(sc);
+            }
+            if (!doomed.isEmpty()) {
+                undo.add(new Session.DropColumnConstraintsUndo(user.schemaName,
+                        user.table.getName(), doomed));
+            }
+            undo.add(new Session.DropColumnUndo(user.schemaName, user.table.getName(),
+                    user.column, idx, held));
+            user.table.removeColumn(user.column.getName());
+            dropIndexesOverColumn(user.schemaName, user.table.getName(), user.column.getName());
+        }
+        for (TypeDependents.Dependent d : TypeDependents.writtenIn(executor.database,
+                executor.systemCatalog, executor.searchPathSchemas(), typeNamed(key))) {
+            if (exceptSchema != null && exceptSchema.equalsIgnoreCase(routineSchemaOf(d))) continue;
+            TypeDependents.remove(executor.database, d, undo);
+        }
+    }
+
+    /**
+     * Take the attribute off the composite type, the way ALTER TYPE ... DROP ATTRIBUTE does. The
+     * composite type outlives the drop of the type its attribute was declared as, so the attribute
+     * is not taken out of the list: it keeps its number under a name nobody could have written,
+     * and the attributes after it keep theirs.
+     */
+    private void dropCompositeAttribute(TypeUser user, List<Session.UndoEntry> undo) {
+        List<CreateTypeStmt.CompositeField> fields =
+                executor.database.getCompositeTypes().get(user.compositeKey());
+        if (fields == null) return;
+        // What a type is made of is shared state, so a transaction that rolls back has to find the
+        // attribute list it started with — the same record ALTER TYPE keeps for itself.
+        undo.add(new Session.AlterCompositeTypeUndo(user.compositeKey(), fields));
+        List<CreateTypeStmt.CompositeField> kept = new ArrayList<>();
+        for (int i = 0; i < fields.size(); i++) {
+            CreateTypeStmt.CompositeField f = fields.get(i);
+            kept.add(f.name().equalsIgnoreCase(user.attributeName())
+                    ? new CreateTypeStmt.CompositeField(Database.droppedAttributeName(i + 1),
+                            f.typeName())
+                    : f);
+        }
+        executor.database.replaceCompositeFields(user.compositeKey(), kept);
+    }
+
+    /**
+     * Take a domain away because the type it was written over is going. A domain carried off this
+     * way has to leave exactly what DROP DOMAIN leaves: a record to put it back if the transaction
+     * rolls back, no entry in the schema's register, nothing said about it, and an OID that is
+     * never handed to a domain created later under the same name.
+     */
+    private void takeDomainAway(final String key, List<Session.UndoEntry> undo) {
+        DomainType domain = executor.database.getDomains().get(key);
+        if (domain == null) return;
+        String schema = TypeNamespace.schemaOfKey(key);
+        String bare = TypeNamespace.nameOfKey(key);
+        undo.add(new Session.DropDomainUndo(schema, bare, domain));
+        inStoredTypes(() -> executor.database.getDomains().remove(key));
+        executor.database.unregisterSchemaObject(schema, "domain", bare);
+        executor.database.addComment("type", key, null);
+        executor.identity().typeDropped("d", key);
+    }
+
+    /** The schema a dependent routine or aggregate lives in. */
+    private static String routineSchemaOf(TypeDependents.Dependent dependent) {
+        if (dependent.routine != null) return Database.schemaOf(dependent.routine);
+        return dependent.aggregate.getSchemaName() != null
+                ? dependent.aggregate.getSchemaName() : "public";
+    }
+
+    /**
+     * An index over a column that has just gone is built on a column that is no longer there.
+     * PostgreSQL drops it with the column; leaving it registered kept the index's name taken and
+     * left pg_indexes describing an index over nothing.
+     */
+    private void dropIndexesOverColumn(String schemaName, String tableName, String columnName) {
+        String qualified = schemaName + "." + tableName;
+        java.util.regex.Pattern word = java.util.regex.Pattern.compile(
+                "(?i)\\b" + java.util.regex.Pattern.quote(columnName) + "\\b");
+        List<String> going = new ArrayList<>();
+        for (Map.Entry<String, List<String>> entry
+                : executor.database.getIndexColumns().entrySet()) {
+            String owner = executor.database.getIndexTable(entry.getKey());
+            if (owner == null || !owner.equalsIgnoreCase(qualified)) continue;
+            boolean uses = false;
+            if (entry.getValue() != null) {
+                for (String c : entry.getValue()) {
+                    if (c.equalsIgnoreCase(columnName) || word.matcher(c).find()) {
+                        uses = true;
+                        break;
+                    }
+                }
+            }
+            String where = executor.database.getIndexWhereClause(entry.getKey());
+            if (!uses && where != null && word.matcher(where).find()) uses = true;
+            if (uses) going.add(entry.getKey());
+        }
+        for (String index : going) {
+            // The index goes with the column, so a rolled-back drop has to bring both back.
+            executor.recordUndo(new Session.DropIndexUndo(executor.database.snapshotIndex(index)));
+            executor.database.removeIndex(index);
+        }
+    }
+
+    /**
+     * Whether a type name written in a declaration reaches the type stored under {@code key}. The
+     * word a column or a parameter carries resolves through the search path exactly as it did when
+     * it was written, so what is compared is the type each name reaches and not the text of it.
+     */
+    private TypeDependents.Names typeNamed(final String key) {
+        return written -> key.equals(TypeNamespace.find(executor.database.typeKeys(), written));
+    }
+
+    /**
+     * Clear the default of every column that draws from this sequence, recording what each one
+     * held. The columns sit on relations the statement never named, so they are in no relation's
+     * snapshot: without a record of its own a rolled-back drop left them with no default and the
+     * next INSERT stopped filling them in.
+     */
+    private void clearSequenceDefaults(Sequence seq) {
+        for (SequenceDependent dep : findSequenceDependents(seq)) {
+            executor.recordUndo(new Session.ColumnDefaultUndo(dep.schemaName,
+                    dep.table.getName(), dep.column.getName(), dep.column.getDefaultValue()));
+            dep.column.setDefaultValue(null);
+        }
     }
 
     /** The schema a DROP looks in: the one it named, or the session's own. */
     private String dropLookupSchema(DropStmt stmt) {
         return stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
+    }
+
+    /**
+     * Change the stored type maps rather than what this session may see of them.
+     *
+     * <p>The enums, composite types and domains a session reads are filtered to the ones visible
+     * to it, and while another session holds uncommitted DDL that reading is a copy of the stored
+     * map rather than the map itself. Removing a key from the copy threw the copy away: the drop
+     * reported success and the type stayed where it was, still usable under a name PostgreSQL had
+     * already taken away from every session. Taking a type away, or moving it to another name or
+     * schema, is not a question of what this session can see, so it is done with no viewer bound
+     * and reaches the stored map whatever anyone else is in the middle of.
+     */
+    private void inStoredTypes(Runnable change) {
+        Session viewer = Database.bindViewer(null);
+        try {
+            change.run();
+        } finally {
+            Database.bindViewer(viewer);
+        }
     }
 
     private void dropType(DropStmt stmt) {
@@ -3144,20 +3958,39 @@ class DdlObjectExecutor {
         refuseOrCascadeTypeDependents(stmt, key);
         String schema = TypeNamespace.schemaOfKey(key);
         String bare = TypeNamespace.nameOfKey(key);
+        // DDL is transactional, so a drop whose statement or transaction rolls back never
+        // happened. Without a record of what went, a rolled-back DROP TYPE left the type gone for
+        // good, and a DROP TYPE whose second name reached nothing had already taken the first.
+        if (isEnum) {
+            executor.recordUndo(new Session.DropEnumTypeUndo(schema, bare,
+                    executor.database.getCustomEnums().get(key)));
+        }
+        if (isComposite) {
+            executor.recordUndo(new Session.DropCompositeTypeUndo(schema, bare,
+                    executor.database.getCompositeTypes().get(key)));
+        }
+        if (isRange) {
+            executor.recordUndo(new Session.DropRangeTypeUndo(schema, bare,
+                    executor.database.getRangeTypes().get(key)));
+        }
+        if (isDomain) {
+            executor.recordUndo(new Session.DropDomainUndo(schema, bare,
+                    executor.database.getDomains().get(key)));
+        }
         // The OIDs go with the type: PostgreSQL never hands a dropped one to a type created later
         // under the same name.
         if (isEnum) {
-            executor.database.getCustomEnums().remove(key);
+            inStoredTypes(() -> executor.database.getCustomEnums().remove(key));
             executor.identity().typeDropped("e", key);
         }
         if (isComposite) {
-            executor.database.getCompositeTypes().remove(key);
+            inStoredTypes(() -> executor.database.getCompositeTypes().remove(key));
             executor.identity().typeDropped("c", key);
         }
         if (isRange) executor.database.getRangeTypes().remove(key);
         if (isShell) executor.database.getShellTypes().remove(key);
         if (isDomain) {
-            executor.database.getDomains().remove(key);
+            inStoredTypes(() -> executor.database.getDomains().remove(key));
             executor.identity().typeDropped("d", key);
         }
         executor.database.unregisterSchemaObject(schema,
@@ -3174,29 +4007,119 @@ class DdlObjectExecutor {
     }
 
     /**
-     * Every table column whose declared type is the type stored under {@code key}, described the
-     * way PostgreSQL describes a column that stands in the way of a drop — {@code column c of
-     * table t}, with the table schema-qualified where the search path does not reach it. A column
-     * records the type it was declared with under the same key, so a column of a.e is not found
-     * by dropping b.e.
+     * One thing declared as a type: a relation, a column of one, an attribute of a composite type,
+     * or a domain written over it — with how PostgreSQL names it where a drop is refused.
      */
-    private List<String> columnsDeclaredAsType(String key) {
-        List<String> found = new ArrayList<>();
+    private static final class TypeUser {
+        final String schemaName;
+        final Table table;
+        /** The column declared as the type, or null when the whole relation is declared OF it. */
+        final Column column;
+        /** A composite type's attribute or a domain written over the type, or null. */
+        final TypeDependents.Dependent type;
+        final String described;
+
+        TypeUser(String schemaName, Table table, Column column, String described) {
+            this(schemaName, table, column, null, described);
+        }
+
+        TypeUser(String schemaName, Table table, Column column, TypeDependents.Dependent type,
+                 String described) {
+            this.schemaName = schemaName;
+            this.table = table;
+            this.column = column;
+            this.type = type;
+            this.described = described;
+        }
+
+        /** The composite type this attribute belongs to, or null when this is not one. */
+        String compositeKey() {
+            return type == null ? null : type.compositeKey;
+        }
+
+        /** That attribute's name, or null. */
+        String attributeName() {
+            return type == null ? null : type.attributeName;
+        }
+
+        /** The domain written over the type, or null when this dependent is not a domain. */
+        String domainKey() {
+            return type == null ? null : type.domainKey;
+        }
+
+        /** The type this one was declared as, which for an array declaration is the array type. */
+        String typeShown(String display) {
+            return type == null ? display : type.typeShown(display);
+        }
+    }
+
+    /**
+     * Everything declared as the type stored under {@code key} — a table column, a table declared
+     * OF it, a composite type's attribute, a domain written over it — described the way PostgreSQL
+     * describes what stands in the way of a drop: {@code column c of table t}, {@code column x of
+     * composite type c}, {@code type d}, each qualified where the search path does not reach it. A
+     * declaration records the type it was written with under the same key, so a column of a.e is
+     * not found by dropping b.e. Each one is kept beside the thing itself, so that CASCADE takes
+     * away what the refusal names rather than working the list out a second time.
+     */
+    private List<TypeUser> declaredAsType(String key) {
+        // PostgreSQL reports dependencies in the order it recorded them: an array declaration
+        // ahead of everything, because an array type is recorded as depending on its element type;
+        // then relations in the order they were created, and within one relation its columns from
+        // the last back to the first. Walking the schema maps reported them in whatever order
+        // those maps happened to hold them, which for two tables built on the same type was
+        // neither order. Each entry is kept beside the OID of what carries it -- which follows
+        // creation order -- and its attnum, and the list is put in that order once it is complete.
+        List<Object[]> found = new ArrayList<>();
         List<String> visible = executor.searchPathSchemas();
         for (Schema schema : executor.database.getSchemas().values()) {
             for (Table t : schema.getTables().values()) {
-                for (Column c : t.getColumns()) {
-                    // A domain is a type like any other, and a column declared as one depends on
-                    // it exactly as a column declared as an enum depends on that.
+                int relOid = executor.systemCatalog.getOid(
+                        "rel:" + schema.getName() + "." + t.getName());
+                String shown = RelationNamespace.shownName(visible, schema.getName(), t.getName());
+                // A typed table depends on the whole type, not on one column of it: its shape is
+                // the type's, so dropping the type would leave the table with no definition at
+                // all. PostgreSQL names the table itself rather than any of its columns.
+                if (sameType(key, t.getOfTypeName())) {
+                    found.add(new Object[]{1, relOid, 0,
+                            new TypeUser(schema.getName(), t, null, "table " + shown)});
+                }
+                List<Column> cols = t.getColumns();
+                for (int i = 0; i < cols.size(); i++) {
+                    Column c = cols.get(i);
+                    // A domain and a range are types like any other, and a column declared as one
+                    // depends on it exactly as a column declared as an enum depends on that.
                     if (sameType(key, c.getEnumTypeName()) || sameType(key, c.getCompositeTypeName())
-                            || sameType(key, c.getDomainTypeName())) {
-                        found.add("column " + c.getName() + " of table "
-                                + RelationNamespace.shownName(visible, schema.getName(), t.getName()));
+                            || sameType(key, c.getDomainTypeName())
+                            || sameType(key, c.getRangeTypeName())) {
+                        found.add(new Object[]{1, relOid, i + 1, new TypeUser(schema.getName(), t, c,
+                                "column " + c.getName() + " of table " + shown)});
                     }
                 }
             }
         }
-        return found;
+        // A composite type's attribute and a domain are declared as the type exactly as a column
+        // is, and stand in the way of the drop the same way, so they take their places in this one
+        // list rather than in a second one of their own. Which declarations name a type is settled
+        // where the routines written in terms of it are settled.
+        for (TypeDependents.Dependent d : TypeDependents.typesWrittenIn(executor.database,
+                executor.systemCatalog, visible, typeNamed(key))) {
+            found.add(new Object[]{d.throughArray ? 0 : 1, d.age(), d.attnum(),
+                    new TypeUser(d.typeSchema(), null, null, d, d.described())});
+        }
+        java.util.Collections.sort(found, new java.util.Comparator<Object[]>() {
+            @Override
+            public int compare(Object[] a, Object[] b) {
+                int byArray = Integer.compare((Integer) a[0], (Integer) b[0]);
+                if (byArray != 0) return byArray;
+                int byRelation = Integer.compare((Integer) a[1], (Integer) b[1]);
+                return byRelation != 0 ? byRelation
+                        : Integer.compare((Integer) b[2], (Integer) a[2]);
+            }
+        });
+        List<TypeUser> users = new ArrayList<>();
+        for (Object[] entry : found) users.add((TypeUser) entry[3]);
+        return users;
     }
 
     /** Whether a column's recorded type name denotes the type stored under {@code key}. */
@@ -3217,9 +4140,37 @@ class DdlObjectExecutor {
                     "schema \"" + stmt.name() + "\" does not exist, skipping", null);
         }
         if (schema != null) {
+            // What hangs from the schema is worked out before anything is taken away, because it
+            // is both what RESTRICT refuses for and what CASCADE reports having removed.
+            List<SchemaDependent> hanging = schemaDependents(schema, stmt.name());
+            if (!stmt.cascade() && !hanging.isEmpty()) {
+                List<String> lines = new ArrayList<>();
+                for (SchemaDependent d : hanging) lines.add(d.because);
+                MemgresException refusal = new MemgresException("cannot drop schema " + stmt.name()
+                        + " because other objects depend on it", "2BP01");
+                refusal.setDetail(dependencyDetail(lines));
+                refusal.setHint("Use DROP ... CASCADE to drop the dependent objects too.");
+                throw refusal;
+            }
+            List<Session.UndoEntry> restore = new ArrayList<>();
+            Set<String> registryBack = new HashSet<>(
+                    executor.database.getSchemaObjects(stmt.name().toLowerCase()));
             if (stmt.cascade()) {
+                dropOutsideSchemaDependents(stmt.name(), hanging, restore);
+                // A type and a sequence the schema holds are dropped with it, and CASCADE means
+                // the same for them here as it does where they are named on their own: what was
+                // written in terms of the type, and every default drawing on the sequence, goes
+                // too. Naming them in the notice and leaving them standing left a column declared
+                // as a type nothing held.
+                dropSchemaTypeAndSequenceDependents(stmt.name());
                 List<String> tableNames = new ArrayList<>(schema.getTables().keySet());
                 for (String tName : tableNames) {
+                    Table dropped = schema.getTable(tName);
+                    if (dropped != null) {
+                        restore.add(new Session.DropTableUndo(stmt.name(), tName, dropped,
+                                executor.database.getTriggersForTable(stmt.name(), tName),
+                                executor.database.snapshotRulesGoingWith(stmt.name(), tName)));
+                    }
                     executor.database.getAllTriggers().remove(tName.toLowerCase());
                 }
                 for (String tName : tableNames) {
@@ -3254,6 +4205,12 @@ class DdlObjectExecutor {
                     }
                 }
                 tableNames.forEach(schema::removeTable);
+                // A rule goes with the relation it is written on, and these relations have just
+                // gone -- and so does a rule written on a relation elsewhere whose actions name
+                // one of them, which is what CASCADE was asked for.
+                for (String tName : tableNames) {
+                    executor.database.dropRulesGoingWith(droppedSchemaName, tName);
+                }
 
                 String schemaName = stmt.name().toLowerCase();
                 Set<String> registeredObjects = new HashSet<>(executor.database.getSchemaObjects(schemaName));
@@ -3265,14 +4222,23 @@ class DdlObjectExecutor {
                     switch (objType) {
                         // Only this schema's type goes: the same name may be another schema's.
                         case "enum":
+                            restore.add(new Session.DropEnumTypeUndo(schemaName, objName,
+                                    executor.database.getCustomEnums()
+                                            .get(TypeNamespace.key(schemaName, objName))));
                             executor.database.getCustomEnums()
                                     .remove(TypeNamespace.key(schemaName, objName));
                             break;
                         case "composite":
+                            restore.add(new Session.DropCompositeTypeUndo(schemaName, objName,
+                                    executor.database.getCompositeTypes()
+                                            .get(TypeNamespace.key(schemaName, objName))));
                             executor.database.getCompositeTypes()
                                     .remove(TypeNamespace.key(schemaName, objName));
                             break;
                         case "range":
+                            restore.add(new Session.DropRangeTypeUndo(schemaName, objName,
+                                    executor.database.getRangeTypes()
+                                            .get(TypeNamespace.key(schemaName, objName))));
                             executor.database.getRangeTypes()
                                     .remove(TypeNamespace.key(schemaName, objName));
                             break;
@@ -3280,32 +4246,456 @@ class DdlObjectExecutor {
                             executor.database.getShellTypes()
                                     .remove(TypeNamespace.key(schemaName, objName));
                             break;
-                        case "sequence":
+                        case "sequence": {
                             // This schema's sequence of that name, not another schema's.
+                            Sequence going = executor.database.getSequence(schemaName, objName);
+                            if (going != null) {
+                                restore.add(new Session.DropSequenceUndo(going.qualifiedName(), going));
+                            }
                             executor.database.removeSequence(schemaName, objName);
                             break;
+                        }
                         case "domain":
+                            restore.add(new Session.DropDomainUndo(schemaName, objName,
+                                    executor.database.getDomains()
+                                            .get(TypeNamespace.key(schemaName, objName))));
                             executor.database.getDomains()
                                     .remove(TypeNamespace.key(schemaName, objName));
                             break;
                         case "index":
                             executor.database.removeIndex(schemaName, objName);
                             break;
-                        case "function":
+                        case "function": {
                             // Only this schema's copy goes; the same name may exist elsewhere.
+                            List<PgFunction> going = new ArrayList<>(
+                                    executor.database.getFunctionOverloads(schemaName, objName));
+                            if (!going.isEmpty()) {
+                                restore.add(new Session.DropFunctionUndo(schemaName, objName, going));
+                            }
                             executor.database.removeFunction(schemaName, objName);
                             break;
-                        case "view":
+                        }
+                        case "view": {
+                            // A view is a relation like any other: it carries rules of its own,
+                            // and a rule elsewhere that writes to it or reads it cannot outlive it.
+                            Database.ViewDef going = executor.database.getView(schemaName, objName);
+                            if (going != null) {
+                                restore.add(new Session.DropViewUndo(objName, going,
+                                        executor.database.getTriggersForTable(schemaName, objName),
+                                        executor.database.snapshotRulesGoingWith(schemaName, objName)));
+                            }
+                            executor.database.dropRulesGoingWith(schemaName, objName);
                             executor.database.removeView(schemaName, objName);
                             break;
+                        }
                     }
                 }
                 executor.database.removeSchemaObjects(schemaName);
-            } else if (!schema.getTables().isEmpty()) {
-                throw new MemgresException("cannot drop schema " + stmt.name() + " because other objects depend on it");
+                // PostgreSQL says what CASCADE took with the schema, as it does for every other
+                // drop -- a script that meant to remove one schema has no other way of learning
+                // it removed a view in another.
+                List<String> cascaded = new ArrayList<>();
+                for (SchemaDependent d : hanging) cascaded.add(d.described);
+                noticeDropCascades(executor, cascaded);
             }
             executor.database.removeSchema(stmt.name());
             executor.database.removeObjectOwner("schema:" + stmt.name());
+            // A rolled-back DROP SCHEMA never happened, so the schema comes back holding
+            // everything it held: PostgreSQL rolls a catalogue change back whole, and without this
+            // the relations, their rows and the rules written on them stayed gone for good.
+            executor.recordUndo(new Session.DropSchemaUndo(schema, registryBack, restore));
+        }
+    }
+
+    /**
+     * Take away what hangs from the types and the sequences a schema holds, before the schema and
+     * everything in it goes. Each of them is reached through the same call the statement that
+     * names it on its own makes, so a dependent meets the same end either way.
+     */
+    private void dropSchemaTypeAndSequenceDependents(String schemaName) {
+        for (String entry : new ArrayList<>(
+                executor.database.getSchemaObjects(schemaName.toLowerCase()))) {
+            int colon = entry.indexOf(':');
+            if (colon < 0) continue;
+            String kind = entry.substring(0, colon);
+            String name = entry.substring(colon + 1);
+            if ("sequence".equals(kind)) {
+                Sequence seq = executor.database.getSequence(schemaName, name);
+                if (seq != null) clearSequenceDefaults(seq);
+                continue;
+            }
+            String typeKey = TypeNamespace.key(schemaName, name);
+            if (isTypeKind(kind, typeKey)) dropTypeDependents(typeKey, schemaName);
+        }
+    }
+
+    /** One object that goes when a schema does, as PostgreSQL names it and as it explains it. */
+    private static final class SchemaDependent {
+        /** How the cascade report names it: {@code table s.t}. */
+        final String described;
+        /** Why it is in the way: {@code table s.t depends on schema s}. */
+        final String because;
+        /** The schema of a view outside the dropped one, which CASCADE has to remove itself. */
+        final String outsideSchema;
+        /** The bare name of that view, or null when this line stands for something else. */
+        final String outsideView;
+        /** The relation carrying a policy outside the dropped schema, or null. */
+        final Table policyTable;
+        final RlsPolicy policy;
+
+        SchemaDependent(String described, String because) {
+            this(described, because, null, null, null, null);
+        }
+
+        SchemaDependent(String described, String because, String outsideSchema, String outsideView,
+                        Table policyTable, RlsPolicy policy) {
+            this.described = described;
+            this.because = because;
+            this.outsideSchema = outsideSchema;
+            this.outsideView = outsideView;
+            this.policyTable = policyTable;
+            this.policy = policy;
+        }
+    }
+
+    /** One object a schema holds, with the OID that says when it was created. */
+    private static final class SchemaMember {
+        final int oid;
+        final String kind;
+        final String name;
+        /** The name as PostgreSQL writes it in a dependency line, schema-qualified where needed. */
+        final String shown;
+
+        SchemaMember(int oid, String kind, String name, String shown) {
+            this.oid = oid;
+            this.kind = kind;
+            this.name = name;
+            this.shown = shown;
+        }
+
+        String described() { return kind + " " + shown; }
+    }
+
+    /**
+     * Everything that goes when a schema does, in the order PostgreSQL reports it.
+     *
+     * <p>A schema is what its objects hang from, so every relation, type and routine in it depends
+     * on it: that is what RESTRICT refuses for and what CASCADE takes away. An index is not among
+     * them, because an index hangs from the relation it is on rather than from the schema. Each of
+     * them is followed at once by whatever outside the schema hangs from that one, which is the
+     * order PostgreSQL walks its dependency catalogue in.
+     */
+    private List<SchemaDependent> schemaDependents(Schema schema, String schemaName) {
+        List<String> visible = executor.searchPathSchemas();
+        List<SchemaMember> members = schemaMembers(schema, schemaName, visible);
+        List<SchemaDependent> out = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        for (SchemaMember m : members) {
+            out.add(new SchemaDependent(m.described(),
+                    m.described() + " depends on schema " + schemaName));
+            appendDependentsOf(out, schemaName, m.kind, schemaName, m.name, m.shown, visible, seen);
+        }
+        return out;
+    }
+
+    /**
+     * The objects a schema holds, in creation order. The relations are the ones the schema itself
+     * carries; everything else is read out of the register that records which schema an object was
+     * created in, which keeps an entry for an object that has since been dropped -- so what the
+     * database still holds is what is asked, not what the register remembers.
+     */
+    private List<SchemaMember> schemaMembers(Schema schema, String schemaName,
+                                             List<String> visible) {
+        List<SchemaMember> found = new ArrayList<>();
+        for (Table t : schema.getTables().values()) {
+            found.add(relationMember(visible, schemaName, "table", t.getName()));
+        }
+        List<String> entries = new ArrayList<>(
+                executor.database.getSchemaObjects(schemaName.toLowerCase()));
+        Collections.sort(entries);
+        for (String entry : entries) {
+            int colon = entry.indexOf(':');
+            if (colon < 0) continue;
+            String kind = entry.substring(0, colon);
+            String name = entry.substring(colon + 1);
+            String typeKey = TypeNamespace.key(schemaName, name);
+            if ("view".equals(kind)) {
+                Database.ViewDef v = executor.database.getView(schemaName, name);
+                if (v == null) continue;
+                found.add(relationMember(visible, schemaName,
+                        v.materialized() ? "materialized view" : "view", v.name()));
+            } else if ("sequence".equals(kind)) {
+                Sequence seq = executor.database.getSequence(schemaName, name);
+                if (seq == null) continue;
+                found.add(relationMember(visible, schemaName, "sequence", seq.getName()));
+            } else if (ForeignTables.OBJECT_TYPE.equals(kind)) {
+                if (!ForeignTables.existsIn(executor.database, schemaName, name)) continue;
+                found.add(relationMember(visible, schemaName, "foreign table", name));
+            } else if ("function".equals(kind)) {
+                // A routine is identified by its argument types, so every overload of the name is
+                // an object of its own and PostgreSQL names each with the arguments it takes.
+                for (PgFunction f : executor.database.getFunctionOverloads(schemaName, name)) {
+                    // Each overload owns a pg_proc row of its own. Reading the bare name gave every
+                    // overload of it the first one's number, so they all sorted to one place.
+                    found.add(new SchemaMember(executor.systemCatalog.getOid(
+                            CatalogCoreBuilder.routineOidKey(executor.database, f)),
+                            f.isProcedure() ? "procedure" : "function", name,
+                            RelationNamespace.shownName(visible, schemaName, name)
+                                    + "(" + routineArgumentTypes(f) + ")"));
+                }
+            } else if (isTypeKind(kind, typeKey)) {
+                // Enums, composites, ranges, shells and domains are all types, and PostgreSQL
+                // calls each of them a type when it says what depends on what.
+                found.add(new SchemaMember(executor.systemCatalog.getOid("type:" + typeKey),
+                        "type", name, RelationNamespace.shownName(visible, schemaName, name)));
+            }
+        }
+        Collections.sort(found, new java.util.Comparator<SchemaMember>() {
+            @Override
+            public int compare(SchemaMember a, SchemaMember b) {
+                return Integer.compare(a.oid, b.oid);
+            }
+        });
+        return found;
+    }
+
+    /** Whether the register's entry still names a type this database holds. */
+    private boolean isTypeKind(String kind, String typeKey) {
+        if ("enum".equals(kind)) return executor.database.getCustomEnums().containsKey(typeKey);
+        if ("composite".equals(kind)) return executor.database.getCompositeTypes().containsKey(typeKey);
+        if ("range".equals(kind)) return executor.database.getRangeTypes().containsKey(typeKey);
+        if ("shell".equals(kind)) return executor.database.getShellTypes().contains(typeKey);
+        if ("domain".equals(kind)) return executor.database.getDomains().containsKey(typeKey);
+        return false;
+    }
+
+    private SchemaMember relationMember(List<String> visible, String schemaName, String kind,
+                                        String name) {
+        return new SchemaMember(executor.systemCatalog.getOid("rel:" + schemaName + "." + name),
+                kind, name, RelationNamespace.shownName(visible, schemaName, name));
+    }
+
+    /**
+     * A routine's argument types as PostgreSQL writes them when it names the routine. An output
+     * parameter is not part of what identifies the routine, so it is not written here either.
+     */
+    private static String routineArgumentTypes(PgFunction f) {
+        StringBuilder sb = new StringBuilder();
+        if (f.getParams() == null) return "";
+        for (PgFunction.Param p : f.getParams()) {
+            if (p.mode() != null && ("OUT".equalsIgnoreCase(p.mode())
+                    || "TABLE".equalsIgnoreCase(p.mode()))) {
+                continue;
+            }
+            if (sb.length() > 0) sb.append(", ");
+            sb.append(DataType.canonicalName(p.typeName()));
+        }
+        return sb.toString();
+    }
+
+    /**
+     * What outside a schema hangs from one object inside it: a view that reads the relation or
+     * calls the routine, whatever reads that view in turn, a row security policy whose expressions
+     * name either, a column declared as the type, and a column default drawing on the sequence.
+     *
+     * <p>A view or a policy inside the schema is left out: it hangs from the schema itself and is
+     * already reported there, which is where PostgreSQL reports it.
+     */
+    private void appendDependentsOf(List<SchemaDependent> out, String schemaName, String ownerKind,
+                                    String ownerSchema, String ownerName, String ownerShown,
+                                    List<String> visible, Set<String> seen) {
+        String on = " depends on " + ownerKind + " " + ownerShown;
+        // A view and a policy hanging from one object are two rows of the same dependency
+        // catalogue, and PostgreSQL walks it in OID order: which of them is reported first is
+        // which of them was created first, not which kind of thing it is. Every view followed by
+        // every policy agreed with PostgreSQL only where the views happened to be the older.
+        List<Object[]> direct = new ArrayList<>();
+        if (!"type".equals(ownerKind) && !"function".equals(ownerKind)
+                && !"procedure".equals(ownerKind)) {
+            for (Database.ViewDef v : ViewDependencies.directDependentViews(
+                    executor.database, executor.systemCatalog, ownerSchema, ownerName)) {
+                String vs = v.schemaName() != null ? v.schemaName() : "public";
+                if (vs.equalsIgnoreCase(schemaName)) continue;
+                direct.add(new Object[]{vs, v});
+            }
+        }
+        if ("function".equals(ownerKind) || "procedure".equals(ownerKind)) {
+            direct.addAll(viewsCalling(schemaName, ownerName));
+        }
+        direct.addAll(policiesDependingOn(schemaName, ownerKind, ownerSchema, ownerName));
+        Collections.sort(direct, new java.util.Comparator<Object[]>() {
+            @Override
+            public int compare(Object[] a, Object[] b) {
+                return Integer.compare(oidOfDependent(a), oidOfDependent(b));
+            }
+        });
+        for (Object[] entry : direct) {
+            if (entry.length == 2) {
+                String vs = (String) entry[0];
+                Database.ViewDef v = (Database.ViewDef) entry[1];
+                if (!seen.add("view:" + vs.toLowerCase() + "." + v.name().toLowerCase())) continue;
+                String kind = v.materialized() ? "materialized view" : "view";
+                String shown = RelationNamespace.shownName(visible, vs, v.name());
+                out.add(new SchemaDependent(kind + " " + shown, kind + " " + shown + on,
+                        vs, v.name(), null, null));
+                appendDependentsOf(out, schemaName, kind, vs, v.name(), shown, visible, seen);
+                continue;
+            }
+            String ts = (String) entry[0];
+            Table t = (Table) entry[1];
+            RlsPolicy p = (RlsPolicy) entry[2];
+            if (!seen.add("policy:" + ts.toLowerCase() + "." + t.getName().toLowerCase()
+                    + ":" + p.getName().toLowerCase())) {
+                continue;
+            }
+            String shown = "policy " + p.getName() + " on table "
+                    + RelationNamespace.shownName(visible, ts, t.getName());
+            out.add(new SchemaDependent(shown, shown + on, null, null, t, p));
+        }
+        if ("type".equals(ownerKind)) {
+            String typeKey = TypeNamespace.key(ownerSchema, ownerName);
+            for (TypeUser user : declaredAsType(typeKey)) {
+                // A column of a relation the schema is taking with it is covered by the relation's
+                // own line, which is the one PostgreSQL reports: a whole relation on the way out
+                // stands for every column of it.
+                if (schemaName.equalsIgnoreCase(user.schemaName)) continue;
+                if (!seen.add("column:" + user.described.toLowerCase())) continue;
+                out.add(new SchemaDependent(user.described, user.described + on));
+            }
+            // A routine written in terms of the type cannot outlive it either. One inside the
+            // schema hangs from the schema itself and is already reported there, which is where
+            // PostgreSQL reports it.
+            for (TypeDependents.Dependent d : TypeDependents.writtenIn(executor.database,
+                    executor.systemCatalog, visible, typeNamed(typeKey))) {
+                if (routineSchemaOf(d).equalsIgnoreCase(schemaName)) continue;
+                if (!seen.add("routine:" + d.described().toLowerCase())) continue;
+                out.add(new SchemaDependent(d.described(), d.described() + " depends on "
+                        + ownerKind + " " + d.typeShown(ownerShown)));
+            }
+        }
+        if ("sequence".equals(ownerKind)) {
+            Sequence seq = executor.database.getSequence(ownerSchema, ownerName);
+            if (seq == null) return;
+            for (SequenceDependent dep : findSequenceDependents(seq)) {
+                String shown = "default value for column " + dep.columnName() + " of table "
+                        + dep.tableRef(visible);
+                if (!seen.add("default:" + shown.toLowerCase())) continue;
+                out.add(new SchemaDependent(shown, shown + on));
+            }
+        }
+    }
+
+    /**
+     * The stored views whose query calls a routine of this name in this schema, each beside the
+     * schema it lives in. PostgreSQL records a view's dependency on every routine its query calls,
+     * so a view outside the schema cannot outlive a routine inside it.
+     */
+    private List<Object[]> viewsCalling(String schemaName, String routineName) {
+        List<Object[]> found = new ArrayList<>();
+        for (Database.ViewDef v : executor.database.getViews().values()) {
+            String vs = v.schemaName() != null ? v.schemaName() : "public";
+            if (vs.equalsIgnoreCase(schemaName)) continue;
+            if (!calls(v.query(), vs, schemaName, routineName)) continue;
+            found.add(new Object[]{vs, v});
+        }
+        Collections.sort(found, new java.util.Comparator<Object[]>() {
+            @Override
+            public int compare(Object[] a, Object[] b) {
+                return Integer.compare(oidOfView(a), oidOfView(b));
+            }
+        });
+        return found;
+    }
+
+    private int oidOfView(Object[] entry) {
+        return executor.systemCatalog.getOid("rel:" + entry[0] + "."
+                + ((Database.ViewDef) entry[1]).name());
+    }
+
+    /**
+     * The number that says when a dependent was created: a view's own relation, or the policy's
+     * row. Both are drawn from the one sequence PostgreSQL numbers every catalogue row from, so
+     * the two kinds can be put in one order.
+     */
+    private int oidOfDependent(Object[] entry) {
+        if (entry.length == 2) return oidOfView(entry);
+        return executor.systemCatalog.getOid(ObjectIdentity.policyKey((String) entry[0],
+                ((Table) entry[1]).getName(), ((RlsPolicy) entry[2]).getName()));
+    }
+
+    /** Whether a parsed tree calls the routine {@code schemaName.routineName}. */
+    private static boolean calls(Object tree, String home, String schemaName, String routineName) {
+        if (tree == null || routineName == null) return false;
+        final String wanted = routineName.toLowerCase();
+        final String schema = schemaName == null ? "public" : schemaName.toLowerCase();
+        final String where = home == null ? "public" : home.toLowerCase();
+        final boolean[] found = new boolean[1];
+        AstWalk.forEach(tree, node -> {
+            if (found[0] || !(node instanceof FunctionCallExpr)) return;
+            String written = ((FunctionCallExpr) node).name();
+            if (written == null) return;
+            String bare = RelationNamespace.bareName(written).toLowerCase();
+            if (!bare.equals(wanted)) return;
+            int dot = written.lastIndexOf('.');
+            if (dot > 0) {
+                if (written.substring(0, dot).equalsIgnoreCase(schema)) found[0] = true;
+                return;
+            }
+            // Written bare, the name resolved through the search path when the definition was
+            // stored, which reaches public and the schema the definition itself lives in.
+            if (schema.equals("public") || schema.equals(where)) found[0] = true;
+        });
+        return found[0];
+    }
+
+    /**
+     * The row security policies outside the schema whose USING or WITH CHECK expression names this
+     * object. PostgreSQL records what a policy's expressions read, so a policy on a relation
+     * elsewhere goes when the relation or the routine it reads does.
+     */
+    private List<Object[]> policiesDependingOn(String schemaName, String ownerKind,
+                                               String ownerSchema, String ownerName) {
+        List<Object[]> found = new ArrayList<>();
+        boolean routine = "function".equals(ownerKind) || "procedure".equals(ownerKind);
+        if (!routine && "type".equals(ownerKind)) return found;
+        for (Map.Entry<String, Schema> se : executor.database.getSchemas().entrySet()) {
+            if (se.getKey().equalsIgnoreCase(schemaName)) continue;
+            for (Table t : se.getValue().getTables().values()) {
+                for (RlsPolicy p : t.getRlsPolicies()) {
+                    boolean hit = routine
+                            ? calls(p.getUsingExpr(), se.getKey(), ownerSchema, ownerName)
+                                    || calls(p.getWithCheckExpr(), se.getKey(), ownerSchema, ownerName)
+                            : ViewDependencies.reads(p.getUsingExpr(), se.getKey(), ownerSchema, ownerName)
+                                    || ViewDependencies.reads(p.getWithCheckExpr(), se.getKey(),
+                                            ownerSchema, ownerName);
+                    if (hit) found.add(new Object[]{se.getKey(), t, p});
+                }
+            }
+        }
+        return found;
+    }
+
+    /**
+     * Take away the views and policies outside the schema that hang from something inside it, so
+     * that CASCADE means what PostgreSQL means by it. A view left behind read a relation that was
+     * no longer there and a policy left behind silenced every row of the relation it was on.
+     */
+    private void dropOutsideSchemaDependents(String schemaName, List<SchemaDependent> hanging,
+                                             List<Session.UndoEntry> restore) {
+        for (SchemaDependent d : hanging) {
+            if (d.policy != null && d.policyTable != null) {
+                restore.add(new Session.DropPolicyUndo(d.policyTable, d.policy));
+                d.policyTable.getRlsPolicies().remove(d.policy);
+            }
+            if (d.outsideView == null) continue;
+            Database.ViewDef going = executor.database.getView(d.outsideSchema, d.outsideView);
+            if (going == null) continue;
+            restore.add(new Session.DropViewUndo(d.outsideView, going,
+                    executor.database.getTriggersForTable(d.outsideSchema, d.outsideView),
+                    executor.database.snapshotRulesGoingWith(d.outsideSchema, d.outsideView)));
+            executor.database.dropRulesGoingWith(d.outsideSchema, d.outsideView);
+            executor.database.removeView(d.outsideSchema, d.outsideView);
+            executor.database.removeObjectOwner("view:" + d.outsideSchema + "." + d.outsideView);
         }
     }
 
@@ -3313,20 +4703,39 @@ class DdlObjectExecutor {
         if (stmt.onTable() != null) {
             // A policy is named by its relation, so IF EXISTS skips on a relation that is not
             // there just as it does on a policy that is not.
-            if (stmt.ifExists() && ddl.resolveTableOrNull(stmt.onTable()) == null) {
-                noticeSkipped("relation \"" + stmt.onTable() + "\"");
+            // A written qualifier says which schema holds the relation the policy is on; a policy
+            // on another schema's relation of that name is a different policy. PostgreSQL names
+            // the relation without its schema when it reports the policy missing.
+            String written = stmt.onTable();
+            boolean qualified = written.indexOf('.') >= 0;
+            String onSchema = qualified ? written.substring(0, written.indexOf('.')) : "public";
+            String onTable = RelationNamespace.bareName(written);
+            if (stmt.ifExists()
+                    && (qualified
+                            ? RelationNamespace.kindOf(executor.database, onSchema, onTable) == null
+                            : ddl.resolveTableOrNull(onTable) == null)) {
+                noticeSkipped("relation \"" + written + "\"");
                 return;
             }
-            Table table = executor.resolveTable("public", stmt.onTable());
+            // A qualifier naming no schema at all is a missing schema rather than a missing
+            // relation, which is what PostgreSQL reports for it.
+            if (qualified) {
+                SchemaQualifier.requireSchema(executor.database, executor.session, onSchema);
+            }
+            Table table = executor.resolveTable(onSchema, onTable, qualified);
+            // Row security is what protects the relation from the role reading it, so taking a
+            // policy away is the owner's to do. PostgreSQL says relation here, not table.
+            executor.requireRelationOwner(
+                    qualified ? onSchema : executor.defaultSchema(), onTable);
             boolean found = false;
             for (RlsPolicy p : table.getRlsPolicies()) {
                 if (p.getName().equalsIgnoreCase(stmt.name())) { found = true; break; }
             }
             if (!found) {
                 if (!stmt.ifExists()) {
-                    throw new MemgresException("policy \"" + stmt.name() + "\" for table \"" + stmt.onTable() + "\" does not exist", "42704");
+                    throw new MemgresException("policy \"" + stmt.name() + "\" for table \"" + onTable + "\" does not exist", "42704");
                 }
-                noticeSkipped("policy \"" + stmt.name() + "\" for table \"" + stmt.onTable() + "\"");
+                noticeSkipped("policy \"" + stmt.name() + "\" for table \"" + onTable + "\"");
             }
             table.getRlsPolicies().removeIf(p -> p.getName().equalsIgnoreCase(stmt.name()));
         } else if (!stmt.ifExists()) {
@@ -3335,17 +4744,23 @@ class DdlObjectExecutor {
     }
 
     private void dropRule(DropStmt stmt) {
-        String onTable = stmt.onTable() != null ? stmt.onTable() : "";
-        if (stmt.onTable() != null && ddl.resolveTableOrNull(stmt.onTable()) == null
-                && !executor.database.hasView(stmt.onTable())) {
+        // A written qualifier says which schema holds the relation the rule is on; a rule on
+        // another schema's relation of that name is a different rule. PostgreSQL names the
+        // relation without its schema when it reports the rule missing.
+        String written = stmt.onTable() != null ? stmt.onTable() : "";
+        String onSchema = executor.relationSchemaOf(null, written);
+        String onTable = RelationNamespace.bareName(written);
+        if (stmt.onTable() != null
+                && RelationNamespace.kindOf(executor.database, onSchema, onTable) == null) {
             if (!stmt.ifExists()) {
-                executor.resolveTable(executor.defaultSchema(), stmt.onTable());
+                throw new MemgresException(
+                        "relation \"" + written + "\" does not exist", "42P01");
             }
-            noticeSkipped("relation \"" + stmt.onTable() + "\"");
+            noticeSkipped("relation \"" + written + "\"");
             return;
         }
-        if (executor.database.hasRule(stmt.name(), onTable)) {
-            executor.database.removeRule(stmt.name(), onTable);
+        if (executor.database.hasRule(onSchema, stmt.name(), onTable)) {
+            executor.database.removeRule(onSchema, stmt.name(), onTable);
         } else if (!stmt.ifExists()) {
             throw new MemgresException("rule \"" + stmt.name() + "\" for relation \"" + onTable + "\" does not exist", "42704");
         } else {
@@ -3375,10 +4790,12 @@ class DdlObjectExecutor {
             throw new MemgresException("relation \"" + RelationNamespace.bareName(stmt.name())
                     + "\" already exists", "42P07");
         }
+        requireSequenceTypeExists(stmt.getAsType());
         DdlSequenceValidator.Params p = DdlSequenceValidator.forCreate(stmt.getAsType(),
                 stmt.incrementBy(), stmt.minValue(), stmt.maxValue(), stmt.startWith(), stmt.getCache());
         Sequence seq = new Sequence(seqName, p.startWith, p.incrementBy, p.minValue, p.maxValue);
         seq.setSchemaName(seqSchema);
+        seq.setUnlogged(stmt.unlogged());
         DdlSequenceValidator.apply(seq, p);
         if (stmt.cycle() != null) seq.setCycle(stmt.cycle());
         if (stmt.ownedByTable() != null) applySequenceOwnedBy(seq, stmt.ownedByTable(), stmt.ownedByColumn());
@@ -3388,6 +4805,26 @@ class DdlObjectExecutor {
         executor.recordUndo(new Session.CreateSequenceUndo(seq.qualifiedName()));
         executor.database.setObjectOwner("sequence:" + seqName, executor.sessionUser());
         return QueryResult.message(QueryResult.Type.SET, "CREATE SEQUENCE");
+    }
+
+    /**
+     * PostgreSQL asks whether an {@code AS} name is a type at all before it asks whether it is one
+     * a sequence can be built on, so an unknown name is the missing type it is (42704) and a real
+     * type that is not one of the three integer types is left to the sequence's own check (22023).
+     */
+    private void requireSequenceTypeExists(String written) {
+        if (written == null) return;
+        String bare = written.replaceAll("\\(.*\\)", "").replace("[]", "").trim();
+        int dot = bare.lastIndexOf('.');
+        String lookup = dot >= 0 ? bare.substring(dot + 1) : bare;
+        if (DataType.fromPgName(lookup) != null
+                || executor.database.isCustomEnum(lookup)
+                || executor.database.isDomain(lookup)
+                || executor.database.isCompositeType(lookup)
+                || executor.database.isRangeType(lookup)) {
+            return;
+        }
+        throw PgErrors.undefinedObject("type", lookup);
     }
 
     // ---- ALTER SEQUENCE ----
@@ -3454,6 +4891,7 @@ class DdlObjectExecutor {
             retargetSequenceDefaults(renamed, seq);
             return QueryResult.message(QueryResult.Type.SET, "ALTER SEQUENCE");
         }
+        requireSequenceTypeExists(stmt.getAsType());
         DdlSequenceValidator.Params p = DdlSequenceValidator.forAlter(seq, stmt.getAsType(),
                 stmt.incrementBy(), stmt.minValue(), stmt.maxValue(), stmt.startWith(),
                 stmt.restart(), stmt.restartWith(), stmt.getCache());
@@ -3515,6 +4953,10 @@ class DdlObjectExecutor {
             DomainType parent = executor.database.getDomain(baseTypeName);
             if (parent != null) baseType = parent.getBaseType();
             else if (executor.database.isCustomEnum(baseTypeName)) baseType = DataType.ENUM;
+            // A composite is a type like any other, and PostgreSQL lets a domain stand over one:
+            // the domain's values are rows of that composite, so they are carried as records, and
+            // the base type's own name is what says which composite the rows belong to.
+            else if (executor.database.isCompositeType(baseTypeName)) baseType = DataType.RECORD;
             else if (TypeNamespace.writtenSchema(baseTypeName) != null
                     && DataType.fromPgName(TypeNamespace.bare(baseTypeName)) != null) {
                 baseType = DataType.fromPgName(TypeNamespace.bare(baseTypeName));
@@ -3531,29 +4973,45 @@ class DdlObjectExecutor {
                 baseType = arrayType;
             }
         }
+        // Which collations exist is settled before the base type is asked whether it carries one:
+        // PostgreSQL resolves the name first and reports a missing collation whatever the type.
+        DdlDefinitionChecks.requireCollationExists(executor.database, stmt.collation());
         if (stmt.collation() != null && !isCollatable(baseType)) {
             throw PgErrors.datatypeMismatch(
                     "collations are not supported by type " + CatalogHelper.pgTypeName(baseType));
         }
-        checkDomainConstraintExpr(stmt.checkExpr());
-
-        String checkExprStr = stmt.checkExpr() != null ? stmt.checkExpr().toString() : null;
-        // If constraint has explicit name, store as named constraint; otherwise store as inline
-        DomainType domain;
-        if (stmt.constraintName() != null && stmt.checkExpr() != null) {
-            domain = new DomainType(
-                    stmt.name(), baseType, baseTypeName, stmt.notNull(),
-                    null, null,
-                    stmt.defaultExpr() != null ? DdlExecutor.exprToDefaultString(stmt.defaultExpr()) : null
-            );
-            domain.addConstraint(stmt.constraintName(), checkExprStr, stmt.checkExpr());
-        } else {
-            domain = new DomainType(
-                    stmt.name(), baseType, baseTypeName, stmt.notNull(),
-                    checkExprStr,
-                    stmt.checkExpr(),
-                    stmt.defaultExpr() != null ? DdlExecutor.exprToDefaultString(stmt.defaultExpr()) : null
-            );
+        // Every CHECK the definition wrote is a constraint of its own. A statement parsed before
+        // the list existed still arrives with the single pair, so it is read as a list of one.
+        java.util.List<CreateDomainStmt.DomainCheck> declared = stmt.checks();
+        if (declared == null) declared = new java.util.ArrayList<CreateDomainStmt.DomainCheck>();
+        if (declared.isEmpty() && stmt.checkExpr() != null) {
+            declared.add(new CreateDomainStmt.DomainCheck(stmt.constraintName(), stmt.checkExpr()));
+        }
+        for (CreateDomainStmt.DomainCheck check : declared) {
+            checkDomainConstraintExpr(check.expr());
+        }
+        // The first unnamed CHECK is the domain's inline one, which is the constraint PostgreSQL
+        // names <domain>_check; every other one is stored under the name it was written with, or
+        // under the next generated name after the ones already taken.
+        CreateDomainStmt.DomainCheck inline =
+                !declared.isEmpty() && declared.get(0).name() == null ? declared.get(0) : null;
+        DomainType domain = new DomainType(
+                stmt.name(), baseType, baseTypeName, stmt.notNull(),
+                inline != null ? inline.expr().toString() : null,
+                inline != null ? inline.expr() : null,
+                stmt.defaultExpr() != null ? DdlExecutor.exprToDefaultString(stmt.defaultExpr()) : null
+        );
+        for (CreateDomainStmt.DomainCheck check : declared) {
+            if (check == inline) continue;
+            String checkName = check.name();
+            // A name written twice for one domain is a name pg_constraint could hold only once, and
+            // PostgreSQL refuses the whole definition rather than storing one of the two.
+            if (checkName != null && domainHasConstraint(domain, checkName)) {
+                throw new MemgresException("constraint \"" + checkName + "\" for domain \""
+                        + stmt.name() + "\" already exists", "42710");
+            }
+            if (checkName == null) checkName = generatedCheckName(domain);
+            domain.addConstraint(checkName, check.expr().toString(), check.expr());
         }
         // Keep the base type's modifier: information_schema.domains describes a domain the way
         // it describes a column, so varchar(12) has to know it is twelve characters wide.
@@ -3564,7 +5022,7 @@ class DdlObjectExecutor {
         // The default is read with the base type's input function here, not at the first insert.
         domain.setDefaultValue(requireDefaultReadableAsDomain(domain, domain.getDefaultValue()));
         domain.setSchemaName(domainSchema);
-        executor.identity().typeCreated(TypeNamespace.key(domainSchema, stmt.name()));
+        executor.identity().typeCreated("d", TypeNamespace.key(domainSchema, stmt.name()));
         executor.database.addDomain(domain);
         executor.database.registerSchemaObject(domainSchema, "domain", stmt.name());
         executor.recordUndo(new Session.CreateDomainUndo(domainSchema, stmt.name()));
@@ -3714,7 +5172,12 @@ class DdlObjectExecutor {
     }
 
     QueryResult executeAlterDomain(AlterDomainStmt stmt) {
-        DomainType domain = executor.database.getDomain(stmt.domainName());
+        // Which domain a bare name means is the search path's answer, and one held by a schema the
+        // path does not reach is not a domain this statement can name at all -- the same rule DROP
+        // DOMAIN and COMMENT ON DOMAIN already follow.
+        String domainKey =
+                TypeNamespace.resolve(executor.database, executor.session, stmt.domainName());
+        DomainType domain = domainKey == null ? null : executor.database.getDomain(domainKey);
         if (domain == null) {
             throw new MemgresException("type \"" + stmt.domainName() + "\" does not exist", "42704");
         }
@@ -3831,7 +5294,7 @@ class DdlObjectExecutor {
                             nc.isValidated());
                 }
                 String newKey = TypeNamespace.key(domSchema, newName);
-                executor.database.getDomains().remove(oldKey);
+                inStoredTypes(() -> executor.database.getDomains().remove(oldKey));
                 executor.database.addDomain(renamed);
                 executor.database.unregisterSchemaObject(domSchema, "domain", domain.getName());
                 executor.database.registerSchemaObject(domSchema, "domain", newName);
@@ -3848,7 +5311,7 @@ class DdlObjectExecutor {
                 String oldKey = TypeNamespace.key(from, domain.getName());
                 String to = stmt.newConstraintName().toLowerCase();
                 TypeNamespace.requireFree(executor.database, to, domain.getName());
-                executor.database.getDomains().remove(oldKey);
+                inStoredTypes(() -> executor.database.getDomains().remove(oldKey));
                 domain.setSchemaName(to);
                 executor.database.addDomain(domain);
                 executor.database.unregisterSchemaObject(from, "domain", domain.getName());
@@ -3888,9 +5351,9 @@ class DdlObjectExecutor {
     }
 
     /**
-     * Follow a renamed or moved enum or composite from every column declared with it. A column of
-     * a type keeps reading that type through the rename, which is what PostgreSQL's OIDs give it
-     * for nothing and memgres, which records names, has to do here.
+     * Follow a renamed or moved enum, composite or range from every column declared with it. A
+     * column of a type keeps reading that type through the rename, which is what PostgreSQL's OIDs
+     * give it for nothing and memgres, which records names, has to do here.
      */
     private void retargetTypeColumns(String oldKey, String newKey) {
         for (Schema s : executor.database.getSchemas().values()) {
@@ -3899,6 +5362,9 @@ class DdlObjectExecutor {
                     if (oldKey.equalsIgnoreCase(c.getEnumTypeName())) c.setEnumTypeName(newKey);
                     if (oldKey.equalsIgnoreCase(c.getCompositeTypeName())) {
                         c.setCompositeTypeName(newKey);
+                    }
+                    if (oldKey.equalsIgnoreCase(c.getRangeTypeName())) {
+                        c.setRangeTypeName(newKey);
                     }
                 }
             }
@@ -4047,6 +5513,43 @@ class DdlObjectExecutor {
     }
 
     /**
+     * Resolve the names and the calls a partial index's predicate is written over, against the
+     * relation the index is being built on. PostgreSQL settles both while it reads the statement,
+     * so a qualifier naming another relation and a call naming no function are reported as
+     * themselves rather than as whatever the trial row below happens to make of them -- which is
+     * what named an unknown function by an argument type the column never had.
+     */
+    private void readPredicateNames(Table table, String whereClause) {
+        if (table == null) return;
+        Expression pred;
+        try {
+            pred = com.memgres.engine.parser.Parser.parseExpression(whereClause);
+        } catch (RuntimeException ignored) {
+            return; // a predicate this cannot read is reported by the checks that follow
+        }
+        StoredExprNames.read(ddl, pred, table, null, false, true);
+    }
+
+    /**
+     * The same for an index key that is an expression rather than a bare column name.
+     *
+     * <p>A key that reads back as one plain name is left alone, and has to be: a key is recorded
+     * as the text it was written as with the quotes taken off, so a column called {@code "A b"}
+     * arrives here looking like an expression and reads as the column {@code A} alone.
+     */
+    private void readKeyNames(Table table, String written) {
+        if (table == null) return;
+        Expression key;
+        try {
+            key = com.memgres.engine.parser.Parser.parseExpression(written);
+        } catch (RuntimeException ignored) {
+            return; // a key this cannot read is reported by the checks that follow
+        }
+        if (key instanceof ColumnRef) return;
+        StoredExprNames.read(ddl, key, table, null, false, true);
+    }
+
+    /**
      * Evaluate a partial index's predicate once against a row of placeholder values, so that an
      * operator or function that does not exist for the column types is reported now.
      */
@@ -4100,6 +5603,9 @@ class DdlObjectExecutor {
         // finding the schema it was written under.
         SchemaQualifier.requireSchema(executor.database, executor.session, s.schema());
         String indexSchema = s.schema() != null ? s.schema() : executor.defaultSchema();
+        // An index is part of the relation's own definition, so adding one is the owner's to do.
+        // A role holding nothing but SELECT could build an index over the whole table.
+        if (s.table() != null) executor.requireTableOwner(indexSchema, s.table());
         // Only this schema's relations can take the name: two schemas may each hold an index
         // called i, and refusing the second one turned valid SQL away.
         boolean nameTaken = s.name() != null
@@ -4110,11 +5616,27 @@ class DdlObjectExecutor {
         // subquery is reported even when the access method or the index name is also wrong.
         checkIndexExpressionsAndPredicate(s);
         Table indexTarget = resolveIndexTarget(s);
+        // An index nobody named still gets one: PostgreSQL derives it from the relation and from
+        // what each indexed column is worth as a name, and numbers it when a relation of that name
+        // already lives in the schema. Leaving the name null registered nothing at all and still
+        // reported success, so the index the writer asked for simply was not there afterwards.
+        if (s.name() == null && s.table() != null && s.columns() != null) {
+            s = new CreateIndexStmt(
+                    IndexNameChooser.choose(executor.database, indexSchema, s.table(), indexTarget,
+                            s.columns(), s.includeColumns()),
+                    s.schema(), s.table(), s.columns(), s.unique(), s.ifNotExists(),
+                    s.concurrently(), s.method(), s.includeColumns(), s.whereClause(),
+                    s.columnOptions(), s.nullsNotDistinct(), s.withOptions());
+        }
         if (indexTarget != null) {
             DdlIndexValidator.validate(executor.database, indexTarget, s.method(), s.unique(),
                     s.columns(), s.columnOptions(), s.includeColumns(), s.withOptions());
         }
         if (s.whereClause() != null) {
+            // Every name and every call in the predicate is settled where the index is written,
+            // and settled before the predicate is asked to be a condition: a call naming no
+            // function at all is reported as that, not by whatever a trial row makes of it.
+            readPredicateNames(indexTarget, s.whereClause());
             // Type resolution happens while the statement is analysed, so a predicate that does
             // not type-check is reported as that rather than as a mutable-function predicate.
             checkPredicateIsBoolean(indexTarget, s.whereClause());
@@ -4128,6 +5650,15 @@ class DdlObjectExecutor {
                 String idxSchema = s.schema() != null ? s.schema() : executor.defaultSchema();
                 Table idxTable = executor.resolveTable(idxSchema, s.table());
                 for (String col : s.columns()) {
+                    // CURRENT_DATE and the other value functions SQL writes without an argument
+                    // list are keys of the same kind as a call, not names of columns: PostgreSQL
+                    // reads them through the grammar that admits a call and then refuses them for
+                    // being no more than stable. A relation that does hold a column of that name
+                    // can still be indexed on it, because only a quoted name reaches it.
+                    if (DdlIndexValidator.isSqlValueFunction(col) && idxTable.getColumnIndex(col) < 0) {
+                        throw new MemgresException(
+                                "functions in index expression must be marked IMMUTABLE", "42P17");
+                    }
                     // Skip expression-based index columns (contain parens, operators, or spaces)
                     if (col.contains("(") || col.contains(")") || col.contains(" ")
                             || col.contains("+") || col.contains("*") || col.contains("/") || col.contains("||")) {
@@ -4137,6 +5668,12 @@ class DdlObjectExecutor {
                         // User-defined function volatility is NOT checked — PG allows it.
                         DdlExecutor.checkBuiltinVolatileInExpression(exprStr, executor.database,
                                 "functions in index expression must be marked IMMUTABLE");
+                        // A key is stored against this relation and no other, so a qualifier on a
+                        // name is a relation the statement never mentioned and a call in it names a
+                        // function that has to exist -- both settled where the index is written
+                        // rather than by whatever the trial row below happens to make of them,
+                        // which named an unknown function by an argument type it never had.
+                        readKeyNames(idxTable, exprStr);
                         // Try to evaluate the expression against a dummy row to catch type errors
                         try {
                             // Strip outer wrapper parens like ((a + b)) → a + b, but NOT function call parens
@@ -4243,10 +5780,16 @@ class DdlObjectExecutor {
                     try {
                         Expression predExpr =
                             com.memgres.engine.parser.Parser.parseExpression(s.whereClause());
+                        // A predicate is stored against this relation and no other, so a qualifier
+                        // on a name is a relation the statement never mentioned and a call in it
+                        // names a function that has to exist -- both settled where the index is
+                        // written, as they are wherever else PostgreSQL stores an expression.
+                        StoredExprNames.read(ddl, predExpr, idxTable, null, false, true);
                         // Walk the expression to find column references
                         ddl.validateExprColumnRefs(predExpr, idxTable, null);
                     } catch (MemgresException me) {
-                        if ("42703".equals(me.getSqlState())) throw me;
+                        if ("42703".equals(me.getSqlState()) || "42P01".equals(me.getSqlState())
+                                || "42883".equals(me.getSqlState())) throw me;
                         // Other errors ignored
                     } catch (Exception ignored) {}
                 }
@@ -4299,10 +5842,14 @@ class DdlObjectExecutor {
                             wherePred = com.memgres.engine.parser.Parser.parseExpression(s.whereClause());
                         } catch (Exception ignored) {}
                     }
-                    // Parse expression columns if any
+                    // Parse expression columns if any. A key that names a column of the relation
+                    // is that column whatever characters its name happens to hold: "A b" is one
+                    // quoted name, not two words, and reading it as an expression left the index
+                    // enforcing something the relation has no column for.
                     boolean hasExprCols = s.columns().stream().anyMatch(c ->
-                            c.contains("(") || c.contains(" ") || c.contains("+") || c.contains("-")
-                            || c.contains("*") || c.contains("/") || c.contains("||"));
+                            valTable.getColumnIndex(c) < 0
+                            && (c.contains("(") || c.contains(" ") || c.contains("+") || c.contains("-")
+                            || c.contains("*") || c.contains("/") || c.contains("||")));
                     List<Expression> parsedExprs = null;
                     if (hasExprCols) {
                         parsedExprs = new ArrayList<>();
@@ -4332,12 +5879,15 @@ class DdlObjectExecutor {
                         }
                         // Compute key values
                         StringBuilder keyBuilder = new StringBuilder();
+                        List<Object> keyValues = new ArrayList<>();
                         if (parsedExprs != null) {
                             for (Expression expr : parsedExprs) {
                                 try {
                                     Object val = executor.evalExpr(expr, rowCtx);
+                                    keyValues.add(val);
                                     keyBuilder.append(val == null ? "\0NULL\0" : val.toString()).append('\1');
                                 } catch (Exception e) {
+                                    keyValues.add(null);
                                     keyBuilder.append("\0ERR\0").append('\1');
                                 }
                             }
@@ -4346,16 +5896,26 @@ class DdlObjectExecutor {
                                 int ci = valTable.getColumnIndex(col);
                                 if (ci >= 0) {
                                     Object val = evalRow[ci];
+                                    keyValues.add(val);
                                     keyBuilder.append(val == null ? "\0NULL\0" : val.toString()).append('\1');
                                 }
                             }
                         }
                         String key = keyBuilder.toString();
-                        if (!key.contains("\0NULL\0") && !seenKeys.add(key)) {
-                            String idxName = s.name() != null ? s.name() : s.table() + "_unique";
-                            throw new MemgresException(
-                                "could not create unique index \"" + idxName + "\"\n  "
-                                + "Detail: Key already exists.", "23505");
+                        // A null in the key makes its row unlike every other, so it cannot stop the
+                        // index being built -- unless the index was declared NULLS NOT DISTINCT,
+                        // which is what that clause is for.
+                        boolean comparable = s.nullsNotDistinct() || !key.contains("\0NULL\0");
+                        if (comparable && !seenKeys.add(key)) {
+                            // Nothing was written here, so the complaint is about what the table
+                            // was found holding, not about a key that already exists: PostgreSQL
+                            // ends this one "is duplicated." and names the index as the constraint.
+                            MemgresException dup = new MemgresException(
+                                    "could not create unique index \"" + s.name() + "\"", "23505");
+                            dup.setConstraint(s.name());
+                            dup.setDetail(IndexKeyDescription.duplicated(
+                                    valTable, s.columns(), keyValues.toArray()));
+                            throw dup;
                         }
                     }
                 }
@@ -4423,44 +5983,6 @@ class DdlObjectExecutor {
                     } catch (MemgresException ignored) {}
                 }
             }
-            // Auto-propagate index to existing partitions (PG creates matching child indexes automatically)
-            if (s.table() != null) {
-                try {
-                    Table parentTable = executor.resolveTable(idxSchemaForMeta, s.table());
-                    if (parentTable.getPartitionStrategy() != null && !parentTable.getPartitions().isEmpty()) {
-                        for (Table partition : parentTable.getPartitions()) {
-                            String childIdxName = s.name() + "_" + partition.getName();
-                            if (!executor.database.hasIndex(idxSchemaForMeta, childIdxName)) {
-                                executor.database.addIndex(idxSchemaForMeta, childIdxName, s.columns());
-                                executor.database.addIndexMeta(idxSchemaForMeta, childIdxName,
-                                        idxSchemaForMeta + "." + partition.getName(),
-                                        s.unique(), s.method(), s.whereClause());
-                                executor.database.registerSchemaObject(idxSchemaForMeta, "index", childIdxName);
-                                executor.database.setIndexParent(
-                                        Database.idxKey(idxSchemaForMeta, childIdxName),
-                                        Database.idxKey(idxSchemaForMeta, s.name()));
-                                // Build TableIndex on partition for query optimization
-                                boolean hasExprColsP = s.columns().stream().anyMatch(c ->
-                                        c.contains("(") || c.contains(" ") || c.contains("+") || c.contains("-")
-                                        || c.contains("*") || c.contains("/") || c.contains("||"));
-                                if (!hasExprColsP && s.whereClause() == null) {
-                                    int[] pColIndices = new int[s.columns().size()];
-                                    boolean pAllFound = true;
-                                    for (int ci = 0; ci < s.columns().size(); ci++) {
-                                        int idx = partition.getColumnIndex(s.columns().get(ci));
-                                        if (idx < 0) { pAllFound = false; break; }
-                                        pColIndices[ci] = idx;
-                                    }
-                                    if (pAllFound && partition.getIndex(childIdxName) == null) {
-                                        TableIndex pIdx = new TableIndex(childIdxName, pColIndices, s.unique());
-                                        partition.buildIndex(pIdx);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } catch (MemgresException ignored) {}
-            }
         }
         // For UNIQUE indexes, also add a UNIQUE constraint to enforce uniqueness
         if (s.unique() && s.table() != null && s.columns() != null) {
@@ -4479,8 +6001,9 @@ class DdlObjectExecutor {
                 // For expression-based indexes (e.g., lower(email), (a + b)), parse and store the expressions
                 // Detect expressions: contains parens, operators, or spaces (not a simple column name)
                 boolean hasExprCols = s.columns().stream().anyMatch(c ->
-                        c.contains("(") || c.contains(" ") || c.contains("+") || c.contains("-")
-                        || c.contains("*") || c.contains("/") || c.contains("||"));
+                        idxTable.getColumnIndex(c) < 0
+                        && (c.contains("(") || c.contains(" ") || c.contains("+") || c.contains("-")
+                        || c.contains("*") || c.contains("/") || c.contains("||")));
                 if (hasExprCols) {
                     List<Expression> exprCols = new ArrayList<>();
                     for (String col : s.columns()) {
@@ -4498,38 +6021,30 @@ class DdlObjectExecutor {
                 sc.setFromIndex(true);
                 if (s.nullsNotDistinct()) sc.setNullsNotDistinct(true);
                 idxTable.addConstraint(sc);
-                // For partitioned tables, also add the constraint to each partition
-                if (idxTable.getPartitionStrategy() != null && !idxTable.getPartitions().isEmpty()) {
-                    for (Table partition : idxTable.getPartitions()) {
-                        StoredConstraint partSc = StoredConstraint.unique(constraintName + "_" + partition.getName(), s.columns());
-                        if (s.whereClause() != null) {
-                            try {
-                                Expression predExpr2 = com.memgres.engine.parser.Parser.parseExpression(s.whereClause());
-                                partSc.setWhereExpr(predExpr2);
-                            } catch (Exception ignored2) {}
-                        }
-                        partSc.setFromIndex(true);
-                        if (s.nullsNotDistinct()) partSc.setNullsNotDistinct(true);
-                        partition.addConstraint(partSc);
-                        // Build index on partition too
-                        try {
-                            int[] pColIndices = new int[s.columns().size()];
-                            boolean pAllFound = true;
-                            for (int ci = 0; ci < s.columns().size(); ci++) {
-                                int idx = partition.getColumnIndex(s.columns().get(ci));
-                                if (idx < 0) { pAllFound = false; break; }
-                                pColIndices[ci] = idx;
-                            }
-                            if (pAllFound && partition.getIndex(s.name() + "_" + partition.getName()) == null) {
-                                TableIndex pIdx = new TableIndex(s.name() + "_" + partition.getName(), pColIndices, true);
-                                partition.buildIndex(pIdx);
-                            }
-                        } catch (Exception ignored3) {}
-                    }
-                }
             } catch (MemgresException ignored) {
                 // Table might not exist yet (e.g., on materialized views)
             }
+        }
+        // An index on a partitioned table is a rule about the whole hierarchy, so every partition
+        // gets its own copy of it -- named after the partition and the columns it reads, which is
+        // the name PostgreSQL reports when a duplicate key violates a unique one. The copies are
+        // made here, last, because a unique index leaves behind the constraint they are taken
+        // from, and a copy made before it existed enforced nothing.
+        if (s.name() != null && s.columns() != null && s.table() != null) {
+            try {
+                String partitionedSchema = s.schema() != null ? s.schema() : executor.defaultSchema();
+                Table partitionedParent = executor.resolveTable(partitionedSchema, s.table());
+                if (partitionedParent.getPartitionStrategy() != null) {
+                    for (Table childPartition : partitionedParent.getPartitions()) {
+                        // The copy belongs to the relation it indexes, so it is registered in that
+                        // relation's own schema -- which is not the partitioned table's when the
+                        // partition was created somewhere else.
+                        ddl.tableExecutor.copyParentIndex(partitionedParent, childPartition,
+                                childPartition.getSchemaName(),
+                                Database.idxKey(partitionedSchema, s.name()));
+                    }
+                }
+            } catch (MemgresException ignored) {}
         }
         return QueryResult.message(QueryResult.Type.SET, "CREATE INDEX");
     }

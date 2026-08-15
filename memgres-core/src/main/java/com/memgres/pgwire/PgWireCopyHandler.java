@@ -20,15 +20,35 @@ class PgWireCopyHandler {
     private static final Logger LOG = LoggerFactory.getLogger(PgWireCopyHandler.class);
 
     private final Session session;
+    /** The handler this COPY belongs to, so a failure can be answered the way its protocol wants. */
+    private final PgWireHandler owner;
 
     // COPY FROM STDIN state
     boolean inCopyFromMode;
     com.memgres.engine.parser.ast.CopyStmt activeCopyStmt;
     ByteArrayOutputStream copyBuffer;
     int copyRowCount;
+    /** Rows ON_ERROR ignore dropped: REJECT_LIMIT caps them and a NOTICE reports them at the end. */
+    long copySkippedCount;
+    /**
+     * How many lines of the input the copy has read, and the last of them as the sender wrote it.
+     *
+     * <p>PostgreSQL counts every line it reads, the header among them, and a line that a quoted
+     * field carried a newline through counts once however many newlines it holds. It keeps the
+     * line itself for as long as it may still have to say which one was refused.
+     */
+    long copyLineNumber;
+    String copyLineText;
+    /**
+     * True when Execute opened this COPY rather than a simple Query. The extended protocol's
+     * ReadyForQuery belongs to Sync alone, so a COPY that ends under it must not send one of its
+     * own — a client counting them was one message out of step from that point on.
+     */
+    boolean copyFromExtended;
 
-    PgWireCopyHandler(Session session) {
+    PgWireCopyHandler(Session session, PgWireHandler owner) {
         this.session = session;
+        this.owner = owner;
     }
 
     // ---- COPY TO STDOUT ----
@@ -168,14 +188,22 @@ class PgWireCopyHandler {
     // ---- COPY FROM STDIN ----
 
     /** Send CopyInResponse and enter copy-from mode. */
-    void sendCopyInResult(ChannelHandlerContext ctx, QueryResult result) {
+    void sendCopyInResult(ChannelHandlerContext ctx, QueryResult result, boolean extended) {
         CopyStmt copyStmt = result.getCopyStmt();
+        MemgresException refusal = result.getCopyRefusal();
         boolean isBinary = "binary".equalsIgnoreCase(copyStmt.format());
         int numCols;
         if (copyStmt.columns() != null && !copyStmt.columns().isEmpty()) {
             numCols = copyStmt.columns().size();
+        } else if (refusal != null) {
+            // Nothing is going to be sent, and the relation this names is not one whose columns
+            // can be counted here, so the count says nothing rather than guessing.
+            numCols = 0;
         } else {
-            numCols = session.getTableColumnCount(copyStmt.table());
+            // A generated column takes no field in the data, so the count the CopyInResponse
+            // advertises has to leave it out — the sender writes one field fewer than the
+            // relation has columns.
+            numCols = nonGeneratedColumnCount(copyStmt.table());
         }
 
         ByteBuf hdr = ctx.alloc().buffer();
@@ -186,10 +214,31 @@ class PgWireCopyHandler {
         for (int i = 0; i < numCols; i++) hdr.writeShort(isBinary ? 1 : 0);
         ctx.writeAndFlush(hdr);
 
+        if (refusal != null) {
+            // PostgreSQL opens the copy and only then finds it cannot store rows in this relation,
+            // so the client is told to send data and told the statement failed one message later.
+            // The refusal is raised here, with the CopyInResponse already on its way out, so that
+            // it is answered like any other failed statement; copy mode is never entered, and the
+            // CopyData, CopyDone or CopyFail the client sends on the strength of the
+            // CopyInResponse are read and thrown away as PostgreSQL throws them away.
+            throw refusal;
+        }
+
+        // PostgreSQL opens the copy before it fires anything, so the relation's BEFORE statement
+        // triggers run here rather than while the statement was still being judged: one that
+        // refuses the copy is reported after the client has been told to send its data, and copy
+        // mode is never entered, so what it sends on the strength of the CopyInResponse is read
+        // and thrown away.
+        session.beginCopyFrom(copyStmt);
+
         inCopyFromMode = true;
         activeCopyStmt = copyStmt;
         copyBuffer = new ByteArrayOutputStream();
         copyRowCount = 0;
+        copySkippedCount = 0;
+        copyLineNumber = 0;
+        copyLineText = null;
+        copyFromExtended = extended;
     }
 
     /** Handle incoming CopyData message. */
@@ -202,6 +251,7 @@ class PgWireCopyHandler {
 
     /** Handle CopyDone: parse and insert all collected data. */
     void handleCopyDone(ChannelHandlerContext ctx) {
+        boolean extended = copyFromExtended;
         try {
             Set<Object[]> insertedRows = Collections.newSetFromMap(new IdentityHashMap<>());
             boolean isBinary = "binary".equalsIgnoreCase(activeCopyStmt.format());
@@ -209,12 +259,8 @@ class PgWireCopyHandler {
             if (isBinary) {
                 parseBinaryCopyData(insertedRows);
             } else {
-                java.nio.charset.Charset copyCharset = StandardCharsets.UTF_8;
-                if (activeCopyStmt.encoding() != null) {
-                    try {
-                        copyCharset = java.nio.charset.Charset.forName(activeCopyStmt.encoding());
-                    } catch (Exception ignored) { /* fall back to UTF-8 */ }
-                }
+                java.nio.charset.Charset copyCharset = activeCopyStmt.encoding() != null
+                        ? copyCharset(activeCopyStmt.encoding()) : StandardCharsets.UTF_8;
                 String data = new String(copyBuffer.toByteArray(), copyCharset);
                 boolean isCsv = "csv".equalsIgnoreCase(activeCopyStmt.format());
                 String delimiter = activeCopyStmt.delimiter();
@@ -230,8 +276,20 @@ class PgWireCopyHandler {
                         ? activeCopyStmt.escape().charAt(0) : quoteC;
 
                 String[] lines;
+                // How many of the input's line terminators each row carried through inside a
+                // quoted field: PostgreSQL numbers the lines it read rather than the rows it made
+                // of them, so a row spanning three lines advances the count by three.
+                long[] carried = null;
                 if (isCsv) {
-                    lines = splitCsvLines(data, quoteC, escapeC);
+                    try {
+                        CsvLines split = splitCsvLinesCounted(data, quoteC, escapeC);
+                        lines = split.lines;
+                        carried = split.carried;
+                    } catch (UnclosedField unclosed) {
+                        copyLineNumber = unclosed.line;
+                        copyLineText = unclosed.text;
+                        throw new MemgresException("unterminated CSV quoted field", "22P04");
+                    }
                 } else {
                     lines = data.split("\n", -1);
                     // The segment after the final newline is not a row (a trailing
@@ -243,11 +301,15 @@ class PgWireCopyHandler {
                 }
 
                 boolean first = true;
+                int lineIndex = 0;
                 for (String rawLine : lines) {
                     // CSV lines have terminators already handled in splitCsvLines;
                     // for text, strip a trailing \r (CRLF input).
                     String line = !isCsv && rawLine.endsWith("\r")
                             ? rawLine.substring(0, rawLine.length() - 1) : rawLine;
+                    copyLineNumber += 1 + (carried != null ? carried[lineIndex] : 0);
+                    lineIndex++;
+                    copyLineText = line;
                     if (line.equals("\\.")) break; // end-of-data marker (both formats)
                     if (header && first) {
                         first = false;
@@ -266,7 +328,9 @@ class PgWireCopyHandler {
                             if (expectedCols != null && !expectedCols.isEmpty()) {
                                 if (headerValues.size() != expectedCols.size()) {
                                     throw new com.memgres.engine.MemgresException(
-                                            "COPY HEADER MATCH: column count mismatch", "22P04");
+                                            "wrong number of fields in header line: got "
+                                            + headerValues.size() + ", expected "
+                                            + expectedCols.size(), "22P04");
                                 }
                                 for (int hi = 0; hi < expectedCols.size(); hi++) {
                                     String expected = expectedCols.get(hi).toLowerCase();
@@ -291,55 +355,395 @@ class PgWireCopyHandler {
                         values = parseTextLine(line, delimiter, nullStr, defaultStr);
                     }
 
-                    try {
-                        Object[] insertedRow = session.executeCopyFromRow(activeCopyStmt, values);
-                        if (insertedRow != null) insertedRows.add(insertedRow);
-                        copyRowCount++;
-                    } catch (Exception rowErr) {
-                        if (onErrorIgnore) continue;
-                        if (!insertedRows.isEmpty()) {
-                            try {
-                                session.deleteInsertedRows(activeCopyStmt.table(), insertedRows);
-                            } catch (Exception rollbackErr) {
-                                LOG.error("Error rolling back COPY rows", rollbackErr);
-                            }
-                        }
-                        throw rowErr;
-                    }
+                    insertCopyRow(values, insertedRows, onErrorIgnore);
                 }
             }
 
+            // ON_ERROR ignore drops rows and still reports success, so PostgreSQL says how many
+            // were left out — the count in the tag does not say that anything was.
+            if (copySkippedCount > 0
+                    && !"silent".equalsIgnoreCase(activeCopyStmt.logVerbosity())) {
+                sendNotice(ctx, copySkippedCount == 1
+                        ? "1 row was skipped due to data type incompatibility"
+                        : copySkippedCount + " rows were skipped due to data type incompatibility");
+            }
+            // A COPY is one statement, so what it still owes once its last row has gone in is owed
+            // once: every AFTER row trigger it held back, and then the relation's AFTER statement
+            // triggers over everything it wrote. A refusal from either is the statement's refusal
+            // and takes the rows back out with it.
+            // Nothing is being read any more, so an error from here on names no line: PostgreSQL
+            // holds its AFTER triggers back until the last row has gone in, by which time the copy
+            // has stopped reading and the line it stopped on is no longer anybody's to report.
+            copyLineNumber = 0;
+            copyLineText = null;
+            try {
+                session.finishCopyFrom();
+            } catch (RuntimeException endOfCopy) {
+                rollbackCopyRows(insertedRows);
+                throw endOfCopy;
+            }
             PgWireHandler.sendCommandComplete(ctx, "COPY " + copyRowCount);
         } catch (MemgresException e) {
-            PgWireHandler.sendErrorSimple(ctx, e.getSqlState(), e.getMessage());
+            // Everything the error carries goes out with it: a refusal from inside a COPY reaches
+            // the sender with no statement text to look at, so its detail and the line it names
+            // are all there is to go on.
+            PgWireHandler.sendErrorWithDetails(ctx, e, extended, copyErrorContext(e));
+            if (extended) owner.setErrorPendingUntilSync(ctx);
         } catch (Exception e) {
             LOG.error("Error during COPY FROM", e);
             PgWireHandler.sendErrorSimple(ctx, "XX000", "COPY FROM failed: " + e.getMessage());
+            if (extended) owner.setErrorPendingUntilSync(ctx);
         } finally {
             resetCopyState();
-            PgWireHandler.sendReadyForQuery(ctx, session);
+            // Under the extended protocol the CommandComplete belongs to the Execute that opened
+            // the COPY, and PostgreSQL writes it without pushing it: the completion reaches the
+            // client with the next Flush or Sync it asks for. Flushing it at CopyDone handed the
+            // statement's result over a round trip before PostgreSQL hands it over, which is a
+            // difference a client counting messages between CopyDone and Sync can see. A failure
+            // is the one thing PostgreSQL does push at once, and the refusal above has done that.
+            if (!extended) {
+                PgWireHandler.sendReadyForQuery(ctx, session);
+            }
+        }
+    }
+
+    /**
+     * Store one COPY FROM row, and decide what to do when it will not go in.
+     *
+     * <p>One routine for the text loop and the binary loop, because the policy is one policy: a
+     * row is counted only once it has been stored, ON_ERROR ignore covers only what a type's
+     * input function raises, REJECT_LIMIT is a ceiling on the rows that were skipped, and a row
+     * that fails for any other reason takes the whole COPY back out again. Written twice, the two
+     * formats drifted: binary COPY left every row before the failure permanently stored.
+     *
+     * @param skippable whether ON_ERROR ignore is in force; binary COPY has no soft errors, so a
+     *        binary row is always strict however the option was written
+     */
+    private void insertCopyRow(List<String> values, Set<Object[]> insertedRows, boolean skippable) {
+        try {
+            Object[] insertedRow = session.executeCopyFromRow(activeCopyStmt, values);
+            // A row the WHERE rejected, or one a BEFORE trigger returned NULL for, was never
+            // stored, and PostgreSQL counts only the rows that were.
+            if (insertedRow == null) return;
+            insertedRows.add(insertedRow);
+            copyRowCount++;
+        } catch (MemgresException rowErr) {
+            if (skippable && isConversionError(rowErr)) {
+                copySkippedCount++;
+                Long limit = activeCopyStmt.rejectLimit();
+                if (limit != null && copySkippedCount > limit.longValue()) {
+                    rollbackCopyRows(insertedRows);
+                    MemgresException over = new MemgresException("skipped more than REJECT_LIMIT ("
+                            + limit + ") rows due to data type incompatibility", "22P02");
+                    // The row that took the count past the limit is the one PostgreSQL is still
+                    // holding when it gives up, so what it names is that row's field.
+                    over.setCopyField(rowErr.getCopyField());
+                    throw over;
+                }
+                return;
+            }
+            rollbackCopyRows(insertedRows);
+            throw rowErr;
+        } catch (RuntimeException rowErr) {
+            rollbackCopyRows(insertedRows);
+            throw rowErr;
+        }
+    }
+
+    /**
+     * What a client prints as CONTEXT under an error a COPY raised.
+     *
+     * <p>PostgreSQL names the relation and the line of the input it had reached, and quotes that
+     * line as the sender wrote it: for a sender of thousands of lines it is the only way to tell
+     * which one was refused. A failure inside a field's own reader names the field instead,
+     * because the value that could not be read says more than the line it sat on. A row that
+     * failed inside something running on the copy's behalf carries what that was first, the way
+     * PostgreSQL stacks them.
+     */
+    private String copyErrorContext(MemgresException e) {
+        String reading = copyReadingContext(e);
+        if (e.getPgContext() == null) return reading;
+        return reading == null ? e.getPgContext() : e.getPgContext() + "\n" + reading;
+    }
+
+    /** The frame the copy itself contributes, or null where it is no longer reading a line. */
+    private String copyReadingContext(MemgresException e) {
+        if (copyLineNumber == 0 || activeCopyStmt == null) return null;
+        // A foreign key is checked once the statement has stored everything it is going to store,
+        // so by the time it refuses a row the copy has no line in hand to name.
+        if ("23503".equals(e.getSqlState())) return null;
+        Table relation;
+        try {
+            relation = session.resolveTable(activeCopyStmt.table());
+        } catch (RuntimeException gone) {
+            return null;
+        }
+        StringBuilder sb = new StringBuilder("COPY ");
+        sb.append(relation.getName()).append(", line ").append(copyLineNumber);
+        if (e.getCopyField() != null) {
+            sb.append(", ").append(e.getCopyField());
+        } else if (copyLineText != null && !lineReadOverBefore(e, relation)) {
+            sb.append(": \"").append(limitPrintoutLength(copyLineText)).append('"');
+        }
+        return sb.toString();
+    }
+
+    /**
+     * The line as PostgreSQL quotes it: whole while it is short, and cut off with an ellipsis once
+     * it is not.
+     *
+     * <p>A sender's line is as long as it cares to make it, and one carrying a few wide columns
+     * pushed the refusal itself off the reader's screen. PostgreSQL cuts at a hundred bytes of the
+     * encoded text and never inside a character, so a line of accented text loses a whole letter
+     * rather than half of one.
+     */
+    private static String limitPrintoutLength(String text) {
+        int bytes = 0;
+        int cut = -1;
+        int i = 0;
+        while (i < text.length()) {
+            int cp = text.codePointAt(i);
+            int width = cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+            if (cut < 0 && bytes + width > MAX_COPY_DATA_DISPLAY) cut = i;
+            bytes += width;
+            i += Character.charCount(cp);
+        }
+        return bytes <= MAX_COPY_DATA_DISPLAY ? text : text.substring(0, cut) + "...";
+    }
+
+    /** How much of a line PostgreSQL is willing to quote, in bytes of the encoded text. */
+    private static final int MAX_COPY_DATA_DISPLAY = 100;
+
+    /**
+     * True when the line would have been read over before this refusal was raised.
+     *
+     * <p>PostgreSQL reads a copy's rows ahead into a buffer and stores them together, and a unique
+     * or exclusion index is maintained as the buffer goes in rather than as the line is read: the
+     * refusal can still say which line the row came from, but no longer what was on it. A relation
+     * carrying a BEFORE row trigger is stored a row at a time, because the trigger may look at
+     * what the copy has written so far, and there the line is still to hand.
+     */
+    private boolean lineReadOverBefore(MemgresException e, Table relation) {
+        if (!"23505".equals(e.getSqlState()) && !"23P01".equals(e.getSqlState())) return false;
+        for (PgTrigger trigger : session.getDatabase().getTriggersForTable(relation.getName())) {
+            if (!trigger.isForEachStatement()
+                    && trigger.getTiming() == PgTrigger.Timing.BEFORE
+                    && trigger.getEvent() == PgTrigger.Event.INSERT) {
+                return false;
+            }
+        }
+        return !fillsAVolatileDefault(relation);
+    }
+
+    /**
+     * Whether the copy has to work out a default for this relation that PostgreSQL calls volatile.
+     *
+     * <p>Such a default may read the relation it is filling, so PostgreSQL will not buffer rows
+     * ahead of one -- the same reason a BEFORE row trigger stops it -- and the line each row came
+     * from is still to hand when an index refuses it. Only a column the sender writes nothing for
+     * has its default worked out at all, so a volatile default the statement's own column list
+     * names is not one of these. A sequence is the exception PostgreSQL makes by name: a serial or
+     * an identity column is much the commonest default there is and nextval reads nothing.
+     */
+    private boolean fillsAVolatileDefault(Table relation) {
+        List<String> written = activeCopyStmt.columns();
+        // A copy that names no columns is sent a field for every one of them and defaults none.
+        if (written == null || written.isEmpty()) return false;
+        for (Column col : relation.getColumns()) {
+            if (col.isGenerated() || namedAmong(written, col.getName())) continue;
+            String def = col.getDefaultValue();
+            if (def == null) continue;
+            if (callsAVolatileRoutine(def, 0)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Whether an expression calls anything PostgreSQL records as volatile.
+     *
+     * <p>What a routine is declared is what PostgreSQL believes, so a function the user wrote
+     * VOLATILE counts and the same body written STABLE or IMMUTABLE does not: matching the text
+     * against a list of names recognised the built-ins and nothing else, and a relation defaulted
+     * from a user's own VOLATILE function was buffered when PostgreSQL would not have buffered it.
+     * A function with no volatility of its own is volatile, which is PostgreSQL's default too.
+     */
+    private boolean callsAVolatileRoutine(String expr, int depth) {
+        for (String name : calledNames(expr)) {
+            String bare = name.substring(name.lastIndexOf('.') + 1);
+            if (VOLATILE_DEFAULT_CALLS.contains(bare)) return true;
+            PgFunction routine = session.getDatabase().getFunction(name);
+            if (routine == null) continue;
+            String volatility = routine.getVolatility();
+            // What was declared STABLE or IMMUTABLE is believed however its body reads: PostgreSQL
+            // will not fold a body more volatile than the declaration that covers it, so the
+            // declaration is what is left standing there.
+            if (volatility != null && !"VOLATILE".equalsIgnoreCase(volatility)) continue;
+            String folded = depth < 4 ? foldedSqlBody(routine) : null;
+            if (folded == null || callsAVolatileRoutine(folded, depth + 1)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * The expression a SQL function is folded into where its body is one, or null where it is not.
+     *
+     * <p>PostgreSQL folds such a function into the default before it asks whether the default is
+     * volatile, so what governs there is the body and not the word the declaration used: a function
+     * written VOLATILE whose body is {@code SELECT 7} leaves a constant behind and the copy buffers
+     * as it would for any other constant. A body that goes on to read something is left standing
+     * where it was written, and its declaration is believed.
+     */
+    private static String foldedSqlBody(PgFunction routine) {
+        if (!"sql".equalsIgnoreCase(routine.getLanguage())) return null;
+        String body = routine.getBody();
+        if (body == null) return null;
+        String trimmed = body.trim();
+        while (trimmed.endsWith(";")) trimmed = trimmed.substring(0, trimmed.length() - 1).trim();
+        if (!trimmed.regionMatches(true, 0, "select", 0, 6)) return null;
+        String selectList = trimmed.substring(6).trim();
+        if (selectList.isEmpty() || readsFurther(selectList)) return null;
+        return selectList;
+    }
+
+    /** True where a select list goes on past itself: a FROM, or a second statement behind it. */
+    private static boolean readsFurther(String text) {
+        int depth = 0;
+        boolean inString = false;
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (inString) {
+                if (c == '\'') inString = false;
+            } else if (c == '\'') {
+                inString = true;
+            } else if (c == '(') {
+                depth++;
+            } else if (c == ')') {
+                depth--;
+            } else if (depth == 0) {
+                if (c == ';') return true;
+                if ((c == 'f' || c == 'F') && text.regionMatches(true, i, "from", 0, 4)
+                        && (i == 0 || !isNameChar(text.charAt(i - 1)))
+                        && (i + 4 >= text.length() || !isNameChar(text.charAt(i + 4)))) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * The names an expression's text calls, lowercased and with whatever schema they were written
+     * with. A name is a call where a parenthesis follows it; text inside a string literal is none
+     * of them, so a default whose value happens to spell one is not mistaken for it.
+     */
+    private static List<String> calledNames(String expr) {
+        List<String> names = new ArrayList<>();
+        int i = 0;
+        while (i < expr.length()) {
+            char c = expr.charAt(i);
+            if (c == '\'') {
+                i++;
+                while (i < expr.length() && expr.charAt(i) != '\'') i++;
+                i++;
+                continue;
+            }
+            if (!Character.isLetter(c) && c != '_' && c != '"') {
+                i++;
+                continue;
+            }
+            int start = i;
+            while (i < expr.length() && isNameChar(expr.charAt(i))) i++;
+            int end = i;
+            while (i < expr.length() && Character.isWhitespace(expr.charAt(i))) i++;
+            if (i < expr.length() && expr.charAt(i) == '(') {
+                names.add(expr.substring(start, end).replace("\"", "").toLowerCase());
+            }
+        }
+        return names;
+    }
+
+    private static boolean isNameChar(char c) {
+        return Character.isLetterOrDigit(c) || c == '_' || c == '.' || c == '"' || c == '$';
+    }
+
+    private static boolean namedAmong(List<String> names, String column) {
+        for (String name : names) {
+            if (name.equalsIgnoreCase(column)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * The built-ins PostgreSQL records as volatile. A routine the user wrote has a declaration to
+     * be asked for its volatility; these have none, so they are known by name. {@code nextval} is
+     * left out on purpose: it is the exception PostgreSQL makes for a serial or identity default.
+     */
+    private static final Set<String> VOLATILE_DEFAULT_CALLS = new HashSet<>(Arrays.asList(
+            "random", "random_normal", "clock_timestamp", "timeofday", "gen_random_uuid",
+            "uuid_generate_v1", "uuid_generate_v4", "uuidv4", "uuidv7", "currval", "setval",
+            "txid_current", "pg_current_xact_id"));
+
+    /**
+     * True for the failures ON_ERROR ignore is allowed to skip: the ones a type's input function
+     * raises, which is the data-exception class. A constraint, a trigger or a row that belongs to
+     * no partition is not bad data, and PostgreSQL aborts the COPY for those. Malformed COPY data
+     * (22P04) is the reader's complaint rather than a type's, and is not skippable either.
+     */
+    private static boolean isConversionError(MemgresException e) {
+        String state = e.getSqlState();
+        return state != null && state.startsWith("22") && !"22P04".equals(state);
+    }
+
+    private void rollbackCopyRows(Set<Object[]> insertedRows) {
+        if (insertedRows.isEmpty()) return;
+        try {
+            session.deleteInsertedRows(activeCopyStmt.table(), insertedRows);
+        } catch (Exception rollbackErr) {
+            LOG.error("Error rolling back COPY rows", rollbackErr);
         }
     }
 
     /** Parse and insert binary format COPY FROM data. */
     private void parseBinaryCopyData(Set<Object[]> insertedRows) {
         byte[] raw = copyBuffer.toByteArray();
+        // The frame is read rather than seeked over. A stream that is not PGCOPY at all, and one
+        // that stops in the middle of a field, are both bad COPY data, and PostgreSQL says which
+        // of the two it is — seeking past the header reported them as internal Java errors.
+        if (raw.length < COPY_SIGNATURE.length + 8 || !startsWithSignature(raw)) {
+            throw new MemgresException("COPY file signature not recognized", "22P04");
+        }
         java.nio.ByteBuffer buf = java.nio.ByteBuffer.wrap(raw);
-        buf.position(11); // skip PGCOPY signature
-        buf.getInt();     // skip flags
+        buf.position(COPY_SIGNATURE.length);
+        int flags = buf.getInt();
+        if ((flags & 0xFFFF0000) != 0) {
+            throw new MemgresException("unrecognized critical flags in COPY file header", "22P04");
+        }
         int extLen = buf.getInt();
+        if (extLen < 0 || extLen > buf.remaining()) {
+            throw new MemgresException("invalid COPY file header (wrong length)", "22P04");
+        }
         buf.position(buf.position() + extLen);
 
         DataType[] colTypes = resolveActiveCopyColumnTypes();
+        int expectedFields = colTypes != null ? colTypes.length : -1;
 
+        // PostgreSQL tolerates a stream that ends without the -1 trailer, so its absence is not
+        // an error here either.
         while (buf.remaining() >= 2) {
             short fieldCount = buf.getShort();
             if (fieldCount == -1) break;
+            if (expectedFields >= 0 && fieldCount != expectedFields) {
+                throw new MemgresException("row field count is " + fieldCount
+                        + ", expected " + expectedFields, "22P04");
+            }
             List<String> values = new ArrayList<>();
             for (int i = 0; i < fieldCount; i++) {
+                if (buf.remaining() < 4) throw unexpectedCopyEof();
                 int len = buf.getInt();
                 if (len == -1) {
                     values.add(null);
+                } else if (len < 0 || len > buf.remaining()) {
+                    throw unexpectedCopyEof();
                 } else {
                     byte[] fieldData = new byte[len];
                     buf.get(fieldData);
@@ -347,10 +751,138 @@ class PgWireCopyHandler {
                     values.add(PgWireBinaryCodec.decodeBinaryField(fieldData, dt));
                 }
             }
-            Object[] insertedRow = session.executeCopyFromRow(activeCopyStmt, values);
-            if (insertedRow != null) insertedRows.add(insertedRow);
-            copyRowCount++;
+            copyLineNumber++;
+            insertCopyRow(values, insertedRows, false);
         }
+    }
+
+    private static final byte[] COPY_SIGNATURE =
+            {'P', 'G', 'C', 'O', 'P', 'Y', '\n', (byte) 0xFF, '\r', '\n', 0};
+
+    private static boolean startsWithSignature(byte[] raw) {
+        for (int i = 0; i < COPY_SIGNATURE.length; i++) {
+            if (raw[i] != COPY_SIGNATURE[i]) return false;
+        }
+        return true;
+    }
+
+    private static MemgresException unexpectedCopyEof() {
+        return new MemgresException("unexpected EOF in COPY data", "22P04");
+    }
+
+    /** How many fields the data carries: a generated column takes none, in either direction. */
+    private int nonGeneratedColumnCount(String tableName) {
+        Table table = session.resolveTable(tableName);
+        int n = 0;
+        for (Column col : table.getColumns()) {
+            if (!col.isGenerated()) n++;
+        }
+        return n;
+    }
+
+    /**
+     * The Java charset a PostgreSQL encoding name asks for. The names are PostgreSQL's own —
+     * LATIN1, WIN1252, SJIS — and {@code Charset.forName} knows none of them, so the option fell
+     * back to UTF-8 without saying so and every byte outside ASCII came out as another character.
+     */
+    private static java.nio.charset.Charset copyCharset(String pgName) {
+        StringBuilder key = new StringBuilder(pgName.length());
+        for (int i = 0; i < pgName.length(); i++) {
+            char c = pgName.charAt(i);
+            if (Character.isLetterOrDigit(c)) key.append(Character.toLowerCase(c));
+        }
+        String javaName = PG_TO_JAVA_CHARSET.get(key.toString());
+        try {
+            return java.nio.charset.Charset.forName(javaName != null ? javaName : pgName);
+        } catch (Exception e) {
+            return StandardCharsets.UTF_8;
+        }
+    }
+
+    private static final Map<String, String> PG_TO_JAVA_CHARSET = new HashMap<>();
+
+    static {
+        PG_TO_JAVA_CHARSET.put("utf8", "UTF-8");
+        PG_TO_JAVA_CHARSET.put("unicode", "UTF-8");
+        // SQL_ASCII does no conversion at all, so the byte-preserving charset is the closest Java
+        // has to it: every byte reads back as the character with that code point.
+        PG_TO_JAVA_CHARSET.put("sqlascii", "ISO-8859-1");
+        PG_TO_JAVA_CHARSET.put("latin1", "ISO-8859-1");
+        PG_TO_JAVA_CHARSET.put("iso88591", "ISO-8859-1");
+        PG_TO_JAVA_CHARSET.put("latin2", "ISO-8859-2");
+        PG_TO_JAVA_CHARSET.put("iso88592", "ISO-8859-2");
+        PG_TO_JAVA_CHARSET.put("latin3", "ISO-8859-3");
+        PG_TO_JAVA_CHARSET.put("iso88593", "ISO-8859-3");
+        PG_TO_JAVA_CHARSET.put("latin4", "ISO-8859-4");
+        PG_TO_JAVA_CHARSET.put("iso88594", "ISO-8859-4");
+        PG_TO_JAVA_CHARSET.put("iso88595", "ISO-8859-5");
+        PG_TO_JAVA_CHARSET.put("iso88596", "ISO-8859-6");
+        PG_TO_JAVA_CHARSET.put("iso88597", "ISO-8859-7");
+        PG_TO_JAVA_CHARSET.put("iso88598", "ISO-8859-8");
+        PG_TO_JAVA_CHARSET.put("latin5", "ISO-8859-9");
+        PG_TO_JAVA_CHARSET.put("iso88599", "ISO-8859-9");
+        PG_TO_JAVA_CHARSET.put("latin7", "ISO-8859-13");
+        PG_TO_JAVA_CHARSET.put("iso885913", "ISO-8859-13");
+        PG_TO_JAVA_CHARSET.put("latin9", "ISO-8859-15");
+        PG_TO_JAVA_CHARSET.put("iso885915", "ISO-8859-15");
+        PG_TO_JAVA_CHARSET.put("koi8", "KOI8-R");
+        PG_TO_JAVA_CHARSET.put("koi8r", "KOI8-R");
+        PG_TO_JAVA_CHARSET.put("koi8u", "KOI8-U");
+        PG_TO_JAVA_CHARSET.put("win", "windows-1251");
+        for (int cp = 1250; cp <= 1258; cp++) {
+            String name = "windows-" + cp;
+            PG_TO_JAVA_CHARSET.put("win" + cp, name);
+            PG_TO_JAVA_CHARSET.put("cp" + cp, name);
+            PG_TO_JAVA_CHARSET.put("windows" + cp, name);
+        }
+        PG_TO_JAVA_CHARSET.put("alt", "IBM866");
+        PG_TO_JAVA_CHARSET.put("win866", "IBM866");
+        PG_TO_JAVA_CHARSET.put("cp866", "IBM866");
+        PG_TO_JAVA_CHARSET.put("win874", "x-windows-874");
+        PG_TO_JAVA_CHARSET.put("cp874", "x-windows-874");
+        PG_TO_JAVA_CHARSET.put("tis620", "TIS-620");
+        PG_TO_JAVA_CHARSET.put("thai", "TIS-620");
+        PG_TO_JAVA_CHARSET.put("sjis", "Shift_JIS");
+        PG_TO_JAVA_CHARSET.put("mskanji", "Shift_JIS");
+        PG_TO_JAVA_CHARSET.put("shiftjis", "Shift_JIS");
+        PG_TO_JAVA_CHARSET.put("win932", "Shift_JIS");
+        PG_TO_JAVA_CHARSET.put("cp932", "Shift_JIS");
+        PG_TO_JAVA_CHARSET.put("eucjp", "EUC-JP");
+        PG_TO_JAVA_CHARSET.put("euckr", "EUC-KR");
+        PG_TO_JAVA_CHARSET.put("uhc", "x-windows-949");
+        PG_TO_JAVA_CHARSET.put("win949", "x-windows-949");
+        PG_TO_JAVA_CHARSET.put("cp949", "x-windows-949");
+        PG_TO_JAVA_CHARSET.put("euccn", "GB2312");
+        PG_TO_JAVA_CHARSET.put("gbk", "GBK");
+        PG_TO_JAVA_CHARSET.put("win936", "GBK");
+        PG_TO_JAVA_CHARSET.put("cp936", "GBK");
+        PG_TO_JAVA_CHARSET.put("gb18030", "GB18030");
+        PG_TO_JAVA_CHARSET.put("big5", "Big5");
+        PG_TO_JAVA_CHARSET.put("bigfive", "Big5");
+        PG_TO_JAVA_CHARSET.put("win950", "Big5");
+        PG_TO_JAVA_CHARSET.put("cp950", "Big5");
+    }
+
+    /**
+     * A NoticeResponse. It is how PostgreSQL reports the rows ON_ERROR ignore dropped: the COPY
+     * succeeded, and nothing in its tag would tell the client that anything was left out.
+     */
+    private static void sendNotice(ChannelHandlerContext ctx, String message) {
+        ByteBuf buf = ctx.alloc().buffer();
+        buf.writeByte('N');
+        int lengthIdx = buf.writerIndex();
+        buf.writeInt(0);
+        buf.writeByte('S');
+        PgWireValueFormatter.writeCString(buf, "NOTICE");
+        buf.writeByte('V');
+        PgWireValueFormatter.writeCString(buf, "NOTICE");
+        buf.writeByte('C');
+        PgWireValueFormatter.writeCString(buf, "00000");
+        buf.writeByte('M');
+        PgWireValueFormatter.writeCString(buf, message);
+        buf.writeByte(0);
+        buf.setInt(lengthIdx, buf.writerIndex() - lengthIdx);
+        ctx.write(buf);
     }
 
     /** Resolve column names for the active COPY FROM statement's table (for HEADER MATCH). */
@@ -361,6 +893,8 @@ class PgWireCopyHandler {
             if (table == null) return null;
             List<String> names = new ArrayList<>();
             for (Column col : table.getColumns()) {
+                // A generated column has no field in the data, so it has no header field either.
+                if (col.isGenerated()) continue;
                 names.add(col.getName());
             }
             return names;
@@ -389,9 +923,12 @@ class PgWireCopyHandler {
                 }
                 return types;
             }
-            DataType[] types = new DataType[cols.size()];
-            for (int i = 0; i < cols.size(); i++) types[i] = cols.get(i).getType();
-            return types;
+            List<DataType> types = new ArrayList<>();
+            for (Column col : cols) {
+                if (col.isGenerated()) continue;
+                types.add(col.getType());
+            }
+            return types.toArray(new DataType[0]);
         } catch (Exception e) {
             return null;
         }
@@ -400,15 +937,126 @@ class PgWireCopyHandler {
     /** Handle CopyFail: abort the COPY. */
     void handleCopyFail(ChannelHandlerContext ctx, PgWireMessage msg) {
         String errorMsg = msg.getQuery();
+        boolean extended = copyFromExtended;
+        MemgresException failed = new MemgresException(
+                "COPY from stdin failed: " + (errorMsg != null ? errorMsg : ""), "57014");
+        // PostgreSQL counts a line as it starts on it rather than as it finishes, so a copy the
+        // sender gave up on names the line it was still waiting for.
+        String reading = copyFailContext();
         resetCopyState();
-        PgWireHandler.sendErrorSimple(ctx, "57014", errorMsg != null ? errorMsg : "COPY FROM STDIN failed");
+        // PostgreSQL says whose failure it was and quotes what the client sent. The error also has
+        // to reach the client now: a CopyFail sent on its own is followed by nothing that would
+        // flush it, so a client that sends one and waits was waiting on a buffer.
+        PgWireHandler.sendErrorWithDetails(ctx, failed, extended, reading);
+        if (extended) {
+            owner.setErrorPendingUntilSync(ctx);
+        } else {
+            PgWireHandler.sendReadyForQuery(ctx, session);
+        }
+    }
+
+    /** The relation and the line a copy was waiting for, for a sender that gave up on it. */
+    private String copyFailContext() {
+        if (activeCopyStmt == null) return null;
+        long waitingFor = lineWaitedFor();
+        // A binary copy reads its header before it is reading lines at all, and PostgreSQL has not
+        // yet said what the copy is doing when it does: a sender that gives up before writing the
+        // header is answered with no context field of any kind.
+        if (waitingFor == 0) return null;
+        try {
+            return "COPY " + session.resolveTable(activeCopyStmt.table()).getName()
+                    + ", line " + waitingFor;
+        } catch (RuntimeException gone) {
+            return null;
+        }
+    }
+
+    /**
+     * The line the copy would have read next, or zero where it had not begun reading lines.
+     *
+     * <p>PostgreSQL counts a line as it starts on it rather than as it finishes, so a copy nothing
+     * was ever sent to is waiting on line 1 and one that was sent two whole rows is waiting on line
+     * 3, whatever it has since done with them. Nothing here has been read yet -- the reading is one
+     * pass once the copy ends -- so the count is taken over what the sender did write.
+     */
+    private long lineWaitedFor() {
+        byte[] sent = copyBuffer == null ? new byte[0] : copyBuffer.toByteArray();
+        if ("binary".equalsIgnoreCase(activeCopyStmt.format())) {
+            if (sent.length < COPY_SIGNATURE.length + 8 || !startsWithSignature(sent)) return 0;
+            return 1 + wholeBinaryRows(sent);
+        }
+        java.nio.charset.Charset charset = activeCopyStmt.encoding() != null
+                ? copyCharset(activeCopyStmt.encoding()) : StandardCharsets.UTF_8;
+        String text = new String(sent, charset);
+        boolean isCsv = "csv".equalsIgnoreCase(activeCopyStmt.format());
+        char quoteC = activeCopyStmt.quote() != null && !activeCopyStmt.quote().isEmpty()
+                ? activeCopyStmt.quote().charAt(0) : '"';
+        char escapeC = activeCopyStmt.escape() != null && !activeCopyStmt.escape().isEmpty()
+                ? activeCopyStmt.escape().charAt(0) : quoteC;
+        long complete = 0;
+        boolean inQuote = false;
+        // A quoted field carries the input's terminator through as data, and PostgreSQL still counts
+        // it: the copy is waiting that many lines further on. Which character counts is the one the
+        // input's first terminator outside quotes turned out to be, a carriage return until then —
+        // the same rule the splitter reads its lines by.
+        char embeddedTerminator = '\r';
+        boolean terminatorKnown = false;
+        long quotedTerminators = 0;
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (isCsv && inQuote && c == escapeC && i + 1 < text.length()
+                    && (text.charAt(i + 1) == quoteC || text.charAt(i + 1) == escapeC)) {
+                i++;
+            } else if (isCsv && inQuote && c == embeddedTerminator) {
+                quotedTerminators++;
+            } else if (isCsv && c == quoteC) {
+                inQuote = !inQuote;
+            } else if (!inQuote && (c == '\n' || (isCsv && c == '\r'))) {
+                if (c == '\r' && i + 1 < text.length() && text.charAt(i + 1) == '\n') i++;
+                if (!terminatorKnown) {
+                    embeddedTerminator = c;
+                    terminatorKnown = true;
+                }
+                complete++;
+            }
+        }
+        return complete + quotedTerminators + 1;
+    }
+
+    /** How many whole rows a sender's binary stream holds after the header it opened with. */
+    private static long wholeBinaryRows(byte[] sent) {
+        java.nio.ByteBuffer buf = java.nio.ByteBuffer.wrap(sent);
+        buf.position(COPY_SIGNATURE.length + 4);
+        int extLen = buf.getInt();
+        if (extLen < 0 || extLen > buf.remaining()) return 0;
+        buf.position(buf.position() + extLen);
+        long rows = 0;
+        while (buf.remaining() >= 2) {
+            short fieldCount = buf.getShort();
+            if (fieldCount < 0) return rows;
+            for (int i = 0; i < fieldCount; i++) {
+                if (buf.remaining() < 4) return rows;
+                int len = buf.getInt();
+                if (len == -1) continue;
+                if (len < 0 || len > buf.remaining()) return rows;
+                buf.position(buf.position() + len);
+            }
+            rows++;
+        }
+        return rows;
     }
 
     private void resetCopyState() {
+        // A copy that ended without finishing owes nothing: its rows have gone back out again.
+        session.discardCopyFrom();
         inCopyFromMode = false;
         activeCopyStmt = null;
         copyBuffer = null;
         copyRowCount = 0;
+        copySkippedCount = 0;
+        copyLineNumber = 0;
+        copyLineText = null;
+        copyFromExtended = false;
     }
 
     // ---- Wire helpers ----
@@ -706,9 +1354,41 @@ class PgWireCopyHandler {
      * bare \r act as line terminators outside quotes.
      */
     static String[] splitCsvLines(String data, char quote, char escape) {
+        return splitCsvLinesCounted(data, quote, escape).lines;
+    }
+
+    /** The rows an input holds, and how many lines each of them was written over. */
+    private static final class CsvLines {
+        final String[] lines;
+        final long[] carried;
+
+        CsvLines(String[] lines, long[] carried) {
+            this.lines = lines;
+            this.carried = carried;
+        }
+    }
+
+    /**
+     * Split CSV data into lines, counting the terminators each row carried through a quoted field.
+     *
+     * <p>The count is what the copy has to add to its line number for that row: PostgreSQL numbers
+     * the lines of the input, so a row written over three of them leaves the next row three lines
+     * further on rather than one.
+     */
+    private static CsvLines splitCsvLinesCounted(String data, char quote, char escape) {
         List<String> lines = new ArrayList<>();
+        List<Long> carried = new ArrayList<>();
         StringBuilder current = new StringBuilder();
         boolean inQuote = false;
+        // PostgreSQL counts a newline carried through a quoted field as a line of its own, but only
+        // once it knows what a line terminator looks like in this input -- which it learns from the
+        // first one it reads outside quotes, and takes to be a carriage return until then. That is
+        // why an input whose only newline sits inside an unterminated field is still line 1 while
+        // the same field on the second line of an input is line 3.
+        char embeddedTerminator = '\r';
+        boolean terminatorKnown = false;
+        long quotedTerminators = 0;
+        long lineTerminators = 0;
         int i = 0;
         while (i < data.length()) {
             char c = data.charAt(i);
@@ -719,6 +1399,10 @@ class PgWireCopyHandler {
                     i += 2;
                     continue;
                 }
+                if (c == embeddedTerminator) {
+                    quotedTerminators++;
+                    lineTerminators++;
+                }
                 if (c == quote) {
                     inQuote = false;
                 }
@@ -728,7 +1412,13 @@ class PgWireCopyHandler {
                 if (c == '\r' && i + 1 < data.length() && data.charAt(i + 1) == '\n') {
                     i++; // \r\n is a single terminator
                 }
+                if (!terminatorKnown) {
+                    embeddedTerminator = c;
+                    terminatorKnown = true;
+                }
                 lines.add(current.toString());
+                carried.add(lineTerminators);
+                lineTerminators = 0;
                 current.setLength(0);
                 i++;
             } else {
@@ -743,11 +1433,30 @@ class PgWireCopyHandler {
             // The input ran out with a quote still open, so the last field never ended. There is
             // no row here to store: the remainder of the input is the inside of a field whose
             // closing quote the sender did not write.
-            throw new com.memgres.engine.MemgresException("unterminated CSV quoted field", "22P04");
+            throw new UnclosedField(lines.size() + 1 + quotedTerminators, current.toString());
         }
         if (current.length() > 0) {
             lines.add(current.toString());
+            carried.add(lineTerminators);
         }
-        return lines.toArray(new String[0]);
+        long[] counts = new long[carried.size()];
+        for (int n = 0; n < counts.length; n++) counts[n] = carried.get(n).longValue();
+        return new CsvLines(lines.toArray(new String[0]), counts);
+    }
+
+    /**
+     * The tail of an input whose last field never closed its quote, with the line PostgreSQL says
+     * it was on. Only the copy knows what the relation is called, so the splitter hands the two
+     * back rather than raising the refusal itself.
+     */
+    private static final class UnclosedField extends RuntimeException {
+        final long line;
+        final String text;
+
+        UnclosedField(long line, String text) {
+            super(null, null, false, false);
+            this.line = line;
+            this.text = text;
+        }
     }
 }

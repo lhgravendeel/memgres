@@ -75,11 +75,13 @@ class PgWireBinaryCodec {
         }
         // Float4 (OID 700): 4-byte float
         if (paramOid == 700 && bytes.length == 4) {
-            return String.valueOf(Float.intBitsToFloat(readInt4(bytes, 0)));
+            return com.memgres.engine.PgFloatFormat.float4out(
+                    Float.intBitsToFloat(readInt4(bytes, 0)));
         }
         // Float8 (OID 701): 8-byte double
         if (paramOid == 701 && bytes.length == 8) {
-            return String.valueOf(Double.longBitsToDouble(readInt8(bytes, 0)));
+            return com.memgres.engine.PgFloatFormat.float8out(
+                    Double.longBitsToDouble(readInt8(bytes, 0)));
         }
         // Numeric (OID 1700): PG binary numeric format
         if (paramOid == 1700 && bytes.length >= 8) {
@@ -89,13 +91,14 @@ class PgWireBinaryCodec {
         if (paramOid == 1114 && bytes.length == 8) {
             long microsSince2000 = readInt8(bytes, 0);
             LocalDateTime epoch = LocalDateTime.of(2000, 1, 1, 0, 0, 0);
-            return epoch.plusNanos(microsSince2000 * 1000).toString();
+            return written(epoch.plusNanos(microsSince2000 * 1000));
         }
         // Timestamptz (OID 1184): 8-byte microseconds since 2000-01-01 UTC
         if (paramOid == 1184 && bytes.length == 8) {
             long microsSince2000 = readInt8(bytes, 0);
             OffsetDateTime epoch = OffsetDateTime.of(2000, 1, 1, 0, 0, 0, 0, ZoneOffset.UTC);
-            return epoch.plusNanos(microsSince2000 * 1000).toString();
+            OffsetDateTime at = epoch.plusNanos(microsSince2000 * 1000);
+            return written(at.toLocalDateTime()) + "+00";
         }
         // Date (OID 1082): 4-byte days since 2000-01-01
         if (paramOid == 1082 && bytes.length == 4) {
@@ -105,7 +108,36 @@ class PgWireBinaryCodec {
         // Time (OID 1083): 8-byte microseconds since midnight
         if (paramOid == 1083 && bytes.length == 8) {
             long micros = readInt8(bytes, 0);
-            return LocalTime.ofNanoOfDay(micros * 1000).toString();
+            return written(LocalTime.ofNanoOfDay(micros * 1000));
+        }
+        // Interval (OID 1186): microseconds, then days, then months
+        if (paramOid == 1186 && bytes.length == 16) {
+            return new PgInterval(readInt4(bytes, 12), readInt4(bytes, 8),
+                    readInt8(bytes, 0)).toString();
+        }
+        // Money (OID 790): 8 bytes of the smallest unit the locale counts in
+        if (paramOid == 790 && bytes.length == 8) {
+            return new com.memgres.engine.PgMoney(
+                    BigDecimal.valueOf(readInt8(bytes, 0), 2)).toString();
+        }
+        // A tuple identifier (OID 27): the block, then the offset inside it
+        if (paramOid == 27 && bytes.length == 6) {
+            return "(" + (readInt4(bytes, 0) & 0xFFFFFFFFL) + "," + readInt2(bytes, 4) + ")";
+        }
+        // macaddr (OID 829): the six bytes of the address itself
+        if (paramOid == 829 && bytes.length == 6) {
+            StringBuilder mac = new StringBuilder();
+            for (byte b : bytes) {
+                if (mac.length() > 0) mac.append(':');
+                mac.append(String.format("%02x", Integer.valueOf(b & 0xFF)));
+            }
+            return mac.toString();
+        }
+        // pg_lsn (OID 3220): one 64-bit position, written as two halves
+        if (paramOid == 3220 && bytes.length == 8) {
+            long lsn = readInt8(bytes, 0);
+            return Long.toHexString(lsn >>> 32).toUpperCase() + "/"
+                    + Long.toHexString(lsn & 0xFFFFFFFFL).toUpperCase();
         }
         // UUID (OID 2950): 16 bytes
         if (paramOid == 2950 && bytes.length == 16) {
@@ -123,6 +155,33 @@ class PgWireBinaryCodec {
         }
         // Fallback: treat as text
         return new String(bytes, StandardCharsets.UTF_8);
+    }
+
+    /**
+     * A date or a time written the way the server writes one.
+     *
+     * <p>A value read out of a binary parameter is handed on as text, and the text has to be the
+     * text the type prints: Java leaves out a zero seconds field and a zero fraction, so midnight
+     * arrived as {@code 00:00} and the first of January as {@code 2000-01-01T00:00} — neither of
+     * which is what PostgreSQL answers with, and neither of which is what the same value written
+     * out by this server looks like.
+     */
+    private static String written(LocalDateTime value) {
+        return value.toLocalDate() + " " + written(value.toLocalTime());
+    }
+
+    /** The same, for the time of day on its own. */
+    private static String written(LocalTime value) {
+        StringBuilder out = new StringBuilder();
+        out.append(String.format("%02d:%02d:%02d", Integer.valueOf(value.getHour()),
+                Integer.valueOf(value.getMinute()), Integer.valueOf(value.getSecond())));
+        int micros = value.getNano() / 1000;
+        if (micros != 0) {
+            String fraction = String.format("%06d", Integer.valueOf(micros));
+            while (fraction.endsWith("0")) fraction = fraction.substring(0, fraction.length() - 1);
+            out.append('.').append(fraction);
+        }
+        return out.toString();
     }
 
     // ---- Decoding: binary COPY fields ----

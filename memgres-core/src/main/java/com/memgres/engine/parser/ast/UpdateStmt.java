@@ -14,7 +14,36 @@ public final class UpdateStmt implements Statement {
     public final Expression where;
     public final List<SelectStmt.SelectTarget> returning;
     public final List<SelectStmt.CommonTableExpr> withClauses;
+    /**
+     * ONLY was written before the relation name, which keeps the statement to that relation's own
+     * storage: PostgreSQL does not follow it down to the partitions or the inheritance children,
+     * so UPDATE ONLY on a partitioned table affects nothing at all.
+     */
+    public final boolean only;
 
+    public UpdateStmt(
+            String schema,
+            String table,
+            String alias,
+            List<InsertStmt.SetClause> setClauses,
+            List<SelectStmt.FromItem> from,
+            Expression where,
+            List<SelectStmt.SelectTarget> returning,
+            List<SelectStmt.CommonTableExpr> withClauses,
+            boolean only
+    ) {
+        this.schema = schema;
+        this.table = table;
+        this.alias = alias;
+        this.setClauses = setClauses;
+        this.from = from;
+        this.where = where;
+        this.returning = returning;
+        this.withClauses = withClauses;
+        this.only = only;
+    }
+
+    /** Constructor for a statement that did not write ONLY. */
     public UpdateStmt(
             String schema,
             String table,
@@ -25,14 +54,7 @@ public final class UpdateStmt implements Statement {
             List<SelectStmt.SelectTarget> returning,
             List<SelectStmt.CommonTableExpr> withClauses
     ) {
-        this.schema = schema;
-        this.table = table;
-        this.alias = alias;
-        this.setClauses = setClauses;
-        this.from = from;
-        this.where = where;
-        this.returning = returning;
-        this.withClauses = withClauses;
+        this(schema, table, alias, setClauses, from, where, returning, withClauses, false);
     }
 
     /** Constructor without alias. */
@@ -58,6 +80,7 @@ public final class UpdateStmt implements Statement {
     public Expression where() { return where; }
     public List<SelectStmt.SelectTarget> returning() { return returning; }
     public List<SelectStmt.CommonTableExpr> withClauses() { return withClauses; }
+    public boolean only() { return only; }
 
     @Override
     public boolean equals(Object o) {
@@ -71,16 +94,17 @@ public final class UpdateStmt implements Statement {
             && java.util.Objects.equals(from, that.from)
             && java.util.Objects.equals(where, that.where)
             && java.util.Objects.equals(returning, that.returning)
-            && java.util.Objects.equals(withClauses, that.withClauses);
+            && java.util.Objects.equals(withClauses, that.withClauses)
+            && only == that.only;
     }
 
     @Override
     public int hashCode() {
-        return java.util.Objects.hash(schema, table, alias, setClauses, from, where, returning, withClauses);
+        return java.util.Objects.hash(schema, table, alias, setClauses, from, where, returning, withClauses, only);
     }
 
     @Override
     public String toString() {
-        return "UpdateStmt[schema=" + schema + ", " + "table=" + table + ", " + "alias=" + alias + ", " + "setClauses=" + setClauses + ", " + "from=" + from + ", " + "where=" + where + ", " + "returning=" + returning + ", " + "withClauses=" + withClauses + "]";
+        return "UpdateStmt[schema=" + schema + ", " + "table=" + table + ", " + "alias=" + alias + ", " + "setClauses=" + setClauses + ", " + "from=" + from + ", " + "where=" + where + ", " + "returning=" + returning + ", " + "withClauses=" + withClauses + ", " + "only=" + only + "]";
     }
 }

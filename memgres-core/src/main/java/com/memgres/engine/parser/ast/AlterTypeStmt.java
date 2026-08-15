@@ -10,6 +10,12 @@ public final class AlterTypeStmt implements Statement {
     public final String neighbor;
     /** DROP ATTRIBUTE IF EXISTS: a missing attribute is a notice, not an error. */
     public final boolean ifExists;
+    /**
+     * ALTER ATTRIBUTE ... TYPE ... CASCADE. A table declared OF a composite has the type's shape
+     * and no shape of its own, so PostgreSQL refuses to change an attribute's type under it unless
+     * the statement says to reshape the table too.
+     */
+    public final boolean cascade;
     /** ALTER TYPE schema.name — null when the name was written bare. */
     private String schemaName;
 
@@ -38,6 +44,20 @@ public final class AlterTypeStmt implements Statement {
             String neighbor,
             boolean ifExists
     ) {
+        this(typeName, action, value, newValue, ifNotExists, position, neighbor, ifExists, false);
+    }
+
+    public AlterTypeStmt(
+            String typeName,
+            Action action,
+            String value,
+            String newValue,
+            boolean ifNotExists,
+            String position,
+            String neighbor,
+            boolean ifExists,
+            boolean cascade
+    ) {
         this.typeName = typeName;
         this.action = action;
         this.value = value;
@@ -46,6 +66,7 @@ public final class AlterTypeStmt implements Statement {
         this.position = position;
         this.neighbor = neighbor;
         this.ifExists = ifExists;
+        this.cascade = cascade;
     }
 
     public enum Action { ADD_VALUE, RENAME_VALUE, RENAME_TO, SET_SCHEMA, OWNER_TO,
@@ -59,6 +80,7 @@ public final class AlterTypeStmt implements Statement {
     public String position() { return position; }
     public String neighbor() { return neighbor; }
     public boolean ifExists() { return ifExists; }
+    public boolean cascade() { return cascade; }
 
     @Override
     public boolean equals(Object o) {

@@ -13,6 +13,8 @@ import java.util.Objects;
 public final class CreateRuleStmt implements Statement {
     public final String name;
     public final String event;
+    /** The schema the relation was written with, or null where the search path decides. */
+    public final String schema;
     public final String table;
     public final String action;
     public final String command;
@@ -29,8 +31,14 @@ public final class CreateRuleStmt implements Statement {
 
     public CreateRuleStmt(String name, String event, String table, String action,
                           List<String> commands, String whereClause, boolean orReplace) {
+        this(name, event, null, table, action, commands, whereClause, orReplace);
+    }
+
+    public CreateRuleStmt(String name, String event, String schema, String table, String action,
+                          List<String> commands, String whereClause, boolean orReplace) {
         this.name = name;
         this.event = event;
+        this.schema = schema;
         this.table = table;
         this.action = action;
         this.commands = commands == null ? java.util.Collections.<String>emptyList() : commands;
@@ -41,6 +49,7 @@ public final class CreateRuleStmt implements Statement {
 
     public String name() { return name; }
     public String event() { return event; }
+    public String schema() { return schema; }
     public String table() { return table; }
     public String action() { return action; }
     public String command() { return command; }
@@ -55,6 +64,7 @@ public final class CreateRuleStmt implements Statement {
         CreateRuleStmt that = (CreateRuleStmt) o;
         return Objects.equals(name, that.name)
             && Objects.equals(event, that.event)
+            && Objects.equals(schema, that.schema)
             && Objects.equals(table, that.table)
             && Objects.equals(action, that.action)
             && Objects.equals(commands, that.commands)
@@ -64,7 +74,7 @@ public final class CreateRuleStmt implements Statement {
 
     @Override
     public int hashCode() {
-        return Objects.hash(name, event, table, action, commands, whereClause, orReplace);
+        return Objects.hash(name, event, schema, table, action, commands, whereClause, orReplace);
     }
 
     @Override

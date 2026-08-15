@@ -452,27 +452,40 @@ class FromJoinExecutor {
         List<RowContext> results = new ArrayList<>();
         SelectStmt.SubqueryFrom sqf = (SelectStmt.SubqueryFrom) join.right();
         boolean isLeft = join.joinType() == SelectStmt.JoinType.LEFT;
+        boolean readWhole = false;
 
         for (RowContext leftCtx : leftContexts) {
+            // An item PostgreSQL keeps apart is run once per row of the relation beside it, and only
+            // for the rows that relation's own scan kept, so it is not run at all for a row the
+            // query has already discarded.
+            if (fromResolver.lateralItemUnasked(sqf, leftCtx)) continue;
             executor.outerContextStack.push(leftCtx);
             try {
-                QueryResult subResult;
-                if (sqf.subquery() instanceof SelectStmt) {
-                    SelectStmt sel = (SelectStmt) sqf.subquery();
-                    subResult = executor.executeSelect(sel);
-                } else {
-                    subResult = executor.executeStatement(sqf.subquery());
-                }
-                String alias = sqf.alias() != null ? sqf.alias() : "subquery";
+                QueryResult subResult = fromResolver.readLateralSubquery(sqf);
+                String alias = FromResolver.lateralAlias(sqf);
                 // An alias list renames what the item exposes, so it has to be applied here as
                 // well as on the comma-separated form: without it the names in
                 // "JOIN LATERAL (SELECT t.v) l(z)" stayed the sub-select's own and z was a column
                 // that did not exist.
                 Table virtualTable = new Table(alias, FromFunctionResolver.applyColumnAliases(
                         new ArrayList<>(subResult.getColumns()), sqf.columnAliases()));
+                FromResolver.renamesColumnsOf(virtualTable, alias, subResult.getColumns(),
+                        sqf.columnAliases());
                 boolean matched = false;
+                // A VIRTUAL generated column the sub-select left for this relation to work out is
+                // worked out here, because the join condition and the query's WHERE may read it.
+                boolean lateralVirtual = executor.dmlExecutor.hasVirtualColumns(virtualTable);
+                // Pulled up, the item is not a query of its own: the relation underneath is one of
+                // this query's and is scanned once, whatever the item's own comparison with the row
+                // beside it keeps out of the pairing.
+                if (!readWhole) {
+                    readWhole = true;
+                    fromResolver.readLateralItemWhole(sqf, alias, join.on());
+                }
                 for (Object[] row : subResult.getRows()) {
-                    RowContext rightCtx = new RowContext(virtualTable, alias, row);
+                    RowContext rightCtx = new RowContext(virtualTable, alias, lateralVirtual
+                            ? executor.dmlExecutor.computeVirtualColumns(virtualTable, alias, row)
+                            : row);
                     RowContext merged = mergeContexts(leftCtx, rightCtx);
                     if (join.on() != null) {
                         if (joinConditionHolds(join.on(), merged)) {

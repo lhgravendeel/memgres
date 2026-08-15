@@ -109,6 +109,18 @@ class DmlConflictHelper {
                 if (!conflictCols.get(i).equalsIgnoreCase(scCols.get(i))) { colMatch = false; break; }
             }
             if (!colMatch) continue;
+            // A partial index holds only the rows its predicate admits, so a row it would not hold
+            // collides with nothing there and a row it does not hold is nothing to collide with.
+            // The predicate that decides this is the index's own: the one written beside the target
+            // is read to settle which index arbitrates and says nothing about which rows it holds.
+            if (sc.getWhereExpr() != null) {
+                if (!indexHolds(table, sc.getWhereExpr(), proposedRow)) return null;
+                for (Object[] existingRow : table.getRows()) {
+                    if (!indexHolds(table, sc.getWhereExpr(), existingRow)) continue;
+                    if (sameKey(existingRow, colIndices, proposedVals)) return existingRow;
+                }
+                return null;
+            }
             TableIndex idx = table.getIndex(sc.getName());
             if (idx != null) {
                 Object[] conflict = idx.findConflict(proposedRow, null);
@@ -127,6 +139,19 @@ class DmlConflictHelper {
             if (allMatch) return existingRow;
         }
         return null;
+    }
+
+    /** Whether a partial index holds a row, which is what its own predicate decides. */
+    private boolean indexHolds(Table table, Expression predicate, Object[] row) {
+        return executor.isTruthy(executor.evalExpr(predicate, new RowContext(table, null, row)));
+    }
+
+    /** Whether an existing row carries the same key as the row being written. */
+    private boolean sameKey(Object[] existingRow, int[] colIndices, Object[] proposedVals) {
+        for (int i = 0; i < colIndices.length; i++) {
+            if (!executor.valuesEqual(proposedVals[i], existingRow[colIndices[i]])) return false;
+        }
+        return true;
     }
 
     /** Find an existing row that conflicts on the given column set. */
@@ -190,7 +215,7 @@ class DmlConflictHelper {
                         break;
                     }
                 }
-                if (allMatch && sc.getWhereExpr() != null && conflictWhere == null) continue;
+                if (allMatch && !ArbiterPredicate.infers(table, conflictWhere, sc.getWhereExpr())) continue;
                 if (allMatch) {
                     matchedConstraint = sc;
                     break;
@@ -208,7 +233,7 @@ class DmlConflictHelper {
                         break;
                     }
                 }
-                if (allMatch && sc.getWhereExpr() != null && conflictWhere == null) continue;
+                if (allMatch && !ArbiterPredicate.infers(table, conflictWhere, sc.getWhereExpr())) continue;
                 if (allMatch) {
                     matchedConstraint = sc;
                     matchedAsPlainColumns = true;

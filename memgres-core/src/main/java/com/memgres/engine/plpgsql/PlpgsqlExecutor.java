@@ -43,6 +43,18 @@ public class PlpgsqlExecutor {
     // qualification (funcname.x) resolves parameters but never body-DECLAREd variables.
     private java.util.Set<String> currentFunctionParams;
 
+    /** The record NEW was handed to the trigger routine as, or null outside a trigger routine. */
+    private Object triggerNewRecord;
+    /**
+     * Whether the trigger routine has written to NEW at all.
+     *
+     * <p>PostgreSQL decides whether a trigger rewrote the row by whether the routine handed back a
+     * tuple other than the one it was given, and a PL/pgSQL routine builds a new one the moment
+     * anything is assigned to NEW -- so {@code NEW.i := NEW.i} counts as a rewrite although the
+     * row still reads the same, while a routine that only returns NEW does not.
+     */
+    private boolean triggerRowRewritten;
+
     // Control flow signals
     private static class ReturnSignal extends RuntimeException {
         final Object value;
@@ -126,6 +138,7 @@ public class PlpgsqlExecutor {
 
         void set(String name, Object value) {
             String key = resolve(name);
+            noteTriggerRowWrite(this, key, value);
             Scope s = this;
             while (s != null) {
                 if (s.variables.containsKey(key)) {
@@ -790,7 +803,20 @@ public class PlpgsqlExecutor {
             for (int i = 0; i < table.getColumns().size(); i++)
                 oldMap.put(table.getColumns().get(i).getName().toLowerCase(), oldRow[i]);
         }
-        scope.declare("new", newMap);
+        // A row-level DELETE trigger has no NEW row. PostgreSQL leaves NEW as the null record, so
+        // reading a column of it answers NULL -- which is what a body shared by an INSERT and a
+        // DELETE trigger writes -- while RETURN NEW still returns nothing and skips the row, and
+        // RETURN OLD lets the delete go ahead. Leaving the record out altogether made every
+        // mention of NEW.col a column that could not be resolved.
+        boolean deleteRowTrigger = trigger != null && !trigger.isForEachStatement()
+                && trigger.getEvent() == PgTrigger.Event.DELETE;
+        Map<String, Object> newRecord = deleteRowTrigger
+                ? new LinkedHashMap<String, Object>() : newMap;
+        // What the routine was handed, so that a write to it can be told from a routine that
+        // handed the same record straight back. See {@link #rewroteTriggerRow()}.
+        this.triggerNewRecord = newRecord;
+        this.triggerRowRewritten = false;
+        scope.declare("new", newRecord);
         scope.declare("old", oldMap);
         scope.declare("found", false);
 
@@ -798,6 +824,9 @@ public class PlpgsqlExecutor {
             scope.declare("tg_op", trigger.getEvent().name());
             scope.declare("tg_name", trigger.getName());
             scope.declare("tg_table_name", table.getName());
+            // The name PostgreSQL kept from before schemas, which reads the same relation as
+            // TG_TABLE_NAME does and is still what plenty of trigger bodies are written against.
+            scope.declare("tg_relname", table.getName());
             scope.declare("tg_table_schema", "public");
             scope.declare("tg_when", trigger.getTiming().name());
             scope.declare("tg_level", trigger.isForEachStatement() ? "STATEMENT" : "ROW");
@@ -816,6 +845,7 @@ public class PlpgsqlExecutor {
             scope.declare("tg_op", "INSERT");
             scope.declare("tg_name", "");
             scope.declare("tg_table_name", table.getName());
+            scope.declare("tg_relname", table.getName());
             scope.declare("tg_table_schema", "public");
             scope.declare("tg_when", "BEFORE");
             scope.declare("tg_level", "ROW");
@@ -837,9 +867,23 @@ public class PlpgsqlExecutor {
             if (retVal == null) {
                 // BEFORE/INSTEAD OF row triggers: RETURN NULL skips the row.
                 // AFTER (and statement-level) triggers: the return value is ignored.
-                return skipCapable ? null : newRow;
+                if (skipCapable) return null;
+                return deleteRowTrigger ? oldRow : newRow;
+            }
+            // NEW and OLD are both declared for every trigger, and the one the event does not have
+            // is an empty record. A composite always has fields, so an empty one can only be that
+            // record: PostgreSQL reads it as NULL, and RETURN OLD from a BEFORE INSERT trigger
+            // skips the row exactly as RETURN NULL does. Copying its nothing over NEW instead let
+            // the row through.
+            if (retVal instanceof Map && ((Map<?, ?>) retVal).isEmpty()) {
+                if (skipCapable) return null;
+                return deleteRowTrigger ? oldRow : newRow;
             }
             if (retVal instanceof Map) {
+                // The row a DELETE trigger returns says only that the delete goes ahead. There is no
+                // NEW row to write it back into, and writing the entry-time values back over the row
+                // undid whatever the trigger body had done to it.
+                if (deleteRowTrigger) return oldRow;
                 // AFTER triggers: PG ignores the returned row entirely
                 if (!afterTiming && newRow != null) {
                     @SuppressWarnings("unchecked")
@@ -857,14 +901,13 @@ public class PlpgsqlExecutor {
         }
 
         // Copy NEW map back (skipped for AFTER triggers: modifications to NEW are ignored, as in PG)
-        if (!afterTiming) {
-            @SuppressWarnings("unchecked")
-            Map<String, Object> finalNew = (Map<String, Object>) scope.get("new");
+        if (!afterTiming && !deleteRowTrigger) {
+            Map<String, Object> finalNew = triggerRecordAsMap(scope.get("new"), table);
             if (finalNew != null && newRow != null) {
                 copyMapToRow(finalNew, newRow, table);
             }
         }
-        return newRow;
+        return deleteRowTrigger ? oldRow : newRow;
     }
 
     /**
@@ -881,6 +924,56 @@ public class PlpgsqlExecutor {
         } catch (ReturnSignal rs) {
             // event triggers return void
         }
+    }
+
+    /**
+     * Whether the trigger routine that has just run wrote to NEW.
+     *
+     * <p>PostgreSQL asks this of the row a copy of a partitioned table's trigger leaves behind: a
+     * copy that hands back a tuple other than the one it was given has its row re-checked against
+     * the partition it was routed to, and one that hands the same tuple straight back has not.
+     */
+    public boolean rewroteTriggerRow() {
+        return triggerRowRewritten;
+    }
+
+    /**
+     * Note a write to NEW. A whole-record assignment of NEW to itself is not one: PostgreSQL is
+     * left holding the record it started with, and reads that as a routine that changed nothing.
+     */
+    private void noteTriggerRowWrite(Scope scope, String key, Object value) {
+        if (triggerNewRecord == null || !"new".equals(key)) return;
+        if (value == triggerNewRecord) return;
+        if (scope.get(key) != triggerNewRecord) return;
+        triggerRowRewritten = true;
+    }
+
+    /**
+     * The record NEW is left holding, as a map of the relation's own columns.
+     *
+     * <p>A whole-record assignment may hand NEW a row value rather than a record — {@code NEW :=
+     * ROW(...)} builds one — and PostgreSQL reads such a value field by field in the relation's
+     * column order, so the routine goes on as though the record had been written field by field.
+     */
+    private Map<String, Object> triggerRecordAsMap(Object record, Table table) {
+        if (record instanceof Map) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> asRecord = (Map<String, Object>) record;
+            return asRecord;
+        }
+        List<Object> values;
+        if (record instanceof AstExecutor.PgRow) {
+            values = ((AstExecutor.PgRow) record).values();
+        } else if (record instanceof Object[]) {
+            values = java.util.Arrays.asList((Object[]) record);
+        } else {
+            return null;
+        }
+        Map<String, Object> asRecord = new LinkedHashMap<>();
+        for (int i = 0; i < table.getColumns().size() && i < values.size(); i++) {
+            asRecord.put(table.getColumns().get(i).getName().toLowerCase(), values.get(i));
+        }
+        return asRecord;
     }
 
     private void copyMapToRow(Map<String, Object> map, Object[] row, Table table) {
@@ -3087,6 +3180,7 @@ public class PlpgsqlExecutor {
      * "y.a".
      */
     private void assignNestedField(Map<String, Object> map, String fieldPath, Object value) {
+        if (map == triggerNewRecord) triggerRowRewritten = true;
         Map<String, Object> current = map;
         String remaining = fieldPath;
         int dot;
@@ -3820,7 +3914,9 @@ public class PlpgsqlExecutor {
                     // Also don't substitute common SQL keywords that happen to match variable names
                     if (!isPrecededByDot && !isInInsertColList && !isOutputOnly
                             && !scan.protectedTokens.contains(i)
-                            && isSubstitutableVariable(t.value(), scope)) {
+                            && isSubstitutableVariable(t.value(), scope,
+                                    i + 1 < tokens.size()
+                                            && tokens.get(i + 1).type() == TokenType.DOT)) {
                         // An identifier that matches both a variable and a column of a table
                         // referenced by this statement is ambiguous. PL/pgSQL (with the PG
                         // default plpgsql.variable_conflict = error) raises 42702; SQL-language
@@ -3875,6 +3971,14 @@ public class PlpgsqlExecutor {
                             boolean followedByDot = i + 1 < tokens.size() && tokens.get(i + 1).type() == TokenType.DOT;
                             if (followedByDot) {
                                 appendTokenToSb(sb, t);
+                            } else if (mapVal.isEmpty()
+                                    && ("new".equals(lowerName) || "old".equals(lowerName))) {
+                                // The record the event does not carry is declared empty rather than
+                                // absent, so OLD.col still resolves. Read whole it is NULL in
+                                // PostgreSQL, which is what a body shared by an INSERT and an
+                                // UPDATE trigger tests with `OLD IS NULL`. A row literal with no
+                                // fields left SQL the evaluator read as an unresolvable column.
+                                appendValue(sb, null);
                             } else if (mapVal.size() == 1) {
                                 appendValue(sb, mapVal.values().iterator().next());
                             } else {
@@ -4113,10 +4217,20 @@ public class PlpgsqlExecutor {
         }
     }
 
-    private boolean isSubstitutableVariable(String name, Scope scope) {
+    /**
+     * Whether this occurrence of a name is to be replaced by its value.
+     *
+     * @param fieldAccess true when a field of the record is being read rather than the record
+     *        itself. NEW and OLD are read a field at a time far more often than whole, and
+     *        {@code NEW.col} is resolved against the record elsewhere — but read whole they are
+     *        values like any other, and the record the event does not carry is NULL. That is what
+     *        a trigger body shared by an INSERT and an UPDATE tests with {@code OLD IS NULL};
+     *        leaving the bare name in the SQL made it an identifier nothing answers to.
+     */
+    private boolean isSubstitutableVariable(String name, Scope scope, boolean fieldAccess) {
         // Don't substitute certain SQL keywords even if they're in scope
         String upper = name.toUpperCase();
-        if (upper.equals("NEW") || upper.equals("OLD")) return false;
+        if (upper.equals("NEW") || upper.equals("OLD")) return !fieldAccess && scope.has(name);
         if (upper.equals("FOUND")) return true;
         return scope.has(name);
     }

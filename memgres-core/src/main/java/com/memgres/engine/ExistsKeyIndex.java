@@ -115,7 +115,17 @@ final class ExistsKeyIndex {
         if (unusable) return null;
         if (keys == null) {
             Set<Object> built = new HashSet<Object>();
-            QueryResult result = executor.executeStatement(keyQuery);
+            QueryResult result;
+            try {
+                result = executor.executeStatement(keyQuery);
+            } catch (RuntimeException notReadableThatWay) {
+                // Reading the key column of every row is not what the subquery asked for: it asked
+                // for the rows its own qualification holds of, and PostgreSQL stops reading at the
+                // first of them. A column that raises for a row behind that one is never read, so
+                // the subquery is run as it was written and answers for itself.
+                unusable = true;
+                return null;
+            }
             for (Object[] row : result.getRows()) {
                 Object v = row.length > 0 ? row[0] : null;
                 if (v == null) continue;   // NULL is equal to nothing, so it is no key

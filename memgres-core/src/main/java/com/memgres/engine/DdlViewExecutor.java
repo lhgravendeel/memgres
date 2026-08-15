@@ -72,8 +72,11 @@ class DdlViewExecutor {
                         throw renamed;
                     }
                     if (oldCol.getType() != newCol.getType()) {
-                        throw new MemgresException("cannot change data type of view column \"" + oldCol.getName()
-                                + "\" from " + oldCol.getType() + " to " + newCol.getType(), "42P16");
+                        // The types are named the way PostgreSQL names them, as everywhere else
+                        // that reports one; the enum constant is this engine's spelling, not SQL's.
+                        throw new MemgresException("cannot change data type of view column \""
+                                + oldCol.getName() + "\" from " + oldCol.getType().toRegtypeDisplay()
+                                + " to " + newCol.getType().toRegtypeDisplay(), "42P16");
                     }
                 }
             } catch (MemgresException e) {
@@ -94,8 +97,14 @@ class DdlViewExecutor {
         // Apply the optional column alias list: CREATE [MATERIALIZED] VIEW v(a, b) AS ...
         query = applyColumnAliasList(stmt, query);
 
-        // A CHECK OPTION on a view no INSERT can reach is a promise that can never be kept.
-        String obstacle = stmt.checkOption() != null ? autoUpdatableObstacle(query) : null;
+        // A CHECK OPTION on a view no INSERT can reach is a promise that can never be kept. It may
+        // be written either as the WITH CHECK OPTION suffix or as a check_option storage parameter,
+        // and PostgreSQL refuses both on a view that is not automatically updatable.
+        String declaredCheckOption = stmt.checkOption();
+        if (declaredCheckOption == null && stmt.withOptions() != null) {
+            declaredCheckOption = stmt.withOptions().get("check_option");
+        }
+        String obstacle = declaredCheckOption != null ? autoUpdatableObstacle(query) : null;
         if (obstacle != null) {
             MemgresException e = PgErrors.notImplemented(
                     "WITH CHECK OPTION is supported only on automatically updatable views");
@@ -120,6 +129,7 @@ class DdlViewExecutor {
                 rejectDuplicateColumnNames(cols);
                 executor.database.addView(new Database.ViewDef(stmt.name(), viewSchema, query, stmt.orReplace(),
                         true, cols, rows, null, null, stmt.withOptions(), true));
+                noteWhatTheViewCost(cols, true);
             } else {
                 // WITH NO DATA: resolve column metadata but leave the view unpopulated —
                 // any scan must fail with 55000 until REFRESH MATERIALIZED VIEW.
@@ -133,6 +143,7 @@ class DdlViewExecutor {
                 rejectDuplicateColumnNames(cols);
                 executor.database.addView(new Database.ViewDef(stmt.name(), viewSchema, query, stmt.orReplace(),
                         true, cols, Cols.listOf(), null, null, stmt.withOptions(), false));
+                noteWhatTheViewCost(cols, false);
             }
         } else {
             List<Column> resolvedColumns = null;
@@ -173,6 +184,19 @@ class DdlViewExecutor {
             return QueryResult.command(QueryResult.Type.SELECT_INTO, rowCount);
         }
         return QueryResult.message(QueryResult.Type.SET, "CREATE VIEW");
+    }
+
+    /**
+     * A materialized view has storage of its own, so what it costs depends on the columns its
+     * query turned out to have — a wide one is kept out of line, and that is a relation more —
+     * and on whether the statement asked for the rows as well as the definition.
+     *
+     * @see CommandIdCost
+     */
+    private void noteWhatTheViewCost(List<Column> columns, boolean withData) {
+        if (executor.session == null) return;
+        executor.session.noteCatalogRowsWritten(
+                CommandIdCost.forCreatedMaterializedView(columns, withData));
     }
 
     /**
@@ -244,8 +268,15 @@ class DdlViewExecutor {
      * columns as the original (verified by executing both).
      */
     private Statement expandWildcardTargets(Statement query) {
-        Statement expanded = expandStarsRec(query);
+        boolean[] fromCatalogue = new boolean[1];
+        Statement expanded = expandStarsRec(query, Collections.<String, List<String>>emptyMap(),
+                fromCatalogue);
         if (expanded == query) return query;
+        // Running the query is how an expansion made from the catalogue's idea of a relation is
+        // checked. A star that stood over a WITH item needs no such check -- its columns are the
+        // names the query's own reader gives them -- and running the query would run whatever the
+        // query calls, where PostgreSQL runs nothing at all to store a definition.
+        if (!fromCatalogue[0]) return expanded;
         // Safety net: expansion must be behavior-preserving for the view's output columns.
         try {
             QueryResult original = executor.executeStatement(query);
@@ -265,34 +296,53 @@ class DdlViewExecutor {
         return names;
     }
 
-    private Statement expandStarsRec(Statement query) {
+    /**
+     * Settle the stars in a query. {@code ctes} names the columns each WITH item already in scope
+     * publishes, which is what a star over one of them stands for, and {@code fromCatalogue} is
+     * set when a star was expanded from the columns a relation has rather than from those names.
+     */
+    private Statement expandStarsRec(Statement query, Map<String, List<String>> ctes,
+                                     boolean[] fromCatalogue) {
         if (query instanceof SetOpStmt) {
             SetOpStmt so = (SetOpStmt) query;
-            Statement left = expandStarsRec(so.left());
-            Statement right = expandStarsRec(so.right());
+            Statement left = expandStarsRec(so.left(), ctes, fromCatalogue);
+            Statement right = expandStarsRec(so.right(), ctes, fromCatalogue);
             if (left == so.left() && right == so.right()) return so;
             return new SetOpStmt(left, so.op(), so.all(), right, so.orderBy(), so.limit(), so.offset());
         }
         if (!(query instanceof SelectStmt)) return query;
         SelectStmt s = (SelectStmt) query;
-        if (s.targets() == null || s.from() == null || s.from().isEmpty()) return s;
-        // CTE columns are not resolvable outside statement execution; leave those queries as-is.
-        if (s.withClauses() != null && !s.withClauses().isEmpty()) return s;
+        if (s.targets() == null) return s;
+        // A WITH item is a relation this query reads like any other, so the stars inside it are
+        // settled first; the names it then publishes are what a star over it stands for.
+        Map<String, List<String>> scope = new LinkedHashMap<>(ctes);
+        List<SelectStmt.CommonTableExpr> withItems =
+                expandStarsInCtes(s.withClauses(), scope, fromCatalogue);
+        Statement settledWith = withItems == s.withClauses() ? s : rebuilt(s, s.targets(), withItems);
+        if (s.from() == null || s.from().isEmpty()) return settledWith;
         boolean hasStar = false;
         for (SelectStmt.SelectTarget t : s.targets()) {
             if (t.expr() instanceof WildcardExpr) { hasStar = true; break; }
         }
-        if (!hasStar) return s;
+        if (!hasStar) return settledWith;
         // NATURAL joins merge common columns without an explicit USING list; the plain
         // bindings don't reflect that merge, so leave those queries unexpanded.
-        if (hasNaturalJoin(s.from())) return s;
+        if (hasNaturalJoin(s.from())) return settledWith;
+        // A query reading one WITH item takes the star's columns from the names that item
+        // publishes, because a WITH item is not a relation the bindings below can be resolved
+        // against. A query reading one alongside anything else is left as it was: which columns
+        // stand where is then a counting-off this cannot do.
+        List<SelectStmt.SelectTarget> overCte = expandOverCte(s, scope);
+        if (overCte != null) return rebuilt(s, overCte, withItems);
+        if (namesCte(s.from(), scope)) return settledWith;
         List<RowContext.TableBinding> bindings;
         try {
             bindings = executor.fromResolver.resolveTableBindings(s.from());
         } catch (Exception e) {
-            return s;
+            return settledWith;
         }
-        if (bindings.isEmpty()) return s;
+        if (bindings.isEmpty()) return settledWith;
+        fromCatalogue[0] = true;
         Set<String> usingCols = new HashSet<>();
         collectUsingColumns(s.from(), usingCols);
 
@@ -313,7 +363,7 @@ class DdlViewExecutor {
                         }
                     }
                 }
-                if (!matched) return s; // unresolvable qualifier — leave the query unexpanded
+                if (!matched) return settledWith; // unresolvable qualifier — leave the query unexpanded
             } else {
                 Set<String> emittedUsing = new HashSet<>();
                 for (RowContext.TableBinding b : bindings) {
@@ -331,9 +381,123 @@ class DdlViewExecutor {
                 }
             }
         }
-        return new SelectStmt(s.distinct(), s.distinctOn(), newTargets, s.from(), s.where(), s.groupBy(),
-                s.having(), s.windowDefs(), s.orderBy(), s.limit(), s.offset(), s.withClauses(),
+        return rebuilt(s, newTargets, withItems);
+    }
+
+    /** The same query with another select list and another set of WITH items. */
+    private static SelectStmt rebuilt(SelectStmt s, List<SelectStmt.SelectTarget> targets,
+                                      List<SelectStmt.CommonTableExpr> withItems) {
+        return new SelectStmt(s.distinct(), s.distinctOn(), targets, s.from(), s.where(), s.groupBy(),
+                s.having(), s.windowDefs(), s.orderBy(), s.limit(), s.offset(), withItems,
                 s.groupingSets(), s.lockClause(), s.withTies());
+    }
+
+    /**
+     * Settle the stars inside each WITH item and record, in {@code scope}, the names the item
+     * publishes. An item is written under the names of its own select list unless it was given a
+     * column list, which renames them; an item whose names cannot be counted is left out of the
+     * scope, and a star over it is then left as it was written.
+     */
+    private List<SelectStmt.CommonTableExpr> expandStarsInCtes(
+            List<SelectStmt.CommonTableExpr> items, Map<String, List<String>> scope,
+            boolean[] fromCatalogue) {
+        if (items == null || items.isEmpty()) return items;
+        List<SelectStmt.CommonTableExpr> settled = new ArrayList<>();
+        boolean changed = false;
+        for (SelectStmt.CommonTableExpr item : items) {
+            Statement body = expandStarsRec(item.query(), scope, fromCatalogue);
+            changed |= body != item.query();
+            settled.add(body == item.query() ? item : withBody(item, body));
+            List<String> names = item.columnNames() != null && !item.columnNames().isEmpty()
+                    ? item.columnNames() : publishedNames(body);
+            if (names != null && item.name() != null) scope.put(item.name().toLowerCase(), names);
+        }
+        return changed ? settled : items;
+    }
+
+    /** The same WITH item over another body. */
+    private static SelectStmt.CommonTableExpr withBody(SelectStmt.CommonTableExpr item,
+                                                       Statement body) {
+        return new SelectStmt.CommonTableExpr(item.name(), item.columnNames(), body,
+                item.recursive(), item.searchColumn(), item.searchDepthFirst(),
+                item.searchByColumns(), item.cycleColumn(), item.cyclePathColumn(),
+                item.cycleByColumns(), item.cycleMarkValue(), item.cycleMarkDefault(),
+                item.materialized());
+    }
+
+    /**
+     * The names a query publishes its columns under, or null where they cannot be counted. A set
+     * operation publishes the names of its first arm, and a star that could not be settled stands
+     * for however many columns its relation has, which is not a number this can produce.
+     */
+    private List<String> publishedNames(Statement query) {
+        if (query instanceof SetOpStmt) return publishedNames(((SetOpStmt) query).left());
+        if (!(query instanceof SelectStmt)) return null;
+        SelectStmt s = (SelectStmt) query;
+        if (s.targets() == null || s.targets().isEmpty()) return null;
+        List<String> names = new ArrayList<>();
+        try {
+            for (SelectStmt.SelectTarget t : s.targets()) {
+                if (t.expr() instanceof WildcardExpr) return null;
+                names.add(t.alias() != null ? t.alias() : executor.exprToAlias(t.expr()));
+            }
+        } catch (Exception e) {
+            // A name this cannot work out leaves the item out of the scope, and a star over it is
+            // left as it was written -- the same answer as before, never a refusal.
+            return null;
+        }
+        return names;
+    }
+
+    /**
+     * The select list of a query whose FROM is a single WITH item, with its stars replaced by the
+     * columns that item publishes, or null when this is not such a query. The columns are written
+     * under the name the item is read as, so an item given an alias is named by the alias.
+     */
+    private List<SelectStmt.SelectTarget> expandOverCte(SelectStmt s,
+                                                        Map<String, List<String>> scope) {
+        if (s.from().size() != 1 || !(s.from().get(0) instanceof SelectStmt.TableRef)) return null;
+        SelectStmt.TableRef ref = (SelectStmt.TableRef) s.from().get(0);
+        if (ref.schema() != null || ref.table() == null) return null;
+        List<String> columns = scope.get(ref.table().toLowerCase());
+        if (columns == null || columns.isEmpty()) return null;
+        // A WITH item publishing two columns of one name is a view PostgreSQL refuses to create,
+        // so the star over it is left as it was and the refusal is reported where it already was.
+        Set<String> seen = new HashSet<>();
+        for (String column : columns) {
+            if (!seen.add(column.toLowerCase())) return null;
+        }
+        String readAs = ref.alias() != null ? ref.alias() : ref.table();
+        List<SelectStmt.SelectTarget> newTargets = new ArrayList<>();
+        for (SelectStmt.SelectTarget target : s.targets()) {
+            if (!(target.expr() instanceof WildcardExpr)) {
+                newTargets.add(target);
+                continue;
+            }
+            String qualifier = ((WildcardExpr) target.expr()).table();
+            if (qualifier != null && !qualifier.equalsIgnoreCase(readAs)) return null;
+            for (String column : columns) {
+                newTargets.add(new SelectStmt.SelectTarget(new ColumnRef(readAs, column), null));
+            }
+        }
+        return newTargets;
+    }
+
+    /** Whether any relation this FROM tree names is a WITH item rather than a stored one. */
+    private static boolean namesCte(List<SelectStmt.FromItem> items, Map<String, List<String>> scope) {
+        for (SelectStmt.FromItem item : items) {
+            if (item instanceof SelectStmt.JoinFrom) {
+                SelectStmt.JoinFrom j = (SelectStmt.JoinFrom) item;
+                if (namesCte(Arrays.asList(j.left(), j.right()), scope)) return true;
+            } else if (item instanceof SelectStmt.TableRef) {
+                SelectStmt.TableRef ref = (SelectStmt.TableRef) item;
+                if (ref.schema() == null && ref.table() != null
+                        && scope.containsKey(ref.table().toLowerCase())) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     private static void collectUsingColumns(List<SelectStmt.FromItem> items, Set<String> out) {

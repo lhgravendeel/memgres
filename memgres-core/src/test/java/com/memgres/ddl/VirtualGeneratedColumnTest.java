@@ -302,7 +302,9 @@ class VirtualGeneratedColumnTest {
     @Test
     void info_schema_generation_expression_for_virtual() throws SQLException {
         exec("CREATE TABLE t1(id int PRIMARY KEY, a int, b int GENERATED ALWAYS AS (a + 1) VIRTUAL)");
-        assertEquals("a + 1", scalar(
+        // The catalog stores the parsed expression and prints it back, so the parentheses
+        // PostgreSQL puts around a binary operator are part of what it reports.
+        assertEquals("(a + 1)", scalar(
                 "SELECT generation_expression FROM information_schema.columns WHERE table_name = 't1' AND column_name = 'b'"));
     }
 

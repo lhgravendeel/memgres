@@ -146,14 +146,41 @@ class PartitionRrResidualsTest {
     @Test
     void attach_partition_serial_parent_int_child_is_compatible() throws SQLException {
         // serial is not a real type; its stored type is int4, so an int child column
-        // must be accepted (no false positive from the type check).
+        // must be accepted (no false positive from the type check). serial also carries
+        // NOT NULL, and PostgreSQL requires the child to repeat every NOT NULL the parent
+        // has, so the child column is declared NOT NULL as well.
         try (Connection c = autoConn(); Statement s = c.createStatement()) {
             s.execute("DROP TABLE IF EXISTS c4_ser_parent");
             s.execute("DROP TABLE IF EXISTS c4_ser_child");
             s.execute("CREATE TABLE c4_ser_parent (id serial, name text) PARTITION BY LIST(id)");
-            s.execute("CREATE TABLE c4_ser_child (id int, name text)");
+            s.execute("CREATE TABLE c4_ser_child (id int NOT NULL, name text)");
             s.execute("ALTER TABLE c4_ser_parent ATTACH PARTITION c4_ser_child FOR VALUES IN (1)");
+            // the attach really took, so routing reaches the child
+            s.execute("INSERT INTO c4_ser_parent (id, name) VALUES (1, 'ok')");
+            try (ResultSet rs = s.executeQuery("SELECT count(*) FROM c4_ser_child")) {
+                assertTrue(rs.next());
+                assertEquals(1, rs.getInt(1));
+            }
             s.execute("DROP TABLE IF EXISTS c4_ser_parent");
+        }
+    }
+
+    @Test
+    void attach_partition_nullable_child_of_not_null_parent_is_refused() throws SQLException {
+        // PostgreSQL 18: a child whose column is nullable cannot be attached under a parent
+        // column that is NOT NULL, because the partition would admit rows the parent forbids.
+        try (Connection c = autoConn(); Statement s = c.createStatement()) {
+            s.execute("DROP TABLE IF EXISTS c4_nn_parent");
+            s.execute("DROP TABLE IF EXISTS c4_nn_child");
+            s.execute("CREATE TABLE c4_nn_parent (id serial, name text) PARTITION BY LIST(id)");
+            s.execute("CREATE TABLE c4_nn_child (id int, name text)");
+            SQLException e = assertThrows(SQLException.class, () ->
+                    s.execute("ALTER TABLE c4_nn_parent ATTACH PARTITION c4_nn_child FOR VALUES IN (1)"));
+            assertEquals("42804", e.getSQLState());
+            assertTrue(e.getMessage().contains(
+                    "column \"id\" in child table \"c4_nn_child\" must be marked NOT NULL"), e.getMessage());
+            s.execute("DROP TABLE IF EXISTS c4_nn_child");
+            s.execute("DROP TABLE IF EXISTS c4_nn_parent");
         }
     }
 

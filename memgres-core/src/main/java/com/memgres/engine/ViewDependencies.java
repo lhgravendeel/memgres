@@ -23,8 +23,14 @@ final class ViewDependencies {
 
     private ViewDependencies() {}
 
-    /** True when {@code query} reads the relation {@code schemaName.relName}. */
-    static boolean reads(Statement query, String viewSchema, String schemaName, String relName) {
+    /**
+     * True when {@code query} reads the relation {@code schemaName.relName}.
+     *
+     * <p>A whole statement is the usual thing to ask about, but a row security policy's USING and
+     * WITH CHECK are expressions on their own and read relations the same way, so what is walked
+     * is any parsed tree rather than a statement in particular.
+     */
+    static boolean reads(Object query, String viewSchema, String schemaName, String relName) {
         if (query == null || relName == null) return false;
         final String wanted = relName.toLowerCase();
         final Set<String> cteNames = new HashSet<String>();
@@ -53,40 +59,80 @@ final class ViewDependencies {
         return found[0];
     }
 
-    /** The names of the views that read {@code schemaName.relName} directly. */
-    static List<String> directDependents(Database db, String schemaName, String relName) {
+    /**
+     * The names of the views that read {@code schemaName.relName} directly, in the order
+     * PostgreSQL names them.
+     *
+     * <p>PostgreSQL walks the dependency catalogue, whose entries are keyed by the dependent's
+     * OID, so the order it reports is the order the dependents were created. Walking the stored
+     * view map handed them out in that map's hash order instead, which is neither creation order
+     * nor name order, so the same three views were named differently from one run to the next.
+     * The OID register follows creation order, so asking it is what puts them back.
+     */
+    static List<String> directDependents(Database db, OidSupplier oids,
+                                         String schemaName, String relName) {
         List<String> out = new ArrayList<String>();
+        for (Database.ViewDef v : directDependentViews(db, oids, schemaName, relName)) {
+            out.add(v.name());
+        }
+        return out;
+    }
+
+    /**
+     * The same, as the stored definitions themselves.
+     *
+     * <p>Two schemas may each hold a view of one name, and a name on its own cannot say which of
+     * them read the relation: a caller that has to act on the dependent -- drop it, or say which
+     * schema it is in -- needs the definition it found rather than the name it answers to.
+     */
+    static List<Database.ViewDef> directDependentViews(Database db, OidSupplier oids,
+                                                       String schemaName, String relName) {
+        List<Object[]> found = new ArrayList<Object[]>();
         for (Map.Entry<String, Database.ViewDef> e : db.getViews().entrySet()) {
             Database.ViewDef v = e.getValue();
             // A view that reads itself is not something else that depends on it. PostgreSQL
             // records no such dependency, and CREATE OR REPLACE can produce one -- the view is
             // then unreadable, but it still drops on its own.
             if (v.name().equalsIgnoreCase(relName)) continue;
-            if (reads(v.query(), v.schemaName(), schemaName, relName)) out.add(v.name());
+            if (!reads(v.query(), v.schemaName(), schemaName, relName)) continue;
+            String vs = v.schemaName() != null ? v.schemaName() : "public";
+            int oid = oids == null ? 0 : oids.oid("rel:" + vs + "." + v.name());
+            found.add(new Object[]{Integer.valueOf(oid), v});
         }
+        java.util.Collections.sort(found, new java.util.Comparator<Object[]>() {
+            @Override
+            public int compare(Object[] a, Object[] b) {
+                return Integer.compare((Integer) a[0], (Integer) b[0]);
+            }
+        });
+        List<Database.ViewDef> out = new ArrayList<Database.ViewDef>();
+        for (Object[] entry : found) out.add((Database.ViewDef) entry[1]);
         return out;
     }
 
     /**
      * The views that must go when {@code schemaName.relName} does: the ones reading it, the ones
      * reading those, and so on. A view over a view is dropped by a CASCADE on the base table.
+     *
+     * <p>Reported in the order PostgreSQL reports them, which is a depth-first walk: each
+     * dependent is followed by whatever depends on it before the next one of its own rank.
      */
-    static List<String> cascadeDependents(Database db, String schemaName, String relName) {
+    static List<String> cascadeDependents(Database db, OidSupplier oids,
+                                          String schemaName, String relName) {
         List<String> out = new ArrayList<String>();
-        List<String[]> frontier = new ArrayList<String[]>();
-        frontier.add(new String[]{schemaName, relName});
-        Set<String> seen = new HashSet<String>();
-        while (!frontier.isEmpty()) {
-            String[] cur = frontier.remove(frontier.size() - 1);
-            for (String viewName : directDependents(db, cur[0], cur[1])) {
-                if (!seen.add(viewName.toLowerCase())) continue;
-                out.add(viewName);
-                Database.ViewDef v = db.getView(viewName);
-                String vs = v != null && v.schemaName() != null ? v.schemaName() : "public";
-                frontier.add(new String[]{vs, viewName});
-            }
-        }
+        walkCascade(db, oids, schemaName, relName, new HashSet<String>(), out);
         return out;
+    }
+
+    private static void walkCascade(Database db, OidSupplier oids, String schemaName,
+                                    String relName, Set<String> seen, List<String> out) {
+        for (String viewName : directDependents(db, oids, schemaName, relName)) {
+            if (!seen.add(viewName.toLowerCase())) continue;
+            out.add(viewName);
+            Database.ViewDef v = db.getView(viewName);
+            String vs = v != null && v.schemaName() != null ? v.schemaName() : "public";
+            walkCascade(db, oids, vs, viewName, seen, out);
+        }
     }
 
     /**
@@ -94,26 +140,45 @@ final class ViewDependencies {
      * view that reads one of those, each named beside the relation it actually reads and by the
      * kind that relation really is. A view over a view is as much a dependent as one over the
      * table, and naming the whole chain is what shows why the last of them is in the way.
+     *
+     * <p>The order is PostgreSQL's: the direct dependents in creation order, and each of them
+     * followed at once by whatever depends on it in turn.
      */
-    static List<String> dependencyLines(Database db, String schemaName, String relName,
-                                        String relKind, List<String> searchPath) {
+    static List<String> dependencyLines(Database db, OidSupplier oids, String schemaName,
+                                        String relName, String relKind, List<String> searchPath) {
+        return dependencyLines(db, oids, schemaName, relName, relKind, searchPath,
+                java.util.Collections.<String>emptySet());
+    }
+
+    /**
+     * The same, less the relations the one DROP names beside this one. PostgreSQL settles
+     * everything a statement will delete before it looks for what would be left pointing at any
+     * of it, so a view the same DROP takes down is no reason to refuse, and what depends on that
+     * view in turn is reported when its own name comes up, which is where PostgreSQL reports it.
+     *
+     * @param together bare relation names, lower case, that the same statement drops
+     */
+    static List<String> dependencyLines(Database db, OidSupplier oids, String schemaName,
+                                        String relName, String relKind, List<String> searchPath,
+                                        Set<String> together) {
         List<String> out = new ArrayList<String>();
-        List<String[]> frontier = new ArrayList<String[]>();
-        frontier.add(new String[]{schemaName, relName, relKind});
-        Set<String> seen = new HashSet<String>();
-        while (!frontier.isEmpty()) {
-            String[] cur = frontier.remove(0);
-            for (String viewName : directDependents(db, cur[0], cur[1])) {
-                if (!seen.add(viewName.toLowerCase())) continue;
-                Database.ViewDef v = db.getView(viewName);
-                String vs = v != null && v.schemaName() != null ? v.schemaName() : "public";
-                String kind = v != null && v.materialized() ? "materialized view" : "view";
-                out.add(kind + " " + RelationNamespace.shownName(searchPath, vs, viewName)
-                        + " depends on " + cur[2] + " "
-                        + RelationNamespace.shownName(searchPath, cur[0], cur[1]));
-                frontier.add(new String[]{vs, viewName, kind});
-            }
-        }
+        walkLines(db, oids, schemaName, relName, relKind, searchPath,
+                new HashSet<String>(together), out);
         return out;
+    }
+
+    private static void walkLines(Database db, OidSupplier oids, String schemaName, String relName,
+                                  String relKind, List<String> searchPath, Set<String> seen,
+                                  List<String> out) {
+        for (String viewName : directDependents(db, oids, schemaName, relName)) {
+            if (!seen.add(viewName.toLowerCase())) continue;
+            Database.ViewDef v = db.getView(viewName);
+            String vs = v != null && v.schemaName() != null ? v.schemaName() : "public";
+            String kind = v != null && v.materialized() ? "materialized view" : "view";
+            out.add(kind + " " + RelationNamespace.shownName(searchPath, vs, viewName)
+                    + " depends on " + relKind + " "
+                    + RelationNamespace.shownName(searchPath, schemaName, relName));
+            walkLines(db, oids, vs, viewName, kind, searchPath, seen, out);
+        }
     }
 }

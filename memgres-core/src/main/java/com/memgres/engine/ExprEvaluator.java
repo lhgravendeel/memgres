@@ -123,6 +123,14 @@ class ExprEvaluator {
             WildcardExpr wc = (WildcardExpr) expr;
             if (wc.table() != null && ctx != null) {
                 RowContext.TableBinding b = ctx.getBinding(wc.table());
+                // A star standing where a value is expected reads a whole row, and the row it
+                // names may belong to a query this one is written inside: count(o.*) in a
+                // subquery counts the outer row, because that is the row PostgreSQL resolves the
+                // name against once the subquery's own FROM clause has not got it.
+                for (Iterator<RowContext> it = executor.outerContextStack.descendingIterator();
+                        b == null && it.hasNext(); ) {
+                    b = it.next().getBinding(wc.table());
+                }
                 if (b != null) {
                     // Return the full row as a List so IS DISTINCT FROM can compare row tuples
                     java.util.List<Object> rowList = new java.util.ArrayList<>(b.row().length);
@@ -427,8 +435,14 @@ class ExprEvaluator {
                 return Boolean.parseBoolean(lit.value());
             case NULL:
                 return null;
-            case DEFAULT:
-                throw new MemgresException("DEFAULT is not allowed in this context", "42601");
+            case DEFAULT: {
+                // PostgreSQL points at the keyword itself. The tree records no offset for it, so
+                // the word is named and the protocol layer finds it in the statement text.
+                MemgresException misplaced =
+                        new MemgresException("DEFAULT is not allowed in this context", "42601");
+                misplaced.setPositionToken("DEFAULT");
+                throw misplaced;
+            }
             default:
                 throw new IllegalStateException("Unknown literal type: " + lit.literalType());
         }
@@ -907,11 +921,20 @@ class ExprEvaluator {
             String tableKey = schemaName + "." + ref.table.getName();
             Map<Object[], long[]> meta = executor.database.getRowMeta(tableKey);
             long[] rowMeta = meta.get(ref.row);
+            // A row read out of a snapshot or a statement's image is a copy of the values and
+            // nothing else, and where a row sits is a property of the row: the version being read
+            // is still there, at the place it has always occupied, so that is the place
+            // PostgreSQL answers ctid, xmin and the rest from.
+            if (rowMeta == null && executor.session != null) {
+                rowMeta = executor.session.tupleIdentityOfCopy(tableKey, ref.row);
+            }
             switch (ref.column) {
                 case "xmin": return rowMeta != null ? rowMeta[0] : 0L;
                 case "xmax": return rowMeta != null ? rowMeta[1] : 0L;
                 case "cmin": return rowMeta != null ? (int) rowMeta[2] : 0;
-                case "cmax": return rowMeta != null ? (int) rowMeta[3] : 0;
+                // A tuple carries one command identifier, and PostgreSQL answers both cmin and
+                // cmax from it, so a row always reports the same number for the two.
+                case "cmax": return rowMeta != null ? (int) rowMeta[2] : 0;
                 case "ctid": {
                     // Every row has a place of its own. Where no place was recorded — rows a
                     // CREATE TABLE AS or a COPY put there — the fallback was zero for all of
@@ -2026,31 +2049,13 @@ class ExprEvaluator {
     }
 
     /** PG validates CASE branch type compatibility at plan time. Reject obvious mismatches. */
-    /** Validate a collation name at runtime, raising 42704 if unknown. */
+    /**
+     * Validate a collation name at runtime, raising 42704 if unknown. Which names exist is one
+     * question with one answer, so a COLLATE in an expression and a COLLATE in a column definition
+     * ask it in the same place.
+     */
     private void validateCollationAtRuntime(String collation) {
-        if (collation == null) return;
-        String lower = collation.toLowerCase().replace("\"", "");
-        // Built-in collations that are always available
-        if (lower.equals("c") || lower.equals("posix") || lower.equals("default")
-                || lower.equals("ucs_basic") || lower.equals("unicode") || lower.equals("icu_root")
-                || lower.equals("pg_c_utf8")
-                || lower.equals("c.utf-8") || lower.equals("c.utf8")) {
-            return;
-        }
-        // Schema-qualified built-in collations
-        if (lower.startsWith("pg_catalog.")) {
-            String unqualified = lower.substring("pg_catalog.".length());
-            if (unqualified.equals("c") || unqualified.equals("posix") || unqualified.equals("default")
-                    || unqualified.equals("ucs_basic") || unqualified.equals("unicode")
-                    || unqualified.equals("icu_root") || unqualified.equals("pg_c_utf8")) {
-                return;
-            }
-        }
-        // User-defined collations in the database
-        if (executor.database.getCollation(lower) != null) {
-            return;
-        }
-        throw new MemgresException("collation \"" + collation + "\" for encoding \"UTF8\" does not exist", "42704");
+        DdlDefinitionChecks.requireCollationExists(executor.database, collation);
     }
 
     private void validateCaseBranchTypes(CaseExpr c) {
@@ -3008,7 +3013,9 @@ class ExprEvaluator {
                 SelectStmt sel = (SelectStmt) sq.subquery();
                 SelectStmt.SelectTarget inner = sel.targets().get(0);
                 if (inner.alias() != null) return inner.alias();
-                if (inner.expr() instanceof WildcardExpr) return starSubqueryAlias(sel);
+                if (inner.expr() instanceof WildcardExpr) {
+                    return starSubqueryAlias(sel, ((WildcardExpr) inner.expr()).table());
+                }
                 return exprToAlias(inner.expr());
             }
             return "?column?";
@@ -3104,10 +3111,32 @@ class ExprEvaluator {
      * {@code (SELECT * FROM c)} answer under the same name in PostgreSQL. Deliberately narrow: one
      * FROM item exposing exactly one column, and any difficulty describing it leaves the label as
      * the unnamed one it was.
+     *
+     * <p>A name written in front of the star picks one relation out of the FROM clause, so the
+     * label is that relation's own column however many relations the clause holds — which is what
+     * names {@code (SELECT b.* FROM x a, y b)} after b's column rather than leaving it unnamed.
+     * A name the clause does not answer to is left to the rule above it.
      */
-    private String starSubqueryAlias(SelectStmt sel) {
-        if (sel.from() == null || sel.from().size() != 1) return "?column?";
+    private String starSubqueryAlias(SelectStmt sel, String qualifier) {
         try {
+            RowContext.TableBinding named = null;
+            if (qualifier != null && sel.from() != null) {
+                for (SelectStmt.FromItem item : sel.from()) {
+                    for (RowContext.TableBinding b : executor.fromResolver.resolveItemShape(item)) {
+                        String exposed = b.alias() != null ? b.alias() : b.table().getName();
+                        if (exposed != null && exposed.equalsIgnoreCase(qualifier)) {
+                            named = b;
+                            break;
+                        }
+                    }
+                    if (named != null) break;
+                }
+            }
+            if (named != null && named.table() != null) {
+                List<Column> own = named.table().getColumns();
+                return own.size() == 1 ? own.get(0).getName() : "?column?";
+            }
+            if (sel.from() == null || sel.from().size() != 1) return "?column?";
             List<Column> columns = new ArrayList<>();
             for (RowContext.TableBinding b : executor.fromResolver.resolveItemShape(sel.from().get(0))) {
                 columns.addAll(b.table().getColumns());

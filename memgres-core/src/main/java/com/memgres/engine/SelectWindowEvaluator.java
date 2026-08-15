@@ -1742,6 +1742,23 @@ class SelectWindowEvaluator {
                     : new java.math.BigDecimal(offset.toString());
             return subtract ? cur.subtract(off) : cur.add(off);
         }
+        // Two whole numbers add up exactly. Going through double rounded anything past 2^53, so a
+        // row's own frame boundary came out above the row itself and the row fell outside its own
+        // frame; PostgreSQL raises on an offset that overflows the key's type rather than wrapping.
+        if (integralColumn && !fractionalOffset) {
+            long cur = ((Number) currentVal).longValue();
+            long off = ((Number) offset).longValue();
+            long exact;
+            try {
+                exact = subtract ? Math.subtractExact(cur, off) : Math.addExact(cur, off);
+            } catch (ArithmeticException e) {
+                throw new MemgresException("bigint out of range", "22003");
+            }
+            if (currentVal instanceof Integer) return (int) exact;
+            if (currentVal instanceof Long) return exact;
+            if (currentVal instanceof Short) return (short) exact;
+            return (byte) exact;
+        }
         double numOffset = ((Number) offset).doubleValue();
         double currentNum = ((Number) currentVal).doubleValue();
         double result = subtract ? currentNum - numOffset : currentNum + numOffset;

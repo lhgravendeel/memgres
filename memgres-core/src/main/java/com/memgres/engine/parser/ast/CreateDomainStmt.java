@@ -10,7 +10,33 @@ public final class CreateDomainStmt implements Statement {
     public final boolean notNull;
     public final Expression checkExpr;
     public final String constraintName; // explicit constraint name for CHECK, or null
+    /**
+     * Every CHECK the definition wrote, in the order it wrote them. A domain may carry any number
+     * of them, each with a name of its own or with none, so the pair above is the head of this
+     * list rather than the whole of what was written.
+     */
+    private java.util.List<DomainCheck> checks;
     private String collation;           // COLLATE clause, or null
+
+    /** One CHECK of a domain: the name written before it, or null, and the condition itself. */
+    public static final class DomainCheck {
+        private final String name;
+        private final Expression expr;
+
+        public DomainCheck(String name, Expression expr) {
+            this.name = name;
+            this.expr = expr;
+        }
+
+        public String name() { return name; }
+        public Expression expr() { return expr; }
+
+        @Override
+        public String toString() { return "DomainCheck[name=" + name + ", expr=" + expr + "]"; }
+    }
+
+    public java.util.List<DomainCheck> checks() { return checks; }
+    public void setChecks(java.util.List<DomainCheck> checks) { this.checks = checks; }
     /** The schema the name was written in, or null when it was written bare. */
     private String schemaName;
 

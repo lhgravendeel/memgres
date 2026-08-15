@@ -146,6 +146,38 @@ final class ObjectIdentity {
     void relationCreated(String schema, String name) {
         String key = relKey(schema, name);
         if (oidMap.remove(key) != null) mutations.incrementAndGet();
+        // The number is handed out here, not at the first question about the name, because
+        // PostgreSQL assigns an OID when the object is created: the numbers then run in creation
+        // order, and everything ordered by OID -- pg_class as pg_dump reads it, the list of what
+        // depends on a type -- comes back in the order the objects were made rather than in the
+        // order some catalog query happened to walk the schemas.
+        oid(key);
+        numberRowType(schema, name);
+    }
+
+    /**
+     * Number the row type of a relation that has one, and the array over it. PostgreSQL writes
+     * three rows for a table or a view and numbers them as it writes them: the relation, then the
+     * array type, then the row type itself, so {@code _t}'s OID is below {@code t}'s and both are
+     * above the relation's. Memgres left them to be minted whenever a catalog query first asked,
+     * which put every row type after every relation and left them in whatever order a hash map
+     * held the tables in. A sequence and an index have no row type — pg_class.reltype is zero for
+     * both — so nothing is numbered for them.
+     */
+    private void numberRowType(String schema, String name) {
+        String kind = RelationNamespace.kindOf(database, schema, bare(name));
+        if (!RelationNamespace.TABLE.equals(kind)
+                && !RelationNamespace.VIEW.equals(kind)
+                && !RelationNamespace.MATVIEW.equals(kind)) {
+            return;
+        }
+        // Spelled exactly as the catalog builder spells it when it writes the pg_type rows, or the
+        // numbers minted here would answer for nothing.
+        String rowType = TypeNamespace.oidKey(schema, bare(name));
+        release(rowType);
+        release(rowType + "[]");
+        oid(rowType + "[]");
+        oid(rowType);
     }
 
     /**
@@ -162,15 +194,73 @@ final class ObjectIdentity {
         forgetCommentsEverywhere(null, name);
     }
 
-    /** A user type has just been created under this name; the same reasoning as for a relation. */
-    void typeCreated(String name) {
-        if (oidMap.remove(typeKey(name)) != null) mutations.incrementAndGet();
-        if (oidMap.remove(typeKey(name + "[]")) != null) mutations.incrementAndGet();
+    /**
+     * A user type has just been created under this name; the same reasoning as for a relation.
+     *
+     * @param kind {@code e} for an enum, {@code r} for a range, {@code c} for a composite,
+     *             {@code d} for a domain
+     */
+    void typeCreated(String kind, String name) {
+        // A range type is four types: the range, the multirange that holds ranges of it, and an
+        // array over each. All four are written by the one CREATE TYPE and all four are numbered
+        // by it.
+        String multirange = "r".equals(kind)
+                ? TypeNamespace.key(TypeNamespace.schemaOfKey(name),
+                        RangeOperations.multirangeTypeName(TypeNamespace.nameOfKey(name)))
+                : null;
+        release(typeKey(name));
+        release(typeKey(name + "[]"));
+        if (multirange != null) {
+            release(typeKey(multirange));
+            release(typeKey(multirange + "[]"));
+        }
         typeForward.remove(typeKey(name));
         for (Iterator<Map.Entry<String, String>> it = typeForward.entrySet().iterator(); it.hasNext(); ) {
             if (it.next().getValue().equals(typeKey(name))) it.remove();
         }
         forgetCommentsEverywhere("e", name);
+        // The numbers are handed out here rather than at the first question about the name, and in
+        // the order PostgreSQL writes the rows: a composite's relation first, then the array type,
+        // then a range's multirange and the array over that, and the type itself last. PostgreSQL
+        // numbers every catalogue row from one sequence as it writes it, so everything ordered by
+        // OID -- pg_type as a client reads it, the list of what depends on a schema -- comes back
+        // in the order the objects were made rather than in the order some catalog query happened
+        // to walk the kinds.
+        if ("c".equals(kind)) {
+            oid(relKey(TypeNamespace.schemaOfKey(name), TypeNamespace.nameOfKey(name)));
+        }
+        oid(typeKey(name + "[]"));
+        if (multirange != null) {
+            oid(typeKey(multirange));
+            oid(typeKey(multirange + "[]"));
+        }
+        oid(typeKey(name));
+    }
+
+    /**
+     * A routine has just been created, and this is the key its {@code pg_proc} row is filed under.
+     * PostgreSQL numbers that row as it writes it, so routines take their place in creation order
+     * beside relations and types instead of arriving whenever something first asked about them.
+     */
+    void routineCreated(String key) {
+        release(key);
+        oid(key);
+    }
+
+    /**
+     * A row security policy has just been created. A policy is a catalogue row of its own and is
+     * numbered when it is written, which is what decides whether a refusal reports it ahead of or
+     * behind a view hanging from the same object.
+     */
+    void policyCreated(String schema, String table, String name) {
+        String key = policyKey(schema, table, name);
+        release(key);
+        oid(key);
+    }
+
+    /** Retire a key, counting the change so a cache built over the map notices it. */
+    private void release(String key) {
+        if (oidMap.remove(key) != null) mutations.incrementAndGet();
     }
 
     /**
@@ -199,13 +289,18 @@ final class ObjectIdentity {
         }
         movePrivileges(oldSchema, bare(oldName), newSchema, bare(newName));
         moveOwner(kind, oldSchema, bare(oldName), newSchema, bare(newName));
-        // A trigger and a rule are on the relation, not on its name. Both registries are keyed by
-        // bare name, so they can only be moved when nothing else answers to either name — the
-        // same reason a comment stays put.
+        // A trigger is on the relation, not on its name, but the trigger registry is keyed by
+        // bare name, so triggers can only be moved when nothing else answers to either name --
+        // the same reason a comment stays put.
         if (("r".equals(kind) || "v".equals(kind) || "m".equals(kind))
                 && unambiguous(oldName, newName, newSchema)) {
             database.retargetTriggers(bare(oldName), bare(newName), newSchema);
-            database.retargetRules(bare(oldName), bare(newName));
+        }
+        // A rule is on the relation too, and it records which schema's relation that is, so it
+        // goes with the relation whatever else answers to the name -- including a move that
+        // changes only the schema, which leaves the rule filed under a relation that has gone.
+        if ("r".equals(kind) || "v".equals(kind) || "m".equals(kind)) {
+            database.retargetRules(oldSchema, bare(oldName), newSchema, bare(newName));
         }
         if ("r".equals(kind)) retargetIndexes(oldSchema, bare(oldName), newSchema, bare(newName));
         if (renamed) sweepOtherSpellings(bare(oldName));
@@ -502,6 +597,14 @@ final class ObjectIdentity {
 
     private static String typeKey(String name) {
         return "type:" + name;
+    }
+
+    /**
+     * Spelled exactly as {@link CatalogSecurityBuilder} spells it when it writes the pg_policy row,
+     * or the number minted at CREATE POLICY would answer for nothing.
+     */
+    static String policyKey(String schema, String table, String name) {
+        return "pol:" + schema + "." + table + "." + name;
     }
 
     /** Strip a schema qualifier a caller may have left on the name. */

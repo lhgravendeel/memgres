@@ -24,7 +24,12 @@ class DdlAlterActionParser {
     AlterTableStmt.AlterAction parseAlterAction() {
         if (parser.matchKeywords("ADD", "COLUMN")) {
             boolean ifNotExists = parser.matchKeywords("IF", "NOT", "EXISTS");
-            return new AlterTableStmt.AddColumn(tableParser.parseColumnDef(), ifNotExists);
+            AlterTableStmt.AddColumn added =
+                    new AlterTableStmt.AddColumn(tableParser.parseColumnDef(), ifNotExists);
+            // A CHECK written on the column is parsed as a table constraint, the way CREATE TABLE
+            // reads it, and has to be taken from the parser here or it is simply dropped.
+            added.setInlineConstraints(tableParser.drainPendingColumnChecks());
+            return added;
         }
         if (parser.matchKeyword("ADD")) {
             if (tableParser.isTableConstraintStart()) {
@@ -33,7 +38,10 @@ class DdlAlterActionParser {
                 return new AlterTableStmt.AddConstraint(tc, notValid);
             }
             // ADD COLUMN without the COLUMN keyword
-            return new AlterTableStmt.AddColumn(tableParser.parseColumnDef());
+            AlterTableStmt.AddColumn bare =
+                    new AlterTableStmt.AddColumn(tableParser.parseColumnDef());
+            bare.setInlineConstraints(tableParser.drainPendingColumnChecks());
+            return bare;
         }
         if (parser.matchKeywords("DROP", "COLUMN")) {
             boolean ifExists = parser.matchKeywords("IF", "EXISTS");
@@ -153,11 +161,22 @@ class DdlAlterActionParser {
             // Fall through; could be other SET variants, but for now error
             throw new ParseException("Unsupported ALTER TABLE SET action", parser.peek());
         }
-        // RESET (storage_parameter, ...): no-op for in-memory database
+        // RESET (storage_parameter, ...): the names are what the executor removes from
+        // pg_class.reloptions, so they have to survive the parse.
         if (parser.matchKeyword("RESET")) {
-            if (parser.check(TokenType.LEFT_PAREN)) {
-                DdlTableParser.consumeUntilParen(parser);
-                return new AlterTableStmt.SetStorageParams();
+            if (parser.match(TokenType.LEFT_PAREN)) {
+                List<String> names = new ArrayList<>();
+                while (!parser.isAtEnd() && !parser.check(TokenType.RIGHT_PAREN)) {
+                    // A parameter may be namespaced, as toast.autovacuum_enabled is.
+                    String key = parser.readIdentifier().toLowerCase();
+                    if (parser.match(TokenType.DOT)) {
+                        key = key + "." + parser.readIdentifier().toLowerCase();
+                    }
+                    names.add(key);
+                    parser.match(TokenType.COMMA);
+                }
+                parser.match(TokenType.RIGHT_PAREN);
+                return new AlterTableStmt.ResetStorageParams(names);
             }
         }
         if (parser.matchKeyword("OWNER")) {
@@ -171,7 +190,15 @@ class DdlAlterActionParser {
             parser.expectKeyword("SECURITY");
             return new AlterTableStmt.ForceRls();
         }
-        if (parser.matchKeywords("NO", "FORCE")) {
+        // PostgreSQL's grammar commits to a NO-prefixed action the moment it reads NO: the only
+        // actions that continue it are NO INHERIT and NO FORCE ROW LEVEL SECURITY. A statement
+        // that says anything else after NO is therefore refused at the word following NO, not at
+        // NO itself, which is what looking two words ahead before committing would report.
+        if (parser.matchKeyword("NO")) {
+            if (parser.matchKeyword("INHERIT")) {
+                return new AlterTableStmt.NoInherit(parser.readIdentifier());
+            }
+            parser.expectKeyword("FORCE");
             parser.expectKeyword("ROW");
             parser.expectKeyword("LEVEL");
             parser.expectKeyword("SECURITY");
@@ -257,8 +284,9 @@ class DdlAlterActionParser {
             return new AlterTableStmt.SetReplicaIdentity(identity);
         }
         if (parser.matchKeywords("CLUSTER", "ON")) {
-            parser.readIdentifier(); // index name, no-op for in-memory db
-            return new AlterTableStmt.RenameTable(null);
+            // The index has to be one of this relation's own, and only the executor can tell, so
+            // the name travels with the action rather than being read and thrown away.
+            return new AlterTableStmt.ClusterOn(parser.readIdentifier());
         }
 
         throw new ParseException("Unsupported ALTER TABLE action", parser.peek());
@@ -324,23 +352,55 @@ class DdlAlterActionParser {
         if (parser.matchKeywords("DROP", "DEFAULT")) return new AlterTableStmt.DropDefault();
         if (parser.matchKeyword("TYPE") || parser.matchKeywords("SET", "DATA", "TYPE")) {
             String typeName = parser.parseTypeName();
-            // A collation only exists for the collatable types, so naming one for any other type
-            // is a contradiction PG refuses rather than silently ignoring.
+            // A collation only exists for the collatable types, so naming one for any other type is
+            // a contradiction PG refuses rather than silently ignoring -- but it refuses it last,
+            // after the column, the type name and the collation name have all been settled. So the
+            // clause is carried to the executor rather than judged here, where nothing else is
+            // known yet. Discarding it left a retype to a collatable type never checking that the
+            // collation named existed at all.
+            String collation = null;
             if (parser.matchKeyword("COLLATE")) {
-                com.memgres.engine.DdlDefinitionChecks.rejectUncollatableType(typeName);
-                String collation = parser.readIdentifier();
+                collation = parser.readIdentifier();
                 if (parser.match(TokenType.DOT)) collation = collation + "." + parser.readIdentifier();
                 ExpressionParser.validateCollationStatic(collation, parser.peek());
             }
             // Capture optional USING clause for data conversion
             Expression usingExpr = null;
             if (parser.matchKeyword("USING")) usingExpr = parser.parseExpression();
-            return new AlterTableStmt.SetType(typeName, usingExpr);
+            return new AlterTableStmt.SetType(typeName, usingExpr, collation);
+        }
+        // SET (option = value, ...) and RESET (option, ...) are per-column planner options rather
+        // than one of the words below, so they are told apart by the paren that follows.
+        if (parser.checkKeyword("SET") && parser.pos + 1 < parser.tokens.size()
+                && parser.tokens.get(parser.pos + 1).type() == TokenType.LEFT_PAREN) {
+            parser.advance();
+            return new AlterTableStmt.SetColumnOptions(parseColumnOptionList());
+        }
+        if (parser.checkKeyword("RESET") && parser.pos + 1 < parser.tokens.size()
+                && parser.tokens.get(parser.pos + 1).type() == TokenType.LEFT_PAREN) {
+            parser.advance();
+            return new AlterTableStmt.ResetColumnOptions(
+                    new ArrayList<String>(parseColumnOptionList().keySet()));
         }
         // SET STATISTICS n / SET STORAGE type: planner hints, no-op
         if (parser.checkKeyword("SET") && parser.pos + 1 < parser.tokens.size()) {
             String nextVal = parser.tokens.get(parser.pos + 1).value().toUpperCase();
-            if (nextVal.equals("STATISTICS")) { parser.advance(); parser.advance(); int target = Integer.parseInt(parser.advance().value()); return new AlterTableStmt.SetStatistics(target); }
+            if (nextVal.equals("STATISTICS")) {
+                parser.advance();
+                parser.advance();
+                return new AlterTableStmt.SetStatistics(readSignedInt());
+            }
+            // EXPRESSION is not reserved, so it arrives as a plain identifier -- the same reason
+            // DROP EXPRESSION below is matched on the word rather than on the token's kind.
+            if (nextVal.equals("EXPRESSION")) {
+                parser.advance();
+                parser.advance();
+                parser.expectKeyword("AS");
+                parser.expect(TokenType.LEFT_PAREN);
+                String newGenExpr = tableParser.buildRawSqlUntilCloseParen();
+                parser.expect(TokenType.RIGHT_PAREN);
+                return new AlterTableStmt.SetExpression(newGenExpr);
+            }
             if (nextVal.equals("STORAGE")) { parser.advance(); parser.advance(); String storageType = parser.readIdentifier(); return new AlterTableStmt.SetStorage(storageType); }
             // SET GENERATED ALWAYS / SET GENERATED BY DEFAULT: change identity mode
             if (nextVal.equals("GENERATED")) {
@@ -353,19 +413,14 @@ class DdlAlterActionParser {
                 return new AlterTableStmt.SetDefault(new FunctionCallExpr("nextval",
                         Cols.listOf(Literal.ofString(marker))));
             }
-            // SET INCREMENT BY n: modify identity sequence increment
-            if (nextVal.equals("INCREMENT")) {
+            // SET INCREMENT BY / START WITH / MINVALUE / MAXVALUE / CACHE / CYCLE all alter the
+            // sequence behind an identity column, by the same rules ALTER SEQUENCE follows. The
+            // values used to be read and thrown away, so none of these changed anything.
+            if (nextVal.equals("INCREMENT") || nextVal.equals("START") || nextVal.equals("MINVALUE")
+                    || nextVal.equals("MAXVALUE") || nextVal.equals("CYCLE") || nextVal.equals("CACHE")
+                    || nextVal.equals("NO")) {
                 parser.advance(); // consume SET
-                parser.advance(); // consume INCREMENT
-                parser.matchKeyword("BY"); // optional BY
-                long incVal = Long.parseLong(parser.advance().value());
-                return new AlterTableStmt.SetDefault(new FunctionCallExpr("nextval",
-                        Cols.listOf(Literal.ofString("__set_increment__:" + incVal))));
-            }
-            // SET START WITH / SET MINVALUE / SET MAXVALUE / SET CYCLE / SET CACHE, no-op
-            if (nextVal.equals("START") || nextVal.equals("MINVALUE") || nextVal.equals("MAXVALUE")
-                    || nextVal.equals("CYCLE") || nextVal.equals("CACHE")) {
-                parser.advance(); consumeUntilEndOfAction(); return new AlterTableStmt.ColumnNoOp();
+                return parseAlterIdentitySequence();
             }
         }
         // ADD GENERATED [ALWAYS|BY DEFAULT] AS IDENTITY [(sequence_options)]
@@ -391,7 +446,7 @@ class DdlAlterActionParser {
         // RESTART [WITH n]: identity restart
         if (parser.matchKeyword("RESTART")) {
             if (parser.matchKeyword("WITH")) {
-                long restartVal = Long.parseLong(parser.advance().value());
+                long restartVal = DdlParser.readSeqLong(parser);
                 return new AlterTableStmt.SetDefault(new FunctionCallExpr("nextval",
                         Cols.listOf(Literal.ofString("__restart__:" + restartVal))));
             }
@@ -409,6 +464,113 @@ class DdlAlterActionParser {
         throw new ParseException("Unsupported ALTER COLUMN action", parser.peek());
     }
 
+    /**
+     * A signed integer written where PostgreSQL's grammar has SignedIconst. Anything else -- a
+     * word, a fraction, a number too wide for an int -- is a syntax error there rather than a
+     * value the statement carries, which is why the token is named back rather than described.
+     */
+    private int readSignedInt() {
+        // SignedIconst carries either sign, so an explicit + is written where a - may be and means
+        // the number itself. And it is Iconst that stands there, not a constant of any kind: a
+        // string literal is a syntax error however numeric its contents read.
+        boolean neg = parser.match(TokenType.MINUS);
+        if (!neg) parser.match(TokenType.PLUS);
+        Token token = parser.advance();
+        if (token.type() != TokenType.INTEGER_LITERAL) {
+            throw ParseException.saying("syntax error at or near \"" + asWritten(token) + "\"",
+                    token, "42601");
+        }
+        try {
+            // The sign belongs to the number: the lowest int has no positive counterpart.
+            return Integer.parseInt((neg ? "-" : "") + token.value());
+        } catch (NumberFormatException e) {
+            throw ParseException.saying("syntax error at or near \"" + asWritten(token) + "\"",
+                    token, "42601");
+        }
+    }
+
+    /**
+     * The token as the statement spelled it. A literal's value is its content with the quoting
+     * taken off, and PostgreSQL points at the whole literal -- {@code 'x'}, not {@code x} -- when
+     * it names the word its grammar stopped on.
+     */
+    private static String asWritten(Token token) {
+        switch (token.type()) {
+            case STRING_LITERAL:
+                return "'" + token.value().replace("'", "''") + "'";
+            case BIT_STRING_LITERAL:
+                return "B'" + token.value() + "'";
+            case QUOTED_IDENTIFIER:
+                return "\"" + token.value().replace("\"", "\"\"") + "\"";
+            default:
+                return token.raw();
+        }
+    }
+
+    /** A parenthesised {@code key [= value]} list, as a column's own options are written. */
+    private java.util.Map<String, String> parseColumnOptionList() {
+        parser.expect(TokenType.LEFT_PAREN);
+        java.util.Map<String, String> options = new java.util.LinkedHashMap<String, String>();
+        do {
+            String key = parser.readIdentifier().toLowerCase();
+            String value = null;
+            if (parser.match(TokenType.EQUALS)) {
+                StringBuilder sb = new StringBuilder();
+                while (!parser.isAtEnd() && !parser.check(TokenType.COMMA)
+                        && !parser.check(TokenType.RIGHT_PAREN)) {
+                    sb.append(parser.advance().value());
+                }
+                value = sb.toString().trim();
+            }
+            options.put(key, value);
+        } while (parser.match(TokenType.COMMA));
+        parser.expect(TokenType.RIGHT_PAREN);
+        return options;
+    }
+
+    /**
+     * The sequence options an identity column may be altered with, read from the first option
+     * keyword onward. PostgreSQL's grammar lets them repeat -- {@code SET INCREMENT BY 2 SET START
+     * WITH 100} is one action carrying two options -- so each further SET is read here rather than
+     * left to be reported as an unsupported action.
+     */
+    private AlterTableStmt.AlterColumnAction parseAlterIdentitySequence() {
+        Long increment = null, minValue = null, maxValue = null, startWith = null;
+        Integer cache = null;
+        Boolean cycle = null;
+        boolean noMinValue = false, noMaxValue = false;
+        while (true) {
+            if (parser.matchKeyword("INCREMENT")) {
+                parser.matchKeyword("BY");
+                increment = Long.valueOf(DdlParser.readSeqLong(parser));
+            } else if (parser.matchKeyword("START")) {
+                parser.matchKeyword("WITH");
+                startWith = Long.valueOf(DdlParser.readSeqLong(parser));
+            } else if (parser.matchKeywords("NO", "MINVALUE")) {
+                noMinValue = true;
+            } else if (parser.matchKeywords("NO", "MAXVALUE")) {
+                noMaxValue = true;
+            } else if (parser.matchKeywords("NO", "CYCLE")) {
+                cycle = Boolean.FALSE;
+            } else if (parser.matchKeyword("MINVALUE")) {
+                minValue = Long.valueOf(DdlParser.readSeqLong(parser));
+            } else if (parser.matchKeyword("MAXVALUE")) {
+                maxValue = Long.valueOf(DdlParser.readSeqLong(parser));
+            } else if (parser.matchKeyword("CACHE")) {
+                cache = Integer.valueOf((int) DdlParser.readSeqLong(parser));
+            } else if (parser.matchKeyword("CYCLE")) {
+                cycle = Boolean.TRUE;
+            } else {
+                break;
+            }
+            // Another option only follows behind another SET; anything else ends the action.
+            if (!parser.checkKeyword("SET")) break;
+            parser.advance();
+        }
+        return new AlterTableStmt.AlterIdentitySequence(increment, minValue, maxValue, startWith,
+                cache, cycle, noMinValue, noMaxValue);
+    }
+
     private AlterTableStmt.AlterColumnAction parseAddGenerated() {
         boolean addAlways = parser.matchKeyword("ALWAYS");
         if (!addAlways) { parser.matchKeyword("BY"); parser.matchKeyword("DEFAULT"); }
@@ -424,13 +586,14 @@ class DdlAlterActionParser {
                     seqName = parser.readIdentifier();
                     if (parser.match(TokenType.DOT)) seqName = seqName + "." + parser.readIdentifier();
                 } else if (parser.matchKeywords("START", "WITH")) {
-                    startWith = Long.parseLong(parser.advance().value());
+                    // A minus is a token of its own, so reading one raw token saw "-".
+                    startWith = Long.valueOf(DdlParser.readSeqLong(parser));
                 } else if (parser.matchKeywords("INCREMENT", "BY")) {
-                    incrementBy = Long.parseLong(parser.advance().value());
+                    incrementBy = Long.valueOf(DdlParser.readSeqLong(parser));
                 } else if (parser.matchKeyword("START")) {
-                    startWith = Long.parseLong(parser.advance().value());
+                    startWith = Long.valueOf(DdlParser.readSeqLong(parser));
                 } else if (parser.matchKeyword("INCREMENT")) {
-                    incrementBy = Long.parseLong(parser.advance().value());
+                    incrementBy = Long.valueOf(DdlParser.readSeqLong(parser));
                 } else {
                     parser.advance(); // skip unrecognized tokens
                 }

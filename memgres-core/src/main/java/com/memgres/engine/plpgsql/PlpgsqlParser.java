@@ -924,9 +924,9 @@ public class PlpgsqlParser {
             if (intoVars == null && matchKw("INTO")) {
                 if (matchKw("STRICT")) strict = true;
                 intoVars = new ArrayList<>();
-                intoVars.add(readIdent());
+                intoVars.add(readIntoTarget());
                 while (match(TokenType.COMMA)) {
-                    intoVars.add(readIdent());
+                    intoVars.add(readIntoTarget());
                 }
             } else if (usingExprs.isEmpty() && matchKw("USING")) {
                 // Stop each USING expression at a following INTO so the reversed order works.
@@ -942,6 +942,20 @@ public class PlpgsqlParser {
         return new PlpgsqlStatement.ExecuteStmt(sqlExpr, usingExprs, intoVars, strict);
     }
 
+    /**
+     * What an INTO clause writes to, which may be a field of a record rather than a variable of
+     * its own: PostgreSQL takes {@code INTO r.a} wherever it takes {@code INTO r}, and a trigger
+     * routine writing {@code INTO NEW.i} has rewritten the row exactly as an assignment would.
+     */
+    private String readIntoTarget() {
+        StringBuilder target = new StringBuilder(readIdent());
+        while (check(TokenType.DOT)) {
+            advance();
+            target.append('.').append(readIdent());
+        }
+        return target.toString();
+    }
+
     // ---- SQL statements ----
 
     /**
@@ -954,119 +968,73 @@ public class PlpgsqlParser {
     }
 
     private PlpgsqlStatement parseSqlStmt() {
-        String sql = collectUntilSemicolon();
+        CollectedSql collected = collectSqlUntilSemicolon();
+        String sql = collected.text;
         match(TokenType.SEMICOLON);
 
         List<String> intoVars = null;
         boolean strict = false;
 
-        // Detect SELECT ... INTO [STRICT] var1[, var2, ...] ... FROM
-        // Normalize whitespace for detection (newlines before INTO)
+        // PL/pgSQL owns the INTO clause: it has to be taken out of the statement before the SQL
+        // parser is given it. Where the clause is was settled while the text was rebuilt, token
+        // by token, because the finished text cannot tell the keyword INTO from the same letters
+        // inside a string literal -- SELECT ' into me ' INTO v holds two and means one.
         String upper = sql.toUpperCase();
-        // For CTE queries (WITH ... SELECT ... INTO), find the final SELECT outside parens
-        int selectStart = 0;
-        if (upper.startsWith("WITH")) {
-            int depth = 0;
-            for (int ci = 0; ci < upper.length() - 6; ci++) {
-                char ch = upper.charAt(ci);
-                if (ch == '(') depth++;
-                else if (ch == ')') depth--;
-                else if (depth == 0 && upper.startsWith("SELECT", ci)
-                        && (ci == 0 || !Character.isLetterOrDigit(upper.charAt(ci - 1)))
-                        && (ci + 6 >= upper.length() || !Character.isLetterOrDigit(upper.charAt(ci + 6)))) {
-                    selectStart = ci;
-                }
-            }
-        }
+        // In a CTE query the clause belongs to the final SELECT, so the search starts there and
+        // the INTO of a WITH ... INSERT INTO is left where it stands.
+        int selectStart = upper.startsWith("WITH") ? collected.lastSelect : 0;
         if (upper.startsWith("SELECT") || (upper.startsWith("WITH") && selectStart > 0)) {
-            int intoIdx = -1;
-            int intoEnd = -1;
-            // Search for INTO only after the final SELECT (important for CTE queries)
-            java.util.regex.Matcher intoMatcher = java.util.regex.Pattern.compile("\\sINTO\\s", java.util.regex.Pattern.CASE_INSENSITIVE).matcher(sql);
-            if (intoMatcher.find(selectStart)) { intoIdx = intoMatcher.start(); intoEnd = intoMatcher.end(); }
-            if (intoIdx >= 0) {
-                String afterInto = sql.substring(intoEnd).trim();
-                if (afterInto.toUpperCase().startsWith("STRICT ")) {
+            int[] into = collected.firstIntoAfter(selectStart);
+            if (into != null) {
+                int fromIdx = collected.firstFromAfter(into[1]);
+                String targets = (fromIdx >= 0 ? sql.substring(into[1], fromIdx)
+                        : sql.substring(into[1])).trim();
+                if (targets.toUpperCase().startsWith("STRICT ")) {
                     strict = true;
-                    afterInto = afterInto.substring(7).trim();
+                    targets = targets.substring(7).trim();
                 }
-                // Find FROM with any whitespace prefix
-                java.util.regex.Matcher fromMatcher = java.util.regex.Pattern.compile("\\sFROM\\s", java.util.regex.Pattern.CASE_INSENSITIVE).matcher(afterInto);
-                int fromIdx = fromMatcher.find() ? fromMatcher.start() : -1;
-                if (fromIdx >= 0) {
-                    String beforeFrom = joinFieldPaths(afterInto.substring(0, fromIdx).trim());
-                    // Parse comma-separated variable list
-                    // Check if this looks like a variable list (identifiers separated by commas)
-                    String[] parts = beforeFrom.split(",");
-                    boolean allIdents = true;
-                    List<String> varNames = new ArrayList<>();
-                    for (String part : parts) {
-                        String trimmed = part.trim();
-                        // A target may be a field of a composite variable as well as a plain name
-                        if (trimmed.matches("[a-zA-Z_][a-zA-Z0-9_]*(\\.[a-zA-Z_][a-zA-Z0-9_]*)*")) {
-                            varNames.add(trimmed);
-                        } else {
-                            allIdents = false;
-                            break;
-                        }
-                    }
-                    if (allIdents && !varNames.isEmpty()) {
-                        intoVars = varNames;
-                        sql = sql.substring(0, intoIdx) + " " + afterInto.substring(fromIdx);
+                targets = joinFieldPaths(targets);
+                // What follows the target list belongs to the statement and goes back into it.
+                String tail = fromIdx >= 0 ? sql.substring(fromIdx) : "";
+                boolean allIdents = true;
+                List<String> varNames = new ArrayList<>();
+                for (String part : targets.split(",")) {
+                    String trimmed = part.trim();
+                    // A target may be a field of a composite variable as well as a plain name
+                    if (trimmed.matches("[a-zA-Z_][a-zA-Z0-9_]*(\\.[a-zA-Z_][a-zA-Z0-9_]*)*")) {
+                        varNames.add(trimmed);
                     } else {
-                        // Single variable followed by extra expressions (old behavior)
-                        int spaceIdx = beforeFrom.indexOf(' ');
-                        if (spaceIdx > 0) {
-                            intoVars = Cols.listOf(beforeFrom.substring(0, spaceIdx).trim());
-                            String restExpr = beforeFrom.substring(spaceIdx).trim();
-                            sql = sql.substring(0, intoIdx) + " " + restExpr + afterInto.substring(fromIdx);
-                        } else {
-                            intoVars = Cols.listOf(beforeFrom);
-                            sql = sql.substring(0, intoIdx) + " " + afterInto.substring(fromIdx);
-                        }
+                        allIdents = false;
+                        break;
                     }
+                }
+                if (allIdents && !varNames.isEmpty()) {
+                    intoVars = varNames;
+                    sql = sql.substring(0, into[0]) + tail;
                 } else {
-                    // SELECT expr INTO var (no FROM)
-                    String trimmedAfter = joinFieldPaths(afterInto.trim());
-                    // Parse comma-separated variable list for no-FROM case too
-                    String[] parts = trimmedAfter.split(",");
-                    boolean allIdents = true;
-                    List<String> varNames = new ArrayList<>();
-                    for (String part : parts) {
-                        String trimmed = part.trim();
-                        // A target may be a field of a composite variable as well as a plain name
-                        if (trimmed.matches("[a-zA-Z_][a-zA-Z0-9_]*(\\.[a-zA-Z_][a-zA-Z0-9_]*)*")) {
-                            varNames.add(trimmed);
-                        } else {
-                            allIdents = false;
-                            break;
-                        }
-                    }
-                    if (allIdents && !varNames.isEmpty()) {
-                        intoVars = varNames;
-                        sql = sql.substring(0, intoIdx);
+                    // Single variable followed by extra expressions (old behavior)
+                    int spaceIdx = targets.indexOf(' ');
+                    if (spaceIdx > 0) {
+                        intoVars = Cols.listOf(targets.substring(0, spaceIdx).trim());
+                        sql = sql.substring(0, into[0]) + " " + targets.substring(spaceIdx).trim() + tail;
                     } else {
-                        int spaceIdx = trimmedAfter.indexOf(' ');
-                        if (spaceIdx > 0) {
-                            intoVars = Cols.listOf(trimmedAfter.substring(0, spaceIdx).trim());
-                            sql = sql.substring(0, intoIdx) + " " + trimmedAfter.substring(spaceIdx).trim();
-                        } else {
-                            intoVars = Cols.listOf(trimmedAfter);
-                            sql = sql.substring(0, intoIdx);
-                        }
+                        intoVars = Cols.listOf(targets);
+                        sql = sql.substring(0, into[0]) + tail;
                     }
                 }
             }
         }
 
-        // Handle SHOW param INTO var
+        // Handle SHOW param INTO var -- the clause is the last INTO in the statement, and one
+        // variable name is all that may follow it.
         if (intoVars == null && upper.startsWith("SHOW")) {
-            java.util.regex.Matcher showIntoMatcher = java.util.regex.Pattern.compile(
-                    "\\bINTO\\b\\s+(\\w+)\\s*$",
-                    java.util.regex.Pattern.CASE_INSENSITIVE).matcher(sql);
-            if (showIntoMatcher.find()) {
-                intoVars = Cols.listOf(showIntoMatcher.group(1).trim());
-                sql = sql.substring(0, showIntoMatcher.start()).trim();
+            int[] into = collected.lastInto();
+            if (into != null) {
+                String target = sql.substring(into[1]).trim();
+                if (target.matches("\\w+")) {
+                    intoVars = Cols.listOf(target);
+                    sql = sql.substring(0, into[0]).trim();
+                }
             }
         }
 
@@ -1075,13 +1043,14 @@ public class PlpgsqlParser {
             String upperSql = sql.toUpperCase();
             if (upperSql.startsWith("INSERT") || upperSql.startsWith("UPDATE") || upperSql.startsWith("DELETE")
                     || upperSql.startsWith("WITH")) {
-                // Look for RETURNING ... INTO pattern
-                java.util.regex.Matcher retIntoMatcher = java.util.regex.Pattern.compile(
-                        "\\bRETURNING\\b(.+?)\\bINTO\\b(.+)$",
-                        java.util.regex.Pattern.CASE_INSENSITIVE | java.util.regex.Pattern.DOTALL).matcher(sql);
-                if (retIntoMatcher.find()) {
-                    String returningCols = retIntoMatcher.group(1).trim();
-                    String intoTargets = retIntoMatcher.group(2).trim();
+                // The clause is the first INTO token after RETURNING. Taking the first INTO in
+                // the text instead ended the list at a literal that spelled it, and the statement
+                // then went to the SQL parser still carrying an INTO it cannot read.
+                int[] into = collected.returning == null ? null
+                        : collected.firstIntoAfter(collected.returning[1]);
+                if (into != null) {
+                    String returningCols = sql.substring(collected.returning[1], into[0]).trim();
+                    String intoTargets = sql.substring(into[1]).trim();
                     // Check for STRICT
                     if (intoTargets.toUpperCase().startsWith("STRICT ")) {
                         strict = true;
@@ -1100,7 +1069,7 @@ public class PlpgsqlParser {
                     if (!varNames.isEmpty()) {
                         intoVars = varNames;
                         // Remove the INTO ... part, keep RETURNING clause in SQL
-                        sql = sql.substring(0, retIntoMatcher.start()) + "RETURNING " + returningCols;
+                        sql = sql.substring(0, collected.returning[0]) + " RETURNING " + returningCols;
                     }
                 }
             }
@@ -1445,17 +1414,86 @@ public class PlpgsqlParser {
     }
 
     private String collectUntilSemicolon() {
+        return collectSqlUntilSemicolon().text.trim();
+    }
+
+    /**
+     * A statement's text rebuilt from its tokens, with the offsets of the clause keywords in it.
+     *
+     * <p>PL/pgSQL has to find INTO, FROM and RETURNING in a statement it otherwise passes on
+     * untouched, and a search over the finished text cannot tell a keyword from the same letters
+     * inside a string literal. The offsets are recorded as the text is built, where a literal is
+     * one token, and only at the top level, so the FROM of {@code extract(year FROM d)} is not
+     * one of them. Each is the offset of the space the token was written after, which is where a
+     * text search would have matched, so what is cut and what is kept is unchanged.
+     */
+    private static final class CollectedSql {
+        final String text;
+        /** {start, end} of every top-level INTO. */
+        final List<int[]> intos;
+        /** The start of every top-level FROM. */
+        final List<Integer> froms;
+        /** The start of the last top-level SELECT, or -1 when the statement has none. */
+        final int lastSelect;
+        /** {start, end} of the first top-level RETURNING, or null. */
+        final int[] returning;
+
+        CollectedSql(String text, List<int[]> intos, List<Integer> froms, int lastSelect,
+                     int[] returning) {
+            this.text = text;
+            this.intos = intos;
+            this.froms = froms;
+            this.lastSelect = lastSelect;
+            this.returning = returning;
+        }
+
+        int[] firstIntoAfter(int offset) {
+            for (int[] into : intos) {
+                if (into[0] >= offset) return into;
+            }
+            return null;
+        }
+
+        int[] lastInto() {
+            return intos.isEmpty() ? null : intos.get(intos.size() - 1);
+        }
+
+        int firstFromAfter(int offset) {
+            for (Integer from : froms) {
+                if (from.intValue() >= offset) return from.intValue();
+            }
+            return -1;
+        }
+    }
+
+    private CollectedSql collectSqlUntilSemicolon() {
         StringBuilder sb = new StringBuilder();
+        List<int[]> intos = new ArrayList<>();
+        List<Integer> froms = new ArrayList<>();
+        int lastSelect = -1;
+        int[] returning = null;
         int depth = 0;
         while (!isAtEnd()) {
             Token t = peek();
             if (t.type() == TokenType.SEMICOLON && depth == 0) break;
             if (t.type() == TokenType.LEFT_PAREN) depth++;
             if (t.type() == TokenType.RIGHT_PAREN) depth--;
+            int start = sb.length();
             appendToken(sb, t);
+            if (depth == 0 && t.type() == TokenType.KEYWORD) {
+                if (t.value().equalsIgnoreCase("INTO")) {
+                    intos.add(new int[]{start, sb.length()});
+                } else if (t.value().equalsIgnoreCase("FROM")) {
+                    froms.add(Integer.valueOf(start));
+                } else if (t.value().equalsIgnoreCase("SELECT")) {
+                    lastSelect = start;
+                } else if (returning == null && t.value().equalsIgnoreCase("RETURNING")) {
+                    returning = new int[]{start, sb.length()};
+                }
+            }
             advance();
         }
-        return sb.toString().trim();
+        return new CollectedSql(sb.toString(), intos, froms, lastSelect, returning);
     }
 
     private String collectUntilKeyword(String keyword) {

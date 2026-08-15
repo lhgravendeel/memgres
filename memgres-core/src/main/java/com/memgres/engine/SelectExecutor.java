@@ -95,20 +95,29 @@ class SelectExecutor {
 
     QueryResult executeSelect(SelectStmt stmt) {
         boolean pushedCteScope = false;
+        // A WITH item that writes is part of this one statement rather than a statement of its own,
+        // and PostgreSQL runs them all from the statement's single snapshot. What one of them
+        // writes therefore has to be noted, so that a later one is not shown it.
+        boolean writesFromWith = false;
         if (stmt.withClauses() != null && !stmt.withClauses().isEmpty()) {
             Map<String, SelectStmt.CommonTableExpr> cteMap = new LinkedHashMap<>();
             for (SelectStmt.CommonTableExpr cte : stmt.withClauses()) {
                 cteMap.put(cte.name().toLowerCase(), cte);
+                if (isDmlCte(cte.query())) writesFromWith = true;
             }
             // Before the scope is pushed: a refusal here must not leave a WITH scope standing on
             // the stack for whatever the connection runs next.
             cteExecutor.validateRecursiveItems(stmt.withClauses());
             executor.cteStack.push(cteMap);
+            // PostgreSQL pulls a WITH item up into the query that declares it when that query names
+            // it once, so which query that is has to be known where the item is read.
+            executor.fromResolver.noteCteScope(stmt.withClauses(), stmt);
             for (String cteName : cteMap.keySet()) {
                 executor.cteResultCache.remove(cteName);
             }
             pushedCteScope = true;
         }
+        if (writesFromWith && executor.session != null) executor.session.beginCommandWrites();
 
         try {
             QueryResult result = executeSelectInner(stmt);
@@ -127,7 +136,9 @@ class SelectExecutor {
         } finally {
             if (pushedCteScope) {
                 executor.cteStack.pop();
+                executor.fromResolver.forgetCteScope(stmt.withClauses());
             }
+            if (writesFromWith && executor.session != null) executor.session.endCommandWrites();
         }
     }
 
@@ -145,7 +156,813 @@ class SelectExecutor {
         });
     }
 
+    /**
+     * The columns a statement reads, or null when it reads every column a relation has.
+     *
+     * <p>A {@code *} reads them all; {@code count(*)} reads none, which is why PostgreSQL counts
+     * the rows of a relation whose virtual column would raise. A name written without its relation
+     * stands for whatever supplies it, so the answer is the union over the whole statement,
+     * subqueries included -- a correlated subquery reads the row the outer scan produced. A name
+     * that is also a relation's own name may be a whole-row reference, and a NATURAL join names
+     * nothing at all: both read every column there is.
+     *
+     * <p>A {@code *} written inside a nested query is that query's own and not this one's:
+     * PostgreSQL pulls a derived table up into the query that reads it, so what {@code SELECT k
+     * FROM (SELECT * FROM t) s} reads of t is k. A query with a {@code *} of its own therefore
+     * reads what the query around it reads as well, and only a query with nothing around it reads
+     * every column there is.
+     */
+    private Set<String> columnsRead(SelectStmt stmt) {
+        Set<String> columns = namesWritten(stmt);
+        if (columns == null) return null;
+        if (!readsEveryColumnItself(stmt)) return columns;
+        Set<String> enclosing = executor.dmlExecutor.enclosingColumnsRead();
+        if (enclosing == null) return null;
+        columns.addAll(enclosing);
+        return columns;
+    }
+
+    /**
+     * The columns a query holds when nothing above it settles what it holds -- a WITH item
+     * PostgreSQL keeps apart, which is computed in full before the query reading it is planned.
+     *
+     * <p>What such an item holds is its own select list, so a {@code *} written there stands for
+     * every column of the relation underneath, a VIRTUAL generated one included, and the generation
+     * expression is worked out for every row the item holds. Read instead under the demand of the
+     * query above, a column that query never names was left unworked-out and {@code WITH c AS
+     * MATERIALIZED (SELECT * FROM t) SELECT count(*) FROM c} answered a count where PostgreSQL
+     * raises what {@code 10/a} raises for a row of t. An arm of a set operation is part of the same
+     * query, so a star written on one arm is the whole operation's.
+     */
+    Set<String> columnsHeldAlone(Statement query) {
+        if (query instanceof SetOpStmt) {
+            Set<String> columns = new HashSet<>();
+            Set<String> left = columnsHeldAlone(((SetOpStmt) query).left());
+            if (left == null) return null;
+            Set<String> right = columnsHeldAlone(((SetOpStmt) query).right());
+            if (right == null) return null;
+            columns.addAll(left);
+            columns.addAll(right);
+            return columns;
+        }
+        Set<String> columns = namesWritten(query);
+        if (columns == null || readsEveryColumnItself(query)) return null;
+        return columns;
+    }
+
+    /**
+     * The columns a statement's own qualifications read, or null when they read every column.
+     *
+     * <p>These are the columns a scan has to have worked out as it passes over a row, because they
+     * decide whether the row is kept at all: the WHERE, and the FROM clause's join conditions.
+     * Everything else the statement names is read of the rows they kept.
+     *
+     * <p>A qualification the query above pushed down is not among them. It is read where the rows
+     * this query produced are offered to that query, which is after this query's own WHERE has run,
+     * so what it names is worked out there and only for the rows it has not already discarded.
+     */
+    private Set<String> columnsFiltered(SelectStmt stmt) {
+        List<Object> qualifications = new ArrayList<>();
+        qualifications.add(stmt.where());
+        qualifications.add(stmt.from());
+        Set<String> columns = namesWritten(qualifications);
+        if (columns == null) return null;
+        return readsEveryColumnItself(qualifications) ? null : columns;
+    }
+
+    /**
+     * The parts of this query's WHERE a scan may decide one of its rows by, with the restrictions
+     * the WHERE's equalities derive between them.
+     *
+     * <p>Two columns compared for equality, one of which is compared with a written constant,
+     * stand in one class: {@code s.a = o.a AND o.a = 5} says {@code s.a = 5} as surely as it says
+     * either of the two, and PostgreSQL puts that restriction on s's own scan -- which decides the
+     * row before a VIRTUAL generated column of it is reached.
+     *
+     * <p>A join's condition is read with the WHERE as far as a part of it settles which rows there
+     * are. An inner join answers the pairs its condition holds of and no others, and a row of the
+     * side an outer join does not preserve that the condition rejects is paired with nothing and
+     * carried by no row the query answers -- so a part about that side alone restricts its scan
+     * exactly as a WHERE clause does. A part about the side an outer join does preserve is not one:
+     * that side answers a row whatever the condition says, padded with nulls. Neither is a part
+     * comparing the two sides, so nothing is carried across an outer join.
+     *
+     * <p>A LATERAL item's own comparison with the row beside it stands in the same class, because
+     * PostgreSQL pulls the item up into this query: {@code (SELECT * FROM t z WHERE z.a = o.a)}
+     * read as s says s.a = o.a here, and beside o.a = 5 that says s.a = 5. The comparison itself is
+     * not a restriction this query's scans can read -- it speaks of two relations -- so only what
+     * it derives is kept.
+     */
+    private List<Expression> scanRestrictions(SelectStmt stmt) {
+        List<Expression> parts = FromResolver.conjunctsOf(stmt.where());
+        joinScanRestrictions(stmt.from(), parts);
+        // A sub-select the statement above reads as one join with itself is restricted by what
+        // that statement's own equalities say about the column the two are joined on.
+        parts.addAll(executor.fromResolver.restrictionsPushedInto(stmt));
+        List<Expression> equated = new ArrayList<>(parts);
+        executor.fromResolver.lateralCorrelations(stmt.from(), equated);
+        // What the statement holding this query has already settled about the row standing beside
+        // this scan stands in the same class: it is one query with this one, and its plain parts
+        // are read before the part this one is written in.
+        equated.addAll(executor.fromResolver.enclosingEqualities(
+                FromResolver.exposedNamesOf(stmt.from())));
+        parts.addAll(DmlExecutor.impliedEqualities(equated));
+        return parts;
+    }
+
+    /**
+     * The parts of a FROM clause's join conditions that settle which rows a scan under it has.
+     *
+     * <p>An inner join answers the pairs its condition holds of and no others, so every part of
+     * that condition decides which rows there are. An outer join answers a row of the side it
+     * preserves whatever its condition says, so nothing about that side is taken from it; a row of
+     * the other side the condition rejects is paired with nothing and carried by no row the query
+     * answers, which is what makes a part about that side alone a restriction on its own scan. That
+     * is what leaves {@code o LEFT JOIN t s ON s.a = 5 AND s.g = 2} readable over a relation whose
+     * {@code 10/a} raises where a is zero.
+     */
+    private static void joinScanRestrictions(List<SelectStmt.FromItem> fromItems,
+                                             List<Expression> out) {
+        if (fromItems == null) return;
+        for (SelectStmt.FromItem item : fromItems) joinScanRestrictions(item, out);
+    }
+
+    private static void joinScanRestrictions(SelectStmt.FromItem item, List<Expression> out) {
+        if (!(item instanceof SelectStmt.JoinFrom)) return;
+        SelectStmt.JoinFrom join = (SelectStmt.JoinFrom) item;
+        joinScanRestrictions(join.left(), out);
+        joinScanRestrictions(join.right(), out);
+        SelectStmt.JoinType type = join.joinType();
+        if (type == SelectStmt.JoinType.INNER || type == SelectStmt.JoinType.CROSS) {
+            out.addAll(FromResolver.conjunctsOf(join.on()));
+            return;
+        }
+        SelectStmt.FromItem gated = null;
+        if (type == SelectStmt.JoinType.LEFT || type == SelectStmt.JoinType.NATURAL_LEFT) {
+            gated = join.right();
+        } else if (type == SelectStmt.JoinType.RIGHT || type == SelectStmt.JoinType.NATURAL_RIGHT) {
+            gated = join.left();
+        }
+        if (gated == null) return;
+        Set<String> notPreserved =
+                FromResolver.exposedNamesOf(Collections.singletonList(gated));
+        for (Expression part : FromResolver.conjunctsOf(join.on())) {
+            if (speaksOnlyOfThese(part, notPreserved)) out.add(part);
+        }
+    }
+
+    /** Whether every relation a condition names is one of these, and it names at least one. */
+    private static boolean speaksOnlyOfThese(Expression part, Set<String> relations) {
+        final boolean[] named = {false};
+        final boolean[] only = {true};
+        AstWalk.forEach(part, node -> {
+            if (!(node instanceof ColumnRef)) return;
+            String table = ((ColumnRef) node).table();
+            if (table == null || !relations.contains(table.toLowerCase())) {
+                only[0] = false;
+            } else {
+                named[0] = true;
+            }
+        });
+        return only[0] && named[0];
+    }
+
+    /**
+     * A qualification written so that its parts are read in the order PostgreSQL reads them.
+     *
+     * <p>PostgreSQL orders the parts of a qualification by what each costs to evaluate and stops at
+     * the first one that is false. A part holding a query is a plan of its own and costs more than
+     * any comparison of values the row already carries, so the plain parts decide the row first and
+     * a row they reject never runs the query at all -- which is what leaves {@code WHERE EXISTS
+     * (SELECT 1 FROM t s WHERE s.a = o.a AND s.g = 2) AND o.a = 5} readable over a relation whose
+     * {@code 10/a} raises for the row this one never pairs with. Written the other way round it
+     * already read that way, because that is the order it was written in.
+     *
+     * <p>The parts are put back together rather than read one at a time, so that what decides a row
+     * is the same expression evaluated by the same rule -- three-valued and refusing a part that is
+     * not a truth value -- and only the order it is read in has moved.
+     */
+    static Expression readCheapestFirst(Expression qualification) {
+        List<Expression> parts = FromResolver.conjunctsOf(qualification);
+        if (parts.size() < 2) return qualification;
+        boolean[] costly = new boolean[parts.size()];
+        int costlyCount = 0;
+        for (int i = 0; i < parts.size(); i++) {
+            costly[i] = AstWalk.anyMatch(parts.get(i), node -> node instanceof Statement);
+            if (costly[i]) costlyCount++;
+        }
+        if (costlyCount == 0 || costlyCount == parts.size()) return qualification;
+        List<Expression> ordered = new ArrayList<>();
+        for (int i = 0; i < parts.size(); i++) if (!costly[i]) ordered.add(parts.get(i));
+        for (int i = 0; i < parts.size(); i++) if (costly[i]) ordered.add(parts.get(i));
+        boolean moved = false;
+        for (int i = 0; i < parts.size(); i++) {
+            if (parts.get(i) != ordered.get(i)) { moved = true; break; }
+        }
+        if (!moved) return qualification;
+        Expression read = ordered.get(0);
+        for (int i = 1; i < ordered.size(); i++) {
+            read = new BinaryExpr(read, BinaryExpr.BinOp.AND, ordered.get(i));
+        }
+        return read;
+    }
+
+    /**
+     * The relation a name written without one in this query's qualification stands for, where the
+     * query reads only one and there is nothing else it could have meant.
+     */
+    static String loneRelationOf(SelectStmt stmt) {
+        Set<String> read = FromResolver.exposedNamesOf(stmt.from());
+        return read.size() == 1 ? read.iterator().next() : null;
+    }
+
+    /**
+     * The columns this query reads, with what the query above reads of it translated back through
+     * the alias list its FROM item wrote. A name that list does not give is a name this query's
+     * relation cannot supply, so it says nothing about which of its columns are read.
+     */
+    private Set<String> columnsReadThrough(SelectStmt stmt, Map<String, String> writtenTo) {
+        if (writtenTo == null) return columnsRead(stmt);
+        Set<String> columns = namesWritten(stmt);
+        if (columns == null) return null;
+        if (!readsEveryColumnItself(stmt)) return columns;
+        Set<String> enclosing = executor.dmlExecutor.enclosingColumnsRead();
+        if (enclosing == null) return null;
+        for (String name : enclosing) {
+            String own = writtenTo.get(name.toLowerCase());
+            if (own != null) columns.add(own);
+        }
+        return columns;
+    }
+
+    /**
+     * What each column this query exposes is called above it, against what it is called here, for
+     * a FROM item that wrote an alias list. Null when the query's output cannot be lined up with
+     * the list, in which case nothing is translated and the relation is read as it was before.
+     */
+    private static Map<String, String> derivedNameMap(SelectStmt stmt,
+                                                      List<RowContext.OutCol> output,
+                                                      List<String> columnAliases) {
+        List<String> written = new ArrayList<>();
+        List<String> own = new ArrayList<>();
+        List<RowContext.OutCol> sources = new ArrayList<>();
+        if (!derivedShape(stmt, output, written, sources, columnAliases)) return null;
+        sources.clear();
+        // What this query calls its columns need not tell them apart for the list to be read back:
+        // the name in each place of the list stands over the column in that place, and two columns
+        // of one name say only that both of them are demanded.
+        if (!derivedShape(stmt, output, own, sources, null, false)) return null;
+        if (written.size() != own.size()) return null;
+        Map<String, String> map = new HashMap<>();
+        for (int i = 0; i < written.size(); i++) map.put(written.get(i).toLowerCase(), own.get(i));
+        return map;
+    }
+
+    /**
+     * The output columns of this query that the relation built from it works them out for itself,
+     * against the column each is read from.
+     *
+     * <p>PostgreSQL pulls a derived table, a WITH item and a view up into the query that reads
+     * them, so a reference to a VIRTUAL generated column of a relation underneath stands in the
+     * query above and its expression is evaluated over the rows that query kept. A relation that
+     * exposes, under their own names, every column the expression reads can carry the column
+     * generated and answer for it itself, which is what leaves {@code SELECT s.g FROM o LEFT JOIN
+     * (SELECT * FROM t) s ON o.a = s.a WHERE o.a = 5} readable over a relation whose {@code 10/a}
+     * raises for a row the join discards.
+     *
+     * <p>A LIMIT, an OFFSET, a sort or a DISTINCT settles something about the rows here rather than
+     * above, and then the column is worked out below, as PostgreSQL works it out. An alias list
+     * does not: it renames the reference and not the expression, and the relation built above
+     * remembers the names the expression is written in.
+     */
+    private Map<String, Column> derivedGeneratedColumns(SelectStmt stmt,
+                                                        List<RowContext> contexts) {
+        if (stmt.limit() != null || stmt.offset() != null || stmt.distinct()) {
+            return Collections.emptyMap();
+        }
+        if (stmt.orderBy() != null && !stmt.orderBy().isEmpty()) return Collections.emptyMap();
+        if (stmt.distinctOn() != null && !stmt.distinctOn().isEmpty()) return Collections.emptyMap();
+        List<String> names = new ArrayList<>();
+        List<RowContext.OutCol> sources = new ArrayList<>();
+        List<RowContext.TableBinding> shape = contexts.get(0).getBindings();
+        if (!derivedShape(stmt, contexts.get(0).outputColumnsOrDefault(), names, sources, null)) {
+            return Collections.emptyMap();
+        }
+        Map<String, Column> generated = new HashMap<>();
+        List<Column> kept = new ArrayList<>();
+        for (int i = 0; i < sources.size(); i++) {
+            Column behind = columnBehind(sources.get(i), shape);
+            if (behind == null || !behind.isVirtual()) continue;
+            if (!readsOnlyExposed(behind, sources.get(i).bindings[0], names, sources, shape)) {
+                continue;
+            }
+            generated.put(names.get(i).toLowerCase(), behind);
+            kept.add(behind);
+        }
+        // Whether a column is worked out here is settled by its name, so a second relation with a
+        // generated column of the same name that is NOT left to the relation above would be left
+        // unworked-out by a name that was never about it.
+        for (int i = 0; i < sources.size(); i++) {
+            Column behind = columnBehind(sources.get(i), shape);
+            if (behind == null || !behind.isVirtual() || kept.contains(behind)) continue;
+            for (Column left : kept) {
+                if (left.getName().equalsIgnoreCase(behind.getName())) {
+                    return Collections.emptyMap();
+                }
+            }
+        }
+        return generated;
+    }
+
+    /**
+     * Whether every column a generation expression reads is exposed by this query under its own
+     * name and from the same relation, so a row of the relation built from this query answers for
+     * the expression as the stored row did.
+     */
+    private static boolean readsOnlyExposed(Column generated, int binding, List<String> names,
+                                            List<RowContext.OutCol> sources,
+                                            List<RowContext.TableBinding> shape) {
+        Expression expr;
+        try {
+            expr = generated.getGeneratedExprAst();
+        } catch (RuntimeException unreadable) {
+            return false;
+        }
+        if (expr == null) return false;
+        final boolean[] exposed = {true};
+        AstWalk.forEach(expr, node -> {
+            if (!(node instanceof ColumnRef)) return;
+            ColumnRef ref = (ColumnRef) node;
+            // A generation expression reads the row's own columns, and names them bare.
+            if (ref.column() == null || ref.table() != null) {
+                exposed[0] = false;
+                return;
+            }
+            for (int j = 0; j < sources.size(); j++) {
+                RowContext.OutCol source = sources.get(j);
+                if (source.bindings.length != 1 || source.bindings[0] != binding) continue;
+                Column from = columnBehind(source, shape);
+                if (from == null || from.isVirtual()) continue;
+                if (!from.getName().equalsIgnoreCase(ref.column())) continue;
+                // Exposed under another name, the reference would find nothing above.
+                if (names.get(j).equalsIgnoreCase(ref.column())) return;
+            }
+            exposed[0] = false;
+        });
+        return exposed[0];
+    }
+
+    /** The relation columns whose values the relation built from this query works out itself. */
+    private static Set<String> leftToRelationNames(Map<String, Column> leftToRelation) {
+        if (leftToRelation.isEmpty()) return Collections.emptySet();
+        Set<String> names = new HashSet<>();
+        for (Column behind : leftToRelation.values()) names.add(behind.getName().toLowerCase());
+        return names;
+    }
+
+    /**
+     * Work out here, after all, the columns that were to be left to the relation above.
+     *
+     * <p>A query that groups its rows or numbers them answers with columns of its own rather than
+     * with the ones its FROM clause supplied, so there is nothing for the relation above to work
+     * the expression out against and the query has to do it itself.
+     */
+    private void fillLeftToRelation(List<RowContext> contexts, Map<String, Column> leftToRelation) {
+        if (leftToRelation.isEmpty()) return;
+        final Set<String> named = leftToRelationNames(leftToRelation);
+        executor.dmlExecutor.computeVirtualColumnsForOutput(contexts, () -> named);
+    }
+
+    /**
+     * Give back their generation expression to the columns the relation built from this query
+     * works out for itself, so a reference to one is worked out where it stands.
+     */
+    private static void leaveGenerated(List<Column> resultColumns,
+                                       Map<String, Column> leftToRelation) {
+        if (leftToRelation.isEmpty()) return;
+        for (int i = 0; i < resultColumns.size(); i++) {
+            String name = resultColumns.get(i).getName();
+            Column behind = name == null ? null : leftToRelation.get(name.toLowerCase());
+            if (behind == null) continue;
+            boolean lone = true;
+            for (int j = 0; j < resultColumns.size(); j++) {
+                // Two output columns of one name leave no way to say which a reference meant.
+                if (j != i && name.equalsIgnoreCase(resultColumns.get(j).getName())) {
+                    lone = false;
+                    break;
+                }
+            }
+            if (lone) resultColumns.set(i, behind.withName(name));
+        }
+    }
+
+    /**
+     * The rows of this query whose columns are worked out, where a LIMIT stops the scan under it
+     * before the rest of them.
+     *
+     * <p>PostgreSQL asks a scan for one row more than the LIMIT needs and then stops it, so a row
+     * past the limit is never produced and a VIRTUAL generated column of it is never worked out --
+     * which is what leaves {@code SELECT * FROM t LIMIT 1} readable over a relation whose
+     * {@code 10/a} raises for its second row. Only a query that answers with the rows its scan
+     * produced, in the order it produced them, stops that early: a sort, a DISTINCT, a grouping, a
+     * window or a set expanded in the select list all have to be given every row first, and then
+     * every row is worked out however few the query goes on to answer.
+     */
+    private List<RowContext> readUpToLimit(SelectStmt stmt, List<RowContext> rows) {
+        if (stmt.limit() == null || !answersInScanOrder(stmt)) return rows;
+        // Only a count the query wrote out as a number. Anything else is worked out where the
+        // clause holding it is read, which is after every clause this stands among.
+        if (!(stmt.limit() instanceof Literal)) return rows;
+        if (stmt.offset() != null && !(stmt.offset() instanceof Literal)) return rows;
+        Long limit = writtenRowCount(stmt.limit());
+        if (limit == null || limit < 0 || limit > Integer.MAX_VALUE) return rows;
+        long offset = 0;
+        if (stmt.offset() != null) {
+            Long written = writtenRowCount(stmt.offset());
+            if (written == null || written < 0 || written > Integer.MAX_VALUE) return rows;
+            offset = written;
+        }
+        long read = offset + limit;
+        return read < rows.size() ? rows.subList(0, (int) read) : rows;
+    }
+
+    /** Whether a query answers with the rows its scan produced, in the order it produced them. */
+    private static boolean answersInScanOrder(SelectStmt stmt) {
+        if (stmt.distinct() || stmt.withTies() || stmt.lockClause() != null) return false;
+        if (stmt.orderBy() != null && !stmt.orderBy().isEmpty()) return false;
+        if (stmt.distinctOn() != null && !stmt.distinctOn().isEmpty()) return false;
+        if (stmt.groupBy() != null && !stmt.groupBy().isEmpty()) return false;
+        if (stmt.groupingSets() != null && !stmt.groupingSets().isEmpty()) return false;
+        if (stmt.having() != null) return false;
+        for (SelectStmt.SelectTarget target : stmt.targets()) {
+            // A target that computes anything may aggregate the rows, number them, or expand one
+            // of them into several, and then which rows the limit counts is settled above the scan.
+            if (!(target.expr() instanceof WildcardExpr)
+                    && !(target.expr() instanceof ColumnRef)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** Whether any relation these rows came from has a VIRTUAL generated column at all. */
+    private boolean readsVirtualColumns(List<RowContext> contexts) {
+        if (contexts.isEmpty()) return false;
+        for (RowContext.TableBinding binding : contexts.get(0).getBindings()) {
+            if (binding.table() != null && executor.dmlExecutor.hasVirtualColumns(binding.table())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * The rows the query above keeps of the relation this query is being read as.
+     *
+     * <p>Its qualification is written against this query's output columns, so the rows are offered
+     * to it under those names: a target that is a column of the FROM clause, or a {@code *}, which
+     * is all of them. Anything else -- a computed target, a qualified star -- leaves a name this
+     * cannot answer for, and then no row is dropped and the relation is read as it was read
+     * before. A qualification that cannot be decided from a row leaves that row in for the same
+     * reason.
+     */
+    private List<RowContext> keptByEnclosingQualification(List<RowContext> contexts,
+                                                          List<Expression> qualification,
+                                                          SelectStmt stmt, String relation,
+                                                          List<String> columnAliases) {
+        List<String> names = new ArrayList<>();
+        List<RowContext.OutCol> sources = new ArrayList<>();
+        List<RowContext.TableBinding> shape = contexts.get(0).getBindings();
+        if (!derivedShape(stmt, contexts.get(0).outputColumnsOrDefault(), names, sources,
+                columnAliases)) {
+            return contexts;
+        }
+        Table described = describeDerived(relation, names, sources, shape);
+        // Which of the offered columns is a VIRTUAL generated column of the relation underneath.
+        // PostgreSQL reads a scan's qualifications cheapest first and stops at the first one that is
+        // false, and a qualification holding a generation expression costs more than one that only
+        // compares a stored column -- so the stored ones decide the row, and the expression of a row
+        // they reject is never worked out. That is what leaves a derived table over a relation whose
+        // 10/a raises for one row readable by WHERE s.a = 5 AND s.g = 2.
+        Set<String> generated = new HashSet<>();
+        for (int i = 0; i < sources.size(); i++) {
+            Column behind = columnBehind(sources.get(i), shape);
+            if (behind != null && behind.isVirtual()) generated.add(names.get(i).toLowerCase());
+        }
+        List<Expression> ordered = new ArrayList<>();
+        for (Expression part : qualification) {
+            if (!costsAGenerationExpression(part, generated)) ordered.add(part);
+        }
+        int stored = ordered.size();
+        for (Expression part : qualification) {
+            if (costsAGenerationExpression(part, generated)) ordered.add(part);
+        }
+        List<RowContext> kept = new ArrayList<>();
+        for (RowContext ctx : contexts) {
+            Object[] row = offeredRow(sources, ctx);
+            RowContext offered = new RowContext(described, relation, row);
+            boolean keep = true;
+            boolean worked = generated.isEmpty();
+            for (int i = 0; i < ordered.size(); i++) {
+                if (i >= stored && !worked) {
+                    fillOfferedGenerated(sources, ctx);
+                    row = offeredRow(sources, ctx);
+                    offered = new RowContext(described, relation, row);
+                    worked = true;
+                }
+                try {
+                    if (!executor.isTruthy(executor.evalExpr(ordered.get(i), offered))) {
+                        keep = false;
+                        break;
+                    }
+                } catch (RuntimeException undecided) {
+                    // Nothing was decided about the row, so nothing is decided against it.
+                }
+            }
+            if (keep) kept.add(ctx);
+        }
+        return kept;
+    }
+
+    /** The relation column one offered column is read from, or null when it is not one column's. */
+    private static Column columnBehind(RowContext.OutCol source,
+                                       List<RowContext.TableBinding> shape) {
+        if (source.bindings.length != 1 || source.bindings[0] >= shape.size()) return null;
+        Table from = shape.get(source.bindings[0]).table();
+        if (from == null || source.columns[0] >= from.getColumns().size()) return null;
+        return from.getColumns().get(source.columns[0]);
+    }
+
+    private static Object[] offeredRow(List<RowContext.OutCol> sources, RowContext ctx) {
+        Object[] row = new Object[sources.size()];
+        for (int i = 0; i < row.length; i++) row[i] = sources.get(i).valueIn(ctx.getBindings());
+        return row;
+    }
+
+    /**
+     * Whether reading one part of a qualification costs a generation expression.
+     *
+     * <p>A part that reads false out of what is written in it alone costs nothing, whatever it
+     * names: it is false for every row there is, so PostgreSQL settles it while it plans and the
+     * expression it seems to read is never worked out.
+     */
+    private boolean costsAGenerationExpression(Expression part, Set<String> generated) {
+        return readsAny(part, generated) && !executor.fromResolver.settledFalse(part);
+    }
+
+    /** Whether a qualification names any of these columns. */
+    private static boolean readsAny(Expression part, Set<String> columns) {
+        if (columns.isEmpty()) return false;
+        return AstWalk.anyMatch(part, node -> node instanceof ColumnRef
+                && ((ColumnRef) node).column() != null
+                && columns.contains(((ColumnRef) node).column().toLowerCase()));
+    }
+
+    /** Work out the VIRTUAL generated columns this row offers, into the row it is read from. */
+    private void fillOfferedGenerated(List<RowContext.OutCol> sources, RowContext ctx) {
+        List<RowContext.TableBinding> bindings = ctx.getBindings();
+        for (RowContext.OutCol source : sources) {
+            Column behind = columnBehind(source, bindings);
+            if (behind == null || !behind.isVirtual()) continue;
+            RowContext.TableBinding binding = bindings.get(source.bindings[0]);
+            if (binding.row() == null) continue;
+            executor.dmlExecutor.fillVirtualColumns(binding.table(), binding.row(),
+                    Collections.singleton(behind.getName().toLowerCase()));
+        }
+    }
+
+    /**
+     * The output columns of a query that are columns of its own FROM clause, in order, under the
+     * names the query above answers to them by.
+     *
+     * <p>{@code columnAliases} is the alias list the FROM item wrote, which renames the columns
+     * this query exposes one for one from the left. The count is kept as the targets are walked
+     * rather than as the names are collected, because a target this cannot answer for still takes
+     * a place in the list the alias list renames.
+     */
+    private static boolean derivedShape(SelectStmt stmt, List<RowContext.OutCol> output,
+                                        List<String> names, List<RowContext.OutCol> sources,
+                                        List<String> columnAliases) {
+        return derivedShape(stmt, output, names, sources, columnAliases, true);
+    }
+
+    /**
+     * The same, for a caller that can make sense of a query two of whose columns answer to one
+     * name. Nothing may be decided about the relation from such a name, so a qualification is
+     * never read through one; reading an alias list back the other way is a different question,
+     * because the list names each column by the place it stands in.
+     */
+    private static boolean derivedShape(SelectStmt stmt, List<RowContext.OutCol> output,
+                                        List<String> names, List<RowContext.OutCol> sources,
+                                        List<String> columnAliases, boolean distinctNames) {
+        int position = 0;
+        for (SelectStmt.SelectTarget target : stmt.targets()) {
+            Expression expr = target.expr();
+            if (expr instanceof WildcardExpr && standsForWholeClause((WildcardExpr) expr, stmt)) {
+                for (RowContext.OutCol oc : output) {
+                    names.add(writtenAs(columnAliases, position++, oc.name));
+                    sources.add(oc);
+                }
+                continue;
+            }
+            if (!(expr instanceof ColumnRef) || ((ColumnRef) expr).column() == null) {
+                // A computed target is not a column of the FROM clause, so this cannot answer for
+                // the name it exposes. Leaving it out is safe: a qualification naming it cannot be
+                // decided here at all, and an undecided qualification drops no row.
+                position++;
+                continue;
+            }
+            String column = ((ColumnRef) expr).column();
+            RowContext.OutCol found = null;
+            for (RowContext.OutCol oc : output) {
+                if (!oc.name.equalsIgnoreCase(column)) continue;
+                if (found != null) return false;
+                found = oc;
+            }
+            if (found == null) return false;
+            names.add(writtenAs(columnAliases, position++,
+                    target.alias() != null ? target.alias() : column));
+            sources.add(found);
+        }
+        Set<String> exposed = new HashSet<>();
+        for (String name : names) {
+            // Two output columns under one name leave no way to say which one the qualification
+            // meant, so nothing about the relation can be decided from it.
+            if (distinctNames && !exposed.add(name.toLowerCase())) return false;
+        }
+        return !names.isEmpty();
+    }
+
+    /**
+     * Whether a star in a select list stands for every column the FROM clause supplies.
+     *
+     * <p>A bare one does. One written with a relation before it does when the clause names that
+     * relation and nothing else, because then its columns are all the columns there are -- and a
+     * derived table written that way is pulled up into the query reading it exactly as one written
+     * with a bare star is.
+     */
+    private static boolean standsForWholeClause(WildcardExpr star, SelectStmt stmt) {
+        if (star.table() == null) return true;
+        Set<String> exposed = FromResolver.exposedNamesOf(stmt.from());
+        return exposed.size() == 1 && exposed.contains(star.table().toLowerCase());
+    }
+
+    /** The name an alias list gives the output column in this place, or the query's own name. */
+    private static String writtenAs(List<String> columnAliases, int position, String own) {
+        return columnAliases != null && position < columnAliases.size()
+                ? columnAliases.get(position) : own;
+    }
+
+    /** A relation described by the names a query answers to above it, to offer its rows under. */
+    private static Table describeDerived(String relation, List<String> names,
+                                         List<RowContext.OutCol> sources,
+                                         List<RowContext.TableBinding> shape) {
+        List<Column> columns = new ArrayList<>();
+        for (int i = 0; i < names.size(); i++) {
+            RowContext.OutCol oc = sources.get(i);
+            DataType type = oc.type;
+            if (type == null && oc.bindings[0] < shape.size()) {
+                Table from = shape.get(oc.bindings[0]).table();
+                if (from != null && oc.columns[0] < from.getColumns().size()) {
+                    type = from.getColumns().get(oc.columns[0]).getType();
+                }
+            }
+            columns.add(new Column(names.get(i), type, true, false, null));
+        }
+        return new Table(relation, columns);
+    }
+
+    /**
+     * The column names written anywhere in a statement or in a part of one, or null when one of
+     * them is a whole-row reference -- a relation's own name read as a value, which is every column
+     * that relation has at once.
+     *
+     * <p>What a derived table closed to the query reading it writes down is left out: those names
+     * are its own relations' and say nothing about the rows this query holds. See
+     * {@link #closedToThisQuery}.
+     */
+    private static Set<String> namesWritten(Object root) {
+        final Set<String> columns = new HashSet<>();
+        final Set<String> relations = new HashSet<>();
+        AstWalk.forEachOutside(root, SelectExecutor::closedToThisQuery, node -> {
+            if (node instanceof ColumnRef) {
+                String column = ((ColumnRef) node).column();
+                if (column != null) columns.add(column.toLowerCase());
+            } else if (node instanceof SelectStmt.TableRef) {
+                SelectStmt.TableRef ref = (SelectStmt.TableRef) node;
+                if (ref.table() != null) relations.add(ref.table().toLowerCase());
+                if (ref.alias() != null) relations.add(ref.alias().toLowerCase());
+            } else if (node instanceof SelectStmt.SubqueryFrom) {
+                String alias = ((SelectStmt.SubqueryFrom) node).alias();
+                if (alias != null) relations.add(alias.toLowerCase());
+            } else if (node instanceof SelectStmt.FunctionFrom) {
+                String alias = ((SelectStmt.FunctionFrom) node).alias();
+                if (alias != null) relations.add(alias.toLowerCase());
+            } else if (node instanceof SelectStmt.CommonTableExpr) {
+                String name = ((SelectStmt.CommonTableExpr) node).name();
+                if (name != null) relations.add(name.toLowerCase());
+            } else if (node instanceof SelectStmt.JoinFrom) {
+                // A USING list names its columns as text rather than as references.
+                SelectStmt.JoinFrom join = (SelectStmt.JoinFrom) node;
+                if (join.using() != null) {
+                    for (String using : join.using()) columns.add(using.toLowerCase());
+                }
+            }
+        });
+        for (String relation : relations) {
+            // A relation's own name read as a value is the whole row, every column of it.
+            if (columns.contains(relation)) return null;
+        }
+        return columns;
+    }
+
+    /**
+     * Whether a FROM item is a query closed to the one reading it, so that the columns it names
+     * are its own relations' and not that query's.
+     *
+     * <p>A derived table that is not LATERAL cannot reach a column of the query around it, and
+     * PostgreSQL pulls the two together: a column named inside it is worked out over the rows the
+     * query above kept rather than for every row the scan under it passes over. Counted as the
+     * reading query's, a VIRTUAL generated column named only in such a table was worked out where
+     * that query had already discarded the row, or never asked for the column at all -- which is
+     * what {@code SELECT s.a FROM (SELECT a, k, g FROM t) s} asked of a relation whose
+     * {@code 10/a} raises where a is zero.
+     *
+     * <p>A query that reaches further out than the one reading it -- to a query that one is
+     * written inside, which a derived table may do -- is not closed at all: what it names there it
+     * names of a row being scanned above, and that scan has to have worked it out. Nothing is
+     * assumed about a body without a FROM clause of its own, because every name in one is a name
+     * it reached out for.
+     */
+    private static boolean closedToThisQuery(Object node) {
+        if (!(node instanceof SelectStmt.SubqueryFrom)) return false;
+        SelectStmt.SubqueryFrom item = (SelectStmt.SubqueryFrom) node;
+        if (item.lateral() || !(item.subquery() instanceof SelectStmt)) return false;
+        SelectStmt inner = (SelectStmt) item.subquery();
+        if (inner.from() == null || inner.from().isEmpty()) return false;
+        final Set<String> supplied = FromResolver.exposedNamesOf(inner.from());
+        return !AstWalk.anyMatch(inner, named -> named instanceof ColumnRef
+                && ((ColumnRef) named).table() != null
+                && !supplied.contains(((ColumnRef) named).table().toLowerCase()));
+    }
+
+    /**
+     * Whether this query level itself asks for every column of what it reads: a {@code *}, or a
+     * NATURAL join, which names no columns and joins on whatever the two sides happen to share.
+     * A {@code *} inside a nested query belongs to that query, which is asked the same question of
+     * itself when it runs.
+     */
+    private static boolean readsEveryColumnItself(Object root) {
+        final Set<Object> seen = Collections.newSetFromMap(new IdentityHashMap<Object, Boolean>());
+        final Deque<Object> queue = new ArrayDeque<>();
+        queue.add(root);
+        seen.add(root);
+        while (!queue.isEmpty()) {
+            Object node = queue.poll();
+            if (node instanceof WildcardExpr || node instanceof CompositeStarExpr) return true;
+            if (node instanceof SelectStmt.JoinFrom) {
+                SelectStmt.JoinFrom join = (SelectStmt.JoinFrom) node;
+                if (join.joinType() != null && join.joinType().name().startsWith("NATURAL")) {
+                    return true;
+                }
+            }
+            AstWalk.forEachChild(node, child -> {
+                // Another statement is another query level, answering for its own columns.
+                if (child instanceof Statement) return;
+                if (seen.add(child)) queue.add(child);
+            });
+        }
+        return false;
+    }
+
     private QueryResult executeSelectInner(SelectStmt stmt) {
+        // PostgreSQL pulls a derived table, a WITH item and a view up into the query that reads
+        // them, so that query's WHERE qualifies the scan underneath rather than filtering what the
+        // scan produced. A VIRTUAL generated column is worked out where the reference to it stands,
+        // so a row the enclosing qualification discards never reaches the generation expression --
+        // which is what leaves a relation whose expression raises for one of its rows readable
+        // through a view. A LIMIT or an OFFSET keeps the two apart: it settles which rows there are
+        // before the enclosing qualification is read, so PostgreSQL leaves that qualification where
+        // it was written. The offer is taken here and cleared, because a query nested further in is
+        // a query of its own and is qualified by whatever reads it.
+        final String readAs = executor.fromResolver.derivedRelation;
+        final List<Expression> pushedQualification = executor.fromResolver.derivedQualification;
+        // An alias list renames every column the relation exposes, so the query above writes those
+        // names and this query still answers to its own.
+        final List<String> readAsColumns = executor.fromResolver.derivedColumnAliases;
+        final boolean readAsArm = executor.fromResolver.derivedSetOperation;
+        // The relation this query is read as may name its own columns, and a column left for it to
+        // work out would arrive there under a name its expression is not written in.
+        final boolean readAsRenamed = executor.fromResolver.derivedRenamesColumns;
+        executor.fromResolver.derivedRelation = null;
+        executor.fromResolver.derivedQualification = null;
+        executor.fromResolver.derivedColumnAliases = null;
+        executor.fromResolver.derivedSetOperation = false;
+        executor.fromResolver.derivedRenamesColumns = false;
+        final List<Expression> enclosingQualification =
+                readAs == null || pushedQualification == null
+                        || stmt.limit() != null || stmt.offset() != null
+                        ? Collections.<Expression>emptyList() : pushedQualification;
         // The range table is built before any clause is read, so a relation the statement names
         // and does not have is reported on its own. Only the NAMES are resolved here and nothing
         // is read: reading a FROM item is observable -- a WITH item that writes would be applied,
@@ -227,26 +1044,63 @@ class SelectExecutor {
         // statement carrying one, the clauses are judged on the raw tree instead -- the older,
         // coarser order -- because refusing the statement after its INSERT has been applied would
         // be a write PostgreSQL never performs.
+        // A VIRTUAL generated column is not stored: its value is worked out from the row as the
+        // relation is read. PostgreSQL puts the generation expression where the reference to the
+        // column stood, so what this statement names is what may be evaluated, and its own
+        // qualifications are what the scan itself has to work out. This covers describing the FROM
+        // clause as well as reading it, because describing a WITH item means running it, and the
+        // rows it is built from are a relation's just the same.
         QueryLevelScope scope;
-        if (hasDataModifyingCte(stmt)) {
-            scope = null;
-        } else {
-            List<RowContext.TableBinding> described =
-                    executor.fromResolver.resolveTableBindings(stmt.from());
-            // Describing swallows every relation it cannot follow, so a short list is a list with
-            // a relation missing from it and the columns that relation holds would look like
-            // columns nothing holds.
-            scope = new QueryLevelScope(this, described, null, stmt,
-                    described.size() == FromResolver.relationCount(stmt.from()));
-        }
-        // A join condition belongs to the FROM clause, which PostgreSQL transforms before it reads
-        // any other clause, so this is judged before the select list's calls are.
-        rejectNonBooleanJoinConditions(stmt.from(), scope);
-        FilterCheck.reject(this, stmt, scope);
-        rejectMisplacedSrfs(stmt);
+        List<RowContext> contexts;
+        // What the FROM clause exposes, for a clause that produced no rows to read it off. It is
+        // described while this query is still the one its relations are being read for: a WITH item
+        // PostgreSQL keeps apart is computed when the query above first asks it for a row, and a
+        // description taken afterwards is a reader that asks for one on nobody's behalf.
+        List<RowContext.TableBinding> describedEmpty = null;
+        List<RowContext.OutCol> describedEmptyOutput = null;
+        SelectStmt priorQualifying = executor.fromResolver.qualifyingQuery;
+        List<Expression> priorPushed = executor.fromResolver.qualifyingPushed;
+        executor.fromResolver.qualifyingQuery = stmt;
+        // PostgreSQL pulls a whole chain of derived relations up at once, so a qualification this
+        // query has taken from the query above is handed on to the relation it is built from.
+        executor.fromResolver.qualifyingPushed =
+                enclosingQualification.isEmpty() ? null : enclosingQualification;
+        executor.dmlExecutor.enterColumnDemand(() -> columnsRead(stmt),
+                () -> columnsFiltered(stmt),
+                () -> scanRestrictions(stmt),
+                () -> FromResolver.exposedNamesOf(stmt.from()),
+                () -> executor.fromResolver.readAsJoinAbove(stmt),
+                () -> executor.fromResolver.settledByOneRowOf(stmt));
+        try {
+            if (hasDataModifyingCte(stmt)) {
+                scope = null;
+            } else {
+                List<RowContext.TableBinding> described =
+                        executor.fromResolver.resolveTableBindings(stmt.from());
+                // Describing swallows every relation it cannot follow, so a short list is a list
+                // with a relation missing from it and the columns that relation holds would look
+                // like columns nothing holds.
+                scope = new QueryLevelScope(this, described, null, stmt,
+                        described.size() == FromResolver.relationCount(stmt.from()));
+            }
+            // A join condition belongs to the FROM clause, which PostgreSQL transforms before it
+            // reads any other clause, so this is judged before the select list's calls are.
+            rejectNonBooleanJoinConditions(stmt.from(), scope);
+            FilterCheck.reject(this, stmt, scope);
+            rejectMisplacedSrfs(stmt);
 
-        List<RowContext> contexts = executor.fromResolver.resolveFromClause(
-                stmt.from(), stmt.where(), stmt.having(), stmt);
+            contexts = executor.fromResolver.resolveFromClause(
+                    stmt.from(), stmt.where(), stmt.having(), stmt);
+            if (contexts.isEmpty()) {
+                describedEmpty = executor.fromResolver.resolveTableBindings(stmt.from());
+                describedEmptyOutput =
+                        executor.fromResolver.resolveClauseOutput(stmt.from(), describedEmpty);
+            }
+        } finally {
+            executor.dmlExecutor.exitColumnDemand();
+            executor.fromResolver.qualifyingQuery = priorQualifying;
+            executor.fromResolver.qualifyingPushed = priorPushed;
+        }
 
         List<RowContext.TableBinding> baseBindings;
         // What the FROM clause exposes, in order: every relation's columns except where a USING
@@ -259,8 +1113,8 @@ class SelectExecutor {
             baseOutput = contexts.get(0).outputColumnsOrDefault();
             everyRelation = true;
         } else {
-            baseBindings = executor.fromResolver.resolveTableBindings(stmt.from());
-            baseOutput = executor.fromResolver.resolveClauseOutput(stmt.from(), baseBindings);
+            baseBindings = describedEmpty;
+            baseOutput = describedEmptyOutput;
             everyRelation = baseBindings.size() == FromResolver.relationCount(stmt.from());
         }
         // Reading a relation takes a lock on it, and reading it FOR UPDATE takes a stronger one.
@@ -317,7 +1171,7 @@ class SelectExecutor {
                                     break;
                                 }
                             }
-                            if (!wholeRow) {
+                            if (!wholeRow && !enclosingLevelAnswers(cr)) {
                                 MemgresException colEx = new MemgresException("column \"" + cr.column() + "\" does not exist", "42703");
                                 String hint = RowContext.suggestClosestColumn(cr.column(), baseBindings);
                                 if (hint != null) colEx.setHint(hint);
@@ -355,6 +1209,14 @@ class SelectExecutor {
                             }
                         }
                         if (!tableFound) {
+                            if (hiddenByAlias == null) {
+                                if (enclosingLevelAnswers(cr)) continue;
+                                // A relation of a query this one is written inside, reached by its
+                                // own name after an alias renamed it, is out of reach there for
+                                // the reason it would be out of reach here, and PostgreSQL says so
+                                // rather than calling it a relation the statement never mentioned.
+                                hiddenByAlias = enclosingAliasHiding(cr.table());
+                            }
                             if (hiddenByAlias != null) {
                                 MemgresException ex = new MemgresException(
                                         "invalid reference to FROM-clause entry for table \"" + cr.table() + "\"", "42P01");
@@ -368,6 +1230,16 @@ class SelectExecutor {
                             // when the same lookup fails at evaluation time.
                             MemgresException colEx = new MemgresException(
                                     "column " + cr.table() + "." + cr.column() + " does not exist", "42703");
+                            // A query this one is written inside may be reading a relation of the
+                            // same name that does hold the column, and the name reaches the nearer
+                            // one. PostgreSQL points at the one it could not reach, in place of
+                            // guessing at a near miss among the columns that are here.
+                            if (enclosingLevelHoldsColumn(cr.table(), cr.column())) {
+                                colEx.setDetail("There is a column named \"" + cr.column()
+                                        + "\" in table \"" + cr.table()
+                                        + "\", but it cannot be referenced from this part of the query.");
+                                throw colEx;
+                            }
                             List<RowContext.TableBinding> named = new ArrayList<>();
                             for (RowContext.TableBinding b : baseBindings) {
                                 if (cr.table().equalsIgnoreCase(b.alias())
@@ -443,9 +1315,17 @@ class SelectExecutor {
                     && executor.cteStack.isEmpty()) {
                 executor.validateWhereTypesAgainstTable(stmt.where(), baseBindings.get(0).table());
             }
-            contexts = contexts.stream()
-                    .filter(ctx -> executor.isTruthy(executor.evalExpr(stmt.where(), ctx)))
-                    .collect(Collectors.toList());
+            final Expression qualification = readCheapestFirst(stmt.where());
+            // A sub-select written among the parts stands under the whole qualification, because
+            // PostgreSQL reads the two as one query and what the other parts say reaches its scan.
+            executor.fromResolver.enterQualification(stmt.where(), loneRelationOf(stmt));
+            try {
+                contexts = contexts.stream()
+                        .filter(ctx -> executor.isTruthy(executor.evalExpr(qualification, ctx)))
+                        .collect(Collectors.toList());
+            } finally {
+                executor.fromResolver.exitQualification();
+            }
             // Track index scan: if WHERE clause is on a table that has indexes, count it
             if (!baseBindings.isEmpty()) {
                 for (RowContext.TableBinding binding : baseBindings) {
@@ -454,6 +1334,54 @@ class SelectExecutor {
                         srcTable.incrementIdxScanCount();
                         break;
                     }
+                }
+            }
+        }
+
+        // A VIRTUAL generated column is not stored: PostgreSQL puts its generation expression
+        // where the reference to the column stood, so the select list's is evaluated for the rows
+        // the WHERE let through and a statement that never names the column never evaluates it at
+        // all. Working every one out as the relation was scanned raised, for a row the query
+        // discards, an error the query never asked for.
+        // Where this query is itself a relation of the query above, that query's qualification has
+        // been pulled down onto this scan, so the rows it discards are discarded here as well.
+        List<RowContext> virtualRows = contexts;
+        if (!enclosingQualification.isEmpty() && readsVirtualColumns(contexts)) {
+            virtualRows = keptByEnclosingQualification(contexts, enclosingQualification, stmt,
+                    readAs, readAsColumns);
+            if (virtualRows.size() < contexts.size()) {
+                executor.fromResolver.derivedQualificationApplied = true;
+            }
+        }
+        virtualRows = readUpToLimit(stmt, virtualRows);
+        // A relation built from this query that exposes, under their own names, every column a
+        // generation expression reads can carry that column generated and work it out itself. That
+        // is what PostgreSQL does: it pulls the query up, so the reference stands in the query
+        // above and the expression is evaluated over the rows that query's joins and its WHERE
+        // kept. Working it out here instead worked it out for rows the join discards.
+        final Map<String, Column> leftToRelation =
+                readAs != null && !readAsArm && !readAsRenamed && !contexts.isEmpty()
+                        && readsVirtualColumns(contexts)
+                        ? derivedGeneratedColumns(stmt, contexts)
+                        : Collections.<String, Column>emptyMap();
+        // What the query above reads is written in the names its alias list gave this query's
+        // columns, so it says nothing about them until it is read back through the list. That is
+        // so whether or not the query above may qualify the relation as well: a WITH item it is
+        // kept apart from is read under its own names just the same.
+        final Map<String, String> writtenTo =
+                readAsColumns == null || readAsColumns.isEmpty() || contexts.isEmpty() ? null
+                        : derivedNameMap(stmt, contexts.get(0).outputColumnsOrDefault(),
+                                readAsColumns);
+        executor.dmlExecutor.computeVirtualColumnsForOutput(virtualRows,
+                () -> columnsReadThrough(stmt, writtenTo), leftToRelationNames(leftToRelation));
+
+        // What a serializable transaction has read, row by row. PostgreSQL's predicate locks are
+        // on the rows a scan returned, which is what the WHERE has just settled; recording the
+        // relation alone made two transactions that touched different rows of it look like a cycle.
+        if (executor.session != null && executor.session.isSerializable()) {
+            for (RowContext ssiCtx : contexts) {
+                for (RowContext.TableBinding ssiBinding : ssiCtx.getBindings()) {
+                    executor.session.trackSsiReadRow(ssiBinding.sourceTable(), ssiBinding.row());
                 }
             }
         }
@@ -495,6 +1423,7 @@ class SelectExecutor {
                     expandTargetsForOrdinals(stmt.targets(), baseBindings, baseOutput);
             if (groupedTargets != stmt.targets()) grouped = stmt.withTargets(groupedTargets);
             groupByValidator.validate(grouped, groupedTargets, baseBindings);
+            fillLeftToRelation(virtualRows, leftToRelation);
             return aggregateEvaluator.executeAggregateSelect(grouped, contexts, baseBindings);
         }
 
@@ -511,6 +1440,7 @@ class SelectExecutor {
         if (hasWindowFunctionInTargets(stmt.targets())
                 || distinctOnNeedsWindowEvaluation(stmt)
                 || windowEvaluator.orderByNeedsWindowEvaluation(stmt)) {
+            fillLeftToRelation(virtualRows, leftToRelation);
             return windowEvaluator.executeWindowSelect(stmt, contexts, baseBindings);
         }
 
@@ -615,7 +1545,7 @@ class SelectExecutor {
                             lockable = false;
                             break;
                         }
-                        if (!b.table().getRows().contains(b.row())) {
+                        if (!rowStillStored(b, b.row())) {
                             lockable = false;
                             break;
                         }
@@ -647,20 +1577,78 @@ class SelectExecutor {
             final Set<String> targets = lockTargets;
             SelectStmt.LockClause lc = stmt.lockClause();
             final String lockMode = lc.mode();
+            List<RowContext> relocked = new ArrayList<>(contexts.size());
+            // The relations this query locks rows in, as it found them, kept only once a wait is
+            // really about to happen. See the second reading of the qualification below.
+            Map<String, List<Object[]>> asOfStatement = new LinkedHashMap<>();
+            // Which stored row each row of this transaction's snapshot stands for, by relation.
+            Map<String, Map<Object[], Object[]>> storedBehind = new LinkedHashMap<>();
             for (RowContext ctx : contexts) {
-                for (RowContext.TableBinding b : ctx.getBindings()) {
+                List<RowContext.TableBinding> bindings = ctx.getBindings();
+                List<RowContext.TableBinding> rebound = null;
+                List<String> lockedIn = new ArrayList<>(1);
+                List<Object[]> lockedRows = new ArrayList<>(1);
+                boolean gone = false;
+                for (int bi = 0; bi < bindings.size(); bi++) {
+                    RowContext.TableBinding b = bindings.get(bi);
                     if (!isLockTarget(b, targets)) continue;
                     String tName = b.table().getName();
-                    Object[] lockRow = executor.database.liveRowForSnapshotCopy(b.row(), executor.session);
+                    Object[] lockRow = rowToLock(b, storedBehind);
                     if (lc.nowait()) {
                         if (!executor.database.tryLockRow(tName, lockRow, executor.session, lockMode)) {
                             throw new MemgresException("could not obtain lock on row in relation \"" + tName + "\"", "55P03");
                         }
                     } else {
+                        keepRelationAsFound(asOfStatement, b.table(), b.row());
+                        awaitWriterOfRow(b.table(), lockRow);
                         executor.database.lockRowWaiting(tName, lockRow, executor.session, lockMode);
                     }
+                    lockedIn.add(tName);
+                    lockedRows.add(lockRow);
+                    // The wait ended because the transaction holding the row finished with it, so
+                    // the version this query read is not the version it locked. PostgreSQL answers
+                    // from the one it locked: a row that transaction deleted is no longer a row at
+                    // all, and returning the pre-image loses the write the lock was taken to see.
+                    if (!rowStillStored(b, lockRow)) {
+                        rejectIfVersionMovedOn(b, lockRow, false);
+                        rejectIfMovedToAnotherPartition(lockRow, b.storedRow());
+                        gone = true;
+                        break;
+                    }
+                    rejectIfVersionMovedOn(b, lockRow, true);
+                    if (lockRow != b.row()) {
+                        if (rebound == null) rebound = new ArrayList<>(bindings);
+                        rebound.set(bi, new RowContext.TableBinding(
+                                b.table(), b.alias(), lockRow, b.sourceTable()));
+                    }
                 }
+                RowContext locked = ctx;
+                if (!gone && rebound != null) {
+                    locked = new RowContext(rebound);
+                    locked.setOutputColumns(ctx.getOutputColumns());
+                    locked.setUsingColumns(ctx.getUsingColumns());
+                    locked.setOuterJoinNullPadded(ctx.isOuterJoinNullPadded());
+                }
+                // And the qualification is read again against that version: a row that no longer
+                // answers the WHERE is not one the query may report, however long it waited. Only
+                // that row is read again, though -- everything else the qualification reads is
+                // still the relation as this query found it, because PostgreSQL re-reads the
+                // qualification under the snapshot the query started with and substitutes the
+                // locked row alone. A subquery over the same relation that read the write the
+                // query waited for would drop a row the query had already chosen.
+                if (!gone && !lockedRows.isEmpty() && stmt.where() != null
+                        && !qualStillHolds(stmt.where(), locked, asOfStatement)) {
+                    gone = true;
+                }
+                if (gone) {
+                    for (int i = 0; i < lockedRows.size(); i++) {
+                        executor.database.unlockRow(lockedIn.get(i), lockedRows.get(i));
+                    }
+                    continue;
+                }
+                relocked.add(locked);
             }
+            contexts = relocked;
         }
 
         // Apply WITH TIES on contexts before projection (needs access to ORDER BY expressions)
@@ -750,6 +1738,7 @@ class SelectExecutor {
             resultRows = applyOffsetAndLimit(stmt, resultRows);
         }
 
+        leaveGenerated(resultColumns, leftToRelation);
         return QueryResult.select(resultColumns, resultRows);
     }
 
@@ -1429,6 +2418,23 @@ class SelectExecutor {
                             projections.add(ctx -> ctx.getBindings().get(bindingIdx).row()[colIdx]);
                         }
                     }
+                    // A star is qualified by a name like any other reference, so a name this
+                    // query's FROM clause has not got is looked for in the query it stands
+                    // inside, which is where PostgreSQL looks. The row that query is on is one
+                    // row for the whole of this query's run, so what the star expands to is the
+                    // values it is holding.
+                    if (!named) {
+                        RowContext.TableBinding outer = enclosingBindingNamed(w.table());
+                        if (outer != null) {
+                            named = true;
+                            final Object[] outerRow = outer.row();
+                            for (int i = 0; i < outer.table().getColumns().size(); i++) {
+                                resultColumns.add(copyColumnWithOid(outer.table(), i));
+                                final int colIdx = i;
+                                projections.add(ctx -> outerRow[colIdx]);
+                            }
+                        }
+                    }
                     // A qualifier no FROM item answers to expands to nothing at all, which is a
                     // query returning rows of no columns rather than the refusal it should be.
                     if (!named && !baseBindings.isEmpty()) {
@@ -1614,6 +2620,13 @@ class SelectExecutor {
                     }
                 }
             }
+        }
+        if (expr instanceof SubscriptExpr) {
+            // One element of an array of a composite is a value of that composite, so (cs[1]).*
+            // lists the composite's own fields -- the array's declaration is what says which
+            // composite, the type the subscript answers with saying only "text".
+            return executor.compositeTypeHandler.arrayElementCompositeType(
+                    ((SubscriptExpr) expr).base(), new RowContext(baseBindings));
         }
         if (expr instanceof FieldAccessExpr) {
             FieldAccessExpr fa = (FieldAccessExpr) expr;
@@ -2476,6 +3489,97 @@ class SelectExecutor {
     }
 
     /**
+     * Whether a query this one is written inside answers to a name this level has not got.
+     *
+     * <p>A subquery stands in the scope of the query around it, and PostgreSQL resolves a name its
+     * own FROM clause does not supply against that query, and against the query around that,
+     * before it complains about it. The select list is no different from WHERE in this: refusing a
+     * name here that an enclosing row supplies turned an ordinary correlated reference written in
+     * a subquery's select list into a missing FROM-clause entry.
+     *
+     * <p>The search stops at the first enclosing level with anything to say about the name — the
+     * value it holds, or a complaint of its own — because that is the level PostgreSQL resolves
+     * the reference against, and evaluating the reference walks the same levels in the same order
+     * and so repeats whatever that level has to say.
+     */
+    private boolean enclosingLevelAnswers(ColumnRef ref) {
+        for (Iterator<RowContext> it = executor.outerContextStack.descendingIterator(); it.hasNext(); ) {
+            RowContext outer = it.next();
+            try {
+                outer.resolveColumn(ref.table(), ref.column());
+                return true;
+            } catch (MemgresException e) {
+                // The one complaint that means "not at this level, ask the next one out": a
+                // qualifier none of its entries answers to, or -- for a name written bare -- a
+                // column none of its entries holds.
+                String notHere = ref.table() == null ? "42703" : "42P01";
+                if (!notHere.equals(e.getSqlState())) return true;
+                // A bare name may be that level's own row rather than a column of it.
+                if (ref.table() == null && bindsRelationNamed(outer, ref.column())) return true;
+            }
+        }
+        return false;
+    }
+
+    /** Whether a row binds a relation under this name, which a bare reference to it reads whole. */
+    private static boolean bindsRelationNamed(RowContext ctx, String name) {
+        return bindingNamedIn(ctx, name) != null;
+    }
+
+    /** Whether a query this one is written inside reads a relation of that name holding a column. */
+    private boolean enclosingLevelHoldsColumn(String qualifier, String column) {
+        for (Iterator<RowContext> it = executor.outerContextStack.descendingIterator(); it.hasNext(); ) {
+            for (RowContext.TableBinding b : it.next().getBindings()) {
+                if (b.table() == null) continue;
+                String exposed = b.alias() != null ? b.alias() : b.table().getName();
+                if (exposed == null || !exposed.equalsIgnoreCase(qualifier)) continue;
+                if (b.table().getColumnIndex(column) >= 0) return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * The alias covering a relation of that name in a query this one is written inside, or null
+     * where no enclosing query is reading one. An alias is the only name its relation answers to,
+     * so the relation is there and out of reach rather than absent.
+     */
+    private String enclosingAliasHiding(String name) {
+        for (Iterator<RowContext> it = executor.outerContextStack.descendingIterator(); it.hasNext(); ) {
+            for (RowContext.TableBinding b : it.next().getBindings()) {
+                if (b.alias() == null || b.table() == null) continue;
+                String own = b.table().getName();
+                if (own != null && own.equalsIgnoreCase(name) && !b.alias().equalsIgnoreCase(own)) {
+                    return b.alias();
+                }
+            }
+        }
+        return null;
+    }
+
+    /** The relation an enclosing query answers to under this name, innermost query first. */
+    private RowContext.TableBinding enclosingBindingNamed(String name) {
+        if (name == null) return null;
+        for (Iterator<RowContext> it = executor.outerContextStack.descendingIterator(); it.hasNext(); ) {
+            RowContext.TableBinding found = bindingNamedIn(it.next(), name);
+            if (found != null) return found;
+        }
+        return null;
+    }
+
+    /** The one binding of a row that answers to a name, or null where none or several do. */
+    private static RowContext.TableBinding bindingNamedIn(RowContext ctx, String name) {
+        RowContext.TableBinding found = null;
+        for (RowContext.TableBinding b : ctx.getBindings()) {
+            String exposed = b.alias() != null ? b.alias() : b.table().getName();
+            if (exposed == null || !exposed.equalsIgnoreCase(name)) continue;
+            if (found != null && found != b) return null;
+            found = b;
+        }
+        return found;
+    }
+
+    /**
      * The one case SQL lets two FROM items share a name: both are relations written without an
      * alias, and they are different relations. {@code FROM public.t, other.t} is legal because
      * either can still be reached by writing its schema; give either an alias, or let one of them
@@ -3137,6 +4241,169 @@ class SelectExecutor {
             if (jf.right() != null) collectLockTargets(jf.right(), out);
         }
         // Subqueries and set-returning functions have no lockable base rows of their own
+    }
+
+    /**
+     * Keep the relation holding a row that is about to be waited for, as this query found it.
+     *
+     * <p>Nothing is kept for a row nobody else is writing: the wait for such a row ends with the
+     * relation holding exactly what it held, so there is nothing for a second reading of the
+     * qualification to be misled by, and a query locking rows in a large relation should not pay
+     * for a copy of it.
+     */
+    private void keepRelationAsFound(Map<String, List<Object[]>> images, Table table, Object[] row) {
+        if (executor.session == null || table == null) return;
+        if (!executor.database.isRowBeingUpdatedByOtherSession(row, executor.session)) return;
+        String schemaName = executor.database.schemaNameOf(table);
+        if (schemaName == null) schemaName = table.getSchemaName();
+        String key = schemaName + "." + table.getName();
+        if (images.containsKey(key)) return;
+        List<Object[]> image = executor.session.committedImageOf(key, table);
+        if (image != null) images.put(key, image);
+    }
+
+    /** Read the qualification again, with each kept relation read from the image kept of it. */
+    private boolean qualStillHolds(Expression where, RowContext ctx, Map<String, List<Object[]>> images) {
+        List<String> reading = new ArrayList<>(images.size());
+        for (Map.Entry<String, List<Object[]>> image : images.entrySet()) {
+            if (executor.session.readImageOf(image.getKey(), image.getValue())) {
+                reading.add(image.getKey());
+            }
+        }
+        try {
+            return executor.isTruthy(executor.evalExpr(where, ctx));
+        } finally {
+            for (String key : reading) executor.session.stopReadingImageOf(key);
+        }
+    }
+
+    /**
+     * The row a FOR UPDATE really takes its lock on.
+     *
+     * <p>A transaction reading from a snapshot is handed copies of the values rather than the
+     * rows themselves, and a row lock belongs to the row: locking a copy nobody else can reach
+     * found no conflict at all, so the query came back at once where PostgreSQL waits -- and
+     * then, the copy being stored nowhere, reported no row. The snapshot knows which stored row
+     * each of its rows stands for, and that is the row to wait for and to lock. A version another
+     * session is part-way through replacing is a pre-image of a stored row and resolves the same
+     * way.
+     */
+    private Object[] rowToLock(RowContext.TableBinding b,
+                               Map<String, Map<Object[], Object[]>> storedBehind) {
+        Object[] row = b.row();
+        if (executor.session != null && b.table() != null) {
+            String key = relationKey(b.table());
+            Map<Object[], Object[]> behind = storedBehind.get(key);
+            if (behind == null) {
+                behind = executor.session.storedRowsBehindSnapshot(key);
+                storedBehind.put(key, behind);
+            }
+            Object[] stored = behind.get(row);
+            if (stored == null) stored = executor.session.snapshotRowTuple(key, row);
+            if (stored != null) row = stored;
+        }
+        return executor.database.liveRowForSnapshotCopy(row, executor.session);
+    }
+
+    /**
+     * Wait for the transaction that is part-way through writing the row this query means to lock.
+     *
+     * <p>A row lock is taken in the relation the query named, so it finds nothing to wait for when
+     * the write was made through another name for the same row: an UPDATE that takes a row out of
+     * the partition holding it is written through the partitioned table and locked through the
+     * partition. The query then decided what had become of the row while the transaction that was
+     * moving it had settled nothing, and refused a lock that PostgreSQL grants whenever that
+     * transaction ends up rolling back. PostgreSQL waits for the transaction itself; only once it
+     * is over do the questions below -- is the row still stored, has its version moved on, has it
+     * gone to another partition -- have the answers it decides on.
+     */
+    private void awaitWriterOfRow(Table table, Object[] lockRow) {
+        final Session me = executor.session;
+        if (me == null || table == null || lockRow == null) return;
+        final String key = relationKey(table);
+        Session writing = null;
+        for (Session other : executor.database.getActiveSessions()) {
+            if (other == me) continue;
+            if (writesRow(other, key, lockRow)) { writing = other; break; }
+        }
+        if (writing == null) return;
+        final Session waitFor = writing;
+        executor.database.awaitConcurrentWrite(me, waitFor,
+                () -> writesRow(waitFor, key, lockRow), table.getName());
+    }
+
+    /** Whether a transaction has a write of its own in flight on this row of this relation. */
+    private static boolean writesRow(Session other, String key, Object[] row) {
+        if (!other.isInTransaction() || other.isDoomed()) return false;
+        for (Object[] gone : other.getUncommittedDeletes(key)) {
+            if (gone == row) return true;
+        }
+        return other.getUncommittedUpdates(key).containsKey(row);
+    }
+
+    /**
+     * Refuse a lock on a row that has moved on since the snapshot this query reads from.
+     *
+     * <p>A REPEATABLE READ or SERIALIZABLE transaction may act only on the version of a row its
+     * snapshot holds. Once the wait ends and the row has been written or deleted by a transaction
+     * that committed in the meantime, PostgreSQL has no version to give it that both answers the
+     * query and belongs to the snapshot, so it ends the transaction instead. READ COMMITTED has
+     * no such trouble: it reads whatever the row has become and carries on.
+     */
+    private void rejectIfVersionMovedOn(RowContext.TableBinding b, Object[] lockRow,
+                                        boolean stillStored) {
+        if (executor.session == null || b.table() == null) return;
+        if (!executor.session.readsFromSnapshot()) return;
+        String key = relationKey(b.table());
+        long[] wasReading = executor.session.tupleIdentityOfCopy(key, b.row());
+        if (wasReading == null || wasReading.length < 5) return;
+        if (stillStored) {
+            Table storage = executor.session.snapshotRowStorage(key, b.row());
+            long[] nowThere = executor.database
+                    .getRowMeta(storage == null ? key : relationKey(storage)).get(lockRow);
+            if (nowThere != null && nowThere.length >= 5 && nowThere[4] == wasReading[4]) return;
+        }
+        throw new MemgresException("could not serialize access due to concurrent update", "40001");
+    }
+
+    /** The name a relation is snapshotted and keeps its row metadata under. */
+    private static String relationKey(Table table) {
+        return table.getSchemaName() + "." + table.getName();
+    }
+
+    /**
+     * Refuse a lock whose row another transaction moved into a different partition.
+     *
+     * <p>PostgreSQL will not follow a row across relations, so a query that waited for the lock
+     * has nothing left to lock and is told so rather than quietly dropping a row it had already
+     * chosen. See the same refusal on the write paths.
+     */
+    private void rejectIfMovedToAnotherPartition(Object[] lockRow, Object[] storedRow) {
+        if (executor.session == null) return;
+        for (Session other : executor.database.getActiveSessions()) {
+            if (other == executor.session) continue;
+            if (other.movedRowToAnotherPartition(lockRow)
+                    || other.movedRowToAnotherPartition(storedRow)) {
+                throw DmlExecutor.movedToAnotherPartition(executor.session);
+            }
+        }
+    }
+
+    /**
+     * Whether a row a lock was taken on is still stored.
+     *
+     * <p>Which relation to ask is the question a partitioned table and an inheritance parent
+     * answer differently from an ordinary one: a partitioned table stores nothing of its own and
+     * an inheritance parent need not store what its children hold, so asking the relation the
+     * query named said that every row read through either of them had gone, and the query
+     * reported none of them. A row read through such a relation is also rearranged into its
+     * columns, and it is the row where it lives that the relation below still holds.
+     */
+    private static boolean rowStillStored(RowContext.TableBinding b, Object[] lockRow) {
+        if (DmlExecutor.relationOrDescendantHolds(b.table(), lockRow)) return true;
+        Object[] stored = b.storedRow();
+        return stored != null && stored != lockRow
+                && DmlExecutor.relationOrDescendantHolds(b.table(), stored);
     }
 
     /** True when this row binding belongs to one of the FOR UPDATE lock targets. */

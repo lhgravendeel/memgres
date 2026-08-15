@@ -19,7 +19,12 @@ class DdlPolicyParser {
     CreatePolicyStmt parseCreatePolicy() {
         String name = parser.readIdentifier();
         parser.expectKeyword("ON");
+        String schema = null;
         String table = parser.readIdentifier();
+        // The relation a policy is on may be written with the schema that holds it. Reading the
+        // qualifier as the whole name left the statement looking for a relation called after the
+        // schema, and the one it named was never reached.
+        if (parser.match(TokenType.DOT)) { schema = table; table = parser.readIdentifier(); }
 
         // AS {PERMISSIVE|RESTRICTIVE}
         String policyType = "PERMISSIVE";
@@ -62,7 +67,8 @@ class DdlPolicyParser {
         if (exprs[0] != null && "INSERT".equals(command)) {
             throw PgErrors.syntax("only WITH CHECK expression allowed for INSERT");
         }
-        return new CreatePolicyStmt(name, table, command, exprs[0], exprs[1], policyType, roles);
+        return new CreatePolicyStmt(name, table, command, exprs[0], exprs[1], policyType, roles,
+                schema);
     }
 
     DropStmt parseDropPolicy() {
@@ -71,7 +77,15 @@ class DdlPolicyParser {
         String onTable = null;
         if (parser.matchKeyword("ON")) {
             onTable = parser.readIdentifier();
+            // The relation a policy is on may be written with the schema that holds it, and the
+            // drop has to look for the policy on that schema's relation rather than on one called
+            // after the schema.
+            if (parser.match(TokenType.DOT)) onTable = onTable + "." + parser.readIdentifier();
         }
+        // PostgreSQL's DROP POLICY names one policy: its grammar has no list at all, so a comma
+        // after the relation is where the statement stops making sense. Reading on regardless took
+        // the first policy of the list down and said nothing about the rest of it.
+        if (parser.check(TokenType.COMMA)) throw ParseException.at(parser.peek());
         boolean cascade = parser.matchKeyword("CASCADE");
         parser.matchKeyword("RESTRICT");
         return new DropStmt(DropStmt.ObjectType.POLICY, name, onTable, ifExists, cascade);
@@ -80,7 +94,11 @@ class DdlPolicyParser {
     AlterPolicyStmt parseAlterPolicy() {
         String name = parser.readIdentifier();
         parser.expectKeyword("ON");
+        String schema = null;
         String table = parser.readIdentifier();
+        // The relation a policy is on may be written with the schema that holds it, here as much
+        // as where the policy was written.
+        if (parser.match(TokenType.DOT)) { schema = table; table = parser.readIdentifier(); }
 
         // ALTER POLICY name ON table RENAME TO newname
         if (parser.matchKeywords("RENAME", "TO")) {
@@ -90,7 +108,8 @@ class DdlPolicyParser {
                 Token cmdToken = parser.advance();
                 throw new ParseException("syntax error at or near \"" + cmdToken.value() + "\"", cmdToken);
             }
-            return new AlterPolicyStmt(name, table, newName, null, null);
+            return new AlterPolicyStmt(name, table, newName, null, null,
+                    java.util.Collections.<String>emptyList(), schema);
         }
 
         // The command a policy guards is fixed when it is created; only the roles and the
@@ -107,7 +126,7 @@ class DdlPolicyParser {
         }
 
         Expression[] exprs = parseUsingWithCheck();
-        return new AlterPolicyStmt(name, table, null, exprs[0], exprs[1], roles);
+        return new AlterPolicyStmt(name, table, null, exprs[0], exprs[1], roles, schema);
     }
 
     /** Shared parsing for USING (expr) and WITH CHECK (expr) clauses. */

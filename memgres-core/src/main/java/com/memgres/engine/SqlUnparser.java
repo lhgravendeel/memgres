@@ -22,6 +22,118 @@ public class SqlUnparser {
      */
     private static final ThreadLocal<String> qualifyingSchema = new ThreadLocal<String>();
 
+    /**
+     * The relation whose name may be left off a column reference, or null when every reference is
+     * written with the relation it comes from.
+     *
+     * <p>PostgreSQL prefixes a column with its relation only where the prefix says something: a
+     * query that reads exactly one relation, and is not itself inside another query, needs none,
+     * so {@code SELECT * FROM t} is stored as {@code SELECT i, v FROM t} and not as
+     * {@code SELECT t.i, t.v FROM t}. Everything else keeps the prefix — a join, a sub-select
+     * (whose columns may come from the query around it), a set operation's arms.
+     */
+    private static final ThreadLocal<String> bareRelation = new ThreadLocal<String>();
+
+    /** Whether a query is already being deparsed, which makes the next one a sub-select. */
+    private static final ThreadLocal<Boolean> insideQuery = new ThreadLocal<Boolean>();
+
+    /**
+     * The relation a query's columns can only have come from, or null when there is more than one
+     * or when the single item is not a plain relation.
+     */
+    private static String soleRelationAlias(SelectStmt sel) {
+        if (sel == null || sel.from() == null || sel.from().size() != 1) return null;
+        SelectStmt.FromItem only = sel.from().get(0);
+        if (!(only instanceof SelectStmt.TableRef)) return null;
+        SelectStmt.TableRef ref = (SelectStmt.TableRef) only;
+        return ref.alias() != null ? ref.alias() : ref.table();
+    }
+
+    /** The state to restore once this query has been deparsed. */
+    private static Object[] enterQuery(SelectStmt sel) {
+        Object[] prior = new Object[]{bareRelation.get(), insideQuery.get()};
+        bareRelation.set(prior[1] == null ? soleRelationAlias(sel) : null);
+        insideQuery.set(Boolean.TRUE);
+        return prior;
+    }
+
+    private static void leaveQuery(Object[] prior) {
+        bareRelation.set((String) prior[0]);
+        insideQuery.set((Boolean) prior[1]);
+    }
+
+    /**
+     * The declared type of a column of one of the relations a stored query reads, or null when
+     * the caller cannot say. Supplied only where the relations can be looked up; without it an
+     * untyped literal is printed as it was written.
+     */
+    public interface ColumnTypes {
+        /** @param relation the alias or relation name written before the column, or null */
+        String typeOf(String relation, String column);
+    }
+
+    /** The column types of the query being deparsed, or null when the caller supplied none. */
+    private static final ThreadLocal<ColumnTypes> readColumnTypes = new ThreadLocal<ColumnTypes>();
+
+    /**
+     * Deparse a stored query with the types of the relations it reads to hand, so that a literal
+     * that was still of type {@code unknown} when the query was written is printed as the constant
+     * PostgreSQL resolved it to.
+     */
+    public static String toSqlPretty(Statement stmt, ColumnTypes types) {
+        readColumnTypes.set(types);
+        try {
+            return toSqlPretty(stmt);
+        } finally {
+            readColumnTypes.remove();
+        }
+    }
+
+    /**
+     * An operand of an operator, as PostgreSQL prints it after parse analysis.
+     *
+     * <p>A bare string literal has no type of its own: compared with a column, it is read as a
+     * value of that column's type, and PostgreSQL prints the constant that came of it. The label
+     * is dropped only where reading the text back gives the same type again — {@code x = 4} for an
+     * integer column, but {@code v = 'v'::text} for a text one, which is the rule
+     * {@code get_const_expr} follows.
+     */
+    private static String comparedToSql(BinaryExpr op, Expression self, Expression sibling,
+                                        String written) {
+        ColumnTypes types = readColumnTypes.get();
+        if (types == null || !isComparison(op.op())) return written;
+        if (!(self instanceof Literal)
+                || ((Literal) self).literalType() != Literal.LiteralType.STRING
+                || !(sibling instanceof ColumnRef)) {
+            return written;
+        }
+        ColumnRef ref = (ColumnRef) sibling;
+        String typeName = types.typeOf(ref.table(), ref.column());
+        DataType dt = typeName == null ? null : DataType.fromPgName(typeName);
+        if (dt == null) return written;
+        String value = ((Literal) self).value();
+        if (dt == DataType.INTEGER) {
+            try {
+                return String.valueOf(Integer.parseInt(value.trim()));
+            } catch (NumberFormatException notThisType) {
+                return written;
+            }
+        }
+        if (dt == DataType.BOOLEAN) return written;
+        return written + "::" + dt.toRegtypeDisplay();
+    }
+
+    /** True for the operators that resolve an untyped literal against the other operand's type. */
+    private static boolean isComparison(BinaryExpr.BinOp op) {
+        switch (op) {
+            case EQUAL: case NOT_EQUAL: case LESS_THAN: case GREATER_THAN:
+            case LESS_EQUAL: case GREATER_EQUAL:
+                return true;
+            default:
+                return false;
+        }
+    }
+
     /** Deparse a stored definition with unqualified relations written under {@code schema}. */
     public static String toSqlQualified(com.memgres.engine.parser.ast.Statement stmt, String schema,
                                         boolean pretty) {
@@ -97,7 +209,14 @@ public class SqlUnparser {
             // The space that separated this clause from the one before belongs to neither now
             // that a newline does; leaving it turns into trailing whitespace at end of line.
             while (end > cut[i] && Character.isWhitespace(sql.charAt(end - 1))) end--;
-            out.append(CLAUSE_INDENTS[i][1]).append(sql, cut[i], end);
+            String clause = sql.substring(cut[i], end);
+            // PostgreSQL gives every relation of a comma-separated FROM list a line of its own,
+            // lined up under the first one. Only the commas between the items break: the ones
+            // inside a function call's arguments or a sub-select belong to those.
+            if (i == 0 && clause.indexOf(',') >= 0) {
+                clause = joinTrimmed(splitTopLevel(clause), ",\n    ");
+            }
+            out.append(CLAUSE_INDENTS[i][1]).append(clause);
         }
         return out.toString();
     }
@@ -200,6 +319,15 @@ public class SqlUnparser {
     }
 
     private static String selectToSql(SelectStmt sel) {
+        Object[] prior = enterQuery(sel);
+        try {
+            return selectBodyToSql(sel);
+        } finally {
+            leaveQuery(prior);
+        }
+    }
+
+    private static String selectBodyToSql(SelectStmt sel) {
         StringBuilder sb = new StringBuilder("SELECT ");
         if (sel.distinct()) sb.append("DISTINCT ");
 
@@ -270,11 +398,23 @@ public class SqlUnparser {
     }
 
     private static String targetToSql(SelectStmt.SelectTarget target) {
-        String expr = exprToSql(target.expr());
+        String expr = targetExprToSql(target.expr(), exprToSql(target.expr()));
         if (target.alias() != null) {
             return expr + " AS " + target.alias();
         }
         return expr;
+    }
+
+    /**
+     * A select item as PostgreSQL prints it, which is the item after analysis rather than as it
+     * was written. A bare string literal is still of type {@code unknown} while the query is being
+     * read, and a column of a stored query may not stay unknown: PostgreSQL resolves it to text,
+     * so {@code SELECT 'v' AS lit} comes back as {@code SELECT 'v'::text AS lit}.
+     */
+    private static String targetExprToSql(Expression expr, String written) {
+        boolean untypedLiteral = expr instanceof Literal
+                && ((Literal) expr).literalType() == Literal.LiteralType.STRING;
+        return untypedLiteral ? written + "::text" : written;
     }
 
     private static String fromItemToSql(SelectStmt.FromItem item) {
@@ -324,13 +464,18 @@ public class SqlUnparser {
             }
         } else if (expr instanceof ColumnRef) {
             ColumnRef ref = (ColumnRef) expr;
-            return (ref.table() != null ? ref.table() + "." : "") + ref.column();
+            String written = bareRelation.get();
+            boolean prefixSaysNothing = written != null && ref.table() != null
+                    && written.equalsIgnoreCase(ref.table());
+            return (ref.table() != null && !prefixSaysNothing ? ref.table() + "." : "") + ref.column();
         } else if (expr instanceof WildcardExpr) {
             WildcardExpr w = (WildcardExpr) expr;
             return w.table() != null ? w.table() + ".*" : "*";
         } else if (expr instanceof BinaryExpr) {
             BinaryExpr bin = (BinaryExpr) expr;
-            return "(" + exprToSql(bin.left()) + " " + binOpToSql(bin.op()) + " " + exprToSql(bin.right()) + ")";
+            return "(" + comparedToSql(bin, bin.left(), bin.right(), exprToSql(bin.left()))
+                    + " " + binOpToSql(bin.op()) + " "
+                    + comparedToSql(bin, bin.right(), bin.left(), exprToSql(bin.right())) + ")";
         } else if (expr instanceof CustomOperatorExpr) {
             CustomOperatorExpr cop = (CustomOperatorExpr) expr;
             if (cop.left() != null) {
@@ -435,7 +580,16 @@ public class SqlUnparser {
     public static String toSqlPretty(Statement stmt) {
         if (!(stmt instanceof SelectStmt)) return toSql(stmt);
         SelectStmt sel = (SelectStmt) stmt;
-        String plain = selectToSql(sel);
+        Object[] prior = enterQuery((SelectStmt) stmt);
+        try {
+            return selectBodyToSqlPretty(sel);
+        } finally {
+            leaveQuery(prior);
+        }
+    }
+
+    private static String selectBodyToSqlPretty(SelectStmt sel) {
+        String plain = selectBodyToSql(sel);
         // Only the clauses that hold a bare expression differ; rebuilding the whole statement
         // would duplicate every clause rule for a difference that is confined to three of them.
         StringBuilder sb = new StringBuilder(plain.length());
@@ -444,7 +598,7 @@ public class SqlUnparser {
         if (sel.targets() != null && !sel.targets().isEmpty()) {
             head = "SELECT " + (sel.distinct() ? "DISTINCT " : "")
                     + sel.targets().stream()
-                        .map(t -> exprToSqlPretty(t.expr(), 0)
+                        .map(t -> targetExprToSql(t.expr(), exprToSqlPretty(t.expr(), 0))
                                 + (t.alias() != null ? " AS " + t.alias() : ""))
                         .collect(Collectors.joining(", "));
         }
@@ -507,11 +661,13 @@ public class SqlUnparser {
         if (expr instanceof BinaryExpr) {
             BinaryExpr bin = (BinaryExpr) expr;
             int prec = precedenceOf(bin.op());
-            String text = exprToSqlPretty(bin.left(), prec)
+            String text = comparedToSql(bin, bin.left(), bin.right(),
+                            exprToSqlPretty(bin.left(), prec))
                     + " " + binOpToSql(bin.op()) + " "
                     // The right operand of a left-associative operator has to say so when it is
                     // another operator of the same strength: a - (b - c) is not a - b - c.
-                    + exprToSqlPretty(bin.right(), prec + 1);
+                    + comparedToSql(bin, bin.right(), bin.left(),
+                            exprToSqlPretty(bin.right(), prec + 1));
             return prec < minPrecedence ? "(" + text + ")" : text;
         }
         if (expr instanceof UnaryExpr) {

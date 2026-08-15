@@ -67,6 +67,17 @@ public class StoredConstraint {
     /** pg_constraint.conperiod: a temporal foreign key, whose last column is a span to cover. */
     private boolean period;
     private boolean noInherit; // CHECK ... NO INHERIT: constraint not inherited by child tables
+    /**
+     * How many parents handed this constraint down and have since dropped their own copy of it
+     * along with the column it tests, without ever withdrawing the rule from this relation.
+     *
+     * <p>PostgreSQL counts the parents a constraint was taken from once, when the relation takes
+     * it, and a copy dropped as a dependency of a dropped column tells the descendants nothing --
+     * so the count stands where it stood, and the relation goes on being refused permission to
+     * withdraw a rule nothing above it declares any more. The links can no longer say how many
+     * those were, so what they contributed is kept here.
+     */
+    private int retainedInheritCount;
     private boolean convalidated = true; // pg_constraint.convalidated: false when added with NOT VALID
     private boolean fromIndex; // true if this constraint was created via CREATE UNIQUE INDEX (not ADD CONSTRAINT)
     private boolean promotedFromIndex; // true if created via ADD CONSTRAINT ... UNIQUE USING INDEX
@@ -117,6 +128,13 @@ public class StoredConstraint {
     public Type getType() { return type; }
     public List<String> getColumns() { return columns; }
     public Expression getCheckExpr() { return checkExpr; }
+
+    /** Parents whose copy of this constraint is gone but whose count this relation still holds. */
+    public int getRetainedInheritCount() { return retainedInheritCount; }
+
+    public void setRetainedInheritCount(int count) {
+        this.retainedInheritCount = count < 0 ? 0 : count;
+    }
     public String getReferencesTable() { return referencesTable; }
     /** Follow the referenced relation through ALTER TABLE ... RENAME TO. */
     public void setReferencesTable(String table) { this.referencesTable = table; }

@@ -85,6 +85,7 @@ public class Parser extends ExpressionParser {
             // that the parser doesn't fully consume (LEAKPROOF, READ WRITE, NOT VALID, etc.)
             if (stmt instanceof SelectStmt || stmt instanceof InsertStmt || stmt instanceof SetOpStmt
                     || stmt instanceof UpdateStmt || stmt instanceof DeleteStmt
+                    || stmt instanceof MergeStmt
                     || stmt instanceof UnlistenStmt || stmt instanceof NotifyStmt
                     || stmt instanceof ListenStmt || stmt instanceof ExplainStmt) {
                 if (t.type() == TokenType.ERROR) {

@@ -12,9 +12,11 @@ import java.util.*;
 class ConstraintValidator {
 
     private final AstExecutor executor;
+    private final DmlTriggerHelper triggerHelper;
 
     ConstraintValidator(AstExecutor executor) {
         this.executor = executor;
+        this.triggerHelper = new DmlTriggerHelper(executor);
     }
 
     /** Find the schema name that contains the given table. */
@@ -63,6 +65,15 @@ class ConstraintValidator {
 
         for (StoredConstraint sc : table.getConstraints()) {
             if (sc.isNotEnforced()) continue;
+            if (sc.getType() == StoredConstraint.Type.EXCLUDE) {
+                // An exclusion constraint is broken by a pair of rows just as a unique one is, so
+                // a row another session has written and not committed is no more decidable here
+                // than there: whether it conflicts depends on that transaction committing.
+                PendingUniqueConflict excluded =
+                        pendingExcludeConflict(table, newRow, excludeRow, sc, pending);
+                if (excluded != null) return excluded;
+                continue;
+            }
             if (sc.getType() != StoredConstraint.Type.PRIMARY_KEY
                     && sc.getType() != StoredConstraint.Type.UNIQUE) {
                 continue;
@@ -99,6 +110,44 @@ class ConstraintValidator {
                 if (allMatch) {
                     return new PendingUniqueConflict(entry.getValue(), candidate, table.getName());
                 }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * The same question for an exclusion constraint: is one of the rows another session has
+     * written and not committed in conflict with the row being written?
+     *
+     * <p>The operators are the constraint's own rather than plain equality, because that is what
+     * decides an exclusion conflict; a NULL on either side takes part in nothing, exactly as it
+     * does in the ordinary scan.
+     */
+    private PendingUniqueConflict pendingExcludeConflict(Table table, Object[] newRow,
+                                                         Object[] excludeRow, StoredConstraint sc,
+                                                         Map<Object[], Session> pending) {
+        List<StoredConstraint.ExcludeElement> elements = sc.getExcludeElements();
+        if (elements == null || elements.isEmpty()) return null;
+        int[] colIndices = new int[elements.size()];
+        for (int i = 0; i < elements.size(); i++) {
+            colIndices[i] = table.getColumnIndex(elements.get(i).column());
+            if (colIndices[i] < 0) return null;
+        }
+        for (Map.Entry<Object[], Session> entry : pending.entrySet()) {
+            Object[] candidate = entry.getKey();
+            if (candidate == excludeRow) continue;
+            boolean allMatch = true;
+            for (int i = 0; i < elements.size(); i++) {
+                Object newVal = colIndices[i] < newRow.length ? newRow[colIndices[i]] : null;
+                Object existVal = colIndices[i] < candidate.length ? candidate[colIndices[i]] : null;
+                if (newVal == null || existVal == null) { allMatch = false; break; }
+                if (!excludeOpMatches(elements.get(i).operator(), newVal, existVal)) {
+                    allMatch = false;
+                    break;
+                }
+            }
+            if (allMatch) {
+                return new PendingUniqueConflict(entry.getValue(), candidate, table.getName());
             }
         }
         return null;
@@ -169,7 +218,11 @@ class ConstraintValidator {
     }
 
     void validateConstraints(Table table, Object[] row, Object[] excludeRow) {
-        // 1. NOT NULL enforcement
+        validateConstraints(table, row, excludeRow, null);
+    }
+
+    /** A column declared NOT NULL takes no row that leaves it empty. */
+    private void requireNotNullColumns(Table table, Object[] row) {
         for (int i = 0; i < table.getColumns().size(); i++) {
             Column col = table.getColumns().get(i);
             if (!col.isNullable() && row[i] == null) {
@@ -187,11 +240,42 @@ class ConstraintValidator {
                 throw ex;
             }
         }
+    }
+
+    /**
+     * What a proposed row has to pass before an ON CONFLICT arbiter is asked about it.
+     *
+     * <p>PostgreSQL judges the row against the columns that may not be null and against the
+     * relation's CHECK constraints while it still holds only what the statement wrote, and only
+     * then looks for a conflicting row -- so a row the arbiter would have skipped is refused for
+     * what it holds all the same, and DO UPDATE never runs for it. The unique constraint the
+     * arbiter is itself about, and the foreign keys PostgreSQL fires as triggers, are asked
+     * afterwards and are left where they are.
+     */
+    void validateBeforeConflictArbitration(Table table, Object[] row) {
+        requireNotNullColumns(table, row);
+        for (StoredConstraint sc : table.getConstraints()) {
+            if (sc.isNotEnforced() || sc.getType() != StoredConstraint.Type.CHECK) continue;
+            if (checkIsCurrentlyDeferred(sc)) continue;
+            validateCheck(table, row, sc);
+        }
+    }
+
+    /**
+     * @param decided a constraint the caller has already settled for this row, or null. A
+     *     referential action checks its own key against the referenced table as that table will be
+     *     once the statement is over; checking it again here, without knowing which rows are going
+     *     away, reports a key that nothing was going to reference.
+     */
+    void validateConstraints(Table table, Object[] row, Object[] excludeRow, StoredConstraint decided) {
+        // 1. NOT NULL enforcement
+        requireNotNullColumns(table, row);
 
         // 2. Constraint checks
         for (StoredConstraint sc : table.getConstraints()) {
             // PG 18: NOT ENFORCED constraints are stored but not validated
             if (sc.isNotEnforced()) continue;
+            if (sc == decided) continue;
 
             // Deferred constraint handling: defer to COMMIT if currently deferred
             boolean shouldDefer = checkIsCurrentlyDeferred(sc);
@@ -303,7 +387,7 @@ class ConstraintValidator {
                     ex.setTable(table.getName());
                     String schema = findSchemaName(table);
                     if (schema != null) ex.setSchema(schema);
-                    ex.setDetail(buildKeyDetail(columns, newVals));
+                    ex.setDetail(buildKeyDetail(table, columns, newVals));
                     throw ex;
                 }
             }
@@ -356,7 +440,7 @@ class ConstraintValidator {
                     ex.setTable(table.getName());
                     String schema = findSchemaName(table);
                     if (schema != null) ex.setSchema(schema);
-                    ex.setDetail(buildKeyDetail(columns, newVals));
+                    ex.setDetail(buildKeyDetail(table, columns, newVals));
                     throw ex;
                 }
                 return;
@@ -394,26 +478,19 @@ class ConstraintValidator {
                 ex.setTable(table.getName());
                 String schema = findSchemaName(table);
                 if (schema != null) ex.setSchema(schema);
-                ex.setDetail(buildKeyDetail(columns, newVals));
+                ex.setDetail(buildKeyDetail(table, columns, newVals));
                 throw ex;
             }
         }
     }
 
-    /** Build PG-style DETAIL string: "Key (col1, col2)=(val1, val2) already exists." */
-    private String buildKeyDetail(List<String> columns, Object[] vals) {
-        StringBuilder sb = new StringBuilder("Key (");
-        for (int i = 0; i < columns.size(); i++) {
-            if (i > 0) sb.append(", ");
-            sb.append(columns.get(i));
-        }
-        sb.append(")=(");
-        for (int i = 0; i < vals.length; i++) {
-            if (i > 0) sb.append(", ");
-            sb.append(vals[i] == null ? "null" : vals[i]);
-        }
-        sb.append(") already exists.");
-        return sb.toString();
+    /**
+     * The DETAIL of a duplicate key: <em>Key (col1, col2)=(val1, val2) already exists.</em> The key
+     * is named as PostgreSQL names it, which is not always as it was written down -- a name needing
+     * quotes gets them, and a key that is an expression is deparsed.
+     */
+    private String buildKeyDetail(Table table, List<String> columns, Object[] vals) {
+        return IndexKeyDescription.alreadyExists(table, columns, vals);
     }
 
     private void validateCheck(Table table, Object[] row, StoredConstraint sc) {
@@ -443,11 +520,21 @@ class ConstraintValidator {
         validateForeignKey(table, row, sc);
     }
 
-    /** True while this constraint's checks are being postponed to COMMIT for the current session. */
+    /**
+     * True while this constraint's checks are being postponed for the current session.
+     *
+     * <p>An explicit transaction is not what makes a constraint deferred. PostgreSQL runs a
+     * statement outside one in an implicit transaction of its own, and a DEFERRABLE INITIALLY
+     * DEFERRED constraint is checked when that transaction commits -- once the statement is over,
+     * with its AFTER triggers and its data-modifying WITH items done -- rather than as each row is
+     * written. Asking for an explicit transaction here checked such a constraint row by row in
+     * autocommit, so a statement that swaps two unique values was refused halfway through it.
+     *
+     * @see Session#runEndOfStatementDeferredChecks()
+     */
     private boolean checkIsCurrentlyDeferred(StoredConstraint sc) {
         return sc.isDeferrable()
                 && executor.session != null
-                && executor.session.isInTransaction()
                 && executor.session.isConstraintCurrentlyDeferred(sc);
     }
 
@@ -460,6 +547,11 @@ class ConstraintValidator {
                                                 StoredConstraint sc, List<String> refColNames,
                                                 Object[] parentVals, String childSchemaName,
                                                 boolean restrict) {
+        // A constraint a partition inherited belongs to the partitioned table, and that is the
+        // relation PostgreSQL names — not the partition the offending row happens to live in.
+        // The DETAIL names it too, so the two halves of the error cannot disagree.
+        String constrainedTable = sc.getInheritedFrom() != null
+                ? sc.getInheritedFrom() : childTable.getName();
         StringBuilder detailSb = new StringBuilder("Key (");
         for (int i = 0; i < refColNames.size(); i++) {
             if (i > 0) detailSb.append(", ");
@@ -471,11 +563,7 @@ class ConstraintValidator {
             detailSb.append(parentVals[i]);
         }
         detailSb.append(") is ").append(restrict ? "" : "still ")
-                .append("referenced from table \"").append(childTable.getName()).append("\".");
-        // A constraint a partition inherited belongs to the partitioned table, and that is the
-        // relation PostgreSQL names — not the partition the offending row happens to live in.
-        String constrainedTable = sc.getInheritedFrom() != null
-                ? sc.getInheritedFrom() : childTable.getName();
+                .append("referenced from table \"").append(constrainedTable).append("\".");
         MemgresException ex = new MemgresException(
                 "update or delete on table \"" + parentTable.getName() + "\" violates "
                         + (restrict ? "RESTRICT setting of " : "")
@@ -585,7 +673,7 @@ class ConstraintValidator {
                 ex.setTable(table.getName());
                 String schema = findSchemaName(table);
                 if (schema != null) ex.setSchema(schema);
-                ex.setDetail(buildKeyDetail(columns, vals));
+                ex.setDetail(buildKeyDetail(table, columns, vals));
                 throw ex;
             }
         }
@@ -628,10 +716,14 @@ class ConstraintValidator {
     private MemgresException parentSideViolation(Table parentTable, Table childTable,
                                                  StoredConstraint sc, Object[] childRow,
                                                  List<String> refColNames) {
+        // A partition's copy of an inherited key belongs to the partitioned table, and that is
+        // the relation PostgreSQL names, in the message and in the detail alike.
+        String constrainedTable = sc.getInheritedFrom() != null
+                ? sc.getInheritedFrom() : childTable.getName();
         MemgresException ex = new MemgresException(
                 "update or delete on table \"" + parentTable.getName()
                         + "\" violates foreign key constraint \"" + sc.getName()
-                        + "\" on table \"" + childTable.getName() + "\"", "23503");
+                        + "\" on table \"" + constrainedTable + "\"", "23503");
         ex.setConstraint(sc.getName());
         ex.setTable(parentTable.getName());
         String schemaName = findSchemaName(parentTable);
@@ -648,7 +740,7 @@ class ConstraintValidator {
             detail.append(idx >= 0 ? childRow[idx] : null);
         }
         detail.append(") is still referenced from table \"")
-              .append(childTable.getName()).append("\".");
+              .append(constrainedTable).append("\".");
         ex.setDetail(detail.toString());
         return ex;
     }
@@ -694,6 +786,9 @@ class ConstraintValidator {
         // Get the FK values from the row
         Object[] fkVals = new Object[fkColIndices.length];
         for (int i = 0; i < fkColIndices.length; i++) {
+            // A key column this relation does not carry describes no value in this row. Reading
+            // past the row's end raised an internal error where there is simply nothing to check.
+            if (fkColIndices[i] < 0 || fkColIndices[i] >= row.length) return;
             fkVals[i] = row[fkColIndices[i]];
         }
 
@@ -727,8 +822,10 @@ class ConstraintValidator {
             searchTables.add(refTable);
         }
 
+        java.util.Set<Object[]> invisible = invisibleReferencedRows(refTable, vanishing);
+
         if (sc.isPeriod()) {
-            if (periodKeyCovered(searchTables, refColNames, sc, table, row, fkColIndices, vanishing)) {
+            if (periodKeyCovered(searchTables, refColNames, sc, table, row, fkColIndices, invisible)) {
                 return;
             }
             throw childSideViolation(table, sc, fkColIndices, fkVals);
@@ -749,8 +846,25 @@ class ConstraintValidator {
             }
             if (selfMatch) found = true;
         }
+        if (!found) found = referencedKeyPresent(searchTables, refColNames, fkVals, invisible);
+        // The key may be gone only because another session is part-way through deleting the row
+        // that holds it, which nothing can decide until that transaction ends. The check waits for
+        // it and then looks again, rather than refusing a write that becomes valid the moment that
+        // transaction rolls back.
+        while (!found && awaitDeletedReferencedRow(searchTables, refColNames, fkVals)) {
+            invisible = invisibleReferencedRows(refTable, vanishing);
+            found = referencedKeyPresent(searchTables, refColNames, fkVals, invisible);
+        }
+
+        if (!found) {
+            throw childSideViolation(table, sc, fkColIndices, fkVals);
+        }
+    }
+
+    /** Whether any of the referenced tables still holds the key, counting no invisible row. */
+    private boolean referencedKeyPresent(List<Table> searchTables, List<String> refColNames,
+                                         Object[] fkVals, java.util.Set<Object[]> invisible) {
         for (Table searchTable : searchTables) {
-            if (found) break;
             // Recompute ref column indices for each partition table (columns should match)
             int[] stRefColIndices = new int[refColNames.size()];
             boolean colsOk = true;
@@ -760,20 +874,18 @@ class ConstraintValidator {
             }
             if (!colsOk) continue;
             TableIndex refIdx = findIndexForColumns(searchTable, refColNames);
-            if (refIdx != null && (vanishing == null || vanishing.isEmpty())) {
-                found = refIdx.containsKey(fkVals);
+            if (refIdx != null && (invisible == null || invisible.isEmpty())) {
+                if (refIdx.containsKey(fkVals)) return true;
             } else if (refIdx != null) {
                 // The key is still in the index, so ask the index which rows hold it and let a row
-                // this statement is deleting count for nothing.
+                // this statement is deleting, or one another session has not committed, count for
+                // nothing.
                 for (Object[] refRow : refIdx.findAll(fkVals)) {
-                    if (!vanishing.contains(refRow)) {
-                        found = true;
-                        break;
-                    }
+                    if (!invisible.contains(refRow)) return true;
                 }
             } else {
                 for (Object[] refRow : searchTable.getRows()) {
-                    if (vanishing != null && vanishing.contains(refRow)) continue;
+                    if (invisible != null && invisible.contains(refRow)) continue;
                     boolean allMatch = true;
                     for (int i = 0; i < stRefColIndices.length; i++) {
                         if (!valuesEqual(fkVals[i], refRow[stRefColIndices[i]])) {
@@ -781,17 +893,58 @@ class ConstraintValidator {
                             break;
                         }
                     }
-                    if (allMatch) {
-                        found = true;
-                        break;
-                    }
+                    if (allMatch) return true;
                 }
             }
         }
+        return false;
+    }
 
-        if (!found) {
-            throw childSideViolation(table, sc, fkColIndices, fkVals);
+    /**
+     * Wait while the key a foreign key wants is missing only because another session has deleted
+     * the row that holds it without committing.
+     *
+     * <p>PostgreSQL takes a share lock on the referenced row to check a foreign key, so a child
+     * write whose parent row another transaction is in the middle of removing waits for that
+     * transaction instead of deciding: whether the key is really gone depends on it. Reporting at
+     * once threw away a write that is valid as soon as that transaction rolls back.
+     *
+     * @return true when there was something to wait for, so the caller looks for the key again
+     */
+    private boolean awaitDeletedReferencedRow(List<Table> searchTables, List<String> refColNames,
+                                              Object[] fkVals) {
+        if (executor.session == null || executor.database == null) return false;
+        if (!anyOtherOpenTransaction()) return false;
+        for (Table searchTable : searchTables) {
+            int[] indices = new int[refColNames.size()];
+            boolean colsOk = true;
+            for (int i = 0; i < refColNames.size(); i++) {
+                indices[i] = searchTable.getColumnIndex(refColNames.get(i));
+                if (indices[i] < 0) { colsOk = false; break; }
+            }
+            if (!colsOk) continue;
+            final String key = uncommittedKey(searchTable);
+            for (Session other : executor.database.getActiveSessions()) {
+                if (other == executor.session || other.isDoomed() || !other.isInTransaction()) continue;
+                for (Object[] gone : other.getUncommittedDeletes(key)) {
+                    if (!rowHoldsKey(gone, indices, fkVals)) continue;
+                    final Session blocker = other;
+                    final Object[] waitedFor = gone;
+                    executor.database.awaitConcurrentWrite(executor.session, blocker,
+                            () -> stillDeleting(blocker, key, waitedFor), searchTable.getName());
+                    return true;
+                }
+            }
         }
+        return false;
+    }
+
+    /** True while the row is still a delete that session has not committed. */
+    private static boolean stillDeleting(Session other, String schemaTable, Object[] row) {
+        for (Object[] candidate : other.getUncommittedDeletes(schemaTable)) {
+            if (candidate == row) return true;
+        }
+        return false;
     }
 
     /** PostgreSQL's child-side wording for a key the referenced table does not hold. */
@@ -813,7 +966,7 @@ class ConstraintValidator {
         detailSb.append(")=(");
         for (int i = 0; i < fkColIndices.length; i++) {
             if (i > 0) detailSb.append(", ");
-            detailSb.append(fkVals[i]);
+            detailSb.append(ErrorValueText.of(fkVals[i]));
         }
         detailSb.append(") is not present in table \"").append(sc.getReferencesTable()).append("\".");
         ex.setDetail(detailSb.toString());
@@ -913,8 +1066,12 @@ class ConstraintValidator {
             if (colIndices[i] < 0) return;
         }
 
+        // Rows a failed transaction wrote are dead: they exclude nothing any more, exactly as they
+        // hold no unique key any more.
+        final java.util.Set<Object[]> dead = deadUncommittedRows(table);
         for (Object[] existingRow : table.getRows()) {
             if (existingRow == excludeRow) continue;
+            if (dead.contains(existingRow)) continue;
             boolean allMatch = true;
             for (int i = 0; i < elements.size(); i++) {
                 Object newVal = newRow[colIndices[i]];
@@ -956,7 +1113,7 @@ class ConstraintValidator {
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < colIndices.length; i++) {
             if (i > 0) sb.append(", ");
-            sb.append(row[colIndices[i]]);
+            sb.append(ErrorValueText.of(row[colIndices[i]]));
         }
         return sb.toString();
     }
@@ -965,6 +1122,11 @@ class ConstraintValidator {
         switch (op) {
             case "=":
                 return valuesEqual(a, b);
+            // The operator is what decides a conflict, so <> excludes every value unlike the one
+            // already stored: a second row is refused unless it holds exactly the same value.
+            case "<>":
+            case "!=":
+                return !valuesEqual(a, b);
             case "&&":
                 return rangesOverlap(a.toString(), b.toString());
             default:
@@ -1091,6 +1253,7 @@ class ConstraintValidator {
                 throw new MemgresException("there is no primary key for referenced table \""
                         + refTableName + "\"", "42704");
             }
+            rejectDeferrableReferencedKey(refTable, refCols, refTableName, true);
         } else {
             for (String col : refCols) {
                 requireKeyColumn(refTable, col);
@@ -1110,6 +1273,7 @@ class ConstraintValidator {
                 throw new MemgresException("there is no unique constraint matching given keys for referenced table \""
                         + refTableName + "\"", "42830");
             }
+            if (!fk.isPeriod()) rejectDeferrableReferencedKey(refTable, refCols, refTableName, false);
             if (fk.isPeriod()) requirePeriodColumnsAreRanges(table, refTable, fk, refCols);
         }
         if (fkCols.size() != refCols.size()) {
@@ -1153,6 +1317,31 @@ class ConstraintValidator {
             if (col.isPrimaryKey()) pkCols.add(col.getName());
         }
         return pkCols;
+    }
+
+    /**
+     * A foreign key is checked as the row is written, and a deferrable key's index need not be
+     * unique at that moment: PostgreSQL will not build a foreign key over one at all. How it words
+     * the refusal follows the statement rather than the key -- a reference that named no columns
+     * went to the primary key and is told so.
+     */
+    private static void rejectDeferrableReferencedKey(Table refTable, List<String> refCols,
+                                                      String refTableName, boolean impliedKey) {
+        for (StoredConstraint sc : refTable.getConstraints()) {
+            if (sc.getType() != StoredConstraint.Type.PRIMARY_KEY
+                    && sc.getType() != StoredConstraint.Type.UNIQUE) continue;
+            if (!sc.isDeferrable() || sc.getWhereExpr() != null) continue;
+            List<String> cols = sc.getColumns();
+            if (cols == null || cols.size() != refCols.size()) continue;
+            boolean allPresent = true;
+            for (String want : refCols) {
+                if (!StoredConstraint.containsIgnoreCase(cols, want)) { allPresent = false; break; }
+            }
+            if (!allPresent) continue;
+            throw new MemgresException("cannot use a deferrable "
+                    + (impliedKey ? "primary key" : "unique constraint")
+                    + " for referenced table \"" + refTableName + "\"", "55000");
+        }
     }
 
     /**
@@ -1268,6 +1457,119 @@ class ConstraintValidator {
         return indices;
     }
 
+    /** The lower-cased names of the columns an action writes, for {@code UPDATE OF} triggers. */
+    private java.util.Set<String> actionColumnNames(Table childTable, int[] indices) {
+        java.util.Set<String> names = new LinkedHashSet<>();
+        for (int idx : indices) {
+            if (idx >= 0 && idx < childTable.getColumns().size()) {
+                names.add(childTable.getColumns().get(idx).getName().toLowerCase());
+            }
+        }
+        return names;
+    }
+
+    /**
+     * One row a referential action is about to rewrite: the stored row, the values it holds now,
+     * and the values the action computed for it.
+     *
+     * <p>The rows are collected before any of them is written, so the scan over the referencing
+     * table is not disturbed by the writes it leads to.
+     */
+    static final class ActionRow {
+        final Object[] row;
+        final Object[] oldValues;
+        final Object[] newValues;
+
+        ActionRow(Object[] row, Object[] oldValues, Object[] newValues) {
+            this.row = row;
+            this.oldValues = oldValues;
+            this.newValues = newValues;
+        }
+    }
+
+    /** Whether another session is inside a transaction that could still make a row permanent. */
+    private boolean anyOtherOpenTransaction() {
+        for (Session other : executor.database.getActiveSessions()) {
+            if (other == executor.session || other.isDoomed()) continue;
+            if (other.isInTransaction()) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Wait until no other session holds an uncommitted row of the referencing table under this key.
+     *
+     * <p>A referential action decides what becomes of the rows that reference a key, and a row
+     * another transaction has written but not committed is not one it may decide anything about:
+     * PostgreSQL locks the referencing rows, so the write on the parent waits for that transaction
+     * to settle. Deciding instead refuses a delete over a row that may never exist, or cascades
+     * into a row that transaction is still free to keep.
+     */
+    private void awaitPendingChildRows(Table childTable, int[] childColIndices, Object[] parentVals) {
+        if (executor.session == null || executor.database == null) return;
+        if (!anyOtherOpenTransaction()) return;
+        final String key = uncommittedKey(childTable);
+        while (true) {
+            // The wait can end without the row having moved. Polling the cancel token here means a
+            // statement_timeout or a client cancel still ends this loop if it does.
+            StatementCancel.check();
+            PendingUniqueConflict blocked = null;
+            for (Session other : executor.database.getActiveSessions()) {
+                if (other == executor.session || other.isDoomed() || !other.isInTransaction()) continue;
+                for (Object[] candidate : other.getUncommittedInserts(key)) {
+                    if (rowHoldsKey(candidate, childColIndices, parentVals)) {
+                        blocked = new PendingUniqueConflict(other, candidate, childTable.getName());
+                        break;
+                    }
+                }
+                if (blocked != null) break;
+            }
+            if (blocked == null) return;
+            final PendingUniqueConflict pending = blocked;
+            executor.database.awaitConcurrentWrite(executor.session, pending.owner,
+                    () -> isStillPending(pending, key), pending.relation);
+        }
+    }
+
+    /** Whether a row carries the referencing values a write on that parent key would act on. */
+    private boolean rowHoldsKey(Object[] row, int[] childColIndices, Object[] parentVals) {
+        for (int i = 0; i < childColIndices.length; i++) {
+            int idx = childColIndices[i];
+            if (idx < 0 || idx >= row.length) return false;
+            if (!valuesEqual(parentVals[i], row[idx])) return false;
+        }
+        return true;
+    }
+
+    /**
+     * The rows of a referenced table that a foreign-key check may not count.
+     *
+     * <p>{@code vanishing} holds the rows the statement itself is taking away. To them belong the
+     * rows another session has inserted and not committed: PostgreSQL decides the check under the
+     * writing session's own snapshot, where another transaction's unfinished insert is simply not
+     * there, so a child row may not be admitted on the strength of a parent row that may never
+     * exist. The union is built only when another transaction really is open, so an ordinary check
+     * pays a walk over the sessions and nothing else.
+     */
+    private java.util.Set<Object[]> invisibleReferencedRows(Table refTable,
+                                                            java.util.Set<Object[]> vanishing) {
+        if (executor.session == null || executor.database == null) return vanishing;
+        if (!anyOtherOpenTransaction()) return vanishing;
+        String key = uncommittedKey(refTable);
+        java.util.Set<Object[]> hidden = null;
+        for (Session other : executor.database.getActiveSessions()) {
+            if (other == executor.session || !other.isInTransaction()) continue;
+            java.util.Set<Object[]> theirs = other.getUncommittedInserts(key);
+            if (theirs == null || theirs.isEmpty()) continue;
+            if (hidden == null) {
+                hidden = Collections.newSetFromMap(new java.util.IdentityHashMap<Object[], Boolean>());
+                if (vanishing != null) hidden.addAll(vanishing);
+            }
+            hidden.addAll(theirs);
+        }
+        return hidden == null ? vanishing : hidden;
+    }
+
     /**
      * Handle FK ON DELETE actions for all tables that reference the given table.
      */
@@ -1335,8 +1637,15 @@ class ConstraintValidator {
 
                     String childSchemaName = schema.getName();
 
+                    awaitPendingChildRows(childTable, childColIndices, parentVals);
+
                     switch (sc.getOnDelete()) {
                         case CASCADE: {
+                            // PostgreSQL runs the action as a DELETE on the referencing table, so
+                            // that table's own FOR EACH STATEMENT triggers fire for it -- once for
+                            // the whole statement, and even when no row of it matches.
+                            final DmlTriggerHelper.ReferentialStatement acting =
+                                    triggerHelper.referentialStatement(childTable, PgTrigger.Event.DELETE);
                             // Collect rows to delete, then use Table.deleteRows for proper index maintenance
                             java.util.Set<Object[]> deleteSet = Collections.newSetFromMap(new java.util.IdentityHashMap<>());
                             for (Object[] childRow : childTable.getRows()) {
@@ -1347,25 +1656,42 @@ class ConstraintValidator {
                                         break;
                                     }
                                 }
-                                if (matches) deleteSet.add(childRow);
-                            }
-                            if (!deleteSet.isEmpty()) {
-                                // Recurse: handle FK cascades on the child table's dependents before deleting
-                                for (Object[] childRow : deleteSet) {
-                                    // The rows this cascade is about to remove are as gone, to
-                                    // anything referencing them, as the ones the statement named:
-                                    // a SET DEFAULT further down may not point at one of them.
-                                    handleFkOnDelete(childTable, childRow, deleteSet, cascaded);
+                                // A row the same statement is already deleting leaves the action
+                                // nothing to do: removing it again records a second undo entry and
+                                // fires its triggers a second time.
+                                if (matches && (alsoDeleting == null || !alsoDeleting.contains(childRow))) {
+                                    deleteSet.add(childRow);
                                 }
-                                childTable.deleteRows(deleteSet);
-                                // Record undo so ROLLBACK can restore the deleted rows
-                                recordCascadeDeleteUndo(childSchemaName, childTable.getName(), new ArrayList<>(deleteSet));
                             }
+                            // PostgreSQL runs the action as a DELETE on the referencing table, so
+                            // the child's own row triggers fire and a BEFORE trigger returning NULL
+                            // keeps its row — leaving, as PostgreSQL leaves it, a reference to a
+                            // row that has gone.
+                            executor.dmlExecutor.applyReferentialDelete(childTable, childSchemaName,
+                                    deleteSet, surviving -> {
+                                        // The rows still standing are the ones the action takes, and
+                                        // an AFTER STATEMENT trigger's OLD TABLE is made of them.
+                                        if (acting != null) {
+                                            for (Object[] going : surviving) acting.wrote(null, going);
+                                        }
+                                        // Recurse before the rows go: the rows this cascade is about
+                                        // to remove are as gone, to anything referencing them, as
+                                        // the ones the statement named — a SET DEFAULT further down
+                                        // may not point at one of them.
+                                        for (Object[] childRow : new ArrayList<>(surviving)) {
+                                            handleFkOnDelete(childTable, childRow, surviving, cascaded);
+                                        }
+                                    });
                             break;
                         }
                         case SET_NULL: {
+                            // The action is an UPDATE of the referencing table, and that table's
+                            // statement-level triggers fire for it as for one a client wrote.
+                            final DmlTriggerHelper.ReferentialStatement acting =
+                                    triggerHelper.referentialStatement(childTable, PgTrigger.Event.UPDATE);
                             int[] nullIndices = actionColumnIndices(
                                     childTable, sc.getOnDeleteSetNullColumns(), childColIndices);
+                            List<ActionRow> pending = new ArrayList<>();
                             for (Object[] childRow : childTable.getRows()) {
                                 boolean matches = true;
                                 for (int i = 0; i < childColIndices.length; i++) {
@@ -1380,17 +1706,25 @@ class ConstraintValidator {
                                     for (int idx : nullIndices) {
                                         newVals[idx] = null;
                                     }
-                                    childTable.updateRowInPlace(childRow, oldVals, newVals);
-                                    recordCascadeUpdateUndo(childSchemaName, childTable.getName(), childRow, oldVals);
-                                    // Recurse: the child row's FK columns changed, so its dependents may need cascading
-                                    handleFkOnUpdate(childTable, oldVals, childRow);
+                                    pending.add(new ActionRow(childRow, oldVals, newVals));
                                 }
+                            }
+                            for (ActionRow acted : executor.dmlExecutor.applyReferentialUpdate(
+                                    childTable, childSchemaName, pending,
+                                    actionColumnNames(childTable, nullIndices), null)) {
+                                if (acting != null) acting.wrote(acted.row, acted.oldValues);
+                                // Recurse: the child row's FK columns changed, so its dependents may need cascading
+                                handleFkOnUpdate(childTable, acted.oldValues, acted.row);
                             }
                             break;
                         }
                         case SET_DEFAULT: {
+                            // Also an UPDATE of the referencing table as far as its triggers go.
+                            final DmlTriggerHelper.ReferentialStatement acting =
+                                    triggerHelper.referentialStatement(childTable, PgTrigger.Event.UPDATE);
                             int[] defaultIndices = actionColumnIndices(
                                     childTable, sc.getOnDeleteSetNullColumns(), childColIndices);
+                            List<ActionRow> pending = new ArrayList<>();
                             for (Object[] childRow : childTable.getRows()) {
                                 boolean matches = true;
                                 for (int i = 0; i < childColIndices.length; i++) {
@@ -1423,10 +1757,16 @@ class ConstraintValidator {
                                     // while the action runs, but it will not be there afterwards.
                                     checkDefaultKeyStillThere(childTable, newVals, sc, alsoDeleting,
                                             parentTable, refColNames);
-                                    childTable.updateRowInPlace(childRow, oldVals, newVals);
-                                    recordCascadeUpdateUndo(childSchemaName, childTable.getName(), childRow, oldVals);
-                                    handleFkOnUpdate(childTable, oldVals, childRow);
+                                    pending.add(new ActionRow(childRow, oldVals, newVals));
                                 }
+                            }
+                            // The acting key has just been checked, and only that check knows which
+                            // parent rows are going away, so the generic pass leaves it alone.
+                            for (ActionRow acted : executor.dmlExecutor.applyReferentialUpdate(
+                                    childTable, childSchemaName, pending,
+                                    actionColumnNames(childTable, defaultIndices), sc)) {
+                                if (acting != null) acting.wrote(acted.row, acted.oldValues);
+                                handleFkOnUpdate(childTable, acted.oldValues, acted.row);
                             }
                             break;
                         }
@@ -1521,8 +1861,15 @@ class ConstraintValidator {
 
                     String childSchemaName = schema.getName();
 
+                    awaitPendingChildRows(childTable, childColIndices, oldParentVals);
+
                     switch (sc.getOnUpdate()) {
                         case CASCADE: {
+                            // As on the delete side, the action is a statement against the
+                            // referencing table, and its statement-level triggers fire once for it.
+                            final DmlTriggerHelper.ReferentialStatement acting =
+                                    triggerHelper.referentialStatement(childTable, PgTrigger.Event.UPDATE);
+                            List<ActionRow> pending = new ArrayList<>();
                             for (Object[] childRow : childTable.getRows()) {
                                 boolean matches = true;
                                 for (int i = 0; i < childColIndices.length; i++) {
@@ -1537,15 +1884,21 @@ class ConstraintValidator {
                                     for (int i = 0; i < childColIndices.length; i++) {
                                         newVals[childColIndices[i]] = newParentVals[i];
                                     }
-                                    childTable.updateRowInPlace(childRow, oldVals, newVals);
-                                    recordCascadeUpdateUndo(childSchemaName, childTable.getName(), childRow, oldVals);
-                                    // Recurse: the child row's FK columns changed
-                                    handleFkOnUpdate(childTable, oldVals, childRow, cascaded);
+                                    pending.add(new ActionRow(childRow, oldVals, newVals));
                                 }
+                            }
+                            for (ActionRow acted : executor.dmlExecutor.applyReferentialUpdate(
+                                    childTable, childSchemaName, pending,
+                                    actionColumnNames(childTable, childColIndices), null)) {
+                                if (acting != null) acting.wrote(acted.row, acted.oldValues);
+                                // Recurse: the child row's FK columns changed
+                                handleFkOnUpdate(childTable, acted.oldValues, acted.row, cascaded);
                             }
                             break;
                         }
                         case SET_NULL: {
+                            final DmlTriggerHelper.ReferentialStatement acting =
+                                    triggerHelper.referentialStatement(childTable, PgTrigger.Event.UPDATE);
                             // Determine which child column indices to null
                             int[] updateNullIndices;
                             java.util.List<String> updateSetNullCols = sc.getOnUpdateSetNullColumns();
@@ -1557,6 +1910,7 @@ class ConstraintValidator {
                             } else {
                                 updateNullIndices = childColIndices;
                             }
+                            List<ActionRow> pending = new ArrayList<>();
                             for (Object[] childRow : childTable.getRows()) {
                                 boolean matches = true;
                                 for (int i = 0; i < childColIndices.length; i++) {
@@ -1571,14 +1925,21 @@ class ConstraintValidator {
                                     for (int idx : updateNullIndices) {
                                         newVals[idx] = null;
                                     }
-                                    childTable.updateRowInPlace(childRow, oldVals, newVals);
-                                    recordCascadeUpdateUndo(childSchemaName, childTable.getName(), childRow, oldVals);
-                                    handleFkOnUpdate(childTable, oldVals, childRow, cascaded);
+                                    pending.add(new ActionRow(childRow, oldVals, newVals));
                                 }
+                            }
+                            for (ActionRow acted : executor.dmlExecutor.applyReferentialUpdate(
+                                    childTable, childSchemaName, pending,
+                                    actionColumnNames(childTable, updateNullIndices), null)) {
+                                if (acting != null) acting.wrote(acted.row, acted.oldValues);
+                                handleFkOnUpdate(childTable, acted.oldValues, acted.row, cascaded);
                             }
                             break;
                         }
                         case SET_DEFAULT: {
+                            final DmlTriggerHelper.ReferentialStatement acting =
+                                    triggerHelper.referentialStatement(childTable, PgTrigger.Event.UPDATE);
+                            List<ActionRow> pending = new ArrayList<>();
                             for (Object[] childRow : childTable.getRows()) {
                                 boolean matches = true;
                                 for (int i = 0; i < childColIndices.length; i++) {
@@ -1605,10 +1966,17 @@ class ConstraintValidator {
                                         throw parentSideViolation(parentTable, childTable, sc,
                                                 newVals, updateRefColNames(sc, parentTable));
                                     }
-                                    childTable.updateRowInPlace(childRow, oldVals, newVals);
-                                    recordCascadeUpdateUndo(childSchemaName, childTable.getName(), childRow, oldVals);
-                                    handleFkOnUpdate(childTable, oldVals, childRow, cascaded);
+                                    pending.add(new ActionRow(childRow, oldVals, newVals));
                                 }
+                            }
+                            // The acting key was just checked, and its failure is worded from the
+                            // parent's side; the generic pass would report the child's wording for
+                            // the same key, so it leaves that constraint alone.
+                            for (ActionRow acted : executor.dmlExecutor.applyReferentialUpdate(
+                                    childTable, childSchemaName, pending,
+                                    actionColumnNames(childTable, childColIndices), sc)) {
+                                if (acting != null) acting.wrote(acted.row, acted.oldValues);
+                                handleFkOnUpdate(childTable, acted.oldValues, acted.row, cascaded);
                             }
                             break;
                         }
@@ -1701,7 +2069,7 @@ class ConstraintValidator {
      * it is computed again whenever it is read, so there is no value in the row to print. A stored
      * generated column is in the row like any other and prints like one.
      */
-    private String formatRow(Table table, Object[] row) {
+    String formatRow(Table table, Object[] row) {
         List<Column> columns = table == null ? null : table.getColumns();
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < row.length; i++) {
@@ -1710,7 +2078,7 @@ class ConstraintValidator {
                     && columns.get(i).isVirtual() && columns.get(i).isGenerated()) {
                 sb.append("virtual");
             } else {
-                sb.append(row[i] == null ? "null" : row[i].toString());
+                sb.append(ErrorValueText.of(row[i]));
             }
         }
         return sb.toString();
@@ -2198,7 +2566,7 @@ class ConstraintValidator {
     }
 
     /** Record an undo entry for cascaded child row deletes so ROLLBACK can restore them. */
-    private void recordCascadeDeleteUndo(String schemaName, String tableName, List<Object[]> rows) {
+    void recordCascadeDeleteUndo(String schemaName, String tableName, List<Object[]> rows) {
         if (rows.isEmpty()) return;
         executor.recordUndo(new Session.DeleteUndo(schemaName, tableName, rows));
         if (executor.session != null) {
@@ -2207,7 +2575,7 @@ class ConstraintValidator {
     }
 
     /** Record an undo entry for a cascaded child row update so ROLLBACK can restore it. */
-    private void recordCascadeUpdateUndo(String schemaName, String tableName, Object[] row, Object[] oldValues) {
+    void recordCascadeUpdateUndo(String schemaName, String tableName, Object[] row, Object[] oldValues) {
         executor.recordUndo(new Session.UpdateUndo(schemaName, tableName, row, oldValues));
         if (executor.session != null) {
             executor.session.trackUncommittedUpdate(schemaName + "." + tableName, row, oldValues);

@@ -133,8 +133,10 @@ class Round15IndexVariantsTest {
                 "SELECT indexdef FROM pg_indexes WHERE indexname='r15_ix_o_idx'");
         assertTrue(def != null && def.toUpperCase().contains("DESC"),
                 "indexdef must preserve DESC; got " + def);
-        assertTrue(def.toUpperCase().contains("NULLS FIRST"),
-                "indexdef must preserve NULLS FIRST; got " + def);
+        // Descending order puts nulls first already, so PostgreSQL prints the definition without
+        // saying so — it only writes a null ordering down where it is not the one the direction
+        // implies. Written back, "v DESC" and "v DESC NULLS FIRST" are the same index.
+        assertEquals("CREATE INDEX r15_ix_o_idx ON public.r15_ix_o USING btree (v DESC)", def);
     }
 
     @Test

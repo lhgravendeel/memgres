@@ -478,6 +478,38 @@ public class ExpressionParser {
      *
      * @param qualified whether an interval field list has already taken this name's precision.
      */
+    /**
+     * The types PostgreSQL's grammar has a production of its own for, and which take no modifier.
+     * That production has no place for a parenthesis, so the parenthesis itself is the word the
+     * grammar stopped on: {@code int(5)} is a syntax error rather than a modifier it turned down.
+     */
+    private static final java.util.Set<String> UNMODIFIABLE_GRAMMAR_TYPES = Cols.setOf(
+            "int", "integer", "bigint", "smallint", "boolean", "real", "double precision", "json");
+
+    /** The written type names that carry a modifier. Every other type this engine knows has none. */
+    private static final java.util.Set<String> MODIFIABLE_TYPES = Cols.setOf(
+            "numeric", "decimal", "float", "varchar", "character varying", "char", "character",
+            "bpchar", "bit", "bit varying", "varbit",
+            "timestamp", "timestamptz", "time", "timetz", "interval");
+
+    /**
+     * Refuse a modifier written after a type that has none. A type read as a plain name is looked
+     * up and found to have no modifier input function, which PostgreSQL reports in words rather
+     * than as a syntax error. Names this engine does not know are left alone: a domain or an enum
+     * is the executor's to resolve, and only it can say whether the name means anything at all.
+     */
+    private void rejectTypeModifier(String written) {
+        // The one type whose name is written with its quotes is "char", and the quotes are how it
+        // is told apart from char, so a name spelled that way is left to the executor.
+        if (written.startsWith("\"")) return;
+        String name = written.toLowerCase();
+        if (UNMODIFIABLE_GRAMMAR_TYPES.contains(name)) throw ParseException.at(peek());
+        if (MODIFIABLE_TYPES.contains(name)) return;
+        if (com.memgres.engine.DataType.fromPgName(name) == null) return;
+        throw ParseException.saying("type modifier is not allowed for type \"" + name + "\"",
+                peek(), "42601");
+    }
+
     private String finishTypeName(StringBuilder sb, boolean qualified) {
         // Handle precision: (N) or (N,M), for types not already handled above
         // PG allows negative scale in numeric(p,s), e.g. numeric(10,-2) rounds to hundreds
@@ -487,6 +519,9 @@ public class ExpressionParser {
             throw ParseException.at(peek());
         }
         if (check(TokenType.LEFT_PAREN)) {
+            // A modifier belongs to the types that have one, and PostgreSQL settles that where the
+            // type name is read rather than storing a width nothing would ever consult.
+            rejectTypeModifier(sb.toString());
             advance();
             sb.append("(");
             // A negative precision is out of range rather than unparseable, so it is read here
@@ -1686,8 +1721,9 @@ public class ExpressionParser {
                     return specialFormParser.parseTimestamp(); 
                 }
                 case "DEFAULT": {
-                    advance();
-                    return Literal.ofDefault();
+                    // The tree carries no offsets of its own, and a misplaced DEFAULT is reported
+                    // against the keyword, so where this one was written is kept with the node.
+                    return Literal.ofDefault(advance().position());
                 }
                 case "OPERATOR": {
                     return specialFormParser.parsePrefixQualifiedOperator(); 

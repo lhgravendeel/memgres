@@ -116,7 +116,12 @@ class CatalogMetadataFunctions {
                                             CatalogConstraintBuilder.constraintKey(
                                                     schemaName, tbl.getName(), conname));
                                     if (nnOid == coid) {
-                                        return "NOT NULL " + c.getName();
+                                        // A constraint whose rows were never read says so in its
+                                        // own definition, the same way a CHECK declared that way
+                                        // does: the clause is part of what the constraint is.
+                                        return "NOT NULL " + RuleDeparser.quoteIdentifier(c.getName())
+                                                + (tbl.isNotNullValidated(c.getName())
+                                                        ? "" : " NOT VALID");
                                     }
                                 }
                             }
@@ -186,11 +191,16 @@ class CatalogMetadataFunctions {
                     }
                 }
                 // A rule written with CREATE RULE is stored as the text it deparses to.
-                for (java.util.Map.Entry<String, String[]> entry
-                        : executor.database.getRuleDefinitions().entrySet()) {
-                    int rOid = executor.systemCatalog.getOid(
-                            "rule:" + entry.getKey() + "_" + entry.getValue()[0]);
-                    if (rOid == ruleOid) return entry.getValue()[1];
+                for (Database.StoredRule rule : executor.database.getRuleEntries()) {
+                    int rOid = executor.systemCatalog.getOid("rule:"
+                            + (rule.getSchema() == null ? "public" : rule.getSchema())
+                            + "." + rule.getTable() + ":" + rule.getName());
+                    if (rOid == ruleOid) {
+                        // A relation the reader's search path reaches is written without its
+                        // schema, which is what the deparser this stands in for does.
+                        return CatalogStubBuilder.ruleDefinitionAsRead(rule.getDefinition(),
+                                executor.searchPathSchemas());
+                    }
                 }
                 return null;
             }
@@ -490,8 +500,9 @@ class CatalogMetadataFunctions {
                 return new RegprocValue(lookup.oid, lookup.display);
             }
             case "pg_partition_root": {
-                // pg_partition_root(regclass) → returns root partition table
-                // In memgres, partitioning is limited; return the table itself as root
+                // The root of the hierarchy the relation belongs to. PostgreSQL answers NULL for a
+                // relation that is neither a partition nor partitioned, because such a relation is
+                // in no hierarchy at all; a partitioned table with no parent is its own root.
                 if (fn.args().isEmpty()) return null;
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
@@ -504,11 +515,17 @@ class CatalogMetadataFunctions {
                 if (tableName.startsWith("\"") && tableName.endsWith("\"")) {
                     tableName = tableName.substring(1, tableName.length() - 1);
                 }
-                // Try to find the table in schemas; return table name as root
                 for (Schema s : executor.database.getSchemas().values()) {
                     Table tbl = s.getTable(tableName);
                     if (tbl == null) tbl = s.getTable(tableName.toLowerCase());
-                    if (tbl != null) return tableName;
+                    if (tbl == null) continue;
+                    if (tbl.getPartitionParent() == null && tbl.getPartitionStrategy() == null) {
+                        return null;
+                    }
+                    while (tbl.getPartitionParent() != null) {
+                        tbl = tbl.getPartitionParent();
+                    }
+                    return tbl.getName();
                 }
                 return null;
             }
@@ -598,14 +615,16 @@ class CatalogMetadataFunctions {
         String whereClause = CatalogHelper.deparseIndexPredicate(executor.database, tableName,
                 executor.database.getIndexWhereClause(indexKey));
         List<String> normalizedCols = CatalogHelper.deparseIndexColumns(executor.database, tableName, cols);
-        List<String> columnOptions = executor.database.getIndexColumnOptions(indexKey);
+        List<String> columnOptions = CatalogHelper.deparseIndexOptions(executor.database, tableName,
+                idxMethod, cols, executor.database.getIndexColumnOptions(indexKey));
         List<String> includeColumns = executor.database.getIndexIncludeColumns(indexKey);
         boolean nullsNotDistinct = executor.database.isIndexNullsNotDistinct(indexKey)
                 || constraintNullsNotDistinct;
         // The pretty form drops the schema from the table name when the search path reaches it,
         // which is the only difference between the two spellings PostgreSQL prints.
         return CatalogStubBuilder.buildIndexDef(indexName,
-                pretty ? unqualifiedWhenOnPath(tableName) : tableName, unique, idxMethod,
+                CatalogHelper.indexRelationRef(executor.database, tableName,
+                        pretty ? unqualifiedWhenOnPath(tableName) : tableName), unique, idxMethod,
                 normalizedCols, columnOptions, includeColumns, nullsNotDistinct, whereClause,
                 executor.database.getIndexReloptions(indexKey));
     }
@@ -678,7 +697,11 @@ class CatalogMetadataFunctions {
      */
     private String buildTriggerDef(List<PgTrigger> triggers, String schema) {
         PgTrigger first = triggers.get(0);
-        StringBuilder sb = new StringBuilder("CREATE TRIGGER ");
+        // A constraint trigger says so in its own definition and carries the deferrability that is
+        // the whole point of the form: replayed without those words it comes back as an ordinary
+        // trigger that fires immediately.
+        StringBuilder sb = new StringBuilder(
+                first.isConstraintTrigger() ? "CREATE CONSTRAINT TRIGGER " : "CREATE TRIGGER ");
         sb.append(first.getName()).append(' ');
         sb.append(first.getTiming() == PgTrigger.Timing.INSTEAD_OF ? "INSTEAD OF"
                 : first.getTiming().name()).append(' ');
@@ -704,6 +727,15 @@ class CatalogMetadataFunctions {
             sb.append(" REFERENCING");
             if (oldTable != null) sb.append(" OLD TABLE AS ").append(oldTable);
             if (newTable != null) sb.append(" NEW TABLE AS ").append(newTable);
+        }
+        if (first.isConstraintTrigger()) {
+            // PostgreSQL always spells the deferrability out for a constraint trigger, both
+            // halves of it, whichever way it was written.
+            if (first.getConstraintRelation() != null) {
+                sb.append(" FROM ").append(first.getConstraintRelation());
+            }
+            sb.append(first.isDeferrable() ? " DEFERRABLE" : " NOT DEFERRABLE");
+            sb.append(first.isInitiallyDeferred() ? " INITIALLY DEFERRED" : " INITIALLY IMMEDIATE");
         }
         sb.append(" FOR EACH ").append(first.isForEachStatement() ? "STATEMENT" : "ROW");
         if (first.getWhenClause() != null && !first.getWhenClause().isEmpty()) {
@@ -833,7 +865,13 @@ class CatalogMetadataFunctions {
                     if (t != null) break;
                 }
             }
-            if (t != null) cols = t.getColumns();
+            if (t != null) {
+                cols = t.getColumns();
+                // A dropped column keeps its number, so an attnum is not a position in what is
+                // left: the columns past the hole answer to numbers larger than the list is long.
+                int at = t.columnIndexOfAttnum(attnum);
+                return at < 0 || at >= cols.size() ? null : cols.get(at).getName();
+            }
         }
         if (cols == null || attnum > cols.size()) return null;
         return cols.get(attnum - 1).getName();
@@ -886,17 +924,15 @@ class CatalogMetadataFunctions {
             // name up meant two schemas' views of one name answered with whichever came first.
             Database.ViewDef view = executor.database.getView(viewName);
             if (view != null && view.query() != null) {
-                String sql;
-                if (relationsAreVisible(view)) {
-                    sql = view.sourceSQL() != null ? view.sourceSQL()
-                            : (minimizeParens ? SqlUnparser.toSqlPretty(view.query())
-                                              : SqlUnparser.toSql(view.query()));
-                } else {
-                    // Nothing the body names would be found by its bare name from here, so the
-                    // definition is written with the relations qualified.
-                    sql = SqlUnparser.toSqlQualified(view.query(), view.schemaName(), minimizeParens);
-                }
-                return SqlUnparser.prettyViewDef(sql, wrapColumn) + ";";
+                // Both forms are laid out, and both are deparsed rather than echoed: text left
+                // behind by a rewrite was written on one line, and no amount of reformatting it
+                // afterwards reaches inside a sub-select, a CASE or a WITH clause.
+                // Nothing the body names would be found by its bare name from a schema off the
+                // search path, so from there the relations are written qualified.
+                String qualifyingSchema = relationsAreVisible(view) ? null : view.schemaName();
+                return ViewDeparser.viewDef(view.query(), minimizeParens, wrapColumn,
+                        ViewDeparser.columnTypesOf(executor.database, view), qualifyingSchema)
+                        + ";";
             }
         }
         // An OID that names no view, or names a relation that is not one, has no definition:
@@ -931,35 +967,19 @@ class CatalogMetadataFunctions {
         for (java.util.Map.Entry<String, Schema> entry : executor.database.getSchemas().entrySet()) {
             String schemaName = entry.getKey();
             if (explicitSchema != null && !schemaName.equalsIgnoreCase(explicitSchema)) continue;
-            Schema schema = entry.getValue();
-            Table tbl = schema.getTable(tblName);
-            if (tbl != null) {
-                relationFound = true;
-                for (Column col : tbl.getColumns()) {
-                    if (col.getName().equalsIgnoreCase(colName)) {
-                        columnFound = true;
-                        String def = col.getDefaultValue();
-                        if (def != null && def.toLowerCase().contains("nextval")) {
-                            int q1 = def.indexOf('\'');
-                            int q2 = def.indexOf('\'', q1 + 1);
-                            if (q1 >= 0 && q2 > q1) {
-                                return schemaName + "." + def.substring(q1 + 1, q2);
-                            }
-                        }
-                        if (col.getType() == DataType.SERIAL || col.getType() == DataType.BIGSERIAL
-                                || col.getType() == DataType.SMALLSERIAL
-                                || (def != null && def.contains("__identity__"))) {
-                            String seqName = tblName + "_" + colName + "_seq";
-                            if (executor.database.getSequence(schemaName, seqName) == null) {
-                                Sequence seq = new Sequence(seqName, tbl.getSerialCounter(), 1L, null, null);
-                                seq.setSchemaName(schemaName);
-                                executor.database.addSequence(seq);
-                            }
-                            return schemaName + "." + seqName;
-                        }
-                    }
+            Table tbl = entry.getValue().getTable(tblName);
+            if (tbl == null) continue;
+            relationFound = true;
+            for (Column col : tbl.getColumns()) {
+                // The second argument is an identifier PostgreSQL has already parsed, so it is
+                // matched exactly: pg_get_serial_sequence('t','I') names a column that is not
+                // there rather than another way of writing i.
+                if (col.getName().equals(colName)) {
+                    columnFound = true;
+                    break;
                 }
             }
+            if (columnFound) break;
         }
         // A name that resolves to nothing is an error, not a NULL: a caller asking for the sequence
         // behind a column it misspelled would otherwise read the NULL as "column has no sequence".
@@ -970,12 +990,15 @@ class CatalogMetadataFunctions {
             throw new MemgresException(
                     "column \"" + colName + "\" of relation \"" + tblName + "\" does not exist", "42703");
         }
-        // M20: fallback — check sequences with OWNED BY pointing to this table.column
-        for (java.util.Map.Entry<String, Sequence> seqEntry : executor.database.getSequences().entrySet()) {
-            Sequence seq = seqEntry.getValue();
-            if (seq.getOwnedByTable() != null && seq.getOwnedByTable().equalsIgnoreCase(tblName)
-                    && seq.getOwnedByColumn() != null && seq.getOwnedByColumn().equalsIgnoreCase(colName)) {
-                return seq.getSchemaName() + "." + seq.getName();
+        // PostgreSQL defines this as a pg_depend lookup: the answer is the sequence the column
+        // owns, which is the one created with a serial or identity column and the one attached by
+        // ALTER SEQUENCE ... OWNED BY. A column whose DEFAULT merely names an independently
+        // created sequence owns none, and the answer there is NULL. Reading the default text
+        // instead answered for somebody else's sequence — and, on a column with no sequence at
+        // all, created one, so a SELECT left a relation behind that no DROP knew about.
+        for (Sequence seq : executor.database.getSequences().values()) {
+            if (seq.isOwnedBy(tblName, colName)) {
+                return Quoting.identifier(seq.getSchemaName()) + "." + Quoting.identifier(seq.getName());
             }
         }
         return null;
@@ -1972,16 +1995,18 @@ class CatalogMetadataFunctions {
 
     // ---- Helper methods ----
 
-    /** A key's columns as a definition spells them, with PERIOD in front of the last of a temporal one. */
+    /**
+     * A key's columns as a definition spells them, with PERIOD in front of the last of a temporal
+     * one. A name is quoted where it has to be: a definition is text that has to read back as the
+     * same key, and "A b" written bare names two things instead of one.
+     */
     private static String keyColumnList(java.util.List<String> columns, boolean period) {
-        if (!period || columns == null || columns.isEmpty()) {
-            return String.join(", ", columns == null ? java.util.Collections.<String>emptyList() : columns);
-        }
+        if (columns == null || columns.isEmpty()) return "";
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < columns.size(); i++) {
             if (i > 0) sb.append(", ");
-            if (i == columns.size() - 1) sb.append("PERIOD ");
-            sb.append(columns.get(i));
+            if (period && i == columns.size() - 1) sb.append("PERIOD ");
+            sb.append(RuleDeparser.quoteIdentifier(columns.get(i)));
         }
         return sb.toString();
     }
@@ -2063,18 +2088,28 @@ class CatalogMetadataFunctions {
     }
 
     private String formatConstraintDef(StoredConstraint sc, String ownSchema, Table owner) {
+        StringBuilder sb = new StringBuilder();
         switch (sc.getType()) {
             case PRIMARY_KEY:
-                return "PRIMARY KEY (" + String.join(", ", sc.getColumns()) + ")";
+                sb.append("PRIMARY KEY (").append(keyColumnList(sc.getColumns(), false)).append(")");
+                break;
             case UNIQUE:
                 // NULLS NOT DISTINCT is part of what the constraint says, so the definition it
                 // reports back has to say it too.
-                return "UNIQUE " + (sc.isNullsNotDistinct() ? "NULLS NOT DISTINCT " : "")
-                        + "(" + String.join(", ", sc.getColumns()) + ")";
+                sb.append("UNIQUE ").append(sc.isNullsNotDistinct() ? "NULLS NOT DISTINCT " : "")
+                        .append("(").append(keyColumnList(sc.getColumns(), false)).append(")");
+                break;
             case CHECK:
-                return "CHECK (" + RuleDeparser.deparse(sc.getCheckExpr(), RuleDeparser.forTable(owner)) + ")";
+                sb.append("CHECK (")
+                        .append(RuleDeparser.deparse(sc.getCheckExpr(), RuleDeparser.forTable(owner)))
+                        .append(")");
+                // NO INHERIT is a clause only a CHECK carries, and PostgreSQL prints it here,
+                // ahead of the clauses every constraint kind shares. A key is non-inheritable by
+                // construction rather than by a clause, so it prints nothing.
+                if (sc.isNoInherit()) sb.append(" NO INHERIT");
+                break;
             case FOREIGN_KEY: {
-                StringBuilder sb = new StringBuilder("FOREIGN KEY (");
+                sb.append("FOREIGN KEY (");
                 // A temporal key writes PERIOD in front of its last column, on both sides: that
                 // word is what says the column is a span to be covered rather than matched, so a
                 // definition printed without it does not spell the constraint that was declared.
@@ -2093,20 +2128,25 @@ class CatalogMetadataFunctions {
                             .append(keyColumnList(sc.getReferencesColumns(), sc.isPeriod()))
                             .append(")");
                 }
+                // The match type decides whether a partly-null key is checked at all, so a
+                // definition that drops it describes a key that enforces something else.
+                // PostgreSQL prints nothing for MATCH SIMPLE, which is the default.
+                if ("FULL".equalsIgnoreCase(sc.getMatchType())) sb.append(" MATCH FULL");
+                else if ("PARTIAL".equalsIgnoreCase(sc.getMatchType())) sb.append(" MATCH PARTIAL");
                 if (sc.getOnUpdate() != null && sc.getOnUpdate() != StoredConstraint.FkAction.NO_ACTION) {
                     sb.append(" ON UPDATE ").append(fkActionToSql(sc.getOnUpdate()));
                 }
                 if (sc.getOnDelete() != null && sc.getOnDelete() != StoredConstraint.FkAction.NO_ACTION) {
                     sb.append(" ON DELETE ").append(fkActionToSql(sc.getOnDelete()));
                 }
-                return sb.toString();
+                break;
             }
             case EXCLUDE: {
                 // H16: reflect the actual backing index access method rather than
                 // always printing gist.
                 String am = executor.database.getIndexMethod(sc.getName());
                 if (am == null || am.isEmpty()) am = "btree";
-                StringBuilder sb = new StringBuilder("EXCLUDE USING ").append(am).append(" (");
+                sb.append("EXCLUDE USING ").append(am).append(" (");
                 if (sc.getExcludeElements() != null) {
                     for (int i = 0; i < sc.getExcludeElements().size(); i++) {
                         if (i > 0) sb.append(", ");
@@ -2115,11 +2155,23 @@ class CatalogMetadataFunctions {
                     }
                 }
                 sb.append(")");
-                return sb.toString();
+                break;
             }
             default:
                 throw new IllegalStateException("Unknown constraint type: " + sc.getType());
         }
+        // The clauses every constraint kind may carry, in the order PostgreSQL prints them. A
+        // definition that leaves them out describes a different constraint: replayed, it would be
+        // checked at a different time, or would validate rows the writer deliberately left
+        // unchecked. A constraint that is not enforced cannot have been validated either, and
+        // PostgreSQL says so once -- it prints NOT ENFORCED and leaves NOT VALID off.
+        if (sc.isDeferrable()) {
+            sb.append(" DEFERRABLE");
+            if (sc.isInitiallyDeferred()) sb.append(" INITIALLY DEFERRED");
+        }
+        if (sc.isNotEnforced()) sb.append(" NOT ENFORCED");
+        else if (!sc.isConvalidated()) sb.append(" NOT VALID");
+        return sb.toString();
     }
 
     private static final java.util.Map<Integer, String> EXTRA_TYPE_NAMES;

@@ -15,7 +15,6 @@ public final class CopyStmt implements Statement {
     public final String delimiter;
     public final String nullString;
     public final boolean header;
-    public final List<List<String>> inlineData; // for COPY FROM STDIN with inline data
     public final Statement subquery;            // for COPY (SELECT ...) TO form
     public final String quote;                  // CSV quote character (default '"')
     public final String escape;                 // CSV escape character (default = quote)
@@ -28,6 +27,29 @@ public final class CopyStmt implements Statement {
     public final String whereClause;            // WHERE clause for COPY TO
     public final String onError;                // ON_ERROR option ('stop' or 'ignore')
     public final String defaultString;
+    /** REJECT_LIMIT: how many rows ON_ERROR ignore may skip before the COPY fails. Null = no cap. */
+    public final Long rejectLimit;
+    /** LOG_VERBOSITY: 'default', 'verbose' or 'silent'; silent asks for no skipped-rows notice. */
+    public final String logVerbosity;
+
+    /**
+     * The WHERE clause as an expression, parsed once and kept for the rows that follow. Parsing it
+     * per row made every row of a COPY pay for the same text again.
+     */
+    private Expression parsedWhere;
+
+    /**
+     * What the option list earned, held back until the relation has been opened. PostgreSQL's
+     * grammar takes any option name and any value; the list is read against the option set only
+     * once COPY has the relation in hand, so a statement that names a relation which is not there
+     * says so, whatever the options say — and a column list that names nothing is reported first
+     * too. Raising it while parsing put the option's complaint in front of both.
+     */
+    private RuntimeException optionError;
+
+    public RuntimeException optionError() { return optionError; }
+
+    public void setOptionError(RuntimeException optionError) { this.optionError = optionError; }
 
     public CopyStmt(
             String table,
@@ -38,7 +60,6 @@ public final class CopyStmt implements Statement {
             String delimiter,
             String nullString,
             boolean header,
-            List<List<String>> inlineData,
             Statement subquery,
             String quote,
             String escape,
@@ -52,6 +73,37 @@ public final class CopyStmt implements Statement {
             String onError,
             String defaultString
     ) {
+        this(table, columns, isFrom, source, format, delimiter, nullString, header,
+             subquery, quote, escape, forceQuote, forceNotNull, forceNull, headerMatch, freeze,
+             encoding, whereClause, onError, defaultString, null, null);
+    }
+
+    public CopyStmt(
+            String table,
+            List<String> columns,
+            boolean isFrom,
+            String source,
+            String format,
+            String delimiter,
+            String nullString,
+            boolean header,
+            Statement subquery,
+            String quote,
+            String escape,
+            List<String> forceQuote,
+            List<String> forceNotNull,
+            List<String> forceNull,
+            boolean headerMatch,
+            boolean freeze,
+            String encoding,
+            String whereClause,
+            String onError,
+            String defaultString,
+            Long rejectLimit,
+            String logVerbosity
+    ) {
+        this.rejectLimit = rejectLimit;
+        this.logVerbosity = logVerbosity;
         this.table = table;
         this.columns = columns;
         this.isFrom = isFrom;
@@ -60,7 +112,6 @@ public final class CopyStmt implements Statement {
         this.delimiter = delimiter;
         this.nullString = nullString;
         this.header = header;
-        this.inlineData = inlineData;
         this.subquery = subquery;
         this.quote = quote;
         this.escape = escape;
@@ -78,39 +129,32 @@ public final class CopyStmt implements Statement {
     /** Full constructor without onError/defaultString (backward-compatible). */
     public CopyStmt(String table, List<String> columns, boolean isFrom, String source,
                     String format, String delimiter, String nullString, boolean header,
-                    List<List<String>> inlineData, Statement subquery,
+                    Statement subquery,
                     String quote, String escape, List<String> forceQuote, List<String> forceNotNull,
                     boolean freeze, String encoding, String whereClause) {
         this(table, columns, isFrom, source, format, delimiter, nullString, header,
-             inlineData, subquery, quote, escape, forceQuote, forceNotNull, null, false, freeze, encoding,
+             subquery, quote, escape, forceQuote, forceNotNull, null, false, freeze, encoding,
              whereClause, null, null);
     }
 
     /** Constructor with onError/defaultString but without forceNull/headerMatch. */
     public CopyStmt(String table, List<String> columns, boolean isFrom, String source,
                     String format, String delimiter, String nullString, boolean header,
-                    List<List<String>> inlineData, Statement subquery,
+                    Statement subquery,
                     String quote, String escape, List<String> forceQuote, List<String> forceNotNull,
                     boolean freeze, String encoding, String whereClause,
                     String onError, String defaultString) {
         this(table, columns, isFrom, source, format, delimiter, nullString, header,
-             inlineData, subquery, quote, escape, forceQuote, forceNotNull, null, false, freeze, encoding,
+             subquery, quote, escape, forceQuote, forceNotNull, null, false, freeze, encoding,
              whereClause, onError, defaultString);
     }
 
     /** Constructor without new options (backward-compatible). */
     public CopyStmt(String table, List<String> columns, boolean isFrom, String source,
                     String format, String delimiter, String nullString, boolean header,
-                    List<List<String>> inlineData, Statement subquery) {
+                    Statement subquery) {
         this(table, columns, isFrom, source, format, delimiter, nullString, header,
-             inlineData, subquery, "\"", "\"", null, null, false, null, null);
-    }
-
-    /** Backward-compatible constructor without subquery. */
-    public CopyStmt(String table, List<String> columns, boolean isFrom, String source,
-                    String format, String delimiter, String nullString, boolean header,
-                    List<List<String>> inlineData) {
-        this(table, columns, isFrom, source, format, delimiter, nullString, header, inlineData, null);
+             subquery, "\"", "\"", null, null, false, null, null);
     }
 
     public String table() { return table; }
@@ -121,7 +165,6 @@ public final class CopyStmt implements Statement {
     public String delimiter() { return delimiter; }
     public String nullString() { return nullString; }
     public boolean header() { return header; }
-    public List<List<String>> inlineData() { return inlineData; }
     public Statement subquery() { return subquery; }
     public String quote() { return quote; }
     public String escape() { return escape; }
@@ -134,6 +177,10 @@ public final class CopyStmt implements Statement {
     public String whereClause() { return whereClause; }
     public String onError() { return onError; }
     public String defaultString() { return defaultString; }
+    public Long rejectLimit() { return rejectLimit; }
+    public String logVerbosity() { return logVerbosity; }
+    public Expression parsedWhere() { return parsedWhere; }
+    public void setParsedWhere(Expression parsedWhere) { this.parsedWhere = parsedWhere; }
 
     @Override
     public boolean equals(Object o) {
@@ -149,7 +196,6 @@ public final class CopyStmt implements Statement {
             && Objects.equals(format, that.format)
             && Objects.equals(delimiter, that.delimiter)
             && Objects.equals(nullString, that.nullString)
-            && Objects.equals(inlineData, that.inlineData)
             && Objects.equals(subquery, that.subquery)
             && Objects.equals(quote, that.quote)
             && Objects.equals(escape, that.escape)
@@ -164,7 +210,7 @@ public final class CopyStmt implements Statement {
     @Override
     public int hashCode() {
         return Objects.hash(table, columns, isFrom, source, format, delimiter, nullString,
-                header, inlineData, subquery, quote, escape, forceQuote, forceNotNull,
+                header, subquery, quote, escape, forceQuote, forceNotNull,
                 freeze, encoding, whereClause, onError, defaultString);
     }
 
@@ -179,7 +225,6 @@ public final class CopyStmt implements Statement {
                 ", delimiter=" + delimiter +
                 ", nullString=" + nullString +
                 ", header=" + header +
-                ", inlineData=" + inlineData +
                 ", subquery=" + subquery +
                 ", quote=" + quote +
                 ", escape=" + escape +

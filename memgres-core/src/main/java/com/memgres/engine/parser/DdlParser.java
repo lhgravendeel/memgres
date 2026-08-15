@@ -62,7 +62,10 @@ class DdlParser {
         if (parser.matchKeyword("FUNCTION")) return functionParser.parseCreateFunction(orReplace, false);
         if (parser.matchKeyword("PROCEDURE")) return functionParser.parseCreateFunction(orReplace, true);
         if (parser.matchKeyword("TRIGGER")) return parseCreateTrigger(orReplace);
-        if (parser.matchKeywords("CONSTRAINT", "TRIGGER")) return parseCreateTrigger(false, true);
+        // OR REPLACE is carried into a constraint trigger rather than dropped: PostgreSQL has no
+        // way to replace one and says so (0A000), which it cannot do if the statement arrives
+        // looking like a plain CREATE CONSTRAINT TRIGGER.
+        if (parser.matchKeywords("CONSTRAINT", "TRIGGER")) return parseCreateTrigger(orReplace, true);
         if (parser.matchKeyword("EXTENSION")) return parseCreateExtension();
         if (parser.matchKeyword("INDEX")) return indexParser.parseCreateIndex(unique, false);
         if (parser.matchKeyword("VIEW")) return parseCreateView(orReplace, false);
@@ -73,7 +76,7 @@ class DdlParser {
             parser.expectKeyword("VIEW");
             return parseCreateView(orReplace, true);
         }
-        if (parser.matchKeyword("SEQUENCE")) return parseCreateSequence(temporary);
+        if (parser.matchKeyword("SEQUENCE")) return parseCreateSequence(temporary, unlogged);
         if (parser.matchKeyword("DOMAIN")) return parseCreateDomain();
         if (parser.matchKeyword("SCHEMA")) return parseCreateSchema();
         if (parser.matchKeyword("POLICY")) return policyParser.parseCreatePolicy();
@@ -344,16 +347,77 @@ class DdlParser {
                 parser.expect(TokenType.RIGHT_PAREN);
                 castName = sourceType.toLowerCase() + "->" + targetType.toLowerCase();
             }
+            // A cast is named one at a time, so the comma a list would need is a syntax error.
+            if (parser.check(TokenType.COMMA)) throw ParseException.at(parser.peek());
             boolean cascade2 = parser.matchKeyword("CASCADE");
             parser.matchKeyword("RESTRICT");
             return new DropStmt(objectType, castName, null, ifExists, cascade2);
         }
 
+        DropTarget first = parseDropTarget(objectType);
+        // One DROP may name several objects of the one kind, and PostgreSQL takes all of them
+        // down in the same statement; reading only the first left every later name standing
+        // without a word said about it. The kinds whose grammar names a single object -- a rule
+        // and a trigger, which are written with the relation they sit on, a cast, and an
+        // operator class or family -- have no list at all, and the comma is a syntax error.
+        List<DropTarget> targets = new ArrayList<>();
+        targets.add(first);
+        while (parser.check(TokenType.COMMA)) {
+            if (!dropNamesAList(objectType)) throw ParseException.at(parser.peek());
+            parser.advance();
+            targets.add(parseDropTarget(objectType));
+        }
+
+        boolean cascade = parser.matchKeyword("CASCADE");
+        parser.matchKeyword("RESTRICT");
+
+        // CASCADE and RESTRICT are written once and settle for every name, so the names after the
+        // first are built only now that the behaviour is known.
+        List<DropStmt> more = new ArrayList<>();
+        for (int i = 1; i < targets.size(); i++) {
+            more.add(targets.get(i).toStatement(objectType, ifExists, cascade, null));
+        }
+        return first.toStatement(objectType, ifExists, cascade, more);
+    }
+
+    /** Whether PostgreSQL's grammar lets this kind of DROP name more than one object. */
+    private static boolean dropNamesAList(DropStmt.ObjectType objectType) {
+        return objectType != DropStmt.ObjectType.TRIGGER
+                && objectType != DropStmt.ObjectType.RULE
+                && objectType != DropStmt.ObjectType.POLICY
+                && objectType != DropStmt.ObjectType.OPERATOR_CLASS
+                && objectType != DropStmt.ObjectType.OPERATOR_FAMILY;
+    }
+
+    /** One name a DROP lists, read before CASCADE or RESTRICT is settled for the whole list. */
+    private static final class DropTarget {
+        private final String name;
+        private final String onTable;
+        private final String schema;
+        private final List<String> paramTypes;
+
+        DropTarget(String name, String onTable, String schema, List<String> paramTypes) {
+            this.name = name;
+            this.onTable = onTable;
+            this.schema = schema;
+            this.paramTypes = paramTypes;
+        }
+
+        DropStmt toStatement(DropStmt.ObjectType objectType, boolean ifExists, boolean cascade,
+                             List<DropStmt> more) {
+            return new DropStmt(objectType, name, onTable, ifExists, cascade, paramTypes, schema,
+                    more);
+        }
+    }
+
+    /** The name, signature and relation of one object a DROP statement names. */
+    private DropTarget parseDropTarget(DropStmt.ObjectType objectType) {
         String name;
         String qualifier = null;
         if (objectType == DropStmt.ObjectType.OPERATOR) {
             StringBuilder sb = new StringBuilder();
             while (!parser.isAtEnd() && !parser.check(TokenType.LEFT_PAREN) && !parser.check(TokenType.SEMICOLON)
+                    && !parser.check(TokenType.COMMA)
                     && !parser.checkKeyword("CASCADE") && !parser.checkKeyword("RESTRICT")) {
                 sb.append(parser.advance().value());
             }
@@ -426,16 +490,17 @@ class DdlParser {
         if ((objectType == DropStmt.ObjectType.TRIGGER || objectType == DropStmt.ObjectType.RULE)
                 && parser.matchKeyword("ON")) {
             onTable = parser.readIdentifier();
+            // The relation a rule or a trigger is on may be written with the schema that holds it.
+            // Reading the qualifier as the whole name left the drop looking for a relation called
+            // after the schema, and the one the statement named was never reached.
+            if (parser.match(TokenType.DOT)) onTable = onTable + "." + parser.readIdentifier();
         }
         // For OPERATOR CLASS/FAMILY, store the USING method in onTable
         if (opMethod != null) {
             onTable = opMethod;
         }
 
-        boolean cascade = parser.matchKeyword("CASCADE");
-        parser.matchKeyword("RESTRICT");
-
-        return new DropStmt(objectType, name, onTable, ifExists, cascade, funcParamTypes, dropSchema);
+        return new DropTarget(name, onTable, dropSchema, funcParamTypes);
     }
 
     /**
@@ -553,16 +618,22 @@ class DdlParser {
                 while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
                 return new AlterTableStmt(viewSchema, viewName,
                         Cols.listOf((AlterTableStmt.AlterAction)
-                                new AlterTableStmt.SetSchema(newSchema)), viewIfExists);
+                                new AlterTableStmt.SetSchema(newSchema)), viewIfExists)
+                        .withWrittenKind("materialized view");
             }
             if (parser.matchKeyword("SET") && parser.check(TokenType.LEFT_PAREN)) {
                 Map<String, String> opts = parseViewWithOptions();
                 return new AlterViewStmt(writtenView, null, viewIfExists,
                         AlterViewStmt.Action.SET_OPTIONS, opts, true);
             }
-            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-            return new AlterViewStmt(writtenView, null, viewIfExists,
-                    AlterViewStmt.Action.NO_OP, null, true);
+            // Whatever else the statement says is an ALTER TABLE action about the same relation,
+            // and that path already knows which actions a materialized view takes and which it
+            // refuses. Consuming the rest here accepted every one of them, nonsense included.
+            // The kind the keyword named travels with the node, because that path takes any
+            // relation and this statement takes only a materialized view.
+            return new AlterTableStmt(viewSchema, viewName,
+                    parseAlterActionList(viewName), viewIfExists)
+                    .withWrittenKind("materialized view");
         }
 
         if (parser.matchKeyword("VIEW")) {
@@ -587,7 +658,8 @@ class DdlParser {
                 while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
                 return new AlterTableStmt(viewSchema, viewName,
                         Cols.listOf((AlterTableStmt.AlterAction)
-                                new AlterTableStmt.SetSchema(newSchema)), viewIfExists);
+                                new AlterTableStmt.SetSchema(newSchema)), viewIfExists)
+                        .withWrittenKind("view");
             }
             if (parser.matchKeywords("RENAME", "TO")) {
                 return new AlterViewStmt(writtenView, parser.readIdentifier(), viewIfExists, AlterViewStmt.Action.RENAME_TO);
@@ -599,8 +671,13 @@ class DdlParser {
                 Map<String, String> opts = parseViewWithOptions();
                 return new AlterViewStmt(writtenView, null, viewIfExists, AlterViewStmt.Action.SET_OPTIONS, opts);
             }
-            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-            return new AlterViewStmt(writtenView, null, viewIfExists, AlterViewStmt.Action.NO_OP);
+            // As for a materialized view above: the remaining actions are ALTER TABLE actions
+            // about this relation, and only that path can tell a column default -- which a view
+            // accepts -- from an ADD COLUMN, which it does not. The kind the keyword named goes
+            // with them, because that path takes any relation and this statement takes only a view.
+            return new AlterTableStmt(viewSchema, viewName,
+                    parseAlterActionList(viewName), viewIfExists)
+                    .withWrittenKind("view");
         }
 
         if (parser.matchKeyword("DOMAIN")) return parseAlterDomain();
@@ -723,11 +800,42 @@ class DdlParser {
         if (parser.match(TokenType.DOT)) { schema = table; table = parser.readIdentifier(); }
 
         List<AlterTableStmt.AlterAction> actions = new ArrayList<>();
+        tableParser.setRelationName(table);
         do {
             actions.add(alterActionParser.parseAlterAction());
+            // RENAME, SET SCHEMA and ATTACH/DETACH PARTITION are productions of their own in
+            // PostgreSQL's grammar rather than members of the comma-separated action list, so a
+            // comma after one of them is a syntax error and not a second action.
+            if (parser.check(TokenType.COMMA) && standsAlone(actions.get(actions.size() - 1))) {
+                throw ParseException.saying("syntax error at or near \",\"", parser.peek(), "42601");
+            }
         } while (parser.match(TokenType.COMMA));
 
         return new AlterTableStmt(schema, table, actions, ifExists, only);
+    }
+
+    /** True for the ALTER TABLE actions PostgreSQL's grammar will not put in a comma list. */
+    private static boolean standsAlone(AlterTableStmt.AlterAction action) {
+        return action instanceof AlterTableStmt.RenameTable
+                || action instanceof AlterTableStmt.RenameColumn
+                || action instanceof AlterTableStmt.RenameConstraint
+                || action instanceof AlterTableStmt.SetSchema
+                || action instanceof AlterTableStmt.AttachPartition
+                || action instanceof AlterTableStmt.DetachPartition;
+    }
+
+    /**
+     * The action list of an ALTER statement that is handed to the ALTER TABLE path. Reading it
+     * with the table action parser is what makes an action a view cannot take reach the executor
+     * that knows how to refuse it, and an action no grammar has a real syntax error.
+     */
+    private List<AlterTableStmt.AlterAction> parseAlterActionList(String relation) {
+        List<AlterTableStmt.AlterAction> parsed = new ArrayList<>();
+        tableParser.setRelationName(relation);
+        do {
+            parsed.add(alterActionParser.parseAlterAction());
+        } while (parser.match(TokenType.COMMA));
+        return parsed;
     }
 
     // ---- CREATE TRIGGER ----
@@ -788,14 +896,35 @@ class DdlParser {
             }
         }
 
-        boolean trigDeferrable = parser.matchKeyword("DEFERRABLE");
+        // Only a constraint trigger can be deferred, so only its grammar has a FROM relation and
+        // a deferrability clause; on a plain CREATE TRIGGER those words are not part of the
+        // sentence at all, which is why PostgreSQL answers with a syntax error rather than
+        // ignoring them. NOT DEFERRABLE is a spelling of its own: read as a bare DEFERRABLE it
+        // never matched, and the statement failed on the word after it.
+        String constraintRelation = null;
+        boolean trigDeferrable = false;
         boolean trigInitiallyDeferred = false;
-        if (parser.matchKeyword("INITIALLY")) {
-            if (parser.matchKeyword("DEFERRED")) {
-                trigInitiallyDeferred = true;
-            } else {
-                parser.matchKeyword("IMMEDIATE");
+        if (constraint) {
+            if (parser.matchKeyword("FROM")) {
+                constraintRelation = parser.readIdentifier();
+                if (parser.match(TokenType.DOT)) {
+                    constraintRelation = constraintRelation + "." + parser.readIdentifier();
+                }
             }
+            if (!parser.matchKeywords("NOT", "DEFERRABLE")) {
+                trigDeferrable = parser.matchKeyword("DEFERRABLE");
+            }
+            if (parser.matchKeyword("INITIALLY")) {
+                if (parser.matchKeyword("DEFERRED")) {
+                    trigInitiallyDeferred = true;
+                } else {
+                    parser.matchKeyword("IMMEDIATE");
+                }
+            }
+        } else if (parser.checkKeyword("DEFERRABLE")) {
+            Token deferToken = parser.peek();
+            throw new ParseException("syntax error at or near \"" + deferToken.value() + "\"",
+                    deferToken);
         }
 
         parser.expectKeyword("FOR");
@@ -840,7 +969,8 @@ class DdlParser {
 
         return new CreateTriggerStmt(name, timing, events, table, tableSchema, funcName, orReplace, whenClause,
                 updateOfColumns.isEmpty() ? null : updateOfColumns, newTransitionTable, oldTransitionTable, !forEachRow,
-                trigDeferrable, trigInitiallyDeferred, funcArgs.isEmpty() ? null : funcArgs);
+                trigDeferrable, trigInitiallyDeferred, funcArgs.isEmpty() ? null : funcArgs,
+                constraint, constraintRelation);
     }
 
     // ---- CREATE VIEW ----
@@ -927,6 +1057,7 @@ class DdlParser {
             parser.consumeLeadingParens(viewParens);
             Statement query = parser.tryParseSetOp(parseViewBody());
             parser.consumeTrailingParens(viewParens);
+            query = applyTrailingQueryClauses(query);
             boolean withData = true;
             if (parser.matchKeyword("WITH")) {
                 if (parser.matchKeyword("NO")) { parser.expectKeyword("DATA"); withData = false; }
@@ -956,6 +1087,7 @@ class DdlParser {
         parser.consumeLeadingParens(viewParens2);
         Statement query = parser.tryParseSetOp(parseViewBody());
         parser.consumeTrailingParens(viewParens2);
+        query = applyTrailingQueryClauses(query);
 
         String checkOption = null;
         if (parser.matchKeyword("WITH")) {
@@ -968,6 +1100,56 @@ class DdlParser {
 
         return new CreateViewStmt(name, query, orReplace, false, columnNames, true, checkOption, withOptions)
                 .withSchema(viewSchema);
+    }
+
+    /**
+     * Read the clauses that order and limit a whole parenthesised body.
+     *
+     * <p>{@code (SELECT ...) ORDER BY x LIMIT n} closes its parenthesis before those clauses, so
+     * the query inside never sees them; without reading them here the view was stored as the
+     * query alone and answered every row of it.
+     */
+    private Statement applyTrailingQueryClauses(Statement query) {
+        List<SelectStmt.OrderByItem> orderBy;
+        Expression limit;
+        Expression offset;
+        if (query instanceof SetOpStmt) {
+            SetOpStmt setOp = (SetOpStmt) query;
+            orderBy = setOp.orderBy();
+            limit = setOp.limit();
+            offset = setOp.offset();
+        } else if (query instanceof SelectStmt) {
+            SelectStmt select = (SelectStmt) query;
+            orderBy = select.orderBy();
+            limit = select.limit();
+            offset = select.offset();
+        } else {
+            return query;
+        }
+        boolean changed = false;
+        if (parser.matchKeywords("ORDER", "BY")) {
+            orderBy = parser.parseOrderByList();
+            changed = true;
+        }
+        if (parser.matchKeyword("LIMIT")) {
+            limit = parser.matchKeyword("ALL") ? Literal.ofNull() : parser.parseExpression();
+            changed = true;
+        }
+        if (parser.matchKeyword("OFFSET")) {
+            offset = parser.parseExpression();
+            changed = true;
+        }
+        if (!changed) return query;
+        if (query instanceof SetOpStmt) {
+            SetOpStmt setOp = (SetOpStmt) query;
+            return new SetOpStmt(setOp.left(), setOp.op(), setOp.all(), setOp.right(), orderBy,
+                    limit, offset, setOp.withTies());
+        }
+        SelectStmt select = (SelectStmt) query;
+        return new SelectStmt(select.distinct(), select.distinctOn(), select.targets(),
+                select.from(), select.where(), select.groupBy(), select.having(),
+                select.windowDefs(), orderBy, limit, offset, select.withClauses(),
+                select.groupingSets(), select.lockClause(), select.withTies());
     }
 
     /**
@@ -985,15 +1167,20 @@ class DdlParser {
         parser.expect(TokenType.LEFT_PAREN);
         do {
             String key = parser.readIdentifier();
-            parser.expect(TokenType.EQUALS);
-            // value can be identifier (true/false) or string literal or number
-            String value;
-            if (parser.check(TokenType.STRING_LITERAL)) {
-                value = parser.advance().value();
-            } else if (parser.check(TokenType.INTEGER_LITERAL)) {
-                value = parser.advance().value();
-            } else {
-                value = parser.readIdentifier();
+            // PostgreSQL's storage-parameter grammar is `name [= value]`, and a bare name means
+            // true. Demanding the value turned WITH (security_barrier) -- the spelling pg_dump
+            // writes -- into a syntax error, so a schema pairing a barrier view with a row-secured
+            // table could not be loaded at all.
+            String value = "true";
+            if (parser.match(TokenType.EQUALS)) {
+                // value can be identifier (true/false) or string literal or number
+                if (parser.check(TokenType.STRING_LITERAL)) {
+                    value = parser.advance().value();
+                } else if (parser.check(TokenType.INTEGER_LITERAL)) {
+                    value = parser.advance().value();
+                } else {
+                    value = parser.readIdentifier();
+                }
             }
             opts.put(key.toLowerCase(), value.toLowerCase());
         } while (parser.match(TokenType.COMMA));
@@ -1253,8 +1440,15 @@ class DdlParser {
             throw new ParseException("unrecognized rule event", eventToken);
         }
         parser.expectKeyword("TO");
+        // A rule is written on one relation, and a qualifier says which schema holds it rather
+        // than being part of the relation's name. Folding the two into one string sent the
+        // executor looking in the current schema for a relation literally called "s.t".
+        String schema = null;
         String table = parser.readIdentifier();
-        if (parser.match(TokenType.DOT)) table = table + "." + parser.readIdentifier();
+        if (parser.match(TokenType.DOT)) {
+            schema = table;
+            table = parser.readIdentifier();
+        }
         StringBuilder where = new StringBuilder();
         if (parser.matchKeyword("WHERE")) {
             int depth = 0;
@@ -1282,7 +1476,7 @@ class DdlParser {
             }
             if (sb.length() > 0) commands.add(sb.toString().trim());
         }
-        return new CreateRuleStmt(name, event, table, action, commands,
+        return new CreateRuleStmt(name, event, schema, table, action, commands,
                 where.length() == 0 ? null : where.toString().trim(), orReplace);
     }
 
@@ -1363,7 +1557,11 @@ class DdlParser {
         Expression defaultExpr = null;
         boolean notNull = false;
         boolean sawNotNull = false, sawNull = false, sawDefault = false;
-        Expression checkExpr = null;
+        // Every CHECK the definition writes is a constraint of its own, and a CONSTRAINT clause
+        // names the one that follows it: keeping a single expression made the last CHECK written
+        // the only one the domain ever carried.
+        java.util.List<CreateDomainStmt.DomainCheck> checks =
+                new java.util.ArrayList<CreateDomainStmt.DomainCheck>();
         String constraintName = null;
         String collation = null;
         if (parser.matchKeyword("COLLATE")) {
@@ -1390,8 +1588,11 @@ class DdlParser {
             else if (parser.matchKeyword("NULL")) { notNull = false; sawNull = true; }
             else if (parser.matchKeyword("CHECK")) {
                 parser.expect(TokenType.LEFT_PAREN);
-                checkExpr = parser.parseExpression();
+                Expression written = parser.parseExpression();
                 parser.expect(TokenType.RIGHT_PAREN);
+                // A CONSTRAINT clause names the constraint that follows it and no later one.
+                checks.add(new CreateDomainStmt.DomainCheck(constraintName, written));
+                constraintName = null;
             } else if (parser.matchKeyword("CONSTRAINT")) { constraintName = parser.readIdentifier(); }
             // A domain has no rows, so the table-level constraint forms are meaningless on one.
             else if (parser.checkKeyword("UNIQUE")) {
@@ -1408,8 +1609,10 @@ class DdlParser {
                 throw PgErrors.syntax("conflicting NULL/NOT NULL constraints");
             }
         }
-        CreateDomainStmt domainStmt =
-                new CreateDomainStmt(name, baseType, defaultExpr, notNull, checkExpr, constraintName);
+        CreateDomainStmt domainStmt = new CreateDomainStmt(name, baseType, defaultExpr, notNull,
+                checks.isEmpty() ? null : checks.get(0).expr(),
+                checks.isEmpty() ? null : checks.get(0).name());
+        domainStmt.setChecks(checks);
         domainStmt.setCollation(collation);
         domainStmt.setSchemaName(schema);
         return domainStmt;
@@ -1418,6 +1621,16 @@ class DdlParser {
     // ---- SEQUENCE ----
 
     long readSeqLong() {
+        return readSeqLong(parser);
+    }
+
+    /**
+     * The same reader, reachable from the other parsers that read a sequence option list. An
+     * identity column's parenthesised options are the same grammar written inside a column
+     * definition, and reading them with a bare parse turned a signed or fractional value into an
+     * internal error rather than the message PostgreSQL sends.
+     */
+    static long readSeqLong(Parser parser) {
         boolean neg = false;
         if (parser.check(TokenType.MINUS)) { parser.advance(); neg = true; }
         Token token = parser.advance();
@@ -1442,22 +1655,36 @@ class DdlParser {
         }
     }
 
+    /**
+     * Each sequence option may be written once. PostgreSQL reads a repeated one as a fault in the
+     * statement rather than letting the last one win, and CYCLE and NO CYCLE are the same option,
+     * so writing both is the same complaint. The set belongs to the statement, not to one call:
+     * ALTER SEQUENCE reads its options in a loop, and a per-call set would miss the repetition.
+     */
+    private static void seqOptionOnce(java.util.Set<String> seen, String option) {
+        if (!seen.add(option)) throw PgErrors.syntax("conflicting or redundant options");
+    }
+
     private void parseSequenceOptions(Long[] startWith, Long[] incrementBy, Long[] minValue,
                                       Long[] maxValue, Boolean[] cycle, Integer[] cache, String[] asType,
-                                      String[] ownedByTable, String[] ownedByColumn) {
+                                      String[] ownedByTable, String[] ownedByColumn,
+                                      java.util.Set<String> seen) {
         while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
-            if (parser.matchKeywords("START", "WITH")) { startWith[0] = readSeqLong(); continue; }
-            if (parser.matchKeyword("START")) { startWith[0] = readSeqLong(); continue; }
-            if (parser.matchKeywords("INCREMENT", "BY")) { incrementBy[0] = readSeqLong(); continue; }
-            if (parser.matchKeyword("INCREMENT")) { incrementBy[0] = readSeqLong(); continue; }
-            if (parser.matchKeyword("MINVALUE")) { minValue[0] = readSeqLong(); continue; }
-            if (parser.matchKeyword("MAXVALUE")) { maxValue[0] = readSeqLong(); continue; }
-            if (parser.matchKeywords("NO", "MINVALUE")) { continue; }
-            if (parser.matchKeywords("NO", "MAXVALUE")) { continue; }
-            if (parser.matchKeyword("CACHE")) { cache[0] = (int) readSeqLong(); continue; }
-            if (parser.matchKeyword("CYCLE")) { cycle[0] = true; continue; }
-            if (parser.matchKeywords("NO", "CYCLE")) { cycle[0] = false; continue; }
+            if (parser.matchKeywords("START", "WITH")) { seqOptionOnce(seen, "START"); startWith[0] = readSeqLong(); continue; }
+            if (parser.matchKeyword("START")) { seqOptionOnce(seen, "START"); startWith[0] = readSeqLong(); continue; }
+            if (parser.matchKeywords("INCREMENT", "BY")) { seqOptionOnce(seen, "INCREMENT"); incrementBy[0] = readSeqLong(); continue; }
+            if (parser.matchKeyword("INCREMENT")) { seqOptionOnce(seen, "INCREMENT"); incrementBy[0] = readSeqLong(); continue; }
+            if (parser.matchKeyword("MINVALUE")) { seqOptionOnce(seen, "MINVALUE"); minValue[0] = readSeqLong(); continue; }
+            if (parser.matchKeyword("MAXVALUE")) { seqOptionOnce(seen, "MAXVALUE"); maxValue[0] = readSeqLong(); continue; }
+            if (parser.matchKeywords("NO", "MINVALUE")) { seqOptionOnce(seen, "MINVALUE"); continue; }
+            if (parser.matchKeywords("NO", "MAXVALUE")) { seqOptionOnce(seen, "MAXVALUE"); continue; }
+            if (parser.matchKeyword("CACHE")) { seqOptionOnce(seen, "CACHE"); cache[0] = (int) readSeqLong(); continue; }
+            if (parser.matchKeyword("CYCLE")) { seqOptionOnce(seen, "CYCLE"); cycle[0] = true; continue; }
+            if (parser.matchKeywords("NO", "CYCLE")) { seqOptionOnce(seen, "CYCLE"); cycle[0] = false; continue; }
             if (parser.matchKeywords("OWNED", "BY")) {
+                // OWNED BY is an option of the statement like any other: it may be written once,
+                // and a statement carrying only it is a complete ALTER SEQUENCE.
+                seqOptionOnce(seen, "OWNED BY");
                 if (parser.matchKeyword("NONE")) {
                     if (ownedByTable != null) { ownedByTable[0] = "NONE"; ownedByColumn[0] = "NONE"; }
                     continue;
@@ -1472,12 +1699,12 @@ class DdlParser {
                 }
                 continue;
             }
-            if (parser.matchKeyword("AS")) { if (asType != null) asType[0] = parser.readIdentifier(); else parser.readIdentifier(); continue; }
+            if (parser.matchKeyword("AS")) { seqOptionOnce(seen, "AS"); if (asType != null) asType[0] = parser.readIdentifier(); else parser.readIdentifier(); continue; }
             break;
         }
     }
 
-    CreateSequenceStmt parseCreateSequence(boolean temporary) {
+    CreateSequenceStmt parseCreateSequence(boolean temporary, boolean unlogged) {
         boolean ifNotExists = parser.matchKeywords("IF", "NOT", "EXISTS");
         String name = parser.readIdentifier();
         String seqSchema = null;
@@ -1487,8 +1714,10 @@ class DdlParser {
         Integer[] cache = {null};
         String[] asType = {null};
         String[] ownedByTable = {null}, ownedByColumn = {null};
-        parseSequenceOptions(startWith, incrementBy, minValue, maxValue, cycle, cache, asType, ownedByTable, ownedByColumn);
+        parseSequenceOptions(startWith, incrementBy, minValue, maxValue, cycle, cache, asType,
+                ownedByTable, ownedByColumn, new java.util.HashSet<String>());
         CreateSequenceStmt stmt = new CreateSequenceStmt(name, ifNotExists, startWith[0], incrementBy[0], minValue[0], maxValue[0], cycle[0], temporary);
+        stmt.setUnlogged(unlogged);
         stmt.setCache(cache[0]);
         stmt.setAsType(asType[0]);
         stmt.setOwnedBy(ownedByTable[0], ownedByColumn[0]);
@@ -1521,8 +1750,10 @@ class DdlParser {
         String[] ownedByTable = {null}, ownedByColumn = {null};
         String[] asType = {null};
         Integer[] cache = {null};
+        java.util.Set<String> seen = new java.util.HashSet<String>();
         while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
             if (parser.matchKeyword("RESTART")) {
+                seqOptionOnce(seen, "RESTART");
                 restart = true;
                 if (parser.matchKeyword("WITH")) { restartWith = readSeqLong(); }
                 else if (parser.check(TokenType.INTEGER_LITERAL) || parser.check(TokenType.MINUS)) { restartWith = readSeqLong(); }
@@ -1534,8 +1765,14 @@ class DdlParser {
                 return owned;
             }
             int saved = parser.pos;
-            parseSequenceOptions(startWith, incrementBy, minValue, maxValue, cycle, cache, asType, ownedByTable, ownedByColumn);
+            parseSequenceOptions(startWith, incrementBy, minValue, maxValue, cycle, cache, asType,
+                    ownedByTable, ownedByColumn, seen);
             if (parser.pos == saved) break;
+        }
+        // ALTER SEQUENCE has to say what to alter: a statement that names a sequence and stops is
+        // an unfinished one, not a successful no-op.
+        if (seen.isEmpty()) {
+            throw PgErrors.syntax("syntax error at end of input");
         }
         AlterSequenceStmt stmt = new AlterSequenceStmt(name, restart, restartWith, incrementBy[0], minValue[0],
                 maxValue[0], startWith[0], cycle[0], null, null, ownedByTable[0], ownedByColumn[0]);
@@ -1748,13 +1985,11 @@ class DdlParser {
                 throw new ParseException("syntax error", parser.peek());
             }
             String attrName = parser.readIdentifier();
-            String attrType = parser.readIdentifier();
-            // Handle multi-word types like "double precision"
-            if (attrType.equalsIgnoreCase("double") && parser.matchKeyword("PRECISION")) {
-                attrType = "double precision";
-            } else if (attrType.equalsIgnoreCase("character") && parser.matchKeyword("VARYING")) {
-                attrType = "character varying";
-            }
+            // An attribute is declared the way a column is, so its type is read the same way. The
+            // width in varchar(5), the precision in numeric(8,2), an interval's fields and an
+            // array's brackets are all part of what the attribute is, and reading the type name a
+            // word at a time left every one of them behind.
+            String attrType = parser.parseTypeName();
             return new AlterTypeStmt(typeName, AlterTypeStmt.Action.ADD_ATTRIBUTE, attrName, attrType, false, null, null);
         }
         if (parser.matchKeywords("DROP", "ATTRIBUTE")) {
@@ -1768,13 +2003,16 @@ class DdlParser {
             parser.matchKeyword("SET"); // optional SET before DATA
             parser.matchKeyword("DATA"); // optional DATA
             parser.expectKeyword("TYPE");
-            String newType = parser.readIdentifier();
-            if (newType.equalsIgnoreCase("double") && parser.matchKeyword("PRECISION")) {
-                newType = "double precision";
-            } else if (newType.equalsIgnoreCase("character") && parser.matchKeyword("VARYING")) {
-                newType = "character varying";
-            }
-            return new AlterTypeStmt(typeName, AlterTypeStmt.Action.ALTER_ATTRIBUTE_TYPE, attrName, newType, false, null, null);
+            // The type an attribute is changed to is written the way a column's is, modifier and
+            // all: ALTER ATTRIBUTE y TYPE varchar(5) changes it to varchar(5), not to varchar.
+            String newType = parser.parseTypeName();
+            // CASCADE is what lets the change reach the tables declared OF this type; without it
+            // PostgreSQL refuses rather than reshaping a relation the statement did not name.
+            // RESTRICT is the default written out.
+            boolean cascade = parser.matchKeyword("CASCADE");
+            if (!cascade) parser.matchKeyword("RESTRICT");
+            return new AlterTypeStmt(typeName, AlterTypeStmt.Action.ALTER_ATTRIBUTE_TYPE, attrName,
+                    newType, false, null, null, false, cascade);
         }
         if (parser.matchKeywords("SET", "SCHEMA"))
             return new AlterTypeStmt(typeName, AlterTypeStmt.Action.SET_SCHEMA, parser.readIdentifier(), null, false, null, null);

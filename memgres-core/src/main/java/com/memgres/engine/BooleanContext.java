@@ -449,7 +449,30 @@ final class BooleanContext {
         String bare = FunctionEvaluator.stripSchemaPrefix(written.toLowerCase(Locale.ROOT));
         if (types.isUserFunction(bare)) return null;
         String exact = exactSignatureType(bare, args, types);
-        return exact != null ? exact : SINGLE_RETURN_TYPES.get(bare);
+        if (exact != null) return exact;
+        String value = VALUE_FUNCTION_TYPES.get(bare);
+        return value != null ? value : SINGLE_RETURN_TYPES.get(bare);
+    }
+
+    /**
+     * The SQL value functions the grammar spells as bare keywords. Each of them is a call, but not
+     * every one is a call to something pg_catalog holds under that name — there is a now() to look
+     * up and no current_timestamp() — so the ones the signature list cannot answer for are named
+     * here. Each type was read off PostgreSQL rather than assumed: CURRENT_TIME carries a zone
+     * where LOCALTIME does not, and that is the whole of the difference between the two.
+     */
+    private static final java.util.Map<String, String> VALUE_FUNCTION_TYPES = valueFunctionTypes();
+
+    private static java.util.Map<String, String> valueFunctionTypes() {
+        java.util.Map<String, String> types = new java.util.HashMap<String, String>();
+        types.put("current_timestamp", DataType.TIMESTAMPTZ.toRegtypeDisplay());
+        types.put("localtimestamp", DataType.TIMESTAMP.toRegtypeDisplay());
+        types.put("current_date", DataType.DATE.toRegtypeDisplay());
+        types.put("current_time", DataType.TIMETZ.toRegtypeDisplay());
+        types.put("localtime", DataType.TIME.toRegtypeDisplay());
+        types.put("current_role", DataType.NAME.toRegtypeDisplay());
+        types.put("current_catalog", DataType.NAME.toRegtypeDisplay());
+        return types;
     }
 
     /**

@@ -14,12 +14,44 @@ import java.util.concurrent.locks.ReentrantLock;
  */
 public class Table {
 
-    private final String name;
+    /**
+     * A rename is the same relation under another name, so the name is changed on the table
+     * rather than copied onto a replacement. Every partition bound, inheritance link, policy,
+     * storage parameter and constraint name a copy would have had to remember stays where it is.
+     */
+    private volatile String name;
     // CopyOnWriteArrayList: safe for concurrent reads (getColumnIndex from DML threads)
     // while DDL methods (renameColumn, alterColumnType, etc.) modify via set().
     private final List<Column> columns;
+    /**
+     * The attribute numbers this relation has handed out that no column answers to any more, in
+     * ascending order, each beside the column that held it. PostgreSQL does not renumber a
+     * relation when a column goes: the dropped column's row stays behind under a name nothing
+     * could have written, so every column after it keeps the number a constraint, an index, a
+     * default or a trigger may already be holding.
+     */
+    private final List<DroppedAttribute> droppedAttributes = new CopyOnWriteArrayList<>();
     private volatile List<Object[]> rows = new ArrayList<>();
     private final AtomicLong serialCounter = new AtomicLong(1);
+    /**
+     * The line pointers this relation has handed out. Where a tuple sits is a property of the
+     * relation's own file rather than of the name it stands under, so a rename or a move to
+     * another schema carries the numbering with it, while a relation created after another was
+     * dropped begins a file of its own and starts again at one.
+     */
+    private final AtomicLong tupleIdCounter = new AtomicLong(0);
+    /**
+     * What each row's system columns answer: the transaction that wrote it, the one that removed
+     * it, the command each of those was, and the line pointer it sits at, kept against the row
+     * itself.
+     *
+     * <p>None of that belongs to the name the relation stands under. PostgreSQL renames a relation,
+     * and moves one between schemas, without rewriting a tuple, so afterwards a row still names
+     * the transaction that inserted it and still sits where it always sat. Held under the written
+     * name instead, the whole book became unreachable the moment the name changed, and the book a
+     * dropped relation left behind stayed for as long as the server ran.
+     */
+    private final Map<Object[], long[]> rowMeta = new java.util.IdentityHashMap<>();
     private final List<StoredConstraint> constraints = new CopyOnWriteArrayList<>();
     /**
      * The name a column's NOT NULL constraint answers to, keyed by column. Every NOT NULL column
@@ -28,6 +60,42 @@ public class Table {
      * CONSTRAINT ask for. Only names that differ from the default are stored here.
      */
     private final Map<String, String> notNullConstraintNames = new java.util.concurrent.ConcurrentHashMap<>();
+    /** Per column: the name an inherited NOT NULL answers to, once it can no longer be derived. */
+    private final Map<String, String> inheritedNotNullNames = new java.util.concurrent.ConcurrentHashMap<>();
+    /** Per column: parents whose NOT NULL this one still counts although they no longer declare it. */
+    private final Map<String, Integer> retainedNotNullInheritCounts = new java.util.concurrent.ConcurrentHashMap<>();
+    /**
+     * The columns this relation holds only because a parent declares them. PostgreSQL calls a
+     * column local when the relation's own definition named it, and that is a different question
+     * from how many parents also have it: a child that restates an inherited column in its own
+     * column list is reported local and inherited once over, both at the same time.
+     */
+    private final java.util.Set<String> inheritedColumns =
+            java.util.concurrent.ConcurrentHashMap.<String>newKeySet();
+    /**
+     * The columns whose NOT NULL arrived from a parent rather than from this relation's own
+     * definition. Such a constraint answers to the name the relation that declared it gave it, and
+     * nobody below may drop it; a child that restates NOT NULL for itself carries a constraint of
+     * its own name that it may withdraw.
+     */
+    private final java.util.Set<String> inheritedNotNullColumns =
+            java.util.concurrent.ConcurrentHashMap.<String>newKeySet();
+    /**
+     * The columns whose NOT NULL was declared NO INHERIT. Such a rule is about this relation's own
+     * rows and nobody else's: PostgreSQL hands the column down without it, and a descendant that
+     * declares NOT NULL for itself counts no parent for it.
+     */
+    private final java.util.Set<String> noInheritNotNullColumns =
+            java.util.concurrent.ConcurrentHashMap.<String>newKeySet();
+    /**
+     * The columns whose NOT NULL was declared NOT VALID and has not been validated since. Every
+     * constraint PostgreSQL keeps carries that flag, and a NOT NULL is one constraint per column,
+     * so this is where the column's own copy of it lives. The rule itself is in force either way --
+     * every row written from now on is held to it -- and the flag says only whether the rows
+     * already stored have been read, which is what VALIDATE CONSTRAINT goes back to do.
+     */
+    private final java.util.Set<String> notValidatedNotNullColumns =
+            java.util.concurrent.ConcurrentHashMap.<String>newKeySet();
     private final ReentrantLock writeLock = new ReentrantLock();
 
     // Hash indexes keyed by constraint name (for PK, UNIQUE constraints)
@@ -44,7 +112,12 @@ public class Table {
     private volatile java.time.OffsetDateTime lastAnalyze;
 
     // Inheritance
-    private Table parentTable;
+    /**
+     * Every table this one directly inherits from, in the order they were named. PostgreSQL keeps
+     * one pg_inherits row per parent with inhseqno counting from 1, so a table declared under two
+     * parents has two of them; a single field kept only whichever came last.
+     */
+    private final List<Table> inheritParents = new CopyOnWriteArrayList<>();
     private final List<Table> children = new CopyOnWriteArrayList<>();
 
     // Partitioning
@@ -89,8 +162,51 @@ public class Table {
         this.columns = new CopyOnWriteArrayList<>(columns);
     }
 
+    /**
+     * The name this relation answers to for the session asking. A rename inside an open
+     * transaction has happened for nobody else yet, and since the rename changes the one
+     * relation object rather than making a second one, everyone else would otherwise read the
+     * new name off it — which is the new name leaking out of an uncommitted transaction.
+     */
     public String getName() {
-        return name;
+        String previous = renamedFrom;
+        if (previous == null) return name;
+        Session renamer = renamedBy;
+        if (renamer == null || !renamer.isInTransaction()) return name;
+        Session viewer = Database.currentViewer();
+        return viewer == null || viewer == renamer ? name : previous;
+    }
+
+    /**
+     * Rename this table. Only a schema that has already removed it under the old name may call
+     * this: the schema keys its tables by name, so the two have to move together.
+     */
+    public void setName(String name) {
+        this.name = name;
+    }
+
+    /**
+     * The name this relation is still known by outside the transaction that renamed it, and the
+     * session that did. DDL is transactional, so until that transaction ends the old name is the
+     * relation's name for every other session.
+     */
+    private volatile String renamedFrom;
+    private volatile Session renamedBy;
+
+    /** Record that {@code renamer}, mid-transaction, renamed this relation away from {@code from}. */
+    void markUncommittedRename(String from, Session renamer) {
+        if (renamer == null || !renamer.isInTransaction()) return;
+        // Two renames in one transaction: the name everyone else knows is the one it started with.
+        if (renamedFrom == null || renamedBy != renamer) renamedFrom = from;
+        renamedBy = renamer;
+    }
+
+    /** That transaction has ended, one way or the other; the name it left is the name. */
+    void forgetUncommittedRename(Session renamer) {
+        if (renamedBy == renamer) {
+            renamedBy = null;
+            renamedFrom = null;
+        }
     }
 
     /**
@@ -297,14 +413,27 @@ public class Table {
         public static final class RowWithSource {
         public final Table source;
         public final Object[] row;
+        /**
+         * The row as the relation that stores it holds it. Reading a row through the relation
+         * above it rearranges it to that relation's columns, and the rearranged copy is not the
+         * tuple PostgreSQL answers ctid, xmin and the rest from: those belong to the row where it
+         * lives, which is this one.
+         */
+        public final Object[] stored;
 
         public RowWithSource(Table source, Object[] row) {
+            this(source, row, row);
+        }
+
+        public RowWithSource(Table source, Object[] row, Object[] stored) {
             this.source = source;
             this.row = row;
+            this.stored = stored;
         }
 
         public Table source() { return source; }
         public Object[] row() { return row; }
+        public Object[] stored() { return stored; }
 
         @Override
         public boolean equals(Object o) {
@@ -350,14 +479,15 @@ public class Table {
                 for (int i = 0; i < columns.size() && i < childRws.row().length; i++) {
                     parentRow[i] = childRws.row()[i];
                 }
-                allRows.add(new RowWithSource(childRws.source(), parentRow));
+                allRows.add(new RowWithSource(childRws.source(), parentRow, childRws.stored()));
             }
         }
         for (Table partition : partitions) {
             // Recurse so multi-level partitioning (partition of a partition) is included
             for (RowWithSource rws : partition.getAllRowsWithSource()) {
                 Object[] asParent = partition.rowToParent(rws.row());
-                allRows.add(asParent == rws.row() ? rws : new RowWithSource(rws.source(), asParent));
+                allRows.add(asParent == rws.row() ? rws
+                        : new RowWithSource(rws.source(), asParent, rws.stored()));
             }
         }
         return allRows;
@@ -444,11 +574,124 @@ public class Table {
         }
     }
 
+    /**
+     * The index of a column the caller has to be able to find, in PostgreSQL's words when it
+     * cannot: the complaint names the relation the name was looked for in, and quotes the name.
+     * The SQLSTATE is stated here rather than left to be inferred from the message text, which
+     * is what "Column not found" was relying on.
+     */
+    private int requireColumnIndex(String columnName) {
+        int idx = getColumnIndex(columnName);
+        if (idx < 0) {
+            throw new MemgresException("column \"" + columnName + "\" of relation \""
+                    + name + "\" does not exist", "42703");
+        }
+        return idx;
+    }
+
+    /**
+     * One attribute number a dropped column left taken, and the column that held it.
+     *
+     * <p>PostgreSQL forgets what type a dropped attribute had -- the type itself may be gone by
+     * now -- but keeps the width, alignment and storage that type gave it, because the rows
+     * already stored are laid out that way. The column it was declared as is what answers all of
+     * those, so the column is what is kept.
+     */
+    public static final class DroppedAttribute {
+        private final int attnum;
+        private final Column column;
+        private final boolean local;
+        private final short inheritCount;
+
+        DroppedAttribute(int attnum, Column column, boolean local, short inheritCount) {
+            this.attnum = attnum;
+            this.column = column;
+            this.local = local;
+            this.inheritCount = inheritCount;
+        }
+
+        public int getAttnum() { return attnum; }
+
+        public Column getColumn() { return column; }
+
+        /** Whether the relation's own definition named the column, as attislocal reports it. */
+        public boolean isLocal() { return local; }
+
+        /** How many relations above this one declared the column, as attinhcount reports it. */
+        public short getInheritCount() { return inheritCount; }
+    }
+
+    /** Whether a column of this relation has been dropped, leaving its number taken. */
+    public boolean hasDroppedAttributes() {
+        return !droppedAttributes.isEmpty();
+    }
+
+    /** The numbers dropped columns left behind, ascending, beside the columns that held them. */
+    public List<DroppedAttribute> getDroppedAttributes() {
+        return droppedAttributes;
+    }
+
+    /**
+     * The attribute number PostgreSQL reports for the column sitting at {@code index}: its
+     * position plus one for every column dropped at or before it, since a dropped column never
+     * gives its number back. An index naming no column answers 0, the number pg_index and
+     * pg_trigger use for something that is not a column of the relation.
+     */
+    public int attnumAt(int index) {
+        if (index < 0) return 0;
+        int attnum = index + 1;
+        for (DroppedAttribute gone : droppedAttributes) {
+            if (gone.getAttnum() <= attnum) attnum++;
+        }
+        return attnum;
+    }
+
+    /** The same for a column named rather than counted; 0 when this relation has no such column. */
+    public int attnumOf(String columnName) {
+        return attnumAt(getColumnIndex(columnName));
+    }
+
+    /**
+     * Where the column carrying {@code attnum} sits, or -1 when the number belongs to a dropped
+     * column or to no attribute of this relation at all. An attnum is not a position: past a
+     * dropped column the numbers run ahead of the list they are read out of.
+     */
+    public int columnIndexOfAttnum(int attnum) {
+        if (attnum < 1) return -1;
+        int index = attnum - 1;
+        for (DroppedAttribute gone : droppedAttributes) {
+            if (gone.getAttnum() == attnum) return -1;
+            if (gone.getAttnum() < attnum) index--;
+        }
+        return index >= 0 && index < columns.size() ? index : -1;
+    }
+
+    /**
+     * Every attribute this relation has ever numbered, the dropped ones included. PostgreSQL
+     * counts them all in pg_class.relnatts, which is why relnatts and the number of columns a
+     * relation still has are two different questions.
+     */
+    public int getAttributeCount() {
+        return getColumns().size() + droppedAttributes.size();
+    }
+
     public void removeColumn(String columnName) {
+        removeColumn(columnName, true);
+    }
+
+    /**
+     * @param leaveDroppedAttribute whether the column's number stays taken. A DROP COLUMN leaves
+     *                              it taken, which is why PostgreSQL never renumbers what follows;
+     *                              a column that was added and then taken back was never part of
+     *                              the relation, so its number goes back with it and the next
+     *                              ADD COLUMN is handed the same one.
+     */
+    public void removeColumn(String columnName, boolean leaveDroppedAttribute) {
         writeLock.lock();
         try {
-            int idx = getColumnIndex(columnName);
-            if (idx < 0) throw new MemgresException("Column not found: " + columnName);
+            int idx = requireColumnIndex(columnName);
+            int attnum = attnumAt(idx);
+            Column removed = columns.get(idx);
             // PG drops constraints that depend on the column automatically: single-column
             // constraints, multi-column PK/UNIQUE/FK containing it, and CHECK/EXCLUDE/partial
             // constraints whose expressions reference it. Without this they linger in
@@ -462,6 +705,24 @@ public class Table {
                 if (sc.getName() != null) indexes.remove(sc.getName());
             }
             columns.remove(idx);
+            if (leaveDroppedAttribute) {
+                // Whether the column was the relation's own travels with the row it leaves
+                // behind: PostgreSQL clears a dropped attribute's type and its name and leaves
+                // the rest of what the attribute said standing. A partition declares nothing of
+                // its own, and by the time a child's copy of an inherited column goes the parents
+                // have already dropped theirs, so what is left to count is the relations this one
+                // takes its columns from.
+                boolean local = partitionParent == null && isColumnLocal(columnName);
+                recordDroppedAttribute(attnum, removed, local,
+                        local ? (short) 0 : (short) getDirectParents().size());
+            }
+            inheritedColumns.remove(columnName.toLowerCase());
+            inheritedNotNullColumns.remove(columnName.toLowerCase());
+            noInheritNotNullColumns.remove(columnName.toLowerCase());
+            noInheritNotNullColumns.remove(columnName.toLowerCase());
+            inheritedNotNullNames.remove(columnName.toLowerCase());
+            retainedNotNullInheritCounts.remove(columnName.toLowerCase());
+            notValidatedNotNullColumns.remove(columnName.toLowerCase());
             columnsChanged();
             List<Object[]> current = rows;
             List<Object[]> newRows = new ArrayList<>(current.size());
@@ -490,6 +751,21 @@ public class Table {
         } finally {
             writeLock.unlock();
         }
+    }
+
+    /**
+     * Remember that {@code attnum} is taken and by what, keeping the list ascending so that
+     * {@link #attnumAt} can count the numbers below a position in a single pass. A column dropped
+     * from the end of the relation is recorded after one dropped from the middle, so the order
+     * they are recorded in is not the order they are held in.
+     */
+    private void recordDroppedAttribute(int attnum, Column column, boolean local, short inhCount) {
+        int at = 0;
+        while (at < droppedAttributes.size()
+                && droppedAttributes.get(at).getAttnum() < attnum) {
+            at++;
+        }
+        droppedAttributes.add(at, new DroppedAttribute(attnum, column, local, inhCount));
     }
 
     /** Rebuild all indexes from current constraints (after column layout changes). */
@@ -523,6 +799,15 @@ public class Table {
     public void addColumnAt(Column column, int position, List<Object> values) {
         writeLock.lock();
         try {
+            // Putting a column back is undoing the drop that took it away, and a drop that never
+            // happened left no number taken: the relation is the one it was before, so nothing may
+            // be holding a number aside for a column it still has.
+            for (DroppedAttribute gone : droppedAttributes) {
+                if (gone.getColumn() == column) {
+                    droppedAttributes.remove(gone);
+                    break;
+                }
+            }
             columns.add(position, column);
             columnsChanged();
             List<Object[]> current = rows;
@@ -554,9 +839,24 @@ public class Table {
         writeLock.lock();
         try {
             int idx = getColumnIndex(oldName);
-            if (idx < 0) throw new MemgresException("Column not found: " + oldName);
+            // A rename names only the column: PostgreSQL leaves the relation out of this one,
+            // where DROP COLUMN and ALTER COLUMN both name it.
+            if (idx < 0) {
+                throw new MemgresException("column \"" + oldName + "\" does not exist", "42703");
+            }
             Column old = columns.get(idx);
             columns.set(idx, old.withName(newName));
+            // It is the same column under another name, so whether the relation declared it, and
+            // whether it declared the NOT NULL on it, travel with it.
+            if (inheritedColumns.remove(oldName.toLowerCase())) {
+                inheritedColumns.add(newName.toLowerCase());
+            }
+            if (inheritedNotNullColumns.remove(oldName.toLowerCase())) {
+                inheritedNotNullColumns.add(newName.toLowerCase());
+            }
+            if (notValidatedNotNullColumns.remove(oldName.toLowerCase())) {
+                notValidatedNotNullColumns.add(newName.toLowerCase());
+            }
             columnsChanged();
             // Keep constraints attached to the column under its new name
             for (StoredConstraint sc : constraints) {
@@ -589,8 +889,7 @@ public class Table {
      * precision/scale constraint.
      */
     public void alterColumnType(String columnName, DataType newType, Integer precision, Integer scale) {
-        int idx = getColumnIndex(columnName);
-        if (idx < 0) throw new MemgresException("Column not found: " + columnName);
+        int idx = requireColumnIndex(columnName);
         // Historical behavior for callers that don't resolve type metadata themselves
         // (e.g. serial->int conversion): carry over the old column's enum type name.
         alterColumnType(columnName, newType, precision, scale, columns.get(idx).getEnumTypeName(), null);
@@ -605,25 +904,52 @@ public class Table {
      */
     public void alterColumnType(String columnName, DataType newType, Integer precision, Integer scale,
                                 String enumTypeName, DataType arrayElementType) {
-        int idx = getColumnIndex(columnName);
-        if (idx < 0) throw new MemgresException("Column not found: " + columnName);
+        int idx = requireColumnIndex(columnName);
         Column old = columns.get(idx);
         columns.set(idx, old.withType(newType, precision, scale, enumTypeName, arrayElementType));
         columnsChanged();
     }
 
     public void alterColumnDefault(String columnName, String defaultValue) {
-        int idx = getColumnIndex(columnName);
-        if (idx < 0) throw new MemgresException("Column not found: " + columnName);
+        int idx = requireColumnIndex(columnName);
         columns.set(idx, columns.get(idx).withDefault(defaultValue));
         columnsChanged();
     }
 
     public void alterColumnNullable(String columnName, boolean nullable) {
-        int idx = getColumnIndex(columnName);
-        if (idx < 0) throw new MemgresException("Column not found: " + columnName);
+        int idx = requireColumnIndex(columnName);
         columns.set(idx, columns.get(idx).withNullable(nullable));
+        // The constraint goes with the flag, so a NOT NULL declared here afterwards is this
+        // relation's own rather than one it was still holding on a parent's behalf.
+        if (nullable) {
+            inheritedNotNullColumns.remove(columnName.toLowerCase());
+            notValidatedNotNullColumns.remove(columnName.toLowerCase());
+        }
         columnsChanged();
+    }
+
+    /** The line pointer the next tuple written into this relation takes. */
+    public long nextTupleId() {
+        return tupleIdCounter.incrementAndGet();
+    }
+
+    /** How many line pointers this relation has handed out. */
+    public long getTupleIdCounter() {
+        return tupleIdCounter.get();
+    }
+
+    /** What this relation's rows answer for xmin, xmax, cmin, cmax and ctid. */
+    public Map<Object[], long[]> getRowMeta() {
+        return rowMeta;
+    }
+
+    /**
+     * Number the relation's tuples from {@code value} again. TRUNCATE gives the relation a new
+     * file, so the row written after it lives at the first line pointer once more; a TRUNCATE
+     * that is rolled back leaves the old file in place, and with it the numbering it had reached.
+     */
+    public void resetTupleIdCounter(long value) {
+        tupleIdCounter.set(value);
     }
 
     public long getSerialCounter() {
@@ -792,17 +1118,14 @@ public class Table {
                 if (hasNull) continue; // NULLs are distinct: never conflict
             }
             if (!seen.add(key)) {
-                StringBuilder keyDesc = new StringBuilder();
-                StringBuilder valDesc = new StringBuilder();
+                Object[] keyValues = new Object[colIndices.length];
                 for (int ci = 0; ci < colIndices.length; ci++) {
-                    if (ci > 0) { keyDesc.append(", "); valDesc.append(", "); }
-                    keyDesc.append(sc.getColumns().get(ci));
-                    valDesc.append(row[colIndices[ci]]);
+                    keyValues[ci] = row[colIndices[ci]];
                 }
                 MemgresException dup = new MemgresException("could not create unique index \""
                         + sc.getName() + "\"", "23505");
                 dup.setConstraint(sc.getName());
-                dup.setDetail("Key (" + keyDesc + ")=(" + valDesc + ") is duplicated.");
+                dup.setDetail(IndexKeyDescription.duplicated(this, sc.getColumns(), keyValues));
                 throw dup;
             }
         }
@@ -935,17 +1258,210 @@ public class Table {
 
     private String[] definedColumnTypes;
 
+    /**
+     * The relation this one stands in front of, when a FROM item's alias list renamed its columns;
+     * null for every other relation.
+     *
+     * <p>PostgreSQL renames the references to a relation's columns and not the expressions stored
+     * with them, so a VIRTUAL generated column reached through such a list still carries a
+     * generation expression written in the names the relation underneath answers to. The rows are
+     * that relation's own and its columns sit in the same places, so the expression is worked out
+     * against it while the query above writes the new names.
+     */
+    public Table getColumnsRenamedFrom() { return columnsRenamedFrom; }
+
+    public void setColumnsRenamedFrom(Table renamed) { this.columnsRenamedFrom = renamed; }
+
+    private Table columnsRenamedFrom;
+
     public boolean isFunctionResult() { return functionResult; }
     public void setFunctionResult(boolean functionResult) { this.functionResult = functionResult; }
 
     public boolean isViewProjection() { return viewProjection; }
     public void setViewProjection(boolean viewProjection) { this.viewProjection = viewProjection; }
+
+    /**
+     * The composite type this table was declared OF, schema-qualified, or null.
+     *
+     * <p>A typed table's shape is the type's, not its own: PostgreSQL refuses to add a column to
+     * one, and refuses to drop the type while the table stands. Both need the table to remember
+     * which type it came from, because the columns alone no longer say.
+     */
+    public String getOfTypeName() { return ofTypeName; }
+    public void setOfTypeName(String ofTypeName) { this.ofTypeName = ofTypeName; }
+
+    private String ofTypeName;
     public Map<String, String> getReloptions() { return reloptions; }
     public void setReloptions(Map<String, String> reloptions) { this.reloptions = reloptions; }
 
     // Inheritance
-    public Table getParentTable() { return parentTable; }
-    public void setParentTable(Table parent) { this.parentTable = parent; }
+    /** The first parent, which is the only one for all but a multiply-inheriting table. */
+    public Table getParentTable() { return inheritParents.isEmpty() ? null : inheritParents.get(0); }
+
+    /** Records another inheritance parent; one already linked is not linked a second time. */
+    public void setParentTable(Table parent) {
+        if (parent == null) return;
+        for (Table existing : inheritParents) {
+            if (existing == parent) return;
+        }
+        inheritParents.add(parent);
+    }
+
+    /**
+     * Breaks one inheritance link and leaves the rest standing. NO INHERIT names a single parent,
+     * and a child declared under two of them goes on inheriting from the other -- emptying the
+     * whole list took the remaining parent's columns and constraints away from the child as well,
+     * and left pg_inherits saying it inherits from nobody.
+     */
+    public void removeParentTable(Table parent) {
+        if (parent == null) return;
+        for (int i = 0; i < inheritParents.size(); i++) {
+            if (inheritParents.get(i) == parent) {
+                inheritParents.remove(i);
+                return;
+            }
+        }
+    }
+
+    /** Every table this one inherits from, in the order the declaration named them. */
+    public List<Table> getInheritParents() { return inheritParents; }
+
+    /**
+     * The relations this one takes its columns from: the partitioned table it is a partition of,
+     * or the tables it was declared to inherit. PostgreSQL counts them per column in
+     * pg_attribute.attinhcount and calls a column local only when none of them declares it.
+     */
+    public List<Table> getDirectParents() {
+        if (partitionParent == null) return inheritParents;
+        List<Table> out = new ArrayList<>(inheritParents.size() + 1);
+        out.add(partitionParent);
+        out.addAll(inheritParents);
+        return out;
+    }
+
+    /**
+     * Records that this relation holds the column only because a parent declares it, which is what
+     * PostgreSQL reports as attislocal false. A column arrives that way from INHERITS and from a
+     * column added to a parent afterwards, never from the relation's own column list.
+     */
+    public void markColumnInherited(String column) {
+        if (column != null) inheritedColumns.add(column.toLowerCase());
+    }
+
+    /** True when this relation's own definition named the column. */
+    public boolean isColumnLocal(String column) {
+        return column != null && !inheritedColumns.contains(column.toLowerCase());
+    }
+
+    /**
+     * Records that the column is this relation's own from now on. A parent that drops a column
+     * from itself alone leaves every child holding it, and PostgreSQL then records it as a column
+     * each of them declared: nobody hands it down any longer, so there is nobody left to hold it
+     * on behalf of.
+     */
+    public void markColumnLocal(String column) {
+        if (column != null) inheritedColumns.remove(column.toLowerCase());
+    }
+
+    /**
+     * Records that the column's NOT NULL is a parent's rule rather than this relation's own. The
+     * constraint then answers to the name the parent gave it, and only the parent may withdraw it.
+     */
+    public void markNotNullInherited(String column) {
+        if (column != null) inheritedNotNullColumns.add(column.toLowerCase());
+    }
+
+    /** True when this relation's own definition declared the column NOT NULL. */
+    public boolean isNotNullLocal(String column) {
+        return column != null && !inheritedNotNullColumns.contains(column.toLowerCase());
+    }
+
+    /**
+     * Records that the column's NOT NULL was declared NO INHERIT, which is a rule about this
+     * relation's rows alone. PostgreSQL hands nothing of it down: a child takes the column with no
+     * NOT NULL on it at all, and one that declares NOT NULL for itself holds a rule it owns
+     * outright rather than one it shares with the relation above.
+     */
+    public void markNotNullNoInherit(String column) {
+        if (column != null) noInheritNotNullColumns.add(column.toLowerCase());
+    }
+
+    /** True when this relation's NOT NULL on the column stops here rather than being handed down. */
+    public boolean isNotNullNoInherit(String column) {
+        return column != null && noInheritNotNullColumns.contains(column.toLowerCase());
+    }
+
+    /**
+     * Records that the column's NOT NULL was declared NOT VALID: the rows already stored were not
+     * read, so PostgreSQL leaves the constraint standing over every write from now on and waits
+     * for VALIDATE CONSTRAINT to go back over what is there.
+     */
+    public void markNotNullNotValidated(String column) {
+        if (column != null) notValidatedNotNullColumns.add(column.toLowerCase());
+    }
+
+    /** Records that the rows already stored have been read and none of them holds a null. */
+    public void markNotNullValidated(String column) {
+        if (column != null) notValidatedNotNullColumns.remove(column.toLowerCase());
+    }
+
+    /** Whether the rows already stored have been held to the column's NOT NULL. */
+    public boolean isNotNullValidated(String column) {
+        return column == null || !notValidatedNotNullColumns.contains(column.toLowerCase());
+    }
+
+    /**
+     * Records that the column's NOT NULL is this relation's own from now on. A relation that
+     * leaves the parent whose rule it was holds it on nobody's behalf, which is what lets it
+     * withdraw the rule; PostgreSQL leaves it the relation's own even if that parent takes the
+     * relation back afterwards.
+     */
+    public void markNotNullLocal(String column) {
+        if (column != null) inheritedNotNullColumns.remove(column.toLowerCase());
+    }
+
+    /**
+     * Writes down the name this relation's inherited NOT NULL answers to.
+     *
+     * <p>PostgreSQL names a constraint once, when it is created, and the name of a rule a relation
+     * took from a parent is the name that parent gave it -- which stops being derivable the moment
+     * the links change underneath it. A relation declared under two parents keeps the first one's
+     * name after it leaves that parent, and one whose parent has dropped the column keeps it with
+     * nothing above it to read it from. Only that name is kept here; a rule the relation declared
+     * for itself answers to {@link #notNullConstraintName} as it always did.
+     */
+    public void pinInheritedNotNullName(String column, String name) {
+        if (column == null) return;
+        if (name == null) inheritedNotNullNames.remove(column.toLowerCase());
+        else inheritedNotNullNames.put(column.toLowerCase(), name);
+    }
+
+    /** The name written down for an inherited NOT NULL on this column, or null when none was. */
+    public String inheritedNotNullName(String column) {
+        return column == null ? null : inheritedNotNullNames.get(column.toLowerCase());
+    }
+
+    /**
+     * How many parents handed this column's NOT NULL down and have since let the column go without
+     * withdrawing the rule.
+     *
+     * <p>PostgreSQL counts the parents a constraint was taken from once and never counts them
+     * again: a parent's copy dropped along with the column it tests tells the descendants nothing,
+     * so the count stands where it stood. The links say nothing about those parents any more, so
+     * what they contributed is kept here and added to what the links still say.
+     */
+    public int retainedNotNullInheritCount(String column) {
+        if (column == null) return 0;
+        Integer held = retainedNotNullInheritCounts.get(column.toLowerCase());
+        return held == null ? 0 : held.intValue();
+    }
+
+    public void setRetainedNotNullInheritCount(String column, int count) {
+        if (column == null) return;
+        if (count <= 0) retainedNotNullInheritCounts.remove(column.toLowerCase());
+        else retainedNotNullInheritCounts.put(column.toLowerCase(), Integer.valueOf(count));
+    }
+
     public List<Table> getChildren() { return children; }
     public void addChild(Table child) { children.add(child); }
     public void removeChild(Table child) { children.remove(child); }
@@ -971,7 +1487,15 @@ public class Table {
 
     /** Re-orders a row written through the parent into this partition's own column order. */
     public Object[] rowFromParent(Object[] parentRow) {
-        if (parentColumnRemap == null) return parentRow;
+        if (parentColumnRemap == null) {
+            // The orders agree, so the row passes straight through — but a partition that ended
+            // up with a different number of columns from its parent would otherwise hand a short
+            // row to code indexing by its own columns, which reads past the end of it.
+            if (parentRow != null && parentRow.length != columns.size()) {
+                return java.util.Arrays.copyOf(parentRow, columns.size());
+            }
+            return parentRow;
+        }
         Object[] out = new Object[columns.size()];
         for (int i = 0; i < parentColumnRemap.length && i < parentRow.length; i++) {
             int target = parentColumnRemap[i];

@@ -25,6 +25,28 @@ public class Sequence {
     private volatile boolean called = false;
     private String ownedByTable;
     private String ownedByColumn;
+    /**
+     * True for a sequence the engine made to feed a serial or identity column, as against one
+     * created by CREATE SEQUENCE and attached with OWNED BY. Both die with the column they belong
+     * to; PostgreSQL records the first as an internal dependency and the second as an automatic one.
+     */
+    private boolean internal;
+    /** UNLOGGED, which a sequence carries as any other relation does and pg_class reports. */
+    private boolean unlogged;
+
+    /**
+     * What tells one sequence from another for the length of a session.
+     *
+     * <p>currval and lastval answer for the sequence a session drew from, which PostgreSQL keys by
+     * relid: a rename does not change it, and a DROP followed by a CREATE of the same name makes a
+     * different relation. Keying that state by name let a re-created sequence inherit the dropped
+     * one's currval, and left a renamed one's stranded under the name it no longer has.
+     */
+    private static final AtomicLong INSTANCES = new AtomicLong();
+    private final long instanceId = INSTANCES.incrementAndGet();
+
+    /** This sequence's identity: stable across renames, and never reused by another sequence. */
+    public long getInstanceId() { return instanceId; }
 
     /**
      * The sequence name a column default draws from, or null when the default draws from none.
@@ -227,4 +249,27 @@ public class Sequence {
     public void setOwnedByTable(String ownedByTable) { this.ownedByTable = ownedByTable; }
     public String getOwnedByColumn() { return ownedByColumn; }
     public void setOwnedByColumn(String ownedByColumn) { this.ownedByColumn = ownedByColumn; }
+
+    /**
+     * Record that this sequence exists to feed one column of one table, which is what makes it die
+     * with that column. Composing {@code <table>_<column>_seq} again at drop time answered for a
+     * name the sequence may never have had — after a column rename it never has.
+     */
+    public void ownedBy(String tableName, String columnName, boolean internalDependency) {
+        this.ownedByTable = tableName;
+        this.ownedByColumn = columnName;
+        this.internal = internalDependency;
+    }
+
+    /** True when this sequence belongs to the named column of the named table. */
+    public boolean isOwnedBy(String tableName, String columnName) {
+        return ownedByTable != null && ownedByTable.equalsIgnoreCase(tableName)
+                && ownedByColumn != null && ownedByColumn.equalsIgnoreCase(columnName);
+    }
+
+    /** True when the engine made this sequence for a serial or identity column. */
+    public boolean isInternal() { return internal; }
+
+    public boolean isUnlogged() { return unlogged; }
+    public void setUnlogged(boolean unlogged) { this.unlogged = unlogged; }
 }

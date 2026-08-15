@@ -1,6 +1,5 @@
 package com.memgres.pgwire;
 
-import com.memgres.engine.util.Cols;
 
 import com.memgres.core.Memgres;
 import com.memgres.engine.*;
@@ -82,8 +81,24 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
         QueryResult suspendedResult;
         int suspendedOffset;
         QueryResult describeResult;
+        /**
+         * What the run Describe made of this portal's statement was refused with. PostgreSQL runs
+         * a statement once, so that refusal is the portal's answer and Execute reports it; asking
+         * again put the statement to a question whose circumstances the first run had used up.
+         */
+        RuntimeException describeFailure;
         boolean rowDescriptionSent;
         boolean describeAttempted;
+        /**
+         * True once the portal has delivered everything it has. A cleared suspendedResult cannot
+         * say so on its own — it looks exactly like a portal that has not started — so an Execute
+         * on a finished portal ran the statement a second time, side effects and all.
+         */
+        boolean done;
+        /** Whether the finished portal returned rows, which is what decides how PG answers it. */
+        boolean rowReturning;
+        /** The finished result's kind, so the zero-count tag names the right verb. */
+        QueryResult.Type completedType;
         String stmtName = "";
 
         Portal(String sql, List<Object> paramValues, short[] resultFormatCodes) {
@@ -117,7 +132,7 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
         this.session = new Session(database);
         this.session.setDatabaseName(databaseName);
         this.session.setDatabaseRegistry(registry);
-        this.copyHandler = new PgWireCopyHandler(session);
+        this.copyHandler = new PgWireCopyHandler(session, this);
         this.describeHelper = new PgWireDescribeHelper(session, database);
     }
 
@@ -281,8 +296,7 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
         }
         sendErrorSimple(ctx, msg.getSqlState(), msg.getQuery());
         if (PgWireDecoder.isExtendedQueryMessage(msg.getOffendingType())) {
-            errorPendingUntilSync = true;
-            ctx.flush();
+            extendedErrorReported(ctx);
         } else {
             sendReadyForQuery(ctx, session);
         }
@@ -362,7 +376,7 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                 this.session = new Session(database);
                 this.session.setDatabaseName(requestedDb);
                 this.session.setDatabaseRegistry(registry);
-                this.copyHandler = new PgWireCopyHandler(session);
+                this.copyHandler = new PgWireCopyHandler(session, this);
                 this.describeHelper = new PgWireDescribeHelper(session, database);
             }
 
@@ -551,6 +565,14 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
             if (session != null && session.isFailed() && !session.isExplicitTransactionBlock()) {
                 session.rollback();
             }
+            // A simple query takes the unnamed prepared statement and the unnamed portal with it.
+            // They stand for whatever the client was last doing over the extended protocol, and a
+            // Query is a new thing to be doing: PostgreSQL lets go of both, so a Bind that reaches
+            // for the statement afterwards, or an Execute that reaches for the portal, is reaching
+            // for something that is no longer there rather than running work from before.
+            preparedStatements.remove("");
+            portals.remove("");
+            dropPortalsOutsideTransaction();
             sendReadyForQuery(ctx, session);
         }
     }
@@ -568,6 +590,19 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                 sql != null ? sql.substring(0, Math.min(800, sql.length())).replace("\n", " ") : "(null)");
         }
 
+        try {
+            analyzeAtParse(stmtName, sql);
+        } catch (MemgresException e) {
+            enrichErrorPosition(e, sql);
+            sendErrorWithDetails(ctx, e, true);
+            extendedErrorReported(ctx);
+            return;
+        } catch (RuntimeException | StackOverflowError e) {
+            // Reading a statement is not the place to invent a failure. Whatever the analyzer
+            // could not make sense of is left to Execute, which is where it was reported before.
+            LOG.debug("[PROTO] Parse-time analysis skipped: {}", e.toString());
+        }
+
         preparedStatements.put(stmtName, new PreparedStmt(sql, paramOids));
         if (stmtName != null && !stmtName.isEmpty()) {
             stmtDescribed.remove(stmtName);
@@ -579,6 +614,72 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
         buf.writeByte('1');
         buf.writeInt(4);
         ctx.write(buf);
+    }
+
+    /**
+     * Everything PostgreSQL settles while it reads a statement, before it answers ParseComplete.
+     *
+     * <p>Analysis happens where the statement is parsed, so a client that misspells a keyword or
+     * names a relation that is not there hears about it at Parse — before it has been told the
+     * statement and its bindings were good. memgres left every such fault to Execute, which put
+     * the answer one or two messages after the one that carried the mistake.
+     *
+     * <p>The order is PostgreSQL's own: the text has to read as a statement, and as one statement;
+     * a block that has already failed then refuses everything but its own end; the names in the
+     * statement are resolved after that; and the prepared statement is stored last, which is where
+     * a name already in use is noticed.
+     */
+    private void analyzeAtParse(String stmtName, String sql) {
+        if (sql == null) return;
+        int commands = commandsIn(sql).length;
+        // Nothing but comments and semicolons is the empty query, which PG parses and answers.
+        if (commands == 0) return;
+        if (commands > 1) {
+            // Text that does not read as a statement is still the syntax error it is, so it is
+            // parsed before its commands are counted.
+            com.memgres.engine.parser.Parser.parseAll(sql);
+            throw new MemgresException(
+                    "cannot insert multiple commands into a prepared statement", "42601");
+        }
+        com.memgres.engine.parser.ast.Statement body = com.memgres.engine.parser.Parser.parse(sql);
+        if (session != null && session.isTransactionAborted() && !endsAbortedBlock(sql)) {
+            throw new MemgresException(
+                    "current transaction is aborted, commands ignored until end of transaction block",
+                    "25P02");
+        }
+        if (body != null && session != null) session.executor().analyzeWithoutRunning(body);
+        // A named prepared statement is not replaced by a second Parse under the same name: the
+        // client closes it first, and PostgreSQL refuses rather than take away a statement whose
+        // portals are still running. The unnamed one is the one every Parse replaces.
+        if (stmtName != null && !stmtName.isEmpty() && preparedStatements.containsKey(stmtName)) {
+            throw new MemgresException(
+                    "prepared statement \"" + stmtName + "\" already exists", "42P05");
+        }
+    }
+
+    /**
+     * The statements a piece of text holds. A segment carrying only a comment is not one of them:
+     * treating it as a statement answered a query whose semicolon is followed by a comment with
+     * the comment's empty result instead of the query's own rows.
+     */
+    private String[] commandsIn(String sql) {
+        List<String> commands = new ArrayList<>();
+        for (String part : splitStatements(sql)) {
+            if (!PgWireDescribeHelper.stripLeadingComments(part).trim().isEmpty()) commands.add(part);
+        }
+        return commands.toArray(new String[0]);
+    }
+
+    /**
+     * Whether the statement is one a failed transaction block still runs: the ones that end it.
+     * PostgreSQL refuses everything else at the message that carried it — Parse, Bind and Execute
+     * alike — rather than let a client believe work was queued behind an error.
+     */
+    private static boolean endsAbortedBlock(String sql) {
+        if (sql == null) return false;
+        String upper = sql.trim().toUpperCase();
+        return upper.startsWith("COMMIT") || upper.startsWith("END")
+                || upper.startsWith("ABORT") || upper.startsWith("ROLLBACK");
     }
 
     /**
@@ -720,19 +821,36 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
         return types;
     }
 
+    /**
+     * Whether a statement of this shape carries its parameters in the Bind message. PREPARE,
+     * CREATE, EXECUTE and DO all write $N inside a body of their own, where it is not a
+     * placeholder the protocol fills in, so what the text holds says nothing about the message.
+     */
+    private static boolean carriesBindParameters(String sql) {
+        if (sql == null) return false;
+        String trimmed = sql.replaceAll("^\\s+", "").toUpperCase();
+        return trimmed.startsWith("SELECT") || trimmed.startsWith("INSERT")
+                || trimmed.startsWith("UPDATE") || trimmed.startsWith("DELETE")
+                || trimmed.startsWith("EXPLAIN") || trimmed.startsWith("WITH")
+                || trimmed.startsWith("VALUES") || trimmed.startsWith("TABLE");
+    }
+
+    /**
+     * How many parameters the statement was prepared for, or -1 when the text cannot say. A type
+     * declared at Parse counts even where the text does not use it, because that is the count
+     * PostgreSQL holds the Bind message against.
+     */
+    private static int requiredParameterCount(PreparedStmt prepared) {
+        int declared = prepared.paramOids() != null ? prepared.paramOids().length : 0;
+        if (declared == 0 && !carriesBindParameters(prepared.sql())) return -1;
+        return Math.max(declared, maxParamPlaceholder(prepared.sql()));
+    }
+
     /** Scan SQL for $N parameter placeholders, return the highest N (0 if none).
      *  Only counts in DML/EXPLAIN statements. Skips PREPARE, CREATE, ALTER, DROP, etc.
      *  Skips single-quoted strings, dollar-quoted strings, and SQL comments. */
     private static int maxParamPlaceholder(String sql) {
-        // Only DML/EXPLAIN statements can have wire-level bind parameters.
-        // PREPARE, CREATE, ALTER, DROP, EXECUTE, DO, etc. embed $N in their body, not as bind params.
-        String trimmed = sql.replaceAll("^\\s+", "").toUpperCase();
-        if (!(trimmed.startsWith("SELECT") || trimmed.startsWith("INSERT") ||
-              trimmed.startsWith("UPDATE") || trimmed.startsWith("DELETE") ||
-              trimmed.startsWith("EXPLAIN") || trimmed.startsWith("WITH") ||
-              trimmed.startsWith("VALUES") || trimmed.startsWith("TABLE"))) {
-            return 0;
-        }
+        if (!carriesBindParameters(sql)) return 0;
 
         int max = 0;
         int len = sql.length();
@@ -802,40 +920,113 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
 
         PreparedStmt prepared = preparedStatements.get(stmtName);
         if (prepared == null) {
-            sendExtendedError(ctx, "26000", "prepared statement \"" + stmtName + "\" does not exist");
+            sendExtendedError(ctx, "26000", noSuchPreparedStatement(stmtName));
             return;
         }
 
         // Validate bind parameter count matches $N placeholders in the SQL
         int suppliedParams = msg.getParameterValues() != null ? msg.getParameterValues().length : 0;
-        int requiredParams = maxParamPlaceholder(prepared.sql());
-        if (suppliedParams < requiredParams) {
+        short[] formatCodes = msg.getParameterFormatCodes();
+        // A format code list either says nothing, says one thing for all the parameters, or says
+        // one thing per parameter. Any other length is a message that cannot be read as it stands.
+        if (formatCodes != null && formatCodes.length > 1 && formatCodes.length != suppliedParams) {
+            sendExtendedError(ctx, "08P01", "bind message has " + formatCodes.length
+                    + " parameter formats but " + suppliedParams + " parameters");
+            return;
+        }
+        // The statement was prepared for a number of parameters, and Bind supplies exactly that
+        // many. Too many is as much a mismatch as too few: the extra value is bound to nothing,
+        // and the statement that would run is not the one the client thinks it sent.
+        int requiredParams = requiredParameterCount(prepared);
+        if (requiredParams >= 0 && suppliedParams != requiredParams) {
             sendExtendedError(ctx, "08P01",
                     "bind message supplies " + suppliedParams + " parameters, but prepared statement \"" +
                     stmtName + "\" requires " + requiredParams);
             return;
         }
+        if (session != null && session.isTransactionAborted() && !endsAbortedBlock(prepared.sql())) {
+            sendExtendedError(ctx, "25P02",
+                    "current transaction is aborted, commands ignored until end of transaction block");
+            return;
+        }
+
+        // A portal belongs to the transaction that made it and lives until that transaction ends,
+        // so while a block is open the name is still taken: PostgreSQL refuses a second Bind to it
+        // rather than take away a portal the client may still be reading from. The unnamed portal
+        // is the one every Bind replaces. The portal is made before the values are read, which is
+        // why a name already in use is answered for ahead of a value that will not read.
+        if (!portalName.isEmpty() && portals.containsKey(portalName)) {
+            sendExtendedError(ctx, "42P03", "cursor \"" + portalName + "\" already exists");
+            return;
+        }
 
         List<Object> paramValues = new ArrayList<>();
         byte[][] rawValues = msg.getParameterValues();
-        short[] formatCodes = msg.getParameterFormatCodes();
         if (rawValues != null) {
+            int[] resolvedOids = null;
             for (int i = 0; i < rawValues.length; i++) {
+                short format = 0;
+                if (formatCodes != null && formatCodes.length > 0) {
+                    format = formatCodes.length == 1 ? formatCodes[0] : formatCodes[i];
+                }
+                // Text and binary are the two shapes a parameter arrives in, and PostgreSQL
+                // refuses the message rather than guess at what a third would have meant.
+                if (format != 0 && format != 1) {
+                    sendExtendedError(ctx, "22023", "unsupported format code: " + format);
+                    return;
+                }
                 if (rawValues[i] == null) {
                     paramValues.add(null);
-                } else {
-                    short format = 0;
-                    if (formatCodes != null && formatCodes.length > 0) {
-                        format = formatCodes.length == 1 ? formatCodes[0] : formatCodes[i];
-                    }
-                    if (format == 0) {
-                        paramValues.add(new String(rawValues[i], StandardCharsets.UTF_8));
-                    } else {
-                        int paramOid = (prepared.paramOids() != null && i < prepared.paramOids().length)
-                                ? prepared.paramOids()[i] : 0;
-                        paramValues.add(PgWireBinaryCodec.decodeBinaryParam(rawValues[i], paramOid));
-                    }
+                    continue;
                 }
+                int paramOid = (prepared.paramOids() != null && i < prepared.paramOids().length)
+                        ? prepared.paramOids()[i] : 0;
+                if (format == 0) {
+                    // A value is read as the type the parameter resolved to, which is the type the
+                    // client declared or, where it declared none, the one the statement itself
+                    // says the parameter has to be.
+                    int resolved = paramOid;
+                    if (resolved == 0) {
+                        if (resolvedOids == null) {
+                            resolvedOids = PgWireParamTypes.infer(prepared.sql(), rawValues.length,
+                                    database, session);
+                        }
+                        if (resolvedOids != null && i < resolvedOids.length) {
+                            resolved = resolvedOids[i];
+                        }
+                    }
+                    String text = new String(rawValues[i], StandardCharsets.UTF_8);
+                    MemgresException unreadable =
+                            PgWireParamValues.unreadable(session, text, resolved);
+                    if (unreadable != null) {
+                        sendErrorWithDetails(ctx, unreadable, true);
+                        extendedErrorReported(ctx);
+                        return;
+                    }
+                    paramValues.add(text);
+                } else {
+                    MemgresException wrongLength =
+                            PgWireParamValues.wrongBinaryLength(rawValues[i], paramOid, i + 1);
+                    if (wrongLength != null) {
+                        sendExtendedError(ctx, wrongLength.getSqlState(), wrongLength.getMessage());
+                        return;
+                    }
+                    paramValues.add(PgWireBinaryCodec.decodeBinaryParam(rawValues[i], paramOid));
+                }
+            }
+        }
+
+        // The result formats are applied to the portal's row description, so a list naming more of
+        // them than the statement has columns is a message that cannot be carried out. A list of
+        // one stands for every column however many there are, and a statement that answers with no
+        // rows has no description to apply them to, so neither is held against a count.
+        short[] resultFormats = msg.getResultFormatCodes();
+        if (resultFormats != null && resultFormats.length > 1) {
+            int columns = resultColumnCount(prepared.sql());
+            if (columns >= 0 && resultFormats.length != columns) {
+                sendExtendedError(ctx, "08P01", "bind message has " + resultFormats.length
+                        + " result formats but query has " + columns + " columns");
+                return;
             }
         }
 
@@ -854,6 +1045,35 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
         ctx.write(buf);
     }
 
+    /**
+     * How PostgreSQL names a prepared statement that is not there. The unnamed one has no name to
+     * write down, so it is described rather than quoted: a client told that a statement called ""
+     * was missing went looking for one it had never sent.
+     */
+    private static String noSuchPreparedStatement(String name) {
+        return name == null || name.isEmpty()
+                ? "unnamed prepared statement does not exist"
+                : "prepared statement \"" + name + "\" does not exist";
+    }
+
+    /**
+     * How many columns the statement answers with, or -1 when reading it does not settle that.
+     * Reading is all this may do: Bind runs nothing, and a statement is not free to run.
+     */
+    private int resultColumnCount(String sql) {
+        if (sql == null || session == null) return -1;
+        try {
+            com.memgres.engine.parser.ast.Statement body =
+                    com.memgres.engine.parser.Parser.parse(sql);
+            if (body == null) return -1;
+            return session.executor().resultColumnsWithoutRunning(body);
+        } catch (RuntimeException | StackOverflowError e) {
+            // A statement this cannot read is one Parse has already answered for; the message
+            // stands as it was sent.
+            return -1;
+        }
+    }
+
     private void handleDescribe(ChannelHandlerContext ctx, PgWireMessage msg) {
         byte descType = msg.getDescribeType();
         String name = msg.getStatementName() != null ? msg.getStatementName() : "";
@@ -862,7 +1082,7 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
         if (descType == 'S') {
             PreparedStmt prepared = preparedStatements.get(name);
             if (prepared == null) {
-                sendExtendedError(ctx, "26000", "prepared statement \"" + name + "\" does not exist");
+                sendExtendedError(ctx, "26000", noSuchPreparedStatement(name));
                 return;
             }
             try {
@@ -897,9 +1117,16 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
             if (result.rowDescSent()) {
                 rowDescSentByDescribe = true;
                 portal.rowDescriptionSent = true;
-                if (result.cachedResult() != null) {
-                    portal.describeResult = result.cachedResult();
-                }
+            }
+            // A Describe that had to run the statement to learn its shape has already applied it,
+            // so Execute has to report that run rather than start another. Keeping the result only
+            // when a row description went with it left the statement to run a second time whenever
+            // it turned out to have no columns.
+            if (result.cachedResult() != null) {
+                portal.describeResult = result.cachedResult();
+            }
+            if (result.failure() != null) {
+                portal.describeFailure = result.failure();
             }
         }
     }
@@ -1026,20 +1253,39 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
         String portalName = msg.getPortalName() != null ? msg.getPortalName() : "";
         int maxRows = msg.getMaxRows();
 
+        // Only a portal a Bind made is executed. The prepared statement a portal was built from is
+        // not a portal: it carries no parameter values and no result formats, and PostgreSQL runs
+        // nothing from it, so reaching for the unnamed statement when the named portal was missing
+        // ran work the client had not asked for — the statement a later Parse had put there, or
+        // one whose portal the transaction that made it had already taken away.
         Portal portal = portals.get(portalName);
+
+        // PostgreSQL holds no portal of that name and says so, rather than answer as though the
+        // client had sent an empty query: an Execute naming a portal that was never bound — or one
+        // the transaction that made it took away with it — is a mistake worth reporting.
         if (portal == null) {
-            PreparedStmt unnamed = preparedStatements.get("");
-            if (unnamed != null) {
-                portal = new Portal(unnamed.sql(), Cols.listOf(), null);
-            }
+            sendExtendedError(ctx, "34000", "portal \"" + portalName + "\" does not exist");
+            return;
         }
 
-        if (portal == null || portal.sql() == null || portal.sql().trim().isEmpty()) {
+        if (portal.sql() == null || portal.sql().trim().isEmpty()) {
             if (Memgres.logAllStatements) LOG.info("[PROTO] Execute → EmptyQueryResponse (no portal/sql)");
             ByteBuf buf = ctx.alloc().buffer();
             buf.writeByte('I');
             buf.writeInt(4);
             ctx.write(buf);
+            return;
+        }
+
+        // A portal that has run to its end is finished. PostgreSQL answers one that returned rows
+        // with an empty result of the same kind, and refuses one that did not — it does not run
+        // the statement again, which had been writing a second row and creating a second table.
+        if (portal.done) {
+            if (portal.rowReturning) {
+                sendCommandCompleteWithNotices(ctx, exhaustedPortalTag(portal.completedType));
+            } else {
+                sendExtendedError(ctx, "55000", "portal \"" + portalName + "\" cannot be run");
+            }
             return;
         }
 
@@ -1067,9 +1313,25 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                 result = portal.describeResult;
                 portal.describeResult = null;
                 source = "cached";
+            } else if (portal.describeFailure != null) {
+                // The statement has already run, and that run refused it. PostgreSQL runs it once
+                // and reports the refusal here, so this is where it is reported: running it over
+                // asked a question whose circumstances had moved on, and a statement that had lost
+                // a race with another session won the re-run and answered as though it had never
+                // been refused at all.
+                RuntimeException refused = portal.describeFailure;
+                portal.describeFailure = null;
+                // A refused statement leaves a block fit for nothing but its own end. That was
+                // undone after the describing run so the statement's shape could still be worked
+                // out, and it takes effect here, where the refusal is reported.
+                if (session != null
+                        && session.getStatus() == Session.TransactionStatus.IN_TRANSACTION) {
+                    session.restoreStatus(Session.TransactionStatus.FAILED);
+                }
+                throw refused;
             } else {
                 source = "fresh";
-                String[] stmts = splitStatements(portal.sql());
+                String[] stmts = commandsIn(portal.sql());
                 if (stmts.length > 1) {
                     for (int si = 0; si < stmts.length - 1; si++) {
                         String s = stmts[si].trim();
@@ -1079,7 +1341,7 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                             } catch (MemgresException e) {
                                 enrichErrorPosition(e, s);
                                 sendErrorWithDetails(ctx, e, true);
-                                errorPendingUntilSync = true;
+                                extendedErrorReported(ctx);
                                 return;
                             }
                         }
@@ -1099,22 +1361,46 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
 
             rowDescSentByDescribe = false;
 
+            // Any portal that returns rows can be fetched from, which includes INSERT, UPDATE,
+            // DELETE and MERGE with RETURNING. COPY is its own protocol and is not one of them.
+            boolean rowReturning = result.getType() != QueryResult.Type.COPY_OUT
+                    && result.getType() != QueryResult.Type.COPY_IN
+                    && result.getRows() != null && result.getColumns() != null
+                    && !result.getColumns().isEmpty();
+
+            // Text and binary are the two shapes a column can be written in. PostgreSQL refuses
+            // the Execute before it writes a row rather than send one in a format the client asked
+            // for and it does not have.
+            if (rowReturning) {
+                int badFormat = unsupportedResultFormat(portal.resultFormatCodes(),
+                        result.getColumns().size());
+                if (badFormat >= 0) {
+                    sendExtendedError(ctx, "22023", "unsupported format code: " + badFormat);
+                    return;
+                }
+            }
+
             // Handle maxRows (cursor-based fetching with portal suspend/resume)
-            if (maxRows > 0 && result.getType() == QueryResult.Type.SELECT) {
+            if (maxRows > 0 && rowReturning) {
                 List<Object[]> allRows = result.getRows();
                 int offset = portal.suspendedOffset;
                 int end = Math.min(offset + maxRows, allRows.size());
                 for (int i = offset; i < end; i++) {
                     sendDataRow(ctx, allRows.get(i), result.getColumns(), portal.resultFormatCodes());
                 }
-                if (end < allRows.size()) {
+                // PostgreSQL suspends whenever the limit was reached, even when reaching it took
+                // the last row: whether anything follows is the next Execute's answer to give.
+                if (end - offset == maxRows) {
                     portal.suspendedResult = result;
                     portal.suspendedOffset = end;
                     sendPortalSuspended(ctx);
                 } else {
                     portal.suspendedResult = null;
                     portal.suspendedOffset = 0;
-                    sendCommandCompleteWithNotices(ctx, "SELECT " + allRows.size());
+                    portal.done = true;
+                    portal.rowReturning = true;
+                    portal.completedType = result.getType();
+                    sendCommandCompleteWithNotices(ctx, commandTag(result, end - offset));
                 }
             } else {
                 // CALL with OUT params: PG sends RowDescription during Execute (not Describe)
@@ -1134,6 +1420,9 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                 } else {
                     sendResultDataOnly(ctx, result, portal.resultFormatCodes());
                 }
+                portal.done = true;
+                portal.rowReturning = rowReturning;
+                portal.completedType = result.getType();
             }
             // Emit ParameterStatus updates for tracked GUC parameters after SET
             if (result.getType() == QueryResult.Type.SET) {
@@ -1143,7 +1432,7 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
             LOG.warn("[PROTO] Execute ERROR {}: {} | {}", e.getSqlState(), e.getMessage(), sqlSnip);
             enrichErrorPosition(e, portal.sql());
             sendErrorWithDetails(ctx, e, true);
-            errorPendingUntilSync = true;
+            extendedErrorReported(ctx);
         } catch (ArithmeticException e) {
             String errMsg = e.getMessage() != null ? e.getMessage() : "arithmetic error";
             LOG.warn("[PROTO] Execute ARITH ERROR: {} | {}", errMsg, sqlSnip);
@@ -1157,7 +1446,7 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
             MemgresException translated = PgErrors.translate(e);
             enrichErrorPosition(translated, portal.sql());
             sendErrorWithDetails(ctx, translated, true);
-            errorPendingUntilSync = true;
+            extendedErrorReported(ctx);
         } finally {
             if (session != null) session.setIdleState();
         }
@@ -1175,7 +1464,30 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                 database.releaseXactAdvisoryLocks(session);
             }
         }
+        dropPortalsOutsideTransaction();
         sendReadyForQuery(ctx, session);
+    }
+
+    /**
+     * A portal belongs to the transaction that made it, and PostgreSQL drops every one of them
+     * when that transaction ends: the name is free again afterwards, and a portal cannot be run a
+     * second time from outside the block that bound it. In autocommit each statement is its own
+     * transaction, which is why an unfinished portal does not outlive the ReadyForQuery.
+     */
+    private void dropPortalsOutsideTransaction() {
+        if (!portals.isEmpty() && (session == null || !session.isInTransaction())) {
+            portals.clear();
+        }
+    }
+
+    /** The first result format code that is neither text nor binary, or -1 when they all are. */
+    private static int unsupportedResultFormat(short[] codes, int columns) {
+        if (codes == null || codes.length == 0) return -1;
+        for (int i = 0; i < columns; i++) {
+            short code = codes.length == 1 ? codes[0] : (i < codes.length ? codes[i] : 0);
+            if (code != 0 && code != 1) return code;
+        }
+        return -1;
     }
 
     private void handleFlush(ChannelHandlerContext ctx) {
@@ -1238,7 +1550,9 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
             case SET:
                 return result.getMessage() != null ? result.getMessage() : "SET";
             case BEGIN:
-                return "BEGIN";
+                // BEGIN and START TRANSACTION open the same block, and the tag names the one the
+                // client wrote.
+                return result.getMessage() != null ? result.getMessage() : "BEGIN";
             case COMMIT:
                 return "COMMIT";
             case ROLLBACK:
@@ -1249,6 +1563,46 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                 return null;
             default:
                 throw new IllegalStateException("Unknown result type: " + result.getType());
+        }
+    }
+
+    /**
+     * The tag for one Execute of a portal that returns rows. PostgreSQL counts the rows that
+     * Execute delivered — a resumed portal reports its own rows, not the whole result — while a
+     * portal that returns none keeps the statement's affected-row count.
+     */
+    private static String commandTag(QueryResult result, int rowsThisExecute) {
+        switch (result.getType()) {
+            case SELECT:
+            case SELECT_INTO:
+                return "SELECT " + rowsThisExecute;
+            case INSERT:
+                return "INSERT 0 " + rowsThisExecute;
+            case UPDATE:
+                return "UPDATE " + rowsThisExecute;
+            case DELETE:
+                return "DELETE " + rowsThisExecute;
+            case MERGE:
+                return "MERGE " + rowsThisExecute;
+            default:
+                return commandTag(result);
+        }
+    }
+
+    /** What PostgreSQL answers an Execute on a portal that has already delivered everything. */
+    private static String exhaustedPortalTag(QueryResult.Type type) {
+        if (type == null) return "SELECT 0";
+        switch (type) {
+            case INSERT:
+                return "INSERT 0 0";
+            case UPDATE:
+                return "UPDATE 0";
+            case DELETE:
+                return "DELETE 0";
+            case MERGE:
+                return "MERGE 0";
+            default:
+                return "SELECT 0";
         }
     }
 
@@ -1276,7 +1630,7 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                 copyHandler.sendCopyOutResult(ctx, result);
                 break;
             case COPY_IN:
-                copyHandler.sendCopyInResult(ctx, result);
+                copyHandler.sendCopyInResult(ctx, result, false);
                 break;
             case EMPTY: {
                 ByteBuf buf = ctx.alloc().buffer();
@@ -1316,7 +1670,7 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                 copyHandler.sendCopyOutResult(ctx, result);
                 break;
             case COPY_IN:
-                copyHandler.sendCopyInResult(ctx, result);
+                copyHandler.sendCopyInResult(ctx, result, true);
                 break;
             case EMPTY: {
                 ByteBuf buf = ctx.alloc().buffer();
@@ -1446,6 +1800,20 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
 
     /** Send an error with full diagnostic fields from a MemgresException. */
     static void sendErrorWithDetails(ChannelHandlerContext ctx, MemgresException ex, boolean isExtended) {
+        sendErrorWithDetails(ctx, ex, isExtended, null);
+    }
+
+    /**
+     * The same, and with it what the server was doing when it raised: the field a client prints
+     * as CONTEXT.
+     *
+     * <p>PostgreSQL sends it whenever the error came out of something reading on the client's
+     * behalf rather than out of the statement text, which is what a COPY is: the relation, the
+     * line of the input reached and the line itself are the only way a sender of thousands of
+     * lines can tell which one the server would not take.
+     */
+    static void sendErrorWithDetails(ChannelHandlerContext ctx, MemgresException ex,
+                                     boolean isExtended, String context) {
         ByteBuf buf = ctx.alloc().buffer();
         buf.writeByte('E');
         int lengthIdx = buf.writerIndex();
@@ -1469,6 +1837,14 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
         if (ex.getPosition() > 0) {
             buf.writeByte('P');
             PgWireValueFormatter.writeCString(buf, String.valueOf(ex.getPosition()));
+        }
+        // Where the caller named no context of its own, the error's stands: PostgreSQL reports
+        // the frames of whatever was running on the statement's behalf -- a PL/pgSQL function, a
+        // trigger -- whether or not a COPY was reading when it raised.
+        String where = context != null ? context : ex.getPgContext();
+        if (where != null) {
+            buf.writeByte('W');
+            PgWireValueFormatter.writeCString(buf, where);
         }
         if (ex.getSchema() != null) {
             buf.writeByte('s');
@@ -1505,7 +1881,40 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
     /** Send an error for extended query protocol (sets error flag to skip until Sync). */
     private void sendExtendedError(ChannelHandlerContext ctx, String sqlState, String message) {
         sendError(ctx, sqlState, message, true);
+        extendedErrorReported(ctx);
+    }
+
+    /**
+     * A COPY under the extended protocol failed, so everything up to Sync is skipped just as it
+     * is for any other extended error. The copy handler sends its own ErrorResponse — it is the
+     * one that knows what went wrong — and this is what stops the messages that follow.
+     */
+    void setErrorPendingUntilSync(ChannelHandlerContext ctx) {
+        extendedErrorReported(ctx);
+    }
+
+    /**
+     * What an ErrorResponse inside an extended-query sequence carries with it. PostgreSQL does all
+     * three for every error, whichever layer raised it.
+     *
+     * <p>Everything up to Sync is skipped. The transaction the error happened in is aborted: from
+     * that moment the block can do no more work, the statements after it are refused with 25P02,
+     * and COMMIT throws away what it had done rather than making it permanent. Only a statement
+     * that reached the executor used to abort here, so an error the protocol layer raised for
+     * itself — a portal that has already run to its end, a message whose bytes could not be read —
+     * left the block open and running: ReadyForQuery answered T where PostgreSQL answers E.
+     *
+     * <p>And the bytes go out now rather than at the next Sync, because PostgreSQL flushes as soon
+     * as it has written an ErrorResponse. Nothing else would push them: the messages up to Sync are
+     * skipped, and a client's Flush among them is skipped with them, so a client that flushes and
+     * waits for the answer was waiting on a buffer.
+     */
+    private void extendedErrorReported(ChannelHandlerContext ctx) {
         errorPendingUntilSync = true;
+        if (session != null && session.getStatus() == Session.TransactionStatus.IN_TRANSACTION) {
+            session.restoreStatus(Session.TransactionStatus.FAILED);
+        }
+        ctx.flush();
     }
 
     /** A connection the server is about to drop; PG reports these at FATAL, not ERROR. */
@@ -1578,6 +1987,12 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
             if (at >= 0) e.setPosition(at + 1);
             return;
         }
+        // A row that breaks a constraint breaks it as it is stored, and a write to a column the
+        // relation computes for itself is refused as the statement is rewritten. Neither is read
+        // off a place in the text, so PostgreSQL sends no Position for them — while their messages
+        // quote a column or a relation name that the search below finds somewhere in the statement
+        // anyway: for UPDATE t SET d = DEFAULT it found the "d" inside the word UPDATE.
+        if (hasNoParseLocation(e.getSqlState())) return;
         // Extract quoted name from error message patterns like: relation "foo" does not exist
         // or column "bar" does not exist, or at or near "token"
         String name = null;
@@ -1633,6 +2048,20 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
 
     private static boolean isIdentChar(char c) {
         return Character.isLetterOrDigit(c) || c == '_' || c == '$';
+    }
+
+    /**
+     * True for the errors PostgreSQL raises with nowhere in the statement behind them.
+     *
+     * <p>Integrity constraint violations — class 23, whether they come from a row being stored or
+     * from a relation being altered under rows it already holds — are found by the executor rather
+     * than by the parser, and a value written to an identity or generated column is refused by the
+     * rewriter. Measured against PostgreSQL 18: not one of them carries a P field. A data exception
+     * is a different matter and keeps its position, because a constant the parser coerced does have
+     * a place in the text.
+     */
+    private static boolean hasNoParseLocation(String sqlState) {
+        return sqlState != null && (sqlState.startsWith("23") || sqlState.equals("428C9"));
     }
 
     /** After a SET command, emit ParameterStatus messages for tracked GUC parameters. */
@@ -1732,6 +2161,13 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
         String message = notice.message() != null ? notice.message() : "";
         buf.writeByte('M');
         PgWireValueFormatter.writeCString(buf, message);
+
+        // A notice's DETAIL is a field of its own, the way an error's is: a client reads it
+        // through ServerErrorMessage.getDetail() and would never see it folded into the message.
+        if (notice.detail() != null && !notice.detail().isEmpty()) {
+            buf.writeByte('D');
+            PgWireValueFormatter.writeCString(buf, notice.detail());
+        }
 
         if (notice.hint() != null && !notice.hint().isEmpty()) {
             buf.writeByte('H');
@@ -1957,8 +2393,7 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                 // result. Inside an extended-query sequence the client's own Sync produces it, so
                 // this only answers where the client is actually waiting for one.
                 if (PgWireDecoder.isExtendedQueryMessage(currentFrontendType)) {
-                    errorPendingUntilSync = true;
-                    ctx.flush();
+                    extendedErrorReported(ctx);
                 } else {
                     sendReadyForQuery(ctx, session);
                 }

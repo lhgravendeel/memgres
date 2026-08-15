@@ -428,8 +428,10 @@ class CatalogPrivilegeFunctions {
         if (attnum < 0) return "";
         if (attnum == 0 || rel.table == null) return null;
         List<Column> columns = rel.table.getColumns();
-        if (attnum > columns.size()) return null;
-        return columns.get(attnum - 1).getName().toLowerCase();
+        // A dropped column keeps its number, so an attnum is not a position in what is left.
+        int at = rel.table.columnIndexOfAttnum(attnum);
+        if (at < 0 || at >= columns.size()) return null;
+        return columns.get(at).getName().toLowerCase();
     }
 
     private boolean schemaExists(String schema) {

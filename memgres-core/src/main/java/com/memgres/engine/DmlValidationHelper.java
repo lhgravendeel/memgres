@@ -2,6 +2,7 @@ package com.memgres.engine;
 
 import com.memgres.engine.util.Cols;
 
+import com.memgres.engine.parser.ast.CreateTypeStmt;
 import com.memgres.engine.parser.ast.Expression;
 import com.memgres.engine.parser.ast.SelectStmt;
 
@@ -36,6 +37,22 @@ class DmlValidationHelper {
         ex.setConstraint(constraintName);
         ex.setDatatype(TypeNamespace.bare(domainName));
         return ex;
+    }
+
+    /**
+     * A value on its way into a column, held to the column's type before it is stored.
+     *
+     * <p>A composite is judged here rather than once it is stored, because stored it is the same
+     * text whichever way it was written and PostgreSQL answers the two ways differently: a record
+     * of the wrong shape is a cast it cannot make, text of the wrong shape is input its reader
+     * cannot read.
+     */
+    Object storedValue(Object value, Column column) {
+        if (column.getCompositeTypeName() != null && column.getArrayElementType() == null) {
+            executor.compositeTypeHandler.requireCompositeShape(value,
+                    column.getCompositeTypeName());
+        }
+        return TypeCoercion.coerceForStorage(value, column);
     }
 
     void applyCitextFolding(Table table, Object[] row) {
@@ -80,6 +97,16 @@ class DmlValidationHelper {
     void validateDomainChecks(Object[] row, Table table) {
         for (int i = 0; i < table.getColumns().size(); i++) {
             Column col = table.getColumns().get(i);
+            // A composite's fields are values of the types the composite declares for them, so a
+            // field typed by a domain is judged by that domain wherever the composite is built --
+            // including from a plain string written into the column, and from an assignment to one
+            // field, neither of which passes through a cast to the composite. An array of a
+            // composite is judged element by element by the cast that builds it, so only a value
+            // of the composite itself is judged here.
+            if (col.getCompositeTypeName() != null && col.getArrayElementType() == null) {
+                row[i] = valueOfComposite(row[i], col.getCompositeTypeName());
+                validateCompositeFieldDomains(row[i], col.getCompositeTypeName());
+            }
             String domainName = col.getDomainTypeName();
             if (domainName != null) {
                 // Walk from the base domain outwards: a domain over a domain inherits its
@@ -91,38 +118,217 @@ class DmlValidationHelper {
                     String base = d.getBaseTypeName();
                     d = base == null ? null : executor.database.getDomain(base);
                 }
-                for (DomainType domain : chain) {
-                    if (row[i] == null && domain.isNotNull()) {
-                        MemgresException ex = new MemgresException("domain "
-                                + domainDisplay(domain.getName())
-                                + " does not allow null values", "23502");
-                        ex.setDatatype(domain.getName());
-                        throw ex;
-                    }
-                    // A domain CHECK still runs for NULL: CHECK (VALUE IS NOT NULL) rejects it
-                    Table tempTable = new Table("_domain_check",
-                            Cols.listOf(new Column("value", domain.getBaseType(), true, false, null)));
-                    RowContext tempCtx = new RowContext(tempTable, null, new Object[]{row[i]});
-                    // Check the original (unnamed) CHECK constraint
-                    // In PG, a CHECK that returns NULL does NOT violate; only explicit false violates
-                    if (domain.getParsedCheck() != null) {
-                        Object result = executor.evalExpr(domain.getParsedCheck(), tempCtx);
-                        if (result != null && !executor.isTruthy(result)) {
-                            throw domainCheckViolation(domainName, domain.getName() + "_check");
+                // An array of a domain holds one of the domain's values in every element, and
+                // PostgreSQL builds each of them as a value of the domain -- so the domain's rules
+                // are every element's rules, down through the dimensions. A null array holds no
+                // value of the domain at all, and a domain built over an array is itself one value.
+                for (Object held : domainValuesIn(row[i], col, domainName)) {
+                    for (DomainType domain : chain) {
+                        if (held == null && domain.isNotNull()) {
+                            MemgresException ex = new MemgresException("domain "
+                                    + domainDisplay(domain.getName())
+                                    + " does not allow null values", "23502");
+                            ex.setDatatype(domain.getName());
+                            throw ex;
                         }
-                    }
-                    // Check named constraints added via ALTER DOMAIN ADD CONSTRAINT
-                    for (DomainType.NamedConstraint nc : domain.getNamedConstraints()) {
-                        if (nc.parsedCheck() != null) {
-                            Object result = executor.evalExpr(nc.parsedCheck(), tempCtx);
+                        // A domain CHECK still runs for NULL: CHECK (VALUE IS NOT NULL) rejects it
+                        Table tempTable = new Table("_domain_check",
+                                Cols.listOf(new Column("value", domain.getBaseType(), true, false, null)));
+                        RowContext tempCtx = new RowContext(tempTable, null, new Object[]{held});
+                        // Check the original (unnamed) CHECK constraint
+                        // In PG, a CHECK that returns NULL does NOT violate; only explicit false violates
+                        if (domain.getParsedCheck() != null) {
+                            Object result = executor.evalExpr(domain.getParsedCheck(), tempCtx);
                             if (result != null && !executor.isTruthy(result)) {
-                                throw domainCheckViolation(domainName, nc.name());
+                                throw domainCheckViolation(domainName, domain.getName() + "_check");
+                            }
+                        }
+                        // Check named constraints added via ALTER DOMAIN ADD CONSTRAINT
+                        for (DomainType.NamedConstraint nc : domain.getNamedConstraints()) {
+                            if (nc.parsedCheck() != null) {
+                                Object result = executor.evalExpr(nc.parsedCheck(), tempCtx);
+                                if (result != null && !executor.isTruthy(result)) {
+                                    throw domainCheckViolation(domainName, nc.name());
+                                }
                             }
                         }
                     }
                 }
             }
         }
+    }
+
+    /**
+     * The values a column's domain has to be satisfied by. One for an ordinary column, and for a
+     * column whose domain is itself built over an array; every element, however many dimensions
+     * deep, for a column declared as an array of the domain; and none at all where such a column
+     * holds no array, since a null array is not a value of the domain.
+     */
+    private List<Object> domainValuesIn(Object value, Column col, String domainName) {
+        DomainType domain = executor.database.getDomain(domainName);
+        boolean arrayOfTheDomain = col.getArrayElementType() != null
+                && (domain == null || domain.getArrayElementType() == null);
+        if (!arrayOfTheDomain) return Collections.singletonList(value);
+        List<Object> held = new ArrayList<Object>();
+        PgArray array = value == null ? null : PgArray.from(value);
+        if (array != null) collectDomainValues(array, held);
+        return held;
+    }
+
+    /** Every element of an array, walking into the arrays a multidimensional one is written as. */
+    private void collectDomainValues(List<?> elements, List<Object> out) {
+        for (Object element : elements) {
+            if (element instanceof List<?>) collectDomainValues((List<?>) element, out);
+            else out.add(element);
+        }
+    }
+
+    /**
+     * Every domain a composite value's fields are declared with, run against those fields.
+     *
+     * <p>PostgreSQL builds a value of the field's own type for each field of a composite, whichever
+     * way the composite was written, and a domain's constraints run wherever a value of it is
+     * built. Only the value already held is judged: nothing here changes what is stored.
+     */
+    private void validateCompositeFieldDomains(Object value, String typeName) {
+        if (value == null) return;
+        List<CreateTypeStmt.CompositeField> fields = executor.database.getRowType(typeName);
+        if (fields == null) return;
+        if (value instanceof AstExecutor.PgRow) {
+            List<Object> values = ((AstExecutor.PgRow) value).values();
+            for (int i = 0; i < values.size() && i < fields.size(); i++) {
+                Object field = values.get(i);
+                // A value already held as itself is written the way its own output function writes
+                // it, which is the form its input function reads back.
+                checkFieldAgainstItsType(field == null ? null : field.toString(), true,
+                        fields.get(i).typeName());
+            }
+            return;
+        }
+        if (value instanceof String && RecordLiteral.looksLikeRecord((String) value)) {
+            // The literal is read by the composite's own reader, which is the only thing that
+            // knows which quotes were structure and which were content.
+            List<RecordLiteral.Field> parts = RecordLiteral.parse((String) value);
+            for (int i = 0; i < parts.size() && i < fields.size(); i++) {
+                checkFieldAgainstItsType(parts.get(i).text, parts.get(i).quoted,
+                        fields.get(i).typeName());
+            }
+        }
+    }
+
+    /**
+     * One field read as the type its composite declares for it, for the constraints that reading
+     * runs. A domain carries them itself and a composite carries its own fields' ones, so those
+     * are the only two types a field is re-read as; anything else has nothing to answer for.
+     */
+    private void checkFieldAgainstItsType(String text, boolean quoted, String fieldType) {
+        if (text == null || fieldType == null) return;
+        // An unquoted field with nothing in it is the SQL null, which no CHECK is run for here.
+        if (text.isEmpty() && !quoted) return;
+        if (executor.database.isCompositeType(fieldType)) {
+            validateCompositeFieldDomains(text, fieldType);
+            return;
+        }
+        if (!executor.database.isDomain(fieldType)) return;
+        try {
+            executor.castEvaluator.applyCast(text, fieldType.toLowerCase().trim());
+        } catch (MemgresException e) {
+            // A type whose input function cannot read the text is not what is being judged: only
+            // the constraints the type carries are, and PostgreSQL refuses the whole write when
+            // one of those fails.
+            if (e.getSqlState() != null && e.getSqlState().startsWith("23")) throw e;
+        }
+    }
+
+    /**
+     * A value being written into a composite-typed column, built as a value of that composite.
+     *
+     * <p>PostgreSQL makes a value of the column's own type before it stores a row, and for a
+     * composite that means one field of each attribute's declared type. A record with the wrong
+     * number of fields is not a value of the type at all, and an attribute declared varchar(3) has
+     * no room for a fourth character wherever the value is built -- the same refusal a column of
+     * that width gives. Storing whatever text the writer happened to write let a column of the
+     * composite hold anything shaped like a record.
+     */
+    private Object valueOfComposite(Object value, String typeName) {
+        executor.compositeTypeHandler.requireCompositeShape(value, typeName);
+        if (!(value instanceof String)) return value;
+        String text = ((String) value).trim();
+        if (!RecordLiteral.looksLikeRecord(text)) return value;
+        List<CreateTypeStmt.CompositeField> fields = executor.database.getRowType(typeName);
+        if (fields == null) return value;
+        List<RecordLiteral.Field> parts = RecordLiteral.parse(text);
+        List<Object> held = new ArrayList<>();
+        boolean changed = false;
+        for (int i = 0; i < parts.size(); i++) {
+            RecordLiteral.Field part = parts.get(i);
+            // An unquoted field with nothing in it is the SQL null, which no width bounds.
+            Object was = part.quoted || !part.text.isEmpty() ? part.text : null;
+            Object now = fieldHeldToItsType(was, fields.get(i).typeName());
+            if (now != was) changed = true;
+            held.add(now);
+        }
+        // Only a value the attribute types actually changed is rewritten, so a record that was
+        // already what its type says stays exactly as it was written.
+        return changed ? new AstExecutor.PgRow(held).toPgText() : value;
+    }
+
+    /**
+     * One field held to the width, length or scale its composite declares for it. A declaration
+     * with no modifier bounds nothing, which is the ordinary case and leaves the field alone.
+     */
+    private Object fieldHeldToItsType(Object value, String fieldType) {
+        if (value == null || fieldType == null) return value;
+        String spec = fieldType.trim();
+        int open = spec.indexOf('(');
+        int close = spec.indexOf(')', open + 1);
+        if (open <= 0 || close < 0) return value;
+        String base = spec.substring(0, open).trim().toLowerCase(Locale.ROOT);
+        String[] args = spec.substring(open + 1, close).split(",");
+        int first;
+        try {
+            first = Integer.parseInt(args[0].trim());
+        } catch (NumberFormatException e) {
+            return value;
+        }
+        if (base.equals("varchar") || base.equals("character varying")) {
+            String s = value.toString();
+            if (s.length() > first) {
+                throw new MemgresException(
+                        "value too long for type character varying(" + first + ")", "22001");
+            }
+            return value;
+        }
+        if (base.equals("char") || base.equals("character") || base.equals("bpchar")) {
+            String s = value.toString();
+            if (s.length() > first) {
+                throw new MemgresException(
+                        "value too long for type character(" + first + ")", "22001");
+            }
+            StringBuilder padded = new StringBuilder(s);
+            while (padded.length() < first) padded.append(' ');
+            return padded.toString();
+        }
+        if (base.equals("numeric") || base.equals("decimal")) {
+            java.math.BigDecimal bd;
+            try {
+                bd = new java.math.BigDecimal(value.toString().trim());
+            } catch (NumberFormatException e) {
+                return value;
+            }
+            int scale = 0;
+            if (args.length > 1) {
+                try {
+                    scale = Integer.parseInt(args[1].trim());
+                } catch (NumberFormatException e) {
+                    return value;
+                }
+            }
+            java.math.BigDecimal rounded = bd.setScale(scale, java.math.RoundingMode.HALF_UP);
+            TypeCoercion.checkNumericTypmod(rounded, first, scale);
+            return rounded;
+        }
+        return value;
     }
 
     /**
@@ -206,7 +412,7 @@ class DmlValidationHelper {
         StringBuilder failing = new StringBuilder();
         for (int i = 0; i < row.length; i++) {
             if (i > 0) failing.append(", ");
-            failing.append(row[i] == null ? "null" : row[i].toString());
+            failing.append(ErrorValueText.of(row[i]));
         }
         MemgresException ex = new MemgresException(
                 "new row violates check option for view \"" + viewName + "\"", "44000");

@@ -215,12 +215,23 @@ class Pg18AdditionsTest {
 
     /** A rejection limit means nothing without permission to reject anything. */
     @Test
-    void copyRejectLimitNeedsOnError() {
+    void copyRejectLimitNeedsOnError() throws SQLException {
+        // An ordinary table of its own: PostgreSQL opens the relation a COPY names before it
+        // reads the option list, so the relation has to be one it can open for the option's
+        // refusal to be what comes back.
+        try (Statement st = conn.createStatement()) {
+            st.execute("CREATE TABLE pg18_rl (a int)");
+        }
         SQLException e = assertThrows(SQLException.class, () -> {
             try (Statement st = conn.createStatement()) {
-                st.execute("COPY pg_class FROM STDIN WITH (FORMAT csv, REJECT_LIMIT 3)");
+                st.execute("COPY pg18_rl FROM STDIN WITH (FORMAT csv, REJECT_LIMIT 3)");
             }
         });
         assertEquals("22023", e.getSQLState());
+        assertEquals("ERROR: COPY REJECT_LIMIT requires ON_ERROR to be set to IGNORE",
+                e.getMessage());
+        try (Statement st = conn.createStatement()) {
+            st.execute("DROP TABLE pg18_rl");
+        }
     }
 }

@@ -201,19 +201,32 @@ class PartitionIndexTest {
     }
 
     @Test
-    void alter_index_attach_succeeds_when_no_auto_created_child() throws SQLException {
-        // If partition is added AFTER the index, no auto-created child exists,
-        // so manual create + attach should work
+    void alter_index_attach_rejects_a_second_index_for_a_partition_attach_already_indexed()
+            throws SQLException {
+        // A table taken into the hierarchy is indexed the way the hierarchy is indexed, so
+        // ATTACH PARTITION leaves it already carrying the parent index's copy, named for itself.
         exec("CREATE TABLE pi_b2 (id int, region int) PARTITION BY LIST (region)");
         exec("CREATE INDEX pi_b2_parent_idx ON pi_b2 (id)");
-        // Add partition AFTER index — PG would auto-create here too, but test the attach path
         exec("CREATE TABLE pi_b2_p1 (id int, region int)");
-        // Manually attach as partition (not via PARTITION OF, so no auto-index)
         exec("ALTER TABLE pi_b2 ATTACH PARTITION pi_b2_p1 FOR VALUES IN (1)");
-        exec("CREATE INDEX pi_b2_child_idx ON pi_b2_p1 (id)");
+        assertEquals("pi_b2_p1_id_idx", scalarStr(
+                "SELECT ic.relname FROM pg_index i "
+                + "JOIN pg_class c ON i.indrelid = c.oid "
+                + "JOIN pg_class ic ON i.indexrelid = ic.oid "
+                + "WHERE c.relname = 'pi_b2_p1'"));
 
-        // This should succeed — parent has no pre-existing child for pi_b2_p1
-        exec("ALTER INDEX pi_b2_parent_idx ATTACH PARTITION pi_b2_child_idx");
+        // A second index over the same columns is one more than the partition may contribute:
+        // PostgreSQL names the partition that is already covered.
+        exec("CREATE INDEX pi_b2_child_idx ON pi_b2_p1 (id)");
+        try {
+            exec("ALTER INDEX pi_b2_parent_idx ATTACH PARTITION pi_b2_child_idx");
+            fail("ALTER INDEX ATTACH should reject when the partition is already covered");
+        } catch (SQLException e) {
+            assertEquals("55000", e.getSQLState(),
+                    "Expected SQLSTATE 55000; got " + e.getSQLState() + " — " + e.getMessage());
+            assertTrue(e.getMessage().contains("cannot attach"),
+                    "Error message should contain 'cannot attach'; got: " + e.getMessage());
+        }
 
         int inheritCount = scalarInt(
                 "SELECT count(*)::int FROM pg_index i "
@@ -221,7 +234,7 @@ class PartitionIndexTest {
                 + "JOIN pg_class pc ON h.inhparent = pc.oid "
                 + "WHERE pc.relname = 'pi_b2_parent_idx'");
         assertEquals(1, inheritCount,
-                "Manually attached child should appear in pg_inherits");
+                "the copy ATTACH PARTITION made is the one that inherits from the parent index");
     }
 
     // =========================================================================

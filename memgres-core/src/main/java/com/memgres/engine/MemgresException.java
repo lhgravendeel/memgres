@@ -18,6 +18,7 @@ public class MemgresException extends RuntimeException {
     private String positionToken; // the token in the query text the position points at
     private boolean positionSuppressed; // PostgreSQL sends no P field for this error
     private String pgContext; // PL/pgSQL exception context (function name + line)
+    private String copyField; // the field of a COPY line this was raised in
 
     public MemgresException(String message) {
         super(primaryOf(message));
@@ -182,6 +183,17 @@ public class MemgresException extends RuntimeException {
     public MemgresException withoutHint() { this.hint = null; return this; }
     public String getPgContext() { return pgContext; }
     public void setPgContext(String pgContext) { this.pgContext = pgContext; }
+
+    /**
+     * The field of a COPY line this error was raised in, named the way PostgreSQL names it.
+     *
+     * <p>PostgreSQL holds on to the column and the text it is handing a type's reader for as long
+     * as that reader is running, and reports them in place of the line when it fails: the value
+     * that could not be read says more than the line it sat on. The relation and the line number
+     * are the copy's own to add, so what is recorded here is only what the reader knew.
+     */
+    public String getCopyField() { return copyField; }
+    public void setCopyField(String copyField) { this.copyField = copyField; }
 
     /**
      * Infer a SQLSTATE code from common error message patterns.

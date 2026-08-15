@@ -323,44 +323,43 @@ class IndexConflictTest {
     // ========================================================================
 
     /**
-     * ON CONFLICT (col) WHERE predicate DO UPDATE ... when no partial unique index with
-     * that exact predicate exists should give SQLSTATE 42P10 in PG 18.
-     * Memgres gives 42601. The test accepts both but requires one of the two codes.
+     * A predicate written on ON CONFLICT does not have to be an index's predicate: PostgreSQL
+     * asks only that the index it picks be usable for every row the predicate admits, and an
+     * index with no predicate of its own is usable for all of them. So the primary key answers
+     * here, and the statement runs.
      */
     @Test
-    void on_conflict_partial_index_no_matching_constraint_gives_42P10_or_42601() throws SQLException {
+    void on_conflict_where_over_a_plain_unique_index_is_accepted() throws SQLException {
         exec("CREATE TABLE idx69_t(id int PRIMARY KEY, val text, tenant_id int)");
         try {
-            // No partial unique index on (id) WHERE tenant_id = 10 exists, so this must fail
-            SQLException ex = assertThrows(SQLException.class,
-                    () -> exec("INSERT INTO idx69_t(id, val, tenant_id) VALUES (1, 'a', 10) " +
-                               "ON CONFLICT (id) WHERE tenant_id = 10 " +
-                               "DO UPDATE SET val = EXCLUDED.val"));
-            String state = ex.getSQLState();
-            assertTrue(state.equals("42P10") || state.equals("42601"),
-                    "ON CONFLICT with unmatched partial index should give 42P10 or 42601, got "
-                            + state);
+            exec("INSERT INTO idx69_t(id, val, tenant_id) VALUES (1, 'a', 10) " +
+                 "ON CONFLICT (id) WHERE tenant_id = 10 DO UPDATE SET val = EXCLUDED.val");
+            exec("INSERT INTO idx69_t(id, val, tenant_id) VALUES (1, 'b', 10) " +
+                 "ON CONFLICT (id) WHERE tenant_id = 10 DO UPDATE SET val = EXCLUDED.val");
+            assertEquals("b", scalar("SELECT val FROM idx69_t WHERE id = 1"));
         } finally {
             exec("DROP TABLE IF EXISTS idx69_t");
         }
     }
 
     /**
-     * Similar ON CONFLICT partial predicate mismatch with a different WHERE clause.
+     * The refusal is for a predicate that does not cover the partial index's own: an index built
+     * over some of the rows cannot answer for a statement that admits others.
      */
     @Test
-    void on_conflict_partial_index_different_predicate_gives_42P10_or_42601() throws SQLException {
-        exec("CREATE TABLE idx70_t(id int PRIMARY KEY, val text, region text)");
+    void on_conflict_where_a_partial_index_does_not_cover_gives_42P10() throws SQLException {
+        exec("CREATE TABLE idx70_t(id int, val text, tenant_id int)");
+        exec("CREATE UNIQUE INDEX idx70_i ON idx70_t (id) WHERE tenant_id = 5");
         try {
-            // There is no partial unique index on (id) WHERE region = 'eu'
             SQLException ex = assertThrows(SQLException.class,
-                    () -> exec("INSERT INTO idx70_t(id, val, region) VALUES (1, 'b', 'eu') " +
-                               "ON CONFLICT (id) WHERE region = 'eu' " +
+                    () -> exec("INSERT INTO idx70_t(id, val, tenant_id) VALUES (1, 'a', 10) " +
+                               "ON CONFLICT (id) WHERE tenant_id = 10 " +
                                "DO UPDATE SET val = EXCLUDED.val"));
-            String state = ex.getSQLState();
-            assertTrue(state.equals("42P10") || state.equals("42601"),
-                    "ON CONFLICT with unmatched partial predicate should give 42P10 or 42601, got "
-                            + state);
+            assertEquals("42P10", ex.getSQLState());
+            // The predicate the index was built for does answer.
+            exec("INSERT INTO idx70_t(id, val, tenant_id) VALUES (1, 'a', 5) " +
+                 "ON CONFLICT (id) WHERE tenant_id = 5 DO UPDATE SET val = EXCLUDED.val");
+            assertEquals("a", scalar("SELECT val FROM idx70_t WHERE tenant_id = 5"));
         } finally {
             exec("DROP TABLE IF EXISTS idx70_t");
         }

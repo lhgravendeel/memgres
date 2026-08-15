@@ -56,6 +56,10 @@ final class ViewUpdatability {
             "Views that do not select from a single table or view are not automatically updatable.";
     static final String DETAIL_NOT_COLUMN =
             "View columns that are not columns of their base relation are not updatable.";
+    // Not a fault of the view's own shape: a rule that stands in for the write only for the rows
+    // its qualification holds leaves the rest of the statement with nothing to be rewritten onto.
+    static final String DETAIL_CONDITIONAL_RULE =
+            "Views with conditional DO INSTEAD rules are not automatically updatable.";
 
     /** How deep a chain of views over views is followed before it is called a loop. */
     private static final int MAX_VIEW_DEPTH = 100;
@@ -111,7 +115,7 @@ final class ViewUpdatability {
             // the shape of that view no longer decides anything. A trigger does not count here:
             // PostgreSQL reports a view over a trigger-updatable view as not auto-updatable and
             // only counts the trigger when the caller asks it to.
-            if (insteadRuleEvents(db, inner.name()) == ALL_EVENTS) return null;
+            if (insteadRuleEvents(db, inner.schemaName(), inner.name()) == ALL_EVENTS) return null;
             return notAutoUpdatable(db, inner, depth + 1);
         }
         return null;
@@ -166,21 +170,22 @@ final class ViewUpdatability {
     }
 
     /** The events an unconditional INSTEAD rule on this relation covers, as event bits. */
-    static int insteadRuleEvents(Database db, String relation) {
+    static int insteadRuleEvents(Database db, String schema, String relation) {
         int events = 0;
-        if (isUnconditionalInsteadRule(db, relation, "INSERT")) events |= INSERT;
-        if (isUnconditionalInsteadRule(db, relation, "UPDATE")) events |= UPDATE;
-        if (isUnconditionalInsteadRule(db, relation, "DELETE")) events |= DELETE;
+        if (isUnconditionalInsteadRule(db, schema, relation, "INSERT")) events |= INSERT;
+        if (isUnconditionalInsteadRule(db, schema, relation, "UPDATE")) events |= UPDATE;
+        if (isUnconditionalInsteadRule(db, schema, relation, "DELETE")) events |= DELETE;
         return events;
     }
 
-    private static boolean isUnconditionalInsteadRule(Database db, String relation, String event) {
-        String rule = db.getRule(relation, event);
-        if (rule == null) return false;
-        if (!rule.startsWith("INSTEAD") && !"INSTEAD_NOTHING".equals(rule)) return false;
-        // A rule with a WHERE of its own only replaces the write for the rows it matches, so
-        // PostgreSQL does not count it as making the view updatable.
-        return db.getRuleQualification(relation, event) == null;
+    private static boolean isUnconditionalInsteadRule(Database db, String schema, String relation,
+                                                      String event) {
+        for (Database.StoredRule rule : db.getRules(schema, relation, event)) {
+            // A rule with a WHERE of its own only replaces the write for the rows it matches, so
+            // PostgreSQL does not count it as making the view updatable.
+            if (rule.isInstead() && rule.getQualification() == null) return true;
+        }
+        return false;
     }
 
     /**
@@ -202,7 +207,8 @@ final class ViewUpdatability {
             return t != null ? ALL_EVENTS : 0;
         }
         if (vd.materialized() || depth > MAX_VIEW_DEPTH) return 0;
-        int events = insteadRuleEvents(db, relation);
+        int events = insteadRuleEvents(db, vd.schemaName() != null ? vd.schemaName() : schema,
+                relation);
         if (includeTriggers) events |= insteadOfEvents(db, relation);
         // A view of an updatable shape is only as updatable as what it selects from: a view over
         // a view that nothing can write to accepts nothing either, and a view over one that only

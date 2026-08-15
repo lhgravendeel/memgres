@@ -12,6 +12,12 @@ public final class AlterPolicyStmt implements Statement {
     public final Expression withCheckExpr;
     /** The roles a TO clause named; empty when it wrote none. Each has to be a role that exists. */
     public final java.util.List<String> roles;
+    /**
+     * The schema written in front of the relation, or null when the name was written bare. A
+     * policy belongs to its relation rather than to the relation's name, so a policy of one name
+     * on another schema's relation of that name is a different policy.
+     */
+    public final String schema;
 
     public AlterPolicyStmt(
             String name,
@@ -31,16 +37,30 @@ public final class AlterPolicyStmt implements Statement {
             Expression withCheckExpr,
             java.util.List<String> roles
     ) {
+        this(name, table, renameTo, usingExpr, withCheckExpr, roles, null);
+    }
+
+    public AlterPolicyStmt(
+            String name,
+            String table,
+            String renameTo,
+            Expression usingExpr,
+            Expression withCheckExpr,
+            java.util.List<String> roles,
+            String schema
+    ) {
         this.name = name;
         this.table = table;
         this.renameTo = renameTo;
         this.usingExpr = usingExpr;
         this.withCheckExpr = withCheckExpr;
         this.roles = roles == null ? java.util.Collections.<String>emptyList() : roles;
+        this.schema = schema;
     }
 
     public String name() { return name; }
     public String table() { return table; }
+    public String schema() { return schema; }
     public String renameTo() { return renameTo; }
     public Expression usingExpr() { return usingExpr; }
     public Expression withCheckExpr() { return withCheckExpr; }
@@ -55,16 +75,17 @@ public final class AlterPolicyStmt implements Statement {
             && java.util.Objects.equals(table, that.table)
             && java.util.Objects.equals(renameTo, that.renameTo)
             && java.util.Objects.equals(usingExpr, that.usingExpr)
-            && java.util.Objects.equals(withCheckExpr, that.withCheckExpr);
+            && java.util.Objects.equals(withCheckExpr, that.withCheckExpr)
+            && java.util.Objects.equals(schema, that.schema);
     }
 
     @Override
     public int hashCode() {
-        return java.util.Objects.hash(name, table, renameTo, usingExpr, withCheckExpr);
+        return java.util.Objects.hash(name, table, renameTo, usingExpr, withCheckExpr, schema);
     }
 
     @Override
     public String toString() {
-        return "AlterPolicyStmt[name=" + name + ", " + "table=" + table + ", " + "renameTo=" + renameTo + ", " + "usingExpr=" + usingExpr + ", " + "withCheckExpr=" + withCheckExpr + "]";
+        return "AlterPolicyStmt[name=" + name + ", " + "table=" + table + ", " + "schema=" + schema + ", " + "renameTo=" + renameTo + ", " + "usingExpr=" + usingExpr + ", " + "withCheckExpr=" + withCheckExpr + "]";
     }
 }
