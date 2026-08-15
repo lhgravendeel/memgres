@@ -203,8 +203,9 @@ SELECT m FROM zzw5a_rd2log;
 DROP TABLE zzw5a_rd2 CASCADE;
 DROP TABLE zzw5a_rd2log CASCADE;
 
--- A column with no default still reads null in NEW, and a column the system computes reads null
--- there too: a generated column is computed after the rewriter has run.
+-- A column with no default still reads null in NEW, and a column the system computes reads the
+-- value the row is about to hold: PostgreSQL works a stored generated column out where the rule
+-- reads it.
 DROP TABLE IF EXISTS zzw5a_rd3 CASCADE;
 DROP TABLE IF EXISTS zzw5a_rd3log CASCADE;
 CREATE TABLE zzw5a_rd3 (a int, s int GENERATED ALWAYS AS (a*2) STORED, t text);
@@ -221,7 +222,7 @@ SELECT a, s, t FROM zzw5a_rd3;
 
 -- begin-expected
 -- columns: m
--- row: null/null
+-- row: 8/null
 -- end-expected
 SELECT m FROM zzw5a_rd3log;
 

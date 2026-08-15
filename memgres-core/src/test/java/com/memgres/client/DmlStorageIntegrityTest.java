@@ -5529,7 +5529,7 @@ void virtualColumnStillReadableWhenItsExpressionHolds() throws Exception {
     }
 
     @Test
-    void aColumnWithNoDefaultAndOneTheSystemComputesBothReadNullInNew() throws Exception {
+    void aColumnTheSystemComputesReadsItsValueInNewAndOneWithNoDefaultReadsNull() throws Exception {
         exec("DROP TABLE IF EXISTS zzw5a_rd3 CASCADE");
         exec("DROP TABLE IF EXISTS zzw5a_rd3log CASCADE");
         exec("CREATE TABLE zzw5a_rd3 (a int, s int GENERATED ALWAYS AS (a*2) STORED, t text)");
@@ -5538,9 +5538,11 @@ void virtualColumnStillReadableWhenItsExpressionHolds() throws Exception {
                 + " VALUES (coalesce(NEW.s::text, 'null') || '/' || coalesce(NEW.t, 'null'))");
         exec("INSERT INTO zzw5a_rd3 (a) VALUES (4)");
 
-        // A generated column is computed after the rewriter has run, so NEW reads null for one.
+        // A stored generated column is worked out where the rule reads it, from the row the
+        // statement is writing, so NEW carries the value the row is about to hold. A column
+        // nothing was written to and nothing computes reads null there.
         assertEquals("8", scalar("SELECT s FROM zzw5a_rd3"));
-        assertEquals("null/null", scalar("SELECT m FROM zzw5a_rd3log"));
+        assertEquals("8/null", scalar("SELECT m FROM zzw5a_rd3log"));
 
         exec("DROP TABLE zzw5a_rd3 CASCADE");
         exec("DROP TABLE zzw5a_rd3log CASCADE");

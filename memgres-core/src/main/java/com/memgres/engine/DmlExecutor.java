@@ -6776,11 +6776,12 @@ class DmlExecutor {
 
     /**
      * The values a row being inserted carries for each column, as {@code NEW} reads them. NEW
-     * carries every column of it -- the ones the statement supplied and the ones it left to their
-     * defaults — not a name left standing in the rule's own SQL.
+     * carries every column of it -- the ones the statement supplied, the ones it left to their
+     * defaults and the ones the system computes — not a name left standing in the rule's own SQL.
      */
     private java.util.LinkedHashMap<String, Object> insertRuleNewValues(
-            List<Expression> valueRow, RowContext valueCtx, InsertStmt stmt, Table table) {
+            List<Expression> valueRow, RowContext valueCtx, InsertStmt stmt, Table table,
+            List<Database.StoredRule> rules) {
         // Values arrive in the order the statement names them, and through a view that is
         // the view's own column order mapped onto the base table.
         List<String> colNames = stmt.columns();
@@ -6806,13 +6807,108 @@ class DmlExecutor {
         }
         // PostgreSQL fills in the default of every column the statement did not supply while it is
         // rewriting the statement, which is before the rules are applied, so NEW carries the
-        // default rather than a null. A column the system computes is left alone: a generated
-        // column is computed after the rewriter has run, and NEW reads null for one.
+        // default rather than a null.
         for (Column c : table.getColumns()) {
             if (supplied.contains(c.getName().toLowerCase()) || c.isGenerated()) continue;
             values.put(c.getName(), insertRuleDefault(stmt, table, c));
         }
+        putRuleGeneratedValues(stmt, table, rules, values);
         return values;
+    }
+
+    /**
+     * What NEW carries for a column the system computes.
+     *
+     * <p>A STORED generated column is worked out from the row the statement is writing, by the same
+     * expression over the same values the write itself uses, so a rule reads the value the row is
+     * about to hold. PostgreSQL works it out where the rule reads it, putting the expression in
+     * place of the reference while it rewrites the rule, so a column no rule names is not worked
+     * out at all and an expression that raises for the row raises only where a rule reads it.
+     *
+     * <p>A VIRTUAL column is left alone: it is worked out where a query names the column of a
+     * stored row, and NEW is no such row. So is every column of a view, which computes nothing of
+     * its own -- the relation underneath does that, after the rules written on the view have run.
+     */
+    private void putRuleGeneratedValues(InsertStmt stmt, Table table,
+                                        List<Database.StoredRule> rules,
+                                        java.util.LinkedHashMap<String, Object> values) {
+        // A rule of a view's own stands in place of the rewrite onto the relation underneath, and
+        // a view computes no column of its own, so NEW reads nothing there -- the same reason a
+        // default of the relation underneath does not reach one.
+        Database.ViewDef view = executor.database.getView(
+                executor.relationSchemaOf(stmt.schema(), stmt.table()), stmt.table());
+        if (view != null
+                && !executor.database.getRules(view.schemaName(), view.name(), "INSERT").isEmpty()) {
+            return;
+        }
+        List<Column> wanted = new ArrayList<>();
+        for (Column c : table.getColumns()) {
+            if (c.isGenerated() && !c.isVirtual() && rulesReadNewColumn(rules, c.getName())) {
+                wanted.add(c);
+            }
+        }
+        if (wanted.isEmpty()) return;
+        // The expression reads the other columns as the write stores them and not as the statement
+        // spelled them: a timestamp written as a string literal is a timestamp to it.
+        Object[] row = insertRuleNewRow(table, values);
+        for (int i = 0; i < row.length; i++) {
+            Column c = table.getColumns().get(i);
+            if (!c.isGenerated()) row[i] = TypeCoercion.coerceForStorage(row[i], c);
+        }
+        for (Column c : wanted) {
+            values.put(c.getName(), evalGeneratedColumn(table, row, c));
+        }
+    }
+
+    /**
+     * Whether any rule of the relation reads a column of NEW, in one of its actions or in its own
+     * qualification. A qualification reads NEW unqualified as well as by name -- PostgreSQL puts
+     * the row in scope for one, and for no action -- so a bare column there is one of NEW's.
+     *
+     * <p>The answer is in the parse tree: a {@code NEW.s} written inside one of the rule's own
+     * string literals is part of that string and not a reference to anything. A rule that will not
+     * parse is taken to read the column, there being no tree to ask.
+     */
+    private boolean rulesReadNewColumn(List<Database.StoredRule> rules, String column) {
+        for (Database.StoredRule rule : rules) {
+            if (rule.getQualification() != null
+                    && readsNewColumn(rule.getQualification(), column, true)) {
+                return true;
+            }
+            if (rule.isNothing()) continue;
+            for (String action : Database.ruleActions(rule.getBody())) {
+                if (readsNewColumn(action, column, false)) return true;
+            }
+        }
+        return false;
+    }
+
+    /** Whether one piece of a rule's SQL names the column as NEW's. */
+    private boolean readsNewColumn(String sql, String column, boolean qualification) {
+        String text = sql == null ? "" : sql.trim();
+        if (text.endsWith(";")) text = text.substring(0, text.length() - 1).trim();
+        Object tree;
+        try {
+            tree = qualification ? com.memgres.engine.parser.Parser.parseExpression(text)
+                    : com.memgres.engine.parser.Parser.parse(text);
+        } catch (RuntimeException notParsed) {
+            return true;
+        }
+        return AstWalk.anyMatch(tree, node -> namesNewColumn(node, column, qualification));
+    }
+
+    /** True when an AST node reads the named column of NEW, or the whole of NEW. */
+    private static boolean namesNewColumn(Object node, String column, boolean bare) {
+        if (node instanceof ColumnRef) {
+            ColumnRef ref = (ColumnRef) node;
+            if (!column.equalsIgnoreCase(ref.column())) return false;
+            return ref.table() == null ? bare : ref.table().equalsIgnoreCase("new");
+        }
+        if (node instanceof WildcardExpr) {
+            String table = ((WildcardExpr) node).table();
+            return table != null && table.equalsIgnoreCase("new");
+        }
+        return false;
     }
 
     /**
@@ -6851,7 +6947,7 @@ class DmlExecutor {
         for (int i = 0; i < valueRows.size(); i++) {
             RowContext valueCtx = valueRowContexts == null ? null : valueRowContexts.get(i);
             java.util.LinkedHashMap<String, Object> newValues =
-                    insertRuleNewValues(valueRows.get(i), valueCtx, stmt, table);
+                    insertRuleNewValues(valueRows.get(i), valueCtx, stmt, table, rules);
             for (Database.StoredRule rule : rules) {
                 if (!rule.isInstead() || rule.getQualification() == null) continue;
                 if (insertRuleFires(rule, table, newValues)) {
@@ -6903,7 +6999,7 @@ class DmlExecutor {
         for (int i = 0; i < valueRows.size(); i++) {
             RowContext valueCtx = valueRowContexts == null ? null : valueRowContexts.get(i);
             java.util.LinkedHashMap<String, Object> newValues =
-                    insertRuleNewValues(valueRows.get(i), valueCtx, stmt, table);
+                    insertRuleNewValues(valueRows.get(i), valueCtx, stmt, table, rules);
             // Each rule's WHERE is judged once for the row, not once for each of its actions.
             boolean[] fires = new boolean[rules.size()];
             for (int r = 0; r < rules.size(); r++) {

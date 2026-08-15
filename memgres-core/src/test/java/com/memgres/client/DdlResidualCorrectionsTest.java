@@ -167,9 +167,11 @@ class DdlResidualCorrectionsTest {
     @Test
     void namingAConstraintOverAnAlreadyNotNullColumnCreatesNothing() throws Exception {
         exec("CREATE TABLE nn_d (id int PRIMARY KEY, b int NOT NULL)");
-        // PostgreSQL merges the declaration into the constraint that is already there, so the
-        // written name never comes into existence.
-        assertAccepted("ALTER TABLE nn_d ADD CONSTRAINT nn_d_b NOT NULL b");
+        // There is no constraint left for the written name to be the name of, and PostgreSQL
+        // refuses the declaration rather than reporting one it did not create.
+        assertRejected("55000",
+                "cannot create not-null constraint \"nn_d_b\" on column \"b\" of table \"nn_d\"",
+                "ALTER TABLE nn_d ADD CONSTRAINT nn_d_b NOT NULL b");
         assertRejected("42704", "constraint \"nn_d_b\" of relation \"nn_d\" does not exist",
                 "ALTER TABLE nn_d DROP CONSTRAINT nn_d_b");
         assertRejected("42704", "constraint \"nn_d_b\" of relation \"nn_d\" does not exist",

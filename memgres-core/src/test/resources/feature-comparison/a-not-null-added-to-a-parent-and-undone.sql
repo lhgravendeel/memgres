@@ -99,8 +99,13 @@ SELECT count(*)::int AS cnt FROM pg_constraint c JOIN pg_class cl ON c.conrelid 
 DELETE FROM zzn6_wc;
 ALTER TABLE zzn6_wp ADD CONSTRAINT zzn6_wn NOT NULL i;
 
--- stmt: a column that already refuses a null has nothing left to hand down, so ONLY is taken
---       and adds nothing: the rule the hierarchy holds is still the one already there
+-- stmt: a column that already refuses a null has nothing left for a second name to answer
+--       to, so the declaration is refused and the hierarchy holds the one rule already made
+-- note: PostgreSQL 18.0 merged this into the constraint already there; a later PostgreSQL 18 refuses it, and that refusal is what is asserted
+-- begin-expected-error
+-- sqlstate: 55000
+-- message-like: cannot create not-null constraint "zzn6_wn2" on column "i" of table "zzn6_wp"
+-- end-expected-error
 ALTER TABLE ONLY zzn6_wp ADD CONSTRAINT zzn6_wn2 NOT NULL i;
 
 -- begin-expected

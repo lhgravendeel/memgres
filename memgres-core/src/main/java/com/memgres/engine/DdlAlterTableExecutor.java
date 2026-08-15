@@ -3594,6 +3594,11 @@ class DdlAlterTableExecutor {
         }
         if (addConstraint.constraint().type() == TableConstraint.ConstraintType.NOT_NULL) {
             for (String colName : addConstraint.constraint().columns()) {
+                // A written name belongs to a constraint that comes into existence, and over a
+                // column that already refuses a null there is none to make: PostgreSQL refuses
+                // the declaration rather than folding it into the constraint already there.
+                rejectSecondNotNullConstraint(table, colName, addConstraint.constraint().name(),
+                        addConstraint.notValid(), stmt.table());
                 // The rows already stored decide whether the rule can hold at all — unless NOT
                 // VALID was written, which is exactly the request to leave them alone. The column
                 // is still marked NOT NULL below, because PostgreSQL enforces such a constraint on
@@ -3619,9 +3624,10 @@ class DdlAlterTableExecutor {
                     }
                 }
                 recordNotNullUndo(table, colName);
-                // A column that is already NOT NULL keeps the constraint it has: PostgreSQL
-                // merges the new declaration into it and never creates the written name, so
-                // DROP CONSTRAINT on that name is 42704 there and must be here too.
+                // A column that is already NOT NULL keeps the constraint it has: what reaches
+                // here names that constraint or names none at all, and PostgreSQL folds such a
+                // declaration in without creating a second one, so DROP CONSTRAINT on a name
+                // that was never created is 42704 there and must be here too.
                 boolean alreadyNotNull = colIdx >= 0
                         && !table.getColumns().get(colIdx).isNullable();
                 // NOT VALID is recorded against the constraint the statement creates, and a
@@ -4215,6 +4221,30 @@ class DdlAlterTableExecutor {
     private static boolean takesNotNullNow(Table table, String column) {
         int idx = table.getColumnIndex(column);
         return idx >= 0 && table.getColumns().get(idx).isNullable();
+    }
+
+    /**
+     * A named NOT NULL declaration over a column that already carries one under another name
+     * creates nothing, and PostgreSQL will not let a statement say it created a constraint that
+     * is not there: it names the constraint it was asked to make, the column and the relation.
+     * The one exception is a validated declaration over a constraint marked NOT VALID, which is
+     * refused for the rows nobody has read instead -- see
+     * {@link #rejectMergeIntoNotValidNotNull}.
+     */
+    private static void rejectSecondNotNullConstraint(Table table, String column, String name,
+                                                      boolean notValid, String relationName) {
+        if (name == null) return;
+        int idx = table.getColumnIndex(column);
+        if (idx < 0 || table.getColumns().get(idx).isNullable()) return;
+        // The rows nobody has read come first: a validated declaration written over a constraint
+        // marked NOT VALID is refused for those, and the refusal names that constraint.
+        if (!notValid && notValidNotNull(table, column)) return;
+        // Written under the name the constraint already answers to, the declaration asks for
+        // nothing that is not there.
+        String held = CatalogConstraintBuilder.notNullConstraintName(table, column);
+        if (held != null && held.equalsIgnoreCase(name)) return;
+        throw new MemgresException("cannot create not-null constraint \"" + name
+                + "\" on column \"" + column + "\" of table \"" + relationName + "\"", "55000");
     }
 
     /**

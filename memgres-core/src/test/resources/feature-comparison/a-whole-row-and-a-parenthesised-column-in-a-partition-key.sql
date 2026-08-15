@@ -256,6 +256,11 @@ CREATE TABLE zzt4a_gc (i int, k int GENERATED ALWAYS AS (i * 2) STORED)
 CREATE TABLE zzt4a_gg (i int, k int GENERATED ALWAYS AS (i * 2) STORED)
   PARTITION BY RANGE (i, (k));
 
+-- Nothing above was built, on a server that answers as this file says. A server
+-- that took one of them instead would leave it standing for every file after
+-- this one, so the names are cleared either way.
+DROP TABLE IF EXISTS zzt4a_ga, zzt4a_gb, zzt4a_gc, zzt4a_gg;
+
 -- ============================================================================
 -- VALUES reads as a column name, so the parenthesis after it is the fault
 -- ============================================================================
