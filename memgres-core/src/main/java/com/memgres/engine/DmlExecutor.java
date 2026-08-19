@@ -254,7 +254,7 @@ class DmlExecutor {
                 cteMap.put(cte.name().toLowerCase(), cte);
             }
             executor.cteStack.push(cteMap);
-            for (String cteName : cteMap.keySet()) executor.cteResultCache.remove(cteName);
+            for (SelectStmt.CommonTableExpr cte : withClauses) executor.cteResultCache.remove(cte);
             pushed = true;
         }
         try {
@@ -273,11 +273,8 @@ class DmlExecutor {
     /** Execute any DML CTEs that haven't been executed yet (not in cache). */
     private void executePendingDmlCtes(List<SelectStmt.CommonTableExpr> withClauses) {
         for (SelectStmt.CommonTableExpr cte : withClauses) {
-            if (isDmlStatement(cte.query())) {
-                String key = cte.name().toLowerCase();
-                if (!executor.cteResultCache.containsKey(key)) {
-                    executor.selectExecutor.executeCte(cte);
-                }
+            if (isDmlStatement(cte.query()) && !executor.cteResultCache.containsKey(cte)) {
+                executor.selectExecutor.executeCte(cte);
             }
         }
     }
@@ -527,6 +524,13 @@ class DmlExecutor {
         // column of the relation is that error, not whatever the action would also have been.
         if (oc.columns() != null) {
             for (String col : oc.columns()) {
+                // A system column is a column the relation has, so the arbiter resolves; what
+                // it finds is that no index was ever built over one, which is the same answer
+                // any column with no unique index behind it gets.
+                if (DdlDefinitionChecks.isSystemColumnName(col)) {
+                    throw new MemgresException("there is no unique or exclusion constraint"
+                            + " matching the ON CONFLICT specification", "42P10");
+                }
                 if (table.getColumnIndex(col) < 0) {
                     // An arbiter names a column of an index rather than a column being written,
                     // so PostgreSQL reports it as a name nothing answers to rather than as a
@@ -7836,8 +7840,23 @@ class DmlExecutor {
             ColumnRef cr = (ColumnRef) node;
             String qualifier = cr.table();
             if (qualifier != null && !qualifier.equalsIgnoreCase(self)
-                    && !qualifier.equalsIgnoreCase(relationName)) {
-                return;   // another relation's name: not this scope's to judge
+                    && !"old".equalsIgnoreCase(qualifier) && !"new".equalsIgnoreCase(qualifier)) {
+                // The target is the whole scope here, so a qualifier naming anything else names a
+                // relation the statement does not have — and an alias hides the relation's own
+                // name, which PostgreSQL words differently because the reader did write it down.
+                //
+                // OLD and NEW are not relations the statement lists: they are entries a rule's
+                // rewrite put in the range table, and the statement reaching here may be one.
+                if (qualifier.equalsIgnoreCase(relationName)) {
+                    MemgresException hidden = new MemgresException(
+                            "invalid reference to FROM-clause entry for table \"" + qualifier + "\"",
+                            "42P01");
+                    hidden.setHint("Perhaps you meant to reference the table alias \""
+                            + alias + "\".");
+                    throw hidden;
+                }
+                throw new MemgresException(
+                        "missing FROM-clause entry for table \"" + qualifier + "\"", "42P01");
             }
             if (SYSTEM_COLUMNS.contains(cr.column().toLowerCase())) return;
             if (table.getColumnIndex(mapViewColumn(cr.column())) < 0) {

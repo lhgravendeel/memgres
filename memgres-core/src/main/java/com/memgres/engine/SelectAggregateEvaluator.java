@@ -581,6 +581,57 @@ class SelectAggregateEvaluator {
     // ---- Aggregate expression evaluation ----
 
     Object evalAggregateExpr(Expression expr, List<RowContext> group, RowContext representative) {
+        // A sub-select written here may hold an aggregate that is not its own: PostgreSQL puts an
+        // aggregate at the query level its argument variables come from, so one naming only this
+        // query's columns is answered here, over this group, and the sub-select reads the answer.
+        if (representative != null) {
+            List<Expression> ofThisLevel =
+                    select.outerLevelAggregatesIn(expr, representative.getBindings());
+            if (!ofThisLevel.isEmpty()) {
+                return evalWithLevelAggregates(expr, ofThisLevel, group, representative);
+            }
+        }
+        return evalHere(expr, group, representative);
+    }
+
+    /**
+     * Answer the calls this level owns, then evaluate what encloses them with those answers in
+     * hand. They stay answered for as long as that takes, nested queries and all: the sub-select
+     * they are written in reads them as values, so it neither groups around them nor refuses them
+     * for standing in a clause that may hold no aggregate.
+     */
+    private Object evalWithLevelAggregates(Expression expr, List<Expression> owned,
+                                           List<RowContext> group, RowContext representative) {
+        List<RowContext.TableBinding> scope = representative.getBindings();
+        Map<Expression, ExprEvaluator.PrecomputedValueExpr> answers =
+                new IdentityHashMap<Expression, ExprEvaluator.PrecomputedValueExpr>();
+        // A level further out may have answers of its own still standing; they are answers about
+        // other nodes, so both sets hold at once.
+        if (executor.exprEvaluator.levelFoldedAnswers() != null) {
+            answers.putAll(executor.exprEvaluator.levelFoldedAnswers());
+        }
+        for (Expression call : owned) {
+            Object value = call instanceof OrderedSetAggExpr
+                    ? evalOrderedSetAggregate((OrderedSetAggExpr) call, group)
+                    : evalAggregate((FunctionCallExpr) call, group);
+            answers.put(call, new ExprEvaluator.PrecomputedValueExpr(value,
+                    executor.exprEvaluator.inferTypeFromContext(call, scope)));
+        }
+        Map<Expression, ExprEvaluator.PrecomputedValueExpr> prior =
+                executor.exprEvaluator.swapLevelFolded(answers);
+        try {
+            return evalHere(expr, group, representative);
+        } finally {
+            executor.exprEvaluator.swapLevelFolded(prior);
+        }
+    }
+
+    private Object evalHere(Expression expr, List<RowContext> group, RowContext representative) {
+        // A call an enclosing query level has already answered is that answer, not an aggregate
+        // for this group: its arguments name the columns of a relation this query does not read.
+        ExprEvaluator.PrecomputedValueExpr answered =
+                executor.exprEvaluator.levelFoldedFor(expr);
+        if (answered != null) return answered.value();
         if (expr instanceof FunctionCallExpr) {
             FunctionCallExpr fn = (FunctionCallExpr) expr;
             String name = FunctionEvaluator.stripSchemaPrefix(fn.name().toLowerCase());
@@ -711,31 +762,6 @@ class SelectAggregateEvaluator {
         } else if (expr instanceof OrderedSetAggExpr) {
             OrderedSetAggExpr osa = (OrderedSetAggExpr) expr;
             return evalOrderedSetAggregate(osa, group);
-        } else if (expr instanceof InExpr) {
-            InExpr in = (InExpr) expr;
-            Object val = evalAggregateExpr(in.expr(), group, representative);
-            if (val == null) return null;
-            // IN (subquery) is a set membership test, not a comparison against one value: reading
-            // the subquery as an element of the value list made every row of it a scalar
-            // subquery, so a second row raised 21000 instead of answering. Fold only the left
-            // side here -- which is where the aggregate is -- and let the ordinary evaluator run
-            // the subquery.
-            if (in.values() != null && in.values().size() == 1
-                    && in.values().get(0) instanceof SubqueryExpr) {
-                return executor.evalExpr(new InExpr(
-                        new ExprEvaluator.PrecomputedValueExpr(val), in.values(),
-                        in.negated(), in.fromAny()), representative);
-            }
-            boolean found = false;
-            boolean hasNull = false;
-            for (Expression v : in.values()) {
-                Object elem = executor.evalExpr(v, representative);
-                if (elem == null) { hasNull = true; continue; }
-                if (TypeCoercion.areEqual(val, elem)) { found = true; break; }
-            }
-            if (found) return !in.negated();
-            if (hasNull) return null;
-            return in.negated();
         } else if (expr instanceof LikeExpr) {
             LikeExpr like = (LikeExpr) expr;
             Object left = evalAggregateExpr(like.left(), group, representative);
@@ -786,9 +812,39 @@ class SelectAggregateEvaluator {
         } else if (expr instanceof SubqueryExpr) {
             // Subqueries can be evaluated without a representative row
             return executor.evalExpr(expr, representative);
+        } else if (select.containsAggregate(expr)) {
+            return evalFoldedOverGroup(expr, group, representative);
         } else {
             return representative != null ? executor.evalExpr(expr, representative) : null;
         }
+    }
+
+    /**
+     * Compute the aggregate calls an expression holds over the group, then evaluate what encloses
+     * them as the ordinary expression it is.
+     *
+     * <p>The folding above names the containers it handles one at a time, and answers only for
+     * the containers named. An aggregate written under BETWEEN, inside ARRAY[] or ROW(), in an IN
+     * list, under COLLATE or AT TIME ZONE, or subscripted, reached ordinary evaluation instead,
+     * where an aggregate call has no value: the row answered NULL, and a HAVING written that way
+     * kept no rows at all.
+     */
+    private Object evalFoldedOverGroup(Expression expr, List<RowContext> group,
+                                       RowContext representative) {
+        List<RowContext.TableBinding> scope = representative != null
+                ? representative.getBindings() : new ArrayList<RowContext.TableBinding>();
+        Map<Expression, ExprEvaluator.PrecomputedValueExpr> folded =
+                new IdentityHashMap<Expression, ExprEvaluator.PrecomputedValueExpr>();
+        for (Expression call : ExprSearch.aggregateCallsIn(expr, select::isAggregateFunction)) {
+            Object value = call instanceof OrderedSetAggExpr
+                    ? evalOrderedSetAggregate((OrderedSetAggExpr) call, group)
+                    : evalAggregate((FunctionCallExpr) call, group);
+            // The folded value keeps the type the call was declared to have: a group that
+            // aggregated to NULL still aggregated something of a type.
+            folded.put(call, new ExprEvaluator.PrecomputedValueExpr(value,
+                    executor.exprEvaluator.inferTypeFromContext(call, scope)));
+        }
+        return executor.exprEvaluator.evalWithFolded(folded, expr, representative);
     }
 
     // ---- Ordered-set aggregates ----
@@ -797,8 +853,18 @@ class SelectAggregateEvaluator {
         String name = osa.funcName().toLowerCase();
         List<SelectStmt.OrderByItem> orderBy = osa.withinGroupOrderBy();
         checkOrderedSetArity(osa, group);
+        // The direct arguments are typed from the query, not from whichever rows a FILTER left,
+        // so the row the types are read off is taken before the predicate is applied.
+        RowContext typeSample = group.isEmpty() ? null : group.get(0);
+        // A FILTER chooses which rows the aggregate accumulates, and an ordered-set aggregate
+        // accumulates rows like any other.
+        if (osa.filter() != null) {
+            group = group.stream()
+                    .filter(ctx -> executor.isTruthy(executor.evalExpr(osa.filter(), ctx)))
+                    .collect(Collectors.toList());
+        }
         if (HYPOTHETICAL_SET_AGGREGATES.contains(name)) {
-            return evalHypotheticalSetAggregate(name, osa, group);
+            return evalHypotheticalSetAggregate(name, osa, group, typeSample);
         }
 
         List<RowContext> sorted = new ArrayList<>(group);
@@ -825,7 +891,12 @@ class SelectAggregateEvaluator {
         switch (name) {
             case "percentile_disc": {
                 if (osa.args().isEmpty()) return null;
-                Object fractionObj = executor.evalExpr(osa.args().get(0), group.isEmpty() ? null : group.get(0));
+                // The fraction is declared double precision, so a literal written without a type
+                // of its own is read by that type's input function rather than by whatever could
+                // be made of it: percentile_cont('zz') is not a fraction out of range, it is not
+                // a double precision at all.
+                Object fractionObj = readDirectArg(osa.args().get(0), DataType.DOUBLE_PRECISION,
+                        typeSample);
                 if (fractionObj == null) return null;
                 // Handle array argument: compute percentile for each element
                 if (fractionObj instanceof java.util.List) {
@@ -833,14 +904,7 @@ class SelectAggregateEvaluator {
                     java.util.List<Object> results = new java.util.ArrayList<>();
                     for (Object f : fractions) {
                         if (f == null) { results.add(null); continue; }
-                        double fv;
-                        try { fv = executor.toDouble(f); } catch (Exception e) {
-                            throw new MemgresException("percentile fraction must be between 0 and 1", "22003");
-                        }
-                        if (Double.isNaN(fv))
-                            throw new MemgresException("percentile value NaN is not between 0 and 1", "22003");
-                        if (fv < 0.0 || fv > 1.0)
-                            throw new MemgresException("percentile fraction must be between 0 and 1", "22003");
+                        double fv = percentileFraction(f);
                         if (vals.isEmpty()) { results.add(null); continue; }
                         int idx = (int) Math.ceil(fv * vals.size()) - 1;
                         if (idx < 0) idx = 0;
@@ -849,14 +913,7 @@ class SelectAggregateEvaluator {
                     }
                     return results;
                 }
-                double fraction;
-                try { fraction = executor.toDouble(fractionObj); } catch (Exception e) {
-                    throw new MemgresException("percentile fraction must be between 0 and 1", "22003");
-                }
-                if (Double.isNaN(fraction))
-                    throw new MemgresException("percentile value NaN is not between 0 and 1", "22003");
-                if (fraction < 0.0 || fraction > 1.0)
-                    throw new MemgresException("percentile fraction must be between 0 and 1", "22003");
+                double fraction = percentileFraction(fractionObj);
                 if (vals.isEmpty()) return null;
                 int idx = (int) Math.ceil(fraction * vals.size()) - 1;
                 if (idx < 0) idx = 0;
@@ -865,7 +922,12 @@ class SelectAggregateEvaluator {
             }
             case "percentile_cont": {
                 if (osa.args().isEmpty()) return null;
-                Object fractionObj = executor.evalExpr(osa.args().get(0), group.isEmpty() ? null : group.get(0));
+                // The fraction is declared double precision, so a literal written without a type
+                // of its own is read by that type's input function rather than by whatever could
+                // be made of it: percentile_cont('zz') is not a fraction out of range, it is not
+                // a double precision at all.
+                Object fractionObj = readDirectArg(osa.args().get(0), DataType.DOUBLE_PRECISION,
+                        typeSample);
                 if (fractionObj == null) return null;
                 // Handle array argument: compute percentile for each element
                 if (fractionObj instanceof java.util.List) {
@@ -873,51 +935,25 @@ class SelectAggregateEvaluator {
                     java.util.List<Object> results = new java.util.ArrayList<>();
                     for (Object f : fractions) {
                         if (f == null) { results.add(null); continue; }
-                        double fv;
-                        try { fv = executor.toDouble(f); } catch (Exception e) {
-                            throw new MemgresException("percentile fraction must be between 0 and 1", "22003");
-                        }
-                        if (fv < 0.0 || fv > 1.0)
-                            throw new MemgresException("percentile fraction must be between 0 and 1", "22003");
+                        double fv = percentileFraction(f);
                         if (vals.isEmpty()) { results.add(null); continue; }
                         if (vals.size() == 1) { results.add(vals.get(0)); continue; }
                         double pos = fv * (vals.size() - 1);
                         int lo = (int) Math.floor(pos);
                         int hi = (int) Math.ceil(pos);
                         if (lo == hi) { results.add(vals.get(lo)); continue; }
-                        double loVal = executor.toDouble(vals.get(lo));
-                        double hiVal = executor.toDouble(vals.get(hi));
-                        double r = loVal + (hiVal - loVal) * (pos - lo);
-                        if (r == Math.floor(r) && !Double.isInfinite(r)) {
-                            long lr = (long) r;
-                            if (lr >= Integer.MIN_VALUE && lr <= Integer.MAX_VALUE) { results.add((int) lr); continue; }
-                            results.add(lr); continue;
-                        }
-                        results.add(r);
+                        results.add(interpolate(vals.get(lo), vals.get(hi), pos - lo));
                     }
                     return results;
                 }
-                double fraction;
-                try { fraction = executor.toDouble(fractionObj); } catch (Exception e) {
-                    throw new MemgresException("percentile fraction must be between 0 and 1", "22003");
-                }
-                if (fraction < 0.0 || fraction > 1.0)
-                    throw new MemgresException("percentile fraction must be between 0 and 1", "22003");
+                double fraction = percentileFraction(fractionObj);
                 if (vals.isEmpty()) return null;
                 if (vals.size() == 1) return vals.get(0);
                 double pos = fraction * (vals.size() - 1);
                 int lower = (int) Math.floor(pos);
                 int upper = (int) Math.ceil(pos);
                 if (lower == upper) return vals.get(lower);
-                double lo = executor.toDouble(vals.get(lower));
-                double hi = executor.toDouble(vals.get(upper));
-                double result = lo + (hi - lo) * (pos - lower);
-                if (result == Math.floor(result) && !Double.isInfinite(result)) {
-                    long lresult = (long) result;
-                    if (lresult >= Integer.MIN_VALUE && lresult <= Integer.MAX_VALUE) return (int) lresult;
-                    return lresult;
-                }
-                return result;
+                return interpolate(vals.get(lower), vals.get(upper), pos - lower);
             }
             case "mode": {
                 if (vals.isEmpty()) return null;
@@ -954,6 +990,16 @@ class SelectAggregateEvaluator {
     private static final Set<String> HYPOTHETICAL_SET_AGGREGATES = new LinkedHashSet<>(
             Arrays.asList("rank", "dense_rank", "percent_rank", "cume_dist"));
 
+    /** The aggregates PostgreSQL declares over no arguments at all, which are written {@code f(*)}. */
+    private static final Set<String> PARAMETERLESS_AGGREGATES =
+            new HashSet<>(Arrays.asList("count"));
+
+    /** Whether PostgreSQL declares this aggregate over no arguments at all. */
+    static boolean isParameterlessAggregate(String name) {
+        return name != null
+                && PARAMETERLESS_AGGREGATES.contains(name.toLowerCase(java.util.Locale.ROOT));
+    }
+
     /**
      * Every ordered-set aggregate has a fixed arity, and for the hypothetical-set four the direct
      * arguments have to match the WITHIN GROUP sort columns one for one — they are the row being
@@ -975,6 +1021,141 @@ class SelectAggregateEvaluator {
             return;
         }
         if (!ok) throw noSuchOrderedSetFunction(osa, group);
+        checkOrderedSetArgTypes(osa, group, name);
+    }
+
+    /**
+     * The types the two percentiles are catalogued over, checked before a value is read.
+     *
+     * <p>percentile_cont interpolates between the two values the fraction falls between, so it is
+     * declared only over the types that can be halved: double precision and interval. percentile_disc
+     * returns one of the values it was given whole and takes any type at all for it. Both read the
+     * fraction as a double precision. memgres counted the arguments and then evaluated whatever was
+     * written, so percentile_cont over a date came back as the date itself and a fraction that was no
+     * number at all was reported as a fraction out of range.
+     *
+     * <p>A literal written with no type of its own says nothing to resolve against and takes the
+     * declared one, so it is left alone here and read by that type's input function later.
+     */
+    private void checkOrderedSetArgTypes(OrderedSetAggExpr osa, List<RowContext> group, String name) {
+        if (!name.equals("percentile_cont") && !name.equals("percentile_disc")) return;
+        RowContext sample = group.isEmpty() ? null : group.get(0);
+        Expression fraction = osa.args().get(0);
+        if (!isUntypedLiteral(fraction)) {
+            DataType written = executor.exprEvaluator.inferTypeFromContext(
+                    fraction, typeBindings(sample));
+            // The fraction may be written one at a time or as an array of them, and the array form
+            // asks the same of its elements as the scalar form asks of the whole.
+            DataType element = DataType.elementOf(written);
+            if (!readsAsDoublePrecision(element != null ? element : written)) {
+                throw noSuchOrderedSetFunction(osa, group);
+            }
+        }
+        if (!name.equals("percentile_cont")) return;
+        Expression key = osa.withinGroupOrderBy().get(0).expr();
+        if (isUntypedLiteral(key)) return;
+        DataType keyType = typeOfKey(key, sample);
+        if (keyType != null && keyType != DataType.INTERVAL && !readsAsDoublePrecision(keyType)) {
+            throw noSuchOrderedSetFunction(osa, group);
+        }
+    }
+
+    /**
+     * The value {@code weight} of the way from one sort key to the next.
+     *
+     * <p>percentile_cont is declared over double precision and over interval, and an interval is
+     * not a number of anything: its months, days and microseconds are kept apart because a month
+     * is not a fixed number of days. Reading one as a double made every one of them zero, so a
+     * median of one hour and three hours came back as 0 rather than two hours.
+     */
+    private Object interpolate(Object low, Object high, double weight) {
+        if (low instanceof PgInterval && high instanceof PgInterval) {
+            PgInterval lo = (PgInterval) low;
+            return lo.plus(((PgInterval) high).minus(lo).multiply(weight));
+        }
+        double lo = executor.toDouble(low);
+        double result = lo + (executor.toDouble(high) - lo) * weight;
+        // A whole number reads back as one: percentile_cont over integers answers 2, not 2.0.
+        if (result == Math.floor(result) && !Double.isInfinite(result)) {
+            long whole = (long) result;
+            if (whole >= Integer.MIN_VALUE && whole <= Integer.MAX_VALUE) {
+                return Integer.valueOf((int) whole);
+            }
+            return Long.valueOf(whole);
+        }
+        return Double.valueOf(result);
+    }
+
+    /**
+     * A percentile fraction, checked the way PostgreSQL checks it.
+     *
+     * <p>The message names the value it was handed rather than restating the rule, and prints it to
+     * six significant digits — so 2.0 is reported as 2, 1e10 as 1e+10 and 1.234567891 as 1.23457.
+     */
+    private double percentileFraction(Object value) {
+        double fraction = executor.toDouble(value);
+        if (!Double.isNaN(fraction) && fraction >= 0.0 && fraction <= 1.0) return fraction;
+        throw new MemgresException("percentile value " + sixSignificantDigits(fraction)
+                + " is not between 0 and 1", "22003");
+    }
+
+    /**
+     * A double written the way PostgreSQL writes one into a message: six significant digits, in
+     * plain notation while the exponent stays within reach and in scientific notation once it does
+     * not, with trailing zeros dropped either way. Not the same as writing the value out as a
+     * value, which keeps every digit needed to read it back.
+     */
+    private static String sixSignificantDigits(double d) {
+        if (Double.isNaN(d)) return "NaN";
+        if (Double.isInfinite(d)) return d > 0 ? "Infinity" : "-Infinity";
+        BigDecimal rounded = new BigDecimal(d).round(new java.math.MathContext(6));
+        int exponent = rounded.precision() - rounded.scale() - 1;
+        if (exponent >= -4 && exponent < 6) {
+            return rounded.stripTrailingZeros().toPlainString();
+        }
+        String mantissa = rounded.movePointLeft(exponent).stripTrailingZeros().toPlainString();
+        int magnitude = Math.abs(exponent);
+        return mantissa + "e" + (exponent < 0 ? "-" : "+")
+                + (magnitude < 10 ? "0" : "") + magnitude;
+    }
+
+    /** The types PostgreSQL will hand to a double precision parameter without being asked twice. */
+    /**
+     * Whether an ordered-set call answers to a catalogued signature — a name and argument count a
+     * known one has, with direct arguments of a type it takes.
+     *
+     * <p>PostgreSQL resolves the function before it asks anything about the arguments' grouping, so
+     * a call answering to nothing is a function that does not exist rather than one whose direct
+     * arguments read an ungrouped column. Asked of the query rather than of a group, which is why
+     * it takes bindings instead of rows: it is the same question {@link #checkOrderedSetArgTypes}
+     * answers over one, and both percentiles read their fraction as a double precision.
+     *
+     * <p>The catalogued arity counts the whole signature — what the call takes directly followed by
+     * what it orders — so the count to compare against is both together.
+     */
+    boolean resolvesAsOrderedSet(OrderedSetAggExpr osa, List<RowContext.TableBinding> bindings) {
+        String name = FunctionEvaluator.stripSchemaPrefix(osa.funcName().toLowerCase());
+        int arity = osa.args().size()
+                + (osa.withinGroupOrderBy() == null ? 0 : osa.withinGroupOrderBy().size());
+        if (BuiltinAggregateSignatures.orderedSetArity(name) != arity) return false;
+        for (Expression arg : osa.args()) {
+            if (isUntypedLiteral(arg)) continue;
+            DataType written = executor.exprEvaluator.inferTypeFromContext(arg, bindings);
+            DataType element = DataType.elementOf(written);
+            if (!readsAsDoublePrecision(element != null ? element : written)) return false;
+        }
+        return true;
+    }
+
+    private static boolean readsAsDoublePrecision(DataType type) {
+        if (type == null) return true;
+        switch (type) {
+            case SMALLINT: case INTEGER: case BIGINT:
+            case REAL: case DOUBLE_PRECISION: case NUMERIC:
+                return true;
+            default:
+                return false;
+        }
     }
 
     /**
@@ -983,13 +1164,17 @@ class SelectAggregateEvaluator {
      * NULL placement — the row is inserted into the same ordering the WITHIN GROUP clause states.
      */
     private Object evalHypotheticalSetAggregate(
-            String name, OrderedSetAggExpr osa, List<RowContext> group) {
+            String name, OrderedSetAggExpr osa, List<RowContext> group, RowContext typeSample) {
         List<SelectStmt.OrderByItem> orderBy = osa.withinGroupOrderBy();
-        RowContext sample = group.isEmpty() ? null : group.get(0);
         int keys = orderBy.size();
         Object[] hypo = new Object[keys];
         for (int i = 0; i < keys; i++) {
-            hypo[i] = executor.evalExpr(osa.args().get(i), sample);
+            // The direct argument is the value being ranked against its sort column and is
+            // declared to have that column's type, so rank('zz') WITHIN GROUP (ORDER BY an
+            // integer) is 'zz' read as an integer -- which it is not. Ranking the literal as
+            // written compared a string against numbers and answered.
+            hypo[i] = readDirectArg(osa.args().get(i),
+                    typeOfKey(orderBy.get(i).expr(), typeSample), typeSample);
         }
         long below = 0;
         long atOrBelow = 0;
@@ -1015,6 +1200,41 @@ class SelectAggregateEvaluator {
         }
         // cume_dist: the hypothetical row joins both the numerator and the denominator
         return Double.valueOf((double) (atOrBelow + 1) / (n + 1));
+    }
+
+    /**
+     * A direct argument, read through the type the aggregate declares for it. A literal written
+     * without a type of its own is PostgreSQL's {@code unknown} and takes the declared one, so it
+     * is read by that type's input function and is refused there if it is not one of its values.
+     */
+    private Object readDirectArg(Expression arg, DataType wanted, RowContext sample) {
+        Object value = executor.evalExpr(arg, sample);
+        if (value == null || wanted == null || !isUntypedLiteral(arg)) return value;
+        return executor.castEvaluator.applyCast(value, wanted.getPgName(), true);
+    }
+
+    /** Whether the expression is a string literal, which carries no type until it is given one. */
+    private static boolean isUntypedLiteral(Expression arg) {
+        return arg instanceof Literal
+                && ((Literal) arg).literalType() == Literal.LiteralType.STRING;
+    }
+
+    /** The type of a WITHIN GROUP sort column, or null where this level cannot name it. */
+    private DataType typeOfKey(Expression key, RowContext sample) {
+        return executor.exprEvaluator.inferTypeFromContext(key, typeBindings(sample));
+    }
+
+    /**
+     * What the types of an ordered-set call are read against: the group's own row where it has one,
+     * and what the FROM clause exposes where the group came out empty. PostgreSQL settles the call
+     * before it reads a page, so a group with no rows in it answers for its types just the same —
+     * reading a column off nothing at all made every one of them look like text.
+     */
+    private List<RowContext.TableBinding> typeBindings(RowContext sample) {
+        if (sample != null) return sample.getBindings();
+        GroupingScope scope = groupingScope.get();
+        return scope != null && scope.bindings != null
+                ? scope.bindings : new ArrayList<RowContext.TableBinding>();
     }
 
     /** Order two sort keys under a WITHIN GROUP ORDER BY list, column directions and all. */
@@ -1087,6 +1307,17 @@ class SelectAggregateEvaluator {
         if (expr instanceof Literal && ((Literal) expr).literalType() == Literal.LiteralType.STRING) {
             return "unknown";
         }
+        // The name PostgreSQL prints is the type the argument was written as, which is not always
+        // recoverable from the value it produces: money carries itself as a string and an array
+        // arrives as its elements. Read the expression's own type where there is one, and fall back
+        // to the value only where there is not.
+        try {
+            DataType written = executor.exprEvaluator.inferTypeFromContext(
+                    expr, typeBindings(sample));
+            if (written != null) return written.toRegtypeDisplay();
+        } catch (RuntimeException ex) {
+            // Nothing said about the type; the value may still say it.
+        }
         Object v;
         try {
             v = executor.evalExpr(expr, sample);
@@ -1101,11 +1332,37 @@ class SelectAggregateEvaluator {
     Object evalAggregate(FunctionCallExpr fn, List<RowContext> group) {
         String name = FunctionEvaluator.stripSchemaPrefix(fn.name().toLowerCase());
 
+        // The star in f(*) says which rows to accumulate over, not what to accumulate: the call
+        // has no arguments, and resolves only against a signature declared over none. count is the
+        // only aggregate that has one, so sum(*) is a function that does not exist -- where
+        // reading the first argument of a call that has none faulted internally instead.
+        if (fn.star() && !PARAMETERLESS_AGGREGATES.contains(name)) {
+            MemgresException e = new MemgresException(
+                    "function " + fn.name() + "() does not exist", "42883");
+            e.setHint("No function matches the given name and argument types."
+                    + " You might need to add explicit type casts.");
+            throw e;
+        }
+        // And the other way round: a parameterless aggregate is not written with an empty argument
+        // list, because the list is not what is empty. PostgreSQL says which spelling to use.
+        if (!fn.star() && fn.args().isEmpty() && PARAMETERLESS_AGGREGATES.contains(name)) {
+            throw new MemgresException(name
+                    + "(*) must be used to call a parameterless aggregate function", "42809");
+        }
+
         // An aggregate is resolved from the types of its arguments like any other call, and a
         // name declared over several categories -- sum over numbers and over intervals -- is not
         // resolved by an untyped literal at all.
         FunctionEvaluator.rejectAmbiguousBuiltin(executor, name, fn.args(),
                 group.isEmpty() ? null : group.get(0));
+
+        // An aggregate's own ORDER BY is a sort like any other, and a key nothing can be sorted
+        // by leaves it with no order to accumulate in.
+        if (!group.isEmpty() && fn.orderBy() != null) {
+            for (SelectStmt.OrderByItem item : fn.orderBy()) {
+                select.rejectUnsortableKey(item.expr(), group.get(0).getBindings());
+            }
+        }
 
         // A nested aggregate is refused while the statement is analysed, in
         // SelectWindowEvaluator.validateCallPlacement, so that the shape is rejected whether or

@@ -35,6 +35,24 @@ class CatalogSystemFunctions {
         return TypeNamespace.display(executor.database, executor.session, stored);
     }
 
+    /**
+     * The type the definition behind a relation settled for the column a reference names, or null
+     * where the relation is not one built from a definition or its definition settled nothing.
+     */
+    private static String definedColumnType(RowContext ctx, ColumnRef ref) {
+        if (ctx == null) return null;
+        for (RowContext.TableBinding b : ctx.getBindings()) {
+            Table table = b.table();
+            if (table == null || !table.hasDefinedColumnTypes()) continue;
+            String exposed = b.alias() != null ? b.alias() : table.getName();
+            if (ref.table() != null && !ref.table().equalsIgnoreCase(exposed)) continue;
+            int idx = table.getColumnIndex(ref.column());
+            if (idx < 0) continue;
+            return table.definedColumnType(idx);
+        }
+        return null;
+    }
+
     /** True when the call names a user function whose declared result type is polymorphic. */
     private boolean isPolymorphicUserFunction(FunctionCallExpr fn) {
         String name = fn.name();
@@ -130,6 +148,11 @@ class CatalogSystemFunctions {
             }
             case "pg_typeof": {
                 Expression rawExpr = fn.args().get(0);
+                // A call that was folded before this expression was reached is still written here
+                // as the call it is, so what it came to is asked for rather than read off the node.
+                ExprEvaluator.PrecomputedValueExpr alreadyFolded =
+                        executor.exprEvaluator.foldedFor(rawExpr);
+                if (alreadyFolded != null) rawExpr = alreadyFolded;
                 // Whatever this method ends up reading the value for, it reads it once. Asking
                 // twice ran a function with an effect twice: pg_typeof(lo_unlink(x)) unlinked the
                 // object and then complained that no such object existed.
@@ -196,6 +219,12 @@ class CatalogSystemFunctions {
                             return pgTypeDisplayName(colDef.getType());
                         }
                     }
+                    // A relation built from a query carries what its own definition settled for
+                    // each column, and that is the declaration pg_typeof asks for. Falling through
+                    // to the value read the type off whatever the row happened to hold, so a
+                    // column written NULL was called unknown -- which is a type no relation has.
+                    String defined = definedColumnType(ctx, colRef);
+                    if (defined != null && !defined.endsWith("[]")) return typeDisplay(defined);
                 }
 
                 // Subscripting an array yields one element of it, a range of one yields another

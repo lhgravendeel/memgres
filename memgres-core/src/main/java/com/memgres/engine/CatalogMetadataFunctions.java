@@ -1917,6 +1917,20 @@ class CatalogMetadataFunctions {
             found.add(new ProcCandidate(fnSchema, fn.getName(), argTypes,
                     executor.systemCatalog.getOid(key)));
         }
+        // An aggregate a query defined is a pg_proc row like any other, so a signature naming it
+        // names something: regprocedure reads the catalogue, not the list of things that can be
+        // called as plain functions.
+        for (PgAggregate agg : executor.database.getUserAggregates().values()) {
+            if (!agg.getName().equalsIgnoreCase(name)) continue;
+            String aggSchema = agg.getSchemaName() == null ? "public" : agg.getSchemaName();
+            if (!aggSchema.equalsIgnoreCase(schema)) continue;
+            List<String> argTypes = new ArrayList<String>();
+            if (agg.getArgTypes() != null) {
+                for (String argType : agg.getArgTypes()) argTypes.add(procTypeDisplay(argType));
+            }
+            addUnlessPresent(found, new ProcCandidate(aggSchema, agg.getName(), argTypes,
+                    executor.systemCatalog.getOid("proc:" + agg.getName())));
+        }
         if (!"pg_catalog".equalsIgnoreCase(schema)) return found;
 
         // A few built-ins are registered as functions of their own as well, so that ALTER

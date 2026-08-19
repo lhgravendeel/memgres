@@ -1575,6 +1575,7 @@ class CatalogCoreBuilder {
                     // Registered from PgInternalTypes instead, with PG's own metadata.
                     || dt == DataType.PG_NODE_TREE || dt == DataType.ANYARRAY
                     || dt == DataType.INTERNAL_CHAR
+                    || dt == DataType.TID || dt == DataType.CID
                     || dt == DataType.PG_LSN || dt == DataType.PG_NDISTINCT
                     || dt == DataType.PG_DEPENDENCIES || dt == DataType.PG_MCV_LIST) continue;
             String pgName = dt.getPgName();

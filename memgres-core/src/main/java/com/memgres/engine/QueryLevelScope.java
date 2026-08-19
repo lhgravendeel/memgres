@@ -520,8 +520,16 @@ final class QueryLevelScope {
         return hit[0];
     }
 
-    /** The name as PostgreSQL folds it: unquoted parts are already lower case when parsed. */
+    /**
+     * The name a call is written under, with any {@code pg_catalog.} qualifier taken off.
+     *
+     * <p>The name has been folded once already, where it was written: the lexer folds an unquoted
+     * identifier and keeps a quoted one as it stands, and a keyword read as a name is folded as it
+     * is read. So there is nothing left to fold, and folding again undid the quotes — it made
+     * {@code "ZzFn"()} ask after zzfn, which is a function the database was never told about, and
+     * refused a call PostgreSQL runs.
+     */
     static String bareName(String name) {
-        return FunctionEvaluator.stripSchemaPrefix(name.toLowerCase(Locale.ROOT));
+        return FunctionEvaluator.stripSchemaPrefix(name);
     }
 }

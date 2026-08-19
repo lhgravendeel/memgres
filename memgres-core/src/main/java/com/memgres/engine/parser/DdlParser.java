@@ -1317,7 +1317,13 @@ class DdlParser {
         // Arguments before ORDER BY are the direct arguments of an ordered-set aggregate; they
         // are not passed to the transition function, so the two groups have to stay apart.
         int directArgCount = -1;
-        if (parser.match(TokenType.LEFT_PAREN)) {
+        // The old spelling writes no argument list at all: CREATE AGGREGATE name (BASETYPE = ...,
+        // SFUNC = ..., STYPE = ...) names the argument type inside the parameter list, in whatever
+        // order it likes. One paren group follows either way, so what tells them apart is that a
+        // parameter is a name followed by "=" where an argument list starts with a type.
+        boolean oldSpelling = parser.check(TokenType.LEFT_PAREN)
+                && parser.peekAt(2).type() == TokenType.EQUALS;
+        if (!oldSpelling && parser.match(TokenType.LEFT_PAREN)) {
             // Check for ORDER BY (ordered-set aggregate) or * or type list
             if (parser.matchKeyword("ORDER")) {
                 parser.matchKeyword("BY");
@@ -1350,9 +1356,13 @@ class DdlParser {
                 parser.match(TokenType.EQUALS);
                 switch (key) {
                     case "SFUNC":
+                        sfunc = parser.readIdentifier();
+                        break;
                     case "BASETYPE":
-                        if (key.equals("SFUNC")) sfunc = parser.readIdentifier();
-                        else parser.readIdentifier(); // BASETYPE consumed but not used (old syntax)
+                        // In the old spelling this is the argument list; BASETYPE = "ANY" is how
+                        // that spelling writes an aggregate that takes none.
+                        String baseType = parser.parseTypeName();
+                        if (oldSpelling && !"any".equalsIgnoreCase(baseType)) argTypes.add(baseType);
                         break;
                     case "STYPE":
                         stype = parser.parseTypeName();

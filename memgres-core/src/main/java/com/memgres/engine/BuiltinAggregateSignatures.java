@@ -149,4 +149,25 @@ final class BuiltinAggregateSignatures {
             {"variance", "701", "701"}, // variance(double precision) -> double precision
             {"xmlagg", "142", "142"}, // xmlagg(xml) -> xml
     };
+
+    /**
+     * The number of arguments the catalogue records for an ordered-set aggregate that is nothing
+     * else, or -1 for a name that is not one.
+     *
+     * <p>PostgreSQL catalogues an ordered-set aggregate under its whole signature — the arguments
+     * it takes directly followed by the one it orders — so a call written without WITHIN GROUP is
+     * resolved against that signature like any other call. {@code percentile_cont(0.5)} answers to
+     * nothing of that shape and is a function that does not exist; {@code percentile_cont(0.5, 1)}
+     * answers to it and is only missing its clause. Only the count decides, because a name and an
+     * argument count is as far as PostgreSQL gets before it notices what kind of aggregate it has.
+     *
+     * <p>rank, dense_rank, percent_rank and cume_dist are left out: they are window functions as
+     * well, take a variadic argument list that any count answers to, and are already told apart in
+     * {@code PlacementCheck} by whether they were written with arguments at all.
+     */
+    static int orderedSetArity(String name) {
+        if ("percentile_cont".equals(name) || "percentile_disc".equals(name)) return 2;
+        if ("mode".equals(name)) return 1;
+        return -1;
+    }
 }

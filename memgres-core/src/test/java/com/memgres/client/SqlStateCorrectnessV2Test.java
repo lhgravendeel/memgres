@@ -681,17 +681,30 @@ class SqlStateCorrectnessV2Test {
     // Section 8: WITHIN GROUP / Ordered Set Aggregates
     // ========================================================================
 
-    @Test void percentile_disc_without_within_group_gives_42601() {
-        // percentile_disc requires WITHIN GROUP syntax
-        assertSqlState("SELECT percentile_disc(0.5)", "42601");
+    // An ordered-set aggregate is catalogued under its whole signature — the arguments it takes
+    // directly followed by the one it orders — so a call written without WITHIN GROUP is resolved
+    // against that signature like any other call, and never a syntax error.
+
+    @Test void percentile_disc_of_the_wrong_arity_gives_42883() {
+        // percentile_disc(float8, anyelement): one argument answers to no signature at all
+        assertSqlState("SELECT percentile_disc(0.5)", "42883");
     }
 
-    @Test void percentile_cont_without_within_group_gives_42601() {
-        assertSqlState("SELECT percentile_cont(0.5)", "42601");
+    @Test void percentile_cont_of_the_wrong_arity_gives_42883() {
+        assertSqlState("SELECT percentile_cont(0.5)", "42883");
     }
 
-    @Test void mode_without_within_group_gives_42601() {
-        assertSqlState("SELECT mode()", "42601");
+    @Test void mode_of_the_wrong_arity_gives_42883() {
+        assertSqlState("SELECT mode()", "42883");
+    }
+
+    @Test void percentile_disc_of_the_right_arity_gives_42809() {
+        // The arguments answer to the signature, so what the call lacks is the clause
+        assertSqlState("SELECT percentile_disc(0.5, 1)", "42809");
+    }
+
+    @Test void mode_of_the_right_arity_gives_42809() {
+        assertSqlState("SELECT mode(1)", "42809");
     }
 
     // ========================================================================

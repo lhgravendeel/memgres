@@ -108,6 +108,7 @@ class DdlAlterTableExecutor {
         }
 
         List<AlterTableStmt.AlterAction> ordered = orderedActions(stmt.actions());
+        rejectSystemColumnActions(ordered);
         rejectBeforeApplying(ordered, table, stmt);
         for (AlterTableStmt.AlterAction action : ordered) {
             table = executeAction(action, table, stmt, schemaName);
@@ -170,6 +171,34 @@ class DdlAlterTableExecutor {
         List<AlterTableStmt.AlterAction> sorted = new ArrayList<>(actions);
         sorted.sort(java.util.Comparator.comparingInt(DdlAlterTableExecutor::actionPass));
         return sorted;
+    }
+
+    /**
+     * The system columns are the relation's, not the definer's: they are there because the row is
+     * stored, and no ALTER TABLE can drop, rename or redefine one.
+     *
+     * <p>PostgreSQL says so directly rather than reporting the column as missing, and says it for
+     * {@code DROP COLUMN IF EXISTS} too -- the column is very much there, which is the reason it
+     * cannot go. Adding one to a key is refused where the index would be built, since what
+     * PostgreSQL says there depends on the type. See {@link DdlDefinitionChecks}.
+     */
+    private static void rejectSystemColumnActions(List<AlterTableStmt.AlterAction> actions) {
+        if (actions == null) return;
+        for (AlterTableStmt.AlterAction action : actions) {
+            if (action instanceof AlterTableStmt.DropColumn) {
+                refuse("drop", ((AlterTableStmt.DropColumn) action).column());
+            } else if (action instanceof AlterTableStmt.RenameColumn) {
+                refuse("rename", ((AlterTableStmt.RenameColumn) action).oldName());
+            } else if (action instanceof AlterTableStmt.AlterColumn) {
+                refuse("alter", ((AlterTableStmt.AlterColumn) action).column());
+            }
+        }
+    }
+
+    private static void refuse(String verb, String column) {
+        if (!DdlDefinitionChecks.isSystemColumnName(column)) return;
+        throw new MemgresException(
+                "cannot " + verb + " system column \"" + column.toLowerCase() + "\"", "0A000");
     }
 
     /**
@@ -1072,6 +1101,7 @@ class DdlAlterTableExecutor {
             }
             try {
                 Expression genParsed = com.memgres.engine.parser.Parser.parseExpression(genExpr);
+                DdlDefinitionChecks.rejectSystemColumnInGeneration(genParsed);
                 StoredExprNames.read(ddl, genParsed, table, def.name(), false, true);
                 ddl.validateExprColumnRefs(genParsed, table, def.name(), false, true);
                 // What the expression produces has to be a value the column can hold, and
@@ -2855,9 +2885,16 @@ class DdlAlterTableExecutor {
         // may carry the change. The relation's own system columns are names the expression may
         // reach, so they resolve. Left unresolved, the expression was only ever evaluated per row,
         // which meant a retype of an empty table took a USING clause naming nothing at all.
+        // A transform expression converts one row's old value into the new one, on that row alone.
+        // There is no query around it for a sub-query to run in, no group for an aggregate to be
+        // taken over and no window for a window call to be numbered against, so PostgreSQL refuses
+        // all three where it reads the clause. memgres evaluated whatever was written per row and
+        // let them through -- ALTER ... USING count(*) rewrote the table with a count in it.
         if (setType.usingExpr() != null) {
             StoredExprNames.read(ddl, setType.usingExpr(), table, null, true, true);
             ddl.validateExprColumnRefs(setType.usingExpr(), table, null, true, true);
+            executor.selectExecutor.placementCheck.rejectStoredDefinition(
+                    setType.usingExpr(), "transform expressions", "transform expression");
         }
         // PostgreSQL settles which column is being retyped before it settles what it is being
         // retyped to, so a statement that gets both wrong is reported as the undefined column: a
@@ -3686,6 +3723,18 @@ class DdlAlterTableExecutor {
         if (addedKind == TableConstraint.ConstraintType.PRIMARY_KEY
                 || addedKind == TableConstraint.ConstraintType.UNIQUE
                 || addedKind == TableConstraint.ConstraintType.EXCLUDE) {
+            // A primary key added to a relation that already exists makes its columns NOT NULL
+            // first, and a system column takes no constraint of the definer's, so PostgreSQL
+            // stops there rather than at the index it never gets to build.
+            if (addedKind == TableConstraint.ConstraintType.PRIMARY_KEY
+                    && addConstraint.constraint().columns() != null) {
+                for (String col : addConstraint.constraint().columns()) {
+                    if (DdlDefinitionChecks.isSystemColumnName(col)) {
+                        throw new MemgresException("cannot add not-null constraint on system"
+                                + " column \"" + col.toLowerCase() + "\"", "0A000");
+                    }
+                }
+            }
             DdlDefinitionChecks.validateKeyColumns(table, addConstraint.constraint().columns(),
                     addedKind == TableConstraint.ConstraintType.PRIMARY_KEY ? "primary key"
                             : addedKind == TableConstraint.ConstraintType.UNIQUE ? "unique"

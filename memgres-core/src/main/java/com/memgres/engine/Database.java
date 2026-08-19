@@ -774,6 +774,22 @@ public class Database {
         if (meta != null && meta.length > 1) meta[1] = xmax;
     }
 
+    /**
+     * Record which transaction has taken a lock on a row.
+     *
+     * <p>PostgreSQL has one field for it and the row's removal both: a locked row carries the
+     * locker's id in its xmax, distinguished from a deleted one by flags the row's answer for xmax
+     * does not show. So {@code SELECT ... FOR UPDATE} leaves the row naming the transaction that
+     * locked it, and it goes on naming it after that transaction commits or rolls back, in the same
+     * way a rolled-back DELETE leaves its mark. Locking wrote nothing, so a locked row answered
+     * zero -- the answer of a row nobody has touched.
+     */
+    public void setRowLockMeta(Table storage, Object[] row, long xmax) {
+        if (storage == null || row == null) return;
+        long[] meta = storage.getRowMeta().get(row);
+        if (meta != null && meta.length > 1) meta[1] = xmax;
+    }
+
     /** Remove row metadata (on delete). */
     public void removeRowMeta(String tableKey, Object[] row) {
         Table storage = relationNamed(tableKey);
@@ -1444,7 +1460,11 @@ public class Database {
 
     // Functions, stored by name, supporting overloads with different parameter types
     public void addFunction(PgFunction function) {
-        String key = function.getName().toLowerCase();
+        // A routine is filed under the name it was written with. An identifier has been folded
+        // once already by the time it gets here -- unquoted where it was written, kept as written
+        // where it was quoted -- so folding it again made CREATE FUNCTION "ZzFn" answer to zzfn,
+        // which is a function PostgreSQL says does not exist.
+        String key = function.getName();
         List<PgFunction> overloads = functionOverloads.computeIfAbsent(key, k -> new ArrayList<>());
         overloads.add(function);
         functions.put(key, function); // last-added wins for simple name lookup
@@ -1489,7 +1509,7 @@ public class Database {
         if (dot > 0) {
             return getFunction(name.substring(0, dot), name.substring(dot + 1));
         }
-        String key = name.toLowerCase();
+        String key = name;
         List<PgFunction> overloads = functionOverloads.get(key);
         if (overloads != null && !overloads.isEmpty()) return overloads.get(0);
         return functions.get(key);
@@ -1498,7 +1518,7 @@ public class Database {
     /** Returns a function matching both name and schema, or null. */
     public PgFunction getFunction(String schema, String name) {
         if (schema == null) return getFunction(name);
-        String key = name.toLowerCase();
+        String key = name;
         List<PgFunction> overloads = functionOverloads.get(key);
         if (overloads != null) {
             for (PgFunction f : overloads) {
@@ -1512,7 +1532,7 @@ public class Database {
 
     /** Returns all overloads for the given function name. */
     public List<PgFunction> getFunctionOverloads(String name) {
-        List<PgFunction> overloads = functionOverloads.get(name.toLowerCase());
+        List<PgFunction> overloads = functionOverloads.get(name);
         return overloads != null ? overloads : Cols.listOf();
     }
 
@@ -1691,7 +1711,7 @@ public class Database {
     }
 
     public void removeFunction(String name) {
-        String key = name.toLowerCase();
+        String key = name;
         functions.remove(key);
         functionOverloads.remove(key);
     }
@@ -1723,7 +1743,7 @@ public class Database {
     }
 
     private void removeMatchingOverloads(String name, java.util.function.Predicate<PgFunction> matches) {
-        String key = name.toLowerCase();
+        String key = name;
         List<PgFunction> overloads = functionOverloads.get(key);
         if (overloads == null) return;
         overloads.removeIf(matches);
@@ -1738,8 +1758,8 @@ public class Database {
     /** Rename a single specific overload of a function/procedure. */
     public void renameFunctionOverload(PgFunction func, String newName) {
         String oldName = func.getName();
-        String oldKey = oldName.toLowerCase();
-        String newKey = newName.toLowerCase();
+        String oldKey = oldName;
+        String newKey = newName;
         // Remove this specific overload from the old name's overload list
         List<PgFunction> oldOverloads = functionOverloads.get(oldKey);
         if (oldOverloads != null) {
@@ -1777,8 +1797,8 @@ public class Database {
 
     /** Rename a function/procedure: re-key in all maps, update the PgFunction name field. */
     public void renameFunction(String oldName, String newName) {
-        String oldKey = oldName.toLowerCase();
-        String newKey = newName.toLowerCase();
+        String oldKey = oldName;
+        String newKey = newName;
         List<PgFunction> overloads = functionOverloads.remove(oldKey);
         PgFunction single = functions.remove(oldKey);
         if (overloads != null) {
@@ -3287,10 +3307,15 @@ public class Database {
         markUncommittedObject(view, CURRENT_VIEWER.get());
     }
 
-    /** The key a view is stored under: its schema and its name. */
+    /**
+     * The key a view is stored under: its schema and its name, both as they were written. An
+     * identifier has already been folded once by then — unquoted where it was written, kept as
+     * written where it was quoted — so folding it again here made {@code CREATE VIEW "ZzView"}
+     * reachable as {@code zzview}, which is a relation PostgreSQL does not have.
+     */
     private static String viewKey(String schemaName, String name) {
         String schema = schemaName == null ? "public" : schemaName;
-        return schema.toLowerCase() + "." + name.toLowerCase();
+        return schema + "." + name;
     }
 
     /**
@@ -3299,17 +3324,16 @@ public class Database {
      */
     public ViewDef getView(String name) {
         if (name == null) return null;
-        String lower = name.toLowerCase();
-        ViewDef exact = views.get(lower);
+        ViewDef exact = views.get(name);
         if (exact != null) return exact;
-        if (lower.indexOf('.') >= 0) {
+        if (name.indexOf('.') >= 0) {
             // A qualified name names one schema's view and no other's.
             return null;
         }
-        ViewDef found = views.get("public." + lower);
+        ViewDef found = views.get("public." + name);
         if (found != null) return found;
         for (Map.Entry<String, ViewDef> e : views.entrySet()) {
-            if (e.getValue().name().equalsIgnoreCase(lower)) return e.getValue();
+            if (e.getValue().name().equals(name)) return e.getValue();
         }
         return null;
     }

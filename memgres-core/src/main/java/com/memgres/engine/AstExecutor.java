@@ -81,10 +81,24 @@ public class AstExecutor {
     final Deque<RowContext> outerContextStack = new ArrayDeque<>();
     // CTE registry: name -> query body (scoped per top-level query)
     final Deque<Map<String, SelectStmt.CommonTableExpr>> cteStack = new ArrayDeque<>();
-    // CTE result cache: prevents double execution of CTE bodies
-    final Map<String, QueryResult> cteResultCache = new HashMap<>();
+    // CTE result cache: prevents double execution of CTE bodies. Keyed by the WITH item itself
+    // rather than by its name, because a name is not one item: a nested WITH may declare the same
+    // name for a different query, and keying by name let the inner item's rows answer for the
+    // outer one for the rest of the statement.
+    final Map<SelectStmt.CommonTableExpr, QueryResult> cteResultCache =
+            new IdentityHashMap<SelectStmt.CommonTableExpr, QueryResult>();
     // CTEs currently being executed (to prevent infinite recursion in recursive CTEs)
     final Set<String> executingCtes = new HashSet<>();
+    /**
+     * The rows a recursive WITH item's own name stands for while its recursive term is being run:
+     * scratch relations belonging to this session alone, keyed by the lowercased item name.
+     *
+     * <p>They used to be installed as real tables in the shared schema, which put one session's
+     * half-finished recursion where every other session could read it — and displaced, for the
+     * length of the recursion, whatever stored relation happened to carry the same name. Held
+     * here they are reachable from this session's resolution and from nowhere else.
+     */
+    final Map<String, Table> recursiveWorkingSets = new HashMap<>();
     // The same items by identity: a nested WITH clause may declare the same name for a different
     // item, and that inner item is readable while the outer one of that name is still running.
     final Set<SelectStmt.CommonTableExpr> executingCteNodes =
@@ -1640,6 +1654,13 @@ public class AstExecutor {
         // said may be left standing here: it would hold rows back from a write that is not going
         // through any view at all.
         lastViewQuals = null;
+        // Inside a recursive term the item's own bare name stands for the rows of the round
+        // before, so it is answered here and not from any schema. Writing out a schema is a
+        // reference to a stored relation and never to the working set.
+        if (!userQualified && !recursiveWorkingSets.isEmpty()) {
+            Table workingSet = recursiveWorkingSets.get(tableName.toLowerCase());
+            if (workingSet != null) return workingSet;
+        }
         String tempSchemaName = session != null ? session.getTempSchemaName() : "pg_temp";
         // Resolve pg_temp alias to the actual session temp schema
         if ("pg_temp".equalsIgnoreCase(schemaName)) {

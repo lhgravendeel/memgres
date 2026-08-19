@@ -148,6 +148,21 @@ public class Table {
     // so UPDATE/DELETE dispatch INSTEAD OF triggers per matching row rather than touching storage.
     private boolean viewProjection;
 
+    /**
+     * Whether this relation keeps the rows it hands out, rather than composing them on the way past.
+     *
+     * <p>The system columns are properties of a stored tuple: where it sits, which relation holds
+     * it, which transaction wrote it. A relation that stores nothing has none of them, which is why
+     * a sub-SELECT, a CTE, a VALUES list, a view or a function scan answers 42703 for {@code ctid}
+     * where a table answers a position -- the rows a derived relation produces are not anywhere.
+     *
+     * <p>Set where a relation is entered into a schema, since living in a schema is what storing
+     * rows means here; the two relations that store rows without being entered into one -- a
+     * materialized view read from its cache, and a system catalog composed on demand -- say so
+     * where they are built.
+     */
+    private boolean storesRows;
+
     // Replica identity for logical replication (DEFAULT, FULL, NOTHING, or index name)
     // 'd' = DEFAULT (PK), 'f' = FULL, 'n' = NOTHING, 'i' = USING INDEX
     private volatile char replicaIdentity = 'd';
@@ -1214,9 +1229,14 @@ public class Table {
         String pinned = notNullConstraintNames.remove(oldColumn.toLowerCase());
         if (pinned != null) notNullConstraintNames.put(newColumn.toLowerCase(), pinned);
     }
+    /**
+     * The constraint of this name, or null. A constraint name is an identifier and has been folded
+     * once already where it was written, so it is matched as it stands: a constraint created as
+     * {@code "ZzCk"} is not the one {@code zzck} names.
+     */
     public StoredConstraint getConstraint(String name) {
         for (StoredConstraint c : constraints) {
-            if (c.getName() != null && c.getName().equalsIgnoreCase(name)) return c;
+            if (c.getName() != null && c.getName().equals(name)) return c;
         }
         return null;
     }
@@ -1279,6 +1299,10 @@ public class Table {
 
     public boolean isViewProjection() { return viewProjection; }
     public void setViewProjection(boolean viewProjection) { this.viewProjection = viewProjection; }
+
+    /** See {@link #storesRows}. */
+    public boolean storesRows() { return storesRows; }
+    public void setStoresRows(boolean storesRows) { this.storesRows = storesRows; }
 
     /**
      * The composite type this table was declared OF, schema-qualified, or null.

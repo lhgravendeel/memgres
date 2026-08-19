@@ -321,8 +321,15 @@ final class GroupByValidator {
             // is a value PostgreSQL refuses to group by at all.
             throw new MemgresException("non-integer constant in GROUP BY", "42601");
         }
-        if (item instanceof ArrayExpr && ((ArrayExpr) item).isRow()) {
+        if (item instanceof ArrayExpr && ((ArrayExpr) item).isRow()
+                && !((ArrayExpr) item).rowKeyword()) {
             // GROUP BY (a, b) groups by each member, exactly as if they were written apart.
+            //
+            // Only when written that way. GROUP BY ROW(a, b) builds the same value but is one
+            // expression of row type, and grouping by it licenses that row and nothing else:
+            // PostgreSQL flattens the parenthesised list because the list is what was written,
+            // not because of what it evaluates to. Flattening both let SELECT a, b GROUP BY
+            // ROW(a, b) through, where PostgreSQL asks for a in the GROUP BY clause.
             out.add(item);
             for (Expression element : ((ArrayExpr) item).elements()) {
                 addResolved(element, targets, bindings, out);
@@ -432,6 +439,15 @@ final class GroupByValidator {
             } catch (NumberFormatException e) {
                 return false;
             }
+        }
+        if ("float".equalsIgnoreCase(name)) {
+            // float is the one built-in name whose argument chooses the type rather than
+            // qualifying it: float and float(53) are double precision, float(25) and below down
+            // to float(1) are real, and neither type records the number that was written.
+            if (scale != null) return false;
+            DataType named = precision == null || precision > 24
+                    ? DataType.DOUBLE_PRECISION : DataType.REAL;
+            return named == declaredType(column.getType());
         }
         DataType cast = builtInType(name);
         if (cast == null || cast != declaredType(column.getType())) return false;
@@ -674,6 +690,17 @@ final class GroupByValidator {
                         rejectUnknownColumn(arg);
                         throw new MemgresException("arguments to GROUPING must be grouping "
                                 + "expressions of the associated query level", "42803");
+                    }
+                    return;
+                }
+                // An ordered-set aggregate's direct arguments are settled once for the group
+                // rather than read per row, so they are the query's to judge like anything else;
+                // what it sorts and filters it consumes. Only where the call resolves, though —
+                // a call answering to no signature is a missing function first of all.
+                if (expr instanceof OrderedSetAggExpr) {
+                    OrderedSetAggExpr osa = (OrderedSetAggExpr) expr;
+                    if (select.aggregateEvaluator.resolvesAsOrderedSet(osa, bindings)) {
+                        for (Expression arg : osa.args()) walk(arg);
                     }
                     return;
                 }
@@ -929,6 +956,22 @@ final class GroupByValidator {
             }
             if (table.getColumnIndex(ref.column()) >= 0) return binding;
         }
+        // A relation that stores its rows carries the system columns as well, and a grouping
+        // masks one out exactly as it masks out a declared column: a ctid varies within a group
+        // of rows, so naming it outside the GROUP BY asks for a value the group does not have.
+        // Looked for only after every declared column, since where a derived relation projects a
+        // column of its own under one of these names, that column is what the name means.
+        if (!DdlDefinitionChecks.isSystemColumnName(ref.column())) return null;
+        for (RowContext.TableBinding binding : bindings) {
+            Table table = binding.table();
+            if (table == null) continue;
+            if (ref.table() != null
+                    && !ref.table().equalsIgnoreCase(binding.alias())
+                    && !ref.table().equalsIgnoreCase(table.getName())) {
+                continue;
+            }
+            if (binding.sourceTable() != null && binding.sourceTable().storesRows()) return binding;
+        }
         return null;
     }
 
@@ -962,6 +1005,27 @@ final class GroupByValidator {
                     : (binding.alias() != null ? binding.alias() : binding.table().getName());
             return "col:" + relation.toLowerCase() + "." + ref.column().toLowerCase();
         }
+        if (node instanceof Literal) {
+            // A literal stands for the value it spells, and 'a' is not 'A'. Lowercased with
+            // everything else, GROUP BY s || 'a' licensed a select list saying s || 'A' -- two
+            // different expressions, and PostgreSQL asks for s in the GROUP BY clause. The rest
+            // of a node's leaves are names of things (a type, an operator, a field), which SQL
+            // reads without regard to case, so only this one is kept as written. Where the
+            // literal was written is not part of what it says.
+            Literal literal = (Literal) node;
+            return "lit:" + literal.literalType().name() + ":" + literal.value();
+        }
+        if (node instanceof ArrayExpr) {
+            // Whether the ROW keyword was written decides how a GROUP BY item is read, not what
+            // the expression is: ROW(a, b) and (a, b) are the same expression, so having grouped
+            // by either one the select list may say the other.
+            ArrayExpr array = (ArrayExpr) node;
+            StringBuilder sb = new StringBuilder(array.isRow() ? "row(" : "array(");
+            for (Expression element : array.elements()) {
+                sb.append(canon(element, bindings)).append(',');
+            }
+            return sb.append(')').toString();
+        }
         if (node instanceof Enum) return ((Enum<?>) node).name();
         if (node instanceof Iterable) {
             StringBuilder sb = new StringBuilder("[");
@@ -970,8 +1034,7 @@ final class GroupByValidator {
         }
         if (!isAstNode(node)) return String.valueOf(node).toLowerCase();
         StringBuilder sb = new StringBuilder(node.getClass().getSimpleName()).append('(');
-        for (Field field : node.getClass().getFields()) {
-            if (Modifier.isStatic(field.getModifiers())) continue;
+        for (Field field : partsOf(node.getClass())) {
             Object value;
             try {
                 value = field.get(node);
@@ -983,8 +1046,41 @@ final class GroupByValidator {
         return sb.append(')').toString();
     }
 
+    /**
+     * The fields that make a node what it is.
+     *
+     * <p>Declared rather than public: most nodes hold their parts in public fields, but a few
+     * hold them privately behind accessors, and a node read for its public fields alone comes
+     * out as no parts at all -- so every one of them compared equal to every other. That is how
+     * {@code GROUP BY arr[2]} licensed {@code arr[1]}: both are a subscript reference, which
+     * keeps its base and its subscripts privately, and there was nothing left to tell them
+     * apart. Which fields a type has is a property of the type, so it is settled once per type.
+     */
+    private static Field[] partsOf(Class<?> nodeClass) {
+        Field[] cached = PARTS.get(nodeClass);
+        if (cached != null) return cached;
+        List<Field> kept = new ArrayList<Field>();
+        for (Class<?> c = nodeClass; c != null && isAstClass(c); c = c.getSuperclass()) {
+            for (Field field : c.getDeclaredFields()) {
+                if (Modifier.isStatic(field.getModifiers())) continue;
+                if (!field.isAccessible()) field.setAccessible(true);
+                kept.add(field);
+            }
+        }
+        Field[] parts = kept.toArray(new Field[0]);
+        PARTS.put(nodeClass, parts);
+        return parts;
+    }
+
+    private static final java.util.Map<Class<?>, Field[]> PARTS =
+            new java.util.concurrent.ConcurrentHashMap<Class<?>, Field[]>();
+
     private static boolean isAstNode(Object node) {
-        Class<?> c = node.getClass();
+        return isAstClass(node.getClass());
+    }
+
+    private static boolean isAstClass(Class<?> nodeClass) {
+        Class<?> c = nodeClass;
         while (c != null && c.getEnclosingClass() != null) c = c.getEnclosingClass();
         String pkg = c == null || c.getPackage() == null ? "" : c.getPackage().getName();
         return pkg.startsWith("com.memgres.engine.parser.ast");

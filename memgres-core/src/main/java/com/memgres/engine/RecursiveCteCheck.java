@@ -44,6 +44,14 @@ public final class RecursiveCteCheck {
 
     private RecursiveCteCheck() { }
 
+    /** Whether a WITH item was written as a statement that writes rows rather than as a query. */
+    private static boolean writesRows(Statement stmt) {
+        return stmt instanceof com.memgres.engine.parser.ast.InsertStmt
+                || stmt instanceof com.memgres.engine.parser.ast.UpdateStmt
+                || stmt instanceof com.memgres.engine.parser.ast.DeleteStmt
+                || stmt instanceof com.memgres.engine.parser.ast.MergeStmt;
+    }
+
     /** True when a WITH item's body names the item itself, so it really does recurse. */
     public static boolean selfReferencing(SelectStmt.CommonTableExpr cte) {
         return !selfReferences(cte.query(), cte.name()).isEmpty();
@@ -55,6 +63,14 @@ public final class RecursiveCteCheck {
      */
     static void validate(SelectExecutor select, SelectStmt.CommonTableExpr cte) {
         String name = cte.name();
+
+        // A statement that writes cannot be iterated to a fixed point at all, so PostgreSQL says
+        // that before it says anything about the shape the item was written in. Reporting only
+        // the missing UNION described the shape and left the reason unsaid.
+        if (writesRows(cte.query())) {
+            throw new MemgresException("recursive query \"" + name
+                    + "\" must not contain data-modifying statements", "42P19");
+        }
 
         // The only shape PG can evaluate is "non-recursive term UNION [ALL] recursive term".
         if (!(cte.query() instanceof SetOpStmt)
@@ -504,6 +520,43 @@ public final class RecursiveCteCheck {
             for (Expression e : sel.groupBy()) {
                 if (e != null && select.containsAggregate(e)) return true;
             }
+        }
+        return false;
+    }
+
+    /**
+     * Refuse a column SEARCH or CYCLE adds under a name the WITH item's own query already answers
+     * to.
+     *
+     * <p>The added column is in place while the recursive term is read, so the item's name answers
+     * to that column name twice by then. PostgreSQL reads the term before it reads the clause that
+     * added the column: where the term names the column without saying which relation it means,
+     * that unsettleable reference is what the statement is refused for; where it does not, nothing
+     * was ambiguous and the collision between the two columns is.
+     */
+    static void rejectAddedColumn(SelectStmt.CommonTableExpr cte, List<String> columns,
+                                  String name, String what) {
+        if (name == null || !holdsColumn(columns, name)) return;
+        if (namedBareInRecursiveTerm(cte, name)) {
+            throw new MemgresException("column reference \"" + name + "\" is ambiguous", "42702");
+        }
+        throw new MemgresException(
+                what + " \"" + name + "\" already used in WITH query column list", "42601");
+    }
+
+    /** Whether the recursive term names this column without saying which relation it comes from. */
+    private static boolean namedBareInRecursiveTerm(SelectStmt.CommonTableExpr cte, String name) {
+        if (!(cte.query() instanceof SetOpStmt)) return false;
+        return AstWalk.anyMatch(((SetOpStmt) cte.query()).right(),
+                node -> node instanceof com.memgres.engine.parser.ast.ColumnRef
+                        && ((com.memgres.engine.parser.ast.ColumnRef) node).table() == null
+                        && ((com.memgres.engine.parser.ast.ColumnRef) node).column()
+                                .equalsIgnoreCase(name));
+    }
+
+    private static boolean holdsColumn(List<String> columns, String name) {
+        for (String column : columns) {
+            if (column != null && column.equalsIgnoreCase(name)) return true;
         }
         return false;
     }

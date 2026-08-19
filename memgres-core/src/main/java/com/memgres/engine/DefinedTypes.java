@@ -247,7 +247,14 @@ final class DefinedTypes {
                 // read, so the query's very width is unsettled.
                 if (expr instanceof CompositeStarExpr) return null;
                 String name = target.alias() != null ? target.alias() : nameOf(expr);
-                shape.add(name, BooleanContext.typeOf(expr, types));
+                String type = BooleanContext.typeOf(expr, types);
+                // A relation's column has a type, whatever was written into it, so PostgreSQL
+                // settles an unknown one as text where the relation is built -- which is what a
+                // written NULL or a literal with no type of its own is. Leaving it unsettled
+                // described the column by whichever value happened to be read out of it, so one
+                // row of a derived table called it unknown and the next called it something else.
+                if (type == null && isUntyped(expr)) type = "text";
+                shape.add(name, type);
             }
             return shape;
         } finally {
@@ -272,6 +279,15 @@ final class DefinedTypes {
             }
         }
         return any;
+    }
+
+    /** Whether what is written here is one of the literals PostgreSQL calls unknown. */
+    private static boolean isUntyped(Expression expr) {
+        if (!(expr instanceof com.memgres.engine.parser.ast.Literal)) return false;
+        com.memgres.engine.parser.ast.Literal.LiteralType kind =
+                ((com.memgres.engine.parser.ast.Literal) expr).literalType();
+        return kind == com.memgres.engine.parser.ast.Literal.LiteralType.NULL
+                || kind == com.memgres.engine.parser.ast.Literal.LiteralType.STRING;
     }
 
     /** The name a select-list expression answers to when nothing renamed it. */

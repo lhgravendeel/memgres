@@ -112,8 +112,8 @@ class SelectExecutor {
             // PostgreSQL pulls a WITH item up into the query that declares it when that query names
             // it once, so which query that is has to be known where the item is read.
             executor.fromResolver.noteCteScope(stmt.withClauses(), stmt);
-            for (String cteName : cteMap.keySet()) {
-                executor.cteResultCache.remove(cteName);
+            for (SelectStmt.CommonTableExpr cte : stmt.withClauses()) {
+                executor.cteResultCache.remove(cte);
             }
             pushedCteScope = true;
         }
@@ -124,11 +124,8 @@ class SelectExecutor {
             // Force-execute any unreferenced DML CTEs (PG always executes data-modifying CTEs)
             if (stmt.withClauses() != null) {
                 for (SelectStmt.CommonTableExpr cte : stmt.withClauses()) {
-                    if (isDmlCte(cte.query())) {
-                        String key = cte.name().toLowerCase();
-                        if (!executor.cteResultCache.containsKey(key)) {
-                            cteExecutor.executeCte(cte);
-                        }
+                    if (isDmlCte(cte.query()) && !executor.cteResultCache.containsKey(cte)) {
+                        cteExecutor.executeCte(cte);
                     }
                 }
             }
@@ -1257,6 +1254,7 @@ class SelectExecutor {
         }
 
         rejectAmbiguousQualifiedRefs(stmt, baseBindings, usingColumnsLower);
+        if (everyRelation) rejectOutOfScopeQualifier(stmt.where(), stmt, baseBindings);
 
         // Every condition is coerced to boolean as the clause holding it is transformed, and
         // PostgreSQL transforms the FROM clause before the select list and the select list before
@@ -1307,6 +1305,11 @@ class SelectExecutor {
         // WHERE
         if (stmt.where() != null) {
             placementCheck.reject(stmt.where(), "WHERE", scope);
+            // A sub-select in WHERE may hold an aggregate that is this query's own, and an
+            // aggregate of this query may not stand in this query's WHERE wherever it is written.
+            if (!outerLevelAggregatesIn(stmt.where(), baseBindings).isEmpty()) {
+                throw new MemgresException("aggregate functions are not allowed in WHERE", "42803");
+            }
             BooleanContext.check(stmt.where(), "WHERE", columnTypes);
             // Pre-flight type validation of WHERE clause (PG checks at plan time)
             // Only validate for simple single-table SELECTs (not CTEs/subqueries/joins)
@@ -1394,6 +1397,7 @@ class SelectExecutor {
         if (stmt.orderBy() != null) {
             for (SelectStmt.OrderByItem item : stmt.orderBy()) {
                 BooleanContext.scan(item.expr(), columnTypes);
+                rejectUnsortableKey(item.expr(), baseBindings);
             }
         }
         if (stmt.groupBy() != null) {
@@ -1405,10 +1409,15 @@ class SelectExecutor {
         boolean hasGroupingSets = stmt.groupingSets() != null && !stmt.groupingSets().isEmpty();
         // An aggregate anywhere — select list, HAVING or ORDER BY — makes the query grouped,
         // so every other expression in it must itself be grouped or aggregated.
+        // An aggregate written inside a sub-select counts here too when it is this query's own:
+        // PostgreSQL puts an aggregate at the level its argument variables come from, so
+        // SELECT (SELECT count(a.v)) FROM t a counts the rows of t, once.
         boolean hasAggregates = hasAggregateInTargets(stmt.targets()) ||
                 (stmt.having() != null && containsAggregate(stmt.having())) ||
                 hasAggregateInOrderBy(stmt.orderBy()) ||
-                hasAggregateInWindowDefs(stmt.windowDefs());
+                hasAggregateInWindowDefs(stmt.windowDefs()) ||
+                !outerLevelAggregates(stmt, baseBindings).isEmpty();
+        rejectNestedOuterLevelAggregate(stmt, baseBindings);
 
         // HAVING makes the query grouped whether or not anything in it aggregates: with no
         // GROUP BY the whole table is one group, so the query answers at most one row and its
@@ -1566,6 +1575,10 @@ class SelectExecutor {
                     }
                 }
                 if (lockable) {
+                    if (lockedBinding != null) {
+                        executor.database.setRowLockMeta(lockedBinding.table(), lockedBinding.row(),
+                                executor.session.getTransactionId());
+                    }
                     filtered.add(ctx);
                     if (filtered.size() >= needed) break;
                 }
@@ -1616,6 +1629,9 @@ class SelectExecutor {
                         break;
                     }
                     rejectIfVersionMovedOn(b, lockRow, true);
+                    // The row is this transaction's now, and PostgreSQL says so on the row itself.
+                    executor.database.setRowLockMeta(b.table(), lockRow,
+                            executor.session.getTransactionId());
                     if (lockRow != b.row()) {
                         if (rebound == null) rebound = new ArrayList<>(bindings);
                         rebound.set(bi, new RowContext.TableBinding(
@@ -1667,7 +1683,10 @@ class SelectExecutor {
             // Apply LIMIT WITH TIES on contexts
             long limRaw = limitOffsetValue(stmt.limit(), true);
             int lim = clampToSize(limRaw < 0 ? Integer.MAX_VALUE : limRaw, contexts.size());
-            if (limRaw >= 0 && lim < contexts.size() && !contexts.isEmpty()) {
+            // A limit of none keeps none, and there is no last row for the rest to be tied with:
+            // reading one where the count is zero read past the front of the list, which the
+            // client saw as an internal fault.
+            if (limRaw >= 0 && lim > 0 && lim < contexts.size()) {
                 RowContext lastCtx = contexts.get(lim - 1);
                 int end = lim;
                 while (end < contexts.size()) {
@@ -1886,6 +1905,10 @@ class SelectExecutor {
                 || (stmt.orderBy() != null && orderByHasWindowFunction(stmt.orderBy()))) {
             throw lockNotAllowed(mode, "window functions");
         }
+        if (hasSetReturningCallInTargets(stmt.targets())
+                || (stmt.orderBy() != null && orderByHasSetReturningCall(stmt.orderBy()))) {
+            throw lockNotAllowed(mode, "set-returning functions in the target list");
+        }
         if (!descend || stmt.from() == null) return;
         for (SelectStmt.FromItem item : stmt.from()) {
             if (item instanceof SelectStmt.SubqueryFrom) {
@@ -1898,6 +1921,29 @@ class SelectExecutor {
     private boolean orderByHasWindowFunction(List<SelectStmt.OrderByItem> orderBy) {
         for (SelectStmt.OrderByItem item : orderBy) {
             if (containsWindowFunction(item.expr())) return true;
+        }
+        return false;
+    }
+
+    /**
+     * A set-returning call in what the query answers with, ORDER BY included.
+     *
+     * <p>A lock is taken on the rows a scan produced, and a set-returning call in the select list
+     * makes rows that no scan produced -- so PostgreSQL refuses the pair outright rather than
+     * locking some rows once and others several times. ORDER BY counts because it is part of the
+     * same list: PostgreSQL sorts by expressions it added to the target list, so a call written
+     * there is a call written in it.
+     */
+    private boolean hasSetReturningCallInTargets(List<SelectStmt.SelectTarget> targets) {
+        for (SelectStmt.SelectTarget target : targets) {
+            if (!collectSrfCalls(target.expr()).isEmpty()) return true;
+        }
+        return false;
+    }
+
+    private boolean orderByHasSetReturningCall(List<SelectStmt.OrderByItem> orderBy) {
+        for (SelectStmt.OrderByItem item : orderBy) {
+            if (!collectSrfCalls(item.expr()).isEmpty()) return true;
         }
         return false;
     }
@@ -1915,45 +1961,62 @@ class SelectExecutor {
     }
 
     boolean containsAggregate(Expression expr) {
-        if (expr instanceof SubqueryExpr) return false;
-        if (expr instanceof ExistsExpr) return false;
-        if (expr instanceof AnyAllExpr) return false;
-        if (expr instanceof ArraySubqueryExpr) return false;
-        if (expr instanceof OrderedSetAggExpr) return true;
-        // A window function is not itself an aggregate, but what it reads may be one: it runs
-        // over the grouped result, so sum(sum(v)) OVER () and rank() OVER (ORDER BY sum(v)) are
-        // queries with one row per group exactly as sum(v) on its own would be.
-        if (expr instanceof WindowFuncExpr) {
-            WindowFuncExpr wf = (WindowFuncExpr) expr;
-            for (Expression arg : wf.args()) {
-                if (containsAggregate(arg)) return true;
+        return ExprSearch.holdsAggregate(expr, this::isAggregateFunction,
+                this::isAnsweredAtOuterLevel);
+    }
+
+    /**
+     * Whether an enclosing query level has already answered this call.
+     *
+     * <p>PostgreSQL puts an aggregate at the query level its argument variables come from, which
+     * need not be the level it is written at. An aggregate written inside a sub-select but naming
+     * only the enclosing query's columns is computed there, over the enclosing query's group, and
+     * by the time the sub-select runs it is a value: not a call this query has to group around,
+     * and not a call misplaced in a clause that may hold none.
+     */
+    boolean isAnsweredAtOuterLevel(Expression expr) {
+        return executor.exprEvaluator.levelFoldedFor(expr) != null;
+    }
+
+    /**
+     * The aggregate calls a query's clauses hold that belong to this query level, written inside
+     * sub-selects of it. These are what make the query grouped, and what it has to answer over
+     * each group before the sub-selects holding them can run.
+     */
+    List<Expression> outerLevelAggregates(SelectStmt stmt, List<RowContext.TableBinding> scope) {
+        List<Expression> owned = new ArrayList<>();
+        if (stmt.targets() != null) {
+            for (SelectStmt.SelectTarget target : stmt.targets()) {
+                owned.addAll(placementCheck.outerLevelAggregatesIn(target.expr(), scope));
             }
-            return windowSpecContainsAggregate(wf.partitionBy(), wf.orderBy());
         }
-        if (expr instanceof FunctionCallExpr) {
-            FunctionCallExpr fn = (FunctionCallExpr) expr;
-            if (isAggregateFunction(fn.name())) return true;
-            for (Expression arg : fn.args()) {
-                if (containsAggregate(arg)) return true;
+        owned.addAll(outerLevelAggregatesIn(stmt.having(), scope));
+        if (stmt.orderBy() != null) {
+            for (SelectStmt.OrderByItem item : stmt.orderBy()) {
+                owned.addAll(outerLevelAggregatesIn(item.expr(), scope));
             }
-            return false;
         }
-        if (expr instanceof BinaryExpr) return containsAggregate(((BinaryExpr) expr).left()) || containsAggregate(((BinaryExpr) expr).right());
-        if (expr instanceof CustomOperatorExpr) { CustomOperatorExpr c = (CustomOperatorExpr) expr; return (c.left() != null && containsAggregate(c.left())) || containsAggregate(c.right()); }
-        if (expr instanceof UnaryExpr) return containsAggregate(((UnaryExpr) expr).operand());
-        if (expr instanceof CastExpr) return containsAggregate(((CastExpr) expr).expr());
-        if (expr instanceof IsJsonExpr) return containsAggregate(((IsJsonExpr) expr).expr());
-        if (expr instanceof IsNullExpr) return containsAggregate(((IsNullExpr) expr).expr());
-        if (expr instanceof InExpr) return containsAggregate(((InExpr) expr).expr());
-        if (expr instanceof LikeExpr) return containsAggregate(((LikeExpr) expr).left()) || containsAggregate(((LikeExpr) expr).pattern());
-        if (expr instanceof CaseExpr) {
-            CaseExpr c = (CaseExpr) expr;
-            for (CaseExpr.WhenClause when : c.whenClauses()) {
-                if (containsAggregate(when.condition()) || containsAggregate(when.result())) return true;
+        return owned;
+    }
+
+    /** The same, of one expression. */
+    List<Expression> outerLevelAggregatesIn(Expression expr, List<RowContext.TableBinding> scope) {
+        return placementCheck.outerLevelAggregatesIn(expr, scope);
+    }
+
+    /** Refuses one of those calls written inside the arguments of another aggregate of this query. */
+    void rejectNestedOuterLevelAggregate(SelectStmt stmt, List<RowContext.TableBinding> scope) {
+        if (stmt.targets() != null) {
+            for (SelectStmt.SelectTarget target : stmt.targets()) {
+                placementCheck.rejectNestedOuterLevelAggregate(target.expr(), scope);
             }
-            return c.elseExpr() != null && containsAggregate(c.elseExpr());
         }
-        return false;
+        placementCheck.rejectNestedOuterLevelAggregate(stmt.having(), scope);
+        if (stmt.orderBy() != null) {
+            for (SelectStmt.OrderByItem item : stmt.orderBy()) {
+                placementCheck.rejectNestedOuterLevelAggregate(item.expr(), scope);
+            }
+        }
     }
 
     boolean hasAggregateInTargets(List<SelectStmt.SelectTarget> targets) {
@@ -1999,29 +2062,7 @@ class SelectExecutor {
     }
 
     boolean containsWindowFunction(Expression expr) {
-        if (expr instanceof SubqueryExpr) return false;
-        if (expr instanceof ExistsExpr) return false;
-        if (expr instanceof AnyAllExpr) return false;
-        if (expr instanceof ArraySubqueryExpr) return false;
-        if (expr instanceof WindowFuncExpr) return true;
-        if (expr instanceof BinaryExpr) return containsWindowFunction(((BinaryExpr) expr).left()) || containsWindowFunction(((BinaryExpr) expr).right());
-        if (expr instanceof CustomOperatorExpr) { CustomOperatorExpr c = (CustomOperatorExpr) expr; return (c.left() != null && containsWindowFunction(c.left())) || containsWindowFunction(c.right()); }
-        if (expr instanceof UnaryExpr) return containsWindowFunction(((UnaryExpr) expr).operand());
-        if (expr instanceof CastExpr) return containsWindowFunction(((CastExpr) expr).expr());
-        if (expr instanceof IsNullExpr) return containsWindowFunction(((IsNullExpr) expr).expr());
-        if (expr instanceof CaseExpr) {
-            CaseExpr c = (CaseExpr) expr;
-            for (CaseExpr.WhenClause when : c.whenClauses()) {
-                if (containsWindowFunction(when.condition()) || containsWindowFunction(when.result())) return true;
-            }
-            return c.elseExpr() != null && containsWindowFunction(c.elseExpr());
-        }
-        if (expr instanceof FunctionCallExpr) {
-            for (Expression arg : ((FunctionCallExpr) expr).args()) {
-                if (containsWindowFunction(arg)) return true;
-            }
-        }
-        return false;
+        return ExprSearch.holdsWindowFunction(expr);
     }
 
     boolean hasWindowFunctionInTargets(List<SelectStmt.SelectTarget> targets) {
@@ -2353,7 +2394,10 @@ class SelectExecutor {
             long limRaw = limitOffsetValue(stmt.limit(), true);
             int lim = clampToSize(limRaw < 0 ? Integer.MAX_VALUE : limRaw, resultRows.size());
             if (limRaw >= 0 && lim < resultRows.size()) {
-                if (stmt.withTies() && stmt.orderBy() != null && !stmt.orderBy().isEmpty() && !resultRows.isEmpty()) {
+                // A limit of none keeps none, and there is no last row for the rest to be tied
+                // with, so the count decides it on its own.
+                if (stmt.withTies() && stmt.orderBy() != null && !stmt.orderBy().isEmpty()
+                        && lim > 0) {
                     // WITH TIES: include additional rows tied with the last row by ORDER BY values
                     Object[] lastRow = resultRows.get(lim - 1);
                     // Resolve ORDER BY column indices
@@ -3623,6 +3667,52 @@ class SelectExecutor {
         return e;
     }
 
+    /**
+     * Refuse a qualifier in the qualification that no FROM item of this query answers to.
+     *
+     * <p>Which relations a query may name is settled by its FROM clause, not by the rows the scan
+     * turns out to produce, so the same qualification is refused over an empty relation as over a
+     * full one. The select list is judged this way already; the qualification was left to whichever
+     * row reached the evaluator first, and over no rows there was none.
+     *
+     * <p>A subquery is left alone: it brings a FROM list of its own, and a name this level has not
+     * got may be one of its relations or a correlated reference to a query around this one.
+     */
+    private void rejectOutOfScopeQualifier(Expression where, SelectStmt stmt,
+                                           List<RowContext.TableBinding> bindings) {
+        if (where == null || bindings.isEmpty()) return;
+        if (AstWalk.anyMatch(where, n -> n instanceof SelectStmt || n instanceof SetOpStmt)) return;
+        AstWalk.forEach(where, node -> {
+            if (!(node instanceof ColumnRef)) return;
+            ColumnRef cr = (ColumnRef) node;
+            String qualifier = cr.table();
+            if (qualifier == null || cr.column() == null) return;
+            for (RowContext.TableBinding b : bindings) {
+                if (qualifier.equalsIgnoreCase(b.alias())) return;
+                if (b.alias() == null && qualifier.equalsIgnoreCase(b.table().getName())) return;
+            }
+            if (executor.exprEvaluator.schemaPrefixReaches(bindings, cr.schema(), qualifier) != null) {
+                return;
+            }
+            if (enclosingLevelAnswers(cr)) return;
+            String hiddenByAlias = enclosingAliasHiding(qualifier);
+            for (RowContext.TableBinding b : bindings) {
+                if (b.alias() != null && qualifier.equalsIgnoreCase(b.table().getName())) {
+                    hiddenByAlias = b.alias();
+                }
+            }
+            if (hiddenByAlias != null) {
+                MemgresException ex = new MemgresException(
+                        "invalid reference to FROM-clause entry for table \"" + qualifier + "\"",
+                        "42P01");
+                ex.setHint("Perhaps you meant to reference the table alias \""
+                        + hiddenByAlias + "\".");
+                throw ex;
+            }
+            throw outOfScopeOrMissing(qualifier, stmt.from());
+        });
+    }
+
     static String exposedNameOf(SelectStmt.FromItem item) {
         String name = null;
         if (item instanceof SelectStmt.TableRef) {
@@ -4100,6 +4190,23 @@ class SelectExecutor {
             keys.add(on);
         }
         return keys.isEmpty() ? contexts : expandContextsForSrfs(keys, contexts);
+    }
+
+    /**
+     * Refuses a sort key of a type nothing can be sorted by, wherever one is written -- the
+     * query's own ORDER BY, a window's, an aggregate's.
+     *
+     * <p>An ordinal is a position in the select list rather than a value, and the target it
+     * counts is judged on its own; a key whose type nothing here settles is left alone, since a
+     * query refused on a guess is worse than a query sorted on one.
+     */
+    void rejectUnsortableKey(Expression key, List<RowContext.TableBinding> bindings) {
+        if (key == null || bindings == null) return;
+        if (key instanceof Literal
+                && ((Literal) key).literalType() == Literal.LiteralType.INTEGER) return;
+        MemgresException refusal =
+                OperatorResolution.noOrderingFor(executor.exprEvaluator.inferTypeFromContext(key, bindings));
+        if (refusal != null) throw refusal;
     }
 
     private List<RowContext> expandContextsForOrderBySrfs(SelectStmt stmt, List<RowContext> contexts) {

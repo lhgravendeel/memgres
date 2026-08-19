@@ -171,6 +171,9 @@ public class SystemCatalog implements OidSupplier {
         }
         Table built = isPgCatalog ? pgCatalogBuilder.build(tbl, session)
                 : infoSchemaBuilder.build(tbl, session);
+        // A catalog is composed on demand here and stored on disk in PostgreSQL, but it is a table
+        // either way: its rows have the system columns, where an information_schema view's do not.
+        if (built != null && isPgCatalog) built.setStoresRows(true);
         if (cache != null && built != null) cache.put(key, built);
         return built;
     }

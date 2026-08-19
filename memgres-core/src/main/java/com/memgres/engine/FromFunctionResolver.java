@@ -184,6 +184,11 @@ class FromFunctionResolver {
             throw onlyForRecord();
         }
         checkBuiltinColumnDefinitionList(fname, rawColAliases);
+        // TABLESAMPLE decides what it will accept before it reads anything: the relation, the
+        // method, how many arguments the method was given and what types they are, all settled
+        // from what was written. Evaluating first raised a division by zero for a statement
+        // PostgreSQL refuses for naming no relation at all.
+        if (fname.startsWith("__tablesample__:")) return resolveTablesample(funcFrom, fname, alias);
         List<Object> evalArgs = new ArrayList<>();
         for (Expression arg : funcFrom.args()) {
             evalArgs.add(executor.evalExpr(arg, null));
@@ -231,7 +236,6 @@ class FromFunctionResolver {
             return resolvePgGetSequenceData(alias, colAliases, evalArgs);
         if (fname.equals("string_to_table")) return resolveStringToTable(alias, colAliases, evalArgs);
         if (fname.equals("regexp_split_to_table")) return resolveRegexpSplitToTable(alias, colAliases, evalArgs);
-        if (fname.startsWith("__tablesample__:")) return resolveTablesample(fname, alias, evalArgs);
         if (fname.equals("pg_create_logical_replication_slot")) return resolveCreateLogicalReplicationSlot(alias, colAliases, evalArgs);
         if (fname.equals("pg_create_physical_replication_slot")) return resolveCreatePhysicalReplicationSlot(alias, colAliases, evalArgs);
         if (fname.equals("pg_ls_dir")) return resolvePgLsDir(alias, colAliases);
@@ -1471,33 +1475,14 @@ class FromFunctionResolver {
 
     // ---- TABLESAMPLE ----
 
-    private List<RowContext> resolveTablesample(String fname, String alias, List<Object> evalArgs) {
+    private List<RowContext> resolveTablesample(SelectStmt.FunctionFrom funcFrom, String fname,
+                                                String alias) {
         String tableName = fname.substring("__tablesample__:".length());
-        String method = evalArgs.get(0).toString();
-        // Both parameters are read before anything is sampled, and PostgreSQL says so rather than
-        // sampling with nothing in hand: the percentage is 2202H and the seed 2202G.
-        if (evalArgs.get(1) == null) {
-            throw new MemgresException("TABLESAMPLE parameter cannot be null", "2202H");
-        }
-        double pct = executor.toDouble(evalArgs.get(1));
-        // REPEATABLE is declared over double precision, so a fraction is a seed and not a fault in
-        // the statement. What the sampler wants of it is a repeatable starting point: a whole
-        // number is used as itself, so a seed that always picked these rows still picks them.
-        Long seed = null;
-        if (evalArgs.size() > 2) {
-            if (evalArgs.get(2) == null) {
-                throw new MemgresException("TABLESAMPLE REPEATABLE parameter cannot be null", "2202G");
-            }
-            double written = executor.toDouble(evalArgs.get(2));
-            seed = Long.valueOf(written == Math.rint(written) && !Double.isInfinite(written)
-                    ? (long) written : Double.doubleToLongBits(written));
-        }
-
-        // The sampler reads the percentage as a fraction of the whole, so anything outside 0..100
-        // names no fraction at all. PostgreSQL says the same words either side of the range.
-        if (pct < 0 || pct > 100) {
-            throw new MemgresException("sample percentage must be between 0 and 100", "2202H");
-        }
+        List<Expression> args = funcFrom.args();
+        String method = ((Literal) args.get(0)).value();
+        int argsWritten = Integer.parseInt(((Literal) args.get(1)).value());
+        Expression pctExpr = args.get(2);
+        Expression seedExpr = args.size() > 3 ? args.get(3) : null;
 
         // Sampling reads a fraction of a stored relation's pages, so there has to be one. A WITH
         // item is computed, not stored, and PG says so rather than that the name is unknown.
@@ -1546,6 +1531,64 @@ class FromFunctionResolver {
                 throw new MemgresException("relation \"" + tableName + "\" does not exist", "42P01");
             }
         }
+
+        // The relation settled, the method is looked up, and only then is it asked what it wants.
+        // PostgreSQL names it bare here: what was written is an identifier the grammar resolves,
+        // not a string, so it is not quoted back.
+        if (!"system".equals(method) && !"bernoulli".equals(method)) {
+            throw new MemgresException(
+                    "tablesample method " + method + " does not exist", "42704");
+        }
+        // How many arguments a method takes is the method's own business rather than the
+        // grammar's, so a second one is not a syntax error: bernoulli is asked and says it
+        // wanted one.
+        if (argsWritten != 1) {
+            throw new MemgresException("tablesample method " + method
+                    + " requires 1 argument, not " + argsWritten, "2202H");
+        }
+        // Both arguments are declared over a type, and what was written has to be a value
+        // PostgreSQL would put there without being told to: the percentage is a real and the seed
+        // a double precision. Reading whatever arrived as a number instead sampled 0 rows for a
+        // boolean, 100 for the text '100', and raised an internal Java fault for a seed that was
+        // not a whole number.
+        // The arguments are settled before the scan begins, so they are outside the relation the
+        // clause is attached to: PostgreSQL says the column exists but not here.
+        String exposed = alias != null ? alias : tableName;
+        refuseSampleArgColumns(pctExpr, table, exposed);
+        if (seedExpr != null) refuseSampleArgColumns(seedExpr, table, exposed);
+
+        boolean pctUntyped = requireSampleArgType(pctExpr, DataType.REAL, "TABLESAMPLE");
+        boolean seedUntyped = seedExpr != null
+                && requireSampleArgType(seedExpr, DataType.DOUBLE_PRECISION, "REPEATABLE");
+
+        // Both parameters are read before anything is sampled, and PostgreSQL says so rather than
+        // sampling with nothing in hand: the percentage is 2202H and the seed 2202G.
+        Object pctValue = readSampleArg(pctExpr, pctUntyped ? DataType.REAL : null);
+        if (pctValue == null) {
+            throw new MemgresException("TABLESAMPLE parameter cannot be null", "2202H");
+        }
+        double pct = executor.toDouble(pctValue);
+        // REPEATABLE is declared over double precision, so a fraction is a seed and not a fault in
+        // the statement. What the sampler wants of it is a repeatable starting point: a whole
+        // number is used as itself, so a seed that always picked these rows still picks them.
+        Long seed = null;
+        if (seedExpr != null) {
+            Object seedValue = readSampleArg(seedExpr,
+                    seedUntyped ? DataType.DOUBLE_PRECISION : null);
+            if (seedValue == null) {
+                throw new MemgresException("TABLESAMPLE REPEATABLE parameter cannot be null", "2202G");
+            }
+            double written = executor.toDouble(seedValue);
+            seed = Long.valueOf(written == Math.rint(written) && !Double.isInfinite(written)
+                    ? (long) written : Double.doubleToLongBits(written));
+        }
+        // The sampler reads the percentage as a fraction of the whole, so anything outside 0..100
+        // names no fraction at all -- and a NaN is outside it, since it is neither in nor out of
+        // any range. PostgreSQL says the same words either side.
+        if (!(pct >= 0) || pct > 100) {
+            throw new MemgresException("sample percentage must be between 0 and 100", "2202H");
+        }
+
         // The rows of an inheritance child or a partition belong to the relation named, so a
         // sampled scan draws from the same population a plain scan reads. Sampling the relation's
         // own list alone made TABLESAMPLE see a fraction of a table it could not report.
@@ -1573,6 +1616,65 @@ class FromFunctionResolver {
             contexts.add(new RowContext(table, tableAlias, row));
         }
         return contexts;
+    }
+
+    /**
+     * What a sampling argument must be, decided from what was written rather than from what it
+     * evaluates to. True where the argument has no type of its own.
+     *
+     * <p>PostgreSQL puts the argument where the clause declares one, which is the same coercion it
+     * performs for an assignment: every number reaches a real, and nothing else does. A value with
+     * no type of its own -- a bare literal -- is read by the target's own input function instead,
+     * so {@code '100'} is a percentage while {@code '100'::text} is not.
+     */
+    private boolean requireSampleArgType(Expression arg, DataType wanted, String clause) {
+        String written = executor.binaryOpEvaluator.declaredTypeForResolution(arg, null);
+        if (written == null) return true;
+        DataType writtenType = DataType.fromPgName(written);
+        if (writtenType == null || CastLegality.assignable(writtenType, wanted)) return false;
+        throw new MemgresException("argument of " + clause + " must be type "
+                + wanted.toRegtypeDisplay() + ", not type " + writtenType.toRegtypeDisplay(),
+                "42804");
+    }
+
+    /**
+     * A column of the sampled relation, written where the sampling argument goes.
+     *
+     * <p>How much of a relation to read is decided before any of it is read, so the argument is
+     * outside the relation the clause is attached to even though it is written next to its name.
+     * PostgreSQL distinguishes the two ways of getting that wrong: a bare column name is a column
+     * that does not exist here, and a qualified one is a FROM-clause entry that cannot be
+     * referenced from here. A name the relation does not have at all is left alone -- it is
+     * unknown for the ordinary reason.
+     */
+    private void refuseSampleArgColumns(Object node, Table table, String exposed) {
+        if (node == null || node instanceof Statement) return;
+        if (node instanceof ColumnRef) {
+            ColumnRef ref = (ColumnRef) node;
+            if (ref.table != null) {
+                if (!ref.table.equalsIgnoreCase(exposed)) return;
+                MemgresException e = new MemgresException(
+                        "invalid reference to FROM-clause entry for table \"" + ref.table + "\"",
+                        "42P01");
+                e.setDetail("There is an entry for table \"" + ref.table
+                        + "\", but it cannot be referenced from this part of the query.");
+                throw e;
+            }
+            if (table.getColumnIndex(ref.column) < 0) return;
+            MemgresException e = new MemgresException(
+                    "column \"" + ref.column + "\" does not exist", "42703");
+            e.setDetail("There is a column named \"" + ref.column + "\" in table \"" + exposed
+                    + "\", but it cannot be referenced from this part of the query.");
+            throw e;
+        }
+        AstWalk.forEachChild(node, child -> refuseSampleArgColumns(child, table, exposed));
+    }
+
+    /** The argument's value, read by {@code wanted}'s input function where it had no type. */
+    private Object readSampleArg(Expression arg, DataType wanted) {
+        Object value = executor.evalExpr(arg, null);
+        if (wanted == null || value == null) return value;
+        return executor.castEvaluator.applyCast(value, wanted.getPgName(), true);
     }
 
     /**

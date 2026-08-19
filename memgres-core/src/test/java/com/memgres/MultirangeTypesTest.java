@@ -1588,15 +1588,21 @@ class MultirangeTypesTest {
 
     // ===== DEEP GAP AUDIT: Multirange MIN/MAX =====
 
+    /** min and max are declared over the types that have one, and a multirange is not among them. */
     @Test
     void multirangeMinMax() throws Exception {
         try (Statement st = conn.createStatement()) {
             st.execute("CREATE TABLE mm_mr (mr int4multirange)");
             st.execute("INSERT INTO mm_mr VALUES ('{[5,10)}'), ('{[1,3)}'), ('{[20,30)}')");
-            try (ResultSet rs = st.executeQuery("SELECT min(mr), max(mr) FROM mm_mr")) {
+            SQLException e = assertThrows(SQLException.class,
+                    () -> st.executeQuery("SELECT min(mr) FROM mm_mr"));
+            assertEquals("42883", e.getSQLState());
+            SQLException e2 = assertThrows(SQLException.class,
+                    () -> st.executeQuery("SELECT max(mr) FROM mm_mr"));
+            assertEquals("42883", e2.getSQLState());
+            try (ResultSet rs = st.executeQuery("SELECT count(mr) FROM mm_mr")) {
                 assertTrue(rs.next());
-                assertEquals("{[1,3)}", rs.getString(1));
-                assertEquals("{[20,30)}", rs.getString(2));
+                assertEquals(3, rs.getInt(1));
             }
             st.execute("DROP TABLE mm_mr");
         }

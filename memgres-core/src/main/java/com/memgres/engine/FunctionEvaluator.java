@@ -997,10 +997,21 @@ class FunctionEvaluator {
             }
         }
 
-        // Ordered-set aggregates require WITHIN GROUP clause; without it, PG gives 42601
-        if (name.equals("percentile_cont") || name.equals("percentile_disc") || name.equals("mode")) {
-            throw new MemgresException(
-                "function " + name + " requires WITHIN GROUP (ORDER BY ...) syntax", "42601");
+        // An ordered-set aggregate is catalogued under its whole signature -- the arguments it
+        // takes directly followed by the one it orders -- so a call written without WITHIN GROUP
+        // is resolved against that signature like any other. Where the written arguments answer to
+        // it, what the call lacks is the clause; where they do not, no function of that name and
+        // shape exists at all. memgres said the same thing about both, and said it as a syntax
+        // error, which is neither of the two answers PostgreSQL gives.
+        int orderedSetArity = BuiltinAggregateSignatures.orderedSetArity(name);
+        if (orderedSetArity >= 0 && !userDeclaredFunction(executor, name)) {
+            if (orderedSetArity == fn.args().size()) {
+                throw new MemgresException(
+                        "WITHIN GROUP is required for ordered-set aggregate " + name, "42809");
+            }
+            throw new MemgresException("function " + fn.name() + "(" + argTypeNames(fn, ctx)
+                    + ") does not exist\n  Hint: No function matches the given name and argument"
+                    + " types. You might need to add explicit type casts.", "42883");
         }
 
         // VALUES is not a function; using it as a function argument is a syntax error
@@ -3863,8 +3874,17 @@ class FunctionEvaluator {
     private static String canonicalTypeName(String type) {
         if (type == null) return null;
         String t = type.toLowerCase().trim();
+        // An array of a type that carries a length is written character(5)[], and dropping
+        // everything from the paren dropped the brackets with it: the call was then judged as
+        // taking the element type, so array_to_string over an array of them had no signature.
+        String suffix = "";
+        while (t.endsWith("[]")) {
+            suffix = suffix + "[]";
+            t = t.substring(0, t.length() - 2).trim();
+        }
         int paren = t.indexOf('(');
         if (paren > 0) t = t.substring(0, paren).trim();
+        if (!suffix.isEmpty()) return canonicalTypeName(t) + suffix;
         switch (t) {
             case "int": case "int4": return "integer";
             case "int2": return "smallint";
@@ -3909,10 +3929,17 @@ class FunctionEvaluator {
         // to declare under the same spelling: bytea('x') is 'x'::bytea and takes one argument of
         // whatever was written, so there is no overload to choose between.
         if (args.size() == 1 && executor.functionEvaluator.coercibleTypeName(name) != null) return;
-        args = flattenRowArguments(args);
+        args = flattenRowArguments(name, args);
         int[] written = new int[args.size()];
         for (int i = 0; i < args.size(); i++) {
             Expression arg = args.get(i);
+            // A row constructor is one argument of record type. Nothing else reads it as one, so
+            // it is named here rather than left with no type at all, which would take every call
+            // carrying a row out of this rule's reach.
+            if (arg instanceof ArrayExpr && ((ArrayExpr) arg).isRow()) {
+                written[i] = DataType.RECORD.getOid();
+                continue;
+            }
             String declared = executor.binaryOpEvaluator.declaredTypeForResolution(arg, ctx);
             if (declared == null) {
                 if (!isUntypedLiteral(arg)) return;   // no opinion about this call
@@ -3981,8 +4008,13 @@ class FunctionEvaluator {
      * The arguments a call really passes. {@code (a, b) OVERLAPS (c, d)} is written as two pairs
      * and declared as four arguments, so the pairs are read apart before the signature is looked
      * up; otherwise the call is judged against an arity nothing declares.
+     *
+     * <p>OVERLAPS is the whole of it. Everywhere else a row constructor is one argument of one
+     * record type, and reading it apart judged {@code row_to_json(ROW(1, true))} as a call of two
+     * arguments that nothing declares.
      */
-    private static List<Expression> flattenRowArguments(List<Expression> args) {
+    private static List<Expression> flattenRowArguments(String name, List<Expression> args) {
+        if (!"overlaps".equals(name)) return args;
         boolean anyRow = false;
         for (Expression arg : args) {
             if (arg instanceof ArrayExpr && ((ArrayExpr) arg).isRow()) { anyRow = true; break; }
@@ -4698,15 +4730,11 @@ class FunctionEvaluator {
     /**
      * The name a call resolves by. The lexer folds an unquoted identifier and leaves a quoted one
      * as written, so a name that still carries a capital was written in quotes: {@code "ABS"} is
-     * not abs, and PostgreSQL finds no function of that name at all. Folding it anyway answered a
-     * call PostgreSQL refuses. A name the user declared is looked for as written first, so a
-     * function created under a quoted mixed-case name keeps working.
+     * not abs, and PostgreSQL finds no function of that name at all. A routine declared under a
+     * quoted name is filed under that name and answers to it, which is why the name is handed on
+     * exactly as it was written.
      */
     private String foldedName(String written) {
-        String folded = written.toLowerCase(Locale.ROOT);
-        if (written.equals(folded)) return folded;
-        if (executor.database.getFunction(written) != null) return folded;
-        if (executor.database.getFunction(folded) != null) return folded;
         return written;
     }
 

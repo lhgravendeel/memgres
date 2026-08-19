@@ -5461,6 +5461,7 @@ class DdlObjectExecutor {
      * silently returns fewer rows than the same query answered from the heap.
      */
     private void checkIndexExpressionsAndPredicate(CreateIndexStmt s) {
+        rejectIndexOverSystemColumns(s);
         if (s.columns() != null) {
             for (String col : s.columns()) {
                 // An index key is kept as the text it was written as, so its type names are read
@@ -5495,6 +5496,48 @@ class DdlObjectExecutor {
             executor.selectExecutor.placementCheck.rejectStoredDefinition(
                     pred, "index predicates", "index predicate");
         }
+    }
+
+    /**
+     * An index reads what a row is, and a system column says instead where the row is and who
+     * wrote it -- values the index itself would move. PostgreSQL builds none over them, wherever
+     * in the statement one is written: a key, an INCLUDE payload, an expression or a predicate.
+     *
+     * <p>A key written as a bare column name is refused by {@code rejectSystemKeyColumn}, which
+     * has PostgreSQL's other wording for the two of them no index could be built over anyway.
+     */
+    private void rejectIndexOverSystemColumns(CreateIndexStmt s) {
+        if (s.columns() != null) {
+            for (String col : s.columns()) {
+                if (col == null) continue;
+                DdlDefinitionChecks.rejectSystemKeyColumn(col.trim());
+                if (namesASystemColumn(col)) throw DdlDefinitionChecks.indexOnSystemColumn();
+            }
+        }
+        if (s.includeColumns() != null) {
+            for (String col : s.includeColumns()) {
+                if (col != null) DdlDefinitionChecks.rejectSystemKeyColumn(col.trim());
+            }
+        }
+        if (s.whereClause() != null && namesASystemColumn(s.whereClause())) {
+            throw DdlDefinitionChecks.indexOnSystemColumn();
+        }
+    }
+
+    /** Whether a written index key or predicate reads a system column anywhere inside it. */
+    private static boolean namesASystemColumn(String written) {
+        Expression expr;
+        try {
+            expr = com.memgres.engine.parser.Parser.parseExpression(written);
+        } catch (RuntimeException ignored) {
+            return false;
+        }
+        return AstWalk.findFirst(expr, new java.util.function.Predicate<Object>() {
+            @Override public boolean test(Object n) {
+                return n instanceof ColumnRef
+                        && DdlDefinitionChecks.isSystemColumnName(((ColumnRef) n).column());
+            }
+        }) != null;
     }
 
     /**

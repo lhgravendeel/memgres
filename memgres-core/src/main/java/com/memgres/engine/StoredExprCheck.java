@@ -129,7 +129,10 @@ final class StoredExprCheck {
             }
             return;
         }
-        if (table.getColumnIndex(ref.column()) < 0) {
+        // As above, for a name written without a relation: a policy decides about the relation's
+        // own rows, and reads a system column off one exactly as it reads a declared column.
+        if (table.getColumnIndex(ref.column()) < 0
+                && !DdlDefinitionChecks.isSystemColumnName(ref.column())) {
             throw new MemgresException("column \"" + ref.column() + "\" does not exist", "42703");
         }
         if (bareColumnIsAmbiguous) {

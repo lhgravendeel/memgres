@@ -58,6 +58,26 @@ public final class SelectStmt implements Statement {
     public boolean joinExpression() { return joinExpression; }
 
     /**
+     * This query with a different WITH clause, or with none, and everything else about it kept.
+     *
+     * <p>Both directions are needed. A WITH clause is parsed before the query it hangs off, so the
+     * query has to be given the items afterwards; and an arm of a set operation that carries WITH
+     * has its items brought up to the whole operation, so the arm is run once more without them or
+     * it would declare them twice. Rebuilding either by hand is where clauses go missing: written
+     * out through a shorter constructor, a query lost its GROUPING SETS, its WINDOW definitions,
+     * its DISTINCT ON, its WITH TIES and its lock clause, and answered as though they had never
+     * been written.
+     */
+    public SelectStmt withWithClauses(List<CommonTableExpr> newWithClauses) {
+        SelectStmt copy = new SelectStmt(distinct, distinctOn, targets, from, where, groupBy,
+                having, windowDefs, orderBy, limit, offset, newWithClauses, groupingSets,
+                lockClause, withTies);
+        copy.fromValues = fromValues;
+        copy.joinExpression = joinExpression;
+        return copy;
+    }
+
+    /**
      * How many columns a query's select list writes, or -1 when the text does not settle it -- a
      * star, or anything else that may stand for more than one column. This is what PostgreSQL
      * measures a subquery's width by: it is a property of the text, settled before any row is
@@ -249,16 +269,29 @@ public final class SelectStmt implements Statement {
         public final Expression expr;
         public final boolean descending;
         public final Boolean nullsFirst;
+        /**
+         * The operator a USING clause named, where it names one this engine can look up; null
+         * where the sort was written ASC, DESC or with an operator of no known spelling. An
+         * ordering operator has to exist for the type being sorted, and only the type says so.
+         */
+        public final BinaryExpr.BinOp usingOperator;
 
         public OrderByItem(Expression expr, boolean descending, Boolean nullsFirst) {
+            this(expr, descending, nullsFirst, null);
+        }
+
+        public OrderByItem(Expression expr, boolean descending, Boolean nullsFirst,
+                           BinaryExpr.BinOp usingOperator) {
             this.expr = expr;
             this.descending = descending;
             this.nullsFirst = nullsFirst;
+            this.usingOperator = usingOperator;
         }
 
         public Expression expr() { return expr; }
         public boolean descending() { return descending; }
         public Boolean nullsFirst() { return nullsFirst; }
+        public BinaryExpr.BinOp usingOperator() { return usingOperator; }
 
         @Override
         public boolean equals(Object o) {
@@ -267,12 +300,13 @@ public final class SelectStmt implements Statement {
             OrderByItem that = (OrderByItem) o;
             return java.util.Objects.equals(expr, that.expr)
                 && descending == that.descending
-                && java.util.Objects.equals(nullsFirst, that.nullsFirst);
+                && java.util.Objects.equals(nullsFirst, that.nullsFirst)
+                && usingOperator == that.usingOperator;
         }
 
         @Override
         public int hashCode() {
-            return java.util.Objects.hash(expr, descending, nullsFirst);
+            return java.util.Objects.hash(expr, descending, nullsFirst, usingOperator);
         }
 
         @Override
@@ -418,6 +452,12 @@ public final class SelectStmt implements Statement {
         public final FromItem right;
         public final Expression on;
         public final List<String> using;
+        /**
+         * The name a USING clause may be given, or null. It answers with the merged columns and
+         * nothing else: {@code a JOIN b USING (id) AS j} makes {@code id} the one column {@code j}
+         * has, while {@code a} and {@code b} go on answering to their own names.
+         */
+        public final String usingAlias;
 
         public JoinFrom(
                 FromItem left,
@@ -426,11 +466,23 @@ public final class SelectStmt implements Statement {
                 Expression on,
                 List<String> using
         ) {
+            this(left, joinType, right, on, using, null);
+        }
+
+        public JoinFrom(
+                FromItem left,
+                JoinType joinType,
+                FromItem right,
+                Expression on,
+                List<String> using,
+                String usingAlias
+        ) {
             this.left = left;
             this.joinType = joinType;
             this.right = right;
             this.on = on;
             this.using = using;
+            this.usingAlias = usingAlias;
         }
 
         public FromItem left() { return left; }
@@ -438,6 +490,7 @@ public final class SelectStmt implements Statement {
         public FromItem right() { return right; }
         public Expression on() { return on; }
         public List<String> using() { return using; }
+        public String usingAlias() { return usingAlias; }
 
         @Override
         public boolean equals(Object o) {
@@ -448,17 +501,18 @@ public final class SelectStmt implements Statement {
                 && java.util.Objects.equals(joinType, that.joinType)
                 && java.util.Objects.equals(right, that.right)
                 && java.util.Objects.equals(on, that.on)
-                && java.util.Objects.equals(using, that.using);
+                && java.util.Objects.equals(using, that.using)
+                && java.util.Objects.equals(usingAlias, that.usingAlias);
         }
 
         @Override
         public int hashCode() {
-            return java.util.Objects.hash(left, joinType, right, on, using);
+            return java.util.Objects.hash(left, joinType, right, on, using, usingAlias);
         }
 
         @Override
         public String toString() {
-            return "JoinFrom[left=" + left + ", " + "joinType=" + joinType + ", " + "right=" + right + ", " + "on=" + on + ", " + "using=" + using + "]";
+            return "JoinFrom[left=" + left + ", " + "joinType=" + joinType + ", " + "right=" + right + ", " + "on=" + on + ", " + "using=" + using + ", " + "usingAlias=" + usingAlias + "]";
         }
     }
 
