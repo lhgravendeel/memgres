@@ -52,10 +52,95 @@ class ExprEvaluator {
      */
     private int cancelPollCountdown;
 
+    /**
+     * The calls in the expression being evaluated that were answered before evaluation began,
+     * and what each of them answered. Identity-keyed: it is the node in this expression that was
+     * computed, not any other node spelled the same.
+     *
+     * <p>An aggregate call is computed over a whole group and a window call over a whole
+     * partition, so neither is computed from the row in front of it. What is left is the
+     * expression the call is written inside, and that is an ordinary expression over the values
+     * they came to. Evaluating it here rather than in a second evaluator written alongside is
+     * what makes every place such a call may be written work the same: the evaluators written
+     * alongside knew only the node types somebody had listed, so a call under BETWEEN, in an IN
+     * list or inside ARRAY[] fell through to ordinary evaluation, where the call has no value,
+     * and the row answered NULL -- or, in HAVING, no row at all.
+     */
+    private Map<Expression, PrecomputedValueExpr> foldedValues;
+
+    /**
+     * The calls written inside a nested query that belong to an enclosing query level, and what
+     * each of them answered there.
+     *
+     * <p>PostgreSQL puts an aggregate at the query level its argument variables come from, which
+     * is not always the level it is written at: {@code SELECT (SELECT count(a.v)) FROM t a}
+     * counts the rows of {@code t}, once, because {@code a.v} comes from the outer query. Such a
+     * call is answered over the outer group before the nested query runs at all, and the nested
+     * query reads the answer.
+     *
+     * <p>Kept apart from {@link #foldedValues} because the nested query folds calls of its own as
+     * it runs, and one belonging to a level above has to stay answered while it does.
+     */
+    private Map<Expression, PrecomputedValueExpr> levelFolded;
+
+    /** Installs the enclosing level's answers, returning what was there to be put back. */
+    Map<Expression, PrecomputedValueExpr> swapLevelFolded(
+            Map<Expression, PrecomputedValueExpr> next) {
+        Map<Expression, PrecomputedValueExpr> prior = levelFolded;
+        levelFolded = next;
+        return prior;
+    }
+
+    /** What an enclosing level answered for this call, or null where no level has. */
+    PrecomputedValueExpr levelFoldedFor(Expression expr) {
+        return levelFolded == null ? null : levelFolded.get(expr);
+    }
+
+    /** Every such answer standing at the moment, or null where there are none. */
+    Map<Expression, PrecomputedValueExpr> levelFoldedAnswers() {
+        return levelFolded;
+    }
+
+    /**
+     * Evaluate an expression whose aggregate or window calls have already been answered.
+     *
+     * <p>A nested query may fold calls of its own while this one is part-way through a row, so
+     * what was in hand is put back rather than dropped.
+     */
+    Object evalWithFolded(Map<Expression, PrecomputedValueExpr> folded, Expression expr,
+                          RowContext ctx) {
+        Map<Expression, PrecomputedValueExpr> prior = foldedValues;
+        foldedValues = folded;
+        try {
+            return evalExpr(expr, ctx);
+        } finally {
+            foldedValues = prior;
+        }
+    }
+
+    /**
+     * What this call was folded to, or null where it was not folded.
+     *
+     * <p>A folded value carries the type the call it replaced was declared to have, which the
+     * value alone cannot always say -- and which is the only answer left where the fold produced
+     * NULL.
+     */
+    PrecomputedValueExpr foldedFor(Expression expr) {
+        return foldedValues == null ? null : foldedValues.get(expr);
+    }
+
     public Object evalExpr(Expression expr, RowContext ctx) {
         if (--cancelPollCountdown <= 0) {
             cancelPollCountdown = 4096;
             StatementCancel.check();
+        }
+        if (foldedValues != null) {
+            PrecomputedValueExpr folded = foldedValues.get(expr);
+            if (folded != null) return folded.value();
+        }
+        if (levelFolded != null) {
+            PrecomputedValueExpr answered = levelFolded.get(expr);
+            if (answered != null) return answered.value();
         }
         if (expr instanceof Literal) return evalLiteral(((Literal) expr));
         // A value the engine computed earlier stands for itself.
@@ -76,7 +161,7 @@ class ExprEvaluator {
         }
         if (expr instanceof UnaryExpr) {
             UnaryExpr un = (UnaryExpr) expr;
-            rejectUnaryOperatorOnText(un, ctx);
+            rejectUnresolvablePrefixOperator(un);
             return evalUnaryValue(un.op(), evalExpr(un.operand(), ctx));
         }
         if (expr instanceof FunctionCallExpr) {
@@ -184,8 +269,8 @@ class ExprEvaluator {
             return val;
         }
         if (expr instanceof WindowFuncExpr) {
-            WindowFuncExpr wf = (WindowFuncExpr) expr;
-            // Window functions should be evaluated by executeWindowSelect, not here
+            // Answered above where a window pass computed this call; a window function has no
+            // value of its own to compute from the row in front of it.
             return null;
         }
         if (expr instanceof NamedArgExpr) return evalExpr(((NamedArgExpr) expr).value(), ctx);
@@ -558,13 +643,16 @@ class ExprEvaluator {
             // Unqualified column reference; check current context first
             Object result = null;
             boolean foundInCurrent = false;
-            String savedHint = null; // preserve hint from RowContext for rethrow
+            // What this context said the name was, kept whole for the rethrow below: the
+            // reason a name resolves to nothing is worked out where the relations are known,
+            // and rebuilding the refusal here from the name alone threw that reason away.
+            MemgresException notHere = null;
             try {
                 result = ctx.resolveColumn(null, ref.column());
                 foundInCurrent = true;
             } catch (MemgresException e) {
                 if (!"42703".equals(e.getSqlState())) throw e;
-                if (e.getHint() != null) savedHint = e.getHint();
+                notHere = e;
                 // column not in current context, will try outer contexts / special columns below
             }
             if (foundInCurrent) {
@@ -626,9 +714,9 @@ class ExprEvaluator {
                     // not in this outer context either, continue
                 }
             }
-            MemgresException colEx = new MemgresException("column \"" + ref.column() + "\" does not exist", "42703");
-            if (savedHint != null) colEx.setHint(savedHint);
-            throw colEx;
+            if (notHere != null) throw notHere;
+            throw new MemgresException(
+                    "column \"" + ref.column() + "\" does not exist", "42703");
         } else {
             // Schema-qualified reference (schema.table.column). PostgreSQL resolves one against
             // the FROM entry of that name when the entry is the relation the schema names; a CTE,
@@ -941,13 +1029,13 @@ class ExprEvaluator {
                     // them, so every row shared one ctid: DISTINCT ctid counted one row, and
                     // DELETE WHERE ctid = ... deleted the whole table.
                     if (rowMeta != null && rowMeta.length > 4 && rowMeta[4] != 0) {
-                        return "(0," + rowMeta[4] + ")";
+                        return new PgTid(0, (int) rowMeta[4]);
                     }
                     java.util.List<Object[]> rows = ref.table.getRows();
                     for (int i = 0; i < rows.size(); i++) {
-                        if (rows.get(i) == ref.row) return "(0," + (i + 1) + ")";
+                        if (rows.get(i) == ref.row) return new PgTid(0, i + 1);
                     }
-                    return "(0,0)";
+                    return new PgTid(0, 0);
                 }
                 default: return 0L;
             }
@@ -1376,28 +1464,55 @@ class ExprEvaluator {
     /**
      * Evaluate a unary operation on an already-evaluated value.
      */
+    /** The types every arithmetic prefix operator is declared over. */
+    private static final Set<String> PREFIX_NUMERIC_OPERAND = Cols.setOf(
+            "smallint", "integer", "bigint", "numeric", "real", "double precision");
+
     /**
-     * The arithmetic prefix operators are resolved from the operand's declared type just as the
-     * binary ones are, and PostgreSQL has no {@code @ text}: reading the value instead let
-     * {@code @ '-10'::text} answer -10, which is not even the absolute value it was asked for.
+     * An arithmetic prefix operator is resolved from the type its operand is written with, just as
+     * a binary one is resolved from the types on both sides, and only then is a value read. The
+     * operand was being read first and handed back unchanged whenever nothing knew what to do with
+     * it, which answered {@code -'abc'::text} with abc and {@code @ '-10'::text} with -10 -- not
+     * even the absolute value it was asked for. Only a type the query itself writes down counts:
+     * a column's type here is whatever the engine settled on, and refusing an operator on the
+     * strength of that would reject SQL PostgreSQL runs.
      */
-    private void rejectUnaryOperatorOnText(UnaryExpr un, RowContext ctx) {
+    private void rejectUnresolvablePrefixOperator(UnaryExpr un) {
         String symbol;
         switch (un.op()) {
+            case NEGATE: symbol = "-"; break;
+            case POSITIVE: symbol = "+"; break;
             case ABS: symbol = "@"; break;
             case SQRT: symbol = "|/"; break;
             case CBRT: symbol = "||/"; break;
             default: return;
         }
-        if (!(un.operand() instanceof CastExpr)) return;
-        String declared = ((CastExpr) un.operand()).typeName();
-        if (declared == null) return;
-        String t = DataType.canonicalName(declared);
-        if (!"text".equals(t) && !"character varying".equals(t) && !"character".equals(t)
-                && !"name".equals(t) && !"boolean".equals(t)) return;
+        String written = typeWrittenInQuery(un.operand());
+        if (written == null) {
+            // An operand that says nothing about its type leaves the operator to be chosen from
+            // the candidates alone. Every candidate but one is a number, so the numeric one wins
+            // -- except for minus, which also negates an interval, and PostgreSQL will not choose
+            // between the two.
+            if (un.op() == UnaryExpr.UnaryOp.NEGATE && isUnknownConstant(un.operand())) {
+                throw new MemgresException("operator is not unique: - unknown"
+                        + "\n  Hint: Could not choose a best candidate operator."
+                        + " You might need to add explicit type casts.", "42725");
+            }
+            return;
+        }
+        String operand = DataType.canonicalName(written);
+        if (PREFIX_NUMERIC_OPERAND.contains(operand)) return;
+        // Minus is the one prefix operator declared over a span of time as well as over a number,
+        // and a time of day converts to a span implicitly, so it resolves against that one.
+        if (un.op() == UnaryExpr.UnaryOp.NEGATE
+                && ("interval".equals(operand) || "time without time zone".equals(operand))) {
+            return;
+        }
         // The advice follows from the message: an operator written in front of its one operand has
         // one argument to cast, and PostgreSQL says so in the singular.
-        throw new MemgresException("operator does not exist: " + symbol + " " + t, "42883");
+        throw new MemgresException("operator does not exist: " + symbol + " " + operand
+                + "\n  Hint: No operator matches the given name and argument type."
+                + " You might need to add an explicit type cast.", "42883");
     }
 
     Object evalUnaryValue(UnaryExpr.UnaryOp op, Object val) {
@@ -1822,10 +1937,20 @@ class ExprEvaluator {
                 other = innermostElementOperand(other);
             }
             if (resolvable) {
+                BinaryExpr.BinOp op = in.negated()
+                        ? BinaryExpr.BinOp.NOT_EQUAL : BinaryExpr.BinOp.EQUAL;
                 executor.binaryOpEvaluator.rejectUnresolvableOperator(
-                        new BinaryExpr(in.expr(),
-                                in.negated() ? BinaryExpr.BinOp.NOT_EQUAL : BinaryExpr.BinOp.EQUAL,
-                                other), ctx);
+                        new BinaryExpr(in.expr(), op, other), ctx);
+                // Every entry of a written list is resolved against the left-hand side, not just
+                // the first: PostgreSQL settles the whole list on one type before it searches it,
+                // so 1 IN (1, true) is refused rather than answered true by the entry that matched
+                // before the one that could not be compared was reached.
+                if (!in.fromAny()) {
+                    for (int i = 1; i < in.values().size(); i++) {
+                        executor.binaryOpEvaluator.rejectUnresolvableOperator(
+                                new BinaryExpr(in.expr(), op, in.values().get(i)), ctx);
+                    }
+                }
             }
         }
         Object val = evalExpr(in.expr(), ctx);
@@ -1848,20 +1973,24 @@ class ExprEvaluator {
             // select lists and not about the rows, so it is asked ahead of the null answer a null
             // left-hand side would otherwise short-circuit to.
             rejectSubqueryWidth(comparandWidth(in.expr(), val), subResult);
+            // A set with nothing in it settles the answer without comparing anything, so there is
+            // nothing left for a null on the left to be unknown about. Answering unknown first
+            // dropped rows from a WHERE: "x NOT IN (SELECT 1 WHERE false)" kept every row but the
+            // null one, where PostgreSQL keeps them all.
+            if (subResult.getRows().isEmpty()) return in.negated();
             if (val == null) return null; // NULL IN (...) is NULL
             boolean found = false;
             boolean hasNull = false;
             for (Object[] row : subResult.getRows()) {
                 List<?> rowVal = val instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) val).values() : (val instanceof List<?> ? (List<?>) val : null);
                 if (rowVal != null && row.length > 1) {
-                    // Row value IN (multi-column subquery): compare element by element
-                    boolean allMatch = true;
-                    for (int ri = 0; ri < Math.min(rowVal.size(), row.length); ri++) {
-                        Object lv = rowVal.get(ri), rv = row[ri];
-                        if (lv == null || rv == null) { allMatch = false; hasNull = true; break; }
-                        if (!TypeCoercion.areEqual(lv, rv)) { allMatch = false; break; }
-                    }
-                    if (allMatch && rowVal.size() == row.length) { found = true; break; }
+                    // Row value IN (multi-column subquery): the rows are compared as rows, so a
+                    // null member leaves the pair unknown rather than deciding it, and a member
+                    // that differs settles the pair false however many others were unknown.
+                    if (rowVal.size() != row.length) continue;
+                    Object equal = BinaryOpEvaluator.rowEquality(rowVal, Arrays.asList(row), true);
+                    if (equal == null) { hasNull = true; continue; }
+                    if (Boolean.TRUE.equals(equal)) { found = true; break; }
                 } else {
                     Object elem = row.length > 0 ? row[0] : null;
                     if (elem == null) { hasNull = true; continue; }
@@ -1878,6 +2007,7 @@ class ExprEvaluator {
         // reached the entry that was at fault, so 1 IN (1, (SELECT 1, 2)) answered true.
         rejectWideSubqueryElements(in.values());
         rejectRowEntryMismatch(in);
+        val = resolveInListTypes(in, val);
         if (val == null) {
             // "= ANY(<array>)" over an array holding nothing settles the answer without comparing
             // anything, so a null on the left leaves nothing to be unknown about: it is false, and
@@ -1915,6 +2045,21 @@ class ExprEvaluator {
                         throw new MemgresException("operator does not exist: integer = text", "42883");
                     }
                 }
+            }
+            // Written out as IN, a row is compared as a row, so a null member leaves the pair
+            // unknown instead of settling it not-equal. The ANY spelling over an array is not that
+            // comparison: it is the ordinary "=" of the record type, which reads a null as a value
+            // like any other, so ROW(1,NULL) = ANY (ARRAY[ROW(1,2)]) is false rather than unknown.
+            // An array is one value and is not read this way either: two arrays holding a null in
+            // the same place are the same array.
+            if (!in.fromAny() && val instanceof AstExecutor.PgRow && elem instanceof AstExecutor.PgRow
+                    && ((AstExecutor.PgRow) val).values().size()
+                        == ((AstExecutor.PgRow) elem).values().size()) {
+                Object equal = BinaryOpEvaluator.rowEquality(((AstExecutor.PgRow) val).values(),
+                        ((AstExecutor.PgRow) elem).values(), true);
+                if (equal == null) { hasNull = true; continue; }
+                if (Boolean.TRUE.equals(equal)) { found = true; break; }
+                continue;
             }
             // If both val and elem are Lists, compare as row values
             if (val instanceof List<?> && elem instanceof List<?>) {
@@ -1967,16 +2112,43 @@ class ExprEvaluator {
         Object val = evalExpr(bet.expr(), ctx);
         Object low = evalExpr(bet.low(), ctx);
         Object high = evalExpr(bet.high(), ctx);
-        if (val == null || low == null || high == null) return null;
-        boolean inRange;
+        // Being shorthand for that pair of comparisons is the whole of what BETWEEN is, so the two
+        // are joined by the same AND every other pair is: a comparison that came out false settles
+        // the answer whatever the other one did. Answering unknown as soon as any operand was null
+        // made "1 BETWEEN 2 AND NULL" unknown, where 1 is below 2 whatever the upper bound is.
+        Boolean inRange;
         if (bet.symmetric()) {
-            boolean normalRange = compareValues(val, low) >= 0 && compareValues(val, high) <= 0;
-            boolean swappedRange = compareValues(val, high) >= 0 && compareValues(val, low) <= 0;
-            inRange = normalRange || swappedRange;
+            inRange = or3(and3(atLeast(val, low), atMost(val, high)),
+                    and3(atLeast(val, high), atMost(val, low)));
         } else {
-            inRange = compareValues(val, low) >= 0 && compareValues(val, high) <= 0;
+            inRange = and3(atLeast(val, low), atMost(val, high));
         }
-        return bet.negated() ? !inRange : inRange;
+        if (inRange == null) return null;
+        return bet.negated() ? Boolean.valueOf(!inRange.booleanValue()) : inRange;
+    }
+
+    /** {@code a >= b}, unknown where either side is. */
+    private Boolean atLeast(Object a, Object b) {
+        if (a == null || b == null) return null;
+        return Boolean.valueOf(compareValues(a, b) >= 0);
+    }
+
+    /** {@code a <= b}, unknown where either side is. */
+    private Boolean atMost(Object a, Object b) {
+        if (a == null || b == null) return null;
+        return Boolean.valueOf(compareValues(a, b) <= 0);
+    }
+
+    /** AND over the three values, where one false settles it without the other being known. */
+    private static Boolean and3(Boolean a, Boolean b) {
+        if (Boolean.FALSE.equals(a) || Boolean.FALSE.equals(b)) return Boolean.FALSE;
+        return a == null || b == null ? null : Boolean.TRUE;
+    }
+
+    /** OR over the three values, where one true settles it without the other being known. */
+    private static Boolean or3(Boolean a, Boolean b) {
+        if (Boolean.TRUE.equals(a) || Boolean.TRUE.equals(b)) return Boolean.TRUE;
+        return a == null || b == null ? null : Boolean.FALSE;
     }
 
     private Object evalLike(LikeExpr like, RowContext ctx) {
@@ -2127,6 +2299,45 @@ class ExprEvaluator {
                 "CASE types record and text cannot be matched", "42804");
         }
         unifyResultTypes("CASE", caseResultBranches(c));
+        resolveCaseOperandTypes(c);
+    }
+
+    /**
+     * A simple CASE is written as {@code operand = value} for each WHEN, and PostgreSQL settles
+     * both sides of that equality before it compares anything. The operand settles its own type
+     * first -- an operand that says nothing about it is text, not whatever the first WHEN turns
+     * out to be -- and each WHEN value is then read as that type, so a value from another family
+     * has no equality to be tested with and a written-out one that will not read that way is an
+     * input error. Comparing the values as they came out let {@code CASE 1 WHEN 'a'} answer.
+     */
+    private void resolveCaseOperandTypes(CaseExpr c) {
+        if (c.operand() == null) return;
+        String operandType = typeWrittenInQuery(c.operand());
+        if (operandType == null) {
+            if (!isUnknownConstant(c.operand())) return;
+            operandType = "text";
+        }
+        ResultFamily operandFamily = familyOf(operandType);
+        if (operandFamily == null) return;
+        for (CaseExpr.WhenClause when : c.whenClauses()) {
+            Expression value = when.condition();
+            String valueType = typeWrittenInQuery(value);
+            if (valueType == null) {
+                // Reading an unknown as the settled type is what turns a mismatch into an input
+                // error, and only the families memgres reads exactly as PostgreSQL does take part.
+                if (isUntypedStringLiteral(value) && (operandFamily == ResultFamily.NUMERIC
+                        || operandFamily == ResultFamily.BOOLEAN)) {
+                    executor.castValue(((Literal) value).value(), operandType);
+                }
+                continue;
+            }
+            ResultFamily valueFamily = familyOf(valueType);
+            if (valueFamily == null || valueFamily == operandFamily) continue;
+            throw new MemgresException("operator does not exist: " + pgName(operandType) + " = "
+                    + pgName(valueType)
+                    + "\n  Hint: No operator matches the given name and argument types."
+                    + " You might need to add explicit type casts.", "42883");
+        }
     }
 
     // ---- Subquery evaluation ----
@@ -2202,6 +2413,37 @@ class ExprEvaluator {
             }
             if (isWrittenScalar(entry)) throw noRecordOperator(typeNameOf(entry), false);
         }
+    }
+
+    /**
+     * The left side of an IN, read as the type the comparison settles on. Every entry is compared
+     * against the left with the same operator, so PostgreSQL settles one type across the left and
+     * the whole list before it compares anything: an entry written out but not readable as that
+     * type is an error whether or not an earlier entry already matched, and an untyped left is
+     * read as the list's type rather than kept as text. Reading them one pair at a time and
+     * stopping at the first match let {@code 1 IN (1, 'x')} answer true and {@code 'x' IN (1)}
+     * answer false.
+     *
+     * @return the left value, read as the settled type where the query left that open
+     */
+    private Object resolveInListTypes(InExpr in, Object val) {
+        // "= ANY(<array>)" is one value on the right, not a list, and the array settles its own
+        // element type.
+        if (in.fromAny()) return val;
+        String settled = typeWrittenInQuery(in.expr());
+        for (int i = 0; settled == null && i < in.values().size(); i++) {
+            settled = typeWrittenInQuery(in.values().get(i));
+        }
+        // Only the families memgres reads exactly as PostgreSQL does take part: a date or a string
+        // accepts too much for a failure here to mean what PostgreSQL's failure means.
+        ResultFamily family = settled == null ? null : familyOf(settled);
+        if (family != ResultFamily.NUMERIC && family != ResultFamily.BOOLEAN) return val;
+        for (int i = 0; i < in.values().size(); i++) {
+            Expression entry = in.values().get(i);
+            if (isUntypedStringLiteral(entry)) executor.castValue(((Literal) entry).value(), settled);
+        }
+        return isUntypedStringLiteral(in.expr())
+                ? executor.castValue(((Literal) in.expr()).value(), settled) : val;
     }
 
     static void rejectWideSubqueryElements(List<Expression> elements) {
@@ -2436,9 +2678,47 @@ class ExprEvaluator {
         return idx.contains(executor, outerValue);
     }
 
+    /**
+     * The comparison an ANY or ALL makes is the ordinary one between the left side and one value
+     * of the subquery, and PostgreSQL settles both types from the query text before it runs
+     * anything: a subquery hands its answer out as a value of some type, so an unknown in its
+     * select list is text by the time the comparison is built. Waiting for the values meant a
+     * subquery that produced no rows was never checked at all, and one that did was judged by
+     * whether its first value happened to look like a number.
+     */
+    private void resolveAnyAllTypes(AnyAllExpr aa) {
+        String rightType = subqueryOutputType(aa.subquery());
+        if (rightType == null) return;
+        ResultFamily rightFamily = familyOf(rightType);
+        if (rightFamily == null) return;
+        String leftType = typeWrittenInQuery(aa.left());
+        if (leftType == null) {
+            // Reading an unknown left side as the type it is compared against is what turns a
+            // mismatch into an input error, and only the families read exactly as PostgreSQL
+            // reads them take part.
+            if (isUntypedStringLiteral(aa.left()) && (rightFamily == ResultFamily.NUMERIC
+                    || rightFamily == ResultFamily.BOOLEAN)) {
+                executor.castValue(((Literal) aa.left()).value(), rightType);
+            }
+            return;
+        }
+        ResultFamily leftFamily = familyOf(leftType);
+        if (leftFamily == null || leftFamily == rightFamily) return;
+        throw noAnyAllOperator(pgName(leftType), aa.op(), pgName(rightType));
+    }
+
+    /** PostgreSQL's complaint that a comparison has no operator between two types. */
+    private static MemgresException noAnyAllOperator(String leftType, BinaryExpr.BinOp op,
+            String rightType) {
+        return new MemgresException("operator does not exist: " + leftType + " "
+                + BinaryOpEvaluator.opSymbol(op) + " " + rightType
+                + "\n  Hint: No operator matches the given name and argument types."
+                + " You might need to add explicit type casts.", "42883");
+    }
+
     private Object evalAnyAll(AnyAllExpr aa, RowContext ctx) {
+        resolveAnyAllTypes(aa);
         Object leftVal = evalExpr(aa.left(), ctx);
-        if (leftVal == null) return null;
 
         if (ctx != null) executor.outerContextStack.push(ctx);
         QueryResult subResult;
@@ -2448,14 +2728,15 @@ class ExprEvaluator {
             if (ctx != null) executor.outerContextStack.pop();
         }
 
-        // Type check: if left is numeric and subquery returns text, reject
+        // Where the query did not say what the subquery produces, the values it produced are the
+        // only evidence there is: text on the right of an arithmetic comparison with a number on
+        // the left has no operator, whatever else the column may hold.
         if (leftVal instanceof Number && !subResult.getRows().isEmpty()) {
             Object firstElem = subResult.getRows().get(0).length > 0 ? subResult.getRows().get(0)[0] : null;
             if (firstElem instanceof String && !((String) firstElem).isEmpty()) {
                 String s = (String) firstElem;
                 try { new java.math.BigDecimal(s); } catch (NumberFormatException e) {
-                    String leftType = leftVal instanceof Integer ? "integer" : "bigint";
-                    throw new MemgresException("operator does not exist: " + leftType + " " + aa.op().name().toLowerCase().replace("_", " ") + " text", "42883");
+                    throw noAnyAllOperator(AstExecutor.pgTypeNameOf(leftVal), aa.op(), "text");
                 }
             }
         }
@@ -2469,6 +2750,12 @@ class ExprEvaluator {
         // subquery has no comparison to make. Reading only the first column of it answered
         // 1 = ANY (SELECT id, name FROM t) with true.
         rejectSubqueryWidth(written, subResult);
+
+        // A set with nothing in it settles the answer without comparing anything: ALL holds over
+        // nothing and ANY holds over nothing for no value at all, whether or not the left side is
+        // known. Only once something is there to compare against is a null on the left unknown.
+        if (subResult.getRows().isEmpty()) return aa.isAll();
+        if (leftVal == null) return null;
 
         if (aa.isAll()) {
             boolean hasNull = false;
@@ -3065,15 +3352,20 @@ class ExprEvaluator {
     /**
      * The type of the single column a sub-query answers with, or null when it cannot be read.
      *
-     * <p>Typing the target needs the names its own FROM supplies, which is what a shape is for.
-     * Deliberately quiet: a sub-query this cannot describe leaves the type unknown rather than
-     * guessing, and unknown is what the callers already handled.
+     * <p>Typing the target needs the names its own FROM supplies, which is what a shape is for,
+     * and the names the enclosing query supplies after them: a sub-query may read a column of a
+     * relation further out — {@code (SELECT sum(a.v))} is written over the enclosing {@code a} —
+     * and a target whose columns did not resolve was typed from the call's fallback instead of
+     * from what it was called on. Deliberately quiet: a sub-query this cannot describe leaves the
+     * type unknown rather than guessing, and unknown is what the callers already handled.
      */
-    private DataType subqueryColumnType(Statement subquery) {
+    private DataType subqueryColumnType(Statement subquery, List<RowContext.TableBinding> outer) {
         // A set operation answers with the types its first arm writes, so that is where the one
         // column's type is read from. Giving up on it reported the column as text, and ARRAY() over
         // it as an array of text, for a query whose arms are all integers.
-        if (subquery instanceof SetOpStmt) return subqueryColumnType(((SetOpStmt) subquery).left());
+        if (subquery instanceof SetOpStmt) {
+            return subqueryColumnType(((SetOpStmt) subquery).left(), outer);
+        }
         if (!(subquery instanceof SelectStmt)) return null;
         SelectStmt sel = (SelectStmt) subquery;
         if (sel.targets() == null || sel.targets().size() != 1) return null;
@@ -3086,7 +3378,8 @@ class ExprEvaluator {
                 }
             }
             // A star stands for the columns the FROM item exposes, and a sub-query used as a
-            // value has exactly one, so its type is that column's own.
+            // value has exactly one, so its type is that column's own. Only its own: a star
+            // reaches no further out than the FROM it is written against.
             if (target instanceof WildcardExpr) {
                 Column only = null;
                 for (RowContext.TableBinding b : inner) {
@@ -3097,6 +3390,8 @@ class ExprEvaluator {
                 }
                 return only == null ? null : only.getType();
             }
+            // Its own names first, so one both levels supply is read as its own.
+            if (outer != null) inner.addAll(outer);
             return inferTypeFromContext(target, inner);
         } catch (RuntimeException e) {
             return null;
@@ -3722,6 +4017,11 @@ class ExprEvaluator {
         }
         if (expr instanceof ColumnRef) {
             ColumnRef ref = (ColumnRef) expr;
+            // A system column is none of the ones the relation declares, so the loop below never
+            // found it and it fell through to text: a client asked for ctid was told it had read
+            // a string, and every rule downstream that decides on the described type followed.
+            DataType system = SystemColumns.resolve(ref, bindings);
+            if (system != null) return system;
             for (RowContext.TableBinding b : bindings) {
                 if (ref.table() != null) {
                     if (!ref.table().equalsIgnoreCase(b.alias()) &&
@@ -4145,9 +4445,14 @@ class ExprEvaluator {
             // The JSON builders answer in json or jsonb by their own name.
             DataType jsonResult = jsonFunctionResultType(name);
             if (jsonResult != null) return jsonResult;
-            // Check user-defined functions and aggregates for return type
+            // Check user-defined functions and aggregates for return type. A routine of the
+            // database's own is filed under the name it was declared with, and the name of this
+            // call has been folded once already where it was written -- so it is looked up as it
+            // stands. Folding it a second time asked the catalog after a routine it does not
+            // hold, and a call of a quoted name was then described as text whatever it returns.
             if (executor != null && executor.database != null) {
-                PgFunction userFunc = resolveUserFunctionForTyping(name, fn, bindings);
+                String declaredName = FunctionEvaluator.stripSchemaPrefix(fn.name());
+                PgFunction userFunc = resolveUserFunctionForTyping(declaredName, fn, bindings);
                 if (userFunc != null && userFunc.getReturnType() != null) {
                     String declaredReturn = userFunc.getReturnType().replaceAll("\\(.*\\)", "").trim();
                     // SETOF t is a set of t, and a call that expands into rows carries one t per
@@ -4168,7 +4473,7 @@ class ExprEvaluator {
                     DataType dt = DataType.fromPgName(declaredReturn);
                     if (dt != null) return dt;
                 }
-                PgAggregate userAgg = executor.database.getAggregate(name);
+                PgAggregate userAgg = executor.database.getAggregate(declaredName);
                 if (userAgg != null) {
                     // If aggregate has a finalfunc, use its return type
                     String ff = userAgg.getFinalfunc();
@@ -4227,10 +4532,10 @@ class ExprEvaluator {
         // ARRAY(...) has the array of that type. Reporting either as text made the driver decode
         // integers as strings, even though pg_typeof already answered correctly.
         if (expr instanceof SubqueryExpr) {
-            return subqueryColumnType(((SubqueryExpr) expr).subquery());
+            return subqueryColumnType(((SubqueryExpr) expr).subquery(), bindings);
         }
         if (expr instanceof ArraySubqueryExpr) {
-            DataType element = subqueryColumnType(((ArraySubqueryExpr) expr).subquery());
+            DataType element = subqueryColumnType(((ArraySubqueryExpr) expr).subquery(), bindings);
             DataType array = element == null ? null : DataType.arrayOf(element);
             return array != null ? array : DataType.TEXT_ARRAY;
         }
@@ -4574,7 +4879,7 @@ class ExprEvaluator {
     // ---- Result type unification ----
 
     /** The families a branch list can be unified within; PostgreSQL never mixes two of them. */
-    private enum ResultFamily { STRING, NUMERIC, BOOLEAN, DATETIME }
+    private enum ResultFamily { STRING, NUMERIC, BOOLEAN, DATETIME, ARRAY }
 
     /**
      * The type an expression is given by the query text itself -- a cast or a literal -- and
@@ -4593,10 +4898,88 @@ class ExprEvaluator {
                 case INTEGER: return "integer";
                 case FLOAT: return "numeric";
                 case BOOLEAN: return "boolean";
+                case BIT_STRING: return "bit";
                 default: return null;
             }
         }
+        if (expr instanceof ArrayExpr) {
+            String element = arrayElementTypeWritten((ArrayExpr) expr);
+            return element == null ? null : element + "[]";
+        }
+        if (expr instanceof SubqueryExpr) {
+            return subqueryOutputType(((SubqueryExpr) expr).subquery());
+        }
+        if (expr instanceof BinaryExpr) return arithmeticResultTypeWritten((BinaryExpr) expr);
         return null;
+    }
+
+    /**
+     * The element type an array constructor is written with. Every element takes part, because
+     * PostgreSQL settles one element type across the whole constructor before it builds anything;
+     * an element that says nothing about its type is read as the settled one, and a constructor
+     * whose elements all say nothing is an array of text.
+     */
+    private static String arrayElementTypeWritten(ArrayExpr arr) {
+        // A row is not an array: its fields keep their own types rather than settling on one.
+        if (arr.isRow() || arr.elements() == null || arr.elements().isEmpty()) return null;
+        String settled = null;
+        for (Expression element : arr.elements()) {
+            // Only one level: an array of arrays is one value of one type here, and deciding what
+            // that type is takes rules this does not have.
+            if (element instanceof ArrayExpr) return null;
+            String name = typeWrittenInQuery(element);
+            if (name == null) {
+                if (!isUnknownConstant(element)) return null;
+                continue;
+            }
+            ResultFamily family = familyOf(name);
+            if (family == null) return null;
+            if (settled == null) { settled = name; continue; }
+            if (familyOf(settled) != family) return null;
+            if (rankOf(name) > rankOf(settled)) settled = name;
+        }
+        // Nothing in the constructor said what it held, and PostgreSQL reads that as text.
+        return settled != null ? pgName(settled) : "text";
+    }
+
+    /**
+     * The type a scalar subquery is written to produce. Its select list settles it, and an unknown
+     * there is settled too: a subquery hands its answer out as a value of some type, so there is
+     * no unknown left to be read as whatever it is compared against.
+     */
+    private static String subqueryOutputType(Statement subquery) {
+        if (!(subquery instanceof SelectStmt)) return null;
+        SelectStmt stmt = (SelectStmt) subquery;
+        if (stmt.targets() == null || stmt.targets().size() != 1) return null;
+        Expression target = stmt.targets().get(0).expr();
+        String name = typeWrittenInQuery(target);
+        if (name != null) return name;
+        return isUnknownConstant(target) ? "text" : null;
+    }
+
+    /** The type an arithmetic expression is written to produce: the wider of its two operands. */
+    private static String arithmeticResultTypeWritten(BinaryExpr bin) {
+        switch (bin.op()) {
+            case ADD: case SUBTRACT: case MULTIPLY: case DIVIDE: case MODULO: break;
+            default: return null;
+        }
+        String left = typeWrittenInQuery(bin.left());
+        String right = typeWrittenInQuery(bin.right());
+        if (left == null || right == null) return null;
+        if (familyOf(left) != ResultFamily.NUMERIC || familyOf(right) != ResultFamily.NUMERIC) {
+            return null;
+        }
+        return rankOf(right) > rankOf(left) ? right : left;
+    }
+
+    /**
+     * True for a constant that says nothing about its type -- a bare string or a bare NULL -- both
+     * of which PostgreSQL reads as {@code unknown} until something settles what they are.
+     */
+    private static boolean isUnknownConstant(Expression expr) {
+        if (!(expr instanceof Literal)) return false;
+        Literal.LiteralType type = ((Literal) expr).literalType();
+        return type == Literal.LiteralType.STRING || type == Literal.LiteralType.NULL;
     }
 
     /** True for a string literal written without a cast, which is PostgreSQL's {@code unknown}. */
@@ -4639,6 +5022,21 @@ class ExprEvaluator {
                 throw new MemgresException(context + " types " + pgName(ptype) + " and "
                         + pgName(name) + " cannot be matched", "42804");
             }
+            if (family == ResultFamily.ARRAY) {
+                String settledElement = elementOf(ptype);
+                String element = elementOf(name);
+                if (familyOf(element) != familyOf(settledElement)) {
+                    // Two arrays are of one family whatever they hold, so the complaint is not
+                    // that the types cannot be matched but that this one cannot be read as that.
+                    throw new MemgresException(branchLabel(context) + " could not convert type "
+                            + pgName(name) + " to " + pgName(ptype), "42846");
+                }
+                if (rankOf(element) > rankOf(settledElement)) {
+                    ptype = name;
+                    prank = rankOf(element);
+                }
+                continue;
+            }
             int rank = rankOf(name);
             if (rank > prank) {
                 ptype = name;
@@ -4655,6 +5053,20 @@ class ExprEvaluator {
                 executor.castValue(((Literal) branch).value(), ptype);
             }
         }
+    }
+
+    /** The element type of an array type name. */
+    private static String elementOf(String arrayTypeName) {
+        return arrayTypeName.endsWith("[]")
+                ? arrayTypeName.substring(0, arrayTypeName.length() - 2) : arrayTypeName;
+    }
+
+    /**
+     * How PostgreSQL names the construct when it is one branch that will not read as another,
+     * rather than the construct as a whole: a CASE says which part of itself is at fault.
+     */
+    private static String branchLabel(String context) {
+        return "CASE".equals(context) ? "CASE/WHEN" : context;
     }
 
     private static boolean isIntegerValue(Object v) {
@@ -4693,6 +5105,11 @@ class ExprEvaluator {
     /** The family a declared type belongs to, or null when it is one this rule leaves alone. */
     private static ResultFamily familyOf(String typeName) {
         String t = typeName.toLowerCase().trim();
+        // An array is its own family: PostgreSQL matches one array against another by their
+        // element types, and against anything else not at all.
+        if (t.endsWith("[]")) {
+            return familyOf(t.substring(0, t.length() - 2)) == null ? null : ResultFamily.ARRAY;
+        }
         int paren = t.indexOf('(');
         if (paren > 0) t = t.substring(0, paren).trim();
         switch (t) {

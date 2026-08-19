@@ -40,18 +40,21 @@ class SelectSetOpExecutor {
             // Every arm reads the items, so the query PostgreSQL would pull a singly-named item up
             // into is the whole set operation and not the arm the WITH clause was written on.
             executor.fromResolver.noteCteScope(sel.withClauses(), stmt);
-            // Execute left without its own CTE push (it would double-push)
-            SelectStmt stripped = new SelectStmt(sel.distinct(), sel.targets(), sel.from(), sel.where(),
-                    sel.groupBy(), sel.having(), sel.orderBy(), sel.limit(), sel.offset(), null);
-            executor.fromResolver.derivedSetOperation = derivedAs != null;
-            QueryResult leftResult = executor.executeStatement(stripped);
-            executor.fromResolver.derivedRelation = derivedAs;
-            executor.fromResolver.derivedQualification = derivedQuals;
-            executor.fromResolver.derivedColumnAliases = derivedCols;
-            executor.fromResolver.derivedSetOperation = derivedAs != null;
-            QueryResult rightResult = executor.executeStatement(stmt.right());
-            executor.fromResolver.derivedSetOperation = false;
+            // The scope is taken down whatever happens to the arms. Pushing it and only then
+            // entering the block that pops it left the items standing on the connection when an
+            // arm raised, so a later statement of the same session could still read a WITH item
+            // that its own text never declared.
             try {
+                // Execute left without its own CTE push (it would double-push)
+                SelectStmt stripped = sel.withWithClauses(null);
+                executor.fromResolver.derivedSetOperation = derivedAs != null;
+                QueryResult leftResult = executor.executeStatement(stripped);
+                executor.fromResolver.derivedRelation = derivedAs;
+                executor.fromResolver.derivedQualification = derivedQuals;
+                executor.fromResolver.derivedColumnAliases = derivedCols;
+                executor.fromResolver.derivedSetOperation = derivedAs != null;
+                QueryResult rightResult = executor.executeStatement(stmt.right());
+                executor.fromResolver.derivedSetOperation = false;
                 return executeSetOpInner(stmt, leftResult, rightResult);
             } finally {
                 executor.cteStack.pop();

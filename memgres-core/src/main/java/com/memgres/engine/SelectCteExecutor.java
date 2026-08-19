@@ -128,9 +128,9 @@ class SelectCteExecutor {
      * Execute a CTE query and return the result.
      */
     QueryResult executeCte(SelectStmt.CommonTableExpr cte) {
-        String cacheKey = cte.name().toLowerCase();
-        QueryResult cached = executor.cteResultCache.get(cacheKey);
+        QueryResult cached = executor.cteResultCache.get(cte);
         if (cached != null) return cached;
+        String cacheKey = cte.name().toLowerCase();
 
         if (cte.recursive()) detectMutualRecursionCycle(cte, cacheKey);
 
@@ -140,7 +140,7 @@ class SelectCteExecutor {
         // and cut a recursion that is not there, is refused the way PG refuses it.
         if (cte.recursive() && RecursiveCteCheck.selfReferencing(cte)) {
             QueryResult result = executeRecursiveCte(cte);
-            executor.cteResultCache.put(cacheKey, result);
+            executor.cteResultCache.put(cte, result);
             return result;
         }
         if (cte.searchColumn() != null || cte.cycleColumn() != null) {
@@ -184,7 +184,7 @@ class SelectCteExecutor {
             result = QueryResult.select(renamedCols, result.getRows());
         }
 
-        executor.cteResultCache.put(cacheKey, result);
+        executor.cteResultCache.put(cte, result);
         return result;
     }
 
@@ -326,8 +326,7 @@ class SelectCteExecutor {
                         "recursive query exceeded maximum number of rows (" + maxRows + ")", "54001");
             }
             String cteName = cte.name().toLowerCase();
-            Schema targetSchema = executor.database.getOrCreateSchema(executor.defaultSchema());
-            Table previousTable = targetSchema.getTable(cteName);
+            Table previousWorkingSet = executor.recursiveWorkingSets.get(cteName);
 
             if (depthFirstSearch) {
                 // DFS: process one parent row at a time
@@ -349,7 +348,7 @@ class SelectCteExecutor {
 
                     Table singleRowTable = new Table(cteName, columns);
                     singleRowTable.insertRow(parentRow);
-                    targetSchema.addTable(singleRowTable);
+                    executor.recursiveWorkingSets.put(cteName, singleRowTable);
 
                     try {
                         QueryResult iterResult = executor.executeStatement(setOp.right());
@@ -406,8 +405,11 @@ class SelectCteExecutor {
                             newRows.add(row);
                         }
                     } finally {
-                        targetSchema.removeTable(cteName);
-                        if (previousTable != null) targetSchema.addTable(previousTable);
+                        if (previousWorkingSet != null) {
+                            executor.recursiveWorkingSets.put(cteName, previousWorkingSet);
+                        } else {
+                            executor.recursiveWorkingSets.remove(cteName);
+                        }
                     }
                 }
                 workingSet = newRows;
@@ -459,7 +461,7 @@ class SelectCteExecutor {
 
                     Table singleRowTable = new Table(cteName, columns);
                     singleRowTable.insertRow(parentRow);
-                    targetSchema.addTable(singleRowTable);
+                    executor.recursiveWorkingSets.put(cteName, singleRowTable);
 
                     try {
                         QueryResult iterResult = executor.executeStatement(setOp.right());
@@ -513,27 +515,20 @@ class SelectCteExecutor {
                             newRows.add(row);
                         }
                     } finally {
-                        targetSchema.removeTable(cteName);
-                        if (previousTable != null) targetSchema.addTable(previousTable);
-                    }
-                }
-
-                // Fixed-point detection for UNION ALL: if new rows match previous working set exactly,
-                // we've reached a stable state and should terminate (important for mutual recursion)
-                if (isUnionAll && newRows.size() == workingSet.size()) {
-                    boolean stable = true;
-                    for (int ri = 0; ri < newRows.size(); ri++) {
-                        if (!Arrays.deepEquals(newRows.get(ri), workingSet.get(ri))) {
-                            stable = false;
-                            break;
+                        if (previousWorkingSet != null) {
+                            executor.recursiveWorkingSets.put(cteName, previousWorkingSet);
+                        } else {
+                            executor.recursiveWorkingSets.remove(cteName);
                         }
                     }
-                    if (stable) {
-                        workingSet = Collections.emptyList();
-                        continue;
-                    }
                 }
 
+                // UNION ALL stops when a round produces no row, and at nothing else. Stopping
+                // where a round merely repeated the round before was a fixed point the query
+                // never asked for: UNION ALL keeps duplicates, so repeating rows is a recursion
+                // that does not end, and PostgreSQL goes on producing them until the statement is
+                // cancelled. Answering a count instead made an endless query look like a finished
+                // one, with nothing to say the answer was cut short.
                 workingSet = newRows;
                 workingSetCyclePaths = newCyclePaths;
                 workingSetSearchPaths = newSearchPaths;
@@ -667,13 +662,18 @@ class SelectCteExecutor {
                 }
             }
         }
-        String[] added = {cte.searchColumn(), cte.cycleColumn(), cte.cyclePathColumn()};
-        for (String name : added) {
-            if (name != null && indexOfColumn(columns, name) >= 0) {
-                throw new MemgresException(
-                        "column reference \"" + name + "\" is ambiguous", "42702");
-            }
-        }
+        // A column the clause adds under a name the item's query already answers to is a
+        // collision between the two, and PostgreSQL names it as one. Calling every such collision
+        // an ambiguous reference described a consequence that does not always follow, under a
+        // SQLSTATE that says a query wrote something it could not settle.
+        List<String> names = new ArrayList<>();
+        for (Column column : columns) names.add(column.getName());
+        RecursiveCteCheck.rejectAddedColumn(cte, names, cte.searchColumn(),
+                "search sequence column name");
+        RecursiveCteCheck.rejectAddedColumn(cte, names, cte.cycleColumn(),
+                "cycle mark column name");
+        RecursiveCteCheck.rejectAddedColumn(cte, names, cte.cyclePathColumn(),
+                "cycle path column name");
     }
 
     private static int indexOfColumn(List<Column> columns, String name) {

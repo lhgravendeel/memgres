@@ -403,6 +403,8 @@ class FromResolver {
      */
     private QueryResult readCte(SelectStmt.CommonTableExpr cte, String alias,
                                 List<String> columnAliases) {
+        // Refused before the item is computed, so the write it would have applied does not happen.
+        StatementAnalyzer.requireReturning(cte);
         boolean priorApplied = derivedQualificationApplied;
         derivedQualificationApplied = false;
         boolean priorRenamed = derivedRenamesColumns;
@@ -422,7 +424,7 @@ class FromResolver {
                     namesAbove(cte, columnAliases),
                     () -> readCteBody(inlined, unasked, cte));
             if ((derivedQualificationApplied || unasked) && !writesRows(cte.query())) {
-                executor.cteResultCache.remove(cte.name().toLowerCase());
+                executor.cteResultCache.remove(cte);
             }
             return result;
         } finally {
@@ -1798,7 +1800,7 @@ class FromResolver {
             using = FromJoinExecutor.naturalNames(left.output, right.output);
         }
         return new Described(bindings, FromJoinExecutor.shapeOfJoin(
-                left.output, left.bindings.size(), right.output, using).output);
+                left.output, left.bindings.size(), right.output, using, jf.joinType()).output);
     }
 
     private static void addBinding(List<RowContext.TableBinding> bindings, Table table,
@@ -1824,6 +1826,9 @@ class FromResolver {
         for (int i = 0; i < renamed.size(); i++) defined[i] = DefinedTypes.typeIn(table, i);
         exposed.setDefinedColumnTypes(defined);
         exposed.setFunctionResult(table.isFunctionResult());
+        // Renaming the columns for this query level says nothing about where the rows come from,
+        // so a stored relation written under an alias list still has its rows stored.
+        exposed.setStoresRows(table.storesRows());
         return exposed;
     }
 
@@ -2052,6 +2057,7 @@ class FromResolver {
         try {
             List<RowContext> resolved = resolveFromClauseInner(fromItems, where);
             stampCoveredNames(fromItems, resolved);
+            stampJoinedNames(fromItems, resolved);
             return resolved;
         } finally {
             enclosingWhere = priorWhere;
@@ -2087,6 +2093,26 @@ class FromResolver {
         for (RowContext ctx : resolved) ctx.setCoveredNames(covered);
     }
 
+    /**
+     * Tells each row which relations the FROM clause reaches only through a join, so that a system
+     * column written unqualified is not read off one of them.
+     *
+     * <p>A join is one FROM item and exposes one row, made of its sides' ordinary columns. The
+     * system columns are not among them: {@code SELECT ctid FROM a JOIN b ON ...} names nothing,
+     * where over {@code FROM a, b} it names something both sides have and is ambiguous. See
+     * {@code RowContext.joinedNames}.
+     */
+    private static void stampJoinedNames(List<SelectStmt.FromItem> fromItems,
+                                         List<RowContext> resolved) {
+        if (fromItems == null || resolved == null || resolved.isEmpty()) return;
+        Set<String> joined = new LinkedHashSet<>();
+        for (SelectStmt.FromItem item : fromItems) {
+            if (item instanceof SelectStmt.JoinFrom) collectCoveredNames(item, joined);
+        }
+        if (joined.isEmpty()) return;
+        for (RowContext ctx : resolved) ctx.setJoinedNames(joined);
+    }
+
     /** Every relation name written anywhere in a FROM tree, however it was later renamed. */
     static void collectCoveredNames(SelectStmt.FromItem item, Set<String> out) {
         if (item instanceof SelectStmt.JoinFrom) {
@@ -2101,10 +2127,14 @@ class FromResolver {
         }
         // A parenthesized join given an alias is carried as a sub-query over the join itself; the
         // relations under it are written in the query and covered by that alias.
+        //
+        // A sub-SELECT is not that. Its FROM clause belongs to a query of its own and is no part
+        // of this one's range table, so a qualifier naming a relation in it is a relation this
+        // query does not have — missing rather than out of reach.
         if (item instanceof SelectStmt.SubqueryFrom
                 && ((SelectStmt.SubqueryFrom) item).subquery() instanceof SelectStmt) {
             SelectStmt inner = (SelectStmt) ((SelectStmt.SubqueryFrom) item).subquery();
-            if (inner.from() != null) {
+            if (inner.joinExpression() && inner.from() != null) {
                 for (SelectStmt.FromItem f : inner.from()) collectCoveredNames(f, out);
             }
         }
@@ -2369,15 +2399,13 @@ class FromResolver {
             return resolveFromItem(fromItems.get(0));
         }
 
-        // Check if any FROM item is a LATERAL subquery or function call (implicit LATERAL)
+        // A LATERAL subquery or a function call in FROM is run once per row of what stands to its
+        // left. Parentheses do not stop that: an item written inside a join reads what is left of
+        // the whole join, so the clause is resolved item by item whenever one of them holds such
+        // an item anywhere rather than only when one is written at the top of the list.
         boolean hasLateral = false;
         for (SelectStmt.FromItem item : fromItems) {
-            if (item instanceof SelectStmt.SubqueryFrom && ((SelectStmt.SubqueryFrom) item).lateral()) {
-                SelectStmt.SubqueryFrom sqf = (SelectStmt.SubqueryFrom) item;
-                hasLateral = true;
-                break;
-            }
-            if (item instanceof SelectStmt.FunctionFrom) {
+            if (FromJoinExecutor.holdsLateralItem(item)) {
                 hasLateral = true;
                 break;
             }
@@ -2487,6 +2515,23 @@ class FromResolver {
                         // lateral-subquery branch above, which skips it. Padding it with NULLs
                         // instead answered LEFT JOIN LATERAL to a query that did not write one.
                         for (RowContext rightCtx : resolveFunctionItem(funcFrom)) {
+                            newAccumulated.add(joinExecutor.mergeContexts(leftCtx, rightCtx));
+                        }
+                    } finally {
+                        executor.outerContextStack.pop();
+                    }
+                }
+                accumulated = newAccumulated;
+            } else if (accumulated != null && !accumulated.isEmpty()
+                    && FromJoinExecutor.readsNamesOf(fromItem, accumulated.get(0).getBindings())) {
+                // A join written in parentheses whose own lateral item reads a relation standing
+                // to the left of those parentheses. The item is inside the join, so the join is
+                // what has to be resolved once per left row for it to have that row to read.
+                List<RowContext> newAccumulated = new ArrayList<>();
+                for (RowContext leftCtx : accumulated) {
+                    executor.outerContextStack.push(leftCtx);
+                    try {
+                        for (RowContext rightCtx : resolveFromItem(fromItem)) {
                             newAccumulated.add(joinExecutor.mergeContexts(leftCtx, rightCtx));
                         }
                     } finally {
@@ -2766,6 +2811,10 @@ class FromResolver {
             Table virtualTable = new Table(alias,
                     renameColumns(alias, cols, tableRef.columnAliases()));
             renamesColumnsOf(virtualTable, alias, cols, tableRef.columnAliases());
+            // A materialized view keeps its rows where an ordinary view composes them each time it
+            // is read, so its rows sit somewhere and have the system columns that says. See
+            // Table.storesRows.
+            virtualTable.setStoresRows(view.materialized() && view.cachedColumns() != null);
             defineFromView(virtualTable, view);
             lastResolvedRightTable = virtualTable;
             lastResolvedRightAlias = alias;

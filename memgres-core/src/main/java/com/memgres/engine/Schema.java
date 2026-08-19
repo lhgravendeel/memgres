@@ -39,6 +39,9 @@ public class Schema {
 
     public void addTable(Table table) {
         table.setSchemaName(name);
+        // A relation that lives in a schema is one whose rows the database keeps, and keeping them
+        // is what gives them system columns. See Table.storesRows.
+        table.setStoresRows(true);
         tables.put(table.getName(), table);
     }
 

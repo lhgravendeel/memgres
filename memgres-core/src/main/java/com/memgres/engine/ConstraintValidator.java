@@ -2550,6 +2550,7 @@ class ConstraintValidator {
         if (value instanceof InetValue) return "inet";
         if (value instanceof MacaddrValue) return "macaddr";
         if (value instanceof Macaddr8Value) return "macaddr8";
+        if (value instanceof PgTid) return "tid";
         if (value instanceof List) return "integer[]";
         return "text";
     }

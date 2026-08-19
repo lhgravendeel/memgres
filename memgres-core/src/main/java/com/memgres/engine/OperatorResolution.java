@@ -178,6 +178,29 @@ final class OperatorResolution {
     }
 
     /**
+     * The complaint PostgreSQL raises for sorting on a value of this type, or null where the
+     * type can be sorted at all.
+     *
+     * <p>A sort is done by an ordering operator, and {@code <} is the one every sortable type
+     * has. xid and cid have equality and nothing else -- PostgreSQL registers no ordering over
+     * either -- so {@code ORDER BY xmin} is not a sort but a query that cannot be planned, and
+     * memgres sorted the rows by whatever the values happened to compare as.
+     *
+     * <p>Read off the same table the operators themselves are read from, so a type it does not
+     * model is left alone by {@link #refusalFor}'s own judgement rather than by a second list
+     * that would have to be kept in step with it.
+     */
+    static MemgresException noOrderingFor(DataType type) {
+        if (type == null) return null;
+        int oid = type.getOid();
+        if (refusalFor("<", oid, oid, null, null) == null) return null;
+        return new MemgresException(
+                "could not identify an ordering operator for type " + displayName(oid, null)
+                        + "\n  Hint: Use an explicit ordering operator or modify the query.",
+                "42883");
+    }
+
+    /**
      * Whether a missing entry for this type proves anything. A type the table never mentions as an
      * operand is one it does not model, and its absence says nothing.
      */

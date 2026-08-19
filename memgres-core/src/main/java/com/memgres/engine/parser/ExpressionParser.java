@@ -626,6 +626,7 @@ public class ExpressionParser {
             Expression expr = parseExpression();
             boolean desc = false;
             Boolean nullsFirst = null;
+            BinaryExpr.BinOp usingOp = null;
 
             if (matchKeyword("ASC")) { desc = false; }
             else if (matchKeyword("DESC")) { desc = true; }
@@ -637,6 +638,10 @@ public class ExpressionParser {
                     desc = true;
                 }
                 rejectNonOrderingOperator(opTok);
+                // Carried so that the reader that knows what is being sorted can look the operator
+                // up for that type: whether an operator exists at all is a question about the two
+                // operands, which this parser has not got.
+                usingOp = writtenOperator(opTok);
                 // else default ASC for <, and other operators
             }
 
@@ -645,9 +650,31 @@ public class ExpressionParser {
                 else { expectKeyword("LAST"); nullsFirst = false; }
             }
 
-            items.add(new SelectStmt.OrderByItem(expr, desc, nullsFirst));
+            items.add(new SelectStmt.OrderByItem(expr, desc, nullsFirst, usingOp));
         } while (match(TokenType.COMMA));
         return items;
+    }
+
+    /**
+     * The operator a symbol stands for, where the symbol is one this engine knows how to look up
+     * for a pair of operand types; null for anything else, which leaves the sort unjudged rather
+     * than refused.
+     */
+    private static BinaryExpr.BinOp writtenOperator(Token opTok) {
+        switch (opTok.type()) {
+            case TS_MATCH: return BinaryExpr.BinOp.TS_MATCH;
+            case CONTAINS: return BinaryExpr.BinOp.CONTAINS;
+            case CONTAINED_BY: return BinaryExpr.BinOp.CONTAINED_BY;
+            case OVERLAP: return BinaryExpr.BinOp.OVERLAP;
+            case CONCAT: return BinaryExpr.BinOp.CONCAT;
+            case TILDE: return BinaryExpr.BinOp.REGEX_MATCH;
+            case TILDE_STAR: return BinaryExpr.BinOp.REGEX_IMATCH;
+            case EXCL_TILDE: return BinaryExpr.BinOp.NOT_REGEX_MATCH;
+            case EXCL_TILDE_STAR: return BinaryExpr.BinOp.NOT_REGEX_IMATCH;
+            case DOUBLE_TILDE: return BinaryExpr.BinOp.LIKE;
+            case DOUBLE_TILDE_STAR: return BinaryExpr.BinOp.ILIKE;
+            default: return null;
+        }
     }
 
     /**
@@ -943,9 +970,50 @@ public class ExpressionParser {
     }
 
     private Expression parseComparisonOperand() {
-        Expression left = parseOtherOps();
+        Expression left = parsePatternTests(parseOtherOps());
+        return parseComparisonTail(left);
+    }
 
-        // [NOT] IN (...)
+    /**
+     * The IN, BETWEEN, LIKE, ILIKE and SIMILAR TO tests, which bind tighter than a comparison
+     * operator: {@code 1 = 1 IN (1,2)} asks whether 1 equals the answer to {@code 1 IN (1,2)},
+     * which is a boolean, and PostgreSQL refuses it for want of an integer = boolean operator.
+     * Reading them at the same level as = read the comparison first and left the test dangling,
+     * where the select list took the word IN for an output name and threw the test away.
+     */
+    private Expression parsePatternTests(Expression left) {
+        // An IN test ends in a closing parenthesis, so another test may follow it and read its
+        // answer; every other test ends in an expression, and a second test there would be
+        // ambiguous, so PostgreSQL refuses it where the word is written.
+        boolean mayChain = true;
+        while (startsPatternTest()) {
+            if (!mayChain) {
+                throw ParseException.saying("syntax error at or near \"" + peek().value() + "\"",
+                        peek(), "42601");
+            }
+            mayChain = startsInTest();
+            left = parseOnePatternTest(left);
+        }
+        return left;
+    }
+
+    /** Whether an IN, BETWEEN, LIKE, ILIKE, SIMILAR TO or LIKE_REGEX test begins here. */
+    private boolean startsPatternTest() {
+        int at = checkKeyword("NOT") ? 1 : 0;
+        if (checkKeywordAt(at, "IN") || checkKeywordAt(at, "BETWEEN") || checkKeywordAt(at, "LIKE")
+                || checkKeywordAt(at, "ILIKE")) {
+            return true;
+        }
+        if (checkKeywordAt(at, "SIMILAR") && checkKeywordAt(at + 1, "TO")) return true;
+        return at == 0 && checkIdentCI("LIKE_REGEX");
+    }
+
+    /** Whether the test beginning here is an IN or a NOT IN. */
+    private boolean startsInTest() {
+        return checkKeywordAt(checkKeyword("NOT") ? 1 : 0, "IN");
+    }
+
+    private Expression parseOnePatternTest(Expression left) {
         boolean negated = false;
         if (checkKeyword("NOT")) {
             int saved = pos;
@@ -1026,7 +1094,10 @@ public class ExpressionParser {
             left = negated ? new UnaryExpr(UnaryExpr.UnaryOp.NOT, result) : result;
             // Fall through
         }
+        return left;
+    }
 
+    private Expression parseComparisonTail(Expression left) {
         // Comparison operators
         if (match(TokenType.EQUALS)) {
             // Check for = ANY/SOME(...) or = ALL(...)
@@ -1040,7 +1111,11 @@ public class ExpressionParser {
                     Statement subquery = parseSubqueryWithSetOps();
                     consumeTrailingParens(extraParens);
                     expect(TokenType.RIGHT_PAREN);
-                    return new AnyAllExpr(left, BinaryExpr.BinOp.EQUAL, subquery, isAll);
+                    // An ANY or ALL ends in a closing parenthesis, so a comparison may follow it
+                    // and read its answer. Stopping here instead left "= true" for the select list
+                    // to make of what it could, which lost the output name the query gave.
+                    return parseComparisonTail(
+                            new AnyAllExpr(left, BinaryExpr.BinOp.EQUAL, subquery, isAll));
                 }
                 Expression arrayExpr = parseExpression();
                 expect(TokenType.RIGHT_PAREN);
@@ -1050,24 +1125,27 @@ public class ExpressionParser {
                     // comparison but not the same construct, and a one-element IN forbids things
                     // a one-element ANY allows.
                     ArrayExpr arr = (ArrayExpr) arrayExpr;
-                    return new InExpr(left, arr.elements(), false, true);
+                    return parseComparisonTail(new InExpr(left, arr.elements(), false, true));
                 }
                 // ANY/ALL with array expression: evaluate element by element
                 if (!isAll) {
                     // = ANY(array_expr) → treated as IN with the array elements
-                    return new InExpr(left, Cols.listOf(arrayExpr), false, true);
+                    return parseComparisonTail(
+                            new InExpr(left, Cols.listOf(arrayExpr), false, true));
                 }
                 // = ALL(array_expr) → all elements must satisfy the comparison
-                return new AnyAllArrayExpr(left, BinaryExpr.BinOp.EQUAL, arrayExpr, true);
+                return parseComparisonTail(
+                        new AnyAllArrayExpr(left, BinaryExpr.BinOp.EQUAL, arrayExpr, true));
             }
             checkNotBooleanConnective(); // val = AND → syntax error
-            return nonAssociative(new BinaryExpr(left, BinaryExpr.BinOp.EQUAL, parseOtherOps()));
+            return nonAssociative(new BinaryExpr(left, BinaryExpr.BinOp.EQUAL,
+                    parsePatternTests(parseOtherOps())));
         }
-        if (match(TokenType.NOT_EQUALS)) return nonAssociative(parseComparisonRhs(left, BinaryExpr.BinOp.NOT_EQUAL));
-        if (match(TokenType.LESS_THAN)) return nonAssociative(parseComparisonRhs(left, BinaryExpr.BinOp.LESS_THAN));
-        if (match(TokenType.GREATER_THAN)) return nonAssociative(parseComparisonRhs(left, BinaryExpr.BinOp.GREATER_THAN));
-        if (match(TokenType.LESS_EQUALS)) return nonAssociative(parseComparisonRhs(left, BinaryExpr.BinOp.LESS_EQUAL));
-        if (match(TokenType.GREATER_EQUALS)) return nonAssociative(parseComparisonRhs(left, BinaryExpr.BinOp.GREATER_EQUAL));
+        if (match(TokenType.NOT_EQUALS)) return nonAssociative(parseComparisonRhs(left, BinaryExpr.BinOp.NOT_EQUAL, true));
+        if (match(TokenType.LESS_THAN)) return nonAssociative(parseComparisonRhs(left, BinaryExpr.BinOp.LESS_THAN, true));
+        if (match(TokenType.GREATER_THAN)) return nonAssociative(parseComparisonRhs(left, BinaryExpr.BinOp.GREATER_THAN, true));
+        if (match(TokenType.LESS_EQUALS)) return nonAssociative(parseComparisonRhs(left, BinaryExpr.BinOp.LESS_EQUAL, true));
+        if (match(TokenType.GREATER_EQUALS)) return nonAssociative(parseComparisonRhs(left, BinaryExpr.BinOp.GREATER_EQUAL, true));
 
         // Array/JSON operators
         if (match(TokenType.CONTAINS)) return new BinaryExpr(left, BinaryExpr.BinOp.CONTAINS, parseOtherOps());
@@ -1151,6 +1229,15 @@ public class ExpressionParser {
     }
 
     private Expression parseComparisonRhs(Expression left, BinaryExpr.BinOp op) {
+        return parseComparisonRhs(left, op, false);
+    }
+
+    /**
+     * @param patternTests whether the right-hand side may itself be an IN, BETWEEN or LIKE test.
+     *     It may after a comparison operator, which binds looser than those; it may not after one
+     *     of the operator-level spellings such as ~ or ~~, which bind tighter.
+     */
+    private Expression parseComparisonRhs(Expression left, BinaryExpr.BinOp op, boolean patternTests) {
         if (checkKeyword("ANY") || checkKeyword("SOME") || checkKeyword("ALL")) {
             boolean isAll = checkKeyword("ALL");
             advance(); // consume ANY/SOME/ALL
@@ -1168,7 +1255,8 @@ public class ExpressionParser {
             expect(TokenType.RIGHT_PAREN);
             return new AnyAllArrayExpr(left, op, arrayExpr, isAll);
         }
-        return new BinaryExpr(left, op, parseOtherOps());
+        Expression right = parseOtherOps();
+        return new BinaryExpr(left, op, patternTests ? parsePatternTests(right) : right);
     }
 
     /**
@@ -1753,11 +1841,11 @@ public class ExpressionParser {
                         expect(TokenType.LEFT_PAREN);
                         if (check(TokenType.RIGHT_PAREN)) {
                             advance();
-                            return new ArrayExpr(Cols.listOf(), true);
+                            return new ArrayExpr(Cols.listOf(), true, true);
                         }
                         List<Expression> elements = parseExpressionList();
                         expect(TokenType.RIGHT_PAREN);
-                        return new ArrayExpr(elements, true);
+                        return new ArrayExpr(elements, true, true);
                     }
                     advance();
                     return new ColumnRef("row");
@@ -2014,6 +2102,8 @@ public class ExpressionParser {
     private Expression parseFunctionCallExpr(String name) {
         advance(); // consume (
 
+        if ("grouping".equalsIgnoreCase(name)) return parseGroupingExpr(name);
+
         boolean isStar = false;
         boolean distinct = false;
         boolean ignoreNulls = false;
@@ -2031,8 +2121,23 @@ public class ExpressionParser {
             advance();
             args = Cols.listOf();
         } else {
-            // DISTINCT in aggregates
+            // ALL is the other half of DISTINCT and belongs to every call, aggregate or not:
+            // the grammar writes an argument list as "[ ALL | DISTINCT ] expr, ...", so
+            // abs(ALL -1) is abs(-1) and count(ALL v) is count(v). Reading only DISTINCT left ALL
+            // to be parsed as an expression, which made it a column of that name.
             distinct = matchKeyword("DISTINCT");
+            boolean all = !distinct && matchKeyword("ALL");
+            if (distinct || all) {
+                // One of the two, and then arguments: a star is not an argument list, and the
+                // other word is not the start of one either.
+                if (check(TokenType.STAR)) {
+                    throw new ParseException("syntax error at or near \"*\"", peek());
+                }
+                if (checkKeyword("DISTINCT") || checkKeyword("ALL")) {
+                    throw new ParseException(
+                            "syntax error at or near \"" + peek().value() + "\"", peek());
+                }
+            }
             args = parseFunctionArgList();
             // Check for ORDER BY inside aggregate: string_agg(expr, delim ORDER BY ...)
             if (checkKeyword("ORDER")) {
@@ -2070,6 +2175,20 @@ public class ExpressionParser {
             }
         }
 
+        // What may follow a call is WITHIN GROUP, then FILTER, then OVER — in that order, because
+        // that is the order the grammar writes them in. Reading FILTER first made the FILTER an
+        // ordered-set aggregate is entitled to, written where it goes, a syntax error.
+        List<SelectStmt.OrderByItem> withinOrderBy = null;
+        if (checkKeyword("WITHIN")) {
+            advance(); // WITHIN
+            expectKeyword("GROUP");
+            expect(TokenType.LEFT_PAREN);
+            expectKeyword("ORDER");
+            expectKeyword("BY");
+            withinOrderBy = parseOrderByList();
+            expect(TokenType.RIGHT_PAREN);
+        }
+
         // Check for FILTER (WHERE ...) clause on aggregates
         Expression filter = null;
         if (checkKeyword("FILTER")) {
@@ -2080,20 +2199,12 @@ public class ExpressionParser {
             expect(TokenType.RIGHT_PAREN);
         }
 
-        // Check for WITHIN GROUP (ORDER BY ...): ordered-set aggregate
-        if (checkKeyword("WITHIN")) {
-            advance(); // WITHIN
-            expectKeyword("GROUP");
-            expect(TokenType.LEFT_PAREN);
-            expectKeyword("ORDER");
-            expectKeyword("BY");
-            List<SelectStmt.OrderByItem> withinOrderBy = parseOrderByList();
-            expect(TokenType.RIGHT_PAREN);
+        if (withinOrderBy != null) {
             if (checkKeyword("OVER")) {
                 throw new MemgresException("OVER is not supported for ordered-set aggregate "
                         + name.toLowerCase(), "0A000");
             }
-            return new OrderedSetAggExpr(name.toLowerCase(), args, withinOrderBy);
+            return new OrderedSetAggExpr(name.toLowerCase(), args, withinOrderBy, filter);
         }
 
         // Check for OVER clause: window function
@@ -2120,6 +2231,26 @@ public class ExpressionParser {
         }
         if (isStar) return new FunctionCallExpr(name, args, false, true);
         return new FunctionCallExpr(name, args, distinct, false);
+    }
+
+    /**
+     * GROUPING is a production of the grammar in its own right — {@code GROUPING ( expr, ... )} —
+     * rather than a function that happens to be spelled that way. It takes at least one argument,
+     * takes neither DISTINCT nor ALL, and admits nothing after its closing parenthesis. Reading it
+     * as an ordinary call let {@code grouping()} answer 0 and let OVER, FILTER and WITHIN GROUP be
+     * written after it, none of which the grammar has anywhere to put.
+     */
+    private Expression parseGroupingExpr(String name) {
+        if (check(TokenType.RIGHT_PAREN) || check(TokenType.STAR)
+                || checkKeyword("DISTINCT") || checkKeyword("ALL")) {
+            throw new ParseException("syntax error at or near \"" + peek().value() + "\"", peek());
+        }
+        List<Expression> args = parseFunctionArgList();
+        expect(TokenType.RIGHT_PAREN);
+        if (checkKeyword("WITHIN") || checkKeyword("FILTER") || checkKeyword("OVER")) {
+            throw new ParseException("syntax error at or near \"" + peek().value() + "\"", peek());
+        }
+        return new FunctionCallExpr(name, args, false, false);
     }
 
     /** Forwarding method for SelectParser; delegates to ExprSpecialFormParser. */

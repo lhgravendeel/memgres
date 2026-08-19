@@ -181,6 +181,7 @@ final class StatementAnalyzer {
                         new HashMap<String, SelectStmt.CommonTableExpr>(ctes);
                 inner.put(cte.name().toLowerCase(), cte);
                 analyze(cte.query(), inner);
+                checkSearchAndCycleNames(cte, inner);
             }
         }
         // A WITH item is read before anything that reads from it, so a keyword misplaced in
@@ -293,6 +294,7 @@ final class StatementAnalyzer {
             SelectStmt.CommonTableExpr cte = ref.schema() == null
                     ? ctes.get(ref.table().toLowerCase()) : null;
             if (cte != null) {
+                requireReturning(cte);
                 List<String> columns =
                         renamedOrRefuse(cteColumns(cte, ctes), ref.columnAliases(), item);
                 if (columns == null) return opaque();
@@ -336,6 +338,12 @@ final class StatementAnalyzer {
             SelectStmt.JoinFrom join = (SelectStmt.JoinFrom) item;
             boolean left = collectFrom(join.left, ctes, relations);
             boolean right = collectFrom(join.right, ctes, relations);
+            // A named USING clause is one more relation the query answers to, and its columns are
+            // the ones the clause merged and nothing else -- so j.x is a column j has not got
+            // rather than a relation the query has not got.
+            if (join.usingAlias() != null && join.using() != null) {
+                relations.add(queryRelation(join.usingAlias(), null, join.using(), ""));
+            }
             return left && right;
         }
         if (item instanceof SelectStmt.SubqueryFrom) {
@@ -638,6 +646,76 @@ final class StatementAnalyzer {
         if (cte.cycleColumn() != null) all.add(cte.cycleColumn());
         if (cte.cyclePathColumn() != null) all.add(cte.cyclePathColumn());
         return all;
+    }
+
+    /**
+     * A WITH item that writes answers with rows only if it was asked to.
+     *
+     * <p>A statement that writes has no result of its own; RETURNING is what gives it one. So a
+     * query reading from a WITH item that writes without RETURNING is asking for rows that were
+     * never produced, and PostgreSQL refuses it rather than handing back a relation of no columns
+     * — and refuses it while analysing, so the write does not happen either. Answering with an
+     * empty relation instead let the write take effect under a query PG would not have run.
+     */
+    static void requireReturning(SelectStmt.CommonTableExpr cte) {
+        Statement query = cte.query();
+        List<SelectStmt.SelectTarget> returning;
+        if (query instanceof InsertStmt) returning = ((InsertStmt) query).returning();
+        else if (query instanceof UpdateStmt) returning = ((UpdateStmt) query).returning();
+        else if (query instanceof DeleteStmt) returning = ((DeleteStmt) query).returning();
+        else if (query instanceof MergeStmt) returning = ((MergeStmt) query).returning();
+        else return;
+        if (returning == null || returning.isEmpty()) {
+            throw new MemgresException("WITH query \"" + cte.name()
+                    + "\" does not have a RETURNING clause", "0A000");
+        }
+    }
+
+    /**
+     * What SEARCH and CYCLE named, against the columns the WITH item itself has.
+     *
+     * <p>PostgreSQL settles this while it analyses the statement, so an item carrying a SEARCH or
+     * CYCLE clause is held to it whether or not the query goes on to read the item. Running the
+     * checks only from the item's own execution let an unread item say nothing at all — the
+     * statement answered, and the clause that could not have worked went unmentioned.
+     */
+    private void checkSearchAndCycleNames(SelectStmt.CommonTableExpr cte,
+                                          Map<String, SelectStmt.CommonTableExpr> ctes) {
+        if (cte.searchColumn() == null && cte.cycleColumn() == null) return;
+        List<String> columns = queryColumnsOf(cte, ctes);
+        if (cte.columnNames() != null && !cte.columnNames().isEmpty()) {
+            int written = columns != null ? columns.size() : SelectStmt.writtenWidth(cte.query());
+            if (written != cte.columnNames().size()) return;
+            columns = cte.columnNames();
+        }
+        if (columns == null) return;
+        rejectMissingColumn(columns, cte.searchByColumns(), "search");
+        RecursiveCteCheck.rejectAddedColumn(cte, columns, cte.searchColumn(),
+                "search sequence column name");
+        rejectMissingColumn(columns, cte.cycleByColumns(), "cycle");
+        RecursiveCteCheck.rejectAddedColumn(cte, columns, cte.cycleColumn(),
+                "cycle mark column name");
+        RecursiveCteCheck.rejectAddedColumn(cte, columns, cte.cyclePathColumn(),
+                "cycle path column name");
+    }
+
+    /** A SEARCH BY or CYCLE list may only name columns the WITH item has. */
+    private static void rejectMissingColumn(List<String> columns, List<String> named,
+                                            String clause) {
+        if (named == null) return;
+        for (String by : named) {
+            if (!holdsColumn(columns, by)) {
+                throw new MemgresException(
+                        clause + " column \"" + by + "\" not in WITH query column list", "42601");
+            }
+        }
+    }
+
+    private static boolean holdsColumn(List<String> columns, String name) {
+        for (String column : columns) {
+            if (column != null && column.equalsIgnoreCase(name)) return true;
+        }
+        return false;
     }
 
     /** The columns the query a WITH item was written as answers with. */
@@ -1122,6 +1200,7 @@ final class StatementAnalyzer {
                 // into, which this analyzer does not do, so it says nothing past one.
                 if (item.expr() instanceof Literal) { sortable = false; break; }
                 if (item.expr() != null) toCheck.add(item.expr());
+                rejectSortOperatorWithNoEntry(item);
             }
         }
         if (sortable && sel.groupBy() != null) toCheck.addAll(sel.groupBy());
@@ -1129,6 +1208,29 @@ final class StatementAnalyzer {
             if (!checkColumnsIn(e, known, ctes)) break;
         }
         scopes.remove(scopes.size() - 1);
+    }
+
+    /**
+     * An ordering operator has to be an operator at all before it has to order, and the two are
+     * different complaints: {@code ORDER BY a USING @@} over an integer is refused because nothing
+     * defines {@code @@} for two integers, while over text it is refused because {@code @@} orders
+     * nothing. The parser cannot tell them apart, having no idea what is being sorted, so the
+     * question is asked here, where the relations the sort reads from are known. Left unasked, the
+     * operator was consumed and the rows came back in ascending order.
+     *
+     * <p>Only the operators spelled as symbols reach this, and none of them is a {@code <} or
+     * {@code >} member of a btree operator family for any type, so an operator that does exist has
+     * still not got the one property a sort asks of it.
+     */
+    private void rejectSortOperatorWithNoEntry(SelectStmt.OrderByItem item) {
+        BinaryExpr.BinOp op = item.usingOperator();
+        if (op == null || item.expr() == null) return;
+        executor.binaryOpEvaluator.rejectUnresolvableOperator(
+                new BinaryExpr(item.expr(), op, item.expr()), new RowContext(inScope()));
+        MemgresException e = new MemgresException("operator "
+                + BinaryOpEvaluator.spellingOf(op) + " is not a valid ordering operator", "42809");
+        e.setHint("Ordering operators must be \"<\" or \">\" members of btree operator families.");
+        throw e;
     }
 
     /**

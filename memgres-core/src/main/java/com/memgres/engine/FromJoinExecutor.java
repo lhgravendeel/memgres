@@ -37,6 +37,8 @@ class FromJoinExecutor {
         final RowContext.OutCol right;  // read against the right side's own bindings
         /** The one type both sides are read as, or null when they already share one. */
         DataType common;
+        /** Whether either side is declared {@code character(n)}, whose padding is not compared. */
+        boolean blankPadded;
 
         UsingKey(String name, RowContext.OutCol left, RowContext.OutCol right) {
             this.name = name;
@@ -73,9 +75,18 @@ class FromJoinExecutor {
      * table}, none is {@code 42703 column "x" specified in USING clause does not exist in left
      * table}, and the same of the right; the name is matched as written, so a quoted {@code "ID"}
      * does not find a column named {@code id}.
+     *
+     * <p>A merged column answers with whichever side is not null, and which side it asks first
+     * decides what a row that matched answers with — the two are equal but need not be written
+     * alike, so a numeric 1.0 merged with a numeric 1.00 exposes one or the other. PostgreSQL
+     * asks the left side first everywhere but a RIGHT join, which asks the right; that is the
+     * side whose rows are all kept, and the merged column is the one column of it that survives.
      */
     static JoinShape shapeOfJoin(List<RowContext.OutCol> leftOut, int leftBindingCount,
-                                 List<RowContext.OutCol> rightOut, List<String> using) {
+                                 List<RowContext.OutCol> rightOut, List<String> using,
+                                 SelectStmt.JoinType joinType) {
+        boolean rightFirst = joinType == SelectStmt.JoinType.RIGHT
+                || joinType == SelectStmt.JoinType.NATURAL_RIGHT;
         List<RowContext.OutCol> shiftedRight = new ArrayList<>(rightOut.size());
         for (RowContext.OutCol oc : rightOut) shiftedRight.add(oc.shift(leftBindingCount));
         if (using == null || using.isEmpty()) {
@@ -98,11 +109,13 @@ class FromJoinExecutor {
             keys.add(new UsingKey(name, l, r));
             int[] b = new int[l.bindings.length + r.bindings.length];
             int[] c = new int[b.length];
-            System.arraycopy(l.bindings, 0, b, 0, l.bindings.length);
-            System.arraycopy(l.columns, 0, c, 0, l.columns.length);
+            int lAt = rightFirst ? r.bindings.length : 0;
+            int rAt = rightFirst ? 0 : l.bindings.length;
+            System.arraycopy(l.bindings, 0, b, lAt, l.bindings.length);
+            System.arraycopy(l.columns, 0, c, lAt, l.columns.length);
             for (int i = 0; i < r.bindings.length; i++) {
-                b[l.bindings.length + i] = r.bindings[i] + leftBindingCount;
-                c[l.columns.length + i] = r.columns[i];
+                b[rAt + i] = r.bindings[i] + leftBindingCount;
+                c[rAt + i] = r.columns[i];
             }
             merged.add(new RowContext.OutCol(l.name, b, c));
         }
@@ -189,8 +202,20 @@ class FromJoinExecutor {
             return executeFunctionLateralJoin(join, leftContexts);
         }
 
-        List<RowContext> rightContexts = resolveArm(join, join.right(), false);
+        // A parenthesised join whose own LATERAL item reaches past the parentheses is resolved
+        // once per left row, with that row in scope, the way a lateral written at the top of the
+        // join already is.
+        if (join.right() instanceof SelectStmt.JoinFrom && !leftContexts.isEmpty()
+                && readsNamesOf(join.right(), leftContexts.get(0).getBindings())) {
+            return executeCorrelatedArmJoin(join, leftContexts);
+        }
 
+        return joinRows(join, leftContexts, resolveArm(join, join.right(), false));
+    }
+
+    /** One join of two already-resolved sides. */
+    private List<RowContext> joinRows(SelectStmt.JoinFrom join, List<RowContext> leftContexts,
+                                      List<RowContext> rightContexts) {
         // The names each side answers to, whether or not it produced a row. An outer join pads
         // the missing side with NULLs and those rows still carry that side's aliases.
         List<RowContext.TableBinding> leftShape = shapeOf(join.left(), leftContexts);
@@ -204,7 +229,7 @@ class FromJoinExecutor {
 
         List<String> using = join.using();
         if (isNatural(join.joinType())) using = naturalNames(leftOut, rightOut);
-        JoinShape shape = shapeOfJoin(leftOut, leftShape.size(), rightOut, using);
+        JoinShape shape = shapeOfJoin(leftOut, leftShape.size(), rightOut, using, join.joinType());
         List<UsingKey> keys = shape.keys;
         rejectUnequatableUsingTypes(keys, leftShape, rightShape);
         resolveMergedTypes(shape, leftShape, rightShape);
@@ -234,7 +259,39 @@ class FromJoinExecutor {
             default:
                 throw new IllegalStateException("Unknown join type: " + join.joinType());
         }
+        if (join.usingAlias() != null && shape.keys != null) {
+            nameTheMergedColumns(rows, shape, leftShape, rightShape, join.usingAlias());
+        }
         return describe(rows, shape.output, using);
+    }
+
+    /**
+     * A USING clause given a name answers with the merged columns and nothing else, so the name is
+     * one more relation standing on the row: its columns are the ones USING named, in the order it
+     * named them, and each answers what the merged column answers. The relations behind it are not
+     * hidden -- {@code a JOIN b USING (id) AS j} leaves {@code a.x} readable -- and what the join
+     * itself exposes is unchanged, so {@code *} still answers as it did without the name.
+     */
+    private void nameTheMergedColumns(List<RowContext> rows, JoinShape shape,
+                                      List<RowContext.TableBinding> leftShape,
+                                      List<RowContext.TableBinding> rightShape, String alias) {
+        List<Column> columns = new ArrayList<>(shape.keys.size());
+        for (int i = 0; i < shape.keys.size(); i++) {
+            UsingKey key = shape.keys.get(i);
+            DataType type = shape.output.get(i).type;
+            if (type == null) type = declaredType(key.left, leftShape);
+            if (type == null) type = declaredType(key.right, rightShape);
+            columns.add(new Column(key.name, type == null ? DataType.TEXT : type,
+                    true, false, null));
+        }
+        Table named = new Table(alias, columns);
+        for (RowContext ctx : rows) {
+            Object[] values = new Object[columns.size()];
+            for (int i = 0; i < values.length; i++) {
+                values[i] = shape.output.get(i).valueIn(ctx.getBindings());
+            }
+            ctx.addBinding(new RowContext.TableBinding(named, alias, values));
+        }
     }
 
     /**
@@ -301,8 +358,12 @@ class FromJoinExecutor {
         if (shape.keys == null) return;
         for (int i = 0; i < shape.keys.size() && i < shape.output.size(); i++) {
             UsingKey key = shape.keys.get(i);
-            DataType common = commonNumericType(declaredType(key.left, leftShape),
-                    declaredType(key.right, rightShape));
+            DataType leftType = declaredType(key.left, leftShape);
+            DataType rightType = declaredType(key.right, rightShape);
+            // A character(n) is compared without the blanks it was padded out to, whatever the
+            // other side is declared, so char(3) 'a' and char(6) 'a' are the same key.
+            key.blankPadded = leftType == DataType.CHAR || rightType == DataType.CHAR;
+            DataType common = commonNumericType(leftType, rightType);
             if (common == null) continue;
             key.common = common;
             shape.output.set(i, shape.output.get(i).withType(common));
@@ -403,6 +464,91 @@ class FromJoinExecutor {
      * condition does not filter the side it preserves — the rows that fail it are still answered
      * with, padded — so it only reaches the arm that may be padded away.
      */
+    /**
+     * Whether the arm to the right of a join holds a LATERAL item that reads a name the arm to
+     * its left supplies.
+     *
+     * <p>Parentheses do not stop a lateral reference. In
+     * {@code a JOIN (b JOIN LATERAL (SELECT a.v + b.w) s ON true) ON a.id = b.id} the item reads
+     * both {@code a} and {@code b}, and only {@code b} stands inside the parentheses with it.
+     * The right arm was resolved once and on its own, so {@code a} was a relation nothing named
+     * and the whole query was refused — while the same item written at the top of the join, where
+     * the lateral path already runs it once per left row, answered.
+     *
+     * <p>Only what a lateral item reads counts. An ordinary arm may not reach outside itself at
+     * all, and a reference from one that tried is a refusal PostgreSQL gives and this must go on
+     * giving.
+     */
+    static boolean readsNamesOf(SelectStmt.FromItem item, List<RowContext.TableBinding> leftBindings) {
+        if (leftBindings == null || leftBindings.isEmpty()) return false;
+        List<SelectStmt.FromItem> lateralItems = new ArrayList<>();
+        collectLateralItems(item, lateralItems);
+        for (SelectStmt.FromItem lateral : lateralItems) {
+            if (AstWalk.anyMatch(lateral, node -> node instanceof ColumnRef
+                    && namesALeftRelation((ColumnRef) node, leftBindings))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Whether a FROM item holds, at any depth, an item run once per row of what stands beside it. */
+    static boolean holdsLateralItem(SelectStmt.FromItem item) {
+        List<SelectStmt.FromItem> found = new ArrayList<>();
+        collectLateralItems(item, found);
+        return !found.isEmpty();
+    }
+
+    /** The items inside a FROM tree that are run once per row of what stands beside them. */
+    private static void collectLateralItems(SelectStmt.FromItem item, List<SelectStmt.FromItem> out) {
+        if (item instanceof SelectStmt.JoinFrom) {
+            collectLateralItems(((SelectStmt.JoinFrom) item).left(), out);
+            collectLateralItems(((SelectStmt.JoinFrom) item).right(), out);
+            return;
+        }
+        if (item instanceof SelectStmt.FunctionFrom) out.add(item);
+        if (item instanceof SelectStmt.SubqueryFrom && ((SelectStmt.SubqueryFrom) item).lateral()) {
+            out.add(item);
+        }
+    }
+
+    /** Whether a column reference names one of the relations the left arm supplies. */
+    private static boolean namesALeftRelation(ColumnRef ref, List<RowContext.TableBinding> leftBindings) {
+        for (RowContext.TableBinding b : leftBindings) {
+            if (ref.table() != null) {
+                if (ref.table().equalsIgnoreCase(b.alias())
+                        || (b.table() != null && ref.table().equalsIgnoreCase(b.table().getName()))) {
+                    return true;
+                }
+            } else if (b.table() != null && b.table().getColumnIndex(ref.column()) >= 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * A join whose right arm reads the left arm's names: the arm is resolved again for each left
+     * row, with that row in scope, and each left row is joined to what its own resolution
+     * produced. Every row the arm holds is therefore a row that left row could reach, which is
+     * why the pairing is made one left row at a time rather than over the arm as a whole.
+     */
+    private List<RowContext> executeCorrelatedArmJoin(SelectStmt.JoinFrom join,
+                                                      List<RowContext> leftContexts) {
+        List<RowContext> results = new ArrayList<>();
+        for (RowContext leftCtx : leftContexts) {
+            List<RowContext> rightContexts;
+            executor.outerContextStack.push(leftCtx);
+            try {
+                rightContexts = resolveArm(join, join.right(), false);
+            } finally {
+                executor.outerContextStack.pop();
+            }
+            results.addAll(joinRows(join, Cols.listOf(leftCtx), rightContexts));
+        }
+        return results;
+    }
+
     private List<RowContext> resolveArm(SelectStmt.JoinFrom join, SelectStmt.FromItem arm,
                                         boolean leftArm) {
         Expression qual = qualReaching(join, leftArm);
@@ -558,76 +704,15 @@ class FromJoinExecutor {
 
     private List<RowContext> executeInnerJoin(List<RowContext> left, List<RowContext> right,
                                                Expression on, List<UsingKey> keys, int leftWidth) {
-        // Try hash join for large datasets
-        if (on != null && keys == null && left.size() > 0 && right.size() > 0
-                && (long) left.size() * right.size() > 1000) {
-            List<ColumnRef[]> equiKeys = extractEquiJoinKeys(on, left, right);
-            if (equiKeys != null && !equiKeys.isEmpty()) {
-                return executeHashInnerJoin(left, right, on, equiKeys);
-            }
-        }
-        if (keys != null && left.size() > 0 && right.size() > 0
-                && (long) left.size() * right.size() > 1000) {
-            return executeHashInnerJoinUsing(left, right, keys);
-        }
-        // Nested loop fallback
+        RightCandidates candidates = candidatesFor(left, right, on, keys);
         List<RowContext> result = new ArrayList<>();
         for (RowContext l : left) {
-            for (RowContext r : right) {
+            for (RowContext r : candidates.forLeft(l)) {
                 if (!matchesUsingKeys(l, r, keys)) continue;
                 RowContext merged = mergeContexts(l, r);
                 if (on == null || joinConditionHolds(on, merged)) {
                     result.add(merged);
                 }
-            }
-        }
-        return result;
-    }
-
-    private List<RowContext> executeHashInnerJoin(List<RowContext> left, List<RowContext> right,
-                                                   Expression on, List<ColumnRef[]> equiKeys) {
-        Map<String, List<RowContext>> rightIndex = new HashMap<>();
-        for (RowContext r : right) {
-            String key = toJoinKey(equiKeys, r, false);
-            if (key != null) {
-                rightIndex.computeIfAbsent(key, k -> new ArrayList<>()).add(r);
-            }
-        }
-
-        List<RowContext> result = new ArrayList<>();
-        for (RowContext l : left) {
-            String key = toJoinKey(equiKeys, l, true);
-            if (key == null) continue;
-            List<RowContext> candidates = rightIndex.get(key);
-            if (candidates == null) continue;
-            for (RowContext r : candidates) {
-                RowContext merged = mergeContexts(l, r);
-                if (executor.isTruthy(executor.evalExpr(on, merged))) {
-                    result.add(merged);
-                }
-            }
-        }
-        return result;
-    }
-
-    private List<RowContext> executeHashInnerJoinUsing(List<RowContext> left, List<RowContext> right,
-                                                        List<UsingKey> keys) {
-        Map<String, List<RowContext>> rightIndex = new HashMap<>();
-        for (RowContext r : right) {
-            String key = buildUsingKey(r, keys, false);
-            if (key != null) {
-                rightIndex.computeIfAbsent(key, k -> new ArrayList<>()).add(r);
-            }
-        }
-
-        List<RowContext> result = new ArrayList<>();
-        for (RowContext l : left) {
-            String key = buildUsingKey(l, keys, true);
-            if (key == null) continue;
-            List<RowContext> candidates = rightIndex.get(key);
-            if (candidates == null) continue;
-            for (RowContext r : candidates) {
-                result.add(mergeContexts(l, r));
             }
         }
         return result;
@@ -651,94 +736,16 @@ class FromJoinExecutor {
             rightTemplate = Cols.listOf();
         }
 
-        // Try hash join
-        if (on != null && keys == null && left.size() > 0 && right.size() > 0
-                && (long) left.size() * right.size() > 1000) {
-            List<ColumnRef[]> equiKeys = extractEquiJoinKeys(on, left, right);
-            if (equiKeys != null && !equiKeys.isEmpty()) {
-                return executeHashLeftJoin(left, right, on, equiKeys, rightTemplate);
-            }
-        }
-        if (keys != null && left.size() > 0 && right.size() > 0
-                && (long) left.size() * right.size() > 1000) {
-            return executeHashLeftJoinUsing(left, right, keys, rightTemplate);
-        }
-
-        // Nested loop fallback
+        RightCandidates candidates = candidatesFor(left, right, on, keys);
         List<RowContext> result = new ArrayList<>();
         for (RowContext l : left) {
             boolean matched = false;
-            for (RowContext r : right) {
+            for (RowContext r : candidates.forLeft(l)) {
                 if (!matchesUsingKeys(l, r, keys)) continue;
                 RowContext merged = mergeContexts(l, r);
                 if (on == null || joinConditionHolds(on, merged)) {
                     result.add(merged);
                     matched = true;
-                }
-            }
-            if (!matched) {
-                result.add(mergeWithNullRight(l, rightTemplate));
-            }
-        }
-        return result;
-    }
-
-    private List<RowContext> executeHashLeftJoin(List<RowContext> left, List<RowContext> right,
-                                                  Expression on, List<ColumnRef[]> equiKeys,
-                                                  List<RowContext.TableBinding> rightTemplate) {
-        Map<String, List<RowContext>> rightIndex = new HashMap<>();
-        for (RowContext r : right) {
-            String key = toJoinKey(equiKeys, r, false);
-            if (key != null) {
-                rightIndex.computeIfAbsent(key, k -> new ArrayList<>()).add(r);
-            }
-        }
-
-        List<RowContext> result = new ArrayList<>();
-        for (RowContext l : left) {
-            String key = toJoinKey(equiKeys, l, true);
-            boolean matched = false;
-            if (key != null) {
-                List<RowContext> candidates = rightIndex.get(key);
-                if (candidates != null) {
-                    for (RowContext r : candidates) {
-                        RowContext merged = mergeContexts(l, r);
-                        if (executor.isTruthy(executor.evalExpr(on, merged))) {
-                            result.add(merged);
-                            matched = true;
-                        }
-                    }
-                }
-            }
-            if (!matched) {
-                result.add(mergeWithNullRight(l, rightTemplate));
-            }
-        }
-        return result;
-    }
-
-    private List<RowContext> executeHashLeftJoinUsing(List<RowContext> left, List<RowContext> right,
-                                                       List<UsingKey> keys,
-                                                       List<RowContext.TableBinding> rightTemplate) {
-        Map<String, List<RowContext>> rightIndex = new HashMap<>();
-        for (RowContext r : right) {
-            String key = buildUsingKey(r, keys, false);
-            if (key != null) {
-                rightIndex.computeIfAbsent(key, k -> new ArrayList<>()).add(r);
-            }
-        }
-
-        List<RowContext> result = new ArrayList<>();
-        for (RowContext l : left) {
-            String key = buildUsingKey(l, keys, true);
-            boolean matched = false;
-            if (key != null) {
-                List<RowContext> candidates = rightIndex.get(key);
-                if (candidates != null) {
-                    for (RowContext r : candidates) {
-                        result.add(mergeContexts(l, r));
-                        matched = true;
-                    }
                 }
             }
             if (!matched) {
@@ -861,7 +868,7 @@ class FromJoinExecutor {
         List<RowContext.TableBinding> merged = new ArrayList<>(left.getBindings());
         for (RowContext.TableBinding b : rightTemplate) {
             Object[] nullRow = new Object[b.table().getColumns().size()];
-            merged.add(new RowContext.TableBinding(b.table(), b.alias(), nullRow));
+            merged.add(RowContext.TableBinding.nullExtended(b.table(), b.alias(), nullRow));
         }
         RowContext ctx = new RowContext(merged);
         ctx.setUsingColumns(left.getUsingColumns());
@@ -873,7 +880,7 @@ class FromJoinExecutor {
         List<RowContext.TableBinding> merged = new ArrayList<>();
         for (RowContext.TableBinding b : leftTemplate) {
             Object[] nullRow = new Object[b.table().getColumns().size()];
-            merged.add(new RowContext.TableBinding(b.table(), b.alias(), nullRow));
+            merged.add(RowContext.TableBinding.nullExtended(b.table(), b.alias(), nullRow));
         }
         merged.addAll(right.getBindings());
         RowContext ctx = new RowContext(merged);
@@ -918,33 +925,104 @@ class FromJoinExecutor {
                 leftVal = TypeCoercion.coerce(leftVal, key.common);
                 rightVal = TypeCoercion.coerce(rightVal, key.common);
                 if (leftVal == null || rightVal == null) return false;
-                if (leftVal instanceof java.math.BigDecimal
-                        && rightVal instanceof java.math.BigDecimal) {
-                    // Two numerics are the same number whatever scale each was widened to.
-                    if (((java.math.BigDecimal) leftVal)
-                            .compareTo((java.math.BigDecimal) rightVal) != 0) {
-                        return false;
-                    }
-                    continue;
-                }
             }
-            if (!Objects.equals(leftVal, rightVal) && !leftVal.toString().equals(rightVal.toString())) {
+            // The engine's own equality, which is the rule the = operator answers by. Comparing
+            // what the two values printed instead made a numeric 1.0 differ from the same value
+            // written 1.00, and made two values of unrelated types that happened to print the
+            // same text match.
+            if (!ValueKey.sameValue(leftVal, rightVal, key.blankPadded)) {
                 return false;
             }
         }
         return true;
     }
 
+    // ---- Candidate rows ----
+
+    /** Beyond this many pairs a join indexes the right side rather than walking all of it. */
+    private static final long WALK_UP_TO_PAIRS = 1000;
+
+    /**
+     * The right-hand rows a left row could join to.
+     *
+     * <p>A join small enough to take pair by pair hands back every right row; a larger one hands
+     * back the bucket a hash index put the possible matches in. Either way the caller applies the
+     * same test to every candidate it is given, so what the index decides is how much work the
+     * join does and never which rows it finds: a bucket holding more than it needs to costs
+     * comparisons, and one holding too few would lose rows.
+     *
+     * <p>The indexed and the walked join used to be separate executions of the whole join, and
+     * that is what let them disagree. The indexed ones matched on what a value printed rather
+     * than on what it was, one of them dropped the USING comparison altogether and both read the
+     * ON condition without the boolean check the walked one applies — so the same query answered
+     * differently either side of a thousand pairs.
+     */
+    private static final class RightCandidates {
+        private final List<RowContext> all;
+        private final Map<String, List<RowContext>> index;
+        private final List<ColumnRef[]> equiKeys;
+        private final List<UsingKey> usingKeys;
+
+        private RightCandidates(List<RowContext> all, Map<String, List<RowContext>> index,
+                                List<ColumnRef[]> equiKeys, List<UsingKey> usingKeys) {
+            this.all = all;
+            this.index = index;
+            this.equiKeys = equiKeys;
+            this.usingKeys = usingKeys;
+        }
+
+        List<RowContext> forLeft(RowContext left) {
+            if (index == null) return all;
+            String key = equiKeys != null
+                    ? toJoinKey(equiKeys, left, true)
+                    : buildUsingKey(left, usingKeys, true);
+            // A key with a null in it matches nothing, which is what the comparison would have
+            // answered had the row been walked past instead.
+            if (key == null) return Collections.emptyList();
+            List<RowContext> hit = index.get(key);
+            return hit == null ? Collections.<RowContext>emptyList() : hit;
+        }
+    }
+
+    private static RightCandidates candidatesFor(List<RowContext> left, List<RowContext> right,
+                                                 Expression on, List<UsingKey> keys) {
+        RightCandidates walk = new RightCandidates(right, null, null, null);
+        if (left.isEmpty() || right.isEmpty()
+                || (long) left.size() * right.size() <= WALK_UP_TO_PAIRS) {
+            return walk;
+        }
+        if (keys != null) {
+            return indexRight(right, null, keys);
+        }
+        List<ColumnRef[]> equiKeys = extractEquiJoinKeys(on, left, right);
+        if (equiKeys == null || equiKeys.isEmpty()) return walk;
+        return indexRight(right, equiKeys, null);
+    }
+
+    private static RightCandidates indexRight(List<RowContext> right, List<ColumnRef[]> equiKeys,
+                                              List<UsingKey> usingKeys) {
+        Map<String, List<RowContext>> index = new HashMap<>();
+        for (RowContext r : right) {
+            String key = equiKeys != null
+                    ? toJoinKey(equiKeys, r, false)
+                    : buildUsingKey(r, usingKeys, false);
+            if (key != null) {
+                index.computeIfAbsent(key, k -> new ArrayList<>()).add(r);
+            }
+        }
+        return new RightCandidates(right, index, equiKeys, usingKeys);
+    }
+
     // ---- Hash join key extraction ----
 
-    private List<ColumnRef[]> extractEquiJoinKeys(Expression on, List<RowContext> left, List<RowContext> right) {
+    private static List<ColumnRef[]> extractEquiJoinKeys(Expression on, List<RowContext> left, List<RowContext> right) {
         if (on == null) return null;
         List<ColumnRef[]> keys = new ArrayList<>();
         if (!collectEquiJoinKeys(on, left, right, keys)) return null;
         return keys.isEmpty() ? null : keys;
     }
 
-    private boolean collectEquiJoinKeys(Expression expr, List<RowContext> left, List<RowContext> right,
+    private static boolean collectEquiJoinKeys(Expression expr, List<RowContext> left, List<RowContext> right,
                                          List<ColumnRef[]> keys) {
         if (expr instanceof BinaryExpr) {
             BinaryExpr bin = (BinaryExpr) expr;
@@ -975,7 +1053,7 @@ class FromJoinExecutor {
         return true;
     }
 
-    private boolean belongsToSide(ColumnRef ref, List<RowContext> side) {
+    private static boolean belongsToSide(ColumnRef ref, List<RowContext> side) {
         if (side.isEmpty()) return false;
         RowContext sample = side.get(0);
         if (ref.table() != null) {
@@ -988,47 +1066,23 @@ class FromJoinExecutor {
         return false;
     }
 
-    private String toJoinKey(List<ColumnRef[]> keys, RowContext ctx, boolean leftSide) {
+    private static String toJoinKey(List<ColumnRef[]> keys, RowContext ctx, boolean leftSide) {
         StringBuilder sb = new StringBuilder();
         for (ColumnRef[] pair : keys) {
             ColumnRef ref = leftSide ? pair[0] : pair[1];
             Object val = ctx.resolveColumn(ref.table(), ref.column());
             if (val == null) return null;
-            if (sb.length() > 0) sb.append('\0');
-            sb.append(joinKeyOf(val));
+            ValueKey.appendTo(sb, val);
         }
         return sb.toString();
     }
 
-    /**
-     * How a value reads as a hash-join key. Both sides have to read it the same way or the one
-     * side's rows land in a bucket the other never looks in: a regproc column prints as the
-     * function's name but compares as its OID, so hashing what it prints made every join from a
-     * catalog's regproc column to pg_proc.oid find nothing once the two sides were large enough
-     * for the hash path — while the same join over smaller relations, taken as a nested loop,
-     * matched.
-     */
-    private static String joinKeyOf(Object val) {
-        if (val instanceof RegprocValue) return String.valueOf(((RegprocValue) val).oid());
-        return val.toString();
-    }
-
-    private String buildUsingKey(RowContext ctx, List<UsingKey> keys, boolean leftSide) {
+    private static String buildUsingKey(RowContext ctx, List<UsingKey> keys, boolean leftSide) {
         StringBuilder sb = new StringBuilder();
         for (UsingKey key : keys) {
             Object val = (leftSide ? key.left : key.right).valueIn(ctx.getBindings());
             if (val == null) return null;
-            // Both sides have to hash on the same reading of the value, or the wider side's rows
-            // land in a bucket the narrower side never looks in.
-            if (key.common != null) {
-                val = TypeCoercion.coerce(val, key.common);
-                if (val == null) return null;
-                if (val instanceof java.math.BigDecimal) {
-                    val = ((java.math.BigDecimal) val).stripTrailingZeros().toPlainString();
-                }
-            }
-            if (sb.length() > 0) sb.append('\0');
-            sb.append(val.toString());
+            ValueKey.appendTo(sb, val);
         }
         return sb.toString();
     }

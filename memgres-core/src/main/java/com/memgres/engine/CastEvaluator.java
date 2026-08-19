@@ -340,7 +340,7 @@ class CastEvaluator {
     /** The types whose value memgres keeps exactly as it was written; see {@link #applyCast}. */
     private static final java.util.Set<String> KEPT_AS_WRITTEN =
             new java.util.HashSet<>(java.util.Arrays.asList(
-                    "regcollation", "aclitem", "pg_snapshot", "txid_snapshot", "cid",
+                    "regcollation", "aclitem", "pg_snapshot", "txid_snapshot",
                     "cstring", "unknown"));
 
     /** Whether a type of this name was declared here, in which case it is not PostgreSQL's. */
@@ -632,7 +632,12 @@ class CastEvaluator {
             case "float4": {
                 double dv = readDoubleFor(val, "real");
                 float fv = (float) dv;
-                boolean broughtInfinity = Double.isInfinite(dv)
+                // An infinity the value already was, as opposed to one the conversion arrived at.
+                // Reading the converted double instead let anything past double's own range --
+                // '1e400' -- through as an infinity nobody wrote, where PG says it is out of range
+                // for real just as it does for a magnitude that only overflows real.
+                boolean broughtInfinity = ((val instanceof Double || val instanceof Float)
+                        && Double.isInfinite(((Number) val).doubleValue()))
                         || (val instanceof String && isInfinityLiteral(((String) val).trim()));
                 if (Float.isInfinite(fv) && !broughtInfinity) {
                     // A float8 that no longer fits float4 is a narrowing overflow, which PG
@@ -1130,8 +1135,23 @@ class CastEvaluator {
                 return TypeCoercion.checkedLsn(val);
             }
             case "tid":
-                // tuple identifier; preserve as-is
-                return val.toString();
+                // A tuple identifier is a block and a slot within it, not the text it prints as:
+                // held as text, two of them compared by spelling and anything at all read as one.
+                if (val instanceof PgTid) return val;
+                return PgTid.parse(val.toString());
+            case "cid": {
+                // The command counter within a transaction, an unsigned 32-bit number like xid.
+                if (val instanceof Number) return ((Number) val).longValue();
+                String cs = val.toString().trim();
+                try {
+                    long parsed = Long.parseLong(cs);
+                    if (parsed < 0 || parsed > 4294967295L) throw new NumberFormatException();
+                    return parsed;
+                } catch (NumberFormatException e) {
+                    throw new MemgresException(
+                            "invalid input syntax for type cid: \"" + cs + "\"", "22P02");
+                }
+            }
             case "jsonpath":
                 return normalizeJsonpath(val.toString());
             case "oidvector":

@@ -517,7 +517,10 @@ class SelectParser {
                 }
                 parser.expect(TokenType.RIGHT_PAREN);
                 for (SelectStmt.WindowDef existing : windowDefs) {
-                    if (existing.name().equalsIgnoreCase(winName)) {
+                    // Two WINDOW names collide when they are the same name, and a quoted name
+                    // keeps the case it was written in: "W" and "w" are two windows, not one
+                    // defined twice.
+                    if (existing.name().equals(winName)) {
                         throw new com.memgres.engine.MemgresException(
                                 "window \"" + winName + "\" is already defined", "42P20");
                     }
@@ -537,107 +540,16 @@ class SelectParser {
             if (parser.checkKeyword("ORDER")) throw new ParseException("Multiple ORDER BY clauses", parser.peek());
         }
 
-        // LIMIT
-        Expression limit = null;
-        if (parser.matchKeyword("LIMIT")) {
-            // LIMIT ALL is LIMIT NULL: no limit, but a LIMIT clause was written, and the rules
-            // that turn on whether a query has one have to be able to see it.
-            limit = parser.matchKeyword("ALL") ? Literal.ofNull() : parseLimitOffsetExpr();
-            sawLimit = true;
-            if (parser.checkKeyword("LIMIT")) throw new ParseException("Multiple LIMIT clauses", parser.peek());
-        }
-
-        // OFFSET [n] [ROWS]
-        Expression offset = null;
-        if (parser.matchKeyword("OFFSET")) {
-            offset = parseLimitOffsetExpr();
-            parser.matchKeyword("ROW");    // optional ROWS/ROW keyword after offset value
-            parser.matchKeyword("ROWS");
-        }
-
-        // FETCH FIRST|NEXT [n] ROW|ROWS {ONLY | WITH TIES} (SQL standard equivalent of LIMIT)
-        boolean withTies = false;
-        if (parser.matchKeyword("FETCH")) {
-            parser.matchKeyword("FIRST");
-            parser.matchKeyword("NEXT");
-            if (!parser.checkKeyword("ROW") && !parser.checkKeyword("ROWS")) {
-                limit = parseLimitOffsetExpr();
-            } else {
-                limit = Literal.ofInt("1"); // FETCH FIRST ROW ONLY = FETCH FIRST 1 ROW ONLY
-            }
-            parser.matchKeyword("ROW");
-            parser.matchKeyword("ROWS");
-            if (parser.matchKeyword("WITH")) {
-                parser.expectKeyword("TIES");
-                // WITH TIES keeps every row equal to the last one returned, which only means
-                // something once the query has said what "equal" is.
-                if (orderBy == null || orderBy.isEmpty()) {
-                    throw new MemgresException(
-                            "WITH TIES cannot be specified without ORDER BY clause", "42601");
-                }
-                withTies = true;
-            } else {
-                parser.matchKeyword("ONLY");
-            }
-            // PG also allows OFFSET after FETCH: FETCH FIRST 3 ROWS ONLY OFFSET 2
-            if (offset == null && parser.matchKeyword("OFFSET")) {
-                offset = parseLimitOffsetExpr();
-                parser.matchKeyword("ROW");
-                parser.matchKeyword("ROWS");
-            }
-        }
-
-        // FOR UPDATE / FOR NO KEY UPDATE / FOR SHARE / FOR KEY SHARE
-        // PG 18 allows multiple FOR clauses, e.g. FOR UPDATE FOR SHARE
-        String lockMode = null;
-        boolean nowait = false;
-        boolean skipLocked = false;
-        List<String> forUpdateTables = new ArrayList<>();
-        while (parser.checkKeyword("FOR")) {
-            parser.advance(); // consume FOR
-            if (parser.matchKeyword("NO")) {
-                parser.matchKeyword("KEY");
-                parser.matchKeyword("UPDATE");
-                lockMode = "NO KEY UPDATE";
-            } else if (parser.matchKeyword("KEY")) {
-                parser.matchKeyword("SHARE");
-                lockMode = "KEY SHARE";
-            } else if (parser.matchKeyword("UPDATE")) {
-                lockMode = "UPDATE";
-            } else if (parser.matchKeyword("SHARE")) {
-                lockMode = "SHARE";
-            } else {
-                // FOR opens a locking clause and nothing else here, so a word that names no lock
-                // strength is the word PostgreSQL stops on -- swallowing the FOR accepted a
-                // statement that trailed off into nothing.
-                throw ParseException.at(parser.peek());
-            }
-            // Optional: OF table_name [, ...]
-            if (parser.matchKeyword("OF")) {
-                forUpdateTables = new ArrayList<>();
-                forUpdateTables.add(readLockTargetName(lockMode));
-                while (parser.match(TokenType.COMMA)) forUpdateTables.add(readLockTargetName(lockMode));
-                // Whether these names are really in FROM is decided by the executor, which sees
-                // the whole FROM tree including aliases, subqueries and outer-join sides.
-            }
-            // Optional: NOWAIT | SKIP LOCKED
-            if (parser.matchKeyword("NOWAIT")) {
-                nowait = true;
-            } else if (parser.matchKeyword("SKIP")) {
-                parser.matchKeyword("LOCKED");
-                skipLocked = true;
-            }
-        }
-        SelectStmt.LockClause lockClause = lockMode != null
-                ? new SelectStmt.LockClause(lockMode, nowait, skipLocked, forUpdateTables) : null;
-
-        // PG allows LIMIT/OFFSET after FOR clauses
-        if (limit == null && parser.matchKeyword("LIMIT")) {
-            limit = parser.matchKeyword("ALL") ? Literal.ofNull() : parseLimitOffsetExpr();
-        }
-        if (offset == null && parser.matchKeyword("OFFSET")) {
-            offset = parseLimitOffsetExpr();
-        }
+        // How many rows and where from, and which of them to lock. PostgreSQL writes the two as
+        // one choice -- the locking clause comes before the row count or after it, never through
+        // the middle of it -- so they are read as one here too.
+        SelectLimit rows = parseSelectLimit(orderBy);
+        sawLimit = rows != null && rows.limit != null;
+        SelectStmt.LockClause lockClause = parseRowLockClause();
+        if (rows == null) rows = parseSelectLimit(orderBy);
+        Expression limit = rows == null ? null : rows.limit;
+        Expression offset = rows == null ? null : rows.offset;
+        boolean withTies = rows != null && rows.withTies;
 
         SelectStmt select = new SelectStmt(distinct, distinctOn, targets, from, where, groupBy, having, windowDefs, orderBy, limit, offset, null, groupingSets, lockClause, withTies);
         if (selectIntoTable != null) {
@@ -697,6 +609,16 @@ class SelectParser {
             rows.add(parser.parseExpressionList());
             parser.expect(TokenType.RIGHT_PAREN);
         } while (parser.match(TokenType.COMMA));
+
+        // Every row of a VALUES list is the same relation's row, so they all have to be the same
+        // width. The rows below are chained on as UNION ALL selects, which reported the mismatch
+        // as one between two queries -- a union nobody wrote.
+        for (int r = 1; r < rows.size(); r++) {
+            if (rows.get(r).size() != rows.get(0).size()) {
+                throw ParseException.saying("VALUES lists must all be the same length",
+                        parser.peek(), "42601");
+            }
+        }
 
         // First row becomes SELECT expr1 AS column1, expr2 AS column2, ...
         List<SelectStmt.SelectTarget> firstTargets = new ArrayList<>();
@@ -788,6 +710,10 @@ class SelectParser {
                 throw new com.memgres.engine.MemgresException(
                     "WITH query is not recursive", "42601");
             }
+            // A column named twice in a BY list is asked for twice, and PostgreSQL says so before
+            // it says anything about the names the clauses add.
+            rejectRepeatedColumn(searchByColumns, "search");
+            rejectRepeatedColumn(cycleByColumns, "cycle");
             // Every column SEARCH and CYCLE add stands beside the others in the item's column
             // list, so two of them under one name leave the query no way to say which it meant.
             if (searchCol != null && cycleCol != null && searchCol.equals(cycleCol)) {
@@ -806,6 +732,18 @@ class SelectParser {
                     origCte.query(), origCte.recursive(), searchCol, searchDepthFirst, searchByColumns,
                     cycleCol, cyclePathCol, cycleByColumns, cycleMarkValue, cycleMarkDefault,
                     origCte.materialized()));
+        }
+    }
+
+    /** Refuse a SEARCH BY or CYCLE list that names the same column twice. */
+    private static void rejectRepeatedColumn(java.util.List<String> columns, String clause) {
+        if (columns == null) return;
+        java.util.Set<String> seen = new java.util.HashSet<String>();
+        for (String column : columns) {
+            if (!seen.add(column.toLowerCase())) {
+                throw new com.memgres.engine.MemgresException(
+                        clause + " column \"" + column + "\" specified more than once", "42701");
+            }
         }
     }
 
@@ -890,16 +828,12 @@ class SelectParser {
                         CreateTableAsStmt ctas = (CreateTableAsStmt) body;
                         // WITH ... SELECT INTO
                         if (ctas.query() instanceof SelectStmt) {
-                            SelectStmt innerSel = (SelectStmt) ctas.query();
-                            SelectStmt withSel = new SelectStmt(innerSel.distinct(), innerSel.distinctOn(), innerSel.targets(), innerSel.from(),
-                                    innerSel.where(), innerSel.groupBy(), innerSel.having(), innerSel.windowDefs(), innerSel.orderBy(), innerSel.limit(), innerSel.offset(), ctes, innerSel.groupingSets(), innerSel.lockClause(), innerSel.withTies());
+                            SelectStmt withSel = ((SelectStmt) ctas.query()).withWithClauses(ctes);
                             return new CreateTableAsStmt(ctas.schema(), ctas.name(), ctas.ifNotExists(), ctas.temporary(), withSel, ctas.withData());
                         }
                         return ctas;
                     }
-                    SelectStmt sel = (SelectStmt) body;
-                    return new SelectStmt(sel.distinct(), sel.distinctOn(), sel.targets(), sel.from(),
-                            sel.where(), sel.groupBy(), sel.having(), sel.windowDefs(), sel.orderBy(), sel.limit(), sel.offset(), ctes, sel.groupingSets(), sel.lockClause(), sel.withTies());
+                    return ((SelectStmt) body).withWithClauses(ctes);
                 }
                 case "INSERT":
                     return parser.parseInsert(ctes);
@@ -1209,7 +1143,12 @@ class SelectParser {
     List<SelectStmt.SelectTarget> parseSelectTargets() {
         List<SelectStmt.SelectTarget> targets = new ArrayList<>();
         // SELECT with no columns: SELECT FROM t or bare SELECT;
+        // A set operator may stand here too -- "SELECT UNION SELECT" is two selects of no columns
+        // at all, and answers with one row of no columns. Reading the operator as a column name
+        // made the word itself the column and left the query complaining it did not exist.
         if (parser.checkKeyword("FROM") || parser.checkKeyword("WHERE") || parser.checkKeyword("INTO")
+                || parser.checkKeyword("UNION") || parser.checkKeyword("INTERSECT")
+                || parser.checkKeyword("EXCEPT")
                 || parser.isAtEnd() || parser.check(TokenType.SEMICOLON)) {
             return targets; // empty target list
         }
@@ -1225,8 +1164,19 @@ class SelectParser {
             }
             targets.add(parseSelectTarget());
         } while (parser.match(TokenType.COMMA));
+        // A row PostgreSQL builds has room for 1664 columns, so a select list longer than that is
+        // refused rather than answered with. Reading any number of them let a generated query grow
+        // past what a row can hold.
+        if (targets.size() > MAX_TARGETS) {
+            throw ParseException.saying(
+                    "target lists can have at most " + MAX_TARGETS + " entries",
+                    parser.peek(), "54011");
+        }
         return targets;
     }
+
+    /** The number of entries a target list may hold. */
+    private static final int MAX_TARGETS = 1664;
 
     SelectStmt.SelectTarget parseSelectTarget() {
         // Handle * wildcard
@@ -1299,6 +1249,7 @@ class SelectParser {
             SelectStmt.FromItem right = parseFromPrimary();
             Expression on = null;
             List<String> using = null;
+            String usingAlias = null;
 
             if (joinType != SelectStmt.JoinType.CROSS && joinType != SelectStmt.JoinType.NATURAL
                     && joinType != SelectStmt.JoinType.NATURAL_LEFT && joinType != SelectStmt.JoinType.NATURAL_RIGHT
@@ -1312,12 +1263,17 @@ class SelectParser {
                         using.add(parser.readIdentifier());
                     } while (parser.match(TokenType.COMMA));
                     parser.expect(TokenType.RIGHT_PAREN);
+                    // A USING clause may be named, and the name answers with the merged columns
+                    // alone. PostgreSQL takes it only after the word AS -- a bare name there is
+                    // where the alias of the right-hand relation would have gone, and writing one
+                    // is a syntax error. Not reading it made the whole clause unparseable.
+                    if (parser.matchKeyword("AS")) usingAlias = parser.readIdentifier();
                 } else {
                     throw new ParseException("JOIN requires ON or USING clause", parser.peek());
                 }
             }
 
-            item = new SelectStmt.JoinFrom(item, joinType, right, on, using);
+            item = new SelectStmt.JoinFrom(item, joinType, right, on, using, usingAlias);
         }
 
         return item;
@@ -1713,6 +1669,19 @@ class SelectParser {
             }
         }
 
+        // A relation may be written with a trailing star, which asks for the rows of its
+        // descendants as well -- the same thing ONLY refuses, and what a bare name already means.
+        // PostgreSQL's grammar takes the star only where no ONLY was written, so "ONLY t *" is a
+        // syntax error while "t *" is the table. Not reading it made every inheritance query
+        // written the older way a syntax error.
+        if (!only) parser.match(TokenType.STAR);
+
+        // PostgreSQL's grammar puts LATERAL in front of a subquery, a function call, ROWS FROM,
+        // XMLTABLE or JSON_TABLE, and nowhere else. Reaching here is a plain relation name, where
+        // PostgreSQL is still waiting for the parenthesis of a function call and reports whatever
+        // stands after the name. Accepting it let a table be joined as if it were lateral.
+        if (lateral) throw ParseException.at(parser.peek());
+
         String alias = null;
         if (parser.matchKeyword("AS")) {
             alias = parser.readColumnName();
@@ -1740,53 +1709,43 @@ class SelectParser {
             parser.expect(TokenType.RIGHT_PAREN);
         }
 
-        // TABLESAMPLE method (percentage) [REPEATABLE (seed)]
+        // TABLESAMPLE method (arguments) [REPEATABLE (seed)]
         if (parser.checkKeyword("TABLESAMPLE")) {
             parser.advance(); // consume TABLESAMPLE
-            // method name: SYSTEM, BERNOULLI, or identifier
+            // The method is named by an identifier like any other, so a quoted one keeps the case
+            // it was written in and an unquoted one is folded. Reading it as a bare word only made
+            // TABLESAMPLE "bernoulli" (100) a syntax error where PostgreSQL samples the table.
             String method;
-            if (parser.peek().type() == TokenType.KEYWORD || parser.peek().type() == TokenType.IDENTIFIER) {
+            if (parser.peek().type() == TokenType.QUOTED_IDENTIFIER) {
+                method = parser.advance().value();
+            } else if (parser.peek().type() == TokenType.KEYWORD
+                    || parser.peek().type() == TokenType.IDENTIFIER) {
                 method = parser.advance().value().toLowerCase();
             } else {
-                throw new ParseException("Expected sampling method", parser.peek());
+                throw ParseException.at(parser.peek());
             }
-            if (!method.equals("system") && !method.equals("bernoulli")) {
-                // PostgreSQL names the method bare here: what was written is an identifier the
-                // grammar resolves, not a string, so it is not quoted back.
-                throw new com.memgres.engine.MemgresException(
-                    "tablesample method " + method + " does not exist", "42704");
-            }
+            // A method takes a list of arguments, and how many it wants is the method's own
+            // business rather than the grammar's -- PostgreSQL parses two and then says bernoulli
+            // wanted one. Only the first is carried on: where there is not exactly one the
+            // statement is refused, so evaluating the rest would raise for a query that never ran.
             parser.expect(TokenType.LEFT_PAREN);
-            Expression pctExpr = parser.parseExpression();
+            List<Expression> methodArgs = new ArrayList<>();
+            methodArgs.add(parser.parseExpression());
+            while (parser.match(TokenType.COMMA)) methodArgs.add(parser.parseExpression());
             parser.expect(TokenType.RIGHT_PAREN);
-            // Optional REPEATABLE (seed)
-            Long seed = null;
-            if (parser.matchKeyword("REPEATABLE")) {
-                parser.expect(TokenType.LEFT_PAREN);
-                Expression seedExpr = parser.parseExpression();
-                parser.expect(TokenType.RIGHT_PAREN);
-                // Store seed in special FunctionFrom
-                // We encode as FunctionFrom with name "__tablesample__"
-                // args: [table_alias_expr, percentage, seed, method_literal]
-                seed = 0L; // placeholder, actual seed evaluated at runtime
-                List<Expression> tsArgs = new ArrayList<>();
-                tsArgs.add(Literal.ofString(method));
-                tsArgs.add(pctExpr);
-                tsArgs.add(seedExpr);
-                String finalAlias = alias != null ? alias : tableName;
-                // Return a wrapper FunctionFrom that references the table
-                return new SelectStmt.FunctionFrom(
-                    "__tablesample__:" + (schema != null ? schema + "." : "") + tableName,
-                    tsArgs, finalAlias, null);
-            }
-            // No seed
+            // args: [method, count of arguments written, first argument, seed if REPEATABLE]
             List<Expression> tsArgs = new ArrayList<>();
             tsArgs.add(Literal.ofString(method));
-            tsArgs.add(pctExpr);
-            String finalAlias2 = alias != null ? alias : tableName;
+            tsArgs.add(Literal.ofInt(String.valueOf(methodArgs.size())));
+            tsArgs.add(methodArgs.get(0));
+            if (parser.matchKeyword("REPEATABLE")) {
+                parser.expect(TokenType.LEFT_PAREN);
+                tsArgs.add(parser.parseExpression());
+                parser.expect(TokenType.RIGHT_PAREN);
+            }
             return new SelectStmt.FunctionFrom(
                 "__tablesample__:" + (schema != null ? schema + "." : "") + tableName,
-                tsArgs, finalAlias2, null);
+                tsArgs, alias != null ? alias : tableName, null);
         }
 
         return new SelectStmt.TableRef(schema, tableName, alias, only, columnAliases);
@@ -1947,42 +1906,98 @@ class SelectParser {
             }
             orderBy = parser.parseOrderByList();
         }
-        Expression limit = null;
-        if (parser.matchKeyword("LIMIT") && !parser.matchKeyword("ALL")) {
-            limit = parseLimitOffsetExpr();
-        }
-        Expression offset = null;
-        if (parser.matchKeyword("OFFSET")) {
-            offset = parseLimitOffsetExpr();
-            parser.matchKeyword("ROW");
-            parser.matchKeyword("ROWS");
-        }
-        boolean withTies = false;
-        if (parser.matchKeyword("FETCH")) {
-            parser.matchKeyword("FIRST");
-            parser.matchKeyword("NEXT");
-            limit = parser.checkKeyword("ROW") || parser.checkKeyword("ROWS")
-                    ? Literal.ofInt("1") : parseLimitOffsetExpr();
-            parser.matchKeyword("ROW");
-            parser.matchKeyword("ROWS");
-            if (parser.matchKeyword("WITH")) {
-                parser.expectKeyword("TIES");
-                if (orderBy == null || orderBy.isEmpty()) {
-                    throw new com.memgres.engine.MemgresException(
-                            "WITH TIES cannot be specified without ORDER BY clause", "42601");
-                }
-                withTies = true;
-            } else {
-                parser.matchKeyword("ONLY");
-            }
-        }
+        SelectLimit rows = parseSelectLimit(orderBy);
         SelectStmt.LockClause lockClause = parseRowLockClause();
+        if (rows == null) rows = parseSelectLimit(orderBy);
 
         return new SelectStmt(false, null, base.targets(), base.from(), null, null, null, null,
-                orderBy, limit, offset, null, null, lockClause, withTies);
+                orderBy, rows == null ? null : rows.limit, rows == null ? null : rows.offset,
+                null, null, lockClause, rows != null && rows.withTies);
     }
 
-    /** FOR UPDATE / FOR NO KEY UPDATE / FOR SHARE / FOR KEY SHARE, with its options. */
+    /**
+     * How many rows a query answers with and where it starts from: {@code LIMIT}, {@code FETCH}
+     * and {@code OFFSET}, which PostgreSQL takes as one clause written in either order.
+     */
+    private static final class SelectLimit {
+        private Expression limit;
+        private Expression offset;
+        private boolean withTies;
+    }
+
+    /**
+     * The row count and starting point, or null where the query gave neither.
+     *
+     * <p>PostgreSQL's {@code select_limit} is a count and an offset in either order, and it is one
+     * clause: whichever comes first, the other follows it immediately. Reading each word as its own
+     * optional clause meant the order they were written in decided whether the query parsed --
+     * {@code OFFSET 1 LIMIT 1 FOR UPDATE} was a syntax error where {@code LIMIT 1 OFFSET 1 FOR
+     * UPDATE} was not, and only the first of the two could ever precede the locking clause.
+     *
+     * @param orderBy the query's sort, which WITH TIES needs to have been given
+     */
+    private SelectLimit parseSelectLimit(List<SelectStmt.OrderByItem> orderBy) {
+        SelectLimit rows = new SelectLimit();
+        if (parseLimitClause(rows, orderBy)) {
+            parseOffsetClause(rows);
+        } else if (parseOffsetClause(rows)) {
+            parseLimitClause(rows, orderBy);
+        } else {
+            return null;
+        }
+        return rows;
+    }
+
+    /** {@code LIMIT n | LIMIT ALL | FETCH FIRST n ROWS ONLY | ... WITH TIES}. */
+    private boolean parseLimitClause(SelectLimit rows, List<SelectStmt.OrderByItem> orderBy) {
+        if (rows.limit != null) return false;
+        if (parser.matchKeyword("LIMIT")) {
+            // LIMIT ALL is LIMIT NULL: no limit, but a LIMIT clause was written, and the rules
+            // that turn on whether a query has one have to be able to see it.
+            rows.limit = parser.matchKeyword("ALL") ? Literal.ofNull() : parseLimitOffsetExpr();
+            return true;
+        }
+        if (!parser.matchKeyword("FETCH")) return false;
+        parser.matchKeyword("FIRST");
+        parser.matchKeyword("NEXT");
+        rows.limit = parser.checkKeyword("ROW") || parser.checkKeyword("ROWS")
+                ? Literal.ofInt("1")            // FETCH FIRST ROW ONLY is FETCH FIRST 1 ROW ONLY
+                : parseLimitOffsetExpr();
+        parser.matchKeyword("ROW");
+        parser.matchKeyword("ROWS");
+        if (parser.matchKeyword("WITH")) {
+            parser.expectKeyword("TIES");
+            // WITH TIES keeps every row equal to the last one returned, which only means
+            // something once the query has said what "equal" is.
+            if (orderBy == null || orderBy.isEmpty()) {
+                throw new MemgresException(
+                        "WITH TIES cannot be specified without ORDER BY clause", "42601");
+            }
+            rows.withTies = true;
+        } else {
+            parser.matchKeyword("ONLY");
+        }
+        return true;
+    }
+
+    /** {@code OFFSET n [ROW | ROWS]}. */
+    private boolean parseOffsetClause(SelectLimit rows) {
+        if (rows.offset != null || !parser.matchKeyword("OFFSET")) return false;
+        rows.offset = parseLimitOffsetExpr();
+        parser.matchKeyword("ROW");
+        parser.matchKeyword("ROWS");
+        return true;
+    }
+
+    /**
+     * FOR UPDATE / FOR NO KEY UPDATE / FOR SHARE / FOR KEY SHARE, with its options.
+     *
+     * <p>Every word after the first was optional, so the first one decided the whole clause and a
+     * statement that trailed off part-way through it still took a lock: {@code FOR NO} and
+     * {@code FOR KEY} named strengths nobody wrote, and {@code FOR UPDATE SKIP} quietly turned on
+     * SKIP LOCKED, so a worker-queue query answered with fewer rows than its author asked for.
+     * What the strength is spelled with is not optional, and neither is LOCKED.
+     */
     private SelectStmt.LockClause parseRowLockClause() {
         String lockMode = null;
         boolean nowait = false;
@@ -1991,34 +2006,42 @@ class SelectParser {
         while (parser.checkKeyword("FOR")) {
             parser.advance();
             if (parser.matchKeyword("NO")) {
-                parser.matchKeyword("KEY");
-                parser.matchKeyword("UPDATE");
+                requireKeyword("KEY");
+                requireKeyword("UPDATE");
                 lockMode = "NO KEY UPDATE";
             } else if (parser.matchKeyword("KEY")) {
-                parser.matchKeyword("SHARE");
+                requireKeyword("SHARE");
                 lockMode = "KEY SHARE";
             } else if (parser.matchKeyword("UPDATE")) {
                 lockMode = "UPDATE";
             } else if (parser.matchKeyword("SHARE")) {
                 lockMode = "SHARE";
             } else {
-                throw new ParseException("syntax error at or near \"" + parser.peek().value() + "\"",
-                        parser.peek());
+                // FOR opens a locking clause and nothing else here, so a word that names no lock
+                // strength is the word PostgreSQL stops on.
+                throw ParseException.at(parser.peek());
             }
             if (parser.matchKeyword("OF")) {
                 ofTables = new ArrayList<>();
                 ofTables.add(readLockTargetName(lockMode));
                 while (parser.match(TokenType.COMMA)) ofTables.add(readLockTargetName(lockMode));
+                // Whether these names are really in FROM is decided by the executor, which sees
+                // the whole FROM tree including aliases, subqueries and outer-join sides.
             }
             if (parser.matchKeyword("NOWAIT")) {
                 nowait = true;
             } else if (parser.matchKeyword("SKIP")) {
-                parser.matchKeyword("LOCKED");
+                requireKeyword("LOCKED");
                 skipLocked = true;
             }
         }
         return lockMode == null ? null
                 : new SelectStmt.LockClause(lockMode, nowait, skipLocked, ofTables);
+    }
+
+    /** The word the grammar has no alternative to here, reported where PostgreSQL reports it. */
+    private void requireKeyword(String keyword) {
+        if (!parser.matchKeyword(keyword)) throw ParseException.at(parser.peek());
     }
 
     /**
@@ -2053,15 +2076,18 @@ class SelectParser {
                     new SelectStmt.SubqueryFrom(subStmt, "__table_subquery__", false, null));
             return new SelectStmt(false, targets, from, null, null, null, null, null, null, null);
         }
+        // TABLE names a relation the same way a FROM item does, so it takes ONLY and the trailing
+        // star too. Reading a bare name only made "TABLE ONLY t" a syntax error.
+        boolean only = parser.matchKeyword("ONLY");
         String schema = null;
         String tableName = parser.readIdentifier();
         if (parser.match(TokenType.DOT)) { schema = tableName; tableName = parser.readIdentifier(); }
+        if (!only) parser.match(TokenType.STAR);
         // Build: SELECT * FROM tablename
         List<SelectStmt.SelectTarget> targets = Cols.listOf(
                 new SelectStmt.SelectTarget(new WildcardExpr(), null));
-        String fullName = schema != null ? schema + "." + tableName : tableName;
         List<SelectStmt.FromItem> from = Cols.listOf(
-                new SelectStmt.TableRef(fullName, null));
+                new SelectStmt.TableRef(schema, tableName, null, only, null));
         return new SelectStmt(false, targets, from, null, null, null, null, null, null, null);
     }
 

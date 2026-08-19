@@ -870,13 +870,17 @@ public class Lexer {
             }
         }
         String word = sb.toString();
-        String upper = word.toUpperCase();
+        // Which word this is, and what an unquoted name folds to, are properties of the language
+        // and not of the machine it runs on, so the fold is Locale.ROOT's. Under the default
+        // locale a Turkish JVM reads IN as "İN", which is no keyword, and MIN as "mın", which is
+        // no aggregate.
+        String upper = word.toUpperCase(java.util.Locale.ROOT);
 
         if (KEYWORDS.contains(upper)) {
             return new Token(TokenType.KEYWORD, upper, start, word);
         }
         // PG truncates identifiers to NAMEDATALEN-1 = 63 bytes
-        String id = word.toLowerCase();
+        String id = word.toLowerCase(java.util.Locale.ROOT);
         if (id.length() > 63) id = id.substring(0, 63);
         return new Token(TokenType.IDENTIFIER, id, start, word);
     }

@@ -61,6 +61,16 @@ public final class BuiltinCallTypes {
     /** The pseudo-types a signature uses to say "whatever was passed", which settle nothing. */
     private static final Set<Integer> POLYMORPHIC = buildPolymorphic();
 
+    /** The polymorphic names that stand for one kind of type rather than for any type at all. */
+    private static final int ANYARRAY = 2277;
+    private static final int ANYCOMPATIBLEARRAY = 5078;
+    private static final int ANYRANGE = 3831;
+    private static final int ANYMULTIRANGE = 4537;
+    private static final int ANYCOMPATIBLERANGE = 5080;
+    private static final int ANYCOMPATIBLEMULTIRANGE = 5086;
+    private static final int RECORD = 2249;
+    private static final int ANYENUM = 3500;
+
     private static Map<Integer, Character> buildCategories() {
         Map<Integer, Character> m = new HashMap<Integer, Character>();
         int[] numeric = {20, 21, 23, 26, 700, 701, 790, 1700, 2202, 2203, 2204, 2205, 2206, 3734, 3769, 4096, 4089};
@@ -83,7 +93,11 @@ public final class BuiltinCallTypes {
         for (int i = 0; i < bits.length; i++) m.put(Integer.valueOf(bits[i]), Character.valueOf(BITSTRING));
         int[] geometric = {600, 601, 602, 603, 604, 628, 718};
         for (int i = 0; i < geometric.length; i++) m.put(Integer.valueOf(geometric[i]), Character.valueOf(GEOMETRIC));
-        int[] user = {17, 114, 142, 774, 829, 2950, 3220, 3614, 3615, 3802};
+        // tid, xid and cid are of PostgreSQL's user category too. Leaving them out was not a
+        // silence: an argument of a category nothing here records is read as a type PostgreSQL
+        // does not have, and resolution stands down over it rather than risk refusing a call
+        // memgres declares and PostgreSQL does not. So length(ctid) ran.
+        int[] user = {17, 27, 28, 29, 114, 142, 774, 829, 2950, 3220, 3614, 3615, 3802};
         for (int i = 0; i < user.length; i++) m.put(Integer.valueOf(user[i]), Character.valueOf(USER));
         // The ranges and the multiranges are one category of PostgreSQL's own, and a multirange
         // is as much a member of it as the range it collects. Recording only the ranges left the
@@ -493,6 +507,27 @@ public final class BuiltinCallTypes {
         for (int i = 0; i < argOids.length; i++) {
             if (argOids[i] == UNKNOWN) continue;
             int declared = declaredAt(sig, i);
+            // anyarray and anyrange stand for a type of that kind and for no other, which is the
+            // whole of what makes max(xid) a function that does not exist: max is declared over
+            // a list of types and over anyarray, an xid is none of the list and is not an array.
+            // Reading them as "anything at all" is what let every such call through, since one
+            // signature taking anything made the name reachable however it was called.
+            if (declared == ANYARRAY || declared == ANYCOMPATIBLEARRAY) {
+                if (categoryOf(argOids[i]) != ARRAY) return false;
+                continue;
+            }
+            if (declared == ANYRANGE || declared == ANYMULTIRANGE
+                    || declared == ANYCOMPATIBLERANGE || declared == ANYCOMPATIBLEMULTIRANGE) {
+                if (categoryOf(argOids[i]) != RANGE) return false;
+                continue;
+            }
+            // record stands for a row and anyenum for an enum, and for nothing else. max is
+            // declared over both, so reading them as "anything at all" made max reachable from
+            // every type there is -- max(boolean) among them, which PostgreSQL does not have.
+            // An argument of a type this does not classify has already been let go above, so
+            // whatever reaches here is a built-in, and no built-in is an enum or a row.
+            if (declared == RECORD && argOids[i] != RECORD) return false;
+            if (declared == ANYENUM) return false;
             if (POLYMORPHIC.contains(Integer.valueOf(declared))) continue;
             if (!convertible(argOids[i], declared)) return false;
         }

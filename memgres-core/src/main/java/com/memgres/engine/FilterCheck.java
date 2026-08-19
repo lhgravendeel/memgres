@@ -123,6 +123,14 @@ final class FilterCheck {
         Object found = AstWalk.findFirst(root, node -> wrongAggregateArity(select, node));
         if (found == null) return;
         FunctionCallExpr call = (FunctionCallExpr) found;
+        // A parameterless aggregate is not written with an empty argument list, because the list
+        // is not what is empty: the star in count(*) says which rows to count, not what. PG names
+        // the spelling to use rather than reporting a count of some other arity.
+        String bare = QueryLevelScope.bareName(call.name());
+        if (call.args().isEmpty() && SelectAggregateEvaluator.isParameterlessAggregate(bare)) {
+            throw new MemgresException(
+                    bare + "(*) must be used to call a parameterless aggregate function", "42809");
+        }
         StringBuilder types = new StringBuilder();
         for (int i = 0; i < call.args().size(); i++) {
             if (i > 0) types.append(", ");

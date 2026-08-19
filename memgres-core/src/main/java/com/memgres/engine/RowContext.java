@@ -27,6 +27,15 @@ public class RowContext {
          * are answered from the place the row occupies in the relation below.
          */
         public final Object[] storedRow;
+        /**
+         * Whether this side of an outer join matched nothing and was filled in with nulls.
+         *
+         * <p>Such a row's columns are null because there is no row: the relation is still named
+         * and still has the shape it has, but none of it is being read here. Its system columns
+         * are null for the same reason, and answering them off the relation instead handed back
+         * the position and the transaction of a tuple this row is not.
+         */
+        public final boolean nullExtended;
 
         public TableBinding(Table table, String alias, Object[] row, Table sourceTable) {
             this(table, alias, row, sourceTable, row);
@@ -34,11 +43,17 @@ public class RowContext {
 
         public TableBinding(Table table, String alias, Object[] row, Table sourceTable,
                             Object[] storedRow) {
+            this(table, alias, row, sourceTable, storedRow, false);
+        }
+
+        private TableBinding(Table table, String alias, Object[] row, Table sourceTable,
+                             Object[] storedRow, boolean nullExtended) {
             this.table = table;
             this.alias = alias;
             this.row = row;
             this.sourceTable = sourceTable;
             this.storedRow = storedRow;
+            this.nullExtended = nullExtended;
         }
 
         /** Convenience constructor without sourceTable (defaults to table). */
@@ -46,11 +61,17 @@ public class RowContext {
             this(table, alias, row, table);
         }
 
+        /** The relation as an unmatched side of an outer join names it: its shape, and no row. */
+        public static TableBinding nullExtended(Table table, String alias, Object[] nullRow) {
+            return new TableBinding(table, alias, nullRow, table, nullRow, true);
+        }
+
         public Table table() { return table; }
         public String alias() { return alias; }
         public Object[] row() { return row; }
         public Table sourceTable() { return sourceTable; }
         public Object[] storedRow() { return storedRow; }
+        public boolean isNullExtended() { return nullExtended; }
 
         @Override
         public boolean equals(Object o) {
@@ -150,7 +171,7 @@ public class RowContext {
         }
     }
 
-    private final List<TableBinding> bindings;
+    private List<TableBinding> bindings;
     /**
      * The columns this row exposes, in order, when a join merged some of them; null when the
      * answer is simply every binding's columns in order. See {@link OutCol}.
@@ -165,6 +186,15 @@ public class RowContext {
      * parenthesized join. Naming one is a reference that cannot reach, not a missing entry.
      */
     private Set<String> coveredNames;
+    /**
+     * Relations the FROM clause reaches only through a join expression.
+     *
+     * <p>A join is one FROM item, and what it exposes is a row of both its sides' ordinary
+     * columns -- so an unqualified {@code ctid} written over {@code a JOIN b} names nothing the
+     * join has, while over {@code a, b} it names something both of them have and is ambiguous.
+     * The relations under the join still answer to their own names, so {@code a.ctid} is fine.
+     */
+    private Set<String> joinedNames;
     /**
      * View-column aliasing: maps a view column name (lower-case) to the underlying base-table
      * column name. Set when a DML statement runs through an auto-updatable view that renames
@@ -281,6 +311,19 @@ public class RowContext {
     }
 
     /**
+     * Adds a relation this row answers to, after the ones it already holds. Used where a USING
+     * clause is given a name of its own: the name is a relation like any other, whose columns are
+     * the ones the join merged. Appending it leaves every binding already referred to by index
+     * where it was.
+     */
+    public void addBinding(TableBinding binding) {
+        List<TableBinding> next = new ArrayList<>(bindings.size() + 1);
+        next.addAll(bindings);
+        next.add(binding);
+        bindings = next;
+    }
+
+    /**
      * A second context over the same row, whose bound values can be set independently of this
      * one's. Used where one input row has to stand for several output rows -- a set-returning
      * call in GROUP BY or ORDER BY produces one row per element and each needs its own binding.
@@ -307,10 +350,7 @@ public class RowContext {
     public TableBinding getBinding(String qualifier) {
         TableBinding found = null;
         for (TableBinding b : bindings) {
-            boolean matches = b.alias() != null
-                    ? b.alias().equalsIgnoreCase(qualifier)
-                    : b.table().getName().equalsIgnoreCase(qualifier);
-            if (!matches) continue;
+            if (!namedBy(b, qualifier)) continue;
             // Two relations of one name from two schemas may both stand in a FROM clause --
             // FROM s1.t, s2.t is legal, because either can still be reached by writing its
             // schema. Written bare, the name reaches both, and PostgreSQL says so rather than
@@ -332,16 +372,31 @@ public class RowContext {
     public List<TableBinding> bindingsNamed(String qualifier) {
         List<TableBinding> named = new ArrayList<>();
         for (TableBinding b : bindings) {
-            boolean matches = b.alias() != null
-                    ? b.alias().equalsIgnoreCase(qualifier)
-                    : b.table().getName().equalsIgnoreCase(qualifier);
-            if (matches) named.add(b);
+            if (namedBy(b, qualifier)) named.add(b);
         }
         return named;
     }
 
+    /**
+     * Whether a qualifier names this binding. An alias hides the relation's own name, so only one
+     * of the two is ever compared.
+     *
+     * <p>Both sides are identifiers that have already been folded once — unquoted where they were
+     * written, and left as written where they were quoted — so they are compared as they stand.
+     * Comparing them regardless of case let {@code FROM t AS "Q"} answer to {@code q.a} and
+     * {@code FROM t x} answer to {@code "X".a}, which is to say it undid the quotes.
+     */
+    private static boolean namedBy(TableBinding b, String qualifier) {
+        return b.alias() != null
+                ? b.alias().equals(qualifier)
+                : b.table().getName().equals(qualifier);
+    }
+
     /** Records the relations this row's FROM clause covers over. See {@code coveredNames}. */
     public void setCoveredNames(Set<String> names) { this.coveredNames = names; }
+
+    /** Records the relations this row reaches only through a join. See {@code joinedNames}. */
+    public void setJoinedNames(Set<String> names) { this.joinedNames = names; }
 
     /**
      * What a qualifier no binding answers to is: a relation the query does not have, or one it has
@@ -374,8 +429,16 @@ public class RowContext {
         boolean systemName = lcCol.equals("tableoid") || lcCol.equals("ctid") || lcCol.equals("xmin")
                 || lcCol.equals("xmax") || lcCol.equals("cmin") || lcCol.equals("cmax");
         if (systemName && !aBindingDeclares(tableQualifier, columnName)) {
-            if (lcCol.equals("tableoid")) return resolveTableoid(tableQualifier);
-            return resolveSystemColumn(tableQualifier, lcCol);
+            TableBinding owner = systemColumnBinding(tableQualifier, lcCol);
+            if (owner != null) {
+                // Nothing of an unmatched outer-join side is being read here, its system
+                // columns included.
+                if (owner.isNullExtended()) return null;
+                if (lcCol.equals("tableoid")) return new TableoidRef(owner.sourceTable());
+                return new SystemColumnRef(owner.sourceTable(), owner.storedRow(), lcCol);
+            }
+            // No FROM item here has one. The name is then an ordinary column name like any
+            // other, and saying which columns there are instead is the more useful answer.
         }
         // Translate view column names to base-table names for renamed-column view DML.
         columnName = aliasColumn(columnName);
@@ -464,50 +527,69 @@ public class RowContext {
     }
 
     /**
-     * Resolve the tableoid pseudo-column for a binding.
-     * Returns a placeholder integer that will be resolved via SystemCatalog OID lookup.
-     * The sourceTable is the actual table that stores the row (partition for partitioned tables).
+     * The FROM item a system column name is being read from, or null where none here has one.
+     *
+     * <p>Only a relation that stores its rows has system columns, so a sub-SELECT, a CTE, a
+     * VALUES list, an ordinary view or a function scan is passed over. Unqualified, the name is
+     * searched across every FROM item the query listed and is ambiguous when two of them offer
+     * it; a join is one item, and what it exposes is its sides' ordinary columns only, so a
+     * relation reached only through a join does not answer an unqualified system column even
+     * though it is the only relation there. See {@code joinedNames}.
      */
-    private Object resolveTableoid(String tableQualifier) {
-        if (tableQualifier != null) {
-            TableBinding b = getBinding(tableQualifier);
-            if (b == null) {
-                throw new MemgresException("missing FROM-clause entry for table \"" + tableQualifier + "\"", "42P01");
+    private TableBinding systemColumnBinding(String qualifier, String colName) {
+        if (qualifier != null) {
+            TableBinding b = getBinding(qualifier);
+            if (b == null) throw noSuchFromEntry(qualifier);
+            return b.sourceTable().storesRows() ? b : null;
+        }
+        TableBinding found = null;
+        TableBinding behindAJoin = null;
+        for (TableBinding b : bindings) {
+            if (!b.sourceTable().storesRows()) continue;
+            if (joinedNames != null && joinedNames.contains(bindingName(b))) {
+                if (behindAJoin == null) behindAJoin = b;
+                continue;
             }
-            // Return the source table name so it can be resolved to an OID
-            return new TableoidRef(b.sourceTable());
+            if (found != null) {
+                throw new MemgresException(
+                        "column reference \"" + colName + "\" is ambiguous", "42702");
+            }
+            found = b;
         }
-        // Unqualified, return from first binding
-        if (!bindings.isEmpty()) {
-            return new TableoidRef(bindings.get(0).sourceTable());
-        }
-        throw new MemgresException("column \"tableoid\" does not exist", "42703");
+        if (found != null) return found;
+        if (behindAJoin != null) throw joinHidesIt(colName);
+        return null;
+    }
+
+    /** The name a FROM item answers to here: what it was aliased as, else the relation's own. */
+    private static String bindingName(TableBinding b) {
+        return (b.alias() != null ? b.alias() : b.table().getName()).toLowerCase();
     }
 
     /**
-     * Resolve system columns (ctid, xmin, xmax, cmin, cmax) for a row.
+     * What a system column written unqualified over a join is: a name the join does not expose,
+     * belonging to relations that are still there to be named one at a time.
      */
-    private Object resolveSystemColumn(String tableQualifier, String colName) {
-        TableBinding b;
-        if (tableQualifier != null) {
-            b = getBinding(tableQualifier);
-            if (b == null) {
-                throw new MemgresException("missing FROM-clause entry for table \"" + tableQualifier + "\"", "42P01");
+    private MemgresException joinHidesIt(String colName) {
+        List<TableBinding> owners = new ArrayList<TableBinding>();
+        for (TableBinding b : bindings) {
+            if (b.sourceTable().storesRows() && joinedNames.contains(bindingName(b))) {
+                owners.add(b);
             }
+        }
+        MemgresException e = new MemgresException(
+                "column \"" + colName + "\" does not exist", "42703");
+        if (owners.size() == 1) {
+            e.setDetail("There is a column named \"" + colName + "\" in table \""
+                    + bindingName(owners.get(0))
+                    + "\", but it cannot be referenced from this part of the query.");
+            e.setHint("To reference that column, you must use a table-qualified name.");
         } else {
-            if (bindings.isEmpty()) {
-                throw new MemgresException("column \"" + colName + "\" does not exist", "42703");
-            }
-            b = bindings.get(0);
+            e.setDetail("There are columns named \"" + colName + "\", but they are in tables "
+                    + "that cannot be referenced from this part of the query.");
+            e.setHint("Try using a table-qualified name.");
         }
-        Table table = b.sourceTable();
-        Object[] row = b.storedRow();
-        if (colName.equals("ctid")) {
-            // Return a SystemColumnRef so ExprEvaluator can compute with metadata
-            return new SystemColumnRef(table, row, "ctid");
-        }
-        // xmin, xmax, cmin, cmax: look up from row metadata
-        return new SystemColumnRef(table, row, colName);
+        return e;
     }
 
     /** Marker for deferred system column resolution (xmin/xmax/cmin/cmax). */

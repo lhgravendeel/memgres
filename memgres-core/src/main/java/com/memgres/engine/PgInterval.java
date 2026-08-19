@@ -117,18 +117,31 @@ public class PgInterval implements Comparable<PgInterval> {
         if (Double.isNaN(factor)) throw intervalOutOfRange();
         // PG cascades fractional parts: fractional months → days, fractional days → microseconds
         double totalMonths = months * factor;
-        int newMonths = (int) totalMonths;
-        double fracMonths = totalMonths - newMonths;
-        // 1 month = 30 days in PG interval arithmetic
-        double totalDays = days * factor + fracMonths * 30.0;
-        int newDays = (int) totalDays;
-        double fracDays = totalDays - newDays;
-        // 1 day = 24 hours = 86400000000 microseconds
-        double newMicros = microseconds * factor + fracDays * 86400_000_000L;
-        if (!Double.isFinite(totalMonths) || !Double.isFinite(totalDays) || !Double.isFinite(newMicros)) {
-            throw intervalOutOfRange();
+        double totalDays = days * factor;
+        if (!Double.isFinite(totalMonths) || !Double.isFinite(totalDays)) throw intervalOutOfRange();
+        long newMonths = (long) totalMonths;
+        long newDays = (long) totalDays;
+        // Each fraction is rounded to the microsecond before it is carried down. Cascading the
+        // raw quotient instead let 0.9 of a month come out 26.999999999999996 days, which spills a
+        // whole day's worth of microseconds: 3 months 10 days times 0.3 read 29 days 24:00:00
+        // where it is 30 days. 1 month is 30 days and 1 day is 86400 seconds here, as PG has it.
+        double monthRemainderDays = roundToMicros((totalMonths - newMonths) * 30.0);
+        double secRemainder = roundToMicros((totalDays - newDays
+                + monthRemainderDays - (long) monthRemainderDays) * 86400.0);
+        // The seconds may have reached a whole day, by rounding or by what cascaded into them.
+        if (Math.abs(secRemainder) >= 86400.0) {
+            newDays += (long) (secRemainder / 86400.0);
+            secRemainder -= (long) (secRemainder / 86400.0) * 86400.0;
         }
-        return checked((long) totalMonths, (long) totalDays, Math.round(newMicros));
+        newDays += (long) monthRemainderDays;
+        double newMicros = microseconds * factor + secRemainder * 1_000_000.0;
+        if (!Double.isFinite(newMicros)) throw intervalOutOfRange();
+        return checked(newMonths, newDays, Math.round(newMicros));
+    }
+
+    /** A quantity read to the microsecond, which is as fine as an interval is kept. */
+    private static double roundToMicros(double value) {
+        return Math.rint(value * 1_000_000.0) / 1_000_000.0;
     }
 
     /**

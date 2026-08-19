@@ -4244,7 +4244,15 @@ public class PlpgsqlExecutor {
         } else if (val instanceof RawSql) {
             sb.append(((RawSql) val).sql);
         } else if (val instanceof Number || val instanceof Boolean) {
-            sb.append(val);
+            // A negative number written out is a minus in front of a number, and the minus would
+            // bind less tightly than a cast written after it: x::text with x = -1 would be read as
+            // -(1::text). Parentheses keep the value one operand of whatever surrounds it.
+            String text = String.valueOf(val);
+            if (text.startsWith("-")) {
+                sb.append("(").append(text).append(")");
+            } else {
+                sb.append(text);
+            }
         } else if (val instanceof byte[]) {
             byte[] bytes = (byte[]) val;
             // Format as bytea hex literal: '\x...'::bytea

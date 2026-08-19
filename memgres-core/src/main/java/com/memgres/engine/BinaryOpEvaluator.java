@@ -647,6 +647,11 @@ class BinaryOpEvaluator {
     }
 
     /** The spelling PostgreSQL's pg_operator uses for each of the operators written here. */
+    static String spellingOf(BinaryExpr.BinOp op) {
+        return pgSpelling(op);
+    }
+
+    /** The spelling PostgreSQL's pg_operator uses for each of the operators written here. */
     private static String pgSpelling(BinaryExpr.BinOp op) {
         switch (op) {
             case ADD: return "+";
@@ -797,6 +802,18 @@ class BinaryOpEvaluator {
      * failure than the permissiveness this rule removes.
      */
     String declaredTypeForResolution(Expression expr, RowContext ctx) {
+        // A call an enclosing query level has already answered is of the type it answered with.
+        // Its arguments name that level's columns, which this one cannot read, so asking what it
+        // would resolve to here asks about a call nothing here defines.
+        ExprEvaluator.PrecomputedValueExpr answered = executor.exprEvaluator.levelFoldedFor(expr);
+        if (answered != null) {
+            return answered.declaredType() == null ? null : answered.declaredType().getPgName();
+        }
+        // A test answers yes or no, whatever it is a test of, so an operator written over one is
+        // written over a boolean. Reading a test as saying nothing about its type left
+        // 1 = (1 IN (1,2)) to be run as a comparison of an integer with a boolean, which
+        // PostgreSQL has no operator for.
+        if (isBooleanByConstruction(expr)) return "boolean";
         // A subscript is declared what one element of the thing subscripted is declared, and a
         // range of them is declared what the whole is: without that a bpchar element read as text
         // kept the blanks its declaration padded it to.
@@ -910,6 +927,11 @@ class BinaryOpEvaluator {
         }
         if (expr instanceof ColumnRef && ctx != null) {
             ColumnRef ref = (ColumnRef) expr;
+            // A system column is typed by what it is, not by the relation's declarations, which
+            // the loop below is all that reads: xmin > 0 ran where PostgreSQL has no
+            // xid > integer, and ctid::bigint was judged against whatever the value looked like.
+            DataType system = SystemColumns.resolve(ref, ctx.getBindings());
+            if (system != null) return system.getPgName();
             for (RowContext.TableBinding b : ctx.getBindings()) {
                 // The written name first: it costs a comparison, where deciding whether the
                 // binding is a base table costs a walk of the schemas.
@@ -919,12 +941,39 @@ class BinaryOpEvaluator {
                 int idx = b.table().getColumnIndex(ref.column());
                 if (idx < 0) continue;
                 if (!columnTypeIsDeclared(b.table(), idx)) return null;
+                // A column of a composite type is of that type, whatever it is stored as. The
+                // stored type is text, and answering text said the row was a string.
+                if (b.table().getColumns().get(idx).getCompositeTypeName() != null) return null;
                 DataType t = b.table().getColumns().get(idx).getType();
                 if (t == DataType.INTERNAL_CHAR) return "\"char\"";
                 return t == null ? null : t.getPgName();
             }
         }
         return null;
+    }
+
+    /** The operators whose answer is a truth value rather than a value of the operand's type. */
+    private static final java.util.Set<BinaryExpr.BinOp> BOOLEAN_RESULT_OPS =
+            java.util.Collections.unmodifiableSet(java.util.EnumSet.of(
+                    BinaryExpr.BinOp.EQUAL, BinaryExpr.BinOp.NOT_EQUAL,
+                    BinaryExpr.BinOp.LESS_THAN, BinaryExpr.BinOp.GREATER_THAN,
+                    BinaryExpr.BinOp.LESS_EQUAL, BinaryExpr.BinOp.GREATER_EQUAL,
+                    BinaryExpr.BinOp.AND, BinaryExpr.BinOp.OR,
+                    BinaryExpr.BinOp.LIKE, BinaryExpr.BinOp.ILIKE, BinaryExpr.BinOp.SIMILAR_TO,
+                    BinaryExpr.BinOp.REGEX_MATCH, BinaryExpr.BinOp.REGEX_IMATCH,
+                    BinaryExpr.BinOp.NOT_REGEX_MATCH, BinaryExpr.BinOp.NOT_REGEX_IMATCH,
+                    BinaryExpr.BinOp.IS_DISTINCT_FROM, BinaryExpr.BinOp.IS_NOT_DISTINCT_FROM));
+
+    /** Whether an expression is a truth value by the shape it is written in. */
+    private static boolean isBooleanByConstruction(Expression expr) {
+        if (expr instanceof InExpr || expr instanceof BetweenExpr || expr instanceof LikeExpr
+                || expr instanceof IsNullExpr || expr instanceof IsBooleanExpr
+                || expr instanceof IsJsonExpr || expr instanceof ExistsExpr
+                || expr instanceof AnyAllExpr || expr instanceof AnyAllArrayExpr) {
+            return true;
+        }
+        if (expr instanceof UnaryExpr) return ((UnaryExpr) expr).op == UnaryExpr.UnaryOp.NOT;
+        return expr instanceof BinaryExpr && BOOLEAN_RESULT_OPS.contains(((BinaryExpr) expr).op());
     }
 
     /**
@@ -2655,7 +2704,7 @@ class BinaryOpEvaluator {
      *
      * @param equal true for {@code =}, false for {@code <>}
      */
-    private static Object rowEquality(List<?> l, List<?> r, boolean equal) {
+    static Object rowEquality(List<?> l, List<?> r, boolean equal) {
         boolean unknown = false;
         for (int i = 0; i < l.size(); i++) {
             Object lv = l.get(i), rv = r.get(i);

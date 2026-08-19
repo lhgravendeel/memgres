@@ -551,6 +551,7 @@ class DdlTableExecutor {
                 if (hasSubquery) {
                     throw new MemgresException("cannot use subquery in column generation expression", "0A000");
                 }
+                DdlDefinitionChecks.rejectSystemColumnInGeneration(generated);
                 // What the expression produces has to be a value the column can hold. A bare
                 // literal is read with the column type's input function, and PostgreSQL reads it
                 // when the column is defined -- exactly as it reads a DEFAULT written there.

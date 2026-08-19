@@ -10,6 +10,7 @@ import com.memgres.engine.parser.ast.OrderedSetAggExpr;
 import com.memgres.engine.parser.ast.SelectStmt;
 import com.memgres.engine.parser.ast.Statement;
 import com.memgres.engine.parser.ast.SubqueryExpr;
+import com.memgres.engine.parser.ast.WildcardExpr;
 import com.memgres.engine.parser.ast.WindowFuncExpr;
 
 import java.util.ArrayList;
@@ -242,13 +243,19 @@ final class PlacementCheck {
             }
             if (mode == Mode.WINDOWS_ONLY) return null;
             if (GroupByValidator.isGroupingCall(fn)) return Kind.GROUPING;
-            if (select.isAggregateFunction(fn.name())) return Kind.AGGREGATE;
+            if (select.isAggregateFunction(fn.name())) {
+                // An aggregate the enclosing query has already answered is a value here, not a
+                // call this clause is holding: see SelectExecutor#isAnsweredAtOuterLevel.
+                return select.isAnsweredAtOuterLevel(fn) ? null : Kind.AGGREGATE;
+            }
             if (mode != Mode.PLACEMENT && FilterCheck.carriesRefusedFilter(select, fn)) {
                 return Kind.NOT_AGGREGATE;
             }
             return null;
         }
-        if (mode != Mode.WINDOWS_ONLY && node instanceof OrderedSetAggExpr) return Kind.AGGREGATE;
+        if (mode != Mode.WINDOWS_ONLY && node instanceof OrderedSetAggExpr) {
+            return select.isAnsweredAtOuterLevel((OrderedSetAggExpr) node) ? null : Kind.AGGREGATE;
+        }
         return null;
     }
 
@@ -341,6 +348,168 @@ final class PlacementCheck {
         }
     }
 
+    /**
+     * The aggregate calls written inside a sub-select of this clause that belong to the query
+     * level {@code outer} describes, in the order they were written.
+     *
+     * <p>The same rule as {@link #rejectOuterLevelAggregate}, asked of a query rather than of a
+     * single relation, and asked to name the calls rather than to refuse them: a select list may
+     * hold such a call perfectly legally, and what the query then needs is to answer it over its
+     * own groups.
+     *
+     * <p>The search goes down as far as the sub-selects go, carrying the names each level supplies
+     * as it descends: a call is this level's only if nothing between here and where it is written
+     * supplies any of the columns it names. A sub-select with no FROM supplies nothing, so every
+     * column written in one comes from further out; one whose FROM this cannot describe, and
+     * everything below it, is left alone.
+     */
+    List<Expression> outerLevelAggregatesIn(Object node, List<RowContext.TableBinding> outer) {
+        if (node == null || outer == null || outer.isEmpty()) {
+            return java.util.Collections.<Expression>emptyList();
+        }
+        List<Expression> owned = new ArrayList<Expression>();
+        collectOwnedAggregates(node, new LinkedHashSet<String>(), outer, owned);
+        return owned;
+    }
+
+    /**
+     * Rejects an aggregate of this query level written inside the arguments of another aggregate
+     * of it. Both are answered over the same group, and the inner one would have to be answered
+     * first, over rows the outer one has already consumed — so PostgreSQL refuses the shape.
+     *
+     * <p>{@link SelectWindowEvaluator} already refuses one written directly, {@code sum(count(v))}.
+     * This is the same call written inside a sub-select, {@code sum((SELECT count(v)))}, which
+     * belongs here all the same. The walk stops at a nested query, because judging what is written
+     * inside one is that query's own business; the arguments are searched with the rule that finds
+     * such a call wherever it stands.
+     */
+    void rejectNestedOuterLevelAggregate(Object node, List<RowContext.TableBinding> outer) {
+        if (node == null || node instanceof Statement || outer == null || outer.isEmpty()) return;
+        List<Expression> args = null;
+        if (node instanceof OrderedSetAggExpr) {
+            args = ((OrderedSetAggExpr) node).args();
+        } else if (node instanceof FunctionCallExpr
+                && select.isAggregateFunction(((FunctionCallExpr) node).name())) {
+            args = ((FunctionCallExpr) node).args();
+        }
+        if (args != null) {
+            for (Expression arg : args) {
+                if (!outerLevelAggregatesIn(arg, outer).isEmpty()) {
+                    throw new MemgresException("aggregate function calls cannot be nested", "42803");
+                }
+            }
+        }
+        AstWalk.forEachChild(node, child -> rejectNestedOuterLevelAggregate(child, outer));
+    }
+
+    private void collectOwnedAggregates(Object node, Set<String> supplied,
+                                        List<RowContext.TableBinding> outer,
+                                        List<Expression> owned) {
+        List<SelectStmt> nested = new ArrayList<SelectStmt>();
+        collectNestedSelects(node, nested);
+        for (SelectStmt sub : nested) {
+            Set<String> ownScope = shapeOf(sub);
+            if (ownScope == null) continue;
+            ownScope.addAll(supplied);
+            List<Object> aggregates = new ArrayList<Object>();
+            collectAggregatesInScope(sub.targets(), aggregates);
+            collectAggregatesInScope(sub.where(), aggregates);
+            collectAggregatesInScope(sub.having(), aggregates);
+            for (Object aggregate : aggregates) {
+                if (select.isAnsweredAtOuterLevel((Expression) aggregate)) continue;
+                if (belongsToLevel(aggregate, ownScope, outer)) owned.add((Expression) aggregate);
+            }
+            collectOwnedAggregates(sub.targets(), ownScope, outer, owned);
+            collectOwnedAggregates(sub.where(), ownScope, outer, owned);
+            collectOwnedAggregates(sub.having(), ownScope, outer, owned);
+        }
+    }
+
+    /**
+     * The names a sub-select's own FROM supplies — each item's alias and each of its columns — or
+     * null where an item is one this cannot describe. A relation, a CTE, a derived table and a
+     * set-returning function all have a shape, and all four are read: an aggregate is judged
+     * against what a level supplies, not against what kind of thing supplies it.
+     */
+    private Set<String> shapeOf(SelectStmt sub) {
+        Set<String> names = new LinkedHashSet<String>();
+        if (sub.from() == null) return names;
+        try {
+            for (SelectStmt.FromItem item : sub.from()) {
+                for (RowContext.TableBinding b : select.executor.fromResolver.resolveItemShape(item)) {
+                    if (b.alias() != null) names.add(b.alias().toLowerCase(Locale.ROOT));
+                    if (b.table() == null) return null;
+                    for (Column c : b.table().getColumns()) {
+                        names.add(c.getName().toLowerCase(Locale.ROOT));
+                    }
+                }
+            }
+        } catch (RuntimeException e) {
+            return null;
+        }
+        return names;
+    }
+
+    /**
+     * Whether every column an aggregate names comes from {@code outer} and none from the
+     * sub-select's own scope. An aggregate naming no column at all belongs where it is written —
+     * {@code count(*)} inside a sub-select counts that sub-select's rows.
+     *
+     * <p>A qualified star names a whole relation rather than one of its columns, and so is judged
+     * by its qualifier alone: {@code count(a.*)} written in a sub-select is the enclosing query's
+     * when {@code a} is the enclosing query's relation. A bare star names no relation, so it stays
+     * where it is written, which is why {@code count(*)} does.
+     */
+    private boolean belongsToLevel(Object aggregate, Set<String> ownScope,
+                                   List<RowContext.TableBinding> outer) {
+        List<ColumnRef> refs = new ArrayList<ColumnRef>();
+        collectColumnRefsInScope(aggregate, refs);
+        List<WildcardExpr> stars = new ArrayList<WildcardExpr>();
+        collectQualifiedStarsInScope(aggregate, stars);
+        if (refs.isEmpty() && stars.isEmpty()) return false;
+        for (WildcardExpr star : stars) {
+            String qualifier = star.table.toLowerCase(Locale.ROOT);
+            if (ownScope.contains(qualifier)) return false;
+            if (!namesRelation(outer, qualifier)) return false;
+        }
+        for (ColumnRef ref : refs) {
+            String column = ref.column();
+            if (column == null || "*".equals(column)) return false;
+            String qualifier = ref.table() == null ? null : ref.table().toLowerCase(Locale.ROOT);
+            if (qualifier != null && ownScope.contains(qualifier)) return false;
+            if (qualifier == null && ownScope.contains(column.toLowerCase(Locale.ROOT))) return false;
+            if (!supplies(outer, qualifier, column)) return false;
+        }
+        return true;
+    }
+
+    /** Whether one of the relations {@code outer} supplies is the one a qualifier names. */
+    private static boolean namesRelation(List<RowContext.TableBinding> outer, String qualifier) {
+        for (RowContext.TableBinding b : outer) {
+            if (qualifier.equalsIgnoreCase(b.alias())) return true;
+        }
+        return false;
+    }
+
+    private void collectQualifiedStarsInScope(Object node, List<WildcardExpr> out) {
+        if (node == null || node instanceof Statement) return;
+        if (node instanceof WildcardExpr) {
+            if (((WildcardExpr) node).table != null) out.add((WildcardExpr) node);
+            return;
+        }
+        AstWalk.forEachChild(node, child -> collectQualifiedStarsInScope(child, out));
+    }
+
+    private static boolean supplies(List<RowContext.TableBinding> outer, String qualifier,
+                                    String column) {
+        for (RowContext.TableBinding b : outer) {
+            if (b.table() == null) continue;
+            if (qualifier != null && !qualifier.equalsIgnoreCase(b.alias())) continue;
+            if (b.table().getColumnIndex(column) >= 0) return true;
+        }
+        return false;
+    }
+
     /** Every sub-select written directly in this clause (one level down; each judges its own). */
     private void collectNestedSelects(Object node, List<SelectStmt> out) {
         if (node == null) return;
@@ -371,10 +540,14 @@ final class PlacementCheck {
      * The lowercased column names a sub-select's own FROM supplies, or null when any FROM item is
      * something this check cannot read — a sub-select, a function, a CTE name, a missing relation.
      * A null answer means "unknown", and an unknown scope disables the rule for that sub-select.
+     *
+     * <p>A sub-select with no FROM supplies nothing, which is known rather than unknown: every
+     * column written in one comes from further out, so {@code SET c = (SELECT max(c))} is an
+     * aggregate of the UPDATE.
      */
     private Set<String> visibleColumns(SelectStmt sub) {
         Set<String> names = new LinkedHashSet<String>();
-        if (sub.from() == null || sub.from().isEmpty()) return null;
+        if (sub.from() == null || sub.from().isEmpty()) return names;
         for (SelectStmt.FromItem item : sub.from()) {
             if (!addVisibleColumns(item, names)) return null;
         }

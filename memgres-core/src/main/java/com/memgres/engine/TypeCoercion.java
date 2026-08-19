@@ -2677,6 +2677,9 @@ public final class TypeCoercion {
         if (a instanceof LocalTime && b instanceof LocalTime) return ((LocalTime) a).compareTo((LocalTime) b);
         if (a instanceof PgInterval && b instanceof PgInterval) return ((PgInterval) a).compareTo((PgInterval) b);
 
+        // A tid is ordered by its block and then its slot. As text, (0,10) came before (0,9).
+        if (a instanceof PgTid && b instanceof PgTid) return ((PgTid) a).compareTo((PgTid) b);
+
         // UUID comparisons
         if (a instanceof java.util.UUID && b instanceof java.util.UUID) {
             return compareUuids((java.util.UUID) a, (java.util.UUID) b);
@@ -3107,6 +3110,7 @@ public final class TypeCoercion {
         if (value instanceof InetValue && !(value instanceof CidrValue)) return DataType.INET;
         if (value instanceof CidrValue) return DataType.CIDR;
         if (value instanceof MacaddrValue) return DataType.MACADDR;
+        if (value instanceof PgTid) return DataType.TID;
         if (value instanceof Macaddr8Value) return DataType.MACADDR8;
         if (value instanceof byte[]) return DataType.BYTEA;
         if (value instanceof List) return DataType.TEXT; // arrays

@@ -140,9 +140,15 @@ final class AstWalk {
      * The fields of a node type that can hold children.
      *
      * <p>Which fields those are is a property of the type, so it is settled once per type rather
-     * than once per node. {@link Class#getFields()} hands back a fresh array on every call and
-     * {@link Class#getEnclosingClass()} is not free either; between them they were the largest
+     * than once per node. {@link Class#getDeclaredFields()} hands back a fresh array on every call
+     * and {@link Class#getEnclosingClass()} is not free either; between them they were the largest
      * cost of walking a statement, and a statement is walked several times over before it runs.
+     *
+     * <p>Declared rather than public: most nodes in the package hold their children in public
+     * fields, but a few hold them privately behind accessors, and a walk that reads only what is
+     * public simply does not enter those. That is not a distinction any caller means to draw --
+     * a subscript reference and a custom operator hold operands like every other node -- and it
+     * made the answers depend on how a node happened to be written.
      */
     private static Field[] childFields(Class<?> nodeClass) {
         Field[] cached = CHILD_FIELDS.get(nodeClass);
@@ -152,10 +158,13 @@ final class AstWalk {
             fields = NONE;
         } else {
             java.util.List<Field> kept = new java.util.ArrayList<Field>();
-            for (Field f : nodeClass.getFields()) {
-                if (Modifier.isStatic(f.getModifiers())) continue;
-                if (f.getType().isPrimitive() || f.getType() == String.class) continue;
-                kept.add(f);
+            for (Class<?> c = nodeClass; c != null && isAstNode(c); c = c.getSuperclass()) {
+                for (Field f : c.getDeclaredFields()) {
+                    if (Modifier.isStatic(f.getModifiers())) continue;
+                    if (f.getType().isPrimitive() || f.getType() == String.class) continue;
+                    if (!f.isAccessible()) f.setAccessible(true);
+                    kept.add(f);
+                }
             }
             fields = kept.isEmpty() ? NONE : kept.toArray(new Field[0]);
         }

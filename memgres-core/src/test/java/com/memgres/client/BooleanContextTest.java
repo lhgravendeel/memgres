@@ -440,23 +440,36 @@ class BooleanContextTest {
 
     /**
      * A type this cannot settle is a type it says nothing about, and there are still definitions
-     * it cannot read through: a call whose result type is decided by resolving it, a bare literal
-     * or NULL that PostgreSQL resolves to text at the sub-query boundary, a record-returning call
-     * with no column definition list, and a star over a USING join, whose merged column changes
-     * both how many columns the star stands for and which relation each came from. PostgreSQL
-     * refuses all five with 42804; these are accepted, which is the safe side of the gap.
+     * it cannot read through: a call whose result type is decided by resolving it, a
+     * record-returning call with no column definition list, and a star over a USING join, whose
+     * merged column changes both how many columns the star stands for and which relation each came
+     * from. PostgreSQL refuses all three with 42804; these are accepted, which is the safe side of
+     * the gap.
+     *
+     * <p>A bare literal or NULL is no longer one of them: a relation's column has a type whatever
+     * was written into it, so the sub-query boundary settles an unknown one as text and the
+     * condition is refused for being text.
      */
     @Test
     void aTypeThatCannotBeSettledIsLeftAlone() {
         assertEquals("OK",
                 stateOf("SELECT count(*) FROM (SELECT greatest(i, 0) AS k FROM bct_t) q WHERE k"));
-        assertEquals("OK", stateOf("SELECT count(*) FROM (SELECT 'x' AS k) q WHERE k"));
-        assertEquals("OK",
-                stateOf("SELECT count(*) FROM (SELECT NULL AS k FROM bct_t) q WHERE k"));
         assertEquals("OK",
                 stateOf("SELECT count(*) FROM jsonb_each('{\"a\":1}') e WHERE e.key"));
         assertEquals("OK", stateOf(
                 "SELECT count(*) FROM (SELECT * FROM bct_t a JOIN bct_u u USING (id)) q WHERE i"));
+    }
+
+    /** An unknown a relation holds is text, so a condition written over one is refused for it. */
+    @Test
+    void anUntypedColumnOfASubqueryIsTextInACondition() {
+        assertEquals("42804", stateOf("SELECT count(*) FROM (SELECT 'x' AS k) q WHERE k"));
+        assertEquals("argument of WHERE must be type boolean, not type text",
+                messageOf("SELECT count(*) FROM (SELECT 'x' AS k) q WHERE k"));
+        assertEquals("42804",
+                stateOf("SELECT count(*) FROM (SELECT NULL AS k FROM bct_t) q WHERE k"));
+        assertEquals("argument of WHERE must be type boolean, not type text",
+                messageOf("SELECT count(*) FROM (SELECT NULL AS k FROM bct_t) q WHERE k"));
     }
 
     @Test

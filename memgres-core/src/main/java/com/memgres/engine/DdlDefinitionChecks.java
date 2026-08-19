@@ -365,6 +365,7 @@ public final class DdlDefinitionChecks {
         Set<String> seen = new java.util.HashSet<String>();
         for (String written : columns) {
             if (written == null || isExpressionKeyElement(written)) continue;
+            rejectSystemKeyColumn(written);
             if (table.getColumnIndex(written) < 0) {
                 throw new MemgresException("column \"" + written
                         + "\" named in key does not exist", "42703");
@@ -384,11 +385,39 @@ public final class DdlDefinitionChecks {
         if (columns == null || table == null) return;
         for (String written : columns) {
             if (written == null || isExpressionKeyElement(written)) continue;
+            rejectSystemKeyColumn(written);
             if (table.getColumnIndex(written) < 0) {
                 throw new MemgresException("column \"" + written
                         + "\" named in key does not exist", "42703");
             }
         }
+    }
+
+    /**
+     * A system column written where an index column belongs.
+     *
+     * <p>What PostgreSQL says depends on the column's type rather than on its being a system one:
+     * {@code xid} and {@code cid} have no btree operator class to build an index with and are
+     * refused for that, where {@code tid} and {@code oid} have one and so reach the rule that no
+     * index may be built over a system column at all.
+     */
+    public static void rejectSystemKeyColumn(String column) {
+        if (!isSystemColumnName(column)) return;
+        String lower = column.toLowerCase();
+        String unindexable = lower.equals("xmin") || lower.equals("xmax") ? "xid"
+                : lower.equals("cmin") || lower.equals("cmax") ? "cid" : null;
+        if (unindexable == null) throw indexOnSystemColumn();
+        MemgresException e = new MemgresException("data type " + unindexable
+                + " has no default operator class for access method \"btree\"", "42704");
+        e.setHint("You must specify an operator class for the index or define a default"
+                + " operator class for the data type.");
+        throw e;
+    }
+
+    /** What an index over a system column is refused as, wherever the column was written. */
+    public static MemgresException indexOnSystemColumn() {
+        return new MemgresException(
+                "index creation on system columns is not supported", "0A000");
     }
 
     /**
@@ -453,6 +482,25 @@ public final class DdlDefinitionChecks {
         if (found != null) {
             throw new MemgresException("system column \"" + ((ColumnRef) found).column()
                     + "\" reference in check constraint is invalid", "42P10");
+        }
+    }
+
+    /**
+     * A generated column is settled from the row's own values while the row is being written, and
+     * a system column has none of its values yet: where the tuple goes and which transaction wrote
+     * it are decided by the write this expression is part of.
+     */
+    public static void rejectSystemColumnInGeneration(Expression expr) {
+        if (expr == null) return;
+        Object found = AstWalk.findFirst(expr, new java.util.function.Predicate<Object>() {
+            @Override public boolean test(Object n) {
+                return n instanceof ColumnRef && isSystemColumnName(((ColumnRef) n).column());
+            }
+        });
+        if (found != null) {
+            throw new MemgresException("cannot use system column \""
+                    + ((ColumnRef) found).column().toLowerCase()
+                    + "\" in column generation expression", "42P10");
         }
     }
 

@@ -159,6 +159,13 @@ public enum DataType {
     // Transaction ID type
     XID(28, "xid"),
 
+    // Where a stored tuple sits, and which command within a transaction wrote or deleted it.
+    // The engine already produced values of both -- ctid, cmin, cmax -- but had no name for
+    // either, so a value of one was described to the client as text and every rule that decides
+    // something from a type stood down over it.
+    TID(27, "tid"),
+    CID(29, "cid"),
+
     // Record (composite) type
     RECORD(2249, "record"),
 
@@ -266,6 +273,10 @@ public enum DataType {
             // xid('100') and pg_lsn('0/16B3748') resolve at all.
             case "xid":
                 return XID;
+            case "tid":
+                return TID;
+            case "cid":
+                return CID;
             case "pg_lsn":
                 return PG_LSN;
             case "bool":

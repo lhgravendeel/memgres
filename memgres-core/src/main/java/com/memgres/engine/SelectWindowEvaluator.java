@@ -302,8 +302,7 @@ class SelectWindowEvaluator {
             WindowFuncExpr wf = (WindowFuncExpr) expr;
             return evaluateWindowFunction(resolveNamedWindow(wf, windowDefs), contexts);
         }
-        List<WindowFuncExpr> windowNodes = new ArrayList<>();
-        collectWindowFunctions(expr, windowNodes);
+        List<WindowFuncExpr> windowNodes = ExprSearch.windowFunctionsIn(expr);
         if (windowNodes.isEmpty()) {
             Object[] results = new Object[contexts.size()];
             for (int i = 0; i < contexts.size(); i++) {
@@ -315,151 +314,26 @@ class SelectWindowEvaluator {
         for (WindowFuncExpr wf : windowNodes) {
             precomputed.put(wf, evaluateWindowFunction(resolveNamedWindow(wf, windowDefs), contexts));
         }
+        // The window value keeps the type its own expression has, on every row -- including the
+        // rows where the call has no value at all. Read off the value it happens to have, a
+        // lag() that has not started yet would be of no type, and pg_typeof said so.
+        List<RowContext.TableBinding> scope = contexts.isEmpty()
+                ? new ArrayList<RowContext.TableBinding>() : contexts.get(0).getBindings();
+        java.util.IdentityHashMap<WindowFuncExpr, DataType> types = new java.util.IdentityHashMap<>();
+        for (WindowFuncExpr wf : windowNodes) {
+            types.put(wf, executor.exprEvaluator.inferTypeFromContext(wf, scope));
+        }
         Object[] results = new Object[contexts.size()];
         for (int i = 0; i < contexts.size(); i++) {
-            results[i] = evalWithWindowValues(expr, contexts.get(i), precomputed, i);
+            java.util.IdentityHashMap<Expression, ExprEvaluator.PrecomputedValueExpr> onThisRow =
+                    new java.util.IdentityHashMap<Expression, ExprEvaluator.PrecomputedValueExpr>();
+            for (WindowFuncExpr wf : windowNodes) {
+                onThisRow.put(wf, new ExprEvaluator.PrecomputedValueExpr(
+                        precomputed.get(wf)[i], types.get(wf)));
+            }
+            results[i] = executor.exprEvaluator.evalWithFolded(onThisRow, expr, contexts.get(i));
         }
         return results;
-    }
-
-    private void collectWindowFunctions(Expression expr, List<WindowFuncExpr> out) {
-        if (expr instanceof WindowFuncExpr) {
-            WindowFuncExpr wf = (WindowFuncExpr) expr;
-            out.add(wf);
-        } else if (expr instanceof BinaryExpr) {
-            BinaryExpr bin = (BinaryExpr) expr;
-            collectWindowFunctions(bin.left(), out);
-            collectWindowFunctions(bin.right(), out);
-        } else if (expr instanceof CustomOperatorExpr) {
-            CustomOperatorExpr cop = (CustomOperatorExpr) expr;
-            if (cop.left() != null) collectWindowFunctions(cop.left(), out);
-            collectWindowFunctions(cop.right(), out);
-        } else if (expr instanceof UnaryExpr) {
-            UnaryExpr un = (UnaryExpr) expr;
-            collectWindowFunctions(un.operand(), out);
-        } else if (expr instanceof CastExpr) {
-            CastExpr cast = (CastExpr) expr;
-            collectWindowFunctions(cast.expr(), out);
-        } else if (expr instanceof CaseExpr) {
-            CaseExpr c = (CaseExpr) expr;
-            for (CaseExpr.WhenClause when : c.whenClauses()) {
-                collectWindowFunctions(when.condition(), out);
-                collectWindowFunctions(when.result(), out);
-            }
-            if (c.elseExpr() != null) collectWindowFunctions(c.elseExpr(), out);
-        } else if (expr instanceof IsNullExpr) {
-            collectWindowFunctions(((IsNullExpr) expr).expr(), out);
-        } else if (expr instanceof FunctionCallExpr) {
-            FunctionCallExpr fn = (FunctionCallExpr) expr;
-            for (Expression arg : fn.args()) collectWindowFunctions(arg, out);
-        }
-    }
-
-    private Object evalWithWindowValues(Expression expr, RowContext ctx,
-                                         java.util.IdentityHashMap<WindowFuncExpr, Object[]> precomputed, int rowIndex) {
-        if (expr instanceof WindowFuncExpr) {
-            WindowFuncExpr wf = (WindowFuncExpr) expr;
-            Object[] vals = precomputed.get(wf);
-            return vals != null ? vals[rowIndex] : null;
-        }
-        if (expr instanceof BinaryExpr) {
-            BinaryExpr bin = (BinaryExpr) expr;
-            if (select.containsWindowFunction(bin.left()) || select.containsWindowFunction(bin.right())) {
-                Object left = select.containsWindowFunction(bin.left())
-                        ? evalWithWindowValues(bin.left(), ctx, precomputed, rowIndex)
-                        : executor.evalExpr(bin.left(), ctx);
-                Object right = select.containsWindowFunction(bin.right())
-                        ? evalWithWindowValues(bin.right(), ctx, precomputed, rowIndex)
-                        : executor.evalExpr(bin.right(), ctx);
-                return executor.evalBinaryValues(bin.op(), left, right);
-            }
-            return executor.evalExpr(expr, ctx);
-        }
-        if (expr instanceof CustomOperatorExpr) {
-            CustomOperatorExpr cop = (CustomOperatorExpr) expr;
-            boolean leftHasWindow = cop.left() != null && select.containsWindowFunction(cop.left());
-            boolean rightHasWindow = select.containsWindowFunction(cop.right());
-            if (leftHasWindow || rightHasWindow) {
-                // Recurse into children, then delegate to normal eval with resolved values
-                return executor.evalExpr(expr, ctx);
-            }
-            return executor.evalExpr(expr, ctx);
-        }
-        if (expr instanceof UnaryExpr) {
-            UnaryExpr un = (UnaryExpr) expr;
-            Object val = select.containsWindowFunction(un.operand())
-                    ? evalWithWindowValues(un.operand(), ctx, precomputed, rowIndex)
-                    : executor.evalExpr(un.operand(), ctx);
-            return executor.evalUnaryValue(un.op(), val);
-        }
-        if (expr instanceof CastExpr) {
-            CastExpr cast = (CastExpr) expr;
-            Object val = select.containsWindowFunction(cast.expr())
-                    ? evalWithWindowValues(cast.expr(), ctx, precomputed, rowIndex)
-                    : executor.evalExpr(cast.expr(), ctx);
-            return executor.castEvaluator.applyCast(val, cast.typeName());
-        }
-        if (expr instanceof IsNullExpr) {
-            // Without this the test fell through to ordinary evaluation, where the window call
-            // has no value and every row answered "IS NULL" -- including the rows that have one.
-            IsNullExpr isn = (IsNullExpr) expr;
-            Object val = select.containsWindowFunction(isn.expr())
-                    ? evalWithWindowValues(isn.expr(), ctx, precomputed, rowIndex)
-                    : executor.evalExpr(isn.expr(), ctx);
-            return isn.negated() ? val != null : val == null;
-        }
-        if (expr instanceof CaseExpr) {
-            CaseExpr c = (CaseExpr) expr;
-            Expression testExpr = c.operand();
-            Object testVal = testExpr != null ? executor.evalExpr(testExpr, ctx) : null;
-            for (CaseExpr.WhenClause when : c.whenClauses()) {
-                Object condVal;
-                if (testExpr != null) {
-                    Object whenVal = select.containsWindowFunction(when.condition())
-                            ? evalWithWindowValues(when.condition(), ctx, precomputed, rowIndex)
-                            : executor.evalExpr(when.condition(), ctx);
-                    condVal = executor.compareValues(testVal, whenVal) == 0 ? Boolean.TRUE : Boolean.FALSE;
-                } else {
-                    condVal = select.containsWindowFunction(when.condition())
-                            ? evalWithWindowValues(when.condition(), ctx, precomputed, rowIndex)
-                            : executor.evalExpr(when.condition(), ctx);
-                }
-                if (executor.isTruthy(condVal)) {
-                    return select.containsWindowFunction(when.result())
-                            ? evalWithWindowValues(when.result(), ctx, precomputed, rowIndex)
-                            : executor.evalExpr(when.result(), ctx);
-                }
-            }
-            if (c.elseExpr() != null) {
-                return select.containsWindowFunction(c.elseExpr())
-                        ? evalWithWindowValues(c.elseExpr(), ctx, precomputed, rowIndex)
-                        : executor.evalExpr(c.elseExpr(), ctx);
-            }
-            return null;
-        }
-        if (expr instanceof FunctionCallExpr) {
-            FunctionCallExpr fn = (FunctionCallExpr) expr;
-            boolean hasWindowArg = fn.args().stream().anyMatch(select::containsWindowFunction);
-            if (hasWindowArg) {
-                List<Expression> resolvedArgs = new ArrayList<>();
-                List<RowContext.TableBinding> argScope = ctx != null
-                        ? ctx.getBindings() : new ArrayList<RowContext.TableBinding>();
-                for (Expression arg : fn.args()) {
-                    Object val = select.containsWindowFunction(arg)
-                            ? evalWithWindowValues(arg, ctx, precomputed, rowIndex)
-                            : executor.evalExpr(arg, ctx);
-                    // The window value keeps the type its own expression has. Rendering it as a
-                    // string literal handed the enclosing call PostgreSQL's "unknown", so
-                    // pg_typeof(sum(x) OVER ()) answered unknown and anything computed from one
-                    // was resolved as text.
-                    resolvedArgs.add(new ExprEvaluator.PrecomputedValueExpr(val,
-                            executor.exprEvaluator.inferTypeFromContext(arg, argScope)));
-                }
-                return executor.functionEvaluator.evalFunction(
-                        new FunctionCallExpr(fn.name(), resolvedArgs, fn.distinct(), fn.star()), ctx);
-            }
-        }
-        return executor.evalExpr(expr, ctx);
     }
 
     /**
@@ -539,11 +413,13 @@ class SelectWindowEvaluator {
             if (wf.partitionBy() != null) {
                 for (Expression p : wf.partitionBy()) {
                     if (select.containsWindowFunction(p)) throw windowInWindowDefinition();
+                    rejectUnsortablePartition(p, bindings);
                 }
             }
             if (wf.orderBy() != null) {
                 for (SelectStmt.OrderByItem o : wf.orderBy()) {
                     if (select.containsWindowFunction(o.expr())) throw windowInWindowDefinition();
+                    select.rejectUnsortableKey(o.expr(), bindings);
                 }
             }
             if (wf.filter() != null && !select.isAggregateFunction(wf.name())) {
@@ -562,6 +438,14 @@ class SelectWindowEvaluator {
     private void rejectOverOnPlainFunction(WindowFuncExpr wf, QueryLevelScope scope) {
         String name = FunctionEvaluator.stripSchemaPrefix(wf.name().toLowerCase());
         if (PlacementCheck.isWindowFunctionName(name) || select.isAggregateFunction(name)) return;
+        // An ordered-set aggregate is resolved before anything is asked about the OVER clause: the
+        // call answers to a catalogued signature or it does not, and only a call that does is an
+        // aggregate at all. So mode(1) OVER () is missing its WITHIN GROUP, not carrying an OVER
+        // that a plain function has no use for.
+        if (BuiltinAggregateSignatures.orderedSetArity(name) == wf.args().size()) {
+            throw new MemgresException(
+                    "WITHIN GROUP is required for ordered-set aggregate " + name, "42809");
+        }
         // The arguments are transformed before the call is resolved, so a column that is not there
         // is reported first -- as it is for the same call carrying FILTER rather than OVER.
         if (scope != null) {
@@ -605,6 +489,22 @@ class SelectWindowEvaluator {
     private static WindowFuncExpr namedWindowCall(SelectStmt.WindowDef def) {
         return new WindowFuncExpr("row_number", Cols.<Expression>listOf(), false, false,
                 def.partitionBy(), def.orderBy(), def.frame(), null, false, false, null, false);
+    }
+
+    /**
+     * A window is partitioned by sorting the rows on the partition keys, so a key of a type
+     * nothing can be sorted by leaves the window with no way to be built. PostgreSQL says that
+     * as a plan it cannot implement rather than as an operator it cannot find.
+     */
+    private void rejectUnsortablePartition(Expression key, List<RowContext.TableBinding> bindings) {
+        if (key == null || bindings == null) return;
+        if (OperatorResolution.noOrderingFor(
+                select.executor.exprEvaluator.inferTypeFromContext(key, bindings)) == null) {
+            return;
+        }
+        MemgresException e = new MemgresException("could not implement window PARTITION BY", "0A000");
+        e.setDetail("Window partitioning columns must be of sortable datatypes.");
+        throw e;
     }
 
     private static MemgresException windowInWindowDefinition() {
@@ -779,20 +679,7 @@ class SelectWindowEvaluator {
 
     /** Collect every window function in an expression, including ones nested inside another. */
     private void collectWindowFunctionsDeep(Expression expr, List<WindowFuncExpr> out) {
-        if (expr instanceof WindowFuncExpr) {
-            WindowFuncExpr wf = (WindowFuncExpr) expr;
-            out.add(wf);
-            for (Expression arg : wf.args()) collectWindowFunctionsDeep(arg, out);
-            if (wf.partitionBy() != null) {
-                for (Expression p : wf.partitionBy()) collectWindowFunctionsDeep(p, out);
-            }
-            if (wf.orderBy() != null) {
-                for (SelectStmt.OrderByItem o : wf.orderBy()) collectWindowFunctionsDeep(o.expr(), out);
-            }
-            if (wf.filter() != null) collectWindowFunctionsDeep(wf.filter(), out);
-            return;
-        }
-        collectWindowFunctions(expr, out);
+        out.addAll(ExprSearch.allWindowFunctionsIn(expr));
     }
 
     /**
@@ -1004,14 +891,40 @@ class SelectWindowEvaluator {
             throw new MemgresException(
                     "frame " + (isStartBound ? "starting" : "ending") + " offset must not be null", "22004");
         }
-        if (value instanceof Number && ((Number) value).doubleValue() < 0) {
-            if (frame.type() == WindowFuncExpr.FrameType.RANGE) {
-                throw new MemgresException(
-                        "invalid preceding or following size in window function", "22013");
-            }
+        if (!isNegativeOffset(frame.type(), value)) return;
+        if (frame.type() == WindowFuncExpr.FrameType.RANGE) {
             throw new MemgresException(
-                    "frame " + (isStartBound ? "starting" : "ending") + " offset must not be negative", "22013");
+                    "invalid preceding or following size in window function", "22013");
         }
+        throw new MemgresException(
+                "frame " + (isStartBound ? "starting" : "ending") + " offset must not be negative", "22013");
+    }
+
+    /**
+     * Whether a frame offset asks to reach backwards, which no frame offset may.
+     *
+     * <p>Asked of the value as it arrived, the question was answered only for the offsets that
+     * arrived as numbers. An unadorned literal arrives as its text -- nothing has yet asked it to
+     * be anything -- so {@code ROWS '-1' PRECEDING} was not a negative number and went through,
+     * and so did an interval, which a RANGE frame measures its offset in. Each is resolved here
+     * to the thing the frame counts in first: rows and groups are counted in bigints, and a
+     * RANGE offset in whatever it was written as.
+     */
+    private boolean isNegativeOffset(WindowFuncExpr.FrameType type, Object value) {
+        if (type == WindowFuncExpr.FrameType.ROWS || type == WindowFuncExpr.FrameType.GROUPS) {
+            return rowOffset(value) < 0;
+        }
+        if (value instanceof PgInterval) return ((PgInterval) value).isNegative();
+        if (value instanceof Number) return ((Number) value).doubleValue() < 0;
+        if (value instanceof String) {
+            try {
+                return new java.math.BigDecimal(((String) value).trim()).signum() < 0;
+            } catch (NumberFormatException e) {
+                // Not a size this frame can read; what it is instead is said where it is used.
+                return false;
+            }
+        }
+        return false;
     }
 
     /**
@@ -1046,7 +959,10 @@ class SelectWindowEvaluator {
                                                       int limit) {
         if (windowDefs != null) {
             for (int i = 0; i < Math.min(limit, windowDefs.size()); i++) {
-                if (windowDefs.get(i).name().equalsIgnoreCase(name)) return windowDefs.get(i);
+                // A WINDOW name is an identifier: folded already if it was written unquoted, kept
+                // as written if it was quoted. So it is matched as it stands. Matching it whatever
+                // its case let OVER "W" find a window called w, which is a different window.
+                if (windowDefs.get(i).name().equals(name)) return windowDefs.get(i);
             }
         }
         throw PgErrors.undefinedObject("window", name);
@@ -1190,13 +1106,17 @@ class SelectWindowEvaluator {
                 case "ntile": {
                     int numBuckets = 1;
                     if (!wf.args().isEmpty()) {
-                        Object raw = executor.evalExpr(wf.args().get(0), null);
+                        requireIntegerArgument(funcName, wf, 0, contexts);
+                        // How many buckets there are is one answer for the whole partition, and
+                        // PostgreSQL reads it on the partition's first row.
+                        Integer raw = sortedPartition.isEmpty() ? null
+                                : integerArgument(wf, 0, contexts.get(sortedPartition.get(0)));
                         if (raw == null) {
                             // PG: a NULL bucket count produces NULL for every row of the partition
                             for (int idx : sortedPartition) results[idx] = null;
                             break;
                         }
-                        numBuckets = executor.toInt(raw);
+                        numBuckets = raw.intValue();
                     }
                     if (numBuckets <= 0) {
                         throw new MemgresException("argument of ntile must be greater than zero", "22014");
@@ -1278,24 +1198,25 @@ class SelectWindowEvaluator {
                 }
                 case "nth_value": {
                     Expression arg = wf.args().get(0);
-                    int nth = 1;
-                    if (wf.args().size() > 1) {
-                        Object raw = executor.evalExpr(wf.args().get(1), null);
-                        if (raw == null) {
-                            // PG: a NULL position produces NULL for every row of the partition
-                            for (int idx : sortedPartition) results[idx] = null;
-                            break;
-                        }
-                        requireIntegralArgument(funcName, wf, raw, contexts);
-                        nth = executor.toInt(raw);
-                    }
-                    // PG raises 22016 for nth <= 0
-                    if (nth <= 0) {
-                        throw new MemgresException(
-                                "argument of nth_value must be greater than zero", "22016");
-                    }
+                    if (wf.args().size() > 1) requireIntegerArgument(funcName, wf, 1, contexts);
                     WindowFuncExpr.ExcludeMode nvExclude = wf.frame() != null ? wf.frame().excludeMode() : null;
                     for (int i = 0; i < sortedPartition.size(); i++) {
+                        // Which value in the frame is wanted is read on the row it is wanted for.
+                        int nth = 1;
+                        if (wf.args().size() > 1) {
+                            Integer raw = integerArgument(wf, 1, contexts.get(sortedPartition.get(i)));
+                            if (raw == null) {
+                                // PG: a NULL position produces NULL for this row
+                                results[sortedPartition.get(i)] = null;
+                                continue;
+                            }
+                            nth = raw.intValue();
+                        }
+                        // PG raises 22016 for nth <= 0
+                        if (nth <= 0) {
+                            throw new MemgresException(
+                                    "argument of nth_value must be greater than zero", "22016");
+                        }
                         int[] bounds = resolveFrameBounds(wf, i, contexts, sortedPartition);
                         int frameStart = bounds[0];
                         int frameEnd = bounds[1];
@@ -1357,22 +1278,28 @@ class SelectWindowEvaluator {
                     "function " + funcName + "() does not exist", "42883");
         }
         Expression arg = wf.args().get(0);
-        Object defaultVal = wf.args().size() > 2 ? executor.evalExpr(wf.args().get(2), null) : null;
-        long step = 1;
-        if (wf.args().size() > 1) {
-            Object raw = executor.evalExpr(wf.args().get(1), null);
-            if (raw == null) {
-                // PG: a NULL offset produces NULL for every row, ignoring the default
-                for (int idx : sortedPartition) results[idx] = null;
-                return;
-            }
-            requireIntegralArgument(funcName, wf, raw, contexts);
-            step = ((Number) raw).longValue();
-        }
-        if ("lag".equals(funcName)) step = -step;
+        if (wf.args().size() > 1) requireIntegerArgument(funcName, wf, 1, contexts);
 
         int size = sortedPartition.size();
         for (int i = 0; i < size; i++) {
+            // The offset and the default are read on the row the value is being produced for, so
+            // lag(v, o) steps a different distance on each of them and lag(v, 1, v) falls back to
+            // that row's own v. Read once with no row at all, a column named in either place was
+            // simply not there to resolve.
+            RowContext here = contexts.get(sortedPartition.get(i));
+            Object defaultVal = wf.args().size() > 2 ? executor.evalExpr(wf.args().get(2), here) : null;
+            long step = 1;
+            if (wf.args().size() > 1) {
+                Integer offset = integerArgument(wf, 1, here);
+                if (offset == null) {
+                    // PG: a NULL offset produces NULL for this row, ignoring the default
+                    results[sortedPartition.get(i)] = null;
+                    continue;
+                }
+                step = offset.longValue();
+            }
+            if ("lag".equals(funcName)) step = -step;
+
             Object val;
             if (wf.ignoreNulls() && step != 0) {
                 // IGNORE NULLS: walk in the offset's direction counting only non-null values
@@ -1394,23 +1321,85 @@ class SelectWindowEvaluator {
     }
 
     /**
-     * The position arguments of lag, lead and nth_value are declared integer, so a fractional
-     * value is not a value error but a call PostgreSQL has no function for.
+     * Refuse a call whose declared-integer argument was not written as an integer.
+     *
+     * <p>Which function a call names is settled by the types its arguments were written with,
+     * before any of them is read. Judged by the value that came back instead, the position
+     * arguments of lag, lead, ntile and nth_value answered for the wrong things: only a
+     * fractional value was caught, so {@code lag(v, 2::bigint)} counted rows there is no
+     * {@code lag(integer, bigint)} to count and {@code ntile(2147483648)} came back as a value
+     * out of range rather than a call that does not exist -- and ntile was not asked at all.
+     *
+     * <p>PostgreSQL widens smallint to integer on its own and gives an unadorned literal
+     * whatever type its use asks for. Nothing else reaches an integer parameter without a cast
+     * written for it, so there is no such function to call.
      */
-    private void requireIntegralArgument(String funcName, WindowFuncExpr wf, Object offset,
-                                          List<RowContext> contexts) {
-        if (!(offset instanceof java.math.BigDecimal) && !(offset instanceof Double)
-                && !(offset instanceof Float)) {
-            return;
-        }
+    private void requireIntegerArgument(String funcName, WindowFuncExpr wf, int index,
+                                        List<RowContext> contexts) {
+        List<RowContext.TableBinding> scope = contexts.isEmpty()
+                ? new ArrayList<RowContext.TableBinding>() : contexts.get(0).getBindings();
+        if (widensToInteger(declaredType(wf.args().get(index), scope))) return;
         StringBuilder sig = new StringBuilder(funcName).append('(');
         for (int i = 0; i < wf.args().size(); i++) {
             if (i > 0) sig.append(", ");
-            Object v = contexts.isEmpty() ? null : executor.evalExpr(wf.args().get(i), contexts.get(0));
-            sig.append(pgTypeName(v));
+            sig.append(pgTypeName(declaredType(wf.args().get(i), scope)));
         }
-        sig.append(')');
-        throw new MemgresException("function " + sig + " does not exist", "42883");
+        MemgresException e = new MemgresException(
+                "function " + sig.append(')') + " does not exist", "42883");
+        e.setHint("No function matches the given name and argument types."
+                + " You might need to add explicit type casts.");
+        throw e;
+    }
+
+    /**
+     * The type an argument was written with.
+     *
+     * <p>A quoted literal is written with no type at all: it becomes whatever it is used as, so
+     * {@code lag(v, '1')} is a call on an integer. A whole number is written as the narrowest of
+     * integer, bigint and numeric that holds it, which is what makes {@code ntile(2147483648)} a
+     * call on a bigint and so no call at all.
+     */
+    private DataType declaredType(Expression arg, List<RowContext.TableBinding> scope) {
+        if (arg instanceof Literal) {
+            Literal literal = (Literal) arg;
+            if (literal.literalType() == Literal.LiteralType.STRING) return null;
+            if (literal.literalType() == Literal.LiteralType.INTEGER) {
+                try {
+                    java.math.BigInteger written = new java.math.BigInteger(literal.value().trim());
+                    if (written.bitLength() < 32) return DataType.INTEGER;
+                    return written.bitLength() < 64 ? DataType.BIGINT : DataType.NUMERIC;
+                } catch (NumberFormatException e) {
+                    return DataType.NUMERIC;
+                }
+            }
+        }
+        return executor.exprEvaluator.inferTypeFromContext(arg, scope);
+    }
+
+    /** A null type is a literal nothing has yet asked to be anything, which an integer may ask. */
+    private static boolean widensToInteger(DataType declared) {
+        return declared == null || declared == DataType.SMALLINT || declared == DataType.INTEGER;
+    }
+
+    /**
+     * The value of a declared-integer argument on a row, or null where it has none.
+     *
+     * <p>An unadorned literal arrives as the text it was written as, since nothing had asked it
+     * to be anything until now. Read straight through a cast to {@link Number}, it left the
+     * client an internal error for {@code lag(v, '1')}; here it is read as the integer the
+     * parameter asks for, and says so when it does not read as one.
+     */
+    private Integer integerArgument(WindowFuncExpr wf, int index, RowContext row) {
+        Object raw = executor.evalExpr(wf.args().get(index), row);
+        if (raw == null) return null;
+        if (raw instanceof Number) return Integer.valueOf(((Number) raw).intValue());
+        String text = String.valueOf(raw).trim();
+        try {
+            return Integer.valueOf(text);
+        } catch (NumberFormatException e) {
+            throw new MemgresException(
+                    "invalid input syntax for type integer: \"" + text + "\"", "22P02");
+        }
     }
 
     private void evaluateAggregateWindowFunction(WindowFuncExpr wf, String funcName,
@@ -1570,9 +1559,17 @@ class SelectWindowEvaluator {
      * way in rather than truncated: {@code ROWS 1.5 PRECEDING} covers two rows, not one.
      */
     private long rowOffset(Object rawOffset) {
-        if (rawOffset instanceof java.math.BigDecimal) {
-            return ((java.math.BigDecimal) rawOffset)
-                    .setScale(0, java.math.RoundingMode.HALF_UP).longValue();
+        if (rawOffset instanceof java.math.BigDecimal || rawOffset instanceof java.math.BigInteger) {
+            // Narrowed by longValue(), an offset past the bigint range wrapped round into a small
+            // one and the frame quietly covered the wrong rows; there is no such bigint to count.
+            java.math.BigDecimal exact = rawOffset instanceof java.math.BigDecimal
+                    ? (java.math.BigDecimal) rawOffset
+                    : new java.math.BigDecimal((java.math.BigInteger) rawOffset);
+            try {
+                return exact.setScale(0, java.math.RoundingMode.HALF_UP).longValueExact();
+            } catch (ArithmeticException e) {
+                throw new MemgresException("bigint out of range", "22003");
+            }
         }
         if (rawOffset instanceof Double || rawOffset instanceof Float) {
             return Math.round(((Number) rawOffset).doubleValue());
@@ -1831,16 +1828,66 @@ class SelectWindowEvaluator {
             return Cols.listOf(all);
         }
 
-        Map<String, List<Integer>> partitionMap = new LinkedHashMap<>();
+        List<Object[]> keys = new ArrayList<>(contexts.size());
         for (int i = 0; i < contexts.size(); i++) {
-            StringBuilder key = new StringBuilder();
-            for (Expression expr : partitionBy) {
-                Object val = executor.evalExpr(expr, contexts.get(i));
-                key.append(val == null ? "\0NULL" : val.toString()).append('\1');
+            Object[] vals = new Object[partitionBy.size()];
+            for (int k = 0; k < partitionBy.size(); k++) {
+                vals[k] = executor.evalExpr(partitionBy.get(k), contexts.get(i));
             }
-            partitionMap.computeIfAbsent(key.toString(), k -> new ArrayList<>()).add(i);
+            keys.add(vals);
         }
-        return new ArrayList<>(partitionMap.values());
+
+        // A partition is the rows whose keys are equal by the rule = answers by, which is not the
+        // rows whose keys print alike: a numeric 1.0 and a numeric 1.00 are the same number and
+        // one partition, and printing them put each in its own. Running the parts of a composite
+        // key together with a separator was the other half of it — a value containing the
+        // separator reached into its neighbour, so ('a', 'b') and ('a\u0001b', '') read as one
+        // partition.
+        //
+        // Rows that are equal are guaranteed to share a label, so only rows sharing one are ever
+        // compared; rows that merely share one are then separated by the comparison.
+        Map<String, List<List<Integer>>> byLabel = new HashMap<>();
+        List<List<Integer>> partitions = new ArrayList<>();
+        for (int i = 0; i < contexts.size(); i++) {
+            Object[] vals = keys.get(i);
+            StringBuilder label = new StringBuilder();
+            for (Object val : vals) ValueKey.appendTo(label, val);
+            List<List<Integer>> sharing = byLabel.get(label.toString());
+            if (sharing == null) {
+                sharing = new ArrayList<>();
+                byLabel.put(label.toString(), sharing);
+            }
+            List<Integer> partition = null;
+            for (List<Integer> candidate : sharing) {
+                if (samePartitionKey(vals, keys.get(candidate.get(0)))) {
+                    partition = candidate;
+                    break;
+                }
+            }
+            if (partition == null) {
+                partition = new ArrayList<>();
+                sharing.add(partition);
+                partitions.add(partition);
+            }
+            partition.add(i);
+        }
+        return partitions;
+    }
+
+    /**
+     * Whether two rows belong to the same partition. A null is not a value and never equals one,
+     * but two of them fall in the same partition all the same — {@code PARTITION BY} groups the
+     * way {@code GROUP BY} and {@code DISTINCT} group rather than the way {@code =} compares.
+     */
+    private static boolean samePartitionKey(Object[] a, Object[] b) {
+        for (int i = 0; i < a.length; i++) {
+            if (a[i] == null || b[i] == null) {
+                if (a[i] != b[i]) return false;
+            } else if (!ValueKey.sameValue(a[i], b[i], false)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private boolean orderByValuesEqual(List<SelectStmt.OrderByItem> orderBy, List<RowContext> contexts,
