@@ -3739,6 +3739,10 @@ class DdlAlterTableExecutor {
                     addedKind == TableConstraint.ConstraintType.PRIMARY_KEY ? "primary key"
                             : addedKind == TableConstraint.ConstraintType.UNIQUE ? "unique"
                             : "exclusion");
+            if (addedKind != TableConstraint.ConstraintType.EXCLUDE) {
+                DdlDefinitionChecks.requireKeyColumnOpclass(table,
+                        addConstraint.constraint().columns());
+            }
             DdlDefinitionChecks.requireKeyColumnsExist(table,
                     addConstraint.constraint().includedColumns());
             if (addedKind == TableConstraint.ConstraintType.EXCLUDE) {

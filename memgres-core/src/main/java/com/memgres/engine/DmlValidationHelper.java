@@ -278,57 +278,7 @@ class DmlValidationHelper {
      * with no modifier bounds nothing, which is the ordinary case and leaves the field alone.
      */
     private Object fieldHeldToItsType(Object value, String fieldType) {
-        if (value == null || fieldType == null) return value;
-        String spec = fieldType.trim();
-        int open = spec.indexOf('(');
-        int close = spec.indexOf(')', open + 1);
-        if (open <= 0 || close < 0) return value;
-        String base = spec.substring(0, open).trim().toLowerCase(Locale.ROOT);
-        String[] args = spec.substring(open + 1, close).split(",");
-        int first;
-        try {
-            first = Integer.parseInt(args[0].trim());
-        } catch (NumberFormatException e) {
-            return value;
-        }
-        if (base.equals("varchar") || base.equals("character varying")) {
-            String s = value.toString();
-            if (s.length() > first) {
-                throw new MemgresException(
-                        "value too long for type character varying(" + first + ")", "22001");
-            }
-            return value;
-        }
-        if (base.equals("char") || base.equals("character") || base.equals("bpchar")) {
-            String s = value.toString();
-            if (s.length() > first) {
-                throw new MemgresException(
-                        "value too long for type character(" + first + ")", "22001");
-            }
-            StringBuilder padded = new StringBuilder(s);
-            while (padded.length() < first) padded.append(' ');
-            return padded.toString();
-        }
-        if (base.equals("numeric") || base.equals("decimal")) {
-            java.math.BigDecimal bd;
-            try {
-                bd = new java.math.BigDecimal(value.toString().trim());
-            } catch (NumberFormatException e) {
-                return value;
-            }
-            int scale = 0;
-            if (args.length > 1) {
-                try {
-                    scale = Integer.parseInt(args[1].trim());
-                } catch (NumberFormatException e) {
-                    return value;
-                }
-            }
-            java.math.BigDecimal rounded = bd.setScale(scale, java.math.RoundingMode.HALF_UP);
-            TypeCoercion.checkNumericTypmod(rounded, first, scale);
-            return rounded;
-        }
-        return value;
+        return TypeCoercion.heldToItsType(value, fieldType);
     }
 
     /**

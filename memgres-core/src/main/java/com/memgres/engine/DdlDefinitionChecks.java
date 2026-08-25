@@ -378,6 +378,32 @@ public final class DdlDefinitionChecks {
     }
 
     /**
+     * A key is a btree index, so each column it names must have a btree operator class. json has
+     * none: it defines no ordering, and not even an equality, because one document may be written
+     * down in more ways than one. jsonb has both and is allowed.
+     */
+    public static void requireKeyColumnOpclass(Table table, java.util.List<String> columns) {
+        if (columns == null || table == null) return;
+        String am = "btree";
+        for (String written : columns) {
+            if (written == null || isExpressionKeyElement(written)) continue;
+            int at = table.getColumnIndex(written);
+            if (at < 0) continue;   // a column that is not there is reported by the caller
+            String typeName = DdlIndexValidator.indexedTypeName(table.getColumns().get(at));
+            // A type this engine cannot name is left alone: refusing a valid key is the worse
+            // failure of the two.
+            if (typeName == null || DdlIndexValidator.defaultOpclass(am, typeName) != null) {
+                continue;
+            }
+            MemgresException e = new MemgresException("data type " + typeName
+                    + " has no default operator class for access method \"" + am + "\"", "42704");
+            e.setHint("You must specify an operator class for the index or define a default"
+                    + " operator class for the data type.");
+            throw e;
+        }
+    }
+
+    /**
      * The existence half alone, for the payload columns of an {@code INCLUDE} clause: those are
      * carried in the index rather than compared, so naming one twice is not a key collision.
      */

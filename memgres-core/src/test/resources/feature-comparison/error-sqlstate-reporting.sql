@@ -133,9 +133,40 @@ SELECT interval '1 day' + interval '2 hours' AS a;
 -- ============================================================================
 -- 5. Nesting deeper than the parser will follow
 -- ============================================================================
+-- begin-expected-error
+-- sqlstate: 54001
+-- message-like: stack depth limit exceeded
+-- end-expected-error
 SELECT ((repeat('[', 20000) || repeat(']', 20000))::jsonb IS NOT NULL)::text AS a;
+
+-- expected-divergence: nesting is bounded by the stack the reading of it takes, and a level of
+-- json costs PostgreSQL fewer bytes than a level of jsonb does, so PostgreSQL follows json a
+-- little further than it follows jsonb. Both engines read either family to 16000 levels and give
+-- out somewhere beyond that; where exactly is a property of the stack, not of the document.
 SELECT ((repeat('[', 20000) || repeat(']', 20000))::json IS NOT NULL)::text AS a;
+
+-- begin-expected
+-- columns: a
+-- row: true
+-- end-expected
+SELECT ((repeat('[', 16000) || repeat(']', 16000))::jsonb IS NOT NULL)::text AS a;
+
+-- begin-expected
+-- columns: a
+-- row: true
+-- end-expected
+SELECT ((repeat('[', 16000) || repeat(']', 16000))::json IS NOT NULL)::text AS a;
+
+-- begin-expected
+-- columns: a
+-- row: true
+-- end-expected
 SELECT ((repeat('[', 100) || repeat(']', 100))::jsonb IS NOT NULL)::text AS a;
+
+-- begin-expected
+-- columns: a
+-- row: true
+-- end-expected
 SELECT ((repeat('[', 100) || repeat(']', 100))::json IS NOT NULL)::text AS a;
 
 DROP TABLE IF EXISTS esr_nan CASCADE;

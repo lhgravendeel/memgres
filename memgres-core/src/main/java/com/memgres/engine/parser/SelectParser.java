@@ -2110,6 +2110,9 @@ class SelectParser {
         Expression input = parser.parseExpression();
         parser.expect(TokenType.COMMA);
         Expression path = parser.parseExpression();
+        // A row path may be given a name. The name is only ever used to talk about the path, and
+        // the clause that did so is gone, so reading it is all there is to do with it.
+        if (parser.matchKeyword("AS")) parser.readColumnName();
         // Optional PASSING
         Map<String, Expression> passing = null;
         if (parser.matchKeyword("PASSING")) {
@@ -2119,11 +2122,15 @@ class SelectParser {
         parser.expect(TokenType.LEFT_PAREN);
         List<JsonTableExpr.JsonTableColumn> columns = parseJsonTableColumns();
         parser.expect(TokenType.RIGHT_PAREN);
-        // Optional ERROR ON ERROR
+        // The whole call answers for a row path that failed: it raises, or it yields no rows.
         JsonExistsExpr.OnBehavior onError = null;
         if (parser.matchKeyword("ERROR")) {
             parser.expectKeyword("ON"); parser.expectKeyword("ERROR");
             onError = JsonExistsExpr.OnBehavior.ERROR;
+        } else if (parser.matchKeyword("EMPTY")) {
+            parser.matchKeyword("ARRAY");
+            parser.expectKeyword("ON"); parser.expectKeyword("ERROR");
+            onError = JsonExistsExpr.OnBehavior.EMPTY_ARRAY;
         }
         parser.expect(TokenType.RIGHT_PAREN);
         // Alias
@@ -2133,9 +2140,20 @@ class SelectParser {
         } else if (parser.peek().type() == TokenType.IDENTIFIER || parser.peek().type() == TokenType.QUOTED_IDENTIFIER) {
             alias = parser.readIdentifier();
         }
+        // The alias may rename the columns as well, the way a relation's does.
+        List<String> columnAliases = null;
+        if (alias != null && parser.check(TokenType.LEFT_PAREN)) {
+            parser.advance();
+            columnAliases = new ArrayList<>();
+            while (!parser.check(TokenType.RIGHT_PAREN) && !parser.isAtEnd()) {
+                columnAliases.add(parser.readIdentifier());
+                parser.match(TokenType.COMMA);
+            }
+            parser.expect(TokenType.RIGHT_PAREN);
+        }
         JsonTableExpr jtExpr = new JsonTableExpr(input, path, columns, passing, onError);
         // Store as FunctionFrom with the JsonTableExpr packed into args
-        return new SelectStmt.FunctionFrom("__json_table__", Cols.listOf(jtExpr), alias, null);
+        return new SelectStmt.FunctionFrom("__json_table__", Cols.listOf(jtExpr), alias, columnAliases);
     }
 
     // ---- XMLTABLE FROM item ----
@@ -2219,6 +2237,7 @@ class SelectParser {
                 parser.advance(); // consume NESTED
                 parser.matchKeyword("PATH"); // optional
                 Expression nestedPath = parser.parseExpression();
+                if (parser.matchKeyword("AS")) parser.readColumnName(); // the path's own name
                 parser.expectKeyword("COLUMNS");
                 parser.expect(TokenType.LEFT_PAREN);
                 List<JsonTableExpr.JsonTableColumn> nestedCols = parseJsonTableColumns();
@@ -2226,56 +2245,149 @@ class SelectParser {
                 cols.add(JsonTableExpr.JsonTableColumn.nested(nestedPath, nestedCols));
                 continue;
             }
+            Token named = parser.peek();
             String colName = parser.readIdentifier();
             // FOR ORDINALITY
             if (parser.matchKeywords("FOR", "ORDINALITY")) {
+                // The ordinality is the item's place in the sequence this COLUMNS list is read
+                // over, so there is one number to give and only one column may ask for it. A
+                // NESTED list is read over its own sequence and so counts on its own.
+                for (JsonTableExpr.JsonTableColumn earlier : cols) {
+                    if (earlier.forOrdinality) {
+                        throw ParseException.saying("only one FOR ORDINALITY column is allowed",
+                                named, "42601");
+                    }
+                }
                 cols.add(JsonTableExpr.JsonTableColumn.ordinality(colName));
                 continue;
             }
-            // type [FORMAT JSON] [EXISTS] PATH 'expr'
+            // type [FORMAT JSON] [EXISTS] [PATH 'expr'] [wrapper] [quotes] [ON EMPTY] [ON ERROR]
             String typeName = parser.parseTypeName();
-            // Optional FORMAT JSON clause (e.g., nested jsonb FORMAT JSON PATH '$.data')
+            // FORMAT JSON says the column holds whatever the path selected as a document, which is
+            // JSON_QUERY's reading rather than JSON_VALUE's -- the same choice json and jsonb make
+            // by being those types.
+            boolean formatJson = false;
             if (parser.matchKeyword("FORMAT")) {
-                parser.expectKeyword("JSON"); // consume FORMAT JSON, ignore (just a hint)
+                parser.expectKeyword("JSON");
+                formatJson = true;
             }
-            boolean existsPath = false;
-            if (parser.matchKeyword("EXISTS")) {
-                existsPath = true;
-            }
+            boolean existsPath = parser.matchKeyword("EXISTS");
             Expression pathExpr = null;
             if (parser.matchKeyword("PATH")) {
                 pathExpr = parser.parseExpression();
             }
-            Expression defaultOnEmpty = null;
-            Expression defaultOnError = null;
-            // DEFAULT val ON EMPTY / DEFAULT val ON ERROR
-            while (parser.checkKeyword("DEFAULT") || parser.checkKeyword("NULL") || parser.checkKeyword("ERROR")) {
-                if (parser.matchKeyword("DEFAULT")) {
-                    Expression defVal = parser.parseExpression();
-                    parser.expectKeyword("ON");
-                    if (parser.matchKeyword("EMPTY")) {
-                        defaultOnEmpty = defVal;
-                    } else {
-                        parser.expectKeyword("ERROR");
-                        defaultOnError = defVal;
-                    }
-                } else if (parser.matchKeyword("NULL")) {
-                    parser.expectKeyword("ON"); parser.expectKeyword("EMPTY");
-                    // null on empty is default, nothing to set
-                } else if (parser.matchKeyword("ERROR")) {
-                    parser.expectKeyword("ON"); parser.expectKeyword("ERROR");
-                    // error on error
+            JsonQueryExpr.WrapperBehavior wrapper = JsonQueryExpr.WrapperBehavior.NONE;
+            if (parser.matchKeyword("WITH")) {
+                if (parser.matchKeyword("CONDITIONAL")) {
+                    wrapper = JsonQueryExpr.WrapperBehavior.WITH_CONDITIONAL_WRAPPER;
                 } else {
-                    break;
+                    parser.matchKeyword("UNCONDITIONAL");
+                    wrapper = JsonQueryExpr.WrapperBehavior.WITH_WRAPPER;
                 }
+                parser.expectKeyword("WRAPPER");
+            } else if (parser.matchKeyword("WITHOUT")) {
+                parser.expectKeyword("WRAPPER");
+                wrapper = JsonQueryExpr.WrapperBehavior.WITHOUT_WRAPPER;
             }
+            JsonQueryExpr.QuotesBehavior quotes = null;
+            if (parser.matchKeyword("KEEP")) {
+                parser.expectKeyword("QUOTES");
+                quotes = JsonQueryExpr.QuotesBehavior.KEEP;
+            } else if (parser.matchKeyword("OMIT")) {
+                parser.expectKeyword("QUOTES");
+                quotes = JsonQueryExpr.QuotesBehavior.OMIT;
+            }
+            if (quotes != null && (wrapper == JsonQueryExpr.WrapperBehavior.WITH_WRAPPER
+                    || wrapper == JsonQueryExpr.WrapperBehavior.WITH_CONDITIONAL_WRAPPER)) {
+                throw new MemgresException(
+                        "SQL/JSON QUOTES behavior must not be specified when WITH WRAPPER is used",
+                        "42601");
+            }
+            JsonExistsExpr.OnBehavior[] on = new JsonExistsExpr.OnBehavior[2];
+            Expression[] defaults = new Expression[2];
+            JsonOnClauses.Answers answers;
+            String whom;
             if (existsPath) {
-                cols.add(JsonTableExpr.JsonTableColumn.exists(colName, typeName, pathExpr));
+                answers = JsonOnClauses.Answers.TRUTH;
+                whom = "EXISTS columns";
+            } else if (JsonTableExpr.JsonTableColumn.readsDocument(typeName, formatJson, wrapper,
+                    quotes)) {
+                answers = JsonOnClauses.Answers.DOCUMENT;
+                whom = "formatted columns";
             } else {
-                cols.add(JsonTableExpr.JsonTableColumn.typed(colName, typeName, pathExpr, defaultOnEmpty, defaultOnError));
+                answers = JsonOnClauses.Answers.SCALAR;
+                whom = "scalar columns";
+            }
+            parseColumnOnClauses(on, defaults, answers, whom, colName);
+            if (existsPath) {
+                cols.add(JsonTableExpr.JsonTableColumn.exists(colName, typeName, pathExpr, on[1]));
+            } else {
+                cols.add(new JsonTableExpr.JsonTableColumn(colName, typeName, pathExpr, false, false,
+                        formatJson, wrapper, quotes, on[0], defaults[0], on[1], defaults[1],
+                        null, null));
             }
         } while (parser.match(TokenType.COMMA));
         return cols;
+    }
+
+    /**
+     * The {@code ON EMPTY} and {@code ON ERROR} clauses of a JSON_TABLE column, read into slot 0
+     * (empty) and slot 1 (error). A column takes the same answers the expression it stands for
+     * does, and writes them the same way: each clause once, the empty one first.
+     *
+     * <p>They are a sequence rather than a set, because the two say what to do at different
+     * moments. A second clause of either kind, or an ON EMPTY written after the ON ERROR, ends
+     * the list where PostgreSQL ends it -- as a syntax error at the word that could not follow.
+     */
+    private void parseColumnOnClauses(JsonExistsExpr.OnBehavior[] on, Expression[] defaults,
+                                      JsonOnClauses.Answers answers, String whom, String column) {
+        boolean sawEmpty = false;
+        while (true) {
+            Token start = parser.peek();
+            JsonExistsExpr.OnBehavior behavior;
+            Expression defaultValue = null;
+            if (parser.matchKeyword("NULL")) {
+                behavior = JsonExistsExpr.OnBehavior.NULL_VAL;
+            } else if (parser.checkKeyword("ERROR") && parser.checkKeywordAt(1, "ON")) {
+                parser.advance();
+                behavior = JsonExistsExpr.OnBehavior.ERROR;
+            } else if (parser.matchKeyword("DEFAULT")) {
+                behavior = null;
+                defaultValue = parser.parseExpression();
+            } else if (parser.matchKeyword("TRUE")) {
+                behavior = JsonExistsExpr.OnBehavior.TRUE_VAL;
+            } else if (parser.matchKeyword("FALSE")) {
+                behavior = JsonExistsExpr.OnBehavior.FALSE_VAL;
+            } else if (parser.matchKeyword("UNKNOWN")) {
+                behavior = JsonExistsExpr.OnBehavior.UNKNOWN_VAL;
+            } else if (parser.checkKeyword("EMPTY")
+                    && (parser.checkKeywordAt(1, "ARRAY") || parser.checkKeywordAt(1, "OBJECT"))) {
+                parser.advance();
+                behavior = parser.matchKeyword("ARRAY") ? JsonExistsExpr.OnBehavior.EMPTY_ARRAY
+                        : JsonExistsExpr.OnBehavior.EMPTY_OBJECT;
+                if (behavior == JsonExistsExpr.OnBehavior.EMPTY_OBJECT) parser.expectKeyword("OBJECT");
+            } else {
+                return;
+            }
+            parser.expectKeyword("ON");
+            Token which = parser.peek();
+            // An EXISTS column has an ON ERROR clause and no ON EMPTY one, so ON EMPTY is not an
+            // answer it refuses but a word its grammar has no place for.
+            int slot = !answers.truth() && parser.matchKeyword("EMPTY") ? 0 : 1;
+            if (slot == 0 && sawEmpty) {
+                throw ParseException.saying("syntax error at or near \"" + which.raw() + "\"",
+                        which, "42601");
+            }
+            if (slot == 1) parser.expectKeyword("ERROR");
+            JsonOnClauses.require(answers, whom, column, slot == 0, behavior,
+                    defaultValue != null, start);
+            on[slot] = behavior;
+            defaults[slot] = defaultValue;
+            // Nothing may follow the ON ERROR clause; whatever does is left for the caller to
+            // refuse where it stands.
+            if (slot == 1) return;
+            sawEmpty = true;
+        }
     }
 
     private Map<String, Expression> parsePassingClause() {

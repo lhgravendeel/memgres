@@ -46,9 +46,17 @@ final class BuiltinAggregateSignatures {
             {"covar_samp", "701", "701 701"}, // covar_samp(double precision, double precision) -> double precision
             {"every", "16", "16"}, // every(boolean) -> boolean
             {"json_agg", "114", "2283"}, // json_agg(anyelement) -> json
+            {"json_agg_strict", "114", "2283"}, // json_agg_strict(anyelement) -> json
             {"json_object_agg", "114", "2276 2276"}, // json_object_agg(key "any", value "any") -> json
+            {"json_object_agg_strict", "114", "2276 2276"}, // json_object_agg_strict(key "any", value "any") -> json
+            {"json_object_agg_unique", "114", "2276 2276"}, // json_object_agg_unique(key "any", value "any") -> json
+            {"json_object_agg_unique_strict", "114", "2276 2276"}, // json_object_agg_unique_strict(key "any", value "any") -> json
             {"jsonb_agg", "3802", "2283"}, // jsonb_agg(anyelement) -> jsonb
+            {"jsonb_agg_strict", "3802", "2283"}, // jsonb_agg_strict(anyelement) -> jsonb
             {"jsonb_object_agg", "3802", "2276 2276"}, // jsonb_object_agg(key "any", value "any") -> jsonb
+            {"jsonb_object_agg_strict", "3802", "2276 2276"}, // jsonb_object_agg_strict(key "any", value "any") -> jsonb
+            {"jsonb_object_agg_unique", "3802", "2276 2276"}, // jsonb_object_agg_unique(key "any", value "any") -> jsonb
+            {"jsonb_object_agg_unique_strict", "3802", "2276 2276"}, // jsonb_object_agg_unique_strict(key "any", value "any") -> jsonb
             {"max", "1042", "1042"}, // max(character) -> character
             {"max", "1082", "1082"}, // max(date) -> date
             {"max", "1083", "1083"}, // max(time without time zone) -> time without time zone

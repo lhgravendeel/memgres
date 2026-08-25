@@ -93,11 +93,18 @@ class ParserAndCatalogResidualsTest {
                 rows("SELECT (ARRAY['{\"k\":1}']::jsonb[])[1]::text"));
     }
 
-    /** An integer array literal still reads its braces as a nested array. */
+    /**
+     * An array of text is cast element by element, so each element is read as one integer. The
+     * braces are part of the text and are not a nested array: an array of two texts cannot become
+     * an array of four integers, whatever those texts happen to spell.
+     */
     @Test
-    void nestedArrayLiteralsStillParse() throws Exception {
-        assertEquals(Arrays.asList("{{1,2},{3,4}}"),
-                rows("SELECT (ARRAY['{1,2}','{3,4}']::int[][])::text"));
+    void elementsOfATextArrayAreCastOneAtATime() throws Exception {
+        SQLException e = org.junit.jupiter.api.Assertions.assertThrows(SQLException.class,
+                () -> rows("SELECT (ARRAY['{1,2}','{3,4}']::int[][])::text"));
+        assertEquals("22P02", e.getSQLState());
+        assertEquals("ERROR: invalid input syntax for type integer: \"{1,2}\"",
+                e.getMessage().split("\n")[0]);
     }
 
     // ------------------------------------------------------------------

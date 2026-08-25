@@ -211,7 +211,12 @@ class SelectSetOpExecutor {
                         Object val = row[ci];
                         if (val != null) {
                             try {
-                                executor.castEvaluator.applyCast(val, targetType.getPgName());
+                                // The value is read as the column's type and kept that way. Only
+                                // the reading was done and its answer dropped, so the column was
+                                // described as one type and answered values of another: a jsonb
+                                // column handed back the text a row was written as rather than
+                                // the document that text spells.
+                                row[ci] = executor.castEvaluator.applyCast(val, targetType.getPgName());
                             } catch (Exception e) {
                                 // PG returns 22P02 (invalid_text_representation) when a
                                 // literal/unknown value cannot be coerced to the target type
@@ -238,8 +243,10 @@ class SelectSetOpExecutor {
         // have none, and PostgreSQL refuses the whole operation rather than comparing them some
         // other way; only UNION ALL, which never compares anything, takes them.
         if (stmt.op() != SetOpStmt.SetOpType.UNION || !stmt.all()) {
-            rejectColumnWithoutEquality(columns);
+            RowKey.requireEquality(columns);
         }
+        // jsonb is compared as the document it holds rather than as the text it prints as
+        DataType[] keyTypes = RowKey.columnTypes(columns);
         List<Object[]> resultRows = new ArrayList<>();
 
         switch (stmt.op()) {
@@ -247,7 +254,7 @@ class SelectSetOpExecutor {
                 resultRows.addAll(leftResult.getRows());
                 resultRows.addAll(rightResult.getRows());
                 if (!stmt.all()) {
-                    resultRows = deduplicateRows(resultRows);
+                    resultRows = deduplicateRows(resultRows, keyTypes);
                 }
                 break;
             }
@@ -256,10 +263,10 @@ class SelectSetOpExecutor {
                     // Multiset semantics: each left row matches at most once per right occurrence.
                     Map<RowKey, Integer> rightCounts = new HashMap<>();
                     for (Object[] row : rightResult.getRows()) {
-                        rightCounts.merge(new RowKey(row), 1, Integer::sum);
+                        rightCounts.merge(new RowKey(row, keyTypes), 1, Integer::sum);
                     }
                     for (Object[] row : leftResult.getRows()) {
-                        RowKey key = new RowKey(row);
+                        RowKey key = new RowKey(row, keyTypes);
                         int remaining = rightCounts.getOrDefault(key, 0);
                         if (remaining > 0) {
                             resultRows.add(row);
@@ -269,11 +276,11 @@ class SelectSetOpExecutor {
                 } else {
                     Set<RowKey> rightKeys = new HashSet<>();
                     for (Object[] row : rightResult.getRows()) {
-                        rightKeys.add(new RowKey(row));
+                        rightKeys.add(new RowKey(row, keyTypes));
                     }
                     Set<RowKey> seen = new HashSet<>();
                     for (Object[] row : leftResult.getRows()) {
-                        RowKey key = new RowKey(row);
+                        RowKey key = new RowKey(row, keyTypes);
                         if (rightKeys.contains(key) && seen.add(key)) {
                             resultRows.add(row);
                         }
@@ -284,11 +291,11 @@ class SelectSetOpExecutor {
             case EXCEPT: {
                 Map<RowKey, Integer> rightCounts = new HashMap<>();
                 for (Object[] row : rightResult.getRows()) {
-                    rightCounts.merge(new RowKey(row), 1, Integer::sum);
+                    rightCounts.merge(new RowKey(row, keyTypes), 1, Integer::sum);
                 }
                 Set<RowKey> seen = new HashSet<>();
                 for (Object[] row : leftResult.getRows()) {
-                    RowKey key = new RowKey(row);
+                    RowKey key = new RowKey(row, keyTypes);
                     if (stmt.all()) {
                         int remaining = rightCounts.getOrDefault(key, 0);
                         if (remaining > 0) {
@@ -573,21 +580,6 @@ class SelectSetOpExecutor {
     }
 
     /**
-     * The types a set operation cannot compare rows by, because PostgreSQL defines no equality
-     * over them: json is compared by no operator at all (jsonb, which has one, is unaffected), xml
-     * likewise, and a point has ordering operators but no equality. Only these three are listed,
-     * because these are the three the reference server was measured refusing.
-     */
-    private static void rejectColumnWithoutEquality(List<Column> columns) {
-        for (Column column : columns) {
-            DataType type = column.getType();
-            if (type != DataType.JSON && type != DataType.XML && type != DataType.POINT) continue;
-            throw new MemgresException("could not identify an equality operator for type "
-                    + type.toRegtypeDisplay(), "42883");
-        }
-    }
-
-    /**
      * A name that two output columns answer to names neither. The ORDER BY of a set operation
      * reaches its output columns through the set operation, where each of them is a column of its
      * own however it was written -- so two of them called the same thing leave the name with no
@@ -712,11 +704,11 @@ class SelectSetOpExecutor {
         }
     }
 
-    static List<Object[]> deduplicateRows(List<Object[]> rows) {
+    static List<Object[]> deduplicateRows(List<Object[]> rows, DataType[] keyTypes) {
         Set<RowKey> seen = new LinkedHashSet<>();
         List<Object[]> result = new ArrayList<>();
         for (Object[] row : rows) {
-            if (seen.add(new RowKey(row))) {
+            if (seen.add(new RowKey(row, keyTypes))) {
                 result.add(row);
             }
         }

@@ -11,6 +11,129 @@ import java.util.*;
 class TextSearchFunctions {
     private static final Object NOT_HANDLED = FunctionEvaluator.NOT_HANDLED;
 
+    /** What to_tsvector indexes when it is given a document: the strings it stores, and no more. */
+    private static final Set<String> STRINGS_ONLY = Cols.setOf("string");
+
+    /**
+     * Whichever of json and jsonb an argument is written in, or null where it is neither.
+     *
+     * <p>Read from the expression rather than from the value, because a document reaches here as
+     * the characters it is written as and text holding the same characters is a different thing:
+     * {@code to_tsvector('{"a": "cats"}')} indexes the braces and the key, and
+     * {@code to_tsvector('{"a": "cats"}'::json)} indexes neither.
+     */
+    private DataType documentTypeOf(FunctionCallExpr fn, int at, RowContext ctx) {
+        if (fn == null || at >= fn.args().size()) return null;
+        List<RowContext.TableBinding> bindings = ctx == null
+                ? Collections.<RowContext.TableBinding>emptyList() : ctx.getBindings();
+        DataType type;
+        try {
+            type = executor.exprEvaluator.inferTypeFromContext(fn.args().get(at), bindings);
+        } catch (RuntimeException e) {
+            return null;
+        }
+        return type == DataType.JSON || type == DataType.JSONB ? type : null;
+    }
+
+    /**
+     * A document read from its text, as jsonb keeps it where jsonb is what it was written as.
+     *
+     * <p>Which of the two it is decides the order the members come in, and so the positions the
+     * lexemes get: json keeps the order they were written in, jsonb the order it stores them in.
+     */
+    private static JsonValue parseDocument(String text, boolean asJsonb) {
+        return asJsonb ? JsonParser.parseJsonb(text) : JsonParser.parse(text);
+    }
+
+    /**
+     * The pieces of text a document offers a text search, in the order they are met.
+     *
+     * <p>The filter names which kinds count. A string is indexed as the text it holds; a number or
+     * a boolean as the way it prints; a key as the name it is. A JSON null is never indexed,
+     * having nothing to index, and neither is the structure itself.
+     */
+    private static List<String> indexedTexts(JsonValue document, Set<String> filter) {
+        List<String> texts = new ArrayList<String>();
+        collectIndexedTexts(document, filter, texts);
+        return texts;
+    }
+
+    private static void collectIndexedTexts(JsonValue value, Set<String> filter, List<String> out) {
+        switch (value.kind()) {
+            case JsonValue.OBJECT:
+                for (int i = 0; i < value.size(); i++) {
+                    if (filter.contains("key")) out.add(value.keyAt(i));
+                    collectIndexedTexts(value.at(i), filter, out);
+                }
+                return;
+            case JsonValue.ARRAY:
+                for (JsonValue element : value.elements()) {
+                    collectIndexedTexts(element, filter, out);
+                }
+                return;
+            case JsonValue.STRING:
+                if (filter.contains("string")) out.add(value.asString());
+                return;
+            case JsonValue.NUMBER:
+                if (filter.contains("numeric")) out.add(value.numberText());
+                return;
+            case JsonValue.BOOLEAN:
+                if (filter.contains("boolean")) out.add(value.asBoolean() ? "true" : "false");
+                return;
+            default:
+        }
+    }
+
+    /** The kinds the two named to_tsvector forms take a filter over. */
+    private static final Set<String> TS_FILTER_KINDS =
+            Cols.setOf("string", "numeric", "boolean", "key", "all");
+
+    /**
+     * The filter argument of json_to_tsvector, which is a document holding either the one word
+     * "all" or an array of the kinds to index.
+     */
+    private static Set<String> parseTsFilter(Object arg) {
+        JsonValue filter = JsonParser.parseJsonb(arg.toString());
+        List<JsonValue> named = filter.isArray()
+                ? filter.elements() : Collections.singletonList(filter);
+        Set<String> kinds = new HashSet<String>();
+        for (JsonValue kind : named) {
+            if (kind.kind() != JsonValue.STRING || !TS_FILTER_KINDS.contains(kind.asString())) {
+                throw new MemgresException("wrong flag in flag array: \""
+                        + (kind.kind() == JsonValue.STRING ? kind.asString() : kind.typeName())
+                        + "\"", "22023");
+            }
+            kinds.add(kind.asString());
+        }
+        if (kinds.contains("all")) return TS_FILTER_KINDS;
+        return kinds;
+    }
+
+    /** The same document with every string it holds replaced by the headline of that string. */
+    private JsonValue headlineOf(JsonValue value, TsQuery query, String options) {
+        switch (value.kind()) {
+            case JsonValue.OBJECT: {
+                List<JsonValue> values = new ArrayList<JsonValue>(value.size());
+                for (JsonValue member : value.elements()) {
+                    values.add(headlineOf(member, query, options));
+                }
+                return JsonValue.object(value.keys(), values);
+            }
+            case JsonValue.ARRAY: {
+                List<JsonValue> elements = new ArrayList<JsonValue>(value.size());
+                for (JsonValue element : value.elements()) {
+                    elements.add(headlineOf(element, query, options));
+                }
+                return JsonValue.array(elements);
+            }
+            case JsonValue.STRING:
+                return JsonValue.string(
+                        TextSearchOperations.tsHeadline(value.asString(), query, options));
+            default:
+                return value;
+        }
+    }
+
     /** Parse a string as tsvector literal first; fall back to prose tokenization. */
     private static TsVector toTsVector(String s) {
         TsVector parsed = TsVector.parseLiteral(s);
@@ -72,7 +195,8 @@ class TextSearchFunctions {
             "phraseto_tsquery", "plainto_tsquery", "querytree", "setweight", "strip",
             "to_tsquery", "to_tsvector", "ts_debug", "ts_delete", "ts_filter", "ts_headline",
             "ts_lexize", "ts_parse", "ts_rank", "ts_rank_cd", "ts_rewrite", "ts_stat",
-            "ts_token_type", "tsquery_phrase", "tsvector_to_array", "websearch_to_tsquery");
+            "ts_token_type", "tsquery_phrase", "tsvector_to_array", "websearch_to_tsquery",
+            "json_to_tsvector", "jsonb_to_tsvector");
 
     /**
      * Every text-search function PostgreSQL exposes is declared strict, so a NULL argument makes
@@ -90,10 +214,10 @@ class TextSearchFunctions {
         for (Object v : argv) {
             if (v == null) return null;
         }
-        return eval(name, argv, ctx);
+        return eval(name, argv, fn, ctx);
     }
 
-    private Object eval(String name, List<Object> argv, RowContext ctx) {
+    private Object eval(String name, List<Object> argv, FunctionCallExpr fn, RowContext ctx) {
         switch (name) {
             case "__tsquery_not__": {
                 Object operand = argv.get(0);
@@ -102,14 +226,32 @@ class TextSearchFunctions {
                 return TsQuery.not(q);
             }
             case "to_tsvector": {
-                if (argv.size() == 2) {
-                    String configName = resolveTsConfig(
-                            String.valueOf(argv.get(0)));
-                    Object text = argv.get(1);
-                    return text == null ? null : TsVector.fromText(text.toString(), configName);
+                int docAt = argv.size() == 2 ? 1 : 0;
+                String configName = argv.size() == 2
+                        ? resolveTsConfig(String.valueOf(argv.get(0))) : "english";
+                Object text = argv.get(docAt);
+                if (text == null) return null;
+                // A document is indexed by what it holds, not by the characters it is written as:
+                // its keys and its punctuation are structure rather than prose. Only the strings
+                // it stores are indexed, which is the "string" filter the two named forms spell.
+                DataType documentType = documentTypeOf(fn, docAt, ctx);
+                if (documentType != null) {
+                    JsonValue document = parseDocument(text.toString(),
+                            documentType == DataType.JSONB);
+                    return TsVector.fromTexts(indexedTexts(document, STRINGS_ONLY), configName);
                 }
-                Object text = argv.get(0);
-                return text == null ? null : TsVector.fromText(text.toString());
+                return TsVector.fromText(text.toString(), configName);
+            }
+            case "json_to_tsvector":
+            case "jsonb_to_tsvector": {
+                // json_to_tsvector([config,] document, filter)
+                int docAt = argv.size() == 3 ? 1 : 0;
+                String configName = argv.size() == 3
+                        ? resolveTsConfig(String.valueOf(argv.get(0))) : "english";
+                JsonValue document = parseDocument(argv.get(docAt).toString(),
+                        name.startsWith("jsonb"));
+                Set<String> filter = parseTsFilter(argv.get(docAt + 1));
+                return TsVector.fromTexts(indexedTexts(document, filter), configName);
             }
             case "to_tsquery": {
                 String config = "english";
@@ -228,6 +370,7 @@ class TextSearchFunctions {
                 // document into the four-character string "null".
                 String config = null;
                 String document;
+                int documentAt;
                 TsQuery query;
                 String options = null;
                 if (argv.size() >= 4) {
@@ -238,6 +381,7 @@ class TextSearchFunctions {
                     if (cfg == null || doc == null || q == null || opt == null) return null;
                     config = cfg.toString();
                     document = doc.toString();
+                    documentAt = 1;
                     query = q instanceof TsQuery ? ((TsQuery) q) : TsQuery.parse(q.toString());
                     options = opt.toString();
                 } else if (argv.size() == 3) {
@@ -248,9 +392,11 @@ class TextSearchFunctions {
                     if (third instanceof TsQuery) {
                         config = first.toString();
                         document = second.toString();
+                        documentAt = 1;
                         query = (TsQuery) third;
                     } else {
                         document = first.toString();
+                        documentAt = 0;
                         query = second instanceof TsQuery ? ((TsQuery) second) : TsQuery.parse(second.toString());
                         options = third.toString();
                     }
@@ -259,7 +405,20 @@ class TextSearchFunctions {
                     Object q = argv.get(1);
                     if (doc == null || q == null) return null;
                     document = doc.toString();
+                    documentAt = 0;
                     query = q instanceof TsQuery ? ((TsQuery) q) : TsQuery.parse(q.toString());
+                }
+                // A headline over a document keeps the document's shape: each string it holds is
+                // marked up on its own and everything else is left as it stands. Marking up the
+                // written characters instead put the tags wherever the word happened to fall,
+                // inside the quotes that delimit a string or across the punctuation between two.
+                DataType documentType = documentTypeOf(fn, documentAt, ctx);
+                if (documentType != null) {
+                    JsonValue headlined = headlineOf(
+                            parseDocument(document, documentType == DataType.JSONB),
+                            query, options);
+                    return documentType == DataType.JSONB
+                            ? JsonWriter.jsonb(headlined) : JsonWriter.json(headlined);
                 }
                 return TextSearchOperations.tsHeadline(document, query, options);
             }

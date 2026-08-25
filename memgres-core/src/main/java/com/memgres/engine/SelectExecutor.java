@@ -35,6 +35,10 @@ class SelectExecutor {
             "count", "sum", "avg", "min", "max", "string_agg", "array_agg",
             "bool_and", "bool_or", "every",
             "bit_and", "bit_or", "json_agg", "jsonb_agg", "json_object_agg", "jsonb_object_agg",
+            "json_agg_strict", "jsonb_agg_strict",
+            "json_object_agg_strict", "jsonb_object_agg_strict",
+            "json_object_agg_unique", "jsonb_object_agg_unique",
+            "json_object_agg_unique_strict", "jsonb_object_agg_unique_strict",
             "xmlagg", "grouping",
             "var_pop", "var_samp", "stddev_pop", "stddev_samp", "stddev", "variance",
             "bit_xor",
@@ -1495,13 +1499,16 @@ class SelectExecutor {
         // DISTINCT ON
         if (stmt.distinctOn() != null && !stmt.distinctOn().isEmpty()) {
             contexts = expandContextsForDistinctOnSrfs(stmt, contexts);
+            // DISTINCT ON keeps one row per distinct key, so the keys are compared the way = does
+            // rather than by the text they print as
+            DataType[] onTypes = RowKey.keyTypes(executor, stmt.distinctOn(), baseBindings);
             Set<String> seen = new LinkedHashSet<>();
             List<RowContext> deduped = new ArrayList<>();
             for (RowContext ctx : contexts) {
                 StringBuilder keyBuilder = new StringBuilder();
-                for (Expression expr : stmt.distinctOn()) {
-                    Object val = executor.evalExpr(expr, ctx);
-                    keyBuilder.append(val == null ? "\0NULL" : val.toString()).append('\1');
+                for (int oi = 0; oi < stmt.distinctOn().size(); oi++) {
+                    Object val = executor.evalExpr(stmt.distinctOn().get(oi), ctx);
+                    keyBuilder.append(RowKey.keyOf(val, onTypes, oi)).append('\1');
                 }
                 if (seen.add(keyBuilder.toString())) {
                     deduped.add(ctx);
@@ -1750,7 +1757,7 @@ class SelectExecutor {
             });
         }
 
-        resultRows = applyDistinct(stmt, resultRows);
+        resultRows = applyDistinct(stmt, resultRows, resultColumns);
         // Skip applyOffsetAndLimit if WITH TIES was already applied on contexts
         if (!(stmt.withTies() && resolvedOrderBy != null && !resolvedOrderBy.isEmpty()
                 && stmt.limit() != null && !hasSrf)) {
@@ -2299,17 +2306,21 @@ class SelectExecutor {
         return -1;
     }
 
-    List<Object[]> applyDistinct(SelectStmt stmt, List<Object[]> resultRows) {
+    List<Object[]> applyDistinct(SelectStmt stmt, List<Object[]> resultRows,
+                                 List<Column> resultColumns) {
         // DISTINCT ON already deduped on its key expressions above (~line 407); it must never
         // also run this plain full-projection DISTINCT pass. The parser sets stmt.distinct() =
         // true for DISTINCT ON too (SelectParser.parseSelectBody), so without this guard two rows
         // with distinct DISTINCT ON keys but an incidentally-equal projection collapse into one
         // (mtask-8 Group 4) -- PostgreSQL keeps both.
         if (stmt.distinct() && (stmt.distinctOn() == null || stmt.distinctOn().isEmpty())) {
+            // DISTINCT gathers equal rows together, so every column of the row needs an equality
+            RowKey.requireEquality(resultColumns);
+            DataType[] keyTypes = RowKey.columnTypes(resultColumns);
             Set<RowKey> seen = new LinkedHashSet<>();
             List<Object[]> deduped = new ArrayList<>();
             for (Object[] row : resultRows) {
-                if (seen.add(new RowKey(row))) {
+                if (seen.add(new RowKey(row, keyTypes))) {
                     deduped.add(row);
                 }
             }
@@ -2742,10 +2753,12 @@ class SelectExecutor {
             List<CustomEnum> enumLookups = new ArrayList<>();
             List<String> collationLookups = new ArrayList<>();
             List<Boolean> arrayKeys = new ArrayList<>();
+            List<Boolean> jsonbKeys = new ArrayList<>();
             for (SelectStmt.OrderByItem item : resolvedOrderBy) {
                 CustomEnum ce = resolveEnumForExpr(item.expr(), contexts);
                 enumLookups.add(ce);
                 arrayKeys.add(isArrayOrderKey(item.expr(), contexts));
+                jsonbKeys.add(isJsonbOrderKey(item.expr(), contexts));
                 // Extract explicit COLLATE collation name if present
                 collationLookups.add(item.expr() instanceof CollateExpr
                         ? ((CollateExpr) item.expr()).collation() : null);
@@ -2774,6 +2787,11 @@ class SelectExecutor {
                         } else if (arrayKeys.get(idx)) {
                             cmp = executor.compareValues(
                                     TypeCoercion.arrayForCompare(va), TypeCoercion.arrayForCompare(vb));
+                        } else if (jsonbKeys.get(idx)
+                                && va instanceof String && vb instanceof String) {
+                            // jsonb orders as a document, not as the text it prints as: a
+                            // container with fewer members sorts first whatever it holds.
+                            cmp = JsonOperations.compareJsonb((String) va, (String) vb);
                         } else {
                             cmp = executor.compareValues(va, vb);
                         }
@@ -2796,6 +2814,21 @@ class SelectExecutor {
                 Column c = b.table().getColumns().get(i);
                 return c.getArrayElementType() != null || c.getType().getPgName().startsWith("_");
             }
+        }
+        return false;
+    }
+
+    /** True when the sort key is a jsonb column, whose values are stored as their text. */
+    private boolean isJsonbOrderKey(Expression expr, List<RowContext> contexts) {
+        if (expr instanceof CastExpr) {
+            return "jsonb".equalsIgnoreCase(((CastExpr) expr).typeName());
+        }
+        if (!(expr instanceof ColumnRef) || contexts == null || contexts.isEmpty()) return false;
+        String col = ((ColumnRef) expr).column();
+        for (RowContext.TableBinding b : contexts.get(0).getBindings()) {
+            if (b.table() == null) continue;
+            int i = b.table().getColumnIndex(col);
+            if (i >= 0) return b.table().getColumns().get(i).getType() == DataType.JSONB;
         }
         return false;
     }
@@ -2960,7 +2993,7 @@ class SelectExecutor {
             Object[] values = valuesList.toArray();
             if (!srfMap.isEmpty()) {
                 return QueryResult.select(columns, applyOffsetAndLimit(stmt,
-                        applyDistinct(stmt, expandSrfRows(values, srfMap))));
+                        applyDistinct(stmt, expandSrfRows(values, srfMap), columns)));
             }
             List<Object[]> rows = new ArrayList<>();
             rows.add(values);
@@ -3053,7 +3086,7 @@ class SelectExecutor {
             // SELECT DISTINCT unnest(ARRAY[1,1,2]) answers two rows. Skipping this pass left the
             // duplicate the expansion had just created.
             return QueryResult.select(columns,
-                    applyOffsetAndLimit(stmt, applyDistinct(stmt, rows)));
+                    applyOffsetAndLimit(stmt, applyDistinct(stmt, rows, columns)));
         }
 
         // A row list of one still has to honour LIMIT and OFFSET; skipping that made LIMIT 0

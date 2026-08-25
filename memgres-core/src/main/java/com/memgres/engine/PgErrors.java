@@ -17,9 +17,6 @@ public final class PgErrors {
     private PgErrors() {
     }
 
-    /** Guard depth for recursive parsers, below the point where the Java stack gives out. */
-    public static final int MAX_RECURSION_DEPTH = 1000;
-
     /**
      * Nesting limit for routine bodies — functions, procedures and DO blocks.
      *

@@ -263,6 +263,68 @@ public final class TypeCoercion {
     // ---- Actual coercion ----
 
     /**
+     * One value held to the width, length or scale a type declaration names for it. A declaration
+     * with no modifier bounds nothing, which is the ordinary case and leaves the value alone.
+     *
+     * <p>This is what reading a value <em>as</em> a type does, which is not the same as casting to
+     * it: a cast to varchar(2) shortens a longer string, while reading one as varchar(2) refuses
+     * it. Composite fields, and the RETURNING clause of the SQL/JSON expressions, are read.
+     */
+    static Object heldToItsType(Object value, String typeSpec) {
+        if (value == null || typeSpec == null) return value;
+        String spec = typeSpec.trim();
+        int open = spec.indexOf('(');
+        int close = spec.indexOf(')', open + 1);
+        if (open <= 0 || close < 0) return value;
+        String base = spec.substring(0, open).trim().toLowerCase(Locale.ROOT);
+        String[] args = spec.substring(open + 1, close).split(",");
+        int first;
+        try {
+            first = Integer.parseInt(args[0].trim());
+        } catch (NumberFormatException e) {
+            return value;
+        }
+        if (base.equals("varchar") || base.equals("character varying")) {
+            String s = value.toString();
+            if (s.length() > first) {
+                throw new MemgresException(
+                        "value too long for type character varying(" + first + ")", "22001");
+            }
+            return value;
+        }
+        if (base.equals("char") || base.equals("character") || base.equals("bpchar")) {
+            String s = value.toString();
+            if (s.length() > first) {
+                throw new MemgresException(
+                        "value too long for type character(" + first + ")", "22001");
+            }
+            StringBuilder padded = new StringBuilder(s);
+            while (padded.length() < first) padded.append(' ');
+            return padded.toString();
+        }
+        if (base.equals("numeric") || base.equals("decimal")) {
+            BigDecimal bd;
+            try {
+                bd = new BigDecimal(value.toString().trim());
+            } catch (NumberFormatException e) {
+                return value;
+            }
+            int scale = 0;
+            if (args.length > 1) {
+                try {
+                    scale = Integer.parseInt(args[1].trim());
+                } catch (NumberFormatException e) {
+                    return value;
+                }
+            }
+            BigDecimal rounded = bd.setScale(scale, RoundingMode.HALF_UP);
+            checkNumericTypmod(rounded, first, scale);
+            return rounded;
+        }
+        return value;
+    }
+
+    /**
      * Coerce a value to the target DataType. Returns the coerced value.
      * Throws MemgresException on invalid conversion.
      */
@@ -1235,13 +1297,13 @@ public final class TypeCoercion {
     }
 
     /**
-     * Normalize JSONB: canonical form with sorted keys, deduplication (last wins), space after
-     * : and , (PG behavior). Keys are held decoded and escaped again here, so this goes through
-     * the one writer that knows how.
+     * A document as jsonb stores and writes it: members sorted by key with one entry per distinct
+     * key, numbers as numerics, strings holding what their escapes named, and a space after every
+     * colon and comma.
      */
     public static String normalizeJsonb(String json) {
         if (json == null) return null;
-        return JsonOperations.normalizeJsonb(JsonOperations.canonicalizeJsonbStrings(json.trim()));
+        return JsonOperations.normalizeJsonb(json);
     }
 
     /** Format a Java List as a PG array string: {elem1,elem2,...} */
@@ -1967,10 +2029,7 @@ public final class TypeCoercion {
             String offsetVal = utcMatch.group(3);
             // Validate the time part parses
             try {
-                LocalTime lt = LocalTime.parse(timePart);
-                timePart = lt.toString();
-                // Ensure seconds are always present (HH:MM:SS)
-                if (timePart.length() == 5) timePart += ":00";
+                timePart = pgTimeText(LocalTime.parse(timePart));
             } catch (DateTimeParseException e) {
                 String errCode = timePart.matches("\\d{1,2}:\\d{2}(:\\d{2})?.*") ? "22008" : "22007";
                 throw new MemgresException("date/time field value out of range: \"" + val + "\"", errCode);
@@ -1987,8 +2046,7 @@ public final class TypeCoercion {
         // Try parsing with Java's OffsetTime for standard offsets (±18 hours)
         try {
             java.time.OffsetTime ot = java.time.OffsetTime.parse(s, java.time.format.DateTimeFormatter.ISO_OFFSET_TIME);
-            String timePart = ot.toLocalTime().toString();
-            if (timePart.length() == 5) timePart += ":00";
+            String timePart = pgTimeText(ot.toLocalTime());
             int totalSeconds = ot.getOffset().getTotalSeconds();
             String sign = totalSeconds >= 0 ? "+" : "-";
             int absSeconds = Math.abs(totalSeconds);
@@ -2007,9 +2065,7 @@ public final class TypeCoercion {
                 String timePart = s.substring(0, tzIdx);
                 String offsetPart = s.substring(tzIdx); // includes sign
                 try {
-                    LocalTime lt = LocalTime.parse(timePart);
-                    timePart = lt.toString();
-                    if (timePart.length() == 5) timePart += ":00";
+                    timePart = pgTimeText(LocalTime.parse(timePart));
                     return timePart + offsetPart;
                 } catch (DateTimeParseException e3) { /* fall through */ }
             }
@@ -2083,9 +2139,25 @@ public final class TypeCoercion {
     }
 
     /** Print a timetz the way PG does: seconds always, offset minutes only when they matter. */
+    /**
+     * A time of day as PostgreSQL writes it: the second always, and a fraction only to the digits
+     * it has. Java's own toString drops a zero second and pads a fraction to a multiple of three,
+     * so 03:04:05.5 came back as 03:04:05.500 and 03:04 lost its seconds.
+     */
+    static String pgTimeText(LocalTime lt) {
+        StringBuilder sb = new StringBuilder(15);
+        sb.append(String.format("%02d:%02d:%02d", lt.getHour(), lt.getMinute(), lt.getSecond()));
+        if (lt.getNano() != 0) {
+            String micros = String.format("%06d", lt.getNano() / 1000);
+            int end = micros.length();
+            while (end > 1 && micros.charAt(end - 1) == '0') end--;
+            sb.append('.').append(micros, 0, end);
+        }
+        return sb.toString();
+    }
+
     private static String formatTimeTz(java.time.OffsetTime ot) {
-        String timePart = ot.toLocalTime().toString();
-        if (timePart.length() == 5) timePart += ":00";
+        String timePart = pgTimeText(ot.toLocalTime());
         int totalSeconds = ot.getOffset().getTotalSeconds();
         String sign = totalSeconds >= 0 ? "+" : "-";
         int absSeconds = Math.abs(totalSeconds);

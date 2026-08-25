@@ -195,7 +195,7 @@ class SelectWindowEvaluator {
         }
 
         resultRows = applyDistinctOn(stmt, resultRows, sourceContexts, rowOrder);
-        resultRows = select.applyDistinct(stmt, resultRows);
+        resultRows = select.applyDistinct(stmt, resultRows, resultColumns);
         resultRows = select.applyOffsetAndLimit(stmt, resultRows);
         return QueryResult.select(resultColumns, resultRows);
     }
@@ -259,6 +259,8 @@ class SelectWindowEvaluator {
                 windowValues[ki] = evaluateWindowExpression(keys.get(ki), contexts, stmt.windowDefs());
             }
         }
+        DataType[] keyTypes = contexts.isEmpty() ? null
+                : RowKey.keyTypes(executor, keys, contexts.get(0).getBindings());
         Set<String> seen = new LinkedHashSet<>();
         List<Object[]> kept = new ArrayList<>();
         for (int ri = 0; ri < rows.size(); ri++) {
@@ -268,7 +270,7 @@ class SelectWindowEvaluator {
                 Object value = windowValues[ki] != null
                         ? windowValues[ki][source]
                         : executor.evalExpr(keys.get(ki), contexts.get(source));
-                key.append(value == null ? "\0NULL" : RowKey.valueKey(value)).append('\1');
+                key.append(RowKey.keyOf(value, keyTypes, ki)).append('\1');
             }
             if (seen.add(key.toString())) kept.add(rows.get(ri));
         }
@@ -492,14 +494,18 @@ class SelectWindowEvaluator {
     }
 
     /**
-     * A window is partitioned by sorting the rows on the partition keys, so a key of a type
-     * nothing can be sorted by leaves the window with no way to be built. PostgreSQL says that
-     * as a plan it cannot implement rather than as an operator it cannot find.
+     * A window is partitioned by gathering equal keys together and then sorting on them, so a key
+     * of a type with no equality is refused before one with no ordering: point has ordering
+     * operators and no equality, and PostgreSQL names the equality it could not find rather than
+     * the plan. A key that can be compared but not sorted — xid has equality and nothing else —
+     * gets as far as the plan, and PostgreSQL says that as a plan it cannot implement.
      */
     private void rejectUnsortablePartition(Expression key, List<RowContext.TableBinding> bindings) {
         if (key == null || bindings == null) return;
-        if (OperatorResolution.noOrderingFor(
-                select.executor.exprEvaluator.inferTypeFromContext(key, bindings)) == null) {
+        DataType keyType = select.executor.exprEvaluator.inferTypeFromContext(key, bindings);
+        MemgresException noEquality = OperatorResolution.noEqualityFor(keyType);
+        if (noEquality != null) throw noEquality;
+        if (OperatorResolution.noOrderingFor(keyType) == null) {
             return;
         }
         MemgresException e = new MemgresException("could not implement window PARTITION BY", "0A000");
@@ -1828,11 +1834,17 @@ class SelectWindowEvaluator {
             return Cols.listOf(all);
         }
 
+        // jsonb is held as the text it prints as, and that text is not the value: the keys are
+        // taken as the documents they spell so that 1 and 1.0 fall in one partition
+        DataType[] keyTypes = contexts.isEmpty() ? null
+                : RowKey.keyTypes(executor, partitionBy, contexts.get(0).getBindings());
         List<Object[]> keys = new ArrayList<>(contexts.size());
         for (int i = 0; i < contexts.size(); i++) {
             Object[] vals = new Object[partitionBy.size()];
             for (int k = 0; k < partitionBy.size(); k++) {
-                vals[k] = executor.evalExpr(partitionBy.get(k), contexts.get(i));
+                Object val = executor.evalExpr(partitionBy.get(k), contexts.get(i));
+                vals[k] = keyTypes == null || keyTypes[k] != DataType.JSONB || !(val instanceof String)
+                        ? val : JsonOperations.jsonbKey((String) val);
             }
             keys.add(vals);
         }

@@ -39,6 +39,66 @@ class CastEvaluator {
         return lowerSpec;
     }
 
+    /** Handed back when jsonb has no registered cast to the type asked for. */
+    static final Object NOT_A_JSONB_CAST = new Object();
+
+    /** The name PostgreSQL reports a jsonb cast target by, or null for a type jsonb reaches none of. */
+    private static String jsonbNumericTarget(String lowerSpec) {
+        if (lowerSpec.equals("int2") || lowerSpec.equals("smallint")) return "smallint";
+        if (lowerSpec.equals("int") || lowerSpec.equals("int4") || lowerSpec.equals("integer")) {
+            return "integer";
+        }
+        if (lowerSpec.equals("int8") || lowerSpec.equals("bigint")) return "bigint";
+        if (lowerSpec.equals("float4") || lowerSpec.equals("real")) return "real";
+        if (lowerSpec.equals("float8") || lowerSpec.equals("double precision")) {
+            return "double precision";
+        }
+        if (lowerSpec.equals("numeric") || lowerSpec.equals("decimal")) return "numeric";
+        return null;
+    }
+
+    /**
+     * The value a jsonb document holds, ready to be read as the scalar type asked for.
+     *
+     * <p>jsonb keeps what kind of value it holds, so a cast out of it is not a matter of whether
+     * the text it prints as happens to parse: {@code '"1"'::jsonb} is a string and there is no
+     * number in it to read, while {@code '1.5'::jsonb::int} is a number and rounds like any other.
+     * PostgreSQL registers such a cast for boolean and for each of the numeric types, and for
+     * nothing else.
+     *
+     * @return the value to convert, null for a JSON null, or {@link #NOT_A_JSONB_CAST} where
+     *         jsonb has no cast to that type and the ordinary conversion should stand
+     */
+    static Object jsonbCastPayload(String json, String typeSpec) {
+        String lowerSpec = typeSpec == null ? "" : typeSpec.toLowerCase().trim();
+        boolean wantBoolean = lowerSpec.equals("bool") || lowerSpec.equals("boolean");
+        String numericTarget = jsonbNumericTarget(lowerSpec);
+        if (!wantBoolean && numericTarget == null) return NOT_A_JSONB_CAST;
+        JsonValue value;
+        try {
+            value = JsonParser.parseJsonb(json);
+        } catch (MemgresException e) {
+            return NOT_A_JSONB_CAST;   // not a document after all, so this rule has nothing to say
+        }
+        // A JSON null is the document saying it holds no value, which is SQL's null
+        if (value.isNull()) return null;
+        if (wantBoolean) {
+            if (value.kind() != JsonValue.BOOLEAN) throw cannotCastJsonb(value, "boolean");
+            return value.asBoolean();
+        }
+        if (value.kind() != JsonValue.NUMBER) throw cannotCastJsonb(value, numericTarget);
+        java.math.BigDecimal number = value.asNumber();
+        boolean integral = numericTarget.equals("smallint") || numericTarget.equals("integer")
+                || numericTarget.equals("bigint");
+        return integral ? number.setScale(0, java.math.RoundingMode.HALF_UP) : number;
+    }
+
+    /** What jsonb calls the kind of value it found, which is "numeric" where json_typeof says number. */
+    private static MemgresException cannotCastJsonb(JsonValue value, String target) {
+        String kind = value.kind() == JsonValue.NUMBER ? "numeric" : value.typeName();
+        return new MemgresException("cannot cast jsonb " + kind + " to type " + target, "22023");
+    }
+
     private final AstExecutor executor;
 
     /** Reads pg_proc for the regprocedure cast; built once because it holds only the executor. */
@@ -590,11 +650,10 @@ class CastEvaluator {
             if (list != null) {
                 // The literal parser hands back nested lists for nested braces, so a String element
                 // is only ever an element -- a quoted "{1,2}" stays that text rather than becoming
-                // a sub-array. A List arriving from elsewhere still needs the older reading.
-                // The width belongs to each element, so the element is cast with it: '{c}' as a
-                // char(5)[] holds one element padded to five, not the bare text it was written as.
-                List<Object> castList = castArrayElements(list, elementSpecOf(typeSpec, typeName),
-                        literal == null);
+                // a sub-array. The width belongs to each element, so the element is cast with it:
+                // '{c}' as a char(5)[] holds one element padded to five, not the bare text it was
+                // written as.
+                List<Object> castList = castArrayElements(list, elementSpecOf(typeSpec, typeName));
                 // The bounds an array states in front of its braces belong to the value, not to
                 // its spelling: kept as text they were opaque to every function but four.
                 int[] bounds = literal != null ? literal.lowerBounds()
@@ -1085,7 +1144,9 @@ class CastEvaluator {
                 String trimmed = jsonStr.trim();
                 // Parse it properly rather than balancing brackets: a bracket count cannot see a
                 // second document after the first, an unquoted key, or a number JSON has no form for.
-                JsonTextValidator.validate(trimmed);
+                // The text as written, not the trimmed one: the reader skips whitespace itself,
+                // and the text it was handed is the text its complaint quotes back.
+                JsonParser.validate(jsonStr);
                 // JSONB normalizes whitespace and decodes string escapes; JSON preserves input
                 if ("jsonb".equals(typeName)) {
                     return TypeCoercion.normalizeJsonb(trimmed);
@@ -1885,26 +1946,25 @@ class CastEvaluator {
         return spec.indexOf('(') > 0 ? spec : bareElementName;
     }
 
-    private List<Object> castArrayElements(List<?> list, String elemType,
-                                           boolean braceTextIsSubArray) {
+    /**
+     * The elements of an array, each cast to the element type.
+     *
+     * <p>An element that is text stays one element however it is spelled. It used to become a
+     * nested array where its text began and ended with a brace, which is a guess from the
+     * characters rather than from the structure: an array is nested because the value nests, and
+     * {@code ARRAY['{a,b}']::text[]} holds one element that reads {@code &#123;a,b&#125;}.
+     */
+    private List<Object> castArrayElements(List<?> list, String elemType) {
         List<Object> castList = new ArrayList<>();
         for (Object elem : list) {
             if (elem == null) {
                 castList.add(null);
             } else if (elem instanceof List<?>) {
-                castList.add(castArrayElements((List<?>) elem, elemType, braceTextIsSubArray));
+                castList.add(castArrayElements((List<?>) elem, elemType));
             } else {
                 // Do not trim: quoted elements may carry significant leading/trailing whitespace
                 // (already normalized by the parser above for unquoted ones).
-                String elemStr = elem instanceof String ? (String) elem : elem.toString();
-                // For json/jsonb, braces open an object rather than a nested array
-                boolean jsonElement = elemType.equals("json") || elemType.equals("jsonb");
-                if (braceTextIsSubArray && !jsonElement && elem instanceof String
-                        && elemStr.startsWith("{") && elemStr.endsWith("}")) {
-                    castList.add(applyCast(elemStr, elemType + "[]"));
-                } else {
-                    castList.add(applyCast(elem instanceof String ? elemStr : elem, elemType));
-                }
+                castList.add(applyCast(elem, elemType));
             }
         }
         return castList;
@@ -1933,40 +1993,18 @@ class CastEvaluator {
     }
 
     /**
-     * Normalize a jsonpath string to PG format: quote all member accessor keys.
-     * E.g. $.store.book[*].author → $."store"."book"[*]."author"
+     * A jsonpath as PostgreSQL holds one, which is the path parsed and written back out rather
+     * than the text it was given.
+     *
+     * <p>This used to quote member keys by scanning for dots, which left everything else as
+     * written: the mode word, the spacing around operators, the parentheses, the spelling of a
+     * number. jsonpath is a type whose input function parses, so a path that does not parse is a
+     * syntax error here and not later, and one that does comes back out in one shape however it
+     * was written.
      */
     static String normalizeJsonpath(String jp) {
-        if (jp == null || jp.isEmpty()) return jp;
-        StringBuilder sb = new StringBuilder();
-        int i = 0;
-        while (i < jp.length()) {
-            char c = jp.charAt(i);
-            if (c == '.' && i + 1 < jp.length()) {
-                sb.append('.');
-                i++;
-                char next = jp.charAt(i);
-                if (next == '.' || next == '*' || next == '"') {
-                    // recursive descent (..), wildcard (.*), or already quoted
-                    sb.append(next);
-                    i++;
-                } else if (next == '[') {
-                    sb.append(next);
-                    i++;
-                } else {
-                    // member accessor — read the key name and quote it
-                    int start = i;
-                    while (i < jp.length() && jp.charAt(i) != '.' && jp.charAt(i) != '[' && jp.charAt(i) != ' ') {
-                        i++;
-                    }
-                    sb.append('"').append(jp, start, i).append('"');
-                }
-            } else {
-                sb.append(c);
-                i++;
-            }
-        }
-        return sb.toString();
+        if (jp == null) return null;
+        return JsonPath.parse(jp).text();
     }
 
     /**

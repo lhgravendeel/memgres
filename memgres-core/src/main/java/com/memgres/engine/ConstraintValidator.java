@@ -447,6 +447,7 @@ class ConstraintValidator {
             }
         }
 
+        DataType[] scanKeyTypes = TableIndex.keyTypes(table.getColumns(), colIndices);
         for (Object[] existingRow : table.getRows()) {
             if (excludeRow != null && existingRow == excludeRow) continue;
             if (dead.contains(existingRow)) continue;
@@ -465,7 +466,7 @@ class ConstraintValidator {
             boolean allMatch = true;
             for (int i = 0; i < colIndices.length; i++) {
                 Object existingVal = evalExisting[colIndices[i]];
-                if (!valuesEqual(newVals[i], existingVal)) {
+                if (!keyValuesEqual(newVals[i], existingVal, scanKeyTypes[i])) {
                     allMatch = false;
                     break;
                 }
@@ -654,12 +655,13 @@ class ConstraintValidator {
             if (colIndices[i] < 0) return;
         }
 
+        DataType[] keyTypes = TableIndex.keyTypes(table.getColumns(), colIndices);
         Set<TableIndex.IndexKey> seen = new HashSet<>();
         for (Object[] row : table.getRows()) {
             Object[] vals = new Object[colIndices.length];
             boolean hasNull = false;
             for (int i = 0; i < colIndices.length; i++) {
-                vals[i] = TableIndex.normalize(row[colIndices[i]]);
+                vals[i] = TableIndex.normalize(row[colIndices[i]], keyTypes[i]);
                 if (vals[i] == null) hasNull = true;
             }
             // NULLs are distinct by default (skip), unless NULLS NOT DISTINCT
@@ -2059,6 +2061,20 @@ class ConstraintValidator {
     boolean valuesEqual(Object a, Object b) {
         if (a == null || b == null) return a == b;
         return TypeCoercion.areEqual(a, b);
+    }
+
+    /**
+     * Whether two values of a key column are the same key.
+     *
+     * <p>A jsonb is held as the text it prints as, and the text says more than the key does: an
+     * object's members are one set however they were ordered, and {@code 1} and {@code 1.0} are
+     * one number. So it is keyed by the document rather than by the text it was written as.
+     */
+    private boolean keyValuesEqual(Object a, Object b, DataType type) {
+        if (type == DataType.JSONB && a instanceof String && b instanceof String) {
+            return JsonOperations.jsonbKey((String) a).equals(JsonOperations.jsonbKey((String) b));
+        }
+        return valuesEqual(a, b);
     }
 
     /**

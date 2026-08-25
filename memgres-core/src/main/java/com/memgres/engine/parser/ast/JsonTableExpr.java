@@ -1,5 +1,7 @@
 package com.memgres.engine.parser.ast;
 
+import com.memgres.engine.DataType;
+
 import java.util.List;
 import java.util.Map;
 
@@ -30,45 +32,79 @@ public final class JsonTableExpr implements Expression {
         public final Expression pathExpr; // null for FOR ORDINALITY
         public final boolean forOrdinality;
         public final boolean existsPath;
+        /** Whether FORMAT JSON was written, which makes the column read its item as a document. */
+        public final boolean formatJson;
+        public final JsonQueryExpr.WrapperBehavior wrapper;
+        public final JsonQueryExpr.QuotesBehavior quotes; // null = unwritten
+        public final JsonExistsExpr.OnBehavior onEmpty;
         public final Expression defaultOnEmpty;
+        public final JsonExistsExpr.OnBehavior onError;
         public final Expression defaultOnError;
         public final List<JsonTableColumn> nestedColumns; // for NESTED PATH
         public final Expression nestedPath;
 
         public JsonTableColumn(String name, String typeName, Expression pathExpr,
-                               boolean forOrdinality, boolean existsPath,
-                               Expression defaultOnEmpty, Expression defaultOnError,
+                               boolean forOrdinality, boolean existsPath, boolean formatJson,
+                               JsonQueryExpr.WrapperBehavior wrapper,
+                               JsonQueryExpr.QuotesBehavior quotes,
+                               JsonExistsExpr.OnBehavior onEmpty, Expression defaultOnEmpty,
+                               JsonExistsExpr.OnBehavior onError, Expression defaultOnError,
                                List<JsonTableColumn> nestedColumns, Expression nestedPath) {
             this.name = name;
             this.typeName = typeName;
             this.pathExpr = pathExpr;
             this.forOrdinality = forOrdinality;
             this.existsPath = existsPath;
+            this.formatJson = formatJson;
+            this.wrapper = wrapper == null ? JsonQueryExpr.WrapperBehavior.NONE : wrapper;
+            this.quotes = quotes;
+            this.onEmpty = onEmpty;
             this.defaultOnEmpty = defaultOnEmpty;
+            this.onError = onError;
             this.defaultOnError = defaultOnError;
             this.nestedColumns = nestedColumns;
             this.nestedPath = nestedPath;
         }
 
-        /** Simple typed column with path */
-        public static JsonTableColumn typed(String name, String type, Expression path,
-                                            Expression defaultOnEmpty, Expression defaultOnError) {
-            return new JsonTableColumn(name, type, path, false, false, defaultOnEmpty, defaultOnError, null, null);
-        }
-
         /** FOR ORDINALITY column */
         public static JsonTableColumn ordinality(String name) {
-            return new JsonTableColumn(name, null, null, true, false, null, null, null, null);
+            return new JsonTableColumn(name, null, null, true, false, false, null, null,
+                    null, null, null, null, null, null);
         }
 
         /** EXISTS PATH column */
-        public static JsonTableColumn exists(String name, String type, Expression path) {
-            return new JsonTableColumn(name, type, path, false, true, null, null, null, null);
+        public static JsonTableColumn exists(String name, String type, Expression path,
+                                             JsonExistsExpr.OnBehavior onError) {
+            return new JsonTableColumn(name, type, path, false, true, false, null, null,
+                    null, null, onError, null, null, null);
+        }
+
+        /**
+         * Whether a column written this way reads its item as a document rather than as a
+         * scalar -- PostgreSQL's "formatted" column against its "scalar" one.
+         *
+         * <p>A column says so by FORMAT JSON, or by writing a wrapper or quotes clause, which
+         * only a document reading has. Failing that its type settles it: the json types hold a
+         * document, and the array types hold an array's items rather than one scalar.
+         */
+        public static boolean readsDocument(String typeName, boolean formatJson,
+                                            JsonQueryExpr.WrapperBehavior wrapper,
+                                            JsonQueryExpr.QuotesBehavior quotes) {
+            if (formatJson || quotes != null
+                    || (wrapper != null && wrapper != JsonQueryExpr.WrapperBehavior.NONE)) {
+                return true;
+            }
+            int open = typeName == null ? -1 : typeName.indexOf('(');
+            String base = typeName == null ? null
+                    : (open < 0 ? typeName.trim() : typeName.substring(0, open).trim());
+            DataType type = DataType.fromPgName(base);
+            return type == DataType.JSON || type == DataType.JSONB || DataType.isArrayType(type);
         }
 
         /** NESTED PATH column group */
         public static JsonTableColumn nested(Expression nestedPath, List<JsonTableColumn> columns) {
-            return new JsonTableColumn(null, null, null, false, false, null, null, columns, nestedPath);
+            return new JsonTableColumn(null, null, null, false, false, false, null, null,
+                    null, null, null, null, columns, nestedPath);
         }
     }
 

@@ -217,14 +217,14 @@ class FromFunctionResolver {
         if (fname.equals("jsonb_each") || fname.equals("jsonb_each_text") || fname.equals("json_each") || fname.equals("json_each_text"))
             return resolveJsonEach(fname, alias, colAliases, evalArgs);
         if (fname.equals("jsonb_to_recordset") || fname.equals("json_to_recordset") || fname.equals("jsonb_to_record") || fname.equals("json_to_record"))
-            return resolveJsonToRecordset(alias, rawColAliases, evalArgs);
+            return resolveJsonToRecordset(fname, alias, rawColAliases, evalArgs);
         if (fname.equals("json_populate_recordset") || fname.equals("jsonb_populate_recordset")
                 || fname.equals("json_populate_record") || fname.equals("jsonb_populate_record"))
-            return resolveJsonPopulateRecordset(funcFrom, alias, colAliases, evalArgs);
+            return resolveJsonPopulateRecordset(funcFrom, fname, alias, colAliases, evalArgs);
         if (fname.equals("populate_record"))
             return resolveHstorePopulateRecord(funcFrom, alias, evalArgs);
         if (fname.equals("regexp_matches")) return resolveRegexpMatches(alias, colAliases, evalArgs);
-        if (fname.equals("jsonb_path_query")) return resolveJsonbPathQuery(alias, colAliases, evalArgs);
+        if (fname.equals("jsonb_path_query")) return resolveJsonbPathQuery(fname, alias, colAliases, evalArgs);
         if (fname.equals("jsonb_array_elements") || fname.equals("json_array_elements") ||
             fname.equals("jsonb_array_elements_text") || fname.equals("json_array_elements_text"))
             return resolveJsonArrayElements(fname, alias, colAliases, evalArgs);
@@ -244,7 +244,7 @@ class FromFunctionResolver {
             return resolvePgLsDirRecord(alias, colAliases);
         if (fname.equals("pg_partition_tree")) return resolvePgPartitionTree(alias, colAliases, evalArgs);
         if (fname.equals("pg_partition_ancestors")) return resolvePgPartitionAncestors(alias, colAliases, evalArgs);
-        if (fname.equals("jsonb_path_query_tz")) return resolveJsonbPathQuery(alias, colAliases, evalArgs);
+        if (fname.equals("jsonb_path_query_tz")) return resolveJsonbPathQuery(fname, alias, colAliases, evalArgs);
         if (fname.equals("ts_stat")) return resolveTsStat(alias, colAliases, evalArgs);
         if (fname.equals("ts_debug")) return resolveTsDebug(alias, colAliases, evalArgs);
         if (fname.equals("ts_parse")) return resolveTsParse(alias, colAliases, evalArgs);
@@ -1068,100 +1068,75 @@ class FromFunctionResolver {
         if (jsonVal != null) {
             String json = jsonVal.toString().trim();
             JsonFunctions.requireJsonEachObject(fname, json);
-            try {
-                Map<String, String> pairs = JsonFunctions.eachMembers(fname, json);
-                for (Map.Entry<String, String> entry : pairs.entrySet()) {
-                    String value = entry.getValue();
-                    if (isText && value != null && value.startsWith("\"") && value.endsWith("\"")) {
-                        value = value.substring(1, value.length() - 1);
-                    }
-                    Object[] row = new Object[]{entry.getKey(), value};
-                    virtualTable.insertRow(row);
-                    contexts.add(new RowContext(virtualTable, alias, row));
-                }
-            } catch (Exception e) { /* skip */ }
+            for (JsonParser.Member member : JsonFunctions.eachMembers(fname, json)) {
+                // The _text form hands back the text the value stands for, which is the string
+                // with its escapes read rather than with its quotes cut off, and SQL NULL for a
+                // JSON null.
+                String value = isText
+                        ? JsonOperations.jsonValueToText(member.text) : member.text;
+                Object[] row = new Object[]{member.key, value};
+                virtualTable.insertRow(row);
+                contexts.add(new RowContext(virtualTable, alias, row));
+            }
         }
         return contexts;
     }
 
     // ---- jsonb_to_recordset / json_to_recordset ----
 
-    private List<RowContext> resolveJsonToRecordset(String alias, List<String> colAliases, List<Object> evalArgs) {
-        Object jsonVal = evalArgs.get(0);
+    private List<RowContext> resolveJsonToRecordset(String fname, String alias,
+            List<String> colAliases, List<Object> evalArgs) {
         List<Column> cols = new ArrayList<>();
+        List<String> colTypes = new ArrayList<>();
         if (colAliases != null) {
             for (String ca : colAliases) {
                 // Column alias may contain type info: "name type" e.g. "a int"
                 int spaceIdx = ca.indexOf(' ');
-                if (spaceIdx > 0) {
-                    String colName = ca.substring(0, spaceIdx);
-                    String typeName = ca.substring(spaceIdx + 1).trim();
-                    DataType dt = DataType.fromPgName(typeName);
-                    if (dt == null) dt = DataType.TEXT;
-                    cols.add(new Column(colName, dt, true, false, null));
-                } else {
-                    cols.add(new Column(ca, DataType.TEXT, true, false, null));
-                }
+                String colName = spaceIdx > 0 ? ca.substring(0, spaceIdx) : ca;
+                String typeName = spaceIdx > 0 ? ca.substring(spaceIdx + 1).trim() : null;
+                DataType dt = typeName == null ? null : DataType.fromPgName(typeName);
+                cols.add(new Column(colName, dt != null ? dt : DataType.TEXT, true, false, null));
+                colTypes.add(typeName);
             }
         }
-        if (cols.isEmpty()) cols.add(new Column("value", DataType.TEXT, true, false, null));
+        if (cols.isEmpty()) {
+            cols.add(new Column("value", DataType.TEXT, true, false, null));
+            colTypes.add(null);
+        }
+        return populatedRows(fname, alias, cols, colTypes, evalArgs.get(0), null);
+    }
+
+    /**
+     * The rows a record-populating function makes: one for each JSON object it is given, with every
+     * field read as the type it is declared and every field the object is silent about left as the
+     * record being filled already had it.
+     */
+    private List<RowContext> populatedRows(String fname, String alias, List<Column> cols,
+            List<String> colTypes, Object jsonVal, Object[] base) {
         Table virtualTable = new Table(alias, cols);
         List<RowContext> contexts = new ArrayList<>();
-        if (jsonVal != null) {
-            String json = jsonVal.toString().trim();
-            boolean isArray = json.startsWith("[");
-            List<String> jsonObjects = new ArrayList<>();
-            if (isArray) {
-                json = json.substring(1, json.length() - 1).trim();
-                int depth = 0;
-                StringBuilder current = new StringBuilder();
-                for (char c : json.toCharArray()) {
-                    if (c == '{') depth++;
-                    if (c == '}') depth--;
-                    current.append(c);
-                    if (depth == 0 && current.length() > 0) {
-                        jsonObjects.add(current.toString().trim());
-                        current = new StringBuilder();
-                    }
-                    if (c == ',' && depth == 0) current = new StringBuilder();
-                }
-                if (current.length() > 0) jsonObjects.add(current.toString().trim());
-            } else {
-                jsonObjects.add(json);
+        boolean set = fname.endsWith("recordset");
+        // A document that is not there leaves every field to the record being filled, which is
+        // still a record and still one row. Only the set-returning forms answer with nothing:
+        // there is no array of objects to make rows from, so there are none.
+        if (jsonVal == null && set) return contexts;
+        JsonRecordPopulator populator = new JsonRecordPopulator(executor);
+        List<List<JsonParser.Member>> objects = new ArrayList<>();
+        if (jsonVal == null) {
+            objects.add(Collections.<JsonParser.Member>emptyList());
+        } else if (set) {
+            objects = JsonRecordPopulator.objectsMembers(fname, jsonVal.toString());
+        } else {
+            objects.add(JsonRecordPopulator.objectMembers(jsonVal.toString()));
+        }
+        for (List<JsonParser.Member> members : objects) {
+            Object[] row = new Object[cols.size()];
+            for (int ci = 0; ci < cols.size(); ci++) {
+                row[ci] = populator.fieldValue(members, cols.get(ci).getName(),
+                        colTypes.get(ci), base == null ? null : base[ci]);
             }
-            for (String obj : jsonObjects) {
-                if (obj.isEmpty() || obj.equals(",")) continue;
-                Object[] row = new Object[cols.size()];
-                for (int ci = 0; ci < cols.size(); ci++) {
-                    String key = cols.get(ci).getName();
-                    String extracted = JsonOperations.extractKey(obj, key);
-                    if (extracted != null) {
-                        extracted = extracted.trim();
-                        if (extracted.startsWith("\"") && extracted.endsWith("\"")) {
-                            extracted = extracted.substring(1, extracted.length() - 1);
-                        }
-                        if (extracted.equals("true")) extracted = "t";
-                        else if (extracted.equals("false")) extracted = "f";
-                        else if (extracted.equals("null")) extracted = null;
-                    }
-                    if (extracted != null) {
-                        DataType colDt = cols.get(ci).getType();
-                        if (colDt == DataType.INTEGER || colDt == DataType.BIGINT || colDt == DataType.SMALLINT) {
-                            try { row[ci] = Long.parseLong(extracted); } catch (NumberFormatException e) { row[ci] = extracted; }
-                        } else if (colDt == DataType.NUMERIC || colDt == DataType.DOUBLE_PRECISION || colDt == DataType.REAL) {
-                            try { row[ci] = new java.math.BigDecimal(extracted); } catch (NumberFormatException e) { row[ci] = extracted; }
-                        } else if (colDt == DataType.BOOLEAN) {
-                            row[ci] = "t".equals(extracted) || "true".equalsIgnoreCase(extracted);
-                        } else {
-                            row[ci] = extracted;
-                        }
-                    } else {
-                        row[ci] = null;
-                    }
-                }
-                virtualTable.insertRow(row);
-                contexts.add(new RowContext(virtualTable, alias, row));
-            }
+            virtualTable.insertRow(row);
+            contexts.add(new RowContext(virtualTable, alias, row));
         }
         return contexts;
     }
@@ -1169,10 +1144,11 @@ class FromFunctionResolver {
     // ---- json_populate_recordset / jsonb_populate_recordset ----
 
     private List<RowContext> resolveJsonPopulateRecordset(SelectStmt.FunctionFrom funcFrom,
-            String alias, List<String> colAliases, List<Object> evalArgs) {
+            String fname, String alias, List<String> colAliases, List<Object> evalArgs) {
         // First arg defines the composite type (e.g. NULL::my_type)
         // Extract composite type name from the CastExpr in the first argument
         List<Column> cols = new ArrayList<>();
+        List<String> colTypes = new ArrayList<>();
         if (funcFrom.args().size() >= 1 && funcFrom.args().get(0) instanceof CastExpr) {
             String typeName = ((CastExpr) funcFrom.args().get(0)).typeName().toLowerCase();
             List<CreateTypeStmt.CompositeField> fields = executor.database.getCompositeType(typeName);
@@ -1180,6 +1156,7 @@ class FromFunctionResolver {
                 for (CreateTypeStmt.CompositeField field : fields) {
                     DataType dt = DataType.fromPgName(field.typeName());
                     cols.add(new Column(field.name(), dt != null ? dt : DataType.TEXT, true, false, null));
+                    colTypes.add(field.typeName());
                 }
             } else {
                 // Fall back to table columns (PG treats table types as composite types)
@@ -1187,6 +1164,7 @@ class FromFunctionResolver {
                 if (tbl != null) {
                     for (Column c : tbl.getColumns()) {
                         cols.add(new Column(c.getName(), c.getType(), true, false, null));
+                        colTypes.add(c.getType().getPgName());
                     }
                 }
             }
@@ -1194,60 +1172,32 @@ class FromFunctionResolver {
         if (cols.isEmpty() && colAliases != null) {
             for (String ca : colAliases) {
                 cols.add(new Column(ca, DataType.TEXT, true, false, null));
+                colTypes.add(null);
             }
         }
-        if (cols.isEmpty()) cols.add(new Column("value", DataType.TEXT, true, false, null));
-        Table virtualTable = new Table(alias, cols);
-        List<RowContext> contexts = new ArrayList<>();
+        if (cols.isEmpty()) {
+            cols.add(new Column("value", DataType.TEXT, true, false, null));
+            colTypes.add(null);
+        }
+        // The record handed in is what the fields the document is silent about keep
+        Object[] base = baseRow(evalArgs.isEmpty() ? null : evalArgs.get(0), cols);
         Object jsonVal = evalArgs.size() > 1 ? evalArgs.get(1) : null;
-        if (jsonVal != null) {
-            String json = jsonVal.toString().trim();
-            List<String> jsonObjects = new ArrayList<>();
-            if (json.startsWith("[")) {
-                // Array of objects
-                json = json.substring(1, json.length() - 1).trim();
-                int depth = 0;
-                StringBuilder current = new StringBuilder();
-                for (char c : json.toCharArray()) {
-                    if (c == '{') depth++;
-                    if (c == '}') depth--;
-                    current.append(c);
-                    if (depth == 0 && current.length() > 0) {
-                        String s = current.toString().trim();
-                        if (!s.isEmpty() && !s.equals(",")) jsonObjects.add(s);
-                        current = new StringBuilder();
-                    }
-                    if (c == ',' && depth == 0) current = new StringBuilder();
-                }
-                if (current.length() > 0) {
-                    String s = current.toString().trim();
-                    if (!s.isEmpty() && !s.equals(",")) jsonObjects.add(s);
-                }
-            } else if (json.startsWith("{")) {
-                jsonObjects.add(json);
-            }
-            for (String obj : jsonObjects) {
-                if (obj.isEmpty() || obj.equals(",")) continue;
-                Object[] row = new Object[cols.size()];
-                for (int ci = 0; ci < cols.size(); ci++) {
-                    String key = cols.get(ci).getName();
-                    String extracted = JsonOperations.extractKey(obj, key);
-                    if (extracted != null) {
-                        extracted = extracted.trim();
-                        if (extracted.startsWith("\"") && extracted.endsWith("\"")) {
-                            extracted = extracted.substring(1, extracted.length() - 1);
-                        }
-                        if (extracted.equals("null")) extracted = null;
-                        else if (extracted.equals("true")) extracted = "t";
-                        else if (extracted.equals("false")) extracted = "f";
-                    }
-                    row[ci] = extracted;
-                }
-                virtualTable.insertRow(row);
-                contexts.add(new RowContext(virtualTable, alias, row));
-            }
+        return populatedRows(fname, alias, cols, colTypes, jsonVal, base);
+    }
+
+    /** The values the record being filled already holds, in the order its fields are declared. */
+    private static Object[] baseRow(Object base, List<Column> cols) {
+        Map<String, Object> fields = base == null ? null : JsonFunctions.rowFields(base);
+        if (fields == null) return null;
+        Object[] row = new Object[cols.size()];
+        List<Object> positional = new ArrayList<>(fields.values());
+        for (int i = 0; i < cols.size(); i++) {
+            // A row built by ROW(...) names its fields f1, f2 and so on rather than after the type
+            // it was cast to, so the fields are taken in order when the names do not match
+            row[i] = fields.containsKey(cols.get(i).getName()) ? fields.get(cols.get(i).getName())
+                    : i < positional.size() ? positional.get(i) : null;
         }
-        return contexts;
+        return row;
     }
 
     // ---- hstore populate_record ----
@@ -1322,33 +1272,28 @@ class FromFunctionResolver {
 
     // ---- jsonb_path_query ----
 
-    private List<RowContext> resolveJsonbPathQuery(String alias, List<String> colAliases, List<Object> evalArgs) {
-        if (evalArgs.size() < 2) throw new MemgresException("function jsonb_path_query requires at least 2 arguments", "42883");
-        Object jsonVal = evalArgs.get(0);
-        Object pathVal = evalArgs.get(1);
+    private List<RowContext> resolveJsonbPathQuery(String fname, String alias, List<String> colAliases, List<Object> evalArgs) {
+        if (evalArgs.size() < 2) throw new MemgresException("function " + fname + " requires at least 2 arguments", "42883");
         String colName = firstColAlias(colAliases, alias);
         Table virtualTable = new Table(alias, Cols.listOf(new Column(colName, DataType.JSONB, true, false, null)));
         List<RowContext> contexts = new ArrayList<>();
-        if (jsonVal != null && pathVal != null) {
-            String json = jsonVal.toString().trim();
-            String path = pathVal.toString().trim();
-            // The optional third argument binds $name references in the path
-            if (evalArgs.size() > 2 && evalArgs.get(2) != null) {
-                path = JsonFunctions.bindJsonPathVars(path, evalArgs.get(2).toString());
-            }
-            List<String> stringResults = executor.functionEvaluator.evaluateJsonPathAll(json, path);
-            for (String s : stringResults) {
-                String trimmed = s.trim();
-                Object val;
-                if (trimmed.startsWith("\"") && trimmed.endsWith("\"") && trimmed.length() >= 2) {
-                    val = trimmed.substring(1, trimmed.length() - 1);
-                } else {
-                    val = s;
-                }
-                Object[] row = new Object[]{val};
-                virtualTable.insertRow(row);
-                contexts.add(new RowContext(virtualTable, alias, row));
-            }
+        // The function is strict, so a NULL in any argument that was written -- including the
+        // optional ones -- makes the call produce no rows at all.
+        for (int i = 0; i < evalArgs.size(); i++) {
+            if (evalArgs.get(i) == null) return contexts;
+        }
+        String json = evalArgs.get(0).toString().trim();
+        String path = evalArgs.get(1).toString().trim();
+        // The third argument is the object $name references are read out of; the fourth asks for
+        // a document that does not have the shape the path wants to yield nothing rather than raise.
+        String vars = evalArgs.size() > 2 ? evalArgs.get(2).toString() : null;
+        boolean silent = evalArgs.size() > 3 && executor.isTruthy(evalArgs.get(3));
+        List<String> stringResults = executor.functionEvaluator.evaluateJsonPathAll(
+                json, path, vars, silent, fname.endsWith("_tz"));
+        for (String s : stringResults) {
+            Object[] row = new Object[]{s};
+            virtualTable.insertRow(row);
+            contexts.add(new RowContext(virtualTable, alias, row));
         }
         return contexts;
     }
@@ -1397,8 +1342,8 @@ class FromFunctionResolver {
         if (json != null) {
             String s = json.toString().trim();
             JsonFunctions.requireJsonObject(fname, s);
-            for (String key : JsonFunctions.eachMembers(fname, s).keySet()) {
-                Object[] row = new Object[]{key};
+            for (JsonParser.Member member : JsonFunctions.eachMembers(fname, s)) {
+                Object[] row = new Object[]{member.key};
                 virtualTable.insertRow(row);
                 contexts.add(new RowContext(virtualTable, alias, row));
             }
@@ -2231,200 +2176,219 @@ class FromFunctionResolver {
 
     // ---- JSON_TABLE ----
 
+    /**
+     * JSON_TABLE, which is a COLUMNS list read once for every item its row path selected.
+     *
+     * <p>Each column of that list is one of the SQL/JSON query expressions written without its
+     * document -- the row supplies that -- so the columns are read by the same code JSON_VALUE
+     * and JSON_QUERY are, and answer in the type they declare rather than in text.
+     *
+     * <p>A NESTED path is a second COLUMNS list read against a path taken from the row, and it
+     * is joined to the row so that a path selecting nothing still leaves the row standing. Where
+     * a list holds more than one NESTED path they are siblings rather than a product: each in
+     * turn contributes its rows with the other siblings' columns left null, which is why two
+     * arrays of two and one give three rows and not two.
+     */
     private List<RowContext> resolveJsonTable(SelectStmt.FunctionFrom funcFrom, String alias) {
         if (funcFrom.args().isEmpty() || !(funcFrom.args().get(0) instanceof JsonTableExpr)) {
             throw new MemgresException("Invalid JSON_TABLE expression");
         }
         JsonTableExpr jt = (JsonTableExpr) funcFrom.args().get(0);
 
-        // Evaluate input and path
-        Object inputVal = executor.evalExpr(jt.input, null);
-        if (inputVal == null) return new ArrayList<>();
-        Object pathVal = executor.evalExpr(jt.path, null);
-        if (pathVal == null) return new ArrayList<>();
-        String json = inputVal.toString();
-        String path = pathVal.toString();
-
-        // Build column definitions
         List<Column> cols = new ArrayList<>();
-        collectColumnDefs(jt.columns, cols);
-
+        collectJsonTableColumns(jt.columns, cols, new ArrayList<String>());
+        List<String> colAliases = stripColTypes(funcFrom.columnAliases());
+        if (colAliases != null && colAliases.size() > cols.size()) {
+            throw new MemgresException("JSON_TABLE function has " + cols.size()
+                    + " columns available but " + colAliases.size() + " columns specified",
+                    "42P10").suppressPosition();
+        }
+        cols = applyColumnAliases(cols, colAliases, null);
         Table virtualTable = new Table(alias, cols);
         List<RowContext> contexts = new ArrayList<>();
 
-        // Validate JSON input
+        Object inputVal = executor.evalExpr(jt.input, null);
+        if (inputVal == null) return contexts;
+        Object pathVal = executor.evalExpr(jt.path, null);
+        if (pathVal == null) return contexts;
+        // The path is read before anything else, because a path that is not a path is a mistake
+        // in the statement rather than a fact about the document.
+        JsonPath rowPath = JsonFunctions.parsePath(pathVal.toString());
+        String json = inputVal.toString();
         if (!ExprEvaluator.isValidJson(json)) {
-            if (jt.onError == JsonExistsExpr.OnBehavior.ERROR) {
-                ExprEvaluator.requireJson(json);
-            }
-            return contexts; // EMPTY ON ERROR (default)
+            if (jt.onError == JsonExistsExpr.OnBehavior.ERROR) ExprEvaluator.requireJson(json);
+            return contexts;
         }
+        JsonValue document = JsonParser.parseJsonb(json.trim());
+        JsonValue vars = executor.functionEvaluator.jsonFunctions.passingVars(jt.passing, null);
+        boolean raise = jt.onError == JsonExistsExpr.OnBehavior.ERROR;
 
-        // Extract rows using the root path
-        try {
-            List<String> rowJsons = executor.functionEvaluator.evaluateJsonPathAll(json, path);
-            for (int rowIdx = 0; rowIdx < rowJsons.size(); rowIdx++) {
-                String rowJson = rowJsons.get(rowIdx);
-                // Build rows — nested paths cause row multiplication
-                List<List<Object>> expandedRows = buildJsonTableRows(jt.columns, rowJson, rowIdx);
-                for (List<Object> rowValues : expandedRows) {
-                    Object[] row = rowValues.toArray();
-                    virtualTable.insertRow(row);
-                    contexts.add(new RowContext(virtualTable, alias, row));
-                }
+        List<JsonValue> items = jsonTableItems(document, rowPath, vars, raise);
+        for (int i = 0; i < items.size(); i++) {
+            for (Object[] row : jsonTableRows(jt.columns, items.get(i), i + 1, vars, raise)) {
+                virtualTable.insertRow(row);
+                contexts.add(new RowContext(virtualTable, alias, row));
             }
-        } catch (MemgresException e) {
-            if (jt.onError == JsonExistsExpr.OnBehavior.ERROR) {
-                throw e; // Preserve original SQLSTATE (42601 for jsonpath errors, etc.)
-            }
-            // Default: EMPTY ON ERROR — return empty result
-        } catch (Exception e) {
-            if (jt.onError == JsonExistsExpr.OnBehavior.ERROR) {
-                throw new MemgresException("invalid input syntax for type json", "22P02");
-            }
-            // Default: EMPTY ON ERROR — return empty result
         }
-
         return contexts;
     }
 
-    private void collectColumnDefs(List<JsonTableExpr.JsonTableColumn> columns, List<Column> cols) {
+    /**
+     * The columns a COLUMNS list declares, flattened: a NESTED path contributes the columns of
+     * its own list where it stands. Each one's declared type is collected alongside, because the
+     * list settles the type rather than leaving it to be guessed from a value.
+     */
+    static void collectJsonTableColumns(List<JsonTableExpr.JsonTableColumn> columns,
+                                        List<Column> cols, List<String> types) {
         for (JsonTableExpr.JsonTableColumn col : columns) {
             if (col.nestedColumns != null) {
-                collectColumnDefs(col.nestedColumns, cols);
+                collectJsonTableColumns(col.nestedColumns, cols, types);
+            } else if (col.forOrdinality) {
+                cols.add(new Column(col.name, DataType.INTEGER, true, false, null));
+                types.add("integer");
             } else {
-                cols.add(new Column(col.name, col.forOrdinality ? DataType.INTEGER : DataType.TEXT, true, false, null));
+                cols.add(jsonTableColumn(col.name, col.typeName));
+                types.add(col.typeName);
             }
         }
     }
 
-    private List<List<Object>> buildJsonTableRows(List<JsonTableExpr.JsonTableColumn> columns,
-                                                    String rowJson, int rowIdx) {
-        // Check if there's a nested column — if so, we need row multiplication
-        int nestedIdx = -1;
-        for (int i = 0; i < columns.size(); i++) {
-            if (columns.get(i).nestedColumns != null) {
-                nestedIdx = i;
-                break;
-            }
+    /** A JSON_TABLE column, carrying the type it declared rather than the text it was read from. */
+    private static Column jsonTableColumn(String name, String typeSpec) {
+        String base = typeSpec;
+        Integer precision = null;
+        Integer scale = null;
+        int open = typeSpec == null ? -1 : typeSpec.indexOf('(');
+        int close = typeSpec == null ? -1 : typeSpec.indexOf(')', open + 1);
+        if (open > 0 && close > open) {
+            base = typeSpec.substring(0, open).trim() + typeSpec.substring(close + 1).trim();
+            String[] parts = typeSpec.substring(open + 1, close).split(",");
+            precision = parsedInt(parts[0]);
+            if (parts.length > 1) scale = parsedInt(parts[1]);
         }
-
-        if (nestedIdx < 0) {
-            // No nested columns — produce a single row
-            List<Object> row = new ArrayList<>();
-            for (JsonTableExpr.JsonTableColumn col : columns) {
-                row.add(extractColumnValue(col, rowJson, rowIdx));
-            }
-            return Cols.listOf(row);
-        }
-
-        // Has nested column — extract non-nested values first, then multiply by nested rows
-        List<Object> parentValues = new ArrayList<>();
-        for (int i = 0; i < columns.size(); i++) {
-            if (i == nestedIdx) continue;
-            parentValues.add(extractColumnValue(columns.get(i), rowJson, rowIdx));
-        }
-
-        // Evaluate nested path and expand
-        JsonTableExpr.JsonTableColumn nestedCol = columns.get(nestedIdx);
-        String nestedPath = nestedCol.nestedPath != null ? executor.evalExpr(nestedCol.nestedPath, null).toString() : "$";
-        List<String> nestedJsons = executor.functionEvaluator.evaluateJsonPathAll(rowJson, nestedPath);
-
-        List<List<Object>> result = new ArrayList<>();
-        for (int ni = 0; ni < nestedJsons.size(); ni++) {
-            String nestedJson = nestedJsons.get(ni);
-            // Recursively build rows for nested columns (supports multi-level nesting)
-            List<List<Object>> nestedRows = buildJsonTableRows(nestedCol.nestedColumns, nestedJson, ni);
-            for (List<Object> nestedRow : nestedRows) {
-                List<Object> row = new ArrayList<>();
-                int parentIdx = 0;
-                int nestedValIdx = 0;
-                for (int i = 0; i < columns.size(); i++) {
-                    if (i == nestedIdx) {
-                        // Add all values from the nested row
-                        row.addAll(nestedRow);
-                    } else {
-                        row.add(parentValues.get(parentIdx++));
-                    }
-                }
-                result.add(row);
-            }
-        }
-
-        if (result.isEmpty()) {
-            // No nested results — produce one row with nulls for nested columns
-            List<Object> row = new ArrayList<>();
-            int parentIdx = 0;
-            int nestedColCount = countLeafColumns(nestedCol.nestedColumns);
-            for (int i = 0; i < columns.size(); i++) {
-                if (i == nestedIdx) {
-                    for (int nc = 0; nc < nestedColCount; nc++) {
-                        row.add(null);
-                    }
-                } else {
-                    row.add(parentValues.get(parentIdx++));
-                }
-            }
-            result.add(row);
-        }
-
-        return result;
+        DataType type = DataType.fromPgName(base == null ? "text" : base.trim());
+        if (type == null) type = DataType.TEXT;
+        return new Column(name, type, true, false, null, null, precision, scale, null, null, null,
+                DataType.elementOf(type));
     }
 
-    /** Count the total number of leaf columns (recursing into nested columns). */
-    private int countLeafColumns(List<JsonTableExpr.JsonTableColumn> columns) {
-        int count = 0;
-        for (JsonTableExpr.JsonTableColumn col : columns) {
-            if (col.nestedColumns != null) {
-                count += countLeafColumns(col.nestedColumns);
-            } else {
-                count++;
-            }
-        }
-        return count;
-    }
-
-    private Object extractColumnValue(JsonTableExpr.JsonTableColumn col, String rowJson, int rowIdx) {
-        if (col.forOrdinality) {
-            return rowIdx + 1;
-        }
-        if (col.existsPath) {
-            String ep = col.pathExpr != null ? executor.evalExpr(col.pathExpr, null).toString() : "$";
-            List<String> vals = executor.functionEvaluator.evaluateJsonPathAll(rowJson, ep);
-            return !vals.isEmpty();
-        }
-        // Regular column: extract value via path
-        String colPath = col.pathExpr != null ? executor.evalExpr(col.pathExpr, null).toString() : ("$." + col.name);
+    private static Integer parsedInt(String text) {
         try {
-            List<String> vals = executor.functionEvaluator.evaluateJsonPathAll(rowJson, colPath);
-            if (vals.isEmpty()) {
-                if (col.defaultOnEmpty != null) {
-                    return executor.evalExpr(col.defaultOnEmpty, null);
-                }
-                return null;
-            }
-            String raw = vals.get(0);
-            // For jsonb/json columns, normalize with PG jsonb spacing
-            if (col.typeName != null && (col.typeName.equalsIgnoreCase("jsonb") || col.typeName.equalsIgnoreCase("json"))) {
-                return JsonOperations.normalizeJsonb(raw.trim());
-            }
-            return unquoteJsonString(raw);
-        } catch (Exception e) {
-            if (col.defaultOnError != null) {
-                return executor.evalExpr(col.defaultOnError, null);
-            }
+            return Integer.valueOf(text.trim());
+        } catch (NumberFormatException e) {
             return null;
         }
     }
 
-    private String unquoteJsonString(String val) {
-        if (val == null) return null;
-        val = val.trim();
-        if (val.startsWith("\"") && val.endsWith("\"") && val.length() >= 2) {
-            return val.substring(1, val.length() - 1);
+    /** The width of a COLUMNS list, which is the width of its NESTED lists laid end to end. */
+    private static int jsonTableWidth(List<JsonTableExpr.JsonTableColumn> columns) {
+        int width = 0;
+        for (JsonTableExpr.JsonTableColumn col : columns) {
+            width += col.nestedColumns == null ? 1 : jsonTableWidth(col.nestedColumns);
         }
-        if ("null".equals(val)) return null;
-        return val;
+        return width;
+    }
+
+    /**
+     * What a path selects from an item, or nothing where the walk failed and the call did not
+     * ask to be told. JSON_TABLE's own ON ERROR clause answers for the row path and for every
+     * NESTED path; the columns have clauses of their own.
+     */
+    private List<JsonValue> jsonTableItems(JsonValue item, JsonPath path, JsonValue vars,
+                                           boolean raise) {
+        try {
+            return JsonPathEvaluator.query(item, path, vars, false);
+        } catch (MemgresException e) {
+            if (raise) throw e;
+            return new ArrayList<>();
+        }
+    }
+
+    /** The rows one COLUMNS list makes of one item, given the item's place in its own sequence. */
+    private List<Object[]> jsonTableRows(List<JsonTableExpr.JsonTableColumn> columns, JsonValue item,
+                                         int ordinal, JsonValue vars, boolean raise) {
+        Object[] own = new Object[columns.size()];
+        List<Object[]>[] nested = newRowLists(columns.size());
+        int[] nestedWidth = new int[columns.size()];
+        int siblingWidth = 0;
+        for (int i = 0; i < columns.size(); i++) {
+            JsonTableExpr.JsonTableColumn col = columns.get(i);
+            if (col.nestedColumns == null) {
+                own[i] = jsonTableValue(col, item, ordinal, vars);
+                continue;
+            }
+            JsonPath path = JsonFunctions.parsePath(
+                    executor.evalExpr(col.nestedPath, null).toString());
+            List<JsonValue> items = jsonTableItems(item, path, vars, raise);
+            List<Object[]> rows = new ArrayList<>();
+            for (int n = 0; n < items.size(); n++) {
+                rows.addAll(jsonTableRows(col.nestedColumns, items.get(n), n + 1, vars, raise));
+            }
+            nested[i] = rows;
+            nestedWidth[i] = jsonTableWidth(col.nestedColumns);
+            siblingWidth += nestedWidth[i];
+        }
+
+        // The siblings taken in turn, each contributing its rows over a row of nulls the width of
+        // all of them. Where none contributed anything the join keeps the parent row alone.
+        List<Object[]> siblings = new ArrayList<>();
+        int offset = 0;
+        for (int i = 0; i < columns.size(); i++) {
+            if (nested[i] == null) continue;
+            for (Object[] r : nested[i]) {
+                Object[] joined = new Object[siblingWidth];
+                System.arraycopy(r, 0, joined, offset, nestedWidth[i]);
+                siblings.add(joined);
+            }
+            offset += nestedWidth[i];
+        }
+        if (siblings.isEmpty()) siblings.add(new Object[siblingWidth]);
+
+        int width = jsonTableWidth(columns);
+        List<Object[]> result = new ArrayList<>(siblings.size());
+        for (Object[] joined : siblings) {
+            Object[] row = new Object[width];
+            int write = 0;
+            int read = 0;
+            for (int i = 0; i < columns.size(); i++) {
+                if (nested[i] == null) {
+                    row[write++] = own[i];
+                } else {
+                    System.arraycopy(joined, read, row, write, nestedWidth[i]);
+                    write += nestedWidth[i];
+                    read += nestedWidth[i];
+                }
+            }
+            result.add(row);
+        }
+        return result;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<Object[]>[] newRowLists(int size) {
+        return (List<Object[]>[]) new List<?>[size];
+    }
+
+    /** One column of a COLUMNS list, read from the item the row was made of. */
+    private Object jsonTableValue(JsonTableExpr.JsonTableColumn col, JsonValue item, int ordinal,
+                                  JsonValue vars) {
+        if (col.forOrdinality) return ordinal;
+        JsonPath path = JsonFunctions.parsePath(col.pathExpr != null
+                ? executor.evalExpr(col.pathExpr, null).toString()
+                : impliedColumnPath(col.name));
+        SqlJsonEvaluator sqlJson = executor.exprEvaluator.sqlJson;
+        if (col.existsPath) {
+            return sqlJson.existsAs(sqlJson.readExists(item, path, vars, col.onError), col.typeName);
+        }
+        return sqlJson.read(item, path, vars, SqlJsonEvaluator.readingOf(col), null);
+    }
+
+    /**
+     * The path a column with no PATH clause reads: the member named after the column. The name is
+     * quoted, because a column may be called something a path would otherwise read as syntax.
+     */
+    private static String impliedColumnPath(String name) {
+        return "$.\"" + name.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
     }
 
     // ---- pg_create_logical_replication_slot ----

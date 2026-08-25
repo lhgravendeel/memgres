@@ -4,7 +4,8 @@ import java.util.Map;
 
 /**
  * JSON_QUERY(expr, path [RETURNING type] [WITH [CONDITIONAL|UNCONDITIONAL] WRAPPER]
- *   [KEEP|OMIT QUOTES] [EMPTY ARRAY|EMPTY OBJECT|NULL|ERROR ON EMPTY] [NULL|ERROR ON ERROR])
+ *   [KEEP|OMIT QUOTES] [{EMPTY ARRAY|EMPTY OBJECT|NULL|ERROR|DEFAULT expr} ON EMPTY]
+ *   [{EMPTY ARRAY|EMPTY OBJECT|NULL|ERROR|DEFAULT expr} ON ERROR])
  */
 public final class JsonQueryExpr implements Expression {
     public final Expression input;
@@ -14,12 +15,15 @@ public final class JsonQueryExpr implements Expression {
     public final WrapperBehavior wrapper;
     public final QuotesBehavior quotes;
     public final JsonExistsExpr.OnBehavior onEmpty;
+    public final Expression defaultOnEmpty;
     public final JsonExistsExpr.OnBehavior onError;
+    public final Expression defaultOnError;
 
     public JsonQueryExpr(Expression input, Expression path, String returningType,
                          Map<String, Expression> passing,
                          WrapperBehavior wrapper, QuotesBehavior quotes,
-                         JsonExistsExpr.OnBehavior onEmpty, JsonExistsExpr.OnBehavior onError) {
+                         JsonExistsExpr.OnBehavior onEmpty, Expression defaultOnEmpty,
+                         JsonExistsExpr.OnBehavior onError, Expression defaultOnError) {
         this.input = input;
         this.path = path;
         this.returningType = returningType;
@@ -27,10 +31,17 @@ public final class JsonQueryExpr implements Expression {
         this.wrapper = wrapper;
         this.quotes = quotes;
         this.onEmpty = onEmpty;
+        this.defaultOnEmpty = defaultOnEmpty;
         this.onError = onError;
+        this.defaultOnError = defaultOnError;
     }
 
-    public enum WrapperBehavior { NONE, WITH_WRAPPER, WITH_CONDITIONAL_WRAPPER }
+    /**
+     * Which wrapper clause was written. NONE is the absence of one, which is not the same as
+     * WITHOUT_WRAPPER: both ask for the items unwrapped, but writing the clause at all says the
+     * reading is of documents -- which for a JSON_TABLE column its type would otherwise settle.
+     */
+    public enum WrapperBehavior { NONE, WITHOUT_WRAPPER, WITH_WRAPPER, WITH_CONDITIONAL_WRAPPER }
     public enum QuotesBehavior { KEEP, OMIT }
 
     public Expression input() { return input; }
