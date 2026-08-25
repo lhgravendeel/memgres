@@ -19,6 +19,7 @@ public class TableIndex {
     private final String constraintName;
     private final int[] columnIndices;
     private final boolean unique;
+    private final DataType[] keyTypes;
 
     // key → one row (stored bare) or, once a key holds more than one row, a List of rows.
     // A unique index has to be able to hold two rows under one key: a DEFERRABLE constraint
@@ -30,10 +31,28 @@ public class TableIndex {
     // Table.writeLock, but CHM prevents catastrophic corruption if any path is ever missed.
     private final ConcurrentHashMap<IndexKey, Object> entries = new ConcurrentHashMap<>();
 
-    public TableIndex(String constraintName, int[] columnIndices, boolean unique) {
+    public TableIndex(String constraintName, int[] columnIndices, boolean unique,
+                      List<Column> tableColumns) {
         this.constraintName = constraintName;
         this.columnIndices = columnIndices;
         this.unique = unique;
+        this.keyTypes = keyTypes(tableColumns, columnIndices);
+    }
+
+    /**
+     * The types of the columns an index keys by, in key order.
+     *
+     * <p>Almost every type says everything about a value in the value itself, but jsonb does not:
+     * it is held as the text it prints as, where the key is the document that text spells. So an
+     * index over a jsonb column has to be told which column that is.
+     */
+    static DataType[] keyTypes(List<Column> tableColumns, int[] columnIndices) {
+        DataType[] types = new DataType[columnIndices.length];
+        for (int i = 0; i < columnIndices.length; i++) {
+            int at = columnIndices[i];
+            types[i] = at >= 0 && at < tableColumns.size() ? tableColumns.get(at).getType() : null;
+        }
+        return types;
     }
 
     public String getConstraintName() { return constraintName; }
@@ -44,7 +63,7 @@ public class TableIndex {
     public IndexKey extractKey(Object[] row) {
         Object[] vals = new Object[columnIndices.length];
         for (int i = 0; i < columnIndices.length; i++) {
-            vals[i] = normalize(row[columnIndices[i]]);
+            vals[i] = normalize(row[columnIndices[i]], keyTypes[i]);
         }
         return new IndexKey(vals);
     }
@@ -116,7 +135,7 @@ public class TableIndex {
     private IndexKey keyOfValues(Object[] values) {
         Object[] vals = new Object[columnIndices.length];
         for (int i = 0; i < columnIndices.length; i++) {
-            vals[i] = normalize(values[columnIndices[i]]);
+            vals[i] = normalize(values[columnIndices[i]], keyTypes[i]);
         }
         return new IndexKey(vals);
     }
@@ -202,9 +221,23 @@ public class TableIndex {
     private IndexKey makeKey(Object[] keyValues) {
         Object[] vals = new Object[keyValues.length];
         for (int i = 0; i < keyValues.length; i++) {
-            vals[i] = normalize(keyValues[i]);
+            vals[i] = normalize(keyValues[i], i < keyTypes.length ? keyTypes[i] : null);
         }
         return new IndexKey(vals);
+    }
+
+    /**
+     * Normalize a value held in a key column of the given type.
+     *
+     * <p>A jsonb is keyed by the document its text spells rather than by the text: an object's
+     * members are one set however they were written down, and {@code 1} and {@code 1.0} are one
+     * number, so a unique index refuses the second of them.
+     */
+    static Object normalize(Object val, DataType type) {
+        if (type == DataType.JSONB && val instanceof String) {
+            return JsonOperations.jsonbKey((String) val);
+        }
+        return normalize(val);
     }
 
     /**

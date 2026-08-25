@@ -132,17 +132,53 @@ class FunctionEvaluator {
             String v = e.getValue();
             if (v == null) {
                 sb.append("null");
+            } else if (v.equals("t")) {
+                // hstore writes a boolean the way the type prints, one letter; the words "true"
+                // and "false" are text that happens to read like one, and stay text.
+                sb.append("true");
+            } else if (v.equals("f")) {
+                sb.append("false");
+            } else if (isJsonNumber(v)) {
+                sb.append(v);
             } else {
-                try {
-                    new java.math.BigDecimal(v);
-                    sb.append(v); // valid number — unquoted
-                } catch (NumberFormatException ex) {
-                    sb.append("\"").append(v.replace("\\", "\\\\").replace("\"", "\\\"")).append("\"");
-                }
+                sb.append("\"").append(v.replace("\\", "\\\\").replace("\"", "\\\"")).append("\"");
             }
         }
         sb.append("}");
         return sb.toString();
+    }
+
+    /**
+     * Whether a value may be written into a document as the number it reads as.
+     *
+     * <p>What counts is JSON's own grammar for a number, not what a numeric literal may be parsed
+     * from: a document holding {@code +5} or {@code .5} or {@code 05} is not a document. This used
+     * to ask BigDecimal, which accepts all three, so the loose conversions wrote text that no
+     * reader would take back.
+     */
+    private static boolean isJsonNumber(String s) {
+        int i = 0;
+        int n = s.length();
+        if (i < n && s.charAt(i) == '-') i++;
+        int intDigits = i;
+        while (i < n && s.charAt(i) >= '0' && s.charAt(i) <= '9') i++;
+        if (i == intDigits) return false;
+        // A leading zero stands alone: 0 and 0.5 are numbers, 05 is not.
+        if (s.charAt(intDigits) == '0' && i - intDigits > 1) return false;
+        if (i < n && s.charAt(i) == '.') {
+            i++;
+            int fracDigits = i;
+            while (i < n && s.charAt(i) >= '0' && s.charAt(i) <= '9') i++;
+            if (i == fracDigits) return false;
+        }
+        if (i < n && (s.charAt(i) == 'e' || s.charAt(i) == 'E')) {
+            i++;
+            if (i < n && (s.charAt(i) == '+' || s.charAt(i) == '-')) i++;
+            int expDigits = i;
+            while (i < n && s.charAt(i) >= '0' && s.charAt(i) <= '9') i++;
+            if (i == expDigits) return false;
+        }
+        return i == n;
     }
 
     private static String hstoreToJsonString(HstoreValue h) {
@@ -487,6 +523,28 @@ class FunctionEvaluator {
         }
     }
 
+    /**
+     * Refuse an argument list that names both document types.
+     *
+     * <p>json and jsonb are two types and neither is read as the other, so a list that mixes them
+     * has no type they all share. The type of the whole is settled by the first argument that has
+     * one, and it is the first argument that will not go with it that is reported.
+     */
+    private void requireOneDocumentType(FunctionCallExpr fn, String keyword, RowContext ctx) {
+        DataType settled = null;
+        for (Expression arg : fn.args()) {
+            DataType type = staticArgType(arg, ctx);
+            if (type != DataType.JSON && type != DataType.JSONB) continue;
+            if (settled == null) {
+                settled = type;
+            } else if (type != settled) {
+                throw new MemgresException(keyword + " could not convert type "
+                        + type.name().toLowerCase() + " to " + settled.name().toLowerCase(),
+                        "42846");
+            }
+        }
+    }
+
     /** The way PostgreSQL names an argument type in a 42883 raised by a coercion that has none. */
     private String coercionArgTypeName(Expression arg, RowContext ctx) {
         DataType t = staticArgType(arg, ctx);
@@ -615,15 +673,30 @@ class FunctionEvaluator {
             String kind = (String) row[1];
             String function = (String) row[5];
             if (function == null || function.isEmpty()) continue;
+            String[] entry = new String[]{symbol, kind,
+                    castableTypeName(((Integer) row[2]).intValue()),
+                    castableTypeName(((Integer) row[3]).intValue())};
             String[] seen = byFunction.get(function);
             if (seen == null) {
-                byFunction.put(function, new String[]{symbol, kind});
-            } else if (!seen[0].equals(symbol) || !seen[1].equals(kind)) {
+                byFunction.put(function, entry);
+            } else if (!java.util.Arrays.equals(seen, entry)) {
                 ambiguous.add(function);
             }
         }
         for (String function : ambiguous) byFunction.remove(function);
         return byFunction;
+    }
+
+    /**
+     * The name an operand type can be written as in a cast, or null for one memgres does not model
+     * and for the polymorphic pseudo-types, which stand for whatever the call was written with
+     * rather than for a type to convert to.
+     */
+    private static String castableTypeName(int oid) {
+        DataType type = oid == 0 ? null : DataType.fromOid(oid);
+        if (type == null) return null;
+        DataType element = DataType.elementOf(type);
+        return element == null ? type.toRegtypeDisplay() : element.toRegtypeDisplay() + "[]";
     }
 
     /** The binary operator each spelling denotes, for the spellings memgres evaluates. */
@@ -731,9 +804,12 @@ class FunctionEvaluator {
             return executor.evalExpr(rewritten, ctx);
         } catch (MemgresException e) {
             // The query wrote a function, so an argument the operator cannot take is that function
-            // resolving to nothing -- naming the operator would name something nobody wrote.
-            if ("42883".equals(e.getSqlState()) && e.getMessage() != null
-                    && e.getMessage().startsWith("operator does not exist")) {
+            // resolving to nothing -- naming the operator would name something nobody wrote. An
+            // argument that reaches the operand type by no cast is the same thing said the other
+            // way round, since converting to the declared type is what a call does.
+            if (("42883".equals(e.getSqlState()) && e.getMessage() != null
+                    && e.getMessage().startsWith("operator does not exist"))
+                    || "42846".equals(e.getSqlState())) {
                 throw new MemgresException("function " + fn.name() + "("
                         + argTypeNames(fn, ctx) + ") does not exist"
                         + "\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
@@ -756,14 +832,28 @@ class FunctionEvaluator {
         if (operator == null) return null;
         if ("b".equals(operator[1]) && fn.args().size() == 2) {
             BinaryExpr.BinOp op = BINARY_BY_SYMBOL.get(operator[0]);
-            return op == null ? null
-                    : new BinaryExpr(fn.args().get(0), op, fn.args().get(1));
+            return op == null ? null : new BinaryExpr(
+                    asOperandType(fn.args().get(0), operator[2]), op,
+                    asOperandType(fn.args().get(1), operator[3]));
         }
         if ("l".equals(operator[1]) && fn.args().size() == 1) {
             UnaryExpr.UnaryOp op = UNARY_BY_SYMBOL.get(operator[0]);
-            return op == null ? null : new UnaryExpr(op, fn.args().get(0));
+            return op == null ? null
+                    : new UnaryExpr(op, asOperandType(fn.args().get(0), operator[3]));
         }
         return null;
+    }
+
+    /**
+     * The argument as the operand type the operator declares, which is what makes calling the
+     * function the same thing as writing the operator. A function has argument types of its own,
+     * and a call converts to them; the operator behind it does not, and rewriting one as the other
+     * without saying so left the arguments to be resolved from scratch. That is why
+     * {@code jsonb_contains('{}', '{}')} could not decide which {@code @>} was meant, and why
+     * {@code numeric_add(1, 2)} answered an integer where PostgreSQL answers a numeric.
+     */
+    private static Expression asOperandType(Expression arg, String typeName) {
+        return typeName == null ? arg : new CastExpr(arg, typeName);
     }
 
     private void requireArgs(FunctionCallExpr fn, int min) {
@@ -1609,25 +1699,10 @@ class FunctionEvaluator {
                 return result;
             }
             case "coalesce": {
-                // PG validates type compatibility at plan time before short-circuit evaluation.
-                // Check for json vs jsonb type mismatch (PG rejects mixing these)
-                boolean hasJsonFunc = false, hasJsonbCast = false;
-                for (Expression arg : fn.args()) {
-                    if (arg instanceof FunctionCallExpr) {
-                        String fname = ((FunctionCallExpr) arg).name().toLowerCase();
-                        if (fname.equals("json_arrayagg") || fname.equals("json_objectagg")
-                                || fname.equals("json_array_constructor") || fname.equals("json_object_constructor")) {
-                            hasJsonFunc = true;
-                        }
-                    }
-                    if (arg instanceof CastExpr) {
-                        String targetType = ((CastExpr) arg).typeName().toLowerCase();
-                        if (targetType.equals("jsonb")) hasJsonbCast = true;
-                    }
-                }
-                if (hasJsonFunc && hasJsonbCast) {
-                    throw new MemgresException("could not convert type jsonb to json", "42846");
-                }
+                // PG settles the type of the whole from the arguments before it evaluates any of
+                // them, so an argument list that has no type at all fails whichever argument
+                // would have been the answer.
+                requireOneDocumentType(fn, "COALESCE", ctx);
                 // Check for obvious mismatches: numeric literal mixed with non-numeric string literal.
                 boolean hasNum = false, hasBadStr = false;
                 String badVal = null;
@@ -1686,6 +1761,7 @@ class FunctionEvaluator {
             }
             case "greatest": {
                 if (fn.args().isEmpty()) throw new MemgresException("syntax error at or near \")\"", "42601");
+                requireOneDocumentType(fn, "GREATEST", ctx);
                 List<Object> vals = new ArrayList<>();
                 for (Expression arg : fn.args()) vals.add(executor.evalExpr(arg, ctx));
                 validateHomogeneousTypes(vals, "GREATEST");
@@ -1698,6 +1774,7 @@ class FunctionEvaluator {
             }
             case "least": {
                 if (fn.args().isEmpty()) throw new MemgresException("syntax error at or near \")\"", "42601");
+                requireOneDocumentType(fn, "LEAST", ctx);
                 List<Object> vals = new ArrayList<>();
                 for (Expression arg : fn.args()) vals.add(executor.evalExpr(arg, ctx));
                 validateHomogeneousTypes(vals, "LEAST");
@@ -2501,12 +2578,17 @@ class FunctionEvaluator {
             }
             case "json_scalar": {
                 if (fn.args().isEmpty()) throw new MemgresException("function json_scalar requires one argument", "42883");
-                Object val = executor.evalExpr(fn.args().get(0), ctx);
-                if (val == null) return "null";
-                if (val instanceof Number) return val.toString();
-                if (val instanceof Boolean) return val.toString();
-                // strings get quoted
-                return "\"" + val.toString().replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
+                Expression arg = fn.args().get(0);
+                Object val = executor.evalExpr(arg, ctx);
+                // Nothing is not a scalar: SQL's null makes the whole thing null, and is not the
+                // JSON null. Writing the word left a document where PostgreSQL has no value at all.
+                if (val == null) return null;
+                // A document handed in is already the answer, and quoting it made a string of it
+                DataType argType = executor.exprEvaluator.inferExprType(arg);
+                if (argType == DataType.JSON || argType == DataType.JSONB) {
+                    return TypeCoercion.toString(val);
+                }
+                return jsonFunctions.documentFor(val);
             }
             case "json_serialize": {
                 if (fn.args().isEmpty()) throw new MemgresException("function json_serialize requires one argument", "42883");
@@ -3516,6 +3598,10 @@ class FunctionEvaluator {
                         "string_agg", "array_agg", "bool_and", "bool_or", "every",
                         "bit_and", "bit_or", "json_agg", "jsonb_agg",
                         "json_object_agg", "jsonb_object_agg", "xmlagg",
+                        "json_agg_strict", "jsonb_agg_strict",
+                        "json_object_agg_strict", "jsonb_object_agg_strict",
+                        "json_object_agg_unique", "jsonb_object_agg_unique",
+                        "json_object_agg_unique_strict", "jsonb_object_agg_unique_strict",
                         "json_arrayagg", "json_objectagg", "any_value");
                 if (AGGREGATES.contains(name)) {
                     return null; // Will be handled by aggregate executor
@@ -3584,6 +3670,11 @@ class FunctionEvaluator {
 
     List<String> evaluateJsonPathAll(String json, String path) {
         return jsonFunctions.evaluateJsonPathAll(json, path);
+    }
+
+    List<String> evaluateJsonPathAll(String json, String path, String varsJson,
+                                     boolean silent, boolean tz) {
+        return jsonFunctions.evaluateJsonPathAll(json, path, varsJson, silent, tz);
     }
 
     boolean evaluateJsonPathExists(String json, String path) {

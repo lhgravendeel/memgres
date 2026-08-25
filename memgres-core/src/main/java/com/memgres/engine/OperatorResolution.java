@@ -201,6 +201,30 @@ final class OperatorResolution {
     }
 
     /**
+     * The complaint PostgreSQL raises for putting values of this type in a set -- for DISTINCT,
+     * GROUP BY, PARTITION BY and the set operations -- or null where the type can be compared at
+     * all.
+     *
+     * <p>Each of those gathers equal values together, and so needs an equality operator. json has
+     * none: two documents are two texts, and PostgreSQL will not say which of two spellings of one
+     * document is which, so it refuses the query rather than answering by the text. point is the
+     * other way round from xid -- it has ordering operators and no equality.
+     *
+     * <p>Read off the operator table for the same reason {@link #noOrderingFor} is: a type it does
+     * not model is left alone rather than listed a second time somewhere else.
+     */
+    static MemgresException noEqualityFor(DataType type) {
+        if (type == null) return null;
+        int oid = type.getOid();
+        // xml is the one type PostgreSQL gives no operator of any kind, so it appears nowhere in
+        // the table and the table's silence about it says nothing either way. Every other type
+        // with no equality is read off the table.
+        if (type != DataType.XML && refusalFor("=", oid, oid, null, null) == null) return null;
+        return new MemgresException("could not identify an equality operator for type "
+                + type.toRegtypeDisplay(), "42883");
+    }
+
+    /**
      * Whether a missing entry for this type proves anything. A type the table never mentions as an
      * operand is one it does not model, and its absence says nothing.
      */

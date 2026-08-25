@@ -6020,7 +6020,8 @@ class DdlObjectExecutor {
                             }
                         }
                         if (allFound && !hasVirtualCol && idxTable2.getIndex(s.name()) == null) {
-                            TableIndex tableIdx = new TableIndex(s.name(), colIndices, s.unique());
+                            TableIndex tableIdx = new TableIndex(s.name(), colIndices, s.unique(),
+                                    idxTable2.getColumns());
                             idxTable2.buildIndex(tableIdx);
                         }
                     } catch (MemgresException ignored) {}

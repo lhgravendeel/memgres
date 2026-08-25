@@ -133,9 +133,46 @@ SELECT interval '1 day' + interval '2 hours' AS a;
 -- ============================================================================
 -- 5. Nesting deeper than the parser will follow
 -- ============================================================================
-SELECT ((repeat('[', 20000) || repeat(']', 20000))::jsonb IS NOT NULL)::text AS a;
-SELECT ((repeat('[', 20000) || repeat(']', 20000))::json IS NOT NULL)::text AS a;
+-- Nesting is bounded by the stack the reading of it takes rather than by a count of levels, so
+-- the depth at which either engine gives out moves with the platform, with how the server was
+-- built and with what a level of that document family happens to cost. What is defined is that
+-- an ordinary depth is read and an absurd one is refused as 54001 rather than crashing or
+-- answering. The depths below sit far enough from every boundary that no engine's own limit can
+-- decide the outcome; a depth near either limit would only be recording where this machine ran.
+-- begin-expected
+-- columns: a
+-- row: true
+-- end-expected
+SELECT ((repeat('[', 1000) || repeat(']', 1000))::jsonb IS NOT NULL)::text AS a;
+
+-- begin-expected
+-- columns: a
+-- row: true
+-- end-expected
+SELECT ((repeat('[', 1000) || repeat(']', 1000))::json IS NOT NULL)::text AS a;
+
+-- begin-expected-error
+-- sqlstate: 54001
+-- message-like: stack depth limit exceeded
+-- end-expected-error
+SELECT ((repeat('[', 100000) || repeat(']', 100000))::jsonb IS NOT NULL)::text AS a;
+
+-- begin-expected-error
+-- sqlstate: 54001
+-- message-like: stack depth limit exceeded
+-- end-expected-error
+SELECT ((repeat('[', 100000) || repeat(']', 100000))::json IS NOT NULL)::text AS a;
+
+-- begin-expected
+-- columns: a
+-- row: true
+-- end-expected
 SELECT ((repeat('[', 100) || repeat(']', 100))::jsonb IS NOT NULL)::text AS a;
+
+-- begin-expected
+-- columns: a
+-- row: true
+-- end-expected
 SELECT ((repeat('[', 100) || repeat(']', 100))::json IS NOT NULL)::text AS a;
 
 DROP TABLE IF EXISTS esr_nan CASCADE;

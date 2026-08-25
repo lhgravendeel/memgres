@@ -1,7 +1,10 @@
 package com.memgres.engine;
 
+import com.memgres.engine.parser.ast.Expression;
+
 import java.math.BigDecimal;
 import java.util.Arrays;
+import java.util.List;
 
 /**
  * Value-based key for row equality comparison in DISTINCT, UNION/INTERSECT/EXCEPT,
@@ -17,12 +20,100 @@ final class RowKey {
     private final int hash;
 
     RowKey(Object[] row) {
-        this.values = row;
+        this(row, null);
+    }
+
+    /**
+     * A key over a row whose columns' types are known.
+     *
+     * <p>Almost every type says everything about a value in the value itself, but jsonb does not:
+     * it is held as the text it prints as, where the value is the document that text spells, and
+     * the two are not in step — {@code 1} and {@code 1.0} are one number written twice, and an
+     * object's members are one set however they were ordered. So a jsonb column is keyed by its
+     * document rather than by its text, and every other column by the value alone.
+     *
+     * @param types one entry per column, or null when the caller has no types to offer
+     */
+    RowKey(Object[] row, DataType[] types) {
+        Object[] keys = row;
+        if (types != null) {
+            keys = new Object[row.length];
+            for (int i = 0; i < row.length; i++) {
+                keys[i] = i < types.length ? keyValue(row[i], types[i]) : row[i];
+            }
+        }
+        this.values = keys;
         int h = 1;
-        for (Object v : row) {
+        for (Object v : keys) {
             h = 31 * h + normalizedHashCode(v);
         }
         this.hash = h;
+    }
+
+    /**
+     * The value a column of this type is compared by, which is the value itself unless its type
+     * holds more than the value shows.
+     */
+    private static Object keyValue(Object val, DataType type) {
+        if (type == DataType.JSONB && val instanceof String) {
+            return JsonOperations.jsonbKey((String) val);
+        }
+        return val;
+    }
+
+    /**
+     * The types the columns of a result have, or null when none of them is keyed by anything but
+     * its own value — which is almost always, so the rows are then keyed without a second array.
+     */
+    static DataType[] columnTypes(List<Column> columns) {
+        if (columns == null) return null;
+        boolean any = false;
+        DataType[] types = new DataType[columns.size()];
+        for (int i = 0; i < columns.size(); i++) {
+            types[i] = columns.get(i).getType();
+            if (types[i] == DataType.JSONB) any = true;
+        }
+        return any ? types : null;
+    }
+
+    /**
+     * Refuses a result whose rows cannot be gathered into groups, because one of the columns they
+     * would be grouped by has no equality operator.
+     */
+    static void requireEquality(List<Column> columns) {
+        if (columns == null) return;
+        for (Column column : columns) {
+            MemgresException e = OperatorResolution.noEqualityFor(column.getType());
+            if (e != null) throw e;
+        }
+    }
+
+    /**
+     * The types a list of key expressions has, for the clauses that gather rows by expressions
+     * rather than by whole rows — GROUP BY, DISTINCT ON and a window's PARTITION BY. Each of them
+     * needs an equality over its keys, and each of them keys a jsonb by the document rather than
+     * by its text, so both are settled here from the one type.
+     *
+     * @return one entry per expression, or null when none of them is keyed by anything but its
+     *         own value
+     */
+    static DataType[] keyTypes(AstExecutor executor, List<Expression> exprs,
+                               List<RowContext.TableBinding> bindings) {
+        if (exprs == null || exprs.isEmpty()) return null;
+        boolean any = false;
+        DataType[] types = new DataType[exprs.size()];
+        for (int i = 0; i < exprs.size(); i++) {
+            types[i] = executor.exprEvaluator.inferTypeFromContext(exprs.get(i), bindings);
+            MemgresException e = OperatorResolution.noEqualityFor(types[i]);
+            if (e != null) throw e;
+            if (types[i] == DataType.JSONB) any = true;
+        }
+        return any ? types : null;
+    }
+
+    /** The key of the {@code i}th of a list of key expressions, typed by {@link #keyTypes}. */
+    static String keyOf(Object val, DataType[] types, int i) {
+        return types == null || i >= types.length ? valueKey(val) : valueKey(val, types[i]);
     }
 
     @Override
@@ -140,6 +231,18 @@ final class RowKey {
         if (v instanceof Float) return BigDecimal.valueOf((Float) v);
         if (v instanceof Short) return BigDecimal.valueOf((Short) v);
         return null;
+    }
+
+    /**
+     * The key a single value of a known type has. jsonb is the one type held as something other
+     * than its value — see {@link #RowKey(Object[], DataType[])} — so it is the one type whose key
+     * the value alone cannot give.
+     */
+    static String valueKey(Object val, DataType type) {
+        if (type == DataType.JSONB && val instanceof String) {
+            return "\0JSB" + JsonOperations.jsonbKey((String) val);
+        }
+        return valueKey(val);
     }
 
     /** Compute a value-based key string for a single value (for GROUP BY). */

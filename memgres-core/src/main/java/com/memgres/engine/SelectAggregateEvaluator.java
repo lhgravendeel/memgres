@@ -180,12 +180,13 @@ class SelectAggregateEvaluator {
                 groups = new ArrayList<>();
                 groups.add(new ArrayList<>(contexts));
             } else {
+                DataType[] keyTypes = RowKey.keyTypes(executor, effectiveGroupBy, baseBindings);
                 Map<String, List<RowContext>> groupMap = new LinkedHashMap<>();
                 for (RowContext ctx : contexts) {
                     StringBuilder key = new StringBuilder();
-                    for (Expression ge : effectiveGroupBy) {
-                        Object val = executor.evalExpr(ge, ctx);
-                        key.append(val == null ? "\0NULL" : RowKey.valueKey(val)).append('\1');
+                    for (int gi = 0; gi < effectiveGroupBy.size(); gi++) {
+                        Object val = executor.evalExpr(effectiveGroupBy.get(gi), ctx);
+                        key.append(RowKey.keyOf(val, keyTypes, gi)).append('\1');
                     }
                     groupMap.computeIfAbsent(key.toString(), k -> new ArrayList<>()).add(ctx);
                 }
@@ -254,7 +255,7 @@ class SelectAggregateEvaluator {
             });
         }
 
-        allResultRows = select.applyDistinct(stmt, allResultRows);
+        allResultRows = select.applyDistinct(stmt, allResultRows, resultColumns);
         allResultRows = select.applyOffsetAndLimit(stmt, allResultRows);
 
         return QueryResult.select(resultColumns, allResultRows);
@@ -410,12 +411,13 @@ class SelectAggregateEvaluator {
         List<List<RowContext>> groups;
 
         if (hasGroupBy) {
+            DataType[] keyTypes = RowKey.keyTypes(executor, resolvedGroupBy, baseBindings);
             Map<String, List<RowContext>> groupMap = new LinkedHashMap<>();
             for (RowContext ctx : contexts) {
                 StringBuilder keyBuilder = new StringBuilder();
-                for (Expression groupExpr : resolvedGroupBy) {
-                    Object val = executor.evalExpr(groupExpr, ctx);
-                    keyBuilder.append(RowKey.valueKey(val)).append('\1');
+                for (int gi = 0; gi < resolvedGroupBy.size(); gi++) {
+                    Object val = executor.evalExpr(resolvedGroupBy.get(gi), ctx);
+                    keyBuilder.append(RowKey.keyOf(val, keyTypes, gi)).append('\1');
                 }
                 groupMap.computeIfAbsent(keyBuilder.toString(), k -> new ArrayList<>()).add(ctx);
             }
@@ -548,7 +550,7 @@ class SelectAggregateEvaluator {
         }
 
         resultRows = applyDistinctOn(stmt, resultRows, rowGroups);
-        resultRows = select.applyDistinct(stmt, resultRows);
+        resultRows = select.applyDistinct(stmt, resultRows, resultColumns);
         resultRows = select.applyOffsetAndLimit(stmt, resultRows);
 
         return QueryResult.select(resultColumns, resultRows);
@@ -564,14 +566,19 @@ class SelectAggregateEvaluator {
         if (stmt.distinctOn() == null || stmt.distinctOn().isEmpty()) return rows;
         Set<String> seen = new LinkedHashSet<>();
         List<Object[]> kept = new ArrayList<>();
+        DataType[] keyTypes = null;
         for (Object[] row : rows) {
             List<RowContext> group = rowGroups.get(row);
             if (group == null) group = Cols.listOf();
             RowContext representative = group.isEmpty() ? null : group.get(0);
+            if (representative != null) {
+                keyTypes = RowKey.keyTypes(executor, stmt.distinctOn(),
+                        representative.getBindings());
+            }
             StringBuilder key = new StringBuilder();
-            for (Expression on : stmt.distinctOn()) {
-                Object value = evalAggregateExpr(on, group, representative);
-                key.append(value == null ? "\0NULL" : RowKey.valueKey(value)).append('\1');
+            for (int oi = 0; oi < stmt.distinctOn().size(); oi++) {
+                Object value = evalAggregateExpr(stmt.distinctOn().get(oi), group, representative);
+                key.append(RowKey.keyOf(value, keyTypes, oi)).append('\1');
             }
             if (seen.add(key.toString())) kept.add(row);
         }
@@ -635,20 +642,6 @@ class SelectAggregateEvaluator {
         if (expr instanceof FunctionCallExpr) {
             FunctionCallExpr fn = (FunctionCallExpr) expr;
             String name = FunctionEvaluator.stripSchemaPrefix(fn.name().toLowerCase());
-            // Check for json/jsonb type mismatch in COALESCE
-            if (name.equals("coalesce")) {
-                boolean hasJsonAgg = false, hasJsonbCast = false;
-                for (Expression arg : fn.args()) {
-                    if (arg instanceof FunctionCallExpr) {
-                        String aname = ((FunctionCallExpr) arg).name().toLowerCase();
-                        if (aname.equals("json_arrayagg") || aname.equals("json_objectagg")) hasJsonAgg = true;
-                    }
-                    if (arg instanceof CastExpr && ((CastExpr) arg).typeName().equalsIgnoreCase("jsonb")) hasJsonbCast = true;
-                }
-                if (hasJsonAgg && hasJsonbCast) {
-                    throw new MemgresException("could not convert type jsonb to json", "42846");
-                }
-            }
             if (select.isAggregateFunction(name)) {
                 return evalAggregate(fn, group);
             }
@@ -658,7 +651,15 @@ class SelectAggregateEvaluator {
                 for (Expression arg : fn.args()) {
                     Object val = evalAggregateExpr(arg, group, representative);
                     if (val == null) {
-                        resolvedArgs.add(Literal.ofNull());
+                        // An aggregate over no rows still has the type it was declared with, and
+                        // the enclosing call is resolved from the types before any value is
+                        // looked at: COALESCE(json_agg(v), '[]'::jsonb) is an error whether or
+                        // not the json_agg found anything.
+                        DataType declared = executor.exprEvaluator.inferTypeFromContext(arg,
+                                representative != null ? representative.getBindings()
+                                        : new ArrayList<RowContext.TableBinding>());
+                        resolvedArgs.add(declared == null ? Literal.ofNull()
+                                : new ExprEvaluator.PrecomputedValueExpr(null, declared));
                     } else {
                         // Preserve the resolved aggregate's runtime type (a typed value, not a
                         // re-parsed string literal) so a scalar function/expression wrapped
@@ -1375,6 +1376,12 @@ class SelectAggregateEvaluator {
                     .collect(Collectors.toList());
         }
 
+        // DISTINCT is over the whole argument list and belongs to every aggregate alike: what
+        // reaches the transition function is the argument lists with the repeats dropped. Applied
+        // by each aggregate that had been given handling of its own, it was silently ignored by
+        // all the rest -- variance and json_object_agg among them -- which read the repeats.
+        if (fn.distinct() && !fn.args().isEmpty()) group = distinctArguments(fn, group);
+
         switch (name) {
             case "count": {
                 if (fn.star()) {
@@ -1385,10 +1392,11 @@ class SelectAggregateEvaluator {
                     throw new MemgresException("function count(text, text) does not exist\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
                 }
                 if (fn.distinct()) {
+                    DataType keyType = distinctType(arg, group);
                     Set<String> seen = new HashSet<>();
                     for (RowContext ctx : group) {
                         Object val = executor.evalExpr(arg, ctx);
-                        if (val != null) seen.add(distinctKey(val));
+                        if (val != null) seen.add(distinctKey(val, keyType));
                     }
                     return (long) seen.size();
                 }
@@ -1411,10 +1419,11 @@ class SelectAggregateEvaluator {
                 BigDecimal bdSum = BigDecimal.ZERO;
                 try {
                     if (fn.distinct()) {
+                        DataType keyType = distinctType(arg, group);
                         Set<String> seenKeys = new HashSet<>();
                         for (RowContext ctx : group) {
                             Object val = executor.evalExpr(arg, ctx);
-                            if (val == null || !seenKeys.add(distinctKey(val))) continue;
+                            if (val == null || !seenKeys.add(distinctKey(val, keyType))) continue;
                             hasValue = true;
                             if (!(val instanceof Float)) allFloat4 = false;
                             if (isSpecialNumber(val)) {
@@ -1472,10 +1481,11 @@ class SelectAggregateEvaluator {
                 boolean avgSawPosInf = false;
                 boolean avgSawNegInf = false;
                 if (fn.distinct()) {
+                    DataType keyType = distinctType(arg, group);
                     Set<String> seenKeys = new HashSet<>();
                     for (RowContext ctx : group) {
                         Object val = executor.evalExpr(arg, ctx);
-                        if (val == null || !seenKeys.add(distinctKey(val))) continue;
+                        if (val == null || !seenKeys.add(distinctKey(val, keyType))) continue;
                         count++;
                         if (isSpecialNumber(val)) {
                             if (Double.isNaN(((Number) val).doubleValue())) avgSawNotANumber = true;
@@ -1539,12 +1549,13 @@ class SelectAggregateEvaluator {
                 Object delimVal = delimExpr != null ? executor.evalExpr(delimExpr, group.get(0)) : ",";
                 List<RowContext> orderedGroup = sortGroupForAggregate(group, fn);
                 Set<String> seen = fn.distinct() ? new LinkedHashSet<>() : null;
+                DataType keyType = seen == null ? null : distinctType(arg, group);
                 List<Object> parts = new ArrayList<>();
                 boolean allBytea = true;
                 for (RowContext ctx : orderedGroup) {
                     Object val = executor.evalExpr(arg, ctx);
                     if (val == null) continue;
-                    if (seen != null && !seen.add(distinctKey(val))) continue;
+                    if (seen != null && !seen.add(distinctKey(val, keyType))) continue;
                     if (!(val instanceof byte[])) allBytea = false;
                     parts.add(val);
                 }
@@ -1575,9 +1586,10 @@ class SelectAggregateEvaluator {
                 List<RowContext> orderedGroup = sortGroupForAggregate(group, fn);
                 List<Object> list = new ArrayList<>();
                 Set<String> seen = fn.distinct() ? new LinkedHashSet<>() : null;
+                DataType keyType = seen == null ? null : distinctType(arg, group);
                 for (RowContext ctx : orderedGroup) {
                     Object val = executor.evalExpr(arg, ctx);
-                    if (seen != null && val != null && !seen.add(distinctKey(val))) continue;
+                    if (seen != null && val != null && !seen.add(distinctKey(val, keyType))) continue;
                     list.add(val);
                 }
                 // DISTINCT sorts what it keeps, since it has to compare the values anyway, and a
@@ -1758,14 +1770,27 @@ class SelectAggregateEvaluator {
                 return result;
             }
             case "json_agg":
-            case "jsonb_agg": {
+            case "jsonb_agg":
+            case "json_agg_strict":
+            case "jsonb_agg_strict": {
                 if (group.isEmpty()) return null;
+                // The strict form leaves out the rows whose value is null rather than collecting
+                // a JSON null for each; an array of nothing but nulls comes out empty, not null.
+                boolean skipNulls = name.endsWith("_strict");
                 List<RowContext> orderedGroup = sortGroupForAggregate(group, fn);
+                Set<String> seenJson = fn.distinct() ? new LinkedHashSet<>() : null;
+                DataType jsonKeyType =
+                        seenJson == null ? null : distinctType(fn.args().get(0), group);
                 StringBuilder sb = new StringBuilder("[");
                 boolean first = true;
                 JsonFunctions json = executor.functionEvaluator.jsonFunctions;
                 for (RowContext r : orderedGroup) {
                     Object v = json.wholeRowOrValue(fn.args().get(0), r);
+                    if (skipNulls && executor.evalExpr(fn.args().get(0), r) == null) continue;
+                    if (seenJson != null && !seenJson.add(distinctKey(
+                            executor.evalExpr(fn.args().get(0), r), jsonKeyType))) {
+                        continue;
+                    }
                     boolean structured = v instanceof Map<?, ?> || v instanceof List<?>
                             || v instanceof AstExecutor.PgRow;
                     if (!first) {
@@ -1779,12 +1804,23 @@ class SelectAggregateEvaluator {
                     sb.append(json.jsonTextOf(v));
                 }
                 sb.append("]");
-                return name.equals("jsonb_agg")
+                return name.startsWith("jsonb")
                         ? JsonFunctions.normalizedIfStructured(sb.toString()) : sb.toString();
             }
             case "json_object_agg":
-            case "jsonb_object_agg": {
+            case "jsonb_object_agg":
+            case "json_object_agg_strict":
+            case "jsonb_object_agg_strict":
+            case "json_object_agg_unique":
+            case "jsonb_object_agg_unique":
+            case "json_object_agg_unique_strict":
+            case "jsonb_object_agg_unique_strict": {
                 if (group.isEmpty()) return null;
+                // The strict form leaves out the members whose value is null; the unique form
+                // refuses a key that an earlier member of the same group already carried.
+                boolean skipNullValues = name.endsWith("_strict");
+                boolean requireUnique = name.contains("_unique");
+                Set<String> seenObjectKeys = requireUnique ? new LinkedHashSet<>() : null;
                 // json prints the object the way its own text output does, padded and with
                 // spaces round the colon; jsonb is normalized below and loses the padding again
                 StringBuilder sb = new StringBuilder("{ ");
@@ -1795,10 +1831,19 @@ class SelectAggregateEvaluator {
                             .wholeRowOrValue(fn.args().get(1), r);
                     // Dropping the row would silently lose it; PG refuses a NULL key outright
                     if (k == null) {
-                        throw name.equals("jsonb_object_agg")
+                        throw name.startsWith("jsonb")
                                 ? PgErrors.invalidParameter("field name must not be null")
                                 : new MemgresException("null value not allowed for object key", "22004");
                     }
+                    // The key is looked at before the value is: a repeat is a repeat even where
+                    // the member it came with would have been left out for being null.
+                    if (seenObjectKeys != null && !seenObjectKeys.add(k.toString())) {
+                        // jsonb builds the object before it sees the repeat, so it names no key.
+                        throw new MemgresException(name.startsWith("jsonb")
+                                ? "duplicate JSON object key value"
+                                : "duplicate JSON object key value: \"" + k + "\"", "22030");
+                    }
+                    if (skipNullValues && executor.evalExpr(fn.args().get(1), r) == null) continue;
                     if (!first) sb.append(", ");
                     first = false;
                     sb.append("\"").append(k.toString().replace("\"", "\\\"")).append("\" : ");
@@ -1806,7 +1851,7 @@ class SelectAggregateEvaluator {
                 }
                 sb.append(" }");
                 String result = sb.toString();
-                if (name.equals("jsonb_object_agg")) {
+                if (name.startsWith("jsonb")) {
                     result = JsonOperations.normalizeJsonb(result);
                 }
                 return result;
@@ -2251,6 +2296,47 @@ class SelectAggregateEvaluator {
      * equal map to the same key even when their representations differ (numeric 1.0 vs 1.00,
      * or int 1 vs numeric 1.0), matching PostgreSQL's equality-based DISTINCT.
      */
+    private static String distinctKey(Object val, DataType type) {
+        // An aggregate that gathers nulls as well as values needs a key for them too, and one
+        // null is the same value as another wherever DISTINCT is concerned.
+        if (val == null) return "\u0000";
+        // jsonb is held as the text it prints as, which is not the document that text spells:
+        // 1 and 1.0 are one value, and counting them by their texts counted two
+        if (type == DataType.JSONB && val instanceof String) return RowKey.valueKey(val, type);
+        return distinctKey(val);
+    }
+
+    /** The rows of a group whose argument list no earlier row of the group already had. */
+    private List<RowContext> distinctArguments(FunctionCallExpr fn, List<RowContext> group) {
+        List<DataType> types = new ArrayList<>();
+        for (Expression arg : fn.args()) types.add(distinctType(arg, group));
+        Set<String> seen = new HashSet<>();
+        List<RowContext> kept = new ArrayList<>();
+        for (RowContext ctx : group) {
+            StringBuilder key = new StringBuilder();
+            for (int i = 0; i < fn.args().size(); i++) {
+                // A null is a value here, so two argument lists null in the same place are one.
+                key.append(distinctKey(executor.evalExpr(fn.args().get(i), ctx), types.get(i)))
+                        .append('\u0001');
+            }
+            if (seen.add(key.toString())) kept.add(ctx);
+        }
+        return kept;
+    }
+
+    /**
+     * The type a DISTINCT aggregate compares its values as, refusing one that cannot be compared
+     * at all: DISTINCT gathers equal values together, and json has no equality to gather by.
+     */
+    private DataType distinctType(Expression arg, List<RowContext> group) {
+        if (group.isEmpty() || arg == null) return null;
+        DataType type = executor.exprEvaluator.inferTypeFromContext(
+                arg, group.get(0).getBindings());
+        MemgresException refusal = OperatorResolution.noEqualityFor(type);
+        if (refusal != null) throw refusal;
+        return type;
+    }
+
     private static String distinctKey(Object val) {
         // bytea dedups by byte sequence, not array identity
         if (val instanceof byte[]) return RowKey.valueKey(val);
@@ -2391,8 +2477,17 @@ class SelectAggregateEvaluator {
         checkDistinctOrderBy(fn);
         List<RowContext> orderedGroup = new ArrayList<>(group);
         if (fn.orderBy() != null && !fn.orderBy().isEmpty()) {
+            // A jsonb sort key is held as the text it prints as, which is not the order it has:
+            // the type of each key is settled once, before the rows are looked at.
+            List<DataType> keyTypes = new ArrayList<>();
+            List<RowContext.TableBinding> bindings = group.isEmpty()
+                    ? new ArrayList<RowContext.TableBinding>() : group.get(0).getBindings();
+            for (SelectStmt.OrderByItem item : fn.orderBy()) {
+                keyTypes.add(executor.exprEvaluator.inferTypeFromContext(item.expr(), bindings));
+            }
             orderedGroup.sort((a, b) -> {
-                for (SelectStmt.OrderByItem item : fn.orderBy()) {
+                for (int idx = 0; idx < fn.orderBy().size(); idx++) {
+                    SelectStmt.OrderByItem item = fn.orderBy().get(idx);
                     Object va = executor.evalExpr(item.expr(), a);
                     Object vb = executor.evalExpr(item.expr(), b);
                     // PG's default is NULLS LAST ascending, NULLS FIRST descending: nulls sort
@@ -2404,7 +2499,10 @@ class SelectAggregateEvaluator {
                                 ? item.nullsFirst().booleanValue() : item.descending();
                         return (va == null) == nullsFirst ? -1 : 1;
                     }
-                    int cmp = executor.compareValues(va, vb);
+                    int cmp = keyTypes.get(idx) == DataType.JSONB
+                            && va instanceof String && vb instanceof String
+                            ? JsonOperations.compareJsonb((String) va, (String) vb)
+                            : executor.compareValues(va, vb);
                     if (item.descending()) cmp = -cmp;
                     if (cmp != 0) return cmp;
                 }

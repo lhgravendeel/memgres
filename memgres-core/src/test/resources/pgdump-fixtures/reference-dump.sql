@@ -165,7 +165,7 @@ COPY public.customers (id, name, email, created_at, metadata, tags, active, scor
 1	Alice Johnson	alice@example.com	2024-01-15 10:30:00+00	{"tier": "gold", "since": 2020}	{loyal,vip}	t	98.50	a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
 2	Bob Smith	bob@example.com	2024-02-20 14:00:00+00	{"tier": "silver"}	{new}	t	75.25	b1eebc99-9c0b-4ef8-bb6d-6bb9bd380a22
 3	Carol White	carol@example.com	2024-03-10 09:15:00+00	{}	\N	f	\N	\N
-4	Dave "The Dev" O'Brien	dave@example.com	2024-04-01 00:00:00+00	{"notes": "has\ttabs\nand newlines"}	{dev,tester}	t	100.00	d3eebc99-9c0b-4ef8-bb6d-6bb9bd380a44
+4	Dave "The Dev" O'Brien	dave@example.com	2024-04-01 00:00:00+00	{"notes": "has\\ttabs\\nand newlines"}	{dev,tester}	t	100.00	d3eebc99-9c0b-4ef8-bb6d-6bb9bd380a44
 5		empty@example.com	2024-05-15 12:00:00+00	\N	{}	t	0.00	e4eebc99-9c0b-4ef8-bb6d-6bb9bd380a55
 \.
 

@@ -821,6 +821,9 @@ class DdlTableExecutor {
                             tc.type() == TableConstraint.ConstraintType.PRIMARY_KEY ? "primary key"
                                     : tc.type() == TableConstraint.ConstraintType.UNIQUE ? "unique"
                                     : "exclusion");
+                    if (tc.type() != TableConstraint.ConstraintType.EXCLUDE) {
+                        DdlDefinitionChecks.requireKeyColumnOpclass(table, tc.columns());
+                    }
                     DdlDefinitionChecks.requireKeyColumnsExist(table, tc.includedColumns());
                     if (tc.type() == TableConstraint.ConstraintType.EXCLUDE) {
                         DdlDefinitionChecks.requireExclusionCapableAccessMethod(tc.excludeMethod());
@@ -1243,7 +1246,8 @@ class DdlTableExecutor {
             if (colIndices[ci] < 0) return;
         }
         if (partition.getIndex(childIdxName) == null) {
-            partition.buildIndex(new TableIndex(childIdxName, colIndices, unique));
+            partition.buildIndex(new TableIndex(childIdxName, colIndices, unique,
+                    partition.getColumns()));
         }
     }
 
@@ -1693,6 +1697,9 @@ class DdlTableExecutor {
      */
     void storeInlineColumnConstraints(Table table, ColumnDef def, String schemaName,
                                       String tableName, List<StoredConstraint> added) {
+        if (def.primaryKey() || def.unique()) {
+            DdlDefinitionChecks.requireKeyColumnOpclass(table, Cols.listOf(def.name()));
+        }
         if (def.primaryKey()) {
             StoredConstraint pk = StoredConstraint.primaryKey(
                     def.primaryKeyName() != null ? def.primaryKeyName() : tableName + "_pkey",

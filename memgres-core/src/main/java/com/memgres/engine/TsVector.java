@@ -88,26 +88,57 @@ public class TsVector {
      */
     public static TsVector fromText(String text, String config) {
         Map<String, List<PosEntry>> lexemes = new TreeMap<>();
-        if (text == null || text.isEmpty()) return new TsVector(lexemes);
+        addText(lexemes, text, config, new int[2]);
+        return new TsVector(lexemes);
+    }
 
+    /**
+     * A tsvector over the several pieces of text a document holds.
+     *
+     * <p>The parser runs on through them: it does not begin again at one for each piece, so a
+     * piece of nothing but stop words still moves everything after it along. A piece ends where
+     * its last lexeme was, or where it began when it had none, and the next piece starts one
+     * past that -- which leaves a gap of at least one between the last word of one piece and the
+     * first of the next, so that no phrase spans the two.
+     */
+    public static TsVector fromTexts(List<String> texts, String config) {
+        Map<String, List<PosEntry>> lexemes = new TreeMap<>();
+        int[] cursor = new int[2];
+        for (String text : texts) {
+            int began = cursor[REACHED];
+            addText(lexemes, text, config, cursor);
+            cursor[REACHED] = Math.max(cursor[LAST_LEXEME], began) + 1;
+        }
+        return new TsVector(lexemes);
+    }
+
+    /** Where the parser has reached, which the next token follows. */
+    private static final int REACHED = 0;
+    /** Where the last lexeme was put, or zero while there has been none. */
+    private static final int LAST_LEXEME = 1;
+
+    /** Adds one piece of text, moving the cursor on over the positions the piece takes. */
+    private static void addText(Map<String, List<PosEntry>> lexemes, String text, String config,
+                                int[] cursor) {
+        if (text == null || text.isEmpty()) return;
         boolean isSimple = "simple".equalsIgnoreCase(config);
-        int position = 0;
         for (com.memgres.engine.fts.TsParser.Token token
                 : com.memgres.engine.fts.TsParser.parse(text)) {
             com.memgres.engine.fts.TsParser.Dict dict =
                     com.memgres.engine.fts.TsParser.dictionaryFor(token.type());
             if (dict == com.memgres.engine.fts.TsParser.Dict.NONE) continue;
-            position++;
+            int position = ++cursor[REACHED];
             String lower = token.text().toLowerCase();
             if (isSimple || dict == com.memgres.engine.fts.TsParser.Dict.SIMPLE) {
                 addPosition(lexemes, lower, position);
+                cursor[LAST_LEXEME] = position;
                 continue;
             }
             // The snowball dictionary drops stop words before stemming.
             if (STOP_WORDS.contains(lower)) continue;
             addPosition(lexemes, com.memgres.engine.fts.EnglishStemmer.stem(lower), position);
+            cursor[LAST_LEXEME] = position;
         }
-        return new TsVector(lexemes);
     }
 
     private static void addPosition(Map<String, List<PosEntry>> lexemes, String lexeme, int position) {

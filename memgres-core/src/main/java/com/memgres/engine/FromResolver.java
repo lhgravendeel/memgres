@@ -1945,11 +1945,13 @@ class FromResolver {
                     && funcFrom.args().get(0) instanceof JsonTableExpr) {
                 JsonTableExpr jt = (JsonTableExpr) funcFrom.args().get(0);
                 List<Column> cols = new ArrayList<>();
-                collectJsonTableColumnDefs(jt.columns, cols);
+                List<String> types = new ArrayList<>();
+                FromFunctionResolver.collectJsonTableColumns(jt.columns, cols, types);
+                cols = FromFunctionResolver.applyColumnAliases(
+                        cols, FromFunctionResolver.stripColTypes(funcFrom.columnAliases()), null);
                 Table virtualTable = new Table(alias, cols);
-                // Every column here is described as text whatever the definition list said, so
-                // there is no type of one to be trusted.
-                virtualTable.setDefinedColumnTypes(new String[cols.size()]);
+                // The COLUMNS list names each column's type, so these are types to be trusted.
+                virtualTable.setDefinedColumnTypes(types.toArray(new String[0]));
                 bindings.add(new RowContext.TableBinding(virtualTable, alias, new Object[cols.size()]));
             } else {
                 // The shape describes an item that produced no row, so the type has to come from
@@ -2023,17 +2025,6 @@ class FromResolver {
     private void defineFromFunction(Table virtualTable, SelectStmt.FunctionFrom funcFrom) {
         virtualTable.setDefinedColumnTypes(
                 executor.definedTypes.ofFunction(funcFrom, virtualTable.getColumns().size()));
-    }
-
-    /** Recursively collect leaf column definitions from JSON_TABLE columns. */
-    private void collectJsonTableColumnDefs(List<JsonTableExpr.JsonTableColumn> columns, List<Column> cols) {
-        for (JsonTableExpr.JsonTableColumn col : columns) {
-            if (col.nestedColumns != null) {
-                collectJsonTableColumnDefs(col.nestedColumns, cols);
-            } else {
-                cols.add(new Column(col.name, col.forOrdinality ? DataType.INTEGER : DataType.TEXT, true, false, null));
-            }
-        }
     }
 
     // ---- FROM Clause Resolution ----

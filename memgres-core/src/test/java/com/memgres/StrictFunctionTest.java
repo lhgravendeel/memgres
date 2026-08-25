@@ -464,9 +464,9 @@ class StrictFunctionTest {
                     + "SFUNC = dsn_sf, STYPE = integer)");
             try (ResultSet rs = stmt.executeQuery("SELECT dsn_sum(DISTINCT val) FROM dsn")) {
                 assertTrue(rs.next());
-                // NULLs skipped, first non-NULL (10) becomes state (no DISTINCT tracking),
-                // second 10 is new to DISTINCT: 10+10=20, then +20=40
-                assertEquals(40, rs.getInt(1));
+                // DISTINCT leaves 10 and 20; a strict transition takes the first of them as the
+                // state where there is no initial condition, so the one addition is 10 + 20.
+                assertEquals(30, rs.getInt(1));
             }
         }
     }

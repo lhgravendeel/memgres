@@ -794,7 +794,7 @@ public class Table {
                 if (sc.getWhereExpr() != null) continue;
                 int[] colIndices = resolveColumnIndices(sc.getColumns());
                 if (colIndices != null) {
-                    TableIndex idx = new TableIndex(sc.getName(), colIndices, true);
+                    TableIndex idx = new TableIndex(sc.getName(), colIndices, true, getColumns());
                     buildIndex(idx);
                 }
             }
@@ -1121,7 +1121,7 @@ public class Table {
                 }
             }
         }
-        TableIndex probe = new TableIndex(sc.getName(), colIndices, true);
+        TableIndex probe = new TableIndex(sc.getName(), colIndices, true, getColumns());
         java.util.Set<TableIndex.IndexKey> seen = new java.util.HashSet<>();
         for (Object[] row : allRows) {
             TableIndex.IndexKey key = probe.extractKey(row);
@@ -1167,7 +1167,8 @@ public class Table {
                     }
                 }
                 if (!hasVirtualCol) {
-                    TableIndex idx = new TableIndex(constraint.getName(), colIndices, true);
+                    TableIndex idx = new TableIndex(constraint.getName(), colIndices, true,
+                            getColumns());
                     buildIndex(idx);
                 }
             }

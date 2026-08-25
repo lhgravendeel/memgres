@@ -202,7 +202,9 @@ class SqlJsonStandardTest {
 
     @Test
     void jsonValue_extractBoolean() throws SQLException {
-        assertEquals("true", q("SELECT JSON_VALUE('{\"a\":true}', '$.a')"));
+        // JSON_VALUE hands back a SQL value and not the document's own spelling, so a boolean
+        // prints the way booleans print
+        assertEquals("t", q("SELECT JSON_VALUE('{\"a\":true}', '$.a')"));
     }
 
     @Test
@@ -537,7 +539,8 @@ class SqlJsonStandardTest {
 
     @Test
     void jsonScalar_fromNull() throws SQLException {
-        assertEquals("null", q("SELECT JSON_SCALAR(NULL)"));
+        // JSON_SCALAR is strict: nothing in, nothing out -- not the JSON null
+        assertNull(q("SELECT JSON_SCALAR(NULL)"));
     }
 
     @Test
@@ -1037,8 +1040,9 @@ class SqlJsonStandardTest {
 
     @Test
     void isJson_nestedDuplicateKeysAtTopLevel() throws SQLException {
-        // WITH UNIQUE KEYS only checks the top level in PG
-        assertEquals("t", q("SELECT '{\"a\":{\"x\":1,\"x\":2},\"b\":1}' IS JSON WITH UNIQUE KEYS"));
+        // The question is asked of every object in the document, not only the outermost one
+        assertEquals("f", q("SELECT '{\"a\":{\"x\":1,\"x\":2},\"b\":1}' IS JSON WITH UNIQUE KEYS"));
+        assertEquals("f", q("SELECT '{\"a\":[{\"x\":1,\"x\":2}]}' IS JSON WITH UNIQUE KEYS"));
     }
 
     @Test
@@ -1165,8 +1169,14 @@ class SqlJsonStandardTest {
 
     @Test
     void jsonQuery_nullOnError() throws SQLException {
-        // NULL ON ERROR returns null for invalid JSON
-        assertNull(q("SELECT JSON_QUERY('bad json', '$.a' NULL ON ERROR)"));
+        // ON ERROR answers for what the path does to the document, not for what the document is.
+        // A text that is no document at all has to be read before the path can be applied, and
+        // that reading is a cast: it fails outright whatever the clause asks for.
+        SQLException e = assertThrows(SQLException.class,
+                () -> q("SELECT JSON_QUERY('bad json', '$.a' NULL ON ERROR)"));
+        assertEquals("22P02", e.getSQLState());
+        // A path that returns more items than the clause can hold is what NULL ON ERROR answers.
+        assertNull(q("SELECT JSON_QUERY('[1,2]', '$[*]' NULL ON ERROR)"));
     }
 
     @Test
@@ -1448,8 +1458,10 @@ class SqlJsonStandardTest {
 
     @Test
     void jsonTable_withJsonValueInSelect() throws SQLException {
-        // Use JSON_VALUE on a JSON_TABLE column that contains JSON
-        String sql = """
+        // A column that is to hold a document has to be declared as one. A text column takes a
+        // scalar and nothing else, so an object found at its path is an error, and the default
+        // NULL ON ERROR turns it into a null rather than into the text the object was written as.
+        String asText = """
                 SELECT JSON_VALUE(raw_data, '$.x') AS x_val
                 FROM JSON_TABLE(
                     '[{"raw_data":{"x":100}},{"raw_data":{"x":200}}]',
@@ -1458,7 +1470,15 @@ class SqlJsonStandardTest {
                     )
                 ) AS jt
                 ORDER BY x_val""";
-        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(sql)) {
+        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(asText)) {
+            assertTrue(rs.next());
+            assertNull(rs.getString(1));
+            assertTrue(rs.next());
+            assertNull(rs.getString(1));
+            assertFalse(rs.next());
+        }
+        try (Statement s = conn.createStatement();
+             ResultSet rs = s.executeQuery(asText.replace("raw_data text", "raw_data json"))) {
             assertTrue(rs.next());
             assertEquals("100", rs.getString(1));
             assertTrue(rs.next());

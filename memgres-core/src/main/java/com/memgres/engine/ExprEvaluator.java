@@ -17,9 +17,11 @@ import java.util.stream.Collectors;
 class ExprEvaluator {
 
     final AstExecutor executor;
+    final SqlJsonEvaluator sqlJson;
 
     ExprEvaluator(AstExecutor executor) {
         this.executor = executor;
+        this.sqlJson = new SqlJsonEvaluator(executor);
     }
 
     /**
@@ -1419,6 +1421,16 @@ class ExprEvaluator {
                 return null;
             }
         }
+        // jsonb holds a value and not the text it prints as, so a cast out of it reads that value:
+        // there is no number in a string to find, and a number that is not whole rounds.
+        if (val instanceof String && BinaryOpEvaluator.isJsonbTypeName(
+                executor.binaryOpEvaluator.declaredTypeForResolution(cast.expr(), ctx))) {
+            Object payload = CastEvaluator.jsonbCastPayload((String) val, cast.typeName());
+            if (payload != CastEvaluator.NOT_A_JSONB_CAST) {
+                return payload == null ? null
+                        : executor.castEvaluator.applyCast(payload, cast.typeName(), false);
+            }
+        }
         checkNumericSpecialToInteger(cast, val);
         boolean unknownLiteral = cast.expr() instanceof Literal
                 && ((Literal) cast.expr()).literalType() == Literal.LiteralType.STRING;
@@ -1675,29 +1687,62 @@ class ExprEvaluator {
         return isn.negated() ? !isNull : isNull;
     }
 
+    /**
+     * The IS JSON predicate, answered by the reader that reads json input rather than by looking at
+     * the text's first character. What kind of value a document is, and whether it repeats a key,
+     * are questions about the document; a text that opens with a brace is not thereby an object.
+     */
     private Object evalIsJson(IsJsonExpr ij, RowContext ctx) {
+        rejectIsJsonOperand(ij, ctx);
         Object val = evalExpr(ij.expr(), ctx);
         if (val == null) return null; // SQL NULL IS JSON is NULL
-        String s = val.toString().trim();
-        boolean valid = isValidJson(s);
-        if (valid && ij.jsonType() != null) {
-            switch (ij.jsonType()) {
-                case OBJECT: valid = s.startsWith("{"); break;
-                case ARRAY: valid = s.startsWith("["); break;
-                case SCALAR: valid = !s.startsWith("{") && !s.startsWith("["); break;
-                case VALUE: break; // any JSON
-                case BOOLEAN: valid = s.equals("true") || s.equals("false"); break;
-                case NULL: valid = s.equals("null"); break;
-                case STRING: valid = s.startsWith("\"") && s.endsWith("\""); break;
-                case NUMBER: valid = !s.startsWith("{") && !s.startsWith("[")
-                        && !s.startsWith("\"") && !s.equals("true") && !s.equals("false")
-                        && !s.equals("null"); break;
-            }
-        }
-        if (valid && ij.uniqueKeys()) {
-            valid = hasUniqueKeys(s);
-        }
+        // bytea carries the document as its bytes, which is the one form of it that is not text
+        String text = val instanceof byte[]
+                ? new String((byte[]) val, java.nio.charset.StandardCharsets.UTF_8)
+                : val.toString();
+        JsonParser.Shape shape = JsonParser.shapeOf(text.trim());
+        boolean valid = shape != null && matchesJsonType(ij.jsonType(), shape.kind)
+                // Uniqueness is asked of every object in the document, not only the outermost one
+                && (!ij.uniqueKeys() || shape.uniqueKeys);
         return ij.negated() ? !valid : valid;
+    }
+
+    /**
+     * The types IS JSON asks its question of: the string types, json and jsonb, and bytea, which
+     * carries a document as its bytes. Anything else is refused rather than rendered to text and
+     * read, which is how {@code 1 IS JSON} used to answer true.
+     */
+    private static final Set<String> IS_JSON_OPERAND_TYPES = Cols.setOf(
+            "text", "varchar", "character varying", "char", "character", "bpchar", "name",
+            "json", "jsonb", "bytea", "unknown");
+
+    private void rejectIsJsonOperand(IsJsonExpr ij, RowContext ctx) {
+        String declared = executor.binaryOpEvaluator.declaredTypeForResolution(ij.expr(), ctx);
+        if (declared == null) {
+            // A literal nothing has typed is PostgreSQL's unknown and reads as text. Anything else
+            // has a type even where the query did not write one: "current_date IS JSON" asks the
+            // question of a date.
+            if (ij.expr() instanceof Literal) return;
+            DataType inferred = inferExprType(ij.expr());
+            if (inferred == null) return;
+            declared = inferred.getPgName();
+        }
+        if (IS_JSON_OPERAND_TYPES.contains(stripTypeModifier(declared).toLowerCase())) return;
+        throw new MemgresException("cannot use type " + declared + " in IS JSON predicate", "42804");
+    }
+
+    private static boolean matchesJsonType(IsJsonExpr.JsonType wanted, int kind) {
+        if (wanted == null) return true;
+        switch (wanted) {
+            case OBJECT: return kind == JsonValue.OBJECT;
+            case ARRAY: return kind == JsonValue.ARRAY;
+            case SCALAR: return kind != JsonValue.OBJECT && kind != JsonValue.ARRAY;
+            case BOOLEAN: return kind == JsonValue.BOOLEAN;
+            case NULL: return kind == JsonValue.NULL;
+            case STRING: return kind == JsonValue.STRING;
+            case NUMBER: return kind == JsonValue.NUMBER;
+            default: return true;   // VALUE: any document at all
+        }
     }
 
     static boolean isValidJson(String s) {
@@ -1706,7 +1751,7 @@ class ExprEvaluator {
         // rather than by a second, looser one of its own. Judging a document by its opening
         // bracket called '[1,2' and '{"a":1}{"b":2}' JSON, neither of which json input would take.
         try {
-            JsonTextValidator.validate(s.trim());
+            JsonParser.validate(s.trim());
             return true;
         } catch (MemgresException e) {
             return false;
@@ -1722,188 +1767,23 @@ class ExprEvaluator {
         if (s == null) {
             throw new MemgresException("invalid input syntax for type json", "22P02");
         }
-        JsonTextValidator.validate(s.trim());
-    }
-
-    private boolean hasUniqueKeys(String s) {
-        s = s.trim();
-        if (!s.startsWith("{")) return true;
-        // Parse keys manually and check for duplicates
-        Map<String, String> keys = JsonOperations.parseObjectKeys(s);
-        // parseObjectKeys deduplicates, so count raw keys instead
-        return countRawKeys(s) == keys.size();
-    }
-
-    private int countRawKeys(String s) {
-        int count = 0;
-        int depth = 0;
-        boolean inString = false;
-        boolean escaped = false;
-        boolean expectKey = true;
-        for (int i = 1; i < s.length() - 1; i++) {
-            char c = s.charAt(i);
-            if (escaped) { escaped = false; continue; }
-            if (c == '\\') { escaped = true; continue; }
-            if (c == '"') {
-                if (!inString && depth == 0 && expectKey) {
-                    // opening quote of a key
-                    count++;
-                }
-                inString = !inString;
-                continue;
-            }
-            if (inString) continue;
-            if (c == '{' || c == '[') depth++;
-            else if (c == '}' || c == ']') depth--;
-            else if (c == ':' && depth == 0) expectKey = false;
-            else if (c == ',' && depth == 0) expectKey = true;
-        }
-        return count;
+        // Not trimmed: the reader skips whitespace itself, and the text it was handed is the text
+        // its complaint quotes back.
+        JsonParser.validate(s);
     }
 
     // ---- SQL/JSON standard expression evaluation ----
 
     private Object evalJsonExists(JsonExistsExpr je, RowContext ctx) {
-        Object inputVal = evalExpr(je.input(), ctx);
-        if (inputVal == null) return null;
-        Object pathVal = evalExpr(je.path(), ctx);
-        if (pathVal == null) return null;
-        String json = inputVal.toString();
-        String path = pathVal.toString().trim();
-        // PG: syntax errors in jsonpath always propagate (not caught by ON ERROR)
-        if (path.contains("..")) {
-            throw new MemgresException("syntax error at or near \".\" of jsonpath input", "42601");
-        }
-        if (path.contains("[[")) {
-            throw new MemgresException("syntax error at or near \"[\" of jsonpath input", "42601");
-        }
-        // PG: invalid JSON input always errors — the implicit cast to json/jsonb fails
-        // before JSON_EXISTS runs, so ON ERROR cannot catch it
-        requireJson(json);
-        try {
-            // Substitute PASSING variables into path
-            if (je.passing() != null && !je.passing().isEmpty()) {
-                for (Map.Entry<String, Expression> e : je.passing().entrySet()) {
-                    Object v = evalExpr(e.getValue(), ctx);
-                    if (v != null) path = path.replace("$" + e.getKey(), v.toString());
-                }
-            }
-            List<String> results = executor.functionEvaluator.evaluateJsonPathAll(json, path);
-            return !results.isEmpty();
-        } catch (MemgresException e) {
-            if (je.onError() == JsonExistsExpr.OnBehavior.ERROR) throw e;
-            return je.onError() == JsonExistsExpr.OnBehavior.TRUE_VAL ? true : false;
-        }
+        return sqlJson.exists(je, ctx);
     }
 
     private Object evalJsonValue(JsonValueExpr jv, RowContext ctx) {
-        Object inputVal = evalExpr(jv.input(), ctx);
-        if (inputVal == null) return null;
-        Object pathVal = evalExpr(jv.path(), ctx);
-        if (pathVal == null) return null;
-        String json = inputVal.toString();
-        String path = pathVal.toString().trim();
-        // PG: invalid JSON input always throws an error regardless of ON ERROR behavior
-        requireJson(json);
-        try {
-            // Substitute PASSING variables
-            if (jv.passing != null && !jv.passing.isEmpty()) {
-                for (Map.Entry<String, Expression> e : jv.passing.entrySet()) {
-                    Object v = evalExpr(e.getValue(), ctx);
-                    if (v != null) path = path.replace("$" + e.getKey(), v.toString());
-                }
-            }
-            List<String> results = executor.functionEvaluator.evaluateJsonPathAll(json, path);
-            if (results.isEmpty()) {
-                // ON EMPTY behavior
-                if (jv.onEmpty == JsonExistsExpr.OnBehavior.ERROR) {
-                    // ON EMPTY errors propagate directly (not caught by ON ERROR handler)
-                    throw new MemgresException("no SQL/JSON item found for specified path", "22035");
-                }
-                if (jv.defaultOnEmpty != null) return evalExpr(jv.defaultOnEmpty, ctx);
-                return null; // NULL ON EMPTY is default
-            }
-            String result = results.get(0);
-            // JSON_VALUE extracts scalars only — objects/arrays are errors
-            String trimmed = result.trim();
-            if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
-                if (jv.onError == JsonExistsExpr.OnBehavior.ERROR) {
-                    throw new MemgresException("JSON path expression in JSON_VALUE must return single scalar item", "2203F");
-                }
-                if (jv.defaultOnError != null) return evalExpr(jv.defaultOnError, ctx);
-                return null;
-            }
-            // Unquote strings
-            if (trimmed.startsWith("\"") && trimmed.endsWith("\"")) {
-                trimmed = trimmed.substring(1, trimmed.length() - 1);
-            }
-            if (trimmed.equals("null")) return null;
-            // RETURNING type cast
-            if (jv.returningType != null) {
-                return executor.castEvaluator.applyCast(trimmed, jv.returningType);
-            }
-            return trimmed;
-        } catch (MemgresException e) {
-            // ON EMPTY errors should always propagate
-            if (e.getSqlState() != null && e.getSqlState().equals("22035")) throw e;
-            if (jv.onError == JsonExistsExpr.OnBehavior.ERROR) throw e;
-            if (jv.defaultOnError != null) return evalExpr(jv.defaultOnError, ctx);
-            return null;
-        }
+        return sqlJson.value(jv, ctx);
     }
 
     private Object evalJsonQuery(JsonQueryExpr jq, RowContext ctx) {
-        Object inputVal = evalExpr(jq.input(), ctx);
-        if (inputVal == null) return null;
-        Object pathVal = evalExpr(jq.path(), ctx);
-        if (pathVal == null) return null;
-        String json = inputVal.toString();
-        String path = pathVal.toString().trim();
-        try {
-            if (!isValidJson(json)) {
-                if (jq.onError == JsonExistsExpr.OnBehavior.ERROR) requireJson(json);
-                return handleJsonQueryOnEmpty(jq);
-            }
-            List<String> results = executor.functionEvaluator.evaluateJsonPathAll(json, path);
-            if (results.isEmpty()) return handleJsonQueryOnEmpty(jq);
-            String result = results.get(0).trim();
-            // PG: JSON_QUERY normalizes output with spaces (jsonb output style)
-            result = JsonOperations.normalizeJsonb(result);
-            // Wrapper behavior
-            if (jq.wrapper == JsonQueryExpr.WrapperBehavior.WITH_WRAPPER) {
-                List<String> trimmed = new ArrayList<>();
-                for (String r : results) {
-                    trimmed.add(JsonOperations.normalizeJsonb(r.trim()));
-                }
-                if (trimmed.size() == 1) result = "[" + trimmed.get(0) + "]";
-                else result = "[" + String.join(", ", trimmed) + "]";
-            } else if (jq.wrapper == JsonQueryExpr.WrapperBehavior.WITH_CONDITIONAL_WRAPPER) {
-                String t = result.trim();
-                // PG 17+: CONDITIONAL WRAPPER does NOT wrap scalars or single objects/arrays;
-                // it only wraps when multiple items would be returned
-                // Single scalars, objects, and arrays are returned as-is
-            }
-            // Quotes behavior — PG: OMIT QUOTES on a string scalar returns NULL
-            // because an unquoted string is not valid JSON
-            if (jq.quotes == JsonQueryExpr.QuotesBehavior.OMIT) {
-                String t = result.trim();
-                if (t.startsWith("\"") && t.endsWith("\"")) {
-                    // PG: OMIT QUOTES on a scalar string returns NULL (not valid JSON without quotes)
-                    return null;
-                }
-            }
-            return result;
-        } catch (MemgresException e) {
-            if (jq.onError == JsonExistsExpr.OnBehavior.ERROR) throw e;
-            return null;
-        }
-    }
-
-    private Object handleJsonQueryOnEmpty(JsonQueryExpr jq) {
-        if (jq.onEmpty == JsonExistsExpr.OnBehavior.EMPTY_ARRAY) return "[]";
-        if (jq.onEmpty == JsonExistsExpr.OnBehavior.EMPTY_OBJECT) return "{}";
-        if (jq.onEmpty == JsonExistsExpr.OnBehavior.ERROR) throw new MemgresException("no SQL/JSON item found for specified path", "22034");
-        return null;
+        return sqlJson.query(jq, ctx);
     }
 
     private Object evalIn(InExpr in, RowContext ctx) {
@@ -1954,6 +1834,10 @@ class ExprEvaluator {
             }
         }
         Object val = evalExpr(in.expr(), ctx);
+        // jsonb is a value and not the text it prints as, so membership is decided by reading
+        // both sides as documents. Comparing their texts said 1 was not among (1.0).
+        boolean jsonb = BinaryOpEvaluator.isJsonbTypeName(
+                executor.binaryOpEvaluator.declaredTypeForResolution(in.expr(), ctx));
 
         // Check for IN (subquery). The ANY spelling over a written-out array is a list of
         // elements, each of them a value on its own -- so a subquery among them is not the
@@ -1994,7 +1878,7 @@ class ExprEvaluator {
                 } else {
                     Object elem = row.length > 0 ? row[0] : null;
                     if (elem == null) { hasNull = true; continue; }
-                    if (TypeCoercion.areEqual(val, elem)) { found = true; break; }
+                    if (inEquals(jsonb, val, elem)) { found = true; break; }
                 }
             }
             if (found) return !in.negated();
@@ -2071,7 +1955,7 @@ class ExprEvaluator {
                 List<?> arrayElems = (List<?>) elem;
                 for (Object ae : arrayElems) {
                     if (ae == null) { hasNull = true; continue; }
-                    if (TypeCoercion.areEqual(val, ae)) { found = true; break; }
+                    if (inEquals(jsonb, val, ae)) { found = true; break; }
                 }
                 if (found) break;
                 continue;
@@ -2079,7 +1963,10 @@ class ExprEvaluator {
             // An array parameter arrives as the text of its literal, and "= ANY(...)" over it is a
             // comparison against each element. A written IN list is not that: each entry there is
             // one value, and text spelled like an array is the text it is.
-            if (in.fromAny() && elem instanceof String
+            // A jsonb object is written between braces too, and is one value rather than a list of
+            // them: "= ANY(ARRAY['{\"a\":1}'::jsonb])" compares against the object, not against a
+            // member of it.
+            if (in.fromAny() && elem instanceof String && !jsonb
                     && ((String) elem).startsWith("{") && ((String) elem).endsWith("}")
                     && !RangeOperations.isMultirangeOrEmpty(((String) elem).trim())) {
                 String s = (String) elem;
@@ -2091,7 +1978,7 @@ class ExprEvaluator {
                 if (found) break;
                 continue;
             }
-            if (TypeCoercion.areEqual(val, elem)) {
+            if (inEquals(jsonb, val, elem)) {
                 found = true;
                 break;
             }
@@ -2099,6 +1986,18 @@ class ExprEvaluator {
         if (found) return !in.negated();
         if (hasNull) return null;
         return in.negated();
+    }
+
+    /**
+     * Whether a member of the set equals the value being looked for, reading both as documents
+     * where that is what they are. jsonb values are held as their text, and two texts that differ
+     * may still be one value.
+     */
+    private static boolean inEquals(boolean jsonb, Object val, Object elem) {
+        if (jsonb && val instanceof String && elem instanceof String) {
+            return JsonOperations.compareJsonb((String) val, (String) elem) == 0;
+        }
+        return TypeCoercion.areEqual(val, elem);
     }
 
     private Object evalBetween(BetweenExpr bet, RowContext ctx) {
@@ -3283,13 +3182,30 @@ class ExprEvaluator {
 
     // ---- Expression alias derivation ----
 
+    /**
+     * The SQL/JSON constructors, whose column PostgreSQL names after the construct that was
+     * written and not after the routine underneath it. Two of them have a name of their own here
+     * because the construct's name is already an ordinary function's — {@code json_object(text[])}
+     * takes an array of alternating keys and values and is not the same routine at all.
+     */
+    private static final Map<String, String> CONSTRUCTOR_LABELS;
+
+    static {
+        Map<String, String> labels = new HashMap<>();
+        labels.put("json_object_constructor", "json_object");
+        labels.put("json_array_constructor", "json_array");
+        labels.put("json_array_subquery", "json_array");
+        CONSTRUCTOR_LABELS = labels;
+    }
+
     String exprToAlias(Expression expr) {
         if (expr instanceof ColumnRef) return ((ColumnRef) expr).column();
         if (expr instanceof FunctionCallExpr) {
             // PG labels the column with the bare routine name; the schema qualifier is not part of it.
             String fnName = ((FunctionCallExpr) expr).name();
             int dot = fnName.lastIndexOf('.');
-            return dot >= 0 ? fnName.substring(dot + 1) : fnName;
+            return CONSTRUCTOR_LABELS.getOrDefault(fnName,
+                    dot >= 0 ? fnName.substring(dot + 1) : fnName);
         }
         if (expr instanceof WindowFuncExpr) return ((WindowFuncExpr) expr).name();
         if (expr instanceof AtTimeZoneExpr) return "timezone";
@@ -3635,34 +3551,57 @@ class ExprEvaluator {
     }
 
     /**
-     * The document type a JSON-producing function answers in, or null when the name is not one of
-     * them. The pairs differ only in their prefix, so the {@code jsonb_} spelling of every listed
-     * name answers in jsonb and the bare one in json.
+     * The type a function of the JSON family answers in, or null when the name is not one of them.
+     * The two families are spelled alike but for the prefix, so a name is looked up once in its
+     * bare form and the {@code jsonb_} spelling answers in jsonb where the bare one answers in
+     * json. Only the document-valued ones differ that way; a length is an integer and a test is a
+     * boolean in both.
+     *
+     * <p>Without this a call whose value is NULL had nothing to be described by and was reported
+     * as text, so a client reading json_array_length(NULL) back was told it had asked for a string.
      */
+    /** Bare names whose value is a document, so json answers in json and jsonb in jsonb. */
+    private static final Set<String> JSON_FUNCTIONS_RETURNING_A_DOCUMENT = Cols.setOf(
+            "to_json", "row_to_json", "array_to_json", "json_object", "json_object_agg",
+            "json_agg_strict", "json_object_agg_strict", "json_object_agg_unique",
+            "json_object_agg_unique_strict",
+            "json_build_object", "json_build_array", "json_agg", "json_strip_nulls", "json_scalar",
+            "json_extract_path", "json_object_field", "json_array_element",
+            "json_set", "json_insert", "json_set_lax", "json_concat", "json_delete",
+            "json_delete_path", "json_path_query", "json_path_query_first",
+            "json_path_query_array",
+            // The SQL/JSON constructors and aggregates answer in json unless a RETURNING says
+            // otherwise, and a RETURNING is parsed as a cast around the call rather than as part
+            // of it, so the call itself is always json.
+            "json_array_constructor", "json_object_constructor",
+            "json_arrayagg", "json_objectagg");
+
+    /** Bare names that answer yes or no, which both families do alike. */
+    private static final Set<String> JSON_FUNCTIONS_RETURNING_A_BOOLEAN = Cols.setOf(
+            "json_path_exists", "json_path_match", "json_contains", "json_contained",
+            "json_exists", "json_exists_any", "json_exists_all");
+
+    /** Bare names that answer text, which both families do alike. */
+    private static final Set<String> JSON_FUNCTIONS_RETURNING_TEXT = Cols.setOf(
+            "json_typeof", "json_pretty", "json_extract_path_text", "json_object_field_text",
+            "json_array_element_text", "json_object_keys");
+
     private static DataType jsonFunctionResultType(String name) {
+        // The hstore conversions are named the other way round -- the family they answer in is
+        // the end of the name rather than the start -- so they are read here rather than below.
+        if (name.startsWith("hstore_to_json")) {
+            return name.startsWith("hstore_to_jsonb") ? DataType.JSONB : DataType.JSON;
+        }
         boolean b = name.startsWith("jsonb_") || name.equals("to_jsonb");
         String bare = name.startsWith("jsonb_") ? "json_" + name.substring(6)
                 : name.equals("to_jsonb") ? "to_json" : name;
-        switch (bare) {
-            case "to_json":
-            case "row_to_json":
-            case "array_to_json":
-            case "json_object":
-            case "json_object_agg":
-            case "json_build_object":
-            case "json_build_array":
-            case "json_agg":
-            case "json_strip_nulls":
-            case "json_extract_path":
-            case "json_set":
-            case "json_insert":
-            case "json_set_lax":
-            case "json_path_query":
-            case "json_path_query_first":
-                return b ? DataType.JSONB : DataType.JSON;
-            default:
-                return null;
+        if (JSON_FUNCTIONS_RETURNING_A_DOCUMENT.contains(bare)) {
+            return b ? DataType.JSONB : DataType.JSON;
         }
+        if (bare.equals("json_array_length")) return DataType.INTEGER;
+        if (JSON_FUNCTIONS_RETURNING_A_BOOLEAN.contains(bare)) return DataType.BOOLEAN;
+        if (JSON_FUNCTIONS_RETURNING_TEXT.contains(bare)) return DataType.TEXT;
+        return null;
     }
 
     /** True for the network address types, whose operators answer in inet rather than in text. */
@@ -3708,8 +3647,17 @@ class ExprEvaluator {
         }
     }
 
-    /** Whichever of json and jsonb the pair is written in; the operators keep their own flavour. */
+    /**
+     * Whichever of json and jsonb the pair is written in; the operators keep their own flavour.
+     *
+     * <p>hstore spells its lookup with the same arrow and is not a document: it maps text to text,
+     * so reaching into one answers text, and reaching in with a list of keys answers a list of
+     * them. Calling that jsonb handed pgjdbc a value it then tried to read as a document.
+     */
     private static DataType jsonFlavour(DataType lt, DataType rt) {
+        if (lt == DataType.HSTORE) {
+            return rt != null && DataType.isArrayType(rt) ? DataType.TEXT_ARRAY : DataType.TEXT;
+        }
         if (lt == DataType.JSON || rt == DataType.JSON) return DataType.JSON;
         return DataType.JSONB;
     }
@@ -3787,7 +3735,9 @@ class ExprEvaluator {
         if (DataType.isArrayType(lt)) return lt;
         if (DataType.isArrayType(rt)) return rt;
         if (lt == DataType.JSONB || rt == DataType.JSONB) return DataType.JSONB;
-        if (lt == DataType.JSON || rt == DataType.JSON) return DataType.JSON;
+        // json has no || of its own. One beside anything else resolves through anynonarray||text
+        // and answers with the two spellings run together; one beside another json resolves to
+        // nothing at all, and is refused before the answer's type is asked for.
         if (lt == DataType.TSVECTOR || rt == DataType.TSVECTOR) return DataType.TSVECTOR;
         if (lt == DataType.TSQUERY || rt == DataType.TSQUERY) return DataType.TSQUERY;
         if (lt == DataType.HSTORE || rt == DataType.HSTORE) return DataType.HSTORE;
@@ -3985,6 +3935,20 @@ class ExprEvaluator {
         return false;
     }
 
+    /**
+     * The type a SQL/JSON expression answers in: the one its RETURNING clause names, or the
+     * reading's own default where the clause was not written. The modifier is stripped only after
+     * the whole spelling has been offered, because for some types it names the type rather than a
+     * width.
+     */
+    private static DataType returningType(String typeSpec, DataType unwritten) {
+        if (typeSpec == null) return unwritten;
+        DataType declared = DataType.fromPgName(typeSpec.trim());
+        if (declared != null) return declared;
+        DataType stripped = DataType.fromPgName(stripTypeModifier(typeSpec).trim());
+        return stripped != null ? stripped : DataType.TEXT;
+    }
+
     DataType inferTypeFromContext(Expression expr, List<RowContext.TableBinding> bindings) {
         // A subscript of an array is one element of it, and a range of one is another array of
         // the same type; a subscript of a json container is json. Answering jsonb for all of them
@@ -4048,6 +4012,16 @@ class ExprEvaluator {
             Column outer = columnFromOuterContexts(ref);
             if (outer != null) return outer.getType();
             return DataType.TEXT;
+        }
+        // The SQL/JSON expressions answer in the type their RETURNING clause names, and each has
+        // its own default where none was written: JSON_EXISTS asks a question and so is a boolean,
+        // JSON_QUERY hands back a document and JSON_VALUE the value inside one.
+        if (expr instanceof JsonExistsExpr) return DataType.BOOLEAN;
+        if (expr instanceof JsonValueExpr) {
+            return returningType(((JsonValueExpr) expr).returningType, DataType.TEXT);
+        }
+        if (expr instanceof JsonQueryExpr) {
+            return returningType(((JsonQueryExpr) expr).returningType, DataType.JSONB);
         }
         if (expr instanceof CastExpr) {
             CastExpr cast = (CastExpr) expr;
@@ -4213,6 +4187,20 @@ class ExprEvaluator {
                 return dt == DataType.DOUBLE_PRECISION || dt == DataType.REAL
                         ? DataType.DOUBLE_PRECISION : DataType.NUMERIC;
             }
+            // The bitwise aggregates answer in the type they were given: they are declared over
+            // the three integer widths and over bit, and each form gives back its own.
+            if (name.equals("bit_and") || name.equals("bit_or") || name.equals("bit_xor")) {
+                DataType dt = fn.args().isEmpty() ? null
+                        : inferTypeFromContext(fn.args().get(0), bindings);
+                return dt == null ? DataType.INTEGER : dt;
+            }
+            // The two-argument statistical aggregates are declared over float8 alone. All but one
+            // answer in it too: regr_count counts the pairs, and a count is a bigint.
+            if (name.equals("regr_count")) return DataType.BIGINT;
+            if (name.equals("corr") || name.equals("covar_pop") || name.equals("covar_samp")
+                    || name.startsWith("regr_")) {
+                return DataType.DOUBLE_PRECISION;
+            }
             if (name.equals("max") || name.equals("min")) {
                 if (!fn.args().isEmpty()) return inferTypeFromContext(fn.args().get(0), bindings);
                 return DataType.TEXT;
@@ -4347,6 +4335,16 @@ class ExprEvaluator {
                     || name.equals("random_normal")) return DataType.DOUBLE_PRECISION;
             // ts_rank/ts_rank_cd return float4 (OID 700), not text.
             if (name.equals("ts_rank") || name.equals("ts_rank_cd")) return DataType.REAL;
+            // ts_headline hands back what it was given, with the matches marked inside it: a
+            // document comes back a document. Read from the value alone an object came back as
+            // the array its braces spell, so a client was handed a text[] of one element.
+            if (name.equals("ts_headline")) {
+                for (Expression arg : fn.args()) {
+                    DataType given = inferTypeFromContext(arg, bindings);
+                    if (given == DataType.JSON || given == DataType.JSONB) return given;
+                }
+                return DataType.TEXT;
+            }
             if (name.equals("array_sample") || name.equals("array_shuffle")) {
                 // Returns an array of the same type as the input
                 if (!fn.args().isEmpty()) {
@@ -4382,6 +4380,14 @@ class ExprEvaluator {
                             case SERIAL:
                             case SMALLSERIAL:
                                 return DataType.INT4_ARRAY;
+                            // A document is not the text it prints as, and an array of them is
+                            // read back as documents: array_agg over jsonb advertised as _text
+                            // made every later reader of the array take its elements for strings,
+                            // so to_jsonb of one quoted each of them.
+                            case JSON:
+                                return DataType.JSON_ARRAY;
+                            case JSONB:
+                                return DataType.JSONB_ARRAY;
                             default:
                                 return DataType.TEXT_ARRAY;
                         }
@@ -4542,6 +4548,7 @@ class ExprEvaluator {
         if (expr instanceof AnyAllExpr) return DataType.BOOLEAN;
         if (expr instanceof AnyAllArrayExpr) return DataType.BOOLEAN;
         if (expr instanceof IsBooleanExpr) return DataType.BOOLEAN;
+        if (expr instanceof IsJsonExpr) return DataType.BOOLEAN;
         if (expr instanceof CaseExpr) {
             CaseExpr c = (CaseExpr) expr;
             if (!c.whenClauses().isEmpty()) {
@@ -4762,16 +4769,7 @@ class ExprEvaluator {
     // ---- JSON path parsing ----
 
     List<String> parseJsonPathArg(Object right) {
-        if (right instanceof List<?>) {
-            List<?> list = (List<?>) right;
-            return list.stream().map(Object::toString).collect(Collectors.toList());
-        }
-        String s = right.toString().trim();
-        if (s.startsWith("{") && s.endsWith("}")) {
-            String inner = s.substring(1, s.length() - 1);
-            return Arrays.asList(inner.split(","));
-        }
-        return Cols.listOf(s);
+        return JsonOperations.parsePathArray(right);
     }
 
     /** True for the tests that read a three-valued boolean, so a non-boolean has no answer. */

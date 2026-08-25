@@ -25,8 +25,8 @@ ORDER BY doc_id;
 
 -- begin-expected
 -- columns: doc_id|matched_sku
--- row: 1|A1
--- row: 2|C1
+-- row: 1|"A1"
+-- row: 2|"C1"
 -- end-expected
 SELECT d.doc_id, q.matched_sku
 FROM docs AS d

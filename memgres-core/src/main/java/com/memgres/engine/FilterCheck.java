@@ -107,10 +107,14 @@ final class FilterCheck {
         java.util.Map<String, Integer> m = new java.util.HashMap<String, Integer>();
         String[] one = {"count", "sum", "avg", "min", "max", "any_value", "array_agg",
                 "bit_and", "bit_or", "bit_xor", "bool_and", "bool_or", "every",
-                "json_agg", "jsonb_agg", "xmlagg", "stddev", "stddev_pop", "stddev_samp",
+                "json_agg", "jsonb_agg", "json_agg_strict", "jsonb_agg_strict",
+                "xmlagg", "stddev", "stddev_pop", "stddev_samp",
                 "variance", "var_pop", "var_samp", "range_agg", "range_intersect_agg"};
         for (String n : one) m.put(n, Integer.valueOf(1));
         String[] two = {"string_agg", "json_object_agg", "jsonb_object_agg", "corr",
+                "json_object_agg_strict", "jsonb_object_agg_strict",
+                "json_object_agg_unique", "jsonb_object_agg_unique",
+                "json_object_agg_unique_strict", "jsonb_object_agg_unique_strict",
                 "covar_pop", "covar_samp", "regr_avgx", "regr_avgy", "regr_count",
                 "regr_intercept", "regr_r2", "regr_slope", "regr_sxx", "regr_sxy", "regr_syy"};
         for (String n : two) m.put(n, Integer.valueOf(2));

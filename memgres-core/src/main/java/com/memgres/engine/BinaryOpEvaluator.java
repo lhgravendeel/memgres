@@ -677,6 +677,19 @@ class BinaryOpEvaluator {
             case OVERLAP: return "&&";
             case TS_MATCH: return "@@";
             case CONCAT: return "||";
+            // The operators that ask a document about its members, or build a new one from it,
+            // are declared over jsonb alone. Spelling them lets the catalog rule see that json
+            // has no entry for them, rather than answering as though it did.
+            case JSONB_EXISTS: return "?";
+            case JSONB_EXISTS_ANY: return "?|";
+            case JSONB_EXISTS_ALL: return "?&";
+            case JSONB_PATH_EXISTS_OP: return "@?";
+            case JSON_DELETE_PATH: return "#-";
+            // A path down into a document is written only over json and jsonb. The single-step
+            // arrows are left unspelled because hstore uses them too and the catalogue does not
+            // carry the extension's own entries; nothing but a document has a #> at all.
+            case JSON_HASH_ARROW: return "#>";
+            case JSON_HASH_ARROW_TEXT: return "#>>";
             default: return null;
         }
     }
@@ -1212,6 +1225,11 @@ class BinaryOpEvaluator {
         return false;
     }
 
+    /** True for the name a jsonb operand is declared with. */
+    static boolean isJsonbTypeName(String typeName) {
+        return typeName != null && typeName.equalsIgnoreCase("jsonb");
+    }
+
     private static boolean isCastToTextType(Expression expr) {
         if (expr instanceof CastExpr) {
             String tn = ((CastExpr) expr).typeName().toLowerCase();
@@ -1283,6 +1301,18 @@ class BinaryOpEvaluator {
                     || BlankPadding.isBlankPadded(declaredTypeForResolution(bin.right(), ctx)))) {
             left = BlankPadding.trimmed(left);
             right = BlankPadding.trimmed(right);
+        }
+
+        // jsonb is a value and not the text it prints as, so two documents are compared as
+        // documents. Comparing their texts said 1 and 1.0 were different values and ordered
+        // containers by their first character, which put [1, 2] before [3].
+        if (isComparisonOp(bin.op()) && left instanceof String && right instanceof String
+                && (isJsonbTypeName(declaredTypeForResolution(bin.left(), ctx))
+                    || isJsonbTypeName(declaredTypeForResolution(bin.right(), ctx)))) {
+            int cmp = JsonOperations.compareJsonb((String) left, (String) right);
+            if (bin.op() == BinaryExpr.BinOp.IS_DISTINCT_FROM) return cmp != 0;
+            if (bin.op() == BinaryExpr.BinOp.IS_NOT_DISTINCT_FROM) return cmp == 0;
+            return compareOp(bin.op(), cmp);
         }
 
         // The two concatenations that take a text on one side read the other as text too, and
@@ -2016,15 +2046,10 @@ class BinaryOpEvaluator {
                 if (RangeOperations.isMultirangeOrEmpty(ls) || RangeOperations.isMultirangeOrEmpty(rs)) {
                     throw new MemgresException("operator does not exist: multirange || multirange", "42883");
                 }
-                // Text that is spelled the way an array literal is spelled is still text. Reading
-                // it as an array ran '{a,b}' || 'c' together into a three-element array, which is
-                // not what either operand held.
-                if ((ls.trim().startsWith("{") || ls.trim().startsWith("["))) {
-                    // Check for JSON concatenation
-                    if ((rs.trim().startsWith("{") || rs.trim().startsWith("["))) {
-                        return JsonOperations.concatenate(ls, rs);
-                    }
-                }
+                // Text that is spelled the way a document is spelled is still text, and two of
+                // them are run together rather than merged. Which || was written is settled from
+                // the operands' types further up; by here they are two strings, and the only
+                // concatenation left that takes two strings is the one over text.
                 return ls + rs;
             }
             case LIKE: {

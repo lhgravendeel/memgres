@@ -949,13 +949,11 @@ class ExprSpecialFormParser {
         if (ep.matchKeyword("PASSING")) {
             passing = parsePassingVars();
         }
-        JsonExistsExpr.OnBehavior onError = null;
-        if (ep.matchKeyword("TRUE")) { ep.expectKeyword("ON"); ep.expectKeyword("ERROR"); onError = JsonExistsExpr.OnBehavior.TRUE_VAL; }
-        else if (ep.matchKeyword("FALSE")) { ep.expectKeyword("ON"); ep.expectKeyword("ERROR"); onError = JsonExistsExpr.OnBehavior.FALSE_VAL; }
-        else if (ep.matchKeyword("UNKNOWN")) { ep.expectKeyword("ON"); ep.expectKeyword("ERROR"); onError = JsonExistsExpr.OnBehavior.UNKNOWN_VAL; }
-        else if (ep.matchKeyword("ERROR")) { ep.expectKeyword("ON"); ep.expectKeyword("ERROR"); onError = JsonExistsExpr.OnBehavior.ERROR; }
+        JsonExistsExpr.OnBehavior[] on = new JsonExistsExpr.OnBehavior[2];
+        Expression[] defaults = new Expression[2];
+        parseOnClauses(on, defaults, JsonOnClauses.Answers.TRUTH, "JSON_EXISTS()");
         ep.expect(TokenType.RIGHT_PAREN);
-        return new JsonExistsExpr(input, path, passing, onError);
+        return new JsonExistsExpr(input, path, passing, on[1]);
     }
 
     Expression parseJsonValue() {
@@ -972,34 +970,12 @@ class ExprSpecialFormParser {
         if (ep.matchKeyword("RETURNING")) {
             returningType = ep.parseTypeName();
         }
-        JsonExistsExpr.OnBehavior onEmpty = null;
-        Expression defaultOnEmpty = null;
-        JsonExistsExpr.OnBehavior onError = null;
-        Expression defaultOnError = null;
-        // Parse ON EMPTY and ON ERROR clauses (can appear in any order, at most once each)
-        for (int i = 0; i < 2; i++) {
-            if (ep.checkKeyword("DEFAULT")) {
-                ep.advance();
-                Expression defVal = ep.parseExpression();
-                ep.expectKeyword("ON");
-                if (ep.matchKeyword("EMPTY")) { onEmpty = null; defaultOnEmpty = defVal; }
-                else { ep.expectKeyword("ERROR"); onError = null; defaultOnError = defVal; }
-            } else if (ep.checkKeyword("NULL")) {
-                ep.advance();
-                ep.expectKeyword("ON");
-                if (ep.matchKeyword("EMPTY")) { onEmpty = JsonExistsExpr.OnBehavior.NULL_VAL; }
-                else { ep.expectKeyword("ERROR"); onError = JsonExistsExpr.OnBehavior.NULL_VAL; }
-            } else if (ep.checkKeyword("ERROR")) {
-                ep.advance();
-                ep.expectKeyword("ON");
-                if (ep.matchKeyword("EMPTY")) { onEmpty = JsonExistsExpr.OnBehavior.ERROR; }
-                else { ep.expectKeyword("ERROR"); onError = JsonExistsExpr.OnBehavior.ERROR; }
-            } else {
-                break;
-            }
-        }
+        JsonExistsExpr.OnBehavior[] on = new JsonExistsExpr.OnBehavior[2];
+        Expression[] defaults = new Expression[2];
+        parseOnClauses(on, defaults, JsonOnClauses.Answers.SCALAR, "JSON_VALUE()");
         ep.expect(TokenType.RIGHT_PAREN);
-        return new JsonValueExpr(input, path, returningType, passing, onEmpty, defaultOnEmpty, onError, defaultOnError);
+        return new JsonValueExpr(input, path, returningType, passing,
+                on[0], defaults[0], on[1], defaults[1]);
     }
 
     Expression parseJsonQuery() {
@@ -1030,32 +1006,85 @@ class ExprSpecialFormParser {
             }
         } else if (ep.matchKeyword("WITHOUT")) {
             ep.expectKeyword("WRAPPER");
-            wrapper = JsonQueryExpr.WrapperBehavior.NONE;
+            wrapper = JsonQueryExpr.WrapperBehavior.WITHOUT_WRAPPER;
         }
         JsonQueryExpr.QuotesBehavior quotes = JsonQueryExpr.QuotesBehavior.KEEP;
+        boolean quotesWritten = true;
         if (ep.matchKeyword("KEEP")) { ep.expectKeyword("QUOTES"); quotes = JsonQueryExpr.QuotesBehavior.KEEP; }
         else if (ep.matchKeyword("OMIT")) { ep.expectKeyword("QUOTES"); quotes = JsonQueryExpr.QuotesBehavior.OMIT; }
-        JsonExistsExpr.OnBehavior onEmpty = null;
-        JsonExistsExpr.OnBehavior onError = null;
-        for (int i = 0; i < 2; i++) {
-            if (ep.checkKeyword("NULL")) {
-                ep.advance(); ep.expectKeyword("ON");
-                if (ep.matchKeyword("EMPTY")) onEmpty = JsonExistsExpr.OnBehavior.NULL_VAL;
-                else { ep.expectKeyword("ERROR"); onError = JsonExistsExpr.OnBehavior.NULL_VAL; }
-            } else if (ep.checkKeyword("ERROR")) {
-                ep.advance(); ep.expectKeyword("ON");
-                if (ep.matchKeyword("EMPTY")) onEmpty = JsonExistsExpr.OnBehavior.ERROR;
-                else { ep.expectKeyword("ERROR"); onError = JsonExistsExpr.OnBehavior.ERROR; }
-            } else if (ep.checkKeyword("EMPTY")) {
-                ep.advance();
-                if (ep.matchKeyword("ARRAY")) { ep.expectKeyword("ON"); ep.expectKeyword("EMPTY"); onEmpty = JsonExistsExpr.OnBehavior.EMPTY_ARRAY; }
-                else if (ep.matchKeyword("OBJECT")) { ep.expectKeyword("ON"); ep.expectKeyword("EMPTY"); onEmpty = JsonExistsExpr.OnBehavior.EMPTY_OBJECT; }
-            } else {
-                break;
-            }
+        else quotesWritten = false;
+        // A wrapper already decides how the items are written, so saying anything about quotes on
+        // top of it is a contradiction rather than a refinement, and PostgreSQL refuses it.
+        if (quotesWritten && (wrapper == JsonQueryExpr.WrapperBehavior.WITH_WRAPPER
+                || wrapper == JsonQueryExpr.WrapperBehavior.WITH_CONDITIONAL_WRAPPER)) {
+            throw new MemgresException(
+                    "SQL/JSON QUOTES behavior must not be specified when WITH WRAPPER is used",
+                    "42601");
         }
+        JsonExistsExpr.OnBehavior[] on = new JsonExistsExpr.OnBehavior[2];
+        Expression[] defaults = new Expression[2];
+        parseOnClauses(on, defaults, JsonOnClauses.Answers.DOCUMENT, "JSON_QUERY()");
         ep.expect(TokenType.RIGHT_PAREN);
-        return new JsonQueryExpr(input, path, returningType, passing, wrapper, quotes, onEmpty, onError);
+        return new JsonQueryExpr(input, path, returningType, passing, wrapper, quotes,
+                on[0], defaults[0], on[1], defaults[1]);
+    }
+
+    /**
+     * The {@code ON EMPTY} and {@code ON ERROR} clauses of a SQL/JSON expression, read into slot
+     * 0 (empty) and slot 1 (error) of the two arrays.
+     *
+     * <p>The two take the same set of answers, so which of them is being written is only known
+     * once {@code ON} has been passed. Each may be written once and the empty one comes first:
+     * they are a sequence rather than a set, because they say what to do at different moments.
+     * A second clause of either kind ends the list as a syntax error at the word that could not
+     * follow -- for one written after the ON ERROR, that is the caller's business.
+     */
+    private void parseOnClauses(JsonExistsExpr.OnBehavior[] on, Expression[] defaults,
+                                JsonOnClauses.Answers answers, String whom) {
+        boolean sawEmpty = false;
+        while (true) {
+            Token start = ep.peek();
+            JsonExistsExpr.OnBehavior behavior;
+            Expression defaultValue = null;
+            if (ep.matchKeyword("NULL")) {
+                behavior = JsonExistsExpr.OnBehavior.NULL_VAL;
+            } else if (ep.matchKeyword("ERROR")) {
+                behavior = JsonExistsExpr.OnBehavior.ERROR;
+            } else if (ep.matchKeyword("TRUE")) {
+                behavior = JsonExistsExpr.OnBehavior.TRUE_VAL;
+            } else if (ep.matchKeyword("FALSE")) {
+                behavior = JsonExistsExpr.OnBehavior.FALSE_VAL;
+            } else if (ep.matchKeyword("UNKNOWN")) {
+                behavior = JsonExistsExpr.OnBehavior.UNKNOWN_VAL;
+            } else if (ep.matchKeyword("DEFAULT")) {
+                behavior = null;
+                defaultValue = ep.parseExpression();
+            } else if (ep.checkKeyword("EMPTY")
+                    && (ep.checkKeywordAt(1, "ARRAY") || ep.checkKeywordAt(1, "OBJECT"))) {
+                ep.advance();
+                behavior = ep.matchKeyword("ARRAY") ? JsonExistsExpr.OnBehavior.EMPTY_ARRAY
+                        : JsonExistsExpr.OnBehavior.EMPTY_OBJECT;
+                if (behavior == JsonExistsExpr.OnBehavior.EMPTY_OBJECT) ep.expectKeyword("OBJECT");
+            } else {
+                return;
+            }
+            ep.expectKeyword("ON");
+            Token which = ep.peek();
+            // A truth reading has an ON ERROR clause and no ON EMPTY one, so ON EMPTY is not an
+            // answer it refuses but a word its grammar has no place for.
+            int slot = !answers.truth() && ep.matchKeyword("EMPTY") ? 0 : 1;
+            if (slot == 0 && sawEmpty) {
+                throw ParseException.saying("syntax error at or near \"" + which.raw() + "\"",
+                        which, "42601");
+            }
+            if (slot == 1) ep.expectKeyword("ERROR");
+            JsonOnClauses.require(answers, whom, null, slot == 0, behavior, defaultValue != null,
+                    start);
+            on[slot] = behavior;
+            defaults[slot] = defaultValue;
+            if (slot == 1) return;
+            sawEmpty = true;
+        }
     }
 
     Expression parseJsonScalar() {
@@ -1082,20 +1111,34 @@ class ExprSpecialFormParser {
         return new FunctionCallExpr("json_serialize", Cols.listOf(arg));
     }
 
+    /**
+     * The type an SQL/JSON constructor was told to answer with, applied to what it built.
+     *
+     * <p>The clause used to be read and dropped, so every constructor answered with the characters
+     * it had assembled and a text column to hold them. The type settles both: what the column is,
+     * and — jsonb being a document rather than the text it was written as — how it prints. Where
+     * the clause is left out the type is json, which is what the standard says and not text.
+     */
+    private static Expression returning(Expression constructed, String type) {
+        return new CastExpr(constructed, type == null ? "json" : type);
+    }
+
     Expression parseJsonArray() {
         ep.advance(); // consume JSON_ARRAY
         ep.expect(TokenType.LEFT_PAREN);
         // Check for subquery: JSON_ARRAY(SELECT ...)
         if (ep.checkKeyword("SELECT") || ep.checkKeyword("WITH")) {
             Statement subquery = ep.parseSubqueryWithSetOps();
+            String subqueryType = ep.matchKeyword("RETURNING") ? ep.parseTypeName() : null;
             ep.expect(TokenType.RIGHT_PAREN);
             // Wrap as json_array_subquery function call
-            return new FunctionCallExpr("json_array_subquery", Cols.listOf(new SubqueryExpr(subquery)));
+            return returning(new FunctionCallExpr("json_array_subquery",
+                    Cols.listOf(new SubqueryExpr(subquery))), subqueryType);
         }
         // Empty: JSON_ARRAY()
         if (ep.check(TokenType.RIGHT_PAREN)) {
             ep.advance();
-            return new FunctionCallExpr("json_array_constructor", Cols.listOf());
+            return returning(new FunctionCallExpr("json_array_constructor", Cols.listOf()), null);
         }
         List<Expression> args = new ArrayList<>();
         boolean nullOnNull = false;
@@ -1108,11 +1151,11 @@ class ExprSpecialFormParser {
             ep.advance(); ep.advance(); ep.expectKeyword("NULL"); nullOnNull = true; absentOnNull = false;
         } else if (ep.matchKeyword("ABSENT")) { ep.expectKeyword("ON"); ep.expectKeyword("NULL"); }
         // RETURNING type
-        if (ep.matchKeyword("RETURNING")) { ep.parseTypeName(); } // consume but ignore for now
+        String type = ep.matchKeyword("RETURNING") ? ep.parseTypeName() : null;
         ep.expect(TokenType.RIGHT_PAREN);
         // Pack nullOnNull flag as an extra Literal arg
         args.add(Literal.ofString(nullOnNull ? "null_on_null" : "absent_on_null"));
-        return new FunctionCallExpr("json_array_constructor", args);
+        return returning(new FunctionCallExpr("json_array_constructor", args), type);
     }
 
     Expression parseJsonObject() {
@@ -1121,7 +1164,7 @@ class ExprSpecialFormParser {
         // Empty: JSON_OBJECT()
         if (ep.check(TokenType.RIGHT_PAREN)) {
             ep.advance();
-            return new FunctionCallExpr("json_object_constructor", Cols.listOf());
+            return returning(new FunctionCallExpr("json_object_constructor", Cols.listOf()), null);
         }
         List<Expression> args = new ArrayList<>();
         boolean nullOnNull = false;
@@ -1160,12 +1203,12 @@ class ExprSpecialFormParser {
         if (ep.matchKeyword("WITH")) { ep.expectKeyword("UNIQUE"); ep.expectKeyword("KEYS"); uniqueKeys = true; }
         else if (ep.matchKeyword("WITHOUT")) { ep.expectKeyword("UNIQUE"); ep.expectKeyword("KEYS"); }
         // RETURNING type
-        if (ep.matchKeyword("RETURNING")) { ep.parseTypeName(); }
+        String type = ep.matchKeyword("RETURNING") ? ep.parseTypeName() : null;
         ep.expect(TokenType.RIGHT_PAREN);
         // Pack flags as extra args
         args.add(Literal.ofString(nullOnNull ? "null_on_null" : "absent_on_null"));
         args.add(Literal.ofString(uniqueKeys ? "unique_keys" : "no_unique_keys"));
-        return new FunctionCallExpr("json_object_constructor", args);
+        return returning(new FunctionCallExpr("json_object_constructor", args), type);
     }
 
     Expression parseJsonArrayagg() {
@@ -1189,12 +1232,13 @@ class ExprSpecialFormParser {
         boolean nullOnNull = false;
         if (ep.matchKeyword("NULL")) { ep.expectKeyword("ON"); ep.expectKeyword("NULL"); nullOnNull = true; }
         else if (ep.matchKeyword("ABSENT")) { ep.expectKeyword("ON"); ep.expectKeyword("NULL"); }
-        if (ep.matchKeyword("RETURNING")) { ep.parseTypeName(); }
+        String type = ep.matchKeyword("RETURNING") ? ep.parseTypeName() : null;
         ep.expect(TokenType.RIGHT_PAREN);
         // Create as special aggregate function call
         List<Expression> args = Cols.listOf(arg,
                 Literal.ofString(nullOnNull ? "null_on_null" : "absent_on_null"));
-        return new FunctionCallExpr("json_arrayagg", args, false, false, orderBy, null);
+        return returning(new FunctionCallExpr("json_arrayagg", args, false, false, orderBy, null),
+                type);
     }
 
     Expression parseJsonObjectagg() {
@@ -1215,20 +1259,28 @@ class ExprSpecialFormParser {
             }
             val = ep.parseExpression();
         }
-        boolean nullOnNull = false;
-        if (ep.matchKeyword("NULL")) { ep.expectKeyword("ON"); ep.expectKeyword("NULL"); nullOnNull = true; }
-        else if (ep.matchKeyword("ABSENT")) { ep.expectKeyword("ON"); ep.expectKeyword("NULL"); }
+        // A member whose value is null is still a member, so JSON_OBJECTAGG keeps it unless told
+        // otherwise -- the default here is NULL ON NULL, the opposite of the array construct's,
+        // where an absent element would shift every element after it.
+        boolean nullOnNull = true;
+        if (ep.matchKeyword("NULL")) { ep.expectKeyword("ON"); ep.expectKeyword("NULL"); }
+        else if (ep.matchKeyword("ABSENT")) {
+            ep.expectKeyword("ON");
+            ep.expectKeyword("NULL");
+            nullOnNull = false;
+        }
         boolean uniqueKeys = false;
         if (ep.matchKeyword("WITH")) { ep.expectKeyword("UNIQUE"); ep.expectKeyword("KEYS"); uniqueKeys = true; }
         else if (ep.matchKeyword("WITHOUT")) { ep.expectKeyword("UNIQUE"); ep.expectKeyword("KEYS"); }
-        if (ep.matchKeyword("RETURNING")) { ep.parseTypeName(); }
+        String type = ep.matchKeyword("RETURNING") ? ep.parseTypeName() : null;
         ep.expect(TokenType.RIGHT_PAREN);
         List<Expression> args = new ArrayList<>();
         args.add(key);
         args.add(val);
         args.add(Literal.ofString(nullOnNull ? "null_on_null" : "absent_on_null"));
         args.add(Literal.ofString(uniqueKeys ? "unique_keys" : "no_unique_keys"));
-        return new FunctionCallExpr("json_objectagg", args, false, false, null, null);
+        return returning(new FunctionCallExpr("json_objectagg", args, false, false, null, null),
+                type);
     }
 
     /** Check if current position is NULL ON (i.e., NULL ON NULL clause, not a null value) */

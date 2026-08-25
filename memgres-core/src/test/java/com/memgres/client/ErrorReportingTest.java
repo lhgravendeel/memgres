@@ -183,20 +183,24 @@ class ErrorReportingTest {
 
     // ----------------------------------------------------------------- depth
 
+    /**
+     * The depth at which reading gives out is a property of the stack it runs on, not of the
+     * document, so the depth asked for here is far past any stack rather than near this one's.
+     */
     @Test
     void nestingDeeperThanTheParserWillFollow() {
         assertState("54001",
-                "SELECT (repeat('[', 20000) || repeat(']', 20000))::jsonb IS NOT NULL");
+                "SELECT (repeat('[', 100000) || repeat(']', 100000))::jsonb IS NOT NULL");
         assertState("54001",
-                "SELECT (repeat('[', 20000) || repeat(']', 20000))::json IS NOT NULL");
+                "SELECT (repeat('[', 100000) || repeat(']', 100000))::json IS NOT NULL");
     }
 
     @Test
     void moderateNestingIsAccepted() throws Exception {
         assertEquals("true",
-                scalar("SELECT ((repeat('[', 100) || repeat(']', 100))::jsonb IS NOT NULL)::text"));
+                scalar("SELECT ((repeat('[', 1000) || repeat(']', 1000))::jsonb IS NOT NULL)::text"));
         assertEquals("true",
-                scalar("SELECT ((repeat('[', 100) || repeat(']', 100))::json IS NOT NULL)::text"));
+                scalar("SELECT ((repeat('[', 1000) || repeat(']', 1000))::json IS NOT NULL)::text"));
     }
 
     // -------------------------------------------------------------- OVERLAPS
