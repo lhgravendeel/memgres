@@ -151,6 +151,8 @@ public enum DataType {
     REGPROC(24, "regproc"),
     REGCLASS(2205, "regclass"),
     REGTYPE(2206, "regtype"),
+    /** The name of a text search configuration, which is what the search functions take. */
+    REGCONFIG(3734, "regconfig"),
 
     // The 0-based vector types the catalogs use for argument and key lists
     INT2VECTOR(22, "int2vector"),

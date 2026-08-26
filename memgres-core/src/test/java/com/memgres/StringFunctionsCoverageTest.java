@@ -483,9 +483,11 @@ class StringFunctionsCoverageTest {
         assertEquals("hello", query1("SELECT normalize('hello')"));
     }
 
+    /** There is no unicode(): ascii() is the function that answers a character's code point. */
     @Test
     void testUnicode() throws SQLException {
-        assertEquals(65, queryInt("SELECT unicode('A')"));
+        assertEquals(65, queryInt("SELECT ascii('A')"));
+        assertEquals(128512, queryInt("SELECT ascii(U&'\\+01F600')"));
     }
 
     @Test

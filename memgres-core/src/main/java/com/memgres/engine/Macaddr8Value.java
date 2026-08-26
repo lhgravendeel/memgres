@@ -23,59 +23,15 @@ public class Macaddr8Value implements Comparable<Macaddr8Value> {
      * Also accepts 6-byte formats (auto-expanded with ff:fe).
      */
     public static Macaddr8Value parse(String input) {
-        String s = input.trim().toLowerCase();
-        byte[] bytes = null;
-
-        // Try colon-separated
-        if (s.contains(":")) {
-            String[] parts = s.split(":");
-            if (parts.length == 8) {
-                bytes = parseHexParts(parts, 8, input);
-            } else if (parts.length == 6) {
-                // 6-byte: expand to 8 with ff:fe
-                byte[] mac6 = parseHexParts(parts, 6, input);
-                bytes = expand6to8(mac6);
-            }
-        }
-        // Try dash-separated
-        else if (s.contains("-")) {
-            String[] parts = s.split("-");
-            if (parts.length == 8) {
-                bytes = parseHexParts(parts, 8, input);
-            } else if (parts.length == 6) {
-                byte[] mac6 = parseHexParts(parts, 6, input);
-                bytes = expand6to8(mac6);
-            }
-        }
-        // Try dot-separated (4 groups of 4 hex)
-        else if (s.contains(".")) {
-            String[] parts = s.split("\\.");
-            if (parts.length == 4) {
-                bytes = parseDotGroups(parts, 4, input);
-            } else if (parts.length == 3) {
-                // 6-byte dot format
-                byte[] mac6 = parseDotGroups(parts, 3, input);
-                bytes = expand6to8(mac6);
-            }
-        }
-        // Try bare hex
-        else if (s.length() == 16 && s.matches("[0-9a-f]+")) {
-            bytes = new byte[8];
-            for (int i = 0; i < 8; i++) {
-                bytes[i] = (byte) Integer.parseInt(s.substring(i * 2, i * 2 + 2), 16);
-            }
-        } else if (s.length() == 12 && s.matches("[0-9a-f]+")) {
-            byte[] mac6 = new byte[6];
-            for (int i = 0; i < 6; i++) {
-                mac6[i] = (byte) Integer.parseInt(s.substring(i * 2, i * 2 + 2), 16);
-            }
-            bytes = expand6to8(mac6);
-        }
-
+        byte[] bytes = MacaddrGrouping.read(input, "macaddr8", 16, new int[][]{
+                {16}, {2, 2, 2, 2, 2, 2, 2, 2}, {8, 8}, {4, 4, 4, 4}, {6, 10},
+                // The six-byte spellings, which are widened with ff:fe below.
+                {12}, {2, 2, 2, 2, 2, 2}, {6, 6}, {4, 4, 4}});
         if (bytes == null) {
-            throw new MemgresException("invalid input syntax for type macaddr8: \"" + input + "\"", "22P02");
+            throw new MemgresException(
+                    "invalid input syntax for type macaddr8: \"" + input + "\"", "22P02");
         }
-        return new Macaddr8Value(bytes);
+        return new Macaddr8Value(bytes.length == 6 ? expand6to8(bytes) : bytes);
     }
 
     private static byte[] parseHexParts(String[] parts, int expected, String original) {

@@ -401,13 +401,12 @@ class XmlCoverageTest {
     // ---- xmlroot ----
 
     @Test void testXmlrootVersion() throws Exception {
+        // A declaration is written only where it says something. Version 1.0 with no standalone
+        // marker is what every document has anyway, so there is nothing to write.
         try (Statement st = conn.createStatement();
              ResultSet rs = st.executeQuery("SELECT XMLROOT('<a/>', VERSION '1.0')")) {
             assertTrue(rs.next());
-            String result = rs.getString(1);
-            assertTrue(result.contains("<?xml"));
-            assertTrue(result.contains("version=\"1.0\""));
-            assertTrue(result.contains("<a/>"));
+            assertEquals("<a/>", rs.getString(1));
         }
     }
 
@@ -415,9 +414,15 @@ class XmlCoverageTest {
         try (Statement st = conn.createStatement();
              ResultSet rs = st.executeQuery("SELECT XMLROOT('<a/>', VERSION NO VALUE)")) {
             assertTrue(rs.next());
-            String result = rs.getString(1);
-            assertTrue(result.contains("<?xml"));
-            assertTrue(result.contains("<a/>"));
+            assertEquals("<a/>", rs.getString(1));
+        }
+    }
+
+    @Test void testXmlrootVersionOtherThanTheDefault() throws Exception {
+        try (Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery("SELECT XMLROOT('<a/>', VERSION '2.0')")) {
+            assertTrue(rs.next());
+            assertEquals("<?xml version=\"2.0\"?><a/>", rs.getString(1));
         }
     }
 
@@ -443,9 +448,7 @@ class XmlCoverageTest {
         try (Statement st = conn.createStatement();
              ResultSet rs = st.executeQuery("SELECT XMLROOT('<a/>', VERSION '1.0', STANDALONE NO VALUE)")) {
             assertTrue(rs.next());
-            String result = rs.getString(1);
-            assertTrue(result.contains("version=\"1.0\""));
-            assertFalse(result.contains("standalone"));
+            assertEquals("<a/>", rs.getString(1));
         }
     }
 

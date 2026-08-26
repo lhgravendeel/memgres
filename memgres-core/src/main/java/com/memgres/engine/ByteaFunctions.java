@@ -36,78 +36,115 @@ class ByteaFunctions {
         }
     }
 
+    /**
+     * A bit index, which may be wider than an int because {@code get_bit(bytea, bigint)} is a
+     * function PostgreSQL declares.
+     */
+    private static long bitIndex(Object given) {
+        return given instanceof Number ? ((Number) given).longValue()
+                : Long.parseLong(given.toString().trim());
+    }
+
+    /**
+     * A byte index, which may not: PostgreSQL declares {@code get_byte} and {@code set_byte} over
+     * an int alone, so a wider index names no function to call rather than a byte to read.
+     */
+    private int byteIndex(Object given, String function, String before, String after) {
+        if (given instanceof Number) {
+            long value = ((Number) given).longValue();
+            if (value < Integer.MIN_VALUE || value > Integer.MAX_VALUE) {
+                MemgresException e = new MemgresException("function " + function + "(" + before
+                        + "bigint" + after + ") does not exist", "42883");
+                e.setHint("No function matches the given name and argument types. "
+                        + "You might need to add explicit type casts.");
+                throw e;
+            }
+            return (int) value;
+        }
+        return executor.toInt(given);
+    }
+
+    /**
+     * Check the index before an offset is worked out from it.
+     *
+     * <p>Dividing first truncated towards zero, so bit -1 landed in byte 0 and passed a check
+     * that was only ever looking at the byte: the read answered a bit the caller never named and
+     * the write went to one it never named either.
+     */
+    private static void requireBitInRange(long bit, int byteLength) {
+        long bits = (long) byteLength * 8;
+        if (bit < 0 || bit >= bits) {
+            throw new MemgresException(
+                    "index " + bit + " out of valid range, 0.." + (bits - 1), "2202E");
+        }
+    }
+
     Object eval(String name, FunctionCallExpr fn, RowContext ctx) {
         switch (name) {
             case "sha256": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
                 byte[] input = arg instanceof byte[] ? (byte[]) arg : arg.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
-                return ByteaOperations.encodeHex(ByteaOperations.sha256(input));
+                // The digest is bytes. Handing back the hex text of it made the documented
+                // encode(sha256(x),'hex') spell out the hex of the hex.
+                return ByteaOperations.sha256(input);
             }
             case "sha384": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
                 byte[] input = arg instanceof byte[] ? (byte[]) arg : arg.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
-                return ByteaOperations.encodeHex(ByteaOperations.sha384(input));
+                // The digest is bytes. Handing back the hex text of it made the documented
+                // encode(sha384(x),'hex') spell out the hex of the hex.
+                return ByteaOperations.sha384(input);
             }
             case "sha512": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
                 byte[] input = arg instanceof byte[] ? (byte[]) arg : arg.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
-                return ByteaOperations.encodeHex(ByteaOperations.sha512(input));
+                // The digest is bytes. Handing back the hex text of it made the documented
+                // encode(sha512(x),'hex') spell out the hex of the hex.
+                return ByteaOperations.sha512(input);
             }
             case "get_byte": {
                 Object data = executor.evalExpr(fn.args().get(0), ctx);
                 Object offset = executor.evalExpr(fn.args().get(1), ctx);
-                if (data == null) return null;
+                if (data == null || offset == null) return null;
                 byte[] bytes = data instanceof byte[] ? (byte[]) data : data.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
-                return ByteaOperations.getByte(bytes, executor.toInt(offset));
+                return ByteaOperations.getByte(bytes,
+                        byteIndex(offset, "get_byte", "bytea, ", ""));
             }
             case "set_byte": {
                 Object data = executor.evalExpr(fn.args().get(0), ctx);
                 Object offset = executor.evalExpr(fn.args().get(1), ctx);
                 Object newByte = executor.evalExpr(fn.args().get(2), ctx);
-                if (data == null) return null;
+                if (data == null || offset == null || newByte == null) return null;
                 byte[] bytes = data instanceof byte[] ? (byte[]) data : data.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
                 // set_byte(bytea, int, int) returns bytea.
-                return ByteaOperations.setByte(bytes, executor.toInt(offset), executor.toInt(newByte));
+                return ByteaOperations.setByte(bytes,
+                        byteIndex(offset, "set_byte", "bytea, ", ", integer"),
+                        executor.toInt(newByte));
             }
             case "convert_from": {
+                // The encoding says what the bytes spell. Reading them as UTF-8 whatever the
+                // caller named answered a different text, or refused bytes that spell a
+                // perfectly good character in the encoding they were actually written in.
                 Object data = executor.evalExpr(fn.args().get(0), ctx);
-                if (data == null) return null;
-                if (fn.args().size() > 1) {
-                    Object enc = executor.evalExpr(fn.args().get(1), ctx);
-                    if (enc != null) validateEncoding(enc.toString());
-                }
-                // convert_from(bytea, encoding) -> text
-                if (data instanceof byte[]) {
-                    byte[] ba = (byte[]) data;
-                    // Validate UTF-8 encoding
-                    java.nio.charset.CharsetDecoder decoder = java.nio.charset.StandardCharsets.UTF_8.newDecoder()
-                            .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
-                            .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT);
-                    try {
-                        return decoder.decode(java.nio.ByteBuffer.wrap(ba)).toString();
-                    } catch (java.nio.charset.CharacterCodingException e) {
-                        throw new MemgresException("invalid byte sequence for encoding \"UTF8\"", "22021");
-                    }
-                }
-                return data.toString();
+                Object encObj = fn.args().size() > 1
+                        ? executor.evalExpr(fn.args().get(1), ctx) : null;
+                if (data == null || (fn.args().size() > 1 && encObj == null)) return null;
+                String encoding = encObj == null ? "UTF8" : PgEncoding.named(encObj, "source");
+                byte[] source = data instanceof byte[]
+                        ? (byte[]) data
+                        : data.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                return PgEncoding.decode(source, encoding);
             }
             case "convert_to": {
                 Object data = executor.evalExpr(fn.args().get(0), ctx);
-                if (data == null) return null;
-                String encoding = "UTF-8";
-                if (fn.args().size() > 1) {
-                    Object enc = executor.evalExpr(fn.args().get(1), ctx);
-                    if (enc != null) {
-                        validateEncoding(enc.toString());
-                        encoding = enc.toString().toUpperCase();
-                        if (encoding.equals("UTF8")) encoding = "UTF-8";
-                    }
-                }
-                // convert_to(text, encoding) -> bytea
-                return data.toString().getBytes(java.nio.charset.Charset.forName(encoding));
+                Object encObj = fn.args().size() > 1
+                        ? executor.evalExpr(fn.args().get(1), ctx) : null;
+                if (data == null || (fn.args().size() > 1 && encObj == null)) return null;
+                String encoding = encObj == null ? "UTF8" : PgEncoding.named(encObj, "destination");
+                return PgEncoding.encode(data.toString(), encoding);
             }
             case "bit_count": {
                 // PG: bit_count(bytea|bitstring) -> bigint, number of set bits (popcount)
@@ -135,16 +172,14 @@ class ByteaFunctions {
             case "get_bit": {
                 Object data = executor.evalExpr(fn.args().get(0), ctx);
                 Object pos = executor.evalExpr(fn.args().get(1), ctx);
-                if (data == null) return null;
-                int p = executor.toInt(pos);
+                if (data == null || pos == null) return null;
+                long p = bitIndex(pos);
                 if (data instanceof byte[]) {
                     byte[] bytes = (byte[]) data;
                     // bytea get_bit: PG18 numbers bits LSB-first within each byte (bit 0 = LSB of byte 0).
-                    int byteIdx = p / 8;
-                    int bitIdx = p % 8;
-                    if (byteIdx < 0 || byteIdx >= bytes.length) {
-                        throw new MemgresException("index " + p + " out of valid range, 0.." + (bytes.length * 8 - 1), "2202E");
-                    }
+                    requireBitInRange(p, bytes.length);
+                    int byteIdx = (int) (p / 8);
+                    int bitIdx = (int) (p % 8);
                     return (bytes[byteIdx] >> bitIdx) & 1;
                 }
                 // For bit strings, direct character indexing
@@ -155,14 +190,14 @@ class ByteaFunctions {
                     throw new MemgresException("bit index " + p + " out of valid range (0.."
                             + (s.length() - 1) + ")", "2202E");
                 }
-                return Character.getNumericValue(s.charAt(p));
+                return Character.getNumericValue(s.charAt((int) p));
             }
             case "set_bit": {
                 Object data = executor.evalExpr(fn.args().get(0), ctx);
                 Object pos = executor.evalExpr(fn.args().get(1), ctx);
                 Object newBit = executor.evalExpr(fn.args().get(2), ctx);
-                if (data == null) return null;
-                int p = executor.toInt(pos);
+                if (data == null || pos == null || newBit == null) return null;
+                long p = bitIndex(pos);
                 int nb = executor.toInt(newBit);
                 // A bit holds a 0 or a 1, so there is no third value to write into one. Reading
                 // anything else as "clear the bit" quietly did something the caller never asked for.
@@ -172,11 +207,9 @@ class ByteaFunctions {
                 if (data instanceof byte[]) {
                     byte[] bytes = (byte[]) data;
                     // bytea set_bit: PG18 numbers bits LSB-first within each byte (bit 0 = LSB of byte 0).
-                    int byteIdx = p / 8;
-                    int bitIdx = p % 8;
-                    if (byteIdx < 0 || byteIdx >= bytes.length) {
-                        throw new MemgresException("index " + p + " out of valid range, 0.." + (bytes.length * 8 - 1), "2202E");
-                    }
+                    requireBitInRange(p, bytes.length);
+                    int byteIdx = (int) (p / 8);
+                    int bitIdx = (int) (p % 8);
                     byte[] result = bytes.clone();
                     if (nb == 1) {
                         result[byteIdx] = (byte)(result[byteIdx] | (1 << bitIdx));
@@ -188,7 +221,7 @@ class ByteaFunctions {
                 // For bit strings
                 String s = data instanceof AstExecutor.PgBitString ? ((AstExecutor.PgBitString) data).bits() : data.toString();
                 char[] chars = s.toCharArray();
-                if (p >= 0 && p < chars.length) chars[p] = nb == 1 ? '1' : '0';
+                if (p >= 0 && p < chars.length) chars[(int) p] = nb == 1 ? '1' : '0';
                 return new AstExecutor.PgBitString(new String(chars));
             }
             default:

@@ -53,7 +53,7 @@ public final class XmlOperations {
         try {
             parseContent(text);
         } catch (MemgresException e) {
-            throw new MemgresException("invalid XML content: " + extractXmlError(text), "2200N");
+            throw invalidXml(false, extractXmlError(text));
         }
         return text;
     }
@@ -200,7 +200,14 @@ public final class XmlOperations {
      * xmlforest(val AS name, ...)
      * Creates a forest of XML elements.
      */
-    public static String xmlforest(List<String> names, List<Object> values) {
+    /**
+     * xmlforest(val AS name, ...)
+     *
+     * @param alreadyXml which values are xml already, and so go in as the markup they are rather
+     *     than as the characters that spell it -- the same rule xmlelement goes by
+     */
+    public static String xmlforest(List<String> names, List<Object> values,
+                                   List<Boolean> alreadyXml) {
         if (names == null || names.isEmpty()) return null;
         StringBuilder sb = new StringBuilder();
         boolean hasContent = false;
@@ -208,12 +215,30 @@ public final class XmlOperations {
             Object val = i < values.size() ? values.get(i) : null;
             if (val == null) continue; // NULL values produce no element
             String safeName = escapeXmlName(names.get(i));
+            boolean isXml = alreadyXml != null && i < alreadyXml.size()
+                    && Boolean.TRUE.equals(alreadyXml.get(i));
             sb.append('<').append(safeName).append('>');
-            sb.append(escapeXml(val.toString()));
+            sb.append(isXml ? val.toString() : escapeXml(val.toString()));
             sb.append("</").append(safeName).append('>');
             hasContent = true;
         }
         return hasContent ? sb.toString() : null;
+    }
+
+    /**
+     * The complaint about text that is not XML.
+     *
+     * <p>PostgreSQL's sentence is fixed -- it names only whether a document or content was
+     * wanted -- and the parser's own account of what went wrong is the detail beneath it.
+     * Running the two together made the primary message a different sentence for every
+     * malformation, which is not something a client can match on.
+     */
+    private static MemgresException invalidXml(boolean asDocument, String detail) {
+        MemgresException e = new MemgresException(
+                asDocument ? "invalid XML document" : "invalid XML content",
+                asDocument ? "2200M" : "2200N");
+        if (detail != null && !detail.isEmpty()) e.setDetail(detail);
+        return e;
     }
 
     /** xmlpi(name target [, content]): creates an XML processing instruction. */
@@ -232,17 +257,24 @@ public final class XmlOperations {
     }
 
     /** xmlroot(xml, version text, standalone yes|no|no value) */
+    /**
+     * xmlroot(xml, version text, standalone yes|no|no value)
+     *
+     * <p>A declaration is written only where it says something: a standalone marker always does,
+     * and a version does when it is not the one every document has anyway. Writing one for
+     * {@code version '1.0'} alone put twenty-one characters in front of every value that asked
+     * for the version it already had.
+     */
     public static String xmlroot(String xml, String version, String standalone) {
         if (xml == null) return null;
         String body = stripXmlDeclaration(xml);
-        StringBuilder decl = new StringBuilder("<?xml");
-        if (version != null && !version.equalsIgnoreCase("no value")) {
-            decl.append(" version=\"").append(version).append("\"");
-        } else {
-            decl.append(" version=\"1.0\"");
-        }
-        if (standalone != null && !standalone.equalsIgnoreCase("no value")) {
-            decl.append(" standalone=\"").append(standalone.toLowerCase()).append("\"");
+        boolean saysStandalone = standalone != null && !standalone.equalsIgnoreCase("no value");
+        String saidVersion = version == null || version.equalsIgnoreCase("no value")
+                ? "1.0" : version;
+        if (!saysStandalone && saidVersion.equals("1.0")) return body;
+        StringBuilder decl = new StringBuilder("<?xml version=\"").append(saidVersion).append('"');
+        if (saysStandalone) {
+            decl.append(" standalone=\"").append(standalone.toLowerCase()).append('"');
         }
         decl.append("?>");
         return decl.toString() + body;
@@ -412,14 +444,14 @@ public final class XmlOperations {
                 if (Character.isLetter(c) || c == '_') {
                     sb.append(c);
                 } else {
-                    sb.append(String.format("_x%04x_", (int) c));
+                    sb.append(String.format("_x%04X_", (int) c));
                 }
             } else {
                 // Name char: letter, digit, hyphen, dot, underscore, colon
                 if (Character.isLetterOrDigit(c) || c == '-' || c == '.' || c == '_' || c == ':') {
                     sb.append(c);
                 } else {
-                    sb.append(String.format("_x%04x_", (int) c));
+                    sb.append(String.format("_x%04X_", (int) c));
                 }
             }
         }
@@ -467,7 +499,7 @@ public final class XmlOperations {
             builder.setErrorHandler(new SilentErrorHandler());
             builder.parse(new InputSource(new StringReader(text)));
         } catch (Exception e) {
-            throw new MemgresException("invalid XML document: " + e.getMessage(), "2200M");
+            throw invalidXml(true, e.getMessage());
         }
     }
 
@@ -483,7 +515,7 @@ public final class XmlOperations {
             builder.setErrorHandler(new SilentErrorHandler());
             builder.parse(new InputSource(new StringReader(wrapped)));
         } catch (Exception e) {
-            throw new MemgresException("invalid XML content: " + e.getMessage(), "2200N");
+            throw invalidXml(false, e.getMessage());
         }
     }
 

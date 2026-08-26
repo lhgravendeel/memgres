@@ -1054,7 +1054,9 @@ public class ExpressionParser {
             }
             Expression right = parseOtherOps();
             if (matchKeyword("ESCAPE")) {
-                String esc = advance().value(); // string literal
+                // The escape is an operand, so it is kept as one: written as NULL it is
+                // nothing, and reading the token's text made an escape spelled "NULL".
+                Expression esc = parseOtherOps();
                 left = new LikeExpr(left, right, esc, false, negated);
             } else {
                 Expression result = new BinaryExpr(left, BinaryExpr.BinOp.LIKE, right);
@@ -1068,7 +1070,7 @@ public class ExpressionParser {
             }
             Expression right = parseOtherOps();
             if (matchKeyword("ESCAPE")) {
-                String esc = advance().value(); // string literal
+                Expression esc = parseOtherOps();
                 left = new LikeExpr(left, right, esc, true, negated);
             } else {
                 Expression result = new BinaryExpr(left, BinaryExpr.BinOp.ILIKE, right);
@@ -1410,8 +1412,13 @@ public class ExpressionParser {
             return new UnaryExpr(UnaryExpr.UnaryOp.GEO_IS_HORIZONTAL, parseUnary());
         }
         // @@ (geometric center prefix operator) — shares token with binary TS_MATCH,
-        // but a leading @@ can only be the unary center-of-object operator.
-        if (match(TokenType.TS_MATCH)) {
+        // but a leading @@ can only be the unary center-of-object operator. @@@ shares the
+        // token too and has no prefix form at all, so it is refused rather than read as @@.
+        if (check(TokenType.TS_MATCH)) {
+            if ("@@@".equals(peek().value())) {
+                throw new ParseException("operator does not exist: @@@", peek(), "42883");
+            }
+            advance();
             return new UnaryExpr(UnaryExpr.UnaryOp.GEO_CENTER, parseUnary());
         }
         // # (geometric npoints prefix operator) — shares token with binary HASH.

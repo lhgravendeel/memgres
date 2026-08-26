@@ -131,9 +131,10 @@ class BitByteaMoneyTest {
 
     @Test @Order(22)
     void encodeEscapeSingleBackslash() throws SQLException {
-        // encode escape should use single backslash for non-printable
+        // A zero byte, a byte with its high bit set, and the backslash itself are the only ones
+        // written as escapes. Every other byte stands for itself, control character or not.
         String result = query("SELECT encode('\\x000141'::bytea, 'escape')");
-        assertEquals("\\000\\001A", result);
+        assertEquals("\\000\u0001A", result);
     }
 
     @Test @Order(23)

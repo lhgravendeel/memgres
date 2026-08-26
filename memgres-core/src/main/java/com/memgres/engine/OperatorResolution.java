@@ -58,6 +58,13 @@ final class OperatorResolution {
             OPERAND_TYPES.add((Integer) row[2]);
             OPERAND_TYPES.add((Integer) row[3]);
         }
+        // PostgreSQL declares no operator whose own operand is xml -- pg_operator names it
+        // nowhere -- so the table's silence about it is a judgement and not an absence. Left
+        // unjudgeable, xml was compared as the text it prints as and so had an equality and an
+        // ordering it does not have; a GROUP BY or a DISTINCT over an xml column ran where a
+        // real server refuses the query. It still reaches the polymorphic rows, which is how
+        // 'a' || '<a/>'::xml resolves.
+        OPERAND_TYPES.add(Integer.valueOf(DataType.XML.getOid()));
     }
 
     private static boolean isPolymorphic(int oid) {
@@ -219,7 +226,7 @@ final class OperatorResolution {
         // xml is the one type PostgreSQL gives no operator of any kind, so it appears nowhere in
         // the table and the table's silence about it says nothing either way. Every other type
         // with no equality is read off the table.
-        if (type != DataType.XML && refusalFor("=", oid, oid, null, null) == null) return null;
+        if (refusalFor("=", oid, oid, null, null) == null) return null;
         return new MemgresException("could not identify an equality operator for type "
                 + type.toRegtypeDisplay(), "42883");
     }

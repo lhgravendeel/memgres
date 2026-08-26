@@ -479,6 +479,16 @@ public final class TypeCoercion {
         // to be one: the check has to come before the value is taken as already stored.
         if (type == DataType.PG_LSN) return checkedLsn(value);
 
+        // A geometric column holds a shape, and the shape is what the type's own reader makes of
+        // the text. The reader was not run on the way in at all, so a column took whatever
+        // characters it was given: a literal naming no shape was stored, and a box was kept
+        // corner-for-corner as written rather than in the one order every box is held in --
+        // which then compared unequal to the same box written the other way round.
+        if (GeometricOperations.isGeometricType(type)) {
+            return GeometricOperations.format(
+                    GeometricOperations.parseAs(type.getPgName(), String.valueOf(value)));
+        }
+
         // An array column holds an array. Writing the text of one into the column instead threw
         // away the bounds and the element type, so everything read back out of it was a string.
         if (DataType.isArrayType(type)) {
@@ -1473,6 +1483,23 @@ public final class TypeCoercion {
     /** Current DateStyle field order used for parsing ambiguous numeric date input. */
     public static String getDateOrder() {
         return DATE_ORDER.get();
+    }
+
+    /**
+     * The session IntervalStyle, published per-statement alongside DateStyle.
+     *
+     * <p>It says how an interval is written, and also how an ambiguously written one is read:
+     * under the SQL standard's rules one sign stands for every field that follows it.
+     */
+    private static final ThreadLocal<String> INTERVAL_STYLE =
+            ThreadLocal.withInitial(() -> "postgres");
+
+    public static void setIntervalStyle(String style) {
+        INTERVAL_STYLE.set(style == null || style.isEmpty() ? "postgres" : style);
+    }
+
+    public static String getIntervalStyle() {
+        return INTERVAL_STYLE.get();
     }
 
     /**
@@ -2986,6 +3013,29 @@ public final class TypeCoercion {
     /**
      * Type-aware equality check.
      */
+    /**
+     * A value written so that two values the type calls equal write the same text.
+     *
+     * <p>Used where an identity has to be built out of text -- a group key, the pre-check that
+     * decides whether a unique index can be built. {@code toString} is the Java rendering and
+     * not the type's, so a numeric written 1.0 and the same value written 1.00 came out as two
+     * different keys, and a byte array came out as its identity hash.
+     */
+    public static String keyText(Object value) {
+        if (value == null) return "\0NULL\0";
+        if (value instanceof java.math.BigDecimal) {
+            return ((java.math.BigDecimal) value).stripTrailingZeros().toPlainString();
+        }
+        if (value instanceof byte[]) return ByteaOperations.encodeHex((byte[]) value);
+        if (value instanceof Number && !(value instanceof java.math.BigInteger)) {
+            double d = ((Number) value).doubleValue();
+            if (d == Math.rint(d) && !Double.isInfinite(d)) {
+                return java.math.BigDecimal.valueOf(d).stripTrailingZeros().toPlainString();
+            }
+        }
+        return toString(value);
+    }
+
     public static boolean areEqual(Object a, Object b) {
         if (a == null && b == null) return true;
         if (a == null || b == null) return false;
@@ -3013,6 +3063,13 @@ public final class TypeCoercion {
                     boundsB == null ? defaultBounds(lb) : boundsB);
         }
         if (a.equals(b) || b.equals(a)) return true;
+        // A shape is equal to another by the rule its own type has, which is not "the same
+        // characters": two circles of one radius are equal wherever they sit, and two lines are
+        // equal whenever one's coefficients are the other's scaled.
+        if (a instanceof String && b instanceof String) {
+            Boolean shapes = GeometricOperations.equalShapes((String) a, (String) b);
+            if (shapes != null) return shapes.booleanValue();
+        }
         // bytea: compare the bytes, not the array identity
         if (a instanceof byte[] && b instanceof byte[]) {
             return java.util.Arrays.equals((byte[]) a, (byte[]) b);

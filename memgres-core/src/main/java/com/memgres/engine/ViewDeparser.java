@@ -1605,7 +1605,9 @@ public final class ViewDeparser {
         bracketedOperand(node.left(), readAs == null ? 0 : readAs[0], null, operator, true);
         out.append(' ').append(operator).append(" like_escape(");
         operandAs(node.pattern(), DataType.TEXT.getOid(), 0);
-        out.append(", ").append(quoted(node.escape())).append("::text)");
+        out.append(", ");
+        operandAs(node.escape(), DataType.TEXT.getOid(), 0);
+        out.append(")");
         if (paren) out.append(')');
     }
 

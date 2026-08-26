@@ -80,6 +80,11 @@ class FunctionEvaluator {
     private final CatalogSystemFunctions catalogSystemFunctions;
     final JsonFunctions jsonFunctions;
     private final TextSearchFunctions textSearchFunctions;
+
+    /** The configuration a name stands for, which the FROM-clause forms need too. */
+    String namedTsConfig(String rawName) {
+        return textSearchFunctions.namedConfig(rawName);
+    }
     private final DateTimeFunctions dateTimeFunctions;
     private final XmlFunctions xmlFunctions;
     private final GeometricFunctions geometricFunctions;
@@ -1582,6 +1587,9 @@ class FunctionEvaluator {
             }
             case "nextval": {
                 Object seqArg = executor.evalExpr(fn.args().get(0), ctx);
+                // The argument names a sequence, and nothing names none: stringifying it first
+                // made a relation called "null" and complained that it did not exist.
+                if (seqArg == null) return null;
                 String seqName;
                 if (seqArg instanceof RegclassValue) {
                     RegclassValue rc = (RegclassValue) seqArg;
@@ -1613,7 +1621,9 @@ class FunctionEvaluator {
                 return nv;
             }
             case "currval": {
-                String seqName = String.valueOf(executor.evalExpr(fn.args().get(0), ctx));
+                Object currvalArg = executor.evalExpr(fn.args().get(0), ctx);
+                if (currvalArg == null) return null;
+                String seqName = String.valueOf(currvalArg);
                 Sequence seq = requireSequence(seqName);
                 Long drawn = executor.sessionSequenceValues.get(seq.getInstanceId());
                 if (drawn == null) {
@@ -1661,7 +1671,9 @@ class FunctionEvaluator {
                 catch (Exception e) { return null; } // never been used -> null
             }
             case "setval": {
-                String seqName = String.valueOf(executor.evalExpr(fn.args().get(0), ctx));
+                Object setvalArg = executor.evalExpr(fn.args().get(0), ctx);
+                if (setvalArg == null) return null;
+                String seqName = String.valueOf(setvalArg);
                 Sequence seq = requireSequence(seqName);
                 Object rawVal = executor.evalExpr(fn.args().get(1), ctx);
                 if (rawVal == null) return null; // PG treats setval(seq, NULL) as a no-op returning NULL
@@ -2400,49 +2412,13 @@ class FunctionEvaluator {
                 Object strVal = executor.evalExpr(fn.args().get(0), ctx);
                 Object patVal = executor.evalExpr(fn.args().get(1), ctx);
                 Object escVal = executor.evalExpr(fn.args().get(2), ctx);
-                if (strVal == null || patVal == null) return null;
-                String str = strVal.toString();
-                String pat = patVal.toString();
-                String esc = escVal != null ? escVal.toString() : "";
-                // If escape is empty, disable escaping; convert SIMILAR TO pattern to regex
-                String regex;
-                if (esc.isEmpty()) {
-                    // No escape character: convert % and _ but quote everything else for regex
-                    StringBuilder sbNoEsc = new StringBuilder();
-                    for (int ci = 0; ci < pat.length(); ci++) {
-                        char ch = pat.charAt(ci);
-                        if (ch == '%') {
-                            sbNoEsc.append(".*");
-                        } else if (ch == '_') {
-                            sbNoEsc.append(".");
-                        } else {
-                            sbNoEsc.append(java.util.regex.Pattern.quote(String.valueOf(ch)));
-                        }
-                    }
-                    regex = sbNoEsc.toString();
-                } else {
-                    char escChar = esc.charAt(0);
-                    StringBuilder sb = new StringBuilder();
-                    for (int ci = 0; ci < pat.length(); ci++) {
-                        char ch = pat.charAt(ci);
-                        if (ch == escChar && ci + 1 < pat.length()) {
-                            char next = pat.charAt(ci + 1);
-                            // Escaped character: emit literal
-                            sb.append(java.util.regex.Pattern.quote(String.valueOf(next)));
-                            ci++; // skip next
-                        } else if (ch == escChar) {
-                            // An escape with nothing left to escape is dropped, as PG does
-                        } else if (ch == '%') {
-                            sb.append(".*");
-                        } else if (ch == '_') {
-                            sb.append(".");
-                        } else {
-                            sb.append(ch);
-                        }
-                    }
-                    regex = sb.toString();
-                }
-                return str.matches("(?s)" + regex);
+                // The escape is an operand like the other two, so nothing for an escape leaves
+                // nothing to say about the match. Reading the parse tree's word "NULL" as the
+                // escape string made a four-character escape and refused the whole comparison.
+                if (strVal == null || patVal == null || escVal == null) return null;
+                Character escape = PgRegex.escapeCharacter(escVal.toString());
+                return PgRegex.compile(PgRegex.fromSimilarTo(patVal.toString(), escape))
+                        .matcher(strVal.toString()).matches();
             }
             case "overlaps": {
                 // SQL OVERLAPS: (start1, end1_or_interval) OVERLAPS (start2, end2_or_interval) -> boolean
@@ -2817,9 +2793,16 @@ class FunctionEvaluator {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
                 String text = arg.toString();
-                if (text.isEmpty()) return false;
-                int codepoint = text.codePointAt(0);
-                return Character.isDefined(codepoint);
+                // The question is about the whole string, not about its first character: one
+                // unassigned code point anywhere in it is enough to answer no.
+                if (text.isEmpty()) return true;
+                int at = 0;
+                while (at < text.length()) {
+                    int codepoint = text.codePointAt(at);
+                    if (!Character.isDefined(codepoint)) return false;
+                    at += Character.charCount(codepoint);
+                }
+                return true;
             }
             case "__is_normalized__": {
                 // IS [NOT] [NFC|NFD|NFKC|NFKD] NORMALIZED
@@ -2998,22 +2981,19 @@ class FunctionEvaluator {
                 if (input == null) return null;
                 Object srcEncObj = executor.evalExpr(fn.args().get(1), ctx);
                 Object dstEncObj = executor.evalExpr(fn.args().get(2), ctx);
-                String srcEnc = srcEncObj != null ? srcEncObj.toString() : "UTF8";
-                String dstEnc = dstEncObj != null ? dstEncObj.toString() : "UTF8";
+                // Naming the encodings is the whole of what this function does, so a name it
+                // does not know is the caller's error. Swallowing it and handing the bytes back
+                // unchanged said the conversion had happened when nothing had.
+                if (srcEncObj == null || dstEncObj == null) return null;
+                String srcEnc = PgEncoding.named(srcEncObj, "source");
+                String dstEnc = PgEncoding.named(dstEncObj, "destination");
                 byte[] data;
                 if (input instanceof byte[]) {
                     data = (byte[]) input;
                 } else {
                     data = input.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
                 }
-                try {
-                    java.nio.charset.Charset srcCharset = pgEncodingToCharset(srcEnc);
-                    java.nio.charset.Charset dstCharset = pgEncodingToCharset(dstEnc);
-                    String decoded = new String(data, srcCharset);
-                    return decoded.getBytes(dstCharset);
-                } catch (Exception e) {
-                    return data;
-                }
+                return PgEncoding.encode(PgEncoding.decode(data, srcEnc), dstEnc);
             }
 
             // ---- enum comparison ----

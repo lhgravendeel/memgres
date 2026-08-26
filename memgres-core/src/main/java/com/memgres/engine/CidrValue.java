@@ -199,6 +199,9 @@ public class CidrValue extends InetValue {
     /** Override set_masklen to return CidrValue (zeros host bits). */
     public CidrValue setCidrMasklen(int newPrefix) {
         int max = maxBits();
+        // Minus one is PostgreSQL's way of asking for the whole address: it is the one negative
+        // length that names a length, and refusing it left no way to write "all of it".
+        if (newPrefix == -1) newPrefix = max;
         if (newPrefix < 0 || newPrefix > max) {
             throw new MemgresException("invalid mask length: " + newPrefix, "22023");
         }

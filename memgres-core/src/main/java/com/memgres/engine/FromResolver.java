@@ -1930,8 +1930,8 @@ class FromResolver {
                 for (int i = 2; i < funcFrom.args().size(); i++) {
                     Expression arg = funcFrom.args().get(i);
                     String def = arg instanceof Literal ? ((Literal) arg).value() : arg.toString();
-                    String[] parts = def.split(":", 3);
-                    DataType dt = parts.length > 1 ? DataType.fromPgName(parts[1]) : null;
+                    String[] parts = FromFunctionResolver.splitColumnDefinition(def);
+                    DataType dt = parts[1] == null ? null : DataType.fromPgName(parts[1]);
                     cols.add(new Column(parts[0], dt != null ? dt : DataType.TEXT, true, false, null));
                 }
                 Table virtualTable = new Table(alias, cols);

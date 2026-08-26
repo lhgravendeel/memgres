@@ -41,6 +41,8 @@ public class Database {
     private final Map<String, DomainType> domains = new ConcurrentHashMap<>();
     private final Map<String, List<CreateTypeStmt.CompositeField>> compositeTypes = new ConcurrentHashMap<>();
     private final Map<String, String> rangeTypes = new ConcurrentHashMap<>(); // range type key → subtype name
+    /** range type key → the name of the multirange created beside it, which a rename leaves. */
+    private final Map<String, String> rangeMultirangeNames = new ConcurrentHashMap<>();
     private final Set<String> shellTypes = ConcurrentHashMap.newKeySet(); // CREATE TYPE name; with no definition
     private final Map<String, PgAggregate> userAggregates = new ConcurrentHashMap<>();
     private final Map<String, PgOperator> userOperators = new ConcurrentHashMap<>();
@@ -1278,7 +1280,27 @@ public class Database {
     }
 
     public void addRangeType(String schema, String name, String subtype) {
-        rangeTypes.put(TypeNamespace.key(schema, name), subtype);
+        addRangeType(schema, name, subtype, RangeOperations.multirangeTypeName(name));
+    }
+
+    /**
+     * Register a range type together with the name of the multirange created beside it.
+     *
+     * <p>The multirange's name is derived from the range's when the pair is created, and then it
+     * is a name of its own: renaming the range does not rename it. Deriving it afresh at every
+     * use made it follow the range, so a rename moved a type PostgreSQL leaves where it was.
+     */
+    public void addRangeType(String schema, String name, String subtype, String multirangeName) {
+        String key = TypeNamespace.key(schema, name);
+        rangeTypes.put(key, subtype);
+        rangeMultirangeNames.put(key, multirangeName);
+    }
+
+    /** The multirange created alongside a range type, by the name it was given. */
+    public String getMultirangeName(String rangeKey) {
+        String key = TypeNamespace.find(rangeMultirangeNames.keySet(), rangeKey);
+        if (key != null) return rangeMultirangeNames.get(key);
+        return RangeOperations.multirangeTypeName(TypeNamespace.nameOfKey(rangeKey));
     }
 
     /** The subtype of the range type a written name denotes, or null. */
@@ -1293,7 +1315,10 @@ public class Database {
 
     public void removeRangeType(String name) {
         String key = TypeNamespace.find(rangeTypes.keySet(), name);
-        if (key != null) rangeTypes.remove(key);
+        if (key != null) {
+            rangeTypes.remove(key);
+            rangeMultirangeNames.remove(key);
+        }
     }
 
     public Map<String, String> getRangeTypes() {

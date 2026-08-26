@@ -297,6 +297,11 @@ public class AstExecutor {
         TypeCoercion.setSessionZone(currentSessionZone());
         OffsetDateTime previousInstant = TypeCoercion.rawSessionInstant();
         TypeCoercion.setSessionInstant(currentInstant());
+        // ... and the session IntervalStyle, which decides how an ambiguously signed interval
+        // literal is read as well as how one is written.
+        String previousIntervalStyle = TypeCoercion.getIntervalStyle();
+        TypeCoercion.setIntervalStyle(session == null ? null
+                : session.getGucSettings().get("intervalstyle"));
         try {
             List<String> typeSchemas = new ArrayList<String>();
             Statement stmt = Parser.parse(sql, typeSchemas);
@@ -339,6 +344,7 @@ public class AstExecutor {
             TypeCoercion.setDateOrder(previousDateOrder);
             TypeCoercion.setSessionZone(previousZone);
             TypeCoercion.setSessionInstant(previousInstant);
+            TypeCoercion.setIntervalStyle(previousIntervalStyle);
         }
     }
 

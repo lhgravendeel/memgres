@@ -24,46 +24,11 @@ public class MacaddrValue implements Comparable<MacaddrValue> {
      * - xxxxxx-xxxxxx (dash-separated 3-byte groups)
      */
     public static MacaddrValue parse(String input) {
-        String s = input.trim().toLowerCase();
-        byte[] bytes = null;
-
-        // Try colon-separated (6 parts)
-        if (s.contains(":")) {
-            String[] parts = s.split(":");
-            if (parts.length == 6) {
-                bytes = parseHexParts(parts, input);
-            } else if (parts.length == 2) {
-                // xxxxxx:xxxxxx
-                bytes = parse2Groups(parts, 6, input);
-            }
-        }
-        // Try dash-separated (6 parts)
-        else if (s.contains("-")) {
-            String[] parts = s.split("-");
-            if (parts.length == 6) {
-                bytes = parseHexParts(parts, input);
-            } else if (parts.length == 2) {
-                // xxxxxx-xxxxxx
-                bytes = parse2Groups(parts, 6, input);
-            }
-        }
-        // Try dot-separated (3 groups of 4 hex)
-        else if (s.contains(".")) {
-            String[] parts = s.split("\\.");
-            if (parts.length == 3) {
-                bytes = parse3Groups(parts, input);
-            }
-        }
-        // Try bare hex (12 chars)
-        else if (s.length() == 12 && s.matches("[0-9a-f]+")) {
-            bytes = new byte[6];
-            for (int i = 0; i < 6; i++) {
-                bytes[i] = (byte) Integer.parseInt(s.substring(i * 2, i * 2 + 2), 16);
-            }
-        }
-
+        byte[] bytes = MacaddrGrouping.read(input, "macaddr", 12, new int[][]{
+                {12}, {2, 2, 2, 2, 2, 2}, {6, 6}, {4, 4, 4}});
         if (bytes == null) {
-            throw new MemgresException("invalid input syntax for type macaddr: \"" + input + "\"", "22P02");
+            throw new MemgresException(
+                    "invalid input syntax for type macaddr: \"" + input + "\"", "22P02");
         }
         return new MacaddrValue(bytes);
     }

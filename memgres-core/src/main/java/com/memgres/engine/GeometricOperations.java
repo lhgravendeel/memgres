@@ -16,7 +16,16 @@ import java.util.stream.Collectors;
 public final class GeometricOperations {
     private GeometricOperations() {}
 
-    private static final double EPSILON = 1e-10;
+    /**
+     * How near two coordinates have to be before PostgreSQL calls them the same.
+     *
+     * <p>This is its own {@code EPSILON}, and every predicate over these types is written in
+     * terms of it rather than over exact equality -- two shapes are as close as the arithmetic
+     * that built them can tell. A tighter tolerance is not a stricter version of the same
+     * answers: it is a different set of answers, and it made points PostgreSQL calls equal
+     * unequal here, lines it calls vertical sloped, and shapes it calls touching apart.
+     */
+    private static final double EPSILON = 1.0E-06;
 
     // ========================================================================
     // Inner record types
@@ -354,130 +363,307 @@ public final class GeometricOperations {
     // Parsing methods
     // ========================================================================
 
-    public static PgPoint parsePoint(String s) {
-        s = s.trim();
-        // Validate balanced parentheses
-        if (s.contains("(") || s.contains(")")) {
-            int depth = 0;
-            for (char ch : s.toCharArray()) {
-                if (ch == '(') depth++;
-                else if (ch == ')') depth--;
-                if (depth < 0) throw new MemgresException("invalid input syntax for type point: \"" + s + "\"", "22P02");
+    /**
+     * A reader for the geometric literal forms.
+     *
+     * <p>These used to be scraped with a regular expression that found the components it needed
+     * and stopped, so a literal naming more than the type holds was read as its first few parts
+     * and the rest thrown away -- {@code '(1,2),(3,4),(5,6)'::box} became a box, and
+     * {@code '<(1,2),3,4>'} a circle. A scrape also cannot say where it stopped, so a
+     * near-number like {@code 1e} went to the JDK's parser and its complaint reached the client
+     * as an internal error. This reads the literal through from one end to the other and
+     * requires all of it to be spoken for.
+     */
+    private static final class GeoReader {
+        private static final Pattern NUMBER = Pattern.compile(
+                "[-+]?(?:0[xX][0-9a-fA-F]+"
+                        + "|(?:\\d+(?:\\.\\d*)?|\\.\\d+)(?:[eE][-+]?\\d+)?"
+                        + "|[Ii][Nn][Ff](?:[Ii][Nn][Ii][Tt][Yy])?"
+                        + "|[Nn][Aa][Nn])");
+
+        private final String literal;
+        private final String typeName;
+        private int at;
+
+        GeoReader(String literal, String typeName) {
+            this.literal = literal;
+            this.typeName = typeName;
+        }
+
+        MemgresException bad() {
+            return new MemgresException(
+                    "invalid input syntax for type " + typeName + ": \"" + literal + "\"", "22P02");
+        }
+
+        void spaces() {
+            while (at < literal.length() && Character.isWhitespace(literal.charAt(at))) at++;
+        }
+
+        boolean peek(char c) {
+            spaces();
+            return at < literal.length() && literal.charAt(at) == c;
+        }
+
+        boolean accept(char c) {
+            if (!peek(c)) return false;
+            at++;
+            return true;
+        }
+
+        void expect(char c) {
+            if (!accept(c)) throw bad();
+        }
+
+        double number() {
+            spaces();
+            Matcher m = NUMBER.matcher(literal);
+            m.region(at, literal.length());
+            if (!m.lookingAt()) throw bad();
+            String token = m.group();
+            at = m.end();
+            try {
+                if (token.length() > 2 && (token.charAt(0) == '0' || token.charAt(1) == '0')) {
+                    int sign = token.charAt(0) == '-' ? -1 : 1;
+                    String digits = token.charAt(0) == '-' || token.charAt(0) == '+'
+                            ? token.substring(1) : token;
+                    if (digits.length() > 2 && digits.charAt(0) == '0'
+                            && (digits.charAt(1) == 'x' || digits.charAt(1) == 'X')) {
+                        return sign * (double) Long.parseLong(digits.substring(2), 16);
+                    }
+                }
+                return Double.parseDouble(token.replaceAll("(?i)^([-+]?)inf$", "$1Infinity"));
+            } catch (NumberFormatException e) {
+                throw bad();
             }
-            if (depth != 0) throw new MemgresException("invalid input syntax for type point: \"" + s + "\"", "22P02");
         }
-        List<Double> nums = extractDoubles(s);
-        if (nums.size() < 2) {
-            throw new MemgresException("invalid input syntax for type point: \"" + s + "\"", "22P02");
+
+        /** A point, whose parentheses are optional where the surrounding form has its own. */
+        PgPoint point() {
+            boolean parens = accept('(');
+            double x = number();
+            expect(',');
+            double y = number();
+            if (parens) expect(')');
+            return new PgPoint(x, y);
         }
-        if (nums.size() > 2) {
-            throw new MemgresException("invalid input syntax for type point: \"" + s + "\"", "22P02");
+
+        /** As many points as are written, each separated from the last by a comma. */
+        List<PgPoint> points() {
+            List<PgPoint> out = new ArrayList<PgPoint>();
+            out.add(point());
+            while (accept(',')) out.add(point());
+            return out;
         }
-        return new PgPoint(nums.get(0), nums.get(1));
+
+        int mark() {
+            spaces();
+            return at;
+        }
+
+        void reset(int to) {
+            at = to;
+        }
+
+        /** Nothing may be left over: a literal is the whole of what it says. */
+        void end() {
+            spaces();
+            if (at != literal.length()) throw bad();
+        }
+    }
+
+    /**
+     * The points a literal names, with the opening and closing marks the type allows.
+     *
+     * @param open the characters that may open the list, each paired with its closing character
+     */
+    private static List<PgPoint> readPoints(String literal, String typeName, String open,
+                                            String close, int least, int most) {
+        GeoReader r = new GeoReader(literal, typeName);
+        char closer = 0;
+        for (int i = 0; i < open.length(); i++) {
+            int before = r.mark();
+            if (!r.accept(open.charAt(i))) continue;
+            // A round bracket opens both the list and the first point in it, so it wraps the
+            // list only when another follows: '((0,0),(1,1))' is a wrapped list of two points
+            // and '(0,0),(1,1)' is a bare one. A square bracket is never a point's.
+            if (open.charAt(i) == '(' && !r.peek('(')) {
+                r.reset(before);
+                continue;
+            }
+            closer = close.charAt(i);
+            break;
+        }
+        List<PgPoint> points = r.points();
+        if (closer != 0) r.expect(closer);
+        r.end();
+        if (points.size() < least || points.size() > most) throw r.bad();
+        return points;
+    }
+
+    /**
+     * Whether two geometric literals name the same value, by the rule the type has for it.
+     *
+     * <p>Each type says what "the same" means for it, and only some of them say anything: two
+     * circles are equal when they enclose the same area, two lines when one's coefficients are
+     * the other's scaled, and two paths when they have the same number of points. Comparing the
+     * text these print as answered a different question for every one of them.
+     *
+     * @return {@code null} where the two are not both shapes of one kind, and the caller should
+     *     go on to whatever it would otherwise have done
+     */
+    public static Boolean equalShapes(String a, String b) {
+        if (a == null || b == null) return null;
+        String left = a.trim();
+        String right = b.trim();
+        if (!isGeometricString(left) || !isGeometricString(right)) return null;
+        try {
+            if (left.startsWith("<") && right.startsWith("<")) {
+                PgCircle c1 = parseCircle(left);
+                PgCircle c2 = parseCircle(right);
+                return Boolean.valueOf(fpEq(c1.radius * c1.radius, c2.radius * c2.radius));
+            }
+            if (left.startsWith("{") && right.startsWith("{")) {
+                return Boolean.valueOf(sameLine(parseLine(left), parseLine(right)));
+            }
+            if (left.startsWith("[") && right.startsWith("[")) {
+                // A square-bracketed literal is an open path or a segment; a segment holds two
+                // points and is equal when both agree, a path when the counts do.
+                List<PgPoint> p1 = parsePath(left).points;
+                List<PgPoint> p2 = parsePath(right).points;
+                if (p1.size() == 2 && p2.size() == 2) {
+                    return Boolean.valueOf(fpEq(p1.get(0).x, p2.get(0).x)
+                            && fpEq(p1.get(0).y, p2.get(0).y)
+                            && fpEq(p1.get(1).x, p2.get(1).x)
+                            && fpEq(p1.get(1).y, p2.get(1).y));
+                }
+                return Boolean.valueOf(p1.size() == p2.size());
+            }
+        } catch (MemgresException e) {
+            return null;
+        }
+        return null;
+    }
+
+    /**
+     * How two paths stand in order, which PostgreSQL decides by how many points they hold and
+     * by nothing else. Two paths of the same length are neither before nor after each other,
+     * however far apart the points are.
+     *
+     * @return {@code null} where the two are not both paths
+     */
+    public static Integer comparePaths(String a, String b) {
+        if (a == null || b == null) return null;
+        String left = a.trim();
+        String right = b.trim();
+        if (!isGeometricString(left) || !isGeometricString(right)) return null;
+        boolean leftIsPath = left.startsWith("[") || left.startsWith("((");
+        boolean rightIsPath = right.startsWith("[") || right.startsWith("((");
+        if (!leftIsPath || !rightIsPath) return null;
+        try {
+            return Integer.valueOf(Integer.compare(
+                    parsePath(left).points.size(), parsePath(right).points.size()));
+        } catch (MemgresException e) {
+            return null;
+        }
+    }
+
+    /** Whether values of this type are shapes this class reads and writes. */
+    public static boolean isGeometricType(DataType type) {
+        switch (type) {
+            case POINT: case LINE: case LSEG: case BOX: case PATH: case POLYGON: case CIRCLE:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /** The shape a literal names, read as the named type's own reader reads it. */
+    public static Object parseAs(String typeName, String literal) {
+        String name = typeName == null ? "" : typeName.toLowerCase();
+        if (name.equals("point")) return parsePoint(literal);
+        if (name.equals("line")) return parseLine(literal);
+        if (name.equals("lseg")) return parseLseg(literal);
+        if (name.equals("box")) return parseBox(literal);
+        if (name.equals("path")) return parsePath(literal);
+        if (name.equals("polygon")) return parsePolygon(literal);
+        if (name.equals("circle")) return parseCircle(literal);
+        throw new MemgresException("Not a geometric type: " + typeName, "42883");
+    }
+
+    public static PgPoint parsePoint(String s) {
+        return readPoints(s, "point", "", "", 1, 1).get(0);
     }
 
     public static PgLine parseLine(String s) {
-        s = s.trim();
-        // {A,B,C} format
-        if (s.startsWith("{")) {
-            String inner = strip(s, '{', '}');
-            List<Double> nums = extractDoubles(inner);
-            if (nums.size() < 3) {
-                throw new MemgresException("invalid input syntax for type line: \"" + s + "\"", "22P02");
-            }
-            return new PgLine(nums.get(0), nums.get(1), nums.get(2));
+        // A line is written either as its three coefficients or as two points it passes through.
+        if (s.trim().startsWith("{")) {
+            GeoReader r = new GeoReader(s, "line");
+            r.expect('{');
+            double a = r.number();
+            r.expect(',');
+            double b = r.number();
+            r.expect(',');
+            double c = r.number();
+            r.expect('}');
+            r.end();
+            return new PgLine(a, b, c);
         }
-        // Two-point format: [(x1,y1),(x2,y2)] or ((x1,y1),(x2,y2))
-        List<PgPoint> pts = parsePointList(s);
-        if (pts.size() >= 2) {
-            return lineFromPoints(pts.get(0), pts.get(1));
+        List<PgPoint> pts = readPoints(s, "line", "[(", "])", 2, 2);
+        // Two points that are the same point name no line, and PostgreSQL treats points nearer
+        // than its own tolerance as the same: a line built from them is rounding residue
+        // amplified into coefficients rather than the line anyone meant.
+        if (fpEq(pts.get(0).x(), pts.get(1).x()) && fpEq(pts.get(0).y(), pts.get(1).y())) {
+            throw new MemgresException(
+                    "invalid line specification: must be two distinct points", "22P02");
         }
-        throw new MemgresException("invalid input syntax for type line: \"" + s + "\"", "22P02");
+        return lineFromPoints(pts.get(0), pts.get(1));
     }
 
     public static PgLseg parseLseg(String s) {
-        s = s.trim();
-        List<PgPoint> pts = parsePointList(s);
-        if (pts.size() != 2) {
-            throw new MemgresException("invalid input syntax for type lseg: \"" + s + "\"", "22P02");
-        }
+        List<PgPoint> pts = readPoints(s, "lseg", "[(", "])", 2, 2);
         return new PgLseg(pts.get(0), pts.get(1));
     }
 
     public static PgBox parseBox(String s) {
-        s = s.trim();
-        List<PgPoint> pts = parsePointList(s);
-        if (pts.size() < 2) {
-            throw new MemgresException("invalid input syntax for type box: \"" + s + "\"", "22P02");
-        }
+        // A box is the only one of these that is not written between brackets.
+        List<PgPoint> pts = readPoints(s, "box", "(", ")", 2, 2);
         return normalizeBox(pts.get(0), pts.get(1));
     }
 
     public static PgPath parsePath(String s) {
-        s = s.trim();
-        // Validate balanced parentheses/brackets
-        validateBalancedParens(s, "path");
-        boolean closed;
-        if (s.startsWith("[")) {
-            closed = false;
-            s = strip(s, '[', ']');
-        } else if (s.startsWith("(")) {
-            closed = true;
-            // Remove outer parens if present: ((x,y),(x,y)) -> (x,y),(x,y)
-            // But we need to be careful; try stripping outer parens
-            String inner = s.substring(1, s.length() - 1).trim();
-            // Check if the inner string starts with (, if so it's a point list
-            if (inner.startsWith("(")) {
-                s = inner;
-            }
-        } else {
-            closed = true;
-        }
-        List<PgPoint> pts = parsePointList(s);
-        if (pts.isEmpty()) {
-            throw new MemgresException("invalid input syntax for type path: \"" + s + "\"", "22P02");
-        }
+        // Square brackets say the path is open and everything else says it is closed.
+        boolean closed = !s.trim().startsWith("[");
+        List<PgPoint> pts = readPoints(s, "path", "[(", "])", 1, Integer.MAX_VALUE);
         return new PgPath(Cols.listCopyOf(pts), closed);
     }
 
     public static PgPolygon parsePolygon(String s) {
-        s = s.trim();
-        // Validate balanced parentheses
-        validateBalancedParens(s, "polygon");
-        // Remove outer parens if double-wrapped: ((x,y),(x,y))
-        if (s.startsWith("(") && s.endsWith(")")) {
-            String inner = s.substring(1, s.length() - 1).trim();
-            if (inner.startsWith("(")) {
-                s = inner;
-            }
-        }
-        List<PgPoint> pts = parsePointList(s);
-        if (pts.isEmpty()) {
-            throw new MemgresException("invalid input syntax for type polygon: \"" + s + "\"", "22P02");
-        }
+        List<PgPoint> pts = readPoints(s, "polygon", "(", ")", 1, Integer.MAX_VALUE);
         return new PgPolygon(Cols.listCopyOf(pts));
     }
 
     public static PgCircle parseCircle(String s) {
-        s = s.trim();
-        // <(x,y),r> format
-        if (s.startsWith("<")) {
-            s = strip(s, '<', '>');
+        GeoReader r = new GeoReader(s, "circle");
+        char closer = 0;
+        if (r.accept('<')) {
+            closer = '>';
+        } else {
+            // A leading parenthesis belongs to the centre point unless another follows it, in
+            // which case it is the one wrapping the whole circle.
+            int before = r.mark();
+            if (r.accept('(')) {
+                if (r.peek('(')) closer = ')';
+                else r.reset(before);
+            }
         }
-        // Find center point and radius
-        Matcher m = Pattern.compile("\\(\\s*(-?[\\d.eE+-]+)\\s*,\\s*(-?[\\d.eE+-]+)\\s*\\)\\s*,\\s*(-?[\\d.eE+-]+)").matcher(s);
-        if (m.find()) {
-            double cx = Double.parseDouble(m.group(1));
-            double cy = Double.parseDouble(m.group(2));
-            double r = Double.parseDouble(m.group(3));
-            return new PgCircle(new PgPoint(cx, cy), r);
-        }
-        // Fallback
-        List<Double> nums = extractDoubles(s);
-        if (nums.size() >= 3) {
-            return new PgCircle(new PgPoint(nums.get(0), nums.get(1)), nums.get(2));
-        }
-        throw new MemgresException("invalid input syntax for type circle: \"" + s + "\"", "22P02");
+        PgPoint centre = r.point();
+        r.expect(',');
+        double radius = r.number();
+        if (closer != 0) r.expect(closer);
+        r.end();
+        // A circle of negative radius is not a smaller circle: there is no such shape.
+        if (!(radius >= 0)) throw r.bad();
+        return new PgCircle(centre, radius);
     }
 
     // ========================================================================
@@ -567,25 +753,39 @@ public final class GeometricOperations {
     // Line from two points
     // ========================================================================
 
+    /**
+     * The line through two points, written the way PostgreSQL writes it.
+     *
+     * <p>There are three cases and each has its own spelling: a vertical line is {@code x = C}
+     * and so has A of minus one, a horizontal line is {@code y = C} and has B of minus one, and
+     * everything else is {@code mx - y + c = 0}. Computing the coefficients from the
+     * determinant instead and then forcing A positive gave the same line a different sign --
+     * {@code [(0,0),(0,1)]} came out {@code {1,0,0}} where PostgreSQL writes {@code {-1,0,0}}.
+     */
     public static PgLine lineFromPoints(PgPoint p1, PgPoint p2) {
-        if (Math.abs(p1.x - p2.x) < EPSILON && Math.abs(p1.y - p2.y) < EPSILON) {
-            throw new MemgresException("invalid line specification: must be two distinct points", "22023");
+        // The constructor names this a bad argument where the input function names it bad
+        // syntax, and PostgreSQL keeps the two apart.
+        if (fpEq(p1.x, p2.x) && fpEq(p1.y, p2.y)) {
+            throw new MemgresException(
+                    "invalid line specification: must be two distinct points", "22023");
         }
-        double a = p1.y - p2.y;
-        double b = p2.x - p1.x;
-        double c = p1.x * p2.y - p2.x * p1.y;
-        // PG normalizes so that A > 0, or if A == 0 then B > 0
-        if (a < -EPSILON || (Math.abs(a) < EPSILON && b < -EPSILON)) {
-            a = -a;
-            b = -b;
-            c = -c;
-        }
-        // Negating a positive zero yields -0.0; PG prints line coefficients as a clean 0
-        // (e.g. line '[(0,0),(1,1)]' -> {1,-1,0}), so collapse negative zero back to +0.0.
-        if (a == 0.0) a = 0.0;
-        if (b == 0.0) b = 0.0;
-        if (c == 0.0) c = 0.0;
-        return new PgLine(a, b, c);
+        if (fpEq(p1.x, p2.x)) return new PgLine(-1.0, 0.0, p1.x);
+        if (fpEq(p1.y, p2.y)) return new PgLine(0.0, -1.0, p1.y);
+        double a = (p2.y - p1.y) / (p2.x - p1.x);
+        return new PgLine(a, -1.0, p1.y - a * p1.x);
+    }
+
+    /**
+     * Whether two lines are the same line, which they are when one set of coefficients is the
+     * other scaled: {@code {1,1,0}} and {@code {2,2,0}} both say that x and y are opposite.
+     */
+    public static boolean sameLine(PgLine l1, PgLine l2) {
+        double ratio;
+        if (!fpZero(l2.a)) ratio = l1.a / l2.a;
+        else if (!fpZero(l2.b)) ratio = l1.b / l2.b;
+        else if (!fpZero(l2.c)) ratio = l1.c / l2.c;
+        else ratio = 1.0;
+        return fpEq(l1.a, ratio * l2.a) && fpEq(l1.b, ratio * l2.b) && fpEq(l1.c, ratio * l2.c);
     }
 
     // ========================================================================
@@ -608,7 +808,10 @@ public final class GeometricOperations {
     public static PgPoint pointDiv(PgPoint a, PgPoint b) {
         // Complex divide: (a.x + a.y*i) / (b.x + b.y*i)
         double denom = b.x * b.x + b.y * b.y;
-        if (Math.abs(denom) < EPSILON) {
+        // Only a divisor that is exactly zero is a division by zero. The tolerance is for
+        // deciding whether two shapes coincide, not for deciding whether a number is zero, and
+        // applying it here refused a perfectly good division by a very small point.
+        if (denom == 0.0) {
             throw new MemgresException("division by zero");
         }
         return new PgPoint((a.x * b.x + a.y * b.y) / denom, (a.y * b.x - a.x * b.y) / denom);
@@ -985,12 +1188,16 @@ public final class GeometricOperations {
         return b.high.x - b.low.x;
     }
 
+    /**
+     * The slope of the line through two points.
+     *
+     * <p>The difference is taken first minus second, as PostgreSQL takes it. Taking it the other
+     * way round is the same number except in sign, and for a pair on the same horizontal it is
+     * the difference between zero and minus zero -- which prints.
+     */
     public static double slope(PgPoint p1, PgPoint p2) {
-        double dx = p2.x - p1.x;
-        if (Math.abs(dx) < EPSILON) {
-            return Double.POSITIVE_INFINITY;
-        }
-        return (p2.y - p1.y) / dx;
+        if (fpEq(p1.x, p2.x)) return Double.POSITIVE_INFINITY;
+        return (p1.y - p2.y) / (p1.x - p2.x);
     }
 
     public static double slope(PgLseg seg) {
@@ -1263,7 +1470,7 @@ public final class GeometricOperations {
         if (a instanceof PgPoint && b instanceof PgPoint) {
             PgPoint pb = (PgPoint) b;
             PgPoint pa = (PgPoint) a;
-            return Math.abs(pa.x - pb.x) < EPSILON && Math.abs(pa.y - pb.y) < EPSILON;
+            return fpEq(pa.x, pb.x) && fpEq(pa.y, pb.y);
         }
         if (a instanceof PgBox && b instanceof PgBox) {
             PgBox bb = (PgBox) b;
@@ -1273,7 +1480,7 @@ public final class GeometricOperations {
         if (a instanceof PgCircle && b instanceof PgCircle) {
             PgCircle cb = (PgCircle) b;
             PgCircle ca = (PgCircle) a;
-            return sameAs(ca.center, cb.center) && Math.abs(ca.radius - cb.radius) < EPSILON;
+            return sameAs(ca.center, cb.center) && fpEq(ca.radius, cb.radius);
         }
         if (a instanceof PgLine && b instanceof PgLine) {
             PgLine lb = (PgLine) b;
@@ -1558,12 +1765,19 @@ public final class GeometricOperations {
     // line coefficients, and the same order over the sides of a box.
     // ========================================================================
 
-    /** The tolerance PostgreSQL's geometric types compare with (EPSILON in geo_decls.h). */
-    private static final double PG_EPSILON = 1.0E-06;
+    private static boolean fpZero(double a) { return Math.abs(a) <= EPSILON; }
 
-    private static boolean fpZero(double a) { return Math.abs(a) <= PG_EPSILON; }
-
-    private static boolean fpEq(double a, double b) { return Math.abs(a - b) <= PG_EPSILON; }
+    /**
+     * Whether two coordinates are the same coordinate.
+     *
+     * <p>Two not-a-numbers are the same coordinate here, which is not what subtracting them
+     * says: a shape built from a value that is not a number is still that shape, and asking
+     * whether it is itself has to answer yes.
+     */
+    private static boolean fpEq(double a, double b) {
+        if (Double.isNaN(a) || Double.isNaN(b)) return Double.isNaN(a) && Double.isNaN(b);
+        return a == b || Math.abs(a - b) <= EPSILON;
+    }
 
     /** A point together with how far it was from whatever was measured to it. */
     private static final class PointDist {
@@ -1790,12 +2004,29 @@ public final class GeometricOperations {
     // Intersection point (# operator)
     // ========================================================================
 
+    /**
+     * Where two lines cross, worked out the way PostgreSQL works it out.
+     *
+     * <p>Solving by the determinant gives the same point, and gives it with different signs on
+     * the zeros: the crossing of {@code {1,-1,0}} and {@code {1,1,0}} came out
+     * {@code (-0,0)} where a real server names {@code (0,0)}. A negative zero is a value a
+     * client can see, so the arithmetic is done in the same order.
+     */
     public static PgPoint lineLineIntersection(PgLine a, PgLine b) {
-        double det = a.a * b.b - b.a * a.b;
-        if (Math.abs(det) < EPSILON) return null; // parallel
-        double x = (a.b * b.c - b.b * a.c) / det;
-        double y = (b.a * a.c - a.a * b.c) / det;
-        return new PgPoint(x, y);
+        if (!fpZero(a.b)) {
+            if (fpEq(b.a * a.b, a.a * b.b)) return null; // parallel
+            double x = (a.b * b.c - b.b * a.c) / (b.b * a.a - a.b * b.a);
+            double y = -(a.a * x + a.c) / a.b;
+            return new PgPoint(x, y);
+        }
+        if (!fpZero(b.b)) {
+            if (fpEq(a.a * b.b, b.a * a.b)) return null;
+            double x = (b.b * a.c - a.b * b.c) / (a.b * b.a - b.b * a.a);
+            double y = -(b.a * x + b.c) / b.b;
+            return new PgPoint(x, y);
+        }
+        // Both are vertical, so they are parallel or the same line.
+        return null;
     }
 
     public static Object intersectionGeneral(Object a, Object b) {
@@ -2000,14 +2231,20 @@ public final class GeometricOperations {
         return new PgCircle(c, r);
     }
 
-    /** Circumscribed circle of polygon (approximate, uses avg distance from centroid). */
+    /**
+     * The circle a polygon stands for: centred on the mean of its vertices, with the mean
+     * distance from there to them as the radius.
+     *
+     * <p>The furthest vertex is not the radius PostgreSQL computes, and using it made the circle
+     * larger than the one a real server names for every polygon that is not a regular one.
+     */
     public static PgCircle toCircle(PgPolygon poly) {
         PgPoint c = center(poly);
-        double maxR = 0;
+        double total = 0;
         for (PgPoint p : poly.points) {
-            maxR = Math.max(maxR, distancePointPoint(c, p));
+            total += distancePointPoint(c, p);
         }
-        return new PgCircle(c, maxR);
+        return new PgCircle(c, poly.points.isEmpty() ? 0 : total / poly.points.size());
     }
 
     // toLseg

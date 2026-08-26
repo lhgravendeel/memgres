@@ -32,7 +32,7 @@ public class TsQuery {
 
     public static TsQuery term(String t) {
         // PG's snowball dictionary tests the stop list before stemming.
-        String lower = t.toLowerCase();
+        String lower = TsVector.lowerstr(t);
         String stemmed = TsVector.isStopWord(lower) ? "" : TsVector.simpleStem(lower);
         return new TsQuery(Op.TERM, stemmed, false, null, null, null, 0);
     }
@@ -43,14 +43,14 @@ public class TsQuery {
     }
 
     public static TsQuery term(String t, boolean prefix, Set<Character> weights) {
-        String lower = t.toLowerCase();
+        String lower = TsVector.lowerstr(t);
         String stemmed = TsVector.isStopWord(lower) ? "" : TsVector.simpleStem(lower);
         return new TsQuery(Op.TERM, stemmed, prefix, weights, null, null, 0);
     }
 
     /** Create a term without stemming (for 'simple' config). */
     public static TsQuery termSimple(String t, boolean prefix, Set<Character> weights) {
-        return new TsQuery(Op.TERM, t.toLowerCase(), prefix, weights, null, null, 0);
+        return new TsQuery(Op.TERM, TsVector.lowerstr(t), prefix, weights, null, null, 0);
     }
 
     /**
@@ -135,9 +135,9 @@ public class TsQuery {
      */
     public static TsQuery parse(String input, String config) {
         if (input == null || input.trim().isEmpty()) return emptyQuery();
-        List<String> tokens = tokenize(input);
-        if (tokens.isEmpty()) return emptyQuery();
         try {
+            List<String> tokens = tokenize(input);
+            if (tokens.isEmpty()) return emptyQuery();
             int[] pos = {0};
             TsQuery result = parseOr(tokens, pos, config);
             // Leftover tokens mean two operands with no operator between them.
@@ -171,25 +171,34 @@ public class TsQuery {
         return left;
     }
 
+    /**
+     * A run of lexemes joined by phrase operators.
+     *
+     * <p>A stop word still takes up a place in the document, so a phrase written across one is
+     * not the two remaining lexemes side by side but the two of them that much further apart:
+     * {@code the <-> cat <-> the <-> dog} is {@code 'cat' <2> 'dog'}. The dropped operand's
+     * distance used to be dropped with it, which named a phrase the document never holds.
+     */
     private static TsQuery parsePhrase(List<String> tokens, int[] pos, String config) {
         TsQuery left = parsePrimary(tokens, pos, config);
+        int gap = 0;
         while (pos[0] < tokens.size()) {
             String tok = tokens.get(pos[0]);
-            if (tok.equals("<->")) {
-                pos[0]++;
-                TsQuery right = parsePrimary(tokens, pos, config);
-                left = phrase(left, right, 1);
-            } else if (tok.startsWith("<") && tok.endsWith(">")) {
-                try {
-                    int dist = Integer.parseInt(tok.substring(1, tok.length() - 1));
-                    pos[0]++;
-                    TsQuery right = parsePrimary(tokens, pos, config);
-                    left = phrase(left, right, dist);
-                } catch (NumberFormatException e) {
-                    break;
-                }
+            int dist;
+            if (tok.equals("<->")) dist = 1;
+            else if (tok.startsWith("<") && tok.endsWith(">")) dist = phraseDistance(tok);
+            else break;
+            pos[0]++;
+            TsQuery right = parsePrimary(tokens, pos, config);
+            if (left == null || left.isEmpty()) {
+                // Nothing yet to be before anything: the phrase begins at the next lexeme.
+                left = right;
+                gap = 0;
+            } else if (right == null || right.isEmpty()) {
+                gap += dist;
             } else {
-                break;
+                left = phrase(left, right, dist + gap);
+                gap = 0;
             }
         }
         return left;
@@ -200,9 +209,11 @@ public class TsQuery {
         // binary operator / close-paren means the preceding operator has no operand.
         if (pos[0] >= tokens.size()) throw new TsqParseError(true);
         String t = tokens.get(pos[0]);
+        // An operator standing where an operand belongs is a mis-written query, not a query
+        // whose last operator was left dangling: only running off the end is "no operand".
         if (t.equals("&") || t.equals("|") || t.equals(")")
                 || t.equals("<->") || (t.startsWith("<") && t.endsWith(">"))) {
-            throw new TsqParseError(true);
+            throw new TsqParseError(false);
         }
         if (t.equals("!")) {
             pos[0]++;
@@ -233,8 +244,13 @@ public class TsQuery {
             }
             if (!modifier.isEmpty()) {
                 ws = new HashSet<>();
-                for (char c : modifier.toUpperCase().toCharArray()) {
-                    if (c >= 'A' && c <= 'D') ws.add(c);
+                for (char c : modifier.toCharArray()) {
+                    char upper = Character.toUpperCase(c);
+                    // Only the four weights exist. A letter outside them is not a weight the
+                    // query can be about, so the query is mis-written; dropping it silently
+                    // answered a different question from the one that was asked.
+                    if (upper < 'A' || upper > 'D') throw new TsqParseError(false);
+                    ws.add(upper);
                 }
                 if (ws.isEmpty()) ws = null;
             }
@@ -258,14 +274,18 @@ public class TsQuery {
         while (i < input.length()) {
             char c = input.charAt(i);
             if (Character.isWhitespace(c)) { i++; continue; }
-            // <-> or <N>
+            // <-> or <N>. A '<' always begins a phrase operator, so one that does not spell a
+            // whole operator ends the read here. Falling through instead left the character for
+            // the bare-word loop below, which excludes '<' -- nothing was consumed and the outer
+            // loop came round again on the same character, for as long as the client waited.
             if (c == '<') {
                 int end = input.indexOf('>', i);
-                if (end > i) {
-                    tokens.add(input.substring(i, end + 1));
-                    i = end + 1;
-                    continue;
-                }
+                if (end < 0) throw new TsqParseError(false);
+                String inner = input.substring(i + 1, end);
+                if (!inner.equals("-") && !isAllDigits(inner)) throw new TsqParseError(false);
+                tokens.add(input.substring(i, end + 1));
+                i = end + 1;
+                continue;
             }
             if (c == '&' || c == '|' || c == '(' || c == ')') {
                 tokens.add(String.valueOf(c));
@@ -314,6 +334,36 @@ public class TsQuery {
         return tokens;
     }
 
+    private static boolean isAllDigits(String s) {
+        if (s.isEmpty()) return false;
+        for (int i = 0; i < s.length(); i++) {
+            if (s.charAt(i) < '0' || s.charAt(i) > '9') return false;
+        }
+        return true;
+    }
+
+    /** The furthest apart a phrase operator can say two lexemes are. */
+    private static final int MAX_PHRASE_DISTANCE = 16384;
+
+    /**
+     * The distance a {@code <N>} operator names. Out of range is a value error rather than a
+     * syntax error: the operator is spelled correctly and only says something unrepresentable.
+     */
+    private static int phraseDistance(String token) {
+        String digits = token.substring(1, token.length() - 1);
+        long value;
+        try {
+            value = Long.parseLong(digits);
+        } catch (NumberFormatException e) {
+            value = MAX_PHRASE_DISTANCE + 1L;
+        }
+        if (value < 0 || value > MAX_PHRASE_DISTANCE) {
+            throw new MemgresException("distance in phrase operator must be an integer value "
+                    + "between zero and " + MAX_PHRASE_DISTANCE + " inclusive", "22023");
+        }
+        return (int) value;
+    }
+
     public boolean matches(TsVector vector) {
         switch (op) {
             case TERM: {
@@ -343,28 +393,64 @@ public class TsQuery {
             case NOT:
                 return !left.matches(vector);
             case PHRASE: {
-                // Phrase matching: left and right must appear with correct distance
-                if (left.op != Op.TERM || right.op != Op.TERM) {
-                    // For complex phrase subexpressions, fall back to AND
-                    return left.matches(vector) && right.matches(vector);
-                }
-                if (left.term == null || left.term.isEmpty() || right.term == null || right.term.isEmpty()) {
-                    // A phrase with nothing on one side is not a phrase; whatever is left has to
-                    // be found on its own.
-                    return left.matches(vector) && right.matches(vector);
-                }
-                List<Integer> leftPositions = vector.getPositions(left.term);
-                List<Integer> rightPositions = vector.getPositions(right.term);
-                if (leftPositions.isEmpty() || rightPositions.isEmpty()) return false;
-                for (int lp : leftPositions) {
-                    for (int rp : rightPositions) {
-                        if (rp - lp == phraseDistance) return true;
-                    }
-                }
-                return false;
+                // A phrase is about where its operands are, so it is answered by working out
+                // the positions each side matches at rather than by asking each side whether it
+                // matches anywhere. Falling back to AND for an operand that was not a bare
+                // lexeme made 'a <-> (b & c)' true of a document holding a, c and b in that
+                // order, where the phrase says b and c both have to sit right after a.
+                return !matchPositions(vector).isEmpty();
             }
             default:
                 throw new IllegalStateException("Unknown op: " + op);
+        }
+    }
+
+    /**
+     * The positions this query matches at, which is what a phrase around it is asked about.
+     *
+     * <p>A phrase constrains where its operands sit, so each operand has to answer with the
+     * places it was found and not merely with whether it was found at all. Two lexemes joined by
+     * {@code &} inside a phrase are both wanted at the same place, and joined by {@code |} at
+     * either; a phrase of its own contributes the places its own right-hand side ends.
+     */
+    private Set<Integer> matchPositions(TsVector vector) {
+        switch (op) {
+            case TERM: {
+                Set<Integer> found = new TreeSet<Integer>();
+                if (term == null || term.isEmpty()) return found;
+                for (String lexeme : vector.getLexemes()) {
+                    boolean names = prefix ? lexeme.startsWith(term) : lexeme.equals(term);
+                    if (!names) continue;
+                    if (weights != null && !vector.containsLexemeWithWeight(lexeme, weights)) {
+                        continue;
+                    }
+                    found.addAll(vector.getPositions(lexeme));
+                }
+                return found;
+            }
+            case AND: {
+                Set<Integer> found = left.matchPositions(vector);
+                found.retainAll(right.matchPositions(vector));
+                return found;
+            }
+            case OR: {
+                Set<Integer> found = left.matchPositions(vector);
+                found.addAll(right.matchPositions(vector));
+                return found;
+            }
+            case NOT:
+                // Inside a phrase there is no position at which "not this" is found.
+                return new TreeSet<Integer>();
+            default: {
+                Set<Integer> before = left.matchPositions(vector);
+                Set<Integer> found = new TreeSet<Integer>();
+                for (Integer at : right.matchPositions(vector)) {
+                    if (before.contains(Integer.valueOf(at.intValue() - phraseDistance))) {
+                        found.add(at);
+                    }
+                }
+                return found;
+            }
         }
     }
 
@@ -380,7 +466,10 @@ public class TsQuery {
             case PHRASE:
                 return left.containsTerm(lexeme) || right.containsTerm(lexeme);
             case NOT:
-                return false;
+                // A lexeme under a NOT is still one the query names, and the ranking is over
+                // the lexemes a query names. Answering no here scored a query of nothing but a
+                // NOT as though the document held none of its words.
+                return left.containsTerm(lexeme);
             default:
                 throw new IllegalStateException("Unknown op: " + op);
         }
@@ -405,50 +494,53 @@ public class TsQuery {
 
     /** Return a text representation of the query tree (like PG's querytree()).
      *  PG's querytree() strips NOT branches entirely and shows 'T' for them. */
+    /**
+     * The part of the query an index can be searched with, written out.
+     *
+     * <p>A NOT branch names what must not be there, which no index lookup can supply, so it is
+     * written as {@code T} -- "anything". What is left is printed the way the query itself is
+     * printed, brackets and all: the outermost operator is not bracketed, because there is
+     * nothing around it for the brackets to separate it from.
+     */
     public String queryTree() {
         // If the entire query is just NOT, return 'T'
         if (op == Op.NOT) return "T";
-        return queryTreeInner();
+        return queryTreeInner(false, null);
     }
 
-    private String queryTreeInner() {
+    private String queryTreeInner(boolean nested, Op parentOp) {
         switch (op) {
             case TERM: {
                 if (term == null || term.isEmpty()) return "T";
-                return "'" + term + "'";
+                return "'" + term.replace("'", "''") + "'";
             }
-            case AND: {
-                String l = stripNot(left);
-                String r = stripNot(right);
+            case AND:
+            case OR:
+            case PHRASE: {
+                String l = stripNot(left, Op.AND == op || Op.OR == op || Op.PHRASE == op, op);
+                String r = stripNot(right, true, op);
+                String operator = op == Op.AND ? " & "
+                        : op == Op.OR ? " | "
+                        : phraseDistance == 1 ? " <-> " : " <" + phraseDistance + "> ";
+                if (op == Op.PHRASE && ("T".equals(l) || "T".equals(r))) return "T";
                 if ("T".equals(l) && "T".equals(r)) return "T";
                 if ("T".equals(l)) return r;
                 if ("T".equals(r)) return l;
-                return "( " + l + " & " + r + " )";
-            }
-            case OR: {
-                String l = stripNot(left);
-                String r = stripNot(right);
-                if ("T".equals(l) && "T".equals(r)) return "T";
-                if ("T".equals(l)) return r;
-                if ("T".equals(r)) return l;
-                return "( " + l + " | " + r + " )";
+                String joined = l + operator + r;
+                return nested ? "( " + joined + " )" : joined;
             }
             case NOT:
                 return "T";
-            case PHRASE: {
-                String l = stripNot(left);
-                String r = stripNot(right);
-                if ("T".equals(l) || "T".equals(r)) return "T";
-                return "( " + l + " <" + phraseDistance + "> " + r + " )";
-            }
             default:
                 throw new IllegalStateException("Unknown op: " + op);
         }
     }
 
-    private static String stripNot(TsQuery q) {
+    private static String stripNot(TsQuery q, boolean nested, Op parentOp) {
         if (q.op == Op.NOT) return "T";
-        return q.queryTreeInner();
+        // An operand of the same precedence needs no brackets of its own.
+        boolean bracket = q.op != Op.TERM && q.op != parentOp;
+        return q.queryTreeInner(bracket, parentOp);
     }
 
     /** Collect all terms from the query. */
@@ -477,15 +569,22 @@ public class TsQuery {
         switch (op) {
             case TERM: {
                 if (term == null || term.isEmpty()) return "";
-                StringBuilder sb = new StringBuilder("'").append(term).append("'");
+                // A quote inside a lexeme is written twice, so that what is printed reads back
+                // as the lexeme it was printed from rather than closing it early.
+                StringBuilder sb = new StringBuilder("'").append(term.replace("'", "''"))
+                        .append("'");
                 if (prefix || weights != null) {
                     sb.append(":");
+                    // The star says how much of the lexeme has to match and the letters say
+                    // which weights count, and PostgreSQL writes them in that order. Writing
+                    // the star last spelled a query this reader then read as a weight list
+                    // followed by nothing.
+                    if (prefix) sb.append("*");
                     if (weights != null) {
                         List<Character> sorted = new ArrayList<>(weights);
                         Collections.sort(sorted);
                         for (char w : sorted) sb.append(w);
                     }
-                    if (prefix) sb.append("*");
                 }
                 return sb.toString();
             }
@@ -516,6 +615,12 @@ public class TsQuery {
             case PHRASE: {
                 String l = left.toStringInner(true, Op.PHRASE);
                 String r = right.toStringInner(true, Op.PHRASE);
+                // The phrase operator groups to the left, so a phrase on the right is a
+                // different query from the same lexemes run together and has to be written as
+                // one: 'a' <-> ( 'b' <-> 'c' ) puts b and c next to each other and a one before
+                // b, where 'a' <-> 'b' <-> 'c' puts a before b and b before c. Printing them
+                // alike made a value that read back as the other grouping.
+                if (right.op == Op.PHRASE) r = "( " + right.toStringInner(false, null) + " )";
                 String distStr = phraseDistance == 1 ? "<->" : "<" + phraseDistance + ">";
                 return l + " " + distStr + " " + r;
             }

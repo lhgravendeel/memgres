@@ -157,6 +157,26 @@ class DdlObjectExecutor {
                 && executor.database.getCompositeTypes().containsKey(named)) {
             return executeAlterCompositeType(stmt);
         }
+        // A range is a type like the others and answers to the statements that name a type. Only
+        // the enums were looked up below, so a range could not be renamed or moved at all.
+        if (stmt.action() == AlterTypeStmt.Action.RENAME_TO
+                && named != null && executor.database.isRangeType(named)) {
+            String schema = TypeNamespace.schemaOfKey(named);
+            String bare = TypeNamespace.nameOfKey(named);
+            requireTypeNameFree(typeRef(schema, stmt.value()));
+            String subtype = executor.database.getRangeSubtype(named);
+            // The multirange keeps the name it was created with: renaming a range renames the
+            // range and nothing else.
+            String multirange = executor.database.getMultirangeName(named);
+            executor.database.removeRangeType(named);
+            executor.database.addRangeType(schema, stmt.value(), subtype, multirange);
+            executor.database.unregisterSchemaObject(schema, "range", bare);
+            executor.database.registerSchemaObject(schema, "range", stmt.value());
+            executor.database.moveComment("type", named, TypeNamespace.key(schema, stmt.value()));
+            retargetTypeColumns(named, TypeNamespace.key(schema, stmt.value()));
+            executor.identity().typeRenamed("r", named, TypeNamespace.key(schema, stmt.value()));
+            return QueryResult.command(QueryResult.Type.ALTER_TYPE, 0);
+        }
 
         // Which e this is is settled once, by the schema written or by the search path, and the
         // rest of the statement works on that one.
@@ -5907,6 +5927,7 @@ class DdlObjectExecutor {
                     }
                     // Collect key values for rows that pass the WHERE predicate
                     Set<String> seenKeys = new HashSet<>();
+                    Map<String, Object[]> keysFirstSeen = new HashMap<>();
                     boolean idxHasVirtual = executor.dmlExecutor.hasVirtualColumns(valTable);
                     for (Object[] row : existingRows) {
                         Object[] evalRow = idxHasVirtual ? executor.dmlExecutor.computeVirtualColumns(valTable, row) : row;
@@ -5940,11 +5961,22 @@ class DdlObjectExecutor {
                                 if (ci >= 0) {
                                     Object val = evalRow[ci];
                                     keyValues.add(val);
-                                    keyBuilder.append(val == null ? "\0NULL\0" : val.toString()).append('\1');
+                                    // The key is the value, and two values are the same key when
+                                    // the type says they are equal: writing them out and
+                                    // comparing the text made numeric 1.0 and 1.00 two keys, so
+                                    // a unique index was built over rows that violate it.
+                                    keyBuilder.append(val == null ? "\0NULL\0"
+                                            : TypeCoercion.keyText(val)).append('\1');
                                 }
                             }
                         }
                         String key = keyBuilder.toString();
+                        // The complaint names the key as the row that first held it wrote it,
+                        // which is the row a reader will find when they go looking.
+                        Object[] firstSeen = keysFirstSeen.get(key);
+                        if (firstSeen == null) keysFirstSeen.put(key, keyValues.toArray());
+                        else keyValues = new java.util.ArrayList<Object>(
+                                java.util.Arrays.asList(firstSeen));
                         // A null in the key makes its row unlike every other, so it cannot stop the
                         // index being built -- unless the index was declared NULLS NOT DISTINCT,
                         // which is what that clause is for.
@@ -5958,6 +5990,10 @@ class DdlObjectExecutor {
                             dup.setConstraint(s.name());
                             dup.setDetail(IndexKeyDescription.duplicated(
                                     valTable, s.columns(), keyValues.toArray()));
+                            // The relation the index would be over is part of the report, so a
+                            // client reading the fields learns where to look.
+                            dup.setSchema(executor.defaultSchema());
+                            dup.setTable(valTable.getName());
                             throw dup;
                         }
                     }

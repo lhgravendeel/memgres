@@ -23,10 +23,15 @@ public class PgInterval implements Comparable<PgInterval> {
 
     /**
      * PG stores an infinite interval as a reserved field pattern rather than a magnitude, so
-     * the sentinels below are the whole value: days and microseconds carry no meaning for them.
+     * the sentinels below are the whole value: months and days carry no meaning for them.
+     *
+     * <p>The pattern is on the microsecond field, which is the one PostgreSQL reserves. Putting
+     * it on the month field instead took two month counts out of use, and they are counts a
+     * caller can reach: {@code make_interval(months => 2147483647)} is a perfectly good interval
+     * of a hundred and seventy-eight million years, and it came back as infinity.
      */
-    public static final PgInterval INFINITY = new PgInterval(Integer.MAX_VALUE, 0, 0);
-    public static final PgInterval NEG_INFINITY = new PgInterval(Integer.MIN_VALUE, 0, 0);
+    public static final PgInterval INFINITY = new PgInterval(0, 0, Long.MAX_VALUE);
+    public static final PgInterval NEG_INFINITY = new PgInterval(0, 0, Long.MIN_VALUE);
 
     public PgInterval(int months, int days, long microseconds) {
         this.months = months;
@@ -49,12 +54,12 @@ public class PgInterval implements Comparable<PgInterval> {
     public long getMicroseconds() { return microseconds; }
 
     public boolean isInfinite() {
-        return months == Integer.MAX_VALUE || months == Integer.MIN_VALUE;
+        return microseconds == Long.MAX_VALUE || microseconds == Long.MIN_VALUE;
     }
 
-    public boolean isPositiveInfinity() { return months == Integer.MAX_VALUE; }
+    public boolean isPositiveInfinity() { return microseconds == Long.MAX_VALUE; }
 
-    public boolean isNegativeInfinity() { return months == Integer.MIN_VALUE; }
+    public boolean isNegativeInfinity() { return microseconds == Long.MIN_VALUE; }
 
     /** PG rejects an operation whose result would be an indeterminate infinity. */
     private static MemgresException intervalOutOfRange() {
@@ -150,8 +155,9 @@ public class PgInterval implements Comparable<PgInterval> {
      * them either.
      */
     private static PgInterval checked(long months, long days, long micros) {
-        if (months >= Integer.MAX_VALUE || months <= Integer.MIN_VALUE
-                || days > Integer.MAX_VALUE || days < Integer.MIN_VALUE) {
+        if (months > Integer.MAX_VALUE || months < Integer.MIN_VALUE
+                || days > Integer.MAX_VALUE || days < Integer.MIN_VALUE
+                || micros == Long.MAX_VALUE || micros == Long.MIN_VALUE) {
             throw intervalOutOfRange();
         }
         return new PgInterval((int) months, (int) days, micros);
@@ -289,13 +295,18 @@ public class PgInterval implements Comparable<PgInterval> {
         // Try verbose format first: '1 year 2 months 3 weeks 3 days 4 hours 5 minutes 6 seconds'
         Matcher vm = VERBOSE_INTERVAL.matcher(s);
         if (vm.matches() && !s.isEmpty()) {
-            int years = vm.group(1) != null ? Integer.parseInt(vm.group(1)) : 0;
-            int mons = vm.group(2) != null ? Integer.parseInt(vm.group(2)) : 0;
-            int weeks = vm.group(3) != null ? Integer.parseInt(vm.group(3)) : 0;
-            int days = vm.group(4) != null ? Integer.parseInt(vm.group(4)) : 0;
-            int hours = vm.group(5) != null ? Integer.parseInt(vm.group(5)) : 0;
-            int minutes = vm.group(6) != null ? Integer.parseInt(vm.group(6)) : 0;
-            long secondMicros = secondsToMicros(vm.group(7));
+            // A sign carries forward over the fields that follow it, so '-1 year 2 months' is
+            // fourteen months of negative interval and not twelve less two.
+            String[] fields = new String[]{vm.group(1), vm.group(2), vm.group(3), vm.group(4),
+                    vm.group(5), vm.group(6), vm.group(7)};
+            carrySign(fields);
+            int years = fields[0] != null ? Integer.parseInt(fields[0]) : 0;
+            int mons = fields[1] != null ? Integer.parseInt(fields[1]) : 0;
+            int weeks = fields[2] != null ? Integer.parseInt(fields[2]) : 0;
+            int days = fields[3] != null ? Integer.parseInt(fields[3]) : 0;
+            int hours = fields[4] != null ? Integer.parseInt(fields[4]) : 0;
+            int minutes = fields[5] != null ? Integer.parseInt(fields[5]) : 0;
+            long secondMicros = secondsToMicros(fields[6]);
 
             days += weeks * 7;
             long totalMonths = (long) years * 12 + mons;
@@ -362,6 +373,37 @@ public class PgInterval implements Comparable<PgInterval> {
      *
      * @return the parsed interval, or null when the text is not a unit list at all
      */
+    /**
+     * Whether an interval literal is being read under the SQL standard's rules.
+     *
+     * <p>The setting decides how an ambiguously written literal is read as well as how one is
+     * printed: under {@code sql_standard} one sign stands for the whole value, so
+     * {@code '-1 year 2 months'} is fourteen months of negative interval, while under every
+     * other style each field carries its own sign and the same literal is ten months.
+     */
+    private static boolean sqlStandardInput() {
+        String style = TypeCoercion.getIntervalStyle();
+        return style != null && style.equalsIgnoreCase("sql_standard");
+    }
+
+    /**
+     * Apply each field's sign to the fields after it, in place.
+     *
+     * <p>A field that writes its own sign begins again from there; one that does not takes
+     * whichever sign was last written.
+     */
+    private static void carrySign(String[] fields) {
+        if (!sqlStandardInput()) return;
+        boolean negative = false;
+        for (int i = 0; i < fields.length; i++) {
+            String field = fields[i];
+            if (field == null) continue;
+            if (field.startsWith("-")) negative = true;
+            else if (field.startsWith("+")) negative = false;
+            else if (negative) fields[i] = "-" + field;
+        }
+    }
+
     private static PgInterval parseUnitList(String s) {
         String written = s;
         // PG's traditional output opened with '@'; it carries no meaning of its own
@@ -376,13 +418,18 @@ public class PgInterval implements Comparable<PgInterval> {
         boolean matchedAny = false;
         boolean ago = false;
         boolean lastWasUnitless = false;
+        boolean signIsNegative = false;
         int end = 0;
         while (tok.find()) {
             end = tok.end();
             if (tok.group(1) != null) {
                 if (ago) throw invalidIntervalSyntax(written);
                 // A bare time field: the sign on the hours carries across the whole field
-                boolean neg = tok.group(1).startsWith("-");
+                boolean neg = tok.group(1).startsWith("-")
+                        || (signIsNegative && sqlStandardInput()
+                                && !tok.group(1).startsWith("+"));
+                if (tok.group(1).startsWith("-")) signIsNegative = true;
+                else if (tok.group(1).startsWith("+")) signIsNegative = false;
                 long h = Math.abs(Long.parseLong(tok.group(1)));
                 long m = Long.parseLong(tok.group(2));
                 long field = (h * 3600L + m * 60L) * 1_000_000L + secondsToMicros(tok.group(3));
@@ -401,7 +448,11 @@ public class PgInterval implements Comparable<PgInterval> {
             }
             // 'ago' is the last word of a literal; anything after it is a syntax error
             if (ago) throw invalidIntervalSyntax(written);
-            Quantity value = quantity(tok.group(4));
+            String written4 = tok.group(4);
+            if (written4.startsWith("-")) signIsNegative = true;
+            else if (written4.startsWith("+")) signIsNegative = false;
+            else if (signIsNegative && sqlStandardInput()) written4 = "-" + written4;
+            Quantity value = quantity(written4);
             lastWasUnitless = tok.group(5) == null;
             String unit = tok.group(5) == null ? "second" : normalizeUnit(tok.group(5));
             if (unit == null) return null;
@@ -1051,41 +1102,63 @@ public class PgInterval implements Comparable<PgInterval> {
         return toPostgres();
     }
 
+    /**
+     * The verbose style: every field is written as its size, and a value that is negative
+     * throughout says so once at the end.
+     *
+     * <p>The sign of the first field that is not zero decides for the whole value. Where they
+     * agree, {@code ago} carries the sign and each field is written without one; where they do
+     * not, there is no single sign to move and every field keeps its own. Printing a minus on
+     * each field instead spelled {@code @ -1 mon} for what a real server writes
+     * {@code @ 1 mon ago}.
+     */
     private String toPostgresVerbose() {
-        StringBuilder sb = new StringBuilder("@ ");
         int years = months / 12;
         int mons = months % 12;
-        if (years != 0) sb.append(years).append(years == 1 || years == -1 ? " year " : " years ");
-        if (mons != 0) sb.append(mons).append(mons == 1 || mons == -1 ? " mon " : " mons ");
-        if (days != 0) sb.append(days).append(days == 1 || days == -1 ? " day " : " days ");
-
         long absMicros = Math.abs(microseconds);
         long totalSecs = absMicros / 1_000_000;
         long fracMicros = absMicros % 1_000_000;
-        long hours = totalSecs / 3600;
-        long mins = (totalSecs % 3600) / 60;
-        long secs = totalSecs % 60;
-        if (microseconds < 0) {
-            if (hours != 0) sb.append(-hours).append(hours == 1 ? " hour " : " hours ");
-            if (mins != 0) sb.append(-mins).append(mins == 1 ? " min " : " mins ");
-            if (secs != 0 || fracMicros != 0) {
-                sb.append(-secs);
-                if (fracMicros > 0) sb.append(String.format(".%06d", fracMicros).replaceAll("0+$", ""));
-                sb.append(secs == 1 && fracMicros == 0 ? " sec " : " secs ");
-            }
-        } else {
-            if (hours != 0) sb.append(hours).append(hours == 1 ? " hour " : " hours ");
-            if (mins != 0) sb.append(mins).append(mins == 1 ? " min " : " mins ");
-            if (secs != 0 || fracMicros != 0) {
-                sb.append(secs);
-                if (fracMicros > 0) sb.append(String.format(".%06d", fracMicros).replaceAll("0+$", ""));
-                sb.append(secs == 1 && fracMicros == 0 ? " sec " : " secs ");
+        long hours = microseconds < 0 ? -(totalSecs / 3600) : totalSecs / 3600;
+        long mins = microseconds < 0 ? -((totalSecs % 3600) / 60) : (totalSecs % 3600) / 60;
+        long secs = microseconds < 0 ? -(totalSecs % 60) : totalSecs % 60;
+
+        long[] values = {years, mons, days, hours, mins, secs};
+        boolean before = false;
+        for (long value : values) {
+            if (value != 0) {
+                before = value < 0;
+                break;
             }
         }
+        if (values[0] == 0 && values[1] == 0 && values[2] == 0 && values[3] == 0
+                && values[4] == 0 && values[5] == 0 && fracMicros != 0) {
+            before = microseconds < 0;
+        }
 
+        StringBuilder sb = new StringBuilder("@ ");
+        appendVerbose(sb, years, before, "year", "years");
+        appendVerbose(sb, mons, before, "mon", "mons");
+        appendVerbose(sb, days, before, "day", "days");
+        appendVerbose(sb, hours, before, "hour", "hours");
+        appendVerbose(sb, mins, before, "min", "mins");
+        if (secs != 0 || fracMicros != 0) {
+            long shown = before ? -secs : secs;
+            sb.append(shown);
+            if (fracMicros > 0) {
+                sb.append(String.format(".%06d", fracMicros).replaceAll("0+$", ""));
+            }
+            sb.append(shown == 1 && fracMicros == 0 ? " sec " : " secs ");
+        }
         String result = sb.toString().trim();
         if (result.equals("@")) return "@ 0";
-        return result;
+        return before ? result + " ago" : result;
+    }
+
+    private static void appendVerbose(StringBuilder sb, long value, boolean before,
+                                      String one, String many) {
+        if (value == 0) return;
+        long shown = before ? -value : value;
+        sb.append(shown).append(shown == 1 || shown == -1 ? " " + one + " " : " " + many + " ");
     }
 
     private String toPostgres() {
@@ -1131,6 +1204,14 @@ public class PgInterval implements Comparable<PgInterval> {
         return sb.toString().trim();
     }
 
+    /**
+     * The ISO 8601 style, in which every field carries its own sign.
+     *
+     * <p>A value that is negative only in its fraction of a second is still negative, and the
+     * sign has to be written on the seconds even though their whole part is zero: taking the
+     * absolute value first and putting the sign back only where a field was non-zero wrote
+     * {@code PT0.5S} for minus half a second, which reads back as the opposite value.
+     */
     private String toIso8601() {
         StringBuilder sb = new StringBuilder("P");
         int years = months / 12;
@@ -1142,17 +1223,17 @@ public class PgInterval implements Comparable<PgInterval> {
         long absMicros = Math.abs(microseconds);
         if (absMicros > 0 || (years == 0 && mons == 0 && days == 0)) {
             sb.append("T");
+            boolean neg = microseconds < 0;
             long totalSecs = absMicros / 1_000_000;
             long fracMicros = absMicros % 1_000_000;
             long hours = totalSecs / 3600;
             long mins = (totalSecs % 3600) / 60;
             long secs = totalSecs % 60;
-            boolean neg = microseconds < 0;
             if (hours != 0) sb.append(neg ? -hours : hours).append("H");
             if (mins != 0) sb.append(neg ? -mins : mins).append("M");
             if (secs != 0 || fracMicros != 0 || (hours == 0 && mins == 0)) {
-                long displaySecs = neg ? -secs : secs;
-                sb.append(displaySecs);
+                if (neg && secs == 0) sb.append('-');
+                sb.append(neg ? -secs : secs);
                 if (fracMicros > 0) {
                     sb.append(String.format(".%06d", fracMicros).replaceAll("0+$", ""));
                 }
@@ -1162,35 +1243,62 @@ public class PgInterval implements Comparable<PgInterval> {
         return sb.toString();
     }
 
+    /**
+     * The SQL standard style, which allows one sign for the whole value.
+     *
+     * <p>That is only possible when the fields agree in sign and the value is either a
+     * year-month or a day-time one, never both. Where it is possible the sign is written once
+     * in front and the fields follow without one; where it is not, every part is written with
+     * its own sign and the year-month part is written even when it is zero, so that the reader
+     * can tell which shape it is looking at. Writing the year with its sign and the month
+     * without spelled a negative month as a positive one.
+     */
     private String toSqlStandard() {
-        StringBuilder sb = new StringBuilder();
         int years = months / 12;
         int mons = months % 12;
-
-        if (years != 0 || mons != 0) {
-            sb.append(years).append("-").append(Math.abs(mons));
-        }
-
-        if (days != 0) {
-            if (sb.length() > 0) sb.append(" ");
-            sb.append(days);
-        }
-
         long absMicros = Math.abs(microseconds);
-        if (absMicros > 0 || sb.length() == 0) {
-            if (sb.length() > 0) sb.append(" ");
-            long totalSecs = absMicros / 1_000_000;
-            long fracMicros = absMicros % 1_000_000;
-            long hours = totalSecs / 3600;
-            long mins = (totalSecs % 3600) / 60;
-            long secs = totalSecs % 60;
-            if (microseconds < 0) sb.append("-");
-            sb.append(String.format("%d:%02d:%02d", hours, mins, secs));
-            if (fracMicros > 0) {
-                sb.append(String.format(".%06d", fracMicros).replaceAll("0+$", ""));
-            }
-        }
+        long totalSecs = absMicros / 1_000_000;
+        long fracMicros = absMicros % 1_000_000;
+        long sign = microseconds < 0 ? -1 : 1;
+        long hours = sign * (totalSecs / 3600);
+        long mins = sign * ((totalSecs % 3600) / 60);
+        long secs = sign * (totalSecs % 60);
 
+        boolean hasNegative = years < 0 || mons < 0 || days < 0 || microseconds < 0;
+        boolean hasPositive = years > 0 || mons > 0 || days > 0 || microseconds > 0;
+        boolean hasYearMonth = years != 0 || mons != 0;
+        boolean hasDayTime = days != 0 || microseconds != 0;
+        boolean single = !(hasNegative && hasPositive) && !(hasYearMonth && hasDayTime);
+
+        if (!hasYearMonth && !hasDayTime) return "0";
+        StringBuilder sb = new StringBuilder();
+        if (single) {
+            if (hasNegative) {
+                sb.append('-');
+                years = -years;
+                mons = -mons;
+            }
+            if (hasYearMonth) return sb.append(years).append('-').append(Math.abs(mons)).toString();
+            long absDays = Math.abs((long) days);
+            if (days != 0) sb.append(absDays).append(' ');
+            return sb.append(clockPart(Math.abs(hours), Math.abs(mins), Math.abs(secs),
+                    fracMicros)).toString();
+        }
+        sb.append(years < 0 || mons < 0 ? '-' : '+')
+                .append(Math.abs(years)).append('-').append(Math.abs(mons)).append(' ')
+                .append(days < 0 ? '-' : '+').append(Math.abs((long) days)).append(' ')
+                .append(microseconds < 0 ? '-' : '+')
+                .append(clockPart(Math.abs(hours), Math.abs(mins), Math.abs(secs), fracMicros));
+        return sb.toString();
+    }
+
+    /** The hours, minutes and seconds of a value, written without a sign. */
+    private static String clockPart(long hours, long mins, long secs, long fracMicros) {
+        StringBuilder sb = new StringBuilder();
+        sb.append(String.format("%d:%02d:%02d", hours, mins, secs));
+        if (fracMicros > 0) {
+            sb.append(String.format(".%06d", fracMicros).replaceAll("0+$", ""));
+        }
         return sb.toString();
     }
 
@@ -1206,7 +1314,7 @@ public class PgInterval implements Comparable<PgInterval> {
         if (isInfinite() || that.isInfinite()) {
             return months == that.months && days == that.days && microseconds == that.microseconds;
         }
-        return normalizedMicros() == that.normalizedMicros();
+        return normalizedSpan().equals(that.normalizedSpan());
     }
 
     @Override
@@ -1219,9 +1327,24 @@ public class PgInterval implements Comparable<PgInterval> {
     /** The span this interval measures, with a month thirty days and a day twenty-four hours. */
     public long normalizedMicroseconds() { return normalizedMicros(); }
 
+    /**
+     * The span this interval measures, in microseconds.
+     *
+     * <p>Held in more than a long can carry, because it has to be: a month is thirty days of
+     * microseconds, so a month count near the largest one runs to some twenty-one digits.
+     * Flattening it into a long wrapped, and an interval of a billion months then compared
+     * smaller than one day.
+     */
+    private java.math.BigInteger normalizedSpan() {
+        return java.math.BigInteger.valueOf(months)
+                .multiply(java.math.BigInteger.valueOf(30L * 24 * 3600 * 1_000_000L))
+                .add(java.math.BigInteger.valueOf(days)
+                        .multiply(java.math.BigInteger.valueOf(24L * 3600 * 1_000_000L)))
+                .add(java.math.BigInteger.valueOf(microseconds));
+    }
+
     private long normalizedMicros() {
-        return months * 30L * 24 * 3600 * 1_000_000L
-                + days * 24L * 3600 * 1_000_000L + microseconds;
+        return normalizedSpan().longValue();
     }
 
     @Override
@@ -1232,6 +1355,6 @@ public class PgInterval implements Comparable<PgInterval> {
             return Integer.compare(mine, theirs);
         }
         // 1 month = 30 days, 1 day = 24 hours, which is how PostgreSQL orders intervals too.
-        return Long.compare(normalizedMicros(), other.normalizedMicros());
+        return normalizedSpan().compareTo(other.normalizedSpan());
     }
 }

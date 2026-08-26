@@ -1577,6 +1577,7 @@ class CatalogCoreBuilder {
                     || dt == DataType.INTERNAL_CHAR
                     || dt == DataType.TID || dt == DataType.CID
                     || dt == DataType.PG_LSN || dt == DataType.PG_NDISTINCT
+                    || dt == DataType.REGCONFIG
                     || dt == DataType.PG_DEPENDENCIES || dt == DataType.PG_MCV_LIST) continue;
             String pgName = dt.getPgName();
             // One reading of the type's physical attributes, shared with the pg_attribute rows,
@@ -1915,7 +1916,7 @@ class CatalogCoreBuilder {
         for (Map.Entry<String, String> rangeEntry : database.getRangeTypes().entrySet()) {
             String rangeKey = rangeEntry.getKey();
             String rangeName = TypeNamespace.nameOfKey(rangeKey);
-            String multiName = RangeOperations.multirangeTypeName(rangeName);
+            String multiName = database.getMultirangeName(rangeKey);
             String multiKey = TypeNamespace.key(TypeNamespace.schemaOfKey(rangeKey), multiName);
             int rangeNsOid = oids.oid("ns:" + TypeNamespace.schemaOfKey(rangeKey));
             int rangeOid = oids.oid("type:" + rangeKey);
