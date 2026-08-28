@@ -1138,6 +1138,10 @@ class DdlAlterTableExecutor {
         Column col = new Column(def.name(), dt, !notNull, def.primaryKey(), defaultVal,
                 enumTypeName, addPrecision, addScale, genExpr, def.generatedVirtual(), domainTypeName,
                 compositeTypeName, arrayElementType);
+        // A column added later is declared with the same names a column written into CREATE
+        // TABLE is, so a range type has to be carried here too: without it the column knew only
+        // the type its values are stored as, and described itself as text.
+        col.setRangeTypeName(resolved.rangeTypeName());
         String addQualifier = DataType.intervalQualifier(def.typeName());
         col.setIntervalQualifier(addQualifier != null ? addQualifier
                 : resolved.domainIntervalQualifier());

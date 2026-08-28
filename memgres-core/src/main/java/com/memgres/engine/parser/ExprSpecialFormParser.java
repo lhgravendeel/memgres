@@ -393,6 +393,12 @@ class ExprSpecialFormParser {
             if (ep.matchKeyword("FROM")) {
                 charsExpr = firstExpr;
                 stringExpr = ep.parseExpression();
+            } else if (ep.match(TokenType.COMMA)) {
+                // trim(string, characters) is the plain call spelling of the same thing, with
+                // the arguments the other way round from the FROM form. It was not accepted at
+                // all, so the ordinary way of writing this was a syntax error.
+                stringExpr = firstExpr;
+                charsExpr = ep.parseExpression();
             } else {
                 stringExpr = firstExpr;
             }

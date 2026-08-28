@@ -1714,6 +1714,55 @@ class PartitionTriggersAndMergeConcurrencyTest {
         exec("DROP TABLE snw_j1s");
     }
 
+    /**
+     * The same, with the delete already committed before the write begins, so nothing waits for
+     * anything and the outcome does not depend on how the two sessions interleave.
+     *
+     * <p>A write through a join reads its qualification over the other relation as well as the
+     * target, and the row it lost has to be judged the same way. Judged against the target alone
+     * the other relation's names resolved to nothing, the qualification could not be read at
+     * all, and being unable to read it was taken for the row not matching -- so the statement
+     * reported that it wrote nothing about a row it was entitled to write.
+     */
+    @Test
+    void aWriteThroughAJoinIsRefusedTheRowAnAlreadyCommittedDeleteTook() throws Exception {
+        exec("CREATE TABLE snw_k1s (i int)");
+        exec("INSERT INTO snw_k1s VALUES (1),(2),(3)");
+
+        plainTarget("snw_k1");
+        assertEquals("ERR[40001] ERROR: could not serialize access due to concurrent delete",
+                underSnapshotAfterAnotherSessionCommitted(
+                        "REPEATABLE READ", "SELECT count(*) FROM snw_k1",
+                        "DELETE FROM snw_k1 WHERE i = 2",
+                        "UPDATE snw_k1 t SET s = 'z' FROM snw_k1s u WHERE t.i = u.i AND u.i = 2"));
+        exec("DROP TABLE snw_k1");
+
+        plainTarget("snw_k2");
+        assertEquals("ERR[40001] ERROR: could not serialize access due to concurrent delete",
+                underSnapshotAfterAnotherSessionCommitted(
+                        "REPEATABLE READ", "SELECT count(*) FROM snw_k2",
+                        "DELETE FROM snw_k2 WHERE i = 2",
+                        "DELETE FROM snw_k2 t USING snw_k1s u WHERE t.i = u.i AND u.i = 2"));
+        exec("DROP TABLE snw_k2");
+
+        // A row the join was never going to write is not a row the statement lost.
+        plainTarget("snw_k3");
+        assertEquals("[1 rows]", underSnapshotAfterAnotherSessionCommitted(
+                "REPEATABLE READ", "SELECT count(*) FROM snw_k3",
+                "DELETE FROM snw_k3 WHERE i = 2",
+                "UPDATE snw_k3 t SET s = 'z' FROM snw_k1s u WHERE t.i = u.i AND u.i = 1"));
+        exec("DROP TABLE snw_k3");
+
+        plainTarget("snw_k4");
+        assertEquals("[1 rows]", underSnapshotAfterAnotherSessionCommitted(
+                "REPEATABLE READ", "SELECT count(*) FROM snw_k4",
+                "DELETE FROM snw_k4 WHERE i = 2",
+                "DELETE FROM snw_k4 t USING snw_k1s u WHERE t.i = u.i AND u.i = 3"));
+        exec("DROP TABLE snw_k4");
+
+        exec("DROP TABLE snw_k1s");
+    }
+
     @Test
     void aRowOfAPartitionedRelationIsHeldToTheSameRule() throws Exception {
         partitionedTarget("snw_p1");

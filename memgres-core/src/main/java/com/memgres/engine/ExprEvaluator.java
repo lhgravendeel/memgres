@@ -314,13 +314,16 @@ class ExprEvaluator {
                     return b == null;
                 case IS_NOT_UNKNOWN:
                     return b != null;
+                // Whether nothing is a document is not a question with a yes or a no.
                 case IS_DOCUMENT: {
                     Object raw = evalExpr(ib.expr(), ctx);
-                    return raw != null && XmlOperations.isDocument(raw.toString());
+                    return raw == null ? null
+                            : Boolean.valueOf(XmlOperations.isDocument(raw.toString()));
                 }
                 case IS_NOT_DOCUMENT: {
                     Object raw = evalExpr(ib.expr(), ctx);
-                    return raw == null || !XmlOperations.isDocument(raw.toString());
+                    return raw == null ? null
+                            : Boolean.valueOf(!XmlOperations.isDocument(raw.toString()));
                 }
             }
         }
@@ -1128,6 +1131,21 @@ class ExprEvaluator {
         // Built-in text operators that aren't registered as user PgOperator.
         // ^@ is PG 11+ starts-with on text (treated as STRICT).
         if ("^@".equals(cop.opSymbol()) && cop.left() != null) {
+            // Only text starts with text. Reading both sides through toString() gave this
+            // operator a meaning over every pair of values, so 1 ^@ 1 answered true.
+            List<RowContext.TableBinding> bindings = ctx == null
+                    ? java.util.Collections.<RowContext.TableBinding>emptyList()
+                    : ctx.getBindings();
+            DataType leftType = inferTypeFromContext(cop.left(), bindings);
+            DataType rightType = inferTypeFromContext(cop.right(), bindings);
+            if (!isTextLike(leftType) || !isTextLike(rightType)) {
+                MemgresException e = new MemgresException("operator does not exist: "
+                        + operandTypeName(cop.left(), leftVal, ctx) + " ^@ "
+                        + operandTypeName(cop.right(), rightVal, ctx), "42883");
+                e.setHint("No operator matches the given name and argument types. "
+                        + "You might need to add explicit type casts.");
+                throw e;
+            }
             if (leftVal == null || rightVal == null) return null;
             return leftVal.toString().startsWith(rightVal.toString());
         }
@@ -2076,14 +2094,54 @@ class ExprEvaluator {
         }
         String str = leftVal.toString();
         String pat = patternVal.toString();
-        String esc = like.escape();
-        if (esc != null && esc.length() > 1) {
-            // PostgreSQL states the rule the string broke rather than only calling it invalid.
-            throw new MemgresException("invalid escape string"
-                    + "\n  Hint: Escape string must be empty or one character.", "22025");
+        String esc = null;
+        if (like.escape() != null) {
+            Object escVal = evalExpr(like.escape(), ctx);
+            // The escape is an operand, and a comparison with an operand that is nothing has
+            // nothing to answer.
+            if (escVal == null) return null;
+            esc = escVal.toString();
+            if (esc.length() > 1) {
+                // PostgreSQL states the rule the string broke rather than only calling it invalid.
+                throw new MemgresException("invalid escape string"
+                        + "\n  Hint: Escape string must be empty or one character.", "22025");
+            }
         }
         boolean matches = likeMatch(str, pat, esc, like.caseInsensitive());
         return like.negated() ? !matches : matches;
+    }
+
+    /**
+     * Equality, with an enum compared against a word by the enum's own reading of it.
+     *
+     * <p>A word the enum does not hold is not a value of that type at all, so asking whether a
+     * value equals it is asking about something that does not exist. Comparing the two as text
+     * answered false, which reads as "they are different" rather than "there is no such value".
+     */
+    private boolean enumEquals(Object left, Object right) {
+        if ((left instanceof AstExecutor.PgEnum && right instanceof String)
+                || (right instanceof AstExecutor.PgEnum && left instanceof String)) {
+            return compareValues(left, right) == 0;
+        }
+        return TypeCoercion.areEqual(left, right);
+    }
+
+    /** Where a written label stands in an enum, refusing one the enum does not hold. */
+    private static int enumOrdinal(CustomEnum ce, AstExecutor.PgEnum of, String label) {
+        if (!ce.isValidLabel(label)) {
+            String named = of.typeName();
+            int dot = named.lastIndexOf('.');
+            throw new MemgresException("invalid input value for enum "
+                    + (dot < 0 ? named : named.substring(dot + 1)) + ": \"" + label + "\"",
+                    "22P02");
+        }
+        return ce.ordinal(label);
+    }
+
+    /** Whether a type is one of the string types, which are the ones text operators take. */
+    private static boolean isTextLike(DataType type) {
+        return type == null || type == DataType.TEXT || type == DataType.VARCHAR
+                || type == DataType.CHAR || type == DataType.NAME;
     }
 
     private Object evalCase(CaseExpr c, RowContext ctx) {
@@ -2786,9 +2844,9 @@ class ExprEvaluator {
     private boolean evalComparisonOp(BinaryExpr.BinOp op, Object left, Object right) {
         switch (op) {
             case EQUAL:
-                return TypeCoercion.areEqual(left, right);
+                return enumEquals(left, right);
             case NOT_EQUAL:
-                return !TypeCoercion.areEqual(left, right);
+                return !enumEquals(left, right);
             case LESS_THAN:
                 return compareValues(left, right) < 0;
             case GREATER_THAN:
@@ -2824,24 +2882,36 @@ class ExprEvaluator {
         if (a instanceof List<?> && b instanceof List<?>) {
             return TypeCoercion.compare(a, b);
         }
+        // A path is ordered by how many points it holds and by nothing else, so two paths of
+        // one length stand in no order at all however far apart their points are.
+        if (a instanceof String && b instanceof String) {
+            Integer paths = GeometricOperations.comparePaths((String) a, (String) b);
+            if (paths != null) return paths.intValue();
+        }
+        // Two documents are ordered as documents: by how many lexemes they hold, and then by
+        // the lexemes as bytes. Comparing the text they print as put them in the order their
+        // quotes and colons happened to fall in.
+        if (a instanceof TsVector && b instanceof TsVector) {
+            return TextSearchOperations.compareVectors((TsVector) a, (TsVector) b);
+        }
         // PgEnum values compare by ordinal position (creation order)
         if (a instanceof AstExecutor.PgEnum && b instanceof AstExecutor.PgEnum) {
             AstExecutor.PgEnum eb = (AstExecutor.PgEnum) b;
             AstExecutor.PgEnum ea = (AstExecutor.PgEnum) a;
             return ea.compareTo(eb);
         }
-        // One PgEnum and one String (e.g., WHERE enum_col < 'value'); resolve the string to enum ordinal
+        // One PgEnum and one String (e.g., WHERE enum_col < 'value'); the string is read by the
+        // enum's own input function, and a word the enum does not hold is not a value of it --
+        // falling through to a text comparison answered for a value that does not exist.
         if (a instanceof AstExecutor.PgEnum && b instanceof String) {
-            String sb = (String) b;
             AstExecutor.PgEnum ea = (AstExecutor.PgEnum) a;
             CustomEnum ce = executor.database.getCustomEnum(ea.typeName());
-            if (ce != null && ce.isValidLabel(sb)) return Integer.compare(ea.ordinal(), ce.ordinal(sb));
+            if (ce != null) return Integer.compare(ea.ordinal(), enumOrdinal(ce, ea, (String) b));
         }
         if (b instanceof AstExecutor.PgEnum && a instanceof String) {
-            String sa = (String) a;
             AstExecutor.PgEnum eb = (AstExecutor.PgEnum) b;
             CustomEnum ce = executor.database.getCustomEnum(eb.typeName());
-            if (ce != null && ce.isValidLabel(sa)) return Integer.compare(ce.ordinal(sa), eb.ordinal());
+            if (ce != null) return Integer.compare(enumOrdinal(ce, eb, (String) a), eb.ordinal());
         }
         return TypeCoercion.compare(a, b);
     }
@@ -2880,50 +2950,58 @@ class ExprEvaluator {
      */
     static boolean likeMatch(String text, String pattern, String escape, boolean caseInsensitive) {
         boolean noEscape = escape != null && escape.isEmpty();
-        char esc = (escape == null || escape.isEmpty()) ? '\\' : escape.charAt(0);
+        int esc = (escape == null || escape.isEmpty()) ? '\\' : escape.codePointAt(0);
         return matchLike(text, 0, pattern, 0, esc, noEscape, caseInsensitive);
     }
 
+    /**
+     * The walk itself, over characters rather than over the units they are stored in.
+     *
+     * <p>{@code _} stands for one character, and a character above U+FFFF is held in two units.
+     * Stepping a unit at a time made {@code _} stand for half of one, so a pattern of a single
+     * underscore did not match a single emoji and the two halves of it were compared separately.
+     */
     private static boolean matchLike(String t, int ti, String p, int pi,
-                                     char esc, boolean noEscape, boolean ci) {
+                                     int esc, boolean noEscape, boolean ci) {
         int tlen = t.length();
         int plen = p.length();
         while (ti < tlen && pi < plen) {
-            char pc = p.charAt(pi);
+            int pc = p.codePointAt(pi);
             if (!noEscape && pc == esc) {
-                pi++;
+                pi += Character.charCount(pc);
                 if (pi >= plen) throw patternEndsWithEscape();
-                if (!sameChar(p.charAt(pi), t.charAt(ti), ci)) return false;
+                if (!sameChar(p.codePointAt(pi), t.codePointAt(ti), ci)) return false;
             } else if (pc == '%') {
                 pi++;
                 while (pi < plen && p.charAt(pi) == '%') pi++;
                 if (pi >= plen) return true; // a trailing % swallows the rest
                 // The remainder must start with a literal, an escape or _; knowing which
                 // keeps the search from retrying every position of the text.
-                char firstpat = 0;
+                int firstpat = 0;
                 boolean literalFirst = true;
-                if (!noEscape && p.charAt(pi) == esc) {
-                    if (pi + 1 >= plen) throw patternEndsWithEscape();
-                    firstpat = p.charAt(pi + 1);
+                if (!noEscape && p.codePointAt(pi) == esc) {
+                    int after = pi + Character.charCount(esc);
+                    if (after >= plen) throw patternEndsWithEscape();
+                    firstpat = p.codePointAt(after);
                 } else if (p.charAt(pi) == '_') {
                     literalFirst = false;
                 } else {
-                    firstpat = p.charAt(pi);
+                    firstpat = p.codePointAt(pi);
                 }
-                for (int k = ti; k < tlen; k++) {
-                    if (literalFirst && !sameChar(firstpat, t.charAt(k), ci)) continue;
+                for (int k = ti; k < tlen; k += Character.charCount(t.codePointAt(k))) {
+                    if (literalFirst && !sameChar(firstpat, t.codePointAt(k), ci)) continue;
                     if (matchLike(t, k, p, pi, esc, noEscape, ci)) return true;
                 }
                 return false;
             } else if (pc == '_') {
-                ti++;
+                ti += Character.charCount(t.codePointAt(ti));
                 pi++;
                 continue;
-            } else if (!sameChar(pc, t.charAt(ti), ci)) {
+            } else if (!sameChar(pc, t.codePointAt(ti), ci)) {
                 return false;
             }
-            ti++;
-            pi++;
+            ti += Character.charCount(t.codePointAt(ti));
+            pi += Character.charCount(pc);
         }
         if (ti < tlen) return false;
         // The text is spent; only a run of % can still match nothing
@@ -2931,7 +3009,7 @@ class ExprEvaluator {
         return pi >= plen;
     }
 
-    private static boolean sameChar(char a, char b, boolean caseInsensitive) {
+    private static boolean sameChar(int a, int b, boolean caseInsensitive) {
         if (a == b) return true;
         return caseInsensitive
                 && Character.toLowerCase(a) == Character.toLowerCase(b);
@@ -4146,6 +4224,11 @@ class ExprEvaluator {
             String name = FunctionEvaluator.stripSchemaPrefix(fn.name().toLowerCase());
             // count answers in bigint, which is what sum(count(*)) resolves against.
             if (name.equals("count")) return DataType.BIGINT;
+            // A sequence counts in bigint, whichever of its functions is asked.
+            if (name.equals("nextval") || name.equals("currval") || name.equals("lastval")
+                    || name.equals("setval")) {
+                return DataType.BIGINT;
+            }
             if (name.equals("length") || name.equals("char_length")
                     || name.equals("octet_length") || name.equals("bit_length")
                     || name.equals("position") || name.equals("strpos")
@@ -4154,6 +4237,10 @@ class ExprEvaluator {
                     || name.equals("array_lower")
                     || name.equals("num_nonnulls") || name.equals("num_nulls")
                     || name.equals("grouping")
+                    || name.equals("get_byte") || name.equals("get_bit")
+                    || name.equals("regexp_count") || name.equals("regexp_instr")
+                    || name.equals("ascii") || name.equals("npoints")
+                    || name.equals("masklen") || name.equals("family")
                     || name.equals("array_position")) return DataType.INTEGER;
             if (name.equals("array_positions")) return DataType.INT4_ARRAY;
             // The function spellings of @>, <@ and && answer the yes/no question the operators do.
@@ -4335,6 +4422,50 @@ class ExprEvaluator {
                     || name.equals("random_normal")) return DataType.DOUBLE_PRECISION;
             // ts_rank/ts_rank_cd return float4 (OID 700), not text.
             if (name.equals("ts_rank") || name.equals("ts_rank_cd")) return DataType.REAL;
+            // The text-search functions answer values of the text-search types. Left to the
+            // fallback they were all described as text, so a client could not tell a document
+            // from the characters it prints as, and no operator could be resolved over them.
+            if (name.equals("to_tsvector") || name.equals("strip") || name.equals("setweight")
+                    || name.equals("ts_delete") || name.equals("ts_filter")
+                    || name.equals("array_to_tsvector") || name.equals("json_to_tsvector")
+                    || name.equals("jsonb_to_tsvector") || name.equals("tsvector_concat")) {
+                return DataType.TSVECTOR;
+            }
+            if (name.equals("to_tsquery") || name.equals("plainto_tsquery")
+                    || name.equals("phraseto_tsquery") || name.equals("websearch_to_tsquery")
+                    || name.equals("ts_rewrite") || name.equals("tsquery_phrase")
+                    || name.equals("tsquery_and") || name.equals("tsquery_or")
+                    || name.equals("tsquery_not")) {
+                return DataType.TSQUERY;
+            }
+            if (name.equals("get_current_ts_config")) return DataType.REGCONFIG;
+            // The XML constructors answer xml, whatever the characters they built happen to be.
+            if (name.equals("xmlparse") || name.equals("xmlelement") || name.equals("xmlforest")
+                    || name.equals("xmlconcat") || name.equals("xmlroot") || name.equals("xmlpi")
+                    || name.equals("xmlcomment") || name.equals("xmlagg")) {
+                return DataType.XML;
+            }
+            if (name.equals("numnode") || name.equals("tsvector_cmp")
+                    || name.equals("tsquery_cmp")) {
+                return DataType.INTEGER;
+            }
+            if (name.equals("ts_match_vq") || name.equals("ts_match_qv")
+                    || name.equals("ts_match_tt") || name.equals("ts_match_tq")) {
+                return DataType.BOOLEAN;
+            }
+            // The functions that answer bytes rather than the text of them. Left to the
+            // fallback these were described as text, so a client reading the column's type saw
+            // characters where the value is a string of bytes.
+            if (name.equals("sha224") || name.equals("sha256") || name.equals("sha384")
+                    || name.equals("sha512") || name.equals("decode") || name.equals("convert")
+                    || name.equals("convert_to") || name.equals("set_byte")) {
+                return DataType.BYTEA;
+            }
+            // set_bit is declared over both bytea and bit, and answers whichever it was given.
+            if (name.equals("set_bit") && !fn.args().isEmpty()) {
+                DataType given = inferTypeFromContext(fn.args().get(0), bindings);
+                return given == DataType.BYTEA ? DataType.BYTEA : given;
+            }
             // ts_headline hands back what it was given, with the matches marked inside it: a
             // document comes back a document. Read from the value alone an object came back as
             // the array its braces spell, so a client was handed a text[] of one element.

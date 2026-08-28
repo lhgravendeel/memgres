@@ -118,7 +118,7 @@ class CatalogTypeSystemBuilder {
             int rangeTypeOid = oids.oid("type:" + entry.getKey());
             int subtypeOid = resolveTypeOid(subtypeName);
             String multirangeKey = TypeNamespace.key(TypeNamespace.schemaOfKey(entry.getKey()),
-                    RangeOperations.multirangeTypeName(TypeNamespace.nameOfKey(entry.getKey())));
+                    database.getMultirangeName(entry.getKey()));
             table.insertRow(new Object[]{rangeTypeOid, subtypeOid,
                     oids.oid("type:" + multirangeKey), 0, defaultBtreeOpclassOid(subtypeOid),
                     new RegprocValue(0, "-"), new RegprocValue(0, "-")});

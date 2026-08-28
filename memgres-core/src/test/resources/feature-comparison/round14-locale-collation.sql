@@ -80,11 +80,18 @@ SELECT count(*)::text AS c FROM pg_collation WHERE collname = 'r14_coll_from';
 -- ============================================================================
 
 -- 8. German capital sharp S → ß
--- expected-divergence: lower(U+1E9E) result depends on glibc/ICU version — PG may return ß or ẞ
+-- Which character this folds to is read out of the C library's tables and moves with them, so
+-- the letter itself is not something to pin. What does not move is that a fold maps one
+-- character to one character: the length is the same however the tables have it.
 -- begin-expected
 -- columns: v
--- row: ẞ
+-- row: 1
 -- end-expected
+SELECT length(lower(U&'\1E9E'))::text AS v;
+
+-- expected-divergence: which character U+1E9E folds to is read out of the C library's tables,
+-- and those move between platforms and versions; PostgreSQL answers ß where its tables give a
+-- mapping and ẞ where they give none.
 SELECT lower(U&'\1E9E') AS v;
 
 -- 9. initcap

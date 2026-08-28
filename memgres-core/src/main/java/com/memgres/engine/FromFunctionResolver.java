@@ -1250,22 +1250,33 @@ class FromFunctionResolver {
     private List<RowContext> resolveRegexpMatches(String alias, List<String> colAliases, List<Object> evalArgs) {
         Object str = evalArgs.get(0);
         Object pattern = evalArgs.get(1);
-        String flags = evalArgs.size() > 2 ? String.valueOf(evalArgs.get(2)) : "";
         if (str == null || pattern == null) return Cols.listOf();
+        if (evalArgs.size() > 2 && evalArgs.get(2) == null) return Cols.listOf();
+        String flags = evalArgs.size() > 2 ? String.valueOf(evalArgs.get(2)) : "";
         String colName = firstColAlias(colAliases, alias);
-        Column col = new Column(colName, DataType.TEXT, true, false, null);
+        // The rows are arrays of the captured text, one element per group.
+        Column col = new Column(colName, DataType.TEXT_ARRAY, true, false, null);
         Table virtualTable = new Table(alias, Cols.listOf(col));
         List<RowContext> contexts = new ArrayList<>();
-        int jflags = flags.contains("i") ? java.util.regex.Pattern.CASE_INSENSITIVE : 0;
-        java.util.regex.Matcher matcher = java.util.regex.Pattern.compile(pattern.toString(), jflags).matcher(str.toString());
-        while (matcher.find()) {
+        // The pattern is compiled the way every other regular expression in this engine is, so
+        // that the option letters, the class names and the newline rules are the same ones.
+        // Compiling it here with only i and g honoured left this function reading a different
+        // language from the one the operators read.
+        PgRegex.Options opts = PgRegex.parseFlags(flags, true, "regexp_matches");
+        java.util.regex.Matcher matcher =
+                PgRegex.compile(pattern.toString(), opts).matcher(str.toString());
+        int from = 0;
+        while (matcher.find(from)) {
             List<String> groups = new ArrayList<>();
             for (int g = 1; g <= matcher.groupCount(); g++) groups.add(matcher.group(g));
             if (groups.isEmpty()) groups.add(matcher.group(0));
             Object[] row = new Object[]{groups};
             virtualTable.insertRow(row);
             contexts.add(new RowContext(virtualTable, alias, row));
-            if (!flags.contains("g")) break;
+            if (!opts.global) break;
+            // A match of nothing has to move on by one, or the same one is found for ever.
+            from = matcher.end() == matcher.start() ? matcher.end() + 1 : matcher.end();
+            if (from > str.toString().length()) break;
         }
         return contexts;
     }
@@ -2559,6 +2570,14 @@ class FromFunctionResolver {
         String weightFilter = evalArgs.size() > 1 && evalArgs.get(1) != null
                 ? evalArgs.get(1).toString().toUpperCase() : null;
         QueryResult qr = executor.execute(sql);
+        // The query has to describe documents for there to be statistics about them. Counting
+        // whatever the first column held answered for a query naming no tsvector at all, and
+        // the numbers were then about the text some other value happened to print as.
+        if (qr != null && qr.getColumns() != null
+                && (qr.getColumns().size() != 1
+                        || qr.getColumns().get(0).getType() != DataType.TSVECTOR)) {
+            throw new MemgresException("ts_stat query must return one tsvector column", "22023");
+        }
         // word -> [ndoc, nentry]
         Map<String, long[]> stats = new TreeMap<>();
         if (qr != null && qr.getRows() != null) {
@@ -2603,7 +2622,8 @@ class FromFunctionResolver {
         String config = "english";
         String input;
         if (evalArgs.size() >= 2) {
-            config = String.valueOf(evalArgs.get(0));
+            // A configuration that names none is an error, not a fall back to english.
+            config = executor.functionEvaluator.namedTsConfig(String.valueOf(evalArgs.get(0)));
             input = String.valueOf(evalArgs.get(1));
         } else {
             input = String.valueOf(evalArgs.get(0));
@@ -2685,14 +2705,18 @@ class FromFunctionResolver {
         List<String> colNames = new ArrayList<>();
         List<String> colTypes = new ArrayList<>();
         List<String> colPaths = new ArrayList<>();
+        List<String> colDefaults = new ArrayList<>();
+        List<Boolean> colNotNull = new ArrayList<>();
         for (int i = 2; i < args.size(); i++) {
             String def = args.get(i) instanceof com.memgres.engine.parser.ast.Literal
                     ? ((com.memgres.engine.parser.ast.Literal) args.get(i)).value()
                     : executor.evalExpr(args.get(i), null).toString();
-            String[] parts = def.split(":", 3);
+            String[] parts = splitColumnDefinition(def);
             colNames.add(parts[0]);
-            colTypes.add(parts.length > 1 ? parts[1] : "text");
-            colPaths.add(parts.length > 2 ? parts[2] : parts[0]);
+            colTypes.add(parts[1] == null ? "text" : parts[1]);
+            colPaths.add(parts[2]);
+            colDefaults.add(parts[3]);
+            colNotNull.add(Boolean.valueOf("t".equals(parts[4])));
         }
 
         // Use Java XPath to evaluate
@@ -2718,34 +2742,60 @@ class FromFunctionResolver {
                 Object[] rowVals = new Object[colNames.size()];
                 for (int c = 0; c < colNames.size(); c++) {
                     String colPath = colPaths.get(c);
-                    try {
-                        String val = xp.evaluate(colPath, rowNode);
-                        if (val != null && !val.isEmpty()) {
-                            DataType dt = DataType.fromPgName(colTypes.get(c));
-                            // Each column is read in the type it was declared. Reading every
-                            // integer column as an int threw for anything past 2147483647, and
-                            // the catch below turned a bigint the document did carry into NULL.
-                            if (dt == DataType.BIGINT) {
-                                rowVals[c] = Long.parseLong(val.trim());
-                            } else if (dt == DataType.SMALLINT) {
-                                rowVals[c] = Short.parseShort(val.trim());
-                            } else if (dt == DataType.INTEGER) {
-                                rowVals[c] = Integer.parseInt(val.trim());
-                            } else {
-                                rowVals[c] = val;
-                            }
-                        }
-                    } catch (Exception e) {
-                        rowVals[c] = null;
+                    DataType dt = DataType.fromPgName(colTypes.get(c));
+                    if (colPath == null) {
+                        // FOR ORDINALITY: the row's place in the sequence, counted from one.
+                        rowVals[c] = Integer.valueOf(r + 1);
+                        continue;
                     }
+                    String val = xp.evaluate(colPath, rowNode);
+                    if (val == null || val.isEmpty()) {
+                        // Nothing was selected, so the DEFAULT stands in -- and where there is
+                        // none and the column says NOT NULL, the row cannot be built at all.
+                        if (colDefaults.get(c) != null) {
+                            rowVals[c] = TypeCoercion.coerce(colDefaults.get(c),
+                                    dt == null ? DataType.TEXT : dt);
+                        } else if (colNotNull.get(c).booleanValue()) {
+                            throw new MemgresException(
+                                    "null is not allowed in column \"" + colNames.get(c) + "\"",
+                                    "22004");
+                        }
+                        continue;
+                    }
+                    // Each column is read in the type it was declared, and text the type cannot
+                    // read is the document's error rather than a value to quietly drop.
+                    rowVals[c] = TypeCoercion.coerce(val, dt == null ? DataType.TEXT : dt);
                 }
                 virtualTable.insertRow(rowVals);
                 contexts.add(new RowContext(virtualTable, alias, rowVals));
             }
+        } catch (MemgresException e) {
+            throw e;
         } catch (Exception e) {
             throw new MemgresException("XMLTABLE evaluation error: " + e.getMessage(), "42000");
         }
         return contexts;
+    }
+
+    /**
+     * The five parts of an XMLTABLE column definition, each written as its length and the text.
+     *
+     * @return name, type, path, default and whether the column was declared NOT NULL; the path
+     *     and the default are {@code null} where the definition had none
+     */
+    static String[] splitColumnDefinition(String def) {
+        String[] parts = new String[5];
+        int at = 0;
+        for (int i = 0; i < 5 && at < def.length(); i++) {
+            int colon = def.indexOf(':', at);
+            if (colon < 0) break;
+            int length = Integer.parseInt(def.substring(at, colon));
+            at = colon + 1;
+            if (length < 0) continue;
+            parts[i] = def.substring(at, at + length);
+            at += length;
+        }
+        return parts;
     }
 
     // ---- hstore SRFs: skeys, svals, each ----

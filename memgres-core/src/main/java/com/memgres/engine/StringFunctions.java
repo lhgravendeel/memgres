@@ -401,11 +401,18 @@ class StringFunctions {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
                 if (arg instanceof byte[]) return ((byte[]) arg).length; // bytea length = byte count
-                // length(text, encoding): PG resolves two-text-arg call to encoding-aware overload
-                // which then rejects invalid encoding name with 22023 (invalid_parameter_value)
+                // length(text, encoding) counts the characters the text spells in that
+                // encoding. Refusing every name meant the overload could not be called at all.
                 if (fn.args().size() > 1 && !(arg instanceof byte[])) {
                     Object enc = executor.evalExpr(fn.args().get(1), ctx);
-                    throw new MemgresException("\"" + enc + "\" is not a valid encoding name", "22023");
+                    if (enc == null) return null;
+                    String encoding = PgEncoding.canonical(String.valueOf(enc));
+                    if (encoding == null) {
+                        throw new MemgresException(
+                                "invalid encoding name \"" + enc + "\"", "22023");
+                    }
+                    String text = arg.toString();
+                    return text.codePointCount(0, text.length());
                 }
                 if (arg instanceof TsVector) return ((TsVector) arg).length();
                 String argStr = arg.toString();
@@ -465,7 +472,7 @@ class StringFunctions {
                 if (collLocale != null) {
                     return arg.toString().toUpperCase(collLocale);
                 }
-                return arg.toString().toUpperCase();
+                return foldCase(arg.toString(), true);
             }
             // casefold is lower() done for comparison rather than for display: it folds the
             // characters whose case-insensitive match differs from a simple lowercasing.
@@ -476,7 +483,7 @@ class StringFunctions {
                 }
                 Object cfArg = executor.evalExpr(fn.args().get(0), ctx);
                 if (cfArg == null) return null;
-                return cfArg.toString().toLowerCase();
+                return foldCase(cfArg.toString(), false);
             }
             // parse_ident splits a qualified name into its parts, unquoting each one.
             case "parse_ident": {
@@ -513,25 +520,7 @@ class StringFunctions {
                     return r.isEmpty() ? null : narrowRangeBound(r.lowerValue(), fn, ctx);
                 }
                 if (arg instanceof Number) throw new MemgresException("function lower(integer) does not exist", "42883");
-                {
-                    String original = arg.toString();
-                    String lowered = original.toLowerCase();
-                    // PG does not lowercase U+1E9E (capital sharp S) to U+00DF (ß)
-                    if (original.indexOf('\u1E9E') >= 0) {
-                        StringBuilder sb = new StringBuilder(lowered.length());
-                        int oi = 0;
-                        for (int li = 0; li < lowered.length(); li++) {
-                            if (lowered.charAt(li) == '\u00DF' && oi < original.length() && original.charAt(oi) == '\u1E9E') {
-                                sb.append('\u1E9E');
-                            } else {
-                                sb.append(lowered.charAt(li));
-                            }
-                            oi++;
-                        }
-                        return sb.toString();
-                    }
-                    return lowered;
-                }
+                return foldCase(arg.toString(), false);
             }
             case "trim":
             case "to_ascii": {
@@ -544,21 +533,12 @@ class StringFunctions {
                 if (fn.args().size() > 1) {
                     Object encArg = executor.evalExpr(fn.args().get(1), ctx);
                     if (encArg == null) return null;
-                    encoding = encodingNameOf(encArg);
+                    encoding = PgEncoding.named(encArg, null);
                 }
-                if (!TO_ASCII_SOURCES.contains(encoding.toUpperCase())) {
-                    throw new MemgresException("encoding conversion from " + encoding
-                            + " to ASCII not supported", "0A000");
-                }
-                // Strip the accents rather than the letters: that is what the conversion is for.
-                String folded = java.text.Normalizer.normalize(
-                        arg.toString(), java.text.Normalizer.Form.NFD);
-                StringBuilder ascii = new StringBuilder(folded.length());
-                for (int i = 0; i < folded.length(); i++) {
-                    char c = folded.charAt(i);
-                    if (Character.getType(c) != Character.NON_SPACING_MARK) ascii.append(c);
-                }
-                return ascii.toString();
+                // The named encoding says what the source bytes are, and the table for it says
+                // what each of them spells. Stripping accents from the characters instead
+                // answered for text that was never there.
+                return PgEncoding.toAscii(arg.toString(), encoding);
             }
             case "btrim": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
@@ -574,15 +554,12 @@ class StringFunctions {
                     // Strict: there is no answer to "trim these characters" when which characters
                     // is unknown. Rendering the NULL as text trimmed the letters of the word null.
                     if (charsArg == null) return null;
-                    String chars = charsArg.toString();
-                    String s = arg.toString();
-                    int start = 0;
-                    while (start < s.length() && chars.indexOf(s.charAt(start)) >= 0) start++;
-                    int end = s.length() - 1;
-                    while (end >= start && chars.indexOf(s.charAt(end)) >= 0) end--;
-                    return s.substring(start, end + 1);
+                    return trimCharacters(arg.toString(), charsArg.toString(), true, true);
                 }
-                return arg.toString().trim();
+                // With no character set named, the character stripped is the space and only the
+                // space. Java's trim removes everything below it as well, so a tab or a newline
+                // at either end went too -- characters the caller never asked to lose.
+                return trimCharacters(arg.toString(), " ", true, true);
             }
             case "concat": {
                 StringBuilder sb = new StringBuilder();
@@ -649,13 +626,17 @@ class StringFunctions {
                 // SQL-standard substring(text FROM similar_pattern FOR escape_char): three args
                 // where the pattern is a (non-numeric) string, e.g.
                 //   substring('foobar' from '%#"o_b#"%' for '#') -> 'oob'.
-                if (fn.args().size() == 3 && "substring".equals(name)) {
+                // Which of the three-argument forms this is was settled by looking at the
+                // pattern: text that spelled a number was read as a position instead, so the
+                // shape of the data decided which function ran. The declared types settle it.
+                if (fn.args().size() == 3 && "substring".equals(name)
+                        && isTextArgument(fn.args().get(1), ctx)
+                        && isTextArgument(fn.args().get(2), ctx)) {
                     Object patArg = executor.evalExpr(fn.args().get(1), ctx);
-                    if (patArg instanceof String && !((String) patArg).matches("\\s*[+-]?\\d+\\s*")) {
-                        Object escArg = executor.evalExpr(fn.args().get(2), ctx);
-                        return sqlSimilarSubstring(str.toString(), (String) patArg,
-                                escArg == null ? "\\" : escArg.toString());
-                    }
+                    Object escArg = executor.evalExpr(fn.args().get(2), ctx);
+                    if (patArg == null || escArg == null) return null;
+                    return sqlSimilarSubstring(str.toString(), patArg.toString(),
+                            escArg.toString());
                 }
                 Object arg1 = executor.evalExpr(fn.args().get(1), ctx);
                 if (arg1 == null) return null;
@@ -669,14 +650,18 @@ class StringFunctions {
                     } catch (Exception e) {
                         // Not an int, treat as regex pattern
                         java.util.regex.Matcher m = PgRegex.compile(pattern).matcher(str.toString());
-                        // PG returns group 1 if it exists, else whole match
-                        return m.find() ? (m.groupCount() >= 1 && m.group(1) != null ? m.group(1) : m.group()) : null;
+                        if (!m.find()) return null;
+                        // A pattern with a group asks for that group. Where the group took no
+                        // part in the match it captured nothing, and nothing is the answer --
+                        // falling back to the whole match answered a different question.
+                        return m.groupCount() >= 1 ? m.group(1) : m.group();
                     }
                 }
                 Integer startBox = countArgument(fn, ctx, 1, name); // PG 1-based position
                 if (startBox == null) return null;
                 int start = startBox;
                 String strVal = str.toString();
+                int held = characters(strVal);
                 if (fn.args().size() > 2) {
                     Integer countBox = countArgument(fn, ctx, 2, name);
                     if (countBox == null) return null;
@@ -688,13 +673,13 @@ class StringFunctions {
                     // Clip start to [1, len+1], clip end to [start, len+1].
                     int end = start + count; // 1-based exclusive
                     int from = Math.max(1, start) - 1; // 0-based inclusive
-                    int to = Math.min(strVal.length(), Math.max(0, end - 1)); // 0-based exclusive
-                    if (from >= strVal.length() || to <= from) return "";
-                    return strVal.substring(from, to);
+                    int to = Math.min(held, Math.max(0, end - 1)); // 0-based exclusive
+                    if (from >= held || to <= from) return "";
+                    return charSubstring(strVal, from, to);
                 }
                 int from = Math.max(1, start) - 1; // 0-based
-                if (from >= strVal.length()) return "";
-                return strVal.substring(from);
+                if (from >= held) return "";
+                return charSubstring(strVal, from, held);
             }
             case "substring_similar": {
                 // substring(str SIMILAR pattern ESCAPE escape)
@@ -762,16 +747,17 @@ class StringFunctions {
                     fill = fillVal.toString();
                 }
                 String s = str.toString();
-                if (s.length() >= len) return s.substring(0, len);
+                int held = characters(s);
+                if (held >= len) return charSubstring(s, 0, len);
                 // Nothing to pad with, so PG shortens the request to the input itself — which is
                 // also why an outsized length with an empty fill is not a length error.
                 if (fill.isEmpty()) return s;
                 if (len > MAX_PAD_LENGTH) throw requestedLengthTooLarge();
                 StringBuilder sb = new StringBuilder();
-                while (sb.length() + s.length() < len) {
+                while (characters(sb.toString()) + held < len) {
                     sb.append(fill);
                 }
-                return sb.substring(0, len - s.length()) + s;
+                return charSubstring(sb.toString(), 0, len - held) + s;
             }
             case "rpad": {
                 requireIntegerCounts(fn, ctx, "rpad", 1);
@@ -788,16 +774,16 @@ class StringFunctions {
                     fill = fillVal.toString();
                 }
                 String s = str.toString();
-                if (s.length() >= len) return s.substring(0, len);
+                if (characters(s) >= len) return charSubstring(s, 0, len);
                 // Nothing to pad with: PG shortens the request to the input itself, and without
                 // that the loop below appends an empty string forever.
                 if (fill.isEmpty()) return s;
                 if (len > MAX_PAD_LENGTH) throw requestedLengthTooLarge();
                 StringBuilder sb = new StringBuilder(s);
-                while (sb.length() < len) {
+                while (characters(sb.toString()) < len) {
                     sb.append(fill);
                 }
-                return sb.substring(0, len);
+                return charSubstring(sb.toString(), 0, len);
             }
             case "position":
             case "strpos": {
@@ -815,10 +801,10 @@ class StringFunctions {
                 }
                 if (name.equals("position")) {
                     // POSITION: arg1=substring, arg2=string
-                    return arg2.toString().indexOf(arg1.toString()) + 1;
+                    return charIndexOf(arg2.toString(), arg1.toString());
                 }
                 // strpos: arg1=string, arg2=substring
-                return arg1.toString().indexOf(arg2.toString()) + 1;
+                return charIndexOf(arg1.toString(), arg2.toString());
             }
             case "left": {
                 requireIntegerCounts(fn, ctx, "left", 1);
@@ -828,8 +814,9 @@ class StringFunctions {
                 if (nBox == null) return null;
                 int n = nBox;
                 String s = str.toString();
-                if (n >= 0) return s.substring(0, Math.min(n, s.length()));
-                return n + s.length() > 0 ? s.substring(0, s.length() + n) : "";
+                if (n >= 0) return charSubstring(s, 0, n);
+                int held = characters(s);
+                return n + held > 0 ? charSubstring(s, 0, held + n) : "";
             }
             case "right": {
                 requireIntegerCounts(fn, ctx, "right", 1);
@@ -839,8 +826,14 @@ class StringFunctions {
                 if (nBox == null) return null;
                 int n = nBox;
                 String s = str.toString();
-                if (n >= 0) return s.substring(Math.max(0, s.length() - n));
-                return -n < s.length() ? s.substring(-n) : "";
+                int held = characters(s);
+                if (n >= 0) return charSubstring(s, Math.max(0, held - n), held);
+                // A negative count says how many to leave off the front. Negating the smallest
+                // representable count leaves it where it was -- still negative -- and handing
+                // that to substring reported Java's own range complaint as an internal error.
+                int drop = -n;
+                if (drop < 0) drop = 0;
+                return drop < held ? charSubstring(s, drop, held) : "";
             }
             case "repeat": {
                 requireIntegerCounts(fn, ctx, "repeat", 1);
@@ -916,9 +909,12 @@ class StringFunctions {
                     // Distinguish old form (flags string) from PG15+ form (start int)
                     if (arg3 instanceof Number) {
                         pg15Form = true;
-                        startPos = executor.toInt(arg3);
+                        startPos = requireStart(executor.toInt(arg3));
                         if (fn.args().size() > 4) {
-                            nth = executor.toInt(executor.evalExpr(fn.args().get(4), ctx));
+                            // Zero means every match here, so this is the one place a count of
+                            // none is a count and only a negative one names no match at all.
+                            nth = requireOccurrence(
+                                    executor.toInt(executor.evalExpr(fn.args().get(4), ctx)), 0);
                         }
                         if (fn.args().size() > 5) {
                             Object flagsVal = executor.evalExpr(fn.args().get(5), ctx);
@@ -1054,10 +1050,11 @@ class StringFunctions {
                 String flags = "";
                 int subexpr = 0;
                 if (fn.args().size() > 2) {
-                    start = executor.toInt(executor.evalExpr(fn.args().get(2), ctx));
+                    start = requireStart(executor.toInt(executor.evalExpr(fn.args().get(2), ctx)));
                 }
                 if (fn.args().size() > 3) {
-                    nthMatch = executor.toInt(executor.evalExpr(fn.args().get(3), ctx));
+                    nthMatch = requireOccurrence(
+                            executor.toInt(executor.evalExpr(fn.args().get(3), ctx)), 1);
                 }
                 if (fn.args().size() > 4) {
                     Object flagsVal = executor.evalExpr(fn.args().get(4), ctx);
@@ -1108,10 +1105,11 @@ class StringFunctions {
                 String flags = "";
                 int subexpr = 0;
                 if (fn.args().size() > 2) {
-                    start = executor.toInt(executor.evalExpr(fn.args().get(2), ctx));
+                    start = requireStart(executor.toInt(executor.evalExpr(fn.args().get(2), ctx)));
                 }
                 if (fn.args().size() > 3) {
-                    nthMatch = executor.toInt(executor.evalExpr(fn.args().get(3), ctx));
+                    nthMatch = requireOccurrence(
+                            executor.toInt(executor.evalExpr(fn.args().get(3), ctx)), 1);
                 }
                 if (fn.args().size() > 4) {
                     endOption = executor.toInt(executor.evalExpr(fn.args().get(4), ctx));
@@ -1205,7 +1203,10 @@ class StringFunctions {
                         // Width from next argument
                         if (argIdx >= fmtArgs.size()) throw new MemgresException("too few arguments for format()", "22023");
                         Object wArg = fmtArgs.get(argIdx++);
-                        width = wArg instanceof Number ? ((Number) wArg).intValue() : Integer.parseInt(wArg.toString());
+                        // The width is an argument like any other, so it can be nothing -- which
+                        // is no width -- and it can be text that names no number, which is the
+                        // caller's mistake and not this engine's.
+                        width = wArg == null ? 0 : widthArgument(wArg);
                         if (width < 0) { leftAlign = true; width = -width; }
                         hasWidth = true;
                         j++;
@@ -1221,6 +1222,11 @@ class StringFunctions {
                     int useArgIdx = -1;
                     if (fmtStr.charAt(j) == '$' && hasWidth && !leftAlign) {
                         // The "width" digits were actually a position number
+                        // Arguments are numbered from one, so there is no argument zero.
+                        if (width == 0) {
+                            throw new MemgresException("format specifies argument 0, but "
+                                    + "arguments are numbered from 1", "22023");
+                        }
                         useArgIdx = width - 1; // 1-based → 0-based
                         width = 0;
                         hasWidth = false;
@@ -1238,8 +1244,16 @@ class StringFunctions {
                     if (spec != 's' && spec != 'I' && spec != 'L') {
                         throw new MemgresException("unrecognized format() type specifier \"" + spec + "\"", "22023");
                     }
-                    // Get the argument value
-                    int aIdx = useArgIdx >= 0 ? useArgIdx : argIdx++;
+                    // Get the argument value. Naming a position also moves the cursor past it,
+                    // so '%1$s %s' takes the first argument and then the second: leaving the
+                    // cursor alone made the second specifier take the first argument again.
+                    int aIdx;
+                    if (useArgIdx >= 0) {
+                        aIdx = useArgIdx;
+                        argIdx = useArgIdx + 1;
+                    } else {
+                        aIdx = argIdx++;
+                    }
                     if (aIdx < 0 || aIdx >= fmtArgs.size()) {
                         throw new MemgresException("too few arguments for format()", "22023");
                     }
@@ -1290,7 +1304,8 @@ class StringFunctions {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
                 String s = arg.toString();
-                return s.isEmpty() ? 0 : (int) s.charAt(0);
+                // The first character, which above U+FFFF is two units and one code point.
+                return s.isEmpty() ? 0 : s.codePointAt(0);
             }
             case "md5": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
@@ -1350,10 +1365,13 @@ class StringFunctions {
                     // NULL delimiter: split into individual characters
                     String s = str.toString();
                     List<Object> chars = new ArrayList<>();
-                    for (int i = 0; i < s.length(); i++) {
-                        chars.add(String.valueOf(s.charAt(i)));
+                    int at = 0;
+                    while (at < s.length()) {
+                        int next = s.offsetByCodePoints(at, 1);
+                        chars.add(s.substring(at, next));
+                        at = next;
                     }
-                    return chars;
+                    return applyNullString(chars, fn, ctx);
                 }
                 List<Object> result;
                 if (delim.toString().isEmpty()) {
@@ -1364,23 +1382,12 @@ class StringFunctions {
                     String[] parts = str.toString().split(java.util.regex.Pattern.quote(delim.toString()), -1);
                     result = new ArrayList<>(Arrays.asList((Object[]) parts));
                 }
-                if (fn.args().size() > 2) {
-                    Object nullStr = executor.evalExpr(fn.args().get(2), ctx);
-                    if (nullStr != null) {
-                        String ns = nullStr.toString();
-                        for (int i = 0; i < result.size(); i++) {
-                            if (ns.equals(result.get(i))) {
-                                result.set(i, null);
-                            }
-                        }
-                    }
-                }
-                return result;
+                return applyNullString(result, fn, ctx);
             }
             case "encode": {
                 Object data = executor.evalExpr(fn.args().get(0), ctx);
                 Object fmt = executor.evalExpr(fn.args().get(1), ctx);
-                if (data == null) return null;
+                if (data == null || fmt == null) return null;
                 String format = fmt.toString().toLowerCase();
                 byte[] bytes;
                 if (data instanceof byte[]) {
@@ -1389,7 +1396,7 @@ class StringFunctions {
                     bytes = data.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
                 }
                 if (format.equals("base64")) {
-                    return java.util.Base64.getEncoder().encodeToString(bytes);
+                    return ByteaOperations.encodeBase64(bytes);
                 } else if (format.equals("hex")) {
                     StringBuilder hex = new StringBuilder();
                     for (byte b : bytes) hex.append(String.format("%02x", b));
@@ -1402,12 +1409,16 @@ class StringFunctions {
                     StringBuilder sb = new StringBuilder();
                     for (byte b : bytes) {
                         int unsigned = b & 0xFF;
-                        if (unsigned >= 32 && unsigned <= 126 && unsigned != 92) {
-                            sb.append((char) unsigned);
-                        } else if (unsigned == 92) {
+                        // Only a zero byte, a byte with its high bit set, and the backslash
+                        // itself are written as escapes. Escaping every unprintable byte turned
+                        // a tab into four characters and made the length of the result a
+                        // property of this engine rather than of the bytes.
+                        if (unsigned == 92) {
                             sb.append("\\\\");
-                        } else {
+                        } else if (unsigned == 0 || unsigned >= 128) {
                             sb.append('\\').append(String.format("%03o", unsigned));
+                        } else {
+                            sb.append((char) unsigned);
                         }
                     }
                     return sb.toString();
@@ -1419,41 +1430,14 @@ class StringFunctions {
             case "decode": {
                 Object data = executor.evalExpr(fn.args().get(0), ctx);
                 Object fmt = executor.evalExpr(fn.args().get(1), ctx);
-                if (data == null) return null;
+                if (data == null || fmt == null) return null;
                 String format = fmt.toString().toLowerCase();
                 if (format.equals("base64")) {
-                    try {
-                        return java.util.Base64.getDecoder().decode(data.toString());
-                    } catch (IllegalArgumentException e) {
-                        throw new MemgresException("invalid input for decoding: \"" + data + "\"", "22023");
-                    }
+                    return ByteaOperations.decodeBase64(data.toString());
                 } else if (format.equals("hex")) {
-                    String hexStr = data.toString();
-                    if (hexStr.length() % 2 != 0 || !hexStr.matches("[0-9a-fA-F]*")) {
-                        throw new MemgresException("invalid hexadecimal data: odd number of digits", "22023");
-                    }
-                    return ByteaOperations.hexToBytes(hexStr);
+                    return ByteaOperations.decodeHexText(data.toString());
                 } else if (format.equals("escape")) {
-                    // decode(text, 'escape') -> bytea: plain ASCII bytes, with \NNN for non-printable
-                    String s = data.toString();
-                    java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
-                    for (int ci = 0; ci < s.length(); ci++) {
-                        char c = s.charAt(ci);
-                        if (c == '\\' && ci + 3 < s.length()
-                                && s.charAt(ci + 1) >= '0' && s.charAt(ci + 1) <= '3'
-                                && s.charAt(ci + 2) >= '0' && s.charAt(ci + 2) <= '7'
-                                && s.charAt(ci + 3) >= '0' && s.charAt(ci + 3) <= '7') {
-                            int val = (s.charAt(ci + 1) - '0') * 64 + (s.charAt(ci + 2) - '0') * 8 + (s.charAt(ci + 3) - '0');
-                            bos.write(val);
-                            ci += 3;
-                        } else if (c == '\\' && ci + 1 < s.length() && s.charAt(ci + 1) == '\\') {
-                            bos.write('\\');
-                            ci++;
-                        } else {
-                            bos.write((byte) c);
-                        }
-                    }
-                    return bos.toByteArray();
+                    return ByteaOperations.decodeEscape(data.toString());
                 } else {
                     throw new MemgresException("unrecognized encoding: \"" + fmt + "\"", "22023");
                 }
@@ -1506,9 +1490,10 @@ class StringFunctions {
                 }
                 int start = startPos - 1; // 1-based to 0-based
                 String s = str.toString();
-                return s.substring(0, Math.min(start, s.length()))
+                int held = characters(s);
+                return charSubstring(s, 0, start)
                         + replacement
-                        + (start + count < s.length() ? s.substring(start + count) : "");
+                        + (start + count < held ? charSubstring(s, start + count, held) : "");
             }
             case "octet_length": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
@@ -1576,45 +1561,44 @@ class StringFunctions {
                 }
                 return java.text.Normalizer.normalize(arg.toString(), java.text.Normalizer.Form.valueOf(form));
             }
-            case "unicode": {
-                Object arg = executor.evalExpr(fn.args().get(0), ctx);
-                if (arg == null) return null;
-                String s = arg.toString();
-                return s.isEmpty() ? 0 : s.codePointAt(0);
-            }
             case "unistr": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
                 String s = arg.toString();
                 StringBuilder sb = new StringBuilder();
                 for (int i = 0; i < s.length(); i++) {
-                    if (s.charAt(i) == '\\' && i + 1 < s.length()) {
-                        // \+NNNNNN — 6-digit codepoint
-                        if (s.charAt(i + 1) == '+' && i + 7 < s.length()) {
-                            String hex = s.substring(i + 2, i + 8);
-                            try {
-                                sb.appendCodePoint(Integer.parseInt(hex, 16));
-                                i += 7;
-                                continue;
-                            } catch (NumberFormatException e) { /* fall through */ }
-                        }
-                        // \NNNN — 4-digit codepoint
-                        if (i + 4 < s.length()) {
-                            String hex = s.substring(i + 1, i + 5);
-                            try {
-                                sb.appendCodePoint(Integer.parseInt(hex, 16));
-                                i += 4;
-                                continue;
-                            } catch (NumberFormatException e) { /* fall through */ }
-                        }
-                        // \\ — literal backslash
-                        if (s.charAt(i + 1) == '\\') {
-                            sb.append('\\');
-                            i++;
-                            continue;
-                        }
+                    if (s.charAt(i) != '\\') {
+                        sb.append(s.charAt(i));
+                        continue;
                     }
-                    sb.append(s.charAt(i));
+                    // Every backslash here introduces an escape, and there are four spellings
+                    // and no others: a backslash before anything else is the caller's mistake.
+                    // Passing an unrecognised one through unchanged answered text that had not
+                    // been unescaped at all, and left \U -- the eight-digit form -- unread.
+                    if (i + 1 < s.length() && s.charAt(i + 1) == '\\') {
+                        sb.append('\\');
+                        i++;
+                        continue;
+                    }
+                    int digits;
+                    int from;
+                    if (i + 1 < s.length() && s.charAt(i + 1) == '+') {
+                        digits = 6;
+                        from = i + 2;
+                    } else if (i + 1 < s.length() && s.charAt(i + 1) == 'u') {
+                        digits = 4;
+                        from = i + 2;
+                    } else if (i + 1 < s.length() && s.charAt(i + 1) == 'U') {
+                        digits = 8;
+                        from = i + 2;
+                    } else {
+                        digits = 4;
+                        from = i + 1;
+                    }
+                    Integer point = hexPoint(s, from, digits);
+                    if (point == null) throw invalidUnicodeEscape();
+                    sb.appendCodePoint(point.intValue());
+                    i = from + digits - 1;
                 }
                 return sb.toString();
             }
@@ -1679,6 +1663,158 @@ class StringFunctions {
     }
 
     /**
+     * The third argument of {@code string_to_array}: which element text stands for nothing.
+     *
+     * <p>It applies to every way of splitting, and the branch that splits into single characters
+     * used to return before reaching it -- so the argument was honoured or ignored depending on
+     * whether a delimiter had been given.
+     */
+    private List<Object> applyNullString(List<Object> parts, FunctionCallExpr fn, RowContext ctx) {
+        if (fn.args().size() <= 2) return parts;
+        Object nullStr = executor.evalExpr(fn.args().get(2), ctx);
+        if (nullStr == null) return parts;
+        String ns = nullStr.toString();
+        for (int i = 0; i < parts.size(); i++) {
+            if (ns.equals(parts.get(i))) parts.set(i, null);
+        }
+        return parts;
+    }
+
+    /**
+     * Fold a string's case one character at a time.
+     *
+     * <p>PostgreSQL maps each character on its own, so the result has exactly as many
+     * characters as the input. Java's {@code String.toUpperCase} and {@code toLowerCase} apply
+     * the full mappings, where one character may become several: {@code straße} came back
+     * {@code STRASSE}, a letter longer than it went in, and folding {@code İ} produced two
+     * characters where the reference server produces one. A character with no mapping of its
+     * own stays as it is -- which is why an uppercased {@code ß} is still {@code ß}.
+     */
+    static String foldCase(String s, boolean upper) {
+        StringBuilder out = new StringBuilder(s.length());
+        int at = 0;
+        while (at < s.length()) {
+            int cp = s.codePointAt(at);
+            out.appendCodePoint(upper ? Character.toUpperCase(cp) : Character.toLowerCase(cp));
+            at += Character.charCount(cp);
+        }
+        return out.toString();
+    }
+
+    // ------------------------------------------------------------ character positions
+    //
+    // A character is a code point. Java strings are counted in UTF-16 code units, and the two
+    // agree only below U+10000: above it one character takes two units, so every function that
+    // took a position or a length by unit disagreed with length(), which counts characters --
+    // and cutting between the two units of one character produced half of it, which is not a
+    // character at all and cannot be written back out.
+
+    /** How many characters a string holds. */
+    static int characters(String s) {
+        return s.codePointCount(0, s.length());
+    }
+
+    /** Where in the units the given count of characters ends, clamped to the string. */
+    static int unitAt(String s, int characters) {
+        if (characters <= 0) return 0;
+        if (characters >= characters(s)) return s.length();
+        return s.offsetByCodePoints(0, characters);
+    }
+
+    /** The characters from one count to another, either end clamped to the string. */
+    static String charSubstring(String s, int from, int to) {
+        int start = unitAt(s, from);
+        int end = unitAt(s, to);
+        return end <= start ? "" : s.substring(start, end);
+    }
+
+    /** Which character a substring begins at, counted from one, or zero where it is absent. */
+    static int charIndexOf(String haystack, String needle) {
+        int unit = haystack.indexOf(needle);
+        return unit < 0 ? 0 : haystack.codePointCount(0, unit) + 1;
+    }
+
+    /**
+     * Whether an argument is text rather than a number, read from the type it is declared with
+     * rather than from what its value happens to look like.
+     */
+    private boolean isTextArgument(Expression arg, RowContext ctx) {
+        DataType type = executor.exprEvaluator.inferTypeFromContext(
+                arg, ctx == null ? java.util.Collections.<RowContext.TableBinding>emptyList()
+                        : ctx.getBindings());
+        return type == DataType.TEXT || type == DataType.VARCHAR || type == DataType.CHAR;
+    }
+
+    /** The code point the given run of hexadecimal digits names, or {@code null} if it is not one. */
+    private static Integer hexPoint(String s, int from, int digits) {
+        if (from + digits > s.length()) return null;
+        int value = 0;
+        for (int i = from; i < from + digits; i++) {
+            int digit = Character.digit(s.charAt(i), 16);
+            if (digit < 0) return null;
+            value = value * 16 + digit;
+        }
+        return value > Character.MAX_CODE_POINT ? null : Integer.valueOf(value);
+    }
+
+    private static MemgresException invalidUnicodeEscape() {
+        MemgresException e = new MemgresException("invalid Unicode escape", "42601");
+        e.setHint("Unicode escapes must be \\XXXX, \\+XXXXXX, \\uXXXX, or \\UXXXXXXXX.");
+        return e;
+    }
+
+    /** Strip the named characters from one or both ends. */
+    static String trimCharacters(String s, String chars, boolean fromStart, boolean fromEnd) {
+        int start = 0;
+        int end = s.length();
+        if (fromStart) {
+            while (start < end && chars.indexOf(s.charAt(start)) >= 0) start++;
+        }
+        if (fromEnd) {
+            while (end > start && chars.indexOf(s.charAt(end - 1)) >= 0) end--;
+        }
+        return s.substring(start, end);
+    }
+
+    /** The width a {@code %*} specifier was given, which has to be a number to be a width. */
+    private static int widthArgument(Object given) {
+        if (given instanceof Number) return ((Number) given).intValue();
+        try {
+            return Integer.parseInt(given.toString().trim());
+        } catch (NumberFormatException e) {
+            throw new MemgresException(
+                    "invalid input syntax for type integer: \"" + given + "\"", "22P02");
+        }
+    }
+
+    /**
+     * The position a search is to begin at.
+     *
+     * <p>Positions are counted from one, so there is no position zero and nothing before it. The
+     * value was taken as written and handed to the matcher, where a start below one became an
+     * offset before the beginning of the string and left Java's own complaint about it as the
+     * answer -- an internal error where PostgreSQL names the parameter that was wrong.
+     */
+    private static int requireStart(int start) {
+        if (start < 1) {
+            throw new MemgresException("invalid value for parameter \"start\": " + start, "22023");
+        }
+        return start;
+    }
+
+    /**
+     * Which match is wanted, counted from one.
+     *
+     * @param least the smallest count this function gives a meaning to
+     */
+    private static int requireOccurrence(int nth, int least) {
+        if (nth < least) {
+            throw new MemgresException("invalid value for parameter \"n\": " + nth, "22023");
+        }
+        return nth;
+    }
+
+    /**
      * Convert PG {@code \N} numbered backrefs in a regexp_replace replacement string into
      * Java {@code $N} group references. A reference to a group that does not exist is
      * dropped (PG substitutes the empty string). Non-backref characters pass through
@@ -1691,7 +1827,7 @@ class StringFunctions {
             if (c == '\\' && i + 1 < repl.length()) {
                 char next = repl.charAt(i + 1);
                 i++;
-                if (Character.isDigit(next)) {
+                if (next >= '1' && next <= '9') {
                     int g = next - '0';
                     if (g <= groupCount) sb.append('$').append(next);
                     // else: backref to a non-existent group -> empty substitution
@@ -1700,7 +1836,11 @@ class StringFunctions {
                 } else if (next == '\\') {
                     sb.append("\\\\"); // a literal backslash, escaped for Java
                 } else {
-                    sb.append(java.util.regex.Matcher.quoteReplacement(String.valueOf(next)));
+                    // Only \1 to \9 and \& mean anything here. A backslash before anything
+                    // else stands for the two characters as written -- dropping it turned
+                    // '\n' in the replacement into the letter n, and '\0' into the whole match.
+                    sb.append("\\\\").append(
+                            java.util.regex.Matcher.quoteReplacement(String.valueOf(next)));
                 }
                 continue;
             }
@@ -1725,118 +1865,34 @@ class StringFunctions {
      * by the two {@code <escape>"} markers in the SIMILAR-style pattern is returned.
      */
     static Object sqlSimilarSubstring(String str, String pat, String escArg) {
-        String esc = (escArg == null || escArg.isEmpty()) ? "\\" : escArg;
-        // The escape char + '"' marks the start/end of the capture group.
-        String delimiter = java.util.regex.Pattern.quote(esc) + "\"";
+        Character escape = PgRegex.escapeCharacter(escArg);
+        if (escape == null) escape = Character.valueOf('\\');
+        // The two escape-quote markers say which part of the match is wanted. A pattern with
+        // none of them wants the whole match, which is what PostgreSQL returns; answering
+        // nothing meant substring(x SIMILAR p ESCAPE e) was NULL for every ordinary pattern.
+        String delimiter = java.util.regex.Pattern.quote(escape + "\"");
         String[] parts = pat.split(delimiter, -1);
-        if (parts.length < 3) return null; // need exactly two delimiters
-        String regexBefore = similarToRegex(parts[0], esc);
-        String regexCapture = similarToRegex(parts[1], esc);
-        String regexAfter = similarToRegex(parts[2], esc);
-        String fullRegex = "(?s)" + regexBefore + "(" + regexCapture + ")" + regexAfter;
-        try {
-            java.util.regex.Matcher m = java.util.regex.Pattern.compile(fullRegex).matcher(str);
-            if (m.matches()) return m.group(1);
+        String regex;
+        if (parts.length == 3) {
+            regex = "^(?:" + bare(parts[0], escape) + ")("
+                    + bare(parts[1], escape) + ")(?:" + bare(parts[2], escape) + ")$";
+        } else if (parts.length == 1) {
+            regex = "^(" + bare(pat, escape) + ")$";
+        } else {
             return null;
-        } catch (java.util.regex.PatternSyntaxException e) {
-            throw new MemgresException("invalid regular expression: " + e.getMessage(), "2201B");
         }
+        java.util.regex.Matcher m = PgRegex.compile(regex).matcher(str);
+        return m.matches() ? m.group(1) : null;
     }
 
-    private static String similarToRegex(String pattern, String escapeChar) {
-        StringBuilder sb = new StringBuilder();
-        String esc = escapeChar != null && !escapeChar.isEmpty() ? escapeChar : "\\";
-        int i = 0;
-        while (i < pattern.length()) {
-            char ch = pattern.charAt(i);
-            String chStr = String.valueOf(ch);
-            if (chStr.equals(esc) && i + 1 < pattern.length()) {
-                // Escaped character, treat next char as literal
-                sb.append(java.util.regex.Pattern.quote(pattern.substring(i + 1, i + 2)));
-                i += 2;
-            } else if (chStr.equals(esc)) {
-                // An escape with nothing left to escape is dropped, as PG's similar_escape does
-                i++;
-            } else if (ch == '%') {
-                sb.append(".*");
-                i++;
-            } else if (ch == '_') {
-                sb.append(".");
-                i++;
-            } else if (ch == '|') {
-                sb.append("|");
-                i++;
-            } else if (ch == '(') {
-                sb.append("(");
-                i++;
-            } else if (ch == ')') {
-                sb.append(")");
-                i++;
-            } else if (ch == '+') {
-                sb.append("+");
-                i++;
-            } else if (ch == '*') {
-                sb.append("*");
-                i++;
-            } else if (ch == '?') {
-                sb.append("?");
-                i++;
-            } else if (ch == '{') {
-                // Pass through bounded quantifier like {2}, {1,3} as-is
-                int end = pattern.indexOf('}', i);
-                if (end >= 0) {
-                    sb.append(pattern, i, end + 1);
-                    i = end + 1;
-                } else {
-                    sb.append(java.util.regex.Pattern.quote(String.valueOf(ch)));
-                    i++;
-                }
-            } else if (ch == '[') {
-                // Pass character class through to regex, converting POSIX classes to Java equivalents
-                // Find closing ']' that isn't part of a POSIX class like [:alpha:]
-                int end = -1;
-                {
-                    int depth = 0;
-                    for (int j = i + 1; j < pattern.length(); j++) {
-                        if (pattern.charAt(j) == '[' && j + 1 < pattern.length() && pattern.charAt(j + 1) == ':') {
-                            depth++;
-                        } else if (pattern.charAt(j) == ']') {
-                            if (depth > 0 && j > 0 && pattern.charAt(j - 1) == ':') {
-                                depth--;
-                            } else {
-                                end = j;
-                                break;
-                            }
-                        }
-                    }
-                }
-                if (end >= 0) {
-                    String cls = pattern.substring(i, end + 1);
-                    cls = cls.replace("[:alpha:]", "\\p{Alpha}");
-                    cls = cls.replace("[:digit:]", "\\p{Digit}");
-                    cls = cls.replace("[:alnum:]", "\\p{Alnum}");
-                    cls = cls.replace("[:upper:]", "\\p{Upper}");
-                    cls = cls.replace("[:lower:]", "\\p{Lower}");
-                    cls = cls.replace("[:space:]", "\\p{Space}");
-                    cls = cls.replace("[:print:]", "\\p{Print}");
-                    cls = cls.replace("[:punct:]", "\\p{Punct}");
-                    cls = cls.replace("[:cntrl:]", "\\p{Cntrl}");
-                    cls = cls.replace("[:xdigit:]", "\\p{XDigit}");
-                    cls = cls.replace("[:graph:]", "\\p{Graph}");
-                    cls = cls.replace("[:blank:]", "\\p{Blank}");
-                    sb.append(cls);
-                    i = end + 1;
-                } else {
-                    sb.append(java.util.regex.Pattern.quote(chStr));
-                    i++;
-                }
-            } else {
-                sb.append(java.util.regex.Pattern.quote(chStr));
-                i++;
-            }
-        }
-        return sb.toString();
+    /** One piece of a SIMILAR pattern, as a regular expression with no anchors of its own. */
+    private static String bare(String pattern, Character escape) {
+        String whole = PgRegex.fromSimilarTo(pattern, escape);
+        return whole.substring("^(?:".length(), whole.length() - ")$".length());
     }
+
+
+
 
     private boolean isReservedWord(String word) {
         return RESERVED_WORDS.contains(word.toLowerCase());

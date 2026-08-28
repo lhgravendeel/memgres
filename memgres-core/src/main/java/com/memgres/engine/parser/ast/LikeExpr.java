@@ -7,14 +7,15 @@ package com.memgres.engine.parser.ast;
 public final class LikeExpr implements Expression {
     public final Expression left;
     public final Expression pattern;
-    public final String escape;
+    /** The escape the clause named, which is an expression and so may be nothing at all. */
+    public final Expression escape;
     public final boolean caseInsensitive;
     public final boolean negated;
 
     public LikeExpr(
             Expression left,
             Expression pattern,
-            String escape,
+            Expression escape,
             boolean caseInsensitive,
             boolean negated
     ) {
@@ -27,7 +28,7 @@ public final class LikeExpr implements Expression {
 
     public Expression left() { return left; }
     public Expression pattern() { return pattern; }
-    public String escape() { return escape; }
+    public Expression escape() { return escape; }
     public boolean caseInsensitive() { return caseInsensitive; }
     public boolean negated() { return negated; }
 

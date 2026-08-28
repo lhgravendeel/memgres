@@ -59,6 +59,12 @@ class XmlFunctions {
                         for (int j = 0; j < fc.args().size(); j += 2) {
                             Object val = executor.evalExpr(fc.args().get(j), ctx);
                             String attrName = String.valueOf(executor.evalExpr(fc.args().get(j + 1), ctx));
+                            // An element cannot carry the same attribute twice, so the second
+                            // one is the caller's mistake rather than a value to overwrite with.
+                            if (attributes.containsKey(attrName)) {
+                                throw new MemgresException("XML attribute name \"" + attrName
+                                        + "\" appears more than once", "42601");
+                            }
                             if (val != null) attributes.put(attrName, val.toString());
                         }
                     } else {
@@ -89,13 +95,17 @@ class XmlFunctions {
             case "xmlforest": {
                 List<String> names = new ArrayList<>();
                 List<Object> values = new ArrayList<>();
+                List<Boolean> alreadyXml = new ArrayList<>();
                 for (int i = 0; i < fn.args().size(); i += 2) {
                     Object val = executor.evalExpr(fn.args().get(i), ctx);
                     String elemName = String.valueOf(executor.evalExpr(fn.args().get(i + 1), ctx));
                     names.add(elemName);
                     values.add(val);
+                    // An xml value is markup already, and xmlelement has always known that;
+                    // xmlforest escaped it, so a document came out as the characters spelling it.
+                    alreadyXml.add(Boolean.valueOf(isXmlExpr(fn.args().get(i))));
                 }
-                return XmlOperations.xmlforest(names, values);
+                return XmlOperations.xmlforest(names, values, alreadyXml);
             }
             case "xmlpi": {
                 String target = String.valueOf(executor.evalExpr(fn.args().get(0), ctx));

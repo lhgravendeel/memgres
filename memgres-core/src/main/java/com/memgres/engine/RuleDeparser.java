@@ -974,7 +974,7 @@ public final class RuleDeparser {
         String s = "(" + render(l.left(), text, cols, false) + " " + op + " "
                 + render(l.pattern(), text, cols, false);
         if (l.escape() != null) {
-            s += " ESCAPE " + quoteLiteral(l.escape());
+            s += " ESCAPE " + render(l.escape(), text, cols, false);
         }
         return s + ")";
     }

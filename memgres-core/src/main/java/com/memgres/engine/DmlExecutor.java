@@ -2412,11 +2412,14 @@ class DmlExecutor {
         // snapshot pairs rows with the relation they were read from, so a relation whose rows live
         // in partitions or children is left to the check that follows.
         rows = executor.filterByViewQuals(viewQuals, table, rows);
+        java.util.function.Predicate<Object[]> updateWouldHaveWritten = null;
+        String updateSnapshotKey = schemaName + "." + stmt.table();
         if (executor.session != null && updateTargets.size() == 1) {
-            String snapshotKey = schemaName + "." + stmt.table();
-            executor.session.checkRRConcurrentDelete(snapshotKey, table, image ->
-                    stmt.where() == null || executor.isTruthy(
-                            executor.evalExpr(stmt.where(), viewAwareCtx(table, stmt.alias(), image))));
+            String snapshotKey = updateSnapshotKey;
+            final List<RowContext> snapshotFrom = fromContexts;
+            updateWouldHaveWritten = qualificationOverLostRow(table, stmt.alias(), stmt.where(),
+                    snapshotFrom == null ? null : () -> snapshotFrom);
+            executor.session.checkRRConcurrentDelete(snapshotKey, table, updateWouldHaveWritten);
             List<Object[]> visible = new ArrayList<>(rows.size());
             for (Object[] r : rows) {
                 if (executor.session.isVisibleInRRSnapshot(snapshotKey, r)) visible.add(r);
@@ -2481,6 +2484,14 @@ class DmlExecutor {
                 return false;
             }, () -> executor.filterByViewQuals(viewQuals, table,
                     rescanTargets(updateTargets, updateRowOwner))));
+            // Asked again now the scan is over. The other transaction may have committed its
+            // delete in the moment between the first ask and the scan, in which case there was
+            // nothing left to block on and nothing in the scan either -- and the statement would
+            // have reported that it wrote nothing about a row it was entitled to write.
+            if (updateWouldHaveWritten != null) {
+                executor.session.checkRRConcurrentDelete(updateSnapshotKey, table,
+                        updateWouldHaveWritten);
+            }
             List<Object[]> matchedRows = new ArrayList<>();
             List<RowContext> matchedContexts = new ArrayList<>();
             List<RowContext> matchedFromContexts = new ArrayList<>();
@@ -2685,6 +2696,11 @@ class DmlExecutor {
                         viewAwareCtx(table, updateAlias, evalRow, updateRowOwner.get(row))));
             }, () -> executor.filterByViewQuals(viewQuals, table,
                     rescanTargets(updateTargets, updateRowOwner))));
+        }
+        // Asked again now the scan is over: see the same call after the joined scan above.
+        if (updateWouldHaveWritten != null) {
+            executor.session.checkRRConcurrentDelete(updateSnapshotKey, table,
+                    updateWouldHaveWritten);
         }
 
         // A qualified INSTEAD rule has already spoken for the rows its WHERE holds for.
@@ -3131,6 +3147,44 @@ class DmlExecutor {
     }
 
     /**
+     * A write's qualification, read against a row the transaction was shown and the relation no
+     * longer holds.
+     *
+     * <p>This decides whether a row another transaction deleted and committed was one this
+     * statement was going to write, and so whether losing it ends the transaction. A statement
+     * that names other relations -- an UPDATE with a FROM, a DELETE with a USING -- has a
+     * qualification about all of them, so it has to be read with those relations joined in: the
+     * lost row stands on one side and every row of the others on the other, and any pairing that
+     * satisfies it is a row the statement would have written.
+     *
+     * <p>Read against the lost row alone, the other relation's names resolve to nothing and the
+     * qualification cannot be read at all. That failure was taken for the row not matching, so a
+     * write through a join never noticed the row it had lost: it reported that it had written
+     * nothing where PostgreSQL ends the transaction.
+     *
+     * @param extra the other relations the statement names, or {@code null} where it names none;
+     *     read once, and only if there is a lost row to ask about
+     */
+    private java.util.function.Predicate<Object[]> qualificationOverLostRow(
+            Table table, String alias, Expression where,
+            java.util.function.Supplier<List<RowContext>> extra) {
+        if (where == null) return image -> true;
+        if (extra == null) {
+            return image -> executor.isTruthy(
+                    executor.evalExpr(where, viewAwareCtx(table, alias, image)));
+        }
+        final List<List<RowContext>> read = new ArrayList<>(1);
+        return image -> {
+            if (read.isEmpty()) read.add(extra.get());
+            RowContext lost = viewAwareCtx(table, alias, image);
+            for (RowContext other : read.get(0)) {
+                if (executor.isTruthy(executor.evalExpr(where, lost.merge(other)))) return true;
+            }
+            return false;
+        };
+    }
+
+    /**
      * Refuse a statement whose row the transaction it waited for deleted and committed.
      *
      * <p>A transaction reading from a snapshot was shown this row and waited its turn to write
@@ -3533,11 +3587,16 @@ class DmlExecutor {
         // shows, and the rows this transaction's snapshot holds. A row it was shown that another
         // transaction has deleted and committed ends the transaction instead.
         allRows = executor.filterByViewQuals(viewQuals, table, allRows);
+        java.util.function.Predicate<Object[]> deleteWouldHaveTaken = null;
+        String deleteSnapshotKey = schemaName + "." + stmt.table();
         if (executor.session != null && tablesToScan.size() == 1) {
-            String snapshotKey = schemaName + "." + stmt.table();
-            executor.session.checkRRConcurrentDelete(snapshotKey, table, image ->
-                    stmt.where() == null || executor.isTruthy(
-                            executor.evalExpr(stmt.where(), viewAwareCtx(table, stmt.alias(), image))));
+            String snapshotKey = deleteSnapshotKey;
+            boolean deleteJoins = stmt.using() != null && !stmt.using().isEmpty();
+            deleteWouldHaveTaken = qualificationOverLostRow(table, stmt.alias(), stmt.where(),
+                    !deleteJoins ? null
+                            : () -> executor.fromResolver.resolveWrittenFromClause(
+                                    stmt.using(), stmt.where()));
+            executor.session.checkRRConcurrentDelete(snapshotKey, table, deleteWouldHaveTaken);
             List<Object[]> visible = new ArrayList<>(allRows.size());
             for (Object[] r : allRows) {
                 if (executor.session.isVisibleInRRSnapshot(snapshotKey, r)) visible.add(r);
@@ -3684,6 +3743,15 @@ class DmlExecutor {
             }
             toDelete.removeAll(spokenFor);
             deleteOrder.removeIf(spokenFor::contains);
+        }
+
+        // Asked again now the scan is over. The other transaction may have committed its delete
+        // in the moment between the first ask and the scan, in which case there was nothing left
+        // to block on and nothing in the scan either -- and the statement would have reported
+        // that it took nothing about a row it was entitled to take.
+        if (deleteWouldHaveTaken != null) {
+            executor.session.checkRRConcurrentDelete(deleteSnapshotKey, table,
+                    deleteWouldHaveTaken);
         }
 
         // RLS USING filter for DELETE: remove rows that don't pass the DELETE policies, and the

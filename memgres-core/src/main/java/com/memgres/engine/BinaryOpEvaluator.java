@@ -1845,10 +1845,12 @@ class BinaryOpEvaluator {
                         return false;
                     }
                 }
+                requireEnumLabels(left, right);
                 return TypeCoercion.areEqual(left, right);
             }
             case NOT_EQUAL: {
                 if (left == null || right == null) return null; // NULL <> x is NULL
+                requireEnumLabels(left, right);
                 // Handle ROW comparison
                 boolean leftIsArrayNe = left instanceof List && !(left instanceof AstExecutor.PgRow);
                 boolean rightIsArrayNe = right instanceof List && !(right instanceof AstExecutor.PgRow);
@@ -2250,6 +2252,10 @@ class BinaryOpEvaluator {
             }
             case CONTAINS: {
                 if (left == null || right == null) return null;
+                // One query holds another when it names every lexeme the other does.
+                if (left instanceof TsQuery && right instanceof TsQuery) {
+                    return TextSearchOperations.queryContains((TsQuery) left, (TsQuery) right);
+                }
                 // hstore @> hstore containment
                 if (left instanceof HstoreValue || right instanceof HstoreValue) {
                     HstoreValue lh = left instanceof HstoreValue ? (HstoreValue) left : HstoreValue.parse(left.toString());
@@ -2336,6 +2342,10 @@ class BinaryOpEvaluator {
             }
             case CONTAINED_BY: {
                 if (left == null || right == null) return null;
+                // One query holds another when it names every lexeme the other does.
+                if (left instanceof TsQuery && right instanceof TsQuery) {
+                    return TextSearchOperations.queryContains((TsQuery) right, (TsQuery) left);
+                }
                 // hstore <@ hstore: contained-by
                 if (left instanceof HstoreValue || right instanceof HstoreValue) {
                     HstoreValue lh = left instanceof HstoreValue ? (HstoreValue) left : HstoreValue.parse(left.toString());
@@ -3469,6 +3479,10 @@ class BinaryOpEvaluator {
             }
             case CONTAINS: {
                 if (left == null || right == null) return null;
+                // One query holds another when it names every lexeme the other does.
+                if (left instanceof TsQuery && right instanceof TsQuery) {
+                    return TextSearchOperations.queryContains((TsQuery) left, (TsQuery) right);
+                }
                 // hstore @> hstore containment
                 if (left instanceof HstoreValue || right instanceof HstoreValue) {
                     HstoreValue lh = left instanceof HstoreValue ? (HstoreValue) left : HstoreValue.parse(left.toString());
@@ -3529,6 +3543,10 @@ class BinaryOpEvaluator {
             }
             case CONTAINED_BY: {
                 if (left == null || right == null) return null;
+                // One query holds another when it names every lexeme the other does.
+                if (left instanceof TsQuery && right instanceof TsQuery) {
+                    return TextSearchOperations.queryContains((TsQuery) right, (TsQuery) left);
+                }
                 // hstore <@ hstore: contained-by
                 if (left instanceof HstoreValue || right instanceof HstoreValue) {
                     HstoreValue lh = left instanceof HstoreValue ? (HstoreValue) left : HstoreValue.parse(left.toString());
@@ -3896,11 +3914,32 @@ class BinaryOpEvaluator {
     static boolean similarToMatches(String value, String pattern, String escapeChar) {
         String esc = escapeChar != null && !escapeChar.isEmpty() ? escapeChar : "\\";
         rejectMalformedSimilarPattern(pattern, esc);
-        try {
-            return value.matches("(?s)" + similarToRegexForBinaryOp(pattern, esc));
-        } catch (java.util.regex.PatternSyntaxException e) {
-            throw new MemgresException("invalid regular expression: " + e.getDescription(), "2201B");
-        }
+        // The pattern becomes an ordinary regular expression and is then compiled by the one
+        // compiler this engine has, so that its classes and escapes are the same ones.
+        return PgRegex.compile(PgRegex.fromSimilarTo(pattern, Character.valueOf(esc.charAt(0))))
+                .matcher(value).matches();
+    }
+
+    /**
+     * Check that a word compared against an enum is one of that enum's labels.
+     *
+     * <p>A word the enum does not hold names no value of that type, so the comparison has
+     * nothing to be about. Comparing the two as text answered false, which a reader takes to
+     * mean the two values differ rather than that one of them does not exist.
+     */
+    private void requireEnumLabels(Object left, Object right) {
+        AstExecutor.PgEnum held = left instanceof AstExecutor.PgEnum
+                ? (AstExecutor.PgEnum) left
+                : right instanceof AstExecutor.PgEnum ? (AstExecutor.PgEnum) right : null;
+        if (held == null) return;
+        Object other = left instanceof AstExecutor.PgEnum ? right : left;
+        if (!(other instanceof String)) return;
+        CustomEnum ce = executor.database.getCustomEnum(held.typeName());
+        if (ce == null || ce.isValidLabel((String) other)) return;
+        String named = held.typeName();
+        int dot = named.lastIndexOf('.');
+        throw new MemgresException("invalid input value for enum "
+                + (dot < 0 ? named : named.substring(dot + 1)) + ": \"" + other + "\"", "22P02");
     }
 
     /** The two malformations PostgreSQL names specifically, checked on the pattern as written. */

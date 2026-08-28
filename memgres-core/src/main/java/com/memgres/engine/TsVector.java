@@ -16,10 +16,77 @@ public class TsVector {
     /** Max position value per lexeme (PG caps at 16383, we use 256 for position list length cap). */
     static final int MAX_POSITION = 16383;
 
+    /** The most positions one lexeme carries; further ones are dropped. */
+    private static final int MAX_POSITIONS_PER_LEXEME = 256;
+
+    /**
+     * The order lexemes are held in, which is the order they are written in and the order two
+     * vectors are compared in.
+     *
+     * <p>A lexeme is a string of bytes to PostgreSQL and it orders them as bytes. Java orders
+     * strings by UTF-16 code unit, and the two disagree wherever a character sits outside the
+     * basic plane: a surrogate pair begins {@code 0xD800}, which is above every three-byte
+     * character in UTF-16 and below every four-byte one in UTF-8. Ordering by the bytes puts
+     * {@code 'Ａ'} before {@code '😀'} the way PostgreSQL does rather than after it.
+     */
+    static final Comparator<String> LEXEME_ORDER = new Comparator<String>() {
+        @Override
+        public int compare(String a, String b) {
+            byte[] x = a.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            byte[] y = b.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            int n = Math.min(x.length, y.length);
+            for (int i = 0; i < n; i++) {
+                int diff = (x[i] & 0xFF) - (y[i] & 0xFF);
+                if (diff != 0) return diff;
+            }
+            return x.length - y.length;
+        }
+    };
+
+    /** A map of lexemes in the order PostgreSQL holds them. */
+    static TreeMap<String, List<PosEntry>> newLexemeMap() {
+        return new TreeMap<String, List<PosEntry>>(LEXEME_ORDER);
+    }
+
+    /**
+     * The positions of one lexeme, as PostgreSQL keeps them: in order, each position once, none
+     * past the last representable one, and no more of them than a lexeme can carry.
+     *
+     * <p>Where the same position is given twice the stronger weight is the one kept, so
+     * {@code 'a:1,1A'} and {@code 'a:1A,1'} are the same value — which they have to be, because
+     * neither says anything the other does not.
+     */
+    static List<PosEntry> normalisePositions(List<PosEntry> entries) {
+        if (entries == null || entries.isEmpty()) return new ArrayList<PosEntry>();
+        TreeMap<Integer, Character> byPosition = new TreeMap<Integer, Character>();
+        for (PosEntry pe : entries) {
+            int position = Math.min(pe.position(), MAX_POSITION);
+            if (position <= 0) continue;
+            Character held = byPosition.get(position);
+            if (held == null || pe.weight() < held.charValue()) {
+                byPosition.put(position, Character.valueOf(pe.weight()));
+            }
+        }
+        List<PosEntry> out = new ArrayList<PosEntry>();
+        for (Map.Entry<Integer, Character> e : byPosition.entrySet()) {
+            if (out.size() >= MAX_POSITIONS_PER_LEXEME) break;
+            out.add(new PosEntry(e.getKey().intValue(), e.getValue().charValue()));
+        }
+        return out;
+    }
+
+    /** Every lexeme's positions normalised, in place. */
+    private static Map<String, List<PosEntry>> normaliseAll(Map<String, List<PosEntry>> lexemes) {
+        for (Map.Entry<String, List<PosEntry>> e : lexemes.entrySet()) {
+            e.setValue(normalisePositions(e.getValue()));
+        }
+        return lexemes;
+    }
+
     static final Set<String> STOP_WORDS_SET = com.memgres.engine.fts.StopWords.ENGLISH;
 
     static boolean isStopWord(String word) {
-        return STOP_WORDS_SET.contains(word.toLowerCase());
+        return STOP_WORDS_SET.contains(lowerstr(word));
     }
 
     private static final Set<String> STOP_WORDS = STOP_WORDS_SET;
@@ -65,12 +132,13 @@ public class TsVector {
     private final Map<String, List<PosEntry>> lexemes;
 
     public TsVector(Map<String, List<PosEntry>> lexemes) {
-        this.lexemes = new TreeMap<>(lexemes);
+        this.lexemes = newLexemeMap();
+        this.lexemes.putAll(lexemes);
     }
 
     /** Create an empty tsvector. */
     public static TsVector empty() {
-        return new TsVector(new TreeMap<>());
+        return new TsVector(newLexemeMap());
     }
 
     /** Build a tsvector from plain text using english config (tokenize, stem, remove stop words). */
@@ -87,7 +155,7 @@ public class TsVector {
      * contribute no lexeme.
      */
     public static TsVector fromText(String text, String config) {
-        Map<String, List<PosEntry>> lexemes = new TreeMap<>();
+        Map<String, List<PosEntry>> lexemes = newLexemeMap();
         addText(lexemes, text, config, new int[2]);
         return new TsVector(lexemes);
     }
@@ -102,7 +170,7 @@ public class TsVector {
      * first of the next, so that no phrase spans the two.
      */
     public static TsVector fromTexts(List<String> texts, String config) {
-        Map<String, List<PosEntry>> lexemes = new TreeMap<>();
+        Map<String, List<PosEntry>> lexemes = newLexemeMap();
         int[] cursor = new int[2];
         for (String text : texts) {
             int began = cursor[REACHED];
@@ -128,7 +196,7 @@ public class TsVector {
                     com.memgres.engine.fts.TsParser.dictionaryFor(token.type());
             if (dict == com.memgres.engine.fts.TsParser.Dict.NONE) continue;
             int position = ++cursor[REACHED];
-            String lower = token.text().toLowerCase();
+            String lower = lowerstr(token.text());
             if (isSimple || dict == com.memgres.engine.fts.TsParser.Dict.SIMPLE) {
                 addPosition(lexemes, lower, position);
                 cursor[LAST_LEXEME] = position;
@@ -150,12 +218,18 @@ public class TsVector {
         }
     }
 
-    /** Parse a tsvector literal. Supports both quoted and unquoted lexemes:
-     *  'cat':1A,2B 'dog':3 fat:4C word
-     *  PG preserves case of quoted lexemes. Position 0 is rejected (42601). */
+    /**
+     * Read a tsvector literal: {@code 'cat':1A,2B 'dog':3 fat:4C word}.
+     *
+     * <p>The same lexeme written twice names one lexeme holding both position lists, not the
+     * second list alone; the reading is what makes the written form the value's own, so a value
+     * this writes has to come back through here unchanged. Positions are put in order, each kept
+     * once, and any beyond the last representable one brought back to it — all of which the
+     * writer relies on, since it prints what it is given.
+     */
     public static TsVector parseLiteral(String input) {
         if (input == null || input.isEmpty()) return null;
-        Map<String, List<PosEntry>> lexemes = new TreeMap<>();
+        Map<String, List<PosEntry>> lexemes = newLexemeMap();
         int i = 0;
         int len = input.length();
         while (i < len) {
@@ -168,6 +242,7 @@ public class TsVector {
                 // Quoted lexeme: 'word' or 'word''s'
                 i++; // skip opening quote
                 StringBuilder sb = new StringBuilder();
+                boolean closed = false;
                 while (i < len) {
                     char c = input.charAt(i);
                     if (c == '\'' && i + 1 < len && input.charAt(i + 1) == '\'') {
@@ -175,6 +250,7 @@ public class TsVector {
                         i += 2;
                     } else if (c == '\'') {
                         i++; // skip closing quote
+                        closed = true;
                         break;
                     } else if (c == '\\' && i + 1 < len) {
                         sb.append(input.charAt(i + 1));
@@ -184,12 +260,26 @@ public class TsVector {
                         i++;
                     }
                 }
+                if (!closed || sb.length() == 0) throw syntaxErrorIn(input);
                 lexeme = sb.toString(); // preserve case for quoted
             } else {
-                // Unquoted lexeme: read until whitespace or colon
+                // An unquoted lexeme runs to the next space or colon, and a backslash carries
+                // whichever character follows it into the lexeme -- that is the only way a
+                // space or a colon can be part of one without quotes.
                 StringBuilder sb = new StringBuilder();
-                while (i < len && !Character.isWhitespace(input.charAt(i)) && input.charAt(i) != ':') {
-                    sb.append(input.charAt(i));
+                while (i < len) {
+                    char c = input.charAt(i);
+                    if (c == '\\' && i + 1 < len) {
+                        sb.append(input.charAt(i + 1));
+                        i += 2;
+                        continue;
+                    }
+                    if (Character.isWhitespace(c)) break;
+                    // A colon separates a lexeme from its positions, so it can only do that
+                    // once there is a lexeme for it to follow; leading, it is an ordinary
+                    // character and ':1' names a lexeme rather than position 1 of nothing.
+                    if (c == ':' && sb.length() > 0) break;
+                    sb.append(c);
                     i++;
                 }
                 if (sb.length() == 0) { i++; continue; }
@@ -200,6 +290,7 @@ public class TsVector {
             List<PosEntry> entries = new ArrayList<>();
             if (i < len && input.charAt(i) == ':') {
                 i++; // skip ':'
+                boolean any = false;
                 while (i < len && !Character.isWhitespace(input.charAt(i))) {
                     // Parse one position entry
                     StringBuilder numSb = new StringBuilder();
@@ -208,36 +299,63 @@ public class TsVector {
                         i++;
                     }
                     char weight = 'D';
-                    if (i < len && Character.isLetter(input.charAt(i)) && "AaBbCcDd".indexOf(input.charAt(i)) >= 0) {
-                        weight = Character.toUpperCase(input.charAt(i));
+                    if (i < len && weightOf(input.charAt(i)) != 0) {
+                        weight = weightOf(input.charAt(i));
                         i++;
                     }
-                    if (numSb.length() > 0) {
-                        int pos = Integer.parseInt(numSb.toString());
-                        if (pos == 0) {
-                            throw new MemgresException("wrong position info in tsvector: \"" + input + "\"", "42601");
-                        }
-                        if (pos > MAX_POSITION) pos = MAX_POSITION;
-                        if (entries.size() < 256) {
-                            entries.add(new PosEntry(pos, weight));
-                        }
+                    if (numSb.length() == 0) throw syntaxErrorIn(input);
+                    any = true;
+                    // A position is written in decimal and read as a number, so a spelling
+                    // too long for one is still the number it spells: bringing it back to
+                    // the last representable position is what the documented rule asks for.
+                    int pos = clampPosition(numSb.toString());
+                    if (pos == 0) {
+                        throw new MemgresException(
+                                "wrong position info in tsvector: \"" + input + "\"", "42601");
                     }
+                    entries.add(new PosEntry(pos, weight));
                     // A position entry ends at a comma or at the end of the token; anything
                     // else (a stray letter, say) means the literal is malformed, and PG says so
                     if (i < len && input.charAt(i) == ',') {
                         i++;
                     } else {
                         if (i < len && !Character.isWhitespace(input.charAt(i))) {
-                            throw new MemgresException(
-                                    "syntax error in tsvector: \"" + input + "\"", "42601");
+                            throw syntaxErrorIn(input);
                         }
                         break;
                     }
                 }
+                if (!any) throw syntaxErrorIn(input);
             }
-            lexemes.put(lexeme, entries);
+            List<PosEntry> held = lexemes.get(lexeme);
+            if (held == null) {
+                lexemes.put(lexeme, entries);
+            } else {
+                held.addAll(entries);
+            }
         }
-        return lexemes.isEmpty() ? null : new TsVector(lexemes);
+        if (lexemes.isEmpty()) return null;
+        return new TsVector(normaliseAll(lexemes));
+    }
+
+    private static MemgresException syntaxErrorIn(String input) {
+        return new MemgresException("syntax error in tsvector: \"" + input + "\"", "42601");
+    }
+
+    /** The weight a character names, or {@code 0} if it names none. */
+    private static char weightOf(char c) {
+        char upper = Character.toUpperCase(c);
+        if (upper >= 'A' && upper <= 'D') return upper;
+        // A star stands for the strongest weight in this position, as PostgreSQL reads it.
+        if (c == '*') return 'A';
+        return 0;
+    }
+
+    /** The position a run of digits names, brought back to the last representable one. */
+    private static int clampPosition(String digits) {
+        if (digits.length() > 9) return MAX_POSITION;
+        int value = Integer.parseInt(digits);
+        return value > MAX_POSITION ? MAX_POSITION : value;
     }
 
     public boolean matches(TsQuery query) {
@@ -278,10 +396,14 @@ public class TsVector {
     public boolean containsLexemeWithWeight(String lexeme, Set<Character> weights) {
         List<PosEntry> entries = lexemes.get(lexeme);
         if (entries == null) {
-            entries = lexemes.get(simpleStem(lexeme.toLowerCase()));
+            entries = lexemes.get(simpleStem(lowerstr(lexeme)));
         }
         if (entries == null) return false;
         if (weights == null || weights.isEmpty()) return true;
+        // A lexeme with no positions carries no weights either, so there is no weight for the
+        // restriction to fail against and the lexeme answers for every one of them. Requiring a
+        // positional entry made a stripped document match no weighted query at all.
+        if (entries.isEmpty()) return true;
         return entries.stream().anyMatch(e -> weights.contains(e.weight()));
     }
 
@@ -292,23 +414,26 @@ public class TsVector {
 
     /** Remove positions and weights, keeping only lexemes. */
     public TsVector strip() {
-        Map<String, List<PosEntry>> stripped = new TreeMap<>();
+        Map<String, List<PosEntry>> stripped = newLexemeMap();
         for (String key : lexemes.keySet()) {
             stripped.put(key, Cols.listOf());
         }
         return new TsVector(stripped);
     }
 
-    /** Set weight on all positions of all lexemes. */
+    /**
+     * Set the weight on every position of every lexeme.
+     *
+     * <p>A weight belongs to a position, so a lexeme that has no positions has nothing to carry
+     * one and is left as it is. Inventing a position to hang the weight on wrote text that this
+     * reader then refuses -- {@code setweight(strip(v),'A')} could not be read back.
+     */
     public TsVector setWeight(char weight) {
-        Map<String, List<PosEntry>> result = new TreeMap<>();
+        Map<String, List<PosEntry>> result = newLexemeMap();
         for (Map.Entry<String, List<PosEntry>> entry : lexemes.entrySet()) {
             List<PosEntry> newEntries = new ArrayList<>();
             for (PosEntry pe : entry.getValue()) {
                 newEntries.add(new PosEntry(pe.position(), weight));
-            }
-            if (newEntries.isEmpty()) {
-                newEntries.add(new PosEntry(0, weight));
             }
             result.put(entry.getKey(), newEntries);
         }
@@ -317,10 +442,10 @@ public class TsVector {
 
     /** Set weight only for specified lexemes. */
     public TsVector setWeight(char weight, List<String> filterLexemes) {
-        Map<String, List<PosEntry>> result = new TreeMap<>();
+        Map<String, List<PosEntry>> result = newLexemeMap();
         Set<String> filterSet = new HashSet<>(filterLexemes);
         // Also add stemmed forms
-        for (String l : filterLexemes) filterSet.add(simpleStem(l.toLowerCase()));
+        for (String l : filterLexemes) filterSet.add(simpleStem(lowerstr(l)));
         for (Map.Entry<String, List<PosEntry>> entry : lexemes.entrySet()) {
             if (filterSet.contains(entry.getKey())) {
                 List<PosEntry> newEntries = new ArrayList<>();
@@ -335,12 +460,19 @@ public class TsVector {
         return new TsVector(result);
     }
 
-    /** Delete specified lexemes from the vector. */
+    /**
+     * Remove the named lexemes.
+     *
+     * <p>The names are lexemes already, so each one names itself and nothing else. Removing the
+     * stemmed form as well took out a second lexeme the caller never named:
+     * {@code ts_delete(to_tsvector('english','cats and dogs'), 'cats')} lost {@code 'cat'},
+     * which is the lexeme the document actually holds and not the one that was asked for.
+     */
     public TsVector delete(List<String> toDelete) {
-        Map<String, List<PosEntry>> result = new TreeMap<>(lexemes);
+        Map<String, List<PosEntry>> result = newLexemeMap();
+        result.putAll(lexemes);
         for (String l : toDelete) {
             result.remove(l);
-            result.remove(simpleStem(l.toLowerCase()));
         }
         return new TsVector(result);
     }
@@ -348,7 +480,7 @@ public class TsVector {
     /** Filter: keep only lexemes that have any of the given weights. */
     public TsVector filter(Set<Character> weights) {
         if (weights == null || weights.isEmpty()) return empty();
-        Map<String, List<PosEntry>> result = new TreeMap<>();
+        Map<String, List<PosEntry>> result = newLexemeMap();
         for (Map.Entry<String, List<PosEntry>> entry : lexemes.entrySet()) {
             List<PosEntry> filtered = new ArrayList<>();
             for (PosEntry pe : entry.getValue()) {
@@ -365,7 +497,7 @@ public class TsVector {
 
     /** Concatenate two tsvectors. Positions in other are shifted. */
     public TsVector concat(TsVector other) {
-        Map<String, List<PosEntry>> result = new TreeMap<>();
+        Map<String, List<PosEntry>> result = newLexemeMap();
         // Copy this vector's entries
         for (Map.Entry<String, List<PosEntry>> entry : lexemes.entrySet()) {
             result.put(entry.getKey(), new ArrayList<>(entry.getValue()));
@@ -377,14 +509,17 @@ public class TsVector {
                 maxPos = Math.max(maxPos, pe.position());
             }
         }
-        // Merge other vector's entries with shifted positions
+        // Merge other vector's entries with shifted positions. Shifting can carry a position
+        // past the last representable one, and normalising brings it back and drops the
+        // duplicate that then makes -- a position no document can hold is not one to write.
         for (Map.Entry<String, List<PosEntry>> entry : other.lexemes.entrySet()) {
             List<PosEntry> existing = result.computeIfAbsent(entry.getKey(), k -> new ArrayList<>());
             for (PosEntry pe : entry.getValue()) {
-                existing.add(new PosEntry(pe.position() + maxPos, pe.weight()));
+                existing.add(new PosEntry(Math.min(pe.position() + maxPos, MAX_POSITION),
+                        pe.weight()));
             }
         }
-        return new TsVector(result);
+        return new TsVector(normaliseAll(result));
     }
 
     /** Convert to an array of lexeme strings. */
@@ -392,11 +527,22 @@ public class TsVector {
         return new ArrayList<>(lexemes.keySet());
     }
 
-    /** Build a tsvector from an array of strings (PG: no positions assigned). */
+    /**
+     * Build a tsvector from an array of strings (PG: no positions assigned).
+     *
+     * <p>Every element has to be a lexeme. Neither nothing nor an empty string is one, and
+     * passing over them quietly built a vector from an array that did not describe one.
+     */
     public static TsVector fromArray(List<String> words) {
-        Map<String, List<PosEntry>> lexemes = new TreeMap<>();
+        Map<String, List<PosEntry>> lexemes = newLexemeMap();
         for (String word : words) {
-            if (word != null && !word.isEmpty()) {
+            if (word == null) {
+                throw new MemgresException("lexeme array may not contain nulls", "22004");
+            }
+            if (word.isEmpty()) {
+                throw new MemgresException("lexeme array may not contain empty strings", "2200F");
+            }
+            {
                 // PG array_to_tsvector: no positions, preserve case
                 lexemes.put(word, new ArrayList<>());
             }
@@ -456,18 +602,32 @@ public class TsVector {
         return res;
     }
 
+    /**
+     * A lexeme with no positions still takes part in the ranking, as the one place it could be.
+     *
+     * <p>PostgreSQL scores such an entry against a stand-in position of zero with the weakest
+     * weight, and treats the distance between two of them as the largest there is. Skipping
+     * them scored a stripped document as though its lexemes were not there at all.
+     */
+    private static final List<PosEntry> POSNULL =
+            Collections.singletonList(new PosEntry(0, 'D'));
+
     /** PG's calc_rank_and: proximity-based ranking for AND queries. */
     private float calcRankAnd(double[] w, List<String> matchedTerms) {
         float res = -1.0f;
         for (int i = 0; i < matchedTerms.size(); i++) {
-            List<PosEntry> posI = lexemes.get(matchedTerms.get(i));
+            List<PosEntry> posI = positionsOrNull(matchedTerms.get(i));
             for (int j = i + 1; j < matchedTerms.size(); j++) {
-                List<PosEntry> posJ = lexemes.get(matchedTerms.get(j));
+                List<PosEntry> posJ = positionsOrNull(matchedTerms.get(j));
+                boolean standIn = posI == POSNULL || posJ == POSNULL;
                 for (PosEntry pi : posI) {
                     for (PosEntry pj : posJ) {
                         int dist = Math.abs(pi.position() - pj.position());
-                        // Two different operands at the same position contribute nothing.
-                        if (dist == 0) continue;
+                        // Two different operands at the same position contribute nothing --
+                        // unless one of them is only there as a stand-in, in which case they
+                        // are as far apart as two lexemes can be.
+                        if (dist == 0 && !standIn) continue;
+                        if (dist == 0) dist = MAX_POSITION + 1;
                         float wd = wordDistance(dist);
                         float wI = (float) w[weightIndex(pi.weight())];
                         float wJ = (float) w[weightIndex(pj.weight())];
@@ -481,6 +641,12 @@ public class TsVector {
     }
 
     /** PG's word_distance: exponential decay for term proximity, computed in float. */
+    /** The positions a lexeme holds, or the single stand-in where it holds none. */
+    private List<PosEntry> positionsOrNull(String lexeme) {
+        List<PosEntry> held = lexemes.get(lexeme);
+        return held == null || held.isEmpty() ? POSNULL : held;
+    }
+
     private static float wordDistance(int dist) {
         if (dist > 100) return 1e-30f;
         return (float) (1.0 / (1.005 + 0.05 * Math.exp(((double) (float) dist) / 1.5 - 2)));
@@ -532,8 +698,6 @@ public class TsVector {
         if (query.getOp() == TsQuery.Op.TERM) {
             String t = query.getTerm();
             if (t != null && !t.isEmpty()) terms.add(t);
-        } else if (query.getOp() == TsQuery.Op.NOT) {
-            // Do not count terms inside NOT branches
         } else {
             collectQueryTerms(query.getLeft(), terms);
             collectQueryTerms(query.getRight(), terms);
@@ -632,11 +796,9 @@ public class TsVector {
     private static int[] nextCover(List<int[]> doc, int len, TsQuery query,
                                    List<String> terms, int from) {
         while (from < len) {
-            boolean[] seen = new boolean[terms.size()];
             int end = -1, q = 0;
             for (int ptr = from; ptr < len; ptr++) {
-                seen[doc.get(ptr)[2]] = true;
-                if (satisfied(query, terms, seen)) {
+                if (satisfied(query, doc, terms, from, ptr)) {
                     q = doc.get(ptr)[0];
                     end = ptr;
                     break;
@@ -645,11 +807,9 @@ public class TsVector {
             if (end < 0) return null;
 
             // Now shrink from the right-hand end back down to the smallest span.
-            java.util.Arrays.fill(seen, false);
             int begin = -1, p = Integer.MAX_VALUE;
             for (int ptr = end; ptr >= from; ptr--) {
-                seen[doc.get(ptr)[2]] = true;
-                if (satisfied(query, terms, seen)) {
+                if (satisfied(query, doc, terms, ptr, end)) {
                     begin = ptr;
                     p = doc.get(ptr)[0];
                     break;
@@ -685,24 +845,38 @@ public class TsVector {
         return q.getOp() == TsQuery.Op.OR ? TsQuery.or(l, r) : TsQuery.and(l, r);
     }
 
-    /** Evaluates the query with each operand true iff it has been seen in the span. */
-    private static boolean satisfied(TsQuery query, List<String> terms, boolean[] seen) {
-        if (query == null) return false;
-        switch (query.getOp()) {
-            case TERM: {
-                int idx = terms.indexOf(query.getTerm());
-                return idx >= 0 && seen[idx];
-            }
-            case NOT:
-                return !satisfied(query.getLeft() != null ? query.getLeft() : query.getRight(),
-                        terms, seen);
-            case OR:
-                return satisfied(query.getLeft(), terms, seen)
-                        || satisfied(query.getRight(), terms, seen);
-            default: // AND and PHRASE both require every operand within the span
-                return satisfied(query.getLeft(), terms, seen)
-                        && satisfied(query.getRight(), terms, seen);
+    /**
+     * Whether a span of the document satisfies the query.
+     *
+     * <p>The span is read as a document of its own and the query asked about it, so a phrase
+     * inside the query is answered by where its lexemes actually sit. Recording only which
+     * lexemes had been seen made every phrase behave as an AND, and a cover was found wherever
+     * the words appeared at all rather than where they appear next to each other.
+     */
+    private static boolean satisfied(TsQuery query, List<int[]> doc, List<String> terms,
+                                     int from, int to) {
+        Map<String, List<PosEntry>> span = newLexemeMap();
+        for (int i = from; i <= to; i++) {
+            int[] entry = doc.get(i);
+            span.computeIfAbsent(terms.get(entry[2]), k -> new ArrayList<PosEntry>())
+                    .add(new PosEntry(entry[0], WEIGHT_LETTERS[entry[1]]));
         }
+        return new TsVector(span).matches(query);
+    }
+
+    /** The weights in the order their indexes run, weakest first. */
+    private static final char[] WEIGHT_LETTERS = {'D', 'C', 'B', 'A'};
+
+    /**
+     * A lexeme folded to lower case.
+     *
+     * <p>PostgreSQL folds a text-search token with its own {@code lowerstr}, which maps each
+     * character on its own. Java's full mapping turns one character into several -- folding
+     * {@code İ} gave a two-character lexeme -- so a document and a query built from the same
+     * word could end up holding different lexemes and no longer match.
+     */
+    static String lowerstr(String word) {
+        return StringFunctions.foldCase(word, false);
     }
 
     /** The english_stem dictionary: PG's bundled Snowball (Porter2) stemmer. */
@@ -715,7 +889,10 @@ public class TsVector {
         StringBuilder sb = new StringBuilder();
         for (Map.Entry<String, List<PosEntry>> entry : lexemes.entrySet()) {
             if (sb.length() > 0) sb.append(" ");
-            sb.append("'").append(entry.getKey()).append("'");
+            // A lexeme is written between quotes, so a quote inside one is written twice --
+            // otherwise the text closes the lexeme early and cannot be read back as what it
+            // was written from, which is the whole point of having a text form.
+            sb.append("'").append(entry.getKey().replace("'", "''")).append("'");
             List<PosEntry> positions = entry.getValue();
             if (!positions.isEmpty()) {
                 // Build position string, only emit if there are actual positions > 0

@@ -132,6 +132,9 @@ public final class BuiltinFunctionNames {
             "transaction_timestamp", "translate", "trim_array", "trunc", "ts_debug",
             "ts_delete", "ts_filter", "ts_headline", "ts_lexize", "ts_parse", "ts_rank", "ts_rank_cd",
             "ts_rewrite", "ts_stat", "ts_token_type", "tsquery_phrase",
+            "ts_match_vq", "ts_match_qv", "ts_match_tq", "ts_match_tt",
+            "tsquery_and", "tsquery_cmp", "tsquery_not", "tsquery_or",
+            "tsvector_cmp", "tsvector_concat",
             "tsvector_to_array", "txid_current", "txid_current_if_assigned", "txid_current_snapshot",
             "txid_snapshot_xip", "txid_snapshot_xmax", "txid_snapshot_xmin", "txid_status",
             "unistr", "unnest", "upper", "uuidv7", "varbit", "varchar",
@@ -237,7 +240,9 @@ public final class BuiltinFunctionNames {
             "smallint", "soundex", "stddev", "stddev_pop", "stddev_samp", "string_to_table",
             "substring_similar", "table_to_xml", "tan", "tand", "tanh", "to_json", "to_jsonb",
             "trigger", "trim", "trim_scale", "tsmultirange", "tsrange", "tstzmultirange",
-            "tstzrange", "unaccent", "unicode", "unicode_assigned", "unicode_version", "upper_inc",
+            // "unicode" is not a function PostgreSQL has; ascii() is the one that answers a
+            // code point. Keeping it here meant code written against this engine would not run.
+            "tstzrange", "unaccent", "unicode_assigned", "unicode_version", "upper_inc",
             "upper_inf", "uuid", "uuid_extract_timestamp", "uuid_extract_version", "values",
             "uuid_generate_v1", "uuid_generate_v3", "uuid_generate_v4", "uuid_generate_v5",
             "uuid_nil", "uuid_ns_dns", "uuid_ns_url", "uuidv4", "var_pop", "var_samp", "variance",

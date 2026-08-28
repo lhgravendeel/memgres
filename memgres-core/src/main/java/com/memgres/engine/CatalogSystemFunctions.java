@@ -506,6 +506,9 @@ class CatalogSystemFunctions {
                     if (json == DataType.JSON || json == DataType.JSONB) {
                         return pgTypeDisplayName(json);
                     }
+                    // The name of a text search configuration is carried as that name, so the
+                    // value cannot say it is one; only the call that produced it can.
+                    if (json == DataType.REGCONFIG) return "regconfig";
                 }
                 if (arg instanceof java.util.List<?>) {
                     java.util.List<?> list = (java.util.List<?>) arg;

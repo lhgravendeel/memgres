@@ -2173,13 +2173,18 @@ class SelectParser {
         List<String> colNames = new ArrayList<>();
         List<String> colTypes = new ArrayList<>();
         List<Expression> colPaths = new ArrayList<>();
+        List<String> colDefaults = new ArrayList<>();
+        List<Boolean> colNotNull = new ArrayList<>();
         do {
             String colName = parser.readIdentifier();
-            // FOR ORDINALITY
+            // FOR ORDINALITY: the column is the row's place in the sequence rather than
+            // anything read out of the document, and the path stands for that.
             if (parser.matchKeywords("FOR", "ORDINALITY")) {
                 colNames.add(colName);
                 colTypes.add("integer");
                 colPaths.add(null);
+                colDefaults.add(null);
+                colNotNull.add(Boolean.FALSE);
                 continue;
             }
             String typeName = parser.parseTypeName();
@@ -2187,14 +2192,20 @@ class SelectParser {
             if (parser.matchKeyword("PATH")) {
                 pathExpr = parser.parseExpression();
             }
-            // Optional DEFAULT and NOT NULL clauses
+            // The DEFAULT stands in where the path selects nothing, and NOT NULL says that
+            // nothing is not a value this column may take. Both used to be read and dropped.
+            String defaultText = null;
             if (parser.matchKeyword("DEFAULT")) {
-                parser.parseExpression(); // consume default expr
+                Expression defaultExpr = parser.parseExpression();
+                defaultText = defaultExpr instanceof Literal
+                        ? ((Literal) defaultExpr).value() : defaultExpr.toString();
             }
-            parser.matchKeywords("NOT", "NULL");
+            boolean notNull = parser.matchKeywords("NOT", "NULL");
             colNames.add(colName);
             colTypes.add(typeName);
             colPaths.add(pathExpr);
+            colDefaults.add(defaultText);
+            colNotNull.add(Boolean.valueOf(notNull));
         } while (parser.match(TokenType.COMMA));
         parser.expect(TokenType.RIGHT_PAREN);
         // Alias
@@ -2219,9 +2230,19 @@ class SelectParser {
             } else {
                 pathStr = colNames.get(i);
             }
-            args.add(new Literal(Literal.LiteralType.STRING, colNames.get(i) + ":" + colTypes.get(i) + ":" + pathStr));
+            // The column's shape is carried as text through the function's argument list, so
+            // each part is written with its length in front of it and nothing has to be escaped.
+            args.add(new Literal(Literal.LiteralType.STRING, part(colNames.get(i))
+                    + part(colTypes.get(i)) + part(colPaths.get(i) == null ? null : pathStr)
+                    + part(colDefaults.get(i))
+                    + part(colNotNull.get(i).booleanValue() ? "t" : "f")));
         }
         return new SelectStmt.FunctionFrom("__xmltable__", args, alias, null);
+    }
+
+    /** One part of an XMLTABLE column definition, written as its length, a colon and the text. */
+    private static String part(String text) {
+        return text == null ? "-1:" : text.length() + ":" + text;
     }
 
     private List<JsonTableExpr.JsonTableColumn> parseJsonTableColumns() {

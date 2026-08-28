@@ -36,6 +36,36 @@ class TextSearchFunctions {
     }
 
     /**
+     * The weight a {@code setweight} argument names.
+     *
+     * <p>There are four weights and nothing else is one. Reading the first character and using
+     * it whatever it was gave {@code 'a':1X} for a weight of {@code 'X'} -- text no reader of a
+     * tsvector accepts -- and read past the end of an empty argument.
+     *
+     * <p>An argument that names no weight is the caller's, so it is reported as a bad parameter
+     * with the character quoted, the way every other weight-taking function reports one. An
+     * empty argument has no first character, and the one PostgreSQL reads there is the byte that
+     * ends the string.
+     */
+    private static char weightGiven(String given) {
+        char c = given.isEmpty() ? 0 : Character.toUpperCase(given.charAt(0));
+        if (c < 'A' || c > 'D') {
+            throw new MemgresException("unrecognized weight: \""
+                    + (given.isEmpty() ? "\\000" : given.substring(0, 1)) + "\"", "22023");
+        }
+        return c;
+    }
+
+    /** The weight an element of a weight array names. */
+    private static char weightNamed(String given) {
+        char c = given.isEmpty() ? 0 : Character.toUpperCase(given.charAt(0));
+        if (c < 'A' || c > 'D' || given.length() > 1) {
+            throw new MemgresException("unrecognized weight: \"" + given + "\"", "22023");
+        }
+        return c;
+    }
+
+    /**
      * A document read from its text, as jsonb keeps it where jsonb is what it was written as.
      *
      * <p>Which of the two it is decides the order the members come in, and so the positions the
@@ -110,25 +140,26 @@ class TextSearchFunctions {
     }
 
     /** The same document with every string it holds replaced by the headline of that string. */
-    private JsonValue headlineOf(JsonValue value, TsQuery query, String options) {
+    private JsonValue headlineOf(JsonValue value, TsQuery query, String options,
+                                 String config) {
         switch (value.kind()) {
             case JsonValue.OBJECT: {
                 List<JsonValue> values = new ArrayList<JsonValue>(value.size());
                 for (JsonValue member : value.elements()) {
-                    values.add(headlineOf(member, query, options));
+                    values.add(headlineOf(member, query, options, config));
                 }
                 return JsonValue.object(value.keys(), values);
             }
             case JsonValue.ARRAY: {
                 List<JsonValue> elements = new ArrayList<JsonValue>(value.size());
                 for (JsonValue element : value.elements()) {
-                    elements.add(headlineOf(element, query, options));
+                    elements.add(headlineOf(element, query, options, config));
                 }
                 return JsonValue.array(elements);
             }
             case JsonValue.STRING:
-                return JsonValue.string(
-                        TextSearchOperations.tsHeadline(value.asString(), query, options));
+                return JsonValue.string(TextSearchOperations.tsHeadline(
+                        value.asString(), query, options, config));
             default:
                 return value;
         }
@@ -158,6 +189,11 @@ class TextSearchFunctions {
      * configuration created with COPY behaves as its source does, so following copyFrom lands on
      * a stemmer; a name that names nothing at all is an error, not a silent fallback.
      */
+    /** The configuration a name stands for, for callers outside this class. */
+    String namedConfig(String rawName) {
+        return resolveTsConfig(rawName);
+    }
+
     private String resolveTsConfig(String rawName) {
         String name = rawName == null ? "" : rawName.toLowerCase();
         // Strip any schema qualification: configurations live in one namespace here.
@@ -196,7 +232,10 @@ class TextSearchFunctions {
             "to_tsquery", "to_tsvector", "ts_debug", "ts_delete", "ts_filter", "ts_headline",
             "ts_lexize", "ts_parse", "ts_rank", "ts_rank_cd", "ts_rewrite", "ts_stat",
             "ts_token_type", "tsquery_phrase", "tsvector_to_array", "websearch_to_tsquery",
-            "json_to_tsvector", "jsonb_to_tsvector");
+            "json_to_tsvector", "jsonb_to_tsvector",
+            "ts_match_vq", "ts_match_qv", "ts_match_tq", "ts_match_tt",
+            "tsvector_cmp", "tsquery_cmp", "tsquery_not", "tsquery_and", "tsquery_or",
+            "tsvector_concat");
 
     /**
      * Every text-search function PostgreSQL exposes is declared strict, so a NULL argument makes
@@ -275,10 +314,12 @@ class TextSearchFunctions {
                 return TsQuery.parse(tsqStr, config);
             }
             case "plainto_tsquery": {
+                // The configuration says how the text is read, so a name that names none is an
+                // error rather than a quiet fall back to english.
                 String config = "english";
                 String input;
                 if (argv.size() == 2) {
-                    config = String.valueOf(argv.get(0)).toLowerCase();
+                    config = resolveTsConfig(String.valueOf(argv.get(0)));
                     input = String.valueOf(argv.get(1));
                 } else {
                     input = String.valueOf(argv.get(0));
@@ -286,10 +327,12 @@ class TextSearchFunctions {
                 return TextSearchOperations.plainToTsQuery(input, config);
             }
             case "phraseto_tsquery": {
+                // The configuration says how the text is read, so a name that names none is an
+                // error rather than a quiet fall back to english.
                 String config = "english";
                 String input;
                 if (argv.size() == 2) {
-                    config = String.valueOf(argv.get(0)).toLowerCase();
+                    config = resolveTsConfig(String.valueOf(argv.get(0)));
                     input = String.valueOf(argv.get(1));
                 } else {
                     input = String.valueOf(argv.get(0));
@@ -297,10 +340,12 @@ class TextSearchFunctions {
                 return TextSearchOperations.phraseToTsQuery(input, config);
             }
             case "websearch_to_tsquery": {
+                // The configuration says how the text is read, so a name that names none is an
+                // error rather than a quiet fall back to english.
                 String config = "english";
                 String input;
                 if (argv.size() == 2) {
-                    config = String.valueOf(argv.get(0)).toLowerCase();
+                    config = resolveTsConfig(String.valueOf(argv.get(0)));
                     input = String.valueOf(argv.get(1));
                 } else {
                     input = String.valueOf(argv.get(0));
@@ -379,7 +424,7 @@ class TextSearchFunctions {
                     Object q = argv.get(2);
                     Object opt = argv.get(3);
                     if (cfg == null || doc == null || q == null || opt == null) return null;
-                    config = cfg.toString();
+                    config = resolveTsConfig(cfg.toString());
                     document = doc.toString();
                     documentAt = 1;
                     query = q instanceof TsQuery ? ((TsQuery) q) : TsQuery.parse(q.toString());
@@ -390,7 +435,7 @@ class TextSearchFunctions {
                     Object third = argv.get(2);
                     if (first == null || second == null || third == null) return null;
                     if (third instanceof TsQuery) {
-                        config = first.toString();
+                        config = resolveTsConfig(first.toString());
                         document = second.toString();
                         documentAt = 1;
                         query = (TsQuery) third;
@@ -416,17 +461,40 @@ class TextSearchFunctions {
                 if (documentType != null) {
                     JsonValue headlined = headlineOf(
                             parseDocument(document, documentType == DataType.JSONB),
-                            query, options);
+                            query, options, config == null ? "english" : config);
                     return documentType == DataType.JSONB
                             ? JsonWriter.jsonb(headlined) : JsonWriter.json(headlined);
                 }
-                return TextSearchOperations.tsHeadline(document, query, options);
+                return TextSearchOperations.tsHeadline(document, query, options,
+                        config == null ? "english" : config);
             }
             case "ts_rewrite": {
                 Object queryObj = argv.get(0);
+                if (queryObj == null) return null;
+                // The two-argument form takes the pairs to rewrite with from a query rather than
+                // from its own arguments. Routing it to the three-argument code read past the
+                // end of the argument list and reported that as an internal error.
+                if (argv.size() == 2) {
+                    Object sqlObj = argv.get(1);
+                    if (sqlObj == null) return null;
+                    TsQuery rewritten = queryObj instanceof TsQuery
+                            ? (TsQuery) queryObj : TsQuery.parse(queryObj.toString());
+                    QueryResult pairs = executor.execute(sqlObj.toString());
+                    if (pairs != null && pairs.getRows() != null) {
+                        for (Object[] row : pairs.getRows()) {
+                            if (row.length < 2 || row[0] == null || row[1] == null) continue;
+                            TsQuery target = row[0] instanceof TsQuery
+                                    ? (TsQuery) row[0] : TsQuery.parse(row[0].toString());
+                            TsQuery sub = row[1] instanceof TsQuery
+                                    ? (TsQuery) row[1] : TsQuery.parse(row[1].toString());
+                            rewritten = TextSearchOperations.tsRewrite(rewritten, target, sub);
+                        }
+                    }
+                    return rewritten;
+                }
                 Object targetObj = argv.get(1);
                 Object subObj = argv.get(2);
-                if (queryObj == null || targetObj == null || subObj == null) return null;
+                if (targetObj == null || subObj == null) return null;
                 TsQuery query = queryObj instanceof TsQuery ? ((TsQuery) queryObj) : TsQuery.parse(queryObj.toString());
                 TsQuery target = targetObj instanceof TsQuery ? ((TsQuery) targetObj) : TsQuery.parse(targetObj.toString());
                 TsQuery sub = subObj instanceof TsQuery ? ((TsQuery) subObj) : TsQuery.parse(subObj.toString());
@@ -440,8 +508,9 @@ class TextSearchFunctions {
             case "setweight": {
                 Object vecObj = argv.get(0);
                 Object weightObj = argv.get(1);
+                if (vecObj == null || weightObj == null) return null;
                 TsVector vec = vecObj instanceof TsVector ? ((TsVector) vecObj) : toTsVector(vecObj.toString());
-                char weight = weightObj.toString().charAt(0);
+                char weight = weightGiven(weightObj.toString());
                 if (argv.size() >= 3) {
                     Object lexArr = argv.get(2);
                     List<String> filterLexemes = new ArrayList<>();
@@ -486,14 +555,14 @@ class TextSearchFunctions {
                 if (weightsObj instanceof List<?>) {
                     for (Object o : (List<?>) weightsObj) {
                         String ws = o.toString().trim().replace("\"", "");
-                        if (!ws.isEmpty()) filterWeights.add(Character.toUpperCase(ws.charAt(0)));
+                        if (!ws.isEmpty()) filterWeights.add(weightNamed(ws));
                     }
                 } else {
                     String ws = weightsObj.toString();
                     if (ws.startsWith("{") && ws.endsWith("}")) ws = ws.substring(1, ws.length() - 1);
                     for (String w : ws.split(",")) {
                         w = w.trim().replace("\"", "");
-                        if (!w.isEmpty()) filterWeights.add(Character.toUpperCase(w.charAt(0)));
+                        if (!w.isEmpty()) filterWeights.add(weightNamed(w));
                     }
                 }
                 return vec.filter(filterWeights);
@@ -520,21 +589,24 @@ class TextSearchFunctions {
                 String config = "english";
                 String input;
                 if (argv.size() == 2) {
-                    config = String.valueOf(argv.get(0));
+                    config = resolveTsConfig(String.valueOf(argv.get(0)));
                     input = String.valueOf(argv.get(1));
                 } else {
                     input = String.valueOf(argv.get(0));
                 }
-                List<Object[]> debug = TextSearchOperations.tsDebug(input);
+                List<Object[]> debug = TextSearchOperations.tsDebug(config, input);
                 if (debug.isEmpty()) return "";
                 Object[] first = debug.get(0);
                 return "(" + first[0] + ",\"" + first[1] + "\"," + first[2] + "," + first[3] + ",{" + first[5] + "})";
             }
             case "ts_lexize": {
+                // The dictionary is what does the work: the simple one folds the case and keeps
+                // the word, and a stemmer stems it and drops the words on its stop list.
+                // Ignoring the argument answered for the english stemmer whatever was asked for.
                 String dict = String.valueOf(argv.get(0));
                 String token = String.valueOf(argv.get(1));
                 List<String> result = TextSearchOperations.tsLexize(dict, token);
-                return "{" + String.join(",", result) + "}";
+                return result == null ? null : "{" + String.join(",", result) + "}";
             }
             case "ts_token_type": {
                 String parser = argv.isEmpty() ? "default" : String.valueOf(argv.get(0));
@@ -560,6 +632,68 @@ class TextSearchFunctions {
             case "ts_stat": {
                 return null;
             }
+            // The function spellings of the operators. PostgreSQL declares each of these in
+            // pg_proc, so SQL that names one directly resolves; they were missing entirely.
+            case "ts_match_vq":
+            case "ts_match_qv":
+            case "ts_match_tq":
+            case "ts_match_tt": {
+                Object first = argv.get(0);
+                Object second = argv.get(1);
+                if (first == null || second == null) return null;
+                boolean queryFirst = name.equals("ts_match_qv");
+                Object document = queryFirst ? second : first;
+                Object query = queryFirst ? first : second;
+                TsVector vector = document instanceof TsVector
+                        ? (TsVector) document : toTsVector(document.toString());
+                TsQuery parsed = query instanceof TsQuery
+                        ? (TsQuery) query
+                        : name.endsWith("tt") ? TextSearchOperations.plainToTsQuery(
+                                query.toString(), "english")
+                        : TsQuery.parse(query.toString());
+                return vector.matches(parsed);
+            }
+            case "tsvector_cmp": {
+                Object first = argv.get(0);
+                Object second = argv.get(1);
+                if (first == null || second == null) return null;
+                return TextSearchOperations.compareVectors(
+                        first instanceof TsVector ? (TsVector) first : toTsVector(first.toString()),
+                        second instanceof TsVector ? (TsVector) second : toTsVector(second.toString()));
+            }
+            case "tsquery_cmp": {
+                Object first = argv.get(0);
+                Object second = argv.get(1);
+                if (first == null || second == null) return null;
+                return Integer.valueOf(first.toString().compareTo(second.toString()));
+            }
+            case "tsquery_not": {
+                Object only = argv.get(0);
+                if (only == null) return null;
+                return TsQuery.not(only instanceof TsQuery
+                        ? (TsQuery) only : TsQuery.parse(only.toString()));
+            }
+            case "tsquery_and":
+            case "tsquery_or": {
+                Object first = argv.get(0);
+                Object second = argv.get(1);
+                if (first == null || second == null) return null;
+                TsQuery l = first instanceof TsQuery
+                        ? (TsQuery) first : TsQuery.parse(first.toString());
+                TsQuery r = second instanceof TsQuery
+                        ? (TsQuery) second : TsQuery.parse(second.toString());
+                return name.equals("tsquery_and") ? TsQuery.and(l, r) : TsQuery.or(l, r);
+            }
+            case "tsvector_concat": {
+                Object first = argv.get(0);
+                Object second = argv.get(1);
+                if (first == null || second == null) return null;
+                TsVector l = first instanceof TsVector
+                        ? (TsVector) first : toTsVector(first.toString());
+                TsVector r = second instanceof TsVector
+                        ? (TsVector) second : toTsVector(second.toString());
+                return l.concat(r);
+            }
             case "get_current_ts_config": {
                 return TextSearchOperations.getCurrentTsConfig();
             }
@@ -569,10 +703,9 @@ class TextSearchFunctions {
                 if (arrObj instanceof List<?>) {
                     List<?> list = (List<?>) arrObj;
                     for (Object o : list) {
-                        if (o == null) {
-                            throw new MemgresException("null value not allowed for array_to_tsvector", "22004");
-                        }
-                        words.add(o.toString());
+                        // The reader of the array says what an element has to be, so the
+                        // complaint about one is worded there and once.
+                        words.add(o == null ? null : o.toString());
                     }
                 } else if (arrObj instanceof String && ((String) arrObj).startsWith("{") && ((String) arrObj).endsWith("}")) {
                     String s = (String) arrObj;

@@ -244,6 +244,14 @@ public class Lexer {
             return readNumber(start);
         }
 
+        // A national-character literal is an ordinary one: the N says the characters are in the
+        // national character set, which here is the only one there is. It used to be read as a
+        // type name followed by a string, so N'abc' was a cast to a type called n.
+        if ((c == 'N' || c == 'n') && pos + 1 < length && sql.charAt(pos + 1) == '\'') {
+            pos += 1;
+            return readStringLiteral(start);
+        }
+
         // Unicode escape strings: U&'...'
         if ((c == 'U' || c == 'u') && pos + 1 < length && sql.charAt(pos + 1) == '&'
                 && pos + 2 < length && sql.charAt(pos + 2) == '\'') {
@@ -426,6 +434,8 @@ public class Lexer {
             case "|>>": return new Token(TokenType.GEO_ABOVE, "|>>", start);
             case "|&>": return new Token(TokenType.GEO_NOT_EXTEND_BELOW, "|&>", start);
             case "#>>": return new Token(TokenType.JSON_HASH_ARROW_TEXT, "#>>", start);
+            // @@@ is PostgreSQL's older spelling of @@ and means exactly the same thing.
+            case "@@@": return new Token(TokenType.TS_MATCH, "@@@", start);
             case "!~~": return new Token(TokenType.NOT_DOUBLE_TILDE, "!~~", start);
             case "!~*": return new Token(TokenType.EXCL_TILDE_STAR, "!~*", start);
             case "?||": return new Token(TokenType.GEO_PARALLEL, "?||", start);
@@ -561,109 +571,84 @@ public class Lexer {
     private Token readUnicodeStringLiteral(int start) {
         // Read the raw string content first (pos is on the opening quote)
         Token raw = readStringLiteral(start);
-        // Process Unicode escapes: \XXXX (4-digit) or \+NNNNNN (6-digit) → character
-        String val = raw.value();
+        return new Token(TokenType.STRING_LITERAL,
+                decodeUnicodeEscapes(raw.value(), readUescape(), start), start);
+    }
+
+    /**
+     * The character that introduces an escape in the {@code U&} form just read.
+     *
+     * <p>A {@code UESCAPE 'x'} clause after the literal names it, and without one it is the
+     * backslash. The clause was not read at all, so the escape character could never be changed
+     * and every literal that named one was a syntax error at the clause.
+     */
+    private char readUescape() {
+        int mark = pos;
+        while (pos < length && Character.isWhitespace(sql.charAt(pos))) pos++;
+        if (pos + 7 <= length && sql.regionMatches(true, pos, "UESCAPE", 0, 7)) {
+            int after = pos + 7;
+            while (after < length && Character.isWhitespace(sql.charAt(after))) after++;
+            if (after + 2 < length && sql.charAt(after) == '\''
+                    && sql.charAt(after + 2) == '\'') {
+                char escape = sql.charAt(after + 1);
+                pos = after + 3;
+                return escape;
+            }
+        }
+        pos = mark;
+        return '\\';
+    }
+
+    /**
+     * Read the escapes in a {@code U&} literal: four hexadecimal digits, or a plus and six of
+     * them, or the escape character twice for one of itself.
+     */
+    private String decodeUnicodeEscapes(String val, char escape, int start) {
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < val.length(); i++) {
-            if (val.charAt(i) == '\\' && i + 1 < val.length()) {
-                // A doubled escape character stands for one of itself, so U&'a\\b' is
-                // three characters. Reading it as the start of a codepoint left too few digits
-                // behind it, and a string PostgreSQL accepts was refused outright.
-                if (val.charAt(i + 1) == '\\') {
-                    sb.append('\\');
-                    i++;
-                    continue;
-                }
-                // \+NNNNNN form (6-digit codepoint)
-                if (val.charAt(i + 1) == '+' && i + 7 < val.length()) {
-                    String hex = val.substring(i + 2, i + 8);
-                    // Validate all characters are hex digits
-                    boolean valid = true;
-                    for (char hc : hex.toCharArray()) {
-                        if (Character.digit(hc, 16) < 0) { valid = false; break; }
-                    }
-                    if (!valid) {
-                        throw ParseException.saying("invalid Unicode escape value",
-                                new Token(TokenType.ERROR, val, start), "42601");
-                    }
-                    int cp = Integer.parseInt(hex, 16);
-                    sb.appendCodePoint(cp);
-                    i += 7; // skip \+NNNNNN
-                    continue;
-                }
-                // \XXXX form (4-digit codepoint)
-                if (i + 4 < val.length()) {
-                    String hex = val.substring(i + 1, i + 5);
-                    // Validate all characters are hex digits
-                    boolean valid = true;
-                    for (char hc : hex.toCharArray()) {
-                        if (Character.digit(hc, 16) < 0) { valid = false; break; }
-                    }
-                    if (!valid) {
-                        throw ParseException.saying("invalid Unicode escape value",
-                                new Token(TokenType.ERROR, val, start), "42601");
-                    }
-                    int cp = Integer.parseInt(hex, 16);
-                    sb.appendCodePoint(cp);
-                    i += 4; // skip \XXXX
-                    continue;
-                }
-                // Invalid: not enough characters for escape
-                throw ParseException.saying("invalid Unicode escape value"
-                                + "\n  Hint: Unicode escapes must be \\XXXX or \\+XXXXXX.",
+            if (val.charAt(i) != escape || i + 1 >= val.length()) {
+                sb.append(val.charAt(i));
+                continue;
+            }
+            // A doubled escape character stands for one of itself, so U&'a\\b' is three
+            // characters. Reading it as the start of a codepoint left too few digits behind it,
+            // and a string PostgreSQL accepts was refused outright.
+            if (val.charAt(i + 1) == escape) {
+                sb.append(escape);
+                i++;
+                continue;
+            }
+            int digits = val.charAt(i + 1) == '+' ? 6 : 4;
+            int from = val.charAt(i + 1) == '+' ? i + 2 : i + 1;
+            if (from + digits > val.length()) {
+                throw ParseException.saying("invalid Unicode escape value",
                         new Token(TokenType.ERROR, val, start), "42601");
             }
-            sb.append(val.charAt(i));
+            int cp = 0;
+            for (int k = from; k < from + digits; k++) {
+                int digit = Character.digit(val.charAt(k), 16);
+                if (digit < 0) {
+                    throw ParseException.saying("invalid Unicode escape value",
+                            new Token(TokenType.ERROR, val, start), "42601");
+                }
+                cp = cp * 16 + digit;
+            }
+            if (cp > Character.MAX_CODE_POINT) {
+                throw ParseException.saying(
+                        "invalid Unicode escape value at or near \"" + val + "\"",
+                        new Token(TokenType.ERROR, val, start), "42601");
+            }
+            sb.appendCodePoint(cp);
+            i = from + digits - 1;
         }
-        return new Token(TokenType.STRING_LITERAL, sb.toString(), start);
+        return sb.toString();
     }
 
     private Token readUnicodeIdentifier(int start) {
         // Read the raw quoted identifier content first (pos is on the opening double-quote)
         Token raw = readQuotedIdentifier(start);
-        // Process Unicode escapes: \XXXX (4-digit) or \+NNNNNN (6-digit) -> character
-        String val = raw.value();
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < val.length(); i++) {
-            if (val.charAt(i) == '\\' && i + 1 < val.length()) {
-                // \+NNNNNN form (6-digit codepoint)
-                if (val.charAt(i + 1) == '+' && i + 7 < val.length()) {
-                    String hex = val.substring(i + 2, i + 8);
-                    boolean valid = true;
-                    for (char hc : hex.toCharArray()) {
-                        if (Character.digit(hc, 16) < 0) { valid = false; break; }
-                    }
-                    if (!valid) {
-                        throw ParseException.saying("invalid Unicode escape value",
-                                new Token(TokenType.ERROR, val, start), "42601");
-                    }
-                    int cp = Integer.parseInt(hex, 16);
-                    sb.appendCodePoint(cp);
-                    i += 7; // skip \+NNNNNN
-                    continue;
-                }
-                // \XXXX form (4-digit codepoint)
-                if (i + 4 < val.length()) {
-                    String hex = val.substring(i + 1, i + 5);
-                    boolean valid = true;
-                    for (char hc : hex.toCharArray()) {
-                        if (Character.digit(hc, 16) < 0) { valid = false; break; }
-                    }
-                    if (!valid) {
-                        throw ParseException.saying("invalid Unicode escape value",
-                                new Token(TokenType.ERROR, val, start), "42601");
-                    }
-                    int cp = Integer.parseInt(hex, 16);
-                    sb.appendCodePoint(cp);
-                    i += 4; // skip \XXXX
-                    continue;
-                }
-                throw ParseException.saying("invalid Unicode escape value",
-                        new Token(TokenType.ERROR, val, start), "42601");
-            }
-            sb.append(val.charAt(i));
-        }
-        return new Token(TokenType.QUOTED_IDENTIFIER, sb.toString(), start);
+        return new Token(TokenType.QUOTED_IDENTIFIER,
+                decodeUnicodeEscapes(raw.value(), readUescape(), start), start);
     }
 
     private Token readStringLiteral(int start) {
@@ -677,6 +662,10 @@ public class Lexer {
                     pos += 2;
                 } else {
                     pos++; // skip closing quote
+                    // Two literals with a line break between them are one literal. PostgreSQL
+                    // requires the break -- on one line they are two tokens and a syntax error
+                    // -- which is what makes this safe to read here.
+                    if (continuesOnNextLine()) continue;
                     return new Token(TokenType.STRING_LITERAL, sb.toString(), start);
                 }
             } else {
@@ -877,11 +866,46 @@ public class Lexer {
         String upper = word.toUpperCase(java.util.Locale.ROOT);
 
         if (KEYWORDS.contains(upper)) {
+
             return new Token(TokenType.KEYWORD, upper, start, word);
         }
         // PG truncates identifiers to NAMEDATALEN-1 = 63 bytes
-        String id = word.toLowerCase(java.util.Locale.ROOT);
+        // Only the twenty-six letters are folded. PostgreSQL leaves everything else as written,
+        // so MÜLLER is the column mÜller and müller names nothing; folding the whole word made
+        // the two the same name and the one PostgreSQL rejects was found.
+        String id = foldAsciiOnly(word);
         if (id.length() > 63) id = id.substring(0, 63);
         return new Token(TokenType.IDENTIFIER, id, start, word);
+    }
+
+    /**
+     * Whether the literal just closed is continued by another one on a later line.
+     *
+     * <p>Consumes the whitespace and the opening quote when it is, so that reading carries on
+     * into the second literal's characters.
+     */
+    private boolean continuesOnNextLine() {
+        int mark = pos;
+        boolean sawNewline = false;
+        while (pos < length && Character.isWhitespace(sql.charAt(pos))) {
+            if (sql.charAt(pos) == '\n') sawNewline = true;
+            pos++;
+        }
+        if (sawNewline && pos < length && sql.charAt(pos) == '\'') {
+            pos++;
+            return true;
+        }
+        pos = mark;
+        return false;
+    }
+
+    /** Lower-case the twenty-six letters and leave every other character alone. */
+    static String foldAsciiOnly(String word) {
+        StringBuilder sb = new StringBuilder(word.length());
+        for (int i = 0; i < word.length(); i++) {
+            char c = word.charAt(i);
+            sb.append(c >= 'A' && c <= 'Z' ? (char) (c + 32) : c);
+        }
+        return sb.toString();
     }
 }

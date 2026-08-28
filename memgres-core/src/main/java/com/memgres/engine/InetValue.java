@@ -21,7 +21,13 @@ public class InetValue implements Comparable<InetValue> {
 
     /** Parse a PostgreSQL inet literal (e.g. "192.168.1.1", "192.168.1.0/24", "::1/128", "2001:db8::1"). */
     public static InetValue parse(String input) {
-        String s = input.trim();
+        // The literal is the whole of what it says: PostgreSQL reads no space before it and
+        // none after, so trimming accepted text a real server refuses.
+        String s = input;
+        if (!s.equals(s.trim())) {
+            throw new MemgresException(
+                    "invalid input syntax for type inet: \"" + input + "\"", "22P02");
+        }
         String addrPart = s;
         int prefix = -1;
         int slashIdx = s.indexOf('/');
@@ -32,6 +38,16 @@ public class InetValue implements Comparable<InetValue> {
             } catch (NumberFormatException e) {
                 throw new MemgresException("invalid input syntax for type inet: \"" + input + "\"", "22P02");
             }
+        }
+        // An address written with fewer than four octets is abbreviated, and a mask says how
+        // much of it was written: '10/8' is ten dot nothing. This is only a spelling for a
+        // masked address, so an abbreviation with no mask is still not an inet.
+        if (slashIdx >= 0 && !addrPart.contains(":")) {
+            int dots = 0;
+            for (int i = 0; i < addrPart.length(); i++) {
+                if (addrPart.charAt(i) == '.') dots++;
+            }
+            for (int i = dots; i < 3; i++) addrPart = addrPart + ".0";
         }
         byte[] bytes;
         boolean isIPv6Syntax = addrPart.contains(":");
@@ -71,8 +87,6 @@ public class InetValue implements Comparable<InetValue> {
     private static void validateIPv4Octets(String addrPart, String original) {
         String[] octets = addrPart.split("\\.");
         if (octets.length != 4) {
-            // Unlike cidr, PG's inet input requires a full 4-octet IPv4 address;
-            // abbreviated forms such as '10', '10.1' or '10.1.2' are rejected (22P02).
             throw new MemgresException("invalid input syntax for type inet: \"" + original + "\"", "22P02");
         }
         for (String o : octets) {
@@ -152,6 +166,9 @@ public class InetValue implements Comparable<InetValue> {
     /** set_masklen: returns new InetValue with different prefix (keeps address). */
     public InetValue setMasklen(int newPrefix) {
         int max = maxBits();
+        // Minus one is PostgreSQL's way of asking for the whole address: it is the one negative
+        // length that names a length, and refusing it left no way to write "all of it".
+        if (newPrefix == -1) newPrefix = max;
         if (newPrefix < 0 || newPrefix > max) {
             throw new MemgresException("invalid mask length: " + newPrefix, "22023");
         }
@@ -177,8 +194,10 @@ public class InetValue implements Comparable<InetValue> {
 
     /** inet - inet: returns the difference as a long. */
     public long subtract(InetValue other) {
+        // The operator exists for the pair; it is the values that will not go together, and
+        // PostgreSQL says which of the two things is wrong.
         if (this.address.length != other.address.length) {
-            throw new MemgresException("cannot subtract inet values of different families", "42883");
+            throw new MemgresException("cannot subtract inet values of different sizes", "22023");
         }
         BigInteger a = new BigInteger(1, address);
         BigInteger b = new BigInteger(1, other.address);
@@ -187,7 +206,7 @@ public class InetValue implements Comparable<InetValue> {
 
     /** Bitwise AND. */
     public InetValue bitwiseAnd(InetValue other) {
-        checkSameFamily(other);
+        checkSameFamily(other, "AND");
         byte[] result = new byte[address.length];
         for (int i = 0; i < result.length; i++) {
             result[i] = (byte) (address[i] & other.address[i]);
@@ -197,7 +216,7 @@ public class InetValue implements Comparable<InetValue> {
 
     /** Bitwise OR. */
     public InetValue bitwiseOr(InetValue other) {
-        checkSameFamily(other);
+        checkSameFamily(other, "OR");
         byte[] result = new byte[address.length];
         for (int i = 0; i < result.length; i++) {
             result[i] = (byte) (address[i] | other.address[i]);
@@ -379,9 +398,15 @@ public class InetValue implements Comparable<InetValue> {
         return sb.toString();
     }
 
-    private void checkSameFamily(InetValue other) {
+    /**
+     * Two addresses have to be the same width to be combined bit by bit.
+     *
+     * @param operation how the complaint names what was being done, which PostgreSQL spells out
+     */
+    void checkSameFamily(InetValue other, String operation) {
         if (this.address.length != other.address.length) {
-            throw new MemgresException("cannot AND/OR inet values of different families", "42883");
+            throw new MemgresException(
+                    "cannot " + operation + " inet values of different sizes", "22023");
         }
     }
 }

@@ -59,6 +59,32 @@ class DateTimeFunctions {
         this.executor = executor;
     }
 
+    /**
+     * Whether any argument of a call is nothing.
+     *
+     * <p>The {@code make_} family builds a value out of every argument it is given, so one that
+     * is nothing leaves nothing to build. Each of them used to null-check whichever argument it
+     * thought of as the important one and coerce the rest, and a coerced nothing is zero -- a
+     * field the caller never named, which then either made a value or was complained about.
+     */
+    private boolean anyNull(FunctionCallExpr fn, RowContext ctx) {
+        for (Expression arg : fn.args()) {
+            Expression value = arg instanceof NamedArgExpr ? ((NamedArgExpr) arg).value() : arg;
+            if (executor.evalExpr(value, ctx) == null) return true;
+        }
+        return false;
+    }
+
+    /**
+     * A field of an interval, which is stored in an int and so cannot hold more than one.
+     */
+    private static int intervalField(long value, String unit) {
+        if (value > Integer.MAX_VALUE || value < Integer.MIN_VALUE) {
+            throw new MemgresException("interval out of range", "22008");
+        }
+        return (int) value;
+    }
+
     Object eval(String name, FunctionCallExpr fn, RowContext ctx) {
         switch (name) {
             case "age": {
@@ -114,6 +140,12 @@ class DateTimeFunctions {
                 Object[] fields = new Object[]{executor.evalExpr(fn.args().get(0), ctx),
                         executor.evalExpr(fn.args().get(1), ctx),
                         executor.evalExpr(fn.args().get(2), ctx)};
+                // A date is made out of three fields, so a field that is nothing leaves no date
+                // to make. Coercing it to zero instead built a date out of a value the caller
+                // never gave -- year nought, or month nought -- and then complained about it.
+                for (Object field : fields) {
+                    if (field == null) return null;
+                }
                 // make_date is declared over integers alone, so a number too wide for one is a
                 // bigint -- and there is no make_date over bigint for the call to resolve to. Cut
                 // to width instead, 4294967297 became the year 1 and the call quietly succeeded.
@@ -148,6 +180,7 @@ class DateTimeFunctions {
                 }
             }
             case "make_timestamp": {
+                if (anyNull(fn, ctx)) return null;
                 int year = executor.toInt(executor.evalExpr(fn.args().get(0), ctx));
                 int month = executor.toInt(executor.evalExpr(fn.args().get(1), ctx));
                 int day = executor.toInt(executor.evalExpr(fn.args().get(2), ctx));
@@ -159,6 +192,7 @@ class DateTimeFunctions {
                 return makeTimestamp(year, month, day, hour, minute, secs, nanos);
             }
             case "make_timestamptz": {
+                if (anyNull(fn, ctx)) return null;
                 int year = executor.toInt(executor.evalExpr(fn.args().get(0), ctx));
                 int month = executor.toInt(executor.evalExpr(fn.args().get(1), ctx));
                 int day = executor.toInt(executor.evalExpr(fn.args().get(2), ctx));
@@ -173,6 +207,7 @@ class DateTimeFunctions {
                         .atZone(zone).toOffsetDateTime();
             }
             case "make_time": {
+                if (anyNull(fn, ctx)) return null;
                 int hour = executor.toInt(executor.evalExpr(fn.args().get(0), ctx));
                 int minute = executor.toInt(executor.evalExpr(fn.args().get(1), ctx));
                 double sec = executor.toDouble(executor.evalExpr(fn.args().get(2), ctx));
@@ -237,6 +272,7 @@ class DateTimeFunctions {
                         binOffsetMicros(microsBetween(origin, source), strideMicros) * 1000);
             }
             case "make_interval": {
+                if (anyNull(fn, ctx)) return null;
                 int years = 0, months = 0, weeks = 0, days = 0, hours = 0, mins = 0;
                 double secs = 0;
                 boolean hasNamedArgs = !fn.args().isEmpty() && fn.args().get(0) instanceof NamedArgExpr;
@@ -279,8 +315,11 @@ class DateTimeFunctions {
                     mins = fn.args().size() > 5 ? executor.toInt(executor.evalExpr(fn.args().get(5), ctx)) : 0;
                     secs = fn.args().size() > 6 ? executor.toDouble(executor.evalExpr(fn.args().get(6), ctx)) : 0;
                 }
-                return new PgInterval(years * 12 + months,
-                        days + weeks * 7,
+                // The fields are added up in the width they are stored in, so an interval too
+                // large to hold is refused rather than wrapped: 200000000 years is more months
+                // than a month count can carry, and computing it in an int made it negative.
+                return new PgInterval(intervalField(years * 12L + months, "months"),
+                        intervalField(days + weeks * 7L, "days"),
                         (hours * 3600L + mins * 60L) * 1_000_000L + Math.round(secs * 1_000_000));
             }
             case "transaction_timestamp": {
@@ -352,8 +391,15 @@ class DateTimeFunctions {
             case "to_number": {
                 Object source = executor.evalExpr(fn.args().get(0), ctx);
                 if (source == null) return null;
-                return parseNumberWithFormat(source.toString(),
-                        fn.args().size() > 1 ? String.valueOf(executor.evalExpr(fn.args().get(1), ctx)) : null);
+                String template = null;
+                if (fn.args().size() > 1) {
+                    // A template that is nothing is not the word "null" spelled out: with no
+                    // template there is no number to read, the way to_char and to_date have it.
+                    Object fmtObj = executor.evalExpr(fn.args().get(1), ctx);
+                    if (fmtObj == null) return null;
+                    template = fmtObj.toString();
+                }
+                return parseNumberWithFormat(source.toString(), template);
             }
             case "justify_hours": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);

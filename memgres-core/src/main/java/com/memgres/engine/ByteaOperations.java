@@ -59,6 +59,168 @@ public final class ByteaOperations {
         return baos.toByteArray();
     }
 
+    /** The alphabet base64 is written in, and where each character stands in it. */
+    private static final String BASE64_ALPHABET =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    /** How many characters of base64 go on a line before the next one begins. */
+    private static final int BASE64_LINE = 76;
+
+    /**
+     * Write bytes as base64, a line at a time.
+     *
+     * <p>The wrapping is part of the format PostgreSQL writes and reads: its own reader accepts
+     * the newlines and a client that stores the result gets the same text back. Writing one
+     * unbroken line was shorter by exactly the newlines, so any length taken of the result
+     * disagreed, and the text was no longer what the same call on a real server produces.
+     */
+    public static String encodeBase64(byte[] bytes) {
+        StringBuilder out = new StringBuilder();
+        int column = 0;
+        for (int i = 0; i < bytes.length; i += 3) {
+            int remaining = bytes.length - i;
+            int block = (bytes[i] & 0xFF) << 16;
+            if (remaining > 1) block |= (bytes[i + 1] & 0xFF) << 8;
+            if (remaining > 2) block |= bytes[i + 2] & 0xFF;
+            char[] four = new char[4];
+            four[0] = BASE64_ALPHABET.charAt((block >> 18) & 0x3F);
+            four[1] = BASE64_ALPHABET.charAt((block >> 12) & 0x3F);
+            four[2] = remaining > 1 ? BASE64_ALPHABET.charAt((block >> 6) & 0x3F) : '=';
+            four[3] = remaining > 2 ? BASE64_ALPHABET.charAt(block & 0x3F) : '=';
+            for (char c : four) {
+                out.append(c);
+                if (++column == BASE64_LINE) {
+                    out.append('\n');
+                    column = 0;
+                }
+            }
+        }
+        return out.toString();
+    }
+
+    /**
+     * Read base64, ignoring the whitespace its own writer puts in and insisting on the padding
+     * that says how the last group ends.
+     */
+    public static byte[] decodeBase64(String text) {
+        StringBuilder symbols = new StringBuilder(text.length());
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (Character.isWhitespace(c)) continue;
+            if (c != '=' && BASE64_ALPHABET.indexOf(c) < 0) {
+                throw new MemgresException(
+                        "invalid symbol \"" + c + "\" found while decoding base64 sequence",
+                        "22023");
+            }
+            symbols.append(c);
+        }
+        // Four characters spell three bytes, so a count that is not a multiple of four does not
+        // say how the last group ends. Filling in the padding for the caller accepted text that
+        // no writer of this format produces.
+        if (symbols.length() % 4 != 0) {
+            MemgresException e = new MemgresException("invalid base64 end sequence", "22023");
+            e.setHint("Input data is missing padding, is truncated, or is otherwise corrupted.");
+            throw e;
+        }
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        int block = 0;
+        int held = 0;
+        for (int i = 0; i < symbols.length(); i++) {
+            char c = symbols.charAt(i);
+            if (c == '=') {
+                // The padding says the group was short: what is already held is all it spelled.
+                if (held == 3) {
+                    out.write((block >> 10) & 0xFF);
+                    out.write((block >> 2) & 0xFF);
+                } else if (held == 2) {
+                    out.write((block >> 4) & 0xFF);
+                }
+                return out.toByteArray();
+            }
+            block = (block << 6) | BASE64_ALPHABET.indexOf(c);
+            if (++held == 4) {
+                out.write((block >> 16) & 0xFF);
+                out.write((block >> 8) & 0xFF);
+                out.write(block & 0xFF);
+                block = 0;
+                held = 0;
+            }
+        }
+        return out.toByteArray();
+    }
+
+    /**
+     * Read hex digits, ignoring whitespace between them.
+     *
+     * <p>Each character is checked as it is met, so a character that is no digit at all is
+     * reported as that rather than as the odd count it happens to leave behind.
+     */
+    public static byte[] decodeHexText(String text) {
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        int high = -1;
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (Character.isWhitespace(c)) continue;
+            int digit = Character.digit(c, 16);
+            if (digit < 0) {
+                throw new MemgresException("invalid hexadecimal digit: \"" + c + "\"", "22023");
+            }
+            if (high < 0) {
+                high = digit;
+            } else {
+                out.write((high << 4) | digit);
+                high = -1;
+            }
+        }
+        if (high >= 0) {
+            throw new MemgresException(
+                    "invalid hexadecimal data: odd number of digits", "22023");
+        }
+        return out.toByteArray();
+    }
+
+    /**
+     * Read the escape format: the text's own bytes, with a backslash introducing either another
+     * backslash or three octal digits.
+     *
+     * <p>The bytes are the ones the text is written in, so a character outside ASCII contributes
+     * all of its bytes. Writing one byte per Java character truncated every such character to its
+     * low eight bits and lost the rest of it.
+     */
+    public static byte[] decodeEscape(String text) {
+        byte[] source = text.getBytes(StandardCharsets.UTF_8);
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        for (int i = 0; i < source.length; i++) {
+            int c = source[i] & 0xFF;
+            if (c != '\\') {
+                out.write(c);
+                continue;
+            }
+            if (i + 1 < source.length && source[i + 1] == '\\') {
+                out.write('\\');
+                i++;
+                continue;
+            }
+            if (i + 3 < source.length && isOctal(source[i + 1]) && isOctal(source[i + 2])
+                    && isOctal(source[i + 3])) {
+                int value = (source[i + 1] - '0') * 64 + (source[i + 2] - '0') * 8
+                        + (source[i + 3] - '0');
+                if (value > 255) {
+                    throw new MemgresException("invalid input syntax for type bytea", "22P02");
+                }
+                out.write(value);
+                i += 3;
+                continue;
+            }
+            throw new MemgresException("invalid input syntax for type bytea", "22P02");
+        }
+        return out.toByteArray();
+    }
+
+    private static boolean isOctal(byte b) {
+        return b >= '0' && b <= '7';
+    }
+
     /** Encode bytes to hex string */
     public static String encodeHex(byte[] bytes) {
         StringBuilder sb = new StringBuilder("\\x");
