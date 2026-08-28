@@ -38,15 +38,20 @@ class TextSearchFunctions {
     /**
      * The weight a {@code setweight} argument names.
      *
-     * <p>There are four weights and nothing else is one. Reading the first character and using it
-     * whatever it was gave {@code 'a':1X} for a weight of {@code 'X'} -- text no reader of a
+     * <p>There are four weights and nothing else is one. Reading the first character and using
+     * it whatever it was gave {@code 'a':1X} for a weight of {@code 'X'} -- text no reader of a
      * tsvector accepts -- and read past the end of an empty argument.
+     *
+     * <p>An argument that names no weight is the caller's, so it is reported as a bad parameter
+     * with the character quoted, the way every other weight-taking function reports one. An
+     * empty argument has no first character, and the one PostgreSQL reads there is the byte that
+     * ends the string.
      */
     private static char weightGiven(String given) {
         char c = given.isEmpty() ? 0 : Character.toUpperCase(given.charAt(0));
         if (c < 'A' || c > 'D') {
-            throw new MemgresException("unrecognized weight: "
-                    + (given.isEmpty() ? 0 : (int) given.charAt(0)), "XX000");
+            throw new MemgresException("unrecognized weight: \""
+                    + (given.isEmpty() ? "\\000" : given.substring(0, 1)) + "\"", "22023");
         }
         return c;
     }
