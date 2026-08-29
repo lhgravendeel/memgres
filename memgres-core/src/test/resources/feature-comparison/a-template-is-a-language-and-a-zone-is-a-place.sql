@@ -683,14 +683,21 @@ SELECT abbrev, utc_offset::text AS o, is_dst FROM pg_timezone_abbrevs WHERE abbr
 -- row: America/Sao_Paulo | -03
 -- row: Asia/Kathmandu | +0545
 -- row: Asia/Kolkata | IST
--- row: EST | EST
 -- row: Europe/London | BST
--- row: Factory | -00
 -- row: MET | CEST
--- row: ROC | CST
 -- row: UTC | UTC
 -- end-expected
-SELECT name, abbrev FROM pg_timezone_names WHERE name IN ('UTC','America/New_York','Asia/Kolkata','Asia/Kathmandu','America/Sao_Paulo','MET','Europe/London','Africa/Windhoek','EST','Factory','ROC') ORDER BY name;
+SELECT name, abbrev FROM pg_timezone_names WHERE name IN ('UTC','America/New_York','Asia/Kolkata','Asia/Kathmandu','America/Sao_Paulo','MET','Europe/London','Africa/Windhoek') ORDER BY name;
+-- expected-divergence: EST, Factory and ROC are the compatibility names, which live in the zone
+-- database's backward and factory files. A build that leaves those out has the zones the regions
+-- name and none of these, so how many rows come back is a property of the server's zone data.
+-- begin-expected
+-- columns: name | abbrev
+-- row: EST | EST
+-- row: Factory | -00
+-- row: ROC | CST
+-- end-expected
+SELECT name, abbrev FROM pg_timezone_names WHERE name IN ('EST','Factory','ROC') ORDER BY name;
 -- begin-expected
 -- columns: a
 -- row: 05:45:00
