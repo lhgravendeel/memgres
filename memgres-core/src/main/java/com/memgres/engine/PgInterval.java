@@ -200,9 +200,22 @@ public class PgInterval implements Comparable<PgInterval> {
     }
 
     /**
-     * Add this interval to an OffsetDateTime.
+     * Add this interval to an OffsetDateTime, in the session's zone.
      */
     public OffsetDateTime addTo(OffsetDateTime dateTime) {
+        return addTo(dateTime, TypeCoercion.sessionZone());
+    }
+
+    /**
+     * Add this interval to an OffsetDateTime, reckoning its months and days in {@code zone}.
+     *
+     * <p>Months and days are calendar lengths and the time of day survives them, so they are
+     * added to the clock reading the zone shows and the instant is worked out again afterwards —
+     * which is why a day added across the end of summer time is twenty-five hours and a day added
+     * across its start is twenty-three. The microseconds are elapsed time and are added to the
+     * instant, so a day written as twenty-four hours is twenty-four hours whatever the zone does.
+     */
+    public OffsetDateTime addTo(OffsetDateTime dateTime, java.time.ZoneId zone) {
         if (isInfinite()) {
             LocalDateTime bound = isPositiveInfinity()
                     ? TypeCoercion.TIMESTAMP_INFINITY : TypeCoercion.TIMESTAMP_NEG_INFINITY;
@@ -211,10 +224,15 @@ public class PgInterval implements Comparable<PgInterval> {
         OffsetDateTime result;
         try {
             result = dateTime;
-            if (months != 0) result = result.plusMonths(months);
-            if (days != 0) result = result.plusDays(days);
+            if (months != 0 || days != 0) {
+                LocalDateTime local = result.atZoneSameInstant(zone).toLocalDateTime();
+                if (months != 0) local = local.plusMonths(months);
+                if (days != 0) local = local.plusDays(days);
+                result = TypeCoercion.atZoneAsPostgres(local, zone).toOffsetDateTime();
+            }
             if (microseconds != 0) result = result.plusNanos(microseconds * 1000);
         } catch (RuntimeException e) {
+            if (e instanceof MemgresException) throw e;
             throw new MemgresException("timestamp out of range", "22008");
         }
         // The instant is what has to be representable, so the check is made in UTC rather than in

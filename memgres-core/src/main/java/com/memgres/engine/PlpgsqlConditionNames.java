@@ -17,14 +17,14 @@ public final class PlpgsqlConditionNames {
         return NAMES.contains(name.toLowerCase());
     }
 
+    /**
+     * The conditions a handler may name. Only an error is a condition a handler can catch, so the
+     * labels of the classes that are not errors — the successful completion, the warnings, and
+     * the no-data classes — are not among them, and neither is a label the server has retired.
+     */
     private static final Set<String> NAMES = Cols.setOf(
-            "successful_completion",
             // class 01 warning
-            "warning", "dynamic_result_sets_returned", "implicit_zero_bit_padding",
-            "null_value_eliminated_in_set_function", "privilege_not_granted", "privilege_not_revoked",
-            "string_data_right_truncation", "deprecated_feature",
-            // class 02 no data
-            "no_data", "no_additional_dynamic_result_sets_returned",
+            "string_data_right_truncation", // class 02 no data
             // class 03
             "sql_statement_not_yet_complete",
             // class 08 connection
@@ -122,7 +122,7 @@ public final class PlpgsqlConditionNames {
             "database_dropped", "idle_session_timeout", "system_error", "io_error",
             "undefined_file", "duplicate_file",
             // class 72, F0
-            "snapshot_too_old", "config_file_error", "lock_file_exists",
+            "config_file_error", "lock_file_exists",
             // class HV foreign data wrapper
             "fdw_error", "fdw_column_name_not_found", "fdw_dynamic_parameter_value_needed",
             "fdw_function_sequence_error", "fdw_inconsistent_descriptor_information",

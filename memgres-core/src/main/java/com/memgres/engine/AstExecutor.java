@@ -1036,6 +1036,11 @@ public class AstExecutor {
         return constraintValidator.valuesEqual(a, b);
     }
 
+    /** The name PostgreSQL prints for a type, which is not always the catalogue's spelling. */
+    public static String pgTypeDisplayName(DataType type) {
+        return CatalogSystemFunctions.pgTypeDisplayName(type);
+    }
+
     static String pgTypeNameOf(Object value) {
         return ConstraintValidator.pgTypeNameOf(value);
     }
@@ -2185,6 +2190,10 @@ public class AstExecutor {
 
     String resolveEnumTypeName(Expression expr, List<RowContext.TableBinding> bindings) {
         return exprEvaluator.resolveEnumTypeName(expr, bindings);
+    }
+
+    String resolveCompositeTypeName(Expression expr, List<RowContext.TableBinding> bindings) {
+        return exprEvaluator.resolveCompositeTypeName(expr, bindings);
     }
 
     Column buildResultColumn(String alias, Expression expr, List<RowContext.TableBinding> bindings) {

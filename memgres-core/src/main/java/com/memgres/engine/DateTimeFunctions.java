@@ -97,12 +97,16 @@ class DateTimeFunctions {
                     java.time.LocalDateTime dt1 = executor.currentInstant()
                             .atZoneSameInstant(TypeCoercion.sessionZone())
                             .toLocalDate().atStartOfDay();
+                    PgInterval endless = ageAcrossInfinity(dt1, arg);
+                    if (endless != null) return endless;
                     java.time.LocalDateTime dt2 = TypeCoercion.toLocalDateTime(arg);
                     return computeAge(dt1, dt2);
                 }
                 Object a1 = executor.evalExpr(fn.args().get(0), ctx);
                 Object a2 = executor.evalExpr(fn.args().get(1), ctx);
                 if (a1 == null || a2 == null) return null; // age(NULL, x) or age(x, NULL) → NULL
+                PgInterval endless = ageAcrossInfinity(a1, a2);
+                if (endless != null) return endless;
                 java.time.LocalDateTime dt1 = TypeCoercion.toLocalDateTime(a1);
                 java.time.LocalDateTime dt2 = TypeCoercion.toLocalDateTime(a2);
                 return computeAge(dt1, dt2);
@@ -128,13 +132,24 @@ class DateTimeFunctions {
                 if (fn.args().size() > 2) {
                     Object zoneObj = executor.evalExpr(fn.args().get(2), ctx);
                     if (zoneObj == null) return null;
-                    try {
-                        zone = java.time.ZoneId.of(zoneObj.toString().trim());
-                    } catch (RuntimeException e) {
-                        throw new MemgresException("time zone \"" + zoneObj + "\" not recognized", "22023");
-                    }
+                    zone = PgTimeZones.zoneOperand(zoneObj);
                 }
                 return truncateDate(field, source, zone);
+            }
+            case "date_add":
+            case "date_subtract": {
+                Object base = executor.evalExpr(fn.args().get(0), ctx);
+                Object step = executor.evalExpr(fn.args().get(1), ctx);
+                if (base == null || step == null) return null;
+                java.time.ZoneId zone = TypeCoercion.sessionZone();
+                if (fn.args().size() > 2) {
+                    Object zoneObj = executor.evalExpr(fn.args().get(2), ctx);
+                    if (zoneObj == null) return null;
+                    zone = PgTimeZones.zoneOperand(zoneObj);
+                }
+                PgInterval iv = TypeCoercion.toInterval(step);
+                if (name.equals("date_subtract")) iv = iv.negate();
+                return iv.addTo(TypeCoercion.toOffsetDateTime(base), zone);
             }
             case "make_date": {
                 Object[] fields = new Object[]{executor.evalExpr(fn.args().get(0), ctx),
@@ -201,10 +216,12 @@ class DateTimeFunctions {
                 double sec = executor.toDouble(executor.evalExpr(fn.args().get(5), ctx));
                 int secs = (int) sec;
                 int nanos = (int) Math.round((sec - secs) * 1_000_000_000);
-                String tz = fn.args().size() > 6 ? executor.evalExpr(fn.args().get(6), ctx).toString() : "UTC";
-                java.time.ZoneId zone = java.time.ZoneId.of(tz);
-                return makeTimestamp(year, month, day, hour, minute, secs, nanos)
-                        .atZone(zone).toOffsetDateTime();
+                java.time.ZoneId zone = fn.args().size() > 6
+                        ? PgTimeZones.zoneOperand(executor.evalExpr(fn.args().get(6), ctx))
+                        : TypeCoercion.sessionZone();
+                return TypeCoercion.atZoneAsPostgres(
+                        makeTimestamp(year, month, day, hour, minute, secs, nanos), zone)
+                        .toOffsetDateTime();
             }
             case "make_time": {
                 if (anyNull(fn, ctx)) return null;
@@ -257,6 +274,12 @@ class DateTimeFunctions {
                 if (strideMicros <= 0) {
                     throw new MemgresException("stride must be greater than zero", "22008");
                 }
+                // No bin holds an endless instant, so the value stands for its own bin; and an
+                // endless origin is no place to count bins from.
+                if (TypeCoercion.isDateTimeInfinity(originObj)) {
+                    throw new MemgresException("origin out of range", "22008");
+                }
+                if (TypeCoercion.isDateTimeInfinity(sourceObj)) return sourceObj;
                 if (sourceObj instanceof java.time.OffsetDateTime) {
                     // A timestamptz bins on the instant line, so a zone with a non-hour offset
                     // cannot shift which bin a value lands in
@@ -377,14 +400,30 @@ class DateTimeFunctions {
                                         : TypeCoercion.TIMESTAMP_NEG_INFINITY,
                                 java.time.ZoneOffset.UTC);
                     }
-                    return java.time.OffsetDateTime.ofInstant(java.time.Instant.ofEpochSecond(n.longValue()), java.time.ZoneOffset.UTC);
+                    // The epoch seconds are a float8 and the fraction of a second is part of the
+                    // instant, not something to round away. The seconds are counted from
+                    // PostgreSQL's own epoch before being taken to microseconds, because that is
+                    // where the rounding happens and it is the count that decides the ties.
+                    if (epoch < TIMESTAMP_SECONDS_MIN || epoch >= TIMESTAMP_SECONDS_END) {
+                        throw new MemgresException("timestamp out of range: \""
+                                + floatText(epoch) + "\"", "22008");
+                    }
+                    long micros = (long) Math.rint((epoch - POSTGRES_EPOCH_SECONDS) * 1_000_000.0);
+                    return java.time.OffsetDateTime.ofInstant(
+                            java.time.Instant.ofEpochSecond(POSTGRES_EPOCH_SECONDS)
+                                    .plus(micros, java.time.temporal.ChronoUnit.MICROS),
+                            java.time.ZoneOffset.UTC);
                 }
                 if (fn.args().size() >= 2) {
                     Object fmtObj = executor.evalExpr(fn.args().get(1), ctx);
                     if (fmtObj == null) return null;
-                    java.time.LocalDateTime ldt =
-                            DateTimeTemplate.parse(source.toString(), fmtObj.toString());
-                    return ldt.atOffset(java.time.ZoneOffset.UTC);
+                    DateTimeTemplate.Read read =
+                            DateTimeTemplate.read(source.toString(), fmtObj.toString());
+                    // A template that named a displacement read the value against it; one that
+                    // did not read it in the session's zone.
+                    if (read.offset != null) return read.local.atOffset(read.offset);
+                    return TypeCoercion.atZoneAsPostgres(read.local, TypeCoercion.sessionZone())
+                            .toOffsetDateTime();
                 }
                 return TypeCoercion.toOffsetDateTime(source);
             }
@@ -453,18 +492,52 @@ class DateTimeFunctions {
         }
     }
 
+    /**
+     * The age between two instants, subtracted field by field the way PostgreSQL subtracts them.
+     *
+     * <p>A day count short of nothing borrows a month, and the month it borrows is the one the
+     * earlier instant is in — so an age reckoned from a day in June borrows thirty days. Java's
+     * own Period walks forward from the earlier date and borrows the month before the later one,
+     * which is a different answer whenever the two months are different lengths.
+     */
     private PgInterval computeAge(java.time.LocalDateTime dt1, java.time.LocalDateTime dt2) {
-        java.time.Period p = java.time.Period.between(dt2.toLocalDate(), dt1.toLocalDate());
-        long timeMicros = java.time.Duration.between(dt2.toLocalTime(), dt1.toLocalTime()).toNanos() / 1000;
-        // If time part is negative but date part is positive, borrow a day
-        if (timeMicros < 0 && (p.getYears() > 0 || p.getMonths() > 0 || p.getDays() > 0)) {
-            p = p.minusDays(1);
-            timeMicros += 24L * 3600 * 1_000_000;
-        } else if (timeMicros > 0 && (p.getYears() < 0 || p.getMonths() < 0 || p.getDays() < 0)) {
-            p = p.plusDays(1);
-            timeMicros -= 24L * 3600 * 1_000_000;
+        boolean reversed = dt1.isBefore(dt2);
+        java.time.LocalDateTime later = reversed ? dt2 : dt1;
+        java.time.LocalDateTime earlier = reversed ? dt1 : dt2;
+        long micros = (later.getNano() - earlier.getNano()) / 1000L;
+        int secs = later.getSecond() - earlier.getSecond();
+        int mins = later.getMinute() - earlier.getMinute();
+        int hours = later.getHour() - earlier.getHour();
+        int days = later.getDayOfMonth() - earlier.getDayOfMonth();
+        int months = later.getMonthValue() - earlier.getMonthValue();
+        int years = later.getYear() - earlier.getYear();
+        while (micros < 0) {
+            micros += 1_000_000L;
+            secs--;
         }
-        return new PgInterval(p.getYears() * 12 + p.getMonths(), p.getDays(), timeMicros);
+        while (secs < 0) {
+            secs += 60;
+            mins--;
+        }
+        while (mins < 0) {
+            mins += 60;
+            hours--;
+        }
+        while (hours < 0) {
+            hours += 24;
+            days--;
+        }
+        while (days < 0) {
+            days += earlier.toLocalDate().lengthOfMonth();
+            months--;
+        }
+        while (months < 0) {
+            months += 12;
+            years--;
+        }
+        long timeMicros = (hours * 3600L + mins * 60L + secs) * 1_000_000L + micros;
+        PgInterval aged = new PgInterval(years * 12 + months, days, timeMicros);
+        return reversed ? aged.negate() : aged;
     }
 
     /** Microseconds from {@code from} to {@code to}, without {@code Duration.toNanos}'s range. */
@@ -911,6 +984,57 @@ class DateTimeFunctions {
         return new PgInterval(months, days, micros);
     }
 
+    /**
+     * The age between two instants where one of them is endless, or null when both are real
+     * instants. An endless first argument carries its own direction, an endless second argument
+     * carries the opposite one, and two endless arguments pointing the same way leave no
+     * distance between them to name at all.
+     */
+    private static PgInterval ageAcrossInfinity(Object later, Object earlier) {
+        boolean laterEndless = TypeCoercion.isDateTimeInfinity(later);
+        boolean earlierEndless = TypeCoercion.isDateTimeInfinity(earlier);
+        if (!laterEndless && !earlierEndless) return null;
+        if (laterEndless && earlierEndless
+                && TypeCoercion.isPositiveDateTimeInfinity(later)
+                == TypeCoercion.isPositiveDateTimeInfinity(earlier)) {
+            throw new MemgresException("interval out of range", "22008");
+        }
+        boolean forward = laterEndless
+                ? TypeCoercion.isPositiveDateTimeInfinity(later)
+                : !TypeCoercion.isPositiveDateTimeInfinity(earlier);
+        return forward ? PgInterval.INFINITY : PgInterval.NEG_INFINITY;
+    }
+
+    /** 2000-01-01, the day PostgreSQL counts a timestamp from. */
+    private static final long POSTGRES_EPOCH_SECONDS = 946_684_800L;
+    /** The first and the last-but-one second of the timestamp range, counted from 1970. */
+    private static final double TIMESTAMP_SECONDS_MIN = -210_866_803_200.0;
+    private static final double TIMESTAMP_SECONDS_END = 9_224_318_016_000.0;
+
+    /**
+     * A float8 written the way C writes one with {@code %g}: six significant figures, in
+     * exponent form when the exponent is below −4 or at 6 and above, with the zeros that carry
+     * no information taken off the end. This is how PostgreSQL quotes the argument back in the
+     * error it raises for an instant too far out to hold.
+     */
+    private static String floatText(double value) {
+        String s = String.format(java.util.Locale.ROOT, "%g", value);
+        if (s.indexOf('e') >= 0) {
+            int e = s.indexOf('e');
+            String mantissa = s.substring(0, e);
+            if (mantissa.indexOf('.') >= 0) {
+                mantissa = mantissa.replaceAll("0+$", "");
+                if (mantissa.endsWith(".")) mantissa = mantissa.substring(0, mantissa.length() - 1);
+            }
+            return mantissa + s.substring(e);
+        }
+        if (s.indexOf('.') >= 0) {
+            s = s.replaceAll("0+$", "");
+            if (s.endsWith(".")) s = s.substring(0, s.length() - 1);
+        }
+        return s;
+    }
+
     /** to_char dispatches on the value: a number takes the numeric templates, a date the others. */
     private String formatToChar(Object source, String fmt) {
         if (source instanceof Number) return NumericTemplate.format((Number) source, fmt);
@@ -1018,6 +1142,13 @@ class DateTimeFunctions {
      */
     private static java.time.LocalDateTime makeTimestamp(int year, int month, int day,
             int hour, int minute, int secs, int nanos) {
+        // There is no year nought: a negative year names a BC year, which is one lower as a
+        // proleptic year, and a zero names nothing at all.
+        if (year == 0) {
+            throw new MemgresException("date field value out of range: 0-"
+                    + String.format("%02d", month) + "-" + String.format("%02d", day), "22008");
+        }
+        if (year < 0) year = year + 1;
         try {
             return java.time.LocalDateTime.of(year, month, day, hour, minute, secs, nanos);
         } catch (java.time.DateTimeException e) {

@@ -997,14 +997,14 @@ class CatalogStubBuilder {
                 col("is_dst", DataType.BOOLEAN)
         );
         Table table = new Table("pg_timezone_names", cols);
-        // Add common timezones
-        for (String tz : java.time.ZoneId.getAvailableZoneIds().stream().sorted().collect(Collectors.toList())) {
+        java.time.Instant now = java.time.Instant.now();
+        for (String tz : PgTimeZones.zoneNames()) {
             try {
-                java.time.ZoneId zid = java.time.ZoneId.of(tz);
-                java.time.ZoneOffset offset = java.time.ZonedDateTime.now(zid).getOffset();
-                boolean isDst = zid.getRules().isDaylightSavings(java.time.Instant.now());
-                String abbrev = java.time.ZonedDateTime.now(zid).getZone().getId();
-                table.insertRow(new Object[]{tz, abbrev, offset.toString(), isDst});
+                java.time.ZoneId zid = PgTimeZones.zoneFor(tz);
+                java.time.ZoneOffset offset = zid.getRules().getOffset(now);
+                boolean isDst = zid.getRules().isDaylightSavings(now);
+                table.insertRow(new Object[]{tz, PgTimeZones.catalogAbbreviationOf(tz, now),
+                        new PgInterval(0, 0, offset.getTotalSeconds() * 1_000_000L), isDst});
             } catch (Exception ignored) {}
         }
         return table;
@@ -1017,101 +1017,12 @@ class CatalogStubBuilder {
                 col("is_dst", DataType.BOOLEAN)
         );
         Table table = new Table("pg_timezone_abbrevs", cols);
-        // Common timezone abbreviations
-        table.insertRow(new Object[]{"UTC", "00:00:00", false});
-        table.insertRow(new Object[]{"GMT", "00:00:00", false});
-        table.insertRow(new Object[]{"EST", "-05:00:00", false});
-        table.insertRow(new Object[]{"EDT", "-04:00:00", true});
-        table.insertRow(new Object[]{"CST", "-06:00:00", false});
-        table.insertRow(new Object[]{"CDT", "-05:00:00", true});
-        table.insertRow(new Object[]{"MST", "-07:00:00", false});
-        table.insertRow(new Object[]{"MDT", "-06:00:00", true});
-        table.insertRow(new Object[]{"PST", "-08:00:00", false});
-        table.insertRow(new Object[]{"PDT", "-07:00:00", true});
-        table.insertRow(new Object[]{"CET", "01:00:00", false});
-        table.insertRow(new Object[]{"CEST", "02:00:00", true});
-        table.insertRow(new Object[]{"EET", "02:00:00", false});
-        table.insertRow(new Object[]{"EEST", "03:00:00", true});
-        table.insertRow(new Object[]{"JST", "09:00:00", false});
-        table.insertRow(new Object[]{"IST", "05:30:00", false});
-        table.insertRow(new Object[]{"AEST", "10:00:00", false});
-        table.insertRow(new Object[]{"AEDT", "11:00:00", true});
-        // Additional abbreviations to match PG18
-        table.insertRow(new Object[]{"HST", "-10:00:00", false});
-        table.insertRow(new Object[]{"AKST", "-09:00:00", false});
-        table.insertRow(new Object[]{"AKDT", "-08:00:00", true});
-        table.insertRow(new Object[]{"AST", "-04:00:00", false});
-        table.insertRow(new Object[]{"ADT", "-03:00:00", true});
-        table.insertRow(new Object[]{"NST", "-03:30:00", false});
-        table.insertRow(new Object[]{"NDT", "-02:30:00", true});
-        table.insertRow(new Object[]{"WET", "00:00:00", false});
-        table.insertRow(new Object[]{"WEST", "01:00:00", true});
-        table.insertRow(new Object[]{"MET", "01:00:00", false});
-        table.insertRow(new Object[]{"MEST", "02:00:00", true});
-        table.insertRow(new Object[]{"BST", "01:00:00", true});
-        table.insertRow(new Object[]{"SST", "-11:00:00", false});
-        table.insertRow(new Object[]{"ChST", "10:00:00", false});
-        table.insertRow(new Object[]{"NZST", "12:00:00", false});
-        table.insertRow(new Object[]{"NZDT", "13:00:00", true});
-        table.insertRow(new Object[]{"AWST", "08:00:00", false});
-        table.insertRow(new Object[]{"ACST", "09:30:00", false});
-        table.insertRow(new Object[]{"ACDT", "10:30:00", true});
-        table.insertRow(new Object[]{"HKT", "08:00:00", false});
-        table.insertRow(new Object[]{"SGT", "08:00:00", false});
-        table.insertRow(new Object[]{"KST", "09:00:00", false});
-        table.insertRow(new Object[]{"ICT", "07:00:00", false});
-        table.insertRow(new Object[]{"WIB", "07:00:00", false});
-        table.insertRow(new Object[]{"WITA", "08:00:00", false});
-        table.insertRow(new Object[]{"WIT", "09:00:00", false});
-        table.insertRow(new Object[]{"PHT", "08:00:00", false});
-        table.insertRow(new Object[]{"THA", "07:00:00", false});
-        table.insertRow(new Object[]{"MSK", "03:00:00", false});
-        table.insertRow(new Object[]{"SAST", "02:00:00", false});
-        table.insertRow(new Object[]{"EAT", "03:00:00", false});
-        table.insertRow(new Object[]{"WAT", "01:00:00", false});
-        table.insertRow(new Object[]{"CAT", "02:00:00", false});
-        table.insertRow(new Object[]{"PKT", "05:00:00", false});
-        table.insertRow(new Object[]{"NPT", "05:45:00", false});
-        table.insertRow(new Object[]{"BDT", "06:00:00", false});
-        table.insertRow(new Object[]{"MMT", "06:30:00", false});
-        table.insertRow(new Object[]{"CST6CDT", "-06:00:00", false});
-        table.insertRow(new Object[]{"EST5EDT", "-05:00:00", false});
-        table.insertRow(new Object[]{"MST7MDT", "-07:00:00", false});
-        table.insertRow(new Object[]{"PST8PDT", "-08:00:00", false});
-        table.insertRow(new Object[]{"ART", "-03:00:00", false});
-        table.insertRow(new Object[]{"BRT", "-03:00:00", false});
-        table.insertRow(new Object[]{"CLT", "-04:00:00", false});
-        table.insertRow(new Object[]{"COT", "-05:00:00", false});
-        table.insertRow(new Object[]{"ECT", "-05:00:00", false});
-        table.insertRow(new Object[]{"PET", "-05:00:00", false});
-        table.insertRow(new Object[]{"VET", "-04:00:00", false});
-        table.insertRow(new Object[]{"GFT", "-03:00:00", false});
-        table.insertRow(new Object[]{"UYT", "-03:00:00", false});
-        table.insertRow(new Object[]{"PYT", "-04:00:00", false});
-        table.insertRow(new Object[]{"BOT", "-04:00:00", false});
-        table.insertRow(new Object[]{"GST", "04:00:00", false});
-        table.insertRow(new Object[]{"GET", "04:00:00", false});
-        table.insertRow(new Object[]{"AZT", "04:00:00", false});
-        table.insertRow(new Object[]{"AMT", "04:00:00", false});
-        table.insertRow(new Object[]{"HOVT", "07:00:00", false});
-        table.insertRow(new Object[]{"UZT", "05:00:00", false});
-        table.insertRow(new Object[]{"TJT", "05:00:00", false});
-        table.insertRow(new Object[]{"TMT", "05:00:00", false});
-        table.insertRow(new Object[]{"KGT", "06:00:00", false});
-        table.insertRow(new Object[]{"ALMT", "06:00:00", false});
-        table.insertRow(new Object[]{"YEKT", "05:00:00", false});
-        table.insertRow(new Object[]{"NOVT", "07:00:00", false});
-        table.insertRow(new Object[]{"KRAT", "07:00:00", false});
-        table.insertRow(new Object[]{"IRKT", "08:00:00", false});
-        table.insertRow(new Object[]{"YAKT", "09:00:00", false});
-        table.insertRow(new Object[]{"VLAT", "10:00:00", false});
-        table.insertRow(new Object[]{"MAGT", "11:00:00", false});
-        table.insertRow(new Object[]{"PETT", "12:00:00", false});
-        table.insertRow(new Object[]{"FJT", "12:00:00", false});
-        table.insertRow(new Object[]{"TVT", "12:00:00", false});
-        table.insertRow(new Object[]{"TOT", "13:00:00", false});
-        table.insertRow(new Object[]{"CHAST", "12:45:00", false});
-        table.insertRow(new Object[]{"FJST", "13:00:00", true});
+        for (java.util.Map.Entry<String, PgTimeZones.Abbrev> e
+                : PgTimeZones.table().entrySet()) {
+            table.insertRow(new Object[]{e.getKey(),
+                    new PgInterval(0, 0, e.getValue().offsetSeconds * 1_000_000L),
+                    e.getValue().daylight});
+        }
         return table;
     }
 

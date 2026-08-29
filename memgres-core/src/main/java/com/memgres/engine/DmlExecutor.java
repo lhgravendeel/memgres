@@ -1356,6 +1356,16 @@ class DmlExecutor {
                                 PgTrigger.Event.UPDATE, newRow, oldRow, conflictTable, conflictUpdCols);
                         if (newRow == null) continue;   // BEFORE trigger suppressed the row
                         computeGeneratedColumns(conflictTable, newRow);
+                        // A conflict clause updates the row it found, where it found it. A write
+                        // that would put the row in another partition is refused rather than
+                        // moved: PostgreSQL has no route from the arbiter to another partition.
+                        if (partitionRowMovesTo(table, conflictTable, newRow) != null) {
+                            MemgresException elsewhere = new MemgresException(
+                                    "invalid ON UPDATE specification", "0A000");
+                            elsewhere.setDetail("The result tuple would appear in a different"
+                                    + " partition than the original tuple.");
+                            throw elsewhere;
+                        }
                         // Validate constraints BEFORE mutating the row to avoid index corruption
                         partitionHelper.checkPartitionConstraint(conflictTable, newRow);
                         executor.constraintValidator.validateConstraints(conflictTable, newRow, conflictRow);
@@ -2572,6 +2582,10 @@ class DmlExecutor {
                 if (newRow == null) {
                     continue;
                 }
+                // The values are built on a copy so that nothing is written until every check
+                // has passed: with no trigger to build one, the row the relation stores came
+                // straight back and the assignments went into it where it lay.
+                if (newRow == row) newRow = Arrays.copyOf(row, row.length);
                 // RLS USING filter: skip rows not visible under the UPDATE policies, and under the
                 // SELECT policies as well when the statement reads a column of the target
                 if (rlsUpdateActive) {
@@ -2603,6 +2617,9 @@ class DmlExecutor {
                 // bound: the row was never offered to the partitioned table, so PostgreSQL
                 // refuses the update rather than re-routing it.
                 partitionHelper.checkPartitionConstraint(table, newRow);
+                // A view's check option is the view's, not the statement shape's: a write that
+                // reached the view through a join is still a write through the view.
+                validationHelper.enforceViewCheckOption(viewCheckExprs, table, newRow);
                 Object[] fromWritten;
                 Table fromMovedTo = partitionRowMovesTo(table, fromOwner, newRow);
                 if (fromMovedTo != null) {
@@ -7560,6 +7577,14 @@ class DmlExecutor {
                 MergeStmt.WhenMatched wm = (MergeStmt.WhenMatched) clause;
                 if (terminalMatched) throw unreachableWhenClause();
                 if (wm.andCondition() == null) terminalMatched = true;
+                // A name a clause reads is looked up when the statement is read, not when the
+                // clause fires: an arm no row reaches still has to name things that exist.
+                if (wm.setClauses() != null) {
+                    for (InsertStmt.SetClause set : wm.setClauses()) {
+                        requireMergeReadableColumns(set.value(), targetTable, stmt);
+                    }
+                }
+                requireMergeReadableColumns(wm.andCondition(), targetTable, stmt);
             } else if (clause instanceof MergeStmt.WhenNotMatchedBySource) {
                 MergeStmt.WhenNotMatchedBySource ws = (MergeStmt.WhenNotMatchedBySource) clause;
                 if (terminalNotMatchedBySource) throw unreachableWhenClause();
@@ -7627,13 +7652,82 @@ class DmlExecutor {
                         + genCol.getName() + "\"\n  Detail: Column \"" + genCol.getName()
                         + "\" is a generated column.", "428C9");
             }
-            if (genCol.getDefaultValue() != null && genCol.getDefaultValue().contains("__identity__:always")) {
+            if (!wn.overridingSystemValue && genCol.getDefaultValue() != null
+                    && genCol.getDefaultValue().contains("__identity__:always")) {
                 throw new MemgresException("cannot insert a non-DEFAULT value into column \""
                         + genCol.getName() + "\"\n  Detail: Column \"" + genCol.getName()
                         + "\" is an identity column defined as GENERATED ALWAYS."
                         + "\n  Hint: Use OVERRIDING SYSTEM VALUE to override.", "428C9");
             }
         }
+    }
+
+    /**
+     * Refuse an unqualified name in a MERGE clause that is neither a column of the target nor one
+     * of the source. PostgreSQL resolves the whole statement before it reads a row, so a clause
+     * that never fires still has to be one it could have run.
+     *
+     * <p>Nothing is refused where the source's own columns cannot be worked out from the
+     * statement alone: a name that might be one of them is left for the evaluation to find.
+     */
+    private void requireMergeReadableColumns(Expression expr, Table targetTable, MergeStmt stmt) {
+        if (expr == null || targetTable == null) return;
+        java.util.Set<String> named = mergeSourceColumnNames(stmt.source());
+        if (named == null) return;
+        for (Column c : targetTable.getColumns()) {
+            named.add(c.getName().toLowerCase(java.util.Locale.ROOT));
+        }
+        if (AstWalk.anyMatch(expr, n -> n instanceof SubqueryExpr || n instanceof ExistsExpr
+                || n instanceof ArraySubqueryExpr || n instanceof SelectStmt)) {
+            return;
+        }
+        AstWalk.forEach(expr, node -> {
+            if (!(node instanceof ColumnRef)) return;
+            ColumnRef cr = (ColumnRef) node;
+            if (cr.table() != null) return;   // a qualified name is judged by its qualifier
+            if (!named.contains(cr.column().toLowerCase(java.util.Locale.ROOT))) {
+                throw new MemgresException(
+                        "column \"" + cr.column() + "\" does not exist", "42703");
+            }
+        });
+    }
+
+    /**
+     * The names a MERGE's source offers, or null when the statement does not say what they are —
+     * a subquery with no alias list, or a relation this cannot resolve.
+     */
+    private java.util.Set<String> mergeSourceColumnNames(SelectStmt.FromItem source) {
+        if (source instanceof SelectStmt.TableRef) {
+            SelectStmt.TableRef ref = (SelectStmt.TableRef) source;
+            if (ref.columnAliases != null && !ref.columnAliases.isEmpty()) {
+                return loweredNames(ref.columnAliases);
+            }
+            Table sourceTable;
+            try {
+                sourceTable = executor.resolveTable(
+                        ref.schema != null ? ref.schema : executor.defaultSchema(), ref.table);
+            } catch (RuntimeException e) {
+                return null;
+            }
+            if (sourceTable == null) return null;
+            java.util.Set<String> named = new java.util.HashSet<>();
+            for (Column c : sourceTable.getColumns()) {
+                named.add(c.getName().toLowerCase(java.util.Locale.ROOT));
+            }
+            return named;
+        }
+        if (source instanceof SelectStmt.SubqueryFrom) {
+            SelectStmt.SubqueryFrom ref = (SelectStmt.SubqueryFrom) source;
+            if (ref.columnAliases == null || ref.columnAliases.isEmpty()) return null;
+            return loweredNames(ref.columnAliases);
+        }
+        return null;
+    }
+
+    private static java.util.Set<String> loweredNames(List<String> names) {
+        java.util.Set<String> out = new java.util.HashSet<>();
+        for (String n : names) out.add(n.toLowerCase(java.util.Locale.ROOT));
+        return out;
     }
 
     /** The name a MERGE's source is known by inside the WHEN clauses, or null when it has none. */

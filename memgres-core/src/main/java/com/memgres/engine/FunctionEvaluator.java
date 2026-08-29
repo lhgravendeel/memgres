@@ -1160,7 +1160,8 @@ class FunctionEvaluator {
             case "merge_action": {
                 // merge_action() returns 'INSERT', 'UPDATE', or 'DELETE' in MERGE RETURNING (PG 17+)
                 if (executor.currentMergeAction == null) {
-                    throw new MemgresException("merge_action() can only be used in a MERGE RETURNING clause", "42P20");
+                    throw new MemgresException("MERGE_ACTION() can only be used in the RETURNING"
+                            + " list of a MERGE command", "42601");
                 }
                 return executor.currentMergeAction;
             }
@@ -1175,21 +1176,28 @@ class FunctionEvaluator {
             case "now":
             case "current_timestamp": {
                 // now()/current_timestamp must be stable within a transaction (transaction timestamp)
-                if (executor.session != null && executor.session.getTransactionTimestamp() != null) {
-                    return executor.session.getTransactionTimestamp();
-                }
-                return executor.currentStatementTimestamp != null ? executor.currentStatementTimestamp : OffsetDateTime.now();
+                Object stamp = executor.session != null
+                        && executor.session.getTransactionTimestamp() != null
+                        ? executor.session.getTransactionTimestamp()
+                        : (executor.currentStatementTimestamp != null
+                                ? executor.currentStatementTimestamp : OffsetDateTime.now());
+                return keptToPrecision(stamp, fn, ctx);
             }
             case "current_date":
                 return executor.currentInstant()
                         .atZoneSameInstant(TypeCoercion.sessionZone()).toLocalDate();
             case "current_time":
+                // current_time is a time with time zone: the session's clock reading written
+                // against the session's own displacement.
+                return keptToPrecision(TypeCoercion.shiftTimeTzToZone(
+                        executor.currentInstant().atZoneSameInstant(TypeCoercion.sessionZone())
+                                .toLocalTime(), TypeCoercion.sessionZone()), fn, ctx);
             case "localtime":
-                return executor.currentInstant()
-                        .atZoneSameInstant(TypeCoercion.sessionZone()).toLocalTime();
+                return keptToPrecision(executor.currentInstant()
+                        .atZoneSameInstant(TypeCoercion.sessionZone()).toLocalTime(), fn, ctx);
             case "localtimestamp":
-                return executor.currentInstant()
-                        .atZoneSameInstant(TypeCoercion.sessionZone()).toLocalDateTime();
+                return keptToPrecision(executor.currentInstant()
+                        .atZoneSameInstant(TypeCoercion.sessionZone()).toLocalDateTime(), fn, ctx);
             case "version":
                 return "PostgreSQL 18.0";
             case "gen_random_uuid":
@@ -1832,6 +1840,8 @@ class FunctionEvaluator {
             case "justify_days":
             case "justify_interval":
             case "isfinite":
+            case "date_add":
+            case "date_subtract":
             case "date_bin":
                 return dateTimeFunctions.eval(name, fn, ctx);
             case "timezone": {
@@ -1840,20 +1850,16 @@ class FunctionEvaluator {
                 requireArgs(fn, 2);
                 Object zoneArg = executor.evalExpr(fn.args().get(0), ctx);
                 Object tsArg = executor.evalExpr(fn.args().get(1), ctx);
-                if (tsArg == null) return null;
-                String zoneName = zoneArg != null ? zoneArg.toString() : "UTC";
-                java.time.ZoneId zid;
-                try {
-                    zid = java.time.ZoneId.of(zoneName);
-                } catch (java.time.DateTimeException e) {
-                    throw new MemgresException("time zone \"" + zoneName + "\" not recognized", "22023");
-                }
+                // Naming no zone converts into no zone, which is null, not into UTC.
+                if (zoneArg == null || tsArg == null) return null;
+                java.time.ZoneId zid = PgTimeZones.zoneOperand(zoneArg);
                 if (tsArg instanceof OffsetDateTime) {
                     return ((OffsetDateTime) tsArg).atZoneSameInstant(zid).toLocalDateTime();
                 } else if (tsArg instanceof LocalDateTime) {
-                    return ((LocalDateTime) tsArg).atZone(zid).toOffsetDateTime();
-                } else if (tsArg instanceof LocalTime) {
-                    return tsArg;
+                    return TypeCoercion.atZoneAsPostgres((LocalDateTime) tsArg, zid)
+                            .toOffsetDateTime();
+                } else if (tsArg instanceof LocalTime || TypeCoercion.looksLikeTimeTz(tsArg)) {
+                    return TypeCoercion.shiftTimeTzToZone(tsArg, zid);
                 }
                 return tsArg;
             }
@@ -4920,4 +4926,24 @@ class FunctionEvaluator {
         while (code.length() < 4) code.append('0');
         return code.toString();
     }
+
+    /**
+     * A clock reading kept to the digits of the second the call asked for. The four clock
+     * functions take a precision rather than an argument, so a call with none written keeps
+     * every digit it has.
+     */
+    private Object keptToPrecision(Object reading, FunctionCallExpr fn, RowContext ctx) {
+        if (fn.args() == null || fn.args().isEmpty()) return reading;
+        Object asked = executor.evalExpr(fn.args().get(0), ctx);
+        if (asked == null) return reading;
+        int digits = executor.toInt(asked);
+        // A precision past the six digits the type holds is cut back to six rather than refused.
+        if (digits > 6) digits = 6;
+        if (digits < 0) {
+            throw new MemgresException(
+                    "TIMESTAMP(" + digits + ") precision must not be negative", "22023");
+        }
+        return TypeCoercion.roundTemporal(reading, digits);
+    }
+
 }

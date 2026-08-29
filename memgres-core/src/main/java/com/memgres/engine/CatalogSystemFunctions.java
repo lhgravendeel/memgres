@@ -187,6 +187,15 @@ class CatalogSystemFunctions {
                     return "pg_lsn";
                 }
 
+                // CURRENT_TIME is a keyword and not a catalogued routine, and the timetz it
+                // answers with is carried as its own printed text -- which says nothing but text.
+                if (rawExpr instanceof FunctionCallExpr
+                        && "current_time".equals(FunctionEvaluator.stripSchemaPrefix(
+                                ((FunctionCallExpr) rawExpr).name()
+                                        .toLowerCase(java.util.Locale.ROOT)))) {
+                    return "time with time zone";
+                }
+
                 // Check if this is a system column reference (ctid, xmin, xmax, cmin, cmax, tableoid)
                 if (rawExpr instanceof ColumnRef && ctx != null) {
                     ColumnRef colRef = (ColumnRef) rawExpr;
@@ -321,6 +330,24 @@ class CatalogSystemFunctions {
                 if (rawExpr instanceof FunctionCallExpr) {
                     DataType declared = declaredResultType((FunctionCallExpr) rawExpr, ctx);
                     if (isOidCarriedType(declared)) return pgTypeDisplayName(declared);
+                }
+
+                // A routine the reader wrote answers with the type it was declared to answer
+                // with, and the value cannot always say which that is: a character(n) is carried
+                // as the padded text it prints as, which says only text.
+                if (rawExpr instanceof FunctionCallExpr) {
+                    PgFunction wrote = executor.database.getFunction(
+                            FunctionEvaluator.stripSchemaPrefix(((FunctionCallExpr) rawExpr).name()
+                                    .toLowerCase(java.util.Locale.ROOT)));
+                    if (wrote != null && wrote.getReturnType() != null
+                            && !wrote.isSetReturning()) {
+                        String declaredName = wrote.getReturnType().trim();
+                        if (!PolymorphicTypes.isPolymorphic(declaredName)) {
+                            String bare = declaredName.replaceAll("\\(.*\\)", "").trim();
+                            DataType named = DataType.fromPgName(bare);
+                            return named != null ? pgTypeDisplayName(named) : typeDisplay(bare);
+                        }
+                    }
                 }
 
                 // A call that answered nothing has no value to read a type off, and its
@@ -1356,7 +1383,7 @@ class CatalogSystemFunctions {
         return type == null ? written : pgTypeDisplayName(type) + suffix;
     }
 
-    static String pgTypeDisplayName(DataType dt) {
+    public static String pgTypeDisplayName(DataType dt) {
         // An array type is named after its element with brackets after it, not by the catalogue
         // spelling that puts an underscore in front: pg_typeof answers regtype[], not _regtype.
         DataType element = DataType.elementOf(dt);

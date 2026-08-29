@@ -444,13 +444,17 @@ class DmlParser {
         parser.expectKeyword("MERGE");
         parser.expectKeyword("INTO");
 
-        // Target table: [schema.]table [AS alias]
+        // Target table: [ONLY] [schema.]table [*] [AS alias]. A partitioned or inherited target
+        // may be written either way round; MERGE reaches only the named relation in any case, so
+        // both spellings say what the statement already does.
+        parser.matchKeyword("ONLY");
         String schema = null;
         String table = parser.readIdentifier();
         if (parser.match(TokenType.DOT)) {
             schema = table;
             table = parser.readIdentifier();
         }
+        parser.match(TokenType.STAR);
         String targetAlias = null;
         if (parser.matchKeyword("AS")) {
             targetAlias = parser.readColumnName();
@@ -546,6 +550,14 @@ class DmlParser {
                                 } while (parser.match(TokenType.COMMA));
                                 parser.expect(TokenType.RIGHT_PAREN);
                             }
+                            // The INSERT of a MERGE takes the same OVERRIDING clause a plain
+                            // INSERT does, which is what lets it write an always-generated column.
+                            boolean overriding = false;
+                            if (parser.matchKeyword("OVERRIDING")) {
+                                if (parser.matchKeyword("SYSTEM")) overriding = true;
+                                else parser.expectKeyword("USER");
+                                parser.expectKeyword("VALUE");
+                            }
                             parser.expectKeyword("VALUES");
                             parser.expect(TokenType.LEFT_PAREN);
                             List<Expression> values = new ArrayList<>();
@@ -553,7 +565,10 @@ class DmlParser {
                                 values.add(parser.parseExpression());
                             } while (parser.match(TokenType.COMMA));
                             parser.expect(TokenType.RIGHT_PAREN);
-                            whenClauses.add(new MergeStmt.WhenNotMatched(andCondition, false, columns, values));
+                            MergeStmt.WhenNotMatched inserting =
+                                    new MergeStmt.WhenNotMatched(andCondition, false, columns, values);
+                            inserting.overridingSystemValue = overriding;
+                            whenClauses.add(inserting);
                         }
                     } else {
                         throw new ParseException("Expected INSERT or DO NOTHING after WHEN NOT MATCHED THEN", parser.peek());

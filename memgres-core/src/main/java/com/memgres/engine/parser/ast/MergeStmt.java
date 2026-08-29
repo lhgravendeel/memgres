@@ -82,6 +82,11 @@ public final class MergeStmt implements Statement {
         public final boolean doNothing;
         public final List<String> columns;
         public final List<Expression> values;
+        /**
+         * Whether the INSERT was written OVERRIDING SYSTEM VALUE, which is what lets it write a
+         * column the relation generates always.
+         */
+        public boolean overridingSystemValue;
 
         public WhenNotMatched(Expression andCondition, boolean doNothing, List<String> columns, List<Expression> values) {
             this.andCondition = andCondition;

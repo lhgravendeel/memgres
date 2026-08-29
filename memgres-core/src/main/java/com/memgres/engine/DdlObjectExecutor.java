@@ -1015,7 +1015,7 @@ class DdlObjectExecutor {
             // PG compiles the body at CREATE time, so a body it cannot parse never becomes a
             // function that only fails when someone calls it.
             com.memgres.engine.plpgsql.PlpgsqlStatement.Block parsedBody =
-                    com.memgres.engine.plpgsql.PlpgsqlParser.parse(stmt.body());
+                    com.memgres.engine.plpgsql.PlpgsqlParser.parse(stmt.body(), stmt.name());
             List<String> paramNames = new ArrayList<>();
             boolean hasOutParams = false;
             for (int i = 0; i < params.size(); i++) {
@@ -3494,7 +3494,21 @@ class DdlObjectExecutor {
                 : Cols.<PgFunction>listOf();
         if (candidates.isEmpty()) {
             if (!stmt.ifExists()) {
-                throw new MemgresException("function " + stmt.name() + "() does not exist", "42883");
+                boolean procedure = stmt.objectType() == DropStmt.ObjectType.PROCEDURE;
+                // A DROP with no argument list looked the name up on its own, so there is no
+                // signature to report and nothing a cast could change — which is why PostgreSQL
+                // says only that it found nothing by that name, and offers no advice.
+                if (stmt.paramTypes() == null) {
+                    throw new MemgresException("could not find a " + (procedure ? "procedure" : "function")
+                            + " named \"" + stmt.name() + "\"", "42883");
+                }
+                MemgresException missing = new MemgresException(
+                        (procedure ? "procedure " : "function ") + stmt.name()
+                                + "(" + canonicalTypeList(stmt.paramTypes()) + ") does not exist",
+                        "42883");
+                // The routine was named by its signature, not resolved from a call's arguments.
+                missing.setHint(null);
+                throw missing;
             }
             noticeSkipped((stmt.objectType() == DropStmt.ObjectType.PROCEDURE
                     ? "procedure " : "function ") + stmt.name()

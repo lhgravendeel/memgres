@@ -460,7 +460,7 @@ class FromFunctionResolver {
             List<Column> cols = new ArrayList<>();
             cols.add(new Column(colName, DataType.TIMESTAMPTZ, true, false, null));
             Table virtualTable = new Table(alias, cols);
-            long tzStepMicros = SeriesRows.fixedStepMicros(ivStep);
+            long tzStepMicros = SeriesRows.fixedStepMicros(ivStep, false);
             if (tzStepMicros != 0) {
                 return publishSeries(virtualTable, alias,
                         SeriesRows.ofTimestampTzs(tzStart, tzStop, tzStepMicros));
@@ -1934,6 +1934,35 @@ class FromFunctionResolver {
             contexts.add(new RowContext(virtualTable, alias, rowArr));
             return contexts;
         }
+        // A routine declared to answer with a composite answers with its fields, so a query
+        // written over it reads them as columns. Described as one column of the composite's own
+        // name, SELECT * over it gave back the whole row rendered as text.
+        List<Column> composite = compositeColumnsOf(userFunc.getReturnType());
+        if (composite != null) {
+            if (colAliases != null && !colAliases.isEmpty()) {
+                for (int i = 0; i < colAliases.size() && i < composite.size(); i++) {
+                    Column c = composite.get(i);
+                    composite.set(i, new Column(stripColType(colAliases.get(i)), c.getType(),
+                            true, false, null));
+                }
+            }
+            Table compositeTable = new Table(alias, composite);
+            Object[] fields = new Object[composite.size()];
+            if (result instanceof Object[]) {
+                Object[] given = (Object[]) result;
+                System.arraycopy(given, 0, fields, 0, Math.min(given.length, fields.length));
+            } else if (result instanceof Map) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> map = (Map<String, Object>) result;
+                for (int i = 0; i < composite.size(); i++) {
+                    fields[i] = map.get(composite.get(i).getName().toLowerCase());
+                }
+            } else if (result != null) {
+                fields[0] = result;
+            }
+            compositeTable.insertRow(fields);
+            return Cols.listOf(new RowContext(compositeTable, alias, fields));
+        }
         // Scalar function in FROM: one column of the type the function declares.
         String colName = firstColAlias(colAliases, alias);
         DataType declared = DataType.fromPgName(userFunc.getReturnType());
@@ -1948,6 +1977,35 @@ class FromFunctionResolver {
     }
 
     // ---- Shared helpers ----
+
+    /**
+     * The columns a composite type or a table's row type is made of, or null when the name is
+     * neither of those.
+     */
+    private List<Column> compositeColumnsOf(String typeName) {
+        if (typeName == null) return null;
+        String name = typeName.trim();
+        if (name.isEmpty() || name.toUpperCase(java.util.Locale.ROOT).startsWith("SETOF ")) {
+            return null;
+        }
+        List<com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField> fields =
+                executor.database.getCompositeType(name);
+        if (fields != null) {
+            List<Column> cols = new ArrayList<>();
+            for (com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField f : fields) {
+                DataType dt = DataType.fromPgName(f.typeName());
+                cols.add(new Column(f.name(), dt != null ? dt : DataType.TEXT, true, false, null));
+            }
+            return cols;
+        }
+        try {
+            Table source = executor.resolveTable("public", name);
+            if (source != null) return new ArrayList<>(source.getColumns());
+        } catch (RuntimeException ignored) {
+            // Not a relation either, so not a composite.
+        }
+        return null;
+    }
 
     /** The complaint PostgreSQL makes when a column definition list does not fit the record. */
     private static MemgresException recordShapeError(PgFunction userFunc) {

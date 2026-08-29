@@ -3020,11 +3020,16 @@ class SelectExecutor {
             if (val instanceof byte[] && resultType == DataType.TEXT) {
                 resultType = DataType.BYTEA;
             }
+            String compositeName =
+                    executor.resolveCompositeTypeName(target.expr(), Cols.listOf());
             if (resultType == DataType.ENUM) {
                 String enumTypeName = executor.resolveEnumTypeName(target.expr(), Cols.listOf());
                 columns.add(enumTypeName != null
                         ? new Column(alias, DataType.ENUM, true, false, null, enumTypeName)
                         : new Column(alias, DataType.TEXT, true, false, null));
+            } else if (compositeName != null) {
+                // A composite is a type of its own, and the client looks it up by its own OID.
+                columns.add(Column.ofCompositeType(alias, compositeName));
             } else {
                 // A column an enclosing query level supplies — which is what a LATERAL projects —
                 // keeps the whole of its declared type. A bare DataType does not carry an array's
