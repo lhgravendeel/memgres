@@ -79,6 +79,12 @@ public class Column {
         this(name, type, nullable, primaryKey, defaultValue, enumTypeName, precision, scale, generatedExpr, domainTypeName, null, null);
     }
 
+    /** A result column holding one value of a composite type, named by that type. */
+    public static Column ofCompositeType(String name, String compositeTypeName) {
+        return new Column(name, DataType.TEXT, true, false, null, null, null, null, null,
+                null, compositeTypeName, null);
+    }
+
     public Column(String name, DataType type, boolean nullable, boolean primaryKey, String defaultValue,
                   String enumTypeName, Integer precision, Integer scale, String generatedExpr, String domainTypeName,
                   String compositeTypeName, DataType arrayElementType) {

@@ -150,7 +150,17 @@ abstract class SeriesRows extends AbstractList<Object[]> implements RandomAccess
      * carries no zone, and a timestamptz is stepped at its own offset.
      */
     static long fixedStepMicros(PgInterval step) {
+        return fixedStepMicros(step, true);
+    }
+
+    /**
+     * The same, where {@code daysAreFixed} says whether a day is one. Over a timestamptz it is
+     * not: the series is walked in the session's zone, where the day a zone puts its clocks back
+     * is twenty-five hours long, so a step naming days has to be added a step at a time.
+     */
+    static long fixedStepMicros(PgInterval step, boolean daysAreFixed) {
         if (step == null || step.getMonths() != 0 || step.isInfinite()) return 0;
+        if (!daysAreFixed && step.getDays() != 0) return 0;
         try {
             return Math.addExact(Math.multiplyExact((long) step.getDays(), 86_400_000_000L),
                     step.getMicroseconds());

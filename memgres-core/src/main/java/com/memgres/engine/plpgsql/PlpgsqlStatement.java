@@ -8,6 +8,25 @@ import java.util.List;
  */
 public interface PlpgsqlStatement {
 
+    /**
+     * The line of the routine's body this statement was written on, counting the line the body
+     * opens on as one; 0 when the parser did not record it.
+     */
+    int line();
+
+    /** Record which line of the body this statement was written on. */
+    void atLine(int line);
+
+    /**
+     * The expression or the SQL this statement was written with, exactly as the body spells it,
+     * or null when the parser did not record it. PostgreSQL quotes the writer's own text back in
+     * the context it reports, not a rebuilding of it.
+     */
+    String writtenAs();
+
+    /** Record the text this statement was written with. */
+    void writtenAs(String source);
+
     // Helper records (not PlpgsqlStatement)
         public static final class VarDeclaration {
         public final String name;
@@ -192,6 +211,23 @@ public interface PlpgsqlStatement {
     // Statements
 
         public static final class Block implements PlpgsqlStatement {
+        /** Which line of the body this statement was written on. */
+        private int line;
+        /** The expression or SQL this statement was written with, as the body spells it. */
+        private String written;
+
+        @Override
+        public int line() { return line; }
+
+        @Override
+        public void atLine(int line) { this.line = line; }
+
+        @Override
+        public String writtenAs() { return written; }
+
+        @Override
+        public void writtenAs(String source) { this.written = source; }
+
         public final List<VarDeclaration> declarations;
         public final List<PlpgsqlStatement> body;
         public final List<ExceptionHandler> exceptionHandlers;
@@ -243,6 +279,23 @@ public interface PlpgsqlStatement {
     }
 
         public static final class Assignment implements PlpgsqlStatement {
+        /** Which line of the body this statement was written on. */
+        private int line;
+        /** The expression or SQL this statement was written with, as the body spells it. */
+        private String written;
+
+        @Override
+        public int line() { return line; }
+
+        @Override
+        public void atLine(int line) { this.line = line; }
+
+        @Override
+        public String writtenAs() { return written; }
+
+        @Override
+        public void writtenAs(String source) { this.written = source; }
+
         public final String target;
         public final String valueExpr;
 
@@ -275,6 +328,23 @@ public interface PlpgsqlStatement {
     }
 
         public static final class IfStmt implements PlpgsqlStatement {
+        /** Which line of the body this statement was written on. */
+        private int line;
+        /** The expression or SQL this statement was written with, as the body spells it. */
+        private String written;
+
+        @Override
+        public int line() { return line; }
+
+        @Override
+        public void atLine(int line) { this.line = line; }
+
+        @Override
+        public String writtenAs() { return written; }
+
+        @Override
+        public void writtenAs(String source) { this.written = source; }
+
         public final String condition;
         public final List<PlpgsqlStatement> thenBody;
         public final List<ElsifClause> elsifClauses;
@@ -315,6 +385,23 @@ public interface PlpgsqlStatement {
     }
 
         public static final class LoopStmt implements PlpgsqlStatement {
+        /** Which line of the body this statement was written on. */
+        private int line;
+        /** The expression or SQL this statement was written with, as the body spells it. */
+        private String written;
+
+        @Override
+        public int line() { return line; }
+
+        @Override
+        public void atLine(int line) { this.line = line; }
+
+        @Override
+        public String writtenAs() { return written; }
+
+        @Override
+        public void writtenAs(String source) { this.written = source; }
+
         public final String label;
         public final List<PlpgsqlStatement> body;
 
@@ -347,6 +434,23 @@ public interface PlpgsqlStatement {
     }
 
         public static final class WhileStmt implements PlpgsqlStatement {
+        /** Which line of the body this statement was written on. */
+        private int line;
+        /** The expression or SQL this statement was written with, as the body spells it. */
+        private String written;
+
+        @Override
+        public int line() { return line; }
+
+        @Override
+        public void atLine(int line) { this.line = line; }
+
+        @Override
+        public String writtenAs() { return written; }
+
+        @Override
+        public void writtenAs(String source) { this.written = source; }
+
         public final String label;
         public final String condition;
         public final List<PlpgsqlStatement> body;
@@ -383,6 +487,23 @@ public interface PlpgsqlStatement {
     }
 
         public static final class ForStmt implements PlpgsqlStatement {
+        /** Which line of the body this statement was written on. */
+        private int line;
+        /** The expression or SQL this statement was written with, as the body spells it. */
+        private String written;
+
+        @Override
+        public int line() { return line; }
+
+        @Override
+        public void atLine(int line) { this.line = line; }
+
+        @Override
+        public String writtenAs() { return written; }
+
+        @Override
+        public void writtenAs(String source) { this.written = source; }
+
         public final String label;
         public final String varName;
         public final String lower;
@@ -443,6 +564,23 @@ public interface PlpgsqlStatement {
     }
 
         public static final class ForQueryStmt implements PlpgsqlStatement {
+        /** Which line of the body this statement was written on. */
+        private int line;
+        /** The expression or SQL this statement was written with, as the body spells it. */
+        private String written;
+
+        @Override
+        public int line() { return line; }
+
+        @Override
+        public void atLine(int line) { this.line = line; }
+
+        @Override
+        public String writtenAs() { return written; }
+
+        @Override
+        public void writtenAs(String source) { this.written = source; }
+
         public final String label;
         public final List<String> varNames;
         public final String sql;
@@ -484,6 +622,23 @@ public interface PlpgsqlStatement {
     }
 
         public static final class ForeachStmt implements PlpgsqlStatement {
+        /** Which line of the body this statement was written on. */
+        private int line;
+        /** The expression or SQL this statement was written with, as the body spells it. */
+        private String written;
+
+        @Override
+        public int line() { return line; }
+
+        @Override
+        public void atLine(int line) { this.line = line; }
+
+        @Override
+        public String writtenAs() { return written; }
+
+        @Override
+        public void writtenAs(String source) { this.written = source; }
+
         public final String label;
         public final String varName;
         public final int sliceDepth;
@@ -533,6 +688,23 @@ public interface PlpgsqlStatement {
     }
 
         public static final class ExitStmt implements PlpgsqlStatement {
+        /** Which line of the body this statement was written on. */
+        private int line;
+        /** The expression or SQL this statement was written with, as the body spells it. */
+        private String written;
+
+        @Override
+        public int line() { return line; }
+
+        @Override
+        public void atLine(int line) { this.line = line; }
+
+        @Override
+        public String writtenAs() { return written; }
+
+        @Override
+        public void writtenAs(String source) { this.written = source; }
+
         public final String label;
         public final String whenCondition;
 
@@ -565,6 +737,23 @@ public interface PlpgsqlStatement {
     }
 
         public static final class ContinueStmt implements PlpgsqlStatement {
+        /** Which line of the body this statement was written on. */
+        private int line;
+        /** The expression or SQL this statement was written with, as the body spells it. */
+        private String written;
+
+        @Override
+        public int line() { return line; }
+
+        @Override
+        public void atLine(int line) { this.line = line; }
+
+        @Override
+        public String writtenAs() { return written; }
+
+        @Override
+        public void writtenAs(String source) { this.written = source; }
+
         public final String label;
         public final String whenCondition;
 
@@ -597,6 +786,23 @@ public interface PlpgsqlStatement {
     }
 
         public static final class ReturnStmt implements PlpgsqlStatement {
+        /** Which line of the body this statement was written on. */
+        private int line;
+        /** The expression or SQL this statement was written with, as the body spells it. */
+        private String written;
+
+        @Override
+        public int line() { return line; }
+
+        @Override
+        public void atLine(int line) { this.line = line; }
+
+        @Override
+        public String writtenAs() { return written; }
+
+        @Override
+        public void writtenAs(String source) { this.written = source; }
+
         public final String valueExpr;
 
         public ReturnStmt(String valueExpr) {
@@ -625,6 +831,23 @@ public interface PlpgsqlStatement {
     }
 
         public static final class ReturnNextStmt implements PlpgsqlStatement {
+        /** Which line of the body this statement was written on. */
+        private int line;
+        /** The expression or SQL this statement was written with, as the body spells it. */
+        private String written;
+
+        @Override
+        public int line() { return line; }
+
+        @Override
+        public void atLine(int line) { this.line = line; }
+
+        @Override
+        public String writtenAs() { return written; }
+
+        @Override
+        public void writtenAs(String source) { this.written = source; }
+
         public final String valueExpr;
 
         public ReturnNextStmt(String valueExpr) {
@@ -653,6 +876,23 @@ public interface PlpgsqlStatement {
     }
 
         public static final class ReturnQueryStmt implements PlpgsqlStatement {
+        /** Which line of the body this statement was written on. */
+        private int line;
+        /** The expression or SQL this statement was written with, as the body spells it. */
+        private String written;
+
+        @Override
+        public int line() { return line; }
+
+        @Override
+        public void atLine(int line) { this.line = line; }
+
+        @Override
+        public String writtenAs() { return written; }
+
+        @Override
+        public void writtenAs(String source) { this.written = source; }
+
         public final String sql;
 
         public ReturnQueryStmt(String sql) {
@@ -681,6 +921,23 @@ public interface PlpgsqlStatement {
     }
 
         public static final class ReturnQueryExecuteStmt implements PlpgsqlStatement {
+        /** Which line of the body this statement was written on. */
+        private int line;
+        /** The expression or SQL this statement was written with, as the body spells it. */
+        private String written;
+
+        @Override
+        public int line() { return line; }
+
+        @Override
+        public void atLine(int line) { this.line = line; }
+
+        @Override
+        public String writtenAs() { return written; }
+
+        @Override
+        public void writtenAs(String source) { this.written = source; }
+
         public final String sqlExpr;
         public final List<String> usingExprs;
 
@@ -713,6 +970,23 @@ public interface PlpgsqlStatement {
     }
 
         public static final class AssertStmt implements PlpgsqlStatement {
+        /** Which line of the body this statement was written on. */
+        private int line;
+        /** The expression or SQL this statement was written with, as the body spells it. */
+        private String written;
+
+        @Override
+        public int line() { return line; }
+
+        @Override
+        public void atLine(int line) { this.line = line; }
+
+        @Override
+        public String writtenAs() { return written; }
+
+        @Override
+        public void writtenAs(String source) { this.written = source; }
+
         public final String condition;
         public final String message;
 
@@ -745,6 +1019,23 @@ public interface PlpgsqlStatement {
     }
 
         public static final class RaiseStmt implements PlpgsqlStatement {
+        /** Which line of the body this statement was written on. */
+        private int line;
+        /** The expression or SQL this statement was written with, as the body spells it. */
+        private String written;
+
+        @Override
+        public int line() { return line; }
+
+        @Override
+        public void atLine(int line) { this.line = line; }
+
+        @Override
+        public String writtenAs() { return written; }
+
+        @Override
+        public void writtenAs(String source) { this.written = source; }
+
         public final String level;
         public final String format;
         public final List<String> argExprs;
@@ -842,6 +1133,23 @@ public interface PlpgsqlStatement {
     }
 
         public static final class PerformStmt implements PlpgsqlStatement {
+        /** Which line of the body this statement was written on. */
+        private int line;
+        /** The expression or SQL this statement was written with, as the body spells it. */
+        private String written;
+
+        @Override
+        public int line() { return line; }
+
+        @Override
+        public void atLine(int line) { this.line = line; }
+
+        @Override
+        public String writtenAs() { return written; }
+
+        @Override
+        public void writtenAs(String source) { this.written = source; }
+
         public final String sql;
 
         public PerformStmt(String sql) {
@@ -870,6 +1178,23 @@ public interface PlpgsqlStatement {
     }
 
         public static final class ExecuteStmt implements PlpgsqlStatement {
+        /** Which line of the body this statement was written on. */
+        private int line;
+        /** The expression or SQL this statement was written with, as the body spells it. */
+        private String written;
+
+        @Override
+        public int line() { return line; }
+
+        @Override
+        public void atLine(int line) { this.line = line; }
+
+        @Override
+        public String writtenAs() { return written; }
+
+        @Override
+        public void writtenAs(String source) { this.written = source; }
+
         public final String sqlExpr;
         public final List<String> usingExprs;
         public final List<String> intoVars;
@@ -910,6 +1235,23 @@ public interface PlpgsqlStatement {
     }
 
         public static final class SqlStmt implements PlpgsqlStatement {
+        /** Which line of the body this statement was written on. */
+        private int line;
+        /** The expression or SQL this statement was written with, as the body spells it. */
+        private String written;
+
+        @Override
+        public int line() { return line; }
+
+        @Override
+        public void atLine(int line) { this.line = line; }
+
+        @Override
+        public String writtenAs() { return written; }
+
+        @Override
+        public void writtenAs(String source) { this.written = source; }
+
         public final String sql;
         public final List<String> intoVars;
         public final boolean strict;
@@ -946,6 +1288,23 @@ public interface PlpgsqlStatement {
     }
 
         public static final class NullStmt implements PlpgsqlStatement {
+        /** Which line of the body this statement was written on. */
+        private int line;
+        /** The expression or SQL this statement was written with, as the body spells it. */
+        private String written;
+
+        @Override
+        public int line() { return line; }
+
+        @Override
+        public void atLine(int line) { this.line = line; }
+
+        @Override
+        public String writtenAs() { return written; }
+
+        @Override
+        public void writtenAs(String source) { this.written = source; }
+
         public NullStmt() {}
 
         @Override
@@ -967,6 +1326,23 @@ public interface PlpgsqlStatement {
     }
 
         public static final class GetDiagnosticsStmt implements PlpgsqlStatement {
+        /** Which line of the body this statement was written on. */
+        private int line;
+        /** The expression or SQL this statement was written with, as the body spells it. */
+        private String written;
+
+        @Override
+        public int line() { return line; }
+
+        @Override
+        public void atLine(int line) { this.line = line; }
+
+        @Override
+        public String writtenAs() { return written; }
+
+        @Override
+        public void writtenAs(String source) { this.written = source; }
+
         public final List<DiagItem> items;
         public final boolean stacked;
 
@@ -1002,12 +1378,36 @@ public interface PlpgsqlStatement {
     }
 
         public static final class OpenCursorStmt implements PlpgsqlStatement {
+        /** Which line of the body this statement was written on. */
+        private int line;
+        /** The expression or SQL this statement was written with, as the body spells it. */
+        private String written;
+
+        @Override
+        public int line() { return line; }
+
+        @Override
+        public void atLine(int line) { this.line = line; }
+
+        @Override
+        public String writtenAs() { return written; }
+
+        @Override
+        public void writtenAs(String source) { this.written = source; }
+
         public final String cursorName;
         public final String sql;
         /** Argument expressions of {@code OPEN c(...)}, in written order. */
         public final List<String> argExprs;
         /** Parameter name each argument was written against, or null for a positional one. */
         public final List<String> argNames;
+        /**
+         * Whether the query was written as {@code OPEN c FOR EXECUTE expr}, where the cursor's
+         * query is what the expression comes to rather than what stands in the body.
+         */
+        public boolean dynamic;
+        /** The USING arguments of the dynamic form, in written order. */
+        public List<String> usingExprs = java.util.Collections.emptyList();
 
         public OpenCursorStmt(String cursorName, String sql) {
             this(cursorName, sql, java.util.Collections.<String>emptyList(),
@@ -1049,6 +1449,23 @@ public interface PlpgsqlStatement {
     }
 
         public static final class FetchStmt implements PlpgsqlStatement {
+        /** Which line of the body this statement was written on. */
+        private int line;
+        /** The expression or SQL this statement was written with, as the body spells it. */
+        private String written;
+
+        @Override
+        public int line() { return line; }
+
+        @Override
+        public void atLine(int line) { this.line = line; }
+
+        @Override
+        public String writtenAs() { return written; }
+
+        @Override
+        public void writtenAs(String source) { this.written = source; }
+
         public final String cursorName;
         public final List<String> intoVars;
         /** NEXT, PRIOR, FIRST, LAST, ABSOLUTE, RELATIVE, FORWARD or BACKWARD. */
@@ -1134,6 +1551,23 @@ public interface PlpgsqlStatement {
      * {@code a[1].x := 9}. A plain {@code v.f := x} stays an {@link Assignment}.
      */
         public static final class SubscriptAssignment implements PlpgsqlStatement {
+        /** Which line of the body this statement was written on. */
+        private int line;
+        /** The expression or SQL this statement was written with, as the body spells it. */
+        private String written;
+
+        @Override
+        public int line() { return line; }
+
+        @Override
+        public void atLine(int line) { this.line = line; }
+
+        @Override
+        public String writtenAs() { return written; }
+
+        @Override
+        public void writtenAs(String source) { this.written = source; }
+
         public final String baseName;
         public final List<TargetStep> steps;
         public final String valueExpr;
@@ -1155,6 +1589,23 @@ public interface PlpgsqlStatement {
     }
 
         public static final class CloseCursorStmt implements PlpgsqlStatement {
+        /** Which line of the body this statement was written on. */
+        private int line;
+        /** The expression or SQL this statement was written with, as the body spells it. */
+        private String written;
+
+        @Override
+        public int line() { return line; }
+
+        @Override
+        public void atLine(int line) { this.line = line; }
+
+        @Override
+        public String writtenAs() { return written; }
+
+        @Override
+        public void writtenAs(String source) { this.written = source; }
+
         public final String cursorName;
 
         public CloseCursorStmt(String cursorName) {
@@ -1184,6 +1635,23 @@ public interface PlpgsqlStatement {
 
     /** COMMIT [AND CHAIN] inside a procedure body (PG 11+). */
         public static final class CommitStmt implements PlpgsqlStatement {
+        /** Which line of the body this statement was written on. */
+        private int line;
+        /** The expression or SQL this statement was written with, as the body spells it. */
+        private String written;
+
+        @Override
+        public int line() { return line; }
+
+        @Override
+        public void atLine(int line) { this.line = line; }
+
+        @Override
+        public String writtenAs() { return written; }
+
+        @Override
+        public void writtenAs(String source) { this.written = source; }
+
         public final boolean chain;
 
         public CommitStmt(boolean chain) {
@@ -1208,6 +1676,23 @@ public interface PlpgsqlStatement {
 
     /** ROLLBACK [AND CHAIN] inside a procedure body (PG 11+). */
         public static final class RollbackStmt implements PlpgsqlStatement {
+        /** Which line of the body this statement was written on. */
+        private int line;
+        /** The expression or SQL this statement was written with, as the body spells it. */
+        private String written;
+
+        @Override
+        public int line() { return line; }
+
+        @Override
+        public void atLine(int line) { this.line = line; }
+
+        @Override
+        public String writtenAs() { return written; }
+
+        @Override
+        public void writtenAs(String source) { this.written = source; }
+
         public final boolean chain;
 
         public RollbackStmt(boolean chain) {
@@ -1261,6 +1746,23 @@ public interface PlpgsqlStatement {
 
     /** PL/pgSQL CASE statement (searched or simple). */
     public static final class CaseStmt implements PlpgsqlStatement {
+        /** Which line of the body this statement was written on. */
+        private int line;
+        /** The expression or SQL this statement was written with, as the body spells it. */
+        private String written;
+
+        @Override
+        public int line() { return line; }
+
+        @Override
+        public void atLine(int line) { this.line = line; }
+
+        @Override
+        public String writtenAs() { return written; }
+
+        @Override
+        public void writtenAs(String source) { this.written = source; }
+
         public final String searchExpr; // null for searched CASE, non-null for simple CASE
         public final List<CaseWhenClause> whenClauses;
         public final List<PlpgsqlStatement> elseBody;
@@ -1294,6 +1796,23 @@ public interface PlpgsqlStatement {
 
     /** FOR rec IN EXECUTE 'sql' [USING expr, ...] LOOP ... END LOOP */
     public static final class ForExecuteStmt implements PlpgsqlStatement {
+        /** Which line of the body this statement was written on. */
+        private int line;
+        /** The expression or SQL this statement was written with, as the body spells it. */
+        private String written;
+
+        @Override
+        public int line() { return line; }
+
+        @Override
+        public void atLine(int line) { this.line = line; }
+
+        @Override
+        public String writtenAs() { return written; }
+
+        @Override
+        public void writtenAs(String source) { this.written = source; }
+
         public final String label;
         public final List<String> varNames;
         public final String sqlExpr;
@@ -1323,12 +1842,46 @@ public interface PlpgsqlStatement {
 
     /** ABORT in a procedure body — unsupported transaction command (PG raises 0A000 at runtime). */
     public static final class AbortStmt implements PlpgsqlStatement {
+        /** Which line of the body this statement was written on. */
+        private int line;
+        /** The expression or SQL this statement was written with, as the body spells it. */
+        private String written;
+
+        @Override
+        public int line() { return line; }
+
+        @Override
+        public void atLine(int line) { this.line = line; }
+
+        @Override
+        public String writtenAs() { return written; }
+
+        @Override
+        public void writtenAs(String source) { this.written = source; }
+
         @Override
         public String toString() { return "AbortStmt[]"; }
     }
 
     /** SAVEPOINT/ROLLBACK TO SAVEPOINT in a procedure body — rejected at creation time by PG. */
     public static final class SavepointStmt implements PlpgsqlStatement {
+        /** Which line of the body this statement was written on. */
+        private int line;
+        /** The expression or SQL this statement was written with, as the body spells it. */
+        private String written;
+
+        @Override
+        public int line() { return line; }
+
+        @Override
+        public void atLine(int line) { this.line = line; }
+
+        @Override
+        public String writtenAs() { return written; }
+
+        @Override
+        public void writtenAs(String source) { this.written = source; }
+
         @Override
         public String toString() { return "SavepointStmt[]"; }
     }

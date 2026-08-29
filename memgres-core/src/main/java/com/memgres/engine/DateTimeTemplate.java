@@ -72,6 +72,23 @@ final class DateTimeTemplate {
             "y,yyy", "yyyy", "yyy", "yy", "y",
     };
 
+    /**
+     * The keywords an interval cannot answer. An interval is a length, not a point, so it has no
+     * weekday, no month name, no era and no zone; PostgreSQL refuses the whole template rather
+     * than printing a field it has nothing to put in.
+     */
+    private static final java.util.Set<String> CALENDAR_ONLY = new java.util.HashSet<String>(
+            java.util.Arrays.asList("A.D.", "AD", "B.C.", "BC", "DAY", "DY", "D", "ID",
+                    "MONTH", "MON", "OF", "TZ", "TZH", "TZM"));
+
+    /**
+     * The keywords whose padding counts the sign, the way {@code %02d} of −1 is {@code -1}.
+     * Every other numeric keyword pads the digits and writes the sign in front of them, so
+     * {@code MM} of −1 is {@code -01} where {@code DD} of −1 is {@code -1}.
+     */
+    private static final java.util.Set<String> SIGN_INSIDE_WIDTH = new java.util.HashSet<String>(
+            java.util.Arrays.asList("DD", "DDD", "IDDD"));
+
     /** Keywords whose output is digits: only these take a TH suffix and a fixed parse width. */
     private static final java.util.Set<String> DIGIT_KEYS = new java.util.HashSet<String>(
             java.util.Arrays.asList("CC", "DDD", "DD", "D", "HH24", "HH12", "HH", "IDDD", "ID",
@@ -214,6 +231,7 @@ final class DateTimeTemplate {
         long julian;
         boolean interval;
         ZoneOffset offset; // null when the value carries no zone
+        java.time.Instant instant; // the instant behind an offset value, for its zone's name
     }
 
     static String toChar(Object source, String fmt) {
@@ -227,6 +245,10 @@ final class DateTimeTemplate {
                 sb.append(n.ch);
                 continue;
             }
+            if (tm.interval && CALENDAR_ONLY.contains(canon(n.key))) {
+                throw new MemgresException("invalid format specification for an interval value"
+                        + "\n  Hint: Intervals are not tied to specific calendar dates.", "22007");
+            }
             String out = render(n, tm);
             if (out == null) continue;
             if (n.th && DIGIT_KEYS.contains(canon(n.key))) out = out + ordinal(out, n.thUpper);
@@ -237,6 +259,13 @@ final class DateTimeTemplate {
 
     private static Tm broken(Object source) {
         Tm tm = new Tm();
+        if (source instanceof LocalTime) {
+            // There is no to_char over a time: the call reaches to_char(interval, text) through
+            // the cast time carries, so a time is broken out as the length it stands for and no
+            // calendar field of the template has anything to answer with.
+            LocalTime lt = (LocalTime) source;
+            source = new PgInterval(0, 0, lt.toNanoOfDay() / 1000L);
+        }
         if (source instanceof PgInterval) {
             PgInterval iv = (PgInterval) source;
             tm.interval = true;
@@ -248,7 +277,19 @@ final class DateTimeTemplate {
             tm.min = (int) ((micros / 60_000_000L) % 60);
             tm.sec = (int) ((micros / 1_000_000L) % 60);
             tm.micros = (int) (micros % 1_000_000L);
-            tm.quarter = (tm.mon - 1) / 3 + 1;
+            // The calendar keys an interval still answers are computed on the fields as they
+            // stand, which is a date of month nought and year nought. PostgreSQL runs its own
+            // calendar arithmetic over them, so the same arithmetic is run here.
+            tm.quarter = tm.mon == 0 ? 0 : (tm.mon - 1) / 3 + 1;
+            tm.doy = 0;
+            tm.weekOfMonth = (tm.mday - 1) / 7 + 1;
+            tm.weekOfYear = (tm.doy - 1) / 7 + 1;
+            tm.julian = julianDay(tm.year, tm.mon, tm.mday);
+            tm.isoYear = isoYearOf(tm.year, tm.mon, tm.mday);
+            tm.isoWeek = isoWeekOf(tm.year, tm.mon, tm.mday);
+            tm.isoDow = 0;
+            tm.isoDoy = (int) (julianDay(tm.year, tm.mon, tm.mday)
+                    - isoWeekStart(tm.isoYear, 1) + 1);
             return tm;
         }
         LocalDateTime dt;
@@ -262,8 +303,7 @@ final class DateTimeTemplate {
                     TypeCoercion.sessionZone()).toOffsetDateTime();
             dt = odt.toLocalDateTime();
             tm.offset = odt.getOffset();
-        } else if (source instanceof LocalTime) {
-            dt = ((LocalTime) source).atDate(LocalDate.of(1970, 1, 1));
+            tm.instant = odt.toInstant();
         } else {
             dt = TypeCoercion.toLocalDateTime(source);
         }
@@ -336,13 +376,13 @@ final class DateTimeTemplate {
             case "Y":
                 return num(tm.year % 10, 1, fm);
             case "IYYY":
-                return num(isoYear(tm), 4, fm);
+                return numC(isoYear(tm), 4, fm);
             case "IYY":
-                return num(isoYear(tm) % 1000, 3, fm);
+                return numC(isoYear(tm) % 1000, 3, fm);
             case "IY":
-                return num(isoYear(tm) % 100, 2, fm);
+                return numC(isoYear(tm) % 100, 2, fm);
             case "I":
-                return num(isoYear(tm) % 10, 1, fm);
+                return numC(isoYear(tm) % 10, 1, fm);
             case "CC": {
                 int cc;
                 if (tm.interval) cc = tm.year / 100;
@@ -382,11 +422,12 @@ final class DateTimeTemplate {
                 if (tm.dow < 1 || tm.dow > 7) return "";
                 return name(DAYS_SHORT[tm.dow - 1], cs, true, 0);
             case "DDD":
-                return num(tm.doy, 3, fm);
+                // An interval has no day of the year, so its day count answers for it.
+                return numC(tm.interval ? tm.mday : tm.doy, 3, fm);
             case "IDDD":
-                return num(tm.isoDoy, 3, fm);
+                return numC(tm.isoDoy, 3, fm);
             case "DD":
-                return num(tm.mday, 2, fm);
+                return numC(tm.mday, 2, fm);
             case "D":
                 return Integer.toString(tm.dow);
             case "ID":
@@ -398,6 +439,8 @@ final class DateTimeTemplate {
             case "IW":
                 return num(tm.isoWeek, 2, fm);
             case "Q":
+                // An interval with no months has no quarter to be in.
+                if (tm.interval && tm.mon == 0) return "";
                 return Integer.toString(tm.quarter);
             case "RM": {
                 if (tm.mon < 1 || tm.mon > 12) return "";
@@ -408,9 +451,8 @@ final class DateTimeTemplate {
             case "J":
                 return Long.toString(tm.julian);
             case "TZ": {
-                if (tm.offset == null) return "";
-                String id = TypeCoercion.sessionZone().getId();
-                String abbrev = id.equals("Z") || id.equals("UTC") ? "UTC" : id;
+                if (tm.offset == null || tm.instant == null) return "";
+                String abbrev = PgTimeZones.abbreviationOf(TypeCoercion.sessionZone(), tm.instant);
                 return cs == CASE_LOWER ? abbrev.toLowerCase(java.util.Locale.ROOT) : abbrev;
             }
             case "TZH": {
@@ -423,7 +465,7 @@ final class DateTimeTemplate {
             }
             case "OF": {
                 int secs = tm.offset == null ? 0 : tm.offset.getTotalSeconds();
-                String s = (secs < 0 ? "-" : "+") + num(Math.abs(secs) / 3600, 2, false);
+                String s = (secs < 0 ? "-" : "+") + num(Math.abs(secs) / 3600, 2, fm);
                 int mins = (Math.abs(secs) % 3600) / 60;
                 return mins == 0 ? s : s + ":" + num(mins, 2, false);
             }
@@ -433,8 +475,79 @@ final class DateTimeTemplate {
     }
 
     private static int isoYear(Tm tm) {
-        if (tm.interval) return tm.year;
+        if (tm.interval) return tm.isoYear;
         return tm.isoYear <= 0 ? 1 - tm.isoYear : tm.isoYear;
+    }
+
+    /**
+     * The Julian day of a date, by PostgreSQL's own arithmetic — which takes a month of nought
+     * as readily as it takes a real one, and is what an interval's J is computed with.
+     */
+    private static long julianDay(int year, int month, int day) {
+        int y = year;
+        int m = month;
+        if (m > 2) {
+            m += 1;
+            y += 4800;
+        } else {
+            m += 13;
+            y += 4799;
+        }
+        int century = y / 100;
+        long julian = y * 365L - 32167L;
+        julian += y / 4 - century + century / 4;
+        julian += 7834L * m / 256 + day;
+        return julian;
+    }
+
+    /** The weekday of a Julian day, counted from Sunday, the way PostgreSQL counts it. */
+    private static long weekdayOf(long julian) {
+        long day = (julian + 1) % 7;
+        return day < 0 ? day + 7 : day;
+    }
+
+    /** The Julian day the given ISO week of the given ISO year begins on. */
+    private static long isoWeekStart(int isoYear, int week) {
+        long day4 = julianDay(isoYear, 1, 4);
+        return (week - 1) * 7L + (day4 - weekdayOf(day4 - 1));
+    }
+
+    /** The ISO week number of a date, by the same arithmetic. */
+    private static int isoWeekOf(int year, int month, int day) {
+        long dayn = julianDay(year, month, day);
+        long day4 = julianDay(year, 1, 4);
+        long day0 = weekdayOf(day4 - 1);
+        double weeks = (double) (dayn - (day4 - day0)) / 7 + 1;
+        if (weeks >= 52) {
+            day4 = julianDay(year + 1, 1, 4);
+            day0 = weekdayOf(day4 - 1);
+            if (dayn >= day4 - day0) weeks = (double) (dayn - (day4 - day0)) / 7 + 1;
+        }
+        if (weeks <= 0) {
+            day4 = julianDay(year - 1, 1, 4);
+            day0 = weekdayOf(day4 - 1);
+            weeks = (double) (dayn - (day4 - day0)) / 7 + 1;
+        }
+        return (int) weeks;
+    }
+
+    /** The ISO week-numbering year of a date, by the same arithmetic. */
+    private static int isoYearOf(int year, int month, int day) {
+        long dayn = julianDay(year, month, day);
+        long day4 = julianDay(year, 1, 4);
+        long day0 = (day4 - 1 + 1) % 7;
+        if (dayn < day4 - day0) {
+            day4 = julianDay(year - 1, 1, 4);
+            day0 = (day4 - 1 + 1) % 7;
+            return year - 1;
+        }
+        long weeks = (dayn - (day4 - day0)) / 7;
+        if (weeks >= 52) {
+            day4 = julianDay(year + 1, 1, 4);
+            day0 = (day4 - 1 + 1) % 7;
+            if (dayn >= day4 - day0) return year + 1;
+        }
+        return year;
     }
 
     private static String name(String base, int cs, boolean fm, int width) {
@@ -458,6 +571,17 @@ final class DateTimeTemplate {
         for (int i = s.length(); i < width; i++) sb.append('0');
         sb.append(s);
         return (v < 0 ? "-" : "") + sb;
+    }
+
+    /** The same, for the keywords whose field width has the sign inside it. */
+    private static String numC(int v, int width, boolean fm) {
+        if (fm) return Integer.toString(v);
+        String s = Integer.toString(v);
+        StringBuilder sb = new StringBuilder();
+        int digits = v < 0 ? width - 1 : width;
+        for (int i = s.length() - (v < 0 ? 1 : 0); i < digits; i++) sb.append('0');
+        if (v < 0) return "-" + sb + s.substring(1);
+        return sb + s;
     }
 
     /** The English ordinal for the digits already rendered — 11th and 12th, but 21st. */
@@ -512,9 +636,27 @@ final class DateTimeTemplate {
         int yysz;
         boolean bc, pm, clock12, hasYear, hasJulian;
         long julian;
+        int tzHours, tzMinutes;
+        boolean tzNegative, hasZone;
+    }
+
+    /** What a template read: the fields it named, and the zone it named if it named one. */
+    static final class Read {
+        final LocalDateTime local;
+        /** The displacement the template read, or null when it read no zone at all. */
+        final ZoneOffset offset;
+
+        Read(LocalDateTime local, ZoneOffset offset) {
+            this.local = local;
+            this.offset = offset;
+        }
     }
 
     static LocalDateTime parse(String input, String fmt) {
+        return read(input, fmt).local;
+    }
+
+    static Read read(String input, String fmt) {
         List<Node> nodes = parseFormat(fmt);
         Cursor s = new Cursor(input);
         Fields f = new Fields();
@@ -528,8 +670,15 @@ final class DateTimeTemplate {
                 if (fx) {
                     s.i++;
                 } else if (isSeparator(n.ch) || Character.isWhitespace(n.ch)) {
-                    // Without FX a separator matches any separator, or nothing at all.
-                    if (isSeparator(s.peek()) || Character.isWhitespace(s.peek())) s.i++;
+                    // Without FX a separator matches any separator, or nothing at all — except
+                    // the sign in front of a displacement, which belongs to the field that reads
+                    // it and would leave that field pointing the wrong way if it were eaten here.
+                    boolean signOfDisplacement = (s.peek() == '+' || s.peek() == '-')
+                            && readsDisplacement(nodes, idx);
+                    if (!signOfDisplacement
+                            && (isSeparator(s.peek()) || Character.isWhitespace(s.peek()))) {
+                        s.i++;
+                    }
                 } else {
                     // A letter or digit in the template stands for one character of input.
                     s.i++;
@@ -542,7 +691,26 @@ final class DateTimeTemplate {
             }
             readField(n, nodes, idx, s, f);
         }
-        return assemble(f, input);
+        ZoneOffset offset = null;
+        if (f.hasZone) {
+            int secs = f.tzHours * 3600 + f.tzMinutes * 60;
+            offset = ZoneOffset.ofTotalSeconds(f.tzNegative ? -secs : secs);
+        }
+        return new Read(assemble(f, input), offset);
+    }
+
+    /** Whether the next keyword in the template reads a displacement, sign and all. */
+    private static boolean readsDisplacement(List<Node> nodes, int idx) {
+        for (int i = idx + 1; i < nodes.size(); i++) {
+            Node next = nodes.get(i);
+            if (!next.isAction()) {
+                if (Character.isWhitespace(next.ch)) continue;
+                return false;
+            }
+            String key = canon(next.key);
+            return key.equals("OF") || key.equals("TZH");
+        }
+        return false;
     }
 
     private static void readField(Node n, List<Node> nodes, int idx, Cursor s, Fields f) {
@@ -663,11 +831,18 @@ final class DateTimeTemplate {
                 readInt(s, 1, key, slurp);
                 break;
             case "TZH":
-                if (s.has() && (s.peek() == '+' || s.peek() == '-')) s.i++;
-                readInt(s, 2, key, slurp);
+                if (s.has() && s.peek() == '-') {
+                    f.tzNegative = true;
+                    s.i++;
+                } else if (s.has() && s.peek() == '+') {
+                    s.i++;
+                }
+                f.tzHours = readInt(s, 2, key, slurp)[0];
+                f.hasZone = true;
                 break;
             case "TZM":
-                readInt(s, 2, key, slurp);
+                f.tzMinutes = readInt(s, 2, key, slurp)[0];
+                f.hasZone = true;
                 break;
             case "MONTH":
                 f.mon = seqSearch(s, MONTHS_FULL, key) + 1;
@@ -702,11 +877,38 @@ final class DateTimeTemplate {
                 f.bc = seqSearchLiteral(s, names, key) == 1;
                 break;
             }
-            case "TZ":
-            case "OF":
-                // Consumed but not applied: memgres reads every template in the session zone.
-                while (s.has() && !Character.isWhitespace(s.peek())) s.i++;
+            case "OF": {
+                if (s.has() && (s.peek() == '+' || s.peek() == '-')) {
+                    f.tzNegative = s.peek() == '-';
+                    s.i++;
+                }
+                f.tzHours = readInt(s, 2, key, false)[0];
+                if (s.has() && s.peek() == ':') {
+                    s.i++;
+                    f.tzMinutes = readInt(s, 2, key, false)[0];
+                }
+                f.hasZone = true;
                 break;
+            }
+            case "TZ": {
+                // Only an abbreviation stands here: a zone's own name is not one of the names
+                // this field reads, which is what PostgreSQL says when it is handed one.
+                int end = s.i;
+                while (end < s.s.length() && !Character.isWhitespace(s.s.charAt(end))) end++;
+                String named = s.s.substring(s.i, end);
+                ZoneOffset read = PgTimeZones.offsetOf(named);
+                if (read == null) {
+                    throw new MemgresException("invalid value \"" + named + "\" for \"" + key
+                            + "\"\n  Detail: Time zone abbreviation is not recognized.", "22007");
+                }
+                int secs = read.getTotalSeconds();
+                f.tzNegative = secs < 0;
+                f.tzHours = Math.abs(secs) / 3600;
+                f.tzMinutes = (Math.abs(secs) % 3600) / 60;
+                f.hasZone = true;
+                s.i = end;
+                break;
+            }
             default:
                 break;
         }

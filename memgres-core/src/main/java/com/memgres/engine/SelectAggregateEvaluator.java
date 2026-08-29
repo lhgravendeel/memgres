@@ -1056,7 +1056,9 @@ class SelectAggregateEvaluator {
         Expression key = osa.withinGroupOrderBy().get(0).expr();
         if (isUntypedLiteral(key)) return;
         DataType keyType = typeOfKey(key, sample);
-        if (keyType != null && keyType != DataType.INTERVAL && !readsAsDoublePrecision(keyType)) {
+        // A time of day reaches the interval signature as the length from midnight it stands for.
+        if (keyType != null && keyType != DataType.INTERVAL && keyType != DataType.TIME
+                && !readsAsDoublePrecision(keyType)) {
             throw noSuchOrderedSetFunction(osa, group);
         }
     }
@@ -1070,6 +1072,9 @@ class SelectAggregateEvaluator {
      * median of one hour and three hours came back as 0 rather than two hours.
      */
     private Object interpolate(Object low, Object high, double weight) {
+        if (low instanceof java.time.LocalTime && high instanceof java.time.LocalTime) {
+            return interpolate(TypeCoercion.toInterval(low), TypeCoercion.toInterval(high), weight);
+        }
         if (low instanceof PgInterval && high instanceof PgInterval) {
             PgInterval lo = (PgInterval) low;
             return lo.plus(((PgInterval) high).minus(lo).multiply(weight));
@@ -1409,6 +1414,8 @@ class SelectAggregateEvaluator {
             case "sum": {
                 if (group.isEmpty()) return null;
                 Expression arg = fn.args().get(0);
+                Object spanned = intervalTotal(fn, group, false);
+                if (spanned != NOT_A_SPAN) return spanned;
                 boolean hasValue = false;
                 boolean allInts = true;
                 boolean isMoney = false;
@@ -1474,6 +1481,8 @@ class SelectAggregateEvaluator {
             case "avg": {
                 if (group.isEmpty()) return null;
                 Expression arg = fn.args().get(0);
+                Object spanned = intervalTotal(fn, group, true);
+                if (spanned != NOT_A_SPAN) return spanned;
                 requireAggregatableNumeric("avg", arg, group);
                 BigDecimal bdSum = BigDecimal.ZERO;
                 long count = 0;
@@ -2371,6 +2380,62 @@ class SelectAggregateEvaluator {
      * PG has no avg(money) or avg over other non-numeric types; reject rather than
      * silently coercing the value through numeric.
      */
+    /** Told apart from a null total, which is what an empty group of intervals answers with. */
+    private static final Object NOT_A_SPAN = new Object();
+
+    /**
+     * The total, or the mean, of a group of lengths of time. A time of day reaches these
+     * aggregates as the length from midnight it stands for, because that is the only signature
+     * either of them has for it. Answers {@link #NOT_A_SPAN} when the group is not lengths at all,
+     * which leaves the numeric readers below to have it.
+     */
+    private Object intervalTotal(FunctionCallExpr fn, List<RowContext> group, boolean mean) {
+        Expression arg = fn.args().get(0);
+        List<Object> values = new ArrayList<>();
+        DataType keyType = fn.distinct() ? distinctType(arg, group) : null;
+        Set<String> seenKeys = fn.distinct() ? new HashSet<String>() : null;
+        for (RowContext ctx : group) {
+            Object val = executor.evalExpr(arg, ctx);
+            if (val == null) continue;
+            if (!(val instanceof PgInterval) && !(val instanceof java.time.LocalTime)) {
+                return NOT_A_SPAN;
+            }
+            if (fn.distinct() && !seenKeys.add(distinctKey(val, keyType))) continue;
+            values.add(val);
+        }
+        if (values.isEmpty()) return NOT_A_SPAN;
+        PgInterval total = new PgInterval(0, 0, 0);
+        for (Object val : values) total = total.plus(TypeCoercion.toInterval(val));
+        if (!mean) return total;
+        return dividedInterval(total, values.size());
+    }
+
+    /**
+     * An interval divided by a count. The months and the days are whole numbers, so what is left
+     * over from each cascades into the unit below it — a third of a month is ten days, not a
+     * third of a month — and the microseconds take whatever is left after that.
+     */
+    static PgInterval dividedInterval(PgInterval total, int by) {
+        double factor = by;
+        int months = (int) (total.getMonths() / factor);
+        int days = (int) (total.getDays() / factor);
+        double monthDays = roundedToMicros((total.getMonths() / factor - months) * 30.0);
+        double secondsLeft = roundedToMicros((total.getDays() / factor - days
+                + monthDays - (int) monthDays) * 86_400.0);
+        if (Math.abs(secondsLeft) >= 86_400.0) {
+            days += (int) (secondsLeft / 86_400.0);
+            secondsLeft -= (int) (secondsLeft / 86_400.0) * 86_400.0;
+        }
+        days += (int) monthDays;
+        long micros = (long) Math.rint(total.getMicroseconds() / factor + secondsLeft * 1_000_000.0);
+        return new PgInterval(months, days, micros);
+    }
+
+    /** Rounded to the microsecond, which is as fine as an interval is held. */
+    private static double roundedToMicros(double value) {
+        return Math.rint(value * 1_000_000.0) / 1_000_000.0;
+    }
+
     private void requireAggregatableNumeric(String fname, Expression arg, List<RowContext> group) {
         for (RowContext ctx : group) {
             Object val = executor.evalExpr(arg, ctx);

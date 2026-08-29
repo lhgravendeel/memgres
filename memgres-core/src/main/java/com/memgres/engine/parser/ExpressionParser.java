@@ -492,6 +492,16 @@ public class ExpressionParser {
             "bpchar", "bit", "bit varying", "varbit",
             "timestamp", "timestamptz", "time", "timetz", "interval");
 
+    /** The clock functions that take how many digits of the second to keep. */
+    private static final java.util.Set<String> PRECISION_TAKING_VALUE_FUNCTIONS =
+            new java.util.HashSet<>(java.util.Arrays.asList(
+                    "CURRENT_TIMESTAMP", "CURRENT_TIME", "LOCALTIME", "LOCALTIMESTAMP"));
+
+    /** The typed literals whose type carries a precision, written in front of the value. */
+    private static final java.util.Set<String> PRECISION_TAKING_LITERALS =
+            new java.util.HashSet<>(java.util.Arrays.asList(
+                    "timestamp", "timestamptz", "time", "timetz", "interval"));
+
     /**
      * Refuse a modifier written after a type that has none. A type read as a plain name is looked
      * up and found to have no modifier input function, which PostgreSQL reports in words rather
@@ -1776,17 +1786,26 @@ public class ExpressionParser {
                 case "CURRENT_CATALOG":
                 case "CURRENT_SCHEMA": {
                     advance();
+                    List<Expression> valueArgs = Cols.listOf();
                     // Consume optional empty parentheses (e.g., current_schema() or current_user)
                     if (check(TokenType.LEFT_PAREN)) {
                         int saved = pos;
                         advance(); // (
                         if (check(TokenType.RIGHT_PAREN)) {
                             advance(); // )
+                        } else if (PRECISION_TAKING_VALUE_FUNCTIONS.contains(t.value())
+                                && check(TokenType.INTEGER_LITERAL)
+                                && pos + 1 < tokens.size()
+                                && tokens.get(pos + 1).type() == TokenType.RIGHT_PAREN) {
+                            // The four clock functions take how many digits of the second to
+                            // keep, which is a precision and not an argument to resolve against.
+                            valueArgs = Cols.listOf(Literal.ofInt(advance().value()));
+                            advance(); // )
                         } else {
                             pos = saved; // restore; there were args after (
                         }
                     }
-                    return new FunctionCallExpr(t.value().toLowerCase(), Cols.listOf());
+                    return new FunctionCallExpr(t.value().toLowerCase(), valueArgs);
                 }
                 case "INTERVAL": {
                     return specialFormParser.parseInterval(); 
@@ -1953,6 +1972,19 @@ public class ExpressionParser {
             }
             String name = readIdentifier();
 
+            // A typed literal may carry the type's own precision in front of it, the way a column
+            // declaration does: timestamptz(3) '...' keeps three digits of the second.
+            String literalPrecision = "";
+            if (check(TokenType.LEFT_PAREN) && pos + 3 < tokens.size()
+                    && tokens.get(pos + 1).type() == TokenType.INTEGER_LITERAL
+                    && tokens.get(pos + 2).type() == TokenType.RIGHT_PAREN
+                    && tokens.get(pos + 3).type() == TokenType.STRING_LITERAL
+                    && PRECISION_TAKING_LITERALS.contains(name.toLowerCase())) {
+                advance();
+                literalPrecision = "(" + advance().value() + ")";
+                advance();
+            }
+
             // Type-annotated literal: typename 'value' (e.g., point '(1,2)', DATE '2024-01-01', json '{}')
             if (check(TokenType.STRING_LITERAL)) {
                 String lower = name.toLowerCase();
@@ -1982,7 +2014,7 @@ public class ExpressionParser {
                             castType = lower;
                             break;
                     }
-                    return new CastExpr(Literal.ofString(val), castType);
+                    return new CastExpr(Literal.ofString(val), castType + literalPrecision);
                 }
             }
 

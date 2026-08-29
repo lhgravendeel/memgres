@@ -63,6 +63,21 @@ class DateTimeArithmetic {
             return ((PgInterval) right).isPositiveInfinity() ? "infinity" : "-infinity";
         }
 
+        // A date and a time of day are the two halves of a timestamp, so putting them together
+        // makes one — and a time that carries a displacement makes a timestamptz.
+        if (left instanceof LocalDate && right instanceof LocalTime) {
+            return ((LocalDate) left).atTime((LocalTime) right);
+        }
+        if (left instanceof LocalTime && right instanceof LocalDate) {
+            return ((LocalDate) right).atTime((LocalTime) left);
+        }
+        if (left instanceof LocalDate && TypeCoercion.looksLikeTimeTz(right)) {
+            return TypeCoercion.dateAtTimeTz((LocalDate) left, right);
+        }
+        if (TypeCoercion.looksLikeTimeTz(left) && right instanceof LocalDate) {
+            return TypeCoercion.dateAtTimeTz((LocalDate) right, left);
+        }
+
         // date/timestamp + interval (PG: date + interval returns timestamp)
         if (left instanceof LocalDate && right instanceof PgInterval) return ((PgInterval) right).addTo(((LocalDate) left).atStartOfDay());
         if (left instanceof LocalDateTime && right instanceof PgInterval) return ((PgInterval) right).addTo(((LocalDateTime) left));
@@ -270,6 +285,12 @@ class DateTimeArithmetic {
         if (left instanceof LocalDateTime && right instanceof PgInterval) return ((PgInterval) right).negate().addTo(((LocalDateTime) left));
         if (left instanceof OffsetDateTime && right instanceof PgInterval) return ((PgInterval) right).negate().addTo(((OffsetDateTime) left));
 
+        // A time of day taken from a date is the day before it, at that time.
+        if (left instanceof LocalDate && right instanceof LocalTime) {
+            return ((LocalDate) left).atStartOfDay().minusNanos(
+                    ((LocalTime) right).toNanoOfDay());
+        }
+
         // time - interval
         if (left instanceof LocalTime && right instanceof PgInterval) {
             PgInterval iv = (PgInterval) right;
@@ -287,6 +308,11 @@ class DateTimeArithmetic {
         if (left instanceof LocalDate && right instanceof LocalDate) {
             LocalDate rd = (LocalDate) right;
             LocalDate ld = (LocalDate) left;
+            // The answer is a count of days, and no count of days reaches an endless date — not
+            // even the count from the other one.
+            if (TypeCoercion.isDateTimeInfinity(ld) || TypeCoercion.isDateTimeInfinity(rd)) {
+                throw new MemgresException("cannot subtract infinite dates", "22008");
+            }
             return (int) ChronoUnit.DAYS.between(rd, ld);
         }
 

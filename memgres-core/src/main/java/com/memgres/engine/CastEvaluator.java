@@ -800,13 +800,16 @@ class CastEvaluator {
                             odt = odt.atZoneSameInstant(zone).toOffsetDateTime();
                         } catch (Exception ignored) {}
                     }
-                    // Format like PG: yyyy-MM-dd HH:mm:ss+ZZ
+                    // Written the way PostgreSQL writes a timestamptz: the era named where
+                    // there is one, and the displacement as far as it has anything to say.
                     String timePart = odt.getNano() != 0
                             ? stripTrailingFracZeros(odt.format(java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss.SSSSSS")))
                             : odt.format(java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss"));
-                    String offsetStr = odt.getOffset().toString();
-                    if (offsetStr.equals("Z")) offsetStr = "+00";
-                    return odt.format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd")) + " " + timePart + offsetStr;
+                    return String.format("%04d-%02d-%02d",
+                            TypeCoercion.displayYear(odt.getYear()),
+                            odt.getMonthValue(), odt.getDayOfMonth())
+                            + " " + timePart + TypeCoercion.writtenOffset(odt.getOffset())
+                            + TypeCoercion.eraSuffix(odt.getYear());
                 }
                 // Java pads a time's fraction to a multiple of three digits; PG writes only the
                 // digits the value has, so 01:02:03.99 stays two digits wide

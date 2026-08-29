@@ -623,7 +623,7 @@ class MergeAdvancedTest {
         // merge_action() outside MERGE RETURNING should error
         SQLException ex = assertThrows(SQLException.class, () ->
                 query("SELECT merge_action()"));
-        assertEquals("42P20", ex.getSQLState());
+        assertEquals("42601", ex.getSQLState());
     }
 
     @Test
@@ -1014,7 +1014,7 @@ class MergeAdvancedTest {
         });
         SQLException ex = assertThrows(SQLException.class, () ->
                 query("UPDATE t1 SET val = 99 RETURNING merge_action()"));
-        assertEquals("42P20", ex.getSQLState());
+        assertEquals("42601", ex.getSQLState());
     }
 
     @Test
@@ -1025,7 +1025,7 @@ class MergeAdvancedTest {
         });
         SQLException ex = assertThrows(SQLException.class, () ->
                 query("DELETE FROM t1 RETURNING merge_action()"));
-        assertEquals("42P20", ex.getSQLState());
+        assertEquals("42601", ex.getSQLState());
     }
 
     @Test
@@ -1033,6 +1033,6 @@ class MergeAdvancedTest {
         assertDoesNotThrow(() -> exec("CREATE TABLE t1(id int PRIMARY KEY, val int)"));
         SQLException ex = assertThrows(SQLException.class, () ->
                 query("INSERT INTO t1 VALUES (1, 10) RETURNING merge_action()"));
-        assertEquals("42P20", ex.getSQLState());
+        assertEquals("42601", ex.getSQLState());
     }
 }

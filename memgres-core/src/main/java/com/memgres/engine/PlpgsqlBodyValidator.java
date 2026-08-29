@@ -467,7 +467,7 @@ public final class PlpgsqlBodyValidator {
      * PERFORM for running a query for its effect and INTO for keeping its row; a bare SELECT is
      * neither, and running it anyway threw the rows away silently.
      */
-    private void requireDestination(PlpgsqlStatement.SqlStmt stmt) {
+    public static void requireDestination(PlpgsqlStatement.SqlStmt stmt) {
         if (stmt.intoVars() != null && !stmt.intoVars().isEmpty()) return;
         String sql = stmt.sql();
         if (sql == null) return;
@@ -588,7 +588,6 @@ public final class PlpgsqlBodyValidator {
         } else if (stmt instanceof PlpgsqlStatement.SqlStmt) {
             PlpgsqlStatement.SqlStmt sql = (PlpgsqlStatement.SqlStmt) stmt;
             checkWritable(sql.intoVars());
-            requireDestination(sql);
         } else if (stmt instanceof PlpgsqlStatement.ExecuteStmt) {
             checkWritable(((PlpgsqlStatement.ExecuteStmt) stmt).intoVars());
         } else if (stmt instanceof PlpgsqlStatement.FetchStmt) {

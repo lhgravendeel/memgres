@@ -240,6 +240,9 @@ class ExprSpecialFormParser {
     Expression parseTimestamp() {
         ep.advance(); // consume TIMESTAMP
         String tsType = "timestamp";
+        // A typed literal may carry the type's own precision: timestamp(2) '...' keeps two
+        // digits of the second, exactly as a column declared that way would.
+        String precision = parseFieldPrecision();
         if (ep.checkKeyword("WITH")) {
             ep.advance();
             if (ep.checkKeyword("TIME")) ep.advance();
@@ -253,7 +256,7 @@ class ExprSpecialFormParser {
         }
         if (ep.pos < ep.tokens.size() && ep.tokens.get(ep.pos).type() == TokenType.STRING_LITERAL) {
             String val = ep.advance().value();
-            return new CastExpr(Literal.ofString(val), tsType);
+            return new CastExpr(Literal.ofString(val), tsType + precision);
         }
         return new ColumnRef("timestamp");
     }
@@ -266,20 +269,28 @@ class ExprSpecialFormParser {
     Expression parseQualifiedTimeLiteral() {
         int saved = ep.pos;
         ep.advance(); // consume TIME
+        String precision = parseFieldPrecision();
         String type;
         if (ep.checkKeyword("WITH")) {
             type = "timetz";
+            ep.advance();
+            if (ep.checkKeyword("TIME")) ep.advance();
+            if (ep.checkKeyword("ZONE")) ep.advance();
         } else if (ep.checkKeyword("WITHOUT")) {
+            type = "time";
+            ep.advance();
+            if (ep.checkKeyword("TIME")) ep.advance();
+            if (ep.checkKeyword("ZONE")) ep.advance();
+        } else if (!precision.isEmpty()) {
+            // TIME(2) '...' with no zone spelling after it is the plain time, carrying its
+            // precision the way TIMESTAMP(2) does.
             type = "time";
         } else {
             ep.pos = saved;
             return null;
         }
-        ep.advance();
-        if (ep.checkKeyword("TIME")) ep.advance();
-        if (ep.checkKeyword("ZONE")) ep.advance();
         if (ep.pos < ep.tokens.size() && ep.tokens.get(ep.pos).type() == TokenType.STRING_LITERAL) {
-            return new CastExpr(Literal.ofString(ep.advance().value()), type);
+            return new CastExpr(Literal.ofString(ep.advance().value()), type + precision);
         }
         ep.pos = saved;
         return null;

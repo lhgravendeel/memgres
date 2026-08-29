@@ -357,14 +357,7 @@ class PgWireValueFormatter {
 
     /** Format a timezone offset like PG: +00 when minutes==0, +05:30 otherwise. */
     static String formatPgOffset(ZoneOffset offset) {
-        int totalSeconds = offset.getTotalSeconds();
-        int hours = totalSeconds / 3600;
-        int minutes = Math.abs((totalSeconds % 3600) / 60);
-        if (minutes == 0) {
-            return String.format("%+03d", hours);
-        } else {
-            return String.format("%+03d:%02d", hours, minutes);
-        }
+        return com.memgres.engine.TypeCoercion.writtenOffset(offset);
     }
 
     /**
@@ -480,6 +473,12 @@ class PgWireValueFormatter {
                 key = key + "[]";
             }
             return session.resolveOid(key);
+        }
+        // A composite is a type of its own, with a row in pg_type and an OID of its own: the
+        // client resolves the column against that row, not against text.
+        if (col != null && col.getCompositeTypeName() != null && session != null) {
+            int composite = session.resolveOid(session.typeOidKey(col.getCompositeTypeName()));
+            if (composite != 0) return composite;
         }
         // For array columns, advertise the array OID instead of scalar
         if (col != null && col.getArrayElementType() != null && col.getArrayElementType() != DataType.ENUM) {

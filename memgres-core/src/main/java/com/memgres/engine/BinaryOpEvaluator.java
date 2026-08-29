@@ -898,7 +898,18 @@ class BinaryOpEvaluator {
                 written[i] = t == null ? 0 : t.getOid();
             }
             DataType result = DataType.fromOid(BuiltinCallTypes.resultType(fn.name(), written));
-            return result == null ? null : result.getPgName();
+            if (result != null) return result.getPgName();
+            // A routine the reader wrote says what it answers with in its own declaration, which
+            // is as much part of the query as a built-in's is — and a character(n) result read as
+            // text kept the blanks the declaration padded it to.
+            PgFunction userFunc = executor.database.getFunction(
+                    FunctionEvaluator.stripSchemaPrefix(fn.name().toLowerCase(java.util.Locale.ROOT)));
+            if (userFunc != null && userFunc.getReturnType() != null
+                    && !userFunc.isSetReturning()) {
+                String declared = userFunc.getReturnType().trim();
+                if (!PolymorphicTypes.isPolymorphic(declared)) return declared;
+            }
+            return null;
         }
         if (expr instanceof ArrayExpr && !((ArrayExpr) expr).isRow) {
             // ARRAY[2.5] is a numeric[], and a call taking an int[] does not take one. Reading the
@@ -1545,6 +1556,16 @@ class BinaryOpEvaluator {
                         bin.op() == BinaryExpr.BinOp.SHIFT_LEFT,
                         operandTypeName(bin.right(), right, ctx));
             }
+        }
+
+        // One date taken from another answers with a count of days, and no count of days reaches
+        // an endless date. The same two written as timestamps do have an answer — an endless
+        // interval — so which it is turns on the declaration, not on the value.
+        if (bin.op() == BinaryExpr.BinOp.SUBTRACT
+                && (TypeCoercion.isDateTimeInfinity(left) || TypeCoercion.isDateTimeInfinity(right))
+                && isDateTypeName(declaredOperandType(bin.left(), ctx))
+                && isDateTypeName(declaredOperandType(bin.right(), ctx))) {
+            throw new MemgresException("cannot subtract infinite dates", "22008");
         }
 
         // Operator type mismatch validation (before coercion)
@@ -2826,6 +2847,11 @@ class BinaryOpEvaluator {
     }
 
     /** True when a declared type name is one of the range or multirange types. */
+    /** Whether an operand was declared to be a date, as against a timestamp of either kind. */
+    private static boolean isDateTypeName(String declared) {
+        return declared != null && declared.trim().equalsIgnoreCase("date");
+    }
+
     private static boolean isRangeTypeName(String declared) {
         if (declared == null) return false;
         String t = declared.toLowerCase().trim();

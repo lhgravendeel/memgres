@@ -1,6 +1,7 @@
 package com.memgres.engine.plpgsql;
 
 import com.memgres.engine.MemgresException;
+import com.memgres.engine.PlpgsqlConditionNames;
 import com.memgres.engine.util.Cols;
 
 import com.memgres.engine.parser.Lexer;
@@ -17,20 +18,36 @@ import java.util.List;
 public class PlpgsqlParser {
 
     private final List<Token> tokens;
+    /** The body as it was written, so a token's offset can be turned into a line number. */
+    private final String body;
+    /** The text the statement being parsed was written with, once it has collected one. */
+    private String collected;
     private int pos;
     /** Parameters of each cursor declared so far, so an OPEN can be checked against them. */
     private final java.util.Map<String, List<String>> cursorParams = new java.util.HashMap<>();
 
     public PlpgsqlParser(String body) {
-        this.tokens = new Lexer(body).tokenize();
+        this.body = body == null ? "" : body;
+        this.tokens = new Lexer(this.body).tokenize();
         this.pos = 0;
     }
 
     public static PlpgsqlStatement.Block parse(String body) {
+        return parse(body, null);
+    }
+
+    /**
+     * The same, told the name of the routine being compiled. PostgreSQL names it in the context
+     * it reports for an error found while reading the body.
+     */
+    public static PlpgsqlStatement.Block parse(String body, String routineName) {
         PlpgsqlParser parser = new PlpgsqlParser(body);
         try {
             return parser.parseBlock();
         } catch (MemgresException e) {
+            if (routineName != null && e.getPgContext() != null) {
+                e.setPgContext(e.getPgContext().replace("\"?\"", "\"" + routineName + "\""));
+            }
             throw e;
         } catch (RuntimeException e) {
             // Whatever way the parser ran off the rails, the client sent a body that does not
@@ -307,6 +324,10 @@ public class PlpgsqlParser {
 
             boolean constant = matchKw("CONSTANT");
             String typeName = readTypeName();
+            requireWritableTypeName(typeName);
+            // A declared collation says how the variable's text compares, which is settled by the
+            // collation the database runs under; naming it is accepted and changes nothing here.
+            if (matchKw("COLLATE")) readIdent();
             boolean notNull = false;
             if (matchKw("NOT")) { matchKw("NULL"); notNull = true; }
 
@@ -324,6 +345,36 @@ public class PlpgsqlParser {
         }
         return decls;
     }
+
+    /**
+     * Refuse a type name whose length or precision is not an integer at all.
+     *
+     * <p>The grammar reads the number written between the brackets as a signed 32-bit integer, so
+     * one that does not fit is not a length the type could have been given: PostgreSQL reports it
+     * where it stands rather than accepting the declaration and finding out later.
+     */
+    private void requireWritableTypeName(String typeName) {
+        if (typeName == null) return;
+        int paren = typeName.indexOf('(');
+        if (paren < 0 || !typeName.endsWith(")")) return;
+        String base = typeName.substring(0, paren).trim().toLowerCase(java.util.Locale.ROOT);
+        if (!LENGTH_TAKING_TYPES.contains(base)) return;
+        String written = typeName.substring(paren + 1, typeName.length() - 1).trim();
+        try {
+            Integer.parseInt(written);
+        } catch (NumberFormatException e) {
+            MemgresException bad = new MemgresException(
+                    "syntax error at or near \"" + written + "\"", "42601");
+            bad.setPgContext("invalid type name \"" + typeName + "\"");
+            throw bad;
+        }
+    }
+
+    /** The types whose bracketed number the grammar reads as a plain integer length. */
+    private static final java.util.Set<String> LENGTH_TAKING_TYPES =
+            new java.util.HashSet<>(java.util.Arrays.asList(
+                    "varchar", "character varying", "char", "character", "bpchar",
+                    "bit", "bit varying", "varbit"));
 
     private String readTypeName() {
         StringBuilder sb = new StringBuilder();
@@ -430,6 +481,47 @@ public class PlpgsqlParser {
     }
 
     private PlpgsqlStatement parseOneStatement() {
+        int wroteAt = peek().position();
+        // The first run of tokens this statement collects is its own expression or its own SQL;
+        // whatever the statements nested inside it collect belongs to them, so their reading is
+        // put aside and given back afterwards.
+        String outerWritten = collected;
+        collected = null;
+        PlpgsqlStatement stmt = parseOneStatementFrom();
+        // A statement's own line is the one it starts on, and a block's is the line its first
+        // statement starts on — so a statement already stamped from the inside keeps its stamp.
+        if (stmt != null) {
+            if (stmt.line() == 0) stmt.atLine(lineOf(wroteAt));
+            if (stmt.writtenAs() == null) stmt.writtenAs(collected);
+        }
+        collected = outerWritten;
+        return stmt;
+    }
+
+    /**
+     * Record the body text a run of tokens was written as, if this statement has not recorded one
+     * already. The token the collector stopped on bounds the run, so the text is exactly what
+     * stands between the two in the body.
+     */
+    private void recordCollected(int fromToken) {
+        if (collected != null || fromToken >= pos || fromToken >= tokens.size()) return;
+        int start = tokens.get(fromToken).position();
+        int end = pos < tokens.size() ? tokens.get(pos).position() : body.length();
+        if (start < 0 || end > body.length() || start >= end) return;
+        collected = body.substring(start, end).trim();
+    }
+
+    /** The line of the body a character offset falls on, counting the first line as one. */
+    private int lineOf(int offset) {
+        int line = 1;
+        int end = Math.min(offset, body.length());
+        for (int i = 0; i < end; i++) {
+            if (body.charAt(i) == '\n') line++;
+        }
+        return line;
+    }
+
+    private PlpgsqlStatement parseOneStatementFrom() {
         Token t = peek();
 
         // Label: <<label>>, can be SHIFT_LEFT token or two LESS_THAN tokens
@@ -725,7 +817,12 @@ public class PlpgsqlParser {
             if (isLabelToken(peek())) label = readIdent();
         }
         if (matchKw("WHEN")) {
+            // WHEN says a condition follows; nothing following it is not a condition that is
+            // always false, it is a condition the writer left out.
             whenCond = collectUntilSemicolon();
+            if (whenCond.isEmpty()) {
+                throw new MemgresException("missing expression at or near \";\"", "42601");
+            }
         }
         match(TokenType.SEMICOLON);
         return new PlpgsqlStatement.ExitStmt(label, whenCond);
@@ -739,7 +836,12 @@ public class PlpgsqlParser {
             if (isLabelToken(peek())) label = readIdent();
         }
         if (matchKw("WHEN")) {
+            // WHEN says a condition follows; nothing following it is not a condition that is
+            // always false, it is a condition the writer left out.
             whenCond = collectUntilSemicolon();
+            if (whenCond.isEmpty()) {
+                throw new MemgresException("missing expression at or near \";\"", "42601");
+            }
         }
         match(TokenType.SEMICOLON);
         return new PlpgsqlStatement.ContinueStmt(label, whenCond);
@@ -1138,10 +1240,31 @@ public class PlpgsqlParser {
             match(TokenType.RIGHT_PAREN);
         }
         String sql = null;
-        if (matchKw("FOR")) sql = collectUntilSemicolon();
+        boolean dynamic = false;
+        List<String> usingExprs = new ArrayList<>();
+        if (matchKw("FOR")) {
+            // OPEN c FOR EXECUTE names the query with an expression, so what stands in the body
+            // is the expression and not the query. Collected as SQL it became an EXECUTE
+            // statement, which is the command that runs a prepared statement by name.
+            if (matchKw("EXECUTE")) {
+                dynamic = true;
+                sql = collectUntilMulti("USING", ";");
+                if (matchKw("USING")) {
+                    do {
+                        usingExprs.add(collectUntilMulti(",", ";"));
+                    } while (match(TokenType.COMMA));
+                }
+            } else {
+                sql = collectUntilSemicolon();
+            }
+        }
         match(TokenType.SEMICOLON);
         checkCursorArgs(cursorName, argNames);
-        return new PlpgsqlStatement.OpenCursorStmt(cursorName, sql, argExprs, argNames);
+        PlpgsqlStatement.OpenCursorStmt open =
+                new PlpgsqlStatement.OpenCursorStmt(cursorName, sql, argExprs, argNames);
+        open.dynamic = dynamic;
+        open.usingExprs = usingExprs;
+        return open;
     }
 
     /**
@@ -1388,12 +1511,24 @@ public class PlpgsqlParser {
     }
 
     private String readConditionName() {
+        int at = peek().position();
         StringBuilder sb = new StringBuilder();
         sb.append(readIdent());
         if (sb.toString().equalsIgnoreCase("SQLSTATE") && check(TokenType.STRING_LITERAL)) {
             sb.append(" ").append(advance().value());
+            return sb.toString();
         }
-        return sb.toString();
+        // A handler names conditions the server knows, and a name it does not know catches
+        // nothing. PostgreSQL refuses the body rather than compiling a handler that can never run.
+        String named = sb.toString();
+        if (!named.equalsIgnoreCase("OTHERS") && !PlpgsqlConditionNames.isKnown(named)) {
+            MemgresException unknown = new MemgresException(
+                    "unrecognized exception condition \"" + named.toLowerCase(java.util.Locale.ROOT)
+                            + "\"", "42704");
+            unknown.setPgContext("compilation of PL/pgSQL function \"?\" near line " + lineOf(at));
+            throw unknown;
+        }
+        return named;
     }
 
     // ---- Token collecting helpers ----
@@ -1467,6 +1602,7 @@ public class PlpgsqlParser {
     }
 
     private CollectedSql collectSqlUntilSemicolon() {
+        int collectedFrom = pos;
         StringBuilder sb = new StringBuilder();
         List<int[]> intos = new ArrayList<>();
         List<Integer> froms = new ArrayList<>();
@@ -1493,10 +1629,12 @@ public class PlpgsqlParser {
             }
             advance();
         }
+        recordCollected(collectedFrom);
         return new CollectedSql(sb.toString(), intos, froms, lastSelect, returning);
     }
 
     private String collectUntilKeyword(String keyword) {
+        int collectedFrom = pos;
         StringBuilder sb = new StringBuilder();
         int depth = 0;
         while (!isAtEnd()) {
@@ -1507,6 +1645,7 @@ public class PlpgsqlParser {
             appendToken(sb, t);
             advance();
         }
+        recordCollected(collectedFrom);
         return sb.toString().trim();
     }
 
@@ -1516,15 +1655,22 @@ public class PlpgsqlParser {
      * {@code coalesce(a,b)} belongs to the call, so brackets nest the same way parentheses do.
      */
     private String collectUntilMulti(String... terminators) {
+        int collectedFrom = pos;
         StringBuilder sb = new StringBuilder();
         int depth = 0;
         while (!isAtEnd()) {
             Token t = peek();
             if (depth == 0) {
+                boolean stop = false;
                 for (String term : terminators) {
-                    if (term.equals(";") && t.type() == TokenType.SEMICOLON) return sb.toString().trim();
-                    if (term.equals(",") && t.type() == TokenType.COMMA) return sb.toString().trim();
-                    if (t.type() == TokenType.KEYWORD && t.value().equalsIgnoreCase(term)) return sb.toString().trim();
+                    if (term.equals(";") && t.type() == TokenType.SEMICOLON) stop = true;
+                    else if (term.equals(",") && t.type() == TokenType.COMMA) stop = true;
+                    else if (t.type() == TokenType.KEYWORD && t.value().equalsIgnoreCase(term)) stop = true;
+                    if (stop) break;
+                }
+                if (stop) {
+                    recordCollected(collectedFrom);
+                    return sb.toString().trim();
                 }
             }
             if (t.type() == TokenType.LEFT_PAREN || t.type() == TokenType.LEFT_BRACKET) depth++;
@@ -1532,10 +1678,12 @@ public class PlpgsqlParser {
             appendToken(sb, t);
             advance();
         }
+        recordCollected(collectedFrom);
         return sb.toString().trim();
     }
 
     private String collectUntilDotDot() {
+        int collectedFrom = pos;
         StringBuilder sb = new StringBuilder();
         while (!isAtEnd()) {
             Token t = peek();
@@ -1544,6 +1692,7 @@ public class PlpgsqlParser {
             appendToken(sb, t);
             advance();
         }
+        recordCollected(collectedFrom);
         return sb.toString().trim();
     }
 
@@ -1556,6 +1705,10 @@ public class PlpgsqlParser {
             sb.append("'").append(t.value().replace("'", "''")).append("'");
         } else if (t.type() == TokenType.BIT_STRING_LITERAL) {
             sb.append("B'").append(t.value()).append("'");
+        } else if (t.type() == TokenType.QUOTED_IDENTIFIER) {
+            // The quotes are what make the name one name; written back without them a name with
+            // a space in it became two names.
+            sb.append('"').append(t.value().replace("\"", "\"\"")).append('"');
         } else {
             sb.append(t.value());
         }

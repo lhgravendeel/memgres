@@ -1241,9 +1241,42 @@ public final class TypeCoercion {
         return null;
     }
 
+    /**
+     * {@code "infinity"} or {@code "-infinity"} for a value that is one of the sentinels, whether
+     * it is being carried as one or is still spelled out. A date literal reaches the arithmetic
+     * as the word it was written with, so the places that have already settled that they are
+     * looking at a date or a timestamp read it here rather than each spelling it out again.
+     */
+    public static String datetimeInfinityText(Object val) {
+        String held = infinityText(val);
+        if (held != null) return held;
+        if (val instanceof CharSequence) {
+            String text = val.toString().trim().toLowerCase(java.util.Locale.ROOT);
+            if (text.equals("infinity") || text.equals("+infinity")) return "infinity";
+            if (text.equals("-infinity")) return "-infinity";
+        }
+        return null;
+    }
+
+    /**
+     * A string with the blanks a character(n) is written out with taken off the end. The padding
+     * is how the type is written, not part of the value: a character(n) is as long as what was
+     * put in it and compares as that.
+     */
+    public static String trimTrailingBlanks(String s) {
+        int end = s.length();
+        while (end > 0 && s.charAt(end - 1) == ' ') end--;
+        return end == s.length() ? s : s.substring(0, end);
+    }
+
     /** Whether this value is one of the date/time infinities. */
     public static boolean isDateTimeInfinity(Object val) {
-        return infinityText(val) != null;
+        return datetimeInfinityText(val) != null;
+    }
+
+    /** Whether this value is the date/time infinity that lies ahead of every instant. */
+    public static boolean isPositiveDateTimeInfinity(Object val) {
+        return "infinity".equals(datetimeInfinityText(val));
     }
 
     public static String eraSuffix(int prolepticYear) {
@@ -1527,6 +1560,16 @@ public final class TypeCoercion {
     }
 
     /**
+     * A local time read in a zone the way PostgreSQL reads it. A clock reading that came round
+     * twice — the hour a zone puts back — is the second of the two, standard time rather than
+     * summer time, where Java would answer with the first.
+     */
+    public static java.time.ZonedDateTime atZoneAsPostgres(java.time.LocalDateTime local,
+                                                           ZoneId zone) {
+        return local.atZone(zone).withLaterOffsetAtOverlap();
+    }
+
+    /**
      * The instant the current statement reads as "now", published by {@link AstExecutor#execute}.
      * PostgreSQL answers every current date/time from one timestamp, so 'now' and LOCALTIMESTAMP
      * in the same statement cannot land microseconds apart.
@@ -1556,7 +1599,7 @@ public final class TypeCoercion {
 
     // Three numeric fields separated by a single '/' or '-' (same separator), e.g. 01/02/2026.
     private static final java.util.regex.Pattern NUMERIC_DATE =
-            java.util.regex.Pattern.compile("^(\\d{1,4})([-/])(\\d{1,2})\\2(\\d{1,4})$");
+            java.util.regex.Pattern.compile("^(\\d{1,4})([-/.])(\\d{1,2})\\2(\\d{1,4})$");
 
     /**
      * H37: interpret a 3-field slash/dash numeric date according to the DateStyle field
@@ -1565,6 +1608,17 @@ public final class TypeCoercion {
      * A 4-digit leading field always means year-first (YMD), matching PG.
      */
     private static LocalDate tryOrderedNumericDate(String s, String order) {
+        int[] fields = orderedNumericFields(s, order);
+        if (fields == null || fields[0] == 0) return null;
+        try {
+            return LocalDate.of(fields[0], fields[1], fields[2]);
+        } catch (java.time.DateTimeException e) {
+            return null;
+        }
+    }
+
+    /** The year, month and day a three-number date names, in the order the DateStyle reads them. */
+    private static int[] orderedNumericFields(String s, String order) {
         java.util.regex.Matcher m = NUMERIC_DATE.matcher(s);
         if (!m.matches()) return null;
         int f1 = Integer.parseInt(m.group(1));
@@ -1579,13 +1633,22 @@ public final class TypeCoercion {
         } else { // MDY
             month = f1; day = f2; year = f3; yearLen = m.group(4).length();
         }
-        year = normalizeTwoDigitYear(year, yearLen);
-        if (year == 0) return null;
-        try {
-            return LocalDate.of(year, month, day);
-        } catch (java.time.DateTimeException e) {
-            return null;
+        return new int[]{normalizeTwoDigitYear(year, yearLen), month, day};
+    }
+
+    /**
+     * The complaint for a three-number date that would not read. A month outside its own range is
+     * the mistake PostgreSQL suspects of being a date written in another field order, and it is
+     * the only one it offers the DateStyle advice for; a day that does not exist in the month it
+     * names is refused with the message alone.
+     */
+    private static MemgresException numericDateFault(String s, String written, String order) {
+        int[] fields = orderedNumericFields(s, order);
+        if (fields != null && fields[1] >= 1 && fields[1] <= 12 && fields[0] != 0) {
+            return fieldOutOfRange(written);
         }
+        return new MemgresException("date/time field value out of range: \"" + written + "\""
+                + "\n  Hint: Perhaps you need a different \"DateStyle\" setting.", "22008");
     }
 
     /** PG two-digit year rule: 00-69 -> 2000-2069, 70-99 -> 1970-1999. */
@@ -1610,6 +1673,13 @@ public final class TypeCoercion {
             DateTimeFormatter.ofPattern("yyyy-MMM-dd", java.util.Locale.ENGLISH),    // 1999-Jan-08
             DateTimeFormatter.ofPattern("dd-MMM-yyyy", java.util.Locale.ENGLISH),    // 08-Jan-1999
             DateTimeFormatter.ofPattern("MMM dd yyyy", java.util.Locale.ENGLISH),    // Jan 08 1999
+            DateTimeFormatter.ofPattern("d MMM yyyy", java.util.Locale.ENGLISH),     // 8 Jan 1999
+            DateTimeFormatter.ofPattern("MMM d yyyy", java.util.Locale.ENGLISH),     // Jan 8 1999
+            DateTimeFormatter.ofPattern("d MMMM yyyy", java.util.Locale.ENGLISH),    // 8 January 1999
+            DateTimeFormatter.ofPattern("MMMM d yyyy", java.util.Locale.ENGLISH),    // January 8 1999
+            DateTimeFormatter.ofPattern("yyyy MMM d", java.util.Locale.ENGLISH),     // 1999 Jan 8
+            DateTimeFormatter.ofPattern("d-MMM-yyyy", java.util.Locale.ENGLISH),     // 8-Jan-1999
+            DateTimeFormatter.ofPattern("yyyy-MMM-d", java.util.Locale.ENGLISH),     // 1999-Jan-8
     };
 
     // Julian Day Number epoch: November 24, 4714 BC in proleptic Gregorian = JD 0
@@ -1769,12 +1839,12 @@ public final class TypeCoercion {
                 return LocalDate.parse(s, DateTimeFormatter.BASIC_ISO_DATE);
             } catch (DateTimeParseException e) { /* fall through */ }
         }
-        // H37: apply DateStyle field order (DMY/YMD) to ambiguous numeric date input.
-        // For the default MDY order we defer to DATE_FORMATS below to preserve existing behavior.
-        String dateOrder = DATE_ORDER.get();
-        if (dateOrder != null && !"MDY".equals(dateOrder)) {
-            LocalDate ordered = tryOrderedNumericDate(s, dateOrder);
-            if (ordered != null) return ordered;
+        // A date written as three numbers is read in the order the DateStyle puts them in,
+        // whichever of the separators stands between them.
+        LocalDate ordered = tryOrderedNumericDate(s, DATE_ORDER.get());
+        if (ordered != null) return ordered;
+        if (NUMERIC_DATE.matcher(s).matches()) {
+            throw numericDateFault(s, String.valueOf(val), DATE_ORDER.get());
         }
         for (DateTimeFormatter fmt : DATE_FORMATS) {
             try {
@@ -1793,17 +1863,26 @@ public final class TypeCoercion {
         // Try parsing as timestamp then extracting date
         try { return LocalDateTime.parse(s).toLocalDate(); } catch (Exception e) { /* ignore */ }
         try { return OffsetDateTime.parse(s).toLocalDate(); } catch (Exception e) { /* ignore */ }
-        // Strip trailing timezone offset (e.g. "2024-06-15 +02" from JDBC driver) because PG ignores TZ for date type
-        if (s.length() > 10 && s.matches("\\d{4}-\\d{2}-\\d{2}[\\s+].*")) {
-            String datePart = s.substring(0, 10);
+        // A date may carry a time and a zone behind it, which the type then drops. What follows
+        // the date has to be a time or a zone though: text that is neither — the word "garbage"
+        // where the zone should be — was never a date being written with more than it needed.
+        java.util.regex.Matcher trailing = DATE_THEN_MORE.matcher(s);
+        if (trailing.matches()) {
+            String after = trailing.group(2) != null ? trailing.group(2) : trailing.group(3);
+            if (!isTimeAndZoneTail(after)) {
+                throw new MemgresException(
+                        "invalid input syntax for type date: \"" + val + "\"", "22007");
+            }
             for (DateTimeFormatter fmt : DATE_FORMATS) {
-                try { return LocalDate.parse(datePart, fmt); } catch (DateTimeParseException e) { /* try next */ }
+                try {
+                    return LocalDate.parse(trailing.group(1), fmt);
+                } catch (DateTimeParseException e) { /* try next */ }
             }
         }
         // A date that is written correctly but names a day that does not exist has a field out of
         // range (2023-02-29); text that is not a date at all never had a field to overflow, so PG
         // reports it as input syntax instead.
-        if (s.matches("\\d{4}-\\d{2}-\\d{2}.*")) {
+        if (s.matches("\\d{4}-\\d{2}-\\d{2}") || trailing.matches()) {
             throw new MemgresException(
                     "date/time field value out of range: \"" + val + "\"", "22008");
         }
@@ -1824,6 +1903,41 @@ public final class TypeCoercion {
             }
         }
         throw new MemgresException("invalid input syntax for type date: \"" + val + "\"", "22007");
+    }
+
+    /** An ISO date with something written after it, split into the two. */
+    private static final java.util.regex.Pattern DATE_THEN_MORE =
+            java.util.regex.Pattern.compile("(\\d{4}-\\d{2}-\\d{2})(?:[T ](.*)|(\\+.*))");
+
+    /** The time part a date may be written with, and the displacement a time may be written with. */
+    private static final java.util.regex.Pattern TIME_TAIL =
+            java.util.regex.Pattern.compile("\\d{1,2}(:\\d{1,2}(:\\d{1,2}(\\.\\d+)?)?)?");
+    private static final java.util.regex.Pattern OFFSET_TAIL =
+            java.util.regex.Pattern.compile("[+-]\\d{1,2}(:?\\d{2}(:?\\d{2})?)?");
+
+    /** Whether what follows a date is a time, a zone, both, or nothing at all. */
+    private static boolean isTimeAndZoneTail(String tail) {
+        String rest = tail.trim();
+        if (rest.isEmpty()) return true;
+        java.util.regex.Matcher time = TIME_TAIL.matcher(rest);
+        if (time.lookingAt()) rest = rest.substring(time.end()).trim();
+        if (rest.isEmpty()) return true;
+        java.util.regex.Matcher offset = OFFSET_TAIL.matcher(rest);
+        if (offset.lookingAt()) {
+            rest = rest.substring(offset.end()).trim();
+            return rest.isEmpty();
+        }
+        int word = 0;
+        while (word < rest.length() && !Character.isWhitespace(rest.charAt(word))) word++;
+        String named = rest.substring(0, word);
+        if (rest.substring(word).trim().length() != 0) return false;
+        if (PgTimeZones.offsetOf(named) != null) return true;
+        try {
+            PgTimeZones.zoneFor(named);
+            return true;
+        } catch (RuntimeException e) {
+            return false;
+        }
     }
 
     /** A date whose year runs to five digits or more, which the ISO parsers will not read. */
@@ -1889,8 +2003,11 @@ public final class TypeCoercion {
         int hour = m.group(4) == null ? 0 : Integer.parseInt(m.group(4));
         int minute = m.group(5) == null ? 0 : Integer.parseInt(m.group(5));
         int second = m.group(6) == null ? 0 : Integer.parseInt(m.group(6));
+        // A timestamp is held to the microsecond, so a finer fraction is rounded to one rather
+        // than having its last digits dropped.
         long nanos = m.group(7) == null ? 0
-                : new java.math.BigDecimal(m.group(7)).movePointRight(9).longValue();
+                : new java.math.BigDecimal(m.group(7)).movePointRight(6)
+                        .setScale(0, java.math.RoundingMode.HALF_EVEN).longValue() * 1000L;
         if (year > maxYear) throw outOfRange(outOfRangeNoun, original);
         // A month outside 1..12 and a day outside 1..31 are the two mistakes PostgreSQL suspects
         // of being a date written in another field order, and they are the only ones it offers the
@@ -1975,6 +2092,56 @@ public final class TypeCoercion {
     private static final java.util.regex.Pattern CLOCK_LITERAL =
             java.util.regex.Pattern.compile("^(\\d{1,2}):(\\d{1,2})(?::(\\d{1,2})(?:\\.(\\d*))?)?$");
 
+    /** A clock written with no separators at all: HHMM, or HHMMSS with a fraction after it. */
+    private static final java.util.regex.Pattern COMPACT_CLOCK =
+            java.util.regex.Pattern.compile("(\\d{2})(\\d{2})(?:(\\d{2})(?:\\.(\\d*))?)?");
+
+    /** A clock with a word written after it, where a zone would go. */
+    private static final java.util.regex.Pattern CLOCK_THEN_WORD =
+            java.util.regex.Pattern.compile(
+                    "\\d{1,2}:\\d{1,2}(?::\\d{1,2}(?:\\.\\d*)?)?\\s+([A-Za-z][A-Za-z.]*)");
+
+    /** A clock followed by the half of the day it belongs to. */
+    private static final java.util.regex.Pattern MERIDIEM_CLOCK =
+            java.util.regex.Pattern.compile("(.*?)\\s*([ap])m",
+                    java.util.regex.Pattern.CASE_INSENSITIVE);
+
+    /**
+     * A time written without separators, or written against the twelve-hour clock, or both.
+     * Answers null for anything else, which the readers below then take in turn.
+     */
+    private static LocalTime compactOrMeridiemTime(String s) {
+        java.util.regex.Matcher meridiem = MERIDIEM_CLOCK.matcher(s);
+        if (meridiem.matches()) {
+            LocalTime clock = compactOrMeridiemTime(meridiem.group(1).trim());
+            if (clock == null) clock = clockLiteral(meridiem.group(1).trim());
+            if (clock == null) return null;
+            int hour = clock.getHour();
+            if (hour > 12) {
+                throw new MemgresException("date/time field value out of range: \"" + s + "\"",
+                        "22008");
+            }
+            boolean afternoon = Character.toLowerCase(meridiem.group(2).charAt(0)) == 'p';
+            if (afternoon && hour < 12) clock = clock.plusHours(12);
+            if (!afternoon && hour == 12) clock = clock.minusHours(12);
+            return clock;
+        }
+        java.util.regex.Matcher compact = COMPACT_CLOCK.matcher(s);
+        if (!compact.matches()) return null;
+        int nanos = 0;
+        if (compact.group(4) != null && !compact.group(4).isEmpty()) {
+            String digits = (compact.group(4) + "000000000").substring(0, 9);
+            nanos = Integer.parseInt(digits);
+        }
+        try {
+            return roundedToMicros(LocalTime.of(Integer.parseInt(compact.group(1)),
+                    Integer.parseInt(compact.group(2)),
+                    compact.group(3) == null ? 0 : Integer.parseInt(compact.group(3)), nanos));
+        } catch (RuntimeException e) {
+            throw new MemgresException("date/time field value out of range: \"" + s + "\"", "22008");
+        }
+    }
+
     public static LocalTime toLocalTime(Object val) {
         if (val instanceof LocalTime) return ((LocalTime) val);
         if (val instanceof LocalDateTime) return ((LocalDateTime) val).toLocalTime();
@@ -1986,6 +2153,8 @@ public final class TypeCoercion {
         // 24:00:00 is the end of the day, and the only hour-24 time the type takes: 24:00:00.000001
         // is out of range. java.time stops a nanosecond short of it, so it is held as that.
         if (s.matches("24:00(:00(\\.0+)?)?")) return TIME_END_OF_DAY;
+        LocalTime spelled = compactOrMeridiemTime(s);
+        if (spelled != null) return spelled;
         try { return roundedToMicros(LocalTime.parse(s)); } catch (DateTimeParseException e) {
             // A field written with one digit names the same time as one written with two, and the
             // seconds may be left off: PostgreSQL reads '3:4' as three minutes past three. The
@@ -2027,6 +2196,14 @@ public final class TypeCoercion {
             // no time at all gets PG's 22007 wording, which names the type it would not read as.
             // A clock whose fields are written one digit wide is well formatted too, so a field
             // out of range in one is reported as out of range rather than as a spelling mistake.
+            // What follows a clock is a zone, so a word there that names no zone is reported
+            // as the zone it is not rather than as a time that will not read.
+            java.util.regex.Matcher tail = CLOCK_THEN_WORD.matcher(s);
+            if (tail.matches() && PgTimeZones.offsetOf(tail.group(1)) == null) {
+                throw new MemgresException("time zone \""
+                        + tail.group(1).toLowerCase(java.util.Locale.ROOT)
+                        + "\" not recognized", "22023");
+            }
             if (!s.matches("\\d{1,2}:\\d{2}(:\\d{2})?.*") && !s.matches(CLOCK_LITERAL.pattern())) {
                 throw new MemgresException(
                         "invalid input syntax for type time: \"" + val + "\"", "22007");
@@ -2045,6 +2222,7 @@ public final class TypeCoercion {
             // already formatted timetz string; pass through
         }
         String s = val.toString().trim();
+        requireDisplacementInRange(s, val.toString());
 
         // Handle UTC+N / UTC-N format: preserve time as-is, flip the sign for display
         java.util.regex.Matcher utcMatch = java.util.regex.Pattern
@@ -2099,14 +2277,19 @@ public final class TypeCoercion {
         }
 
         // The end of the day is a timetz as much as it is a time.
-        if (s.matches("24:00(:00(\\.0+)?)?")) return "24:00:00+00";
+        if (s.matches("24:00(:00(\\.0+)?)?")) {
+            return "24:00:00" + writtenOffset(offsetOfZoneNow(sessionZone()));
+        }
 
-        // Plain time without offset, default to +00 (UTC)
+        // A clock with no displacement written after it is a reading in the session's zone, and
+        // takes that zone's displacement — not Greenwich's.
+        LocalTime spelled = compactOrMeridiemTime(s);
+        if (spelled != null) {
+            return pgTimeText(spelled) + writtenOffset(offsetOfZoneNow(sessionZone()));
+        }
         try {
             LocalTime lt = LocalTime.parse(s);
-            String timePart = lt.toString();
-            if (timePart.length() == 5) timePart += ":00";
-            return timePart + "+00";
+            return pgTimeText(lt) + writtenOffset(offsetOfZoneNow(sessionZone()));
         } catch (DateTimeParseException e) { /* fall through */ }
 
         // A clock written with one-digit fields, or with the seconds left off, names the same
@@ -2126,6 +2309,23 @@ public final class TypeCoercion {
         throw new MemgresException("date/time field value out of range: \"" + val + "\"", errCode);
     }
 
+    /**
+     * A displacement written the way PostgreSQL writes one: the hours always, the minutes when
+     * there are any, and the seconds when there are any of those — which the zones that were
+     * never a whole number of minutes from Greenwich still have.
+     */
+    public static String writtenOffset(ZoneOffset offset) {
+        int total = offset.getTotalSeconds();
+        int abs = Math.abs(total);
+        StringBuilder sb = new StringBuilder(total < 0 ? "-" : "+");
+        sb.append(String.format("%02d", abs / 3600));
+        int minutes = (abs % 3600) / 60;
+        int seconds = abs % 60;
+        if (minutes != 0 || seconds != 0) sb.append(String.format(":%02d", minutes));
+        if (seconds != 0) sb.append(String.format(":%02d", seconds));
+        return sb.toString();
+    }
+
     /** A clock reading in any of its spellings, with the offset a timetz may carry written after it. */
     private static final java.util.regex.Pattern LOOSE_TIMETZ =
             java.util.regex.Pattern.compile(
@@ -2141,6 +2341,14 @@ public final class TypeCoercion {
      * moved, only written against a different offset. A plain time carries no offset of its own,
      * so it takes the session's first, which is how PG reads {@code time AT TIME ZONE}.
      */
+    /**
+     * A date and a time written against a displacement, put together into the instant they name.
+     */
+    public static OffsetDateTime dateAtTimeTz(LocalDate day, Object timeTz) {
+        java.time.OffsetTime written = parseTimeTzText(toTimeTz(timeTz));
+        return day.atTime(written.toLocalTime()).atOffset(written.getOffset());
+    }
+
     public static String shiftTimeTzToZone(Object val, ZoneId zone) {
         java.time.OffsetTime source = val instanceof LocalTime
                 ? ((LocalTime) val).atOffset(offsetOfZoneNow(sessionZone()))
@@ -2296,7 +2504,11 @@ public final class TypeCoercion {
      */
     public static LocalTime roundedToMicros(LocalTime time) {
         long nanos = time.toNanoOfDay();
-        long micros = (nanos + 500L) / 1000L;
+        // Held to the microsecond, and a fraction exactly halfway between two of them goes to
+        // the even one — which is what makes .0000005 nothing and .0000015 two.
+        long micros = Math.round((double) nanos / 1000.0);
+        long left = nanos % 1000L;
+        if (left == 500L) micros = (nanos / 1000L) + ((nanos / 1000L) % 2L);
         return micros >= 86_400_000_000L ? TIME_END_OF_DAY : LocalTime.ofNanoOfDay(micros * 1000L);
     }
 
@@ -2444,10 +2656,68 @@ public final class TypeCoercion {
                         "date/time field value out of range: \"" + val + "\"", "22008");
             }
         }
+        // A calendar date and a clock, both written without separators and joined by a T.
+        java.util.regex.Matcher compact = COMPACT_TIMESTAMP.matcher(val.toString().trim());
+        if (compact.matches()) {
+            try {
+                return LocalDateTime.of(
+                        LocalDate.parse(compact.group(1), DateTimeFormatter.BASIC_ISO_DATE),
+                        toLocalTime(compact.group(2)));
+            } catch (RuntimeException e) {
+                throw new MemgresException(
+                        "date/time field value out of range: \"" + val + "\"", "22008");
+            }
+        }
+        // A month written by name, with the year standing after the clock rather than before it.
+        java.util.regex.Matcher trailingYear =
+                MONTH_NAME_TRAILING_YEAR.matcher(val.toString().trim());
+        if (trailingYear.matches()) {
+            try {
+                return LocalDateTime.of(
+                        toLocalDate(trailingYear.group(1) + " " + trailingYear.group(3)),
+                        toLocalTime(trailingYear.group(2)));
+            } catch (MemgresException e) { /* fall through to the error below */ }
+        }
         // Use 22008 for well-formatted but out-of-range timestamps
         String errCode = val.toString().trim().matches("\\d{4}-\\d{2}-\\d{2}.*") ? "22008" : "22007";
         throw new MemgresException("invalid input syntax for type timestamp: \"" + val + "\"", errCode);
     }
+
+    /**
+     * The displacement written at the end of a literal, if it carries one. A literal ending in a
+     * bare number is not one of these: {@code '2001-01-01-05'} is a date, not a date at −05.
+     */
+    private static final java.util.regex.Pattern WRITTEN_DISPLACEMENT =
+            java.util.regex.Pattern.compile(".*\\d:\\d{2}(?::\\d{2})?(?:\\.\\d+)?\\s*"
+                    + "([+-])(\\d{1,2})(?::?(\\d{2})(?::?(\\d{2}))?)?");
+
+    /**
+     * A zone is at most sixteen hours from Greenwich, exclusive, and its minutes are minutes.
+     * PostgreSQL reports a displacement outside that as one, rather than reading the literal as
+     * text that is not a timestamp.
+     */
+    private static void requireDisplacementInRange(String s, String written) {
+        java.util.regex.Matcher m = WRITTEN_DISPLACEMENT.matcher(s);
+        if (!m.matches()) return;
+        int hours = Integer.parseInt(m.group(2));
+        int minutes = m.group(3) == null ? 0 : Integer.parseInt(m.group(3));
+        int seconds = m.group(4) == null ? 0 : Integer.parseInt(m.group(4));
+        if (hours > 15 || minutes > 59 || seconds > 59
+                || (hours == 15 && minutes == 59 && seconds == 60)) {
+            throw new MemgresException(
+                    "time zone displacement out of range: \"" + written + "\"", "22009");
+        }
+    }
+
+    /** A date and a clock written with no separators inside either of them. */
+    private static final java.util.regex.Pattern COMPACT_TIMESTAMP =
+            java.util.regex.Pattern.compile("(\\d{8})[T ](\\d{4}(?:\\d{2}(?:\\.\\d*)?)?)");
+
+    /** A named-month date with the clock between the day and the year: Jun 15 12:00:00 2020. */
+    private static final java.util.regex.Pattern MONTH_NAME_TRAILING_YEAR =
+            java.util.regex.Pattern.compile(
+                    "([A-Za-z]{3,9}\\s+\\d{1,2})\\s+(\\d{1,2}:\\d{1,2}(?::\\d{1,2}(?:\\.\\d*)?)?)"
+                            + "\\s+(\\d{1,6})");
 
     /** Parse a value as timestamptz, interpreting any zoneless literal in the JVM's default zone. */
     public static OffsetDateTime toOffsetDateTime(Object val) {
@@ -2464,6 +2734,7 @@ public final class TypeCoercion {
         if (val instanceof LocalDateTime) return ((LocalDateTime) val).atZone(zone).toOffsetDateTime();
         if (val instanceof LocalDate) return ((LocalDate) val).atStartOfDay(zone).toOffsetDateTime();
         String s = val.toString().trim();
+        requireDisplacementInRange(s, val.toString());
         // A zoneless literal is a wall clock reading east or west of UTC, so its own year may run
         // one past the type's last: what has to fit is the moment it names, which is why
         // '294277-01-01 00:00:00' is a timestamptz at +01 and not at +00.
@@ -3342,6 +3613,14 @@ public final class TypeCoercion {
         if (value instanceof java.sql.Timestamp) {
             java.sql.Timestamp ts = (java.sql.Timestamp) value;
             return java.sql.Timestamp.valueOf(roundDateTime(ts.toLocalDateTime(), unit));
+        }
+        if (value instanceof String) {
+            // A timetz is carried as the text it prints as, so it is rounded by reading the
+            // clock out of that text and writing it back with the same displacement.
+            if (looksLikeTimeTz(value)) {
+                java.time.OffsetTime written = parseTimeTzText(toTimeTz(value));
+                return formatTimeTz(written.with(roundNanoOfDay(written.toLocalTime(), unit)));
+            }
         }
         return value;
     }

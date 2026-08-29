@@ -453,8 +453,12 @@ public class PlpgsqlExecutor {
             if (isSetof) {
                 scope.declare("__return_setof_type__", returnType.substring("SETOF".length()).trim());
             }
-            // Store out param names for RETURN NEXT with no expression
-            if (isTable && !outParams.isEmpty()) {
+            List<String[]> shape = declaredResultColumns(returnType, outParams);
+            if (shape != null) scope.declare("__return_expected_columns__", shape);
+            // Store out param names for RETURN NEXT with no expression. A set of records named
+            // by OUT parameters is described by them exactly as a RETURNS TABLE is, so a bare
+            // RETURN NEXT takes its row from them either way.
+            if (!outParams.isEmpty()) {
                 List<String> outNames = new ArrayList<>();
                 for (PgFunction.Param p : outParams) {
                     outNames.add(p.name() != null ? p.name().toLowerCase() : ("$" + (params.indexOf(p) + 1)));
@@ -476,7 +480,7 @@ public class PlpgsqlExecutor {
             if (outParams.isEmpty()) {
                 checkReturnedRecord(rs.value, returnType);
                 checkTriggerReturnIsRow(rs.value, returnType);
-                return voidReturning ? VOID_VALUE : rs.value;
+                return voidReturning ? VOID_VALUE : castReturnedValue(rs.value, returnType);
             }
         }
 
@@ -507,6 +511,47 @@ public class PlpgsqlExecutor {
         }
         return voidReturning ? VOID_VALUE : null;
     }
+
+    /**
+     * The returned value read as the type the routine was declared to return.
+     *
+     * <p>A routine's declaration is a promise about what comes out of it, so PostgreSQL casts
+     * the value on the way out rather than handing the caller whatever the expression happened
+     * to be: RETURN 4.7 from a routine returning integer is 5, and RETURN 'notanint' is the
+     * input error that text is, reported against the cast rather than against the RETURN.
+     */
+    private Object castReturnedValue(Object value, String returnType) {
+        if (value == null || returnType == null) return value;
+        String declared = returnType.trim();
+        if (declared.isEmpty() || !CASTABLE_RETURN.matcher(declared).matches()) return value;
+        String base = declared.replaceAll("\\(.*\\)", "").replace("[]", "").trim();
+        if (UNCAST_RETURN_TYPES.contains(base.toLowerCase(java.util.Locale.ROOT))) return value;
+        if (database.isCompositeType(base) || database.getRowType(base) != null) return value;
+        if (value instanceof Object[] || value instanceof java.util.List<?>
+                || value instanceof java.util.Map<?, ?>) {
+            return value;
+        }
+        try {
+            return astExecutor.castValue(value, declared);
+        } catch (MemgresException e) {
+            if (e.getPgContext() == null) {
+                e.setPgContext("PL/pgSQL function "
+                        + (currentFunctionName == null ? "" : currentFunctionName)
+                        + "() while casting return value to function\'s return type");
+            }
+            throw e;
+        }
+    }
+
+    /** A declared return type simple enough to read a value as: a name, a length, an array. */
+    private static final java.util.regex.Pattern CASTABLE_RETURN =
+            java.util.regex.Pattern.compile("[A-Za-z_][A-Za-z0-9_ ]*(\\(\\s*\\d+\\s*(,\\s*\\d+\\s*)?\\))?(\\[\\])*");
+
+    /** The declared return types a value is handed back under without being read again. */
+    private static final Set<String> UNCAST_RETURN_TYPES = new java.util.HashSet<String>(
+            Arrays.asList("record", "trigger", "event_trigger", "refcursor", "cursor",
+                    "void", "any", "anyelement", "anyarray", "anynonarray", "anycompatible",
+                    "table", "setof", "language_handler", "internal"));
 
     /** The text of the single value of type {@code void}, which is empty and is not NULL. */
     private static final String VOID_VALUE = "";
@@ -1301,7 +1346,155 @@ public class PlpgsqlExecutor {
         }
     }
 
+    /**
+     * Run one statement, and record where it was running if it raises.
+     *
+     * <p>PostgreSQL reports the frames a routine was inside when an error reached the client: the
+     * expression or the SQL that failed, and then the line of the body that expression was
+     * written on. The innermost statement to fail is the one that names itself, so a frame is
+     * only put on an error that has not already been given one further in.
+     */
     private void executeStatement(PlpgsqlStatement stmt, Scope scope) {
+        try {
+            runStatement(stmt, scope);
+        } catch (MemgresException e) {
+            if (e.getPgContext() == null) e.setPgContext(contextFrameFor(stmt));
+            throw e;
+        }
+    }
+
+    /** The statement an EXECUTE last sent, so the frame can name what actually ran. */
+    private String ranDynamically;
+
+    /** The frames PostgreSQL would report for an error raised while this statement ran. */
+    private String contextFrameFor(PlpgsqlStatement stmt) {
+        String inner = innerFrameOf(stmt);
+        String frame = functionLineFrame(stmt);
+        if (frame == null) return null;
+        return inner == null ? frame : inner + "\n" + frame;
+    }
+
+    /** The frame naming the line of the body a statement stands on, and what kind it is. */
+    private String functionLineFrame(PlpgsqlStatement stmt) {
+        String at = statementKindOf(stmt);
+        if (at == null) return null;
+        return "PL/pgSQL function " + (currentFunctionName == null ? "" : currentFunctionName)
+                + "() line " + stmt.line() + " at " + at;
+    }
+
+    /**
+     * The frame naming what inside the statement was running: the assignment it is, the SQL it
+     * sent, or the expression it was reading. Answers null for the statements that have nothing
+     * of their own to name.
+     */
+    private String innerFrameOf(PlpgsqlStatement stmt) {
+        // The text the writer used, where the parser kept it; what the parser rebuilt from the
+        // tokens otherwise, which spells the same expression with its own spacing.
+        String written = stmt.writtenAs();
+        if (stmt instanceof PlpgsqlStatement.Assignment) {
+            PlpgsqlStatement.Assignment a = (PlpgsqlStatement.Assignment) stmt;
+            return "PL/pgSQL assignment \"" + a.target() + " := "
+                    + (written != null ? written : a.valueExpr()) + "\"";
+        }
+        if (stmt instanceof PlpgsqlStatement.SqlStmt) {
+            return sqlFrame(written != null ? written : ((PlpgsqlStatement.SqlStmt) stmt).sql);
+        }
+        if (stmt instanceof PlpgsqlStatement.PerformStmt) {
+            // PERFORM runs its expression as a query, and that query is what the frame names.
+            return sqlFrame("SELECT "
+                    + (written != null ? written : ((PlpgsqlStatement.PerformStmt) stmt).sql));
+        }
+        if (stmt instanceof PlpgsqlStatement.ExecuteStmt) {
+            return sqlFrame(ranDynamically);
+        }
+        if (stmt instanceof PlpgsqlStatement.ForQueryStmt) {
+            return sqlFrame(written != null ? written : ((PlpgsqlStatement.ForQueryStmt) stmt).sql);
+        }
+        if (stmt instanceof PlpgsqlStatement.ReturnQueryStmt) {
+            return sqlFrame(written != null
+                    ? written : ((PlpgsqlStatement.ReturnQueryStmt) stmt).sql);
+        }
+        if (stmt instanceof PlpgsqlStatement.OpenCursorStmt) {
+            return sqlFrame(written != null
+                    ? written : ((PlpgsqlStatement.OpenCursorStmt) stmt).sql);
+        }
+        if (stmt instanceof PlpgsqlStatement.IfStmt) {
+            return expressionFrame(written != null
+                    ? written : ((PlpgsqlStatement.IfStmt) stmt).condition);
+        }
+        if (stmt instanceof PlpgsqlStatement.WhileStmt) {
+            return expressionFrame(written != null
+                    ? written : ((PlpgsqlStatement.WhileStmt) stmt).condition);
+        }
+        if (stmt instanceof PlpgsqlStatement.CaseStmt) {
+            if (((PlpgsqlStatement.CaseStmt) stmt).searchExpr == null) return null;
+            return expressionFrame(written != null
+                    ? written : ((PlpgsqlStatement.CaseStmt) stmt).searchExpr);
+        }
+        if (stmt instanceof PlpgsqlStatement.ExitStmt) {
+            if (((PlpgsqlStatement.ExitStmt) stmt).whenCondition == null) return null;
+            return expressionFrame(written != null
+                    ? written : ((PlpgsqlStatement.ExitStmt) stmt).whenCondition);
+        }
+        if (stmt instanceof PlpgsqlStatement.ContinueStmt) {
+            if (((PlpgsqlStatement.ContinueStmt) stmt).whenCondition == null) return null;
+            return expressionFrame(written != null
+                    ? written : ((PlpgsqlStatement.ContinueStmt) stmt).whenCondition);
+        }
+        if (stmt instanceof PlpgsqlStatement.ReturnStmt) {
+            if (((PlpgsqlStatement.ReturnStmt) stmt).valueExpr == null) return null;
+            return expressionFrame(written != null
+                    ? written : ((PlpgsqlStatement.ReturnStmt) stmt).valueExpr);
+        }
+        if (stmt instanceof PlpgsqlStatement.ReturnNextStmt) {
+            if (((PlpgsqlStatement.ReturnNextStmt) stmt).valueExpr == null) return null;
+            return expressionFrame(written != null
+                    ? written : ((PlpgsqlStatement.ReturnNextStmt) stmt).valueExpr);
+        }
+        return null;
+    }
+
+    private static String sqlFrame(String sql) {
+        return sql == null ? null : "SQL statement \"" + sql.trim() + "\"";
+    }
+
+    private static String expressionFrame(String expr) {
+        return expr == null ? null : "PL/pgSQL expression \"" + expr.trim() + "\"";
+    }
+
+    /** What PostgreSQL calls this kind of statement in the frame that names the body's line. */
+    private static String statementKindOf(PlpgsqlStatement stmt) {
+        if (stmt instanceof PlpgsqlStatement.Assignment
+                || stmt instanceof PlpgsqlStatement.SubscriptAssignment) return "assignment";
+        if (stmt instanceof PlpgsqlStatement.SqlStmt) return "SQL statement";
+        if (stmt instanceof PlpgsqlStatement.PerformStmt) return "PERFORM";
+        if (stmt instanceof PlpgsqlStatement.IfStmt) return "IF";
+        if (stmt instanceof PlpgsqlStatement.CaseStmt) return "CASE";
+        if (stmt instanceof PlpgsqlStatement.LoopStmt) return "LOOP";
+        if (stmt instanceof PlpgsqlStatement.WhileStmt) return "WHILE";
+        if (stmt instanceof PlpgsqlStatement.ForStmt) return "FOR with integer loop variable";
+        if (stmt instanceof PlpgsqlStatement.ForQueryStmt) return "FOR over SELECT rows";
+        if (stmt instanceof PlpgsqlStatement.ForExecuteStmt) return "FOR over EXECUTE statement";
+        if (stmt instanceof PlpgsqlStatement.ForeachStmt) return "FOREACH over array";
+        if (stmt instanceof PlpgsqlStatement.ExitStmt) return "EXIT";
+        if (stmt instanceof PlpgsqlStatement.ContinueStmt) return "CONTINUE";
+        if (stmt instanceof PlpgsqlStatement.ReturnStmt) return "RETURN";
+        if (stmt instanceof PlpgsqlStatement.ReturnNextStmt) return "RETURN NEXT";
+        if (stmt instanceof PlpgsqlStatement.ReturnQueryStmt
+                || stmt instanceof PlpgsqlStatement.ReturnQueryExecuteStmt) return "RETURN QUERY";
+        if (stmt instanceof PlpgsqlStatement.AssertStmt) return "ASSERT";
+        if (stmt instanceof PlpgsqlStatement.RaiseStmt) return "RAISE";
+        if (stmt instanceof PlpgsqlStatement.ExecuteStmt) return "EXECUTE";
+        if (stmt instanceof PlpgsqlStatement.GetDiagnosticsStmt) return "GET DIAGNOSTICS";
+        if (stmt instanceof PlpgsqlStatement.OpenCursorStmt) return "OPEN";
+        if (stmt instanceof PlpgsqlStatement.FetchStmt) return "FETCH";
+        if (stmt instanceof PlpgsqlStatement.CloseCursorStmt) return "CLOSE";
+        if (stmt instanceof PlpgsqlStatement.CommitStmt) return "COMMIT";
+        if (stmt instanceof PlpgsqlStatement.RollbackStmt) return "ROLLBACK";
+        return null;
+    }
+
+    private void runStatement(PlpgsqlStatement stmt, Scope scope) {
         if (stmt instanceof PlpgsqlStatement.Block) {
             PlpgsqlStatement.Block b = (PlpgsqlStatement.Block) stmt;
             executeBlock(b, new Scope(scope));
@@ -1565,6 +1758,9 @@ public class PlpgsqlExecutor {
 
     private void executeLoop(PlpgsqlStatement.LoopStmt stmt, Scope scope) {
         while (true) {
+            // A bare LOOP is the one shape that need never end on its own, so the cancel is asked
+            // about here: a statement that runs for ever is still a statement the client may stop.
+            StatementCancel.check();
             try {
                 executeStatements(stmt.body(), scope);
             } catch (ExitSignal e) {
@@ -1579,6 +1775,7 @@ public class PlpgsqlExecutor {
 
     private void executeWhile(PlpgsqlStatement.WhileStmt stmt, Scope scope) {
         while (isTruthy(evalExpr(stmt.condition(), scope))) {
+            StatementCancel.check();
             try {
                 executeStatements(stmt.body(), scope);
             } catch (ExitSignal e) {
@@ -1592,9 +1789,9 @@ public class PlpgsqlExecutor {
     }
 
     private void executeFor(PlpgsqlStatement.ForStmt stmt, Scope scope) {
-        int lower = toInt(evalExpr(stmt.lower(), scope));
-        int upper = toInt(evalExpr(stmt.upper(), scope));
-        int step = stmt.step() != null ? toInt(evalExpr(stmt.step(), scope)) : 1;
+        int lower = loopBound(stmt.lower(), scope, "lower bound of FOR loop");
+        int upper = loopBound(stmt.upper(), scope, "upper bound of FOR loop");
+        int step = stmt.step() == null ? 1 : loopBound(stmt.step(), scope, "BY value of FOR loop");
         // PG requires a strictly positive BY value, for both forward and REVERSE loops
         // (REVERSE negates the step internally)
         if (step <= 0) {
@@ -1608,9 +1805,12 @@ public class PlpgsqlExecutor {
         loopScope.declare(stmt.varName(), null);
         boolean anyIteration = false;
 
-        for (int i = lower; stmt.reverse() ? i >= upper : i <= upper; i += step) {
+        // The counter is walked as a long so that a loop whose upper bound is the last integer
+        // ends there. Counted in an int it wrapped round to the lowest one and ran for ever.
+        for (long i = lower; stmt.reverse() ? i >= upper : i <= upper; i += step) {
+            StatementCancel.check();
             anyIteration = true;
-            loopScope.declare(stmt.varName(), i);
+            loopScope.declare(stmt.varName(), Integer.valueOf((int) i));
             try {
                 executeStatements(stmt.body(), loopScope);
             } catch (ExitSignal e) {
@@ -1622,6 +1822,16 @@ public class PlpgsqlExecutor {
             }
         }
         scope.set("found", anyIteration);
+    }
+
+    /**
+     * One bound of an integer FOR loop. A bound that is nothing bounds nothing, so PostgreSQL
+     * names which of the three it was rather than reading it as a zero.
+     */
+    private int loopBound(String expr, Scope scope, String what) {
+        Object value = evalExpr(expr, scope);
+        if (value == null) throw new MemgresException(what + " cannot be null", "22004");
+        return toInt(value);
     }
 
     private void executeForQuery(PlpgsqlStatement.ForQueryStmt stmt, Scope scope) {
@@ -1772,6 +1982,7 @@ public class PlpgsqlExecutor {
         }
         boolean anyIteration = false;
         for (Object element : slices) {
+            StatementCancel.check();
             anyIteration = true;
             scope.set(stmt.varName(), element);
             try {
@@ -2119,23 +2330,69 @@ public class PlpgsqlExecutor {
      * A query with fewer of them would otherwise be read with the wrong field offsets.
      */
     private void checkQueryShape(QueryResult result, Scope scope) {
-        String elementType = (String) scope.get("__return_setof_type__");
-        if (elementType == null) return;
-        // SETOF record takes its shape from the caller's column definition list, so only a named
-        // composite says here how many columns the query has to produce
-        List<com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField> fields =
-                database.getRowType(elementType);
-        if (fields == null) return;
-        if (result.getColumns() != null && result.getColumns().size() != fields.size()) {
+        @SuppressWarnings("unchecked")
+        List<String[]> expected = (List<String[]>) scope.get("__return_expected_columns__");
+        if (expected == null || result.getColumns() == null) return;
+        if (result.getColumns().size() != expected.size()) {
             // The two widths are the detail behind the complaint: the message says the query does
             // not fit the declared type, and the counts are what show why.
             throw new MemgresException(
                     "structure of query does not match function result type"
                             + "\n  Detail: Number of returned columns ("
                             + result.getColumns().size()
-                            + ") does not match expected column count (" + fields.size() + ").",
+                            + ") does not match expected column count (" + expected.size() + ").",
                     "42804");
         }
+        // Each column has to be of the type the declaration gives it. The query is fed straight
+        // into a set of that shape, so a column of another type would be read as one it is not.
+        for (int i = 0; i < expected.size(); i++) {
+            DataType want = DataType.fromPgName(expected.get(i)[1]);
+            DataType got = result.getColumns().get(i).getType();
+            if (want == null || got == null || want == got) continue;
+            // Two spellings of one type are one type: a serial is an integer, and a column
+            // declared either way holds the same values.
+            if (AstExecutor.pgTypeDisplayName(want).equals(AstExecutor.pgTypeDisplayName(got))) {
+                continue;
+            }
+            throw new MemgresException("structure of query does not match function result type"
+                    + "\n  Detail: Returned type " + AstExecutor.pgTypeDisplayName(got)
+                    + " does not match expected type " + AstExecutor.pgTypeDisplayName(want)
+                    + " in column \"" + expected.get(i)[0] + "\" (position " + (i + 1) + ").",
+                    "42804");
+        }
+    }
+
+    /**
+     * The columns a set-returning routine is declared to produce: the fields of the composite it
+     * answers with, the columns a RETURNS TABLE names, or the one unnamed column a set of a plain
+     * type is. Answers null where the shape is the caller's to give, which is SETOF record.
+     */
+    private List<String[]> declaredResultColumns(String returnType, List<PgFunction.Param> outParams) {
+        if (!outParams.isEmpty()) {
+            List<String[]> cols = new ArrayList<String[]>();
+            for (PgFunction.Param p : outParams) {
+                cols.add(new String[]{p.name() == null ? "" : p.name(), p.typeName()});
+            }
+            return cols;
+        }
+        if (returnType == null) return null;
+        String declared = returnType.trim();
+        if (!declared.toUpperCase(java.util.Locale.ROOT).startsWith("SETOF ")) return null;
+        String element = declared.substring("SETOF".length()).trim();
+        if (element.equalsIgnoreCase("record")) return null;
+        List<com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField> fields =
+                database.getRowType(element);
+        if (fields != null) {
+            List<String[]> cols = new ArrayList<String[]>();
+            for (com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField f : fields) {
+                cols.add(new String[]{f.name(), f.typeName()});
+            }
+            return cols;
+        }
+        if (DataType.fromPgName(element) == null) return null;
+        List<String[]> one = new ArrayList<String[]>();
+        one.add(new String[]{"", element});
+        return one;
     }
 
     // ---- ASSERT ----
@@ -2256,10 +2513,6 @@ public class PlpgsqlExecutor {
                 if (datatype != null) ex.setDatatype(datatype);
                 if (table != null) ex.setTable(table);
                 if (schema != null) ex.setSchema(schema);
-                // Record context at throw time for PG_EXCEPTION_CONTEXT
-                if (currentFunctionName != null) {
-                    ex.setPgContext("PL/pgSQL function " + currentFunctionName + "() line 1 at RAISE");
-                }
                 throw ex;
             }
             default: {
@@ -2429,6 +2682,9 @@ public class PlpgsqlExecutor {
             // PostgreSQL's SPI does with a multi-statement command.
             QueryResult result = null;
             for (String one : splitDynamicStatements(sql)) {
+                // The frame names the statement that ran, which is the text the expression came
+                // to and not the expression that produced it.
+                ranDynamically = one.trim();
                 result = astExecutor.execute(one);
             }
             if (result == null) return;
@@ -2553,6 +2809,15 @@ public class PlpgsqlExecutor {
 
     private void executeSql(PlpgsqlStatement.SqlStmt stmt, Scope scope) {
         String originalSql = stmt.sql().trim();
+        // A statement that answers with rows has to say where they go, and PostgreSQL says so
+        // when the statement runs rather than when the body is read. The statement never ran, so
+        // there is no SQL frame to quote — only the line of the body it stands on.
+        try {
+            PlpgsqlBodyValidator.requireDestination(stmt);
+        } catch (MemgresException e) {
+            if (e.getPgContext() == null) e.setPgContext(functionLineFrame(stmt));
+            throw e;
+        }
         rejectTransactionCommand(originalSql);
         String sql = substituteVariables(originalSql, scope);
 
@@ -2688,8 +2953,12 @@ public class PlpgsqlExecutor {
             }
         } else if (varNames.size() == 1) {
             String varName = varNames.get(0);
-            if (row.length == 1 && !isRowVariable(scope, varName)) {
-                assignIntoTarget(scope, varName, row[0]);
+            // One target takes one value, and which one is settled by what the target is: a row
+            // variable takes the whole row, a scalar takes the query's first column however many
+            // the query has. Reading a scalar target as row-shaped whenever the query had more
+            // than one column handed it the whole row rendered as text.
+            if (!isRowVariable(scope, varName)) {
+                assignIntoTarget(scope, varName, row.length == 0 ? null : row[0]);
             } else {
                 scope.set(varName, rowRecord(scope, varName, result, row));
             }
@@ -2783,6 +3052,14 @@ public class PlpgsqlExecutor {
      * field names a later {@code r.f} reads.
      */
     private boolean isRowVariable(Scope scope, String varName) {
+        // A trigger's NEW and OLD are rows whatever they were declared as — the event supplies
+        // them, so nothing declared them at all.
+        if (varName != null && (varName.equalsIgnoreCase("NEW") || varName.equalsIgnoreCase("OLD"))
+                && scope.has(varName)) {
+            return true;
+        }
+        // A target the block holds as a record is a row whether or not its declaration said so.
+        if (varName != null && scope.has(varName) && scope.get(varName) instanceof Map) return true;
         String declared = scope.declaredType(varName);
         if (declared == null) return false;
         String type = declared.trim().toLowerCase();
@@ -3292,6 +3569,14 @@ public class PlpgsqlExecutor {
                     "42601");
         }
         String sql = stmt.sql();
+        if (stmt.dynamic) {
+            // The query is what the expression comes to, with the USING arguments put into it.
+            Object named = evalExpr(sql, scope);
+            if (named == null) {
+                throw new MemgresException("query string argument of EXECUTE is null", "22004");
+            }
+            sql = substituteUsingParams(String.valueOf(named), stmt.usingExprs, scope);
+        }
         Object bound = scope.get(stmt.cursorName());
         if (bound instanceof CursorState) {
             CursorState open = (CursorState) bound;
@@ -3760,7 +4045,8 @@ public class PlpgsqlExecutor {
 
                 // A block label qualifies its own variables, which is the only way to reach one
                 // that an inner block shadows.
-                if ((t.type() == TokenType.IDENTIFIER || t.type() == TokenType.KEYWORD)
+                if ((t.type() == TokenType.IDENTIFIER || t.type() == TokenType.KEYWORD
+                        || t.type() == TokenType.QUOTED_IDENTIFIER)
                         && i + 2 < tokens.size()
                         && tokens.get(i + 1).type() == TokenType.DOT
                         && (tokens.get(i + 2).type() == TokenType.IDENTIFIER
@@ -3779,7 +4065,8 @@ public class PlpgsqlExecutor {
                 // resolves parameters but never body-DECLAREd variables — those fall through to
                 // table resolution, which fails with 42P01 (unless funcname names a real
                 // table/alias in this statement).
-                if ((t.type() == TokenType.IDENTIFIER || t.type() == TokenType.KEYWORD)
+                if ((t.type() == TokenType.IDENTIFIER || t.type() == TokenType.KEYWORD
+                        || t.type() == TokenType.QUOTED_IDENTIFIER)
                         && currentFunctionName != null
                         && t.value().equalsIgnoreCase(currentFunctionName)
                         && !scope.has(t.value())
@@ -3801,7 +4088,8 @@ public class PlpgsqlExecutor {
                 }
 
                 // Handle NEW.col / OLD.col / record.field
-                if ((t.type() == TokenType.IDENTIFIER || t.type() == TokenType.KEYWORD)
+                if ((t.type() == TokenType.IDENTIFIER || t.type() == TokenType.KEYWORD
+                        || t.type() == TokenType.QUOTED_IDENTIFIER)
                         && scope.has(t.value())
                         && i + 2 < tokens.size()
                         && tokens.get(i + 1).type() == TokenType.DOT) {
@@ -3894,7 +4182,8 @@ public class PlpgsqlExecutor {
                 }
 
                 // Handle plain variable
-                if ((t.type() == TokenType.IDENTIFIER || t.type() == TokenType.KEYWORD)
+                if ((t.type() == TokenType.IDENTIFIER || t.type() == TokenType.KEYWORD
+                        || t.type() == TokenType.QUOTED_IDENTIFIER)
                         && scope.has(t.value())) {
                     boolean isPrecededByDot = i > 0 && tokens.get(i - 1).type() == TokenType.DOT;
                     boolean isInInsertColList = insertColListRanges.contains(i);
@@ -3987,7 +4276,7 @@ public class PlpgsqlExecutor {
                                 appendValue(sb, val);
                             }
                         } else {
-                            appendValue(sb, val);
+                            appendTypedValue(sb, val, scope.declaredType(t.value()));
                         }
                         continue;
                     }
@@ -4233,6 +4522,27 @@ public class PlpgsqlExecutor {
         if (upper.equals("NEW") || upper.equals("OLD")) return !fieldAccess && scope.has(name);
         if (upper.equals("FOUND")) return true;
         return scope.has(name);
+    }
+
+    /**
+     * Write a variable's value into the SQL under the type the variable was declared with, where
+     * the type is one the value cannot speak for.
+     *
+     * <p>A character(n) is stored blank-padded to its length, and the padding is how the type is
+     * written rather than part of the value: read as a character(n) it is two characters long,
+     * compares equal to the same text unpadded, and loses the blanks when it is read as text.
+     * Written into the SQL as a bare string it kept them everywhere.
+     */
+    private void appendTypedValue(StringBuilder sb, Object val, String declaredType) {
+        String base = declaredType == null ? null
+                : declaredType.replaceAll("\\(.*\\)", "").trim().toLowerCase(java.util.Locale.ROOT);
+        if (val instanceof String && declaredTypmod(declaredType) != null
+                && ("char".equals(base) || "character".equals(base) || "bpchar".equals(base))) {
+            appendValue(sb, val);
+            sb.append("::").append(declaredType.trim());
+            return;
+        }
+        appendValue(sb, val);
     }
 
     private void appendValue(StringBuilder sb, Object val) {
@@ -4614,14 +4924,7 @@ public class PlpgsqlExecutor {
         if (e.getPgContext() != null) {
             return e.getPgContext();
         }
-        StringBuilder sb = new StringBuilder();
-        if (currentFunctionName != null) {
-            sb.append("PL/pgSQL function ").append(currentFunctionName).append("()");
-            sb.append(" line 1 at RAISE");
-        } else {
-            sb.append("PL/pgSQL function line 1 at RAISE");
-        }
-        return sb.toString();
+        return null;
     }
 
     private String mapJavaExceptionToSqlState(RuntimeException e) {

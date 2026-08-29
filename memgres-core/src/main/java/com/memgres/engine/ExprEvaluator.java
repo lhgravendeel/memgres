@@ -242,14 +242,21 @@ class ExprEvaluator {
                 zid = TypeCoercion.sessionZone();
                 if (val == null) return null;
             } else {
+                // The operator is the two-argument timezone(), so what may stand for a zone is
+                // what that function takes: a name or a displacement, and nothing else. A number
+                // is refused by the resolution rules rather than read as a count of hours.
+                DataType zoneType = inferTypeFromContext(attz.zone(), ctx == null
+                        ? Cols.<RowContext.TableBinding>listOf() : ctx.getBindings());
+                DataType valueType = inferTypeFromContext(attz.expr(), ctx == null
+                        ? Cols.<RowContext.TableBinding>listOf() : ctx.getBindings());
+                BuiltinCallTypes.requireCallable("timezone", "pg_catalog.timezone", new int[]{
+                        zoneType == null ? 0 : zoneType.getOid(),
+                        valueType == null ? 0 : valueType.getOid()});
                 Object zoneVal = evalExpr(attz.zone(), ctx);
+                // A zone that is nothing names no zone, and a conversion into no zone is null.
+                if (zoneVal == null) return null;
                 if (val == null) return null;
-                String zoneName = zoneVal == null ? "null" : zoneVal.toString();
-                try {
-                    zid = ZoneId.of(zoneName);
-                } catch (java.time.DateTimeException e) {
-                    throw new MemgresException("time zone \"" + zoneName + "\" not recognized", "22023");
-                }
+                zid = PgTimeZones.zoneOperand(zoneVal);
             }
             if (val instanceof OffsetDateTime) {
                 OffsetDateTime odt = (OffsetDateTime) val;
@@ -258,11 +265,12 @@ class ExprEvaluator {
             } else if (val instanceof LocalDateTime) {
                 LocalDateTime ldt = (LocalDateTime) val;
                 // timestamp -> timestamptz (interpret as in that zone)
-                return ldt.atZone(zid).toOffsetDateTime();
+                return TypeCoercion.atZoneAsPostgres(ldt, zid).toOffsetDateTime();
             } else if (val instanceof java.time.LocalDate) {
-                // A date reaches the operator as a timestamptz at midnight, and converting it
-                // back into the same zone lands on that same midnight.
-                return ((java.time.LocalDate) val).atStartOfDay();
+                // A date reaches the operator as a timestamptz at the session's midnight, so
+                // what comes back is that instant read in the zone the operator names.
+                return ((java.time.LocalDate) val).atStartOfDay(TypeCoercion.sessionZone())
+                        .withZoneSameInstant(zid).toLocalDateTime();
             } else if (val instanceof LocalTime || TypeCoercion.looksLikeTimeTz(val)) {
                 // timetz keeps its instant and changes which offset it is written against; a
                 // plain time reaches the operator having already taken the session's offset.
@@ -3564,8 +3572,8 @@ class ExprEvaluator {
         if (name.equals("percentile_cont")) {
             // An interval is the one non-float8 type PG can interpolate in; everything else it
             // accepts at all resolves through double precision.
-            DataType elem = sorted == DataType.INTERVAL ? DataType.INTERVAL
-                    : DataType.DOUBLE_PRECISION;
+            DataType elem = sorted == DataType.INTERVAL || sorted == DataType.TIME
+                    ? DataType.INTERVAL : DataType.DOUBLE_PRECISION;
             if (!multi) return elem;
             DataType arr = DataType.arrayOf(elem);
             return arr != null ? arr : DataType.TEXT;
@@ -4262,7 +4270,9 @@ class ExprEvaluator {
                     // sum(real) stays real; avg(real) widens, which is where PG puts the line
                     return name.equals("sum") ? DataType.REAL : DataType.DOUBLE_PRECISION;
                 }
-                if (dt == DataType.INTERVAL) return DataType.INTERVAL;
+                // A time of day is a length from midnight to either of these, which is the only
+                // shape either of them has a signature for.
+                if (dt == DataType.INTERVAL || dt == DataType.TIME) return DataType.INTERVAL;
                 if (dt == DataType.MONEY) return DataType.MONEY;
                 if (name.equals("sum") && (dt == DataType.SMALLINT || dt == DataType.INTEGER
                         || dt == DataType.SERIAL || dt == DataType.SMALLSERIAL)) return DataType.BIGINT;
@@ -4314,6 +4324,11 @@ class ExprEvaluator {
                     || name.equals("transaction_timestamp")) return DataType.TIMESTAMPTZ;
             if (name.equals("current_date")
                     || name.equals("to_date") || name.equals("make_date")) return DataType.DATE;
+            // CURRENT_TIME carries a displacement where LOCALTIME does not, which is the whole
+            // difference between the two spellings.
+            if (name.equals("current_time")) return DataType.TIMETZ;
+            if (name.equals("localtime")) return DataType.TIME;
+            if (name.equals("localtimestamp")) return DataType.TIMESTAMP;
             if (name.equals("date_trunc")) {
                 // date_trunc(text, timestamp[tz]|interval[, text timezone]) returns the same
                 // type as its 2nd argument, never DATE. The previous blanket DataType.DATE was
@@ -4608,6 +4623,12 @@ class ExprEvaluator {
                         }
                     }
                     DataType dt = DataType.fromPgName(declaredReturn);
+                    if (dt == null) {
+                        // A declared return type may carry a length or a precision, which names
+                        // no separate type: character(5) is character, held to five.
+                        dt = DataType.fromPgName(
+                                declaredReturn.replaceAll("\\(.*\\)", "").trim());
+                    }
                     if (dt != null) return dt;
                 }
                 PgAggregate userAgg = executor.database.getAggregate(declaredName);
@@ -4635,6 +4656,12 @@ class ExprEvaluator {
             // also a function a query may call directly.
             Expression asOperator = FunctionEvaluator.operatorFunctionExpr(name, fn);
             if (asOperator != null) return inferTypeFromContext(asOperator, bindings);
+            // A built-in the rules above have nothing to say about still has a declared result
+            // type, written down in the same catalogue PostgreSQL resolves the call against.
+            // Reading it there is how to_timestamp says timestamptz and justify_days says
+            // interval, rather than every unlisted name describing itself as text.
+            DataType declared = declaredBuiltinResultType(name, fn, bindings);
+            if (declared != null) return declared;
             return DataType.TEXT;
         }
         if (expr instanceof AtTimeZoneExpr) {
@@ -4754,6 +4781,26 @@ class ExprEvaluator {
     }
 
     /**
+     * The result type the built-in catalogue declares for this call, read against the types the
+     * arguments were written with — which is what tells date_bin over a timestamp from date_bin
+     * over a timestamptz. Answers null for a name the catalogue does not carry, and for a call
+     * whose arguments do not settle on one signature.
+     */
+    private DataType declaredBuiltinResultType(String name, FunctionCallExpr fn,
+                                               List<RowContext.TableBinding> bindings) {
+        if (!BuiltinCallTypes.records(name)) return null;
+        List<Expression> args = fn.args() == null ? Cols.<Expression>listOf() : fn.args();
+        int[] written = new int[args.size()];
+        for (int i = 0; i < args.size(); i++) {
+            DataType argType = inferTypeFromContext(args.get(i), bindings);
+            written[i] = argType == null ? 0 : argType.getOid();
+        }
+        DataType resolved = DataType.fromOid(BuiltinCallTypes.resultType(name, written));
+        if (resolved != null) return resolved;
+        return DataType.fromOid(BuiltinCallTypes.soleResultType(name));
+    }
+
+    /**
      * When an expression's inferred type is {@link DataType#ENUM}, resolves the concrete enum
      * type name so callers can advertise the real per-type OID in RowDescription (see
      * {@code PgWireValueFormatter.columnTypeOid}, which falls back to the ENUM placeholder OID 0
@@ -4765,6 +4812,51 @@ class ExprEvaluator {
      * function/aggregate return type, or divergent enum types on either side of a CASE/COALESCE)
      * -- callers should then advertise TEXT rather than ENUM-with-no-name.
      */
+    /**
+     * The composite type an expression answers with, or null when it answers with a plain value.
+     *
+     * <p>A composite is a type of its own: it has a row in {@code pg_type} and an OID the client
+     * looks it up by. Described as text, a routine declared to answer with one and a whole-row
+     * reference both told the client they were sending a string.
+     */
+    String resolveCompositeTypeName(Expression expr, List<RowContext.TableBinding> bindings) {
+        if (expr instanceof CastExpr) {
+            String named = ((CastExpr) expr).typeName().replaceAll("\\(.*\\)", "").trim();
+            return isCompositeTypeName(named) ? named : null;
+        }
+        if (expr instanceof ColumnRef) {
+            ColumnRef ref = (ColumnRef) expr;
+            // A bare name that is a relation in the FROM clause is that relation's whole row.
+            if (ref.table() == null) {
+                for (RowContext.TableBinding b : bindings) {
+                    String bound = b.alias() != null ? b.alias() : b.table().getName();
+                    if (bound != null && bound.equalsIgnoreCase(ref.column())
+                            && isCompositeTypeName(ref.column())) {
+                        return ref.column();
+                    }
+                }
+            }
+            return null;
+        }
+        if (expr instanceof FunctionCallExpr) {
+            String called = FunctionEvaluator.stripSchemaPrefix(
+                    ((FunctionCallExpr) expr).name().toLowerCase(java.util.Locale.ROOT));
+            PgFunction wrote = executor.database.getFunction(called);
+            if (wrote == null || wrote.getReturnType() == null) return null;
+            String named = wrote.getReturnType().trim();
+            return isCompositeTypeName(named) ? named : null;
+        }
+        return null;
+    }
+
+    /** Whether a name stands for a composite type — one declared as such, or a relation's row. */
+    private boolean isCompositeTypeName(String name) {
+        if (name == null || name.isEmpty()) return false;
+        if (DataType.fromPgName(name.toLowerCase(java.util.Locale.ROOT)) != null) return false;
+        if (executor.database.getCompositeType(name) != null) return true;
+        return executor.database.getRowType(name) != null;
+    }
+
     String resolveEnumTypeName(Expression expr, List<RowContext.TableBinding> bindings) {
         if (expr instanceof ColumnRef) {
             ColumnRef ref = (ColumnRef) expr;
@@ -4894,6 +4986,8 @@ class ExprEvaluator {
                     ? new Column(alias, DataType.ENUM, true, false, null, enumTypeName)
                     : new Column(alias, DataType.TEXT, true, false, null);
         }
+        String compositeName = resolveCompositeTypeName(expr, bindings);
+        if (compositeName != null) return Column.ofCompositeType(alias, compositeName);
         return new Column(alias, targetType, true, false, null);
     }
 
