@@ -684,20 +684,21 @@ SELECT abbrev, utc_offset::text AS o, is_dst FROM pg_timezone_abbrevs WHERE abbr
 -- row: Asia/Kathmandu | +0545
 -- row: Asia/Kolkata | IST
 -- row: Europe/London | BST
--- row: MET | CEST
 -- row: UTC | UTC
 -- end-expected
-SELECT name, abbrev FROM pg_timezone_names WHERE name IN ('UTC','America/New_York','Asia/Kolkata','Asia/Kathmandu','America/Sao_Paulo','MET','Europe/London','Africa/Windhoek') ORDER BY name;
--- expected-divergence: EST, Factory and ROC are the compatibility names, which live in the zone
--- database's backward and factory files. A build that leaves those out has the zones the regions
--- name and none of these, so how many rows come back is a property of the server's zone data.
+SELECT name, abbrev FROM pg_timezone_names WHERE name IN ('UTC','America/New_York','Asia/Kolkata','Asia/Kathmandu','America/Sao_Paulo','Europe/London','Africa/Windhoek') ORDER BY name;
+-- expected-divergence: a zone named for a region and a place is in the file that region is
+-- described in, and every build of the zone database has it. A zone named by one word is not:
+-- MET, EST, Factory and ROC are written in the legacy, backward and factory files, which a
+-- reduced build leaves out. How many of them come back is a property of the server's zone data.
 -- begin-expected
 -- columns: name | abbrev
 -- row: EST | EST
 -- row: Factory | -00
+-- row: MET | CEST
 -- row: ROC | CST
 -- end-expected
-SELECT name, abbrev FROM pg_timezone_names WHERE name IN ('EST','Factory','ROC') ORDER BY name;
+SELECT name, abbrev FROM pg_timezone_names WHERE name IN ('MET','EST','Factory','ROC') ORDER BY name;
 -- begin-expected
 -- columns: a
 -- row: 05:45:00
