@@ -221,7 +221,7 @@ public enum DataType {
     }
 
     public static DataType fromPgName(String name) {
-        String normalized = name.toLowerCase().trim();
+        String normalized = name.toLowerCase(java.util.Locale.ROOT).trim();
         // float(p) is real up to 24 bits of mantissa and double precision above it. The width was
         // read only where a column was declared, so a cast to float(24) answered a float8.
         DataType floatWidth = floatPrecisionType(normalized);
@@ -266,10 +266,15 @@ public enum DataType {
                 return NAME;
             case "oid":
                 return OID;
+            // A registry type carries an OID and reads back as a name. Folded onto integer,
+            // every column of one told the client it was an int4, so a driver asked for it in
+            // binary and read the name's first four bytes as a number.
             case "regclass":
+                return REGCLASS;
             case "regtype":
+                return REGTYPE;
             case "regproc":
-                return INTEGER;
+                return REGPROC;
             // Two types the engine already carries an OID for but had no name for, so a value
             // written as one was described to the client as text. Naming them is what lets
             // xid('100') and pg_lsn('0/16B3748') resolve at all.
@@ -427,7 +432,7 @@ public enum DataType {
      */
     public static String intervalQualifier(String typeName) {
         if (typeName == null) return null;
-        String normalized = typeName.toLowerCase().trim();
+        String normalized = typeName.toLowerCase(java.util.Locale.ROOT).trim();
         if (!normalized.startsWith("interval ")) return null;
         String rest = normalized.substring("interval ".length()).trim();
         int paren = rest.indexOf('(');
@@ -613,12 +618,12 @@ public enum DataType {
     /** Whether this name is one an extension installs rather than one pg_catalog ships. */
     public static boolean installedByAnExtension(String name) {
         return name != null
-                && INSTALLED_BY_AN_EXTENSION.contains(name.trim().toLowerCase());
+                && INSTALLED_BY_AN_EXTENSION.contains(name.trim().toLowerCase(java.util.Locale.ROOT));
     }
 
     public static boolean isPgCatalogTypeName(String name) {
         if (name == null) return false;
-        String lower = name.trim().toLowerCase();
+        String lower = name.trim().toLowerCase(java.util.Locale.ROOT);
         if (INSTALLED_BY_AN_EXTENSION.contains(lower)) return false;
         DataType dt = fromPgName(lower);
         // PostgreSQL hands out everything below 16384 while it builds the catalogs, so an OID at or
@@ -633,7 +638,7 @@ public enum DataType {
      */
     public static String canonicalName(String typeName) {
         if (typeName == null) return null;
-        String lower = typeName.trim().toLowerCase();
+        String lower = typeName.trim().toLowerCase(java.util.Locale.ROOT);
         if (lower.isEmpty() || ALIASED_ONTO_OTHER_TYPE.contains(lower)) return lower;
         int paren = lower.indexOf('(');
         String base = paren > 0 ? lower.substring(0, paren).trim() : lower;

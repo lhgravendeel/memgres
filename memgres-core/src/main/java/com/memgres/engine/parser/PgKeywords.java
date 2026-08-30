@@ -71,18 +71,18 @@ public final class PgKeywords {
     /** Whether this word may name a column, a table alias or a parameter. */
     static boolean canBeColumnName(String word) {
         if (word == null) return false;
-        String upper = word.toUpperCase();
+        String upper = word.toUpperCase(java.util.Locale.ROOT);
         return !RESERVED.contains(upper) && !TYPE_FUNC_NAME.contains(upper);
     }
 
     /** Whether this word names a construct of the grammar but is still allowed as a column. */
     static boolean isColumnNameKeyword(String word) {
-        return word != null && COL_NAME.contains(word.toUpperCase());
+        return word != null && COL_NAME.contains(word.toUpperCase(java.util.Locale.ROOT));
     }
 
     /** Whether this word is one PostgreSQL reserves outright. */
     static boolean isReserved(String word) {
-        return word != null && RESERVED.contains(word.toUpperCase());
+        return word != null && RESERVED.contains(word.toUpperCase(java.util.Locale.ROOT));
     }
 
     /**
@@ -91,7 +91,7 @@ public final class PgKeywords {
      */
     public static boolean isKeywordOrReserved(String word) {
         if (word == null) return false;
-        String upper = word.toUpperCase();
+        String upper = word.toUpperCase(java.util.Locale.ROOT);
         return RESERVED.contains(upper) || TYPE_FUNC_NAME.contains(upper) || COL_NAME.contains(upper);
     }
 }

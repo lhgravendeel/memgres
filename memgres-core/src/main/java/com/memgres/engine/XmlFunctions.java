@@ -27,7 +27,7 @@ class XmlFunctions {
             case "xmlserialize": {
                 // args: mode, xml_value, target_type
                 if (fn.args().size() >= 3) {
-                    String targetType = String.valueOf(executor.evalExpr(fn.args().get(2), ctx)).toLowerCase();
+                    String targetType = String.valueOf(executor.evalExpr(fn.args().get(2), ctx)).toLowerCase(java.util.Locale.ROOT);
                     java.util.Set<String> validTypes = Cols.setOf("text", "varchar", "character varying", "xml", "char", "character", "bytea");
                     if (!validTypes.contains(targetType)) {
                         throw new MemgresException("cannot cast type xml to " + targetType, "42846");
@@ -214,11 +214,11 @@ class XmlFunctions {
     /** Check if an expression produces XML (and thus should not be escaped). */
     private static boolean isXmlExpr(Expression expr) {
         if (expr instanceof FunctionCallExpr) {
-            String n = ((FunctionCallExpr) expr).name().toLowerCase();
+            String n = ((FunctionCallExpr) expr).name().toLowerCase(java.util.Locale.ROOT);
             return n.startsWith("xml") || n.equals("__xmlattributes__");
         }
         if (expr instanceof CastExpr) {
-            String targetType = ((CastExpr) expr).typeName().toLowerCase();
+            String targetType = ((CastExpr) expr).typeName().toLowerCase(java.util.Locale.ROOT);
             return targetType.equals("xml");
         }
         return false;

@@ -122,7 +122,7 @@ class DdlTableExecutor {
         List<Table> parentTables = new ArrayList<>();
         if (stmt.inherits() != null) {
             Set<String> childDeclared = new HashSet<>();
-            for (ColumnDef def : stmt.columns()) childDeclared.add(def.name().toLowerCase());
+            for (ColumnDef def : stmt.columns()) childDeclared.add(def.name().toLowerCase(java.util.Locale.ROOT));
             Set<String> seenParents = new HashSet<>();
             // A CHECK is inherited under the name it was declared with, and the child stores one
             // constraint per name — so two parents may contribute the same name only when they
@@ -135,8 +135,8 @@ class DdlTableExecutor {
                 // The same relation twice is what PostgreSQL refuses, and two relations of one
                 // name in two schemas are not that: keying on the bare name turned a child of
                 // a.t and b.t away, though its columns merge like any other pair of parents'.
-                if (!seenParents.add(parent.getSchemaName().toLowerCase()
-                        + "." + parent.getName().toLowerCase())) {
+                if (!seenParents.add(parent.getSchemaName().toLowerCase(java.util.Locale.ROOT)
+                        + "." + parent.getName().toLowerCase(java.util.Locale.ROOT))) {
                     throw new MemgresException("relation \"" + parentName
                             + "\" would be inherited from more than once", "42P07");
                 }
@@ -149,7 +149,7 @@ class DdlTableExecutor {
                     String checkText = parentCheck.getCheckExpr() == null ? ""
                             : SqlUnparser.exprToSql(parentCheck.getCheckExpr());
                     String priorText = inheritedChecks.put(
-                            parentCheck.getName().toLowerCase(), checkText);
+                            parentCheck.getName().toLowerCase(java.util.Locale.ROOT), checkText);
                     if (priorText != null && !priorText.equals(checkText)) {
                         throw new MemgresException("check constraint name \""
                                 + parentCheck.getName()
@@ -195,7 +195,7 @@ class DdlTableExecutor {
                     }
                     // A default the child does not override would have to be picked from two
                     // parents, and there is no rule for choosing.
-                    if (!childDeclared.contains(col.getName().toLowerCase())
+                    if (!childDeclared.contains(col.getName().toLowerCase(java.util.Locale.ROOT))
                             && existing.getDefaultValue() != null && col.getDefaultValue() != null
                             && !existing.getDefaultValue().equals(col.getDefaultValue())) {
                         // PostgreSQL says how to settle it: a default written on the child leaves
@@ -232,7 +232,7 @@ class DdlTableExecutor {
                     // The options are applied in the order they were written, so a later
                     // EXCLUDING takes back what an earlier INCLUDING ALL brought in.
                     for (String opt : likeEntry.substring(colonIdx + 1).split(",")) {
-                        String what = opt.trim().toUpperCase();
+                        String what = opt.trim().toUpperCase(java.util.Locale.ROOT);
                         boolean excluding = what.startsWith("-");
                         if (excluding) what = what.substring(1);
                         Collection<String> affected = "ALL".equals(what) ? LIKE_OPTION_NAMES
@@ -258,19 +258,19 @@ class DdlTableExecutor {
                 if (likeComposite != null) {
                     likeTable = likeComposite;
                     likeTableSchema = likeTableName.indexOf('.') > 0
-                            ? likeTableName.substring(0, likeTableName.indexOf('.')).toLowerCase()
-                            : schemaName.toLowerCase();
+                            ? likeTableName.substring(0, likeTableName.indexOf('.')).toLowerCase(java.util.Locale.ROOT)
+                            : schemaName.toLowerCase(java.util.Locale.ROOT);
                 } else if (likeView != null && likeView.cachedColumns() != null) {
                     likeTable = new Table(likeView.name(),
                             new ArrayList<Column>(likeView.cachedColumns()));
                     likeTableSchema = likeView.schemaName() != null
-                            ? likeView.schemaName().toLowerCase() : "public";
+                            ? likeView.schemaName().toLowerCase(java.util.Locale.ROOT) : "public";
                 } else {
                     likeTable = executor.resolveTable(schemaName, likeTableName);
                     // A column comment is kept under its table's own schema, so the source's
                     // schema has to be the one INCLUDING COMMENTS reads from.
                     likeTableSchema = likeTableName.indexOf('.') > 0
-                            ? likeTableName.substring(0, likeTableName.indexOf('.')).toLowerCase()
+                            ? likeTableName.substring(0, likeTableName.indexOf('.')).toLowerCase(java.util.Locale.ROOT)
                             : schemaOfRelation(likeTable.getName());
                 }
                 // LIKE copies the shape of a column and nothing more unless the option that
@@ -278,7 +278,7 @@ class DdlTableExecutor {
                 // the new table the source's defaults, its identity and its generation
                 // expression, none of which PostgreSQL copies unasked.
                 for (Column col : likeTable.getColumns()) {
-                    if (!likeColumnNames.add(col.getName().toLowerCase())) {
+                    if (!likeColumnNames.add(col.getName().toLowerCase(java.util.Locale.ROOT))) {
                         throw PgErrors.duplicateColumn(col.getName());
                     }
                     boolean exists = inheritedColumns.stream()
@@ -288,7 +288,7 @@ class DdlTableExecutor {
                         // A NOT NULL constraint travels with the column, under the name it has
                         // on the source table: PostgreSQL copies the constraint, not the rule.
                         if (!col.isNullable()) {
-                            likeNotNullNames.put(col.getName().toLowerCase(),
+                            likeNotNullNames.put(col.getName().toLowerCase(java.util.Locale.ROOT),
                                     CatalogConstraintBuilder.notNullConstraintName(
                                             likeTable, col.getName()));
                         }
@@ -297,7 +297,7 @@ class DdlTableExecutor {
                                     Database.commentKey(likeTableSchema,
                                             likeTable.getName() + "." + col.getName()));
                             if (srcComment != null) {
-                                likeColumnComments.put(col.getName().toLowerCase(), srcComment);
+                                likeColumnComments.put(col.getName().toLowerCase(java.util.Locale.ROOT), srcComment);
                             }
                         }
                     }
@@ -357,8 +357,8 @@ class DdlTableExecutor {
             DdlDefinitionChecks.rejectUncollatableType(def.typeName(), resolved, def.collation);
             // A LIKE has already written its source's columns into this definition, so one of them
             // and a written column of the same name clash exactly as two written ones do.
-            if (!definedColumnNames.add(def.name().toLowerCase())
-                    || likeColumnNames.contains(def.name().toLowerCase())) {
+            if (!definedColumnNames.add(def.name().toLowerCase(java.util.Locale.ROOT))
+                    || likeColumnNames.contains(def.name().toLowerCase(java.util.Locale.ROOT))) {
                 throw new MemgresException("column \"" + def.name() + "\" specified more than once", "42701");
             }
             DdlDefinitionChecks.rejectSystemColumnName(def.name());
@@ -547,7 +547,7 @@ class DdlTableExecutor {
                 boolean hasSubquery = generated != null
                         ? AstWalk.anyMatch(generated, node -> node instanceof SelectStmt
                                 || node instanceof SetOpStmt)
-                        : def.generatedExpr().toLowerCase().replaceAll("\\s+", "").contains("select");
+                        : def.generatedExpr().toLowerCase(java.util.Locale.ROOT).replaceAll("\\s+", "").contains("select");
                 if (hasSubquery) {
                     throw new MemgresException("cannot use subquery in column generation expression", "0A000");
                 }
@@ -1019,12 +1019,12 @@ class DdlTableExecutor {
         Set<String> virtual = new HashSet<>();
         for (Column c : columns) {
             if (c.getGeneratedExpr() != null && c.isVirtual()) {
-                virtual.add(c.getName().toLowerCase());
+                virtual.add(c.getName().toLowerCase(java.util.Locale.ROOT));
             }
         }
         if (virtual.isEmpty()) return;
         for (ColumnDef def : stmt.columns()) {
-            if (!virtual.contains(def.name().toLowerCase())) continue;
+            if (!virtual.contains(def.name().toLowerCase(java.util.Locale.ROOT))) continue;
             if (def.primaryKey()) throw virtualKeyError(true);
             if (def.unique()) throw virtualKeyError(false);
         }
@@ -1034,7 +1034,7 @@ class DdlTableExecutor {
             boolean uq = tc.type() == TableConstraint.ConstraintType.UNIQUE;
             if ((!pk && !uq) || tc.columns() == null) continue;
             for (String col : tc.columns()) {
-                if (virtual.contains(col.toLowerCase())) throw virtualKeyError(pk);
+                if (virtual.contains(col.toLowerCase(java.util.Locale.ROOT))) throw virtualKeyError(pk);
             }
         }
     }
@@ -1061,7 +1061,7 @@ class DdlTableExecutor {
 
     /** True for the per-session temp schema, whatever suffix this session's is named with. */
     static boolean isTempSchema(String schemaName) {
-        return schemaName != null && schemaName.toLowerCase().startsWith("pg_temp");
+        return schemaName != null && schemaName.toLowerCase(java.util.Locale.ROOT).startsWith("pg_temp");
     }
 
     /** M11: Apply default privileges from ALTER DEFAULT PRIVILEGES to a newly created table. */
@@ -1330,7 +1330,7 @@ class DdlTableExecutor {
         if (table.getPartitionStrategy() == null || table.getPartitionColumn() == null) return;
         if (sc.getType() != StoredConstraint.Type.PRIMARY_KEY && sc.getType() != StoredConstraint.Type.UNIQUE) return;
 
-        String rawPartCol = table.getPartitionColumn().toLowerCase().trim();
+        String rawPartCol = table.getPartitionColumn().toLowerCase(java.util.Locale.ROOT).trim();
         // Strip surrounding parens from expression-based partition keys
         if (rawPartCol.startsWith("(")) rawPartCol = rawPartCol.substring(1);
         if (rawPartCol.endsWith(")")) rawPartCol = rawPartCol.substring(0, rawPartCol.length() - 1);
@@ -1650,7 +1650,7 @@ class DdlTableExecutor {
     private static void requireStrategy(String actual, String required) {
         if (actual == null || actual.equalsIgnoreCase(required)) return;
         throw new MemgresException("invalid bound specification for a "
-                + actual.toLowerCase() + " partition", "42P16");
+                + actual.toLowerCase(java.util.Locale.ROOT) + " partition", "42P16");
     }
 
     /** Render a bound tuple the way PostgreSQL spells it in the empty-range detail line. */
@@ -1969,7 +1969,7 @@ class DdlTableExecutor {
         AstWalk.forEach(node, n -> {
             if (!(n instanceof CastExpr)) return;
             CastExpr cast = (CastExpr) n;
-            String target = cast.typeName() == null ? "" : cast.typeName().toLowerCase();
+            String target = cast.typeName() == null ? "" : cast.typeName().toLowerCase(java.util.Locale.ROOT);
             boolean toLocalTime = target.startsWith("date") || target.startsWith("time")
                     || target.startsWith("timestamp");
             if (!toLocalTime || !(cast.expr() instanceof ColumnRef)) return;
@@ -1988,8 +1988,8 @@ class DdlTableExecutor {
         Set<String> generatedColNames = new HashSet<>();
         Set<String> allColNames = new HashSet<>();
         for (ColumnDef def : columnDefs) {
-            if (def.generatedExpr() != null) generatedColNames.add(def.name().toLowerCase());
-            allColNames.add(def.name().toLowerCase());
+            if (def.generatedExpr() != null) generatedColNames.add(def.name().toLowerCase(java.util.Locale.ROOT));
+            allColNames.add(def.name().toLowerCase(java.util.Locale.ROOT));
         }
         Table declared = new Table(relationName, columns);
         // The relation answers to the schema it is being created in, so an expression naming that
@@ -2002,7 +2002,7 @@ class DdlTableExecutor {
                 Set<String> selfNamed = selfQualifiers(def.generatedExpr(), declared);
                 List<String> referencedIdents = DdlExecutor.extractIdentifiers(def.generatedExpr());
                 for (String ident : referencedIdents) {
-                    String identLower = ident.toLowerCase();
+                    String identLower = ident.toLowerCase(java.util.Locale.ROOT);
                     if (selfNamed.contains(identLower)) continue;
                     if (!allColNames.contains(identLower)) {
                         if (!DdlExecutor.isSqlKeywordOrFunction(identLower)) {
@@ -2050,10 +2050,10 @@ class DdlTableExecutor {
                 ColumnRef ref = (ColumnRef) node;
                 String qualifier = ref.table();
                 if (qualifier != null && qualifier.equalsIgnoreCase(declared.getName())) {
-                    named.add(qualifier.toLowerCase());
+                    named.add(qualifier.toLowerCase(java.util.Locale.ROOT));
                     // A schema written in front of it has already been judged above, so what is
                     // left here is this relation's own schema, spelled out.
-                    if (ref.schema() != null) named.add(ref.schema().toLowerCase());
+                    if (ref.schema() != null) named.add(ref.schema().toLowerCase(java.util.Locale.ROOT));
                 }
             }
         });
@@ -2099,7 +2099,7 @@ class DdlTableExecutor {
             dropSingleTable(target[0], target[1], stmt.ifExists(), stmt.cascade(), together,
                     targets.size() > 1);
         }
-        return QueryResult.command(QueryResult.Type.DROP_TABLE, 0);
+        return QueryResult.command(QueryResult.Type.DROP_TABLE, 0).withCommandTag("DROP TABLE");
     }
 
     /**
@@ -2110,7 +2110,7 @@ class DdlTableExecutor {
                                String schemaHint, String written) {
         String schema = schemaHint != null ? schemaHint : writtenSchema(written);
         String bare = RelationNamespace.bareName(written);
-        together.add(bare.toLowerCase());
+        together.add(bare.toLowerCase(java.util.Locale.ROOT));
         // The schema the name reaches goes in beside the bare one, so that a dependent in another
         // schema that happens to share a name with something the list drops is still a dependent.
         together.add(dropTargetKey(schema, bare));
@@ -2134,7 +2134,7 @@ class DdlTableExecutor {
         String tempSchema = executor.session != null ? executor.session.getTempSchemaName() : "pg_temp";
         Schema pgTemp = executor.database.getSchema(tempSchema);
         if (pgTemp != null && pgTemp.getTable(name) != null) schemaName = tempSchema;
-        return schemaName.toLowerCase() + "." + name.toLowerCase();
+        return schemaName.toLowerCase(java.util.Locale.ROOT) + "." + name.toLowerCase(java.util.Locale.ROOT);
     }
 
     /**
@@ -2189,7 +2189,7 @@ class DdlTableExecutor {
     private void collectInheritanceDependents(Table parent, String parentShownName,
                                               Set<String> together, Map<Table, String> found) {
         for (Table child : parent.getChildren()) {
-            if (!together.contains(child.getName().toLowerCase())) {
+            if (!together.contains(child.getName().toLowerCase(java.util.Locale.ROOT))) {
                 // Taking the relation out before putting it back moves it to the end of the order
                 // it was found in, which is where PostgreSQL leaves a relation reached a second
                 // time down another path -- named against the parent that reached it last.
@@ -2276,7 +2276,7 @@ class DdlTableExecutor {
                             // A table the same DROP takes down takes its foreign keys with it, so
                             // it is not something that would be left pointing at this one.
                             if (together.contains((s.getName() + "." + otherTable.getName())
-                                    .toLowerCase())) continue;
+                                    .toLowerCase(java.util.Locale.ROOT))) continue;
                             for (StoredConstraint sc : otherTable.getConstraints()) {
                                 if (sc.getType() != StoredConstraint.Type.FOREIGN_KEY) continue;
                                 if (!sc.getReferencesTable().equalsIgnoreCase(name)) continue;
@@ -2307,7 +2307,7 @@ class DdlTableExecutor {
                         // A rule goes with the relation it is written on, so one whose relation
                         // the same DROP takes down will not outlive this one either.
                         if (rule[2] != null
-                                && together.contains((rule[2] + "." + rule[1]).toLowerCase())) {
+                                && together.contains((rule[2] + "." + rule[1]).toLowerCase(java.util.Locale.ROOT))) {
                             continue;
                         }
                         dependents.add("rule " + rule[0] + " on table " + visibleName(rule[2], rule[1])
@@ -2354,7 +2354,7 @@ class DdlTableExecutor {
                                 // table, and PostgreSQL reports only what it had to take besides
                                 // the objects the statement named.
                                 if (!together.contains((s.getName() + "." + otherTable.getName())
-                                        .toLowerCase())) {
+                                        .toLowerCase(java.util.Locale.ROOT))) {
                                     cascaded.add("constraint " + fkName + " on table "
                                             + otherTable.getName());
                                 }
@@ -2385,7 +2385,7 @@ class DdlTableExecutor {
                         // it had to take besides. A materialized view is named by the kind it
                         // really is, because that is the kind PostgreSQL recorded it under.
                         Database.ViewDef going = executor.database.getView(v);
-                        if (!together.contains(RelationNamespace.bareName(v).toLowerCase())) {
+                        if (!together.contains(RelationNamespace.bareName(v).toLowerCase(java.util.Locale.ROOT))) {
                             cascaded.add((going != null && going.materialized()
                                     ? "materialized view " : "view ")
                                     + RelationNamespace.bareName(v));
@@ -2393,7 +2393,7 @@ class DdlTableExecutor {
                         executor.database.removeView(v);
                     }
                     for (Table child : descendants) {
-                        if (together.contains(child.getName().toLowerCase())) continue;
+                        if (together.contains(child.getName().toLowerCase(java.util.Locale.ROOT))) continue;
                         cascaded.add("table " + child.getName());
                     }
                     // The whole tree is accounted for here, so each child is dropped with no
@@ -2520,7 +2520,7 @@ class DdlTableExecutor {
                 // nextval() on a sequence nothing answered to -- every INSERT that relied on the
                 // default then failed the column's NOT NULL.
                 String registeredIn = executor.database.getSchemaObjects(owned.getSchemaName())
-                        .contains("sequence:" + owned.getName().toLowerCase())
+                        .contains("sequence:" + owned.getName().toLowerCase(java.util.Locale.ROOT))
                                 ? owned.getSchemaName() : null;
                 executor.recordUndo(new Session.DropSequenceUndo(owned.qualifiedName(), owned,
                         registeredIn, executor.database.getObjectOwner("sequence:" + owned.getName())));
@@ -2621,10 +2621,10 @@ class DdlTableExecutor {
      * rather than against the relation.
      */
     private static TypeDependents.Names rowTypeOf(String schemaName, String name) {
-        final String bare = RelationNamespace.bareName(name).toLowerCase();
-        final String qualified = schemaName.toLowerCase() + "." + bare;
+        final String bare = RelationNamespace.bareName(name).toLowerCase(java.util.Locale.ROOT);
+        final String qualified = schemaName.toLowerCase(java.util.Locale.ROOT) + "." + bare;
         return written -> {
-            String lower = written.toLowerCase();
+            String lower = written.toLowerCase(java.util.Locale.ROOT);
             return lower.equals(bare) || lower.equals(qualified);
         };
     }
@@ -2677,7 +2677,7 @@ class DdlTableExecutor {
         String body = fn.getBody();
         if (body == null) return false;
         return java.util.regex.Pattern.compile(
-                "\\b" + java.util.regex.Pattern.quote(tableName.toLowerCase()) + "\\b",
+                "\\b" + java.util.regex.Pattern.quote(tableName.toLowerCase(java.util.Locale.ROOT)) + "\\b",
                 java.util.regex.Pattern.CASE_INSENSITIVE).matcher(body).find();
     }
 
@@ -2752,8 +2752,7 @@ class DdlTableExecutor {
             searchSchemas = Cols.listOf(tableName.substring(0, dot));
             bareName = tableName.substring(dot + 1);
         } else {
-            String defSchema = executor.defaultSchema();
-            searchSchemas = defSchema.equals("public") ? Cols.listOf("public") : Cols.listOf(defSchema, "public");
+            searchSchemas = executor.relationSearchPath();
         }
         for (String schemaName : searchSchemas) {
             Schema schema = executor.database.getSchema(schemaName);
@@ -2809,9 +2808,11 @@ class DdlTableExecutor {
                 checkDropSchemaExists(explicitSchema, false);
                 searchSchemas = Cols.listOf(explicitSchema);
             } else {
-                // Use search_path from session, falling back to "public"
-                String defSchema = executor.defaultSchema();
-                searchSchemas = defSchema.equals("public") ? Cols.listOf("public") : Cols.listOf(defSchema, "public");
+                // A bare name is looked for where every other statement looks for one — which
+                // includes the session's own temporary schema. Searched in the default schema
+                // and public alone, TRUNCATE could not find a temporary table that CREATE,
+                // INSERT, SELECT and DROP all resolve, and refused it as missing.
+                searchSchemas = executor.relationSearchPath();
             }
             for (String schemaName : searchSchemas) {
                 Schema schema = executor.database.getSchema(schemaName);
@@ -2962,7 +2963,9 @@ class DdlTableExecutor {
                         "relation \"" + bareName + "\" does not exist", "42P01");
             }
         }
-        return QueryResult.command(QueryResult.Type.DELETE, 0);
+        // TRUNCATE is not a DELETE and does not report a row count, whatever it removed.
+        return QueryResult.command(QueryResult.Type.DELETE, 0)
+                .withCommandTag("TRUNCATE TABLE");
     }
 
     // ---- CREATE TABLE AS / SELECT INTO ----
@@ -2994,7 +2997,7 @@ class DdlTableExecutor {
                     ? given.get(givenIdx) : srcCol.getName();
             givenIdx++;
             DdlDefinitionChecks.rejectSystemColumnName(colName);
-            if (!seenNames.add(colName.toLowerCase())) {
+            if (!seenNames.add(colName.toLowerCase(java.util.Locale.ROOT))) {
                 throw PgErrors.duplicateColumn(colName);
             }
             columns.add(new Column(colName, srcCol.getType(), true, false, null,

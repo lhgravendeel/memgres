@@ -66,7 +66,7 @@ final class BlankPadding {
     /** Whether a written type name is the blank-padded character type. */
     static boolean isBlankPadded(String typeName) {
         if (typeName == null) return false;
-        String t = typeName.toLowerCase().trim();
+        String t = typeName.toLowerCase(java.util.Locale.ROOT).trim();
         int paren = t.indexOf('(');
         if (paren > 0) t = t.substring(0, paren).trim();
         // Written with quotes it is PostgreSQL's own single byte, which pads nothing.
@@ -77,7 +77,7 @@ final class BlankPadding {
     /** Whether a written type name is one a bpchar is read as, dropping its blanks on the way. */
     private static boolean isAnotherStringType(String typeName) {
         if (typeName == null) return false;
-        String t = typeName.toLowerCase().trim();
+        String t = typeName.toLowerCase(java.util.Locale.ROOT).trim();
         int paren = t.indexOf('(');
         if (paren > 0) t = t.substring(0, paren).trim();
         return t.equals("text") || t.equals("varchar") || t.equals("character varying")

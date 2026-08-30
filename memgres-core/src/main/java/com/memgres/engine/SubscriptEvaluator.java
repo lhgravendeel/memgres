@@ -224,7 +224,7 @@ final class SubscriptEvaluator {
     /** What the expression says its type is, as PostgreSQL would name it, or null when unsettled. */
     private String declaredTypeName(Expression expr, Object value, RowContext ctx) {
         String declared = executor.binaryOpEvaluator.declaredTypeForResolution(expr, ctx);
-        if (declared != null) return declared.toLowerCase();
+        if (declared != null) return declared.toLowerCase(java.util.Locale.ROOT);
         DataType inferred = executor.inferExprType(expr);
         return inferred == null ? null : inferred.getPgName();
     }

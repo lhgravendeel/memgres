@@ -81,6 +81,7 @@ REVOKE USAGE ON SCHEMA compat FROM compat_role;
 ALTER ROLE compat_role SET work_mem = '1MB';
 SET ROLE compat_role;
 RESET ROLE;
+DROP OWNED BY compat_role;
 DROP ROLE compat_role;
 
 -- bad admin/session cases

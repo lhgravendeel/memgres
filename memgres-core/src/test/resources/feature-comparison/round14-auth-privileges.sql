@@ -172,6 +172,11 @@ ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO r14_auth_dp;
 -- end-expected
 SELECT (count(*) >= 1)::text AS ok FROM pg_default_acl;
 
+-- A default privilege applies to every table created afterwards, in this file and in every one
+-- after it, so it is taken back once it has been shown to be there. Left standing, every ACL a
+-- later file reads carries a grant to this role.
+ALTER DEFAULT PRIVILEGES REVOKE SELECT ON TABLES FROM r14_auth_dp;
+
 -- ============================================================================
 -- SECTION H: has_* helpers
 -- ============================================================================

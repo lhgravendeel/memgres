@@ -179,7 +179,7 @@ final class StatementAnalyzer {
                 // A recursive CTE may name itself, so its own name is visible inside it.
                 Map<String, SelectStmt.CommonTableExpr> inner =
                         new HashMap<String, SelectStmt.CommonTableExpr>(ctes);
-                inner.put(cte.name().toLowerCase(), cte);
+                inner.put(cte.name().toLowerCase(java.util.Locale.ROOT), cte);
                 analyze(cte.query(), inner);
                 checkSearchAndCycleNames(cte, inner);
             }
@@ -222,7 +222,7 @@ final class StatementAnalyzer {
         if (ctes == null || ctes.isEmpty()) return outer;
         Map<String, SelectStmt.CommonTableExpr> named =
                 new HashMap<String, SelectStmt.CommonTableExpr>(outer);
-        for (SelectStmt.CommonTableExpr cte : ctes) named.put(cte.name().toLowerCase(), cte);
+        for (SelectStmt.CommonTableExpr cte : ctes) named.put(cte.name().toLowerCase(java.util.Locale.ROOT), cte);
         return named;
     }
 
@@ -292,7 +292,7 @@ final class StatementAnalyzer {
         if (item instanceof SelectStmt.TableRef) {
             SelectStmt.TableRef ref = (SelectStmt.TableRef) item;
             SelectStmt.CommonTableExpr cte = ref.schema() == null
-                    ? ctes.get(ref.table().toLowerCase()) : null;
+                    ? ctes.get(ref.table().toLowerCase(java.util.Locale.ROOT)) : null;
             if (cte != null) {
                 requireReturning(cte);
                 List<String> columns =
@@ -464,7 +464,7 @@ final class StatementAnalyzer {
         if (item instanceof SelectStmt.TableRef) {
             SelectStmt.TableRef ref = (SelectStmt.TableRef) item;
             SelectStmt.CommonTableExpr cte = ref.schema() == null
-                    ? ctes.get(ref.table().toLowerCase()) : null;
+                    ? ctes.get(ref.table().toLowerCase(java.util.Locale.ROOT)) : null;
             if (cte != null) return renamed(cteColumns(cte, ctes), ref.columnAliases());
             Database.ViewDef view = viewDefinition(ref.schema(), ref.table());
             if (view != null) return renamed(viewColumns(view), ref.columnAliases());
@@ -570,7 +570,7 @@ final class StatementAnalyzer {
             if (written == null || !written.endsWith("[]")) return false;
             String element = written.substring(0, written.length() - 2).trim();
             if (DataType.fromPgName(element) == null) return false;
-            return !executor.database.getCompositeTypes().containsKey(element.toLowerCase());
+            return !executor.database.getCompositeTypes().containsKey(element.toLowerCase(java.util.Locale.ROOT));
         }
         return false;
     }
@@ -951,9 +951,9 @@ final class StatementAnalyzer {
             noteHidden(((SelectStmt.SubqueryFrom) item).subquery());
         }
         String name = itemName(item);
-        if (name != null) hidden.add(name.toLowerCase());
+        if (name != null) hidden.add(name.toLowerCase(java.util.Locale.ROOT));
         if (item instanceof SelectStmt.TableRef) {
-            hidden.add(((SelectStmt.TableRef) item).table().toLowerCase());
+            hidden.add(((SelectStmt.TableRef) item).table().toLowerCase(java.util.Locale.ROOT));
         }
     }
 
@@ -965,10 +965,10 @@ final class StatementAnalyzer {
     private boolean namesSomethingCallable(String name) {
         if (name == null) return false;
         if (DataType.fromPgName(name) != null) return true;
-        if (executor.database.getFunction(name.toLowerCase()) != null) return true;
+        if (executor.database.getFunction(name.toLowerCase(java.util.Locale.ROOT)) != null) return true;
         if (executor.database.getCustomEnum(name) != null) return true;
         if (executor.database.getDomain(name) != null) return true;
-        return executor.database.getCompositeTypes().containsKey(name.toLowerCase());
+        return executor.database.getCompositeTypes().containsKey(name.toLowerCase(java.util.Locale.ROOT));
     }
 
     /** The view a name reaches, or null when it reaches none. */
@@ -1009,7 +1009,7 @@ final class StatementAnalyzer {
     private Table requireRelation(String schema, String name,
                                   Map<String, SelectStmt.CommonTableExpr> ctes) {
         if (name == null) return null;
-        if (schema == null && ctes.containsKey(name.toLowerCase())) return null;
+        if (schema == null && ctes.containsKey(name.toLowerCase(java.util.Locale.ROOT))) return null;
         // A view is a relation every query may read, and resolution here is the write path's:
         // it hands back the base table a write would be rewritten onto, or refuses the view
         // outright when no write can go through it. Neither answers what a reader asked — the
@@ -1048,12 +1048,12 @@ final class StatementAnalyzer {
     private void requireColumns(Table table, String relation, List<String> columns) {
         if (table == null || columns == null) return;
         Set<String> known = new HashSet<String>();
-        for (Column c : table.getColumns()) known.add(c.getName().toLowerCase());
+        for (Column c : table.getColumns()) known.add(c.getName().toLowerCase(java.util.Locale.ROOT));
         for (String column : columns) {
-            if (column == null || known.contains(column.toLowerCase())) continue;
+            if (column == null || known.contains(column.toLowerCase(java.util.Locale.ROOT))) continue;
             // A system column is there whether or not it was declared, and writing to one is
             // refused for what it is rather than reported as a column that does not exist.
-            if (SYSTEM_COLUMNS.contains(column.toLowerCase())) continue;
+            if (SYSTEM_COLUMNS.contains(column.toLowerCase(java.util.Locale.ROOT))) continue;
             throw new MemgresException("column \"" + column + "\" of relation \"" + relation
                     + "\" does not exist", "42703");
         }
@@ -1162,11 +1162,11 @@ final class StatementAnalyzer {
         Set<String> known = new HashSet<String>();
         boolean anyStored = false;
         for (RowContext.TableBinding b : inScope()) {
-            for (Column c : b.table().getColumns()) known.add(c.getName().toLowerCase());
+            for (Column c : b.table().getColumns()) known.add(c.getName().toLowerCase(java.util.Locale.ROOT));
             // A relation's own name stands for a row of it, so a bare name matching one of the
             // relations read is a whole-row reference rather than a column that is not there.
-            known.add(b.table().getName().toLowerCase());
-            if (b.alias() != null) known.add(b.alias().toLowerCase());
+            known.add(b.table().getName().toLowerCase(java.util.Locale.ROOT));
+            if (b.alias() != null) known.add(b.alias().toLowerCase(java.util.Locale.ROOT));
             if (!queryRelations.containsKey(b.table())) anyStored = true;
         }
         // The system columns belong to the tuple a relation stores, so they are names to reckon
@@ -1177,7 +1177,7 @@ final class StatementAnalyzer {
         // query may group by even though no relation has a column of that name.
         if (sel.targets != null) {
             for (SelectStmt.SelectTarget t : sel.targets) {
-                if (t.alias() != null) known.add(t.alias().toLowerCase());
+                if (t.alias() != null) known.add(t.alias().toLowerCase(java.util.Locale.ROOT));
             }
         }
         // In the order PostgreSQL settles them, because that is the order it reports them in: the
@@ -1254,7 +1254,7 @@ final class StatementAnalyzer {
             }
             String name = ref.column();
             if (name == null || name.equals("*")) return true;
-            if (!known.contains(name.toLowerCase())) {
+            if (!known.contains(name.toLowerCase(java.util.Locale.ROOT))) {
                 MemgresException e =
                         new MemgresException("column \"" + name + "\" does not exist", "42703");
                 // A name close to one of the columns in scope is worth suggesting, which is the
@@ -1375,7 +1375,7 @@ final class StatementAnalyzer {
             // part of it, and PostgreSQL says so rather than calling it missing. Which of the two
             // it is is settled by the whole range table, and the reader that has that in front of
             // it is the one that runs the query, so a name one of them holds is left to it.
-            if (hidden.contains(qualifier.toLowerCase())) return true;
+            if (hidden.contains(qualifier.toLowerCase(java.util.Locale.ROOT))) return true;
             throw new MemgresException(
                     "missing FROM-clause entry for table \"" + qualifier + "\"", "42P01");
         }
@@ -1400,7 +1400,7 @@ final class StatementAnalyzer {
         // The system columns belong to the tuple a relation stores, so a relation standing for a
         // query's own output has none of them.
         if (!queryRelations.containsKey(found.table())
-                && SYSTEM_COLUMNS.contains(name.toLowerCase())) {
+                && SYSTEM_COLUMNS.contains(name.toLowerCase(java.util.Locale.ROOT))) {
             return true;
         }
         if (found.table().getColumnIndex(name) >= 0) return true;

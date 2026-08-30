@@ -137,7 +137,7 @@ public class ExpressionParser {
     protected boolean checkIntervalField() {
         Token t = peek();
         if (t.type() == TokenType.EOF) return false;
-        String v = t.value().toUpperCase();
+        String v = t.value().toUpperCase(java.util.Locale.ROOT);
         return (t.type() == TokenType.KEYWORD || t.type() == TokenType.IDENTIFIER) &&
                 ("YEAR".equals(v) || "MONTH".equals(v) || "DAY".equals(v) ||
                  "HOUR".equals(v) || "MINUTE".equals(v) || "SECOND".equals(v));
@@ -282,7 +282,7 @@ public class ExpressionParser {
             case LESS_EQUALS: case GREATER_EQUALS:
                 return true;
             case KEYWORD:
-                return FOLLOWS_A_COLUMN.contains(next.value().toUpperCase());
+                return FOLLOWS_A_COLUMN.contains(next.value().toUpperCase(java.util.Locale.ROOT));
             default:
                 return false;
         }
@@ -373,7 +373,7 @@ public class ExpressionParser {
         // Allow keywords as identifiers in many contexts
         if (t.type() == TokenType.KEYWORD) {
             advance();
-            return t.value().toLowerCase();
+            return t.value().toLowerCase(java.util.Locale.ROOT);
         }
         // Allow single-quoted strings as identifiers (PG accepts 'name' in SET ROLE, CREATE ROLE, etc.)
         if (t.type() == TokenType.STRING_LITERAL) {
@@ -395,7 +395,7 @@ public class ExpressionParser {
         }
         if (t.type() == TokenType.KEYWORD) {
             advance();
-            return t.value().toLowerCase();
+            return t.value().toLowerCase(java.util.Locale.ROOT);
         }
         throw new ParseException("Expected identifier or string", t);
     }
@@ -425,7 +425,7 @@ public class ExpressionParser {
             // and the type has to be one that schema holds.
             typeSchemaQualifiers.add(qualifier + "." + name);
             if (!"pg_catalog".equalsIgnoreCase(qualifier)) {
-                name = qualifier.toLowerCase() + "." + name.toLowerCase();
+                name = qualifier.toLowerCase(java.util.Locale.ROOT) + "." + name.toLowerCase(java.util.Locale.ROOT);
             }
         }
         sb.append(name);
@@ -512,7 +512,7 @@ public class ExpressionParser {
         // The one type whose name is written with its quotes is "char", and the quotes are how it
         // is told apart from char, so a name spelled that way is left to the executor.
         if (written.startsWith("\"")) return;
-        String name = written.toLowerCase();
+        String name = written.toLowerCase(java.util.Locale.ROOT);
         if (UNMODIFIABLE_GRAMMAR_TYPES.contains(name)) throw ParseException.at(peek());
         if (MODIFIABLE_TYPES.contains(name)) return;
         if (com.memgres.engine.DataType.fromPgName(name) == null) return;
@@ -591,7 +591,7 @@ public class ExpressionParser {
      * which is why {@code interval year(2)} is a syntax error at the parenthesis.
      */
     private void parseIntervalQualifier(StringBuilder sb) {
-        String first = advance().value().toLowerCase();
+        String first = advance().value().toLowerCase(java.util.Locale.ROOT);
         sb.append(" ").append(first);
         if (first.equals("second")) {
             appendIntervalPrecision(sb);
@@ -608,7 +608,7 @@ public class ExpressionParser {
         if (allowed.length == 0) throw ParseException.at(to);
         advance();  // consume TO
         Token endTok = peek();
-        String end = checkIntervalField() ? endTok.value().toLowerCase() : null;
+        String end = checkIntervalField() ? endTok.value().toLowerCase(java.util.Locale.ROOT) : null;
         boolean ok = false;
         for (int i = 0; i < allowed.length; i++) {
             if (allowed[i].equals(end)) ok = true;
@@ -757,7 +757,7 @@ public class ExpressionParser {
                 String argName = readIdentifier();
                 advance(); // consume => or :=
                 Expression value = parseExpression();
-                list.add(new NamedArgExpr(argName.toLowerCase(), value));
+                list.add(new NamedArgExpr(argName.toLowerCase(java.util.Locale.ROOT), value));
             } else {
                 resetPosition(saved);
                 list.add(parseExpression());
@@ -963,7 +963,7 @@ public class ExpressionParser {
             // IS [NOT] [NFC|NFD|NFKC|NFKD] NORMALIZED
             String normForm = "NFC"; // default
             if (checkIdentCI("NFC") || checkIdentCI("NFD") || checkIdentCI("NFKC") || checkIdentCI("NFKD")) {
-                normForm = advance().value().toUpperCase();
+                normForm = advance().value().toUpperCase(java.util.Locale.ROOT);
             }
             if (checkIdentCI("NORMALIZED")) {
                 advance(); // consume NORMALIZED
@@ -1632,7 +1632,7 @@ public class ExpressionParser {
         // However, reject OS-level locale collations (e.g., en_US.utf8) that
         // memgres cannot support, to match PG behavior for CREATE INDEX COLLATE.
         if (collation == null) return;
-        String lower = collation.toLowerCase().replace("\"", "");
+        String lower = collation.toLowerCase(java.util.Locale.ROOT).replace("\"", "");
         if (KNOWN_COLLATIONS.contains(lower)) return;
         if (lower.startsWith("pg_catalog.")) return;
         // Locale-like names with dots (en_US.utf8) are OS collations not available in memgres
@@ -1741,7 +1741,7 @@ public class ExpressionParser {
         if (t.type() == TokenType.KEYWORD && PgKeywords.isColumnNameKeyword(t.value())
                 && keywordStandsAlone()) {
             advance();
-            return new ColumnRef(null, null, null, t.value().toLowerCase());
+            return new ColumnRef(null, null, null, t.value().toLowerCase(java.util.Locale.ROOT));
         }
 
         // Keywords that are values
@@ -1807,7 +1807,7 @@ public class ExpressionParser {
                             pos = saved; // restore; there were args after (
                         }
                     }
-                    return new FunctionCallExpr(t.value().toLowerCase(), valueArgs);
+                    return new FunctionCallExpr(t.value().toLowerCase(java.util.Locale.ROOT), valueArgs);
                 }
                 case "INTERVAL": {
                     return specialFormParser.parseInterval(); 
@@ -1945,7 +1945,7 @@ public class ExpressionParser {
                 case "NEW":
                 case "OLD": {
                     // Trigger variable: NEW.column or OLD.column or NEW.* / OLD.*
-                    String prefix = advance().value().toLowerCase();
+                    String prefix = advance().value().toLowerCase(java.util.Locale.ROOT);
                     if (match(TokenType.DOT)) {
                         if (check(TokenType.STAR)) {
                             advance();
@@ -1981,7 +1981,7 @@ public class ExpressionParser {
                     && tokens.get(pos + 1).type() == TokenType.INTEGER_LITERAL
                     && tokens.get(pos + 2).type() == TokenType.RIGHT_PAREN
                     && tokens.get(pos + 3).type() == TokenType.STRING_LITERAL
-                    && PRECISION_TAKING_LITERALS.contains(name.toLowerCase())) {
+                    && PRECISION_TAKING_LITERALS.contains(name.toLowerCase(java.util.Locale.ROOT))) {
                 advance();
                 literalPrecision = "(" + advance().value() + ")";
                 advance();
@@ -1989,7 +1989,7 @@ public class ExpressionParser {
 
             // Type-annotated literal: typename 'value' (e.g., point '(1,2)', DATE '2024-01-01', json '{}')
             if (check(TokenType.STRING_LITERAL)) {
-                String lower = name.toLowerCase();
+                String lower = name.toLowerCase(java.util.Locale.ROOT);
                 if (lower.equals("point") || lower.equals("line") || lower.equals("lseg")
                         || lower.equals("box") || lower.equals("path") || lower.equals("polygon")
                         || lower.equals("circle")
@@ -2243,9 +2243,9 @@ public class ExpressionParser {
         if (withinOrderBy != null) {
             if (checkKeyword("OVER")) {
                 throw new MemgresException("OVER is not supported for ordered-set aggregate "
-                        + name.toLowerCase(), "0A000");
+                        + name.toLowerCase(java.util.Locale.ROOT), "0A000");
             }
-            return new OrderedSetAggExpr(name.toLowerCase(), args, withinOrderBy, filter);
+            return new OrderedSetAggExpr(name.toLowerCase(java.util.Locale.ROOT), args, withinOrderBy, filter);
         }
 
         // Check for OVER clause: window function

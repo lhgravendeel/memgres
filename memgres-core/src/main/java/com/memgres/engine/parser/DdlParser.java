@@ -209,10 +209,12 @@ class DdlParser {
         }
         if (parser.matchKeyword("OWNED")) {
             parser.expectKeyword("BY");
-            String role = parser.readIdentifier();
+            List<String> roles = new ArrayList<>();
+            do { roles.add(parser.readIdentifier()); } while (parser.match(TokenType.COMMA));
             boolean cascade = parser.matchKeyword("CASCADE");
             if (!cascade) parser.matchKeyword("RESTRICT");
-            return new DropOwnedStmt(role, cascade);
+            parser.expectEndOfStatement();
+            return new DropOwnedStmt(roles, cascade);
         }
 
         if (parser.matchKeyword("TABLE")) {
@@ -345,7 +347,7 @@ class DdlParser {
                 parser.expectKeyword("AS");
                 String targetType = parser.parseTypeName();
                 parser.expect(TokenType.RIGHT_PAREN);
-                castName = sourceType.toLowerCase() + "->" + targetType.toLowerCase();
+                castName = sourceType.toLowerCase(java.util.Locale.ROOT) + "->" + targetType.toLowerCase(java.util.Locale.ROOT);
             }
             // A cast is named one at a time, so the comma a list would need is a syntax error.
             if (parser.check(TokenType.COMMA)) throw ParseException.at(parser.peek());
@@ -474,7 +476,7 @@ class DdlParser {
                 opSchema = name.substring(0, dotIdx);
                 opName = name.substring(dotIdx + 1);
             }
-            name = opSchema.toLowerCase() + "." + opName + "(" + leftArg.toLowerCase() + "," + rightArg.toLowerCase() + ")";
+            name = opSchema.toLowerCase(java.util.Locale.ROOT) + "." + opName + "(" + leftArg.toLowerCase(java.util.Locale.ROOT) + "," + rightArg.toLowerCase(java.util.Locale.ROOT) + ")";
         }
         if ((objectType == DropStmt.ObjectType.OPERATOR_CLASS
                 || objectType == DropStmt.ObjectType.OPERATOR_FAMILY) && parser.check(TokenType.LEFT_PAREN)) {
@@ -537,7 +539,7 @@ class DdlParser {
             if (parser.checkKeyword("IN") || parser.checkKeyword("INOUT")
                     || parser.checkKeyword("VARIADIC") || parser.checkIdentifier("OUT")
                     || parser.checkIdentifier("INOUT") || parser.checkIdentifier("VARIADIC")) {
-                mode = parser.advance().value().toUpperCase();
+                mode = parser.advance().value().toUpperCase(java.util.Locale.ROOT);
                 if ("IN".equals(mode) && (parser.checkIdentifier("OUT") || parser.checkKeyword("OUT"))) {
                     parser.advance();
                     mode = "INOUT";
@@ -864,16 +866,16 @@ class DdlParser {
 
         List<String> events = new ArrayList<>();
         List<String> updateOfColumns = new ArrayList<>();
-        String event = parser.readIdentifier().toUpperCase();
+        String event = parser.readIdentifier().toUpperCase(java.util.Locale.ROOT);
         events.add(event);
         if (event.equals("UPDATE") && parser.matchKeyword("OF")) {
-            do { updateOfColumns.add(parser.readIdentifier().toLowerCase()); } while (parser.match(TokenType.COMMA));
+            do { updateOfColumns.add(parser.readIdentifier().toLowerCase(java.util.Locale.ROOT)); } while (parser.match(TokenType.COMMA));
         }
         while (parser.matchKeyword("OR")) {
-            event = parser.readIdentifier().toUpperCase();
+            event = parser.readIdentifier().toUpperCase(java.util.Locale.ROOT);
             events.add(event);
             if (event.equals("UPDATE") && parser.matchKeyword("OF")) {
-                do { updateOfColumns.add(parser.readIdentifier().toLowerCase()); } while (parser.match(TokenType.COMMA));
+                do { updateOfColumns.add(parser.readIdentifier().toLowerCase(java.util.Locale.ROOT)); } while (parser.match(TokenType.COMMA));
             }
         }
 
@@ -1022,7 +1024,7 @@ class DdlParser {
         // The body names the view to refer to itself. Point those references at the CTE instead,
         // keeping the view's name as the alias so qualified column references still read the same
         // — otherwise resolving the name would expand the view again, without end.
-        String cteName = "__recursive_view_" + name.toLowerCase() + "__";
+        String cteName = "__recursive_view_" + name.toLowerCase(java.util.Locale.ROOT) + "__";
         retargetSelfReference(body, name, cteName);
 
         SelectStmt.CommonTableExpr cte = new SelectStmt.CommonTableExpr(
@@ -1182,7 +1184,7 @@ class DdlParser {
                     value = parser.readIdentifier();
                 }
             }
-            opts.put(key.toLowerCase(), value.toLowerCase());
+            opts.put(key.toLowerCase(java.util.Locale.ROOT), value.toLowerCase(java.util.Locale.ROOT));
         } while (parser.match(TokenType.COMMA));
         parser.expect(TokenType.RIGHT_PAREN);
         return opts;
@@ -1237,7 +1239,7 @@ class DdlParser {
             String subtypeOpclass = null;
             boolean canonical = false;
             do {
-                String attribute = parser.readIdentifier().toLowerCase();
+                String attribute = parser.readIdentifier().toLowerCase(java.util.Locale.ROOT);
                 parser.expect(TokenType.EQUALS);
                 if (attribute.equals("subtype")) {
                     rangeSubtype = parser.parseTypeName();
@@ -1352,7 +1354,7 @@ class DdlParser {
         String sfunc = null, stype = null, initcond = null, finalfunc = null, combinefunc = null, sortop = null;
         if (parser.match(TokenType.LEFT_PAREN)) {
             while (!parser.check(TokenType.RIGHT_PAREN) && !parser.isAtEnd()) {
-                String key = parser.readIdentifier().toUpperCase();
+                String key = parser.readIdentifier().toUpperCase(java.util.Locale.ROOT);
                 parser.match(TokenType.EQUALS);
                 switch (key) {
                     case "SFUNC":
@@ -1444,7 +1446,7 @@ class DdlParser {
         parser.expectKeyword("AS");
         parser.expectKeyword("ON");
         Token eventToken = parser.peek();
-        String event = parser.readIdentifier().toUpperCase();
+        String event = parser.readIdentifier().toUpperCase(java.util.Locale.ROOT);
         if (!"SELECT".equals(event) && !"INSERT".equals(event)
                 && !"UPDATE".equals(event) && !"DELETE".equals(event)) {
             throw new ParseException("unrecognized rule event", eventToken);
@@ -1546,7 +1548,7 @@ class DdlParser {
         boolean ifNotExists = parser.matchKeywords("IF", "NOT", "EXISTS");
         String name = parser.readIdentifier();
         // The pg_ prefix is reserved for system schemas, so a schema cannot claim it.
-        if (name != null && name.toLowerCase().startsWith("pg_")) {
+        if (name != null && name.toLowerCase(java.util.Locale.ROOT).startsWith("pg_")) {
             throw new MemgresException("unacceptable schema name \"" + name + "\""
                     + "\n  Detail: The prefix \"pg_\" is reserved for system schemas.", "42939");
         }
@@ -1965,7 +1967,7 @@ class DdlParser {
         String typeName = parser.readIdentifier();
         // Carried, not discarded: ALTER TYPE a.e names a.e however many other schemas hold an e,
         // and PostgreSQL reports the name it could not find as it was written.
-        if (parser.match(TokenType.DOT)) typeName = typeName.toLowerCase() + "." + parser.readIdentifier();
+        if (parser.match(TokenType.DOT)) typeName = typeName.toLowerCase(java.util.Locale.ROOT) + "." + parser.readIdentifier();
         if (parser.matchKeywords("ADD", "VALUE")) {
             boolean ifNotExists = parser.matchKeywords("IF", "NOT", "EXISTS");
             Token val = parser.expect(TokenType.STRING_LITERAL);
@@ -2040,12 +2042,12 @@ class DdlParser {
         if (parser.matchKeyword("GRANT")) { isGrant = true; }
         else { parser.expectKeyword("REVOKE"); isGrant = false; if (parser.matchKeywords("GRANT", "OPTION")) parser.expectKeyword("FOR"); }
         do {
-            String priv = parser.readIdentifier().toUpperCase();
+            String priv = parser.readIdentifier().toUpperCase(java.util.Locale.ROOT);
             if (priv.equals("ALL")) { parser.matchKeyword("PRIVILEGES"); privileges.add("ALL"); }
             else { privileges.add(priv); }
         } while (parser.match(TokenType.COMMA));
         parser.expectKeyword("ON");
-        String objectType = parser.readIdentifier().toUpperCase();
+        String objectType = parser.readIdentifier().toUpperCase(java.util.Locale.ROOT);
         List<String> grantees = new ArrayList<>();
         if (parser.matchKeyword("TO") || parser.matchKeyword("FROM")) {
             do { grantees.add(parser.readIdentifier()); } while (parser.match(TokenType.COMMA));
@@ -2204,7 +2206,7 @@ class DdlParser {
 
         while (!parser.isAtEnd() && !parser.check(TokenType.RIGHT_PAREN)) {
             if (parser.match(TokenType.COMMA)) continue;
-            String kw = parser.advance().value().toUpperCase();
+            String kw = parser.advance().value().toUpperCase(java.util.Locale.ROOT);
             switch (kw) {
                 case "LEFTARG":
                     parser.match(TokenType.EQUALS);
@@ -2274,7 +2276,7 @@ class DdlParser {
                 && !parser.check(TokenType.SEMICOLON)) {
             Token t = parser.peek();
             // Stop if we hit a keyword that's a new attribute
-            if (t.type() == TokenType.IDENTIFIER && isOperatorAttribute(t.value().toUpperCase())) break;
+            if (t.type() == TokenType.IDENTIFIER && isOperatorAttribute(t.value().toUpperCase(java.util.Locale.ROOT))) break;
             sb.append(parser.advance().value());
         }
         return sb.toString().trim();
@@ -2366,7 +2368,7 @@ class DdlParser {
 
     /** Check if a token is the start of a multi-word SQL type name. */
     private static boolean isMultiWordTypeStart(String token) {
-        switch (token.toLowerCase()) {
+        switch (token.toLowerCase(java.util.Locale.ROOT)) {
             case "double":        // double precision
             case "character":     // character varying
             case "timestamp":     // timestamp with/without time zone
@@ -2410,7 +2412,7 @@ class DdlParser {
                     if (parser.checkKeyword("IN") || parser.checkKeyword("INOUT")
                             || parser.checkKeyword("VARIADIC") || parser.checkIdentifier("OUT")
                             || parser.checkIdentifier("INOUT") || parser.checkIdentifier("VARIADIC")) {
-                        paramMode = parser.advance().value().toUpperCase();
+                        paramMode = parser.advance().value().toUpperCase(java.util.Locale.ROOT);
                         if ("IN".equals(paramMode) && (parser.checkIdentifier("OUT")
                                 || parser.checkKeyword("OUT"))) {
                             parser.advance();
@@ -2625,7 +2627,7 @@ class DdlParser {
             java.util.Map<String, String> params = new java.util.LinkedHashMap<>();
             if (parser.match(TokenType.LEFT_PAREN)) {
                 while (!parser.isAtEnd() && !parser.check(TokenType.RIGHT_PAREN)) {
-                    String key = parser.readIdentifier().toLowerCase();
+                    String key = parser.readIdentifier().toLowerCase(java.util.Locale.ROOT);
                     parser.match(TokenType.EQUALS);
                     StringBuilder val = new StringBuilder();
                     while (!parser.isAtEnd() && !parser.check(TokenType.COMMA) && !parser.check(TokenType.RIGHT_PAREN)) {
@@ -2644,7 +2646,7 @@ class DdlParser {
             java.util.Map<String, String> params = new java.util.LinkedHashMap<>();
             if (parser.match(TokenType.LEFT_PAREN)) {
                 while (!parser.isAtEnd() && !parser.check(TokenType.RIGHT_PAREN)) {
-                    String key = parser.readIdentifier().toLowerCase();
+                    String key = parser.readIdentifier().toLowerCase(java.util.Locale.ROOT);
                     params.put(key, null); // null value signals removal
                     parser.match(TokenType.COMMA);
                 }
@@ -2805,7 +2807,7 @@ class DdlParser {
             String filterVar = parser.readIdentifier();
             if (!"tag".equalsIgnoreCase(filterVar)) {
                 throw new com.memgres.engine.MemgresException(
-                        "unrecognized filter variable \"" + filterVar.toLowerCase() + "\"", "42601");
+                        "unrecognized filter variable \"" + filterVar.toLowerCase(java.util.Locale.ROOT) + "\"", "42601");
             }
             parser.expectKeyword("IN");
             parser.match(TokenType.LEFT_PAREN);
@@ -2882,7 +2884,7 @@ class DdlParser {
         if (parser.check(TokenType.LEFT_PAREN)) {
             parser.advance(); // (
             do {
-                kinds.add(parser.readIdentifier().toLowerCase());
+                kinds.add(parser.readIdentifier().toLowerCase(java.util.Locale.ROOT));
             } while (parser.match(TokenType.COMMA));
             parser.expect(TokenType.RIGHT_PAREN);
         }
@@ -3387,13 +3389,13 @@ class DdlParser {
         Map<String, String> options = new LinkedHashMap<>();
         if (parser.match(TokenType.LEFT_PAREN)) {
             do {
-                String optName = parser.readIdentifier().toLowerCase();
+                String optName = parser.readIdentifier().toLowerCase(java.util.Locale.ROOT);
                 parser.expect(TokenType.EQUALS);
                 String optVal;
                 if (parser.check(TokenType.STRING_LITERAL)) {
                     optVal = parser.advance().value();
                 } else if (parser.checkKeyword("TRUE") || parser.checkKeyword("FALSE")) {
-                    optVal = parser.advance().value().toLowerCase();
+                    optVal = parser.advance().value().toLowerCase(java.util.Locale.ROOT);
                 } else {
                     optVal = parser.advance().value();
                 }

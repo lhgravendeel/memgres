@@ -206,7 +206,7 @@ final class GroupByValidator {
         if (node instanceof com.memgres.engine.parser.ast.FunctionCallExpr) {
             com.memgres.engine.parser.ast.FunctionCallExpr call =
                     (com.memgres.engine.parser.ast.FunctionCallExpr) node;
-            String name = call.name() == null ? "" : call.name().toLowerCase();
+            String name = call.name() == null ? "" : call.name().toLowerCase(java.util.Locale.ROOT);
             if (("sum".equals(name) || "avg".equals(name)) && call.args().size() == 1
                     && call.args().get(0) instanceof ColumnRef) {
                 ColumnRef ref = (ColumnRef) call.args().get(0);
@@ -475,7 +475,7 @@ final class GroupByValidator {
      * conversion PostgreSQL does not erase. A name this does not know simply keeps its cast.
      */
     private static DataType builtInType(String name) {
-        String lower = name.toLowerCase();
+        String lower = name.toLowerCase(java.util.Locale.ROOT);
         if ("smallint".equals(lower) || "int2".equals(lower)) return DataType.SMALLINT;
         if ("integer".equals(lower) || "int".equals(lower) || "int4".equals(lower)) return DataType.INTEGER;
         if ("bigint".equals(lower) || "int8".equals(lower)) return DataType.BIGINT;
@@ -626,7 +626,7 @@ final class GroupByValidator {
             }
             if (!wholeKeyGrouped) continue;
             for (Column column : binding.table().getColumns()) {
-                out.add(column.getName().toLowerCase());
+                out.add(column.getName().toLowerCase(java.util.Locale.ROOT));
             }
         }
     }
@@ -733,7 +733,7 @@ final class GroupByValidator {
             if (!(arg instanceof ColumnRef)) return;
             ColumnRef ref = (ColumnRef) arg;
             if (ref.table() != null || ref.column() == null) return;
-            if (SYSTEM_COLUMNS.contains(ref.column().toLowerCase())) return;
+            if (SYSTEM_COLUMNS.contains(ref.column().toLowerCase(java.util.Locale.ROOT))) return;
             if (bindings == null || bindings.isEmpty()) return;
             for (RowContext.TableBinding binding : bindings) {
                 if (binding.table() == null) return;
@@ -834,7 +834,7 @@ final class GroupByValidator {
     static boolean isGroupingCall(Expression expr) {
         if (!(expr instanceof com.memgres.engine.parser.ast.FunctionCallExpr)) return false;
         String name = ((com.memgres.engine.parser.ast.FunctionCallExpr) expr).name();
-        return name != null && "grouping".equals(FunctionEvaluator.stripSchemaPrefix(name.toLowerCase()));
+        return name != null && "grouping".equals(FunctionEvaluator.stripSchemaPrefix(name.toLowerCase(java.util.Locale.ROOT)));
     }
 
     private boolean isAggregateCall(Expression expr) {
@@ -1003,7 +1003,7 @@ final class GroupByValidator {
             String relation = binding == null
                     ? (ref.table() == null ? "?" : ref.table())
                     : (binding.alias() != null ? binding.alias() : binding.table().getName());
-            return "col:" + relation.toLowerCase() + "." + ref.column().toLowerCase();
+            return "col:" + relation.toLowerCase(java.util.Locale.ROOT) + "." + ref.column().toLowerCase(java.util.Locale.ROOT);
         }
         if (node instanceof Literal) {
             // A literal stands for the value it spells, and 'a' is not 'A'. Lowercased with
@@ -1032,7 +1032,7 @@ final class GroupByValidator {
             for (Object element : (Iterable<?>) node) sb.append(canon(element, bindings)).append(',');
             return sb.append(']').toString();
         }
-        if (!isAstNode(node)) return String.valueOf(node).toLowerCase();
+        if (!isAstNode(node)) return String.valueOf(node).toLowerCase(java.util.Locale.ROOT);
         StringBuilder sb = new StringBuilder(node.getClass().getSimpleName()).append('(');
         for (Field field : partsOf(node.getClass())) {
             Object value;

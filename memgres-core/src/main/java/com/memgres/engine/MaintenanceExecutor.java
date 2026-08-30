@@ -55,7 +55,7 @@ final class MaintenanceExecutor {
         Database.ViewDef view = executor.database.getView(where, name);
         if (view != null) return view.materialized ? Kind.MATVIEW : Kind.VIEW;
         Schema s = executor.database.getSchema(where);
-        if (s != null && s.getTables().containsKey(name.toLowerCase())) return Kind.TABLE;
+        if (s != null && s.getTables().containsKey(name.toLowerCase(java.util.Locale.ROOT))) return Kind.TABLE;
         if (executor.database.hasIndex(name) || namesAConstraintIndex(name)) return Kind.INDEX;
         if (executor.database.getSequence(where, name) != null) return Kind.SEQUENCE;
         if (isCatalogRelation(schema, name)) return Kind.CATALOG;
@@ -241,10 +241,17 @@ final class MaintenanceExecutor {
         if (columns != null) {
             Map<String, ColumnStatistics> named = new java.util.LinkedHashMap<>();
             for (String column : columns) {
-                ColumnStatistics stats = gathered.get(column.toLowerCase());
-                if (stats != null) named.put(column.toLowerCase(), stats);
+                ColumnStatistics stats = gathered.get(column.toLowerCase(java.util.Locale.ROOT));
+                if (stats != null) named.put(column.toLowerCase(java.util.Locale.ROOT), stats);
             }
             gathered = named;
+        }
+        // ANALYZE writes a catalogue row for each column it learned something about, and a
+        // transaction that writes one gets an id of its own. Over a relation with no rows it
+        // writes nothing and stays read-only, which is why the id turns on the statistics
+        // gathered rather than on the statement having run.
+        if (!gathered.isEmpty() && executor.session != null) {
+            executor.session.getTransactionId();
         }
         executor.database.recordColumnStatistics(relation, gathered);
     }

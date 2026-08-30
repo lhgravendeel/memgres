@@ -45,7 +45,7 @@ class GeometricFunctions {
     private String declaredGeometricType(Expression expr, RowContext ctx) {
         if (expr instanceof CastExpr) {
             String name = ((CastExpr) expr).typeName();
-            return name == null ? null : geometricTypeName(name.toLowerCase().trim());
+            return name == null ? null : geometricTypeName(name.toLowerCase(java.util.Locale.ROOT).trim());
         }
         if (expr instanceof ColumnRef && ctx != null) {
             ColumnRef ref = (ColumnRef) expr;
@@ -430,7 +430,7 @@ class GeometricFunctions {
      */
     private String getArgCastType(Expression expr) {
         if (expr instanceof CastExpr) {
-            return ((CastExpr) expr).typeName().toLowerCase();
+            return ((CastExpr) expr).typeName().toLowerCase(java.util.Locale.ROOT);
         }
         return null;
     }

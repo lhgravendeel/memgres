@@ -366,6 +366,9 @@ class IndexEqualityScanTest {
             } finally {
                 exec(c, "RESET ROLE");
                 exec(c, "DROP POLICY IF EXISTS ies_rls_own ON ies_rls");
+                // A grant names the role, so PostgreSQL will not drop it while one stands;
+                // DROP OWNED BY is what takes them away.
+                exec(c, "DROP OWNED BY ies_bob");
                 exec(c, "DROP ROLE IF EXISTS ies_bob");
             }
         }

@@ -208,8 +208,8 @@ class DmlConflictHelper {
             if (sc.getExpressionColumns() != null && sc.getExpressionColumns().size() == targetExprs.size()) {
                 boolean allMatch = true;
                 for (int i = 0; i < targetExprs.size(); i++) {
-                    String targetExpr = targetExprs.get(i).toLowerCase().replaceAll("\\s+", "");
-                    String idxExpr = sc.getColumns().get(i).toLowerCase().replaceAll("\\s+", "");
+                    String targetExpr = targetExprs.get(i).toLowerCase(java.util.Locale.ROOT).replaceAll("\\s+", "");
+                    String idxExpr = sc.getColumns().get(i).toLowerCase(java.util.Locale.ROOT).replaceAll("\\s+", "");
                     if (!targetExpr.equals(idxExpr)) {
                         allMatch = false;
                         break;
@@ -226,8 +226,8 @@ class DmlConflictHelper {
             if (sc.getColumns() != null && sc.getColumns().size() == targetExprs.size()) {
                 boolean allMatch = true;
                 for (int i = 0; i < targetExprs.size(); i++) {
-                    String targetExpr = targetExprs.get(i).toLowerCase().replaceAll("\\s+", "");
-                    String colName = sc.getColumns().get(i).toLowerCase();
+                    String targetExpr = targetExprs.get(i).toLowerCase(java.util.Locale.ROOT).replaceAll("\\s+", "");
+                    String colName = sc.getColumns().get(i).toLowerCase(java.util.Locale.ROOT);
                     if (!targetExpr.equals(colName)) {
                         allMatch = false;
                         break;

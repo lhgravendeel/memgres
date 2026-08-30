@@ -410,7 +410,7 @@ class CatalogSecurityBuilder {
                 for (RlsPolicy policy : t.getRlsPolicies()) {
                     String cmdChar = "*"; // default = ALL
                     if (policy.getCommand() != null) {
-                        switch (policy.getCommand().toUpperCase()) {
+                        switch (policy.getCommand().toUpperCase(java.util.Locale.ROOT)) {
                             case "SELECT": cmdChar = "r"; break;
                             case "INSERT": cmdChar = "a"; break;
                             case "UPDATE": cmdChar = "w"; break;
@@ -655,10 +655,12 @@ class CatalogSecurityBuilder {
                     null, null, null, virtual, s.getPid(), "ExclusiveLock", true, true, null
             });
             // The lock on a transaction id joins it only once one has been assigned, which is
-            // when a transaction block is open.
-            if (s.getStatus() == Session.TransactionStatus.IN_TRANSACTION) {
+            // when the transaction first writes or is asked for one outright. A transaction that
+            // has only read has no id of its own to hold a lock over.
+            if (s.getStatus() == Session.TransactionStatus.IN_TRANSACTION
+                    && s.hasAssignedTransactionId()) {
                 table.insertRow(new Object[]{
-                        "transactionid", null, null, null, null, null, s.getTransactionId(),
+                        "transactionid", null, null, null, null, null, s.peekTransactionId(),
                         null, null, null, virtual, s.getPid(), "ExclusiveLock", true, false, null
                 });
             }

@@ -98,7 +98,7 @@ class CatalogStubBuilder {
             for (Table tt : sch.getTables().values()) {
                 for (StoredConstraint sc : tt.getConstraints()) {
                     if (sc.getType() == StoredConstraint.Type.FOREIGN_KEY && sc.getReferencesTable() != null) {
-                        fkReferencedTables.add(sc.getReferencesTable().toLowerCase());
+                        fkReferencedTables.add(sc.getReferencesTable().toLowerCase(java.util.Locale.ROOT));
                     }
                 }
             }
@@ -130,9 +130,15 @@ class CatalogStubBuilder {
                     }
                 }
                 boolean hasTrig = hasOwnTrigger
-                        || hasFk || fkReferencedTables.contains(tableName.toLowerCase());
+                        || hasFk || fkReferencedTables.contains(tableName.toLowerCase(java.util.Locale.ROOT));
+                // The relation's owner, which is not always the role the server started as: a
+                // view naming the owner of every relation as that one role told a reader that
+                // nobody else owned anything.
                 table.insertRow(new Object[]{
-                        schemaEntry.getKey(), tableName, "memgres", null, hasIdx, false, hasTrig,
+                        schemaEntry.getKey(), tableName,
+                        CatalogHelper.ownerNameOf(database,
+                                "table:" + AstExecutor.privilegeKey(tblSchema, tableName)),
+                        null, hasIdx, false, hasTrig,
                         t.isRlsEnabled()
                 });
             }
@@ -158,7 +164,9 @@ class CatalogStubBuilder {
                 viewDef = ViewDeparser.viewDef(vd.query(), false, 0,
                         ViewDeparser.columnTypesOf(database, vd), null) + ";";
             }
-            table.insertRow(new Object[]{vSchema, vd.name(), "memgres", viewDef});
+            table.insertRow(new Object[]{vSchema, vd.name(),
+                    CatalogHelper.ownerNameOf(database, "view:" + vSchema + "." + vd.name()),
+                    viewDef});
         }
         return table;
     }
@@ -201,7 +209,7 @@ class CatalogStubBuilder {
                     CatalogHelper.deparseIndexPredicate(database, storedTableQualified,
                             database.getIndexWhereClause(indexKey)));
             table.insertRow(new Object[]{schemaName, tableName, indexName, null, indexDef});
-            addedIndexes.add(Database.idxKey(schemaName, indexName).toLowerCase());
+            addedIndexes.add(Database.idxKey(schemaName, indexName).toLowerCase(java.util.Locale.ROOT));
         }
 
         // 2. Implicit indexes from PRIMARY KEY and UNIQUE constraints
@@ -214,7 +222,7 @@ class CatalogStubBuilder {
                             || sc.getType() == StoredConstraint.Type.UNIQUE) {
                         String indexName = sc.getName();
                         if (addedIndexes.contains(
-                                Database.idxKey(schemaName, indexName).toLowerCase())) continue;
+                                Database.idxKey(schemaName, indexName).toLowerCase(java.util.Locale.ROOT))) continue;
                         String indexDef = "CREATE UNIQUE INDEX "
                                 + RuleDeparser.quoteIdentifier(indexName)
                                 // A partitioned table's key index is the parent of the partitions'
@@ -230,7 +238,7 @@ class CatalogStubBuilder {
                                 // itself a NULLS NOT DISTINCT index, and reads back as one.
                                 + (sc.isNullsNotDistinct() ? " NULLS NOT DISTINCT" : "");
                         table.insertRow(new Object[]{schemaName, t.getName(), indexName, null, indexDef});
-                        addedIndexes.add(indexName.toLowerCase());
+                        addedIndexes.add(indexName.toLowerCase(java.util.Locale.ROOT));
                     }
                 }
             }
@@ -399,7 +407,8 @@ class CatalogStubBuilder {
             long cacheSize = seq != null ? (long) seq.getCache() : 1L;
             Long lastValue = (seq != null && seq.isCalled()) ? seq.currValRaw() : null;
             table.insertRow(new Object[]{
-                    seqSchema, seqName, "memgres", typeName,
+                    seqSchema, seqName,
+                    CatalogHelper.ownerNameOf(database, "sequence:" + seqName), typeName,
                     startWith, minValue, maxValue,
                     incrementBy, cacheSize, cycle, lastValue
             });
@@ -573,7 +582,7 @@ class CatalogStubBuilder {
                 else tableName = parts[0];
             }
             if (tableName != null) {
-                addedIndexes.add(Database.idxKey(indexSchema, indexName).toLowerCase());
+                addedIndexes.add(Database.idxKey(indexSchema, indexName).toLowerCase(java.util.Locale.ROOT));
                 long idxScan = 0L;
                 Schema sch = database.getSchemas().get(indexSchema);
                 if (sch != null) {
@@ -596,7 +605,7 @@ class CatalogStubBuilder {
                 Table t = tableEntry.getValue();
                 for (Map.Entry<String, TableIndex> idxEntry : t.getIndexes().entrySet()) {
                     String constraintName = idxEntry.getKey();
-                    String ciKey = Database.idxKey(schemaName, constraintName).toLowerCase();
+                    String ciKey = Database.idxKey(schemaName, constraintName).toLowerCase(java.util.Locale.ROOT);
                     if (!addedIndexes.contains(ciKey)) {
                         addedIndexes.add(ciKey);
                         table.insertRow(new Object[]{
@@ -693,7 +702,7 @@ class CatalogStubBuilder {
             int relOid = oids.oid("rel:" + schemaTable);
             for (int i = 0; i < t.getColumns().size(); i++) {
                 ColumnStatistics stats =
-                        gathered.get(t.getColumns().get(i).getName().toLowerCase());
+                        gathered.get(t.getColumns().get(i).getName().toLowerCase(java.util.Locale.ROOT));
                 if (stats == null) continue;
                 // Every one of the five numbered slots is a column of this relation, so a row has
                 // to carry them whether or not the slot holds a statistic. Supplying only the
@@ -1101,7 +1110,7 @@ class CatalogStubBuilder {
         for (Map.Entry<String, Database.TsDictDef> entry : database.getTsDicts().entrySet()) {
             Database.TsDictDef dict = entry.getValue();
             int tmplOid = "simple".equalsIgnoreCase(dict.template) ? TMPL_SIMPLE : TMPL_SNOWBALL;
-            table.insertRow(new Object[]{oidCounter++, dict.name.toLowerCase(), publicNs, 10, tmplOid, dict.options});
+            table.insertRow(new Object[]{oidCounter++, dict.name.toLowerCase(java.util.Locale.ROOT), publicNs, 10, tmplOid, dict.options});
         }
         return table;
     }
@@ -1145,7 +1154,7 @@ class CatalogStubBuilder {
         for (Map.Entry<String, Database.TsConfigDef> entry : database.getTsConfigs().entrySet()) {
             Database.TsConfigDef cfg = entry.getValue();
             int publicNs = oids.oid("ns:public");
-            table.insertRow(new Object[]{oidCounter++, cfg.name.toLowerCase(), publicNs, 10,
+            table.insertRow(new Object[]{oidCounter++, cfg.name.toLowerCase(java.util.Locale.ROOT), publicNs, 10,
                     PARSER_DEFAULT});
         }
         return table;
@@ -1262,7 +1271,7 @@ class CatalogStubBuilder {
      * numhword was recorded as mapping hword_part instead.
      */
     private int mapTokenTypeName(String name) {
-        switch (name.toLowerCase()) {
+        switch (name.toLowerCase(java.util.Locale.ROOT)) {
             case "asciiword": return 1;
             case "word": return 2;
             case "numword": return 3;
@@ -1381,12 +1390,12 @@ class CatalogStubBuilder {
             String kind = key.substring(0, colon);
             String name = key.substring(colon + 1);
             if (kind.equals("role") || kind.equals("user")) {
-                if (!database.getRoles().containsKey(name.toLowerCase())) continue;
+                if (!database.getRoles().containsKey(name.toLowerCase(java.util.Locale.ROOT))) continue;
                 table.insertRow(new Object[]{
-                        oids.oid("role:" + name.toLowerCase()), authidClassOid, entry.getValue()});
+                        oids.oid("role:" + name.toLowerCase(java.util.Locale.ROOT)), authidClassOid, entry.getValue()});
             } else if (kind.equals("database")) {
                 table.insertRow(new Object[]{
-                        oids.oid("db:" + name.toLowerCase()), databaseClassOid, entry.getValue()});
+                        oids.oid("db:" + name.toLowerCase(java.util.Locale.ROOT)), databaseClassOid, entry.getValue()});
             }
         }
         return table;
@@ -1585,7 +1594,7 @@ class CatalogStubBuilder {
             Map<String, ColumnStatistics> gathered = database.getColumnStatistics(schemaTable);
             if (gathered == null) continue;
             for (Column col : srcTable.getColumns()) {
-                ColumnStatistics stats = gathered.get(col.getName().toLowerCase());
+                ColumnStatistics stats = gathered.get(col.getName().toLowerCase(java.util.Locale.ROOT));
                 if (stats == null) continue;
                 table.insertRow(new Object[]{
                         schemaName, tableName, col.getName(), false,
@@ -1730,7 +1739,7 @@ class CatalogStubBuilder {
                 Table t = tableEntry.getValue();
                 if (t.getPartitionStrategy() == null) continue;
                 int tblOid = oids.oid("rel:" + schemaName + "." + t.getName());
-                String strategy = t.getPartitionStrategy().substring(0, 1).toLowerCase(); // r/l/h
+                String strategy = t.getPartitionStrategy().substring(0, 1).toLowerCase(java.util.Locale.ROOT); // r/l/h
                 // Find default partition OID
                 Integer defOid = null;
                 for (Table p : t.getPartitions()) {
@@ -2134,7 +2143,7 @@ class CatalogStubBuilder {
             bare = bare.substring(0, bare.length() - 2).trim();
             suffix = suffix + "[]";
         }
-        DataType type = DataType.fromPgName(bare.toLowerCase());
+        DataType type = DataType.fromPgName(bare.toLowerCase(java.util.Locale.ROOT));
         if (type == null) return written;
         String name = type.getPgName();
         // The catalogue spellings are what pg_type holds; regtype prints the readable name.
@@ -2439,8 +2448,7 @@ class CatalogStubBuilder {
         for (Database.ViewDef vd : database.getViews().values()) {
             if (!vd.materialized()) continue;
             String vSchema = vd.schemaName() != null ? vd.schemaName() : "public";
-            String owner = database.getObjectOwner("view:" + vSchema + "." + vd.name());
-            if (owner == null) owner = "memgres";
+            String owner = CatalogHelper.ownerNameOf(database, "view:" + vSchema + "." + vd.name());
             String definition = null;
             if (vd.query() != null) {
                 definition = vd.sourceSQL() != null ? vd.sourceSQL() : SqlUnparser.toSql(vd.query());
@@ -2501,7 +2509,7 @@ class CatalogStubBuilder {
         java.util.LinkedHashSet<String> path = new java.util.LinkedHashSet<>();
         path.add("pg_catalog");
         if (session != null) {
-            for (String s : session.getEffectiveSearchPath(false)) path.add(s.toLowerCase());
+            for (String s : session.getEffectiveSearchPath(false)) path.add(s.toLowerCase(java.util.Locale.ROOT));
         }
         path.add("public");
         return new java.util.ArrayList<>(path);

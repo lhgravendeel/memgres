@@ -199,7 +199,7 @@ public final class NetworkOperations {
             suffix = value.substring(slash);
         }
         // Normalize IPv4-mapped IPv6: ::ffff:HHHH:HHHH → ::ffff:d.d.d.d
-        String lower = addrPart.toLowerCase();
+        String lower = addrPart.toLowerCase(java.util.Locale.ROOT);
         if (lower.startsWith("::ffff:") && !addrPart.contains(".")) {
             String hexPart = addrPart.substring(7); // after "::ffff:"
             String[] groups = hexPart.split(":");

@@ -136,8 +136,8 @@ class PgWireBinaryCodec {
         // pg_lsn (OID 3220): one 64-bit position, written as two halves
         if (paramOid == 3220 && bytes.length == 8) {
             long lsn = readInt8(bytes, 0);
-            return Long.toHexString(lsn >>> 32).toUpperCase() + "/"
-                    + Long.toHexString(lsn & 0xFFFFFFFFL).toUpperCase();
+            return Long.toHexString(lsn >>> 32).toUpperCase(java.util.Locale.ROOT) + "/"
+                    + Long.toHexString(lsn & 0xFFFFFFFFL).toUpperCase(java.util.Locale.ROOT);
         }
         // UUID (OID 2950): 16 bytes
         if (paramOid == 2950 && bytes.length == 16) {
@@ -669,7 +669,7 @@ class PgWireBinaryCodec {
     static LocalDate parseDateMaybeBc(String s) {
         if (s == null) return null;
         String t = s.trim();
-        if (t.toUpperCase().endsWith(" BC")) {
+        if (t.toUpperCase(java.util.Locale.ROOT).endsWith(" BC")) {
             String datePart = t.substring(0, t.length() - 3).trim();
             LocalDate d = LocalDate.parse(datePart);
             return d.withYear(1 - d.getYear());

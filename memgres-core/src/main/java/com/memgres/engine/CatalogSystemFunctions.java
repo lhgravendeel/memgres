@@ -199,7 +199,7 @@ class CatalogSystemFunctions {
                 // Check if this is a system column reference (ctid, xmin, xmax, cmin, cmax, tableoid)
                 if (rawExpr instanceof ColumnRef && ctx != null) {
                     ColumnRef colRef = (ColumnRef) rawExpr;
-                    String colName = colRef.column().toLowerCase();
+                    String colName = colRef.column().toLowerCase(java.util.Locale.ROOT);
                     switch (colName) {
                         case "ctid": return "tid";
                         case "xmin": case "xmax": return "xid";
@@ -264,7 +264,7 @@ class CatalogSystemFunctions {
                         if (sub.isSlice()) return arrayType;
                         DataType element = DataType.fromPgName(arrayType
                                 .substring(0, arrayType.length() - 2)
-                                .toLowerCase().replaceAll("\\(.*\\)", "").trim());
+                                .toLowerCase(java.util.Locale.ROOT).replaceAll("\\(.*\\)", "").trim());
                         if (element != null) return pgTypeDisplayName(element);
                     }
                     DataType inferred = executor.exprEvaluator.inferExprType(rawExpr);
@@ -291,7 +291,7 @@ class CatalogSystemFunctions {
                     if (arrayType != null && arrayType.endsWith("[]")) {
                         DataType element = DataType.fromPgName(arrayType
                                 .substring(0, arrayType.length() - 2)
-                                .toLowerCase().replaceAll("\\(.*\\)", "").trim());
+                                .toLowerCase(java.util.Locale.ROOT).replaceAll("\\(.*\\)", "").trim());
                         if (element != null) return pgTypeDisplayName(element);
                     }
                 }
@@ -379,11 +379,11 @@ class CatalogSystemFunctions {
                     // float(p) names two different types depending on p, so the modifier is
                     // offered whole before it is stripped as a mere width.
                     DataType withModifier =
-                            DataType.fromPgName(cast.typeName().toLowerCase().trim());
+                            DataType.fromPgName(cast.typeName().toLowerCase(java.util.Locale.ROOT).trim());
                     if (withModifier != null && cast.typeName().indexOf('(') > 0) {
                         return pgTypeDisplayName(withModifier);
                     }
-                    String tn = cast.typeName().toLowerCase().replaceAll("\\(.*\\)", "").trim();
+                    String tn = cast.typeName().toLowerCase(java.util.Locale.ROOT).replaceAll("\\(.*\\)", "").trim();
                     if (tn.endsWith("[]")) {
                         String baseType = tn.substring(0, tn.length() - 2).trim();
                         try {
@@ -411,7 +411,7 @@ class CatalogSystemFunctions {
                     Expression firstElem = arrExpr.elements().get(0);
                     if (firstElem instanceof CastExpr) {
                         CastExpr elemCast = (CastExpr) firstElem;
-                        String elemTypeName = elemCast.typeName().toLowerCase().replaceAll("\\(.*\\)", "").trim();
+                        String elemTypeName = elemCast.typeName().toLowerCase(java.util.Locale.ROOT).replaceAll("\\(.*\\)", "").trim();
                         if (executor.database.isCompositeType(elemTypeName)) {
                             return elemTypeName + "[]";
                         }
@@ -427,7 +427,7 @@ class CatalogSystemFunctions {
                             .declaredTypeForResolution(rawExpr, ctx);
                     if (arrayType != null && arrayType.endsWith("[]")) {
                         String elementName = arrayType.substring(0, arrayType.length() - 2)
-                                .toLowerCase().replaceAll("\\(.*\\)", "").trim();
+                                .toLowerCase(java.util.Locale.ROOT).replaceAll("\\(.*\\)", "").trim();
                         DataType element = elementName.endsWith("[]") ? null
                                 : DataType.fromPgName(elementName);
                         if (element != null && DataType.elementOf(element) == null) {
@@ -476,7 +476,7 @@ class CatalogSystemFunctions {
 
                 if (rawExpr instanceof FunctionCallExpr) {
                     FunctionCallExpr rawFn = (FunctionCallExpr) rawExpr;
-                    String rawFnName = rawFn.name().toLowerCase();
+                    String rawFnName = rawFn.name().toLowerCase(java.util.Locale.ROOT);
                     if (rawFnName.equals("greatest") || rawFnName.equals("least")) {
                         boolean hasIntArg = false, hasFloatArg = false;
                         for (Expression a : rawFn.args()) {
@@ -549,16 +549,16 @@ class CatalogSystemFunctions {
                 }
                 if (arg instanceof String && ((String) arg).startsWith("{") && ((String) arg).endsWith("}")) {
                     String s = (String) arg;
-                    if (rawExpr instanceof CastExpr && ((CastExpr) rawExpr).typeName().toLowerCase().endsWith("[]")) {
+                    if (rawExpr instanceof CastExpr && ((CastExpr) rawExpr).typeName().toLowerCase(java.util.Locale.ROOT).endsWith("[]")) {
                         CastExpr cast2 = (CastExpr) rawExpr;
-                        String base = cast2.typeName().toLowerCase().replace("[]", "").trim();
+                        String base = cast2.typeName().toLowerCase(java.util.Locale.ROOT).replace("[]", "").trim();
                         try { return pgTypeDisplayName(DataType.fromPgName(base)) + "[]"; } catch (Exception e) { /* fall through */ }
                     }
                     return "text[]";
                 }
                 if (arg instanceof BigDecimal) return "numeric";
                 DataType dt = TypeCoercion.inferType(arg);
-                return dt != null ? pgTypeDisplayName(dt) : arg.getClass().getSimpleName().toLowerCase();
+                return dt != null ? pgTypeDisplayName(dt) : arg.getClass().getSimpleName().toLowerCase(java.util.Locale.ROOT);
             }
             case "current_database":
             case "current_catalog":
@@ -616,7 +616,7 @@ class CatalogSystemFunctions {
                     if (e.getValue() == null || e.getValue() != nsOid) continue;
                     if (!e.getKey().startsWith("ns:")) continue;
                     String ns = e.getKey().substring(3);
-                    return ns.toLowerCase().startsWith("pg_temp") && !ns.equalsIgnoreCase(mine);
+                    return ns.toLowerCase(java.util.Locale.ROOT).startsWith("pg_temp") && !ns.equalsIgnoreCase(mine);
                 }
                 return false;
             }
@@ -711,7 +711,7 @@ class CatalogSystemFunctions {
             case "pg_stat_reset_shared": {
                 if (!fn.args().isEmpty()) {
                     Object arg = executor.evalExpr(fn.args().get(0), ctx);
-                    String target = arg != null ? arg.toString().toLowerCase() : "";
+                    String target = arg != null ? arg.toString().toLowerCase(java.util.Locale.ROOT) : "";
                     java.util.Set<String> validTargets = new java.util.HashSet<>(java.util.Arrays.asList(
                             "archiver", "bgwriter", "checkpointer", "io", "recovery_prefetch",
                             "slru", "wal"));
@@ -735,7 +735,7 @@ class CatalogSystemFunctions {
             case "pg_indexam_has_property": {
                 Object amOid = fn.args().size() > 0 ? executor.evalExpr(fn.args().get(0), ctx) : 0;
                 Object propArg = fn.args().size() > 1 ? executor.evalExpr(fn.args().get(1), ctx) : "";
-                String prop = String.valueOf(propArg).toLowerCase();
+                String prop = String.valueOf(propArg).toLowerCase(java.util.Locale.ROOT);
                 switch (prop) {
                     case "can_order":
                     case "can_unique":
@@ -746,7 +746,17 @@ class CatalogSystemFunctions {
                 }
             }
             case "pg_tablespace_location": {
-                if (!fn.args().isEmpty()) executor.evalExpr(fn.args().get(0), ctx);
+                // A tablespace inside the data directory has no path of its own, which is the
+                // empty string; an OID that names no tablespace has no directory to look in at
+                // all, and PostgreSQL says so rather than answering as though it found one.
+                if (fn.args().isEmpty()) return null;
+                Object spcArg = executor.evalExpr(fn.args().get(0), ctx);
+                if (spcArg == null) return null;
+                int spcOid = executor.toInt(spcArg);
+                if (spcOid != 1663 && spcOid != 1664) {
+                    throw new MemgresException("could not stat file \"pg_tblspc/" + spcOid
+                            + "\": No such file or directory", "58P01");
+                }
                 return "";
             }
             case "current_setting": {
@@ -806,7 +816,7 @@ class CatalogSystemFunctions {
                     // be chosen once this transaction has taken a snapshot, and a setting that
                     // belongs to a transaction does not stick when there is no transaction open.
                     if (executor.session != null && SessionExecutor.isTransactionScopedGuc(settingName)) {
-                        String lower = settingName.toLowerCase();
+                        String lower = settingName.toLowerCase(java.util.Locale.ROOT);
                         if (lower.equals("transaction_isolation") || lower.equals("transaction_deferrable")) {
                             throw new MemgresException("SET TRANSACTION "
                                     + (lower.equals("transaction_isolation") ? "ISOLATION LEVEL" : "[NOT] DEFERRABLE")
@@ -863,14 +873,39 @@ class CatalogSystemFunctions {
                 return false;
             }
             case "pg_database_size": {
-                if (!fn.args().isEmpty()) executor.evalExpr(fn.args().get(0), ctx);
+                // A size is asked about a database, so the database has to be there. Answering
+                // with a size whatever the argument named let a typo report a database that
+                // does not exist as one holding eight kilobytes.
+                if (fn.args().isEmpty()) return null;
+                Object dbArg = executor.evalExpr(fn.args().get(0), ctx);
+                if (dbArg == null) return null;
+                if (dbArg instanceof Number) {
+                    int dbOid = ((Number) dbArg).intValue();
+                    if (dbOid != executor.systemCatalog.getOid("db:memgres")) {
+                        throw new MemgresException(
+                                "database with OID " + dbOid + " does not exist", "42704");
+                    }
+                } else if (executor.session != null
+                        && !String.valueOf(dbArg).equals(executor.session.getDatabaseName())) {
+                    throw new MemgresException(
+                            "database \"" + dbArg + "\" does not exist", "3D000");
+                }
                 return 8192L;
             }
             case "pg_relation_size":
             case "pg_total_relation_size":
             case "pg_table_size":
             case "pg_indexes_size": {
-                if (!fn.args().isEmpty()) executor.evalExpr(fn.args().get(0), ctx);
+                // The argument is a regclass, so a name that no relation answers to is refused
+                // where it is read; an OID that names nothing is not an error, it is no size.
+                if (fn.args().isEmpty()) return null;
+                Object relArg = executor.evalExpr(fn.args().get(0), ctx);
+                if (relArg == null) return null;
+                if (relArg instanceof Number) {
+                    return executor.systemCatalog.keyForOid(((Number) relArg).intValue()) == null
+                            ? null : 8192L;
+                }
+                executor.castEvaluator.applyCast(relArg, "regclass");
                 return 8192L;
             }
             case "pg_column_toast_chunk_id": {
@@ -909,15 +944,10 @@ class CatalogSystemFunctions {
                 return 0;
             }
             case "pg_size_pretty": {
-                if (!fn.args().isEmpty()) {
-                    Object arg = executor.evalExpr(fn.args().get(0), ctx);
-                    long bytes = arg instanceof Number ? ((Number) arg).longValue() : 0L;
-                    if (bytes < 1024) return bytes + " bytes";
-                    if (bytes < 1024 * 1024) return (bytes / 1024) + " kB";
-                    if (bytes < 1024L * 1024 * 1024) return (bytes / (1024 * 1024)) + " MB";
-                    return (bytes / (1024L * 1024 * 1024)) + " GB";
-                }
-                return "0 bytes";
+                if (fn.args().isEmpty()) return "0 bytes";
+                Object arg = executor.evalExpr(fn.args().get(0), ctx);
+                if (arg == null) return null;
+                return sizePretty(arg);
             }
             case "pg_relation_filepath": {
                 if (!fn.args().isEmpty()) executor.evalExpr(fn.args().get(0), ctx);
@@ -1131,7 +1161,7 @@ class CatalogSystemFunctions {
                 requireArgs(fn, 1);
                 Expression arg0 = fn.args().get(0);
                 if (arg0 instanceof CastExpr) {
-                    String castType = ((CastExpr) arg0).typeName().toLowerCase();
+                    String castType = ((CastExpr) arg0).typeName().toLowerCase(java.util.Locale.ROOT);
                     if (castType.equals("text") || castType.equals("varchar") || castType.equals("character varying")) {
                         throw new MemgresException(
                                 "function pg_xact_status(text) does not exist", "42883");
@@ -1255,33 +1285,71 @@ class CatalogSystemFunctions {
 
     // ---- pg_size_bytes parser ----
 
+    /**
+     * The bytes a size written as text stands for.
+     *
+     * <p>PostgreSQL reads the number with its own numeric scanner, so an exponent is a number
+     * like any other, and it names the unit it could not read rather than only the whole string.
+     * Matched against a hand-written pattern with no exponent, {@code 1e3} was a size nobody
+     * could write, and a bad unit was reported without saying which unit was bad.
+     */
     private static long parseSizeBytes(String sizeStr) {
-        // Try plain numeric first
-        try {
-            return Long.parseLong(sizeStr);
-        } catch (NumberFormatException ignored) {}
-
-        String s = sizeStr.trim();
-        // Match number (possibly decimal) followed by optional unit
-        java.util.regex.Matcher m = java.util.regex.Pattern.compile(
-                "^([\\d.]+)\\s*(bytes?|kB|MB|GB|TB|PB)?$", java.util.regex.Pattern.CASE_INSENSITIVE
-        ).matcher(s);
-        if (!m.matches()) {
+        String text = sizeStr.trim();
+        // The number runs while the characters could still be part of one; what is left is the
+        // unit, which may be nothing at all.
+        int at = 0;
+        if (at < text.length() && (text.charAt(at) == '+' || text.charAt(at) == '-')) at++;
+        int digitsFrom = at;
+        while (at < text.length() && (Character.isDigit(text.charAt(at)) || text.charAt(at) == '.')) {
+            at++;
+        }
+        if (at < text.length() && (text.charAt(at) == 'e' || text.charAt(at) == 'E')) {
+            int exponentAt = at + 1;
+            if (exponentAt < text.length()
+                    && (text.charAt(exponentAt) == '+' || text.charAt(exponentAt) == '-')) {
+                exponentAt++;
+            }
+            if (exponentAt < text.length() && Character.isDigit(text.charAt(exponentAt))) {
+                at = exponentAt;
+                while (at < text.length() && Character.isDigit(text.charAt(at))) at++;
+            }
+        }
+        if (at == digitsFrom) {
             throw new MemgresException("invalid size: \"" + sizeStr + "\"", "22023");
         }
-        double num = Double.parseDouble(m.group(1));
-        String unit = m.group(2);
-        if (unit == null || unit.isEmpty() || unit.equalsIgnoreCase("bytes") || unit.equalsIgnoreCase("byte")) {
-            return (long) num;
+        java.math.BigDecimal number;
+        try {
+            number = new java.math.BigDecimal(text.substring(0, at));
+        } catch (NumberFormatException notANumber) {
+            throw new MemgresException("invalid size: \"" + sizeStr + "\"", "22023");
         }
-        switch (unit.toLowerCase()) {
-            case "kb": return (long) (num * 1024);
-            case "mb": return (long) (num * 1024 * 1024);
-            case "gb": return (long) (num * 1024 * 1024 * 1024);
-            case "tb": return (long) (num * 1024L * 1024 * 1024 * 1024);
-            case "pb": return (long) (num * 1024L * 1024 * 1024 * 1024 * 1024);
-            default:
-                throw new MemgresException("invalid size: \"" + sizeStr + "\"", "22023");
+        String unit = text.substring(at).trim();
+        int shift = unitShift(unit);
+        if (shift < 0) {
+            MemgresException e = new MemgresException(
+                    "invalid size: \"" + sizeStr + "\"", "22023");
+            e.setDetail("Invalid size unit: \"" + unit + "\".");
+            e.setHint("Valid units are \"bytes\", \"B\", \"kB\", \"MB\", \"GB\", \"TB\","
+                    + " and \"PB\".");
+            throw e;
+        }
+        return number.multiply(java.math.BigDecimal.valueOf(1L << shift))
+                .setScale(0, java.math.RoundingMode.HALF_UP).longValueExact();
+    }
+
+    /** How many bits a unit multiplies by, or -1 for a unit PostgreSQL does not read. */
+    private static int unitShift(String unit) {
+        if (unit.isEmpty()) return 0;
+        switch (unit.toLowerCase(java.util.Locale.ROOT)) {
+            case "b":
+            case "byte":
+            case "bytes": return 0;
+            case "kb": return 10;
+            case "mb": return 20;
+            case "gb": return 30;
+            case "tb": return 40;
+            case "pb": return 50;
+            default: return -1;
         }
     }
 
@@ -1405,7 +1473,7 @@ class CatalogSystemFunctions {
         }
         int paren = bare.indexOf('(');
         if (paren > 0) bare = bare.substring(0, paren).trim();
-        DataType type = DataType.fromPgName(bare.toLowerCase());
+        DataType type = DataType.fromPgName(bare.toLowerCase(java.util.Locale.ROOT));
         return type == null ? written : pgTypeDisplayName(type) + suffix;
     }
 
@@ -1529,4 +1597,40 @@ class CatalogSystemFunctions {
         }
         return widest;
     }
+
+    /**
+     * A size written the way a reader reads it.
+     *
+     * <p>PostgreSQL does not change unit at the unit's own size: it stays in bytes until ten
+     * kilobytes, in kilobytes until twenty, and so on, so a kibibyte reads as "1024 bytes" and
+     * not as "1 kB". And it rounds to the nearest rather than truncating, so a size a hair under
+     * a unit does not read as one less than it is.
+     *
+     * <p>A numeric argument keeps its fraction while it is still in bytes.
+     */
+    static String sizePretty(Object arg) {
+        String[] units = {"bytes", "kB", "MB", "GB", "TB", "PB"};
+        if (arg instanceof java.math.BigDecimal || arg instanceof Double || arg instanceof Float) {
+            java.math.BigDecimal size = new java.math.BigDecimal(arg.toString());
+            java.math.BigDecimal limit = java.math.BigDecimal.valueOf(10L * 1024);
+            int unit = 0;
+            while (unit < units.length - 1 && size.abs().compareTo(limit) >= 0) {
+                size = size.divide(java.math.BigDecimal.valueOf(1024), 0,
+                        java.math.RoundingMode.HALF_UP);
+                unit++;
+            }
+            return size.stripTrailingZeros().toPlainString() + " " + units[unit];
+        }
+        long size = arg instanceof Number ? ((Number) arg).longValue() : 0L;
+        int unit = 0;
+        // The unit changes at ten of the next one, not at one of it, and goes on changing while
+        // ten of the next still fit: a mebibyte reads as 1024 kB and a kibibyte as 1024 bytes.
+        while (unit < units.length - 1 && Math.abs(size) >= 10L * 1024) {
+            // Rounded to the nearest, away from zero, which is what PostgreSQL does.
+            size = (size + (size < 0 ? -512 : 512)) / 1024;
+            unit++;
+        }
+        return size + " " + units[unit];
+    }
+
 }

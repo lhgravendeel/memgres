@@ -395,7 +395,7 @@ final class ObjectIdentity {
     private boolean namesALiveType(String key) {
         String name = key.substring("type:".length());
         if (name.endsWith("[]")) name = name.substring(0, name.length() - 2);
-        String lower = name.toLowerCase();
+        String lower = name.toLowerCase(java.util.Locale.ROOT);
         return database.getCustomEnums().containsKey(lower)
                 || database.getDomains().containsKey(lower)
                 || database.getCompositeTypes().containsKey(lower);
@@ -421,7 +421,7 @@ final class ObjectIdentity {
      */
     private int otherRelationsNamed(String name, String exceptSchema) {
         String bare = bare(name);
-        String except = exceptSchema == null ? "public" : exceptSchema.toLowerCase();
+        String except = exceptSchema == null ? "public" : exceptSchema.toLowerCase(java.util.Locale.ROOT);
         int count = 0;
         for (String schema : database.getSchemas().keySet()) {
             if (schema.equalsIgnoreCase(except)) continue;
@@ -520,7 +520,7 @@ final class ObjectIdentity {
         for (Set<String> held : database.getAllRolePrivileges().values()) {
             List<String> moved = null;
             for (String entry : held) {
-                if (entry.toLowerCase().endsWith(from)) {
+                if (entry.toLowerCase(java.util.Locale.ROOT).endsWith(from)) {
                     if (moved == null) moved = new ArrayList<String>();
                     moved.add(entry);
                 }
@@ -580,7 +580,7 @@ final class ObjectIdentity {
         String suffix = "." + bare;
         for (Iterator<Map.Entry<String, Integer>> it = oidMap.entrySet().iterator(); it.hasNext(); ) {
             String k = it.next().getKey();
-            if (!k.startsWith("rel:") || !k.toLowerCase().endsWith(suffix.toLowerCase())) continue;
+            if (!k.startsWith("rel:") || !k.toLowerCase(java.util.Locale.ROOT).endsWith(suffix.toLowerCase(java.util.Locale.ROOT))) continue;
             if (k.startsWith("rel:pg_catalog.") || k.startsWith("rel:information_schema.")) continue;
             it.remove();
             mutations.incrementAndGet();

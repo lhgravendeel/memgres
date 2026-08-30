@@ -272,8 +272,8 @@ class FromResolver {
         return AstWalk.anyMatch(part, node -> {
             if (!(node instanceof ColumnRef)) return false;
             String named = ((ColumnRef) node).table();
-            return named != null && !under.contains(named.toLowerCase())
-                    && beside.contains(named.toLowerCase());
+            return named != null && !under.contains(named.toLowerCase(java.util.Locale.ROOT))
+                    && beside.contains(named.toLowerCase(java.util.Locale.ROOT));
         });
     }
 
@@ -359,7 +359,7 @@ class FromResolver {
         }
         Set<String> carried = new HashSet<>();
         for (RowContext.TableBinding binding : outer.getBindings()) {
-            if (binding.alias() != null) carried.add(binding.alias().toLowerCase());
+            if (binding.alias() != null) carried.add(binding.alias().toLowerCase(java.util.Locale.ROOT));
         }
         if (carried.isEmpty()) return false;
         for (Expression part : conjunctsOf(qualifyingQuery.where())) {
@@ -385,7 +385,7 @@ class FromResolver {
             if (!(node instanceof ColumnRef)) return;
             ColumnRef ref = (ColumnRef) node;
             if (ref.column() == null || ref.table() == null
-                    || !carried.contains(ref.table().toLowerCase())) {
+                    || !carried.contains(ref.table().toLowerCase(java.util.Locale.ROOT))) {
                 usable[0] = false;
             }
         });
@@ -479,7 +479,7 @@ class FromResolver {
         // An item read by a query that is itself never asked for a row is never asked either.
         if (readForNoRow) return true;
         if (alias == null || qualifyingQuery == null) return false;
-        if (!exposedNamesOf(qualifyingQuery.from()).contains(alias.toLowerCase())) return false;
+        if (!exposedNamesOf(qualifyingQuery.from()).contains(alias.toLowerCase(java.util.Locale.ROOT))) return false;
         return admitsNoRow(alias, qualifyingQuery, qualifyingPushed);
     }
 
@@ -545,7 +545,7 @@ class FromResolver {
         if (gated == null) return;
         Set<String> notPreserved = new HashSet<>();
         collectExposedName(gated, notPreserved);
-        if (!notPreserved.contains(alias.toLowerCase())) return;
+        if (!notPreserved.contains(alias.toLowerCase(java.util.Locale.ROOT))) return;
         collectConjuncts(join.on(), out);
         joinsNeverAsking(gated, alias, out);
     }
@@ -822,7 +822,7 @@ class FromResolver {
     private static boolean isVolatileCall(FunctionCallExpr call) {
         String name = call.name();
         if (name == null) return false;
-        String bare = name.toLowerCase();
+        String bare = name.toLowerCase(java.util.Locale.ROOT);
         int dot = bare.lastIndexOf('.');
         if (dot >= 0) bare = bare.substring(dot + 1);
         return VOLATILE_CALLS.contains(bare);
@@ -840,19 +840,19 @@ class FromResolver {
         final Map<String, int[]> counts = new HashMap<>();
         for (Map.Entry<SelectStmt.CommonTableExpr, Object> entry : cteOwners.entrySet()) {
             if (entry.getValue() == owner) {
-                counts.put(entry.getKey().name().toLowerCase(), new int[1]);
+                counts.put(entry.getKey().name().toLowerCase(java.util.Locale.ROOT), new int[1]);
             }
         }
         AstWalk.forEach(owner, node -> {
             if (!(node instanceof SelectStmt.TableRef)) return;
             SelectStmt.TableRef ref = (SelectStmt.TableRef) node;
             if (ref.schema() != null || ref.table() == null) return;
-            int[] seen = counts.get(ref.table().toLowerCase());
+            int[] seen = counts.get(ref.table().toLowerCase(java.util.Locale.ROOT));
             if (seen != null) seen[0]++;
         });
         for (Map.Entry<SelectStmt.CommonTableExpr, Object> entry : cteOwners.entrySet()) {
             if (entry.getValue() != owner) continue;
-            int[] seen = counts.get(entry.getKey().name().toLowerCase());
+            int[] seen = counts.get(entry.getKey().name().toLowerCase(java.util.Locale.ROOT));
             cteReferences.put(entry.getKey(), seen == null ? 1 : seen[0]);
         }
         Integer found = cteReferences.get(cte);
@@ -890,7 +890,7 @@ class FromResolver {
         Set<String> read = new HashSet<>();
         exposedNames(qualifyingQuery.from(), read);
         // The name has to be one that query reads, or that query is not the one reading it.
-        if (!read.contains(alias.toLowerCase())) return null;
+        if (!read.contains(alias.toLowerCase(java.util.Locale.ROOT))) return null;
         List<Expression> parts = new ArrayList<>();
         collectConjuncts(qualifyingQuery.where(), parts);
         collectJoinConjuncts(qualifyingQuery.from(), alias, parts);
@@ -995,7 +995,7 @@ class FromResolver {
         ColumnRef ref = (ColumnRef) side;
         if (ref.column() == null) return null;
         String named = ref.table() != null ? ref.table() : lone;
-        if (named == null || here.contains(named.toLowerCase())) return null;
+        if (named == null || here.contains(named.toLowerCase(java.util.Locale.ROOT))) return null;
         return ref.table() != null ? ref : new ColumnRef(named, ref.column());
     }
 
@@ -1517,7 +1517,7 @@ class FromResolver {
             return;
         }
         String name = SelectExecutor.exposedNameOf(item);
-        if (name != null) out.add(name.toLowerCase());
+        if (name != null) out.add(name.toLowerCase(java.util.Locale.ROOT));
     }
 
     private static void collectConjuncts(Expression expr, List<Expression> out) {
@@ -1558,7 +1558,7 @@ class FromResolver {
         } else if (type == SelectStmt.JoinType.RIGHT || type == SelectStmt.JoinType.NATURAL_RIGHT) {
             collectExposedName(join.left(), notPreserved);
         }
-        if (alias != null && notPreserved.contains(alias.toLowerCase())) {
+        if (alias != null && notPreserved.contains(alias.toLowerCase(java.util.Locale.ROOT))) {
             collectConjuncts(join.on(), out);
         }
     }
@@ -1609,7 +1609,7 @@ class FromResolver {
                 if (lone) named[0] = true; else usable[0] = false;
             } else if (ref.table().equalsIgnoreCase(alias)) {
                 named[0] = true;
-            } else if (read.contains(ref.table().toLowerCase()) || paired) {
+            } else if (read.contains(ref.table().toLowerCase(java.util.Locale.ROOT)) || paired) {
                 // A relation this query does not read is one the statement above holds a row of,
                 // and that row stands still while this scan runs -- but where that statement reads
                 // this query as one join with itself, what compares the two is the condition of
@@ -1872,6 +1872,7 @@ class FromResolver {
             boolean userTableExists = false;
             try { executor.resolveTable(schemaName, tableRef.table()); userTableExists = true; } catch (MemgresException ignored) {}
             if (!userTableExists && SystemCatalog.isSystemCatalog(tableRef.schema(), tableRef.table())) {
+                recordCatalogReadLock(tableRef.schema(), tableRef.table());
                 Table catalogTable = executor.systemCatalog.resolve(tableRef.schema(), tableRef.table(), executor.session);
                 if (catalogTable != null) {
                     addBinding(bindings,
@@ -2075,8 +2076,8 @@ class FromResolver {
         if (covered.isEmpty()) return;
         for (RowContext ctx : resolved) {
             for (RowContext.TableBinding b : ctx.getBindings()) {
-                covered.remove(b.alias() != null ? b.alias().toLowerCase()
-                        : b.table().getName().toLowerCase());
+                covered.remove(b.alias() != null ? b.alias().toLowerCase(java.util.Locale.ROOT)
+                        : b.table().getName().toLowerCase(java.util.Locale.ROOT));
             }
             break;
         }
@@ -2113,7 +2114,7 @@ class FromResolver {
         }
         if (item instanceof SelectStmt.TableRef) {
             SelectStmt.TableRef ref = (SelectStmt.TableRef) item;
-            out.add(ref.alias() != null ? ref.alias().toLowerCase() : ref.table().toLowerCase());
+            out.add(ref.alias() != null ? ref.alias().toLowerCase(java.util.Locale.ROOT) : ref.table().toLowerCase(java.util.Locale.ROOT));
             return;
         }
         // A parenthesized join given an alias is carried as a sub-query over the join itself; the
@@ -2205,7 +2206,7 @@ class FromResolver {
                     ((SelectStmt.SubqueryFrom) item).subquery(), entered.keySet());
             if (written != null && enclosingLevelSupplies(written)) written = null;
             if (written != null) {
-                String exposed = entered.get(written.toLowerCase());
+                String exposed = entered.get(written.toLowerCase(java.util.Locale.ROOT));
                 MemgresException e = new MemgresException(
                         "invalid reference to FROM-clause entry for table \"" + written + "\"",
                         "42P01");
@@ -2351,10 +2352,12 @@ class FromResolver {
             // ordinary lookup has a better answer than this pass does.
             if (!"42P01".equals(e.getSqlState())) return;
         }
-        if (SystemCatalog.isSystemCatalog(tableRef.schema(), tableRef.table())
-                && executor.systemCatalog.resolve(
-                        tableRef.schema(), tableRef.table(), executor.session) != null) {
-            return;
+        if (SystemCatalog.isSystemCatalog(tableRef.schema(), tableRef.table())) {
+            recordCatalogReadLock(tableRef.schema(), tableRef.table());
+            if (executor.systemCatalog.resolve(
+                    tableRef.schema(), tableRef.table(), executor.session) != null) {
+                return;
+            }
         }
         // Nothing answers to the name. Raise it the way the ordinary lookup does, so the message
         // and the "there is a WITH item" hint are identical.
@@ -2619,6 +2622,17 @@ class FromResolver {
     }
 
     /**
+     * Note the AccessShareLock a read of a catalog relation takes, under the name pg_locks reports
+     * the relation by. A catalog reference written without a schema is in pg_catalog.
+     */
+    private void recordCatalogReadLock(String writtenSchema, String relation) {
+        if (executor.session == null) return;
+        String schema = writtenSchema != null ? writtenSchema.toLowerCase(java.util.Locale.ROOT) : "pg_catalog";
+        executor.session.recordRelationLock(
+                schema + "." + relation.toLowerCase(java.util.Locale.ROOT), "AccessShareLock");
+    }
+
+    /**
      * A catalog relation's rows, without those describing a relation this transaction's snapshot
      * did not hold.
      *
@@ -2783,7 +2797,7 @@ class FromResolver {
                 executor.checkTablePrivilege("SELECT", viewSchema, tableRef.table());
                 String priorViewOwner = executor.viewOwnerRole;
                 String viewOwner = executor.database.getObjectOwner(
-                        "view:" + viewSchema.toLowerCase() + "." + tableRef.table().toLowerCase());
+                        "view:" + viewSchema.toLowerCase(java.util.Locale.ROOT) + "." + tableRef.table().toLowerCase(java.util.Locale.ROOT));
                 if (viewOwner != null) executor.viewOwnerRole = viewOwner;
                 QueryResult viewResult;
                 try {
@@ -2843,6 +2857,11 @@ class FromResolver {
         boolean userTableExists = false;
         try { executor.resolveTable(schemaName, tableRef.table(), userQualified); userTableExists = true; } catch (MemgresException ignored) {}
         if (!userTableExists && SystemCatalog.isSystemCatalog(tableRef.schema(), tableRef.table())) {
+            // A catalog relation named in a FROM clause is read like any other, and the read
+            // takes an AccessShareLock the transaction holds. Noted before the relation is
+            // built, because the relation being built may be pg_locks itself: a query asking
+            // what it holds saw every lock but the one it was taking to ask.
+            recordCatalogReadLock(tableRef.schema(), tableRef.table());
             Table catalogTable = executor.systemCatalog.resolve(tableRef.schema(), tableRef.table(), executor.session);
             if (catalogTable != null) {
                 String alias = tableRef.alias() != null ? tableRef.alias() : tableRef.table();
@@ -2850,7 +2869,7 @@ class FromResolver {
                 lastResolvedRightAlias = alias;
                 List<RowContext> contexts = new ArrayList<>();
                 for (Object[] row : snapshotVisibleCatalogRows(catalogTable,
-                        tableRef.table().toLowerCase())) {
+                        tableRef.table().toLowerCase(java.util.Locale.ROOT))) {
                     contexts.add(new RowContext(catalogTable, alias, row));
                 }
                 return contexts;

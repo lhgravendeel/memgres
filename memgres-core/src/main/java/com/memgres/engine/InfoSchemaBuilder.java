@@ -436,7 +436,7 @@ public class InfoSchemaBuilder {
             // A table in a pg_temp namespace is temporary, and the standard has a table type of
             // its own for it — a tool that lists BASE TABLE only would otherwise take it for a
             // permanent table it can go on reading in the next session.
-            boolean temp = schemaEntry.getKey().toLowerCase().startsWith("pg_temp");
+            boolean temp = schemaEntry.getKey().toLowerCase(java.util.Locale.ROOT).startsWith("pg_temp");
             for (String tableName : schemaEntry.getValue().getTables().keySet()) {
                 table.insertRow(new Object[]{
                         catalogName(), schemaEntry.getKey(), tableName,
@@ -695,7 +695,7 @@ public class InfoSchemaBuilder {
      */
     static String intervalTypeOf(String qualifier, Integer precision) {
         if (qualifier == null) return null;
-        String text = qualifier.toUpperCase();
+        String text = qualifier.toUpperCase(java.util.Locale.ROOT);
         if (precision != null) text += "(" + precision + ")";
         return text;
     }
@@ -974,7 +974,7 @@ public class InfoSchemaBuilder {
      */
     private String schemaOwner(String schemaName) {
         if ("public".equalsIgnoreCase(schemaName)) return "pg_database_owner";
-        String owner = database.getObjectOwner("schema:" + schemaName.toLowerCase());
+        String owner = database.getObjectOwner("schema:" + schemaName.toLowerCase(java.util.Locale.ROOT));
         return owner != null ? owner : bootstrapUser();
     }
 
@@ -1040,11 +1040,11 @@ public class InfoSchemaBuilder {
                 java.util.Set<String> isPromotedUniqueCols = new java.util.HashSet<>();
                 for (StoredConstraint usc : t.getConstraints()) {
                     if (usc.getType() == StoredConstraint.Type.UNIQUE && usc.isPromotedFromIndex()) {
-                        for (String c : usc.getColumns()) isPromotedUniqueCols.add(c.toLowerCase());
+                        for (String c : usc.getColumns()) isPromotedUniqueCols.add(c.toLowerCase(java.util.Locale.ROOT));
                     }
                 }
                 for (Column col : t.getColumns()) {
-                    boolean isPromotedUnique = isPromotedUniqueCols.contains(col.getName().toLowerCase());
+                    boolean isPromotedUnique = isPromotedUniqueCols.contains(col.getName().toLowerCase(java.util.Locale.ROOT));
                     // Emit NOT NULL for all NOT NULL columns (including PK columns),
                     // but skip columns covered by UNIQUE constraints promoted from index
                     if (!col.isNullable() && !isPromotedUnique) {
@@ -1279,7 +1279,7 @@ public class InfoSchemaBuilder {
                     routineBody,         // routine_body
                     routineDefinition,   // routine_definition
                     null,                // external_name
-                    language.toUpperCase(), // external_language (M21: PG uppercases: SQL/PLPGSQL)
+                    language.toUpperCase(java.util.Locale.ROOT), // external_language (M21: PG uppercases: SQL/PLPGSQL)
                     "GENERAL",           // parameter_style
                     "NO",                // is_deterministic
                     "MODIFIES",          // sql_data_access
@@ -1427,7 +1427,7 @@ public class InfoSchemaBuilder {
             // view cannot see. Reporting NONE for a view that has one told a client the write
             // would go through unchecked.
             String checkOption = vd.checkOption() == null ? "NONE"
-                    : vd.checkOption().toUpperCase();
+                    : vd.checkOption().toUpperCase(java.util.Locale.ROOT);
             table.insertRow(new Object[]{
                     catalogName(), vSchema, vd.name(), viewDef, checkOption,
                     isUpdatable, isInsertable,
@@ -1696,10 +1696,10 @@ public class InfoSchemaBuilder {
         if (sc.getCheckExpr() == null) return out;
         java.util.Set<String> named = new java.util.LinkedHashSet<>();
         for (String name : DdlExecutor.referencedColumnNames(sc.getCheckExpr())) {
-            named.add(name.toLowerCase());
+            named.add(name.toLowerCase(java.util.Locale.ROOT));
         }
         for (Column c : t.getColumns()) {
-            if (named.contains(c.getName().toLowerCase())) out.add(c.getName());
+            if (named.contains(c.getName().toLowerCase(java.util.Locale.ROOT))) out.add(c.getName());
         }
         return out;
     }
@@ -1796,7 +1796,7 @@ public class InfoSchemaBuilder {
             if (params == null) continue;
             for (int i = 0; i < params.size(); i++) {
                 PgFunction.Param p = params.get(i);
-                String mode = p.mode() == null || p.mode().isEmpty() ? "IN" : p.mode().toUpperCase();
+                String mode = p.mode() == null || p.mode().isEmpty() ? "IN" : p.mode().toUpperCase(java.util.Locale.ROOT);
                 DataType dt = null;
                 String udtName = p.typeName();
                 if (udtName != null) {
@@ -2014,7 +2014,7 @@ public class InfoSchemaBuilder {
         }
 
         String ownerKey() {
-            return (isView ? "view:" : "table:") + schema.toLowerCase() + "." + name.toLowerCase();
+            return (isView ? "view:" : "table:") + schema.toLowerCase(java.util.Locale.ROOT) + "." + name.toLowerCase(java.util.Locale.ROOT);
         }
     }
 
@@ -2057,13 +2057,18 @@ public class InfoSchemaBuilder {
                         priv, "YES", "SELECT".equals(priv) ? "YES" : "NO"});
             }
         }
-        // Grants somebody actually issued, on top of the owner's own.
+        // Grants somebody actually issued, on top of the owner's own. A grant of ALL is a grant
+        // of each privilege the relation has, which is how PostgreSQL lists it: one row each,
+        // rather than one row saying "ALL", which is not a privilege_type any client knows.
+        Map<String, Object[]> rows = new java.util.LinkedHashMap<String, Object[]>();
+        java.util.Set<String> seen = new java.util.HashSet<String>();
         for (Map.Entry<String, java.util.Set<String>> entry : database.getAllRolePrivileges().entrySet()) {
             String grantee = entry.getKey();
             for (String privEntry : entry.getValue()) {
                 String[] parts = privEntry.split(":", 3);
                 if (parts.length != 3 || !"TABLE".equalsIgnoreCase(parts[1])) continue;
                 String privilege = parts[0];
+                if (privilege.endsWith("_GRANT_OPTION")) continue;
                 String objectName = parts[2];
                 String schema = "public";
                 String tableName = objectName;
@@ -2072,28 +2077,124 @@ public class InfoSchemaBuilder {
                     schema = objectName.substring(0, dot);
                     tableName = objectName.substring(dot + 1);
                 }
-                table.insertRow(new Object[]{currentUser(), grantee, catalog, schema, tableName,
-                        privilege, "NO", "SELECT".equalsIgnoreCase(privilege) ? "YES" : "NO"});
+                boolean grantable = entry.getValue().contains(
+                        privilege + "_GRANT_OPTION:" + parts[1] + ":" + parts[2]);
+                for (String named : namedPrivileges(privilege, OWNER_TABLE_PRIVILEGES)) {
+                    // A role holds one of each privilege however many statements gave it: a
+                    // GRANT ALL and a later GRANT SELECT ... WITH GRANT OPTION leave one SELECT,
+                    // which is grantable. Listed once per statement, the same privilege appeared
+                    // twice with two different answers about whether it could be passed on.
+                    String held = grantee + "\u0000" + schema + "\u0000" + tableName
+                            + "\u0000" + named;
+                    if (grantable || !seen.contains(held)) {
+                        if (grantable) rows.remove(held);
+                        seen.add(held);
+                        rows.put(held, new Object[]{ownerOf("table:" + objectName.toLowerCase(java.util.Locale.ROOT)),
+                                grantee, catalog, schema, tableName,
+                                named, grantable ? "YES" : "NO",
+                                "SELECT".equals(named) ? "YES" : "NO"});
+                    }
+                }
             }
         }
+        for (Object[] row : rows.values()) table.insertRow(row);
         return table;
+    }
+
+    /**
+     * The privileges a grant names. ALL names every one the object kind has; anything else names
+     * itself, and a word the kind has no privilege for names none.
+     */
+    private static List<String> namedPrivileges(String written, String[] all) {
+        List<String> out = new ArrayList<String>();
+        if (written == null) return out;
+        if ("ALL".equalsIgnoreCase(written) || "ALL PRIVILEGES".equalsIgnoreCase(written)) {
+            for (String priv : all) out.add(priv);
+            return out;
+        }
+        for (String priv : all) {
+            if (priv.equalsIgnoreCase(written)) { out.add(priv); return out; }
+        }
+        return out;
     }
 
     /** information_schema.column_privileges / role_column_grants. */
     private Table buildIsColumnPrivileges(String viewName) {
         Table table = declaredView(viewName);
         String catalog = catalogName();
+        // PostgreSQL builds this view as the union of two things: the relation's own ACL spread
+        // over every column of it, and each column's own ACL. It is a union that drops
+        // duplicates, so a privilege reached both ways is listed once -- unless the two differ
+        // in whether they can be passed on, which makes them two different rows.
+        java.util.Set<String> seen = new java.util.LinkedHashSet<String>();
+        java.util.List<Object[]> rows = new ArrayList<Object[]>();
         for (Relation rel : userRelations()) {
             String owner = ownerOf(rel.ownerKey());
+            String key = rel.schema.toLowerCase(java.util.Locale.ROOT) + "." + rel.name.toLowerCase(java.util.Locale.ROOT);
             for (Column col : rel.columns) {
                 if (CatalogCoreBuilder.isSystemColumn(col)) continue;
                 for (String priv : OWNER_COLUMN_PRIVILEGES) {
-                    table.insertRow(new Object[]{owner, owner, catalog, rel.schema, rel.name,
-                            col.getName(), priv, "YES"});
+                    addColumnPrivilege(seen, rows, owner, owner, catalog, rel, col.getName(),
+                            priv, true);
+                }
+            }
+            for (Map.Entry<String, java.util.Set<String>> entry
+                    : database.getAllRolePrivileges().entrySet()) {
+                // The relation's own ACL holds one of each privilege however many statements
+                // gave it, and it is grantable if any of them made it so. Expanded one statement
+                // at a time, a role given ALL and then SELECT WITH GRANT OPTION appeared to hold
+                // two SELECTs on every column rather than one grantable one.
+                Map<String, Boolean> relationHeld = new java.util.LinkedHashMap<String, Boolean>();
+                for (String privEntry : entry.getValue()) {
+                    String[] parts = privEntry.split(":", 3);
+                    if (parts.length != 3 || parts[0].endsWith("_GRANT_OPTION")) continue;
+                    if (!"TABLE".equalsIgnoreCase(parts[1])
+                            || !parts[2].equalsIgnoreCase(key)) continue;
+                    boolean grantable = entry.getValue().contains(
+                            parts[0] + "_GRANT_OPTION:" + parts[1] + ":" + parts[2]);
+                    for (String named : namedPrivileges(parts[0], OWNER_COLUMN_PRIVILEGES)) {
+                        Boolean was = relationHeld.get(named);
+                        relationHeld.put(named, Boolean.TRUE.equals(was) || grantable);
+                    }
+                }
+                for (Map.Entry<String, Boolean> held : relationHeld.entrySet()) {
+                    for (Column col : rel.columns) {
+                        if (CatalogCoreBuilder.isSystemColumn(col)) continue;
+                        addColumnPrivilege(seen, rows, owner, entry.getKey(), catalog,
+                                rel, col.getName(), held.getKey(), held.getValue());
+                    }
+                }
+                for (String privEntry : entry.getValue()) {
+                    String[] parts = privEntry.split(":", 3);
+                    if (parts.length != 3) continue;
+                    if (parts[0].endsWith("_GRANT_OPTION")) continue;
+                    boolean grantable = entry.getValue().contains(
+                            parts[0] + "_GRANT_OPTION:" + parts[1] + ":" + parts[2]);
+                    if ("COLUMN".equalsIgnoreCase(parts[1])) {
+                        int dot = parts[2].lastIndexOf('.');
+                        if (dot <= 0) continue;
+                        if (!parts[2].substring(0, dot).equalsIgnoreCase(key)) continue;
+                        String columnName = parts[2].substring(dot + 1);
+                        for (String named : namedPrivileges(parts[0], OWNER_COLUMN_PRIVILEGES)) {
+                            addColumnPrivilege(seen, rows, owner, entry.getKey(), catalog,
+                                    rel, columnName, named, grantable);
+                        }
+                    }
                 }
             }
         }
+        for (Object[] row : rows) table.insertRow(row);
         return table;
+    }
+
+    private void addColumnPrivilege(java.util.Set<String> seen, java.util.List<Object[]> rows,
+                                    String grantor, String grantee, String catalog, Relation rel,
+                                    String columnName, String privilege, boolean grantable) {
+        String key = grantor + "\u0000" + grantee + "\u0000" + rel.schema + "\u0000" + rel.name
+                + "\u0000" + columnName + "\u0000" + privilege + "\u0000" + grantable;
+        if (!seen.add(key)) return;
+        rows.add(new Object[]{grantor, grantee, catalog, rel.schema, rel.name, columnName,
+                privilege, grantable ? "YES" : "NO"});
     }
 
     /** information_schema.routine_privileges / role_routine_grants. */
@@ -2484,10 +2585,10 @@ public class InfoSchemaBuilder {
             @Override public void accept(Object node) {
                 if (node instanceof com.memgres.engine.parser.ast.SelectStmt.CommonTableExpr) {
                     String n = ((com.memgres.engine.parser.ast.SelectStmt.CommonTableExpr) node).name();
-                    if (n != null) invented.add(n.toLowerCase());
+                    if (n != null) invented.add(n.toLowerCase(java.util.Locale.ROOT));
                 } else if (node instanceof com.memgres.engine.parser.ast.SelectStmt.SubqueryFrom) {
                     String a = ((com.memgres.engine.parser.ast.SelectStmt.SubqueryFrom) node).alias();
-                    if (a != null) invented.add(a.toLowerCase());
+                    if (a != null) invented.add(a.toLowerCase(java.util.Locale.ROOT));
                 }
             }
         });
@@ -2497,7 +2598,7 @@ public class InfoSchemaBuilder {
                 com.memgres.engine.parser.ast.SelectStmt.TableRef ref =
                         (com.memgres.engine.parser.ast.SelectStmt.TableRef) node;
                 if (ref.table() == null) return;
-                if (ref.schema() == null && invented.contains(ref.table().toLowerCase())) return;
+                if (ref.schema() == null && invented.contains(ref.table().toLowerCase(java.util.Locale.ROOT))) return;
                 ViewSource src = resolveViewSource(ref.schema(), ref.table(), viewSchema,
                         ref.alias() != null ? ref.alias() : ref.table());
                 if (src != null) sources.add(src);
@@ -2567,7 +2668,7 @@ public class InfoSchemaBuilder {
                 } else if (node instanceof com.memgres.engine.parser.ast.WildcardExpr) {
                     com.memgres.engine.parser.ast.WildcardExpr w =
                             (com.memgres.engine.parser.ast.WildcardExpr) node;
-                    starred.add(w.table() == null ? "*" : w.table().toLowerCase());
+                    starred.add(w.table() == null ? "*" : w.table().toLowerCase(java.util.Locale.ROOT));
                 } else if (node instanceof com.memgres.engine.parser.ast.SelectStmt.JoinFrom) {
                     // USING (a) reads a from both sides even though neither is written down
                     List<String> using =
@@ -2580,8 +2681,8 @@ public class InfoSchemaBuilder {
         });
         // A star stands for every column of the relations it covers.
         for (ViewSource src : sources) {
-            if (starred.contains("*") || starred.contains(src.key.toLowerCase())
-                    || starred.contains(src.name.toLowerCase())) {
+            if (starred.contains("*") || starred.contains(src.key.toLowerCase(java.util.Locale.ROOT))
+                    || starred.contains(src.name.toLowerCase(java.util.Locale.ROOT))) {
                 for (Column c : src.columns) {
                     addColumnUse(out, emitted, src, c.getName());
                 }
@@ -2622,7 +2723,7 @@ public class InfoSchemaBuilder {
         for (Column c : src.columns) {
             if (c.getName().equalsIgnoreCase(column)) { actual = c.getName(); break; }
         }
-        if (emitted.add(src.schema + "." + src.name + "." + actual.toLowerCase())) {
+        if (emitted.add(src.schema + "." + src.name + "." + actual.toLowerCase(java.util.Locale.ROOT))) {
             out.add(new String[]{src.schema, src.name, actual});
         }
     }

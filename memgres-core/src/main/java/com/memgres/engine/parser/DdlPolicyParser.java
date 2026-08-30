@@ -30,10 +30,10 @@ class DdlPolicyParser {
         String policyType = "PERMISSIVE";
         if (parser.matchKeyword("AS")) {
             Token typeToken = parser.advance();
-            policyType = typeToken.value().toUpperCase();
+            policyType = typeToken.value().toUpperCase(java.util.Locale.ROOT);
             if (!"PERMISSIVE".equals(policyType) && !"RESTRICTIVE".equals(policyType)) {
                 throw PgErrors.syntax("unrecognized row security option \""
-                        + typeToken.value().toLowerCase() + "\""
+                        + typeToken.value().toLowerCase(java.util.Locale.ROOT) + "\""
                         + "\n  Hint: Only PERMISSIVE or RESTRICTIVE policies are supported"
                         + " currently.");
             }
@@ -42,7 +42,7 @@ class DdlPolicyParser {
         String command = "ALL";
         if (parser.matchKeyword("FOR")) {
             Token cmdToken = parser.advance();
-            command = cmdToken.value().toUpperCase();
+            command = cmdToken.value().toUpperCase(java.util.Locale.ROOT);
             if (!command.equals("ALL") && !command.equals("SELECT") && !command.equals("INSERT")
                     && !command.equals("UPDATE") && !command.equals("DELETE")) {
                 throw new ParseException("unrecognized row security command type \"" + cmdToken.value() + "\"", cmdToken);

@@ -40,7 +40,7 @@ final class RelationNamespace {
     static String kindOf(Database db, String schemaName, String name) {
         if (db == null || name == null) return null;
         String bare = bareName(name);
-        String schema = schemaName == null ? "public" : schemaName.toLowerCase();
+        String schema = schemaName == null ? "public" : schemaName.toLowerCase(java.util.Locale.ROOT);
         Schema s = db.getSchema(schema);
         if (s != null && s.getTable(bare) != null) return TABLE;
         // A foreign table holds its name in the schema against every other kind, so a CREATE
@@ -104,7 +104,7 @@ final class RelationNamespace {
         // PostgreSQL has one DROP TYPE for every kind of type, so a composite is sent there
         // rather than to a DROP COMPOSITE TYPE no grammar accepts.
         String object = COMPOSITE.equals(found) ? "type" : found;
-        e.setHint("Use DROP " + object.toUpperCase() + " to remove " + article(object) + " " + object + ".");
+        e.setHint("Use DROP " + object.toUpperCase(java.util.Locale.ROOT) + " to remove " + article(object) + " " + object + ".");
         throw e;
     }
 
@@ -115,7 +115,7 @@ final class RelationNamespace {
      */
     static String shownName(java.util.List<String> searchPath, String schemaName, String name) {
         String schema = schemaName == null ? "public" : schemaName;
-        if (searchPath != null && searchPath.contains(schema.toLowerCase())) return name;
+        if (searchPath != null && searchPath.contains(schema.toLowerCase(java.util.Locale.ROOT))) return name;
         return schema + "." + name;
     }
 

@@ -1298,7 +1298,7 @@ class ConstraintValidator {
     /** A key column must exist and must not be a system column. */
     private static void requireKeyColumn(Table table, String column) {
         if (table.getColumnIndex(column) >= 0) return;
-        if (SYSTEM_COLUMNS.contains(column.toLowerCase())) {
+        if (SYSTEM_COLUMNS.contains(column.toLowerCase(java.util.Locale.ROOT))) {
             throw new MemgresException("system columns cannot be used in foreign keys", "0A000");
         }
         throw new MemgresException("column \"" + column
@@ -1464,7 +1464,7 @@ class ConstraintValidator {
         java.util.Set<String> names = new LinkedHashSet<>();
         for (int idx : indices) {
             if (idx >= 0 && idx < childTable.getColumns().size()) {
-                names.add(childTable.getColumns().get(idx).getName().toLowerCase());
+                names.add(childTable.getColumns().get(idx).getName().toLowerCase(java.util.Locale.ROOT));
             }
         }
         return names;

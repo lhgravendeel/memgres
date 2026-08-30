@@ -129,23 +129,23 @@ public class Database {
 
     public void addStubObject(String kind, String name) {
         if (name == null) return;
-        stubObjects.computeIfAbsent(kind.toLowerCase(), k -> ConcurrentHashMap.newKeySet())
-                .add(name.toLowerCase());
+        stubObjects.computeIfAbsent(kind.toLowerCase(java.util.Locale.ROOT), k -> ConcurrentHashMap.newKeySet())
+                .add(name.toLowerCase(java.util.Locale.ROOT));
     }
 
     public boolean hasStubObject(String kind, String name) {
         if (name == null) return false;
-        String lower = name.toLowerCase();
-        Set<String> builtin = BUILTIN_STUBS.get(kind.toLowerCase());
+        String lower = name.toLowerCase(java.util.Locale.ROOT);
+        Set<String> builtin = BUILTIN_STUBS.get(kind.toLowerCase(java.util.Locale.ROOT));
         if (builtin != null && builtin.contains(lower)) return true;
-        Set<String> created = stubObjects.get(kind.toLowerCase());
+        Set<String> created = stubObjects.get(kind.toLowerCase(java.util.Locale.ROOT));
         return created != null && created.contains(lower);
     }
 
     public void removeStubObject(String kind, String name) {
         if (name == null) return;
-        Set<String> created = stubObjects.get(kind.toLowerCase());
-        if (created != null) created.remove(name.toLowerCase());
+        Set<String> created = stubObjects.get(kind.toLowerCase(java.util.Locale.ROOT));
+        if (created != null) created.remove(name.toLowerCase(java.util.Locale.ROOT));
     }
 
     public void renameStubObject(String kind, String oldName, String newName) {
@@ -153,10 +153,10 @@ public class Database {
         addStubObject(kind, newName);
     }
 
-    public void addCollation(CollationDef coll) { userCollations.put(coll.name.toLowerCase(), coll); }
-    public CollationDef getCollation(String name) { return userCollations.get(name.toLowerCase()); }
+    public void addCollation(CollationDef coll) { userCollations.put(coll.name.toLowerCase(java.util.Locale.ROOT), coll); }
+    public CollationDef getCollation(String name) { return userCollations.get(name.toLowerCase(java.util.Locale.ROOT)); }
     public Map<String, CollationDef> getUserCollations() { return userCollations; }
-    public void removeCollation(String name) { userCollations.remove(name.toLowerCase()); }
+    public void removeCollation(String name) { userCollations.remove(name.toLowerCase(java.util.Locale.ROOT)); }
 
     // ---- Text Search catalog objects ----
     private final Map<String, TsConfigDef> tsConfigs = new ConcurrentHashMap<>();
@@ -184,16 +184,16 @@ public class Database {
         }
     }
 
-    public void addTsConfig(TsConfigDef cfg) { tsConfigs.put(cfg.name.toLowerCase(), cfg); }
-    public void removeTsConfig(String name) { tsConfigs.remove(name.toLowerCase()); }
+    public void addTsConfig(TsConfigDef cfg) { tsConfigs.put(cfg.name.toLowerCase(java.util.Locale.ROOT), cfg); }
+    public void removeTsConfig(String name) { tsConfigs.remove(name.toLowerCase(java.util.Locale.ROOT)); }
     public Map<String, TsConfigDef> getTsConfigs() { return tsConfigs; }
 
-    public void addTsDict(TsDictDef dict) { tsDicts.put(dict.name.toLowerCase(), dict); }
-    public void removeTsDict(String name) { tsDicts.remove(name.toLowerCase()); }
+    public void addTsDict(TsDictDef dict) { tsDicts.put(dict.name.toLowerCase(java.util.Locale.ROOT), dict); }
+    public void removeTsDict(String name) { tsDicts.remove(name.toLowerCase(java.util.Locale.ROOT)); }
     public Map<String, TsDictDef> getTsDicts() { return tsDicts; }
 
     public void addTsConfigMap(String configName, String tokenType, String dictName) {
-        tsConfigMaps.put(configName.toLowerCase() + "\0" + tokenType.toLowerCase(), dictName);
+        tsConfigMaps.put(configName.toLowerCase(java.util.Locale.ROOT) + "\0" + tokenType.toLowerCase(java.util.Locale.ROOT), dictName);
     }
     public Map<String, String> getTsConfigMaps() { return tsConfigMaps; }
 
@@ -707,6 +707,15 @@ public class Database {
 
     public List<DefaultAclEntry> getDefaultAcls() { return defaultAcls; }
 
+    /** Every default privilege the role wrote or was named by, which goes when the role does. */
+    public void removeDefaultAclsOf(String roleName) {
+        if (roleName == null) return;
+        defaultAcls.removeIf(e ->
+                (e.grantor != null && e.grantor.equalsIgnoreCase(roleName))
+                        || (e.grantees != null && e.grantees.stream()
+                                .anyMatch(g -> g != null && g.equalsIgnoreCase(roleName))));
+    }
+
     // Global transaction ID counter (monotonically increasing, like PG's xid)
     private final AtomicLong nextTransactionId = new AtomicLong(1);
 
@@ -881,6 +890,14 @@ public class Database {
     public int getMaxPreparedTransactions() { return maxPreparedTransactions; }
     public void setMaxPreparedTransactions(int max) { this.maxPreparedTransactions = max; }
 
+    /**
+     * The role the server runs as, which owns everything nobody else was recorded as owning.
+     * PostgreSQL writes it as the grantor of every entry in an ACL it materialises.
+     */
+    public String bootstrapRoleName() {
+        return "memgres";
+    }
+
     public Database() {
         schemas.put("public", new Schema("public"));
         // Default superuser roles (similar to PG's postgres role)
@@ -1006,13 +1023,13 @@ public class Database {
     private final Map<String, List<String>> analyzedColumns = new ConcurrentHashMap<>();
 
     public void recordAnalyzedColumns(String schemaTable, List<String> columns) {
-        if (columns == null) analyzedColumns.remove(schemaTable.toLowerCase());
-        else analyzedColumns.put(schemaTable.toLowerCase(), new ArrayList<>(columns));
+        if (columns == null) analyzedColumns.remove(schemaTable.toLowerCase(java.util.Locale.ROOT));
+        else analyzedColumns.put(schemaTable.toLowerCase(java.util.Locale.ROOT), new ArrayList<>(columns));
     }
 
     /** The columns statistics were gathered for, or null when they were gathered for all. */
     public List<String> getAnalyzedColumns(String schemaTable) {
-        return analyzedColumns.get(schemaTable.toLowerCase());
+        return analyzedColumns.get(schemaTable.toLowerCase(java.util.Locale.ROOT));
     }
 
     /**
@@ -1025,7 +1042,7 @@ public class Database {
             new ConcurrentHashMap<>();
 
     void recordColumnStatistics(String schemaTable, Map<String, ColumnStatistics> gathered) {
-        String key = schemaTable.toLowerCase();
+        String key = schemaTable.toLowerCase(java.util.Locale.ROOT);
         if (gathered.isEmpty()) {
             columnStatistics.remove(key);
             return;
@@ -1040,16 +1057,16 @@ public class Database {
     }
 
     Map<String, ColumnStatistics> getColumnStatistics(String schemaTable) {
-        return columnStatistics.get(schemaTable.toLowerCase());
+        return columnStatistics.get(schemaTable.toLowerCase(java.util.Locale.ROOT));
     }
 
     void forgetColumnStatistics(String schemaTable) {
-        columnStatistics.remove(schemaTable.toLowerCase());
+        columnStatistics.remove(schemaTable.toLowerCase(java.util.Locale.ROOT));
     }
 
     // Clustered index tracking
-    public void setClusteredIndex(String indexName) { clusteredIndexes.add(idxName(indexName).toLowerCase()); }
-    public boolean isClusteredIndex(String indexName) { return clusteredIndexes.contains(idxName(indexName).toLowerCase()); }
+    public void setClusteredIndex(String indexName) { clusteredIndexes.add(idxName(indexName).toLowerCase(java.util.Locale.ROOT)); }
+    public boolean isClusteredIndex(String indexName) { return clusteredIndexes.contains(idxName(indexName).toLowerCase(java.util.Locale.ROOT)); }
 
     /** Snapshot of all advisory lock holds (for pg_locks). One row per (session, lock, mode). */
     public List<AdvisoryLockRow> getAdvisoryLockRows() {
@@ -1143,11 +1160,11 @@ public class Database {
     }
 
     public void addSchemaAcl(String schemaName, String aclItem) {
-        schemaAcls.computeIfAbsent(schemaName.toLowerCase(), k -> new java.util.ArrayList<>()).add(aclItem);
+        schemaAcls.computeIfAbsent(schemaName.toLowerCase(java.util.Locale.ROOT), k -> new java.util.ArrayList<>()).add(aclItem);
     }
 
     public List<String> getSchemaAcl(String schemaName) {
-        return schemaAcls.get(schemaName.toLowerCase());
+        return schemaAcls.get(schemaName.toLowerCase(java.util.Locale.ROOT));
     }
 
     public void removeSchema(String name) {
@@ -1309,7 +1326,7 @@ public class Database {
         List<CreateTypeStmt.CompositeField> fields = new ArrayList<>();
         for (Column col : table.getColumns()) {
             fields.add(new CreateTypeStmt.CompositeField(col.getName(),
-                    col.getType() != null ? col.getType().name().toLowerCase() : "text"));
+                    col.getType() != null ? col.getType().name().toLowerCase(java.util.Locale.ROOT) : "text"));
         }
         return fields;
     }
@@ -1435,19 +1452,19 @@ public class Database {
 
     // User-defined aggregates
     public void addAggregate(PgAggregate agg) {
-        userAggregates.put(agg.getName().toLowerCase(), agg);
+        userAggregates.put(agg.getName().toLowerCase(java.util.Locale.ROOT), agg);
     }
 
     public PgAggregate getAggregate(String name) {
-        return userAggregates.get(name.toLowerCase());
+        return userAggregates.get(name.toLowerCase(java.util.Locale.ROOT));
     }
 
     public boolean hasAggregate(String name) {
-        return userAggregates.containsKey(name.toLowerCase());
+        return userAggregates.containsKey(name.toLowerCase(java.util.Locale.ROOT));
     }
 
     public void removeAggregate(String name) {
-        userAggregates.remove(name.toLowerCase());
+        userAggregates.remove(name.toLowerCase(java.util.Locale.ROOT));
     }
 
     public Map<String, PgAggregate> getUserAggregates() {
@@ -1456,19 +1473,19 @@ public class Database {
 
     // User-defined operators (keyed by name+argtypes for overloading)
     public void addOperator(PgOperator op) {
-        userOperators.put(op.getKey().toLowerCase(), op);
+        userOperators.put(op.getKey().toLowerCase(java.util.Locale.ROOT), op);
     }
 
     public PgOperator getOperator(String key) {
-        return userOperators.get(key.toLowerCase());
+        return userOperators.get(key.toLowerCase(java.util.Locale.ROOT));
     }
 
     public boolean hasOperator(String key) {
-        return userOperators.containsKey(key.toLowerCase());
+        return userOperators.containsKey(key.toLowerCase(java.util.Locale.ROOT));
     }
 
     public void removeOperator(String key) {
-        userOperators.remove(key.toLowerCase());
+        userOperators.remove(key.toLowerCase(java.util.Locale.ROOT));
     }
 
     public Map<String, PgOperator> getUserOperators() {
@@ -1762,8 +1779,8 @@ public class Database {
      * for function resolution purposes (e.g., fn(integer) should not match fn(text)).
      */
     private boolean isNumericToTextMismatch(String argType, String paramType) {
-        String a = argType.toLowerCase().trim();
-        String p = paramType.toLowerCase().trim();
+        String a = argType.toLowerCase(java.util.Locale.ROOT).trim();
+        String p = paramType.toLowerCase(java.util.Locale.ROOT).trim();
         Set<String> numeric = Cols.setOf("int", "integer", "int4", "bigint", "int8", "smallint", "int2",
                 "numeric", "decimal", "real", "float", "float4", "float8", "double precision");
         Set<String> textual = Cols.setOf("text", "varchar", "character varying", "char", "character", "name");
@@ -1771,8 +1788,8 @@ public class Database {
     }
 
     public boolean typesCompatible(String argType, String paramType) {
-        String a = argType.toLowerCase().trim();
-        String p = paramType.toLowerCase().trim();
+        String a = argType.toLowerCase(java.util.Locale.ROOT).trim();
+        String p = paramType.toLowerCase(java.util.Locale.ROOT).trim();
         if (a.equals(p)) return true;
         // Numeric family
         Set<String> numeric = Cols.setOf("int", "integer", "int4", "bigint", "int8", "smallint", "int2",
@@ -1900,16 +1917,16 @@ public class Database {
 
     // Triggers
     public void addTrigger(PgTrigger trigger) {
-        triggers.computeIfAbsent(trigger.getTableName().toLowerCase(), k -> new ArrayList<>())
+        triggers.computeIfAbsent(trigger.getTableName().toLowerCase(java.util.Locale.ROOT), k -> new ArrayList<>())
                 .add(trigger);
     }
 
     public List<PgTrigger> getTriggersForTable(String tableName) {
         syncPartitionTriggers();
-        List<PgTrigger> list = triggers.get(tableName.toLowerCase());
+        List<PgTrigger> list = triggers.get(tableName.toLowerCase(java.util.Locale.ROOT));
         if (list == null || list.isEmpty()) return Cols.listOf();
         List<PgTrigger> sorted = new ArrayList<>(list);
-        sorted.sort(java.util.Comparator.comparing(t -> t.getName().toLowerCase()));
+        sorted.sort(java.util.Comparator.comparing(t -> t.getName().toLowerCase(java.util.Locale.ROOT)));
         return sorted;
     }
 
@@ -1967,7 +1984,7 @@ public class Database {
      */
     private PgTrigger cloneOnto(PgTrigger trigger, Table parent, Table partition) {
         List<PgTrigger> here = triggers.computeIfAbsent(
-                partition.getName().toLowerCase(), k -> new ArrayList<>());
+                partition.getName().toLowerCase(java.util.Locale.ROOT), k -> new ArrayList<>());
         for (PgTrigger existing : here) {
             if (existing.getName().equalsIgnoreCase(trigger.getName())
                     && existing.getEvent() == trigger.getEvent()) {
@@ -1997,7 +2014,7 @@ public class Database {
         if (parent == null || !parent.getName().equalsIgnoreCase(clone.getClonedFromTable())) {
             return false;
         }
-        List<PgTrigger> original = triggers.get(parent.getName().toLowerCase());
+        List<PgTrigger> original = triggers.get(parent.getName().toLowerCase(java.util.Locale.ROOT));
         if (original == null) return false;
         for (PgTrigger t : original) {
             if (t.getName().equalsIgnoreCase(clone.getName()) && t.getEvent() == clone.getEvent()) {
@@ -2016,7 +2033,7 @@ public class Database {
     }
 
     public void removeTrigger(String name, String tableName) {
-        List<PgTrigger> list = triggers.get(tableName.toLowerCase());
+        List<PgTrigger> list = triggers.get(tableName.toLowerCase(java.util.Locale.ROOT));
         if (list != null) {
             list.removeIf(t -> t.getName().equalsIgnoreCase(name));
         }
@@ -2028,7 +2045,7 @@ public class Database {
      * with no recorded schema are treated as belonging to the table being dropped.
      */
     public void removeTriggersForTable(String schemaName, String tableName) {
-        String key = tableName.toLowerCase();
+        String key = tableName.toLowerCase(java.util.Locale.ROOT);
         List<PgTrigger> list = triggers.get(key);
         if (list == null) return;
         List<PgTrigger> keep = new ArrayList<>();
@@ -2045,7 +2062,7 @@ public class Database {
     /** Triggers on the named table, restricted to one schema where that is recorded. */
     public List<PgTrigger> getTriggersForTable(String schemaName, String tableName) {
         syncPartitionTriggers();
-        List<PgTrigger> list = triggers.get(tableName.toLowerCase());
+        List<PgTrigger> list = triggers.get(tableName.toLowerCase(java.util.Locale.ROOT));
         if (list == null) return new ArrayList<>();
         if (schemaName == null) return new ArrayList<>(list);
         List<PgTrigger> out = new ArrayList<>();
@@ -2058,7 +2075,7 @@ public class Database {
     /** Re-registers triggers removed by a DROP TABLE that a rollback has undone. */
     public void restoreTriggersForTable(String tableName, List<PgTrigger> restored) {
         if (restored == null || restored.isEmpty()) return;
-        String key = tableName.toLowerCase();
+        String key = tableName.toLowerCase(java.util.Locale.ROOT);
         List<PgTrigger> list = triggers.computeIfAbsent(key, k -> new ArrayList<>());
         for (PgTrigger t : restored) {
             if (!list.contains(t)) list.add(t);
@@ -2066,20 +2083,20 @@ public class Database {
     }
 
     public void removeTriggersForTable(String tableName) {
-        triggers.remove(tableName.toLowerCase());
+        triggers.remove(tableName.toLowerCase(java.util.Locale.ROOT));
     }
 
     // Event triggers
     public void addEventTrigger(PgEventTrigger et) {
-        eventTriggers.put(et.getName().toLowerCase(), et);
+        eventTriggers.put(et.getName().toLowerCase(java.util.Locale.ROOT), et);
     }
 
     public PgEventTrigger getEventTrigger(String name) {
-        return eventTriggers.get(name.toLowerCase());
+        return eventTriggers.get(name.toLowerCase(java.util.Locale.ROOT));
     }
 
     public void removeEventTrigger(String name) {
-        eventTriggers.remove(name.toLowerCase());
+        eventTriggers.remove(name.toLowerCase(java.util.Locale.ROOT));
     }
 
     public Map<String, PgEventTrigger> getAllEventTriggers() {
@@ -2088,15 +2105,15 @@ public class Database {
 
     // Extended statistics
     public void addExtendedStatistic(ExtendedStatistic stat) {
-        extendedStatistics.put(stat.getName().toLowerCase(), stat);
+        extendedStatistics.put(stat.getName().toLowerCase(java.util.Locale.ROOT), stat);
     }
 
     public ExtendedStatistic getExtendedStatistic(String name) {
-        return extendedStatistics.get(name.toLowerCase());
+        return extendedStatistics.get(name.toLowerCase(java.util.Locale.ROOT));
     }
 
     public void removeExtendedStatistic(String name) {
-        extendedStatistics.remove(name.toLowerCase());
+        extendedStatistics.remove(name.toLowerCase(java.util.Locale.ROOT));
     }
 
     public Map<String, ExtendedStatistic> getAllExtendedStatistics() {
@@ -2246,7 +2263,7 @@ public class Database {
     /** The key a sequence is stored under: its schema and its name, both folded. */
     static String seqKey(String schemaName, String name) {
         String schema = schemaName == null || schemaName.isEmpty() ? "public" : schemaName;
-        return schema.toLowerCase() + "." + name.toLowerCase();
+        return schema.toLowerCase(java.util.Locale.ROOT) + "." + name.toLowerCase(java.util.Locale.ROOT);
     }
 
     public void addSequence(Sequence sequence) {
@@ -2338,7 +2355,7 @@ public class Database {
 
     /** Remove every sequence belonging to the named schema (a temporary schema going away). */
     public void removeSequencesInSchema(String schemaName) {
-        String prefix = schemaName.toLowerCase() + ".";
+        String prefix = schemaName.toLowerCase(java.util.Locale.ROOT) + ".";
         sequences.keySet().removeIf(k -> k.startsWith(prefix));
     }
 
@@ -2456,7 +2473,7 @@ public class Database {
      */
     public void addRule(String schema, String ruleName, String table, String event, boolean instead,
                         String body, String qualification) {
-        String key = table.toLowerCase();
+        String key = table.toLowerCase(java.util.Locale.ROOT);
         List<StoredRule> rebuilt = new ArrayList<>();
         List<StoredRule> existing = relationRules.get(key);
         if (existing != null) {
@@ -2466,7 +2483,7 @@ public class Database {
                 }
             }
         }
-        rebuilt.add(new StoredRule(schema, table, ruleName, event == null ? "" : event.toUpperCase(),
+        rebuilt.add(new StoredRule(schema, table, ruleName, event == null ? "" : event.toUpperCase(java.util.Locale.ROOT),
                 instead, qualification, body, ruleCreations.incrementAndGet()));
         rebuilt.sort((a, b) -> a.getName().compareToIgnoreCase(b.getName()));
         relationRules.put(key, rebuilt);
@@ -2478,9 +2495,9 @@ public class Database {
      */
     public List<StoredRule> getRules(String schema, String table, String event) {
         List<StoredRule> out = new ArrayList<>();
-        List<StoredRule> list = relationRules.get(table.toLowerCase());
+        List<StoredRule> list = relationRules.get(table.toLowerCase(java.util.Locale.ROOT));
         if (list == null) return out;
-        String want = event.toUpperCase();
+        String want = event.toUpperCase(java.util.Locale.ROOT);
         for (StoredRule r : list) {
             if (!r.isDisabled() && want.equals(r.getEvent()) && ruleInSchema(r, schema)) out.add(r);
         }
@@ -2488,7 +2505,7 @@ public class Database {
     }
 
     private StoredRule findRule(String schema, String ruleName, String table) {
-        List<StoredRule> list = relationRules.get(table.toLowerCase());
+        List<StoredRule> list = relationRules.get(table.toLowerCase(java.util.Locale.ROOT));
         if (list == null) return null;
         for (StoredRule r : list) {
             if (r.getName().equalsIgnoreCase(ruleName) && ruleInSchema(r, schema)) return r;
@@ -2518,9 +2535,9 @@ public class Database {
             ruleDependencies.put(ruleDependencyKey(newName, rule.schema, table),
                     new RuleDependency(newName, rule.schema, table, dependency.relations));
         }
-        List<StoredRule> resorted = new ArrayList<>(relationRules.get(table.toLowerCase()));
+        List<StoredRule> resorted = new ArrayList<>(relationRules.get(table.toLowerCase(java.util.Locale.ROOT)));
         resorted.sort((a, b) -> a.getName().compareToIgnoreCase(b.getName()));
-        relationRules.put(table.toLowerCase(), resorted);
+        relationRules.put(table.toLowerCase(java.util.Locale.ROOT), resorted);
     }
 
     /**
@@ -2575,8 +2592,8 @@ public class Database {
     }
 
     private static String ruleDependencyKey(String ruleName, String schema, String table) {
-        return ruleName.toLowerCase() + ":" + (schema == null ? "" : schema.toLowerCase())
-                + "." + table.toLowerCase();
+        return ruleName.toLowerCase(java.util.Locale.ROOT) + ":" + (schema == null ? "" : schema.toLowerCase(java.util.Locale.ROOT))
+                + "." + table.toLowerCase(java.util.Locale.ROOT);
     }
 
     /**
@@ -2635,7 +2652,7 @@ public class Database {
                 ruleDependencies.remove(e.getKey());
             }
         }
-        String key = table.toLowerCase();
+        String key = table.toLowerCase(java.util.Locale.ROOT);
         List<StoredRule> existing = relationRules.get(key);
         if (existing == null) return;
         List<StoredRule> kept = new ArrayList<>();
@@ -2698,14 +2715,14 @@ public class Database {
     }
 
     private static String everHadKey(String schema, String table) {
-        return "everhad:" + (schema == null ? "" : schema.toLowerCase())
-                + "." + table.toLowerCase();
+        return "everhad:" + (schema == null ? "" : schema.toLowerCase(java.util.Locale.ROOT))
+                + "." + table.toLowerCase(java.util.Locale.ROOT);
     }
 
     /** Whether a relation has, or once had, a rule -- what {@code relhasrules} reports. */
     public boolean everHadRules(String schema, String table) {
         if (schema != null) return rules.containsKey(everHadKey(schema, table));
-        String underAnySchema = "." + table.toLowerCase();
+        String underAnySchema = "." + table.toLowerCase(java.util.Locale.ROOT);
         for (String key : rules.keySet()) {
             if (key.startsWith("everhad:") && key.endsWith(underAnySchema)) return true;
         }
@@ -2721,8 +2738,8 @@ public class Database {
      * @see ObjectIdentity#relationRenamed
      */
     void retargetRules(String oldSchema, String oldTable, String newSchema, String newTable) {
-        String from = oldTable.toLowerCase();
-        String to = newTable.toLowerCase();
+        String from = oldTable.toLowerCase(java.util.Locale.ROOT);
+        String to = newTable.toLowerCase(java.util.Locale.ROOT);
         String everHad = rules.remove(everHadKey(oldSchema, oldTable));
         if (everHad != null) rules.put(everHadKey(newSchema, newTable), everHad);
         List<StoredRule> underName = relationRules.get(from);
@@ -2761,8 +2778,8 @@ public class Database {
      * @see ObjectIdentity#relationRenamed
      */
     void retargetTriggers(String oldTable, String newTable, String newSchema) {
-        String from = oldTable.toLowerCase();
-        String to = newTable.toLowerCase();
+        String from = oldTable.toLowerCase(java.util.Locale.ROOT);
+        String to = newTable.toLowerCase(java.util.Locale.ROOT);
         List<PgTrigger> list = triggers.remove(from);
         if (list == null || list.isEmpty()) return;
         List<PgTrigger> rebuilt = new ArrayList<>();
@@ -2793,7 +2810,7 @@ public class Database {
      * them in {@code pg_rules} describing a relation that was no longer there.
      */
     public void dropRulesOn(String schema, String table) {
-        List<StoredRule> carried = relationRules.get(table.toLowerCase());
+        List<StoredRule> carried = relationRules.get(table.toLowerCase(java.util.Locale.ROOT));
         if (carried != null) {
             // Each goes through the ordinary drop, so what the rule depended on is forgotten too.
             for (StoredRule r : new ArrayList<>(carried)) {
@@ -2843,7 +2860,7 @@ public class Database {
 
     /** What {@link #dropRulesOn} is about to take away, or null where the relation carries none. */
     public RuleSnapshot snapshotRulesOn(String schema, String table) {
-        List<StoredRule> underName = relationRules.get(table.toLowerCase());
+        List<StoredRule> underName = relationRules.get(table.toLowerCase(java.util.Locale.ROOT));
         if (underName == null) return null;
         List<StoredRule> carried = new ArrayList<>();
         for (StoredRule r : underName) {
@@ -2864,7 +2881,7 @@ public class Database {
             StoredRule rule = findRule(dependent[2], dependent[0], dependent[1]);
             if (rule != null && !carried.contains(rule)) carried.add(rule);
         }
-        List<StoredRule> underName = relationRules.get(table.toLowerCase());
+        List<StoredRule> underName = relationRules.get(table.toLowerCase(java.util.Locale.ROOT));
         if (underName != null) {
             for (StoredRule r : underName) {
                 if (ruleInSchema(r, schema) && !carried.contains(r)) carried.add(r);
@@ -2912,7 +2929,7 @@ public class Database {
     public void restoreRules(RuleSnapshot snapshot) {
         if (snapshot == null) return;
         for (StoredRule r : snapshot.carried) {
-            String key = r.table.toLowerCase();
+            String key = r.table.toLowerCase(java.util.Locale.ROOT);
             List<StoredRule> rebuilt = new ArrayList<>();
             List<StoredRule> existing = relationRules.get(key);
             if (existing != null) {
@@ -2939,7 +2956,7 @@ public class Database {
      */
     public void clearRuleHistory(String schema, String table) {
         rules.remove(everHadKey(schema, table));
-        String key = table.toLowerCase();
+        String key = table.toLowerCase(java.util.Locale.ROOT);
         List<StoredRule> gone = relationRules.get(key);
         if (gone == null) return;
         List<StoredRule> kept = new ArrayList<>();
@@ -2955,9 +2972,9 @@ public class Database {
      * rules reads them through {@link #getRules}, which hands back each rule's own WHERE.
      */
     public String getRule(String schema, String table, String event) {
-        List<StoredRule> list = relationRules.get(table.toLowerCase());
+        List<StoredRule> list = relationRules.get(table.toLowerCase(java.util.Locale.ROOT));
         if (list == null) return null;
-        String want = event.toUpperCase();
+        String want = event.toUpperCase(java.util.Locale.ROOT);
         for (StoredRule r : list) {
             if (want.equals(r.getEvent()) && ruleInSchema(r, schema)) return r.getName();
         }
@@ -2985,14 +3002,14 @@ public class Database {
      */
     public static String commentKey(String schema, String name) {
         if (name == null) return null;
-        String s = schema == null || schema.isEmpty() ? "public" : schema.toLowerCase();
-        return s + "." + name.toLowerCase();
+        String s = schema == null || schema.isEmpty() ? "public" : schema.toLowerCase(java.util.Locale.ROOT);
+        return s + "." + name.toLowerCase(java.util.Locale.ROOT);
     }
 
     /** Whether an object of this kind lives outside every schema, so its comment keys by name. */
     public static boolean globalCommentType(String objectType) {
         if (objectType == null) return false;
-        String t = objectType.toLowerCase();
+        String t = objectType.toLowerCase(java.util.Locale.ROOT);
         return t.equals("schema") || t.equals("database") || t.equals("role") || t.equals("user")
                 || t.equals("extension") || t.equals("tablespace") || t.equals("language")
                 || t.equals("procedural language") || t.equals("foreign data wrapper")
@@ -3045,7 +3062,7 @@ public class Database {
      */
     static String idxKey(String schemaName, String name) {
         String schema = schemaName == null || schemaName.isEmpty() ? "public" : schemaName;
-        return schema.toLowerCase() + "." + name;
+        return schema.toLowerCase(java.util.Locale.ROOT) + "." + name;
     }
 
     /** The name half of an index key. */
@@ -3357,8 +3374,8 @@ public class Database {
         Boolean nnd = indexNullsNotDistinct.remove(oldKey);
         if (nnd != null) indexNullsNotDistinct.put(newKey, nnd);
         // Update schema registry, which records the bare name under the schema that holds it.
-        String oldBare = idxName(oldKey).toLowerCase();
-        String newBare = idxName(newKey).toLowerCase();
+        String oldBare = idxName(oldKey).toLowerCase(java.util.Locale.ROOT);
+        String newBare = idxName(newKey).toLowerCase(java.util.Locale.ROOT);
         Set<String> from = schemaObjectRegistry.get(idxSchema(oldKey));
         if (from != null) from.remove("index:" + oldBare);
         registerSchemaObject(idxSchema(newKey), "index", newBare);
@@ -3721,7 +3738,7 @@ public class Database {
     }
 
     public boolean tryLockRow(String tableName, Object[] row, Session session, String mode) {
-        Map<Object[], List<LockEntry>> locks = rowLocks.computeIfAbsent(tableName.toLowerCase(), k -> new IdentityHashMap<>());
+        Map<Object[], List<LockEntry>> locks = rowLocks.computeIfAbsent(tableName.toLowerCase(java.util.Locale.ROOT), k -> new IdentityHashMap<>());
         synchronized (locks) {
             List<LockEntry> entries = locks.get(row);
             if (entries != null) {
@@ -3864,7 +3881,7 @@ public class Database {
                 ? Long.MAX_VALUE : System.currentTimeMillis() + timeoutMs;
 
         Map<Object[], List<LockEntry>> locks =
-                rowLocks.computeIfAbsent(tableName.toLowerCase(), k -> new IdentityHashMap<>());
+                rowLocks.computeIfAbsent(tableName.toLowerCase(java.util.Locale.ROOT), k -> new IdentityHashMap<>());
 
         while (true) {
             Session blocker;
@@ -3920,7 +3937,7 @@ public class Database {
     }
 
     public void unlockRow(String tableName, Object[] row) {
-        Map<Object[], List<LockEntry>> locks = rowLocks.get(tableName.toLowerCase());
+        Map<Object[], List<LockEntry>> locks = rowLocks.get(tableName.toLowerCase(java.util.Locale.ROOT));
         if (locks != null) {
             synchronized (locks) {
                 locks.remove(row);
@@ -4160,19 +4177,19 @@ public class Database {
     // ---- Role management ----
 
     public void createRole(String name, Map<String, String> attributes) {
-        roles.put(name.toLowerCase(), new ConcurrentHashMap<>(attributes));
+        roles.put(name.toLowerCase(java.util.Locale.ROOT), new ConcurrentHashMap<>(attributes));
     }
 
     public boolean hasRole(String name) {
-        return roles.containsKey(name.toLowerCase());
+        return roles.containsKey(name.toLowerCase(java.util.Locale.ROOT));
     }
 
     public Map<String, String> getRole(String name) {
-        return roles.get(name.toLowerCase());
+        return roles.get(name.toLowerCase(java.util.Locale.ROOT));
     }
 
     public void removeRole(String name) {
-        String lower = name.toLowerCase();
+        String lower = name.toLowerCase(java.util.Locale.ROOT);
         roles.remove(lower);
         // Clean up memberships: remove this role as a member from all groups
         for (Set<String> members : roleMemberships.values()) {
@@ -4188,6 +4205,66 @@ public class Database {
         return roles;
     }
 
+    /**
+     * Give a role a new name, and nothing else about it.
+     *
+     * <p>A role is one thing however it is spelled: the privileges granted to it, the roles it is
+     * a member of, the roles that are members of it, the objects it owns and the default
+     * privileges written for it all belong to the role and not to its name. Renamed by dropping
+     * the old name and creating the new one, every one of those was keyed under a name nothing
+     * answered to any more — a rename silently revoked every grant the role held.
+     */
+    public void renameRole(String from, String to) {
+        String oldName = from.toLowerCase(java.util.Locale.ROOT);
+        String newName = to.toLowerCase(java.util.Locale.ROOT);
+        if (oldName.equals(newName)) return;
+        Map<String, String> attributes = roles.remove(oldName);
+        if (attributes == null) return;
+        roles.put(newName, attributes);
+
+        // The roles this one is a member of, and the roles that are members of it.
+        Set<String> ownMembers = roleMemberships.remove(oldName);
+        if (ownMembers != null) roleMemberships.put(newName, ownMembers);
+        for (Set<String> members : roleMemberships.values()) {
+            if (members.remove(oldName)) members.add(newName);
+        }
+        // The admin-option flags are keyed by the pair of names, so both halves are rewritten.
+        for (String key : new ArrayList<>(roleAdminOptions.keySet())) {
+            int bar = key.indexOf('|');
+            if (bar < 0) continue;
+            String granted = key.substring(0, bar);
+            String member = key.substring(bar + 1);
+            if (!granted.equals(oldName) && !member.equals(oldName)) continue;
+            Boolean held = roleAdminOptions.remove(key);
+            if (held == null) continue;
+            roleAdminOptions.put((granted.equals(oldName) ? newName : granted) + "|"
+                    + (member.equals(oldName) ? newName : member), held);
+        }
+
+        Set<String> privileges = rolePrivileges.remove(oldName);
+        if (privileges != null) rolePrivileges.put(newName, privileges);
+
+        // Everything the role owns goes on being owned by it.
+        for (Map.Entry<String, String> owned : objectOwners.entrySet()) {
+            if (oldName.equalsIgnoreCase(owned.getValue())) owned.setValue(newName);
+        }
+
+        // A default privilege written by the role, or for it, names the role either way.
+        for (int i = 0; i < defaultAcls.size(); i++) {
+            DefaultAclEntry entry = defaultAcls.get(i);
+            boolean grantorIsRole = entry.grantor != null && entry.grantor.equalsIgnoreCase(oldName);
+            boolean granteeIsRole = entry.grantees != null && entry.grantees.stream()
+                    .anyMatch(g -> g != null && g.equalsIgnoreCase(oldName));
+            if (!grantorIsRole && !granteeIsRole) continue;
+            List<String> grantees = new ArrayList<>();
+            for (String grantee : entry.grantees) {
+                grantees.add(grantee != null && grantee.equalsIgnoreCase(oldName) ? to : grantee);
+            }
+            defaultAcls.set(i, new DefaultAclEntry(grantorIsRole ? to : entry.grantor,
+                    entry.schema, entry.objectType, entry.privileges, grantees, entry.isGrant));
+        }
+    }
+
     // ---- Role membership ----
 
     public void addRoleMembership(String grantedRole, String memberRole) {
@@ -4195,9 +4272,9 @@ public class Database {
     }
 
     public void addRoleMembership(String grantedRole, String memberRole, boolean withAdminOption) {
-        roleMemberships.computeIfAbsent(grantedRole.toLowerCase(), k -> ConcurrentHashMap.newKeySet())
-                .add(memberRole.toLowerCase());
-        String key = grantedRole.toLowerCase() + "|" + memberRole.toLowerCase();
+        roleMemberships.computeIfAbsent(grantedRole.toLowerCase(java.util.Locale.ROOT), k -> ConcurrentHashMap.newKeySet())
+                .add(memberRole.toLowerCase(java.util.Locale.ROOT));
+        String key = grantedRole.toLowerCase(java.util.Locale.ROOT) + "|" + memberRole.toLowerCase(java.util.Locale.ROOT);
         if (withAdminOption) {
             roleAdminOptions.put(key, true);
         }
@@ -4205,14 +4282,14 @@ public class Database {
 
     public boolean hasAdminOption(String grantedRole, String memberRole) {
         return Boolean.TRUE.equals(
-                roleAdminOptions.get(grantedRole.toLowerCase() + "|" + memberRole.toLowerCase()));
+                roleAdminOptions.get(grantedRole.toLowerCase(java.util.Locale.ROOT) + "|" + memberRole.toLowerCase(java.util.Locale.ROOT)));
     }
 
     public void removeRoleMembership(String grantedRole, String memberRole) {
-        Set<String> members = roleMemberships.get(grantedRole.toLowerCase());
+        Set<String> members = roleMemberships.get(grantedRole.toLowerCase(java.util.Locale.ROOT));
         if (members != null) {
-            members.remove(memberRole.toLowerCase());
-            if (members.isEmpty()) roleMemberships.remove(grantedRole.toLowerCase());
+            members.remove(memberRole.toLowerCase(java.util.Locale.ROOT));
+            if (members.isEmpty()) roleMemberships.remove(grantedRole.toLowerCase(java.util.Locale.ROOT));
         }
     }
 
@@ -4223,10 +4300,10 @@ public class Database {
      */
     public boolean isRoleMemberOf(String member, String role) {
         if (member == null || role == null) return false;
-        String want = role.toLowerCase();
+        String want = role.toLowerCase(java.util.Locale.ROOT);
         Set<String> seen = ConcurrentHashMap.newKeySet();
         Deque<String> pending = new ArrayDeque<>();
-        pending.add(member.toLowerCase());
+        pending.add(member.toLowerCase(java.util.Locale.ROOT));
         while (!pending.isEmpty()) {
             String current = pending.poll();
             if (!seen.add(current)) continue;
@@ -4239,12 +4316,12 @@ public class Database {
     }
 
     public boolean hasRoleMemberships(String roleName) {
-        Set<String> members = roleMemberships.get(roleName.toLowerCase());
+        Set<String> members = roleMemberships.get(roleName.toLowerCase(java.util.Locale.ROOT));
         return members != null && !members.isEmpty();
     }
 
     public void removeAllRoleMemberships(String roleName) {
-        String lower = roleName.toLowerCase();
+        String lower = roleName.toLowerCase(java.util.Locale.ROOT);
         // Remove the role as a granted role (revoke all members)
         roleMemberships.remove(lower);
         // Remove the role as a member of other roles
@@ -4259,45 +4336,91 @@ public class Database {
 
     // ---- Role privilege tracking ----
 
+    /**
+     * The objects a GRANT or a REVOKE has ever named. An ACL is null while nobody has written
+     * one, and materialises the first time either statement names the object -- so a REVOKE
+     * that takes away a grant nobody made still leaves the owner's own entry standing.
+     */
+    private final Set<String> touchedAcls = ConcurrentHashMap.newKeySet();
+
+    public void touchAcl(String objectType, String objectName) {
+        if (objectType == null || objectName == null) return;
+        touchedAcls.add(objectType.toUpperCase(java.util.Locale.ROOT) + ":" + objectName.toLowerCase(java.util.Locale.ROOT));
+    }
+
+    public boolean aclTouched(String objectType, String objectName) {
+        if (objectType == null || objectName == null) return false;
+        return touchedAcls.contains(objectType.toUpperCase(java.util.Locale.ROOT) + ":" + objectName.toLowerCase(java.util.Locale.ROOT));
+    }
+
+    public void forgetAcl(String objectType, String objectName) {
+        if (objectType == null || objectName == null) return;
+        touchedAcls.remove(objectType.toUpperCase(java.util.Locale.ROOT) + ":" + objectName.toLowerCase(java.util.Locale.ROOT));
+    }
+
+    /**
+     * The order grantees first appear in an object's ACL. PostgreSQL appends a new entry to the
+     * end of the list, so the order the grants were written in is the order they read back in;
+     * taken from a map of roles instead, the entries came out in no order at all.
+     */
+    private final Map<String, List<String>> aclGranteeOrder = new ConcurrentHashMap<>();
+
+    public List<String> aclGranteeOrder(String objectType, String objectName) {
+        if (objectType == null || objectName == null) return java.util.Collections.emptyList();
+        List<String> order = aclGranteeOrder.get(
+                objectType.toUpperCase(java.util.Locale.ROOT) + ":" + objectName.toLowerCase(java.util.Locale.ROOT));
+        return order == null ? java.util.Collections.<String>emptyList() : order;
+    }
+
     public void addRolePrivilege(String role, String privilege, String objectType, String objectName) {
-        rolePrivileges.computeIfAbsent(role.toLowerCase(), k -> ConcurrentHashMap.newKeySet())
+        rolePrivileges.computeIfAbsent(role.toLowerCase(java.util.Locale.ROOT), k -> ConcurrentHashMap.newKeySet())
                 .add(privilege + ":" + objectType + ":" + objectName);
+        touchAcl(objectType, objectName);
+        if (objectType != null && objectName != null) {
+            List<String> order = aclGranteeOrder.computeIfAbsent(
+                    objectType.toUpperCase(java.util.Locale.ROOT) + ":" + objectName.toLowerCase(java.util.Locale.ROOT),
+                    k -> java.util.Collections.synchronizedList(new ArrayList<String>()));
+            synchronized (order) {
+                if (!order.contains(role.toLowerCase(java.util.Locale.ROOT))) order.add(role.toLowerCase(java.util.Locale.ROOT));
+            }
+        }
     }
 
     public void removeRolePrivilege(String role, String privilege, String objectType, String objectName) {
-        Set<String> privs = rolePrivileges.get(role.toLowerCase());
+        touchAcl(objectType, objectName);
+        Set<String> privs = rolePrivileges.get(role.toLowerCase(java.util.Locale.ROOT));
         if (privs != null) {
             if ("ALL".equalsIgnoreCase(privilege)) {
                 // Remove all privileges on this object (case-insensitive suffix match)
-                final String suffixLower = ":" + objectType.toLowerCase() + ":" + objectName.toLowerCase();
-                privs.removeIf(p -> p.toLowerCase().endsWith(suffixLower));
+                final String suffixLower = ":" + objectType.toLowerCase(java.util.Locale.ROOT) + ":" + objectName.toLowerCase(java.util.Locale.ROOT);
+                privs.removeIf(p -> p.toLowerCase(java.util.Locale.ROOT).endsWith(suffixLower));
                 // If revoking ALL on a TABLE, also remove any column-level grants for that table
                 if ("TABLE".equalsIgnoreCase(objectType)) {
-                    final String colPrefixLower = ":column:" + objectName.toLowerCase() + ".";
-                    privs.removeIf(p -> p.toLowerCase().contains(colPrefixLower));
+                    final String colPrefixLower = ":column:" + objectName.toLowerCase(java.util.Locale.ROOT) + ".";
+                    privs.removeIf(p -> p.toLowerCase(java.util.Locale.ROOT).contains(colPrefixLower));
                 }
             } else {
                 // Case-insensitive exact match
-                final String keyLower = privilege.toLowerCase() + ":" + objectType.toLowerCase() + ":" + objectName.toLowerCase();
-                privs.removeIf(p -> p.toLowerCase().equals(keyLower));
+                final String keyLower = privilege.toLowerCase(java.util.Locale.ROOT) + ":" + objectType.toLowerCase(java.util.Locale.ROOT) + ":" + objectName.toLowerCase(java.util.Locale.ROOT);
+                privs.removeIf(p -> p.toLowerCase(java.util.Locale.ROOT).equals(keyLower));
             }
-            if (privs.isEmpty()) rolePrivileges.remove(role.toLowerCase());
+            if (privs.isEmpty()) rolePrivileges.remove(role.toLowerCase(java.util.Locale.ROOT));
         }
     }
 
     public boolean hasRolePrivileges(String role) {
-        Set<String> privs = rolePrivileges.get(role.toLowerCase());
+        Set<String> privs = rolePrivileges.get(role.toLowerCase(java.util.Locale.ROOT));
         return privs != null && !privs.isEmpty();
     }
 
     /** Remove all privileges held by a specific role (e.g. when the role is dropped). */
     public void removeAllRolePrivileges(String role) {
-        rolePrivileges.remove(role.toLowerCase());
+        rolePrivileges.remove(role.toLowerCase(java.util.Locale.ROOT));
     }
 
     /** Get all privileges held by a specific role. */
     public Set<String> getRolePrivileges(String role) {
-        Set<String> privs = rolePrivileges.get(role.toLowerCase());
+        Set<String> privs = rolePrivileges.get(role.toLowerCase(java.util.Locale.ROOT));
         return privs != null ? privs : java.util.Collections.emptySet();
     }
 
@@ -4307,12 +4430,47 @@ public class Database {
     }
 
     /** Remove all privileges granted on a specific object (called when the object is dropped). */
+    /**
+     * Take away every privilege granted on an object, which is what dropping it does.
+     *
+     * <p>A grant names the object, so when the object goes the grant goes with it — and with it
+     * the reason a role could not be dropped. Matched by an exact suffix, a grant recorded under
+     * another spelling of the same name stayed behind, and the column-level grants, which are
+     * keyed by the column rather than by the relation, were never looked at: a role that had
+     * been granted anything on a dropped table could not be dropped afterwards.
+     */
     public void removePrivilegesOnObject(String objectType, String objectName) {
-        String suffix = ":" + objectType + ":" + objectName;
+        String suffix = (":" + objectType + ":" + objectName).toLowerCase(java.util.Locale.ROOT);
+        String columnPrefix = (":column:" + objectName + ".").toLowerCase(java.util.Locale.ROOT);
         for (Map.Entry<String, Set<String>> entry : rolePrivileges.entrySet()) {
-            entry.getValue().removeIf(p -> p.endsWith(suffix));
+            entry.getValue().removeIf(p -> {
+                String lower = p.toLowerCase(java.util.Locale.ROOT);
+                int firstColon = lower.indexOf(':');
+                if (firstColon < 0) return false;
+                String keyed = lower.substring(firstColon);
+                return keyed.equals(suffix) || keyed.startsWith(columnPrefix);
+            });
         }
         // Clean up empty entries
+        rolePrivileges.entrySet().removeIf(e -> e.getValue().isEmpty());
+        forgetAcl(objectType, objectName);
+        aclGranteeOrder.remove(objectType.toUpperCase(java.util.Locale.ROOT) + ":" + objectName.toLowerCase(java.util.Locale.ROOT));
+    }
+
+    /**
+     * Take away every privilege granted on anything a schema held. Dropping a schema drops what
+     * is in it, and each of those grants names an object that is no longer there.
+     */
+    public void removePrivilegesInSchema(String schemaName) {
+        String qualified = schemaName.toLowerCase(java.util.Locale.ROOT) + ".";
+        for (Map.Entry<String, Set<String>> entry : rolePrivileges.entrySet()) {
+            entry.getValue().removeIf(p -> {
+                String lower = p.toLowerCase(java.util.Locale.ROOT);
+                int firstColon = lower.indexOf(':');
+                int secondColon = firstColon < 0 ? -1 : lower.indexOf(':', firstColon + 1);
+                return secondColon >= 0 && lower.substring(secondColon + 1).startsWith(qualified);
+            });
+        }
         rolePrivileges.entrySet().removeIf(e -> e.getValue().isEmpty());
     }
 
@@ -4320,28 +4478,71 @@ public class Database {
 
     /** Set the owner of an object. Key format: "type:name" (e.g., "table:public.my_table"). */
     public void setObjectOwner(String objectKey, String ownerRole) {
-        objectOwners.put(objectKey.toLowerCase(), ownerRole.toLowerCase());
+        objectOwners.put(objectKey.toLowerCase(java.util.Locale.ROOT), ownerRole.toLowerCase(java.util.Locale.ROOT));
     }
 
     /** Get the owner of an object, or null if not tracked. */
     public String getObjectOwner(String objectKey) {
-        return objectOwners.get(objectKey.toLowerCase());
+        return objectOwners.get(objectKey.toLowerCase(java.util.Locale.ROOT));
     }
 
     /** Remove ownership entry for an object. */
     public void removeObjectOwner(String objectKey) {
-        objectOwners.remove(objectKey.toLowerCase());
+        objectOwners.remove(objectKey.toLowerCase(java.util.Locale.ROOT));
     }
 
     /** Check if a role owns any objects. */
     public boolean roleOwnsObjects(String roleName) {
-        String lower = roleName.toLowerCase();
+        String lower = roleName.toLowerCase(java.util.Locale.ROOT);
         return objectOwners.containsValue(lower);
+    }
+
+    /**
+     * Whether anything grants a privilege to this role. A grant names the role, so it depends on
+     * it: PostgreSQL will not drop a role while one stands, because the grant would be left
+     * naming somebody who is not there.
+     */
+    public boolean roleHoldsPrivileges(String roleName) {
+        Set<String> held = rolePrivileges.get(roleName.toLowerCase(java.util.Locale.ROOT));
+        return held != null && !held.isEmpty();
+    }
+
+    /**
+     * What the privileges a role holds are on, named the way PostgreSQL names them in the detail
+     * of its refusal: the kind and then the object, each object once however many privileges the
+     * role holds on it.
+     */
+    public List<String> privilegeDependenciesOf(String roleName) {
+        Set<String> held = rolePrivileges.get(roleName.toLowerCase(java.util.Locale.ROOT));
+        List<String> out = new ArrayList<>();
+        if (held == null) return out;
+        java.util.Set<String> seen = new java.util.LinkedHashSet<>();
+        for (String recorded : held) {
+            String[] parts = recorded.split(":", 3);
+            if (parts.length != 3) continue;
+            if (parts[0].endsWith("_GRANT_OPTION")) continue;
+            String kind = parts[1].toLowerCase(java.util.Locale.ROOT);
+            String name = parts[2];
+            // A relation is named bare in the detail, without the schema it is keyed under.
+            if ("table".equals(kind) || "sequence".equals(kind)) {
+                int dot = name.indexOf('.');
+                if (dot > 0) name = name.substring(dot + 1);
+            } else if ("column".equals(kind)) {
+                kind = "table";
+                int lastDot = name.lastIndexOf('.');
+                if (lastDot > 0) name = name.substring(0, lastDot);
+                int dot = name.indexOf('.');
+                if (dot > 0) name = name.substring(dot + 1);
+            }
+            seen.add(kind + " " + name);
+        }
+        out.addAll(seen);
+        return out;
     }
 
     /** Get all object keys owned by a role. */
     public List<String> getObjectsOwnedBy(String roleName) {
-        String lower = roleName.toLowerCase();
+        String lower = roleName.toLowerCase(java.util.Locale.ROOT);
         List<String> owned = new ArrayList<>();
         for (Map.Entry<String, String> entry : objectOwners.entrySet()) {
             if (lower.equals(entry.getValue())) {
@@ -4353,8 +4554,8 @@ public class Database {
 
     /** Transfer all objects owned by one role to another. */
     public void reassignOwned(String fromRole, String toRole) {
-        String fromLower = fromRole.toLowerCase();
-        String toLower = toRole.toLowerCase();
+        String fromLower = fromRole.toLowerCase(java.util.Locale.ROOT);
+        String toLower = toRole.toLowerCase(java.util.Locale.ROOT);
         for (Map.Entry<String, String> entry : objectOwners.entrySet()) {
             if (fromLower.equals(entry.getValue())) {
                 entry.setValue(toLower);
@@ -4365,31 +4566,31 @@ public class Database {
     // ---- Extension management ----
 
     public void addExtension(String name, String version) {
-        installedExtensions.put(name.toLowerCase(), version);
+        installedExtensions.put(name.toLowerCase(java.util.Locale.ROOT), version);
     }
 
     public void addExtension(String name, String version, String schema) {
-        installedExtensions.put(name.toLowerCase(), version);
+        installedExtensions.put(name.toLowerCase(java.util.Locale.ROOT), version);
         if (schema != null) {
-            extensionSchemas.put(name.toLowerCase(), schema);
+            extensionSchemas.put(name.toLowerCase(java.util.Locale.ROOT), schema);
         }
     }
 
     public void setExtensionSchema(String name, String schema) {
-        extensionSchemas.put(name.toLowerCase(), schema);
+        extensionSchemas.put(name.toLowerCase(java.util.Locale.ROOT), schema);
     }
 
     public String getExtensionSchema(String name) {
-        return extensionSchemas.get(name.toLowerCase());
+        return extensionSchemas.get(name.toLowerCase(java.util.Locale.ROOT));
     }
 
     public void removeExtension(String name) {
-        installedExtensions.remove(name.toLowerCase());
-        extensionSchemas.remove(name.toLowerCase());
+        installedExtensions.remove(name.toLowerCase(java.util.Locale.ROOT));
+        extensionSchemas.remove(name.toLowerCase(java.util.Locale.ROOT));
     }
 
     public boolean hasExtension(String name) {
-        return installedExtensions.containsKey(name.toLowerCase());
+        return installedExtensions.containsKey(name.toLowerCase(java.util.Locale.ROOT));
     }
 
     public Map<String, String> getInstalledExtensions() {
@@ -4410,62 +4611,62 @@ public class Database {
      */
     public void registerSchemaObject(String schemaName, String objectType, String objectName) {
         schemaObjectRegistry
-                .computeIfAbsent(schemaName.toLowerCase(), k -> ConcurrentHashMap.newKeySet())
-                .add(objectType + ":" + objectName.toLowerCase());
+                .computeIfAbsent(schemaName.toLowerCase(java.util.Locale.ROOT), k -> ConcurrentHashMap.newKeySet())
+                .add(objectType + ":" + objectName.toLowerCase(java.util.Locale.ROOT));
     }
 
     /** Forget one registered object, for a DDL statement that is being undone. */
     public void unregisterSchemaObject(String schemaName, String objectType, String objectName) {
-        Set<String> entries = schemaObjectRegistry.get(schemaName.toLowerCase());
-        if (entries != null) entries.remove(objectType + ":" + objectName.toLowerCase());
+        Set<String> entries = schemaObjectRegistry.get(schemaName.toLowerCase(java.util.Locale.ROOT));
+        if (entries != null) entries.remove(objectType + ":" + objectName.toLowerCase(java.util.Locale.ROOT));
     }
 
     /**
      * Get all registered objects for a schema.
      */
     public Set<String> getSchemaObjects(String schemaName) {
-        return schemaObjectRegistry.getOrDefault(schemaName.toLowerCase(), Cols.setOf());
+        return schemaObjectRegistry.getOrDefault(schemaName.toLowerCase(java.util.Locale.ROOT), Cols.setOf());
     }
 
     /**
      * Remove schema from registry.
      */
     public void removeSchemaObjects(String schemaName) {
-        schemaObjectRegistry.remove(schemaName.toLowerCase());
+        schemaObjectRegistry.remove(schemaName.toLowerCase(java.util.Locale.ROOT));
     }
 
     // ---- FDW accessors ----
 
     public Map<String, FdwWrapper> getForeignDataWrappers() { return foreignDataWrappers; }
-    public void addForeignDataWrapper(FdwWrapper w) { foreignDataWrappers.put(w.name.toLowerCase(), w); }
-    public void removeForeignDataWrapper(String name) { foreignDataWrappers.remove(name.toLowerCase()); }
+    public void addForeignDataWrapper(FdwWrapper w) { foreignDataWrappers.put(w.name.toLowerCase(java.util.Locale.ROOT), w); }
+    public void removeForeignDataWrapper(String name) { foreignDataWrappers.remove(name.toLowerCase(java.util.Locale.ROOT)); }
 
     public Map<String, FdwServer> getForeignServers() { return foreignServers; }
-    public void addForeignServer(FdwServer s) { foreignServers.put(s.name.toLowerCase(), s); }
-    public FdwServer getForeignServer(String name) { return foreignServers.get(name.toLowerCase()); }
-    public void removeForeignServer(String name) { foreignServers.remove(name.toLowerCase()); }
+    public void addForeignServer(FdwServer s) { foreignServers.put(s.name.toLowerCase(java.util.Locale.ROOT), s); }
+    public FdwServer getForeignServer(String name) { return foreignServers.get(name.toLowerCase(java.util.Locale.ROOT)); }
+    public void removeForeignServer(String name) { foreignServers.remove(name.toLowerCase(java.util.Locale.ROOT)); }
 
     public Map<String, FdwUserMapping> getForeignUserMappings() { return foreignUserMappings; }
-    public void addForeignUserMapping(FdwUserMapping m) { foreignUserMappings.put((m.serverName + ":" + m.userName).toLowerCase(), m); }
+    public void addForeignUserMapping(FdwUserMapping m) { foreignUserMappings.put((m.serverName + ":" + m.userName).toLowerCase(java.util.Locale.ROOT), m); }
 
     public Map<String, FdwForeignTable> getForeignTables() { return foreignTables; }
-    public void addForeignTable(FdwForeignTable ft) { foreignTables.put(ft.tableName.toLowerCase(), ft); }
-    public void removeForeignTable(String name) { foreignTables.remove(name.toLowerCase()); }
+    public void addForeignTable(FdwForeignTable ft) { foreignTables.put(ft.tableName.toLowerCase(java.util.Locale.ROOT), ft); }
+    public void removeForeignTable(String name) { foreignTables.remove(name.toLowerCase(java.util.Locale.ROOT)); }
 
     // ---- Publication / Subscription accessors ----
 
     public Map<String, PubDef> getPublications() { return publications; }
-    public void addPublication(PubDef p) { publications.put(p.name.toLowerCase(), p); }
-    public PubDef getPublication(String name) { return publications.get(name.toLowerCase()); }
-    public void removePublication(String name) { publications.remove(name.toLowerCase()); }
+    public void addPublication(PubDef p) { publications.put(p.name.toLowerCase(java.util.Locale.ROOT), p); }
+    public PubDef getPublication(String name) { return publications.get(name.toLowerCase(java.util.Locale.ROOT)); }
+    public void removePublication(String name) { publications.remove(name.toLowerCase(java.util.Locale.ROOT)); }
 
     public Map<String, SubDef> getSubscriptions() { return subscriptions; }
-    public void addSubscription(SubDef s) { subscriptions.put(s.name.toLowerCase(), s); }
-    public void removeSubscription(String name) { subscriptions.remove(name.toLowerCase()); }
+    public void addSubscription(SubDef s) { subscriptions.put(s.name.toLowerCase(java.util.Locale.ROOT), s); }
+    public void removeSubscription(String name) { subscriptions.remove(name.toLowerCase(java.util.Locale.ROOT)); }
 
     // ---- Replication slot accessors ----
 
     public Map<String, ReplicationSlot> getReplicationSlots() { return replicationSlots; }
-    public void addReplicationSlot(ReplicationSlot s) { replicationSlots.put(s.slotName.toLowerCase(), s); }
-    public void removeReplicationSlot(String name) { replicationSlots.remove(name.toLowerCase()); }
+    public void addReplicationSlot(ReplicationSlot s) { replicationSlots.put(s.slotName.toLowerCase(java.util.Locale.ROOT), s); }
+    public void removeReplicationSlot(String name) { replicationSlots.remove(name.toLowerCase(java.util.Locale.ROOT)); }
 }

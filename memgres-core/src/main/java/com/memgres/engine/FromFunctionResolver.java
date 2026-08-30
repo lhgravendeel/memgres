@@ -62,12 +62,12 @@ class FromFunctionResolver {
         // A set-returning call is resolved from its written arguments like any other, and
         // generate_series is declared over three numeric types: two untyped literals name none
         // of them.
-        FunctionEvaluator.rejectAmbiguousBuiltin(executor, funcFrom.functionName().toLowerCase(),
+        FunctionEvaluator.rejectAmbiguousBuiltin(executor, funcFrom.functionName().toLowerCase(java.util.Locale.ROOT),
                 funcFrom.args(), null);
         List<RowContext> contexts = appendOrdinality(funcFrom, doResolveFunctionFrom(funcFrom));
         checkColumnAliasCount(funcFrom, contexts);
         // TABLESAMPLE binds the real stored table; never flag persistent tables.
-        if (!funcFrom.functionName().toLowerCase().startsWith("__tablesample__:")) {
+        if (!funcFrom.functionName().toLowerCase(java.util.Locale.ROOT).startsWith("__tablesample__:")) {
             // The columns carry whatever type the resolver read off the values it built, so what
             // the call itself settles is recorded beside them. See DefinedTypes. The call settles
             // the same thing for every row it produced, so it is worked out once.
@@ -166,7 +166,7 @@ class FromFunctionResolver {
     }
 
     private List<RowContext> doResolveFunctionFrom(SelectStmt.FunctionFrom funcFrom) {
-        String rawFname = funcFrom.functionName().toLowerCase();
+        String rawFname = funcFrom.functionName().toLowerCase(java.util.Locale.ROOT);
         // A dot in a function's name separates the schema it was written under from the function
         // itself, and only the function is looked up. The TABLESAMPLE marker is not a function name
         // at all -- it carries the relation being sampled, and that relation may itself be written
@@ -357,7 +357,7 @@ class FromFunctionResolver {
      * their arguments are answered for; anything else keeps the type its caller already assumed.
      */
     DataType singleColumnType(SelectStmt.FunctionFrom funcFrom) {
-        String fname = FunctionEvaluator.stripSchemaPrefix(funcFrom.functionName().toLowerCase());
+        String fname = FunctionEvaluator.stripSchemaPrefix(funcFrom.functionName().toLowerCase(java.util.Locale.ROOT));
         if (funcFrom.args().isEmpty()) return null;
         if (fname.equals("unnest") && funcFrom.args().size() == 1) {
             return DataType.elementOf(inferInOuterScope(funcFrom.args().get(0)));
@@ -745,7 +745,7 @@ class FromFunctionResolver {
     private List<RowContext> resolvePgIndexamHasProperty(String alias, List<Object> evalArgs) {
         boolean result = true;
         if (evalArgs.size() >= 2) {
-            String prop = String.valueOf(evalArgs.get(1)).toLowerCase();
+            String prop = String.valueOf(evalArgs.get(1)).toLowerCase(java.util.Locale.ROOT);
             switch (prop) {
                 case "can_order":
                 case "can_unique":
@@ -1150,7 +1150,7 @@ class FromFunctionResolver {
         List<Column> cols = new ArrayList<>();
         List<String> colTypes = new ArrayList<>();
         if (funcFrom.args().size() >= 1 && funcFrom.args().get(0) instanceof CastExpr) {
-            String typeName = ((CastExpr) funcFrom.args().get(0)).typeName().toLowerCase();
+            String typeName = ((CastExpr) funcFrom.args().get(0)).typeName().toLowerCase(java.util.Locale.ROOT);
             List<CreateTypeStmt.CompositeField> fields = executor.database.getCompositeType(typeName);
             if (fields != null) {
                 for (CreateTypeStmt.CompositeField field : fields) {
@@ -1208,7 +1208,7 @@ class FromFunctionResolver {
         List<Column> cols = new ArrayList<>();
         String typeName = null;
         if (funcFrom.args().size() >= 1 && funcFrom.args().get(0) instanceof CastExpr) {
-            typeName = ((CastExpr) funcFrom.args().get(0)).typeName().toLowerCase();
+            typeName = ((CastExpr) funcFrom.args().get(0)).typeName().toLowerCase(java.util.Locale.ROOT);
             java.util.List<CreateTypeStmt.CompositeField> fields =
                     executor.compositeTypeHandler.resolveFieldsForType(typeName);
             if (fields != null) {
@@ -1698,7 +1698,7 @@ class FromFunctionResolver {
                 // Nothing was produced, so nothing described the shape; PG still names the
                 // column after the function.
                 subCols = Cols.listOf(new Column(
-                        FunctionEvaluator.stripSchemaPrefix(call.name().toLowerCase()),
+                        FunctionEvaluator.stripSchemaPrefix(call.name().toLowerCase(java.util.Locale.ROOT)),
                         DataType.TEXT, true, false, null));
             }
             cols.addAll(subCols);
@@ -1769,7 +1769,7 @@ class FromFunctionResolver {
             // The type a SETOF of a scalar returns. RETURNS SETOF int answers int4 columns, and
             // reporting them as text left the driver decoding integers as strings.
             DataType scalarSetofType = null;
-            if (returnType != null && returnType.toUpperCase().startsWith("SETOF ")) {
+            if (returnType != null && returnType.toUpperCase(java.util.Locale.ROOT).startsWith("SETOF ")) {
                 String refTable = returnType.substring(6).trim();
                 scalarSetofType = DataType.fromPgName(refTable);
                 if (!"record".equalsIgnoreCase(refTable)) {
@@ -1813,7 +1813,7 @@ class FromFunctionResolver {
                     Map<String, Object> map = (Map<String, Object>) item;
                     Object[] rowArr = new Object[cols.size()];
                     for (int i = 0; i < cols.size(); i++) {
-                        rowArr[i] = map.get(cols.get(i).getName().toLowerCase());
+                        rowArr[i] = map.get(cols.get(i).getName().toLowerCase(java.util.Locale.ROOT));
                     }
                     virtualTable.insertRow(rowArr);
                     contexts.add(new RowContext(virtualTable, alias, rowArr));
@@ -1885,7 +1885,7 @@ class FromFunctionResolver {
         // Non-list result: OUT-param record function or scalar-returning function in FROM
         List<PgFunction.Param> outParams = new ArrayList<>();
         for (PgFunction.Param p : userFunc.getParams()) {
-            String mode = p.mode() != null ? p.mode().toUpperCase() : "IN";
+            String mode = p.mode() != null ? p.mode().toUpperCase(java.util.Locale.ROOT) : "IN";
             if ("OUT".equals(mode) || "INOUT".equals(mode)) outParams.add(p);
         }
         if (!outParams.isEmpty()) {
@@ -1955,7 +1955,7 @@ class FromFunctionResolver {
                 @SuppressWarnings("unchecked")
                 Map<String, Object> map = (Map<String, Object>) result;
                 for (int i = 0; i < composite.size(); i++) {
-                    fields[i] = map.get(composite.get(i).getName().toLowerCase());
+                    fields[i] = map.get(composite.get(i).getName().toLowerCase(java.util.Locale.ROOT));
                 }
             } else if (result != null) {
                 fields[0] = result;
@@ -2085,7 +2085,7 @@ class FromFunctionResolver {
      */
     private static String valueClass(String typeName) {
         if (typeName == null) return null;
-        String t = typeName.trim().toLowerCase();
+        String t = typeName.trim().toLowerCase(java.util.Locale.ROOT);
         int paren = t.indexOf('(');
         if (paren > 0) t = t.substring(0, paren).trim();
         if (t.endsWith("[]")) return null;
@@ -2626,7 +2626,7 @@ class FromFunctionResolver {
         String sql = evalArgs.get(0).toString();
         // Optional weights filter (2nd arg): only count entries with these weights.
         String weightFilter = evalArgs.size() > 1 && evalArgs.get(1) != null
-                ? evalArgs.get(1).toString().toUpperCase() : null;
+                ? evalArgs.get(1).toString().toUpperCase(java.util.Locale.ROOT) : null;
         QueryResult qr = executor.execute(sql);
         // The query has to describe documents for there to be statistics about them. Counting
         // whatever the first column held answered for a query naming no tsvector at all, and

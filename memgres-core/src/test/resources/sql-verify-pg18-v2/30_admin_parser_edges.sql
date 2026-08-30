@@ -94,5 +94,6 @@ GRANT EXECUTE ON TABLE admin_t TO compat_role2;
 GRANT USAGE ON TABLE admin_t TO compat_role2;
 REVOKE SELECT ON no_such FROM compat_role2;
 
+DROP OWNED BY compat_role2;
 DROP ROLE compat_role2;
 DROP SCHEMA compat CASCADE;

@@ -631,7 +631,7 @@ final class PlacementCheck {
      */
     static boolean isWindowFunctionName(String name) {
         if (name == null) return false;
-        String stripped = FunctionEvaluator.stripSchemaPrefix(name.toLowerCase());
+        String stripped = FunctionEvaluator.stripSchemaPrefix(name.toLowerCase(java.util.Locale.ROOT));
         return WINDOW_ONLY_FUNCTIONS.contains(stripped)
                 || HYPOTHETICAL_SET_FUNCTIONS.contains(stripped);
     }

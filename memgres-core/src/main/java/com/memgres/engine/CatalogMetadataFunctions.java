@@ -224,7 +224,7 @@ class CatalogMetadataFunctions {
                                 .getOrDefault("rel:" + schemaEntry.getKey() + "." + t.getName(), -1);
                         if (tblOid == targetOid && t.getPartitionStrategy() != null) {
                             String col = t.getPartitionColumn();
-                            return t.getPartitionStrategy().toUpperCase() + " (" + (col != null ? col : "") + ")";
+                            return t.getPartitionStrategy().toUpperCase(java.util.Locale.ROOT) + " (" + (col != null ? col : "") + ")";
                         }
                     }
                 }
@@ -331,13 +331,18 @@ class CatalogMetadataFunctions {
                 if (targetOid < 0) return null;
                 return describedBy(targetOid, executor.toInt(colNumArg), null);
             }
-            case "pg_get_userbyid":
-                // Every role OID names the one role memgres has, but it is still an OID: naming
-                // that role for an argument that is not one answered a question nobody could ask.
-                if (!fn.args().isEmpty()) {
-                    executor.castEvaluator.applyCast(executor.evalExpr(fn.args().get(0), ctx), "oid");
-                }
-                return "memgres";
+            case "pg_get_userbyid": {
+                // The role an OID names. Answering with the one role memgres started with meant
+                // every owner column read as that role, so a dump gave every relation away and a
+                // reader could not tell two owners apart.
+                if (fn.args().isEmpty()) return null;
+                Object oidArg = executor.castEvaluator.applyCast(
+                        executor.evalExpr(fn.args().get(0), ctx), "oid");
+                if (oidArg == null) return null;
+                int roleOid = executor.toInt(oidArg);
+                String named = roleNameOf(roleOid);
+                return named != null ? named : "unknown (OID=" + roleOid + ")";
+            }
             case "pg_get_acl": {
                 // PG 18 reads the object's ACL column and answers NULL when it is unset, which is
                 // both what an object nobody has granted on looks like and what an object that is
@@ -358,7 +363,7 @@ class CatalogMetadataFunctions {
                 Object oidArg = executor.evalExpr(fn.args().get(0), ctx);
                 Object catArg = executor.evalExpr(fn.args().get(1), ctx);
                 if (oidArg == null || catArg == null) return null;
-                String cat = String.valueOf(catArg).toLowerCase();
+                String cat = String.valueOf(catArg).toLowerCase(java.util.Locale.ROOT);
                 String kind = cat.contains("database") ? "database"
                         : cat.contains("authid") || cat.contains("roles") ? "role"
                         : cat.contains("tablespace") ? "tablespace" : null;
@@ -462,6 +467,18 @@ class CatalogMetadataFunctions {
                 return evalInformationSchemaHelper(name, fn, ctx);
             case "to_regclass":
                 return evalToRegclass(fn, ctx);
+            case "to_regrole": {
+                // The regrole form that answers null rather than raising where no role has the
+                // name, which is how a caller asks whether a role is there at all.
+                if (fn.args().isEmpty()) return null;
+                Object roleArg = executor.evalExpr(fn.args().get(0), ctx);
+                if (roleArg == null) return null;
+                try {
+                    return executor.castEvaluator.applyCast(roleArg, "regrole");
+                } catch (MemgresException notARole) {
+                    return null;
+                }
+            }
             case "to_regtype":
                 return evalToRegtype(fn, ctx);
             case "pg_switch_wal": {
@@ -517,7 +534,7 @@ class CatalogMetadataFunctions {
                 }
                 for (Schema s : executor.database.getSchemas().values()) {
                     Table tbl = s.getTable(tableName);
-                    if (tbl == null) tbl = s.getTable(tableName.toLowerCase());
+                    if (tbl == null) tbl = s.getTable(tableName.toLowerCase(java.util.Locale.ROOT));
                     if (tbl == null) continue;
                     if (tbl.getPartitionParent() == null && tbl.getPartitionStrategy() == null) {
                         return null;
@@ -666,8 +683,8 @@ class CatalogMetadataFunctions {
         for (Map.Entry<String, List<PgTrigger>> trigEntry : executor.database.getAllTriggers().entrySet()) {
             Map<String, java.util.List<PgTrigger>> grouped = new java.util.LinkedHashMap<>();
             for (PgTrigger trig : trigEntry.getValue()) {
-                String key = (trig.getTableName() == null ? "" : trig.getTableName().toLowerCase())
-                        + "." + trig.getName().toLowerCase();
+                String key = (trig.getTableName() == null ? "" : trig.getTableName().toLowerCase(java.util.Locale.ROOT))
+                        + "." + trig.getName().toLowerCase(java.util.Locale.ROOT);
                 grouped.computeIfAbsent(key, k -> new java.util.ArrayList<>()).add(trig);
             }
             for (Map.Entry<String, List<PgTrigger>> nameEntry : grouped.entrySet()) {
@@ -1048,7 +1065,7 @@ class CatalogMetadataFunctions {
         if (descr == null) return null;
         int wantClass = -1;
         if (catalog != null && !catalog.trim().isEmpty()) {
-            String bare = catalog.trim().toLowerCase();
+            String bare = catalog.trim().toLowerCase(java.util.Locale.ROOT);
             if (bare.startsWith("pg_catalog.")) bare = bare.substring("pg_catalog.".length());
             wantClass = executor.systemCatalog.getOid("rel:pg_catalog." + bare);
         }
@@ -1067,7 +1084,7 @@ class CatalogMetadataFunctions {
         String prefix = kind.equals("database") ? "db:" : kind.equals("role") ? "role:" : "ts:";
         for (Map.Entry<String, Integer> e : executor.systemCatalog.getOidMap().entrySet()) {
             if (e.getValue() != null && e.getValue() == oid && e.getKey().startsWith(prefix)) {
-                return e.getKey().substring(prefix.length()).toLowerCase();
+                return e.getKey().substring(prefix.length()).toLowerCase(java.util.Locale.ROOT);
             }
         }
         return null;
@@ -1368,8 +1385,8 @@ class CatalogMetadataFunctions {
         String resolvedSchemaRc = null;
         if (regclassName.contains(".")) {
             int dotIdx = regclassName.indexOf('.');
-            String schemaNameRc = regclassName.substring(0, dotIdx).toLowerCase();
-            String tblNameRc = regclassName.substring(dotIdx + 1).toLowerCase();
+            String schemaNameRc = regclassName.substring(0, dotIdx).toLowerCase(java.util.Locale.ROOT);
+            String tblNameRc = regclassName.substring(dotIdx + 1).toLowerCase(java.util.Locale.ROOT);
             Schema schemaRc = executor.database.getSchema(schemaNameRc);
             if (schemaRc != null) foundRc = schemaRc.getTable(tblNameRc);
             if (foundRc == null) {
@@ -1396,7 +1413,7 @@ class CatalogMetadataFunctions {
                     String idxTableSchema = null;
                     String idxTableName = idxTable;
                     if (idxTable.contains(".")) {
-                        idxTableSchema = idxTable.substring(0, idxTable.indexOf('.')).toLowerCase();
+                        idxTableSchema = idxTable.substring(0, idxTable.indexOf('.')).toLowerCase(java.util.Locale.ROOT);
                         idxTableName = idxTable.substring(idxTable.indexOf('.') + 1);
                     }
                     if (idxTableSchema != null && idxTableSchema.equals(schemaNameRc)) {
@@ -1409,9 +1426,15 @@ class CatalogMetadataFunctions {
             resolvedSchemaRc = schemaNameRc;
         } else {
             String effectiveSchemaRc = executor.session != null ? executor.session.getEffectiveSchema() : "public";
-            for (Map.Entry<String, Schema> entry : executor.database.getSchemas().entrySet()) {
-                foundRc = entry.getValue().getTable(regclassName);
-                if (foundRc != null) { resolvedSchemaRc = entry.getKey(); break; }
+            // A name written without a schema means what the search path says it means, and
+            // nothing where the path reaches no relation of that name. Searched across every
+            // schema instead, to_regclass answered for a relation the writer could not have
+            // named without qualifying it, and a query using it to test whether a name resolves
+            // was told yes for names that do not.
+            for (String pathSchema : executor.relationSearchPath()) {
+                Schema schemaOnPath = executor.database.getSchema(pathSchema);
+                foundRc = schemaOnPath == null ? null : schemaOnPath.getTable(regclassName);
+                if (foundRc != null) { resolvedSchemaRc = pathSchema; break; }
             }
             if (foundRc == null) {
                 for (String pathSchema : executor.relationSearchPath()) {
@@ -1424,12 +1447,12 @@ class CatalogMetadataFunctions {
                 }
             }
             if (foundRc == null && !foundIndexRc
-                    && executor.database.hasIndex(regclassName.toLowerCase())) {
+                    && executor.database.hasIndex(regclassName.toLowerCase(java.util.Locale.ROOT))) {
                 foundIndexRc = true;
                 resolvedSchemaRc = effectiveSchemaRc;
             }
             if (foundRc == null && !foundIndexRc) {
-                String lowerNameRc = regclassName.toLowerCase();
+                String lowerNameRc = regclassName.toLowerCase(java.util.Locale.ROOT);
                 if (KNOWN_PG_CATALOG_TABLES.contains(lowerNameRc)) {
                     Table sysCatalogRc = executor.systemCatalog.resolve("pg_catalog", lowerNameRc);
                     if (sysCatalogRc != null) {
@@ -1466,7 +1489,7 @@ class CatalogMetadataFunctions {
         if (fn.args().isEmpty()) return null;
         Object arg = executor.evalExpr(fn.args().get(0), ctx);
         if (arg == null) return null;
-        String written = arg.toString().trim().toLowerCase();
+        String written = arg.toString().trim().toLowerCase(java.util.Locale.ROOT);
         String canonical = canonicalTypeName(executor.database, written);
         if (canonical == null) return null;
         // to_regtype answers a regtype, not the name of one: a caller writing
@@ -2101,6 +2124,25 @@ class CatalogMetadataFunctions {
         return false;
     }
 
+    /** The primary-key columns of the relation a foreign key references, in key order. */
+    private List<String> referencedPrimaryKeyOf(StoredConstraint sc) {
+        if (sc.getReferencesTable() == null) return null;
+        String schema = sc.getReferencesSchema() != null ? sc.getReferencesSchema() : "public";
+        Schema holder = executor.database.getSchema(schema);
+        Table referenced = holder == null ? null : holder.getTable(sc.getReferencesTable());
+        if (referenced == null) {
+            for (Schema each : executor.database.getSchemas().values()) {
+                Table found = each.getTable(sc.getReferencesTable());
+                if (found != null) { referenced = found; break; }
+            }
+        }
+        if (referenced == null) return null;
+        for (StoredConstraint key : referenced.getConstraints()) {
+            if (key.getType() == StoredConstraint.Type.PRIMARY_KEY) return key.getColumns();
+        }
+        return null;
+    }
+
     private String formatConstraintDef(StoredConstraint sc, String ownSchema, Table owner) {
         StringBuilder sb = new StringBuilder();
         switch (sc.getType()) {
@@ -2137,9 +2179,16 @@ class CatalogMetadataFunctions {
                     }
                     sb.append(sc.getReferencesTable());
                 }
-                if (sc.getReferencesColumns() != null && !sc.getReferencesColumns().isEmpty()) {
+                // A key written without a column list references the referenced relation's
+                // primary key, and PostgreSQL resolves that when it stores the constraint --
+                // so what is read back names the columns whether or not the writer did.
+                List<String> referencedColumns = sc.getReferencesColumns();
+                if (referencedColumns == null || referencedColumns.isEmpty()) {
+                    referencedColumns = referencedPrimaryKeyOf(sc);
+                }
+                if (referencedColumns != null && !referencedColumns.isEmpty()) {
                     sb.append("(")
-                            .append(keyColumnList(sc.getReferencesColumns(), sc.isPeriod()))
+                            .append(keyColumnList(referencedColumns, sc.isPeriod()))
                             .append(")");
                 }
                 // The match type decides whether a partly-null key is checked at all, so a
@@ -2513,7 +2562,7 @@ class CatalogMetadataFunctions {
             // A function's arguments are inputs unless said otherwise, so IN goes unwritten there.
             // A procedure's are written out, because a procedure's may also be OUT or INOUT.
             if (p.mode() != null && (func.isProcedure() || !p.mode().equalsIgnoreCase("IN"))) {
-                sb.append(p.mode().toUpperCase()).append(" ");
+                sb.append(p.mode().toUpperCase(java.util.Locale.ROOT)).append(" ");
             }
             if (p.name() != null && !p.name().isEmpty()) {
                 sb.append(p.name()).append(" ");
@@ -2552,7 +2601,7 @@ class CatalogMetadataFunctions {
     static String normalizePgTypeName(String typeName) {
         if (typeName == null) return "void";
         typeName = stripTypeModifier(typeName);
-        switch (typeName.toLowerCase().trim()) {
+        switch (typeName.toLowerCase(java.util.Locale.ROOT).trim()) {
             case "int":
             case "int4":
                 return "integer";
@@ -2575,7 +2624,7 @@ class CatalogMetadataFunctions {
             case "char":
                 return "character";
             default:
-                return typeName.toLowerCase();
+                return typeName.toLowerCase(java.util.Locale.ROOT);
         }
     }
 
@@ -2615,7 +2664,7 @@ class CatalogMetadataFunctions {
             if (!first) sb.append(", ");
             first = false;
             if (p.mode() != null && !"IN".equalsIgnoreCase(p.mode())) {
-                sb.append(p.mode().toUpperCase()).append(" ");
+                sb.append(p.mode().toUpperCase(java.util.Locale.ROOT)).append(" ");
             }
             if (p.name() != null && !p.name().isEmpty()) {
                 sb.append(p.name()).append(" ");
@@ -2738,6 +2787,65 @@ class CatalogMetadataFunctions {
      * <p>An aggregate has no function definition at all: PostgreSQL refuses with 42809 rather than
      * printing something a client could execute.
      */
+    /**
+     * The SET lines of a routine's definition, one per parameter its proconfig array holds.
+     *
+     * <p>A value is written quoted, and a parameter whose value is a list has each item quoted
+     * separately: {@code SET search_path TO 'public', 'pg_temp'}.
+     */
+    /** The role an OID was handed out for, or null when no role answers to it. */
+    String roleNameOf(int oid) {
+        String key = executor.systemCatalog.keyForOid(oid);
+        if (key != null && key.startsWith("role:")) return key.substring(5);
+        return oid == 10 ? executor.database.bootstrapRoleName() : null;
+    }
+
+    private static void appendProcSettings(StringBuilder sb, Object proconfig) {
+        if (proconfig == null) return;
+        for (String setting : splitArrayLiteral(proconfig.toString())) {
+            int eq = setting.indexOf('=');
+            if (eq <= 0) continue;
+            String name = setting.substring(0, eq);
+            String value = setting.substring(eq + 1);
+            sb.append(" SET ").append(quoteProcIdent(name)).append(" TO ");
+            String[] items = "search_path".equalsIgnoreCase(name)
+                    ? value.split("\\s*,\\s*") : new String[]{value};
+            for (int i = 0; i < items.length; i++) {
+                if (i > 0) sb.append(", ");
+                String item = items[i];
+                if (item.startsWith("\"") && item.endsWith("\"") && item.length() > 1) {
+                    item = item.substring(1, item.length() - 1);
+                }
+                sb.append('\'').append(item.replace("'", "''")).append('\'');
+            }
+            sb.append("\n");
+        }
+    }
+
+    /** The elements of an array literal, with the quoting that kept an element whole undone. */
+    private static List<String> splitArrayLiteral(String literal) {
+        List<String> out = new ArrayList<>();
+        String body = literal.startsWith("{") && literal.endsWith("}")
+                ? literal.substring(1, literal.length() - 1) : literal;
+        StringBuilder item = new StringBuilder();
+        boolean quoted = false;
+        for (int i = 0; i < body.length(); i++) {
+            char c = body.charAt(i);
+            if (c == '\\' && i + 1 < body.length()) {
+                item.append(body.charAt(++i));
+            } else if (c == '"') {
+                quoted = !quoted;
+            } else if (c == ',' && !quoted) {
+                out.add(item.toString());
+                item.setLength(0);
+            } else {
+                item.append(c);
+            }
+        }
+        if (item.length() > 0) out.add(item.toString());
+        return out;
+    }
+
     private String buildProcFunctionDef(Object[] row) {
         Object kind = procCol(row, "prokind");
         String prokind = kind == null ? "f" : kind.toString();
@@ -2782,6 +2890,9 @@ class CatalogMetadataFunctions {
             if (actual > 0 && actual != 1000) attrs.append(" ROWS ").append(trimNumber(actual));
         }
         if (attrs.length() > 0) sb.append(attrs).append("\n");
+        // A routine's own settings are part of its definition: a SECURITY DEFINER function that
+        // pins search_path runs under a different one entirely without them.
+        appendProcSettings(sb, procCol(row, "proconfig"));
         Object src = procCol(row, "prosrc");
         // A SQL-standard body is not quoted at all — it is written out as the BEGIN ATOMIC block
         // it was declared as, and a definition deparsed with it inside dollar quotes would not
@@ -2910,7 +3021,7 @@ class CatalogMetadataFunctions {
     }
 
     private boolean isBuiltinFunction(String name) {
-        switch (name.toLowerCase()) {
+        switch (name.toLowerCase(java.util.Locale.ROOT)) {
             case "now":
             case "current_timestamp":
             case "current_date":

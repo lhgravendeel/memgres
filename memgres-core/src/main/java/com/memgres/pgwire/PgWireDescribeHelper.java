@@ -92,7 +92,7 @@ class PgWireDescribeHelper {
      * PostgreSQL rejects a LIMIT written after it as readily as it rejects two LIMITs.
      */
     private static boolean alreadyBounded(String sql) {
-        String upper = sql.toUpperCase();
+        String upper = sql.toUpperCase(java.util.Locale.ROOT);
         return upper.contains("LIMIT") || upper.contains("FETCH");
     }
 
@@ -143,7 +143,7 @@ class PgWireDescribeHelper {
         sendParameterDescription(ctx, sql, paramOids);
 
         // DML with RETURNING: infer columns from table schema
-        String upper = stripLeadingComments(sql).toUpperCase();
+        String upper = stripLeadingComments(sql).toUpperCase(java.util.Locale.ROOT);
         if (upper.contains("RETURNING") && (upper.startsWith("INSERT") || upper.startsWith("UPDATE") || upper.startsWith("DELETE") || upper.startsWith("MERGE"))) {
             List<Column> returningCols = inferReturningColumns(sql);
             if (returningCols != null) {
@@ -169,7 +169,7 @@ class PgWireDescribeHelper {
         }
 
         // SHOW statements: execute directly (read-only)
-        String upperSql = stripLeadingComments(sql).toUpperCase();
+        String upperSql = stripLeadingComments(sql).toUpperCase(java.util.Locale.ROOT);
         if (upperSql.startsWith("SHOW")) {
             try {
                 QueryResult result = session.execute(sql.replaceAll(";\\s*$", "").trim(), Cols.listOf());
@@ -268,7 +268,7 @@ class PgWireDescribeHelper {
         RuntimeException probeFailure = null;
 
         // DML with RETURNING
-        String upper = stripLeadingComments(sql).toUpperCase();
+        String upper = stripLeadingComments(sql).toUpperCase(java.util.Locale.ROOT);
         boolean isDmlReturning = upper.contains("RETURNING") && (upper.startsWith("INSERT") || upper.startsWith("UPDATE") || upper.startsWith("DELETE") || upper.startsWith("MERGE"));
         boolean isCteDmlReturning = upper.startsWith("WITH") && !isWithSelect(upper) && upper.contains("RETURNING");
         if (isDmlReturning || isCteDmlReturning) {
@@ -318,7 +318,7 @@ class PgWireDescribeHelper {
                 }
                 if (proc != null) {
                     for (com.memgres.engine.PgFunction.Param p : proc.getParams()) {
-                        String mode = p.mode() != null ? p.mode().toUpperCase() : "IN";
+                        String mode = p.mode() != null ? p.mode().toUpperCase(java.util.Locale.ROOT) : "IN";
                         if ("OUT".equals(mode) || "INOUT".equals(mode)) {
                             hasOutParams = true;
                             break;
@@ -375,7 +375,7 @@ class PgWireDescribeHelper {
                 // all came back to the client as though nothing had happened.
                 if (e instanceof RuntimeException) probeFailure = (RuntimeException) e;
                 // Fallback: re-execute with LIMIT 0 to get column metadata without side effects
-                String upper2 = stripLeadingComments(sql).toUpperCase();
+                String upper2 = stripLeadingComments(sql).toUpperCase(java.util.Locale.ROOT);
                 if (upper2.startsWith("SELECT") && !wouldWaitAgain(sql, e)) {
                     Session.TransactionStatus savedFallback = session.getStatus();
                     try {
@@ -457,7 +457,7 @@ class PgWireDescribeHelper {
     // ---- SQL classification helpers ----
 
     boolean isSafeToDescribe(String sql) {
-        String upper = stripLeadingComments(sql).toUpperCase();
+        String upper = stripLeadingComments(sql).toUpperCase(java.util.Locale.ROOT);
         if (upper.startsWith("INSERT") || upper.startsWith("UPDATE")
                 || upper.startsWith("DELETE") || upper.startsWith("MERGE")) return false;
         if (upper.startsWith("FETCH") || upper.startsWith("EXECUTE")
@@ -484,7 +484,7 @@ class PgWireDescribeHelper {
     }
 
     boolean isQueryStatement(String sql) {
-        String upper = stripLeadingComments(sql).toUpperCase();
+        String upper = stripLeadingComments(sql).toUpperCase(java.util.Locale.ROOT);
         if (upper.startsWith("SELECT") || upper.startsWith("VALUES") || upper.startsWith("COPY")
                 || upper.startsWith("EXPLAIN") || upper.startsWith("(")
                 || upper.startsWith("SHOW") || upper.startsWith("TABLE")) {
@@ -653,7 +653,7 @@ class PgWireDescribeHelper {
             String afterCall = stripped.substring(4).trim(); // skip "CALL"
             int parenIdx = afterCall.indexOf('(');
             if (parenIdx < 0) return null;
-            String procName = afterCall.substring(0, parenIdx).trim().toLowerCase();
+            String procName = afterCall.substring(0, parenIdx).trim().toLowerCase(java.util.Locale.ROOT);
             // Look up the function/procedure
             PgFunction func;
             if (procName.contains(".")) {
@@ -666,7 +666,7 @@ class PgWireDescribeHelper {
             // Collect OUT/INOUT params
             List<Column> outCols = new ArrayList<>();
             for (PgFunction.Param p : func.getParams()) {
-                String mode = p.mode() != null ? p.mode().toUpperCase() : "IN";
+                String mode = p.mode() != null ? p.mode().toUpperCase(java.util.Locale.ROOT) : "IN";
                 if ("OUT".equals(mode) || "INOUT".equals(mode)) {
                     String colName = p.name() != null ? p.name() : "column" + (outCols.size() + 1);
                     outCols.add(new Column(colName, DataType.TEXT, true, false, null));
@@ -682,7 +682,7 @@ class PgWireDescribeHelper {
     // ---- Column inference ----
 
     List<Column> inferColumns(String sql) {
-        String upper = stripLeadingComments(sql).toUpperCase();
+        String upper = stripLeadingComments(sql).toUpperCase(java.util.Locale.ROOT);
         if (upper.startsWith("FETCH")) {
             String cursorName = extractCursorName(sql);
             if (cursorName != null) {
@@ -779,7 +779,7 @@ class PgWireDescribeHelper {
     }
 
     List<Column> inferReturningColumns(String sql) {
-        String upper = stripLeadingComments(sql).toUpperCase();
+        String upper = stripLeadingComments(sql).toUpperCase(java.util.Locale.ROOT);
         String tableName = null;
         if (upper.startsWith("INSERT")) {
             int intoIdx = upper.indexOf("INTO");
@@ -819,7 +819,7 @@ class PgWireDescribeHelper {
                 String srcName = endIdx > 0 ? usingRest.substring(0, endIdx).trim() : usingRest.trim();
                 srcName = srcName.replace("\"", "");
                 for (Schema schema : database.getSchemas().values()) {
-                    mergeSourceTable = schema.getTable(srcName.toLowerCase());
+                    mergeSourceTable = schema.getTable(srcName.toLowerCase(java.util.Locale.ROOT));
                     if (mergeSourceTable == null) mergeSourceTable = schema.getTable(srcName);
                     if (mergeSourceTable != null) break;
                 }
@@ -829,7 +829,7 @@ class PgWireDescribeHelper {
         tableName = tableName.replace("\"", "");
         Table table = null;
         for (Schema schema : database.getSchemas().values()) {
-            table = schema.getTable(tableName.toLowerCase());
+            table = schema.getTable(tableName.toLowerCase(java.util.Locale.ROOT));
             if (table == null) table = schema.getTable(tableName);
             if (table != null) break;
         }
@@ -862,7 +862,7 @@ class PgWireDescribeHelper {
             // the column's type metadata, which is what the type OID is worked out from.
             String alias = null;
             String colName = item;
-            int asIdx = item.toUpperCase().indexOf(" AS ");
+            int asIdx = item.toUpperCase(java.util.Locale.ROOT).indexOf(" AS ");
             if (asIdx >= 0) {
                 alias = item.substring(asIdx + 4).trim();
                 colName = item.substring(0, asIdx).trim();

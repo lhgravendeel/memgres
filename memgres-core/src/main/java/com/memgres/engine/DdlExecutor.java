@@ -46,7 +46,7 @@ class DdlExecutor {
     private CreateTableStmt typedTableColumns(CreateTableStmt stmt) {
         String written = stmt.ofType();
         if (written == null) return stmt;
-        String typeName = written.toLowerCase().trim();
+        String typeName = written.toLowerCase(java.util.Locale.ROOT).trim();
         if (executor.database.getTable(typeName) != null) {
             MemgresException e = PgErrors.wrongObjectType(
                     "type " + written + " is the row type of another table");
@@ -131,7 +131,11 @@ class DdlExecutor {
     QueryResult executeTruncate(TruncateStmt stmt) { return tableExecutor.executeTruncate(stmt); }
     QueryResult executeCreateTableAs(CreateTableAsStmt stmt) { return tableExecutor.executeCreateTableAs(stmt); }
 
-    QueryResult executeAlterTable(AlterTableStmt stmt) { return alterTableExecutor.executeAlterTable(stmt); }
+    QueryResult executeAlterTable(AlterTableStmt stmt) {
+        // ALTER TABLE shares a result type with CREATE TABLE, so the tag has to be said here or
+        // every ALTER reported itself to the client as a CREATE.
+        return alterTableExecutor.executeAlterTable(stmt).withCommandTag("ALTER TABLE");
+    }
 
     QueryResult executeCreateType(CreateTypeStmt stmt) { return objectExecutor.executeCreateType(stmt); }
     QueryResult executeAlterType(AlterTypeStmt stmt) { return objectExecutor.executeAlterType(stmt); }
@@ -167,7 +171,10 @@ class DdlExecutor {
     QueryResult executeCreateRule(CreateRuleStmt stmt) { return adminExecutor.executeCreateRule(stmt); }
     QueryResult executeCreateSchema(CreateSchemaStmt stmt) { return adminExecutor.executeCreateSchema(stmt); }
     QueryResult executeTransaction(TransactionStmt stmt) { return adminExecutor.executeTransaction(stmt); }
-    QueryResult executeExplain(ExplainStmt stmt) { return adminExecutor.executeExplain(stmt); }
+    QueryResult executeExplain(ExplainStmt stmt) {
+        // EXPLAIN returns rows, but it is not a SELECT and does not report a row count.
+        return adminExecutor.executeExplain(stmt).withCommandTag("EXPLAIN");
+    }
     QueryResult executeListen(ListenStmt stmt) { return adminExecutor.executeListen(stmt); }
     QueryResult executeNotify(NotifyStmt stmt) { return adminExecutor.executeNotify(stmt); }
     QueryResult executeUnlisten(UnlistenStmt stmt) { return adminExecutor.executeUnlisten(stmt); }
@@ -796,6 +803,13 @@ class DdlExecutor {
 
     // ---- Static helpers ----
 
+    /** An operand written with the parentheses that keep it the operand it is. */
+    private static String grouped(Expression operand) {
+        String text = exprToDefaultString(operand);
+        return operand instanceof BinaryExpr || operand instanceof CustomOperatorExpr
+                ? "(" + text + ")" : text;
+    }
+
     /** Convert an Expression AST to a default-value string representation. */
     static String exprToDefaultString(Expression expr) {
         if (expr instanceof FunctionCallExpr) {
@@ -822,9 +836,9 @@ class DdlExecutor {
         } else if (expr instanceof CustomOperatorExpr) {
             CustomOperatorExpr cop = (CustomOperatorExpr) expr;
             if (cop.left() != null) {
-                return exprToDefaultString(cop.left()) + " " + cop.opSymbol() + " " + exprToDefaultString(cop.right());
+                return grouped(cop.left()) + " " + cop.opSymbol() + " " + grouped(cop.right());
             } else {
-                return cop.opSymbol() + " " + exprToDefaultString(cop.right());
+                return cop.opSymbol() + " " + grouped(cop.right());
             }
         } else if (expr instanceof BinaryExpr) {
             BinaryExpr bin = (BinaryExpr) expr;
@@ -879,7 +893,11 @@ class DdlExecutor {
                     op = bin.op().name();
                     break;
             }
-            return exprToDefaultString(bin.left()) + " " + op + " " + exprToDefaultString(bin.right());
+            // An operand that is itself an operator expression keeps its own parentheses. This
+            // text is what the default is stored as and what the catalogue re-reads it from, so
+            // grouping the writer put in has to survive the round trip: written flat, a default
+            // of (2 + 3) * 4 read back as 2 + 3 * 4 and reported itself as 2 + (3 * 4).
+            return grouped(bin.left()) + " " + op + " " + grouped(bin.right());
         } else if (expr instanceof UnaryExpr) {
             UnaryExpr un = (UnaryExpr) expr;
             String op;
@@ -992,7 +1010,7 @@ class DdlExecutor {
 
         if (expr instanceof FunctionCallExpr) {
             FunctionCallExpr fn = (FunctionCallExpr) expr;
-            String fnName = fn.name().toLowerCase();
+            String fnName = fn.name().toLowerCase(java.util.Locale.ROOT);
             // Check built-in volatile functions
             if (BUILTIN_VOLATILE_FUNCTIONS.contains(fnName)) {
                 throw new MemgresException(errorMsg, "42P17");
@@ -1033,7 +1051,7 @@ class DdlExecutor {
         } else if (expr instanceof ColumnRef) {
             ColumnRef cr = (ColumnRef) expr;
             // Check bare volatile identifiers like current_timestamp, localtime, etc.
-            if (cr.table() == null && BUILTIN_VOLATILE_IDENTIFIERS.contains(cr.column().toLowerCase())) {
+            if (cr.table() == null && BUILTIN_VOLATILE_IDENTIFIERS.contains(cr.column().toLowerCase(java.util.Locale.ROOT))) {
                 throw new MemgresException(errorMsg, "42P17");
             }
         } else if (expr instanceof BinaryExpr) {
@@ -1132,7 +1150,7 @@ class DdlExecutor {
      * but allows user-defined volatile functions in expression indexes.
      */
     static void checkBuiltinVolatileInExpression(String exprStr, Database db, String errorMsg) {
-        String norm = exprStr.toLowerCase().replaceAll("\\s+", "");
+        String norm = exprStr.toLowerCase(java.util.Locale.ROOT).replaceAll("\\s+", "");
         for (String fn : BUILTIN_VOLATILE_FUNCTIONS) {
             if (norm.contains(fn + "(")) {
                 throw new MemgresException(errorMsg, "42P17");
@@ -1151,7 +1169,7 @@ class DdlExecutor {
      */
     static void checkExpressionImmutability(String exprStr, Database db, String errorMsg) {
         // Fast path: check for built-in volatile names in the raw string
-        String norm = exprStr.toLowerCase().replaceAll("\\s+", "");
+        String norm = exprStr.toLowerCase(java.util.Locale.ROOT).replaceAll("\\s+", "");
         for (String fn : BUILTIN_VOLATILE_FUNCTIONS) {
             if (norm.contains(fn + "(")) {
                 throw new MemgresException(errorMsg, "42P17");
@@ -1300,7 +1318,7 @@ class DdlExecutor {
     ));
 
     static boolean isSqlKeywordOrFunction(String ident) {
-        return SQL_KEYWORDS_AND_FUNCTIONS.contains(ident.toLowerCase());
+        return SQL_KEYWORDS_AND_FUNCTIONS.contains(ident.toLowerCase(java.util.Locale.ROOT));
     }
 
     /** {@code base}, or base with the lowest suffix from 1 upwards that the table does not use. */

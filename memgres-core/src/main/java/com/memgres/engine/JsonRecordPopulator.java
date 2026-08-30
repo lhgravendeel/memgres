@@ -129,7 +129,7 @@ final class JsonRecordPopulator {
     private static boolean isArrayType(String typeName) {
         String name = typeName.trim();
         if (name.endsWith("]")) return true;
-        DataType type = DataType.fromPgName(name.toLowerCase());
+        DataType type = DataType.fromPgName(name.toLowerCase(java.util.Locale.ROOT));
         return type != null && DataType.isArrayType(type);
     }
 }

@@ -279,7 +279,7 @@ final class ViewUpdatability {
             return false;
         }
         if (node instanceof FunctionCallExpr) {
-            String name = ((FunctionCallExpr) node).name().toLowerCase();
+            String name = ((FunctionCallExpr) node).name().toLowerCase(java.util.Locale.ROOT);
             if (name.indexOf('.') >= 0) name = name.substring(name.lastIndexOf('.') + 1);
             if (SelectExecutor.AGGREGATE_FUNCTIONS.contains(name)) return true;
         }
@@ -310,7 +310,7 @@ final class ViewUpdatability {
         if (node == null || node instanceof Statement) return false;
         if (node instanceof FunctionCallExpr) {
             FunctionCallExpr call = (FunctionCallExpr) node;
-            String name = FunctionEvaluator.stripSchemaPrefix(call.name().toLowerCase());
+            String name = FunctionEvaluator.stripSchemaPrefix(call.name().toLowerCase(java.util.Locale.ROOT));
             if (SelectExecutor.SRF_FUNCTION_NAMES.contains(name)) return true;
             if (db != null) {
                 PgFunction declared = db.getFunction(name);

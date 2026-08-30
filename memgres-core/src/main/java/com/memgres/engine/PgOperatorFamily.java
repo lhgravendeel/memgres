@@ -27,6 +27,6 @@ public class PgOperatorFamily {
      * Key for storage: name + method (same name can exist for different methods).
      */
     public String getKey() {
-        return name.toLowerCase() + ":" + method.toLowerCase();
+        return name.toLowerCase(java.util.Locale.ROOT) + ":" + method.toLowerCase(java.util.Locale.ROOT);
     }
 }

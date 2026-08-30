@@ -635,8 +635,8 @@ public final class ViewDeparser {
     /** The name an expression carries of itself, or null where it carries none. */
     private static String ownName(Expression expr) {
         if (expr instanceof ColumnRef) return ((ColumnRef) expr).column();
-        if (expr instanceof FunctionCallExpr) return ((FunctionCallExpr) expr).name().toLowerCase();
-        if (expr instanceof WindowFuncExpr) return ((WindowFuncExpr) expr).name().toLowerCase();
+        if (expr instanceof FunctionCallExpr) return ((FunctionCallExpr) expr).name().toLowerCase(java.util.Locale.ROOT);
+        if (expr instanceof WindowFuncExpr) return ((WindowFuncExpr) expr).name().toLowerCase(java.util.Locale.ROOT);
         if (expr instanceof CaseExpr) return "case";
         if (expr instanceof CollateExpr) return ownName(((CollateExpr) expr).expr());
         if (expr instanceof CastExpr) {
@@ -1717,7 +1717,7 @@ public final class ViewDeparser {
         // PostgreSQL writes the constructs the SQL standard spells as keywords in capitals, and
         // every ordinary function under the name it is registered with.
         String name = node.name();
-        String upper = name.toUpperCase();
+        String upper = name.toUpperCase(java.util.Locale.ROOT);
         boolean sqlConstruct = "COALESCE".equals(upper) || "NULLIF".equals(upper)
                 || "GREATEST".equals(upper) || "LEAST".equals(upper);
         out.append(sqlConstruct ? upper : name).append('(');
@@ -2003,7 +2003,7 @@ public final class ViewDeparser {
         if (node.orderBy() != null && !node.orderBy().isEmpty()) return null;
         boolean hasArgs = node.args() != null && !node.args().isEmpty();
         return SqlValueFunctions.keywordOf(node.name(), hasArgs) == null
-                ? null : node.name().toLowerCase();
+                ? null : node.name().toLowerCase(java.util.Locale.ROOT);
     }
 
     /**

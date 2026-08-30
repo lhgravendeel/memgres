@@ -123,7 +123,7 @@ class ExprSpecialFormParser {
     }
 
     Expression parseBuiltinFunction() {
-        String name = ep.advance().value().toLowerCase();
+        String name = ep.advance().value().toLowerCase(java.util.Locale.ROOT);
         ep.expect(TokenType.LEFT_PAREN);
         int listStart = ep.pos;
         List<Expression> args = new ArrayList<>();
@@ -157,7 +157,7 @@ class ExprSpecialFormParser {
         // Check if 'interval' is used as a column name
         if (ep.pos + 1 < ep.tokens.size()) {
             TokenType nextType = ep.tokens.get(ep.pos + 1).type();
-            String nextVal = ep.tokens.get(ep.pos + 1).value().toUpperCase();
+            String nextVal = ep.tokens.get(ep.pos + 1).value().toUpperCase(java.util.Locale.ROOT);
             boolean isColumnContext = nextType == TokenType.EQUALS || nextType == TokenType.NOT_EQUALS
                     || nextType == TokenType.LESS_THAN || nextType == TokenType.GREATER_THAN
                     || nextType == TokenType.LESS_EQUALS || nextType == TokenType.GREATER_EQUALS
@@ -224,10 +224,10 @@ class ExprSpecialFormParser {
      */
     private String parseIntervalQualifier() {
         if (ep.checkIntervalField()) {
-            String field = ep.advance().value().toLowerCase();
+            String field = ep.advance().value().toLowerCase(java.util.Locale.ROOT);
             if (ep.checkKeyword("TO") || ep.checkIdentCI("TO")) {
                 ep.advance(); // consume TO
-                String toField = ep.readIdentifier().toLowerCase();
+                String toField = ep.readIdentifier().toLowerCase(java.util.Locale.ROOT);
                 return field + " to " + toField + parseFieldPrecision();
             }
             return field + parseFieldPrecision();
@@ -956,7 +956,7 @@ class ExprSpecialFormParser {
         ep.expectKeyword("PASSING");
         if (ep.matchKeyword("BY")) {
             if (ep.check(TokenType.IDENTIFIER) || ep.check(TokenType.KEYWORD)) {
-                String tok = ep.peek().value().toUpperCase();
+                String tok = ep.peek().value().toUpperCase(java.util.Locale.ROOT);
                 if (tok.equals("REF") || tok.equals("VALUE")) {
                     ep.advance();
                 }
@@ -1324,7 +1324,7 @@ class ExprSpecialFormParser {
             Expression val = ep.parseExpression();
             ep.expectKeyword("AS");
             String name = ep.readIdentifier();
-            passing.put(name.toLowerCase(), val);
+            passing.put(name.toLowerCase(java.util.Locale.ROOT), val);
         } while (ep.match(TokenType.COMMA) && !ep.checkKeyword("RETURNING") && !ep.checkKeyword("TRUE")
                 && !ep.checkKeyword("FALSE") && !ep.checkKeyword("ERROR") && !ep.checkKeyword("UNKNOWN")
                 && !ep.check(TokenType.RIGHT_PAREN));

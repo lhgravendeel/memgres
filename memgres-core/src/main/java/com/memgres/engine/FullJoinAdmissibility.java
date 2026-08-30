@@ -397,7 +397,7 @@ final class FullJoinAdmissibility {
 
     private static boolean isBooleanTypeName(String name) {
         if (name == null) return false;
-        String n = name.trim().toLowerCase();
+        String n = name.trim().toLowerCase(java.util.Locale.ROOT);
         int dot = n.lastIndexOf('.');
         if (dot >= 0) n = n.substring(dot + 1);
         return "bool".equals(n) || "boolean".equals(n);
@@ -567,8 +567,8 @@ final class FullJoinAdmissibility {
         for (ColumnRef ref : refs) {
             if (ref.column() == null || SelectExecutor.isSystemColumn(ref.column())) continue;
             if (ref.table() != null) {
-                if (!rangeTable.containsKey(ref.table().toLowerCase())) return true;
-                Table named = rangeTable.get(ref.table().toLowerCase());
+                if (!rangeTable.containsKey(ref.table().toLowerCase(java.util.Locale.ROOT))) return true;
+                Table named = rangeTable.get(ref.table().toLowerCase(java.util.Locale.ROOT));
                 if (named != null && named.getColumnIndex(ref.column()) < 0) return true;
                 continue;
             }
@@ -604,7 +604,7 @@ final class FullJoinAdmissibility {
     }
 
     private static String nameOf(RowContext.TableBinding b) {
-        return (b.alias() != null ? b.alias() : b.table().getName()).toLowerCase();
+        return (b.alias() != null ? b.alias() : b.table().getName()).toLowerCase(java.util.Locale.ROOT);
     }
 
     private void addToRangeTable(SelectStmt.FromItem item, Map<String, Table> out) {
@@ -633,7 +633,7 @@ final class FullJoinAdmissibility {
             return;
         }
         if (name == null) return;
-        if (!out.containsKey(name.toLowerCase())) out.put(name.toLowerCase(), table);
+        if (!out.containsKey(name.toLowerCase(java.util.Locale.ROOT))) out.put(name.toLowerCase(java.util.Locale.ROOT), table);
     }
 
     // ---- Quals above the join ----
@@ -836,7 +836,7 @@ final class FullJoinAdmissibility {
         }
         if (e instanceof FunctionCallExpr) {
             FunctionCallExpr f = (FunctionCallExpr) e;
-            String name = f.name() == null ? "" : f.name().toLowerCase();
+            String name = f.name() == null ? "" : f.name().toLowerCase(java.util.Locale.ROOT);
             int dot = name.lastIndexOf('.');
             if (dot >= 0) name = name.substring(dot + 1);
             if (NON_STRICT.contains(name)) return;
@@ -908,7 +908,7 @@ final class FullJoinAdmissibility {
                 if (n instanceof FunctionCallExpr) {
                     String name = ((FunctionCallExpr) n).name();
                     if (name == null) return true;
-                    name = name.toLowerCase();
+                    name = name.toLowerCase(java.util.Locale.ROOT);
                     int dot = name.lastIndexOf('.');
                     if (dot >= 0) name = name.substring(dot + 1);
                     return VOLATILE_FUNCTIONS.contains(name);

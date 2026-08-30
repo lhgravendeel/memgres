@@ -572,6 +572,7 @@ class RoleAndGrantTest {
         });
         assertDoesNotThrow(() -> {
             exec("DROP TABLE IF EXISTS ragt_col_t1");
+            exec("DROP OWNED BY ragt_col_r1");
             exec("DROP ROLE IF EXISTS ragt_col_r1");
         });
     }

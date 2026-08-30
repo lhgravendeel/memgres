@@ -71,6 +71,20 @@ class SecurityAbuseCaseTest {
     // Helper utilities
     // -------------------------------------------------------------------------
 
+    /**
+     * Drop a role and the grants that name it. A grant depends on the role, so PostgreSQL will
+     * not drop one while a grant stands; DROP OWNED BY is what takes them away, and it needs the
+     * role to be there.
+     */
+    private void dropRoleAndWhatItHolds(String role) throws Exception {
+        try (Statement st = conn.createStatement()) {
+            st.execute("DROP OWNED BY " + role);
+        } catch (SQLException noSuchRole) {
+            // Nothing to take away from a role that is not there.
+        }
+        exec("DROP ROLE IF EXISTS " + role);
+    }
+
     private void exec(String sql) throws Exception {
         try (Statement st = conn.createStatement()) {
             st.execute(sql);
@@ -283,7 +297,7 @@ class SecurityAbuseCaseTest {
     @Test
     @DisplayName("7. GRANT SELECT on a table; has_table_privilege reflects the grant")
     void grantRevokeOnTables() throws Exception {
-        exec("DROP ROLE IF EXISTS sec_readonly_role");
+        dropRoleAndWhatItHolds("sec_readonly_role");
         exec("CREATE ROLE sec_readonly_role");
         exec("CREATE TABLE IF NOT EXISTS sec_grant_tbl (id INT)");
         exec("GRANT SELECT ON sec_grant_tbl TO sec_readonly_role");
@@ -310,7 +324,7 @@ class SecurityAbuseCaseTest {
     @Test
     @DisplayName("8. Column-level GRANT SELECT on specific column is tracked in pg_attribute / information_schema")
     void grantOnColumns() throws Exception {
-        exec("DROP ROLE IF EXISTS sec_readonly_role");
+        dropRoleAndWhatItHolds("sec_readonly_role");
         exec("CREATE ROLE sec_readonly_role");
         exec("""
                 CREATE TABLE IF NOT EXISTS sec_col_grant (
@@ -562,7 +576,7 @@ class SecurityAbuseCaseTest {
     @DisplayName("18. has_table_privilege returns accurate privilege flags for a role")
     void hasTablePrivilege() throws Exception {
         exec("CREATE TABLE IF NOT EXISTS sec_has_priv (id INT)");
-        exec("DROP ROLE IF EXISTS sec_readonly_role");
+        dropRoleAndWhatItHolds("sec_readonly_role");
         exec("CREATE ROLE sec_readonly_role");
         exec("GRANT SELECT ON sec_has_priv TO sec_readonly_role");
 
@@ -661,7 +675,7 @@ class SecurityAbuseCaseTest {
     @DisplayName("22. has_schema_privilege verifies USAGE privilege on a schema")
     void hasSchemaPrivilege() throws Exception {
         exec("CREATE SCHEMA IF NOT EXISTS sec_private");
-        exec("DROP ROLE IF EXISTS sec_readonly_role");
+        dropRoleAndWhatItHolds("sec_readonly_role");
         exec("CREATE ROLE sec_readonly_role");
         exec("GRANT USAGE ON SCHEMA sec_private TO sec_readonly_role");
 

@@ -365,7 +365,7 @@ public class StoredConstraint {
         if (action == null) return FkAction.NO_ACTION;
         // Strip column list suffix (e.g., "SET NULL:a,b" -> "SET NULL")
         String base = action.contains(":") ? action.substring(0, action.indexOf(':')) : action;
-        switch (base.toUpperCase().replace(" ", "_")) {
+        switch (base.toUpperCase(java.util.Locale.ROOT).replace(" ", "_")) {
             case "CASCADE":
                 return FkAction.CASCADE;
             case "SET_NULL":

@@ -110,7 +110,7 @@ class FunctionEvaluator {
     }
 
     private static java.nio.charset.Charset pgEncodingToCharset(String enc) {
-        String upper = enc.toUpperCase().replace("-", "").replace("_", "");
+        String upper = enc.toUpperCase(java.util.Locale.ROOT).replace("-", "").replace("_", "");
         switch (upper) {
             case "UTF8": case "UTF88": return java.nio.charset.StandardCharsets.UTF_8;
             case "LATIN1": case "ISO88591": return java.nio.charset.StandardCharsets.ISO_8859_1;
@@ -544,7 +544,7 @@ class FunctionEvaluator {
                 settled = type;
             } else if (type != settled) {
                 throw new MemgresException(keyword + " could not convert type "
-                        + type.name().toLowerCase() + " to " + settled.name().toLowerCase(),
+                        + type.name().toLowerCase(java.util.Locale.ROOT) + " to " + settled.name().toLowerCase(java.util.Locale.ROOT),
                         "42846");
             }
         }
@@ -1332,7 +1332,7 @@ class FunctionEvaluator {
                 } else {
                     data = dataArg.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
                 }
-                String algo = typeArg.toString().toLowerCase().trim();
+                String algo = typeArg.toString().toLowerCase(java.util.Locale.ROOT).trim();
                 String javaAlgo;
                 switch (algo) {
                     case "md5": javaAlgo = "MD5"; break;
@@ -1370,7 +1370,7 @@ class FunctionEvaluator {
                 } else {
                     key = keyArg.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
                 }
-                String algo = typeArg.toString().toLowerCase().trim();
+                String algo = typeArg.toString().toLowerCase(java.util.Locale.ROOT).trim();
                 String hmacAlgo;
                 switch (algo) {
                     case "md5": hmacAlgo = "HmacMD5"; break;
@@ -1395,7 +1395,7 @@ class FunctionEvaluator {
                 requireArgs(fn, 1);
                 Object typeArg = executor.evalExpr(fn.args().get(0), ctx);
                 if (typeArg == null) return null;
-                String saltType = typeArg.toString().toLowerCase().trim();
+                String saltType = typeArg.toString().toLowerCase(java.util.Locale.ROOT).trim();
                 java.security.SecureRandom sr = new java.security.SecureRandom();
                 switch (saltType) {
                     case "bf": {
@@ -2706,7 +2706,7 @@ class FunctionEvaluator {
                 requireArgs(fn, 1);
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
-                String s = arg.toString().toLowerCase();
+                String s = arg.toString().toLowerCase(java.util.Locale.ROOT);
                 Set<String> trgmSet = new java.util.TreeSet<>();
                 // Pad with two spaces on each side (PG convention)
                 String padded = "  " + s + " ";
@@ -2721,8 +2721,8 @@ class FunctionEvaluator {
                 Object arg1 = executor.evalExpr(fn.args().get(0), ctx);
                 Object arg2 = executor.evalExpr(fn.args().get(1), ctx);
                 if (arg1 == null || arg2 == null) return 0.0;
-                String s1 = arg1.toString().toLowerCase();
-                String s2 = arg2.toString().toLowerCase();
+                String s1 = arg1.toString().toLowerCase(java.util.Locale.ROOT);
+                String s2 = arg2.toString().toLowerCase(java.util.Locale.ROOT);
                 Set<String> trgm1 = trigramSet(s1);
                 Set<String> trgm2 = trigramSet(s2);
                 if (trgm1.isEmpty() && trgm2.isEmpty()) return 1.0;
@@ -2817,7 +2817,7 @@ class FunctionEvaluator {
                 String form = executor.evalExpr(fn.args().get(1), ctx).toString();
                 boolean expectTrue = executor.isTruthy(executor.evalExpr(fn.args().get(2), ctx));
                 java.text.Normalizer.Form nf;
-                switch (form.toUpperCase()) {
+                switch (form.toUpperCase(java.util.Locale.ROOT)) {
                     case "NFD": nf = java.text.Normalizer.Form.NFD; break;
                     case "NFKC": nf = java.text.Normalizer.Form.NFKC; break;
                     case "NFKD": nf = java.text.Normalizer.Form.NFKD; break;
@@ -3322,7 +3322,7 @@ class FunctionEvaluator {
                         String qs = qualifiedSchema;
                         List<PgFunction> filtered = new ArrayList<>();
                         for (PgFunction f : overloads) {
-                            String fSchema = f.getSchemaName() != null ? f.getSchemaName().toLowerCase() : "public";
+                            String fSchema = f.getSchemaName() != null ? f.getSchemaName().toLowerCase(java.util.Locale.ROOT) : "public";
                             if (qs.equalsIgnoreCase(fSchema)) filtered.add(f);
                         }
                         // For pg_catalog qualification, fall back to unfiltered (built-ins lack schema)
@@ -3335,7 +3335,7 @@ class FunctionEvaluator {
                         String searchPath = executor.session.getGucSettings().get("search_path");
                         if (searchPath != null) {
                             for (String sp : searchPath.split(",")) {
-                                String sc = sp.trim().toLowerCase();
+                                String sc = sp.trim().toLowerCase(java.util.Locale.ROOT);
                                 if (!visibleSchemas.contains(sc)) visibleSchemas.add(sc);
                             }
                         }
@@ -3448,7 +3448,7 @@ class FunctionEvaluator {
                         for (Expression arg : fn.args()) {
                             if (arg instanceof NamedArgExpr) {
                                 NamedArgExpr na = (NamedArgExpr) arg;
-                                namedMap.put(na.name().toLowerCase(), na.value());
+                                namedMap.put(na.name().toLowerCase(java.util.Locale.ROOT), na.value());
                             } else {
                                 positionalArgs.add(arg);
                             }
@@ -3457,7 +3457,7 @@ class FunctionEvaluator {
                         // Check for positional arg conflicting with named arg
                         for (int i = 0; i < positionalArgs.size(); i++) {
                             if (i < inputParams.size()) {
-                                String paramName = inputParams.get(i).name() != null ? inputParams.get(i).name().toLowerCase() : null;
+                                String paramName = inputParams.get(i).name() != null ? inputParams.get(i).name().toLowerCase(java.util.Locale.ROOT) : null;
                                 if (paramName != null && namedMap.containsKey(paramName)) {
                                     throw new MemgresException("function " + name + "(" +
                                             buildNamedArgTypeList(fn.args(), ctx) +
@@ -3486,7 +3486,7 @@ class FunctionEvaluator {
                         List<Object> args = new ArrayList<>();
                         for (int i = 0; i < inputParams.size(); i++) {
                             PgFunction.Param p = inputParams.get(i);
-                            String pName = p.name() != null ? p.name().toLowerCase() : null;
+                            String pName = p.name() != null ? p.name().toLowerCase(java.util.Locale.ROOT) : null;
 
                             if (i < positionalArgs.size()) {
                                 args.add(executor.evalExpr(positionalArgs.get(i), ctx));
@@ -3516,7 +3516,7 @@ class FunctionEvaluator {
                             for (Object arg : args) {
                                 if (arg == null) {
                                     String rt = userFunc.getReturnType();
-                                    if (rt != null && (rt.toUpperCase().startsWith("SETOF") || rt.toUpperCase().startsWith("TABLE"))) {
+                                    if (rt != null && (rt.toUpperCase(java.util.Locale.ROOT).startsWith("SETOF") || rt.toUpperCase(java.util.Locale.ROOT).startsWith("TABLE"))) {
                                         return new java.util.ArrayList<>();
                                     }
                                     return null;
@@ -3561,7 +3561,7 @@ class FunctionEvaluator {
                         for (Object arg : args) {
                             if (arg == null) {
                                 String rt = userFunc.getReturnType();
-                                if (rt != null && (rt.toUpperCase().startsWith("SETOF") || rt.toUpperCase().startsWith("TABLE"))) {
+                                if (rt != null && (rt.toUpperCase(java.util.Locale.ROOT).startsWith("SETOF") || rt.toUpperCase(java.util.Locale.ROOT).startsWith("TABLE"))) {
                                     return new java.util.ArrayList<>();
                                 }
                                 return null;
@@ -3815,7 +3815,7 @@ class FunctionEvaluator {
                     quotedPart = true;
                 }
             } else if (c == '.' && !inQuotes) {
-                out.append(quotedPart ? part.toString() : part.toString().trim().toLowerCase());
+                out.append(quotedPart ? part.toString() : part.toString().trim().toLowerCase(java.util.Locale.ROOT));
                 out.append('.');
                 part.setLength(0);
                 quotedPart = false;
@@ -3823,7 +3823,7 @@ class FunctionEvaluator {
                 part.append(c);
             }
         }
-        out.append(quotedPart ? part.toString() : part.toString().trim().toLowerCase());
+        out.append(quotedPart ? part.toString() : part.toString().trim().toLowerCase(java.util.Locale.ROOT));
         return out.toString();
     }
 
@@ -3950,7 +3950,7 @@ class FunctionEvaluator {
     /** The spelling PostgreSQL stores a type under, so that int, int4 and integer compare equal. */
     private static String canonicalTypeName(String type) {
         if (type == null) return null;
-        String t = type.toLowerCase().trim();
+        String t = type.toLowerCase(java.util.Locale.ROOT).trim();
         // An array of a type that carries a length is written character(5)[], and dropping
         // everything from the paren dropped the brackets with it: the call was then judged as
         // taking the element type, so array_to_string over an array of them had no signature.
@@ -4001,7 +4001,7 @@ class FunctionEvaluator {
                                        List<Expression> args, RowContext ctx) {
         if (name == null || args == null || args.isEmpty()) return;
         if (!BuiltinCallTypes.records(name)) return;
-        if (executor.database.getFunctions().containsKey(name.toLowerCase())) return;
+        if (executor.database.getFunctions().containsKey(name.toLowerCase(java.util.Locale.ROOT))) return;
         // A type name written as a call is a cast to that type, whatever else PostgreSQL happens
         // to declare under the same spelling: bytea('x') is 'x'::bytea and takes one argument of
         // whatever was written, so there is no overload to choose between.
@@ -4074,10 +4074,10 @@ class FunctionEvaluator {
      * — they live in pg_catalog, and they are still the built-in.
      */
     private static boolean userDeclaredFunction(AstExecutor executor, String name) {
-        for (PgFunction f : executor.database.getFunctionOverloads(name.toLowerCase())) {
+        for (PgFunction f : executor.database.getFunctionOverloads(name.toLowerCase(java.util.Locale.ROOT))) {
             if (!"pg_catalog".equals(f.getSchemaName())) return true;
         }
-        PgFunction single = executor.database.getFunctions().get(name.toLowerCase());
+        PgFunction single = executor.database.getFunctions().get(name.toLowerCase(java.util.Locale.ROOT));
         return single != null && !"pg_catalog".equals(single.getSchemaName());
     }
 
@@ -4903,7 +4903,7 @@ class FunctionEvaluator {
 
     private static String computeSoundex(String s) {
         if (s == null || s.isEmpty()) return "0000";
-        s = s.toUpperCase();
+        s = s.toUpperCase(java.util.Locale.ROOT);
         // Strip non-alpha
         StringBuilder alpha = new StringBuilder();
         for (char c : s.toCharArray()) {

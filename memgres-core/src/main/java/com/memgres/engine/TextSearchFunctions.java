@@ -195,7 +195,7 @@ class TextSearchFunctions {
     }
 
     private String resolveTsConfig(String rawName) {
-        String name = rawName == null ? "" : rawName.toLowerCase();
+        String name = rawName == null ? "" : rawName.toLowerCase(java.util.Locale.ROOT);
         // Strip any schema qualification: configurations live in one namespace here.
         int dot = name.lastIndexOf('.');
         if (dot >= 0) name = name.substring(dot + 1);
@@ -207,7 +207,7 @@ class TextSearchFunctions {
         for (int hops = 0; hops < 16; hops++) {
             Database.TsConfigDef def = defined.get(current);
             if (def == null) break;
-            String next = def.copyFrom != null ? def.copyFrom.toLowerCase() : null;
+            String next = def.copyFrom != null ? def.copyFrom.toLowerCase(java.util.Locale.ROOT) : null;
             if (next == null) {
                 // Declared with a PARSER rather than COPY: tokenizes without stemming.
                 return "simple";

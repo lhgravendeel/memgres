@@ -119,13 +119,13 @@ class DateTimeFunctions {
                 if (source instanceof Number && !(source instanceof Double)) {
                     throw new MemgresException("function date_part(unknown, integer) does not exist\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
                 }
-                return extractDatePart(fieldObj.toString().toLowerCase(), source, name.equals("extract"));
+                return extractDatePart(fieldObj.toString().toLowerCase(java.util.Locale.ROOT), source, name.equals("extract"));
             }
             case "date_trunc": {
                 Object fieldObj = executor.evalExpr(fn.args().get(0), ctx);
                 Object source = executor.evalExpr(fn.args().get(1), ctx);
                 if (fieldObj == null) return null;
-                String field = fieldObj.toString().toLowerCase();
+                String field = fieldObj.toString().toLowerCase(java.util.Locale.ROOT);
                 // A timestamptz truncates in the session's zone, or in the zone the third
                 // argument names: midnight is a local idea, not a UTC one.
                 java.time.ZoneId zone = TypeCoercion.sessionZone();
@@ -624,7 +624,7 @@ class DateTimeFunctions {
 
     private Object extractDatePart(String rawUnit, Object source, boolean extractForm) {
         if (source == null) return null;
-        String unit = rawUnit.toLowerCase();
+        String unit = rawUnit.toLowerCase(java.util.Locale.ROOT);
         if (source instanceof PgInterval) return intervalField(unit, (PgInterval) source, extractForm);
         if (source instanceof java.time.LocalTime) {
             return timeField(unit, (java.time.LocalTime) source, null, extractForm);
@@ -867,7 +867,7 @@ class DateTimeFunctions {
 
     private Object truncateDate(String rawUnit, Object source, java.time.ZoneId zone) {
         if (source == null) return null;
-        String unit = rawUnit.toLowerCase();
+        String unit = rawUnit.toLowerCase(java.util.Locale.ROOT);
         // PG has no date_trunc over timetz at all, and reaches the interval form for time
         if (asOffsetTime(source) != null) {
             throw new MemgresException("function date_trunc(unknown, time with time zone) does not exist"

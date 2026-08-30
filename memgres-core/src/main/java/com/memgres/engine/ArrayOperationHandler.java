@@ -273,7 +273,7 @@ class ArrayOperationHandler {
                     if (v != null && v instanceof String) {
                         String s = (String) v;
                         // Allow special float values (NaN, Infinity, -Infinity) alongside numeric literals
-                        String lower = s.trim().toLowerCase();
+                        String lower = s.trim().toLowerCase(java.util.Locale.ROOT);
                         if (!lower.equals("nan") && !lower.equals("infinity") && !lower.equals("-infinity")
                                 && !lower.equals("+infinity") && !lower.equals("inf") && !lower.equals("-inf")) {
                             try { new java.math.BigDecimal(s); } catch (NumberFormatException e) {

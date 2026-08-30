@@ -29,7 +29,7 @@ final class DdlSequenceValidator {
     /** Normalise an {@code AS} type name, rejecting anything a sequence cannot be. */
     static String normalizeType(String asType) {
         if (asType == null) return null;
-        String t = asType.toLowerCase().trim();
+        String t = asType.toLowerCase(java.util.Locale.ROOT).trim();
         if (t.equals("smallint") || t.equals("int2")) return "smallint";
         if (t.equals("int") || t.equals("integer") || t.equals("int4")) return "integer";
         if (t.equals("bigint") || t.equals("int8")) return "bigint";

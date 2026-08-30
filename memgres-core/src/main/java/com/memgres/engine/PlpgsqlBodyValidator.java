@@ -38,7 +38,7 @@ public final class PlpgsqlBodyValidator {
 
         boolean setReturning() {
             return returnType != null
-                    && (returnType.toUpperCase().startsWith("SETOF")
+                    && (returnType.toUpperCase(java.util.Locale.ROOT).startsWith("SETOF")
                         || returnType.equalsIgnoreCase("TABLE"));
         }
 
@@ -94,7 +94,7 @@ public final class PlpgsqlBodyValidator {
         Map<String, VarInfo> params = new LinkedHashMap<String, VarInfo>();
         if (paramNames != null) {
             for (String name : paramNames) {
-                if (name != null) params.put(name.toLowerCase(), new VarInfo(false, false, false));
+                if (name != null) params.put(name.toLowerCase(java.util.Locale.ROOT), new VarInfo(false, false, false));
             }
         }
         validator.scopes.push(params);
@@ -114,7 +114,7 @@ public final class PlpgsqlBodyValidator {
         if (block.label() != null) labels.push(new Label(block.label(), false));
         try {
             for (PlpgsqlStatement.VarDeclaration decl : block.declarations()) {
-                String key = decl.name().toLowerCase();
+                String key = decl.name().toLowerCase(java.util.Locale.ROOT);
                 if (frame.containsKey(key)) {
                     throw new MemgresException(
                             "duplicate declaration at or near \"" + decl.name() + "\"", "42601");
@@ -157,7 +157,7 @@ public final class PlpgsqlBodyValidator {
         if (typeName == null) return;
         String type = typeName.trim();
         if (type.isEmpty()) return;
-        String upper = type.toUpperCase();
+        String upper = type.toUpperCase(java.util.Locale.ROOT);
         if (upper.endsWith("%ROWTYPE")) {
             requireRelation(type.substring(0, type.length() - "%ROWTYPE".length()));
             return;
@@ -218,7 +218,7 @@ public final class PlpgsqlBodyValidator {
     }
 
     private VarInfo lookup(String name) {
-        String key = name.toLowerCase();
+        String key = name.toLowerCase(java.util.Locale.ROOT);
         for (Map<String, VarInfo> frame : scopes) {
             VarInfo info = frame.get(key);
             if (info != null) return info;
@@ -289,7 +289,7 @@ public final class PlpgsqlBodyValidator {
      */
     private void checkFetchIntoIsSingleRow(PlpgsqlStatement.FetchStmt stmt) {
         if (stmt.move() || stmt.intoVars() == null || stmt.intoVars().isEmpty()) return;
-        String direction = stmt.direction() == null ? "NEXT" : stmt.direction().toUpperCase();
+        String direction = stmt.direction() == null ? "NEXT" : stmt.direction().toUpperCase(java.util.Locale.ROOT);
         boolean counted = ("FORWARD".equals(direction) || "BACKWARD".equals(direction))
                 && stmt.countExpr() != null;
         if (counted) {
@@ -302,7 +302,7 @@ public final class PlpgsqlBodyValidator {
     private void validateCondition(String condition) {
         String name = condition.trim();
         if (name.equalsIgnoreCase("others")) return;
-        if (name.toLowerCase().startsWith("sqlstate ")) {
+        if (name.toLowerCase(java.util.Locale.ROOT).startsWith("sqlstate ")) {
             String code = name.substring("sqlstate ".length()).trim();
             if (code.startsWith("'") && code.endsWith("'") && code.length() >= 2) {
                 code = code.substring(1, code.length() - 1);
@@ -315,7 +315,7 @@ public final class PlpgsqlBodyValidator {
         }
         if (!PlpgsqlConditionNames.isKnown(name)) {
             throw new MemgresException(
-                    "unrecognized exception condition \"" + name.toLowerCase() + "\"", "42704");
+                    "unrecognized exception condition \"" + name.toLowerCase(java.util.Locale.ROOT) + "\"", "42704");
         }
     }
 
@@ -353,14 +353,14 @@ public final class PlpgsqlBodyValidator {
             }
             checkWritable(item.varName());
             String name = item.itemName().trim();
-            if (!STACKED_ITEMS.contains(name.toUpperCase())
-                    && !CURRENT_ITEMS.contains(name.toUpperCase())) {
+            if (!STACKED_ITEMS.contains(name.toUpperCase(java.util.Locale.ROOT))
+                    && !CURRENT_ITEMS.contains(name.toUpperCase(java.util.Locale.ROOT))) {
                 throw new MemgresException("unrecognized GET DIAGNOSTICS item at or near \""
                         + name + "\"", "42601");
             }
         }
         for (PlpgsqlStatement.DiagItem item : stmt.items()) {
-            String upper = item.itemName().trim().toUpperCase();
+            String upper = item.itemName().trim().toUpperCase(java.util.Locale.ROOT);
             if (stmt.stacked() && !STACKED_ITEMS.contains(upper)) {
                 throw new MemgresException("diagnostics item " + upper
                         + " is not allowed in GET STACKED DIAGNOSTICS", "42601");

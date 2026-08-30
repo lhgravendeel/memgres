@@ -116,7 +116,7 @@ public class PlpgsqlExecutor {
          * every read and write has to land on the variable it stands for.
          */
         String resolve(String name) {
-            String key = name.toLowerCase();
+            String key = name.toLowerCase(java.util.Locale.ROOT);
             for (int hops = 0; hops < 16; hops++) {
                 String target = null;
                 for (Scope s = this; s != null; s = s.parent) {
@@ -196,20 +196,20 @@ public class PlpgsqlExecutor {
         }
 
         boolean isOutputOnly(String name) {
-            String key = name.toLowerCase();
+            String key = name.toLowerCase(java.util.Locale.ROOT);
             if (outputOnlyVars.contains(key)) return true;
             return parent != null && parent.isOutputOnly(key);
         }
 
         void declare(String name, Object value) {
-            variables.put(name.toLowerCase(), value);
+            variables.put(name.toLowerCase(java.util.Locale.ROOT), value);
         }
 
         /** Record the type the variable was declared with, so assignments can be checked. */
         void declareTyped(String name, Object value, String typeName) {
-            String key = name.toLowerCase();
+            String key = name.toLowerCase(java.util.Locale.ROOT);
             variables.put(key, value);
-            if (typeName != null) declaredTypes.put(key, typeName.toLowerCase().trim());
+            if (typeName != null) declaredTypes.put(key, typeName.toLowerCase(java.util.Locale.ROOT).trim());
         }
 
         String declaredType(String name) {
@@ -224,7 +224,7 @@ public class PlpgsqlExecutor {
         }
 
         void declareOutputOnly(String name, Object value) {
-            String key = name.toLowerCase();
+            String key = name.toLowerCase(java.util.Locale.ROOT);
             variables.put(key, value);
             outputOnlyVars.add(key);
         }
@@ -360,13 +360,13 @@ public class PlpgsqlExecutor {
 
     private Object executeFunctionBody(PgFunction function, List<Object> args) {
         PlpgsqlStatement.Block block;
-        String lang = function.getLanguage() != null ? function.getLanguage().toLowerCase() : "plpgsql";
+        String lang = function.getLanguage() != null ? function.getLanguage().toLowerCase(java.util.Locale.ROOT) : "plpgsql";
 
         // Record parameter names for function-name-qualified references (funcname.param)
         java.util.Set<String> paramNames = new java.util.HashSet<>();
         for (int i = 0; i < function.getParams().size(); i++) {
             PgFunction.Param p = function.getParams().get(i);
-            paramNames.add(p.name() != null ? p.name().toLowerCase() : ("$" + (i + 1)));
+            paramNames.add(p.name() != null ? p.name().toLowerCase(java.util.Locale.ROOT) : ("$" + (i + 1)));
         }
         this.currentFunctionParams = paramNames;
 
@@ -389,7 +389,7 @@ public class PlpgsqlExecutor {
         for (int i = 0; i < params.size(); i++) {
             PgFunction.Param p = params.get(i);
             String pName = p.name() != null ? p.name() : ("$" + (i + 1));
-            String mode = p.mode() != null ? p.mode().toUpperCase() : "IN";
+            String mode = p.mode() != null ? p.mode().toUpperCase(java.util.Locale.ROOT) : "IN";
             Object val;
             if ("OUT".equals(mode)) {
                 val = null; // OUT params start as null
@@ -423,7 +423,7 @@ public class PlpgsqlExecutor {
             if (p.name() != null) {
                 // Every parameter answers to its position as well as its name, so
                 // ALIAS FOR $1 reaches the same storage that the name reaches
-                scope.aliases.put("$" + (i + 1), p.name().toLowerCase());
+                scope.aliases.put("$" + (i + 1), p.name().toLowerCase(java.util.Locale.ROOT));
             }
         }
         scope.declare("found", false);
@@ -435,7 +435,7 @@ public class PlpgsqlExecutor {
         // LANGUAGE SQL function of the same signature really does yield NULL, so this is the
         // PL/pgSQL path only.)
         boolean voidReturning = "void".equalsIgnoreCase(returnType);
-        boolean isSetof = returnType != null && returnType.toUpperCase().startsWith("SETOF");
+        boolean isSetof = returnType != null && returnType.toUpperCase(java.util.Locale.ROOT).startsWith("SETOF");
         boolean isTable = returnType != null && returnType.equalsIgnoreCase("TABLE");
 
         // Mark OUT params of RETURNS TABLE functions as output-only to prevent
@@ -461,7 +461,7 @@ public class PlpgsqlExecutor {
             if (!outParams.isEmpty()) {
                 List<String> outNames = new ArrayList<>();
                 for (PgFunction.Param p : outParams) {
-                    outNames.add(p.name() != null ? p.name().toLowerCase() : ("$" + (params.indexOf(p) + 1)));
+                    outNames.add(p.name() != null ? p.name().toLowerCase(java.util.Locale.ROOT) : ("$" + (params.indexOf(p) + 1)));
                 }
                 scope.declare("__return_next_out_params__", outNames);
             }
@@ -625,7 +625,7 @@ public class PlpgsqlExecutor {
      */
     private static String valueClass(String typeName) {
         if (typeName == null) return null;
-        String t = typeName.trim().toLowerCase();
+        String t = typeName.trim().toLowerCase(java.util.Locale.ROOT);
         int paren = t.indexOf('(');
         if (paren > 0) t = t.substring(0, paren).trim();
         if (t.endsWith("[]")) return null;
@@ -714,7 +714,7 @@ public class PlpgsqlExecutor {
         int argIdx = 0;
         for (int i = 0; i < params.size(); i++) {
             PgFunction.Param p = params.get(i);
-            String mode = p.mode() != null ? p.mode().toUpperCase() : "IN";
+            String mode = p.mode() != null ? p.mode().toUpperCase(java.util.Locale.ROOT) : "IN";
             // Skip pure OUT params (e.g., RETURNS TABLE columns) — they are output column
             // definitions, not input variables. Substituting them would corrupt the SQL body.
             if ("OUT".equalsIgnoreCase(mode)) continue;
@@ -785,7 +785,7 @@ public class PlpgsqlExecutor {
         String returnType = function.getReturnType();
         // RETURNS void discards whatever the final statement produced
         if ("void".equalsIgnoreCase(returnType)) return null;
-        boolean isSetof = returnType != null && returnType.toUpperCase().startsWith("SETOF");
+        boolean isSetof = returnType != null && returnType.toUpperCase(java.util.Locale.ROOT).startsWith("SETOF");
         boolean isTable = returnType != null && returnType.equalsIgnoreCase("TABLE");
         if (isSetof || isTable) {
             // Return all rows as a List (each row as Object[] or single value)
@@ -842,11 +842,11 @@ public class PlpgsqlExecutor {
         Map<String, Object> oldMap = new LinkedHashMap<>();
         if (newRow != null) {
             for (int i = 0; i < table.getColumns().size(); i++)
-                newMap.put(table.getColumns().get(i).getName().toLowerCase(), newRow[i]);
+                newMap.put(table.getColumns().get(i).getName().toLowerCase(java.util.Locale.ROOT), newRow[i]);
         }
         if (oldRow != null) {
             for (int i = 0; i < table.getColumns().size(); i++)
-                oldMap.put(table.getColumns().get(i).getName().toLowerCase(), oldRow[i]);
+                oldMap.put(table.getColumns().get(i).getName().toLowerCase(java.util.Locale.ROOT), oldRow[i]);
         }
         // A row-level DELETE trigger has no NEW row. PostgreSQL leaves NEW as the null record, so
         // reading a column of it answers NULL -- which is what a body shared by an INSERT and a
@@ -1016,14 +1016,14 @@ public class PlpgsqlExecutor {
         }
         Map<String, Object> asRecord = new LinkedHashMap<>();
         for (int i = 0; i < table.getColumns().size() && i < values.size(); i++) {
-            asRecord.put(table.getColumns().get(i).getName().toLowerCase(), values.get(i));
+            asRecord.put(table.getColumns().get(i).getName().toLowerCase(java.util.Locale.ROOT), values.get(i));
         }
         return asRecord;
     }
 
     private void copyMapToRow(Map<String, Object> map, Object[] row, Table table) {
         for (int i = 0; i < table.getColumns().size(); i++) {
-            String colName = table.getColumns().get(i).getName().toLowerCase();
+            String colName = table.getColumns().get(i).getName().toLowerCase(java.util.Locale.ROOT);
             if (map.containsKey(colName)) {
                 row[i] = map.get(colName);
             }
@@ -1055,7 +1055,7 @@ public class PlpgsqlExecutor {
     private void executeBlockBody(PlpgsqlStatement.Block block, Scope scope) {
         for (PlpgsqlStatement.VarDeclaration decl : block.declarations()) {
             if (decl.aliasFor() != null) {
-                scope.aliases.put(decl.name().toLowerCase(), decl.aliasFor().toLowerCase());
+                scope.aliases.put(decl.name().toLowerCase(java.util.Locale.ROOT), decl.aliasFor().toLowerCase(java.util.Locale.ROOT));
                 continue;
             }
             if (decl.isCursor() && decl.cursorQuery() != null && !decl.cursorQuery().isEmpty()) {
@@ -1077,7 +1077,7 @@ public class PlpgsqlExecutor {
                 throw new MemgresException("null value cannot be assigned to variable \""
                         + decl.name() + "\" declared NOT NULL", "22004");
             }
-            String key = decl.name().toLowerCase();
+            String key = decl.name().toLowerCase(java.util.Locale.ROOT);
             if (decl.notNull()) scope.notNullVars.put(key, decl.name());
             if (coerceType != null && database.isDomain(coerceType)) {
                 scope.domainVars.put(key, coerceType);
@@ -1207,7 +1207,7 @@ public class PlpgsqlExecutor {
         String spec = elementTypeOf(typeSpec);
         int paren = spec.indexOf('(');
         if (paren < 0 || !spec.endsWith(")")) return null;
-        String base = spec.substring(0, paren).trim().toLowerCase();
+        String base = spec.substring(0, paren).trim().toLowerCase(java.util.Locale.ROOT);
         if (!TYPMOD_BASES.contains(base)) return null;
         return spec.substring(paren + 1, spec.length() - 1).trim();
     }
@@ -1231,7 +1231,7 @@ public class PlpgsqlExecutor {
      */
     static boolean isTemporalTypmodType(String typeSpec) {
         if (typeSpec == null) return false;
-        String spec = typeSpec.trim().toLowerCase();
+        String spec = typeSpec.trim().toLowerCase(java.util.Locale.ROOT);
         int paren = spec.indexOf('(');
         if (paren < 0 || !spec.endsWith(")")) return false;
         String base = spec.substring(0, paren).trim();
@@ -1261,7 +1261,7 @@ public class PlpgsqlExecutor {
         }
         String spec = typeSpec.trim();
         int paren = spec.indexOf('(');
-        String base = spec.substring(0, paren).trim().toLowerCase();
+        String base = spec.substring(0, paren).trim().toLowerCase(java.util.Locale.ROOT);
         String[] args = typmod.split(",");
         int first;
         try {
@@ -1313,7 +1313,7 @@ public class PlpgsqlExecutor {
         if (typeName == null) return null;
         String type = typeName.trim();
         if (type.isEmpty()) return null;
-        String upper = type.toUpperCase();
+        String upper = type.toUpperCase(java.util.Locale.ROOT);
         if (upper.endsWith("%ROWTYPE")) return null;
         if (upper.endsWith("%TYPE")) {
             String resolved = astExecutor.resolveTypeReference(
@@ -1378,8 +1378,12 @@ public class PlpgsqlExecutor {
     private String functionLineFrame(PlpgsqlStatement stmt) {
         String at = statementKindOf(stmt);
         if (at == null) return null;
-        return "PL/pgSQL function " + (currentFunctionName == null ? "" : currentFunctionName)
-                + "() line " + stmt.line() + " at " + at;
+        // A DO block is not a function and has no name of its own, so PostgreSQL names it
+        // inline_code_block. Written as a function with an empty name, the frame read
+        // "PL/pgSQL function () line 1", which names nothing a reader could look up.
+        String where = currentFunctionName == null || currentFunctionName.isEmpty()
+                ? "inline_code_block" : currentFunctionName + "()";
+        return "PL/pgSQL function " + where + " line " + stmt.line() + " at " + at;
     }
 
     /**
@@ -2187,7 +2191,7 @@ public class PlpgsqlExecutor {
     /** A declared type reduced to the name two types are the same when they share. */
     private static String canonicalAttributeType(String typeName) {
         if (typeName == null) return null;
-        String t = typeName.trim().toLowerCase();
+        String t = typeName.trim().toLowerCase(java.util.Locale.ROOT);
         int paren = t.indexOf('(');
         if (paren > 0) t = t.substring(0, paren).trim();
         if (t.isEmpty()) return null;
@@ -2224,7 +2228,7 @@ public class PlpgsqlExecutor {
         // %TYPE names the column rather than its type, so resolve it before reading the base
         String declared = coercionType(scope.declaredType(name));
         if (declared == null) return value;
-        String base = declared.trim().toLowerCase();
+        String base = declared.trim().toLowerCase(java.util.Locale.ROOT);
         int paren = base.indexOf('(');
         if (paren < 0) return value;
         base = base.substring(0, paren).trim();
@@ -2239,7 +2243,7 @@ public class PlpgsqlExecutor {
 
     /** Types whose input keeps no trailing blanks of its own, so a bpchar loses its padding. */
     private static boolean isUnpaddedTextType(String type) {
-        String t = type.trim().toLowerCase();
+        String t = type.trim().toLowerCase(java.util.Locale.ROOT);
         int paren = t.indexOf('(');
         if (paren > 0) t = t.substring(0, paren).trim();
         return t.equals("text") || t.equals("varchar") || t.equals("character varying");
@@ -2413,8 +2417,8 @@ public class PlpgsqlExecutor {
             passed = (Boolean) condVal;
         } else if (condVal != null) {
             String text = String.valueOf(condVal).trim();
-            if (condVal instanceof String && BOOLEAN_TEXT.containsKey(text.toLowerCase())) {
-                passed = BOOLEAN_TEXT.get(text.toLowerCase());
+            if (condVal instanceof String && BOOLEAN_TEXT.containsKey(text.toLowerCase(java.util.Locale.ROOT))) {
+                passed = BOOLEAN_TEXT.get(text.toLowerCase(java.util.Locale.ROOT));
             } else {
                 throw new MemgresException(
                         "invalid input syntax for type boolean: \"" + text + "\"", "22P02");
@@ -2477,7 +2481,7 @@ public class PlpgsqlExecutor {
             // A named condition supplies both the SQLSTATE and, when nothing else does, the
             // message — which PG reports as the condition's own name, underscores and all
             if (errcode == null) errcode = stmt.condition();
-            if (message == null) message = stmt.condition().toLowerCase();
+            if (message == null) message = stmt.condition().toLowerCase(java.util.Locale.ROOT);
         }
         // RAISE SQLSTATE '22012' with nothing else to say reports the SQLSTATE as its message,
         // the same way a condition name reports itself
@@ -2517,9 +2521,9 @@ public class PlpgsqlExecutor {
             }
             default: {
                 // Named condition: RAISE division_by_zero, RAISE unique_violation, etc.
-                String condState = conditionToSqlState(stmt.level().toLowerCase());
+                String condState = conditionToSqlState(stmt.level().toLowerCase(java.util.Locale.ROOT));
                 if (!condState.equals("P0001") || stmt.level().contains("_")) {
-                    String msg = message != null ? message : stmt.level().toLowerCase();
+                    String msg = message != null ? message : stmt.level().toLowerCase(java.util.Locale.ROOT);
                     if (errcode != null) condState = conditionToSqlState(errcode);
                     MemgresException ex = new MemgresException(msg, condState);
                     if (detail != null) ex.setDetail(detail);
@@ -2822,7 +2826,7 @@ public class PlpgsqlExecutor {
         String sql = substituteVariables(originalSql, scope);
 
         // For CALL statements, detect OUT params and bind results back to PL/pgSQL variables
-        if (originalSql.toUpperCase().startsWith("CALL ")) {
+        if (originalSql.toUpperCase(java.util.Locale.ROOT).startsWith("CALL ")) {
             executeCallInPlpgsql(originalSql, sql, scope);
             return;
         }
@@ -2886,13 +2890,13 @@ public class PlpgsqlExecutor {
                 List<String> argNames = splitArguments(argStr);
 
                 // Look up the procedure to find which params are OUT/INOUT
-                String procName = originalSql.substring(5, parenStart).trim().toLowerCase();
+                String procName = originalSql.substring(5, parenStart).trim().toLowerCase(java.util.Locale.ROOT);
                 PgFunction proc = database.getFunction(procName);
                 if (proc != null) {
                     int outIdx = 0;
                     for (int i = 0; i < proc.getParams().size(); i++) {
                         PgFunction.Param p = proc.getParams().get(i);
-                        String mode = p.mode() != null ? p.mode().toUpperCase() : "IN";
+                        String mode = p.mode() != null ? p.mode().toUpperCase(java.util.Locale.ROOT) : "IN";
                         if ("OUT".equals(mode) || "INOUT".equals(mode)) {
                             if (i < argNames.size() && outIdx < row.length) {
                                 String varName = argNames.get(i).trim();
@@ -3008,7 +3012,7 @@ public class PlpgsqlExecutor {
             return record;
         }
         for (int i = 0; i < result.getColumns().size(); i++) {
-            String name = result.getColumns().get(i).getName().toLowerCase();
+            String name = result.getColumns().get(i).getName().toLowerCase(java.util.Locale.ROOT);
             // Two columns of one name are two fields of the row: the first is the one a field
             // reference reaches, and the rest still belong to the row's own text
             if (record.containsKey(name)) name = name + " " + i;
@@ -3062,7 +3066,7 @@ public class PlpgsqlExecutor {
         if (varName != null && scope.has(varName) && scope.get(varName) instanceof Map) return true;
         String declared = scope.declaredType(varName);
         if (declared == null) return false;
-        String type = declared.trim().toLowerCase();
+        String type = declared.trim().toLowerCase(java.util.Locale.ROOT);
         if (type.equals("record") || type.endsWith("%rowtype")) return true;
         return rowTypeFields(type) != null;
     }
@@ -3075,7 +3079,7 @@ public class PlpgsqlExecutor {
         if (declaredType == null) return null;
         String type = declaredType.trim();
         if (type.isEmpty()) return null;
-        if (type.toUpperCase().endsWith("%ROWTYPE")) {
+        if (type.toUpperCase(java.util.Locale.ROOT).endsWith("%ROWTYPE")) {
             type = type.substring(0, type.length() - "%ROWTYPE".length()).trim();
         }
         int dot = type.lastIndexOf('.');
@@ -3085,14 +3089,14 @@ public class PlpgsqlExecutor {
         if (fields != null) {
             List<String> names = new ArrayList<String>();
             for (com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField f : fields) {
-                names.add(f.name().toLowerCase());
+                names.add(f.name().toLowerCase(java.util.Locale.ROOT));
             }
             return names;
         }
         Table table = resolveTableForScan(dot >= 0 ? type.substring(0, dot) : null, bare);
         if (table == null) return null;
         List<String> names = new ArrayList<String>();
-        for (Column c : table.getColumns()) names.add(c.getName().toLowerCase());
+        for (Column c : table.getColumns()) names.add(c.getName().toLowerCase(java.util.Locale.ROOT));
         return names;
     }
 
@@ -3122,7 +3126,7 @@ public class PlpgsqlExecutor {
                     return;
                 }
             } else if (currentFunctionName != null && qualifier.equalsIgnoreCase(currentFunctionName)
-                    && currentFunctionParams != null && currentFunctionParams.contains(field.toLowerCase())
+                    && currentFunctionParams != null && currentFunctionParams.contains(field.toLowerCase(java.util.Locale.ROOT))
                     && scope.has(field)) {
                 // Function-name-qualified assignment reaches parameters only (PG: the block
                 // labeled with the function name contains just the parameters)
@@ -3235,7 +3239,7 @@ public class PlpgsqlExecutor {
 
         if (step.isField()) {
             Map<String, Object> map = toMutableRecord(container, containerType);
-            String field = step.field.toLowerCase();
+            String field = step.field.toLowerCase(java.util.Locale.ROOT);
             Object child = last ? value
                     : applyTargetSteps(map.get(field), fieldType(containerType, field),
                             steps, idx + 1, value, scope);
@@ -3285,7 +3289,7 @@ public class PlpgsqlExecutor {
         for (Column c : table.getColumns()) {
             if (c.getName().equalsIgnoreCase(field)) {
                 return c.getCompositeTypeName() != null ? c.getCompositeTypeName()
-                        : c.getType().name().toLowerCase();
+                        : c.getType().name().toLowerCase(java.util.Locale.ROOT);
             }
         }
         return null;
@@ -3331,7 +3335,7 @@ public class PlpgsqlExecutor {
         if (values == null) values = new ArrayList<Object>();
         for (int i = 0; i < Math.max(values.size(), fields != null ? fields.size() : 0); i++) {
             String name = fields != null && i < fields.size()
-                    ? fields.get(i).name().toLowerCase() : ("f" + (i + 1));
+                    ? fields.get(i).name().toLowerCase(java.util.Locale.ROOT) : ("f" + (i + 1));
             map.put(name, i < values.size() ? values.get(i) : null);
         }
         return map;
@@ -3392,10 +3396,10 @@ public class PlpgsqlExecutor {
      */
     private void checkFieldPath(Scope scope, String qualifier, String fieldPath, Object current) {
         String declared = scope.declaredType(qualifier);
-        String type = declared == null ? null : declared.trim().toLowerCase();
+        String type = declared == null ? null : declared.trim().toLowerCase(java.util.Locale.ROOT);
         List<String> fields = rowTypeFields(type);
         boolean record = "record".equals(type);
-        String upper = qualifier.toUpperCase();
+        String upper = qualifier.toUpperCase(java.util.Locale.ROOT);
         boolean triggerRow = ("NEW".equals(upper) || "OLD".equals(upper)) && current instanceof Map
                 && !((Map<?, ?>) current).isEmpty();
         if (fields == null && !record && !triggerRow) return;
@@ -3410,10 +3414,10 @@ public class PlpgsqlExecutor {
         }
 
         int dot = fieldPath.indexOf('.');
-        String head = (dot > 0 ? fieldPath.substring(0, dot) : fieldPath).trim().toLowerCase();
+        String head = (dot > 0 ? fieldPath.substring(0, dot) : fieldPath).trim().toLowerCase(java.util.Locale.ROOT);
         if (!containsIgnoreCase(fields, head)) {
             // NEW and OLD are bound in upper case; PG names them the way the body wrote them
-            throw new MemgresException("record \"" + qualifier.toLowerCase()
+            throw new MemgresException("record \"" + qualifier.toLowerCase(java.util.Locale.ROOT)
                     + "\" has no field \"" + head + "\"", "42703");
         }
         // Reaching deeper only makes sense when the field's own type names its fields too
@@ -3421,7 +3425,7 @@ public class PlpgsqlExecutor {
         while (dot > 0) {
             String rest = fieldPath.substring(dot + 1);
             dot = rest.indexOf('.');
-            String next = (dot > 0 ? rest.substring(0, dot) : rest).trim().toLowerCase();
+            String next = (dot > 0 ? rest.substring(0, dot) : rest).trim().toLowerCase(java.util.Locale.ROOT);
             List<String> childFields = rowTypeFields(childType);
             if (childFields == null) return;
             if (!containsIgnoreCase(childFields, next)) {
@@ -3438,7 +3442,7 @@ public class PlpgsqlExecutor {
     private String rowTypeName(String declaredType) {
         if (declaredType == null) return null;
         String type = declaredType.trim();
-        if (type.toUpperCase().endsWith("%ROWTYPE")) {
+        if (type.toUpperCase(java.util.Locale.ROOT).endsWith("%ROWTYPE")) {
             type = type.substring(0, type.length() - "%ROWTYPE".length()).trim();
         }
         return type;
@@ -3462,7 +3466,7 @@ public class PlpgsqlExecutor {
         String remaining = fieldPath;
         int dot;
         while ((dot = remaining.indexOf('.')) > 0) {
-            String head = remaining.substring(0, dot).toLowerCase();
+            String head = remaining.substring(0, dot).toLowerCase(java.util.Locale.ROOT);
             remaining = remaining.substring(dot + 1);
             Object child = current.get(head);
             if (!(child instanceof Map)) {
@@ -3474,7 +3478,7 @@ public class PlpgsqlExecutor {
             Map<String, Object> next = (Map<String, Object>) child;
             current = next;
         }
-        current.put(remaining.toLowerCase(), value);
+        current.put(remaining.toLowerCase(java.util.Locale.ROOT), value);
     }
 
     // ---- GET DIAGNOSTICS ----
@@ -3488,7 +3492,7 @@ public class PlpgsqlExecutor {
         }
         for (PlpgsqlStatement.DiagItem item : stmt.items()) {
             Object value;
-            String itemName = item.itemName().toUpperCase();
+            String itemName = item.itemName().toUpperCase(java.util.Locale.ROOT);
             if (stmt.stacked()) {
                 // GET STACKED DIAGNOSTICS — retrieve exception info from handler scope
                 switch (itemName) {
@@ -3907,9 +3911,9 @@ public class PlpgsqlExecutor {
                 if (qualObj instanceof Map) {
                     @SuppressWarnings("unchecked")
                     Map<String, Object> map = (Map<String, Object>) qualObj;
-                    String lowerField = field.toLowerCase();
+                    String lowerField = field.toLowerCase(java.util.Locale.ROOT);
                     if (!map.containsKey(lowerField)) {
-                        String upperQ = qualifier.toUpperCase();
+                        String upperQ = qualifier.toUpperCase(java.util.Locale.ROOT);
                         boolean triggerRow = upperQ.equals("NEW") || upperQ.equals("OLD");
                         // In PG, OLD is NULL during INSERT and NEW is NULL during DELETE.
                         // An empty map means the record is effectively NULL — return null.
@@ -3918,7 +3922,7 @@ public class PlpgsqlExecutor {
                         if (triggerRow || "record".equalsIgnoreCase(declared)
                                 || rowTypeFields(declared) != null) {
                             throw new MemgresException(
-                                    "record \"" + qualifier.toLowerCase() + "\" has no field \"" + lowerField + "\"",
+                                    "record \"" + qualifier.toLowerCase(java.util.Locale.ROOT) + "\" has no field \"" + lowerField + "\"",
                                     "42703");
                         }
                     }
@@ -4051,7 +4055,7 @@ public class PlpgsqlExecutor {
                         && tokens.get(i + 1).type() == TokenType.DOT
                         && (tokens.get(i + 2).type() == TokenType.IDENTIFIER
                             || tokens.get(i + 2).type() == TokenType.KEYWORD)
-                        && !scan.tableRefNames.contains(t.value().toLowerCase())) {
+                        && !scan.tableRefNames.contains(t.value().toLowerCase(java.util.Locale.ROOT))) {
                     Scope labeled = scope.labeled(t.value());
                     if (labeled != null && labeled.has(tokens.get(i + 2).value())) {
                         appendValue(sb, labeled.get(tokens.get(i + 2).value()));
@@ -4074,8 +4078,8 @@ public class PlpgsqlExecutor {
                         && tokens.get(i + 1).type() == TokenType.DOT
                         && (tokens.get(i + 2).type() == TokenType.IDENTIFIER
                             || tokens.get(i + 2).type() == TokenType.KEYWORD)
-                        && !scan.tableRefNames.contains(t.value().toLowerCase())) {
-                    String qualField = tokens.get(i + 2).value().toLowerCase();
+                        && !scan.tableRefNames.contains(t.value().toLowerCase(java.util.Locale.ROOT))) {
+                    String qualField = tokens.get(i + 2).value().toLowerCase(java.util.Locale.ROOT);
                     if (currentFunctionParams != null && currentFunctionParams.contains(qualField)
                             && scope.has(qualField)) {
                         appendValue(sb, scope.get(qualField));
@@ -4083,7 +4087,7 @@ public class PlpgsqlExecutor {
                         continue;
                     }
                     throw new MemgresException(
-                            "missing FROM-clause entry for table \"" + t.value().toLowerCase() + "\"",
+                            "missing FROM-clause entry for table \"" + t.value().toLowerCase(java.util.Locale.ROOT) + "\"",
                             "42P01");
                 }
 
@@ -4093,7 +4097,7 @@ public class PlpgsqlExecutor {
                         && scope.has(t.value())
                         && i + 2 < tokens.size()
                         && tokens.get(i + 1).type() == TokenType.DOT) {
-                    Object qualObj = scope.get(t.value().toLowerCase());
+                    Object qualObj = scope.get(t.value().toLowerCase(java.util.Locale.ROOT));
                     // A variable whose declaration names its fields is read the same way whether
                     // or not a row has been stored in it yet, and a field it has not got is an
                     // error rather than a name for SQL to resolve some other way.
@@ -4101,9 +4105,9 @@ public class PlpgsqlExecutor {
                     if (known != null && !(qualObj instanceof Map)
                             && (tokens.get(i + 2).type() == TokenType.IDENTIFIER
                                 || tokens.get(i + 2).type() == TokenType.KEYWORD)) {
-                        String field = tokens.get(i + 2).value().toLowerCase();
+                        String field = tokens.get(i + 2).value().toLowerCase(java.util.Locale.ROOT);
                         if (!containsIgnoreCase(known, field)) {
-                            throw new MemgresException("record \"" + t.value().toLowerCase()
+                            throw new MemgresException("record \"" + t.value().toLowerCase(java.util.Locale.ROOT)
                                     + "\" has no field \"" + field + "\"", "42703");
                         }
                         appendValue(sb, null);
@@ -4113,9 +4117,9 @@ public class PlpgsqlExecutor {
                     if (qualObj instanceof Map) {
                         @SuppressWarnings("unchecked")
                         Map<String, Object> map = (Map<String, Object>) qualObj;
-                        String field = tokens.get(i + 2).value().toLowerCase();
+                        String field = tokens.get(i + 2).value().toLowerCase(java.util.Locale.ROOT);
                         if (!map.containsKey(field)) {
-                            String qualifier = t.value().toUpperCase();
+                            String qualifier = t.value().toUpperCase(java.util.Locale.ROOT);
                             boolean triggerRow = qualifier.equals("NEW") || qualifier.equals("OLD");
                             if (triggerRow && map.isEmpty()) {
                                 appendValue(sb, null);
@@ -4126,7 +4130,7 @@ public class PlpgsqlExecutor {
                             if (triggerRow || known != null
                                     || "record".equalsIgnoreCase(scope.declaredType(t.value()))) {
                                 throw new MemgresException(
-                                        "record \"" + t.value().toLowerCase() + "\" has no field \"" + field + "\"",
+                                        "record \"" + t.value().toLowerCase(java.util.Locale.ROOT) + "\" has no field \"" + field + "\"",
                                         "42703");
                             }
                         }
@@ -4140,7 +4144,7 @@ public class PlpgsqlExecutor {
                                 && tokens.get(i + consumed + 2).type() == TokenType.DOT) {
                             @SuppressWarnings("unchecked")
                             Map<String, Object> nested = (Map<String, Object>) val;
-                            String nestedField = tokens.get(i + consumed + 3).value().toLowerCase();
+                            String nestedField = tokens.get(i + consumed + 3).value().toLowerCase(java.util.Locale.ROOT);
                             if (!nested.containsKey(nestedField)) break;
                             // Drop the opening paren already written for this group.
                             int lastParen = sb.length() - 1;
@@ -4166,7 +4170,7 @@ public class PlpgsqlExecutor {
                             && i + 3 < tokens.size()) {
                         @SuppressWarnings("unchecked")
                         Map<String, Object> map = (Map<String, Object>) val;
-                        String field = tokens.get(i + 3).value().toLowerCase();
+                        String field = tokens.get(i + 3).value().toLowerCase(java.util.Locale.ROOT);
                         // Remove the opening '(' we already appended to sb
                         int lastParen = sb.length() - 1;
                         while (lastParen >= 0 && sb.charAt(lastParen) == ' ') lastParen--;
@@ -4210,7 +4214,7 @@ public class PlpgsqlExecutor {
                         // referenced by this statement is ambiguous. PL/pgSQL (with the PG
                         // default plpgsql.variable_conflict = error) raises 42702; SQL-language
                         // functions resolve it in favor of the column.
-                        String lowerName = t.value().toLowerCase();
+                        String lowerName = t.value().toLowerCase(java.util.Locale.ROOT);
                         // A variable conflicts with a column only when the identifier appears at the
                         // same paren depth as (or deeper than) the FROM/JOIN that introduced the column.
                         // This avoids false positives when a subquery references a table whose column
@@ -4323,7 +4327,7 @@ public class PlpgsqlExecutor {
         String firstWord = null;
         for (Token t : tokens) {
             if (t.type() == TokenType.KEYWORD || t.type() == TokenType.IDENTIFIER) {
-                firstWord = t.value().toUpperCase();
+                firstWord = t.value().toUpperCase(java.util.Locale.ROOT);
                 break;
             }
             if (t.type() != TokenType.LEFT_PAREN) break;
@@ -4351,7 +4355,7 @@ public class PlpgsqlExecutor {
                     TokenType kt = tokens.get(k).type();
                     if (kt == TokenType.LEFT_PAREN) continue;
                     if (kt == TokenType.KEYWORD || kt == TokenType.IDENTIFIER) {
-                        String kw = tokens.get(k).value().toUpperCase();
+                        String kw = tokens.get(k).value().toUpperCase(java.util.Locale.ROOT);
                         isQuery = kw.equals("SELECT") || kw.equals("WITH") || kw.equals("VALUES")
                                 || kw.equals("INSERT") || kw.equals("UPDATE") || kw.equals("DELETE");
                     }
@@ -4368,7 +4372,7 @@ public class PlpgsqlExecutor {
             }
             boolean isWord = tt == TokenType.KEYWORD || tt == TokenType.IDENTIFIER;
             if (!isWord) continue;
-            String w = t.value().toUpperCase();
+            String w = t.value().toUpperCase(java.util.Locale.ROOT);
             boolean inQueryContext = queryCtx.isEmpty() || Boolean.TRUE.equals(queryCtx.peek());
 
             if (inSetList && depth == setDepth
@@ -4461,12 +4465,12 @@ public class PlpgsqlExecutor {
             for (int k = i; k <= end; k++) {
                 scan.protectedTokens.add(k);
             }
-            if (schemaName != null) scan.tableRefNames.add(schemaName.toLowerCase());
-            scan.tableRefNames.add(tableName.toLowerCase());
+            if (schemaName != null) scan.tableRefNames.add(schemaName.toLowerCase(java.util.Locale.ROOT));
+            scan.tableRefNames.add(tableName.toLowerCase(java.util.Locale.ROOT));
             Table tbl = resolveTableForScan(schemaName, tableName);
             if (tbl != null) {
                 for (Column c : tbl.getColumns()) {
-                    cols.add(c.getName().toLowerCase());
+                    cols.add(c.getName().toLowerCase(java.util.Locale.ROOT));
                 }
             }
             i = end + 1;
@@ -4477,12 +4481,12 @@ public class PlpgsqlExecutor {
                 if (i < tokens.size() && (tokens.get(i).type() == TokenType.IDENTIFIER
                         || tokens.get(i).type() == TokenType.QUOTED_IDENTIFIER)) {
                     scan.protectedTokens.add(i);
-                    scan.tableRefNames.add(tokens.get(i).value().toLowerCase());
+                    scan.tableRefNames.add(tokens.get(i).value().toLowerCase(java.util.Locale.ROOT));
                     i++;
                 }
             } else if (i < tokens.size() && tokens.get(i).type() == TokenType.IDENTIFIER) {
                 scan.protectedTokens.add(i);
-                scan.tableRefNames.add(tokens.get(i).value().toLowerCase());
+                scan.tableRefNames.add(tokens.get(i).value().toLowerCase(java.util.Locale.ROOT));
                 i++;
             }
             if (allowList && i < tokens.size() && tokens.get(i).type() == TokenType.COMMA) {
@@ -4495,9 +4499,9 @@ public class PlpgsqlExecutor {
 
     private Table resolveTableForScan(String schemaName, String tableName) {
         try {
-            String name = tableName.toLowerCase();
+            String name = tableName.toLowerCase(java.util.Locale.ROOT);
             if (schemaName != null) {
-                Schema schema = database.getSchema(schemaName.toLowerCase());
+                Schema schema = database.getSchema(schemaName.toLowerCase(java.util.Locale.ROOT));
                 return schema != null ? schema.getTable(name) : null;
             }
             return database.getTable(name);
@@ -4518,7 +4522,7 @@ public class PlpgsqlExecutor {
      */
     private boolean isSubstitutableVariable(String name, Scope scope, boolean fieldAccess) {
         // Don't substitute certain SQL keywords even if they're in scope
-        String upper = name.toUpperCase();
+        String upper = name.toUpperCase(java.util.Locale.ROOT);
         if (upper.equals("NEW") || upper.equals("OLD")) return !fieldAccess && scope.has(name);
         if (upper.equals("FOUND")) return true;
         return scope.has(name);
@@ -4680,7 +4684,7 @@ public class PlpgsqlExecutor {
 
     private Object coerceParamValue(Object val, String typeName) {
         if (val == null || typeName == null) return val;
-        String type = typeName.toLowerCase().trim();
+        String type = typeName.toLowerCase(java.util.Locale.ROOT).trim();
         // Convert PgRow to a Map when the parameter type is a composite type
         if (val instanceof AstExecutor.PgRow) {
             List<com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField> fields = database.getRowType(type);
@@ -4688,7 +4692,7 @@ public class PlpgsqlExecutor {
                 AstExecutor.PgRow row = (AstExecutor.PgRow) val;
                 Map<String, Object> record = new LinkedHashMap<>();
                 for (int i = 0; i < fields.size(); i++) {
-                    record.put(fields.get(i).name().toLowerCase(),
+                    record.put(fields.get(i).name().toLowerCase(java.util.Locale.ROOT),
                             i < row.values().size() ? row.values().get(i) : null);
                 }
                 return record;
@@ -4733,7 +4737,7 @@ public class PlpgsqlExecutor {
 
     private boolean matchesCondition(List<String> conditions, String sqlState) {
         for (String cond : conditions) {
-            String condLower = cond.toLowerCase().trim();
+            String condLower = cond.toLowerCase(java.util.Locale.ROOT).trim();
             if (condLower.equals("others")) return !"P0004".equals(sqlState);
             if (condLower.startsWith("sqlstate ")) {
                 if (sqlState.equalsIgnoreCase(condLower.substring(9).trim().replace("'", ""))) return true;
@@ -4767,9 +4771,9 @@ public class PlpgsqlExecutor {
         String written = condition.replace("'", "").trim();
         if (!isSqlStateLiteral(written) && !PlpgsqlConditionNames.isKnown(written)) {
             throw new MemgresException(
-                    "unrecognized exception condition \"" + written.toLowerCase() + "\"", "42704");
+                    "unrecognized exception condition \"" + written.toLowerCase(java.util.Locale.ROOT) + "\"", "42704");
         }
-        switch (written.toLowerCase()) {
+        switch (written.toLowerCase(java.util.Locale.ROOT)) {
             case "division_by_zero":
                 return "22012";
             case "unique_violation":

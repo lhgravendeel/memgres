@@ -230,11 +230,32 @@ public class Session {
     // Command counter within current transaction (incremented per statement)
     private long commandId = 0;
 
+    /**
+     * Whether this transaction has been given a transaction id of its own.
+     *
+     * <p>PostgreSQL hands one out when a transaction first needs to write itself onto a row —
+     * or when it is asked for one outright — and a read-only transaction never gets one. So the
+     * lock a transaction holds on its own id joins pg_locks partway through, and a session that
+     * had only read was reported holding a lock over an id nothing had assigned.
+     */
+    private boolean transactionIdAssigned = false;
+
     /** Get the current transaction ID, allocating one if needed (for autocommit DML). */
     public long getTransactionId() {
         if (transactionId == 0) {
             transactionId = database.allocateTransactionId();
         }
+        transactionIdAssigned = true;
+        return transactionId;
+    }
+
+    /** Whether anything has asked this transaction for its id yet. */
+    public boolean hasAssignedTransactionId() {
+        return transactionIdAssigned;
+    }
+
+    /** The transaction id already assigned, without asking for one. */
+    public long peekTransactionId() {
         return transactionId;
     }
     /** Get the current command ID within the transaction. */
@@ -273,6 +294,7 @@ public class Session {
     public void resetAutocommitTxId() {
         if (status == TransactionStatus.IDLE) {
             transactionId = 0;
+            transactionIdAssigned = false;
             commandId = 0;
             commandIdUsed = false;
             // An autocommit statement's transaction ends here, so its locks end with it —
@@ -676,7 +698,7 @@ public class Session {
         }
 
         // Check if this is a transaction command (allowed even in FAILED state)
-        String upper = sql.toUpperCase().trim();
+        String upper = sql.toUpperCase(java.util.Locale.ROOT).trim();
         boolean isTransactionCmd = upper.startsWith("BEGIN") || upper.startsWith("START TRANSACTION")
                 || upper.startsWith("COMMIT") || upper.startsWith("END")
                 || upper.startsWith("ROLLBACK") || upper.startsWith("SAVEPOINT")
@@ -858,6 +880,7 @@ public class Session {
         transactionTimestamp = java.time.OffsetDateTime.now();
         ssiTxnStartSeq = database.allocateSsiSequence();
         transactionId = database.allocateTransactionId();
+        transactionIdAssigned = false;
         commandId = 0;
         commandIdUsed = false;
         partitionMovesPending.clear();
@@ -2191,7 +2214,7 @@ public class Session {
     }
 
     public void setConstraintDeferred(String constraintName, boolean deferred) {
-        String lcName = constraintName.toLowerCase();
+        String lcName = constraintName.toLowerCase(java.util.Locale.ROOT);
         if (deferred) {
             deferredConstraintNames.add(lcName);
             immediateConstraintNames.remove(lcName);
@@ -2206,7 +2229,7 @@ public class Session {
         if (!sc.isDeferrable()) return false;
         // Per-constraint explicit override takes priority
         if (sc.getName() != null) {
-            String lcName = sc.getName().toLowerCase();
+            String lcName = sc.getName().toLowerCase(java.util.Locale.ROOT);
             if (deferredConstraintNames.contains(lcName)) return true;
             if (immediateConstraintNames.contains(lcName)) return false;
         }
@@ -3496,11 +3519,11 @@ public class Session {
         // transaction_isolation (SET TRANSACTION) takes precedence if explicitly set
         if (gucSettings.hasSessionOverride("transaction_isolation")) {
             String txnLevel = gucSettings.get("transaction_isolation");
-            if (txnLevel != null && !txnLevel.isEmpty()) return txnLevel.toLowerCase();
+            if (txnLevel != null && !txnLevel.isEmpty()) return txnLevel.toLowerCase(java.util.Locale.ROOT);
         }
         // Then check default_transaction_isolation (SET SESSION CHARACTERISTICS / setTransactionIsolation)
         String defaultLevel = gucSettings.get("default_transaction_isolation");
-        if (defaultLevel != null && !defaultLevel.isEmpty()) return defaultLevel.toLowerCase();
+        if (defaultLevel != null && !defaultLevel.isEmpty()) return defaultLevel.toLowerCase(java.util.Locale.ROOT);
         return "read committed";
     }
 

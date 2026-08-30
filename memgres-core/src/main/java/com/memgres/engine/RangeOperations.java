@@ -39,7 +39,7 @@ public class RangeOperations {
     /** The element kind of a named range type, or null when the type is not one of PG's. */
     static String elemOfRangeType(String rangeType) {
         if (rangeType == null) return null;
-        String t = rangeType.toLowerCase().trim();
+        String t = rangeType.toLowerCase(java.util.Locale.ROOT).trim();
         if (t.endsWith("multirange")) t = t.substring(0, t.length() - "multirange".length()) + "range";
         if (t.equals("int4range")) return INT;
         if (t.equals("int8range")) return INT8;
@@ -376,7 +376,7 @@ public class RangeOperations {
 
     /** The infinity/NaN word a bound may be written as, or null when it is an ordinary value. */
     private static Double specialNumber(String raw) {
-        String s = raw.trim().toLowerCase();
+        String s = raw.trim().toLowerCase(java.util.Locale.ROOT);
         if (s.equals("infinity") || s.equals("+infinity") || s.equals("inf") || s.equals("+inf")) {
             return Double.valueOf(Double.POSITIVE_INFINITY);
         }

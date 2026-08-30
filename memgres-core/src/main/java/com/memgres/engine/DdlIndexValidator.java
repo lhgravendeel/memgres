@@ -280,7 +280,7 @@ final class DdlIndexValidator {
 
     /** True when an index key is one of the value functions written without an argument list. */
     static boolean isSqlValueFunction(String key) {
-        return key != null && SQL_VALUE_FUNCTIONS.contains(key.toLowerCase());
+        return key != null && SQL_VALUE_FUNCTIONS.contains(key.toLowerCase(java.util.Locale.ROOT));
     }
 
     /**
@@ -304,7 +304,7 @@ final class DdlIndexValidator {
         // The width of the index tuple is settled from the statement alone, so PostgreSQL checks
         // it before it looks the access method up.
         checkIndexColumnCount(columns, includeColumns);
-        String am = method != null ? method.toLowerCase() : "btree";
+        String am = method != null ? method.toLowerCase(java.util.Locale.ROOT) : "btree";
         AccessMethod amInfo = ACCESS_METHODS.get(am);
         if (amInfo == null) {
             throw PgErrors.undefinedObject("access method", method);
@@ -377,7 +377,7 @@ final class DdlIndexValidator {
         for (String part : opts.split(" ")) {
             if (!part.startsWith("collate:")) continue;
             String written = part.substring("collate:".length());
-            String lower = written.toLowerCase().replace("\"", "");
+            String lower = written.toLowerCase(java.util.Locale.ROOT).replace("\"", "");
             if (BUILTIN_COLLATIONS.contains(lower)) return;
             if (lower.startsWith("pg_catalog.")
                     && BUILTIN_COLLATIONS.contains(lower.substring("pg_catalog.".length()))) {
@@ -457,7 +457,7 @@ final class DdlIndexValidator {
             opclassName = opclassName.substring(dot + 1);
         }
         Map<String, String> byName = OPCLASSES.get(am);
-        if (byName == null || !byName.containsKey(opclassName.toLowerCase())) {
+        if (byName == null || !byName.containsKey(opclassName.toLowerCase(java.util.Locale.ROOT))) {
             throw new MemgresException("operator class \"" + opclassName
                     + "\" does not exist for access method \"" + am + "\"", "42704");
         }
@@ -466,7 +466,7 @@ final class DdlIndexValidator {
             // and it names the class here without quoting it.
             throw new MemgresException("operator class " + opclassName + " has no options", "22023");
         }
-        String accepts = byName.get(opclassName.toLowerCase());
+        String accepts = byName.get(opclassName.toLowerCase(java.util.Locale.ROOT));
         if (accepts == null) return;
         int colIdx = table.getColumnIndex(column);
         if (colIdx < 0) return;   // an unknown column is reported by the caller's own check
@@ -764,11 +764,11 @@ final class DdlIndexValidator {
      */
     static void checkRelOptions(String kind, Map<String, String> options) {
         if (options == null || options.isEmpty()) return;
-        Map<String, RelOption> known = REL_OPTIONS.get(kind == null ? "btree" : kind.toLowerCase());
+        Map<String, RelOption> known = REL_OPTIONS.get(kind == null ? "btree" : kind.toLowerCase(java.util.Locale.ROOT));
         if (known == null) return;   // an access method this engine does not model: leave it be
         Map<String, RelOption> toast = REL_OPTIONS.get("toast");
         for (Map.Entry<String, String> entry : options.entrySet()) {
-            String name = entry.getKey().toLowerCase();
+            String name = entry.getKey().toLowerCase(java.util.Locale.ROOT);
             // A namespaced parameter belongs to the TOAST table rather than to this relation, and
             // is judged against what a TOAST table takes. Skipped outright, toast.fillfactor --
             // which PostgreSQL does not know -- was accepted and then stored nowhere.
@@ -790,14 +790,14 @@ final class DdlIndexValidator {
             }
             switch (option.kind) {
                 case 'b':
-                    if (!TRUE_WORDS.contains(value.toLowerCase())
-                            && !FALSE_WORDS.contains(value.toLowerCase())) {
+                    if (!TRUE_WORDS.contains(value.toLowerCase(java.util.Locale.ROOT))
+                            && !FALSE_WORDS.contains(value.toLowerCase(java.util.Locale.ROOT))) {
                         throw new MemgresException("invalid value for boolean option \""
                                 + name + "\": " + value, "22023");
                     }
                     break;
                 case 'e':
-                    if (!option.allowed.contains(value.toLowerCase())) {
+                    if (!option.allowed.contains(value.toLowerCase(java.util.Locale.ROOT))) {
                         MemgresException ex = new MemgresException(
                                 "invalid value for \"" + name + "\" option", "22023");
                         StringBuilder valid = new StringBuilder("Valid values are ");
@@ -828,8 +828,8 @@ final class DdlIndexValidator {
     static String normalizeRelOptionValue(String kind, String name, String value) {
         if (value == null) return "true";
         String trimmed = value.trim();
-        Map<String, RelOption> known = REL_OPTIONS.get(kind == null ? "btree" : kind.toLowerCase());
-        RelOption option = known == null || name == null ? null : known.get(name.toLowerCase());
+        Map<String, RelOption> known = REL_OPTIONS.get(kind == null ? "btree" : kind.toLowerCase(java.util.Locale.ROOT));
+        RelOption option = known == null || name == null ? null : known.get(name.toLowerCase(java.util.Locale.ROOT));
         if (option == null) return trimmed;
         if (option.kind == 'b' || option.kind == 'e') {
             return trimmed.toLowerCase(java.util.Locale.ROOT);
@@ -846,7 +846,7 @@ final class DdlIndexValidator {
         if (options == null) return null;
         Map<String, String> out = new java.util.LinkedHashMap<String, String>();
         for (Map.Entry<String, String> entry : options.entrySet()) {
-            if (entry.getKey().toLowerCase().startsWith("toast.")) continue;
+            if (entry.getKey().toLowerCase(java.util.Locale.ROOT).startsWith("toast.")) continue;
             out.put(entry.getKey(), normalizeRelOptionValue(kind, entry.getKey(), entry.getValue()));
         }
         return out;

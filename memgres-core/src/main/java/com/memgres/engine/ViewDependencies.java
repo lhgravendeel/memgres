@@ -32,21 +32,21 @@ final class ViewDependencies {
      */
     static boolean reads(Object query, String viewSchema, String schemaName, String relName) {
         if (query == null || relName == null) return false;
-        final String wanted = relName.toLowerCase();
+        final String wanted = relName.toLowerCase(java.util.Locale.ROOT);
         final Set<String> cteNames = new HashSet<String>();
         AstWalk.forEach(query, node -> {
             if (node instanceof SelectStmt.CommonTableExpr) {
                 String n = ((SelectStmt.CommonTableExpr) node).name();
-                if (n != null) cteNames.add(n.toLowerCase());
+                if (n != null) cteNames.add(n.toLowerCase(java.util.Locale.ROOT));
             }
         });
         final boolean[] found = new boolean[1];
-        final String schema = schemaName == null ? "public" : schemaName.toLowerCase();
-        final String home = viewSchema == null ? "public" : viewSchema.toLowerCase();
+        final String schema = schemaName == null ? "public" : schemaName.toLowerCase(java.util.Locale.ROOT);
+        final String home = viewSchema == null ? "public" : viewSchema.toLowerCase(java.util.Locale.ROOT);
         AstWalk.forEach(query, node -> {
             if (found[0] || !(node instanceof SelectStmt.TableRef)) return;
             SelectStmt.TableRef ref = (SelectStmt.TableRef) node;
-            if (ref.table() == null || !ref.table().toLowerCase().equals(wanted)) return;
+            if (ref.table() == null || !ref.table().toLowerCase(java.util.Locale.ROOT).equals(wanted)) return;
             if (ref.schema() != null) {
                 if (ref.schema().equalsIgnoreCase(schema)) found[0] = true;
                 return;
@@ -127,7 +127,7 @@ final class ViewDependencies {
     private static void walkCascade(Database db, OidSupplier oids, String schemaName,
                                     String relName, Set<String> seen, List<String> out) {
         for (String viewName : directDependents(db, oids, schemaName, relName)) {
-            if (!seen.add(viewName.toLowerCase())) continue;
+            if (!seen.add(viewName.toLowerCase(java.util.Locale.ROOT))) continue;
             out.add(viewName);
             Database.ViewDef v = db.getView(viewName);
             String vs = v != null && v.schemaName() != null ? v.schemaName() : "public";
@@ -171,7 +171,7 @@ final class ViewDependencies {
                                   String relKind, List<String> searchPath, Set<String> seen,
                                   List<String> out) {
         for (String viewName : directDependents(db, oids, schemaName, relName)) {
-            if (!seen.add(viewName.toLowerCase())) continue;
+            if (!seen.add(viewName.toLowerCase(java.util.Locale.ROOT))) continue;
             Database.ViewDef v = db.getView(viewName);
             String vs = v != null && v.schemaName() != null ? v.schemaName() : "public";
             String kind = v != null && v.materialized() ? "materialized view" : "view";

@@ -26,7 +26,7 @@ class SelectExecutor {
 
     /** Check if a column name is a PostgreSQL system column. */
     static boolean isSystemColumn(String name) {
-        String lc = name.toLowerCase();
+        String lc = name.toLowerCase(java.util.Locale.ROOT);
         return lc.equals("tableoid") || lc.equals("ctid") || lc.equals("xmin")
                 || lc.equals("xmax") || lc.equals("cmin") || lc.equals("cmax");
     }
@@ -76,7 +76,7 @@ class SelectExecutor {
      */
     Table lookupRelationOrNull(String schemaName, String name) {
         if (name == null) return null;
-        String lower = name.toLowerCase();
+        String lower = name.toLowerCase(java.util.Locale.ROOT);
         for (Map<String, SelectStmt.CommonTableExpr> scope : executor.cteStack) {
             // A name mapped to null is a WITH item hidden from the body being run, so the stored
             // relation is what this name means here; anything else shadows the catalog.
@@ -106,7 +106,7 @@ class SelectExecutor {
         if (stmt.withClauses() != null && !stmt.withClauses().isEmpty()) {
             Map<String, SelectStmt.CommonTableExpr> cteMap = new LinkedHashMap<>();
             for (SelectStmt.CommonTableExpr cte : stmt.withClauses()) {
-                cteMap.put(cte.name().toLowerCase(), cte);
+                cteMap.put(cte.name().toLowerCase(java.util.Locale.ROOT), cte);
                 if (isDmlCte(cte.query())) writesFromWith = true;
             }
             // Before the scope is pushed: a refusal here must not leave a WITH scope standing on
@@ -319,7 +319,7 @@ class SelectExecutor {
         AstWalk.forEach(part, node -> {
             if (!(node instanceof ColumnRef)) return;
             String table = ((ColumnRef) node).table();
-            if (table == null || !relations.contains(table.toLowerCase())) {
+            if (table == null || !relations.contains(table.toLowerCase(java.util.Locale.ROOT))) {
                 only[0] = false;
             } else {
                 named[0] = true;
@@ -390,7 +390,7 @@ class SelectExecutor {
         Set<String> enclosing = executor.dmlExecutor.enclosingColumnsRead();
         if (enclosing == null) return null;
         for (String name : enclosing) {
-            String own = writtenTo.get(name.toLowerCase());
+            String own = writtenTo.get(name.toLowerCase(java.util.Locale.ROOT));
             if (own != null) columns.add(own);
         }
         return columns;
@@ -415,7 +415,7 @@ class SelectExecutor {
         if (!derivedShape(stmt, output, own, sources, null, false)) return null;
         if (written.size() != own.size()) return null;
         Map<String, String> map = new HashMap<>();
-        for (int i = 0; i < written.size(); i++) map.put(written.get(i).toLowerCase(), own.get(i));
+        for (int i = 0; i < written.size(); i++) map.put(written.get(i).toLowerCase(java.util.Locale.ROOT), own.get(i));
         return map;
     }
 
@@ -457,7 +457,7 @@ class SelectExecutor {
             if (!readsOnlyExposed(behind, sources.get(i).bindings[0], names, sources, shape)) {
                 continue;
             }
-            generated.put(names.get(i).toLowerCase(), behind);
+            generated.put(names.get(i).toLowerCase(java.util.Locale.ROOT), behind);
             kept.add(behind);
         }
         // Whether a column is worked out here is settled by its name, so a second relation with a
@@ -517,7 +517,7 @@ class SelectExecutor {
     private static Set<String> leftToRelationNames(Map<String, Column> leftToRelation) {
         if (leftToRelation.isEmpty()) return Collections.emptySet();
         Set<String> names = new HashSet<>();
-        for (Column behind : leftToRelation.values()) names.add(behind.getName().toLowerCase());
+        for (Column behind : leftToRelation.values()) names.add(behind.getName().toLowerCase(java.util.Locale.ROOT));
         return names;
     }
 
@@ -543,7 +543,7 @@ class SelectExecutor {
         if (leftToRelation.isEmpty()) return;
         for (int i = 0; i < resultColumns.size(); i++) {
             String name = resultColumns.get(i).getName();
-            Column behind = name == null ? null : leftToRelation.get(name.toLowerCase());
+            Column behind = name == null ? null : leftToRelation.get(name.toLowerCase(java.util.Locale.ROOT));
             if (behind == null) continue;
             boolean lone = true;
             for (int j = 0; j < resultColumns.size(); j++) {
@@ -648,7 +648,7 @@ class SelectExecutor {
         Set<String> generated = new HashSet<>();
         for (int i = 0; i < sources.size(); i++) {
             Column behind = columnBehind(sources.get(i), shape);
-            if (behind != null && behind.isVirtual()) generated.add(names.get(i).toLowerCase());
+            if (behind != null && behind.isVirtual()) generated.add(names.get(i).toLowerCase(java.util.Locale.ROOT));
         }
         List<Expression> ordered = new ArrayList<>();
         for (Expression part : qualification) {
@@ -716,7 +716,7 @@ class SelectExecutor {
         if (columns.isEmpty()) return false;
         return AstWalk.anyMatch(part, node -> node instanceof ColumnRef
                 && ((ColumnRef) node).column() != null
-                && columns.contains(((ColumnRef) node).column().toLowerCase()));
+                && columns.contains(((ColumnRef) node).column().toLowerCase(java.util.Locale.ROOT)));
     }
 
     /** Work out the VIRTUAL generated columns this row offers, into the row it is read from. */
@@ -728,7 +728,7 @@ class SelectExecutor {
             RowContext.TableBinding binding = bindings.get(source.bindings[0]);
             if (binding.row() == null) continue;
             executor.dmlExecutor.fillVirtualColumns(binding.table(), binding.row(),
-                    Collections.singleton(behind.getName().toLowerCase()));
+                    Collections.singleton(behind.getName().toLowerCase(java.util.Locale.ROOT)));
         }
     }
 
@@ -789,7 +789,7 @@ class SelectExecutor {
         for (String name : names) {
             // Two output columns under one name leave no way to say which one the qualification
             // meant, so nothing about the relation can be decided from it.
-            if (distinctNames && !exposed.add(name.toLowerCase())) return false;
+            if (distinctNames && !exposed.add(name.toLowerCase(java.util.Locale.ROOT))) return false;
         }
         return !names.isEmpty();
     }
@@ -805,7 +805,7 @@ class SelectExecutor {
     private static boolean standsForWholeClause(WildcardExpr star, SelectStmt stmt) {
         if (star.table() == null) return true;
         Set<String> exposed = FromResolver.exposedNamesOf(stmt.from());
-        return exposed.size() == 1 && exposed.contains(star.table().toLowerCase());
+        return exposed.size() == 1 && exposed.contains(star.table().toLowerCase(java.util.Locale.ROOT));
     }
 
     /** The name an alias list gives the output column in this place, or the query's own name. */
@@ -848,25 +848,25 @@ class SelectExecutor {
         AstWalk.forEachOutside(root, SelectExecutor::closedToThisQuery, node -> {
             if (node instanceof ColumnRef) {
                 String column = ((ColumnRef) node).column();
-                if (column != null) columns.add(column.toLowerCase());
+                if (column != null) columns.add(column.toLowerCase(java.util.Locale.ROOT));
             } else if (node instanceof SelectStmt.TableRef) {
                 SelectStmt.TableRef ref = (SelectStmt.TableRef) node;
-                if (ref.table() != null) relations.add(ref.table().toLowerCase());
-                if (ref.alias() != null) relations.add(ref.alias().toLowerCase());
+                if (ref.table() != null) relations.add(ref.table().toLowerCase(java.util.Locale.ROOT));
+                if (ref.alias() != null) relations.add(ref.alias().toLowerCase(java.util.Locale.ROOT));
             } else if (node instanceof SelectStmt.SubqueryFrom) {
                 String alias = ((SelectStmt.SubqueryFrom) node).alias();
-                if (alias != null) relations.add(alias.toLowerCase());
+                if (alias != null) relations.add(alias.toLowerCase(java.util.Locale.ROOT));
             } else if (node instanceof SelectStmt.FunctionFrom) {
                 String alias = ((SelectStmt.FunctionFrom) node).alias();
-                if (alias != null) relations.add(alias.toLowerCase());
+                if (alias != null) relations.add(alias.toLowerCase(java.util.Locale.ROOT));
             } else if (node instanceof SelectStmt.CommonTableExpr) {
                 String name = ((SelectStmt.CommonTableExpr) node).name();
-                if (name != null) relations.add(name.toLowerCase());
+                if (name != null) relations.add(name.toLowerCase(java.util.Locale.ROOT));
             } else if (node instanceof SelectStmt.JoinFrom) {
                 // A USING list names its columns as text rather than as references.
                 SelectStmt.JoinFrom join = (SelectStmt.JoinFrom) node;
                 if (join.using() != null) {
-                    for (String using : join.using()) columns.add(using.toLowerCase());
+                    for (String using : join.using()) columns.add(using.toLowerCase(java.util.Locale.ROOT));
                 }
             }
         });
@@ -904,7 +904,7 @@ class SelectExecutor {
         final Set<String> supplied = FromResolver.exposedNamesOf(inner.from());
         return !AstWalk.anyMatch(inner, named -> named instanceof ColumnRef
                 && ((ColumnRef) named).table() != null
-                && !supplied.contains(((ColumnRef) named).table().toLowerCase()));
+                && !supplied.contains(((ColumnRef) named).table().toLowerCase(java.util.Locale.ROOT)));
     }
 
     /**
@@ -1140,7 +1140,7 @@ class SelectExecutor {
         boolean hasJoins = stmt.from().stream().anyMatch(f -> f instanceof SelectStmt.JoinFrom);
         Set<String> usingColumnsLower = new java.util.HashSet<>();
         for (RowContext.OutCol oc : baseOutput) {
-            if (oc.merged()) usingColumnsLower.add(oc.name.toLowerCase());
+            if (oc.merged()) usingColumnsLower.add(oc.name.toLowerCase(java.util.Locale.ROOT));
         }
         if (!contexts.isEmpty()) {
             Set<String> ctxUsing = contexts.get(0).getUsingColumns();
@@ -1474,13 +1474,13 @@ class SelectExecutor {
         if (stmt.distinct() && (stmt.distinctOn() == null || stmt.distinctOn().isEmpty()) && resolvedOrderBy != null && !resolvedOrderBy.isEmpty()) {
             Set<String> targetExprs = new java.util.HashSet<>();
             for (SelectStmt.SelectTarget t : ordinalTargets) {
-                if (t.alias() != null) targetExprs.add(t.alias().toLowerCase());
-                targetExprs.add(t.expr().toString().toLowerCase());
-                if (t.expr() instanceof ColumnRef) targetExprs.add(((ColumnRef) t.expr()).column().toLowerCase());
+                if (t.alias() != null) targetExprs.add(t.alias().toLowerCase(java.util.Locale.ROOT));
+                targetExprs.add(t.expr().toString().toLowerCase(java.util.Locale.ROOT));
+                if (t.expr() instanceof ColumnRef) targetExprs.add(((ColumnRef) t.expr()).column().toLowerCase(java.util.Locale.ROOT));
             }
             for (SelectStmt.OrderByItem ob : resolvedOrderBy) {
-                String obStr = ob.expr().toString().toLowerCase();
-                String obCol = ob.expr() instanceof ColumnRef ? ((ColumnRef) ob.expr()).column().toLowerCase() : obStr;
+                String obStr = ob.expr().toString().toLowerCase(java.util.Locale.ROOT);
+                String obCol = ob.expr() instanceof ColumnRef ? ((ColumnRef) ob.expr()).column().toLowerCase(java.util.Locale.ROOT) : obStr;
                 if (!targetExprs.contains(obStr) && !targetExprs.contains(obCol)) {
                     throw new MemgresException("for SELECT DISTINCT, ORDER BY expressions must appear in select list", "42P10");
                 }
@@ -1523,7 +1523,7 @@ class SelectExecutor {
         if (stmt.lockClause() != null && executor.session != null && stmt.from() != null) {
             lockTargets = new LinkedHashSet<>();
             if (!stmt.lockClause().ofTables().isEmpty()) {
-                for (String of : stmt.lockClause().ofTables()) lockTargets.add(of.toLowerCase());
+                for (String of : stmt.lockClause().ofTables()) lockTargets.add(of.toLowerCase(java.util.Locale.ROOT));
             } else {
                 for (SelectStmt.FromItem fi : stmt.from()) collectLockTargets(fi, lockTargets);
             }
@@ -1820,12 +1820,12 @@ class SelectExecutor {
         }
         Set<String> cteNames = new LinkedHashSet<>();
         if (stmt.withClauses() != null) {
-            for (SelectStmt.CommonTableExpr cte : stmt.withClauses()) cteNames.add(cte.name().toLowerCase());
+            for (SelectStmt.CommonTableExpr cte : stmt.withClauses()) cteNames.add(cte.name().toLowerCase(java.util.Locale.ROOT));
         }
         boolean named = lock.ofTables() != null && !lock.ofTables().isEmpty();
         List<String> targets = new ArrayList<String>();
         if (named) {
-            for (String of : lock.ofTables()) targets.add(of.toLowerCase());
+            for (String of : lock.ofTables()) targets.add(of.toLowerCase(java.util.Locale.ROOT));
         } else {
             targets.addAll(exposed.keySet());
         }
@@ -1869,18 +1869,18 @@ class SelectExecutor {
                                             Set<String> nullable) {
         if (item instanceof SelectStmt.TableRef) {
             SelectStmt.TableRef tr = (SelectStmt.TableRef) item;
-            String name = (tr.alias() != null ? tr.alias() : tr.table()).toLowerCase();
+            String name = (tr.alias() != null ? tr.alias() : tr.table()).toLowerCase(java.util.Locale.ROOT);
             exposed.put(name, item);
             if (nullableHere) nullable.add(name);
         } else if (item instanceof SelectStmt.SubqueryFrom) {
             String alias = ((SelectStmt.SubqueryFrom) item).alias();
             if (alias != null) {
-                exposed.put(alias.toLowerCase(), item);
-                if (nullableHere) nullable.add(alias.toLowerCase());
+                exposed.put(alias.toLowerCase(java.util.Locale.ROOT), item);
+                if (nullableHere) nullable.add(alias.toLowerCase(java.util.Locale.ROOT));
             }
         } else if (item instanceof SelectStmt.FunctionFrom) {
             SelectStmt.FunctionFrom ff = (SelectStmt.FunctionFrom) item;
-            String name = (ff.alias() != null ? ff.alias() : ff.functionName()).toLowerCase();
+            String name = (ff.alias() != null ? ff.alias() : ff.functionName()).toLowerCase(java.util.Locale.ROOT);
             exposed.put(name, item);
             if (nullableHere) nullable.add(name);
         } else if (item instanceof SelectStmt.JoinFrom) {
@@ -1962,7 +1962,7 @@ class SelectExecutor {
     // ---- Expression analysis helpers (shared across delegates) ----
 
     boolean isAggregateFunction(String name) {
-        String stripped = FunctionEvaluator.stripSchemaPrefix(name.toLowerCase());
+        String stripped = FunctionEvaluator.stripSchemaPrefix(name.toLowerCase(java.util.Locale.ROOT));
         return AGGREGATE_FUNCTIONS.contains(stripped)
                 || executor.database.hasAggregate(stripped);
     }
@@ -2671,7 +2671,7 @@ class SelectExecutor {
                 if (idx >= 0) {
                     Column col = b.table().getColumns().get(idx);
                     if (col.getCompositeTypeName() != null) {
-                        return col.getCompositeTypeName().toLowerCase();
+                        return col.getCompositeTypeName().toLowerCase(java.util.Locale.ROOT);
                     }
                 }
             }
@@ -2689,7 +2689,7 @@ class SelectExecutor {
         }
         if (expr instanceof CastExpr) {
             CastExpr cast = (CastExpr) expr;
-            String tn = cast.typeName().toLowerCase().trim();
+            String tn = cast.typeName().toLowerCase(java.util.Locale.ROOT).trim();
             if (executor.database.isCompositeType(tn)) return tn;
         }
         return null;
@@ -3437,7 +3437,7 @@ class SelectExecutor {
         }
         for (ColumnRef cr : refs) {
             if (cr.table() == null || cr.column() == null || "*".equals(cr.column())) continue;
-            if (usingColumns.contains(cr.column().toLowerCase())) continue;
+            if (usingColumns.contains(cr.column().toLowerCase(java.util.Locale.ROOT))) continue;
             for (RowContext.TableBinding b : bindings) {
                 String exposed = b.alias() != null ? b.alias() : b.table().getName();
                 if (!cr.table().equalsIgnoreCase(exposed)) continue;
@@ -3547,7 +3547,7 @@ class SelectExecutor {
             if (join.using() != null) {
                 Set<String> seen = new HashSet<>();
                 for (String col : join.using()) {
-                    if (!seen.add(col.toLowerCase())) {
+                    if (!seen.add(col.toLowerCase(java.util.Locale.ROOT))) {
                         throw new MemgresException(
                                 "column name \"" + col + "\" appears more than once in USING clause",
                                 "42701").suppressPosition();
@@ -3563,7 +3563,7 @@ class SelectExecutor {
     private void addExposed(Map<String, SelectStmt.FromItem> exposed, SelectStmt.FromItem item) {
         String name = exposedNameOf(item);
         if (name == null) return;
-        SelectStmt.FromItem prior = exposed.put(name.toLowerCase(), item);
+        SelectStmt.FromItem prior = exposed.put(name.toLowerCase(java.util.Locale.ROOT), item);
         if (prior != null && !separateRelationsOfOneName(prior, item)) {
             throw new MemgresException("table name \"" + name + "\" specified more than once",
                     "42712").suppressPosition();
@@ -3694,7 +3694,7 @@ class SelectExecutor {
         if (from != null) {
             for (SelectStmt.FromItem item : from) FromResolver.collectCoveredNames(item, covered);
         }
-        if (!covered.contains(qualifier.toLowerCase())) {
+        if (!covered.contains(qualifier.toLowerCase(java.util.Locale.ROOT))) {
             return new MemgresException(
                     "missing FROM-clause entry for table \"" + qualifier + "\"", "42P01");
         }
@@ -3822,7 +3822,7 @@ class SelectExecutor {
      */
     static String firstReferenceTo(Object node, Set<String> names) {
         Set<String> visible = new HashSet<>();
-        for (String name : names) visible.add(name.toLowerCase());
+        for (String name : names) visible.add(name.toLowerCase(java.util.Locale.ROOT));
         return firstReferenceIn(node, visible);
     }
 
@@ -3843,10 +3843,10 @@ class SelectExecutor {
             return;
         }
         String exposed = exposedNameOf(item);
-        if (exposed != null) bound.add(exposed.toLowerCase());
+        if (exposed != null) bound.add(exposed.toLowerCase(java.util.Locale.ROOT));
         if (item instanceof SelectStmt.TableRef) {
             String written = ((SelectStmt.TableRef) item).table();
-            if (written != null) bound.add(written.toLowerCase());
+            if (written != null) bound.add(written.toLowerCase(java.util.Locale.ROOT));
         }
     }
 
@@ -3861,7 +3861,7 @@ class SelectExecutor {
             }
             if (sel.withClauses() != null) {
                 for (SelectStmt.CommonTableExpr cte : sel.withClauses()) {
-                    if (cte.name() != null) bound.add(cte.name().toLowerCase());
+                    if (cte.name() != null) bound.add(cte.name().toLowerCase(java.util.Locale.ROOT));
                 }
             }
             if (!bound.isEmpty()) {
@@ -3872,7 +3872,7 @@ class SelectExecutor {
         }
         if (node instanceof ColumnRef) {
             ColumnRef ref = (ColumnRef) node;
-            return ref.table() != null && here.contains(ref.table().toLowerCase())
+            return ref.table() != null && here.contains(ref.table().toLowerCase(java.util.Locale.ROOT))
                     ? ref.table() : null;
         }
         final Set<String> inScope = here;
@@ -3911,7 +3911,7 @@ class SelectExecutor {
         if (node == null || node instanceof Statement) return false;
         if (node instanceof FunctionCallExpr) {
             PgFunction f = executor.database.getFunction(
-                    FunctionEvaluator.stripSchemaPrefix(((FunctionCallExpr) node).name().toLowerCase()));
+                    FunctionEvaluator.stripSchemaPrefix(((FunctionCallExpr) node).name().toLowerCase(java.util.Locale.ROOT)));
             // ... and one that declares OUT parameters names its columns after all, so a call
             // written without a column list reaches the aggregate with every column it needs and
             // the set is what is left to complain about.
@@ -4034,7 +4034,7 @@ class SelectExecutor {
         Object found = AstWalk.findFirst(expr, node -> {
             if (node instanceof CaseExpr) return containsSrf(node);
             if (node instanceof FunctionCallExpr) {
-                String n = FunctionEvaluator.stripSchemaPrefix(((FunctionCallExpr) node).name().toLowerCase());
+                String n = FunctionEvaluator.stripSchemaPrefix(((FunctionCallExpr) node).name().toLowerCase(java.util.Locale.ROOT));
                 if (CONDITIONAL_CONSTRUCTS.contains(n)) {
                     for (Expression arg : ((FunctionCallExpr) node).args()) {
                         if (containsSrf(arg)) return true;
@@ -4046,7 +4046,7 @@ class SelectExecutor {
         if (found == null) return null;
         String construct = found instanceof CaseExpr ? "CASE"
                 : FunctionEvaluator.stripSchemaPrefix(
-                        ((FunctionCallExpr) found).name().toLowerCase()).toUpperCase();
+                        ((FunctionCallExpr) found).name().toLowerCase(java.util.Locale.ROOT)).toUpperCase(java.util.Locale.ROOT);
         return misplacedSrfWithHint(construct, findSrfCall((Expression) found));
     }
 
@@ -4123,7 +4123,7 @@ class SelectExecutor {
      * supplies them, and a call written without them fails on the column before the set.
      */
     boolean isSetReturningCall(FunctionCallExpr call) {
-        String name = FunctionEvaluator.stripSchemaPrefix(call.name().toLowerCase());
+        String name = FunctionEvaluator.stripSchemaPrefix(call.name().toLowerCase(java.util.Locale.ROOT));
         if (SRF_FUNCTIONS.contains(name)) return true;
         if (executor.database == null) return false;
         PgFunction declared = executor.database.getFunction(name);
@@ -4367,7 +4367,7 @@ class SelectExecutor {
             String schemaName = executor.database.schemaNameOf(t);
             if (schemaName == null) continue;
             executor.session.recordRelationLock(
-                    schemaName.toLowerCase() + "." + t.getName().toLowerCase(), mode);
+                    schemaName.toLowerCase(java.util.Locale.ROOT) + "." + t.getName().toLowerCase(java.util.Locale.ROOT), mode);
         }
     }
 
@@ -4378,8 +4378,8 @@ class SelectExecutor {
     private static void collectLockTargets(SelectStmt.FromItem fi, Set<String> out) {
         if (fi instanceof SelectStmt.TableRef) {
             SelectStmt.TableRef tr = (SelectStmt.TableRef) fi;
-            out.add(tr.table().toLowerCase());
-            if (tr.alias() != null) out.add(tr.alias().toLowerCase());
+            out.add(tr.table().toLowerCase(java.util.Locale.ROOT));
+            if (tr.alias() != null) out.add(tr.alias().toLowerCase(java.util.Locale.ROOT));
         } else if (fi instanceof SelectStmt.JoinFrom) {
             SelectStmt.JoinFrom jf = (SelectStmt.JoinFrom) fi;
             if (jf.left() != null) collectLockTargets(jf.left(), out);
@@ -4553,8 +4553,8 @@ class SelectExecutor {
 
     /** True when this row binding belongs to one of the FOR UPDATE lock targets. */
     private static boolean isLockTarget(RowContext.TableBinding b, Set<String> targets) {
-        if (b.alias() != null && targets.contains(b.alias().toLowerCase())) return true;
-        return b.table() != null && targets.contains(b.table().getName().toLowerCase());
+        if (b.alias() != null && targets.contains(b.alias().toLowerCase(java.util.Locale.ROOT))) return true;
+        return b.table() != null && targets.contains(b.table().getName().toLowerCase(java.util.Locale.ROOT));
     }
 
 }

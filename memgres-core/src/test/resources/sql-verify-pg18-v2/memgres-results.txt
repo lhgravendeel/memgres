@@ -54,7 +54,7 @@ SQL: INSERT INTO no_such_table VALUES (1)
 ERROR [42P01]: ERROR: relation "no_such_table" does not exist
 --- STMT 16 ---
 SQL: SELECT * FROM
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: syntax error at end of input
 --- STMT 17 ---
 SQL: DROP SCHEMA compat CASCADE
 OK: 0 rows affected
@@ -171,7 +171,7 @@ SQL: SELECT 1 1
 ERROR [42601]: ERROR: syntax error at or near "1"
 --- STMT 28 ---
 SQL: SELECT (1
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: syntax error at end of input
 --- STMT 29 ---
 SQL: SELECT 1)
 ERROR [42601]: ERROR: syntax error at or near ")"
@@ -215,7 +215,7 @@ SQL: CREATE TABLE bad8(a int REFERENCES)
 ERROR [42601]: ERROR: syntax error at or near ")"
 --- STMT 42 ---
 SQL: SELECT 'unterminated; SELECT $$unterminated; SELECT E'bad\q'; SELECT 1 + * 2; SELECT (SELECT 1; SELECT CASE WHEN TRUE THEN 1 ELSE END; SELECT CASE WHEN THEN 1 END; SELECT ARRAY[1,2,]; SELECT ROW(1,2,)...
-ERROR [42601]: Unterminated string literal started at position 1.449 in SQL SELECT 'unterminated;
+ERROR [42601]: Unterminated string literal started at position 1,449 in SQL SELECT 'unterminated;
 
 === FILE: 02_value_expressions.sql ===
 --- STMT 1 ---
@@ -480,7 +480,7 @@ COLUMNS: array
 ROW: {}
 --- STMT 64 ---
 SQL: SELECT ARRAY[]
-ERROR [42P18]: ERROR: syntax error at or near ""
+ERROR [42P18]: ERROR: cannot determine type of empty array
 --- STMT 65 ---
 SQL: SELECT ARRAY[NULL]
 RESULT: 1 columns, 1 rows
@@ -726,7 +726,7 @@ SQL: SELECT abs('x')
 ERROR [22P02]: ERROR: invalid input syntax for type double precision: "x"
 --- STMT 39 ---
 SQL: SELECT count(DISTINCT a, b) FROM ftab
-ERROR [42883]: ERROR: function count(text, text) does not exist
+ERROR [42883]: ERROR: function count(integer, integer) does not exist
 --- STMT 40 ---
 SQL: SELECT lag() OVER (ORDER BY a) FROM ftab
 ERROR [42883]: ERROR: function lag() does not exist
@@ -1207,7 +1207,7 @@ SQL: COMMENT ON TABLE child_inh IS 'inheritance child'
 ERROR [42P01]: ERROR: relation "child_inh" does not exist
 --- STMT 68 ---
 SQL: TRUNCATE TABLE child_inh
-ERROR [42P01]: ERROR: Table not found: child_inh
+ERROR [42P01]: ERROR: relation "child_inh" does not exist
 --- STMT 69 ---
 SQL: REFRESH MATERIALIZED VIEW mv1
 ERROR [42P01]: ERROR: relation "mv1" does not exist
@@ -1219,7 +1219,7 @@ SQL: CREATE TABLE bad_inh() INHERITS ()
 ERROR [42601]: ERROR: syntax error at or near ")"
 --- STMT 72 ---
 SQL: CREATE MATERIALIZED VIEW mv_bad AS
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: syntax error at end of input
 --- STMT 73 ---
 SQL: ALTER TABLE child_inh ALTER COLUMN nope TYPE text
 ERROR [42P01]: ERROR: relation "child_inh" does not exist
@@ -1234,7 +1234,7 @@ SQL: COMMENT ON TABLE no_such IS 'x'
 ERROR [42P01]: ERROR: relation "no_such" does not exist
 --- STMT 77 ---
 SQL: TRUNCATE TABLE no_such
-ERROR [42P01]: ERROR: Table not found: no_such
+ERROR [42P01]: ERROR: relation "no_such" does not exist
 --- STMT 78 ---
 SQL: REFRESH MATERIALIZED VIEW no_such
 ERROR [42P01]: ERROR: relation "no_such" does not exist
@@ -1307,13 +1307,13 @@ SQL: INSERT INTO parent(id, code, qty) VALUES (4, NULL, 1)
 ERROR [23502]: ERROR: null value in column "code" of relation "parent" violates not-null constraint
 --- STMT 19 ---
 SQL: INSERT INTO parent(id, code, qty) VALUES (5, 'E', -1)
-ERROR [23514]: ERROR: new row violates check constraint "parent_qty_check"
+ERROR [23514]: ERROR: new row for relation "parent" violates check constraint "parent_qty_check"
 --- STMT 20 ---
 SQL: INSERT INTO child(id, parent_id, qty) VALUES (12, 99, 1)
 ERROR [23503]: ERROR: insert or update on table "child" violates foreign key constraint "child_parent_id_fkey"
 --- STMT 21 ---
 SQL: INSERT INTO child(id, parent_id, qty) VALUES (13, 1, 0)
-ERROR [23514]: ERROR: new row violates check constraint "child_qty_check"
+ERROR [23514]: ERROR: new row for relation "child" violates check constraint "child_qty_check"
 --- STMT 22 ---
 SQL: INSERT INTO child(id, parent_id, qty, total) VALUES (14, 1, 2, 999)
 ERROR [428C9]: ERROR: cannot insert a non-DEFAULT value into column "total"
@@ -1481,10 +1481,10 @@ SQL: INSERT INTO dml(id, a) VALUES (6)
 ERROR [42601]: ERROR: INSERT has more target columns than expressions
 --- STMT 21 ---
 SQL: INSERT INTO dml(nope) VALUES (1)
-ERROR [42703]: ERROR: Column not found: nope
+ERROR [42703]: ERROR: column "nope" of relation "dml" does not exist
 --- STMT 22 ---
 SQL: UPDATE dml SET nope = 1
-ERROR [42703]: ERROR: Column not found: nope
+ERROR [42703]: ERROR: column "nope" of relation "dml" does not exist
 --- STMT 23 ---
 SQL: UPDATE dml SET a = (SELECT id FROM dml)
 ERROR [21000]: ERROR: more than one row returned by a subquery used as an expression
@@ -1809,7 +1809,7 @@ ROW: 4
 ROW: 5
 --- STMT 24 ---
 SQL: -- bad joins/subqueries/CTEs SELECT * FROM j1 JOIN j2
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: syntax error at end of input
 --- STMT 25 ---
 SQL: SELECT * FROM j1 JOIN j2 ON j1.nope = j2.id
 ERROR [42703]: ERROR: column j1.nope does not exist
@@ -1840,7 +1840,7 @@ ROW: 2 | b
 ROW: 3 | c
 --- STMT 33 ---
 SQL: SELECT * FROM j1 WHERE id = ALL (SELECT v FROM j1)
-ERROR [42883]: ERROR: operator does not exist: integer equal text
+ERROR [42883]: ERROR: operator does not exist: integer = text
 --- STMT 34 ---
 SQL: SELECT * FROM j1, LATERAL (SELECT nope FROM j2) q
 ERROR [42703]: ERROR: column "nope" does not exist
@@ -2061,7 +2061,7 @@ COLUMNS: x, y
 ROW: 1 | ok
 --- STMT 16 ---
 SQL: CALL p_ins(1, 'a')
-ERROR [42883]: ERROR: procedure p_ins(integer, unknown) does not exist
+ERROR [42883]: ERROR: procedure p_ins(integer, text) does not exist
 --- STMT 17 ---
 SQL: SELECT * FROM proc_t ORDER BY id
 RESULT: 2 columns, 0 rows
@@ -2203,7 +2203,7 @@ COLUMNS: ?column?
 ROW: 5
 --- STMT 21 ---
 SQL: SELECT path '[(0,0),(1,1),(2,2)]' && box(point(0,0), point(1,1))
-ERROR [42883]: ERROR: overlap not supported between path and box
+ERROR [42883]: ERROR: operator does not exist: path && box
 --- STMT 22 ---
 SQL: SELECT circle(point(0,0), 2) @> point(1,1)
 RESULT: 1 columns, 1 rows
@@ -2219,7 +2219,7 @@ COLUMNS: ?column?
 ROW: NULL
 --- STMT 25 ---
 SQL: SELECT jsonb_path_query('{"a":[1,2,3]}'::jsonb, 'not a path')
-ERROR [42601]: ERROR: syntax error at or near "not" of jsonpath input
+ERROR [42601]: ERROR: syntax error at end of jsonpath input
 --- STMT 26 ---
 SQL: SELECT ARRAY[1,2] || 'x'
 ERROR [22P02]: ERROR: malformed array literal: "x"
@@ -2241,7 +2241,7 @@ SQL: SELECT point(1,2) + 'abc'
 ERROR [22P02]: ERROR: invalid input syntax for type point: "abc"
 --- STMT 31 ---
 SQL: SELECT box(1,2)
-ERROR [42883]: ERROR: function box(integer) does not exist
+ERROR [42883]: ERROR: function box(integer, integer) does not exist
 --- STMT 32 ---
 SQL: SELECT point(1,1) <@ circle(point(0,0), 0.5)
 RESULT: 1 columns, 1 rows
@@ -2538,7 +2538,7 @@ SQL: -- bad positional parameter / Chapter 4 specific cases PREPARE badp AS SELE
 OK: 0 rows affected
 --- STMT 38 ---
 SQL: EXECUTE p1(1)
-ERROR [42601]: ERROR: wrong number of parameters for prepared statement "p1": expected 2, got 1
+ERROR [42601]: ERROR: wrong number of parameters for prepared statement "p1"
 --- STMT 39 ---
 SQL: EXECUTE p2('x')
 ERROR [22P02]: ERROR: invalid input syntax for type int: "x"
@@ -2687,7 +2687,7 @@ SQL: -- bad date/time inputs SELECT DATE '2024-02-30'
 ERROR [22008]: ERROR: date/time field value out of range: "2024-02-30"
 --- STMT 24 ---
 SQL: SELECT TIMESTAMP '2024-13-01 00:00:00'
-ERROR [22008]: ERROR: invalid input syntax for type timestamp: "2024-13-01 00:00:00"
+ERROR [22008]: ERROR: date/time field value out of range: "2024-13-01 00:00:00"
 --- STMT 25 ---
 SQL: SELECT TIME '24:00:01'
 ERROR [22008]: ERROR: date/time field value out of range: "24:00:01"
@@ -2805,7 +2805,7 @@ COLUMNS: ascii, chr
 ROW: 65 | A
 --- STMT 50 ---
 SQL: -- bad text/bit/binary inputs SELECT B'1020'
-ERROR [22P02]: ERROR: "1020" is not a valid binary digit
+ERROR [22P02]: ERROR: "2" is not a valid binary digit
 --- STMT 51 ---
 SQL: SELECT B'101'::bit(4)
 RESULT: 1 columns, 1 rows
@@ -2816,22 +2816,22 @@ SQL: SELECT B'1010' & B'11'
 ERROR [22026]: ERROR: cannot AND bit strings of different sizes
 --- STMT 53 ---
 SQL: SELECT convert_to('abc', 'NO_SUCH_ENCODING')
-ERROR [22023]: ERROR: encoding "NO_SUCH_ENCODING" does not exist
+ERROR [22023]: ERROR: invalid destination encoding name "NO_SUCH_ENCODING"
 --- STMT 54 ---
 SQL: SELECT convert_from(E'\\xFF'::bytea, 'UTF8')
 ERROR [22021]: ERROR: invalid byte sequence for encoding "UTF8"
 --- STMT 55 ---
 SQL: SELECT chr(-1)
-ERROR [22023]: ERROR: requested character too large for encoding: -1
+ERROR [22023]: ERROR: character number must be positive
 --- STMT 56 ---
 SQL: SELECT chr(1114112)
 ERROR [54000]: ERROR: requested character too large for encoding: 1114112
 --- STMT 57 ---
 SQL: SELECT decode('xyz', 'hex')
-ERROR [22023]: ERROR: invalid hexadecimal data: odd number of digits
+ERROR [22023]: ERROR: invalid hexadecimal digit: "x"
 --- STMT 58 ---
 SQL: SELECT U&'bad\0G'
-ERROR [42601]: ERROR: syntax error at or near "bad\0G"
+ERROR [42601]: ERROR: invalid Unicode escape value
 --- STMT 59 ---
 SQL: SELECT substring('abc' FROM 'x')
 RESULT: 1 columns, 1 rows
@@ -2985,7 +2985,7 @@ SQL: REFRESH MATERIALIZED VIEW CONCURRENTLY mv_base
 OK: 0 rows affected
 --- STMT 42 ---
 SQL: -- bad trigger/rule/view cases CREATE TRIGGER bad_timing DURING INSERT ON base_t FOR EACH ROW EXECUTE FUNCTION audit_base_t()
-ERROR [42601]: ERROR: syntax error at or near "during"
+ERROR [42601]: ERROR: syntax error at or near "DURING"
 --- STMT 43 ---
 SQL: CREATE TRIGGER bad_event AFTER UPSERT ON base_t FOR EACH ROW EXECUTE FUNCTION audit_base_t()
 ERROR [42601]: ERROR: syntax error at or near "upsert"
@@ -3009,7 +3009,7 @@ SQL: CREATE RULE bad_rule2 AS ON INSERT TO base_t DO ALSO SELECT 1
 OK: 0 rows affected
 --- STMT 50 ---
 SQL: CREATE VIEW bad_view AS
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: syntax error at end of input
 --- STMT 51 ---
 SQL: CREATE VIEW bad_view2 AS SELECT * FROM no_such_table
 ERROR [42P01]: ERROR: relation "no_such_table" does not exist
@@ -3109,7 +3109,7 @@ SQL: CREATE INDEX p_range_idx ON p_range (id)
 OK: 0 rows affected
 --- STMT 26 ---
 SQL: ALTER TABLE p_range ATTACH PARTITION p_range_100_200 FOR VALUES FROM (100) TO (200)
-ERROR [42809]: ERROR: table "p_range_100_200" is already a partition of "p_range"
+ERROR [42809]: ERROR: "p_range_100_200" is already a partition
 --- STMT 27 ---
 SQL: ALTER TABLE p_list DETACH PARTITION p_list_default
 OK: 0 rows affected
@@ -3167,7 +3167,7 @@ SQL: ALTER TABLE p_list DETACH PARTITION no_such_partition
 ERROR [42P01]: ERROR: relation "no_such_partition" does not exist
 --- STMT 43 ---
 SQL: ALTER TABLE p_range ATTACH PARTITION p_range_1_100 FOR VALUES FROM (1) TO (100)
-ERROR [42809]: ERROR: table "p_range_1_100" is already a partition of "p_range"
+ERROR [42809]: ERROR: "p_range_1_100" is already a partition
 --- STMT 44 ---
 SQL: CREATE TABLE inh_bad() INHERITS ()
 ERROR [42601]: ERROR: syntax error at or near ")"
@@ -3501,7 +3501,7 @@ SQL: SELECT 2 = ANY(ARRAY['a','b'])
 ERROR [42883]: ERROR: operator does not exist: integer = text
 --- STMT 39 ---
 SQL: SELECT int4range(1,5,'bad')
-ERROR [42601]: ERROR: range bound flags must be one of "[]", "[)", "(]", or "()"
+ERROR [42601]: ERROR: invalid range bound flags
 --- STMT 40 ---
 SQL: SELECT int4range(1,5) * numrange(1,5)
 ERROR [42883]: ERROR: operator does not exist: int4range * numrange
@@ -3513,13 +3513,13 @@ SQL: SELECT jsonb_insert('{"a":[1,2,3]}'::jsonb, '{a,x}', '1'::jsonb)
 ERROR [22P02]: ERROR: path element at position 2 is not an integer: "x"
 --- STMT 43 ---
 SQL: SELECT jsonb_path_exists('{"a":[1,2,3]}'::jsonb, 'not a path')
-ERROR [42601]: ERROR: syntax error at or near "not" of jsonpath input
+ERROR [42601]: ERROR: syntax error at end of jsonpath input
 --- STMT 44 ---
 SQL: SELECT jsonb_path_match('{"a":2}'::jsonb, '$.a')
 ERROR [22038]: ERROR: single boolean result is expected
 --- STMT 45 ---
 SQL: SELECT '{"a":1}'::json - 'a'
-ERROR [42883]: ERROR: operator does not exist: json - json
+ERROR [42883]: ERROR: operator does not exist: json - unknown
 --- STMT 46 ---
 SQL: DROP SCHEMA compat CASCADE
 OK: 0 rows affected
@@ -3608,10 +3608,10 @@ ROW:   ->  Seq Scan on admin_t
 SQL: EXPLAIN ANALYZE SELECT * FROM admin_t WHERE id = 1
 RESULT: 1 columns, 4 rows
 COLUMNS: QUERY PLAN
-ROW: Seq Scan on admin_t  (cost=0.00..0.01 rows=1 width=4) (actual time=0.180..0.180 rows=1.00 loops=1)
+ROW: Seq Scan on admin_t  (cost=0.00..0.01 rows=1 width=4) (actual time=0.218..0.218 rows=1.00 loops=1)
 ROW:   Filter: (id = 1)
-ROW: Planning Time: 0.030 ms
-ROW: Execution Time: 0.297 ms
+ROW: Planning Time: 0.042 ms
+ROW: Execution Time: 0.417 ms
 --- STMT 24 ---
 SQL: ANALYZE admin_t
 OK: 0 rows affected
@@ -3716,57 +3716,60 @@ OK: 0 rows affected
 SQL: RESET ROLE
 OK: 0 rows affected
 --- STMT 57 ---
-SQL: DROP ROLE compat_role
+SQL: DROP OWNED BY compat_role
 OK: 0 rows affected
 --- STMT 58 ---
+SQL: DROP ROLE compat_role
+OK: 0 rows affected
+--- STMT 59 ---
 SQL: -- bad admin/session cases SET no_such_guc = '1'
 ERROR [42704]: ERROR: unrecognized configuration parameter "no_such_guc"
---- STMT 59 ---
+--- STMT 60 ---
 SQL: SHOW no_such_guc
 ERROR [42704]: ERROR: unrecognized configuration parameter "no_such_guc"
---- STMT 60 ---
+--- STMT 61 ---
 SQL: LISTEN
 ERROR [42601]: ERROR: syntax error at end of input
---- STMT 61 ---
+--- STMT 62 ---
 SQL: NOTIFY
 ERROR [42601]: ERROR: syntax error at end of input
---- STMT 62 ---
+--- STMT 63 ---
 SQL: UNLISTEN no_such_chan, other
 ERROR [42601]: ERROR: syntax error at or near ","
---- STMT 63 ---
+--- STMT 64 ---
 SQL: EXPLAIN ()
 ERROR [42601]: ERROR: syntax error at or near ")"
---- STMT 64 ---
-SQL: VACUUM (NOTANOPTION) admin_t
-ERROR [42601]: ERROR: syntax error at or near "NOTANOPTION"
 --- STMT 65 ---
+SQL: VACUUM (NOTANOPTION) admin_t
+ERROR [42601]: ERROR: unrecognized VACUUM option "notanoption"
+--- STMT 66 ---
 SQL: ALTER VIEW no_such_view RENAME COLUMN a TO b
 ERROR [42P01]: ERROR: relation "no_such_view" does not exist
---- STMT 66 ---
+--- STMT 67 ---
 SQL: ALTER SEQUENCE no_such_seq RESTART WITH 1
 ERROR [42P01]: ERROR: relation "no_such_seq" does not exist
---- STMT 67 ---
+--- STMT 68 ---
 SQL: ALTER DOMAIN no_such_domain SET DEFAULT 1
 ERROR [42704]: ERROR: type "no_such_domain" does not exist
---- STMT 68 ---
+--- STMT 69 ---
 SQL: ALTER TYPE no_such_type ADD VALUE 'x'
 ERROR [42704]: ERROR: type "no_such_type" does not exist
---- STMT 69 ---
+--- STMT 70 ---
 SQL: REFRESH MATERIALIZED VIEW CONCURRENTLY no_such_mv
 ERROR [42P01]: ERROR: relation "no_such_mv" does not exist
---- STMT 70 ---
+--- STMT 71 ---
 SQL: LOCK TABLE no_such IN ACCESS SHARE MODE
 ERROR [25P01]: ERROR: LOCK TABLE can only be used in transaction blocks
---- STMT 71 ---
+--- STMT 72 ---
 SQL: GRANT SELECT ON no_such TO compat_role
 ERROR [42P01]: ERROR: relation "no_such" does not exist
---- STMT 72 ---
-SQL: SET ROLE no_such_role
-ERROR [22023]: ERROR: invalid value for parameter "role": "no_such_role"
 --- STMT 73 ---
+SQL: SET ROLE no_such_role
+ERROR [22023]: ERROR: role "no_such_role" does not exist
+--- STMT 74 ---
 SQL: DROP ROLE no_such_role
 ERROR [42704]: ERROR: role "no_such_role" does not exist
---- STMT 74 ---
+--- STMT 75 ---
 SQL: DROP SCHEMA compat CASCADE
 OK: 0 rows affected
 
@@ -3883,10 +3886,10 @@ ROW: 6 | 666
 ROW: 10 | 1000
 --- STMT 27 ---
 SQL: -- bad RETURNING / MERGE / scoping cases INSERT INTO tgt(id, a, b) VALUES (1, 1, 'dup') RETURNING nope
-ERROR [42703]: ERROR: column nope does not exist
+ERROR [42703]: ERROR: column "nope" does not exist
 --- STMT 28 ---
 SQL: UPDATE tgt SET a = a + 1 RETURNING missing_col
-ERROR [42703]: ERROR: column missing_col does not exist
+ERROR [42703]: ERROR: column "missing_col" does not exist
 --- STMT 29 ---
 SQL: DELETE FROM tgt RETURNING tgt.nope
 ERROR [42703]: ERROR: column tgt.nope does not exist
@@ -3901,7 +3904,7 @@ SQL: MERGE INTO tgt AS t USING src AS s ON t.id = s.id WHEN MATCHED THEN UPDATE 
 ERROR [21000]: ERROR: more than one row returned by a subquery used as an expression
 --- STMT 33 ---
 SQL: MERGE INTO tgt AS t USING src AS s ON t.id = s.id WHEN MATCHED THEN DELETE WHEN MATCHED THEN UPDATE SET a = 1
-ERROR [42601]: ERROR: MERGE command cannot have more than one unconditional WHEN MATCHED clause
+ERROR [42601]: ERROR: unreachable WHEN clause specified after unconditional WHEN clause
 --- STMT 34 ---
 SQL: SELECT id FROM tgt t JOIN src s ON id = s.id
 ERROR [42702]: ERROR: column reference "id" is ambiguous
@@ -4055,7 +4058,7 @@ OK: 20 rows affected
 SQL: SELECT count(*) FROM sample_t TABLESAMPLE SYSTEM (50)
 RESULT: 1 columns, 1 rows
 COLUMNS: count
-ROW: 10
+ROW: 11
 --- STMT 28 ---
 SQL: SELECT count(*) FROM sample_t TABLESAMPLE BERNOULLI (50) REPEATABLE (123)
 RESULT: 1 columns, 1 rows
@@ -4088,10 +4091,10 @@ SQL: SELECT * FROM ROWS FROM ()
 ERROR [42601]: ERROR: syntax error at or near ")"
 --- STMT 36 ---
 SQL: SELECT * FROM sample_t TABLESAMPLE SYSTEM (-1)
-ERROR [2202H]: ERROR: tablesample percentage must not be negative
+ERROR [2202H]: ERROR: sample percentage must be between 0 and 100
 --- STMT 37 ---
 SQL: SELECT * FROM sample_t TABLESAMPLE no_such_method (10)
-ERROR [42704]: ERROR: tablesample method "no_such_method" does not exist
+ERROR [42704]: ERROR: tablesample method no_such_method does not exist
 --- STMT 38 ---
 SQL: SELECT * FROM ONLY no_such_table
 ERROR [42P01]: ERROR: relation "no_such_table" does not exist
@@ -4240,10 +4243,10 @@ SQL: -- bad updatable view / identity / generated cases INSERT INTO v_simple(id,
 ERROR [428C9]: ERROR: cannot insert a non-DEFAULT value into column "id"
 --- STMT 35 ---
 SQL: INSERT INTO v_simple(a, b) VALUES (-1, 'fails_check')
-ERROR [44000]: ERROR: new row violates check option for view
+ERROR [44000]: ERROR: new row violates check option for view "v_simple"
 --- STMT 36 ---
 SQL: UPDATE v_nested SET a = 1 WHERE b = 'vv'
-ERROR [44000]: ERROR: new row violates check option for view
+ERROR [44000]: ERROR: new row violates check option for view "v_nested"
 --- STMT 37 ---
 SQL: UPDATE base SET c = 123 WHERE id = 1
 ERROR [428C9]: ERROR: column "c" can only be updated to DEFAULT
@@ -4437,7 +4440,7 @@ SQL: SELECT nextval('no_such_seq')
 ERROR [42P01]: ERROR: relation "no_such_seq" does not exist
 --- STMT 39 ---
 SQL: SELECT xmlparse(document '<root><a></root>')
-ERROR [2200M]: ERROR: invalid XML document: The element type "a" must be terminated by the matching end-tag "</a>".
+ERROR [2200M]: ERROR: invalid XML document
 --- STMT 40 ---
 SQL: SELECT xpath('not_xpath(', xmlparse(document '<root><a>1</a></root>'))
 ERROR [10608]: ERROR: invalid XPath expression: not_xpath(
@@ -4661,7 +4664,7 @@ SQL: SELECT * FROM p LIMIT 1 ORDER BY a
 ERROR [42601]: ERROR: syntax error at or near "ORDER"
 --- STMT 18 ---
 SQL: SELECT * FROM p OFFSET 1 LIMIT
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: syntax error at end of input
 --- STMT 19 ---
 SQL: SELECT * FROM p FETCH FIRST 1 ROW ONLY OFFSET 1
 RESULT: 2 columns, 0 rows
@@ -4689,7 +4692,7 @@ SQL: INSERT INTO p DEFAULT VALUES VALUES
 ERROR [42601]: ERROR: syntax error at or near "VALUES"
 --- STMT 27 ---
 SQL: INSERT INTO p OVERRIDING SYSTEM VALUE DEFAULT VALUES
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: syntax error at end of input
 --- STMT 28 ---
 SQL: INSERT INTO p RETURNING
 ERROR [42601]: ERROR: syntax error at or near "RETURNING"
@@ -4731,7 +4734,7 @@ SQL: MERGE INTO p USING p s ON p.a = s.a RETURNING *
 ERROR [42601]: ERROR: syntax error at or near "RETURNING"
 --- STMT 41 ---
 SQL: WITH w AS (SELECT 1) INSERT INTO p VALUES (1, 'x') RETURNING
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: syntax error at end of input
 --- STMT 42 ---
 SQL: WITH RECURSIVE w AS (SELECT 1 UNION ALL) SELECT * FROM w
 ERROR [42601]: ERROR: syntax error at or near ")"
@@ -4758,7 +4761,7 @@ SQL: CREATE VIEW vv AS SELECT
 OK: 0 rows affected
 --- STMT 50 ---
 SQL: CREATE VIEW vv2 AS SELECT * FROM p WITH CHECK
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: syntax error at end of input
 --- STMT 51 ---
 SQL: CREATE MATERIALIZED VIEW mv AS WITH DATA SELECT 1
 ERROR [42601]: ERROR: syntax error at or near "SELECT"
@@ -4782,7 +4785,7 @@ SQL: ALTER TABLE p ALTER a TYPE int
 OK: 0 rows affected
 --- STMT 58 ---
 SQL: ALTER TABLE p ADD COLUMN c int DEFAULT
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: syntax error at end of input
 --- STMT 59 ---
 SQL: ALTER TABLE p RENAME a TO b
 ERROR [42701]: ERROR: column "b" of relation "p" already exists
@@ -4791,10 +4794,10 @@ SQL: ALTER TABLE p ADD CONSTRAINT c CHECK a > 0
 ERROR [42601]: ERROR: syntax error at or near "a"
 --- STMT 61 ---
 SQL: ALTER TABLE p DROP CONSTRAINT
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: syntax error at end of input
 --- STMT 62 ---
 SQL: ALTER TABLE p ATTACH PARTITION p FOR VALUES FROM (1) TO
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: syntax error at end of input
 --- STMT 63 ---
 SQL: ALTER TABLE p ALTER COLUMN a SET GENERATED ALWAYS
 ERROR [55000]: ERROR: column "a" of relation "p" is not an identity column
@@ -4824,7 +4827,7 @@ SQL: DEALLOCATE PREPARE stmt
 ERROR [26000]: ERROR: prepared statement "stmt" does not exist
 --- STMT 72 ---
 SQL: SELECT ARRAY[]
-ERROR [42P18]: ERROR: syntax error at or near ""
+ERROR [42P18]: ERROR: cannot determine type of empty array
 --- STMT 73 ---
 SQL: SELECT ARRAY[1,2,]
 ERROR [42601]: ERROR: syntax error at or near "]"
@@ -4838,7 +4841,7 @@ SQL: SELECT ROW(,1)
 ERROR [42601]: ERROR: syntax error at or near ","
 --- STMT 76 ---
 SQL: SELECT (ROW(1,2)).
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: syntax error at end of input
 --- STMT 77 ---
 SQL: SELECT CAST(1 AS)
 ERROR [42601]: ERROR: syntax error at or near ")"
@@ -4859,7 +4862,7 @@ ROW: 1
 ROW: NULL
 --- STMT 82 ---
 SQL: SELECT * FROM generate_series() WITH ORDINALITY AS
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: syntax error at end of input
 --- STMT 83 ---
 SQL: SELECT * FROM ROWS FROM (generate_series(1,2),) AS x(a,b)
 ERROR [42601]: ERROR: syntax error at or near ")"
@@ -5137,10 +5140,10 @@ SQL: -- simple bad built-in function calls SELECT abs()
 ERROR [42883]: ERROR: function abs() does not exist
 --- STMT 23 ---
 SQL: SELECT abs(1,2)
-ERROR [42883]: ERROR: function abs() does not exist
+ERROR [42883]: ERROR: function abs(integer, integer) does not exist
 --- STMT 24 ---
 SQL: SELECT substring('abc')
-ERROR [42883]: ERROR: function substring(text) does not exist
+ERROR [42883]: ERROR: function substring(unknown) does not exist
 --- STMT 25 ---
 SQL: SELECT overlay('abc' placing 'x')
 ERROR [42601]: ERROR: syntax error at or near ")"
@@ -5167,19 +5170,19 @@ SQL: SELECT range_merge('x', 'y')
 ERROR [42804]: ERROR: function range_merge(text, text) does not exist
 --- STMT 33 ---
 SQL: SELECT convert_to('abc', 'NO_SUCH_ENCODING')
-ERROR [22023]: ERROR: encoding "NO_SUCH_ENCODING" does not exist
+ERROR [22023]: ERROR: invalid destination encoding name "NO_SUCH_ENCODING"
 --- STMT 34 ---
 SQL: SELECT convert_from(E'\\xFF'::bytea, 'UTF8')
 ERROR [22021]: ERROR: invalid byte sequence for encoding "UTF8"
 --- STMT 35 ---
 SQL: SELECT chr(-1)
-ERROR [22023]: ERROR: requested character too large for encoding: -1
+ERROR [22023]: ERROR: character number must be positive
 --- STMT 36 ---
 SQL: SELECT chr(1114112)
 ERROR [54000]: ERROR: requested character too large for encoding: 1114112
 --- STMT 37 ---
 SQL: SELECT decode('xyz', 'hex')
-ERROR [22023]: ERROR: invalid hexadecimal data: odd number of digits
+ERROR [22023]: ERROR: invalid hexadecimal digit: "x"
 --- STMT 38 ---
 SQL: SELECT jsonb_set(NULL, '{a}', '1'::jsonb)
 RESULT: 1 columns, 1 rows
@@ -5252,10 +5255,10 @@ SQL: -- operator mismatch matrix SELECT 1 + true
 ERROR [42883]: ERROR: operator does not exist: integer + boolean
 --- STMT 11 ---
 SQL: SELECT 1 + point(1,2)
-ERROR [42883]: ERROR: operator does not exist: integer + int4range
+ERROR [42883]: ERROR: operator does not exist: integer + point
 --- STMT 12 ---
 SQL: SELECT 1 + 'x'
-ERROR [22P02]: ERROR: invalid input syntax for type double precision: "x"
+ERROR [22P02]: ERROR: invalid input syntax for type integer: "x"
 --- STMT 13 ---
 SQL: SELECT 'a' - 'b'
 ERROR [42725]: ERROR: operator is not unique: unknown - unknown
@@ -5316,7 +5319,7 @@ COLUMNS: ?column?
 ROW: t
 --- STMT 31 ---
 SQL: SELECT OPERATOR(pg_catalog.||)('a','b')
-ERROR [42883]: ERROR: operator does not exist: text || text
+ERROR [42883]: ERROR: operator does not exist: unknown || unknown
 --- STMT 32 ---
 SQL: SELECT + + 1
 RESULT: 1 columns, 1 rows
@@ -5324,7 +5327,7 @@ COLUMNS: ?column?
 ROW: 1
 --- STMT 33 ---
 SQL: SELECT @@@ 1
-ERROR [42883]: ERROR: operator does not exist: @@@ integer
+ERROR [42883]: ERROR: syntax error at or near "@@@"
 --- STMT 34 ---
 SQL: -- a few valid comparisons for contrast SELECT 1 + 2, 1 = 1, 'a' || 'b'
 RESULT: 3 columns, 1 rows
@@ -5515,7 +5518,7 @@ SQL: SELECT point(1,2) + 'abc'
 ERROR [22P02]: ERROR: invalid input syntax for type point: "abc"
 --- STMT 44 ---
 SQL: SELECT box(1,2)
-ERROR [42883]: ERROR: function box(integer) does not exist
+ERROR [42883]: ERROR: function box(integer, integer) does not exist
 --- STMT 45 ---
 SQL: DROP SCHEMA compat CASCADE
 OK: 0 rows affected
@@ -5582,7 +5585,7 @@ SQL: NOTIFY compat_chan, repeat('x', 9000)
 ERROR [42601]: ERROR: syntax error at or near "repeat"
 --- STMT 20 ---
 SQL: LISTEN ""
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: zero-length delimited identifier at or near """"
 --- STMT 21 ---
 SQL: LISTEN "bad name"
 OK: 0 rows affected
@@ -5591,7 +5594,7 @@ SQL: LISTEN 123
 ERROR [42601]: ERROR: syntax error at or near "123"
 --- STMT 23 ---
 SQL: NOTIFY
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: syntax error at end of input
 --- STMT 24 ---
 SQL: UNLISTEN no_such_chan, other
 ERROR [42601]: ERROR: syntax error at or near ","
@@ -5637,16 +5640,16 @@ SQL: SET search_path TO DEFAULT
 OK: 0 rows affected
 --- STMT 37 ---
 SQL: SET TIME ZONE 123456
-ERROR [22023]: ERROR: unrecognized time zone name: "123456"
+ERROR [22023]: ERROR: invalid value for parameter "TimeZone": "123456"
 --- STMT 38 ---
 SQL: SET search_path =
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: syntax error at end of input
 --- STMT 39 ---
 SQL: SHOW
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: syntax error at end of input
 --- STMT 40 ---
 SQL: RESET
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: syntax error at end of input
 --- STMT 41 ---
 SQL: -- COMMENT ON more object kinds CREATE SEQUENCE admin_seq START 1
 OK: 0 rows affected
@@ -5661,7 +5664,7 @@ SQL: COMMENT ON COLUMN admin_t.note IS 'column comment'
 ERROR [42P01]: ERROR: relation "admin_t" does not exist
 --- STMT 45 ---
 SQL: COMMENT ON VIEW admin_v IS 'view comment'
-ERROR [42P01]: ERROR: view "admin_v" does not exist
+ERROR [42P01]: ERROR: relation "admin_v" does not exist
 --- STMT 46 ---
 SQL: COMMENT ON SEQUENCE admin_seq IS 'seq comment'
 OK: 0 rows affected
@@ -5703,7 +5706,7 @@ SQL: COPY (SELECT * FROM admin_t) TO STDOUT
 ERROR [42P01]: ERROR: relation "admin_t" does not exist
 --- STMT 59 ---
 SQL: COPY TO STDOUT
-ERROR [42601]: ERROR: syntax error at or near "stdout"
+ERROR [42601]: ERROR: syntax error at or near "STDOUT"
 --- STMT 60 ---
 SQL: COPY admin_t () TO STDOUT
 ERROR [42601]: ERROR: syntax error at or near ")"
@@ -5735,9 +5738,12 @@ ERROR [42P01]: ERROR: relation "admin_t" does not exist
 SQL: REVOKE SELECT ON no_such FROM compat_role2
 ERROR [42P01]: ERROR: relation "no_such" does not exist
 --- STMT 70 ---
-SQL: DROP ROLE compat_role2
+SQL: DROP OWNED BY compat_role2
 OK: 0 rows affected
 --- STMT 71 ---
+SQL: DROP ROLE compat_role2
+OK: 0 rows affected
+--- STMT 72 ---
 SQL: DROP SCHEMA compat CASCADE
 OK: 0 rows affected
 
@@ -5969,7 +5975,7 @@ SQL: PREPARE bad_count(int) AS SELECT * FROM prep_t WHERE id = $1 AND a = $2
 OK: 0 rows affected
 --- STMT 57 ---
 SQL: EXECUTE bad_count(1)
-ERROR [42601]: ERROR: wrong number of parameters for prepared statement "bad_count": expected 2, got 1
+ERROR [42601]: ERROR: wrong number of parameters for prepared statement "bad_count"
 --- STMT 58 ---
 SQL: PREPARE bad_offset(int) AS SELECT * FROM prep_t OFFSET $1
 OK: 0 rows affected
@@ -6056,18 +6062,18 @@ OK: 0 rows affected
 SQL: INSERT INTO upsert_t(code, note) VALUES ('A', 'a1'), ('B', 'b1') RETURNING id, code, note, updated_at
 RESULT: 4 columns, 2 rows
 COLUMNS: id, code, note, updated_at
-ROW: 1 | A | a1 | 2026-07-30 05:04:13.582726+00
-ROW: 2 | B | b1 | 2026-07-30 05:04:13.582726+00
+ROW: 1 | A | a1 | 2026-08-30 12:04:16.492935+00
+ROW: 2 | B | b1 | 2026-08-30 12:04:16.492935+00
 --- STMT 12 ---
 SQL: -- returning / generated-key shaped cases INSERT INTO upsert_t(code) VALUES ('C') RETURNING *
 RESULT: 4 columns, 1 rows
 COLUMNS: id, code, note, updated_at
-ROW: 3 | C | d | 2026-07-30 05:04:13.583729+00
+ROW: 3 | C | d | 2026-08-30 12:04:16.493654+00
 --- STMT 13 ---
 SQL: INSERT INTO upsert_t(id, code, note) OVERRIDING SYSTEM VALUE VALUES (100, 'SYS', 'sys') RETURNING *
 RESULT: 4 columns, 1 rows
 COLUMNS: id, code, note, updated_at
-ROW: 100 | SYS | sys | 2026-07-30 05:04:13.583729+00
+ROW: 100 | SYS | sys | 2026-08-30 12:04:16.494086+00
 --- STMT 14 ---
 SQL: ALTER TABLE upsert_t ALTER COLUMN id SET GENERATED BY DEFAULT
 OK: 0 rows affected
@@ -6075,7 +6081,7 @@ OK: 0 rows affected
 SQL: INSERT INTO upsert_t(id, code, note) VALUES (200, 'MAN', 'manual') RETURNING *
 RESULT: 4 columns, 1 rows
 COLUMNS: id, code, note, updated_at
-ROW: 200 | MAN | manual | 2026-07-30 05:04:13.584729+00
+ROW: 200 | MAN | manual | 2026-08-30 12:04:16.494928+00
 --- STMT 16 ---
 SQL: ALTER TABLE upsert_t ALTER COLUMN id SET GENERATED ALWAYS
 OK: 0 rows affected
@@ -6087,12 +6093,12 @@ COLUMNS: id, code, note, updated_at
 SQL: INSERT INTO upsert_t(code, note) VALUES ('A', 'a3') ON CONFLICT (code) DO UPDATE SET note = EXCLUDED.note, updated_at = CURRENT_TIMESTAMP RETURNING id, code, note, updated_at
 RESULT: 4 columns, 1 rows
 COLUMNS: id, code, note, updated_at
-ROW: 1 | A | a3 | 2026-07-30 05:04:13.586732+00
+ROW: 1 | A | a3 | 2026-08-30 12:04:16.503433+00
 --- STMT 19 ---
 SQL: INSERT INTO upsert_t(code, note) VALUES ('B', 'b2') ON CONFLICT ON CONSTRAINT upsert_t_code_key DO UPDATE SET note = EXCLUDED.note RETURNING *
 RESULT: 4 columns, 1 rows
 COLUMNS: id, code, note, updated_at
-ROW: 2 | B | b2 | 2026-07-30 05:04:13.582726+00
+ROW: 2 | B | b2 | 2026-08-30 12:04:16.492935+00
 --- STMT 20 ---
 SQL: INSERT INTO upsert_t(code, note) VALUES ('D', 'd1'), ('E', 'e1') RETURNING id, code, note
 RESULT: 3 columns, 2 rows
@@ -6103,7 +6109,7 @@ ROW: 8 | E | e1
 SQL: INSERT INTO upsert_t(code, note) VALUES ('D', 'd2') ON CONFLICT (code) DO UPDATE SET note = EXCLUDED.note WHERE upsert_t.note <> EXCLUDED.note RETURNING *
 RESULT: 4 columns, 1 rows
 COLUMNS: id, code, note, updated_at
-ROW: 7 | D | d2 | 2026-07-30 05:04:13.588733+00
+ROW: 7 | D | d2 | 2026-08-30 12:04:16.504664+00
 --- STMT 22 ---
 SQL: UPDATE upsert_t SET note = note WHERE code = 'A' RETURNING id, code, note
 RESULT: 3 columns, 1 rows
@@ -6121,13 +6127,13 @@ COLUMNS: id, code, note, updated_at
 SQL: SELECT * FROM upsert_t ORDER BY id
 RESULT: 4 columns, 7 rows
 COLUMNS: id, code, note, updated_at
-ROW: 1 | A | a3 | 2026-07-30 05:04:13.586732+00
-ROW: 2 | B | b2 | 2026-07-30 05:04:13.582726+00
-ROW: 3 | C | d | 2026-07-30 05:04:13.583729+00
-ROW: 7 | D | d2 | 2026-07-30 05:04:13.588733+00
-ROW: 8 | E | e1 | 2026-07-30 05:04:13.588733+00
-ROW: 100 | SYS | sys | 2026-07-30 05:04:13.583729+00
-ROW: 200 | MAN | manual | 2026-07-30 05:04:13.584729+00
+ROW: 1 | A | a3 | 2026-08-30 12:04:16.503433+00
+ROW: 2 | B | b2 | 2026-08-30 12:04:16.492935+00
+ROW: 3 | C | d | 2026-08-30 12:04:16.493654+00
+ROW: 7 | D | d2 | 2026-08-30 12:04:16.504664+00
+ROW: 8 | E | e1 | 2026-08-30 12:04:16.504664+00
+ROW: 100 | SYS | sys | 2026-08-30 12:04:16.494086+00
+ROW: 200 | MAN | manual | 2026-08-30 12:04:16.494928+00
 --- STMT 26 ---
 SQL: -- bad upsert / returning cases INSERT INTO upsert_t(code, note) VALUES ('A', 'dup') ON CONFLICT (note) DO NOTHING
 ERROR [42P10]: ERROR: there is no unique or exclusion constraint matching the ON CONFLICT specification
@@ -6267,12 +6273,12 @@ OK: 0 rows affected
 --- STMT 36 ---
 SQL: SELECT 'compat.meta_t'::regclass
 RESULT: 1 columns, 1 rows
-COLUMNS: int4
+COLUMNS: regclass
 ROW: compat.meta_t
 --- STMT 37 ---
 SQL: SELECT 'int4'::regtype
 RESULT: 1 columns, 1 rows
-COLUMNS: int4
+COLUMNS: regtype
 ROW: integer
 --- STMT 38 ---
 SQL: SELECT to_regclass('compat.meta_t')
@@ -6463,7 +6469,7 @@ OK: 3 rows affected
 SQL: -- common app-shaped datetime and filter expressions SELECT CURRENT_DATE, CURRENT_TIMESTAMP, LOCALTIMESTAMP
 RESULT: 3 columns, 1 rows
 COLUMNS: current_date, current_timestamp, localtimestamp
-ROW: 2026-07-30 | 2026-07-30 05:04:17.370776+00 | 2026-07-30 05:04:17.370776
+ROW: 2026-08-30 | 2026-08-30 12:04:17.209525+00 | 2026-08-30 12:04:17.209525
 --- STMT 13 ---
 SQL: SELECT date_trunc('day', created_at), date_trunc('hour', local_ts) FROM app_t ORDER BY id
 RESULT: 2 columns, 3 rows
@@ -6716,7 +6722,7 @@ SQL: ALTER TABLE patch_t ADD CONSTRAINT patch_t_status_ck CHECK (status IN ('bac
 OK: 0 rows affected
 --- STMT 41 ---
 SQL: UPDATE patch_t SET status = 'other' WHERE id = 1
-ERROR [23514]: ERROR: new row violates check constraint "patch_t_status_ck"
+ERROR [23514]: ERROR: new row for relation "patch_t" violates check constraint "patch_t_status_ck"
 --- STMT 42 ---
 SQL: CREATE OR REPLACE VIEW patch_bad AS SELECT * FROM no_such_table
 ERROR [42P01]: ERROR: relation "no_such_table" does not exist
@@ -6787,7 +6793,7 @@ SQL: DO $$ BEGIN BEGIN EXECUTE 'INSERT INTO compat.do_t VALUES (1, ''dup'', CURR
 OK: 0 rows affected
 --- STMT 18 ---
 SQL: -- bad dynamic SQL / DO cases DO $$ BEGIN EXECUTE 'CREATE TABLE compat.x('; END $$
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: syntax error at end of input
 --- STMT 19 ---
 SQL: DO $$ BEGIN RAISE EXCEPTION 'boom'; END $$
 ERROR [P0001]: ERROR: boom
@@ -6931,7 +6937,7 @@ SQL: SELECT * FROM work_item ORDER BY id FOR UPDATE OF no_such_table
 ERROR [42P01]: ERROR: relation "no_such_table" in FOR UPDATE clause not found in FROM clause
 --- STMT 28 ---
 SQL: WITH next_item AS ( SELECT id FROM work_item WHERE status = 'ready' LIMIT 1 ) UPDATE work_item SET status = 'running' FROM next_item WHERE work_item.id = (SELECT id FROM next_item) RETURNING nope
-ERROR [42703]: ERROR: column nope does not exist
+ERROR [42703]: ERROR: column "nope" does not exist
 --- STMT 29 ---
 SQL: DROP SCHEMA compat CASCADE
 OK: 0 rows affected
@@ -7318,7 +7324,7 @@ RESULT: 4 columns, 3 rows
 COLUMNS: id, tenant_id, note, deleted_at
 ROW: 1 | 10 | a | NULL
 ROW: 2 | 20 | b | NULL
-ROW: 3 | 10 | c | 2026-07-30 05:04:29.453731+00
+ROW: 3 | 10 | c | 2026-08-30 12:04:19.283888+00
 --- STMT 17 ---
 SQL: ALTER TABLE tenant_data FORCE ROW LEVEL SECURITY
 OK: 0 rows affected
@@ -7327,7 +7333,7 @@ SQL: SELECT * FROM tenant_data ORDER BY id
 RESULT: 4 columns, 2 rows
 COLUMNS: id, tenant_id, note, deleted_at
 ROW: 1 | 10 | a | NULL
-ROW: 3 | 10 | c | 2026-07-30 05:04:29.453731+00
+ROW: 3 | 10 | c | 2026-08-30 12:04:19.283888+00
 --- STMT 19 ---
 SQL: ALTER POLICY tenant_select_pol ON tenant_data USING (tenant_id = current_setting('compat.tenant_id')::int AND deleted_at IS NULL)
 OK: 0 rows affected
@@ -7347,7 +7353,7 @@ SQL: -- bad policy / RLS cases CREATE POLICY bad_pol ON tenant_data USING (tenan
 OK: 0 rows affected
 --- STMT 24 ---
 SQL: CREATE POLICY bad_cmd_pol ON tenant_data FOR UPSERT USING (true)
-ERROR [42601]: ERROR: syntax error at or near "upsert"
+ERROR [42601]: ERROR: syntax error at or near "UPSERT"
 --- STMT 25 ---
 SQL: ALTER POLICY no_such_pol ON tenant_data USING (true)
 ERROR [42704]: ERROR: policy "no_such_pol" for table "tenant_data" does not exist
@@ -7640,23 +7646,23 @@ OK: 4 rows affected
 SQL: -- common repository query shapes SELECT * FROM repo_account WHERE id = 1
 RESULT: 6 columns, 1 rows
 COLUMNS: id, email, active, deleted_at, version, created_at
-ROW: 1 | a@example.com | t | NULL | 0 | 2026-07-30 05:04:32.170598+00
+ROW: 1 | a@example.com | t | NULL | 0 | 2026-08-30 12:04:19.752609+00
 --- STMT 15 ---
 SQL: SELECT * FROM repo_account WHERE email = 'a@example.com'
 RESULT: 6 columns, 1 rows
 COLUMNS: id, email, active, deleted_at, version, created_at
-ROW: 1 | a@example.com | t | NULL | 0 | 2026-07-30 05:04:32.170598+00
+ROW: 1 | a@example.com | t | NULL | 0 | 2026-08-30 12:04:19.752609+00
 --- STMT 16 ---
 SQL: SELECT * FROM repo_account WHERE deleted_at IS NULL ORDER BY id
 RESULT: 6 columns, 2 rows
 COLUMNS: id, email, active, deleted_at, version, created_at
-ROW: 1 | a@example.com | t | NULL | 0 | 2026-07-30 05:04:32.170598+00
-ROW: 2 | b@example.com | f | NULL | 0 | 2026-07-30 05:04:32.170598+00
+ROW: 1 | a@example.com | t | NULL | 0 | 2026-08-30 12:04:19.752609+00
+ROW: 2 | b@example.com | f | NULL | 0 | 2026-08-30 12:04:19.752609+00
 --- STMT 17 ---
 SQL: SELECT * FROM repo_account WHERE active IS TRUE ORDER BY id
 RESULT: 6 columns, 1 rows
 COLUMNS: id, email, active, deleted_at, version, created_at
-ROW: 1 | a@example.com | t | NULL | 0 | 2026-07-30 05:04:32.170598+00
+ROW: 1 | a@example.com | t | NULL | 0 | 2026-08-30 12:04:19.752609+00
 --- STMT 18 ---
 SQL: SELECT EXISTS (SELECT 1 FROM repo_account WHERE email = 'missing@example.com')
 RESULT: 1 columns, 1 rows
@@ -7677,21 +7683,21 @@ ROW: 2 | 1 | 40.00
 SQL: SELECT o.* FROM repo_order o WHERE o.account_id = 1 ORDER BY o.created_at DESC, o.id DESC LIMIT 2 OFFSET 0
 RESULT: 5 columns, 2 rows
 COLUMNS: id, account_id, status, total, created_at
-ROW: 3 | 1 | done | 30.00 | 2026-07-30 05:04:32.170598+00
-ROW: 2 | 1 | open | 20.00 | 2026-07-30 05:04:32.170598+00
+ROW: 3 | 1 | done | 30.00 | 2026-08-30 12:04:19.753043+00
+ROW: 2 | 1 | open | 20.00 | 2026-08-30 12:04:19.753043+00
 --- STMT 22 ---
 SQL: SELECT o.* FROM repo_order o WHERE (o.created_at, o.id) < (CURRENT_TIMESTAMP, 999999) ORDER BY o.created_at DESC, o.id DESC LIMIT 10
 RESULT: 5 columns, 4 rows
 COLUMNS: id, account_id, status, total, created_at
-ROW: 4 | 2 | open | 40.00 | 2026-07-30 05:04:32.170598+00
-ROW: 3 | 1 | done | 30.00 | 2026-07-30 05:04:32.170598+00
-ROW: 2 | 1 | open | 20.00 | 2026-07-30 05:04:32.170598+00
-ROW: 1 | 1 | open | 10.00 | 2026-07-30 05:04:32.170598+00
+ROW: 4 | 2 | open | 40.00 | 2026-08-30 12:04:19.753043+00
+ROW: 3 | 1 | done | 30.00 | 2026-08-30 12:04:19.753043+00
+ROW: 2 | 1 | open | 20.00 | 2026-08-30 12:04:19.753043+00
+ROW: 1 | 1 | open | 10.00 | 2026-08-30 12:04:19.753043+00
 --- STMT 23 ---
 SQL: UPDATE repo_account SET version = version + 1 WHERE id = 1 AND version = 0 RETURNING *
 RESULT: 6 columns, 1 rows
 COLUMNS: id, email, active, deleted_at, version, created_at
-ROW: 1 | a@example.com | t | NULL | 1 | 2026-07-30 05:04:32.170598+00
+ROW: 1 | a@example.com | t | NULL | 1 | 2026-08-30 12:04:19.752609+00
 --- STMT 24 ---
 SQL: UPDATE repo_account SET version = version + 1 WHERE id = 1 AND version = 0 RETURNING *
 RESULT: 6 columns, 0 rows
@@ -7700,7 +7706,7 @@ COLUMNS: id, email, active, deleted_at, version, created_at
 SQL: INSERT INTO repo_account(email, active) VALUES ('d@example.com', true) ON CONFLICT (email) DO NOTHING RETURNING *
 RESULT: 6 columns, 1 rows
 COLUMNS: id, email, active, deleted_at, version, created_at
-ROW: 4 | d@example.com | t | NULL | 0 | 2026-07-30 05:04:35.218569+00
+ROW: 4 | d@example.com | t | NULL | 0 | 2026-08-30 12:04:22.658348+00
 --- STMT 26 ---
 SQL: SELECT ra.id, ra.email, ro.id AS order_id, ro.status, ro.total FROM repo_account ra LEFT JOIN repo_order ro ON ro.account_id = ra.id WHERE ra.deleted_at IS NULL ORDER BY ra.id, ro.id
 RESULT: 5 columns, 5 rows
@@ -7840,7 +7846,7 @@ SQL: SELECT pg_get_indexdef('compat.missing_i'::regclass)
 ERROR [42P01]: ERROR: relation "compat.missing_i" does not exist
 --- STMT 26 ---
 SQL: SELECT pg_get_functiondef('compat.missing_fn(int)'::regprocedure)
-ERROR [42883]: ERROR: function "missing_fn(int)" does not exist
+ERROR [42883]: ERROR: function "compat.missing_fn(int)" does not exist
 --- STMT 27 ---
 SQL: SELECT col_description('compat.def_help_t'::regclass, 99)
 RESULT: 1 columns, 1 rows

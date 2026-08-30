@@ -106,7 +106,7 @@ final class JsonPathDatetime {
     }
 
     private static boolean mentionsTime(String template) {
-        String upper = template.toUpperCase();
+        String upper = template.toUpperCase(java.util.Locale.ROOT);
         return upper.contains("HH") || upper.contains("MI") || upper.contains("SS")
                 || upper.contains("US") || upper.contains("MS");
     }

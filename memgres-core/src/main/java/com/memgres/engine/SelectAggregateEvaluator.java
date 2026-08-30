@@ -265,7 +265,7 @@ class SelectAggregateEvaluator {
     private static void collectColumnNames(Expression expr, Set<String> out) {
         if (expr == null) return;
         if (expr instanceof ColumnRef) {
-            out.add(((ColumnRef) expr).column().toLowerCase());
+            out.add(((ColumnRef) expr).column().toLowerCase(java.util.Locale.ROOT));
         } else if (expr instanceof BinaryExpr) {
             collectColumnNames(((BinaryExpr) expr).left(), out);
             collectColumnNames(((BinaryExpr) expr).right(), out);
@@ -325,7 +325,7 @@ class SelectAggregateEvaluator {
                 copy = Arrays.copyOf(row, row.length);
                 List<Column> cols = b.table().getColumns();
                 for (int ci = 0; ci < copy.length && ci < cols.size(); ci++) {
-                    if (!groupedColumnNames.contains(cols.get(ci).getName().toLowerCase())) {
+                    if (!groupedColumnNames.contains(cols.get(ci).getName().toLowerCase(java.util.Locale.ROOT))) {
                         copy[ci] = null;
                     }
                 }
@@ -641,7 +641,7 @@ class SelectAggregateEvaluator {
         if (answered != null) return answered.value();
         if (expr instanceof FunctionCallExpr) {
             FunctionCallExpr fn = (FunctionCallExpr) expr;
-            String name = FunctionEvaluator.stripSchemaPrefix(fn.name().toLowerCase());
+            String name = FunctionEvaluator.stripSchemaPrefix(fn.name().toLowerCase(java.util.Locale.ROOT));
             if (select.isAggregateFunction(name)) {
                 return evalAggregate(fn, group);
             }
@@ -851,7 +851,7 @@ class SelectAggregateEvaluator {
     // ---- Ordered-set aggregates ----
 
     private Object evalOrderedSetAggregate(OrderedSetAggExpr osa, List<RowContext> group) {
-        String name = osa.funcName().toLowerCase();
+        String name = osa.funcName().toLowerCase(java.util.Locale.ROOT);
         List<SelectStmt.OrderByItem> orderBy = osa.withinGroupOrderBy();
         checkOrderedSetArity(osa, group);
         // The direct arguments are typed from the query, not from whichever rows a FILTER left,
@@ -1008,7 +1008,7 @@ class SelectAggregateEvaluator {
      * so; accepting a mismatched call instead ranks against whatever prefix happened to line up.
      */
     private void checkOrderedSetArity(OrderedSetAggExpr osa, List<RowContext> group) {
-        String name = osa.funcName().toLowerCase();
+        String name = osa.funcName().toLowerCase(java.util.Locale.ROOT);
         int args = osa.args().size();
         int keys = osa.withinGroupOrderBy() == null ? 0 : osa.withinGroupOrderBy().size();
         boolean ok;
@@ -1140,7 +1140,7 @@ class SelectAggregateEvaluator {
      * what it orders — so the count to compare against is both together.
      */
     boolean resolvesAsOrderedSet(OrderedSetAggExpr osa, List<RowContext.TableBinding> bindings) {
-        String name = FunctionEvaluator.stripSchemaPrefix(osa.funcName().toLowerCase());
+        String name = FunctionEvaluator.stripSchemaPrefix(osa.funcName().toLowerCase(java.util.Locale.ROOT));
         int arity = osa.args().size()
                 + (osa.withinGroupOrderBy() == null ? 0 : osa.withinGroupOrderBy().size());
         if (BuiltinAggregateSignatures.orderedSetArity(name) != arity) return false;
@@ -1277,7 +1277,7 @@ class SelectAggregateEvaluator {
                 types.append(argTypeName(item.expr(), sample));
             }
         }
-        String name = osa.funcName().toLowerCase();
+        String name = osa.funcName().toLowerCase(java.util.Locale.ROOT);
         MemgresException e = new MemgresException(
                 "function " + name + "(" + types + ") does not exist", "42883");
         // Casting nothing would resolve a hypothetical-set call: its direct arguments are the row
@@ -1297,7 +1297,7 @@ class SelectAggregateEvaluator {
      * no such function exists; only a call with no direct arguments at all is named outright.
      */
     private MemgresException notAnOrderedSetAggregate(OrderedSetAggExpr osa, List<RowContext> group) {
-        String name = osa.funcName().toLowerCase();
+        String name = osa.funcName().toLowerCase(java.util.Locale.ROOT);
         boolean starOnly = osa.args().isEmpty()
                 || (osa.args().size() == 1 && osa.args().get(0) instanceof ColumnRef
                     && "*".equals(((ColumnRef) osa.args().get(0)).column()));
@@ -1336,7 +1336,7 @@ class SelectAggregateEvaluator {
     // ---- Core aggregate evaluation ----
 
     Object evalAggregate(FunctionCallExpr fn, List<RowContext> group) {
-        String name = FunctionEvaluator.stripSchemaPrefix(fn.name().toLowerCase());
+        String name = FunctionEvaluator.stripSchemaPrefix(fn.name().toLowerCase(java.util.Locale.ROOT));
 
         // The star in f(*) says which rows to accumulate over, not what to accumulate: the call
         // has no arguments, and resolves only against a signature declared over none. count is the
@@ -2108,7 +2108,7 @@ class SelectAggregateEvaluator {
                 // Nothing readable here; the argument stays unknown and the check is skipped.
             }
         }
-        return declared == null ? "unknown" : declared.trim().toLowerCase();
+        return declared == null ? "unknown" : declared.trim().toLowerCase(java.util.Locale.ROOT);
     }
 
     /** Whether a value of {@code have} reaches a parameter declared {@code want}. */
@@ -2158,7 +2158,7 @@ class SelectAggregateEvaluator {
         }
         // And the arguments have to be of the types it declares.
         for (int i = 0; i < given; i++) {
-            String want = declared[i] == null ? null : declared[i].trim().toLowerCase();
+            String want = declared[i] == null ? null : declared[i].trim().toLowerCase(java.util.Locale.ROOT);
             String have = aggregateArgumentType(fn.args().get(i), group);
             if (want == null || "unknown".equals(have) || want.equals(have)) continue;
             if (!aggregateTypeAccepts(want, have)) {
@@ -2482,7 +2482,7 @@ class SelectAggregateEvaluator {
         String x = a.bits();
         String y = b.bits();
         if (x.length() != y.length()) {
-            throw new MemgresException("cannot " + fname.substring(4).toUpperCase()
+            throw new MemgresException("cannot " + fname.substring(4).toUpperCase(java.util.Locale.ROOT)
                     + " bit strings of different sizes", "22026");
         }
         StringBuilder sb = new StringBuilder(x.length());

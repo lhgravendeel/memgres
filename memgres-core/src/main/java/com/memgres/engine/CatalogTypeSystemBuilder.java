@@ -278,7 +278,7 @@ class CatalogTypeSystemBuilder {
             if (op.getFunction() != null) {
                 PgFunction func = database.getFunction(op.getFunction());
                 if (func != null) {
-                    opcodeOid = oids.oid("func:" + op.getFunction().toLowerCase());
+                    opcodeOid = oids.oid("func:" + op.getFunction().toLowerCase(java.util.Locale.ROOT));
                     if (func.getReturnType() != null) {
                         resultOid = resolveTypeOid(func.getReturnType());
                     }
@@ -374,12 +374,12 @@ class CatalogTypeSystemBuilder {
     private int resolveAccessMethodOid(String method) {
         if (method == null) return 0;
         int builtin = accessMethodOid(method);
-        return builtin != 0 ? builtin : oids.oid("am:" + method.toLowerCase());
+        return builtin != 0 ? builtin : oids.oid("am:" + method.toLowerCase(java.util.Locale.ROOT));
     }
 
     /** PostgreSQL's OID for one of the access methods it ships, or 0 for anything else. */
     private static int accessMethodOid(String method) {
-        switch (method.toLowerCase()) {
+        switch (method.toLowerCase(java.util.Locale.ROOT)) {
             case "btree": return 403;
             case "hash": return 405;
             case "gist": return 783;
@@ -834,7 +834,7 @@ class CatalogTypeSystemBuilder {
             int methodOid = resolveAccessMethodOid(cls.getMethod());
             int familyOid = 0;
             if (cls.getFamilyName() != null) {
-                String famKey = cls.getFamilyName().toLowerCase() + ":" + cls.getMethod().toLowerCase();
+                String famKey = cls.getFamilyName().toLowerCase(java.util.Locale.ROOT) + ":" + cls.getMethod().toLowerCase(java.util.Locale.ROOT);
                 familyOid = oids.oid("opfamily:" + famKey);
             }
             table.insertRow(new Object[]{clsOid, cls.getName(), ns, ownerOid,

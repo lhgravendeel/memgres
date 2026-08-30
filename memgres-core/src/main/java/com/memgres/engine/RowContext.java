@@ -210,7 +210,7 @@ public class RowContext {
     /** Translate a view column name to its base-table name when an aliasing map is present. */
     private String aliasColumn(String columnName) {
         if (columnAliases == null || columnName == null) return columnName;
-        String mapped = columnAliases.get(columnName.toLowerCase());
+        String mapped = columnAliases.get(columnName.toLowerCase(java.util.Locale.ROOT));
         return mapped != null ? mapped : columnName;
     }
     /**
@@ -404,7 +404,7 @@ public class RowContext {
      * calling the second missing sent the reader looking for something they had already written.
      */
     private MemgresException noSuchFromEntry(String qualifier) {
-        if (coveredNames == null || !coveredNames.contains(qualifier.toLowerCase())) {
+        if (coveredNames == null || !coveredNames.contains(qualifier.toLowerCase(java.util.Locale.ROOT))) {
             return new MemgresException(
                     "missing FROM-clause entry for table \"" + qualifier + "\"", "42P01");
         }
@@ -425,7 +425,7 @@ public class RowContext {
         // ctid has an ordinary column called ctid -- and PostgreSQL resolves the name against the
         // columns the item exposes before it looks for a system column. Reading the derived
         // relation's own position instead renumbered every row it carried up.
-        String lcCol = columnName.toLowerCase();
+        String lcCol = columnName.toLowerCase(java.util.Locale.ROOT);
         boolean systemName = lcCol.equals("tableoid") || lcCol.equals("ctid") || lcCol.equals("xmin")
                 || lcCol.equals("xmax") || lcCol.equals("cmin") || lcCol.equals("cmax");
         if (systemName && !aBindingDeclares(tableQualifier, columnName)) {
@@ -489,7 +489,7 @@ public class RowContext {
         // Unqualified, search all bindings
         Object result = null;
         boolean found = false;
-        boolean isUsingCol = usingColumns != null && usingColumns.contains(columnName.toLowerCase());
+        boolean isUsingCol = usingColumns != null && usingColumns.contains(columnName.toLowerCase(java.util.Locale.ROOT));
         for (TableBinding b : bindings) {
             int idx = b.table().getColumnIndex(columnName);
             if (idx >= 0) {
@@ -563,7 +563,7 @@ public class RowContext {
 
     /** The name a FROM item answers to here: what it was aliased as, else the relation's own. */
     private static String bindingName(TableBinding b) {
-        return (b.alias() != null ? b.alias() : b.table().getName()).toLowerCase();
+        return (b.alias() != null ? b.alias() : b.table().getName()).toLowerCase(java.util.Locale.ROOT);
     }
 
     /**
@@ -646,7 +646,7 @@ public class RowContext {
             return new Column("tableoid", DataType.INTEGER, false, false, null);
         }
         // System columns
-        String lc = columnName.toLowerCase();
+        String lc = columnName.toLowerCase(java.util.Locale.ROOT);
         if (lc.equals("ctid")) return new Column("ctid", DataType.TEXT, false, false, null);
         if (lc.equals("xmin") || lc.equals("xmax")) return new Column(lc, DataType.BIGINT, false, false, null);
         if (lc.equals("cmin") || lc.equals("cmax")) return new Column(lc, DataType.INTEGER, false, false, null);

@@ -61,6 +61,27 @@ public final class GrantStmt implements Statement {
     public boolean withAdminOption() { return withAdminOption; }
     public boolean isRoleGrant() { return isRoleGrant; }
     public List<String> columns() { return columns; }
+
+    /**
+     * The columns each privilege was written with, where they differ.
+     *
+     * <p>One statement may name a different column list for each privilege —
+     * {@code GRANT SELECT (b), UPDATE (a)} grants two different things about two different
+     * columns. Read into one shared list, every privilege was granted on every column named
+     * anywhere in the statement, so a role given SELECT on one column got UPDATE on it too.
+     */
+    public List<String> columnsFor(String privilege) {
+        if (perPrivilegeColumns == null || privilege == null) return columns;
+        List<String> own = perPrivilegeColumns.get(privilege.toUpperCase(java.util.Locale.ROOT));
+        return own != null ? own : columns;
+    }
+
+    public GrantStmt withPerPrivilegeColumns(java.util.Map<String, List<String>> byPrivilege) {
+        this.perPrivilegeColumns = byPrivilege;
+        return this;
+    }
+
+    private java.util.Map<String, List<String>> perPrivilegeColumns;
     public String grantor() { return grantor; }
 
     @Override

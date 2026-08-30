@@ -136,7 +136,7 @@ public final class DdlDefinitionChecks {
                 return n instanceof FunctionCallExpr
                         && ((FunctionCallExpr) n).name != null
                         && SIDE_EFFECTING_FUNCTIONS.contains(
-                                ((FunctionCallExpr) n).name.toLowerCase());
+                                ((FunctionCallExpr) n).name.toLowerCase(java.util.Locale.ROOT));
             }
         });
     }
@@ -292,7 +292,7 @@ public final class DdlDefinitionChecks {
      */
     public static String storageCode(String storageType, Column col) {
         String code;
-        switch (storageType.toUpperCase()) {
+        switch (storageType.toUpperCase(java.util.Locale.ROOT)) {
             case "PLAIN": code = "p"; break;
             case "EXTERNAL": code = "e"; break;
             case "EXTENDED": code = "x"; break;
@@ -370,7 +370,7 @@ public final class DdlDefinitionChecks {
                 throw new MemgresException("column \"" + written
                         + "\" named in key does not exist", "42703");
             }
-            if (!seen.add(written.toLowerCase())) {
+            if (!seen.add(written.toLowerCase(java.util.Locale.ROOT))) {
                 throw new MemgresException("column \"" + written + "\" appears twice in "
                         + kind + " constraint", "42701");
             }
@@ -429,7 +429,7 @@ public final class DdlDefinitionChecks {
      */
     public static void rejectSystemKeyColumn(String column) {
         if (!isSystemColumnName(column)) return;
-        String lower = column.toLowerCase();
+        String lower = column.toLowerCase(java.util.Locale.ROOT);
         String unindexable = lower.equals("xmin") || lower.equals("xmax") ? "xid"
                 : lower.equals("cmin") || lower.equals("cmax") ? "cid" : null;
         if (unindexable == null) throw indexOnSystemColumn();
@@ -464,7 +464,7 @@ public final class DdlDefinitionChecks {
      */
     public static void requireExclusionCapableAccessMethod(String method) {
         if (method == null) return;
-        String m = method.toLowerCase();
+        String m = method.toLowerCase(java.util.Locale.ROOT);
         if (m.equals("btree") || m.equals("gist") || m.equals("spgist")) return;
         throw PgErrors.notImplemented("access method \"" + method
                 + "\" does not support exclusion constraints");
@@ -479,7 +479,7 @@ public final class DdlDefinitionChecks {
     public static void rejectSerialPseudotype(String written) {
         if (written == null) return;
         String bare = baseTypeName(written);
-        String lower = bare.toLowerCase();
+        String lower = bare.toLowerCase(java.util.Locale.ROOT);
         if (lower.equals("serial") || lower.equals("bigserial") || lower.equals("smallserial")
                 || lower.equals("serial2") || lower.equals("serial4") || lower.equals("serial8")) {
             throw PgErrors.undefinedObject("type", bare);
@@ -493,7 +493,7 @@ public final class DdlDefinitionChecks {
      */
     /** True for a name every relation carries whether or not anybody declared it. */
     static boolean isSystemColumnName(String name) {
-        return name != null && SYSTEM_COLUMN_NAMES.contains(name.toLowerCase());
+        return name != null && SYSTEM_COLUMN_NAMES.contains(name.toLowerCase(java.util.Locale.ROOT));
     }
 
     public static void rejectSystemColumnInCheck(Expression expr) {
@@ -502,7 +502,7 @@ public final class DdlDefinitionChecks {
             @Override public boolean test(Object n) {
                 return n instanceof ColumnRef
                         && ((ColumnRef) n).column() != null
-                        && SYSTEM_COLUMN_NAMES.contains(((ColumnRef) n).column().toLowerCase());
+                        && SYSTEM_COLUMN_NAMES.contains(((ColumnRef) n).column().toLowerCase(java.util.Locale.ROOT));
             }
         });
         if (found != null) {
@@ -525,7 +525,7 @@ public final class DdlDefinitionChecks {
         });
         if (found != null) {
             throw new MemgresException("cannot use system column \""
-                    + ((ColumnRef) found).column().toLowerCase()
+                    + ((ColumnRef) found).column().toLowerCase(java.util.Locale.ROOT)
                     + "\" in column generation expression", "42P10");
         }
     }
@@ -543,7 +543,7 @@ public final class DdlDefinitionChecks {
      */
     public static void requireCollationExists(Database db, String collation) {
         if (collation == null) return;
-        String name = collation.toLowerCase().replace("\"", "");
+        String name = collation.toLowerCase(java.util.Locale.ROOT).replace("\"", "");
         if (name.startsWith("pg_catalog.")) name = name.substring("pg_catalog.".length());
         if (BUILTIN_COLLATIONS.contains(name)) return;
         if (db != null && db.getCollation(name) != null) return;
@@ -883,7 +883,7 @@ public final class DdlDefinitionChecks {
         }
         if (!(expr instanceof FunctionCallExpr)) return null;
         FunctionCallExpr call = (FunctionCallExpr) expr;
-        String name = call.name() == null ? "" : call.name().toLowerCase();
+        String name = call.name() == null ? "" : call.name().toLowerCase(java.util.Locale.ROOT);
         if (!name.equals("coalesce") && !name.equals("greatest") && !name.equals("least")) {
             return null;
         }

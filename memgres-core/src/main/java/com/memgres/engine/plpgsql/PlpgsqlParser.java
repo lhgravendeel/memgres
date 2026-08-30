@@ -109,7 +109,7 @@ public class PlpgsqlParser {
             advance();
             // A keyword's token carries its upper-case form, which is not the name of anything:
             // the column in "v t.name%TYPE" is called name, not NAME.
-            return t.type() == TokenType.KEYWORD ? t.value().toLowerCase() : t.value();
+            return t.type() == TokenType.KEYWORD ? t.value().toLowerCase(java.util.Locale.ROOT) : t.value();
         }
         throw syntaxError(t);
     }
@@ -211,7 +211,7 @@ public class PlpgsqlParser {
                     throw new MemgresException("syntax error at or near \"" + value + "\"", "42601");
                 }
                 advance();
-                variableConflict = value.toLowerCase();
+                variableConflict = value.toLowerCase(java.util.Locale.ROOT);
             } else if ("print_strict_params".equalsIgnoreCase(option)) {
                 String value = peek().value();
                 if (!"on".equalsIgnoreCase(value) && !"off".equalsIgnoreCase(value)) {
@@ -294,7 +294,7 @@ public class PlpgsqlParser {
                 String cursorSql = collectUntilSemicolon();
                 decls.add(new PlpgsqlStatement.VarDeclaration(name, "REFCURSOR", false, false, null,
                         true, cursorSql, cursorNames));
-                this.cursorParams.put(name.toLowerCase(), cursorNames);
+                this.cursorParams.put(name.toLowerCase(java.util.Locale.ROOT), cursorNames);
                 match(TokenType.SEMICOLON);
                 continue;
             }
@@ -535,7 +535,7 @@ public class PlpgsqlParser {
             else { if (check(TokenType.GREATER_THAN)) advance(); if (check(TokenType.GREATER_THAN)) advance(); }
             t = peek();
             if (t.type() == TokenType.KEYWORD) {
-                switch (t.value().toUpperCase()) {
+                switch (t.value().toUpperCase(java.util.Locale.ROOT)) {
                     case "LOOP":
                         return parseLoop(label);
                     case "WHILE":
@@ -555,7 +555,7 @@ public class PlpgsqlParser {
         }
 
         if (t.type() == TokenType.KEYWORD) {
-            switch (t.value().toUpperCase()) {
+            switch (t.value().toUpperCase(java.util.Locale.ROOT)) {
                 case "IF":
                     return parseIf();
                 case "LOOP":
@@ -913,7 +913,7 @@ public class PlpgsqlParser {
         boolean levelGiven = false;
         if (checkKw("NOTICE") || checkKw("WARNING") || checkKw("EXCEPTION")
                 || checkKw("INFO") || checkKw("LOG") || checkKw("DEBUG")) {
-            level = advance().value().toUpperCase();
+            level = advance().value().toUpperCase(java.util.Locale.ROOT);
             levelGiven = true;
         }
         if (checkKw("SQLSTATE")) {
@@ -968,10 +968,10 @@ public class PlpgsqlParser {
                     String val = collectUntilMulti(",", ";");
                     // PG reads the whole statement before it complains that an option was given
                     // twice, so the complaint belongs to the run rather than to the compile
-                    if (!seen.add(key.toUpperCase()) && duplicateOption == null) {
-                        duplicateOption = key.toUpperCase();
+                    if (!seen.add(key.toUpperCase(java.util.Locale.ROOT)) && duplicateOption == null) {
+                        duplicateOption = key.toUpperCase(java.util.Locale.ROOT);
                     }
-                    switch (key.toUpperCase()) {
+                    switch (key.toUpperCase(java.util.Locale.ROOT)) {
                         case "ERRCODE": errcode = val; break;
                         case "MESSAGE": messageExpr = val; break;
                         case "HINT": hint = val; break;
@@ -1081,7 +1081,7 @@ public class PlpgsqlParser {
         // parser is given it. Where the clause is was settled while the text was rebuilt, token
         // by token, because the finished text cannot tell the keyword INTO from the same letters
         // inside a string literal -- SELECT ' into me ' INTO v holds two and means one.
-        String upper = sql.toUpperCase();
+        String upper = sql.toUpperCase(java.util.Locale.ROOT);
         // In a CTE query the clause belongs to the final SELECT, so the search starts there and
         // the INTO of a WITH ... INSERT INTO is left where it stands.
         int selectStart = upper.startsWith("WITH") ? collected.lastSelect : 0;
@@ -1091,7 +1091,7 @@ public class PlpgsqlParser {
                 int fromIdx = collected.firstFromAfter(into[1]);
                 String targets = (fromIdx >= 0 ? sql.substring(into[1], fromIdx)
                         : sql.substring(into[1])).trim();
-                if (targets.toUpperCase().startsWith("STRICT ")) {
+                if (targets.toUpperCase(java.util.Locale.ROOT).startsWith("STRICT ")) {
                     strict = true;
                     targets = targets.substring(7).trim();
                 }
@@ -1142,7 +1142,7 @@ public class PlpgsqlParser {
 
         // Handle INSERT/UPDATE/DELETE ... RETURNING col1[, col2] INTO var1[, var2]
         if (intoVars == null) {
-            String upperSql = sql.toUpperCase();
+            String upperSql = sql.toUpperCase(java.util.Locale.ROOT);
             if (upperSql.startsWith("INSERT") || upperSql.startsWith("UPDATE") || upperSql.startsWith("DELETE")
                     || upperSql.startsWith("WITH")) {
                 // The clause is the first INTO token after RETURNING. Taking the first INTO in
@@ -1154,7 +1154,7 @@ public class PlpgsqlParser {
                     String returningCols = sql.substring(collected.returning[1], into[0]).trim();
                     String intoTargets = sql.substring(into[1]).trim();
                     // Check for STRICT
-                    if (intoTargets.toUpperCase().startsWith("STRICT ")) {
+                    if (intoTargets.toUpperCase(java.util.Locale.ROOT).startsWith("STRICT ")) {
                         strict = true;
                         intoTargets = intoTargets.substring(7).trim();
                     }
@@ -1272,7 +1272,7 @@ public class PlpgsqlParser {
      * body, so a bad argument list keeps the function from being created at all.
      */
     private void checkCursorArgs(String cursorName, List<String> argNames) {
-        List<String> params = cursorParams.get(cursorName.toLowerCase());
+        List<String> params = cursorParams.get(cursorName.toLowerCase(java.util.Locale.ROOT));
         if (params == null) return;
         if (params.isEmpty()) {
             if (!argNames.isEmpty()) {
@@ -1342,12 +1342,12 @@ public class PlpgsqlParser {
 
         String direction = "NEXT";
         String countExpr = null;
-        if (isLabelToken(peek()) && FETCH_DIRECTIONS.contains(peek().value().toUpperCase())) {
-            direction = advance().value().toUpperCase();
+        if (isLabelToken(peek()) && FETCH_DIRECTIONS.contains(peek().value().toUpperCase(java.util.Locale.ROOT))) {
+            direction = advance().value().toUpperCase(java.util.Locale.ROOT);
         } else if (checkKw("ALL")) {
             // A bare ALL is FORWARD ALL, the same count written the shorter way
             direction = "FORWARD";
-            countExpr = advance().value().toUpperCase();
+            countExpr = advance().value().toUpperCase(java.util.Locale.ROOT);
         }
         if ("ABSOLUTE".equals(direction) || "RELATIVE".equals(direction)
                 || "FORWARD".equals(direction) || "BACKWARD".equals(direction)) {

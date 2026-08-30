@@ -29,7 +29,7 @@ class RangeFunctions {
 
     private static String knownRangeType(String name) {
         if (name == null) return null;
-        String t = name.toLowerCase().trim();
+        String t = name.toLowerCase(java.util.Locale.ROOT).trim();
         switch (t) {
             case "int4range":
             case "int8range":
@@ -377,7 +377,7 @@ class RangeFunctions {
                     Object hiObj = executor.evalExpr(fn.args().get(1), ctx);
                     String bounds = boundFlags(fn, ctx);
                     // For integer subtypes, use canonical form
-                    String st = subtype.toLowerCase();
+                    String st = subtype.toLowerCase(java.util.Locale.ROOT);
                     if (st.equals("int4") || st.equals("integer") || st.equals("int") || st.equals("int8") || st.equals("bigint") || st.equals("smallint") || st.equals("int2")) {
                         Integer lo = loObj == null ? null : executor.toInt(loObj);
                         Integer hi = hiObj == null ? null : executor.toInt(hiObj);

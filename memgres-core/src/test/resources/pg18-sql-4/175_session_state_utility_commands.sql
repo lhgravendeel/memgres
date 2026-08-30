@@ -21,7 +21,7 @@ SELECT current_setting('application_name') AS app_name;
 RESET application_name;
 -- begin-expected
 -- columns: app_name_after_reset
--- row: memgres
+-- row:
 -- end-expected
 SELECT current_setting('application_name', true) AS app_name_after_reset;
 

@@ -333,8 +333,8 @@ class PgWireCopyHandler {
                                             + expectedCols.size(), "22P04");
                                 }
                                 for (int hi = 0; hi < expectedCols.size(); hi++) {
-                                    String expected = expectedCols.get(hi).toLowerCase();
-                                    String actual = headerValues.get(hi) != null ? headerValues.get(hi).trim().toLowerCase() : "";
+                                    String expected = expectedCols.get(hi).toLowerCase(java.util.Locale.ROOT);
+                                    String actual = headerValues.get(hi) != null ? headerValues.get(hi).trim().toLowerCase(java.util.Locale.ROOT) : "";
                                     if (!expected.equals(actual)) {
                                         throw new com.memgres.engine.MemgresException(
                                                 "column name mismatch in header line field " + (hi + 1) +
@@ -656,7 +656,7 @@ class PgWireCopyHandler {
             int end = i;
             while (i < expr.length() && Character.isWhitespace(expr.charAt(i))) i++;
             if (i < expr.length() && expr.charAt(i) == '(') {
-                names.add(expr.substring(start, end).replace("\"", "").toLowerCase());
+                names.add(expr.substring(start, end).replace("\"", "").toLowerCase(java.util.Locale.ROOT));
             }
         }
         return names;

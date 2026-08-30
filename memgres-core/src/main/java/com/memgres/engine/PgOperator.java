@@ -58,9 +58,9 @@ public class PgOperator {
      * Returns a key that uniquely identifies this operator (schema + name + arg types).
      */
     public String getKey() {
-        String l = leftArg != null ? leftArg.toLowerCase() : "NONE";
-        String r = rightArg != null ? rightArg.toLowerCase() : "NONE";
-        String s = schemaName != null ? schemaName.toLowerCase() : "public";
+        String l = leftArg != null ? leftArg.toLowerCase(java.util.Locale.ROOT) : "NONE";
+        String r = rightArg != null ? rightArg.toLowerCase(java.util.Locale.ROOT) : "NONE";
+        String s = schemaName != null ? schemaName.toLowerCase(java.util.Locale.ROOT) : "public";
         return s + "." + name + "(" + l + "," + r + ")";
     }
 }

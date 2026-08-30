@@ -270,7 +270,7 @@ public final class RecursiveCteCheck {
         }
         if (expr instanceof FunctionCallExpr) {
             FunctionCallExpr call = (FunctionCallExpr) expr;
-            String fn = call.name() == null ? "" : call.name().toLowerCase();
+            String fn = call.name() == null ? "" : call.name().toLowerCase(java.util.Locale.ROOT);
             // Only the functions whose result is one of their arguments carry an argument's type.
             if (!fn.equals("coalesce") && !fn.equals("nullif") && !fn.equals("greatest")
                     && !fn.equals("least")) return 0;
@@ -392,7 +392,7 @@ public final class RecursiveCteCheck {
      */
     private static List<String> selfReferences(Object node, String name) {
         List<String> found = new ArrayList<>();
-        String lcName = name.toLowerCase();
+        String lcName = name.toLowerCase(java.util.Locale.ROOT);
         Deque<Object> nodes = new ArrayDeque<>();
         Deque<String> contexts = new ArrayDeque<>();
         Set<Object> seen = Collections.newSetFromMap(new IdentityHashMap<>());
@@ -405,7 +405,7 @@ public final class RecursiveCteCheck {
             if (cur instanceof SelectStmt.TableRef) {
                 SelectStmt.TableRef ref = (SelectStmt.TableRef) cur;
                 if (ref.schema() == null && ref.table() != null
-                        && ref.table().toLowerCase().equals(lcName)) {
+                        && ref.table().toLowerCase(java.util.Locale.ROOT).equals(lcName)) {
                     found.add(context);
                 }
                 continue;
@@ -494,7 +494,7 @@ public final class RecursiveCteCheck {
     private static boolean declaresWithItem(SelectStmt stmt, String lcName) {
         if (stmt.withClauses() == null) return false;
         for (SelectStmt.CommonTableExpr item : stmt.withClauses()) {
-            if (item.name() != null && item.name().toLowerCase().equals(lcName)) return true;
+            if (item.name() != null && item.name().toLowerCase(java.util.Locale.ROOT).equals(lcName)) return true;
         }
         return false;
     }

@@ -34,6 +34,6 @@ public final class CitextValue {
 
     @Override
     public int hashCode() {
-        return value.toLowerCase().hashCode();
+        return value.toLowerCase(java.util.Locale.ROOT).hashCode();
     }
 }
