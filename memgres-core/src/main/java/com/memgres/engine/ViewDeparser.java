@@ -374,12 +374,26 @@ public final class ViewDeparser {
             keyword(" WHERE ", -STD, STD, 1);
             expr(select.where(), 0);
         }
-        List<Expression> groupBy = select.groupBy();
-        if (groupBy != null && !groupBy.isEmpty()) {
+        List<SelectStmt.GroupingElement> written = select.groupingElements();
+        if (written != null && !written.isEmpty()) {
+            // ROLLUP, CUBE and GROUPING SETS each fold to a list of sets, and several spellings
+            // fold to the same list. What is read back is the spelling, so it is written from
+            // what the reader wrote rather than from what it folded to -- otherwise every one of
+            // them read back as a plain GROUP BY, which groups differently from what it says.
             keyword(" GROUP BY ", -STD, STD, 1);
-            for (int i = 0; i < groupBy.size(); i++) {
+            if (select.groupByDistinct()) out.append("DISTINCT ");
+            for (int i = 0; i < written.size(); i++) {
                 if (i > 0) out.append(", ");
-                sortKey(groupBy.get(i));
+                groupingElement(written.get(i));
+            }
+        } else {
+            List<Expression> groupBy = select.groupBy();
+            if (groupBy != null && !groupBy.isEmpty()) {
+                keyword(" GROUP BY ", -STD, STD, 1);
+                for (int i = 0; i < groupBy.size(); i++) {
+                    if (i > 0) out.append(", ");
+                    sortKey(groupBy.get(i));
+                }
             }
         }
         if (select.having() != null) {
@@ -439,6 +453,52 @@ public final class ViewDeparser {
         if (paren) out.append('(');
         expr(key, 0);
         if (paren) out.append(')');
+    }
+
+    /**
+     * One element of a GROUP BY, written as PostgreSQL writes it: ROLLUP and CUBE take their
+     * columns straight after the word, GROUPING SETS takes a space and then its members, and
+     * every member of a GROUPING SETS is parenthesised whether the reader wrote it that way or
+     * not -- which is why {@code GROUPING SETS (a, b)} reads back as {@code ((a), (b))}.
+     */
+    private void groupingElement(SelectStmt.GroupingElement element) {
+        if (element == null) return;
+        switch (element.kind()) {
+            case SIMPLE:
+                expr(element.expr(), 0);
+                break;
+            case LIST:
+                groupingColumns(element.columns());
+                break;
+            case ROLLUP:
+                out.append("ROLLUP");
+                groupingColumns(element.columns());
+                break;
+            case CUBE:
+                out.append("CUBE");
+                groupingColumns(element.columns());
+                break;
+            case SETS:
+            default: {
+                out.append("GROUPING SETS (");
+                List<SelectStmt.GroupingElement> members = element.members();
+                for (int i = 0; i < members.size(); i++) {
+                    if (i > 0) out.append(", ");
+                    groupingElement(members.get(i));
+                }
+                out.append(')');
+                break;
+            }
+        }
+    }
+
+    private void groupingColumns(List<Expression> columns) {
+        out.append('(');
+        for (int i = 0; i < columns.size(); i++) {
+            if (i > 0) out.append(", ");
+            expr(columns.get(i), 0);
+        }
+        out.append(')');
     }
 
     /**

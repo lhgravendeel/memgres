@@ -5,6 +5,7 @@ import com.memgres.engine.util.Cols;
 
 import com.memgres.engine.parser.ast.*;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Set;
 
@@ -598,6 +599,13 @@ class UtilityParser {
             parser.matchKeyword("TRANSACTION");
             return new SetStmt("session_characteristics", encodeModes(requireTransactionModes()));
         }
+        // SET SESSION ROLE and SET LOCAL ROLE name the role the same way SET ROLE does, and
+        // differ only in how long the choice lasts.
+        if ((isSession || isLocal) && parser.checkKeyword("ROLE")) {
+            parser.advance();
+            return new SetStmt("role", readRoleTarget(false), isLocal);
+        }
+
         // SET LOCAL SESSION AUTHORIZATION name | DEFAULT
         if (isLocal && parser.checkKeyword("SESSION") && parser.pos + 1 < parser.tokens.size()
                 && parser.tokens.get(parser.pos + 1).type() == TokenType.KEYWORD
@@ -636,11 +644,16 @@ class UtilityParser {
                     constraintNames.add(readQualifiedConstraintName());
                 }
             }
-            String mode = "IMMEDIATE";
+            // The mode is not optional: SET CONSTRAINTS says which way to set them, and with
+            // nothing written the statement asks for nothing. Defaulted to IMMEDIATE, a
+            // statement meant to defer them quietly did the opposite of what it said.
+            String mode;
             if (parser.matchKeyword("DEFERRED")) {
                 mode = "DEFERRED";
+            } else if (parser.matchKeyword("IMMEDIATE")) {
+                mode = "IMMEDIATE";
             } else {
-                parser.matchKeyword("IMMEDIATE");
+                throw ParseException.at(parser.peek());
             }
             // Encode as "constraints:ALL:DEFERRED" or "constraints:name1,name2:IMMEDIATE"
             return new SetStmt("constraints", String.join(",", constraintNames) + ":" + mode);
@@ -666,59 +679,171 @@ class UtilityParser {
         if (parser.match(TokenType.DOT)) {
             name = name + "." + parser.readIdentifier();
         }
-        // Handle SET TIME ZONE value → treat as SET timezone value
+        // The forms PostgreSQL's grammar spells out by name, each with a value of its own shape.
         if (name.equalsIgnoreCase("TIME") && parser.checkKeyword("ZONE")) {
             parser.advance(); // consume ZONE
-            name = "TimeZone";
-            // Continue to parse the value below
+            return new SetStmt("TimeZone", readZoneValue(), isLocal);
         }
-        // SET name = value | SET name TO value
-        if (parser.match(TokenType.EQUALS) || parser.matchKeyword("TO")) {
-            StringBuilder val = new StringBuilder();
-            boolean hasTokens = false;
-            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
+        if (name.equalsIgnoreCase("NAMES")) {
+            // SET NAMES is the standard's spelling of SET client_encoding.
+            String encoding = "DEFAULT";
+            if (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
                 Token tok = parser.advance();
-                hasTokens = true;
-                // A setting's value is a list of names and constants, so a stray token is a
-                // syntax error rather than a word to store. "SET search_path = $user" has to be
-                // written with the quotes PostgreSQL needs; taking it verbatim stored a search
-                // path of "$ USER, public" that named no schema at all.
-                if (tok.type() == TokenType.ERROR) {
-                    throw ParseException.saying(
-                            "syntax error at or near \"" + tok.value() + "\"", tok, "42601");
-                }
-                if (tok.type() == TokenType.COMMA) {
-                    if (val.length() > 0 && val.charAt(val.length() - 1) == ' ') {
-                        val.setLength(val.length() - 1);
-                    }
-                    val.append(", ");
-                } else if (val.length() == 0
-                        && (tok.type() == TokenType.MINUS || tok.type() == TokenType.PLUS)) {
-                    // The sign of a number belongs to it. Appending a space after every token
-                    // turned "= -15" into "- 15", which is not a number any setting will take.
-                    val.append(tok.value());
-                } else {
-                    val.append(tok.value()).append(" ");
-                }
+                encoding = tok.value();
             }
-            String trimmed = val.toString().trim();
-            if (!hasTokens) {
-                throw new ParseException("syntax error at or near end of input", parser.peek());
-            }
-            return new SetStmt(name, trimmed, isLocal);
+            parser.expectEndOfStatement();
+            SetStmt names = new SetStmt("client_encoding", encoding, isLocal);
+            if ("DEFAULT".equalsIgnoreCase(encoding)) names.setToDefault(true);
+            return names;
         }
-        // SET name value (e.g., SET TIMEZONE 'UTC')
-        StringBuilder val = new StringBuilder();
-        while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
-            Token tok = parser.advance();
-            if (val.length() == 0
-                    && (tok.type() == TokenType.MINUS || tok.type() == TokenType.PLUS)) {
-                val.append(tok.value());
-            } else {
-                val.append(tok.value()).append(" ");
+        if ((name.equalsIgnoreCase("SCHEMA") || name.equalsIgnoreCase("CATALOG"))
+                && parser.check(TokenType.STRING_LITERAL)) {
+            String only = parser.advance().value();
+            parser.expectEndOfStatement();
+            if (name.equalsIgnoreCase("CATALOG")) {
+                throw new MemgresException("cross-database references are not implemented: \""
+                        + only + "\"", "0A000");
             }
+            return new SetStmt("search_path", quotedListName(only), isLocal);
         }
-        return new SetStmt(name, val.toString().trim(), isLocal);
+        // SET name = value | SET name TO value. The value is a list of constants and bare
+        // names, which is a grammar of its own: two bare words in a row are two values, not one
+        // value with a space in it, and a comma between them is what makes them a list.
+        if (parser.match(TokenType.EQUALS) || parser.matchKeyword("TO")) {
+            if (parser.checkKeyword("DEFAULT")) {
+                parser.advance();
+                parser.expectEndOfStatement();
+                SetStmt toDefault = new SetStmt(name, "DEFAULT", isLocal);
+                toDefault.setToDefault(true);
+                return toDefault;
+            }
+            return new SetStmt(name, readSettingValue(name), isLocal);
+        }
+        // Everything else PostgreSQL's grammar spells out by name, and a value written after a
+        // parameter with neither = nor TO between them is a value the grammar has no place for.
+        Token stray = parser.peek();
+        if (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
+            throw ParseException.saying(SYNTAX_AT + stray.raw() + Q, stray, "42601");
+        }
+        throw ParseException.saying("syntax error at end of input", stray, "42601");
+    }
+
+    /**
+     * What may stand for a zone after SET TIME ZONE: a name, a number of hours, an interval, or
+     * one of the two words that mean "put it back". A number is read as an offset in hours, and
+     * PostgreSQL keeps the sign the POSIX way round when it writes the zone back.
+     */
+    private String readZoneValue() {
+        if (parser.checkKeyword("DEFAULT") || parser.checkKeyword("LOCAL")) {
+            String word = parser.advance().value();
+            parser.expectEndOfStatement();
+            return word.toUpperCase(java.util.Locale.ROOT);
+        }
+        if (parser.checkKeyword("INTERVAL")) {
+            parser.advance();
+            Token literal = parser.advance();
+            StringBuilder written = new StringBuilder(literal.value());
+            // The field qualifier an interval may carry says which unit the number counts.
+            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
+                written.append(' ').append(parser.advance().value());
+            }
+            return "INTERVAL:" + written;
+        }
+        boolean negative = parser.match(TokenType.MINUS);
+        if (!negative) parser.match(TokenType.PLUS);
+        Token tok = parser.advance();
+        parser.expectEndOfStatement();
+        if (tok.type() == TokenType.INTEGER_LITERAL || tok.type() == TokenType.FLOAT_LITERAL) {
+            return "HOURS:" + (negative ? "-" : "") + tok.value();
+        }
+        if (negative) {
+            throw ParseException.saying(SYNTAX_AT + tok.raw() + Q, tok, "42601");
+        }
+        return tok.value();
+    }
+
+    /**
+     * The list of values a SET may be given, written back the way PostgreSQL writes it.
+     *
+     * <p>Each item is a string constant, a signed number, or a bare word; the items are separated
+     * by commas and nothing else. An item that would not read back as itself is quoted, which is
+     * how {@code SET search_path = "$user", public} comes back out with its quotes and
+     * {@code SET search_path = 'a, b'} comes back as one quoted name rather than as two.
+     */
+    private String readSettingValue(String name) {
+        List<String> written = new ArrayList<>();
+        boolean listValued = isListValuedSetting(name);
+        do {
+            Token tok = parser.peek();
+            if (parser.isAtEnd() || tok.type() == TokenType.SEMICOLON
+                    || tok.type() == TokenType.EOF) {
+                throw ParseException.saying("syntax error at end of input", tok, "42601");
+            }
+            if (tok.type() == TokenType.ERROR) {
+                throw ParseException.saying(SYNTAX_AT + tok.value() + Q, tok, "42601");
+            }
+            written.add(readOneSettingValue(listValued));
+        } while (parser.match(TokenType.COMMA));
+        Token after = parser.peek();
+        if (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)
+                && after.type() != TokenType.EOF) {
+            throw ParseException.saying(SYNTAX_AT + after.raw() + Q, after, "42601");
+        }
+        // A parameter the reader made up holds one value; PostgreSQL says so by name.
+        if (written.size() > 1 && name.indexOf('.') >= 0) {
+            throw new MemgresException("SET " + name + " takes only one argument", "22023");
+        }
+        return String.join(", ", written);
+    }
+
+    /** One item of a SET's value list. */
+    private String readOneSettingValue(boolean listValued) {
+        boolean negative = parser.match(TokenType.MINUS);
+        if (!negative) parser.match(TokenType.PLUS);
+        Token tok = parser.advance();
+        if (tok.type() == TokenType.STRING_LITERAL) {
+            // A quoted item is the text it holds, whatever that text says.
+            return listValued ? quotedListName(tok.value()) : tok.value();
+        }
+        if (tok.type() == TokenType.INTEGER_LITERAL || tok.type() == TokenType.FLOAT_LITERAL) {
+            return (negative ? "-" : "") + tok.value();
+        }
+        if (negative) {
+            throw ParseException.saying(SYNTAX_AT + tok.raw() + Q, tok, "42601");
+        }
+        if (tok.type() == TokenType.QUOTED_IDENTIFIER) {
+            return listValued ? quotedListName(tok.value()) : tok.value();
+        }
+        if (tok.type() == TokenType.IDENTIFIER || tok.type() == TokenType.KEYWORD) {
+            return listValued ? quotedListName(tok.raw()) : tok.raw();
+        }
+        throw ParseException.saying(SYNTAX_AT + tok.raw() + Q, tok, "42601");
+    }
+
+    /** The settings whose value is a list of names, and so is written back name by name. */
+    private static final Set<String> LIST_VALUED_SETTINGS = Cols.setOf(
+            "search_path", "local_preload_libraries", "session_preload_libraries",
+            "shared_preload_libraries", "temp_tablespaces", "synchronous_standby_names");
+
+    private static boolean isListValuedSetting(String name) {
+        return LIST_VALUED_SETTINGS.contains(name.toLowerCase(java.util.Locale.ROOT));
+    }
+
+    /**
+     * A name in a settings list, quoted where it needs to be. PostgreSQL writes a list back the
+     * way it would have to be written to mean the same thing again, so a name that is not a plain
+     * lower-case word comes back between quotes.
+     */
+    private static String quotedListName(String name) {
+        boolean plain = !name.isEmpty();
+        for (int i = 0; plain && i < name.length(); i++) {
+            char c = name.charAt(i);
+            boolean ok = (c >= 'a' && c <= 'z') || c == '_'
+                    || (i > 0 && ((c >= '0' && c <= '9') || c == '$'));
+            if (!ok) plain = false;
+        }
+        if (plain) return name;
+        return "\"" + name.replace("\"", "\"\"") + "\"";
     }
 
     // ---- DISCARD ----
@@ -1856,9 +1981,13 @@ class UtilityParser {
         if (parser.matchKeyword("ALL")) {
             return new SetStmt("show", "ALL");
         }
+        // A quoted name is the name it holds, letter for letter: PostgreSQL names the column
+        // after the parameter the way it was asked for.
+        boolean quoted = parser.check(TokenType.QUOTED_IDENTIFIER);
         String param = parser.readIdentifier();
         // Handle dotted GUC names: SHOW myapp.tenant_id
         if (parser.match(TokenType.DOT)) {
+            quoted = quoted || parser.check(TokenType.QUOTED_IDENTIFIER);
             param = param + "." + parser.readIdentifier();
         }
         // SHOW TRANSACTION ISOLATION LEVEL
@@ -1870,7 +1999,11 @@ class UtilityParser {
         if (param.equalsIgnoreCase("TIME") && matchZone()) {
             return new SetStmt("show", "TimeZone");
         }
-        return new SetStmt("show", param);
+        // SHOW asks about one parameter. A comma after it starts nothing the grammar has.
+        parser.expectEndOfStatement();
+        SetStmt show = new SetStmt("show", param);
+        if (quoted) show.setAuxiliary(param);
+        return show;
     }
 
     /** ZONE is not a reserved word everywhere, so match it on the word rather than the kind. */
@@ -1883,67 +2016,169 @@ class UtilityParser {
 
     // ---- COMMENT ON ----
 
-    SetStmt parseComment() {
+    /**
+     * The object kinds COMMENT names. A kind spelled in more than one word stands before the
+     * kinds that share its first word, so OPERATOR CLASS is read whole rather than as OPERATOR
+     * followed by a name called "class".
+     */
+    private static final String[][] COMMENT_KINDS = {
+            {"ACCESS", "METHOD"},
+            {"EVENT", "TRIGGER"},
+            {"FOREIGN", "DATA", "WRAPPER"},
+            {"FOREIGN", "TABLE"},
+            {"LARGE", "OBJECT"},
+            {"MATERIALIZED", "VIEW"},
+            {"OPERATOR", "CLASS"},
+            {"OPERATOR", "FAMILY"},
+            {"PROCEDURAL", "LANGUAGE"},
+            {"TEXT", "SEARCH", "CONFIGURATION"},
+            {"TEXT", "SEARCH", "DICTIONARY"},
+            {"TEXT", "SEARCH", "PARSER"},
+            {"TEXT", "SEARCH", "TEMPLATE"},
+            {"USER", "MAPPING"},
+            {"AGGREGATE"}, {"CAST"}, {"COLLATION"}, {"COLUMN"}, {"CONSTRAINT"}, {"CONVERSION"},
+            {"DATABASE"}, {"DOMAIN"}, {"EXTENSION"}, {"FUNCTION"}, {"INDEX"}, {"LANGUAGE"},
+            {"OPERATOR"}, {"POLICY"}, {"PROCEDURE"}, {"PUBLICATION"}, {"ROLE"}, {"ROUTINE"},
+            {"RULE"}, {"SCHEMA"}, {"SEQUENCE"}, {"SERVER"}, {"STATISTICS"}, {"SUBSCRIPTION"},
+            {"TABLE"}, {"TABLESPACE"}, {"TRANSFORM"}, {"TRIGGER"}, {"TYPE"}, {"VIEW"},
+    };
+
+    /**
+     * The kinds SECURITY LABEL names. It reaches fewer of them than COMMENT does: there is no
+     * label on a trigger, a rule, a cast or an operator, and the word is a syntax error there.
+     */
+    private static final Set<String> LABEL_KINDS = new java.util.HashSet<>(Arrays.asList(
+            "TABLE", "COLUMN", "VIEW", "MATERIALIZED VIEW", "FOREIGN TABLE", "SEQUENCE",
+            "AGGREGATE", "FUNCTION", "PROCEDURE", "ROUTINE", "LARGE OBJECT", "TYPE", "DOMAIN",
+            "SCHEMA", "DATABASE", "ROLE", "TABLESPACE", "EVENT TRIGGER", "LANGUAGE",
+            "PROCEDURAL LANGUAGE", "PUBLICATION", "SUBSCRIPTION"));
+
+    /** The kinds whose object is named against a relation: {@code ... name ON relation}. */
+    private static final Set<String> RELATION_SCOPED_KINDS = new java.util.HashSet<>(
+            Arrays.asList("CONSTRAINT", "TRIGGER", "RULE", "POLICY"));
+
+    /** The kinds written with a routine's parenthesised argument list. */
+    private static final Set<String> ROUTINE_KINDS = new java.util.HashSet<>(
+            Arrays.asList("AGGREGATE", "FUNCTION", "PROCEDURE", "ROUTINE"));
+
+    // ---- COMMENT ON ----
+
+    CommentStmt parseComment() {
         parser.expectKeyword("COMMENT");
         parser.expectKeyword("ON");
-        // COMMENT ON {TABLE|COLUMN|FOREIGN DATA WRAPPER|...} name IS 'text'|NULL
-        // Collect tokens before IS, building object type and name properly
-        List<String> tokenValues = new ArrayList<>();
-        while (!parser.isAtEnd() && !parser.checkKeyword("IS")) {
-            Token tok = parser.advance();
-            // Merge dot-separated identifiers into single dotted names
-            if (tok.type() == TokenType.DOT && !tokenValues.isEmpty()) {
-                String prev = tokenValues.remove(tokenValues.size() - 1);
-                if (!parser.isAtEnd() && !parser.checkKeyword("IS")) {
-                    Token next = parser.advance();
-                    tokenValues.add(prev + "." + identifierSpelling(next));
-                } else {
-                    tokenValues.add(prev + ".");
+        return parseCommentBody(false, null);
+    }
+
+    // ---- SECURITY LABEL ----
+
+    CommentStmt parseSecurityLabel() {
+        parser.expectKeyword("SECURITY");
+        parser.expectKeyword("LABEL");
+        String provider = null;
+        if (parser.matchKeyword("FOR")) {
+            Token t = parser.peek();
+            if (t.type() != TokenType.IDENTIFIER && t.type() != TokenType.QUOTED_IDENTIFIER
+                    && t.type() != TokenType.STRING_LITERAL) {
+                throw commentSyntaxError(t);
+            }
+            provider = parser.advance().value();
+        }
+        parser.expectKeyword("ON");
+        return parseCommentBody(true, provider);
+    }
+
+    /**
+     * Everything after the ON, which COMMENT and SECURITY LABEL write the same way: a kind, a name
+     * written the way that kind is written, and one string constant or NULL.
+     */
+    private CommentStmt parseCommentBody(boolean label, String provider) {
+        Token kindToken = parser.peek();
+        String kind = matchCommentKind();
+        if (kind == null || (label && !LABEL_KINDS.contains(kind))) {
+            throw commentSyntaxError(kindToken);
+        }
+        String schema = null;
+        String relation = null;
+        String name = null;
+        List<String> args = null;
+        String using = null;
+
+        if (kind.equals("CAST")) {
+            // A cast is named by the two types it converts between, and both have to be there.
+            parser.expect(TokenType.LEFT_PAREN);
+            String source = readCommentTypeName();
+            expectWordOrSyntaxError("AS");
+            String target = readCommentTypeName();
+            expectRightParen();
+            args = new ArrayList<>();
+            args.add(source);
+            args.add(target);
+            name = "(" + source + " AS " + target + ")";
+        } else if (kind.equals("TRANSFORM")) {
+            expectWordOrSyntaxError("FOR");
+            name = readCommentTypeName();
+            expectWordOrSyntaxError("LANGUAGE");
+            using = parser.readIdentifier();
+        } else if (kind.equals("OPERATOR")) {
+            String[] qualified = readOperatorSpelling();
+            schema = qualified[0];
+            name = qualified[1];
+            args = readOperatorOperands();
+        } else if (kind.equals("OPERATOR CLASS") || kind.equals("OPERATOR FAMILY")) {
+            String[] qualified = readQualifiedCommentName();
+            schema = qualified[0];
+            name = qualified[1];
+            expectWordOrSyntaxError("USING");
+            using = parser.readIdentifier();
+        } else if (kind.equals("LARGE OBJECT")) {
+            Token t = parser.peek();
+            if (t.type() != TokenType.INTEGER_LITERAL && t.type() != TokenType.FLOAT_LITERAL) {
+                throw commentSyntaxError(t);
+            }
+            name = parser.advance().value();
+        } else if (kind.equals("COLUMN")) {
+            List<String> parts = readDottedCommentName();
+            if (parts.size() < 2) {
+                // A label goes to a provider before anything about the name is looked at, so a
+                // server with none loaded never reaches this complaint.
+                if (!label) {
+                    throw ParseException.saying(
+                            "column name must be qualified", parser.peek(), "42601");
                 }
+                name = parts.get(0);
             } else {
-                tokenValues.add(identifierSpelling(tok));
+                name = parts.get(parts.size() - 1);
+                relation = parts.get(parts.size() - 2);
+                if (parts.size() > 2) schema = parts.get(parts.size() - 3);
             }
-        }
-        // A routine's argument list says which routine of that name this is, so it travels with
-        // the name. Dropping it meant a comment on one overload was a comment on whichever
-        // overload happened to be found, and a signature that matches none was not noticed.
-        int paren = tokenValues.indexOf("(");
-        String argumentList = null;
-        if (paren > 0) {
-            StringBuilder args = new StringBuilder();
-            for (int i = paren; i < tokenValues.size(); i++) {
-                String piece = tokenValues.get(i);
-                if (piece.equals("(") || piece.equals(")")) args.append(piece);
-                else if (piece.equals(",")) args.append(", ");
-                else args.append(args.length() > 0 && args.charAt(args.length() - 1) != '('
-                        && !args.toString().endsWith(", ") ? " " : "").append(piece);
-            }
-            argumentList = args.toString();
-            tokenValues = new ArrayList<>(tokenValues.subList(0, paren));
-        }
-        String objectType;
-        String objectName;
-        // CONSTRAINT c ON t / TRIGGER t ON r / RULE r ON t / POLICY p ON t name the object
-        // relative to a relation, so key them as "<relation>.<object>"
-        int onIdx = -1;
-        for (int i = 0; i < tokenValues.size(); i++) {
-            if ("ON".equalsIgnoreCase(tokenValues.get(i))) { onIdx = i; break; }
-        }
-        if (onIdx == 2 && tokenValues.size() == 4) {
-            objectType = tokenValues.get(0);
-            // The relation keeps whatever qualifier it was written with: COMMENT ON CONSTRAINT c
-            // ON a.t names a's t, and dropping the "a" filed the comment under whichever t the
-            // search path happened to reach.
-            objectName = tokenValues.get(3) + "." + tokenValues.get(1);
+        } else if (RELATION_SCOPED_KINDS.contains(kind)) {
+            name = parser.readIdentifier();
+            expectWordOrSyntaxError("ON");
+            String[] qualified = readQualifiedCommentName();
+            schema = qualified[0];
+            relation = qualified[1];
         } else {
-            objectType = tokenValues.size() > 1
-                    ? String.join(" ", tokenValues.subList(0, tokenValues.size() - 1))
-                    : "TABLE";
-            objectName = !tokenValues.isEmpty()
-                    ? tokenValues.get(tokenValues.size() - 1) : "";
-            if (argumentList != null) objectName = objectName + argumentList;
+            String[] qualified = readQualifiedCommentName();
+            schema = qualified[0];
+            name = qualified[1];
+            if (ROUTINE_KINDS.contains(kind)) {
+                // A routine's argument list says which routine of that name this is. An aggregate
+                // is always written with one; the others may leave it off when it settles nothing.
+                if (parser.check(TokenType.LEFT_PAREN)) {
+                    args = readRoutineArgumentTypes();
+                } else if (kind.equals("AGGREGATE")) {
+                    throw commentSyntaxError(parser.peek());
+                }
+            }
         }
-        parser.expectKeyword("IS");
+
+        // One statement names one object. A comma here was read as a second name and quietly
+        // dropped, so COMMENT ON TABLE a, b commented on a alone.
+        if (parser.check(TokenType.COMMA)) {
+            throw commentSyntaxError(parser.peek());
+        }
+        expectWordOrSyntaxError("IS");
+
         String comment = null;
         if (parser.matchKeyword("NULL")) {
             comment = null;
@@ -1953,27 +2188,188 @@ class UtilityParser {
         } else {
             // A comment is one string constant or NULL, never an expression. Swallowing the rest
             // of the line instead accepted 'a' || 'b', 42 and current_user, and filed nothing.
-            Token text = parser.peek();
-            throw ParseException.saying(SYNTAX_AT + asWritten(text) + Q, text, "42601");
+            throw commentSyntaxError(parser.peek());
         }
         parser.expectEndOfStatement();
-        // Store the comment (null for IS NULL to trigger removal)
-        return new SetStmt("comment:" + objectType + ":" + objectName, comment);
+        return new CommentStmt(kind, schema, relation, name, args, using, comment, label, provider);
     }
 
-    // ---- SECURITY LABEL ----
-
-    SetStmt parseSecurityLabel() {
-        parser.expectKeyword("SECURITY");
-        parser.expectKeyword("LABEL");
-        // SECURITY LABEL [FOR provider] ON object IS 'label'
-        String provider = null;
-        if (parser.matchKeyword("FOR")) {
-            provider = parser.readIdentifier();
+    /** The kind written here, read whole, or null when the word names no kind at all. */
+    private String matchCommentKind() {
+        for (String[] words : COMMENT_KINDS) {
+            int saved = parser.pos;
+            boolean all = true;
+            for (String word : words) {
+                if (!parser.matchWord(word)) { all = false; break; }
+            }
+            if (all) return String.join(" ", words);
+            parser.pos = saved;
         }
-        while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-        String value = provider != null ? "provider:" + provider : "ok";
-        return new SetStmt("security_label", value);
+        return null;
+    }
+
+    /** A word the grammar requires, reported where it is missing rather than where it ends. */
+    private void expectWordOrSyntaxError(String word) {
+        if (parser.matchWord(word)) return;
+        throw commentSyntaxError(parser.peek());
+    }
+
+    private void expectRightParen() {
+        if (parser.match(TokenType.RIGHT_PAREN)) return;
+        throw commentSyntaxError(parser.peek());
+    }
+
+    /**
+     * The syntax error at this token, which is "at end of input" when the statement simply ran
+     * out and names a string constant with the quotes that made it one.
+     */
+    private static ParseException commentSyntaxError(Token token) {
+        if (token == null || token.type() == TokenType.EOF
+                || token.type() == TokenType.SEMICOLON) {
+            return ParseException.saying("syntax error at end of input", token, "42601");
+        }
+        return ParseException.saying(SYNTAX_AT + asWritten(token) + Q, token, "42601");
+    }
+
+    /** The dot-separated words of a name, each spelled the way it was written. */
+    private List<String> readDottedCommentName() {
+        List<String> parts = new ArrayList<>();
+        parts.add(parser.readColumnName());
+        while (parser.match(TokenType.DOT)) {
+            parts.add(parser.readColumnName());
+        }
+        return parts;
+    }
+
+    /** A name that may carry a schema, as {schema-or-null, name}. */
+    private String[] readQualifiedCommentName() {
+        List<String> parts = readDottedCommentName();
+        if (parts.size() == 1) return new String[]{null, parts.get(0)};
+        return new String[]{parts.get(parts.size() - 2), parts.get(parts.size() - 1)};
+    }
+
+    /**
+     * An operator's spelling, which is symbols rather than a word, and may carry a schema written
+     * as {@code OPERATOR(schema.+)} would write it — here plainly, as {@code schema.+}.
+     */
+    private String[] readOperatorSpelling() {
+        String schema = null;
+        StringBuilder spelling = new StringBuilder();
+        while (!parser.isAtEnd() && !parser.check(TokenType.LEFT_PAREN)
+                && !parser.check(TokenType.SEMICOLON) && !parser.check(TokenType.EOF)) {
+            Token t = parser.peek();
+            if (t.type() == TokenType.DOT && spelling.length() > 0 && schema == null) {
+                parser.advance();
+                schema = spelling.toString();
+                spelling.setLength(0);
+                continue;
+            }
+            if (t.type() == TokenType.IDENTIFIER || t.type() == TokenType.QUOTED_IDENTIFIER) {
+                // Only a schema may be a word here; the operator itself is symbols.
+                if (spelling.length() > 0) break;
+                parser.advance();
+                spelling.append(t.value());
+                continue;
+            }
+            if (t.type() == TokenType.KEYWORD) break;
+            parser.advance();
+            spelling.append(t.value());
+        }
+        if (spelling.length() == 0) {
+            throw commentSyntaxError(parser.peek());
+        }
+        return new String[]{schema, spelling.toString()};
+    }
+
+    /**
+     * The two operands an operator is named by. NONE stands where an operand is not there, and a
+     * unary operator written NONE on the right is a postfix operator, which PostgreSQL dropped.
+     */
+    private List<String> readOperatorOperands() {
+        if (!parser.check(TokenType.LEFT_PAREN)) {
+            throw commentSyntaxError(parser.peek());
+        }
+        parser.advance();
+        List<String> operands = new ArrayList<>();
+        operands.add(readOperandType());
+        if (parser.match(TokenType.COMMA)) operands.add(readOperandType());
+        expectRightParen();
+        if (operands.size() == 2 && operands.get(1) == null) {
+            throw new MemgresException("postfix operators are not supported", "42601");
+        }
+        return operands;
+    }
+
+    /** One operand of an operator: a type, or NONE where the operator takes nothing. */
+    private String readOperandType() {
+        if (parser.checkWord("NONE")) { parser.advance(); return null; }
+        return readCommentTypeName();
+    }
+
+    /** The types of a routine's arguments, with the mode words that may stand before them. */
+    private List<String> readRoutineArgumentTypes() {
+        parser.expect(TokenType.LEFT_PAREN);
+        List<String> types = new ArrayList<>();
+        if (parser.match(TokenType.RIGHT_PAREN)) return types;
+        while (true) {
+            if (parser.checkWord("IN") || parser.checkWord("OUT") || parser.checkWord("INOUT")
+                    || parser.checkWord("VARIADIC")) {
+                parser.advance();
+            }
+            // An argument may be written "name type" as well as "type"; the name settles nothing
+            // about which routine this is, so what is read is the type at the end.
+            int saved = parser.pos;
+            String first = readCommentTypeName();
+            if (!parser.check(TokenType.COMMA) && !parser.check(TokenType.RIGHT_PAREN)) {
+                parser.pos = saved;
+                parser.readIdentifier();
+                first = readCommentTypeName();
+            }
+            types.add(first);
+            if (parser.match(TokenType.COMMA)) continue;
+            break;
+        }
+        expectRightParen();
+        return types;
+    }
+
+    /** A type name as written, including the several PostgreSQL spells in more than one word. */
+    private String readCommentTypeName() {
+        Token t = parser.peek();
+        if (t.type() != TokenType.IDENTIFIER && t.type() != TokenType.QUOTED_IDENTIFIER
+                && t.type() != TokenType.KEYWORD) {
+            throw commentSyntaxError(t);
+        }
+        StringBuilder sb = new StringBuilder(identifierSpelling(parser.advance()));
+        while (parser.check(TokenType.DOT)) {
+            parser.advance();
+            sb.append('.').append(identifierSpelling(parser.advance()));
+        }
+        if (parser.checkWord("PRECISION") || parser.checkWord("VARYING")) {
+            sb.append(' ').append(parser.advance().value().toLowerCase());
+        } else if (parser.checkWord("WITH") || parser.checkWord("WITHOUT")) {
+            sb.append(' ').append(parser.advance().value().toLowerCase());
+            if (parser.checkWord("TIME")) sb.append(' ').append(parser.advance().value().toLowerCase());
+            if (parser.checkWord("ZONE")) sb.append(' ').append(parser.advance().value().toLowerCase());
+        }
+        if (parser.check(TokenType.LEFT_PAREN)) {
+            // A length or precision belongs to the written type but not to which type it is.
+            int depth = 0;
+            do {
+                Token p = parser.advance();
+                if (p.type() == TokenType.LEFT_PAREN) depth++;
+                else if (p.type() == TokenType.RIGHT_PAREN) depth--;
+            } while (depth > 0 && !parser.isAtEnd());
+        }
+        while (parser.check(TokenType.LEFT_BRACKET)) {
+            parser.advance();
+            sb.append("[]");
+            if (parser.check(TokenType.INTEGER_LITERAL) || parser.check(TokenType.FLOAT_LITERAL)) {
+                parser.advance();
+            }
+            parser.match(TokenType.RIGHT_BRACKET);
+        }
+        return sb.toString();
     }
 
     /**
@@ -1998,170 +2394,360 @@ class UtilityParser {
         parser.advance();
     }
 
-    // ---- ANALYZE ----
+    // ---- VACUUM, ANALYZE, REINDEX, CLUSTER, CHECKPOINT ----
 
-    SetStmt parseAnalyze() {
-        parser.advance(); // ANALYZE or ANALYSE
-        // ANALYZE [VERBOSE] [table [(column, ...)]]
-        parser.matchKeyword("VERBOSE");
-        String tableName = null;
-        String columnList = null;
-        if (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
-            matchOnlyBeforeRelation();
-            tableName = parser.readIdentifier(); // table name
-            if (parser.match(TokenType.DOT)) tableName = tableName + "." + parser.readIdentifier();
-            // Optional column list
-            if (parser.check(TokenType.LEFT_PAREN)) {
-                parser.advance(); // (
-                StringBuilder cols = new StringBuilder();
-                while (!parser.check(TokenType.RIGHT_PAREN) && !parser.isAtEnd()) {
-                    if (cols.length() > 0) { parser.expect(TokenType.COMMA); cols.append(","); }
-                    cols.append(parser.readIdentifier());
-                }
-                parser.expect(TokenType.RIGHT_PAREN);
-                columnList = cols.toString();
-            }
-        }
-        String value = tableName != null ? "table:" + tableName : "ok";
-        if (columnList != null) value += ",columns:" + columnList;
-        return new SetStmt("analyze", value);
-    }
+    /** The options ANALYZE takes, and whether each carries a value. */
+    private static final Set<String> ANALYZE_OPTIONS = Cols.setOf(
+            "VERBOSE", "SKIP_LOCKED", "BUFFER_USAGE_LIMIT");
 
-    // ---- VACUUM ----
-
-    private static final Set<String> VALID_VACUUM_OPTIONS = Cols.setOf(
+    /** The options VACUUM takes. */
+    private static final Set<String> VACUUM_OPTIONS = Cols.setOf(
             "FULL", "FREEZE", "VERBOSE", "ANALYZE", "ANALYSE",
             "DISABLE_PAGE_SKIPPING", "SKIP_LOCKED", "PROCESS_TOAST", "PROCESS_MAIN",
-            "TRUNCATE", "PARALLEL", "INDEX_CLEANUP", "BUFFER_USAGE_LIMIT", "SKIP_DATABASE_STATS");
+            "TRUNCATE", "PARALLEL", "INDEX_CLEANUP", "BUFFER_USAGE_LIMIT",
+            "SKIP_DATABASE_STATS", "ONLY_DATABASE_STATS");
 
-    SetStmt parseVacuum() {
-        parser.expectKeyword("VACUUM");
-        // VACUUM [(options)] [table [(column, ...)]]
-        boolean hasAnalyze = false;
-        boolean hasVerbose = false;
-        if (parser.check(TokenType.LEFT_PAREN)) {
-            parser.advance(); // (
-            while (!parser.check(TokenType.RIGHT_PAREN) && !parser.isAtEnd()) {
-                parser.match(TokenType.COMMA);
-                if (parser.check(TokenType.RIGHT_PAREN)) break;
-                Token optToken = parser.advance();
-                String opt = optToken.value().toUpperCase();
-                if (!VALID_VACUUM_OPTIONS.contains(opt)) {
-                    // ParseException(message, token) reports the token and drops the message, so
-                    // the option that was not recognised was reported as a plain syntax error.
-                    // An option name is folded like any other unquoted word.
-                    throw ParseException.saying("unrecognized VACUUM option \""
-                            + optToken.value().toLowerCase(java.util.Locale.ROOT) + "\"",
-                            optToken, "42601");
-                }
-                // Some options take a value (PARALLEL n, BUFFER_USAGE_LIMIT n, INDEX_CLEANUP bool)
-                String optValue = null;
-                if (!parser.check(TokenType.COMMA) && !parser.check(TokenType.RIGHT_PAREN) && !parser.isAtEnd()) {
-                    optValue = parser.advance().value();
-                }
-                // A boolean option that was given FALSE is off, not merely written: reading the
-                // name alone made VACUUM (ANALYZE FALSE) analyse.
-                boolean optOn = optValue == null || !("false".equalsIgnoreCase(optValue)
-                        || "off".equalsIgnoreCase(optValue) || "0".equals(optValue));
-                if ((opt.equals("ANALYZE") || opt.equals("ANALYSE")) && optOn) hasAnalyze = true;
-                if (opt.equals("VERBOSE") && optOn) hasVerbose = true;
-            }
-            parser.expect(TokenType.RIGHT_PAREN);
-        } else {
-            // Bare options before table name
-            parser.matchKeyword("FULL");
-            parser.matchKeyword("FREEZE");
-            if (parser.matchKeyword("VERBOSE")) hasVerbose = true;
-            if (parser.matchKeyword("ANALYZE") || parser.matchKeyword("ANALYSE")) hasAnalyze = true;
+    /** The options REINDEX takes. */
+    private static final Set<String> REINDEX_OPTIONS = Cols.setOf(
+            "VERBOSE", "CONCURRENTLY", "TABLESPACE");
+
+    /** The options CLUSTER takes. */
+    private static final Set<String> CLUSTER_OPTIONS = Cols.setOf("VERBOSE");
+
+    /**
+     * The parenthesised option list these statements share. PostgreSQL names the statement in the
+     * complaint about an option it does not know, and an empty list is a syntax error at the
+     * closing bracket rather than a list of nothing.
+     */
+    private List<MaintenanceStmt.Option> parseMaintenanceOptions(String verb, Set<String> known) {
+        List<MaintenanceStmt.Option> options = new ArrayList<>();
+        if (!parser.check(TokenType.LEFT_PAREN)) return options;
+        parser.advance();
+        if (parser.check(TokenType.RIGHT_PAREN)) {
+            Token t = parser.peek();
+            throw ParseException.saying(SYNTAX_AT + t.raw() + Q, t, "42601");
         }
-        // Optional table name
-        String vacuumTable = null;
+        do {
+            Token nameTok = parser.advance();
+            String name = nameTok.value().toUpperCase(java.util.Locale.ROOT);
+            if (!known.contains(name)) {
+                throw ParseException.saying("unrecognized " + verb + " option \""
+                        + nameTok.value().toLowerCase(java.util.Locale.ROOT) + "\"",
+                        nameTok, "42601");
+            }
+            String value = null;
+            if (!parser.check(TokenType.COMMA) && !parser.check(TokenType.RIGHT_PAREN)
+                    && !parser.isAtEnd()) {
+                boolean negative = parser.match(TokenType.MINUS);
+                value = (negative ? "-" : "") + parser.advance().value();
+            }
+            options.add(new MaintenanceStmt.Option(name, value));
+        } while (parser.match(TokenType.COMMA));
+        parser.expect(TokenType.RIGHT_PAREN);
+        return options;
+    }
+
+    /** The relation a maintenance statement names, or null when it names none. */
+    private String[] parseMaintenanceRelation() {
+        matchOnlyBeforeRelation();
+        String schema = null;
+        String name = parser.readIdentifier();
+        if (parser.match(TokenType.DOT)) {
+            schema = name;
+            name = parser.readIdentifier();
+        }
+        return new String[]{schema, name};
+    }
+
+    /** The column list an ANALYZE or a VACUUM may name, which has at least one column in it. */
+    private List<String> parseMaintenanceColumns() {
+        if (!parser.check(TokenType.LEFT_PAREN)) return null;
+        parser.advance();
+        if (parser.check(TokenType.RIGHT_PAREN)) {
+            Token t = parser.peek();
+            throw ParseException.saying(SYNTAX_AT + t.raw() + Q, t, "42601");
+        }
+        List<String> columns = new ArrayList<>();
+        do {
+            columns.add(parser.readColumnName());
+        } while (parser.match(TokenType.COMMA));
+        parser.expect(TokenType.RIGHT_PAREN);
+        return columns;
+    }
+
+    /**
+     * Nothing may follow a maintenance statement's target. A word left standing there is a word
+     * the grammar had no place for, and PostgreSQL reports it where it stands rather than reading
+     * it as the relation.
+     */
+    private void expectNothingFurther() {
+        if (parser.isAtEnd() || parser.check(TokenType.SEMICOLON)) return;
+        Token t = parser.peek();
+        throw ParseException.saying(SYNTAX_AT + t.raw() + Q, t, "42601");
+    }
+
+    MaintenanceStmt parseAnalyze() {
+        parser.advance(); // ANALYZE or ANALYSE
+        List<MaintenanceStmt.Option> options =
+                parseMaintenanceOptions("ANALYZE", ANALYZE_OPTIONS);
+        // The bare spelling takes VERBOSE and nothing else in front of the relation.
+        if (options.isEmpty() && parser.matchKeyword("VERBOSE")) {
+            options.add(new MaintenanceStmt.Option("VERBOSE", null));
+        }
+        String schema = null;
+        String name = null;
+        List<String> columns = null;
         if (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
-            matchOnlyBeforeRelation();
-            vacuumTable = parser.readIdentifier();
-            if (parser.match(TokenType.DOT)) vacuumTable = vacuumTable + "." + parser.readIdentifier();
-            if (parser.check(TokenType.LEFT_PAREN)) {
-                // A column list says which columns to gather statistics for, so it means nothing
-                // without ANALYZE — and PostgreSQL says so before it opens the relation. The list
-                // has at least one column in it.
-                parser.advance();
-                if (parser.check(TokenType.RIGHT_PAREN)) {
-                    Token t = parser.peek();
-                    throw ParseException.saying(SYNTAX_AT + t.raw() + Q, t, "42601");
-                }
-                do {
-                    parser.readColumnName();
-                } while (parser.match(TokenType.COMMA));
-                parser.expect(TokenType.RIGHT_PAREN);
-                if (!hasAnalyze) {
+            String[] relation = parseMaintenanceRelation();
+            schema = relation[0];
+            name = relation[1];
+            columns = parseMaintenanceColumns();
+        }
+        expectNothingFurther();
+        return new MaintenanceStmt(MaintenanceStmt.Verb.ANALYZE, options, null, schema, name,
+                columns, null, false);
+    }
+
+    MaintenanceStmt parseVacuum() {
+        parser.expectKeyword("VACUUM");
+        List<MaintenanceStmt.Option> options = parseMaintenanceOptions("VACUUM", VACUUM_OPTIONS);
+        if (options.isEmpty()) {
+            // The bare spelling takes its options in one fixed order, which is the order
+            // PostgreSQL's grammar writes them in: FULL, FREEZE, VERBOSE, ANALYZE.
+            if (parser.matchKeyword("FULL")) options.add(new MaintenanceStmt.Option("FULL", null));
+            if (parser.matchKeyword("FREEZE")) {
+                options.add(new MaintenanceStmt.Option("FREEZE", null));
+            }
+            if (parser.matchKeyword("VERBOSE")) {
+                options.add(new MaintenanceStmt.Option("VERBOSE", null));
+            }
+            if (parser.matchKeyword("ANALYZE") || parser.matchKeyword("ANALYSE")) {
+                options.add(new MaintenanceStmt.Option("ANALYZE", null));
+            }
+            // A second option word after them is one the order had no place for.
+            Token next = parser.peek();
+            if (next.type() == TokenType.KEYWORD && BARE_VACUUM_WORDS.contains(
+                    next.value().toUpperCase(java.util.Locale.ROOT))) {
+                throw ParseException.saying(SYNTAX_AT + next.raw() + Q, next, "42601");
+            }
+        }
+        checkVacuumOptions(options);
+        String schema = null;
+        String name = null;
+        List<String> columns = null;
+        if (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
+            String[] relation = parseMaintenanceRelation();
+            schema = relation[0];
+            name = relation[1];
+            columns = parseMaintenanceColumns();
+            if (columns != null && !isVacuumAnalysing(options)) {
+                throw new MemgresException(
+                        "ANALYZE option must be specified when a column list is provided", "0A000");
+            }
+        }
+        expectNothingFurther();
+        if (name != null) {
+            for (MaintenanceStmt.Option o : options) {
+                if ("ONLY_DATABASE_STATS".equals(o.name)) {
                     throw new MemgresException(
-                            "ANALYZE option must be specified when a column list is provided",
+                            "ONLY_DATABASE_STATS cannot be specified with a list of tables",
                             "0A000");
                 }
             }
         }
-        // Encode flags + table into the value string
-        String value = vacuumTable != null ? "table:" + vacuumTable : "ok";
-        if (hasAnalyze) value = "analyze," + value;
-        if (hasVerbose) value = "verbose," + value;
-        return new SetStmt("vacuum", value);
+        return new MaintenanceStmt(MaintenanceStmt.Verb.VACUUM, options, null, schema, name,
+                columns, null, false);
     }
 
-    // ---- REINDEX ----
+    /** The words the bare VACUUM spelling reads, so a leftover one is reported as one. */
+    private static final Set<String> BARE_VACUUM_WORDS =
+            Cols.setOf("FULL", "FREEZE", "VERBOSE", "ANALYZE", "ANALYSE");
 
-    SetStmt parseReindex() {
+    private static boolean isVacuumAnalysing(List<MaintenanceStmt.Option> options) {
+        for (MaintenanceStmt.Option o : options) {
+            if (!"ANALYZE".equals(o.name) && !"ANALYSE".equals(o.name)) continue;
+            if (o.value == null) return true;
+            return !("false".equalsIgnoreCase(o.value) || "off".equalsIgnoreCase(o.value)
+                    || "0".equals(o.value));
+        }
+        return false;
+    }
+
+    /**
+     * What a VACUUM option list has to say for itself. A boolean option takes a boolean, the
+     * parallel degree is a small number, the buffer limit is a size PostgreSQL will work in, and
+     * a full vacuum has no parallel workers to give.
+     */
+    private void checkVacuumOptions(List<MaintenanceStmt.Option> options) {
+        boolean full = false;
+        boolean parallel = false;
+        for (MaintenanceStmt.Option o : options) {
+            if ("FULL".equals(o.name) && (o.value == null || !"false".equalsIgnoreCase(o.value))) {
+                full = true;
+            }
+            if ("INDEX_CLEANUP".equals(o.name) && o.value != null
+                    && !isBooleanWord(o.value) && !"auto".equalsIgnoreCase(o.value)) {
+                throw new MemgresException("index_cleanup requires a Boolean value", "42601");
+            }
+            if ("PARALLEL".equals(o.name)) {
+                if (o.value == null) {
+                    throw new MemgresException(
+                            "parallel option requires a value between 0 and 1024", "42601");
+                }
+                int workers;
+                try {
+                    workers = Integer.parseInt(o.value.trim());
+                } catch (NumberFormatException e) {
+                    throw new MemgresException(
+                            "parallel option requires a value between 0 and 1024", "42601");
+                }
+                if (workers < 0 || workers > 1024) {
+                    throw new MemgresException(
+                            "parallel workers for vacuum must be between 0 and 1024", "42601");
+                }
+                parallel = workers > 0;
+            }
+            if ("BUFFER_USAGE_LIMIT".equals(o.name)) checkBufferUsageLimit(o.value);
+        }
+        if (full && parallel) {
+            throw new MemgresException("VACUUM FULL cannot be performed in parallel", "0A000");
+        }
+    }
+
+    private static boolean isBooleanWord(String value) {
+        String v = value.trim();
+        return v.equalsIgnoreCase("true") || v.equalsIgnoreCase("false")
+                || v.equalsIgnoreCase("on") || v.equalsIgnoreCase("off")
+                || v.equalsIgnoreCase("yes") || v.equalsIgnoreCase("no")
+                || v.equals("1") || v.equals("0")
+                || v.equalsIgnoreCase("t") || v.equalsIgnoreCase("f");
+    }
+
+    /** The ring buffer a vacuum may use is nothing at all, or a size between 128 kB and 16 GB. */
+    private void checkBufferUsageLimit(String written) {
+        if (written == null) return;
+        long kilobytes;
+        try {
+            kilobytes = sizeInKilobytes(written.trim());
+        } catch (NumberFormatException e) {
+            throw new MemgresException("BUFFER_USAGE_LIMIT option must be 0 or between 128 kB"
+                    + " and 16777216 kB", "22023");
+        }
+        if (kilobytes == 0) return;
+        if (kilobytes < 128 || kilobytes > 16777216) {
+            MemgresException bad = new MemgresException("BUFFER_USAGE_LIMIT option must be 0 or"
+                    + " between 128 kB and 16777216 kB", "22023");
+            if (kilobytes > Integer.MAX_VALUE) bad.setHint("Value exceeds integer range.");
+            throw bad;
+        }
+    }
+
+    /** A size written the way a storage parameter is written, read as kilobytes. */
+    private static long sizeInKilobytes(String written) {
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("(\\d+)\\s*(B|kB|MB|GB|TB)?", java.util.regex.Pattern.CASE_INSENSITIVE)
+                .matcher(written);
+        if (!m.matches()) throw new NumberFormatException(written);
+        long value = Long.parseLong(m.group(1));
+        String unit = m.group(2) == null ? "kB" : m.group(2).toUpperCase(java.util.Locale.ROOT);
+        switch (unit) {
+            case "B": return value / 1024;
+            case "KB": return value;
+            case "MB": return value * 1024;
+            case "GB": return value * 1024 * 1024;
+            case "TB": return value * 1024 * 1024 * 1024;
+            default: return value;
+        }
+    }
+
+    MaintenanceStmt parseReindex() {
         parser.expectKeyword("REINDEX");
-        // REINDEX [(options)] { INDEX | TABLE | SCHEMA | DATABASE | SYSTEM } name
-        if (parser.check(TokenType.LEFT_PAREN)) parser.consumeUntilParen();
-        // Target type
-        String targetType = null;
-        String targetName = null;
-        if (parser.checkKeyword("INDEX")) { parser.advance(); targetType = "INDEX"; }
-        else if (parser.checkKeyword("TABLE")) { parser.advance(); targetType = "TABLE"; }
-        else if (parser.checkKeyword("SCHEMA")) { parser.advance(); targetType = "SCHEMA"; }
-        else if (parser.checkKeyword("DATABASE")) { parser.advance(); targetType = "DATABASE"; }
-        else if (parser.checkKeyword("SYSTEM")) { parser.advance(); targetType = "SYSTEM"; }
-        if (targetType != null) {
-            // optional CONCURRENTLY
-            parser.matchKeyword("CONCURRENTLY");
-            if (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
-                targetName = parser.readIdentifier();
-                if (parser.match(TokenType.DOT)) targetName = targetName + "." + parser.readIdentifier();
+        List<MaintenanceStmt.Option> options = parseMaintenanceOptions("REINDEX", REINDEX_OPTIONS);
+        MaintenanceStmt.Target target;
+        if (parser.matchKeyword("INDEX")) target = MaintenanceStmt.Target.INDEX;
+        else if (parser.matchKeyword("TABLE")) target = MaintenanceStmt.Target.TABLE;
+        else if (parser.matchKeyword("SCHEMA")) target = MaintenanceStmt.Target.SCHEMA;
+        else if (parser.matchKeyword("DATABASE")) target = MaintenanceStmt.Target.DATABASE;
+        else if (parser.matchKeyword("SYSTEM")) target = MaintenanceStmt.Target.SYSTEM;
+        else {
+            // REINDEX names what kind of thing it is reindexing; a bare name is not one.
+            Token t = parser.peek();
+            if (parser.isAtEnd() || t.type() == TokenType.EOF) {
+                throw ParseException.saying("syntax error at end of input", t, "42601");
+            }
+            throw ParseException.saying(SYNTAX_AT + t.raw() + Q, t, "42601");
+        }
+        boolean concurrently = parser.matchKeyword("CONCURRENTLY");
+        if (parser.isAtEnd() || parser.check(TokenType.SEMICOLON)) {
+            throw ParseException.saying("syntax error at end of input", parser.peek(), "42601");
+        }
+        // REINDEX reaches every partition of what it names; there is no ONLY to write.
+        Token first = parser.peek();
+        if (first.type() == TokenType.KEYWORD && "ONLY".equalsIgnoreCase(first.value())) {
+            throw ParseException.saying(SYNTAX_AT + first.raw() + Q, first, "42601");
+        }
+        String schema = null;
+        String name = parser.readIdentifier();
+        if (parser.match(TokenType.DOT)) {
+            schema = name;
+            name = parser.readIdentifier();
+        }
+        expectNothingFurther();
+        checkReindexTablespace(options);
+        return new MaintenanceStmt(MaintenanceStmt.Verb.REINDEX, options, target, schema, name,
+                null, null, concurrently);
+    }
+
+    /** A TABLESPACE named by a REINDEX has to be one the server has. */
+    private void checkReindexTablespace(List<MaintenanceStmt.Option> options) {
+        for (MaintenanceStmt.Option o : options) {
+            if (!"TABLESPACE".equals(o.name) || o.value == null) continue;
+            if (!"pg_default".equalsIgnoreCase(o.value) && !"pg_global".equalsIgnoreCase(o.value)) {
+                throw new MemgresException(
+                        "tablespace \"" + o.value + "\" does not exist", "42704");
             }
         }
-        String value = targetType != null && targetName != null ? targetType + ":" + targetName : "ok";
-        return new SetStmt("reindex", value);
     }
 
-    // ---- CLUSTER ----
-
-    SetStmt parseCluster() {
+    MaintenanceStmt parseCluster() {
         parser.expectKeyword("CLUSTER");
-        // CLUSTER [VERBOSE] table [USING index]
-        parser.matchKeyword("VERBOSE");
-        String tableName = null;
+        List<MaintenanceStmt.Option> options = parseMaintenanceOptions("CLUSTER", CLUSTER_OPTIONS);
+        if (options.isEmpty() && parser.matchKeyword("VERBOSE")) {
+            options.add(new MaintenanceStmt.Option("VERBOSE", null));
+        }
+        String schema = null;
+        String name = null;
         String indexName = null;
         if (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
-            tableName = parser.readIdentifier(); // table name
-            if (parser.match(TokenType.DOT)) tableName = tableName + "." + parser.readIdentifier();
+            Token first = parser.peek();
+            if (first.type() == TokenType.KEYWORD
+                    && "USING".equalsIgnoreCase(first.value())) {
+                throw ParseException.saying(SYNTAX_AT + first.raw() + Q, first, "42601");
+            }
+            String[] relation = parseMaintenanceRelation();
+            schema = relation[0];
+            name = relation[1];
             if (parser.matchKeyword("USING")) {
-                indexName = parser.readIdentifier(); // index name
+                indexName = parser.readIdentifier();
+            } else if (parser.matchKeyword("ON")) {
+                // The spelling PostgreSQL kept from before version 8.3 names the index first.
+                indexName = name;
+                String[] onRelation = parseMaintenanceRelation();
+                schema = onRelation[0];
+                name = onRelation[1];
             }
         }
-        String value = "ok";
-        if (tableName != null && indexName != null) {
-            value = "table:" + tableName + ",index:" + indexName;
-        } else if (tableName != null) {
-            value = "table:" + tableName;
-        }
-        return new SetStmt("cluster", value);
+        expectNothingFurther();
+        return new MaintenanceStmt(MaintenanceStmt.Verb.CLUSTER, options, null, schema, name,
+                null, indexName, false);
     }
 
-    // ---- CHECKPOINT ----
-
-    SetStmt parseCheckpoint() {
+    MaintenanceStmt parseCheckpoint() {
         parser.expectKeyword("CHECKPOINT");
-        return new SetStmt("checkpoint", "ok");
+        // CHECKPOINT is the whole statement: nothing follows it.
+        expectNothingFurther();
+        return new MaintenanceStmt(MaintenanceStmt.Verb.CHECKPOINT,
+                new ArrayList<MaintenanceStmt.Option>(), null, null, null, null, null, false);
     }
 
     // ---- LOAD ----

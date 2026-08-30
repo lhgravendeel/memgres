@@ -1409,6 +1409,12 @@ class DdlAlterTableExecutor {
     private static void rejectNoInheritOnPartitioned(TableConstraint tc, Table table,
                                                      String tableName) {
         if (tc == null || !tc.noInherit() || !isPartitioned(table)) return;
+        // A NOT NULL says so in its own words, and under its own SQLSTATE.
+        if (tc.type() == TableConstraint.ConstraintType.NOT_NULL) {
+            throw new MemgresException(
+                    "not-null constraints on partitioned tables cannot be NO INHERIT", "0A000")
+                    .suppressPosition();
+        }
         throw new MemgresException("cannot add NO INHERIT constraint to partitioned table \""
                 + tableName + "\"", "42P16").suppressPosition();
     }
@@ -3636,10 +3642,12 @@ class DdlAlterTableExecutor {
         if (addConstraint.constraint().type() == TableConstraint.ConstraintType.NOT_NULL) {
             for (String colName : addConstraint.constraint().columns()) {
                 // A written name belongs to a constraint that comes into existence, and over a
-                // column that already refuses a null there is none to make: PostgreSQL refuses
-                // the declaration rather than folding it into the constraint already there.
-                rejectSecondNotNullConstraint(table, colName, addConstraint.constraint().name(),
-                        addConstraint.notValid(), stmt.table());
+                // column that already refuses a null there is none to make. PostgreSQL folds
+                // such a declaration into the constraint already there and leaves that one's
+                // name standing; only a constraint the new declaration contradicts -- one whose
+                // rows nobody has read, or one that does not reach the same relations -- is in
+                // the way, and each of those is reported below for what it is.
+                rejectNoInheritChange(table, colName, addConstraint, stmt.table());
                 // The rows already stored decide whether the rule can hold at all — unless NOT
                 // VALID was written, which is exactly the request to leave them alone. The column
                 // is still marked NOT NULL below, because PostgreSQL enforces such a constraint on
@@ -3683,6 +3691,12 @@ class DdlAlterTableExecutor {
                 table.alterColumnNullable(colName, false);
                 if (!alreadyNotNull && addConstraint.constraint().name() != null) {
                     table.setNotNullConstraintName(colName, addConstraint.constraint().name());
+                }
+                // NO INHERIT says the constraint stops here, and it is part of what the
+                // constraint is: unrecorded, a second declaration could not tell that it
+                // contradicts the one already there, and the catalogue said it reached down.
+                if (!alreadyNotNull && addConstraint.constraint().noInherit()) {
+                    table.markNotNullNoInherit(colName);
                 }
                 // Each descendant keeps its own copy of the column list, so the flag has to reach
                 // them or this relation forbids a null its own descendants go on taking.
@@ -4281,27 +4295,27 @@ class DdlAlterTableExecutor {
     }
 
     /**
-     * A named NOT NULL declaration over a column that already carries one under another name
-     * creates nothing, and PostgreSQL will not let a statement say it created a constraint that
-     * is not there: it names the constraint it was asked to make, the column and the relation.
-     * The one exception is a validated declaration over a constraint marked NOT VALID, which is
-     * refused for the rows nobody has read instead -- see
-     * {@link #rejectMergeIntoNotValidNotNull}.
+     * A NOT NULL constraint either reaches the relations below or it does not, and a second
+     * declaration cannot change which. PostgreSQL folds a declaration that agrees into the
+     * constraint already there and refuses one that disagrees, naming the constraint in the way
+     * and what would settle it.
      */
-    private static void rejectSecondNotNullConstraint(Table table, String column, String name,
-                                                      boolean notValid, String relationName) {
-        if (name == null) return;
+    private static void rejectNoInheritChange(Table table, String column,
+                                              AlterTableStmt.AddConstraint addConstraint,
+                                              String relationName) {
         int idx = table.getColumnIndex(column);
         if (idx < 0 || table.getColumns().get(idx).isNullable()) return;
-        // The rows nobody has read come first: a validated declaration written over a constraint
-        // marked NOT VALID is refused for those, and the refusal names that constraint.
-        if (!notValid && notValidNotNull(table, column)) return;
-        // Written under the name the constraint already answers to, the declaration asks for
-        // nothing that is not there.
+        // A declaration that says the same thing the constraint already says is folded in; one
+        // that says the other thing is refused, whichever of the two directions it goes.
+        if (addConstraint.constraint().noInherit() == table.isNotNullNoInherit(column)) return;
         String held = CatalogConstraintBuilder.notNullConstraintName(table, column);
-        if (held != null && held.equalsIgnoreCase(name)) return;
-        throw new MemgresException("cannot create not-null constraint \"" + name
-                + "\" on column \"" + column + "\" of table \"" + relationName + "\"", "55000");
+        if (held == null) return;
+        MemgresException e = new MemgresException(
+                "cannot change NO INHERIT status of NOT NULL constraint \"" + held
+                        + "\" on relation \"" + relationName + "\"", "55000");
+        e.setHint("You might need to make the existing constraint inheritable using"
+                + " ALTER TABLE ... ALTER CONSTRAINT ... INHERIT.");
+        throw e;
     }
 
     /**
@@ -4460,8 +4474,15 @@ class DdlAlterTableExecutor {
             if (colIdx < 0) continue;
             for (Object[] row : existing.getRows()) {
                 if (rowSatisfiesBounds(row[colIdx], incoming, strategy)) {
-                    throw new MemgresException("updated partition constraint for default partition \""
+                    // The error names the relation the offending row is in, which is what a
+                    // client shows the reader when the message alone does not say where to look.
+                    MemgresException e = new MemgresException(
+                            "updated partition constraint for default partition \""
                             + existing.getName() + "\" would be violated by some row", "23514");
+                    e.setSchema(existing.getSchemaName() == null
+                            ? "public" : existing.getSchemaName());
+                    e.setTable(existing.getName());
+                    throw e;
                 }
             }
         }

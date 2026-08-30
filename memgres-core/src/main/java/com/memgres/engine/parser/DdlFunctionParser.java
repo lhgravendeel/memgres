@@ -122,11 +122,7 @@ class DdlFunctionParser {
                         if (parser.check(TokenType.COMMA) && depth == 0) break;
                         Token dt = parser.advance();
                         if (defaultText.length() > 0) defaultText.append(" ");
-                        if (dt.type() == TokenType.STRING_LITERAL) {
-                            defaultText.append("'").append(dt.value().replace("'", "''")).append("'");
-                        } else {
-                            defaultText.append(dt.value());
-                        }
+                        defaultText.append(dt.sqlText());
                     }
                     if (!parsedParams.isEmpty()) {
                         CreateFunctionStmt.FuncParam last = parsedParams.remove(parsedParams.size() - 1);
@@ -308,11 +304,7 @@ class DdlFunctionParser {
             if (parser.check(TokenType.RIGHT_PAREN)) depth--;
             Token t = parser.advance();
             if (sb.length() > 0) sb.append(" ");
-            if (t.type() == TokenType.STRING_LITERAL) {
-                sb.append("'").append(t.value().replace("'", "''")).append("'");
-            } else {
-                sb.append(t.value());
-            }
+            sb.append(t.sqlText());
         }
         return "SELECT " + sb.toString().trim();
     }
@@ -338,11 +330,7 @@ class DdlFunctionParser {
             if (parser.checkKeyword("END") && depth > 0) depth--;
             Token t = parser.advance();
             if (sb.length() > 0) sb.append(" ");
-            if (t.type() == TokenType.STRING_LITERAL) {
-                sb.append("'").append(t.value().replace("'", "''")).append("'");
-            } else {
-                sb.append(t.value());
-            }
+            sb.append(t.sqlText());
         }
         if (!foundEnd) {
             throw new ParseException("unterminated BEGIN ATOMIC block — missing END", parser.peek());

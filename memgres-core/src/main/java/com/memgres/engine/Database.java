@@ -998,6 +998,55 @@ public class Database {
     public void recordAnalyzedTable(String schemaTable) { analyzedTables.add(schemaTable); }
     public Set<String> getAnalyzedTables() { return analyzedTables; }
 
+    /**
+     * The columns an ANALYZE was told to gather statistics for, per relation. A statement that
+     * names no columns gathers them for all of them, which is what a null record says; a
+     * statement that names some replaces whatever the last one recorded.
+     */
+    private final Map<String, List<String>> analyzedColumns = new ConcurrentHashMap<>();
+
+    public void recordAnalyzedColumns(String schemaTable, List<String> columns) {
+        if (columns == null) analyzedColumns.remove(schemaTable.toLowerCase());
+        else analyzedColumns.put(schemaTable.toLowerCase(), new ArrayList<>(columns));
+    }
+
+    /** The columns statistics were gathered for, or null when they were gathered for all. */
+    public List<String> getAnalyzedColumns(String schemaTable) {
+        return analyzedColumns.get(schemaTable.toLowerCase());
+    }
+
+    /**
+     * What the last ANALYZE learned about each column, per relation. Statistics describe the rows
+     * that were there when they were gathered, so they are kept rather than worked out again on
+     * every read: a table written to after an ANALYZE still answers with what the ANALYZE saw,
+     * which is what a planner reading them would have to work from.
+     */
+    private final Map<String, Map<String, ColumnStatistics>> columnStatistics =
+            new ConcurrentHashMap<>();
+
+    void recordColumnStatistics(String schemaTable, Map<String, ColumnStatistics> gathered) {
+        String key = schemaTable.toLowerCase();
+        if (gathered.isEmpty()) {
+            columnStatistics.remove(key);
+            return;
+        }
+        // An ANALYZE that names columns replaces those and leaves the rest as they were.
+        Map<String, ColumnStatistics> held = columnStatistics.get(key);
+        if (held == null) {
+            columnStatistics.put(key, new LinkedHashMap<>(gathered));
+        } else {
+            held.putAll(gathered);
+        }
+    }
+
+    Map<String, ColumnStatistics> getColumnStatistics(String schemaTable) {
+        return columnStatistics.get(schemaTable.toLowerCase());
+    }
+
+    void forgetColumnStatistics(String schemaTable) {
+        columnStatistics.remove(schemaTable.toLowerCase());
+    }
+
     // Clustered index tracking
     public void setClusteredIndex(String indexName) { clusteredIndexes.add(idxName(indexName).toLowerCase()); }
     public boolean isClusteredIndex(String indexName) { return clusteredIndexes.contains(idxName(indexName).toLowerCase()); }

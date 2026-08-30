@@ -1607,9 +1607,24 @@ public class Table {
     public long getIdxScanCount() { return idxScanCount.get(); }
     public void incrementIdxScanCount() { idxScanCount.incrementAndGet(); }
 
-    // Maintenance timestamps
+    // Maintenance timestamps. A relation's statistics say both when it was last vacuumed or
+    // analysed and how many times it has been, and a monitor watches the count rather than the
+    // time: a count that never moved said no maintenance had ever run.
     public java.time.OffsetDateTime getLastVacuum() { return lastVacuum; }
-    public void setLastVacuum(java.time.OffsetDateTime ts) { this.lastVacuum = ts; }
+    public void setLastVacuum(java.time.OffsetDateTime ts) {
+        this.lastVacuum = ts;
+        vacuumCount.incrementAndGet();
+    }
     public java.time.OffsetDateTime getLastAnalyze() { return lastAnalyze; }
-    public void setLastAnalyze(java.time.OffsetDateTime ts) { this.lastAnalyze = ts; }
+    public void setLastAnalyze(java.time.OffsetDateTime ts) {
+        this.lastAnalyze = ts;
+        analyzeCount.incrementAndGet();
+    }
+    public long getVacuumCount() { return vacuumCount.get(); }
+    public long getAnalyzeCount() { return analyzeCount.get(); }
+
+    private final java.util.concurrent.atomic.AtomicLong vacuumCount =
+            new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong analyzeCount =
+            new java.util.concurrent.atomic.AtomicLong();
 }

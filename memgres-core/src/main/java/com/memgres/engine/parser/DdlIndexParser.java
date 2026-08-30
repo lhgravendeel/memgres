@@ -93,11 +93,7 @@ class DdlIndexParser {
             StringBuilder sb = new StringBuilder();
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
                 Token wt = parser.advance();
-                if (wt.type() == TokenType.STRING_LITERAL) {
-                    sb.append('\'').append(wt.value().replace("'", "''")).append('\'');
-                } else {
-                    sb.append(wt.value());
-                }
+                sb.append(wt.sqlText());
                 sb.append(' ');
             }
             whereClause = sb.toString().trim();

@@ -4060,6 +4060,28 @@ class ExprEvaluator {
             }
             return base == DataType.NAME ? DataType.TEXT : base;
         }
+        // A field of a composite is a value of the type that field was declared with. Left to
+        // whatever the stored value happened to be, every field of every composite was described
+        // to the client as text -- a boolean field among them, which a client then read as one.
+        if (expr instanceof FieldAccessExpr) {
+            FieldAccessExpr fa = (FieldAccessExpr) expr;
+            String composite = resolveCompositeTypeName(fa.expr(), bindings);
+            if (composite == null && fa.expr() instanceof ColumnRef) {
+                composite = compositeOfColumn((ColumnRef) fa.expr(), bindings);
+            }
+            List<CreateTypeStmt.CompositeField> fields = composite == null
+                    ? null : executor.database.getRowType(composite);
+            if (fields != null) {
+                for (CreateTypeStmt.CompositeField field : fields) {
+                    if (!field.name().equalsIgnoreCase(fa.field())) continue;
+                    DataType declared = DataType.fromPgName(
+                            field.typeName().replaceAll("\\(.*\\)", "").trim());
+                    if (declared != null) return declared;
+                }
+            }
+            // A field of something this engine cannot name a composite for is left to whatever
+            // the branches below make of it; answering null here left a column with no type.
+        }
         if (expr instanceof PrecomputedValueExpr) {
             PrecomputedValueExpr pre = (PrecomputedValueExpr) expr;
             if (pre.declaredType() != null) return pre.declaredType();
@@ -4819,6 +4841,21 @@ class ExprEvaluator {
      * looks it up by. Described as text, a routine declared to answer with one and a whole-row
      * reference both told the client they were sending a string.
      */
+    /** The composite a bound column was declared as, or null when it was declared as anything else. */
+    private String compositeOfColumn(ColumnRef ref, List<RowContext.TableBinding> bindings) {
+        for (RowContext.TableBinding b : bindings) {
+            if (b.table() == null) continue;
+            if (ref.table() != null) {
+                String bound = b.alias() != null ? b.alias() : b.table().getName();
+                if (bound == null || !bound.equalsIgnoreCase(ref.table())) continue;
+            }
+            int idx = b.table().getColumnIndex(ref.column());
+            if (idx < 0) continue;
+            return b.table().getColumns().get(idx).getCompositeTypeName();
+        }
+        return null;
+    }
+
     String resolveCompositeTypeName(Expression expr, List<RowContext.TableBinding> bindings) {
         if (expr instanceof CastExpr) {
             String named = ((CastExpr) expr).typeName().replaceAll("\\(.*\\)", "").trim();

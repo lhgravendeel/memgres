@@ -111,10 +111,10 @@ class DdlRoleParser {
 
     DropRoleStmt parseDropRole() {
         boolean ifExists = parser.matchKeywords("IF", "EXISTS");
-        String name = parser.readIdentifier();
-        // Skip any additional names (DROP ROLE name, name2, ...)
-        while (parser.match(TokenType.COMMA)) parser.readIdentifier();
-        return new DropRoleStmt(name, ifExists);
+        List<String> names = new java.util.ArrayList<>();
+        names.add(parser.readIdentifier());
+        while (parser.match(TokenType.COMMA)) names.add(parser.readIdentifier());
+        return new DropRoleStmt(names, ifExists);
     }
 
     /** Shared role option parsing for CREATE ROLE and ALTER ROLE. */

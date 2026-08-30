@@ -332,7 +332,7 @@ final class DdlIndexValidator {
             String opts = columnOptions != null && i < columnOptions.size() ? columnOptions.get(i) : "";
             if (opts == null) opts = "";
             checkCollationExists(database, opts);
-            checkCollatable(table, columns.get(i), opts);
+            checkCollatable(database, table, columns.get(i), opts);
             checkOpclass(database, table, am, columns.get(i), opts);
             checkDefaultOpclass(table, am, columns.get(i), opts);
             if (!amInfo.canOrder) {
@@ -389,19 +389,51 @@ final class DdlIndexValidator {
         }
     }
 
-    /** Only the string types carry a collation, so COLLATE on anything else is meaningless. */
-    private static void checkCollatable(Table table, String column, String opts) {
+    /**
+     * Only the string types carry a collation, so COLLATE on anything else is meaningless. An
+     * array carries the collation of what it holds, and a domain the collation of what it is
+     * over, so those two are asked about the type underneath; an enum and a composite carry none
+     * at all. Passed over rather than asked, an index was built over a collation nothing uses,
+     * and PostgreSQL names the type it was asked for by the name the reader wrote it under.
+     */
+    private static void checkCollatable(Database database, Table table, String column, String opts) {
         if (!opts.contains("collate:")) return;
         int colIdx = table.getColumnIndex(column);
         if (colIdx < 0) return;
         Column col = table.getColumns().get(colIdx);
-        if (col.getEnumTypeName() != null || col.getCompositeTypeName() != null
-                || col.getDomainTypeName() != null || col.getArrayElementType() != null) {
-            return;
+        if (col.getEnumTypeName() != null) {
+            throw PgErrors.datatypeMismatch("collations are not supported by type "
+                    + qualifiedTypeName(database, col.getEnumTypeName()));
+        }
+        if (col.getCompositeTypeName() != null) {
+            throw PgErrors.datatypeMismatch("collations are not supported by type "
+                    + qualifiedTypeName(database, col.getCompositeTypeName()));
+        }
+        if (col.getDomainTypeName() != null) {
+            DomainType domain = database == null ? null
+                    : database.getDomain(col.getDomainTypeName());
+            String base = domain == null ? null
+                    : CatalogHelper.pgTypeName(domain.getBaseType());
+            if (base != null && (STRING_FAMILY.contains(base) || "name".equals(base))) return;
+            throw PgErrors.datatypeMismatch("collations are not supported by type "
+                    + qualifiedTypeName(database, col.getDomainTypeName()));
+        }
+        if (col.getArrayElementType() != null) {
+            String element = CatalogHelper.pgTypeName(col.getArrayElementType());
+            if (element == null || STRING_FAMILY.contains(element) || "name".equals(element)) return;
+            throw PgErrors.datatypeMismatch(
+                    "collations are not supported by type " + element + "[]");
         }
         String colType = CatalogHelper.pgTypeName(col.getType());
         if (colType == null || STRING_FAMILY.contains(colType) || "name".equals(colType)) return;
         throw PgErrors.datatypeMismatch("collations are not supported by type " + colType);
+    }
+
+    /** A user-defined type as PostgreSQL names it in a complaint: schema and then name. */
+    private static String qualifiedTypeName(Database database, String written) {
+        if (written.indexOf('.') >= 0) return written;
+        String schema = database == null ? null : TypeNamespace.schemaOf(database, written);
+        return (schema == null ? "public" : schema) + "." + written;
     }
 
     /** The opclass named on a column must exist for the access method and accept the column's type. */
@@ -680,9 +712,31 @@ final class DdlIndexValidator {
         relopt("heap", "autovacuum_vacuum_scale_factor", RelOption.real(0, 100));
         relopt("heap", "autovacuum_vacuum_insert_scale_factor", RelOption.real(0, 100));
         relopt("heap", "autovacuum_analyze_scale_factor", RelOption.real(0, 100));
-        relopt("heap", "vacuum_index_cleanup", RelOption.enumerated("auto", "on", "off"));
+        relopt("heap", "vacuum_index_cleanup", RelOption.enumerated("auto", "on", "off", "true", "false"));
         // vacuum_max_eager_scan_fraction is a GUC, not a storage parameter: PostgreSQL 18
         // refuses it in WITH (...), so listing it here made memgres accept what PG does not.
+
+        // A TOAST table takes only the parameters that govern when it is vacuumed and analysed;
+        // fillfactor and the rest belong to the relation itself and are refused here.
+        relopt("toast", "autovacuum_enabled", RelOption.bool());
+        relopt("toast", "vacuum_truncate", RelOption.bool());
+        relopt("toast", "vacuum_index_cleanup", RelOption.enumerated("auto", "on", "off", "true", "false"));
+        relopt("toast", "autovacuum_vacuum_threshold", RelOption.integer(0, 2147483647.0));
+        relopt("toast", "autovacuum_vacuum_max_threshold", RelOption.integer(-1, 2147483647.0));
+        relopt("toast", "autovacuum_vacuum_insert_threshold", RelOption.integer(-1, 2147483647.0));
+        relopt("toast", "autovacuum_analyze_threshold", RelOption.integer(0, 2147483647.0));
+        relopt("toast", "autovacuum_vacuum_cost_limit", RelOption.integer(1, 10000));
+        relopt("toast", "autovacuum_freeze_min_age", RelOption.integer(0, 1000000000.0));
+        relopt("toast", "autovacuum_freeze_max_age", RelOption.integer(100000, 2000000000.0));
+        relopt("toast", "autovacuum_freeze_table_age", RelOption.integer(0, 2000000000.0));
+        relopt("toast", "autovacuum_multixact_freeze_min_age", RelOption.integer(0, 1000000000.0));
+        relopt("toast", "autovacuum_multixact_freeze_max_age", RelOption.integer(10000, 2000000000.0));
+        relopt("toast", "autovacuum_multixact_freeze_table_age", RelOption.integer(0, 2000000000.0));
+        relopt("toast", "log_autovacuum_min_duration", RelOption.integer(-1, 2147483647.0));
+        relopt("toast", "autovacuum_vacuum_cost_delay", RelOption.real(-1, 100));
+        relopt("toast", "autovacuum_vacuum_scale_factor", RelOption.real(0, 100));
+        relopt("toast", "autovacuum_vacuum_insert_scale_factor", RelOption.real(0, 100));
+        relopt("toast", "autovacuum_analyze_scale_factor", RelOption.real(0, 100));
 
         relopt("btree", "fillfactor", RelOption.integer(10, 100));
         relopt("btree", "deduplicate_items", RelOption.bool());
@@ -712,13 +766,20 @@ final class DdlIndexValidator {
         if (options == null || options.isEmpty()) return;
         Map<String, RelOption> known = REL_OPTIONS.get(kind == null ? "btree" : kind.toLowerCase());
         if (known == null) return;   // an access method this engine does not model: leave it be
+        Map<String, RelOption> toast = REL_OPTIONS.get("toast");
         for (Map.Entry<String, String> entry : options.entrySet()) {
             String name = entry.getKey().toLowerCase();
-            // A namespaced parameter belongs to the TOAST table rather than to this relation.
-            if (name.startsWith("toast.")) continue;
-            RelOption option = known.get(name);
+            // A namespaced parameter belongs to the TOAST table rather than to this relation, and
+            // is judged against what a TOAST table takes. Skipped outright, toast.fillfactor --
+            // which PostgreSQL does not know -- was accepted and then stored nowhere.
+            Map<String, RelOption> takes = known;
+            if (name.startsWith("toast.")) {
+                name = name.substring(6);
+                takes = toast;
+            }
+            RelOption option = takes.get(name);
             if (option == null) {
-                throw new MemgresException("unrecognized parameter \"" + entry.getKey() + "\"", "22023");
+                throw new MemgresException("unrecognized parameter \"" + name + "\"", "22023");
             }
             String value = entry.getValue();
             // A bare parameter name means "true", which only a boolean option can mean.
@@ -776,11 +837,16 @@ final class DdlIndexValidator {
         return trimmed;
     }
 
-    /** A whole WITH clause, with every value normalised the way the catalogue reports it. */
+    /**
+     * A whole WITH clause, with every value normalised the way the catalogue reports it. A
+     * namespaced parameter is set on the relation's TOAST table and not on the relation, so it
+     * does not belong in the relation's own reloptions and is left out here.
+     */
     static Map<String, String> normalizeRelOptions(String kind, Map<String, String> options) {
         if (options == null) return null;
         Map<String, String> out = new java.util.LinkedHashMap<String, String>();
         for (Map.Entry<String, String> entry : options.entrySet()) {
+            if (entry.getKey().toLowerCase().startsWith("toast.")) continue;
             out.put(entry.getKey(), normalizeRelOptionValue(kind, entry.getKey(), entry.getValue()));
         }
         return out;

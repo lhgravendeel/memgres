@@ -3049,6 +3049,9 @@ class CatalogMetadataFunctions {
             case "pg_function_is_visible":
             case "current_schema":
             case "current_schemas":
+            case "user":
+            case "current_role":
+            case "current_catalog":
             case "current_user":
             case "session_user":
             case "current_database":

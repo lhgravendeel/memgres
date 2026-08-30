@@ -278,13 +278,9 @@ ALTER TABLE zze6gd_b ADD CONSTRAINT zze6gd_bn NOT NULL j NOT VALID;
 -- end-expected-error
 ALTER TABLE zze6gd_b ADD CONSTRAINT zze6gd_bn2 NOT NULL j;
 
--- A second NOT VALID declaration is refused for what it would create: nothing.
--- The constraint already there keeps the column, and its own name.
--- note: PostgreSQL 18.0 merged this into the constraint already there; a later PostgreSQL 18 refuses it, and that refusal is what is asserted
--- begin-expected-error
--- sqlstate: 55000
--- message-like: cannot create not-null constraint "zze6gd_bn3" on column "j" of table "zze6gd_b"
--- end-expected-error
+-- A second NOT VALID declaration creates nothing at all, and is folded in. The
+-- constraint already there keeps the column, its own name, and its own answer
+-- about whether the rows have been read.
 ALTER TABLE zze6gd_b ADD CONSTRAINT zze6gd_bn3 NOT NULL j NOT VALID;
 
 -- begin-expected
@@ -339,14 +335,10 @@ SELECT conname, convalidated FROM pg_constraint WHERE conrelid = 'zze6gd_kk'::re
 DROP TABLE zze6gd_kk;
 
 -- A rule the column already carries and has been held to is not reopened by
--- NOT VALID: the declaration creates nothing at all, and is refused for it.
+-- NOT VALID: the declaration creates nothing at all and is folded in, leaving
+-- the constraint as validated as it was.
 CREATE TABLE zze6gd_hh (i int, j int NOT NULL);
 
--- note: PostgreSQL 18.0 merged this into the constraint already there; a later PostgreSQL 18 refuses it, and that refusal is what is asserted
--- begin-expected-error
--- sqlstate: 55000
--- message-like: cannot create not-null constraint "zze6gd_hn" on column "j" of table "zze6gd_hh"
--- end-expected-error
 ALTER TABLE zze6gd_hh ADD CONSTRAINT zze6gd_hn NOT NULL j NOT VALID;
 
 -- begin-expected

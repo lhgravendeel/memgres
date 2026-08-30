@@ -1762,9 +1762,11 @@ public class ExpressionParser {
                     break;
                 }
                 case "USER": {
-                    // PostgreSQL's USER is a value function, the same as CURRENT_USER.
+                    // PostgreSQL's USER is a value function, the same as CURRENT_USER -- but it
+                    // is written USER, and a column takes the name of the function that filled
+                    // it, so rewriting it here labelled the column current_user.
                     advance();
-                    return new FunctionCallExpr("current_user", new ArrayList<Expression>());
+                    return new FunctionCallExpr("user", new ArrayList<Expression>());
                 }
                 case "TRUE": {
                     advance(); return Literal.ofBoolean(true);

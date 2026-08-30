@@ -325,15 +325,15 @@ class SelectParser {
             // SELECT INTO: the inner query needs WITH clauses attached
             if (withClauses != null && ctas.query() instanceof SelectStmt) {
                 SelectStmt sel = (SelectStmt) ctas.query();
-                SelectStmt withSel = new SelectStmt(sel.distinct(), sel.distinctOn(), sel.targets(), sel.from(),
-                        sel.where(), sel.groupBy(), sel.having(), sel.windowDefs(), sel.orderBy(), sel.limit(), sel.offset(), withClauses, sel.groupingSets(), sel.lockClause(), sel.withTies());
+                SelectStmt withSel = sel.withWithClauses(withClauses);
                 return new CreateTableAsStmt(ctas.schema(), ctas.name(), ctas.ifNotExists(), ctas.temporary(), withSel, ctas.withData());
             }
             return ctas;
         }
-        SelectStmt sel = (SelectStmt) body;
-        return new SelectStmt(sel.distinct(), sel.distinctOn(), sel.targets(), sel.from(),
-                sel.where(), sel.groupBy(), sel.having(), sel.windowDefs(), sel.orderBy(), sel.limit(), sel.offset(), withClauses, sel.groupingSets(), sel.lockClause(), sel.withTies());
+        // Everything the query carries has to come with it, and a short constructor takes only
+        // what it has parameters for -- the written GROUP BY among them, which is what says
+        // whether the clause was a ROLLUP or a plain list.
+        return ((SelectStmt) body).withWithClauses(withClauses);
     }
 
     /**
@@ -412,6 +412,8 @@ class SelectParser {
         // FROM
         List<SelectStmt.FromItem> from = null;
         boolean sawFrom = false, sawWhere = false, sawGroupBy = false, sawHaving = false;
+        List<SelectStmt.GroupingElement> writtenGroupBy = null;
+        boolean writtenGroupByDistinct = false;
         boolean sawOrderBy = false, sawLimit = false;
         if (parser.matchKeyword("FROM")) {
             from = parseFromList();
@@ -440,6 +442,8 @@ class SelectParser {
             if (!groupByDistinct) parser.matchKeyword("ALL");
             // Parse potentially multiple GROUP BY elements that may include GROUPING SETS/ROLLUP/CUBE
             groupingSets = parseGroupByClause();
+            writtenGroupBy = writtenGrouping();
+            writtenGroupByDistinct = groupByDistinct;
             if (groupingSets != null) {
                 // GROUP BY DISTINCT: deduplicate grouping sets
                 if (groupByDistinct) {
@@ -552,6 +556,7 @@ class SelectParser {
         boolean withTies = rows != null && rows.withTies;
 
         SelectStmt select = new SelectStmt(distinct, distinctOn, targets, from, where, groupBy, having, windowDefs, orderBy, limit, offset, null, groupingSets, lockClause, withTies);
+        if (writtenGroupBy != null) select.withGroupingElements(writtenGroupBy, writtenGroupByDistinct);
         if (selectIntoTable != null) {
             return new CreateTableAsStmt(selectIntoSchema, selectIntoTable, false, selectIntoTemp, select, true);
         }
@@ -939,6 +944,14 @@ class SelectParser {
      * {@code GROUP BY ROLLUP(a), ROLLUP(b)} has the four sets {@code (a,b), (a), (b), ()},
      * and {@code GROUP BY a, GROUPING SETS ((b), ())} has {@code (a,b)} and {@code (a)}.
      */
+    /**
+     * The GROUP BY as it was written, filled in by {@link #parseGroupByClause()}. The folding
+     * into grouping sets is one-way, so what was written is kept beside what it folded to.
+     */
+    private List<SelectStmt.GroupingElement> writtenGrouping;
+
+    List<SelectStmt.GroupingElement> writtenGrouping() { return writtenGrouping; }
+
     List<List<Expression>> parseGroupByClause() {
         // Check if any element in the comma-separated list is GROUPING SETS/ROLLUP/CUBE
         // or the empty grouping set (), by scanning ahead at the top level
@@ -972,7 +985,11 @@ class SelectParser {
             }
             if (t.type() == TokenType.SEMICOLON || t.type() == TokenType.EOF) break;
         }
-        if (!hasGroupingSets) return null;
+        if (!hasGroupingSets) {
+            writtenGrouping = null;
+            return null;
+        }
+        List<SelectStmt.GroupingElement> written = new ArrayList<>();
 
         // Mixed GROUP BY: parse comma-separated elements, building cross product of sets
         // e.g. GROUP BY a, GROUPING SETS ((b), ()) -> sets for (a), (b), () cross-producted:
@@ -980,22 +997,26 @@ class SelectParser {
         // Cross product: combine each "base set" with each entry of grouping sets spec
         List<List<List<Expression>>> parts = new ArrayList<>();
         do {
+            SelectStmt.GroupingElement[] element = new SelectStmt.GroupingElement[1];
             if (parser.checkKeyword("GROUPING") && parser.checkKeywordAt(1, "SETS")) {
-                parts.add(parseGroupingSetsOnly());
+                parts.add(parseGroupingSetsOnly(element));
             } else if (parser.checkKeyword("ROLLUP") || parser.checkKeyword("CUBE")) {
-                parts.add(parseRollupOrCube());
+                parts.add(parseRollupOrCube(element));
             } else if (checkEmptyGroupingSet()) {
                 parser.advance(); // (
                 parser.advance(); // )
                 List<List<Expression>> emptySet = new ArrayList<>();
                 emptySet.add(new ArrayList<Expression>());
                 parts.add(emptySet);
+                element[0] = SelectStmt.GroupingElement.list(new ArrayList<Expression>());
             } else {
                 Expression expr = parser.parseExpression();
                 List<List<Expression>> singleColSet = new ArrayList<>();
                 singleColSet.add(Cols.listOf(expr));
                 parts.add(singleColSet);
+                element[0] = SelectStmt.GroupingElement.simple(expr);
             }
+            written.add(element[0]);
         } while (parser.match(TokenType.COMMA) && !parser.checkKeyword("HAVING") && !parser.checkKeyword("ORDER") && !parser.checkKeyword("LIMIT")
                 && !parser.checkKeyword("OFFSET") && !parser.checkKeyword("FETCH") && !parser.checkKeyword("WINDOW")
                 && !parser.isAtEnd() && !parser.check(TokenType.SEMICOLON));
@@ -1016,6 +1037,7 @@ class SelectParser {
             }
             result = newResult;
         }
+        writtenGrouping = written;
         return result;
     }
 
@@ -1048,6 +1070,10 @@ class SelectParser {
      * a one-element set.
      */
     List<List<Expression>> parseGroupingSetsOnly() {
+        return parseGroupingSetsOnly(new SelectStmt.GroupingElement[1]);
+    }
+
+    private List<List<Expression>> parseGroupingSetsOnly(SelectStmt.GroupingElement[] written) {
         parser.expectKeyword("GROUPING");
         parser.expectKeyword("SETS");
         parser.expect(TokenType.LEFT_PAREN);
@@ -1056,17 +1082,24 @@ class SelectParser {
             throw new ParseException("syntax error at or near \")\"", parser.peek());
         }
         List<List<Expression>> sets = new ArrayList<>();
+        List<SelectStmt.GroupingElement> members = new ArrayList<>();
         do {
+            SelectStmt.GroupingElement[] member = new SelectStmt.GroupingElement[1];
             if (parser.checkKeyword("GROUPING") && parser.checkKeywordAt(1, "SETS")) {
-                sets.addAll(parseGroupingSetsOnly());
+                sets.addAll(parseGroupingSetsOnly(member));
             } else if (parser.checkKeyword("ROLLUP") || parser.checkKeyword("CUBE")) {
-                sets.addAll(parseRollupOrCube());
+                sets.addAll(parseRollupOrCube(member));
             } else {
                 List<Expression> set = parseGroupingSetElement();
                 sets.add(set);
+                // Every member of the list is a set, so it is written back parenthesised
+                // whether or not the writer bothered: GROUPING SETS (a) reads back as ((a)).
+                member[0] = SelectStmt.GroupingElement.list(set);
             }
+            members.add(member[0]);
         } while (parser.match(TokenType.COMMA));
         parser.expect(TokenType.RIGHT_PAREN);
+        written[0] = SelectStmt.GroupingElement.sets(members);
         return sets;
     }
 
@@ -1098,6 +1131,10 @@ class SelectParser {
 
     /** Parse ROLLUP(...) or CUBE(...) and expand to grouping sets. */
     List<List<Expression>> parseRollupOrCube() {
+        return parseRollupOrCube(new SelectStmt.GroupingElement[1]);
+    }
+
+    private List<List<Expression>> parseRollupOrCube(SelectStmt.GroupingElement[] written) {
         boolean isCube = parser.checkKeyword("CUBE");
         parser.advance(); // consume ROLLUP or CUBE
         parser.expect(TokenType.LEFT_PAREN);
@@ -1108,6 +1145,8 @@ class SelectParser {
         }
         List<Expression> cols = new ArrayList<>(parser.parseExpressionList());
         parser.expect(TokenType.RIGHT_PAREN);
+        written[0] = isCube ? SelectStmt.GroupingElement.cube(cols)
+                : SelectStmt.GroupingElement.rollup(cols);
 
         if (isCube) {
             // CUBE(a,b) = GROUPING SETS ((a,b),(a),(b),())
