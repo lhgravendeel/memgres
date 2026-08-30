@@ -244,32 +244,9 @@ class AClauseSaysWhatItSaysOrIsRefusedTest {
     }
 
     /**
-     * A named NOT NULL over a column that already refuses a null creates nothing, and is folded
-     * into the constraint already there rather than refused.
+     * NO INHERIT says a NOT NULL stops where it was declared, and that is part of what the
+     * constraint is: unrecorded, the catalogue said it reached down.
      */
-    @Test
-    void asecondNamedNotNullIsFoldedIntoTheOneAlreadyThere() throws SQLException {
-        exec("CREATE TABLE zcl_n (i int NOT NULL)");
-        try {
-            exec("ALTER TABLE zcl_n ADD CONSTRAINT zcl_n2 NOT NULL i");
-            exec("ALTER TABLE ONLY zcl_n ADD CONSTRAINT zcl_n3 NOT NULL i");
-            exec("ALTER TABLE zcl_n ADD CONSTRAINT zcl_n4 NOT NULL i NOT VALID");
-            // The constraint already there keeps its name and stays as validated as it was, so
-            // the names the later statements were written with are the names of nothing.
-            assertEquals(List.of("zcl_n_i_not_null/true"),
-                    rows("SELECT conname::text || '/' || convalidated::text FROM pg_constraint"
-                            + " WHERE conrelid='zcl_n'::regclass AND contype='n'"));
-            assertEquals("42704", stateOf("ALTER TABLE zcl_n DROP CONSTRAINT zcl_n2"));
-            // A declaration that contradicts the one already there is refused, and says which.
-            assertTrue(messageOf("ALTER TABLE zcl_n ADD CONSTRAINT zcl_n5 NOT NULL i NO INHERIT")
-                    .contains("cannot change NO INHERIT status of NOT NULL constraint"
-                            + " \"zcl_n_i_not_null\" on relation \"zcl_n\""));
-        } finally {
-            exec("DROP TABLE zcl_n");
-        }
-    }
-
-    /** A NOT NULL declared NO INHERIT stops where it was declared, and says so. */
     @Test
     void aNotNullDeclaredNoInheritIsRecordedAsStoppingThere() throws SQLException {
         exec("CREATE TABLE zcl_ni (i int)");
@@ -278,33 +255,20 @@ class AClauseSaysWhatItSaysOrIsRefusedTest {
             assertEquals("t", one("SELECT connoinherit FROM pg_constraint"
                     + " WHERE conrelid='zcl_ni'::regclass AND contype='n'"));
             // A partition always carries the partitioned table's rules, so there is no such
-            // constraint to declare there.
+            // constraint to declare there -- and a NOT NULL says so in its own words.
             assertTrue(messageOf("CREATE TABLE zcl_np (i int NOT NULL NO INHERIT)"
                     + " PARTITION BY RANGE (i)")
                     .contains("not-null constraints on partitioned tables cannot be NO INHERIT"));
+            // A CHECK says it in different words and under a different SQLSTATE.
+            exec("CREATE TABLE zcl_pt (i int) PARTITION BY RANGE (i)");
+            assertTrue(messageOf("ALTER TABLE zcl_pt ADD CONSTRAINT zcl_ptc CHECK (i > 0)"
+                    + " NO INHERIT")
+                    .contains("cannot add NO INHERIT constraint to partitioned table \"zcl_pt\""));
+            assertTrue(messageOf("ALTER TABLE zcl_pt ADD CONSTRAINT zcl_ptn NOT NULL i NO INHERIT")
+                    .contains("not-null constraints on partitioned tables cannot be NO INHERIT"));
+            exec("DROP TABLE zcl_pt");
         } finally {
             exec("DROP TABLE zcl_ni");
-        }
-    }
-
-    /** A rule is rewritten before a generated column is computed, so NEW reads null for one. */
-    @Test
-    void aRulesNewReadsNullForAColumnTheSystemComputes() throws SQLException {
-        exec("CREATE TABLE zcl_r (a int, s int GENERATED ALWAYS AS (a*2) STORED,"
-                + " v int GENERATED ALWAYS AS (a*3) VIRTUAL, t text DEFAULT 'd')");
-        exec("CREATE TABLE zcl_rlog (m text)");
-        exec("CREATE RULE zcl_rr AS ON INSERT TO zcl_r DO ALSO INSERT INTO zcl_rlog"
-                + " VALUES (coalesce(NEW.s::text,'null') || '/' || coalesce(NEW.v::text,'null')"
-                + " || '/' || coalesce(NEW.t,'null'))");
-        try {
-            exec("INSERT INTO zcl_r (a) VALUES (4)");
-            // The default of a column the statement left out does reach NEW; a generated column
-            // does not, because there is nothing in the target list to put in its place.
-            assertEquals("null/null/d", one("SELECT m FROM zcl_rlog"));
-            // The row itself still gets the computed values.
-            assertEquals("4/8/12", one("SELECT a || '/' || s || '/' || v FROM zcl_r"));
-        } finally {
-            exec("DROP TABLE zcl_r, zcl_rlog CASCADE");
         }
     }
 

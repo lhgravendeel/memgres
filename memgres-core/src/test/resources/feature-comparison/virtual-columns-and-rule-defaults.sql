@@ -203,10 +203,11 @@ SELECT m FROM zzw5a_rd2log;
 DROP TABLE zzw5a_rd2 CASCADE;
 DROP TABLE zzw5a_rd2log CASCADE;
 
--- A column with no default still reads null in NEW, and so does a column the system computes.
--- PostgreSQL rewrites the rule before it computes a generated column -- the rewriter has only
--- the statement's own target list to put in place of a NEW reference, and a generated column
--- has no entry there -- so NEW reads null for one, stored or virtual alike.
+-- A column with no default still reads null in NEW, and a column the system computes reads the
+-- value the row is about to hold: PostgreSQL works a stored generated column out where the rule
+-- reads it.
+-- note: PostgreSQL 18.0 reads null there; a later PostgreSQL 18 works the value out, and that is
+-- what is asserted
 DROP TABLE IF EXISTS zzw5a_rd3 CASCADE;
 DROP TABLE IF EXISTS zzw5a_rd3log CASCADE;
 CREATE TABLE zzw5a_rd3 (a int, s int GENERATED ALWAYS AS (a*2) STORED, t text);
@@ -223,7 +224,7 @@ SELECT a, s, t FROM zzw5a_rd3;
 
 -- begin-expected
 -- columns: m
--- row: null/null
+-- row: 8/null
 -- end-expected
 SELECT m FROM zzw5a_rd3log;
 

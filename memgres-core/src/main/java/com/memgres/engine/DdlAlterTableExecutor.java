@@ -3642,12 +3642,10 @@ class DdlAlterTableExecutor {
         if (addConstraint.constraint().type() == TableConstraint.ConstraintType.NOT_NULL) {
             for (String colName : addConstraint.constraint().columns()) {
                 // A written name belongs to a constraint that comes into existence, and over a
-                // column that already refuses a null there is none to make. PostgreSQL folds
-                // such a declaration into the constraint already there and leaves that one's
-                // name standing; only a constraint the new declaration contradicts -- one whose
-                // rows nobody has read, or one that does not reach the same relations -- is in
-                // the way, and each of those is reported below for what it is.
-                rejectNoInheritChange(table, colName, addConstraint, stmt.table());
+                // column that already refuses a null there is none to make: PostgreSQL refuses
+                // the declaration rather than folding it into the constraint already there.
+                rejectSecondNotNullConstraint(table, colName, addConstraint.constraint().name(),
+                        addConstraint.notValid(), stmt.table());
                 // The rows already stored decide whether the rule can hold at all — unless NOT
                 // VALID was written, which is exactly the request to leave them alone. The column
                 // is still marked NOT NULL below, because PostgreSQL enforces such a constraint on
@@ -4295,27 +4293,30 @@ class DdlAlterTableExecutor {
     }
 
     /**
-     * A NOT NULL constraint either reaches the relations below or it does not, and a second
-     * declaration cannot change which. PostgreSQL folds a declaration that agrees into the
-     * constraint already there and refuses one that disagrees, naming the constraint in the way
-     * and what would settle it.
+     * A named NOT NULL declaration over a column that already carries one under another name
+     * creates nothing, and PostgreSQL will not let a statement say it created a constraint that
+     * is not there: it names the constraint it was asked to make, the column and the relation.
+     * The one exception is a validated declaration over a constraint marked NOT VALID, which is
+     * refused for the rows nobody has read instead -- see
+     * {@link #rejectMergeIntoNotValidNotNull}.
+     *
+     * <p>PostgreSQL 18.0 folds such a declaration in instead; a later PostgreSQL 18 refuses it,
+     * and the refusal is what is written here.
      */
-    private static void rejectNoInheritChange(Table table, String column,
-                                              AlterTableStmt.AddConstraint addConstraint,
-                                              String relationName) {
+    private static void rejectSecondNotNullConstraint(Table table, String column, String name,
+                                                      boolean notValid, String relationName) {
+        if (name == null) return;
         int idx = table.getColumnIndex(column);
         if (idx < 0 || table.getColumns().get(idx).isNullable()) return;
-        // A declaration that says the same thing the constraint already says is folded in; one
-        // that says the other thing is refused, whichever of the two directions it goes.
-        if (addConstraint.constraint().noInherit() == table.isNotNullNoInherit(column)) return;
+        // The rows nobody has read come first: a validated declaration written over a constraint
+        // marked NOT VALID is refused for those, and the refusal names that constraint.
+        if (!notValid && notValidNotNull(table, column)) return;
+        // Written under the name the constraint already answers to, the declaration asks for
+        // nothing that is not there.
         String held = CatalogConstraintBuilder.notNullConstraintName(table, column);
-        if (held == null) return;
-        MemgresException e = new MemgresException(
-                "cannot change NO INHERIT status of NOT NULL constraint \"" + held
-                        + "\" on relation \"" + relationName + "\"", "55000");
-        e.setHint("You might need to make the existing constraint inheritable using"
-                + " ALTER TABLE ... ALTER CONSTRAINT ... INHERIT.");
-        throw e;
+        if (held != null && held.equalsIgnoreCase(name)) return;
+        throw new MemgresException("cannot create not-null constraint \"" + name
+                + "\" on column \"" + column + "\" of table \"" + relationName + "\"", "55000");
     }
 
     /**

@@ -4054,10 +4054,14 @@ class InheritedDeclarationsAndIndexesTest {
 
         exec("DELETE FROM zzy9nn_wc");
         exec("ALTER TABLE zzy9nn_wp ADD CONSTRAINT zzy9nn_wn NOT NULL i");
-        // A column that already refuses a null has nothing left for a second name to answer to.
-        // PostgreSQL folds the declaration into the constraint already there, which keeps the
-        // name it was made with, so the second name is the name of nothing.
-        assertEquals("OK", stateOf("ALTER TABLE ONLY zzy9nn_wp ADD CONSTRAINT zzy9nn_wn2 NOT NULL i"));
+        // A column that already refuses a null has nothing left for a second name to answer to,
+        // and PostgreSQL will not report a constraint it did not make: the hierarchy is left
+        // holding the one rule already made, under the one name it was made with.
+        assertEquals("55000",
+                stateOf("ALTER TABLE ONLY zzy9nn_wp ADD CONSTRAINT zzy9nn_wn2 NOT NULL i"));
+        assertEquals("cannot create not-null constraint \"zzy9nn_wn2\" on column \"i\""
+                        + " of table \"zzy9nn_wp\"",
+                messageOf("ALTER TABLE ONLY zzy9nn_wp ADD CONSTRAINT zzy9nn_wn2 NOT NULL i"));
         assertEquals("zzy9nn_wc:zzy9nn_wn/false/1,zzy9nn_wp:zzy9nn_wn/true/0",
                 notNullsAcross("'zzy9nn_wp','zzy9nn_wc'"));
 
@@ -5176,9 +5180,13 @@ class InheritedDeclarationsAndIndexesTest {
         assertEquals("You might need to validate it using ALTER TABLE ... VALIDATE CONSTRAINT.",
                 hintOf("ALTER TABLE zzgd7_b ADD CONSTRAINT zzgd7_bn2 NOT NULL j"));
 
-        // A second NOT VALID declaration creates nothing and is folded in. The constraint
-        // already there keeps the column, its own name and its own answer about the rows.
-        assertEquals("OK", stateOf("ALTER TABLE zzgd7_b ADD CONSTRAINT zzgd7_bn3 NOT NULL j NOT VALID"));
+        // A second NOT VALID declaration is refused for what it would create: nothing. The
+        // constraint already there keeps the column, and its own name.
+        assertEquals("55000",
+                stateOf("ALTER TABLE zzgd7_b ADD CONSTRAINT zzgd7_bn3 NOT NULL j NOT VALID"));
+        assertEquals("cannot create not-null constraint \"zzgd7_bn3\" on column \"j\""
+                        + " of table \"zzgd7_b\"",
+                messageOf("ALTER TABLE zzgd7_b ADD CONSTRAINT zzgd7_bn3 NOT NULL j NOT VALID"));
         assertEquals("zzgd7_bn/false",
                 scalar("SELECT string_agg(conname||'/'||convalidated::text, ',' ORDER BY conname)"
                         + " FROM pg_constraint WHERE conrelid = 'zzgd7_b'::regclass"));
@@ -5221,7 +5229,11 @@ class InheritedDeclarationsAndIndexesTest {
     @Test
     void notValidDoesNotReopenARuleTheColumnHasAlreadyBeenHeldTo() throws Exception {
         exec("CREATE TABLE zzgd7_hh (i int, j int NOT NULL)");
-        assertEquals("OK", stateOf("ALTER TABLE zzgd7_hh ADD CONSTRAINT zzgd7_hn NOT NULL j NOT VALID"));
+        assertEquals("55000",
+                stateOf("ALTER TABLE zzgd7_hh ADD CONSTRAINT zzgd7_hn NOT NULL j NOT VALID"));
+        assertEquals("cannot create not-null constraint \"zzgd7_hn\" on column \"j\""
+                        + " of table \"zzgd7_hh\"",
+                messageOf("ALTER TABLE zzgd7_hh ADD CONSTRAINT zzgd7_hn NOT NULL j NOT VALID"));
 
         // The declaration creates nothing, and nothing is what it leaves behind: the constraint
         // already there keeps its name and stays as validated as it was.
