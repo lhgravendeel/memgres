@@ -303,16 +303,29 @@ class DdlTableParser {
             parser.expect(TokenType.RIGHT_PAREN);
         }
 
-        // WITH (storage_parameter = value, ...)
+        // WITH ([namespace.]storage_parameter [= value], ...). A parameter may belong to the
+        // relation's TOAST table rather than to the relation, and one written with no value at
+        // all is a flag being turned on. Requiring a bare word and an "=" made both a syntax
+        // error, and left the branches written to handle them unreachable.
         java.util.Map<String, String> withOptions = null;
         if (parser.matchKeyword("WITH")) {
             if (parser.match(TokenType.LEFT_PAREN)) {
                 withOptions = new java.util.LinkedHashMap<>();
                 do {
-                    String key = parser.readIdentifier();
-                    parser.expect(TokenType.EQUALS);
-                    String val = parser.advance().value();
-                    withOptions.put(key.toLowerCase(), val);
+                    String key = parser.readIdentifier().toLowerCase();
+                    if (parser.match(TokenType.DOT)) {
+                        key = key + "." + parser.readIdentifier().toLowerCase();
+                    }
+                    String val = null;
+                    if (parser.match(TokenType.EQUALS)) {
+                        StringBuilder sb = new StringBuilder();
+                        while (!parser.isAtEnd() && !parser.check(TokenType.COMMA)
+                                && !parser.check(TokenType.RIGHT_PAREN)) {
+                            sb.append(parser.advance().value());
+                        }
+                        val = sb.toString().trim();
+                    }
+                    withOptions.put(key, val);
                 } while (parser.match(TokenType.COMMA));
                 parser.expect(TokenType.RIGHT_PAREN);
             }
@@ -960,9 +973,13 @@ class DdlTableParser {
 
         if (parser.matchKeywords("NOT", "NULL")) {
             String col = parser.readIdentifier();
-            parser.matchKeywords("NO", "INHERIT");
+            // NO INHERIT says the constraint stops at this relation, which is part of what the
+            // constraint is. Read and thrown away, the catalogue reported that it reached down,
+            // and a second declaration could not tell that it contradicted the one already there.
+            boolean noInherit = parser.matchKeywords("NO", "INHERIT");
             return new TableConstraint(constraintName, TableConstraint.ConstraintType.NOT_NULL,
-                    Cols.listOf(col), null, null, null, null, null);
+                    Cols.listOf(col), null, null, null, null, null,
+                    false, false, false, false, noInherit, null, null);
         }
 
         if (parser.matchKeywords("PRIMARY", "KEY")) {
@@ -1344,11 +1361,7 @@ class DdlTableParser {
                     depth--;
                     if (depth == 0) { parser.advance(); break; }
                 }
-                if (t.type() == TokenType.STRING_LITERAL) {
-                    sb.append("'").append(t.value().replace("'", "''")).append("'");
-                } else {
-                    sb.append(t.value());
-                }
+                sb.append(t.sqlText());
                 parser.advance();
                 if (depth > 0) {
                     Token next = parser.peek();
@@ -1385,11 +1398,7 @@ class DdlTableParser {
                     depth--;
                     if (depth == 0) { parser.advance(); break; }
                 }
-                if (t.type() == TokenType.STRING_LITERAL) {
-                    sb.append("'").append(t.value().replace("'", "''")).append("'");
-                } else {
-                    sb.append(t.value());
-                }
+                sb.append(t.sqlText());
                 parser.advance();
                 // Add separator space unless next is a comma, paren, or we just appended a paren
                 if (depth > 0) {
@@ -1453,11 +1462,7 @@ class DdlTableParser {
                 if (depth == 0) break;
             }
             if (text.length() > 0) text.append(" ");
-            if (t.type() == TokenType.STRING_LITERAL) {
-                text.append("'").append(t.value().replace("'", "''")).append("'");
-            } else {
-                text.append(t.value());
-            }
+            text.append(t.sqlText());
             parser.advance();
         }
         return text.toString();

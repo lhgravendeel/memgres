@@ -458,7 +458,9 @@ class CatalogStubBuilder {
                         (long) t.getRows().size(), 0L, // live, dead
                         0L, 0L,                        // mod_since_analyze, ins_since_vacuum
                         lastVac, null, lastAna, null,   // last vacuum/analyze
-                        0L, 0L, 0L, 0L,                // counts
+                        // The counts move with the statements that ran. Nothing runs autovacuum
+                        // here, so the two automatic counts stay where they started.
+                        t.getVacuumCount(), 0L, t.getAnalyzeCount(), 0L,
                         0.0, 0.0, 0.0, 0.0             // total vacuum/analyze times
                 });
             }
@@ -686,8 +688,13 @@ class CatalogStubBuilder {
             if (schema == null) continue;
             Table t = schema.getTable(tableName);
             if (t == null) continue;
+            Map<String, ColumnStatistics> gathered = database.getColumnStatistics(schemaTable);
+            if (gathered == null) continue;
             int relOid = oids.oid("rel:" + schemaTable);
             for (int i = 0; i < t.getColumns().size(); i++) {
+                ColumnStatistics stats =
+                        gathered.get(t.getColumns().get(i).getName().toLowerCase());
+                if (stats == null) continue;
                 // Every one of the five numbered slots is a column of this relation, so a row has
                 // to carry them whether or not the slot holds a statistic. Supplying only the
                 // first six values left the row shorter than the relation it belongs to, and
@@ -697,12 +704,31 @@ class CatalogStubBuilder {
                 row[0] = relOid;
                 row[1] = (short) t.attnumAt(i);
                 row[2] = false;
-                row[3] = 0.0f;
-                row[4] = 0;
-                row[5] = -1.0f;
+                row[3] = stats.nullFrac;
+                row[4] = stats.width;
+                row[5] = stats.nDistinct;
                 // stakind/staop/stacoll are zero in an unused slot; stanumbers/stavalues are null.
                 for (int slot = 6; slot < 6 + 5; slot++) row[slot] = (short) 0;
                 for (int slot = 11; slot < 11 + 10; slot++) row[slot] = 0;
+                for (int slot = 21; slot < 21 + 10; slot++) row[slot] = null;
+                // The slots are filled in the order PostgreSQL fills them: the common values,
+                // then what is left of the range, then how the column's order follows the
+                // table's. A reader asks which slot holds what by its stakind, so an empty one
+                // in the middle would hide the statistics after it.
+                int slot = 0;
+                if (stats.commonValues != null) {
+                    row[6 + slot] = (short) 1;
+                    row[21 + slot] = ColumnStatistics.arrayLiteral(stats.commonFrequencies);
+                    row[26 + slot] = ColumnStatistics.arrayLiteral(stats.commonValues);
+                    slot++;
+                }
+                if (stats.histogramBounds != null) {
+                    row[6 + slot] = (short) 2;
+                    row[26 + slot] = ColumnStatistics.arrayLiteral(stats.histogramBounds);
+                    slot++;
+                }
+                row[6 + slot] = (short) 3;
+                row[21 + slot] = "{" + stats.correlation + "}";
                 table.insertRow(row);
             }
         }
@@ -1334,13 +1360,36 @@ class CatalogStubBuilder {
         return table;
     }
 
+    /**
+     * pg_shdescription: the comments on the objects a whole cluster shares rather than a database.
+     * A role and a database are two of those, so their comments are here and not in
+     * pg_description. Left empty, {@code COMMENT ON ROLE} described nothing anybody could read.
+     */
     Table buildPgShdescription() {
         List<Column> cols = Cols.listOf(
                 colNN("objoid", DataType.OID),
                 colNN("classoid", DataType.OID),
                 col("description", DataType.TEXT)
         );
-        return new Table("pg_shdescription", cols); // empty, no shared descriptions
+        Table table = new Table("pg_shdescription", cols);
+        int authidClassOid = oids.oid("rel:pg_catalog.pg_authid");
+        int databaseClassOid = oids.oid("rel:pg_catalog.pg_database");
+        for (Map.Entry<String, String> entry : database.getComments().entrySet()) {
+            String key = entry.getKey();
+            int colon = key.indexOf(':');
+            if (colon < 0) continue;
+            String kind = key.substring(0, colon);
+            String name = key.substring(colon + 1);
+            if (kind.equals("role") || kind.equals("user")) {
+                if (!database.getRoles().containsKey(name.toLowerCase())) continue;
+                table.insertRow(new Object[]{
+                        oids.oid("role:" + name.toLowerCase()), authidClassOid, entry.getValue()});
+            } else if (kind.equals("database")) {
+                table.insertRow(new Object[]{
+                        oids.oid("db:" + name.toLowerCase()), databaseClassOid, entry.getValue()});
+            }
+        }
+        return table;
     }
 
     Table buildPgConversion() {
@@ -1533,29 +1582,18 @@ class CatalogStubBuilder {
             if (schema == null) continue;
             Table srcTable = schema.getTable(tableName);
             if (srcTable == null) continue;
+            Map<String, ColumnStatistics> gathered = database.getColumnStatistics(schemaTable);
+            if (gathered == null) continue;
             for (Column col : srcTable.getColumns()) {
-                // Compute basic statistics from table data
-                java.util.Set<Object> distinctVals = new java.util.HashSet<>();
-                int nullCount = 0;
-                long totalWidth = 0;
-                int colIdx = srcTable.getColumnIndex(col.getName());
-                for (Object[] row : srcTable.getRows()) {
-                    Object val = (colIdx >= 0 && colIdx < row.length) ? row[colIdx] : null;
-                    if (val == null) {
-                        nullCount++;
-                    } else {
-                        distinctVals.add(val);
-                        totalWidth += val.toString().length();
-                    }
-                }
-                int totalRows = srcTable.getRows().size();
-                float nullFrac = totalRows > 0 ? (float) nullCount / totalRows : 0f;
-                int avgWidth = (totalRows - nullCount) > 0 ? (int) (totalWidth / (totalRows - nullCount)) : 0;
-                float nDistinct = distinctVals.size();
+                ColumnStatistics stats = gathered.get(col.getName().toLowerCase());
+                if (stats == null) continue;
                 table.insertRow(new Object[]{
                         schemaName, tableName, col.getName(), false,
-                        nullFrac, avgWidth, nDistinct,
-                        null, null, null, 0.0f, null, null, null,
+                        stats.nullFrac, stats.width, stats.nDistinct,
+                        ColumnStatistics.arrayLiteral(stats.commonValues),
+                        ColumnStatistics.arrayLiteral(stats.commonFrequencies),
+                        ColumnStatistics.arrayLiteral(stats.histogramBounds),
+                        stats.correlation, null, null, null,
                         null, null, null
                 });
             }

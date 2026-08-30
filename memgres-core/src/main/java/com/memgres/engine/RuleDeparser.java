@@ -980,19 +980,31 @@ public final class RuleDeparser {
     }
 
     /** PG rewrites BETWEEN into comparisons during parse analysis; so do we. */
+    /**
+     * BETWEEN is two comparisons joined, and NOT BETWEEN is the other two joined the other way.
+     *
+     * <p>PostgreSQL builds each of them when it reads the statement -- {@code a >= lo AND a <= hi}
+     * for one and {@code a < lo OR a > hi} for the other -- so what is stored, and what is read
+     * back, never holds a NOT at all. Built as the positive form with a NOT wrapped round it, a
+     * constraint read back said something PostgreSQL would never write, and a schema-comparison
+     * tool saw every such constraint as different from the one it had.
+     */
     private static String renderBetween(BetweenExpr b, ColumnTypes cols) {
-        String lo = comparison(b.expr(), BinaryExpr.BinOp.GREATER_EQUAL, b.low(), cols);
-        String hi = comparison(b.expr(), BinaryExpr.BinOp.LESS_EQUAL, b.high(), cols);
-        String forward = "(" + lo + " AND " + hi + ")";
-        String body;
-        if (b.symmetric()) {
-            String lo2 = comparison(b.expr(), BinaryExpr.BinOp.GREATER_EQUAL, b.high(), cols);
-            String hi2 = comparison(b.expr(), BinaryExpr.BinOp.LESS_EQUAL, b.low(), cols);
-            body = "(" + forward + " OR (" + lo2 + " AND " + hi2 + "))";
-        } else {
-            body = forward;
-        }
-        return b.negated() ? "(NOT " + body + ")" : body;
+        BinaryExpr.BinOp lowOp = b.negated()
+                ? BinaryExpr.BinOp.LESS_THAN : BinaryExpr.BinOp.GREATER_EQUAL;
+        BinaryExpr.BinOp highOp = b.negated()
+                ? BinaryExpr.BinOp.GREATER_THAN : BinaryExpr.BinOp.LESS_EQUAL;
+        String join = b.negated() ? " OR " : " AND ";
+        String lo = comparison(b.expr(), lowOp, b.low(), cols);
+        String hi = comparison(b.expr(), highOp, b.high(), cols);
+        String forward = "(" + lo + join + hi + ")";
+        if (!b.symmetric()) return forward;
+        // SYMMETRIC asks the same question with the bounds the other way round, and the two
+        // answers are joined the way the pair of comparisons within each of them is not.
+        String lo2 = comparison(b.expr(), lowOp, b.high(), cols);
+        String hi2 = comparison(b.expr(), highOp, b.low(), cols);
+        String backward = "(" + lo2 + join + hi2 + ")";
+        return "(" + forward + (b.negated() ? " AND " : " OR ") + backward + ")";
     }
 
     private static String comparison(Expression l, BinaryExpr.BinOp op, Expression r, ColumnTypes cols) {

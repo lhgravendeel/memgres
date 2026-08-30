@@ -206,6 +206,8 @@ DROP TABLE zzw5a_rd2log CASCADE;
 -- A column with no default still reads null in NEW, and a column the system computes reads the
 -- value the row is about to hold: PostgreSQL works a stored generated column out where the rule
 -- reads it.
+-- note: PostgreSQL 18.0 reads null there; a later PostgreSQL 18 works the value out, and that is
+-- what is asserted
 DROP TABLE IF EXISTS zzw5a_rd3 CASCADE;
 DROP TABLE IF EXISTS zzw5a_rd3log CASCADE;
 CREATE TABLE zzw5a_rd3 (a int, s int GENERATED ALWAYS AS (a*2) STORED, t text);

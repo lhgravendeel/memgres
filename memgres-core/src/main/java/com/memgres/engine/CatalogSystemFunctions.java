@@ -582,6 +582,7 @@ class CatalogSystemFunctions {
                 schemas.add("public");
                 return schemas;
             }
+            case "user":
             case "current_user":
             case "current_role": {
                 if (executor.session != null) {
@@ -749,7 +750,11 @@ class CatalogSystemFunctions {
                 return "";
             }
             case "current_setting": {
-                String setting = String.valueOf(executor.evalExpr(fn.args().get(0), ctx));
+                Object askedFor = executor.evalExpr(fn.args().get(0), ctx);
+                // No parameter was named, so there is no setting to report — which is nothing,
+                // not a parameter called "null".
+                if (askedFor == null) return null;
+                String setting = String.valueOf(askedFor);
                 // current_setting reports the display form, the same text SHOW gives: a
                 // parameter counted in a unit reads back as "4MB", not as its 4096 kB.
                 String value = null;
@@ -769,12 +774,28 @@ class CatalogSystemFunctions {
             }
             case "set_config": {
                 if (fn.args().size() >= 2) {
-                    String settingName = String.valueOf(executor.evalExpr(fn.args().get(0), ctx));
+                    Object namedAs = executor.evalExpr(fn.args().get(0), ctx);
+                    // A parameter that is nothing is no parameter to set, and PostgreSQL says so
+                    // rather than looking up a parameter called "null".
+                    if (namedAs == null) {
+                        throw new MemgresException("SET requires parameter name", "22004");
+                    }
+                    String settingName = String.valueOf(namedAs);
                     // set_config is SET written as a function call, so it is judged by the same
                     // rules: an unrecognized parameter is refused rather than invented, and one
                     // that cannot be changed at run time says so with the same SQLSTATE.
                     GucSettings.requireKnown(settingName);
-                    String settingValue = String.valueOf(executor.evalExpr(fn.args().get(1), ctx));
+                    Object valueGiven = executor.evalExpr(fn.args().get(1), ctx);
+                    // A value that is nothing puts the parameter back to its default, which is
+                    // what RESET does; stringified to "null" it was refused as a bad value.
+                    if (valueGiven == null) {
+                        if (executor.session != null) {
+                            executor.session.getGucSettings().reset(settingName);
+                            return executor.session.getGucSettings().getForDisplay(settingName);
+                        }
+                        return null;
+                    }
+                    String settingValue = String.valueOf(valueGiven);
                     GucSettings.checkAssignable(settingName, settingValue);
                     // And by the same value checks: a time zone nobody has, an encoding that is
                     // not one and a role that does not exist are refused here as they are there.
@@ -807,6 +828,11 @@ class CatalogSystemFunctions {
                         } else {
                             executor.session.getGucSettings().set(settingName, settingValue);
                         }
+                        // What comes back is what the parameter now holds, which is not always
+                        // what was written: a boolean set to "0" reads back as "off".
+                        String stored =
+                                executor.session.getGucSettings().getForDisplay(settingName);
+                        if (stored != null) return stored;
                     }
                     return settingValue;
                 }

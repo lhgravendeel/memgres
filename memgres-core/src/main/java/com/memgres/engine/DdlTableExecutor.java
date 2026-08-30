@@ -605,6 +605,13 @@ class DdlTableExecutor {
         // about first.
         for (ColumnDef notInherited : stmt.columns()) {
             if (!notInherited.notNullNoInherit()) continue;
+            // A partition always carries the partitioned table's rules, so a NOT NULL declared
+            // NO INHERIT there asks for one the hierarchy cannot express.
+            if (stmt.partitionBy() != null) {
+                throw new MemgresException(
+                        "not-null constraints on partitioned tables cannot be NO INHERIT", "0A000")
+                        .suppressPosition();
+            }
             for (Table inheritParent : parentTables) {
                 if (!CatalogConstraintBuilder.declaresNotNull(inheritParent, notInherited.name())) {
                     continue;

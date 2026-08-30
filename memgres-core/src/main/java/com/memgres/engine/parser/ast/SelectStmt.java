@@ -33,6 +33,80 @@ public final class SelectStmt implements Statement {
      */
     private boolean fromValues;
 
+    /**
+     * The GROUP BY as it was written, when it held a ROLLUP, a CUBE or a GROUPING SETS.
+     *
+     * <p>Those three are folded into the flat list of grouping sets the query is answered from,
+     * and that folding is one-way: {@code ROLLUP(a, b)}, {@code CUBE(a, b)} and a written-out
+     * GROUPING SETS can all fold to the same sets. What a reader is shown of the query -- its
+     * definition, read back through pg_get_viewdef -- is what was written, so the written form is
+     * kept beside the folded one. Without it every such query read back as a plain GROUP BY of
+     * the columns, which groups differently from what it says.
+     */
+    private List<GroupingElement> groupingElements;
+
+    /** True when GROUP BY DISTINCT was written, which drops the sets the folding repeats. */
+    private boolean groupByDistinct;
+
+    /** One element of a written GROUP BY, kept so the clause can be read back as it stands. */
+    public static final class GroupingElement {
+        /** A plain expression, a parenthesised list, or one of the three set-producing words. */
+        public enum Kind { SIMPLE, LIST, ROLLUP, CUBE, SETS }
+
+        private final Kind kind;
+        private final Expression expr;
+        private final List<Expression> columns;
+        private final List<GroupingElement> members;
+
+        private GroupingElement(Kind kind, Expression expr, List<Expression> columns,
+                                List<GroupingElement> members) {
+            this.kind = kind;
+            this.expr = expr;
+            this.columns = columns;
+            this.members = members;
+        }
+
+        public static GroupingElement simple(Expression expr) {
+            return new GroupingElement(Kind.SIMPLE, expr, null, null);
+        }
+
+        public static GroupingElement list(List<Expression> columns) {
+            return new GroupingElement(Kind.LIST, null, columns, null);
+        }
+
+        public static GroupingElement rollup(List<Expression> columns) {
+            return new GroupingElement(Kind.ROLLUP, null, columns, null);
+        }
+
+        public static GroupingElement cube(List<Expression> columns) {
+            return new GroupingElement(Kind.CUBE, null, columns, null);
+        }
+
+        public static GroupingElement sets(List<GroupingElement> members) {
+            return new GroupingElement(Kind.SETS, null, null, members);
+        }
+
+        public Kind kind() { return kind; }
+
+        public Expression expr() { return expr; }
+
+        public List<Expression> columns() { return columns; }
+
+        public List<GroupingElement> members() { return members; }
+    }
+
+    /** The GROUP BY as it was written, or null when it was a plain list of expressions. */
+    public List<GroupingElement> groupingElements() { return groupingElements; }
+
+    public boolean groupByDistinct() { return groupByDistinct; }
+
+    /** Record the written GROUP BY beside the grouping sets it folds to. */
+    public SelectStmt withGroupingElements(List<GroupingElement> elements, boolean distinctSets) {
+        this.groupingElements = elements;
+        this.groupByDistinct = distinctSets;
+        return this;
+    }
+
     /** Marks this SELECT as the rewritten form of a VALUES list. */
     public SelectStmt asValuesList() {
         this.fromValues = true;
@@ -74,6 +148,8 @@ public final class SelectStmt implements Statement {
                 lockClause, withTies);
         copy.fromValues = fromValues;
         copy.joinExpression = joinExpression;
+        copy.groupingElements = groupingElements;
+        copy.groupByDistinct = groupByDistinct;
         return copy;
     }
 
@@ -796,6 +872,8 @@ public final class SelectStmt implements Statement {
                 windowDefs, orderBy, limit, offset, withClauses, groupingSets, lockClause, withTies);
         copy.fromValues = fromValues;
         copy.joinExpression = joinExpression;
+        copy.groupingElements = groupingElements;
+        copy.groupByDistinct = groupByDistinct;
         return copy;
     }
 

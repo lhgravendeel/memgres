@@ -2095,8 +2095,7 @@ class DdlParser {
             for (int i = exprStart; i < parser.pos; i++) {
                 Token t = parser.tokens.get(i);
                 if (i > exprStart) sb.append(' ');
-                sb.append(t.type() == TokenType.STRING_LITERAL
-                        ? "'" + t.value().replace("'", "''") + "'" : t.value());
+                sb.append(t.sqlText());
             }
             return sb.toString();
         }
@@ -2782,11 +2781,7 @@ class DdlParser {
         for (int i = startPos; i < endPos; i++) {
             if (i > startPos) raw.append(' ');
             Token t = parser.tokens.get(i);
-            if (t.type() == TokenType.STRING_LITERAL) {
-                raw.append("'").append(t.value().replace("'", "''")).append("'");
-            } else {
-                raw.append(t.value());
-            }
+            raw.append(t.sqlText());
         }
         return raw.toString();
     }

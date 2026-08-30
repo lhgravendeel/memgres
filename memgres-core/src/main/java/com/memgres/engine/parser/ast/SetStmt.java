@@ -30,6 +30,18 @@ public final class SetStmt implements Statement {
 
     public String auxiliary() { return auxiliary; }
 
+    /**
+     * Whether the value was written as the keyword DEFAULT rather than as a value. The two look
+     * the same once the value is text: {@code SET x = DEFAULT} puts the parameter back where it
+     * started, while {@code SET x = 'DEFAULT'} offers it the seven characters as a value, which
+     * almost every parameter refuses.
+     */
+    private boolean toDefault;
+
+    public void setToDefault(boolean toDefault) { this.toDefault = toDefault; }
+
+    public boolean isToDefault() { return toDefault; }
+
     public String name() { return name; }
     public String value() { return value; }
     public boolean isLocal() { return isLocal; }

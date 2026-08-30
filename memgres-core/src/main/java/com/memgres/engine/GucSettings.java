@@ -452,6 +452,9 @@ public class GucSettings {
             {"is_superuser", "on", "bool", "internal", "Preset Options", null, null, null, null, "Shows whether the current user is a superuser."},
             {"role", "test", "string", "user", "Client Connection Defaults / Statement Behavior", null, null, null, null, "Sets the current role."},
             {"session_authorization", "test", "string", "superuser", "Client Connection Defaults / Statement Behavior", null, null, null, null, "Sets the session user name."},
+            // The seed the random generator was last given. PostgreSQL keeps it out of
+            // pg_settings, and SHOW answers "unavailable" because there is nothing to read back.
+            {"seed", "unavailable", "real", "user", "Client Connection Defaults / Statement Behavior", null, "-1", "1", null, "Sets the seed for random-number generation."},
     };
 
     /**
@@ -592,6 +595,8 @@ public class GucSettings {
     // PG keeps them defined with an empty-string value after RESET, so current_setting
     // returns '' rather than raising an "unrecognized parameter" error.
     private final Set<String> customPlaceholders = new HashSet<>();
+    /** The spelling each custom parameter was first written with. */
+    private final Map<String, String> customSpellings = new LinkedHashMap<>();
 
     /** Set a session-level parameter. */
     public void set(String name, String value) {
@@ -611,6 +616,9 @@ public class GucSettings {
         // L7: remember custom (dotted) parameters so RESET keeps them as an empty placeholder.
         if (key.indexOf('.') >= 0) {
             customPlaceholders.add(key);
+            // A parameter the reader made up is known by the spelling that made it, and
+            // PostgreSQL answers with that spelling however it is asked for afterwards.
+            if (!customSpellings.containsKey(key)) customSpellings.put(key, name);
         }
         sessionOverrides.put(key, toBaseUnit(key, canonicalValue(key, normalized)));
         // A plain SET inside a transaction is the value for the rest of that transaction too.
@@ -768,6 +776,9 @@ public class GucSettings {
      * 5000 ms as "5s". Only positive values take a unit, so 0 and -1 stay as they are.
      */
     public String getForDisplay(String name) {
+        // The seed is given to the random generator and not kept: there is nothing to read back,
+        // and PostgreSQL says so rather than echoing what it was last handed.
+        if ("seed".equalsIgnoreCase(name)) return "unavailable";
         String val = get(name);
         if (val == null) return null;
         Def def = definition(name);
@@ -918,7 +929,8 @@ public class GucSettings {
         }
         if ("enum".equals(def.vartype)) {
             if (enumMatch(def, value) == null) {
-                throw new MemgresException("invalid value for parameter \"" + def.name + "\": \"" + value + "\""
+                throw new MemgresException("invalid value for parameter \"" + reportedName(def)
+                        + "\": \"" + value + "\""
                         + "\n  Hint: Available values: " + enumHint(def) + ".", "22023");
             }
             return;
@@ -926,7 +938,8 @@ public class GucSettings {
         if ("integer".equals(def.vartype) || "real".equals(def.vartype)) {
             Double n = numericInBaseUnit(def, value);
             if (n == null) {
-                throw new MemgresException("invalid value for parameter \"" + def.name + "\": \"" + value + "\"", "22023");
+                throw new MemgresException("invalid value for parameter \"" + reportedName(def)
+                        + "\": \"" + value + "\"", "22023");
             }
             // An integer parameter is held in a machine integer, so a value too wide for one never
             // becomes a number the parameter's own bounds could be applied to: it is refused as a
@@ -934,7 +947,7 @@ public class GucSettings {
             if ("integer".equals(def.vartype)
                     && (n.doubleValue() > Integer.MAX_VALUE || n.doubleValue() < Integer.MIN_VALUE)) {
                 MemgresException e = new MemgresException("invalid value for parameter \""
-                        + def.name + "\": \"" + value + "\"", "22023");
+                        + reportedName(def) + "\": \"" + value + "\"", "22023");
                 e.setHint("Value exceeds integer range.");
                 throw e;
             }
@@ -950,16 +963,25 @@ public class GucSettings {
         boolean above = max != null && n > max;
         if (!below && !above) return;
         String unit = def.unit == null ? "" : " " + def.unit;
-        throw new MemgresException(trimNumber(n) + unit + " is outside the valid range for parameter \""
-                + def.name + "\" (" + def.minVal + unit + " .. " + def.maxVal + unit + ")", "22023");
+        // A parameter counted in whole units is held to a whole number of them: PostgreSQL
+        // reports the count the value came to after it was cut to the unit, not before.
+        double reported = "integer".equals(def.vartype) ? (long) n : n;
+        throw new MemgresException(trimNumber(reported) + unit
+                + " is outside the valid range for parameter \"" + reportedName(def) + "\" ("
+                + def.minVal + unit + " .. " + def.maxVal + unit + ")", "22023");
     }
 
     /** The value as pg_settings would store it, or null when it is not a number at all. */
     private static Double numericInBaseUnit(Def def, String value) {
-        String text = value.trim();
+        String text = unquote(value);
+        if (text == null) return null;
+        text = text.trim();
         int i = 0;
         while (i < text.length() && (Character.isDigit(text.charAt(i)) || text.charAt(i) == '-'
-                || text.charAt(i) == '+' || text.charAt(i) == '.')) {
+                || text.charAt(i) == '+' || text.charAt(i) == '.'
+                // A number may be written with an exponent, and the sign after the e belongs
+                // to the exponent rather than starting a unit.
+                || text.charAt(i) == 'e' || text.charAt(i) == 'E')) {
             i++;
         }
         Double number = parseNumber(text.substring(0, i));
@@ -985,7 +1007,12 @@ public class GucSettings {
     /** A whole number without the ".0" Java prints for a double. */
     private static String trimNumber(double n) {
         if (n == Math.rint(n) && !Double.isInfinite(n)) return String.valueOf((long) n);
-        return String.valueOf(n);
+        // A parameter counted in whole units holds a whole number of them, so a value that came
+        // to a fraction of one is reported as the number it is: a Java double written out in
+        // exponent notation is not a count of anything.
+        java.math.BigDecimal exact = new java.math.BigDecimal(n);
+        return exact.setScale(6, java.math.RoundingMode.HALF_UP).stripTrailingZeros()
+                .toPlainString();
     }
 
     /** The boolean a written value stands for, or null when it stands for neither. */
@@ -1014,7 +1041,24 @@ public class GucSettings {
         for (String permitted : enumValues(def)) {
             if (permitted.equalsIgnoreCase(v)) return permitted;
         }
-        return null;
+        // Some levels the server knows are not levels it lists: a message level PostgreSQL
+        // will not send to a client is still one a client may ask for, and "debug" is the
+        // spelling it keeps for the level it calls debug2.
+        String hidden = HIDDEN_ENUM_VALUES.get(
+                def.name.toLowerCase(java.util.Locale.ROOT) + ":" + v.toLowerCase(java.util.Locale.ROOT));
+        return hidden;
+    }
+
+    /** The values an enum parameter takes that its own list does not name. */
+    private static final Map<String, String> HIDDEN_ENUM_VALUES;
+
+    static {
+        Map<String, String> hidden = new LinkedHashMap<>();
+        hidden.put("client_min_messages:info", "info");
+        hidden.put("client_min_messages:debug", "debug2");
+        hidden.put("log_min_messages:info", "info");
+        hidden.put("log_min_messages:debug", "debug2");
+        HIDDEN_ENUM_VALUES = hidden;
     }
 
     /** The permitted values of an enum parameter, unwrapped from the array literal. */
@@ -1063,6 +1107,20 @@ public class GucSettings {
     private static String canonicalValue(String name, String value) {
         Def def = definition(name);
         if (def == null || value == null) return value;
+        // A boolean parameter is on or off however it was written. PostgreSQL stores the value
+        // its own way and every reader of it — SHOW, current_setting, pg_settings, the parameter
+        // status the wire reports — answers with that; keeping the spelling meant "0" read back
+        // as "0" and "yes" as "yes".
+        if ("bool".equals(def.vartype)) {
+            Boolean asked = booleanWord(value);
+            if (asked != null) return asked.booleanValue() ? "on" : "off";
+        }
+        // A zone written as a number of hours or as an interval names a fixed displacement, and
+        // PostgreSQL writes it back in the zone database's own notation for one.
+        if ("timezone".equals(name.toLowerCase(java.util.Locale.ROOT))) {
+            String fixed = fixedZoneText(value);
+            if (fixed != null) return fixed;
+        }
         if ("enum".equals(def.vartype)) {
             String match = enumMatch(def, value);
             if (match != null) return match;
@@ -1075,6 +1133,99 @@ public class GucSettings {
             if (rounded != null) return rounded;
         }
         return value;
+    }
+
+    /**
+     * A zone named as a displacement rather than as a place, written the way the zone database
+     * writes one: the name it goes by between angle brackets, then the POSIX offset, which counts
+     * the other way round. Answers null when the value names a place after all.
+     */
+    private static String fixedZoneText(String value) {
+        Integer read = fixedZoneMinutes(value);
+        if (read == null) return null;
+        int minutes = read.intValue();
+        String named = offsetText(minutes);
+        return "<" + named + ">" + offsetText(-minutes);
+    }
+
+    /**
+     * Whether a fixed displacement counts more than the zone database holds. A zone offset is
+     * less than a week either way; anything further is out of range rather than a place.
+     */
+    static boolean zoneOffsetOutOfRange(String value) {
+        Integer minutes = fixedZoneMinutes(value);
+        return minutes != null && Math.abs(minutes) >= 168 * 60;
+    }
+
+    /** The minutes a fixed-displacement zone counts, or null when the value names a place. */
+    private static Integer fixedZoneMinutes(String value) {
+        if (value.startsWith("HOURS:")) {
+            try {
+                return (int) Math.round(Double.parseDouble(value.substring(6)) * 60);
+            } catch (NumberFormatException e) {
+                return null;
+            }
+        }
+        if (value.startsWith("INTERVAL:")) {
+            int minutes = intervalMinutes(value.substring(9));
+            return minutes == Integer.MIN_VALUE ? null : Integer.valueOf(minutes);
+        }
+        return null;
+    }
+
+    /** A displacement in minutes written ±HH or ±HH:MM. */
+    private static String offsetText(int minutes) {
+        int abs = Math.abs(minutes);
+        String sign = minutes < 0 ? "-" : "+";
+        return abs % 60 == 0
+                ? String.format("%s%02d", sign, abs / 60)
+                : String.format("%s%02d:%02d", sign, abs / 60, abs % 60);
+    }
+
+    /** The minutes an interval written after SET TIME ZONE counts, or MIN_VALUE when it is none. */
+    private static int intervalMinutes(String written) {
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile(
+                "\\s*(-?\\d+)(?::(\\d{2}))?\\s*(HOUR|HOURS|MINUTE|MINUTES)?\\s*",
+                java.util.regex.Pattern.CASE_INSENSITIVE).matcher(written);
+        if (!m.matches()) return Integer.MIN_VALUE;
+        int first = Integer.parseInt(m.group(1));
+        String unit = m.group(3) == null ? "HOUR" : m.group(3).toUpperCase(java.util.Locale.ROOT);
+        if (unit.startsWith("MINUTE")) return first;
+        int minutes = first * 60;
+        if (m.group(2) != null) {
+            minutes += (first < 0 ? -1 : 1) * Integer.parseInt(m.group(2));
+        }
+        return minutes;
+    }
+
+    /**
+     * The truth a word stands for, or null when the word is not one PostgreSQL reads as a
+     * boolean. A prefix of "true", "false", "on", "off", "yes" or "no" is one, which is how a
+     * bare "t" and a bare "n" are read.
+     */
+    static Boolean booleanWord(String value) {
+        String text = unquote(value);
+        if (text == null) return null;
+        text = text.trim().toLowerCase(java.util.Locale.ROOT);
+        if (text.isEmpty()) return null;
+        if ("1".equals(text)) return Boolean.TRUE;
+        if ("0".equals(text)) return Boolean.FALSE;
+        if ("true".startsWith(text) || "yes".startsWith(text)) return Boolean.TRUE;
+        if ("false".startsWith(text) || "no".startsWith(text)) return Boolean.FALSE;
+        // "on" and "off" share a prefix, so a bare "o" is neither.
+        if ("on".equals(text)) return Boolean.TRUE;
+        if ("off".startsWith(text) && text.length() >= 2) return Boolean.FALSE;
+        return null;
+    }
+
+    /**
+     * The name PostgreSQL writes a parameter by. Three of them are spelled with capitals —
+     * DateStyle, IntervalStyle and TimeZone — and PostgreSQL uses that spelling in what it says
+     * about them whichever spelling the statement used.
+     */
+    private static String reportedName(Def def) {
+        String canonical = CANONICAL_NAMES.get(def.name.toLowerCase(java.util.Locale.ROOT));
+        return canonical != null ? canonical : def.name;
     }
 
     /** A written value rounded to a whole number, or null when it is not a bare number. */
@@ -1115,7 +1266,9 @@ public class GucSettings {
     /** Get the canonical (display) name for a parameter, preserving PG's mixed-case conventions. */
     public String getCanonicalName(String name) {
         String canonical = CANONICAL_NAMES.get(name.toLowerCase());
-        return canonical != null ? canonical : name.toLowerCase();
+        if (canonical != null) return canonical;
+        String spelled = customSpellings.get(name.toLowerCase());
+        return spelled != null ? spelled : name.toLowerCase();
     }
 
     /**

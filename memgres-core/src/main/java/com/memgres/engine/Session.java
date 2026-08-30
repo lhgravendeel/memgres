@@ -3874,6 +3874,28 @@ public class Session {
     }
 
     /**
+     * Undo a COMMENT ON. A comment is part of an object's definition, so it is written inside the
+     * transaction that wrote it and goes with it; kept, a comment a rolled-back transaction left
+     * behind described an object that never took it.
+     */
+    public static final class CommentUndo implements UndoEntry {
+        private final String objectType;
+        private final String key;
+        private final String previous;
+
+        public CommentUndo(String objectType, String key, String previous) {
+            this.objectType = objectType;
+            this.key = key;
+            this.previous = previous;
+        }
+
+        @Override
+        public void undo(Database db) {
+            db.addComment(objectType, key, previous);
+        }
+    }
+
+    /**
      * Undo a CREATE TYPE ... AS ENUM.
      *
      * <p>DDL is transactional in PostgreSQL, so a type whose transaction rolled back never

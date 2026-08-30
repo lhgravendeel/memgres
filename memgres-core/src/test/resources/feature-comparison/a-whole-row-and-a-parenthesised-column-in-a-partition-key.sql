@@ -16,7 +16,9 @@
 -- PostgreSQL refuses in a partition key because its value is worked out after
 -- the row has been routed, is refused only where the key element is read as a
 -- name: ((k)) is accepted and reads back as RANGE (k), while the bare k and
--- any real expression over it are 42P17.
+-- any real expression over it are 42P17. The relation that leniency makes can
+-- never take a row, so memgres refuses that spelling too; it is the one place
+-- in this file where the two servers are meant to differ.
 --
 -- And VALUES is a word PostgreSQL's grammar reads as a column name, so it is
 -- the parenthesis after it that has nowhere to go: both ((VALUES (1))) and
@@ -224,9 +226,20 @@ CREATE TABLE zzt4a_ge (i int, k int GENERATED ALWAYS AS (i * 2) VIRTUAL)
 CREATE TABLE zzt4a_gf (i int, k int GENERATED ALWAYS AS (i * 2) STORED)
   PARTITION BY RANGE ((k + 1));
 
--- The parentheses decide nothing. An element that comes back to a plain column
--- is that column, and a generated one is refused whichever way it was written,
--- under every strategy, and stored or virtual alike.
+-- Written in parentheses and standing alone, the same generated column is
+-- accepted -- and the relation it makes can never take a row. PostgreSQL routes
+-- a row before it computes a stored generated column, so the key reads null and
+-- the insert is 23514 "no partition of relation found for row", whichever
+-- partition is there to take it. The check that refuses the bare spelling is
+-- not reached on the expression path when the expression comes back to a plain
+-- column, which is why the one spelling is refused and the other is not.
+-- Memgres refuses all of them: a partition key nothing can be routed by is a
+-- relation that silently rejects every write, and the parentheses around a name
+-- do not change which column the key reads.
+-- expected-divergence: a partition key that comes back to a generated column is
+-- refused however it was written. PostgreSQL refuses the bare spelling and takes
+-- the parenthesised one, which leaves a partitioned relation no row can be
+-- routed into -- every insert is 23514 against a key that reads null.
 -- begin-expected-error
 -- sqlstate: 42P17
 -- message-like: cannot use generated column in partition key
@@ -234,6 +247,7 @@ CREATE TABLE zzt4a_gf (i int, k int GENERATED ALWAYS AS (i * 2) STORED)
 CREATE TABLE zzt4a_ga (i int, k int GENERATED ALWAYS AS (i * 2) STORED)
   PARTITION BY RANGE ((k));
 
+-- expected-divergence: as above, under LIST and over a virtual column
 -- begin-expected-error
 -- sqlstate: 42P17
 -- message-like: cannot use generated column in partition key
@@ -241,6 +255,7 @@ CREATE TABLE zzt4a_ga (i int, k int GENERATED ALWAYS AS (i * 2) STORED)
 CREATE TABLE zzt4a_gb (i int, k int GENERATED ALWAYS AS (i * 2) VIRTUAL)
   PARTITION BY LIST ((k));
 
+-- expected-divergence: as above, under HASH
 -- begin-expected-error
 -- sqlstate: 42P17
 -- message-like: cannot use generated column in partition key
@@ -249,6 +264,7 @@ CREATE TABLE zzt4a_gc (i int, k int GENERATED ALWAYS AS (i * 2) STORED)
   PARTITION BY HASH ((k));
 
 -- One ordinary column beside it does not save it either.
+-- expected-divergence: as above, with an ordinary column standing beside it
 -- begin-expected-error
 -- sqlstate: 42P17
 -- message-like: cannot use generated column in partition key

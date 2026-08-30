@@ -38,36 +38,311 @@ class SessionExecutor {
         return executor.defaultSchema();
     }
 
+    /**
+     * The kinds whose name is a relation's. All six share one namespace, so a name that is taken
+     * by another kind is reported as being of that other kind rather than as not being there.
+     */
+    private static final Set<String> RELATION_COMMENT_KINDS = Cols.setOf(
+            "TABLE", "VIEW", "MATERIALIZED VIEW", "INDEX", "SEQUENCE", "FOREIGN TABLE");
+
+    /** The word each relation kind is written with in a "is not a ..." complaint. */
+    private static final Map<String, String> RELATION_KIND_ARTICLE = relationKindArticles();
+
+    private static Map<String, String> relationKindArticles() {
+        Map<String, String> m = new LinkedHashMap<>();
+        m.put("TABLE", "a table");
+        m.put("VIEW", "a view");
+        m.put("MATERIALIZED VIEW", "a materialized view");
+        m.put("INDEX", "an index");
+        m.put("SEQUENCE", "a sequence");
+        m.put("FOREIGN TABLE", "a foreign table");
+        return m;
+    }
+
+    /**
+     * A relation of the kind the statement named. A name that no relation holds is 42P01 and
+     * names the relation; a name another kind of relation holds is 42809 and says which kind it
+     * is not. Resolving as a table alone reported a view as missing and a sequence as a table.
+     */
+    private void requireRelationOfKind(String schemaName, String bareName, String written,
+                                       String wanted) {
+        String kind = RelationNamespace.kindOf(executor.database, schemaName, bareName);
+        if (kind == null) {
+            throw new MemgresException("relation \"" + written + "\" does not exist", "42P01");
+        }
+        String wantedKind = wanted.toLowerCase(java.util.Locale.ROOT);
+        if (kind.equals(wantedKind)) return;
+        // An index built for a PRIMARY KEY or UNIQUE constraint is an index like any other.
+        if (wantedKind.equals("index") && kind.equals(RelationNamespace.INDEX)) return;
+        throw new MemgresException("\"" + bareName + "\" is not "
+                + RELATION_KIND_ARTICLE.get(wanted), "42809");
+    }
+
+    /** The argument list as it was written, for a message that has to hand it back. */
+    private static String writtenArgumentList(List<String> args) {
+        StringBuilder sb = new StringBuilder("(");
+        for (int i = 0; i < args.size(); i++) {
+            if (i > 0) sb.append(", ");
+            sb.append(args.get(i) == null ? "NONE" : args.get(i));
+        }
+        return sb.append(')').toString();
+    }
+
+    /**
+     * The cast a COMMENT names. Both types have to be there, and there has to be a conversion
+     * registered between them: a comment on a cast nobody created describes nothing.
+     */
+    private void requireCast(String source, String target) {
+        String from = requireTypeForComment(source);
+        String to = requireTypeForComment(target);
+        int fromOid = commentTypeOid(source);
+        int toOid = commentTypeOid(target);
+        for (Object[] c : PgCastTable.CASTS) {
+            if ((Integer) c[0] == fromOid && (Integer) c[1] == toOid) return;
+        }
+        for (Object[] c : executor.database.getUserDefinedCasts()) {
+            if ((Integer) c[0] == fromOid && (Integer) c[1] == toOid) return;
+        }
+        throw new MemgresException("cast from type " + from + " to type " + to
+                + " does not exist", "42704");
+    }
+
+    /** The type this word names, spelled the way PostgreSQL spells it, or 42704. */
+    private String requireTypeForComment(String written) {
+        DdlObjectExecutor.validateTypeExists(executor, written);
+        return DataType.canonicalName(written);
+    }
+
+    private int commentTypeOid(String written) {
+        DataType dt = DataType.fromPgName(written);
+        if (dt != null) return dt.getOid();
+        String key = TypeNamespace.oidKeyFor(executor.database, written);
+        return executor.systemCatalog.getOid(
+                key != null ? key : TypeNamespace.oidKey(null, written));
+    }
+
+    /** The key a cast's comment is filed under: the pair of types it converts between. */
+    private String castKey(String source, String target) {
+        return commentTypeOid(source) + " as " + commentTypeOid(target);
+    }
+
+    /**
+     * The operator a COMMENT names. An operator is told apart by its operands as well as by its
+     * spelling, and the complaint when there is none names all three the way a call would.
+     */
+    private String requireOperator(CommentStmt stmt) {
+        List<String> operands = stmt.args();
+        String left = operands.size() > 1 ? operands.get(0) : null;
+        String right = operands.size() > 1 ? operands.get(1) : operands.get(0);
+        String leftType = left == null ? null : requireTypeForComment(left);
+        String rightType = right == null ? null : requireTypeForComment(right);
+        if (!operatorExists(stmt.name(), leftType, rightType)) {
+            throw new MemgresException("operator does not exist: "
+                    + (leftType == null ? "" : leftType + " ") + stmt.name()
+                    + (rightType == null ? "" : " " + rightType), "42883").withoutHint();
+        }
+        return stmt.name() + "(" + (leftType == null ? "none" : leftType) + ","
+                + (rightType == null ? "none" : rightType) + ")";
+    }
+
+    /**
+     * Whether the server has an operator of this spelling over these operands. Both the ones
+     * PostgreSQL ships and the ones CREATE OPERATOR made are looked at; the built-in table is
+     * keyed by OID rather than by written name, so the types are compared by OID too.
+     */
+    private boolean operatorExists(String spelling, String leftType, String rightType) {
+        int leftOid = leftType == null ? 0 : commentTypeOid(leftType);
+        int rightOid = rightType == null ? 0 : commentTypeOid(rightType);
+        for (Object[] op : PgOperatorTable.OPERATORS) {
+            if (!spelling.equals(op[0])) continue;
+            if ((Integer) op[2] == leftOid && (Integer) op[3] == rightOid) return true;
+        }
+        for (PgOperator op : executor.database.getOperatorsByName(spelling)) {
+            int l = op.getLeftArg() == null ? 0 : commentTypeOid(op.getLeftArg());
+            int r = op.getRightArg() == null ? 0 : commentTypeOid(op.getRightArg());
+            if (l == leftOid && r == rightOid) return true;
+        }
+        return false;
+    }
+
+    /**
+     * The remaining kinds a comment reaches, each looked for where that kind of object lives. A
+     * kind nothing checked was a kind whose comment was filed against a name nothing held, so
+     * COMMENT ON SERVER on a server nobody created succeeded and described nothing.
+     */
+    private void requireOtherCommentedObject(String kind, String bareName, CommentStmt stmt) {
+        switch (kind) {
+            case "TABLESPACE":
+                if (!executor.database.hasStubObject("tablespace", bareName)) {
+                    throw new MemgresException(
+                            "tablespace \"" + bareName + "\" does not exist", "42704");
+                }
+                break;
+            case "SERVER":
+                if (executor.database.getForeignServer(bareName) == null) {
+                    throw new MemgresException(
+                            "server \"" + bareName + "\" does not exist", "42704");
+                }
+                break;
+            case "FOREIGN DATA WRAPPER":
+                if (!executor.database.getForeignDataWrappers().containsKey(bareName.toLowerCase())) {
+                    throw new MemgresException("foreign-data wrapper \"" + bareName
+                            + "\" does not exist", "42704");
+                }
+                break;
+            case "PUBLICATION":
+                if (executor.database.getPublication(bareName) == null) {
+                    throw new MemgresException(
+                            "publication \"" + bareName + "\" does not exist", "42704");
+                }
+                break;
+            case "SUBSCRIPTION":
+                if (!executor.database.getSubscriptions().containsKey(bareName.toLowerCase())) {
+                    throw new MemgresException(
+                            "subscription \"" + bareName + "\" does not exist", "42704");
+                }
+                break;
+            case "ACCESS METHOD":
+                if (!ACCESS_METHODS.contains(bareName.toLowerCase())) {
+                    throw new MemgresException(
+                            "access method \"" + bareName + "\" does not exist", "42704");
+                }
+                break;
+            case "OPERATOR CLASS":
+                if (executor.database.getOperatorClass(
+                        bareName.toLowerCase() + ":" + stmt.using().toLowerCase()) == null) {
+                    throw new MemgresException("operator class \"" + bareName
+                            + "\" does not exist for access method \"" + stmt.using() + "\"",
+                            "42704");
+                }
+                break;
+            case "OPERATOR FAMILY":
+                if (executor.database.getOperatorFamily(
+                        bareName.toLowerCase() + ":" + stmt.using().toLowerCase()) == null) {
+                    throw new MemgresException("operator family \"" + bareName
+                            + "\" does not exist for access method \"" + stmt.using() + "\"",
+                            "42704");
+                }
+                break;
+            case "TEXT SEARCH CONFIGURATION":
+                if (!executor.database.getTsConfigs().containsKey(bareName.toLowerCase())
+                        && !BUILT_IN_TS_CONFIGURATIONS.contains(bareName.toLowerCase())) {
+                    throw new MemgresException("text search configuration \"" + bareName
+                            + "\" does not exist", "42704");
+                }
+                break;
+            case "TRANSFORM":
+                // memgres registers no transforms, and PostgreSQL ships none for the languages
+                // it builds by default, so every one named here is one that is not there.
+                throw new MemgresException("transform for type " + requireTypeForComment(bareName)
+                        + " language \"" + stmt.using() + "\" does not exist", "42704");
+            default:
+                break;
+        }
+    }
+
+    /** The access methods the server has; there is no CREATE ACCESS METHOD to add to them. */
+    private static final Set<String> ACCESS_METHODS = Cols.setOf(
+            "heap", "btree", "hash", "gist", "spgist", "gin", "brin");
+
+    /** The text search configurations every server is built with. */
+    private static final Set<String> BUILT_IN_TS_CONFIGURATIONS = Cols.setOf(
+            "simple", "english", "arabic", "armenian", "basque", "catalan", "danish", "dutch",
+            "finnish", "french", "german", "greek", "hindi", "hungarian", "indonesian", "irish",
+            "italian", "lithuanian", "nepali", "norwegian", "portuguese", "romanian", "russian",
+            "serbian", "spanish", "swedish", "tamil", "turkish", "yiddish");
+
+    /** A trigger, rule or policy is there on the relation it was named against, or it is not. */
+    private void requireScopedObject(String kind, String schemaName, CommentStmt stmt) {
+        String relation = stmt.relation();
+        if (RelationNamespace.kindOf(executor.database, schemaName, relation) == null) {
+            throw new MemgresException(
+                    "relation \"" + stmt.writtenRelation() + "\" does not exist", "42P01");
+        }
+        String object = stmt.name();
+        if (kind.equals("TRIGGER")) {
+            boolean found = false;
+            List<PgTrigger> on = executor.database.getAllTriggers().get(relation.toLowerCase());
+            if (on != null) {
+                for (PgTrigger t : on) {
+                    if (t.getName().equalsIgnoreCase(object)) { found = true; break; }
+                }
+            }
+            if (!found) {
+                throw new MemgresException("trigger \"" + object + "\" for table \""
+                        + relation + "\" does not exist", "42704");
+            }
+        } else if (kind.equals("RULE")) {
+            if (!executor.database.hasRule(schemaName, object, relation)) {
+                throw new MemgresException("rule \"" + object + "\" for relation \""
+                        + relation + "\" does not exist", "42704");
+            }
+        } else if (kind.equals("POLICY")) {
+            Schema s = executor.database.getSchema(schemaName);
+            Table t = s == null ? null : s.getTable(relation);
+            boolean found = false;
+            if (t != null) {
+                for (RlsPolicy p : t.getRlsPolicies()) {
+                    if (p.getName().equalsIgnoreCase(object)) { found = true; break; }
+                }
+            }
+            if (!found) {
+                throw new MemgresException("policy \"" + object + "\" for table \""
+                        + relation + "\" does not exist", "42704");
+            }
+        } else if (kind.equals("CONSTRAINT")) {
+            Schema s = executor.database.getSchema(schemaName);
+            Table t = s == null ? null : s.getTable(relation);
+            boolean found = false;
+            if (t != null) {
+                for (StoredConstraint c : t.getConstraints()) {
+                    if (c.getName() != null && c.getName().equalsIgnoreCase(object)) {
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if (!found) {
+                throw new MemgresException("constraint \"" + object + "\" for table \""
+                        + relation + "\" does not exist", "42704");
+            }
+        }
+    }
+
     // ---- SET / SHOW / RESET ----
 
     QueryResult executeSetStmt(SetStmt stmt) {
         GucSettings guc = executor.session != null ? executor.session.getGucSettings() : null;
         String name = stmt.name().toLowerCase();
 
-        if (name.startsWith("comment:")) {
-            String[] parts = stmt.name().split(":", 3);
-            if (parts.length >= 3) {
-                String objType = parts[1].toUpperCase();
-                String objName = parts[2];
-                // Strip schema prefix for resolution and storage (e.g., "public.customers" -> "customers")
-                String writtenSchema = null;
-                String bareName = objName;
-                // CONSTRAINT/TRIGGER/RULE/POLICY names are qualified by their relation, not a
-                // schema, so the prefix must survive into the stored key
-                boolean relationScoped = objType.equals("CONSTRAINT") || objType.equals("TRIGGER")
-                        || objType.equals("RULE") || objType.equals("POLICY");
+        return executeSetStmtTail(stmt, guc, name);
+    }
+
+    // ---- COMMENT ON / SECURITY LABEL ----
+
+    QueryResult executeComment(CommentStmt stmt) {
+        if (stmt.isSecurityLabel()) {
+            // Every label goes to a provider, and a server with none loaded has nowhere to put
+            // one. The statement is still read in full first, so what is malformed is malformed.
+            if (stmt.provider() != null) {
+                throw new MemgresException("security label provider \"" + stmt.provider()
+                        + "\" is not loaded", "22023");
+            }
+            throw new MemgresException("no security label providers have been loaded", "22023");
+        }
+        {
+            {
+                String objType = stmt.kind();
+                String objName = stmt.writtenName();
+                String writtenSchema = stmt.schema();
+                String bareName = stmt.name();
+                boolean relationScoped = stmt.relation() != null && !objType.equals("COLUMN");
                 // A routine's argument list is part of what was written but not of its name.
-                String writtenArgs = null;
-                int signatureAt = bareName.indexOf('(');
-                if (signatureAt > 0) {
-                    writtenArgs = bareName.substring(signatureAt);
-                    objName = objName.substring(0, objName.indexOf('('));
-                    bareName = bareName.substring(0, signatureAt);
+                String writtenArgs = stmt.args() == null ? null : writtenArgumentList(stmt.args());
+                if (relationScoped) {
+                    bareName = stmt.relation() + "." + stmt.name();
                 }
-                if (objName.contains(".") && !objType.equals("COLUMN") && !relationScoped) {
-                    int dot = objName.indexOf('.');
-                    writtenSchema = objName.substring(0, dot);
-                    bareName = objName.substring(dot + 1);
+                if (writtenSchema != null) {
                     // COMMENT resolves the schema first and reports that when it is not there,
                     // rather than the object it never got as far as looking for.
                     SchemaQualifier.requireSchema(executor.database, executor.session, writtenSchema);
@@ -75,64 +350,28 @@ class SessionExecutor {
                 // Where the object actually is, which is what its comment is keyed by: the schema
                 // written, or the first one on the search path that holds it. The kinds that are
                 // not relations settle it for themselves below.
-                String schemaName = relationSchema(writtenSchema, bareName);
-                if (objType.equals("TABLE") || objType.equals("RELATION")) {
-                    // A sequence is a relation but it is not a table, and PostgreSQL says which
-                    // it is rather than filing the comment against the wrong kind of object.
-                    if (executor.database.hasSequence(schemaName, bareName)) {
-                        throw new MemgresException("\"" + bareName + "\" is not a table", "42809");
-                    }
-                    try {
-                        executor.resolveTable(schemaName, bareName);
-                    } catch (MemgresException e) {
-                        throw new MemgresException("relation \"" + objName + "\" does not exist", "42P01");
-                    }
-                    // A comment is part of the relation's own definition, and everything a schema
-                    // reader is told about it comes from there, so setting one is the owner's.
-                    executor.requireTableOwner(schemaName, bareName);
-                } else if (objType.equals("VIEW")) {
-                    if (!executor.database.hasView(bareName)) {
-                        throw new MemgresException("view \"" + objName + "\" does not exist", "42P01");
-                    }
-                } else if (objType.equals("INDEX")) {
-                    // Allow COMMENT ON INDEX for both explicitly created indexes
-                    // and PK/UNIQUE constraint-backed indexes (PG allows both).
-                    if (!executor.database.hasIndex(bareName)) {
-                        // Fallback: check if the name matches a constraint name on any
-                        // table in the relevant schema (constraint-backed indexes like
-                        // tablename_pkey are stored as constraints, not as indexes).
-                        boolean foundConstraint = false;
-                        Schema schema = executor.database.getSchema(schemaName);
-                        if (schema != null) {
-                            for (Table t : schema.getTables().values()) {
-                                for (StoredConstraint sc : t.getConstraints()) {
-                                    if (sc.getName() != null && sc.getName().equalsIgnoreCase(bareName)) {
-                                        foundConstraint = true;
-                                        break;
-                                    }
-                                }
-                                if (foundConstraint) break;
-                            }
-                        }
-                        if (!foundConstraint) {
-                            throw new MemgresException("relation \"" + objName + "\" does not exist", "42P01");
-                        }
+                String schemaName = relationSchema(writtenSchema,
+                        relationScoped ? stmt.relation() : bareName);
+                if (RELATION_COMMENT_KINDS.contains(objType)) {
+                    requireRelationOfKind(schemaName, bareName, objName, objType);
+                    if (objType.equals("TABLE")) executor.requireTableOwner(schemaName, bareName);
+                } else if (objType.equals("CAST")) {
+                    requireCast(stmt.args().get(0), stmt.args().get(1));
+                    bareName = castKey(stmt.args().get(0), stmt.args().get(1));
+                } else if (objType.equals("OPERATOR")) {
+                    bareName = requireOperator(stmt);
+                } else if (objType.equals("STATISTICS")) {
+                    if (executor.database.getExtendedStatistic(bareName) == null) {
+                        throw new MemgresException("statistics object \"" + objName
+                                + "\" does not exist", "42704");
                     }
                 } else if (objType.equals("COLUMN")) {
-                    // Column names are "table.col" or "schema.table.col"
-                    if (objName.contains(".")) {
-                        String tablePart = objName.substring(0, objName.lastIndexOf('.'));
-                        String colPart = objName.substring(objName.lastIndexOf('.') + 1);
-                        // tablePart may be schema-qualified: "public.customers"
-                        String colSchema = executor.defaultSchema();
-                        String colTable = tablePart;
-                        if (tablePart.contains(".")) {
-                            int dot = tablePart.indexOf('.');
-                            colSchema = tablePart.substring(0, dot);
-                            colTable = tablePart.substring(dot + 1);
-                            SchemaQualifier.requireSchema(
-                                    executor.database, executor.session, colSchema);
-                        }
+                    {
+                        String colPart = stmt.name();
+                        String colTable = stmt.relation();
+                        String tablePart = stmt.writtenRelation();
+                        String colSchema = writtenSchema == null
+                                ? relationSchema(null, colTable) : writtenSchema;
                         try {
                             // A composite type has attributes and a pg_class row of its own, so a
                             // comment can be filed against one of them exactly as against a
@@ -160,8 +399,7 @@ class SessionExecutor {
                         }
                         // Store the column under its table's own schema: two schemas may each hold
                         // a t with an x, and what was said about one is not said about the other.
-                        schemaName = tablePart.contains(".")
-                                ? colSchema.toLowerCase() : relationSchema(null, colTable);
+                        schemaName = colSchema.toLowerCase();
                         bareName = colTable + "." + colPart;
                     }
                 } else if (objType.equals("FUNCTION") || objType.equals("PROCEDURE") || objType.equals("ROUTINE")) {
@@ -201,17 +439,6 @@ class SessionExecutor {
                     objType = "TYPE";
                     schemaName = TypeNamespace.schemaOfKey(typeKey);
                     bareName = TypeNamespace.nameOfKey(typeKey);
-                } else if (objType.equals("SEQUENCE")) {
-                    if (!executor.database.hasSequence(schemaName, bareName)) {
-                        throw new MemgresException(
-                                "relation \"" + objName + "\" does not exist", "42P01");
-                    }
-                } else if (objType.equals("MATERIALIZED VIEW")) {
-                    Database.ViewDef mv = executor.database.getView(bareName);
-                    if (mv == null || !mv.materialized) {
-                        throw new MemgresException(
-                                "relation \"" + objName + "\" does not exist", "42P01");
-                    }
                 } else if (objType.equals("ROLE") || objType.equals("USER")) {
                     if (!executor.database.getRoles().containsKey(bareName.toLowerCase())) {
                         throw new MemgresException(
@@ -268,25 +495,24 @@ class SessionExecutor {
                     if (writtenSchema == null && fn != null) schemaName = Database.schemaOf(fn);
                     bareName = routine;
                 } else if (relationScoped) {
-                    // The name is "<relation>.<object>", and the relation may carry a schema of
-                    // its own. Written, it settles which relation this is; bare, the search path
-                    // does — and either way the comment is filed under that relation's schema.
-                    String[] scoped = bareName.split("\\.", 3);
-                    if (scoped.length == 3) {
-                        SchemaQualifier.requireSchema(executor.database, executor.session, scoped[0]);
-                        schemaName = scoped[0].toLowerCase();
-                        bareName = scoped[1] + "." + scoped[2];
-                    } else if (scoped.length == 2) {
-                        schemaName = relationSchema(null, scoped[0]);
-                    }
+                    // The object is named against a relation, and that relation settles which
+                    // schema the comment is filed under.
+                    requireScopedObject(objType, schemaName, stmt);
+                } else {
+                    requireOtherCommentedObject(objType, bareName, stmt);
                 }
                 String key = Database.globalCommentType(objType)
                         ? bareName.toLowerCase() : Database.commentKey(schemaName, bareName);
-                executor.database.addComment(objType.toLowerCase(), key, stmt.value());
+                String stored = objType.toLowerCase();
+                executor.recordUndo(new Session.CommentUndo(
+                        stored, key, executor.database.getComment(stored, key)));
+                executor.database.addComment(stored, key, stmt.comment());
             }
             return QueryResult.message(QueryResult.Type.SET, "COMMENT");
         }
+    }
 
+    private QueryResult executeSetStmtTail(SetStmt stmt, GucSettings guc, String name) {
         if (name.equals("do_block")) {
             // Only a language with an inline handler can carry a DO block, and only a language
             // the catalogue has at all can be named. Discarding the word ran every block as
@@ -341,7 +567,9 @@ class SessionExecutor {
                 }
             }
             if (value == null) value = "";
-            // PG preserves the canonical parameter name case (e.g. "TimeZone" not "timezone")
+            // PG preserves the canonical parameter name case (e.g. "TimeZone" not "timezone").
+            // A name the reader wrote between quotes is that name letter for letter, whichever
+            // spelling the parameter was first set under.
             String colName = guc != null ? guc.getCanonicalName(param) : param;
             List<Column> cols = Cols.listOf(new Column(colName, DataType.TEXT, true, false, null));
             List<Object[]> rows = new ArrayList<>();
@@ -461,168 +689,6 @@ class SessionExecutor {
                 executor.session.importSnapshot(executor.database, snapshotId);
             }
             return QueryResult.message(QueryResult.Type.SET, "SET");
-        }
-
-        if (name.equals("reindex")) {
-            String val = stmt.value();
-            if (val != null && val.contains(":")) {
-                String[] reindexParts = val.split(":", 2);
-                String targetType = reindexParts[0];
-                String targetName = reindexParts[1];
-                if (targetType.equals("TABLE")) {
-                    executor.resolveTable(executor.defaultSchema(), targetName);
-                } else if (targetType.equals("INDEX")) {
-                    if (!executor.database.hasIndex(targetName)) {
-                        // Fallback: PK/UNIQUE constraint-backed indexes are stored as
-                        // constraints, not in the index map. Check constraint names.
-                        boolean foundConstraint = false;
-                        String schema = executor.defaultSchema();
-                        Schema s = executor.database.getSchema(schema);
-                        if (s != null) {
-                            for (Table t : s.getTables().values()) {
-                                for (StoredConstraint sc : t.getConstraints()) {
-                                    if (sc.getName() != null && sc.getName().equalsIgnoreCase(targetName)) {
-                                        foundConstraint = true;
-                                        break;
-                                    }
-                                }
-                                if (foundConstraint) break;
-                            }
-                        }
-                        if (!foundConstraint) {
-                            throw new MemgresException("index \"" + targetName + "\" does not exist", "42704");
-                        }
-                    }
-                }
-            }
-            return QueryResult.message(QueryResult.Type.SET, "REINDEX");
-        }
-
-        if (name.equals("analyze") || name.equals("vacuum")) {
-            if (name.equals("vacuum") && executor.session != null && executor.session.isInRoutine()) {
-                throw new MemgresException("VACUUM cannot be executed from a function", "25001");
-            }
-            // VACUUM cannot run inside a transaction block
-            if (name.equals("vacuum") && executor.session != null && executor.session.isInTransaction()) {
-                throw new MemgresException("VACUUM cannot run inside a transaction block", "25001");
-            }
-            String val = stmt.value();
-            // For VACUUM, parse flags: "verbose,analyze,table:foo" or "verbose,ok"
-            boolean vacuumAnalyze = false;
-            boolean vacuumVerbose = false;
-            if (name.equals("vacuum") && val != null) {
-                if (val.contains("verbose,")) { vacuumVerbose = true; val = val.replace("verbose,", ""); }
-                if (val.contains("analyze,")) { vacuumAnalyze = true; val = val.replace("analyze,", ""); }
-            }
-            // Parse optional column list from ANALYZE value
-            String analyzeColumns = null;
-            if (val != null && val.contains(",columns:")) {
-                int idx = val.indexOf(",columns:");
-                analyzeColumns = val.substring(idx + ",columns:".length());
-                val = val.substring(0, idx);
-            }
-            java.time.OffsetDateTime now = java.time.OffsetDateTime.now();
-            if (val != null && val.startsWith("table:")) {
-                String tblName = val.substring("table:".length());
-                // The name may carry its schema, which is which table this is rather than part
-                // of its name.
-                String tblSchema = executor.defaultSchema();
-                int dot = tblName.lastIndexOf('.');
-                if (dot > 0) {
-                    tblSchema = tblName.substring(0, dot);
-                    tblName = tblName.substring(dot + 1);
-                }
-                Table resolvedTable = executor.resolveTable(tblSchema, tblName);
-                // Record analyzed table for pg_statistic
-                if (name.equals("analyze") || vacuumAnalyze) {
-                    executor.database.recordAnalyzedTable(tblSchema + "." + tblName);
-                    resolvedTable.setLastAnalyze(now);
-                }
-                if (name.equals("vacuum")) {
-                    resolvedTable.setLastVacuum(now);
-                }
-                if (name.equals("analyze")) {
-                    resolvedTable.setLastAnalyze(now);
-                }
-            } else if (name.equals("analyze")) {
-                // ANALYZE without a table name: analyze all tables
-                for (Map.Entry<String, Schema> schemaEntry : executor.database.getSchemas().entrySet()) {
-                    for (Map.Entry<String, Table> tableEntry : schemaEntry.getValue().getTables().entrySet()) {
-                        executor.database.recordAnalyzedTable(schemaEntry.getKey() + "." + tableEntry.getKey());
-                        tableEntry.getValue().setLastAnalyze(now);
-                    }
-                }
-            } else if (name.equals("vacuum")) {
-                // VACUUM without a table name: vacuum all tables
-                for (Map.Entry<String, Schema> schemaEntry : executor.database.getSchemas().entrySet()) {
-                    for (Map.Entry<String, Table> tableEntry : schemaEntry.getValue().getTables().entrySet()) {
-                        tableEntry.getValue().setLastVacuum(now);
-                        if (vacuumAnalyze) {
-                            executor.database.recordAnalyzedTable(schemaEntry.getKey() + "." + tableEntry.getKey());
-                            tableEntry.getValue().setLastAnalyze(now);
-                        }
-                    }
-                }
-            }
-            // Mark extended statistics as analyzed for the table(s)
-            if (name.equals("analyze") || vacuumAnalyze) {
-                for (ExtendedStatistic es : executor.database.getAllExtendedStatistics().values()) {
-                    if (val != null && val.startsWith("table:")) {
-                        String tblName = val.substring("table:".length());
-                        if (es.getTableName().equalsIgnoreCase(tblName)) {
-                            es.setAnalyzed(true);
-                        }
-                    } else {
-                        es.setAnalyzed(true);
-                    }
-                }
-            }
-            // VACUUM VERBOSE: emit NOTICE
-            if (vacuumVerbose && executor.session != null) {
-                String tblInfo = (val != null && val.startsWith("table:")) ? val.substring("table:".length()) : "all tables";
-                executor.session.addNotice("NOTICE", "00000",
-                        "vacuuming \"public." + tblInfo + "\"", null);
-            }
-            return QueryResult.message(QueryResult.Type.SET, name.equals("analyze") ? "ANALYZE" : "VACUUM");
-        }
-
-        if (name.equals("cluster")) {
-            String val = stmt.value();
-            // Parse table and index from value: "table:foo,index:bar"
-            if (val != null && val.contains("table:")) {
-                String tblName = null;
-                String idxName = null;
-                for (String part : val.split(",")) {
-                    if (part.startsWith("table:")) tblName = part.substring("table:".length());
-                    if (part.startsWith("index:")) idxName = part.substring("index:".length());
-                }
-                if (tblName != null) {
-                    executor.resolveTable(executor.defaultSchema(), tblName);
-                    // L8: CLUSTER table without specifying an index requires a previously clustered index
-                    if (idxName == null) {
-                        boolean hasClustered = false;
-                        // Scan all known indexes for this table to see if any are clustered
-                        for (Map.Entry<String, String> e : executor.database.getIndexTableNames().entrySet()) {
-                            String idxTable = e.getValue();
-                            if (idxTable != null && (idxTable.equalsIgnoreCase(tblName)
-                                    || idxTable.endsWith("." + tblName))) {
-                                if (executor.database.isClusteredIndex(e.getKey())) {
-                                    hasClustered = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if (!hasClustered) {
-                            throw new MemgresException(
-                                "there is no previously clustered index for table \"" + tblName + "\"", "42704");
-                        }
-                    }
-                }
-                if (idxName != null) {
-                    executor.database.setClusteredIndex(idxName);
-                }
-            }
-            return QueryResult.message(QueryResult.Type.SET, "CLUSTER");
         }
 
         // ---- Text Search DDL handling ----
@@ -1200,8 +1266,8 @@ class SessionExecutor {
                 "create_ts_config", "create_ts_dict", "drop_ts_configuration", "drop_ts_dictionary",
                 "drop_ts_parser", "drop_ts_template", "alter_ts_config_mapping",
                 "drop_owned", "reassign_owned", "do_block", "comment",
-                "analyze", "vacuum",
-                "cluster", "checkpoint", "load");
+
+                "load");
 
         // PG rejects unknown flat (non-dotted) parameter names with 42704.
         // Dotted names (e.g. my_ext.setting) are allowed as custom variables.
@@ -1212,8 +1278,10 @@ class SessionExecutor {
         if (guc != null && !internalNames.contains(name)) {
             String value = stmt.value();
             // SET param TO DEFAULT is equivalent to RESET param, and is refused for the same
-            // parameters RESET is: putting one back to its default is still changing it.
-            if (value != null && value.equalsIgnoreCase("DEFAULT")) {
+            // parameters RESET is: putting one back to its default is still changing it. The
+            // word has to have been written as a word: 'DEFAULT' between quotes is a value the
+            // parameter is being offered, and almost every parameter refuses it.
+            if (stmt.isToDefault()) {
                 GucSettings.checkAssignable(name, null);
                 guc.reset(name);
                 return QueryResult.message(QueryResult.Type.SET, "SET");
@@ -1233,7 +1301,7 @@ class SessionExecutor {
                             "SET LOCAL can only be used in transaction blocks", null);
                     // Don't apply the value — it's a no-op outside transactions
                 } else {
-                    guc.setLocal(name, value);
+                    guc.setLocal(stmt.name(), value);
                 }
             } else if (TRANSACTION_SCOPED_GUCS.contains(name)
                     && executor.session != null && !executor.session.isInTransaction()) {
@@ -1243,7 +1311,7 @@ class SessionExecutor {
                 executor.session.addNotice("WARNING", "25P01",
                         "SET TRANSACTION can only be used in transaction blocks", null);
             } else {
-                guc.set(name, value);
+                guc.set(stmt.name(), value);
             }
         }
         return QueryResult.message(QueryResult.Type.SET, "SET");
@@ -1409,6 +1477,21 @@ class SessionExecutor {
             // Remove surrounding quotes if present
             if ((tz.startsWith("'") && tz.endsWith("'")) || (tz.startsWith("\"") && tz.endsWith("\""))) {
                 tz = tz.substring(1, tz.length() - 1);
+            }
+            // A zone written as a number of hours or as an interval names a fixed displacement,
+            // and the two forms the grammar reads reach here already told apart from a name. A
+            // displacement is still one the zone database can hold: it counts less than a week
+            // either way, and a bigger one is out of range rather than a zone nobody has.
+            if (tz.startsWith("HOURS:") || tz.startsWith("INTERVAL:")) {
+                if (GucSettings.zoneOffsetOutOfRange(tz)) {
+                    MemgresException e = new MemgresException(
+                            "invalid value for parameter \"TimeZone\": \""
+                                    + (tz.startsWith("HOURS:") ? tz.substring(6) : tz.substring(9))
+                                    + "\"", "22023");
+                    e.setDetail("UTC timezone offset is out of range.");
+                    throw e;
+                }
+                return;
             }
             if (tz.equalsIgnoreCase("UTC") || tz.equalsIgnoreCase("LOCAL") || tz.equalsIgnoreCase("DEFAULT")) return;
             try {

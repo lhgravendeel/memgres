@@ -1059,9 +1059,33 @@ class CatalogConstraintBuilder {
             case "sequence":
             case "foreign table": {
                 // All six are relations, and a relation's OID is minted under its own schema.
-                if (RelationNamespace.kindOf(database, schema, bare) == null) return null;
-                return new Object[]{oids.oid("rel:" + schema + "." + bare),
+                // A comment's key is folded to lower case, so the relation is found by that and
+                // its OID taken from the spelling it was created with -- otherwise a relation
+                // written "Cap" was described by nothing.
+                String real = realRelationName(schema, bare);
+                if (real == null) return null;
+                return new Object[]{oids.oid("rel:" + schema + "." + real),
                         pgClassClassOid, 0, desc, 1};
+            }
+            case "cast": {
+                // A cast's key is the pair of type OIDs it converts between, which is the only
+                // thing that tells one cast from another.
+                int sep = bare.indexOf(" as ");
+                if (sep < 0) return null;
+                int castOid = castOidBetween(bare.substring(0, sep), bare.substring(sep + 4));
+                if (castOid == 0) return null;
+                return new Object[]{castOid, oids.oid("rel:pg_catalog.pg_cast"), 0, desc, 1};
+            }
+            case "operator": {
+                int operatorOid = commentedOperatorOid(bare);
+                if (operatorOid == 0) return null;
+                return new Object[]{operatorOid, oids.oid("rel:pg_catalog.pg_operator"),
+                        0, desc, 1};
+            }
+            case "statistics": {
+                if (database.getExtendedStatistic(bare) == null) return null;
+                return new Object[]{oids.oid("stat:" + bare),
+                        oids.oid("rel:pg_catalog.pg_statistic_ext"), 0, desc, 1};
             }
             case "column": {
                 // objName is "<schema>.<relation>.<column>". A view carries column comments too,
@@ -1149,6 +1173,92 @@ class CatalogConstraintBuilder {
             default:
                 return null;
         }
+    }
+
+    /**
+     * The relation of this name in this schema, spelled the way it was created. Relation names
+     * keep their case and comment keys do not, so the two are matched without regard to it.
+     */
+    private String realRelationName(String schema, String lowered) {
+        if (RelationNamespace.kindOf(database, schema, lowered) != null) return lowered;
+        Schema s = database.getSchema(schema);
+        if (s != null) {
+            for (String name : s.getTables().keySet()) {
+                if (name.equalsIgnoreCase(lowered)) return name;
+            }
+        }
+        for (Database.ViewDef v : database.getViews().values()) {
+            if (v.name().equalsIgnoreCase(lowered)
+                    && schema.equalsIgnoreCase(v.schemaName() == null ? "public" : v.schemaName())) {
+                return v.name();
+            }
+        }
+        return null;
+    }
+
+    /** The OID of the cast between these two type OIDs, or 0 when no such cast is registered. */
+    private int castOidBetween(String sourceOid, String targetOid) {
+        int from;
+        int to;
+        try {
+            from = Integer.parseInt(sourceOid.trim());
+            to = Integer.parseInt(targetOid.trim());
+        } catch (NumberFormatException e) {
+            return 0;
+        }
+        for (Object[] c : PgCastTable.CASTS) {
+            if ((Integer) c[0] == from && (Integer) c[1] == to) return (Integer) c[5];
+        }
+        int userCastOid = 16384;
+        for (Object[] c : database.getUserDefinedCasts()) {
+            if ((Integer) c[0] == from && (Integer) c[1] == to) return userCastOid;
+            userCastOid++;
+        }
+        return 0;
+    }
+
+    /**
+     * The OID of the operator a comment key names. The key is the spelling and the two operand
+     * types, because an operator's name alone does not say which operator it is.
+     */
+    private int commentedOperatorOid(String key) {
+        int paren = key.indexOf('(');
+        if (paren < 0 || !key.endsWith(")")) return 0;
+        String spelling = key.substring(0, paren);
+        String[] operands = key.substring(paren + 1, key.length() - 1).split(",", -1);
+        if (operands.length != 2) return 0;
+        for (PgOperator op : database.getOperatorsByName(spelling)) {
+            if (sameOperand(op.getLeftArg(), operands[0])
+                    && sameOperand(op.getRightArg(), operands[1])) {
+                String opSchema = op.getSchemaName() != null ? op.getSchemaName() : "public";
+                return oids.oid("operator:" + opSchema + "." + op.getKey());
+            }
+        }
+        for (Object[] op : PgOperatorTable.OPERATORS) {
+            if (!spelling.equalsIgnoreCase((String) op[0])) continue;
+            if (sameOperandOid((Integer) op[2], operands[0])
+                    && sameOperandOid((Integer) op[3], operands[1])) {
+                return builtinOperatorOidOf(op);
+            }
+        }
+        return 0;
+    }
+
+    private boolean sameOperand(String declared, String wanted) {
+        if (declared == null) return "none".equalsIgnoreCase(wanted);
+        return DataType.canonicalName(declared).equalsIgnoreCase(wanted);
+    }
+
+    private boolean sameOperandOid(int declaredOid, String wanted) {
+        if ("none".equalsIgnoreCase(wanted)) return declaredOid == 0;
+        DataType dt = DataType.fromPgName(wanted);
+        return dt != null && dt.getOid() == declaredOid;
+    }
+
+    /** The OID pg_operator gives a built-in, which is keyed by its whole signature. */
+    private int builtinOperatorOidOf(Object[] op) {
+        return CatalogTypeSystemBuilder.builtinOperatorOid(
+                (String) op[0], (Integer) op[2], (Integer) op[3]);
     }
 
     Table buildPgTrigger() {

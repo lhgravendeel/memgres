@@ -1409,6 +1409,12 @@ class DdlAlterTableExecutor {
     private static void rejectNoInheritOnPartitioned(TableConstraint tc, Table table,
                                                      String tableName) {
         if (tc == null || !tc.noInherit() || !isPartitioned(table)) return;
+        // A NOT NULL says so in its own words, and under its own SQLSTATE.
+        if (tc.type() == TableConstraint.ConstraintType.NOT_NULL) {
+            throw new MemgresException(
+                    "not-null constraints on partitioned tables cannot be NO INHERIT", "0A000")
+                    .suppressPosition();
+        }
         throw new MemgresException("cannot add NO INHERIT constraint to partitioned table \""
                 + tableName + "\"", "42P16").suppressPosition();
     }
@@ -3684,6 +3690,12 @@ class DdlAlterTableExecutor {
                 if (!alreadyNotNull && addConstraint.constraint().name() != null) {
                     table.setNotNullConstraintName(colName, addConstraint.constraint().name());
                 }
+                // NO INHERIT says the constraint stops here, and it is part of what the
+                // constraint is: unrecorded, a second declaration could not tell that it
+                // contradicts the one already there, and the catalogue said it reached down.
+                if (!alreadyNotNull && addConstraint.constraint().noInherit()) {
+                    table.markNotNullNoInherit(colName);
+                }
                 // Each descendant keeps its own copy of the column list, so the flag has to reach
                 // them or this relation forbids a null its own descendants go on taking.
                 setColumnsNotNull(table, Collections.singletonList(colName));
@@ -4287,6 +4299,9 @@ class DdlAlterTableExecutor {
      * The one exception is a validated declaration over a constraint marked NOT VALID, which is
      * refused for the rows nobody has read instead -- see
      * {@link #rejectMergeIntoNotValidNotNull}.
+     *
+     * <p>PostgreSQL 18.0 folds such a declaration in instead; a later PostgreSQL 18 refuses it,
+     * and the refusal is what is written here.
      */
     private static void rejectSecondNotNullConstraint(Table table, String column, String name,
                                                       boolean notValid, String relationName) {
@@ -4460,8 +4475,15 @@ class DdlAlterTableExecutor {
             if (colIdx < 0) continue;
             for (Object[] row : existing.getRows()) {
                 if (rowSatisfiesBounds(row[colIdx], incoming, strategy)) {
-                    throw new MemgresException("updated partition constraint for default partition \""
+                    // The error names the relation the offending row is in, which is what a
+                    // client shows the reader when the message alone does not say where to look.
+                    MemgresException e = new MemgresException(
+                            "updated partition constraint for default partition \""
                             + existing.getName() + "\" would be violated by some row", "23514");
+                    e.setSchema(existing.getSchemaName() == null
+                            ? "public" : existing.getSchemaName());
+                    e.setTable(existing.getName());
+                    throw e;
                 }
             }
         }

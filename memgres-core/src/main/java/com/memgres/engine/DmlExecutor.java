@@ -6914,6 +6914,9 @@ class DmlExecutor {
      * place of the reference while it rewrites the rule, so a column no rule names is not worked
      * out at all and an expression that raises for the row raises only where a rule reads it.
      *
+     * <p>PostgreSQL 18.0 does not: it reads null there, and a later PostgreSQL 18 works the value
+     * out. What is written here is the later behaviour.
+     *
      * <p>A VIRTUAL column is left alone: it is worked out where a query names the column of a
      * stored row, and NEW is no such row. So is every column of a view, which computes nothing of
      * its own -- the relation underneath does that, after the rules written on the view have run.

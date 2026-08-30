@@ -224,7 +224,7 @@ class FunctionEvaluator {
             "jsonb_delete", "tsquery_phrase", "coalesce", "greatest", "least",
             "grouping", "normalize", "position", "extract", "overlay", "trim",
             "overlaps",
-            "current_user", "session_user", "merge_action",
+            "current_user", "current_role", "user", "session_user", "merge_action",
             "varchar", "bit", "numeric", "char", "bpchar", "decimal", "timestamp", "timestamptz",
             "time", "timetz", "interval", "box", "point", "polygon", "lseg", "circle", "path",
             "line", "int4multirange", "int8multirange", "nummultirange", "tsmultirange",

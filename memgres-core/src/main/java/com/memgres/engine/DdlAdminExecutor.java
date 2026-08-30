@@ -568,20 +568,24 @@ class DdlAdminExecutor {
     // ---- DROP ROLE ----
 
     QueryResult executeDropRole(DropRoleStmt stmt) {
-        if (!stmt.ifExists() && !executor.database.hasRole(stmt.name())) {
-            throw new MemgresException("role \"" + stmt.name() + "\" does not exist", "42704");
+        for (String role : stmt.names()) {
+            dropOneRole(role, stmt.ifExists());
         }
-        if (stmt.ifExists() && !executor.database.hasRole(stmt.name())) {
-            return QueryResult.message(QueryResult.Type.SET, "DROP ROLE");
-        }
-        if (executor.database.roleOwnsObjects(stmt.name())) {
-            throw new MemgresException("role \"" + stmt.name() + "\" cannot be dropped because some objects depend on it\n  "
-                    + "Detail: owner of " + describeOwnedObjects(stmt.name()), "2BP01");
-        }
-        executor.database.removeAllRoleMemberships(stmt.name());
-        executor.database.removeAllRolePrivileges(stmt.name());
-        executor.database.removeRole(stmt.name());
         return QueryResult.message(QueryResult.Type.SET, "DROP ROLE");
+    }
+
+    private void dropOneRole(String role, boolean ifExists) {
+        if (!executor.database.hasRole(role)) {
+            if (ifExists) return;
+            throw new MemgresException("role \"" + role + "\" does not exist", "42704");
+        }
+        if (executor.database.roleOwnsObjects(role)) {
+            throw new MemgresException("role \"" + role + "\" cannot be dropped because some objects depend on it\n  "
+                    + "Detail: owner of " + describeOwnedObjects(role), "2BP01");
+        }
+        executor.database.removeAllRoleMemberships(role);
+        executor.database.removeAllRolePrivileges(role);
+        executor.database.removeRole(role);
     }
 
     /** Drop all objects owned by the specified role. */

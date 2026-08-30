@@ -44,6 +44,7 @@ public class AstExecutor {
     final CastEvaluator castEvaluator = new CastEvaluator(this);
     final ConstraintValidator constraintValidator = new ConstraintValidator(this);
     final SessionExecutor sessionExecutor = new SessionExecutor(this);
+    final MaintenanceExecutor maintenanceExecutor = new MaintenanceExecutor(this);
     final DmlExecutor dmlExecutor = new DmlExecutor(this);
     final DdlExecutor ddlExecutor = new DdlExecutor(this);
     Long lastSequenceValue = null; // for lastval()
@@ -631,6 +632,16 @@ public class AstExecutor {
         if (session == null) return java.time.ZoneId.systemDefault();
         String tz = session.getGucSettings().get("timezone");
         if (tz == null || tz.isEmpty()) return java.time.ZoneId.systemDefault();
+        // A zone written as a displacement carries its POSIX offset after the name it goes by,
+        // and that offset counts the other way round from the one the value means.
+        int bracket = tz.indexOf('>');
+        if (tz.startsWith("<") && bracket > 0) {
+            try {
+                return java.time.ZoneOffset.of(tz.substring(1, bracket));
+            } catch (RuntimeException e) {
+                return java.time.ZoneId.systemDefault();
+            }
+        }
         try {
             return java.time.ZoneId.of(tz);
         } catch (RuntimeException e) {
@@ -856,6 +867,10 @@ public class AstExecutor {
             return result;
         }
         if (stmt instanceof TruncateStmt) return ddlExecutor.executeTruncate(((TruncateStmt) stmt));
+        if (stmt instanceof MaintenanceStmt) {
+            return maintenanceExecutor.execute((MaintenanceStmt) stmt);
+        }
+        if (stmt instanceof CommentStmt) return sessionExecutor.executeComment(((CommentStmt) stmt));
         if (stmt instanceof SetStmt) return sessionExecutor.executeSetStmt(((SetStmt) stmt));
         if (stmt instanceof DiscardStmt) return sessionExecutor.executeDiscard(((DiscardStmt) stmt));
         if (stmt instanceof TransactionStmt) return ddlExecutor.executeTransaction(((TransactionStmt) stmt));

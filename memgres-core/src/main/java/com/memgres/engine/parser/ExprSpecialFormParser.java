@@ -29,7 +29,17 @@ class ExprSpecialFormParser {
         ep.expectKeyword("CASE");
         Expression operand = null;
         if (!ep.checkKeyword("WHEN")) {
+            // A CASE opens with either its operand or its first WHEN. With neither there is
+            // nothing to choose between, and PostgreSQL stops at the word that stands there.
+            if (ep.checkKeyword("END") || ep.checkKeyword("ELSE") || ep.checkKeyword("THEN")) {
+                throw ParseException.at(ep.peek());
+            }
             operand = ep.parseExpression();
+        }
+        // A CASE has at least one WHEN. With none there is nothing to choose between, and
+        // PostgreSQL stops at the word that stands where the first WHEN should.
+        if (!ep.checkKeyword("WHEN")) {
+            throw ParseException.at(ep.peek());
         }
         List<CaseExpr.WhenClause> whens = new ArrayList<>();
         while (ep.matchKeyword("WHEN")) {
@@ -514,7 +524,10 @@ class ExprSpecialFormParser {
                 ep.expectKeyword("OTHERS");
                 excludeMode = WindowFuncExpr.ExcludeMode.NO_OTHERS;
             } else {
-                throw new RuntimeException("Expected CURRENT ROW, TIES, GROUP, or NO OTHERS after EXCLUDE");
+                // What may follow EXCLUDE is four spellings and nothing else, and anything else
+                // is a syntax error at the word written. Raised as a bare RuntimeException it
+                // reached the client as an internal error instead.
+                throw ParseException.at(ep.peek());
             }
         }
 

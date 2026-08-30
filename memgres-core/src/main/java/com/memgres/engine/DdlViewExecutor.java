@@ -133,12 +133,19 @@ class DdlViewExecutor {
             } else {
                 // WITH NO DATA: resolve column metadata but leave the view unpopulated —
                 // any scan must fail with 55000 until REFRESH MATERIALIZED VIEW.
+                // The query is still analysed: a definition names relations and columns and
+                // has to name ones that are there, whether or not the view is filled now.
+                // Caught wholesale, a materialized view over a table nobody created was made,
+                // and every REFRESH of it afterwards failed instead of the CREATE.
                 List<Column> cols = Cols.listOf();
                 try {
                     QueryResult result = executor.executeStatement(query);
                     cols = new ArrayList<>(result.getColumns());
+                } catch (MemgresException e) {
+                    MemgresException fault = definitionFault(e);
+                    if (fault != null) throw fault;
                 } catch (Exception ignored) {
-                    // Column metadata unavailable; the view is still created (matches lenient CREATE VIEW path)
+                    // Column metadata unavailable; the view is still created
                 }
                 rejectDuplicateColumnNames(cols);
                 executor.database.addView(new Database.ViewDef(stmt.name(), viewSchema, query, stmt.orReplace(),
@@ -151,21 +158,8 @@ class DdlViewExecutor {
                 QueryResult result = executor.executeStatement(query);
                 resolvedColumns = new ArrayList<>(result.getColumns());
             } catch (MemgresException e) {
-                if ("42P01".equals(e.getSqlState()) && e.getMessage() != null
-                        && e.getMessage().contains("does not exist") && !e.getMessage().contains("missing FROM-clause")) {
-                    throw e;
-                }
-                if ("42703".equals(e.getSqlState())) {
-                    throw e;
-                }
-                // A query PostgreSQL refuses to analyse is refused as a view definition too:
-                // an ungrouped column, a sort position past the select list or a misplaced
-                // window function is wrong about the query itself, not about the rows it would
-                // read, and storing it only defers the error to every SELECT from the view — a
-                // view over an ungrouped column then answered with an arbitrary row's value.
-                if (ANALYSIS_ERRORS.contains(e.getSqlState())) {
-                    throw e;
-                }
+                MemgresException fault = definitionFault(e);
+                if (fault != null) throw fault;
             } catch (Exception e) {
                 // Silently ignore execution errors during view validation
             }
@@ -540,13 +534,37 @@ class DdlViewExecutor {
 
     // ---- Column alias list: CREATE VIEW v(a, b) AS ... ----
 
+    /**
+     * The fault a definition's query has, or nothing when the query merely could not be run here.
+     *
+     * <p>A definition is analysed when it is written: a relation or a column that is not there,
+     * or a query PostgreSQL refuses to analyse at all -- an ungrouped column, a sort position
+     * past the select list, a misplaced window call -- is wrong about the definition and not
+     * about the rows it would read. Storing it defers the error to every read of the view, where
+     * a view over an ungrouped column answered with an arbitrary row's value.
+     */
+    private MemgresException definitionFault(MemgresException e) {
+        if ("42P01".equals(e.getSqlState()) && e.getMessage() != null
+                && e.getMessage().contains("does not exist")
+                && !e.getMessage().contains("missing FROM-clause")) {
+            return e;
+        }
+        if ("42703".equals(e.getSqlState())) return e;
+        if (ANALYSIS_ERRORS.contains(e.getSqlState())) return e;
+        return null;
+    }
+
     /** True when the view query reads a table that lives in this session's temp namespace. */
     private boolean referencesTempTable(Statement query) {
         if (executor.session == null) return false;
         Schema temp = executor.database.getSchema(executor.session.getTempSchemaName());
         if (temp == null || temp.getTables().isEmpty()) return false;
+        // A reference written with a schema names the relation in that schema. Asked without
+        // one, a query over public.t was taken to read a temporary t that merely shares the
+        // name, and the view built over it was made temporary and lost at the session's end.
+        String tempSchema = executor.session.getTempSchemaName();
         for (String tableName : temp.getTables().keySet()) {
-            if (AstRelationRenamer.referencesRelation(query, null, tableName)) return true;
+            if (AstRelationRenamer.referencesRelation(query, tempSchema, tableName)) return true;
         }
         return false;
     }
