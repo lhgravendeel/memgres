@@ -70,9 +70,9 @@ class PgWireValueFormatter {
         } else if (val instanceof LocalDate) {
             LocalDate ld = (LocalDate) val;
             String datestyle = guc != null ? guc.get("datestyle") : "ISO, MDY";
-            if (datestyle != null && datestyle.toLowerCase().contains("german")) {
+            if (datestyle != null && datestyle.toLowerCase(java.util.Locale.ROOT).contains("german")) {
                 return ld.format(DateTimeFormatter.ofPattern("dd.MM.yyyy"));
-            } else if (datestyle != null && datestyle.toLowerCase().contains("sql")) {
+            } else if (datestyle != null && datestyle.toLowerCase(java.util.Locale.ROOT).contains("sql")) {
                 return ld.format(DateTimeFormatter.ofPattern("MM/dd/yyyy"));
             }
             return com.memgres.engine.TypeCoercion.formatIsoDate(ld);
@@ -82,9 +82,9 @@ class PgWireValueFormatter {
             String timePart = dt.getNano() != 0
                     ? stripTrailingFracZeros(dt.format(DateTimeFormatter.ofPattern("HH:mm:ss.SSSSSS")))
                     : dt.format(DateTimeFormatter.ofPattern("HH:mm:ss"));
-            if (datestyle != null && datestyle.toLowerCase().contains("german")) {
+            if (datestyle != null && datestyle.toLowerCase(java.util.Locale.ROOT).contains("german")) {
                 return dt.format(DateTimeFormatter.ofPattern("dd.MM.yyyy")) + " " + timePart;
-            } else if (datestyle != null && datestyle.toLowerCase().contains("sql")) {
+            } else if (datestyle != null && datestyle.toLowerCase(java.util.Locale.ROOT).contains("sql")) {
                 return dt.format(DateTimeFormatter.ofPattern("MM/dd/yyyy")) + " " + timePart;
             }
             String datePart = String.format("%04d-%02d-%02d",
@@ -110,9 +110,9 @@ class PgWireValueFormatter {
                     ? stripTrailingFracZeros(odt.format(DateTimeFormatter.ofPattern("HH:mm:ss.SSSSSS")))
                     : odt.format(DateTimeFormatter.ofPattern("HH:mm:ss"));
             String offsetStr = formatPgOffset(odt.getOffset());
-            if (datestyle != null && datestyle.toLowerCase().contains("german")) {
+            if (datestyle != null && datestyle.toLowerCase(java.util.Locale.ROOT).contains("german")) {
                 return odt.format(DateTimeFormatter.ofPattern("dd.MM.yyyy")) + " " + timePart + offsetStr;
-            } else if (datestyle != null && datestyle.toLowerCase().contains("sql")) {
+            } else if (datestyle != null && datestyle.toLowerCase(java.util.Locale.ROOT).contains("sql")) {
                 return odt.format(DateTimeFormatter.ofPattern("MM/dd/yyyy")) + " " + timePart + offsetStr;
             }
             // A timestamptz names its era the same way a timestamp does: there is no year zero.

@@ -85,7 +85,7 @@ class SystemCatalogTest {
                     "SELECT a.attname, a.attnotnull " +
                     "FROM pg_catalog.pg_attribute a " +
                     "JOIN pg_catalog.pg_class c ON a.attrelid = c.oid " +
-                    "WHERE c.relname = 'users' ORDER BY a.attnum");
+                    "WHERE c.relname = 'users' AND a.attnum > 0 ORDER BY a.attnum");
             assertTrue(rs.next());
             assertEquals("id", rs.getString("attname"));
             assertTrue(rs.next());

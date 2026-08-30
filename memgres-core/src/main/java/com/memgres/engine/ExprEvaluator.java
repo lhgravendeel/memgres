@@ -355,7 +355,7 @@ class ExprEvaluator {
             // nothing for (f()).x to match — PG says so rather than evaluating the call.
             if (fa.expr() instanceof FunctionCallExpr) {
                 PgFunction pf = executor.database.getFunction(FunctionEvaluator.stripSchemaPrefix(
-                        ((FunctionCallExpr) fa.expr()).name().toLowerCase()));
+                        ((FunctionCallExpr) fa.expr()).name().toLowerCase(java.util.Locale.ROOT)));
                 if (pf != null && pf.declaresRecordResult() && !pf.hasOutParams()) {
                     throw new MemgresException("could not identify column \"" + fa.field()
                             + "\" in record data type", "42703");
@@ -379,7 +379,7 @@ class ExprEvaluator {
             if (val instanceof List<?>) {
                 List<?> list = (List<?>) val;
                 // If the result is a list (from _pg_expandarray), access by field name
-                switch (fieldName.toLowerCase()) {
+                switch (fieldName.toLowerCase(java.util.Locale.ROOT)) {
                     case "x":
                         return list.isEmpty() ? null : list.get(0);
                     case "n":
@@ -554,7 +554,7 @@ class ExprEvaluator {
         }
         // pg_catalog.current_user etc.; treat as the system function directly
         if ("pg_catalog".equalsIgnoreCase(ref.table()) || "information_schema".equalsIgnoreCase(ref.table())) {
-            String col = ref.column().toLowerCase();
+            String col = ref.column().toLowerCase(java.util.Locale.ROOT);
             switch (col) {
                 case "current_user":
                 case "current_role": {
@@ -593,7 +593,7 @@ class ExprEvaluator {
         }
         if (ctx == null) {
             // No row context, check for system columns
-            String col = ref.column().toLowerCase();
+            String col = ref.column().toLowerCase(java.util.Locale.ROOT);
             switch (col) {
                 case "current_user":
                 case "current_role": {
@@ -944,7 +944,7 @@ class ExprEvaluator {
             // Not a recognized type name; fall through to try a registered scalar function below.
         }
         // Try funcOrCastName as a regular single-arg user-defined function.
-        PgFunction userFunc = executor.database.getFunction(funcOrCastName.toLowerCase());
+        PgFunction userFunc = executor.database.getFunction(funcOrCastName.toLowerCase(java.util.Locale.ROOT));
         if (userFunc != null) {
             FunctionCallExpr synthetic = new FunctionCallExpr(
                     funcOrCastName, Cols.listOf(new PrecomputedValueExpr(rowValue)));
@@ -972,7 +972,7 @@ class ExprEvaluator {
         DataType castType = DataType.fromPgName(funcOrCastName);
         if (castType != null) return castType;
         if (executor != null && executor.database != null) {
-            PgFunction userFunc = executor.database.getFunction(funcOrCastName.toLowerCase());
+            PgFunction userFunc = executor.database.getFunction(funcOrCastName.toLowerCase(java.util.Locale.ROOT));
             if (userFunc != null && userFunc.getReturnType() != null) {
                 DataType dt = DataType.fromPgName(userFunc.getReturnType().replaceAll("\\(.*\\)", "").trim());
                 if (dt != null) return dt;
@@ -1209,7 +1209,7 @@ class ExprEvaluator {
     /** An operand as the type the operator declares for it. */
     private Object asDeclared(Object value, String declaredType) {
         if (value == null || declaredType == null) return value;
-        String bare = declaredType.trim().toLowerCase();
+        String bare = declaredType.trim().toLowerCase(java.util.Locale.ROOT);
         if (bare.isEmpty() || bare.equals("any") || bare.startsWith("anyelement")
                 || bare.equals("\"any\"")) {
             return value;
@@ -1227,7 +1227,7 @@ class ExprEvaluator {
     private String operandTypeName(Expression expr, Object value, RowContext ctx) {
         if (isUntypedConstant(expr)) return "unknown";
         String declared = executor.binaryOpEvaluator.declaredTypeForResolution(expr, ctx);
-        if (declared != null && !declared.isEmpty()) return declared.toLowerCase();
+        if (declared != null && !declared.isEmpty()) return declared.toLowerCase(java.util.Locale.ROOT);
         return AstExecutor.pgTypeNameOf(value);
     }
 
@@ -1241,7 +1241,7 @@ class ExprEvaluator {
         // Search schemas: explicit schema, or search_path
         java.util.List<String> schemas = new java.util.ArrayList<>();
         if (schema != null) {
-            schemas.add(schema.toLowerCase());
+            schemas.add(schema.toLowerCase(java.util.Locale.ROOT));
         } else {
             schemas.add("pg_catalog");
             schemas.add("public");
@@ -1251,8 +1251,8 @@ class ExprEvaluator {
                     for (String s : sp.split(",")) {
                         String trimmed = s.trim().replace("\"", "").replace("'", "");
                         if (!trimmed.isEmpty() && !"$user".equals(trimmed)
-                                && !schemas.contains(trimmed.toLowerCase())) {
-                            schemas.add(trimmed.toLowerCase());
+                                && !schemas.contains(trimmed.toLowerCase(java.util.Locale.ROOT))) {
+                            schemas.add(trimmed.toLowerCase(java.util.Locale.ROOT));
                         }
                     }
                 }
@@ -1265,26 +1265,26 @@ class ExprEvaluator {
 
         // Exact schema + type match
         for (PgOperator op : candidates) {
-            String opSchema = op.getSchemaName() != null ? op.getSchemaName().toLowerCase() : "public";
+            String opSchema = op.getSchemaName() != null ? op.getSchemaName().toLowerCase(java.util.Locale.ROOT) : "public";
             if (!schemas.contains(opSchema)) continue;
-            String opLeft = op.getLeftArg() != null ? op.getLeftArg().toLowerCase() : "NONE";
-            String opRight = op.getRightArg() != null ? op.getRightArg().toLowerCase() : "NONE";
-            if (typeMatches(opLeft, leftType.toLowerCase()) && typeMatches(opRight, rightType.toLowerCase())) {
+            String opLeft = op.getLeftArg() != null ? op.getLeftArg().toLowerCase(java.util.Locale.ROOT) : "NONE";
+            String opRight = op.getRightArg() != null ? op.getRightArg().toLowerCase(java.util.Locale.ROOT) : "NONE";
+            if (typeMatches(opLeft, leftType.toLowerCase(java.util.Locale.ROOT)) && typeMatches(opRight, rightType.toLowerCase(java.util.Locale.ROOT))) {
                 return op;
             }
         }
 
         // Fallback: match if operator uses polymorphic / "any" types
         for (PgOperator op : candidates) {
-            String opSchema = op.getSchemaName() != null ? op.getSchemaName().toLowerCase() : "public";
+            String opSchema = op.getSchemaName() != null ? op.getSchemaName().toLowerCase(java.util.Locale.ROOT) : "public";
             if (!schemas.contains(opSchema)) continue;
-            String opLeft = op.getLeftArg() != null ? op.getLeftArg().toLowerCase() : "NONE";
-            String opRight = op.getRightArg() != null ? op.getRightArg().toLowerCase() : "NONE";
+            String opLeft = op.getLeftArg() != null ? op.getLeftArg().toLowerCase(java.util.Locale.ROOT) : "NONE";
+            String opRight = op.getRightArg() != null ? op.getRightArg().toLowerCase(java.util.Locale.ROOT) : "NONE";
             // For unary, check left is NONE
             if ("NONE".equalsIgnoreCase(leftType)) {
                 if ("NONE".equalsIgnoreCase(opLeft) || opLeft.isEmpty()) {
                     if ("any".equalsIgnoreCase(opRight) || "anyelement".equalsIgnoreCase(opRight)
-                            || typeMatches(opRight, rightType.toLowerCase())) {
+                            || typeMatches(opRight, rightType.toLowerCase(java.util.Locale.ROOT))) {
                         return op;
                     }
                 }
@@ -1374,7 +1374,7 @@ class ExprEvaluator {
 
     /** The OID of a type, whether it is one the engine has built in or one the reader created. */
     private int typeOidOf(String typeName) {
-        DataType built = DataType.fromPgName(typeName.toLowerCase());
+        DataType built = DataType.fromPgName(typeName.toLowerCase(java.util.Locale.ROOT));
         if (built != null) return built.getOid();
         String key = TypeNamespace.oidKeyFor(executor.database, typeName);
         return executor.systemCatalog.getOid(
@@ -1403,11 +1403,11 @@ class ExprEvaluator {
         DataType targetType = DataType.fromPgName(stripTypeModifier(target));
         if (source == null || targetType == null) return;
         if (executor.database != null
-                && (executor.database.getCustomEnum(sourceName.toLowerCase()) != null
-                    || executor.database.getCustomEnum(target.toLowerCase()) != null
-                    || executor.database.isCompositeType(target.toLowerCase())
-                    || executor.database.isDomain(target.toLowerCase())
-                    || executor.database.isDomain(sourceName.toLowerCase()))) {
+                && (executor.database.getCustomEnum(sourceName.toLowerCase(java.util.Locale.ROOT)) != null
+                    || executor.database.getCustomEnum(target.toLowerCase(java.util.Locale.ROOT)) != null
+                    || executor.database.isCompositeType(target.toLowerCase(java.util.Locale.ROOT))
+                    || executor.database.isDomain(target.toLowerCase(java.util.Locale.ROOT))
+                    || executor.database.isDomain(sourceName.toLowerCase(java.util.Locale.ROOT)))) {
             return;
         }
         MemgresException refusal = CastLegality.refusalFor(source, targetType);
@@ -1427,7 +1427,7 @@ class ExprEvaluator {
         // If the inner expression is a set-returning function and produced a List,
         // cast each element individually to preserve the List for SRF expansion.
         if (val instanceof java.util.List<?> && cast.expr() instanceof FunctionCallExpr
-                && SelectExecutor.SRF_FUNCTION_NAMES.contains(((FunctionCallExpr) cast.expr()).name().toLowerCase())) {
+                && SelectExecutor.SRF_FUNCTION_NAMES.contains(((FunctionCallExpr) cast.expr()).name().toLowerCase(java.util.Locale.ROOT))) {
             java.util.List<?> list = (java.util.List<?>) val;
             FunctionCallExpr fn = (FunctionCallExpr) cast.expr();
             java.util.List<Object> castList = new java.util.ArrayList<>(list.size());
@@ -1441,7 +1441,7 @@ class ExprEvaluator {
         // why the source has to say it came from json before this applies.
         if (isJsonValued(cast.expr()) && val instanceof String
                 && ((String) val).trim().equals("null")) {
-            String target = cast.typeName() == null ? "" : cast.typeName().toLowerCase().trim();
+            String target = cast.typeName() == null ? "" : cast.typeName().toLowerCase(java.util.Locale.ROOT).trim();
             if (!target.equals("json") && !target.equals("jsonb")
                     && !target.equals("text") && !target.equals("varchar")) {
                 return null;
@@ -1481,7 +1481,7 @@ class ExprEvaluator {
     /** The name PG uses for an integer cast target, or null when the target is not one. */
     private static String integerTypeName(String typeName) {
         if (typeName == null) return null;
-        String t = typeName.toLowerCase().trim();
+        String t = typeName.toLowerCase(java.util.Locale.ROOT).trim();
         if (t.equals("int") || t.equals("int4") || t.equals("integer")) return "integer";
         if (t.equals("int8") || t.equals("bigint")) return "bigint";
         if (t.equals("int2") || t.equals("smallint")) return "smallint";
@@ -1753,7 +1753,7 @@ class ExprEvaluator {
             if (inferred == null) return;
             declared = inferred.getPgName();
         }
-        if (IS_JSON_OPERAND_TYPES.contains(stripTypeModifier(declared).toLowerCase())) return;
+        if (IS_JSON_OPERAND_TYPES.contains(stripTypeModifier(declared).toLowerCase(java.util.Locale.ROOT))) return;
         throw new MemgresException("cannot use type " + declared + " in IS JSON predicate", "42804");
     }
 
@@ -2083,19 +2083,19 @@ class ExprEvaluator {
         // PG only allows LIKE on text-like types; reject integers, booleans, json, etc.
         if (leftVal instanceof Number || leftVal instanceof Boolean) {
             String typeName = leftVal instanceof Integer ? "integer" : leftVal instanceof Long ? "bigint" :
-                    leftVal instanceof Boolean ? "boolean" : leftVal.getClass().getSimpleName().toLowerCase();
+                    leftVal instanceof Boolean ? "boolean" : leftVal.getClass().getSimpleName().toLowerCase(java.util.Locale.ROOT);
             throw new MemgresException("operator does not exist: " + typeName + " ~~ unknown", "42883");
         }
         // Check if left operand comes from a json-returning function
         if (like.left() instanceof FunctionCallExpr) {
-            String fnName = ((FunctionCallExpr) like.left()).name().toLowerCase();
+            String fnName = ((FunctionCallExpr) like.left()).name().toLowerCase(java.util.Locale.ROOT);
             if (fnName.equals("row_to_json") || fnName.equals("to_json") || fnName.equals("json_build_object")
                     || fnName.equals("json_build_array") || fnName.equals("json_agg") || fnName.equals("json_object")) {
                 throw new MemgresException("operator does not exist: json ~~ unknown", "42883");
             }
         }
         if (like.left() instanceof CastExpr) {
-            String castType = ((CastExpr) like.left()).typeName().toLowerCase();
+            String castType = ((CastExpr) like.left()).typeName().toLowerCase(java.util.Locale.ROOT);
             if (castType.equals("json")) {
                 throw new MemgresException("operator does not exist: json ~~ unknown", "42883");
             }
@@ -2200,9 +2200,9 @@ class ExprEvaluator {
         if (!c.whenClauses().isEmpty()) {
             boolean allComposite = c.whenClauses().stream()
                     .map(CaseExpr.WhenClause::result)
-                    .allMatch(e -> e instanceof CastExpr && executor.database.isCompositeType(((CastExpr) e).typeName().toLowerCase()))
+                    .allMatch(e -> e instanceof CastExpr && executor.database.isCompositeType(((CastExpr) e).typeName().toLowerCase(java.util.Locale.ROOT)))
                     && (c.elseExpr() == null
-                        || (c.elseExpr() instanceof CastExpr && executor.database.isCompositeType(((CastExpr) c.elseExpr()).typeName().toLowerCase())));
+                        || (c.elseExpr() instanceof CastExpr && executor.database.isCompositeType(((CastExpr) c.elseExpr()).typeName().toLowerCase(java.util.Locale.ROOT))));
             if (allComposite) {
                 Expression firstResult = c.whenClauses().get(0).result();
                 String typeName = firstResult instanceof CastExpr ? ((CastExpr) firstResult).typeName() : "record";
@@ -2244,7 +2244,7 @@ class ExprEvaluator {
         boolean hasComposite = false;
         boolean hasNonComposite = false;
         for (CaseExpr.WhenClause when : c.whenClauses()) {
-            if (when.result() instanceof CastExpr && executor.database.isCompositeType(((CastExpr) when.result()).typeName().toLowerCase())) {
+            if (when.result() instanceof CastExpr && executor.database.isCompositeType(((CastExpr) when.result()).typeName().toLowerCase(java.util.Locale.ROOT))) {
                 CastExpr ce = (CastExpr) when.result();
                 hasComposite = true;
             } else {
@@ -2252,7 +2252,7 @@ class ExprEvaluator {
             }
         }
         if (c.elseExpr() != null) {
-            if (c.elseExpr() instanceof CastExpr && executor.database.isCompositeType(((CastExpr) c.elseExpr()).typeName().toLowerCase())) {
+            if (c.elseExpr() instanceof CastExpr && executor.database.isCompositeType(((CastExpr) c.elseExpr()).typeName().toLowerCase(java.util.Locale.ROOT))) {
                 CastExpr ce = (CastExpr) c.elseExpr();
                 hasComposite = true;
             } else {
@@ -2767,7 +2767,7 @@ class ExprEvaluator {
         if (declared.endsWith("[]")) {
             return new CastExpr(array, declared.substring(0, declared.length() - 2).trim());
         }
-        DataType type = DataType.fromPgName(declared.toLowerCase());
+        DataType type = DataType.fromPgName(declared.toLowerCase(java.util.Locale.ROOT));
         if (type == null) return null;
         // oidvector and int2vector are arrays as far as a subscript or an ANY is concerned, even
         // though they are their own types: pg_index.indkey is written "= ANY(i.indkey)" by every
@@ -3334,7 +3334,7 @@ class ExprEvaluator {
         if (expr instanceof CustomOperatorExpr) {
             return "?column?";
         }
-        if (expr instanceof OrderedSetAggExpr) return ((OrderedSetAggExpr) expr).funcName().toLowerCase();
+        if (expr instanceof OrderedSetAggExpr) return ((OrderedSetAggExpr) expr).funcName().toLowerCase(java.util.Locale.ROOT);
         if (expr instanceof JsonValueExpr) return "json_value";
         if (expr instanceof JsonQueryExpr) return "json_query";
         if (expr instanceof JsonExistsExpr) return "json_exists";
@@ -3449,7 +3449,7 @@ class ExprEvaluator {
         // The column a cast produces is named after the type the cast resolved to, and for
         // float(p) the modifier is what decides that type: float(24) is a float4 column.
         if (typeName.indexOf('(') > 0 && !typeName.contains("[]")) {
-            DataType withModifier = DataType.fromPgName(typeName.toLowerCase().trim());
+            DataType withModifier = DataType.fromPgName(typeName.toLowerCase(java.util.Locale.ROOT).trim());
             if (withModifier == DataType.REAL || withModifier == DataType.DOUBLE_PRECISION) {
                 return withModifier.getPgName();
             }
@@ -3460,7 +3460,7 @@ class ExprEvaluator {
         // written with the schema still reports the plain type name.
         int schemaDot = base.lastIndexOf('.');
         if (schemaDot > 0) base = base.substring(schemaDot + 1);
-        String baseLower = base.toLowerCase();
+        String baseLower = base.toLowerCase(java.util.Locale.ROOT);
         if (baseLower.equals("time with time zone") || baseLower.equals("timetz")) {
             return "timetz";
         }
@@ -3558,7 +3558,7 @@ class ExprEvaluator {
     private DataType orderedSetAggResultType(OrderedSetAggExpr osa,
                                              List<RowContext.TableBinding> bindings) {
         String name = osa.funcName() == null ? ""
-                : FunctionEvaluator.stripSchemaPrefix(osa.funcName().toLowerCase());
+                : FunctionEvaluator.stripSchemaPrefix(osa.funcName().toLowerCase(java.util.Locale.ROOT));
         if (name.equals("rank") || name.equals("dense_rank")) return DataType.BIGINT;
         if (name.equals("percent_rank") || name.equals("cume_dist")) {
             return DataType.DOUBLE_PRECISION;
@@ -4146,7 +4146,7 @@ class ExprEvaluator {
             // from such casts advertises the real enum type via resolveEnumTypeName below instead
             // of the generic (OID-0) placeholder.
             if (executor != null && executor.database != null
-                    && executor.database.getCustomEnum(typeName.toLowerCase()) != null) {
+                    && executor.database.getCustomEnum(typeName.toLowerCase(java.util.Locale.ROOT)) != null) {
                 return DataType.ENUM;
             }
             return DataType.TEXT;
@@ -4155,7 +4155,10 @@ class ExprEvaluator {
             Literal lit = (Literal) expr;
             switch (lit.literalType()) {
                 case INTEGER:
-                    return DataType.INTEGER;
+                    // A whole number is the narrowest of the three integer types that holds it,
+                    // and numeric when none of them does. Answered as integer whatever it was,
+                    // a constant a client read as int4 was one that does not fit in four bytes.
+                    return integerLiteralType(lit);
                 case FLOAT:
                     // A written constant is numeric whether or not it carries an exponent —
                     // 1.0e0 is the same numeric one as 1.0, and only a cast makes it float8.
@@ -4233,7 +4236,7 @@ class ExprEvaluator {
             // as text.
             WindowFuncExpr wf = (WindowFuncExpr) expr;
             String wfName = wf.name() == null ? ""
-                    : FunctionEvaluator.stripSchemaPrefix(wf.name().toLowerCase());
+                    : FunctionEvaluator.stripSchemaPrefix(wf.name().toLowerCase(java.util.Locale.ROOT));
             if (wfName.equals("row_number") || wfName.equals("rank")
                     || wfName.equals("dense_rank") || wfName.equals("count")) {
                 return DataType.BIGINT;
@@ -4251,7 +4254,7 @@ class ExprEvaluator {
         }
         if (expr instanceof FunctionCallExpr) {
             FunctionCallExpr fn = (FunctionCallExpr) expr;
-            String name = FunctionEvaluator.stripSchemaPrefix(fn.name().toLowerCase());
+            String name = FunctionEvaluator.stripSchemaPrefix(fn.name().toLowerCase(java.util.Locale.ROOT));
             // count answers in bigint, which is what sum(count(*)) resolves against.
             if (name.equals("count")) return DataType.BIGINT;
             // A sequence counts in bigint, whichever of its functions is asked.
@@ -4522,7 +4525,7 @@ class ExprEvaluator {
                     // If the argument is a cast to integer[], infer INT4_ARRAY
                     Expression arg0 = fn.args().get(0);
                     if (arg0 instanceof CastExpr) {
-                        String targetType = ((CastExpr) arg0).typeName().toLowerCase();
+                        String targetType = ((CastExpr) arg0).typeName().toLowerCase(java.util.Locale.ROOT);
                         if (targetType.equals("integer[]") || targetType.equals("int[]") || targetType.equals("int4[]")) return DataType.INT4_ARRAY;
                         if (targetType.equals("text[]") || targetType.equals("varchar[]")) return DataType.TEXT_ARRAY;
                     }
@@ -4841,6 +4844,23 @@ class ExprEvaluator {
      * looks it up by. Described as text, a routine declared to answer with one and a whole-row
      * reference both told the client they were sending a string.
      */
+    /**
+     * The type PostgreSQL gives a whole-number constant: int4 while it fits, then int8, then
+     * numeric. The value decides, not the way it was written.
+     */
+    private static DataType integerLiteralType(Literal lit) {
+        Object value = lit.value();
+        java.math.BigInteger written;
+        try {
+            written = new java.math.BigInteger(String.valueOf(value).trim());
+        } catch (NumberFormatException notWhole) {
+            return DataType.INTEGER;
+        }
+        if (written.bitLength() < 32) return DataType.INTEGER;
+        if (written.bitLength() < 64) return DataType.BIGINT;
+        return DataType.NUMERIC;
+    }
+
     /** The composite a bound column was declared as, or null when it was declared as anything else. */
     private String compositeOfColumn(ColumnRef ref, List<RowContext.TableBinding> bindings) {
         for (RowContext.TableBinding b : bindings) {
@@ -4908,12 +4928,12 @@ class ExprEvaluator {
             return null;
         }
         if (expr instanceof CastExpr) {
-            String typeName = ((CastExpr) expr).typeName().replaceAll("\\(.*\\)", "").trim().toLowerCase();
+            String typeName = ((CastExpr) expr).typeName().replaceAll("\\(.*\\)", "").trim().toLowerCase(java.util.Locale.ROOT);
             return executor.database.getCustomEnum(typeName) != null ? typeName : null;
         }
         if (expr instanceof FunctionCallExpr) {
             FunctionCallExpr fn = (FunctionCallExpr) expr;
-            String name = FunctionEvaluator.stripSchemaPrefix(fn.name().toLowerCase());
+            String name = FunctionEvaluator.stripSchemaPrefix(fn.name().toLowerCase(java.util.Locale.ROOT));
             // An enum's own name written like a call is a cast to it, so the column is that enum.
             if (fn.args().size() == 1 && executor != null) {
                 String coerced = executor.functionEvaluator.coercibleTypeName(name);
@@ -4960,7 +4980,7 @@ class ExprEvaluator {
     private static FunctionCallExpr findArrayAggCall(Expression expr) {
         if (expr instanceof FunctionCallExpr) {
             FunctionCallExpr fn = (FunctionCallExpr) expr;
-            return FunctionEvaluator.stripSchemaPrefix(fn.name().toLowerCase()).equals("array_agg") ? fn : null;
+            return FunctionEvaluator.stripSchemaPrefix(fn.name().toLowerCase(java.util.Locale.ROOT)).equals("array_agg") ? fn : null;
         }
         if (expr instanceof SubqueryExpr) {
             SubqueryExpr sq = (SubqueryExpr) expr;
@@ -5151,7 +5171,7 @@ class ExprEvaluator {
     private static String typeWrittenInQuery(Expression expr) {
         if (expr instanceof CastExpr) {
             String name = ((CastExpr) expr).typeName();
-            return name == null ? null : name.toLowerCase().trim();
+            return name == null ? null : name.toLowerCase(java.util.Locale.ROOT).trim();
         }
         if (expr instanceof Literal) {
             switch (((Literal) expr).literalType()) {
@@ -5364,7 +5384,7 @@ class ExprEvaluator {
 
     /** The family a declared type belongs to, or null when it is one this rule leaves alone. */
     private static ResultFamily familyOf(String typeName) {
-        String t = typeName.toLowerCase().trim();
+        String t = typeName.toLowerCase(java.util.Locale.ROOT).trim();
         // An array is its own family: PostgreSQL matches one array against another by their
         // element types, and against anything else not at all.
         if (t.endsWith("[]")) {
@@ -5395,7 +5415,7 @@ class ExprEvaluator {
      * reaches by keeping whichever of two types the other converts to implicitly.
      */
     private static int rankOf(String typeName) {
-        String t = typeName.toLowerCase().trim();
+        String t = typeName.toLowerCase(java.util.Locale.ROOT).trim();
         int paren = t.indexOf('(');
         if (paren > 0) t = t.substring(0, paren).trim();
         switch (t) {
@@ -5417,7 +5437,7 @@ class ExprEvaluator {
 
     /** The name PostgreSQL prints for a type in a mismatch message. */
     private static String pgName(String typeName) {
-        String t = typeName.toLowerCase().trim();
+        String t = typeName.toLowerCase(java.util.Locale.ROOT).trim();
         switch (t) {
             case "int": case "int4": return "integer";
             case "int2": return "smallint";

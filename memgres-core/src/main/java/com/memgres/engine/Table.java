@@ -731,13 +731,13 @@ public class Table {
                 recordDroppedAttribute(attnum, removed, local,
                         local ? (short) 0 : (short) getDirectParents().size());
             }
-            inheritedColumns.remove(columnName.toLowerCase());
-            inheritedNotNullColumns.remove(columnName.toLowerCase());
-            noInheritNotNullColumns.remove(columnName.toLowerCase());
-            noInheritNotNullColumns.remove(columnName.toLowerCase());
-            inheritedNotNullNames.remove(columnName.toLowerCase());
-            retainedNotNullInheritCounts.remove(columnName.toLowerCase());
-            notValidatedNotNullColumns.remove(columnName.toLowerCase());
+            inheritedColumns.remove(columnName.toLowerCase(java.util.Locale.ROOT));
+            inheritedNotNullColumns.remove(columnName.toLowerCase(java.util.Locale.ROOT));
+            noInheritNotNullColumns.remove(columnName.toLowerCase(java.util.Locale.ROOT));
+            noInheritNotNullColumns.remove(columnName.toLowerCase(java.util.Locale.ROOT));
+            inheritedNotNullNames.remove(columnName.toLowerCase(java.util.Locale.ROOT));
+            retainedNotNullInheritCounts.remove(columnName.toLowerCase(java.util.Locale.ROOT));
+            notValidatedNotNullColumns.remove(columnName.toLowerCase(java.util.Locale.ROOT));
             columnsChanged();
             List<Object[]> current = rows;
             List<Object[]> newRows = new ArrayList<>(current.size());
@@ -863,14 +863,14 @@ public class Table {
             columns.set(idx, old.withName(newName));
             // It is the same column under another name, so whether the relation declared it, and
             // whether it declared the NOT NULL on it, travel with it.
-            if (inheritedColumns.remove(oldName.toLowerCase())) {
-                inheritedColumns.add(newName.toLowerCase());
+            if (inheritedColumns.remove(oldName.toLowerCase(java.util.Locale.ROOT))) {
+                inheritedColumns.add(newName.toLowerCase(java.util.Locale.ROOT));
             }
-            if (inheritedNotNullColumns.remove(oldName.toLowerCase())) {
-                inheritedNotNullColumns.add(newName.toLowerCase());
+            if (inheritedNotNullColumns.remove(oldName.toLowerCase(java.util.Locale.ROOT))) {
+                inheritedNotNullColumns.add(newName.toLowerCase(java.util.Locale.ROOT));
             }
-            if (notValidatedNotNullColumns.remove(oldName.toLowerCase())) {
-                notValidatedNotNullColumns.add(newName.toLowerCase());
+            if (notValidatedNotNullColumns.remove(oldName.toLowerCase(java.util.Locale.ROOT))) {
+                notValidatedNotNullColumns.add(newName.toLowerCase(java.util.Locale.ROOT));
             }
             columnsChanged();
             // Keep constraints attached to the column under its new name
@@ -937,8 +937,8 @@ public class Table {
         // The constraint goes with the flag, so a NOT NULL declared here afterwards is this
         // relation's own rather than one it was still holding on a parent's behalf.
         if (nullable) {
-            inheritedNotNullColumns.remove(columnName.toLowerCase());
-            notValidatedNotNullColumns.remove(columnName.toLowerCase());
+            inheritedNotNullColumns.remove(columnName.toLowerCase(java.util.Locale.ROOT));
+            notValidatedNotNullColumns.remove(columnName.toLowerCase(java.util.Locale.ROOT));
         }
         columnsChanged();
     }
@@ -1182,8 +1182,8 @@ public class Table {
     /** Give this column's NOT NULL constraint a name other than the default one. */
     public void setNotNullConstraintName(String column, String name) {
         if (column == null) return;
-        if (name == null) notNullConstraintNames.remove(column.toLowerCase());
-        else notNullConstraintNames.put(column.toLowerCase(), name);
+        if (name == null) notNullConstraintNames.remove(column.toLowerCase(java.util.Locale.ROOT));
+        else notNullConstraintNames.put(column.toLowerCase(java.util.Locale.ROOT), name);
     }
 
     /**
@@ -1195,7 +1195,7 @@ public class Table {
         if (column == null) return null;
         int idx = getColumnIndex(column);
         if (idx < 0 || columns.get(idx).isNullable()) return null;
-        String explicit = notNullConstraintNames.get(column.toLowerCase());
+        String explicit = notNullConstraintNames.get(column.toLowerCase(java.util.Locale.ROOT));
         return explicit != null ? explicit : defaultNotNullConstraintName(column);
     }
 
@@ -1221,14 +1221,14 @@ public class Table {
      */
     public void pinNotNullConstraintName(String column) {
         String current = notNullConstraintName(column);
-        if (current != null) notNullConstraintNames.put(column.toLowerCase(), current);
+        if (current != null) notNullConstraintNames.put(column.toLowerCase(java.util.Locale.ROOT), current);
     }
 
     /** Carry a column's NOT NULL constraint name across a rename of that column. */
     public void moveNotNullConstraintName(String oldColumn, String newColumn) {
         if (oldColumn == null || newColumn == null) return;
-        String pinned = notNullConstraintNames.remove(oldColumn.toLowerCase());
-        if (pinned != null) notNullConstraintNames.put(newColumn.toLowerCase(), pinned);
+        String pinned = notNullConstraintNames.remove(oldColumn.toLowerCase(java.util.Locale.ROOT));
+        if (pinned != null) notNullConstraintNames.put(newColumn.toLowerCase(java.util.Locale.ROOT), pinned);
     }
     /**
      * The constraint of this name, or null. A constraint name is an identifier and has been folded
@@ -1370,12 +1370,12 @@ public class Table {
      * column added to a parent afterwards, never from the relation's own column list.
      */
     public void markColumnInherited(String column) {
-        if (column != null) inheritedColumns.add(column.toLowerCase());
+        if (column != null) inheritedColumns.add(column.toLowerCase(java.util.Locale.ROOT));
     }
 
     /** True when this relation's own definition named the column. */
     public boolean isColumnLocal(String column) {
-        return column != null && !inheritedColumns.contains(column.toLowerCase());
+        return column != null && !inheritedColumns.contains(column.toLowerCase(java.util.Locale.ROOT));
     }
 
     /**
@@ -1385,7 +1385,7 @@ public class Table {
      * on behalf of.
      */
     public void markColumnLocal(String column) {
-        if (column != null) inheritedColumns.remove(column.toLowerCase());
+        if (column != null) inheritedColumns.remove(column.toLowerCase(java.util.Locale.ROOT));
     }
 
     /**
@@ -1393,12 +1393,12 @@ public class Table {
      * constraint then answers to the name the parent gave it, and only the parent may withdraw it.
      */
     public void markNotNullInherited(String column) {
-        if (column != null) inheritedNotNullColumns.add(column.toLowerCase());
+        if (column != null) inheritedNotNullColumns.add(column.toLowerCase(java.util.Locale.ROOT));
     }
 
     /** True when this relation's own definition declared the column NOT NULL. */
     public boolean isNotNullLocal(String column) {
-        return column != null && !inheritedNotNullColumns.contains(column.toLowerCase());
+        return column != null && !inheritedNotNullColumns.contains(column.toLowerCase(java.util.Locale.ROOT));
     }
 
     /**
@@ -1408,12 +1408,12 @@ public class Table {
      * outright rather than one it shares with the relation above.
      */
     public void markNotNullNoInherit(String column) {
-        if (column != null) noInheritNotNullColumns.add(column.toLowerCase());
+        if (column != null) noInheritNotNullColumns.add(column.toLowerCase(java.util.Locale.ROOT));
     }
 
     /** True when this relation's NOT NULL on the column stops here rather than being handed down. */
     public boolean isNotNullNoInherit(String column) {
-        return column != null && noInheritNotNullColumns.contains(column.toLowerCase());
+        return column != null && noInheritNotNullColumns.contains(column.toLowerCase(java.util.Locale.ROOT));
     }
 
     /**
@@ -1422,17 +1422,17 @@ public class Table {
      * for VALIDATE CONSTRAINT to go back over what is there.
      */
     public void markNotNullNotValidated(String column) {
-        if (column != null) notValidatedNotNullColumns.add(column.toLowerCase());
+        if (column != null) notValidatedNotNullColumns.add(column.toLowerCase(java.util.Locale.ROOT));
     }
 
     /** Records that the rows already stored have been read and none of them holds a null. */
     public void markNotNullValidated(String column) {
-        if (column != null) notValidatedNotNullColumns.remove(column.toLowerCase());
+        if (column != null) notValidatedNotNullColumns.remove(column.toLowerCase(java.util.Locale.ROOT));
     }
 
     /** Whether the rows already stored have been held to the column's NOT NULL. */
     public boolean isNotNullValidated(String column) {
-        return column == null || !notValidatedNotNullColumns.contains(column.toLowerCase());
+        return column == null || !notValidatedNotNullColumns.contains(column.toLowerCase(java.util.Locale.ROOT));
     }
 
     /**
@@ -1442,7 +1442,7 @@ public class Table {
      * relation back afterwards.
      */
     public void markNotNullLocal(String column) {
-        if (column != null) inheritedNotNullColumns.remove(column.toLowerCase());
+        if (column != null) inheritedNotNullColumns.remove(column.toLowerCase(java.util.Locale.ROOT));
     }
 
     /**
@@ -1457,13 +1457,13 @@ public class Table {
      */
     public void pinInheritedNotNullName(String column, String name) {
         if (column == null) return;
-        if (name == null) inheritedNotNullNames.remove(column.toLowerCase());
-        else inheritedNotNullNames.put(column.toLowerCase(), name);
+        if (name == null) inheritedNotNullNames.remove(column.toLowerCase(java.util.Locale.ROOT));
+        else inheritedNotNullNames.put(column.toLowerCase(java.util.Locale.ROOT), name);
     }
 
     /** The name written down for an inherited NOT NULL on this column, or null when none was. */
     public String inheritedNotNullName(String column) {
-        return column == null ? null : inheritedNotNullNames.get(column.toLowerCase());
+        return column == null ? null : inheritedNotNullNames.get(column.toLowerCase(java.util.Locale.ROOT));
     }
 
     /**
@@ -1477,14 +1477,14 @@ public class Table {
      */
     public int retainedNotNullInheritCount(String column) {
         if (column == null) return 0;
-        Integer held = retainedNotNullInheritCounts.get(column.toLowerCase());
+        Integer held = retainedNotNullInheritCounts.get(column.toLowerCase(java.util.Locale.ROOT));
         return held == null ? 0 : held.intValue();
     }
 
     public void setRetainedNotNullInheritCount(String column, int count) {
         if (column == null) return;
-        if (count <= 0) retainedNotNullInheritCounts.remove(column.toLowerCase());
-        else retainedNotNullInheritCounts.put(column.toLowerCase(), Integer.valueOf(count));
+        if (count <= 0) retainedNotNullInheritCounts.remove(column.toLowerCase(java.util.Locale.ROOT));
+        else retainedNotNullInheritCounts.put(column.toLowerCase(java.util.Locale.ROOT), Integer.valueOf(count));
     }
 
     public List<Table> getChildren() { return children; }

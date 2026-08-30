@@ -34,9 +34,9 @@ final class SqlValueFunctions {
      */
     static String keywordOf(String name, boolean hasArguments) {
         if (name == null || hasArguments) return null;
-        String lower = name.toLowerCase();
+        String lower = name.toLowerCase(java.util.Locale.ROOT);
         for (int i = 0; i < NAMES.length; i++) {
-            if (NAMES[i].equals(lower)) return NAMES[i].toUpperCase();
+            if (NAMES[i].equals(lower)) return NAMES[i].toUpperCase(java.util.Locale.ROOT);
         }
         return null;
     }
@@ -44,7 +44,7 @@ final class SqlValueFunctions {
     /** The type one of these answers with, or null for a name that is not one of them. */
     static DataType typeOf(String name) {
         if (name == null) return null;
-        String lower = name.toLowerCase();
+        String lower = name.toLowerCase(java.util.Locale.ROOT);
         if ("current_date".equals(lower)) return DataType.DATE;
         if ("current_time".equals(lower)) return DataType.TIMETZ;
         if ("current_timestamp".equals(lower)) return DataType.TIMESTAMPTZ;

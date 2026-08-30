@@ -190,8 +190,10 @@ class SqlStateCorrectnessV2Test {
         assertSqlState("SELECT true * 5", "42883");
     }
 
-    @Test void text_divide_int_gives_42883() {
-        assertSqlState("SELECT 'hello' / 2", "42883");
+    @Test void text_divide_int_reads_the_literal_as_the_other_operand() {
+        // An untyped literal beside a number is read as that number's type, so the fault is
+        // the value and not the operator: PostgreSQL says the text is not an integer.
+        assertSqlState("SELECT 'hello' / 2", "22P02");
     }
 
     @Test void text_multiply_text_is_ambiguous() {

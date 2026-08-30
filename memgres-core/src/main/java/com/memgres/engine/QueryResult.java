@@ -101,6 +101,25 @@ public class QueryResult {
         return affectedRows;
     }
 
+    /**
+     * The tag this statement reports on the wire, where the statement names it itself.
+     *
+     * <p>PostgreSQL's tag names the command that ran — DROP VIEW, ALTER TABLE, TRUNCATE TABLE —
+     * and several commands share one result type here, so the type alone cannot say which ran.
+     * Null where the type settles it.
+     */
+    public String getCommandTag() {
+        return commandTag;
+    }
+
+    /** Say what this statement reports itself as on the wire. */
+    public QueryResult withCommandTag(String tag) {
+        this.commandTag = tag;
+        return this;
+    }
+
+    private String commandTag;
+
     public String getMessage() {
         return message;
     }

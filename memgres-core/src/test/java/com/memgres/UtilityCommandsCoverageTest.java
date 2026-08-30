@@ -417,17 +417,21 @@ class UtilityCommandsCoverageTest {
     @Test
     @DisplayName("103.16 SET then RESET then SHOW verifies reset returns to default")
     void setResetShow() throws Exception {
-        exec("SET client_encoding TO 'LATIN1'");
-        ResultSet rs1 = q("SHOW client_encoding");
+        // Not client_encoding: the server reports a change of it to the client, and this driver
+        // ends the connection rather than read UTF-8 bytes as anything else — which is what
+        // PostgreSQL and this driver do together, measured.
+        exec("SET work_mem TO '5MB'");
+        ResultSet rs1 = q("SHOW work_mem");
         assertTrue(rs1.next());
-        assertEquals("LATIN1", rs1.getString(1));
+        assertEquals("5MB", rs1.getString(1));
 
-        exec("RESET client_encoding");
-        ResultSet rs2 = q("SHOW client_encoding");
+        exec("RESET work_mem");
+        ResultSet rs2 = q("SHOW work_mem");
         assertTrue(rs2.next());
-        // After reset, value should differ from 'LATIN1' (back to default)
+        // After reset, value should differ from '5MB' (back to default)
         String resetVal = rs2.getString(1);
         assertNotNull(resetVal);
+        assertNotEquals("5MB", resetVal);
     }
 
     @Test

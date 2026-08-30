@@ -133,13 +133,13 @@ public final class RuleDeparser {
         final Map<String, PgType> byName = new HashMap<String, PgType>();
         if (table != null) {
             for (Column c : table.getColumns()) {
-                byName.put(c.getName().toLowerCase(), fromColumn(c));
+                byName.put(c.getName().toLowerCase(java.util.Locale.ROOT), fromColumn(c));
             }
         }
         return new ColumnTypes() {
             @Override
             public PgType typeOf(String columnName) {
-                return columnName == null ? null : byName.get(columnName.toLowerCase());
+                return columnName == null ? null : byName.get(columnName.toLowerCase(java.util.Locale.ROOT));
             }
         };
     }
@@ -1176,7 +1176,7 @@ public final class RuleDeparser {
         // find the construct that name spells instead of the function: substring(s, 1, 2) is a
         // call on "substring", while SUBSTRING(s FROM 1 FOR 2) is the construct.
         StringBuilder sb = new StringBuilder(
-                UPPERCASE_FUNCS.contains(name) ? name.toUpperCase() : quoteFunctionName(name));
+                UPPERCASE_FUNCS.contains(name) ? name.toUpperCase(java.util.Locale.ROOT) : quoteFunctionName(name));
         sb.append('(');
         if (fn.distinct()) sb.append("DISTINCT ");
         if (fn.star()) {
@@ -1504,7 +1504,7 @@ public final class RuleDeparser {
     }
 
     private static String lower(String s) {
-        return s == null ? null : s.toLowerCase();
+        return s == null ? null : s.toLowerCase(java.util.Locale.ROOT);
     }
 
     private static String quoteLiteral(String s) {
@@ -1600,7 +1600,7 @@ public final class RuleDeparser {
     }
 
     private static boolean isTypeName(String name) {
-        return name != null && TYPE_ALIASES.containsKey(name.toLowerCase());
+        return name != null && TYPE_ALIASES.containsKey(name.toLowerCase(java.util.Locale.ROOT));
     }
 
     /** Parses a type name as written in a cast into a resolved type. */
@@ -1612,11 +1612,11 @@ public final class RuleDeparser {
         int typmod = -1;
         int paren = t.indexOf('(');
         if (paren > 0 && t.endsWith(")")) {
-            typmod = parseTypmod(t.substring(0, paren).trim().toLowerCase(),
+            typmod = parseTypmod(t.substring(0, paren).trim().toLowerCase(java.util.Locale.ROOT),
                     t.substring(paren + 1, t.length() - 1));
             t = t.substring(0, paren).trim();
         }
-        DataType dt = TYPE_ALIASES.get(t.toLowerCase());
+        DataType dt = TYPE_ALIASES.get(t.toLowerCase(java.util.Locale.ROOT));
         if (dt == null) return PgType.custom(t);
         return array ? PgType.arrayOf(dt) : PgType.of(dt, typmod);
     }

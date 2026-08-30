@@ -358,8 +358,9 @@ class SystemCatalogsCoverageTest {
 
     @Test
     void testPgTablesTableowner() throws SQLException {
+        // The relation belongs to the role that created it, which is the role this connected as.
         String owner = query1("SELECT tableowner FROM pg_tables WHERE tablename = 'users'");
-        assertEquals("memgres", owner);
+        assertEquals(query1("SELECT current_user"), owner);
     }
 
     // ---- pg_views ----
@@ -1059,7 +1060,11 @@ class SystemCatalogsCoverageTest {
 
     @Test
     void testPgGetUserbyid() throws SQLException {
-        assertEquals("memgres", query1("SELECT pg_get_userbyid(1)"));
+        // The OID names a role or it names nothing, and PostgreSQL says which.
+        assertEquals("unknown (OID=1)", query1("SELECT pg_get_userbyid(1)"));
+        assertEquals(query1("SELECT current_user"),
+                query1("SELECT pg_get_userbyid((SELECT oid FROM pg_roles"
+                        + " WHERE rolname = current_user))"));
     }
 
     // ---- pg_encoding_to_char ----
@@ -1102,26 +1107,27 @@ class SystemCatalogsCoverageTest {
 
     @Test
     void testPgRelationSize() throws SQLException {
-        String result = query1("SELECT pg_relation_size(1)");
-        assertEquals("8192", result);
+        // An OID that names no relation has no size, which is nothing rather than a number.
+        assertNull(query1("SELECT pg_relation_size(1)"));
+        assertEquals("8192", query1("SELECT pg_relation_size('users'::regclass)"));
     }
 
     @Test
     void testPgTotalRelationSize() throws SQLException {
-        String result = query1("SELECT pg_total_relation_size(1)");
-        assertEquals("8192", result);
+        assertNull(query1("SELECT pg_total_relation_size(1)"));
+        assertEquals("8192", query1("SELECT pg_total_relation_size('users'::regclass)"));
     }
 
     @Test
     void testPgTableSize() throws SQLException {
-        String result = query1("SELECT pg_table_size(1)");
-        assertEquals("8192", result);
+        assertNull(query1("SELECT pg_table_size(1)"));
+        assertEquals("8192", query1("SELECT pg_table_size('users'::regclass)"));
     }
 
     @Test
     void testPgDatabaseSize() throws SQLException {
-        String result = query1("SELECT pg_database_size(1)");
-        assertEquals("8192", result);
+        // The OID has to name a database, and one is not a database.
+        assertEquals("8192", query1("SELECT pg_database_size(current_database())"));
     }
 
     // ---- to_regclass ----

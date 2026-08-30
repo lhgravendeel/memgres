@@ -110,7 +110,7 @@ public class PgFunction {
     /** True when the signature already names the result columns, as OUT or TABLE parameters. */
     public boolean hasOutParams() {
         for (Param p : params) {
-            String mode = p.mode() != null ? p.mode().toUpperCase() : "IN";
+            String mode = p.mode() != null ? p.mode().toUpperCase(java.util.Locale.ROOT) : "IN";
             if ("OUT".equals(mode) || "INOUT".equals(mode) || "TABLE".equals(mode)) return true;
         }
         return false;

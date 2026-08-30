@@ -579,7 +579,7 @@ public final class GeometricOperations {
 
     /** The shape a literal names, read as the named type's own reader reads it. */
     public static Object parseAs(String typeName, String literal) {
-        String name = typeName == null ? "" : typeName.toLowerCase();
+        String name = typeName == null ? "" : typeName.toLowerCase(java.util.Locale.ROOT);
         if (name.equals("point")) return parsePoint(literal);
         if (name.equals("line")) return parseLine(literal);
         if (name.equals("lseg")) return parseLseg(literal);

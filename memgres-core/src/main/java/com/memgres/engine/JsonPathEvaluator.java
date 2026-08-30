@@ -658,7 +658,7 @@ final class JsonPathEvaluator {
             throw new MemgresException("jsonpath item method .boolean() can only be applied to a"
                     + " boolean, string, or numeric value", "22036");
         }
-        String text = item.asString().trim().toLowerCase();
+        String text = item.asString().trim().toLowerCase(java.util.Locale.ROOT);
         if (text.equals("t") || text.equals("true") || text.equals("y") || text.equals("yes")
                 || text.equals("on") || text.equals("1")) {
             return true;
@@ -713,7 +713,7 @@ final class JsonPathEvaluator {
     }
 
     private static boolean isNotFinite(String text) {
-        String t = text.trim().toLowerCase();
+        String t = text.trim().toLowerCase(java.util.Locale.ROOT);
         if (t.startsWith("+") || t.startsWith("-")) t = t.substring(1);
         return t.equals("inf") || t.equals("infinity") || t.equals("nan");
     }

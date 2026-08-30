@@ -30,11 +30,11 @@ class CatalogConstraintBuilder {
         if (sc.getCheckExpr() == null) return null;
         Set<String> named = new LinkedHashSet<>();
         for (String name : DdlExecutor.referencedColumnNames(sc.getCheckExpr())) {
-            named.add(name.toLowerCase());
+            named.add(name.toLowerCase(java.util.Locale.ROOT));
         }
         List<Object> attnums = new ArrayList<>();
         for (int i = 0; i < t.getColumns().size(); i++) {
-            if (named.contains(t.getColumns().get(i).getName().toLowerCase())) {
+            if (named.contains(t.getColumns().get(i).getName().toLowerCase(java.util.Locale.ROOT))) {
                 attnums.add(Integer.valueOf(t.attnumAt(i)));
             }
         }
@@ -170,7 +170,15 @@ class CatalogConstraintBuilder {
                             : database.getSchemas().get(refSchema).getTable(sc.getReferencesTable());
                     List<Object> confkey = null;
                     if (refTable != null) {
-                        confkey = columnNamesToAttnums(refTable, sc.getReferencesColumns());
+                        // A foreign key written without a column list references the referenced
+                        // relation's primary key, which is what PostgreSQL resolves it to and
+                        // records here. Left null, the catalogue said the key referenced no
+                        // columns at all and pg_get_constraintdef had none to name.
+                        List<String> referenced = sc.getReferencesColumns();
+                        if (referenced == null || referenced.isEmpty()) {
+                            referenced = primaryKeyColumnsOf(refTable);
+                        }
+                        confkey = columnNamesToAttnums(refTable, referenced);
                     }
                     int conindid = 0;
                     if (sc.getType() == StoredConstraint.Type.PRIMARY_KEY
@@ -271,11 +279,11 @@ class CatalogConstraintBuilder {
                 java.util.Set<String> promotedUniqueColumns = new java.util.HashSet<>();
                 for (StoredConstraint usc : t.getConstraints()) {
                     if (usc.getType() == StoredConstraint.Type.UNIQUE && usc.isPromotedFromIndex()) {
-                        for (String c : usc.getColumns()) promotedUniqueColumns.add(c.toLowerCase());
+                        for (String c : usc.getColumns()) promotedUniqueColumns.add(c.toLowerCase(java.util.Locale.ROOT));
                     }
                 }
                 for (Column c : t.getColumns()) {
-                    boolean isPromotedUnique = promotedUniqueColumns.contains(c.getName().toLowerCase());
+                    boolean isPromotedUnique = promotedUniqueColumns.contains(c.getName().toLowerCase(java.util.Locale.ROOT));
                     // Emit NOT NULL for all NOT NULL columns (including PK columns),
                     // but skip columns covered by UNIQUE constraints promoted from index
                     if (!c.isNullable() && !isPromotedUnique) {
@@ -403,7 +411,7 @@ class CatalogConstraintBuilder {
                 if (!trig.isConstraintTrigger() || trig.getTableName() == null) continue;
                 String trigSchema = trig.getSchemaName() != null ? trig.getSchemaName() : "public";
                 String key = constraintKey(trigSchema, trig.getTableName(), trig.getName());
-                if (!seenTriggerConstraints.add(key.toLowerCase())) continue;
+                if (!seenTriggerConstraints.add(key.toLowerCase(java.util.Locale.ROOT))) continue;
                 table.insertRow(new Object[]{
                         oids.oid(key),
                         trig.getName(),
@@ -711,7 +719,7 @@ class CatalogConstraintBuilder {
         // Also add indexes from PK and UNIQUE constraints (implicit indexes)
         Set<String> existingIndexNames = new HashSet<>();
         for (String key : database.getIndexColumns().keySet()) {
-            existingIndexNames.add(key.toLowerCase());
+            existingIndexNames.add(key.toLowerCase(java.util.Locale.ROOT));
         }
         for (Map.Entry<String, Schema> schemaEntry : database.getSchemas().entrySet()) {
             for (Map.Entry<String, com.memgres.engine.Table> tableEntry : schemaEntry.getValue().getTables().entrySet()) {
@@ -721,7 +729,7 @@ class CatalogConstraintBuilder {
                     if (sc.getType() == StoredConstraint.Type.PRIMARY_KEY || sc.getType() == StoredConstraint.Type.UNIQUE) {
                         String indexName = sc.getName();
                         if (existingIndexNames.contains(
-                                Database.idxKey(schemaEntry.getKey(), indexName).toLowerCase())) continue;
+                                Database.idxKey(schemaEntry.getKey(), indexName).toLowerCase(java.util.Locale.ROOT))) continue;
                         List<Object> indkeyList = new java.util.ArrayList<>();
                         for (String colName : sc.getColumns()) {
                             int colIdx = t.getColumnIndex(colName);
@@ -1261,6 +1269,16 @@ class CatalogConstraintBuilder {
                 (String) op[0], (Integer) op[2], (Integer) op[3]);
     }
 
+    /** The columns the relation's primary key is over, in key order, or an empty list. */
+    private static List<String> primaryKeyColumnsOf(Table t) {
+        for (StoredConstraint sc : t.getConstraints()) {
+            if (sc.getType() == StoredConstraint.Type.PRIMARY_KEY) {
+                return sc.getColumns();
+            }
+        }
+        return java.util.Collections.emptyList();
+    }
+
     Table buildPgTrigger() {
         List<Column> cols = Cols.listOf(
                 colNN("oid", DataType.OID),
@@ -1291,8 +1309,8 @@ class CatalogConstraintBuilder {
         Map<String, List<PgTrigger>> byName = new java.util.LinkedHashMap<>();
         for (Map.Entry<String, List<PgTrigger>> entry : database.getAllTriggers().entrySet()) {
             for (PgTrigger trigger : entry.getValue()) {
-                String key = (trigger.getTableName() == null ? "" : trigger.getTableName().toLowerCase())
-                        + "." + trigger.getName().toLowerCase();
+                String key = (trigger.getTableName() == null ? "" : trigger.getTableName().toLowerCase(java.util.Locale.ROOT))
+                        + "." + trigger.getName().toLowerCase(java.util.Locale.ROOT);
                 byName.computeIfAbsent(key, k -> new java.util.ArrayList<>()).add(trigger);
             }
         }

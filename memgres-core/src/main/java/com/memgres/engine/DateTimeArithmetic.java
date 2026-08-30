@@ -469,7 +469,7 @@ class DateTimeArithmetic {
     }
 
     private static boolean isTimestampInfinity(String s) {
-        String t = s.trim().toLowerCase();
+        String t = s.trim().toLowerCase(java.util.Locale.ROOT);
         return t.equals("infinity") || t.equals("-infinity");
     }
 

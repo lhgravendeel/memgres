@@ -30,7 +30,7 @@ class ByteaFunctions {
     );
 
     private void validateEncoding(String encoding) {
-        String upper = encoding.toUpperCase();
+        String upper = encoding.toUpperCase(java.util.Locale.ROOT);
         if (!VALID_ENCODINGS.contains(upper) && !VALID_ENCODINGS.contains(upper.replace("-", ""))) {
             throw new MemgresException("encoding \"" + encoding + "\" does not exist", "22023");
         }

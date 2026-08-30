@@ -70,7 +70,7 @@ class CastEvaluator {
      *         jsonb has no cast to that type and the ordinary conversion should stand
      */
     static Object jsonbCastPayload(String json, String typeSpec) {
-        String lowerSpec = typeSpec == null ? "" : typeSpec.toLowerCase().trim();
+        String lowerSpec = typeSpec == null ? "" : typeSpec.toLowerCase(java.util.Locale.ROOT).trim();
         boolean wantBoolean = lowerSpec.equals("bool") || lowerSpec.equals("boolean");
         String numericTarget = jsonbNumericTarget(lowerSpec);
         if (!wantBoolean && numericTarget == null) return NOT_A_JSONB_CAST;
@@ -174,6 +174,14 @@ class CastEvaluator {
         String name = key.substring(5);
         int suffix = name.indexOf('#');
         return suffix > 0 ? name.substring(0, suffix) : name;
+    }
+
+    /** The role an OID was handed out for, or null when no role answers to it. */
+    private String roleNameForOid(int oid) {
+        String key = executor.systemCatalog.keyForOid(oid);
+        if (key != null && key.startsWith("role:")) return key.substring(5);
+        // The bootstrap superuser holds PostgreSQL's own OID for it rather than one handed out.
+        return oid == 10 ? executor.database.bootstrapRoleName() : null;
     }
 
     /** Maps PG OIDs to their canonical type names (used by ::regtype casts). */
@@ -481,7 +489,7 @@ class CastEvaluator {
         // than kept whole: a name is what identifies an object, and the server has no room for
         // more of it than that.
         if (result instanceof String && ((String) result).length() > 63
-                && "name".equals(typeSpec == null ? null : typeSpec.trim().toLowerCase())) {
+                && "name".equals(typeSpec == null ? null : typeSpec.trim().toLowerCase(java.util.Locale.ROOT))) {
             return ((String) result).substring(0, 63);
         }
         return result;
@@ -495,7 +503,7 @@ class CastEvaluator {
             // A name that denotes no type is refused before the value is looked at, and null is
             // no exception: it left here before any of the resolution below had run, so a bare
             // name went on finding a type in whatever schema happened to hold it.
-            String nullTypeName = typeSpec.toLowerCase().replaceAll("\\(.*\\)", "").trim();
+            String nullTypeName = typeSpec.toLowerCase(java.util.Locale.ROOT).replaceAll("\\(.*\\)", "").trim();
             refuseUnreachableType(nullTypeName);
             // A NOT NULL domain rejects null even through a cast, and the constraint is
             // inherited from every domain it is built on
@@ -514,7 +522,7 @@ class CastEvaluator {
         }
         // The word "null" is not input for any type: PG reads it as text and its input function
         // refuses it. Treating it as SQL NULL turned a malformed value into a missing one.
-        String lowerSpec = typeSpec.toLowerCase().trim();
+        String lowerSpec = typeSpec.toLowerCase(java.util.Locale.ROOT).trim();
 
         // A polymorphic pseudo-type is a placeholder, not a target: the value keeps whatever
         // concrete type the caller passed in.
@@ -532,7 +540,7 @@ class CastEvaluator {
         if (lowerSpec.equals("uuid")) {
             if (val instanceof Number || val instanceof Boolean) {
                 String srcType = val instanceof Integer ? "integer" : val instanceof Long ? "bigint" :
-                        val instanceof Boolean ? "boolean" : val.getClass().getSimpleName().toLowerCase();
+                        val instanceof Boolean ? "boolean" : val.getClass().getSimpleName().toLowerCase(java.util.Locale.ROOT);
                 throw new MemgresException("cannot cast type " + srcType + " to uuid", "42846");
             }
         }
@@ -627,10 +635,10 @@ class CastEvaluator {
         // float(p) is a name whose modifier picks the type rather than the width, so the value it
         // produces has to be narrowed to a real when p allows only a real's mantissa.
         DataType floatWidth = typeSpec.indexOf('(') > 0
-                ? DataType.fromPgName(typeSpec.toLowerCase().trim()) : null;
+                ? DataType.fromPgName(typeSpec.toLowerCase(java.util.Locale.ROOT).trim()) : null;
         if (floatWidth == DataType.REAL) return TypeCoercion.toFloat(val);
         if (floatWidth == DataType.DOUBLE_PRECISION) return TypeCoercion.toDouble(val);
-        String typeName = typeSpec.toLowerCase().replaceAll("\\(.*\\)", "").trim();
+        String typeName = typeSpec.toLowerCase(java.util.Locale.ROOT).replaceAll("\\(.*\\)", "").trim();
         // Handle array casting: when value is a List or PG array literal string, cast each element
         boolean isArrayCast = typeName.contains("[]");
         typeName = typeName.replace("[]", "").trim();
@@ -909,9 +917,9 @@ class CastEvaluator {
                 if (val instanceof java.time.LocalDate) {
                     java.time.LocalDate ld = (java.time.LocalDate) val;
                     String datestyle = (executor.session != null) ? executor.session.getGucSettings().get("datestyle") : "ISO, MDY";
-                    if (datestyle != null && datestyle.toLowerCase().contains("german")) {
+                    if (datestyle != null && datestyle.toLowerCase(java.util.Locale.ROOT).contains("german")) {
                         return ld.format(java.time.format.DateTimeFormatter.ofPattern("dd.MM.yyyy"));
-                    } else if (datestyle != null && datestyle.toLowerCase().contains("sql")) {
+                    } else if (datestyle != null && datestyle.toLowerCase(java.util.Locale.ROOT).contains("sql")) {
                         return ld.format(java.time.format.DateTimeFormatter.ofPattern("MM/dd/yyyy"));
                     }
                     return ld.toString();
@@ -1184,9 +1192,39 @@ class CastEvaluator {
                 if (val instanceof MacaddrValue) return ((MacaddrValue) val).toMacaddr8();
                 return Macaddr8Value.parse(val.toString());
             }
+            case "regrole": {
+                // A role has an OID like anything else in the catalogs, and reading one back has
+                // to name the role. Kept as whatever text arrived, an OID column cast to regrole
+                // printed the number it already held, and a role name cast to one was not
+                // resolved at all -- so a query joining on it matched nothing.
+                if (val instanceof RegroleValue) return val;
+                if (val instanceof Number) {
+                    int roleOid = ((Number) val).intValue();
+                    String named = roleNameForOid(roleOid);
+                    return new RegroleValue(roleOid,
+                            named != null ? named : String.valueOf(roleOid));
+                }
+                String roleText = val.toString().trim();
+                // A number written as text is an OID, not a role called "10".
+                try {
+                    int asOid = Integer.parseInt(roleText);
+                    String named = roleNameForOid(asOid);
+                    return new RegroleValue(asOid, named != null ? named : roleText);
+                } catch (NumberFormatException notANumber) {
+                    // A name, then, and it has to be one the server knows.
+                }
+                String bare = roleText.startsWith("\"") && roleText.endsWith("\"")
+                        && roleText.length() > 1
+                        ? roleText.substring(1, roleText.length() - 1) : roleText;
+                if (!executor.database.getRoles().containsKey(bare.toLowerCase(java.util.Locale.ROOT))
+                        && !bare.equalsIgnoreCase(executor.database.bootstrapRoleName())) {
+                    throw new MemgresException(
+                            "role \"" + bare + "\" does not exist", "42704");
+                }
+                return new RegroleValue(executor.systemCatalog.getOid("role:" + bare), bare);
+            }
             case "regconfig":
             case "regdictionary":
-            case "regrole":
             case "regoper":
             case "regoperator":
                 // reg* OID types — we don't track real OIDs for these internal objects;
@@ -1295,11 +1333,11 @@ class CastEvaluator {
                     schemaPrefix = schemaPrefix.substring(1, schemaPrefix.length() - 1);
                 }
                 // PG lowercases unquoted identifiers
-                String lowerName = relQuoted ? relName : relName.toLowerCase();
+                String lowerName = relQuoted ? relName : relName.toLowerCase(java.util.Locale.ROOT);
                 // Validate relation exists before returning OID
                 boolean rcExists = false;
                 if (schemaPrefix != null) {
-                    String lowerSchema = schemaPrefix.toLowerCase();
+                    String lowerSchema = schemaPrefix.toLowerCase(java.util.Locale.ROOT);
                     // Check system catalog tables (virtual tables in SystemCatalog)
                     if ("pg_catalog".equals(lowerSchema) && lowerName.startsWith("pg_")) {
                         rcExists = true; // All pg_catalog.pg_* tables are recognized
@@ -1346,10 +1384,10 @@ class CastEvaluator {
                 int regOid;
                 String displayName;
                 if (schemaPrefix != null) {
-                    regOid = executor.systemCatalog.getOid("rel:" + schemaPrefix.toLowerCase() + "." + lowerName);
+                    regOid = executor.systemCatalog.getOid("rel:" + schemaPrefix.toLowerCase(java.util.Locale.ROOT) + "." + lowerName);
                     // The name a regclass prints is the relation's own, so an unquoted ZZ_Q1 in
                     // the text prints as the zz_q1 it resolved to rather than as it was written.
-                    displayName = formatRegclassDisplay(schemaPrefix.toLowerCase() + "." + lowerName);
+                    displayName = formatRegclassDisplay(schemaPrefix.toLowerCase(java.util.Locale.ROOT) + "." + lowerName);
                 } else if (lowerName.startsWith("pg_")) {
                     regOid = executor.systemCatalog.getOid("rel:pg_catalog." + lowerName);
                     displayName = quoteIdentIfNeeded(lowerName);
@@ -1402,7 +1440,7 @@ class CastEvaluator {
                     String name = typeNameForOid(oid);
                     return new RegtypeValue(oid, name != null ? name : String.valueOf(oid));
                 }
-                String rtName = val.toString().trim().toLowerCase();
+                String rtName = val.toString().trim().toLowerCase(java.util.Locale.ROOT);
                 // Polymorphic pseudo-types are real pg_type rows, so they cast like any other name
                 if (PolymorphicTypes.isPolymorphic(rtName)) {
                     return new RegtypeValue(PolymorphicTypes.oid(rtName), rtName);
@@ -1541,6 +1579,8 @@ class CastEvaluator {
                 if (val instanceof RegclassValue) return ((RegclassValue) val).oid();
                 if (val instanceof RegprocValue) return ((RegprocValue) val).oid();
                 if (val instanceof RegtypeValue) return ((RegtypeValue) val).oid();
+                if (val instanceof RegnamespaceValue) return ((RegnamespaceValue) val).oid();
+                if (val instanceof RegroleValue) return ((RegroleValue) val).oid();
                 return readOid(val);
             }
             case "regnamespace": {
@@ -1925,7 +1965,7 @@ class CastEvaluator {
 
     /** Check if a trimmed string is an infinity literal accepted by PostgreSQL. */
     private static boolean isInfinityLiteral(String s) {
-        String lower = s.toLowerCase();
+        String lower = s.toLowerCase(java.util.Locale.ROOT);
         return lower.equals("infinity") || lower.equals("-infinity")
                 || lower.equals("+infinity") || lower.equals("inf")
                 || lower.equals("-inf") || lower.equals("+inf");
@@ -1944,7 +1984,7 @@ class CastEvaluator {
      * none to give.
      */
     private static String elementSpecOf(String typeSpec, String bareElementName) {
-        String spec = typeSpec == null ? "" : typeSpec.toLowerCase().trim();
+        String spec = typeSpec == null ? "" : typeSpec.toLowerCase(java.util.Locale.ROOT).trim();
         while (spec.endsWith("[]")) spec = spec.substring(0, spec.length() - 2).trim();
         return spec.indexOf('(') > 0 ? spec : bareElementName;
     }

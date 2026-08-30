@@ -80,7 +80,7 @@ final class AstRelationRenamer {
             if (node instanceof SelectStmt.TableRef) {
                 SelectStmt.TableRef ref = (SelectStmt.TableRef) node;
                 // A bare name a WITH item bound is that item's, not the relation's.
-                if (ref.schema() == null && bound.contains(ref.table().toLowerCase())) return;
+                if (ref.schema() == null && bound.contains(ref.table().toLowerCase(java.util.Locale.ROOT))) return;
                 if (!matches(ref, schema, name)) return;
                 found = true;
                 if (newName == null) return;
@@ -98,7 +98,7 @@ final class AstRelationRenamer {
                 if (select.withClauses() != null && !select.withClauses().isEmpty()) {
                     inner = new HashSet<>(bound);
                     for (SelectStmt.CommonTableExpr cte : select.withClauses()) {
-                        if (cte != null && cte.name() != null) inner.add(cte.name().toLowerCase());
+                        if (cte != null && cte.name() != null) inner.add(cte.name().toLowerCase(java.util.Locale.ROOT));
                     }
                 }
                 visitFields(select, inner);

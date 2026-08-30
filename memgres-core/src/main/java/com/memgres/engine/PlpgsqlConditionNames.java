@@ -14,7 +14,7 @@ public final class PlpgsqlConditionNames {
     private PlpgsqlConditionNames() {}
 
     public static boolean isKnown(String name) {
-        return NAMES.contains(name.toLowerCase());
+        return NAMES.contains(name.toLowerCase(java.util.Locale.ROOT));
     }
 
     /**

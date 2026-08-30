@@ -78,7 +78,7 @@ class DdlIndexParser {
                         sb.append(parser.advance().value());
                         val = sb.toString();
                     }
-                    withOptions.put(key.toLowerCase(), val);
+                    withOptions.put(key.toLowerCase(java.util.Locale.ROOT), val);
                 } while (parser.match(TokenType.COMMA));
                 parser.expect(TokenType.RIGHT_PAREN);
             }
@@ -325,7 +325,7 @@ class DdlIndexParser {
      */
     private boolean requireIndexKeyStart(Token head) {
         if (head.type() == TokenType.QUOTED_IDENTIFIER) return false;
-        String word = head.value() == null ? "" : head.value().toUpperCase();
+        String word = head.value() == null ? "" : head.value().toUpperCase(java.util.Locale.ROOT);
         if (KEY_CONSTRUCTS.contains(word)) return false;
         if (PgKeywords.isReserved(word)) {
             throw PgErrors.syntax("syntax error at or near \"" + tokenInMessage(head) + "\"");

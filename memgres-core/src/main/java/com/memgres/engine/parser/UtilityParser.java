@@ -70,7 +70,7 @@ class UtilityParser {
         if (parser.check(TokenType.STRING_LITERAL)) {
             source = parser.advance().value();
         } else {
-            source = parser.readIdentifier().toUpperCase();
+            source = parser.readIdentifier().toUpperCase(java.util.Locale.ROOT);
         }
         // Handle PROGRAM keyword: consume the program command string
         if ("PROGRAM".equals(source)) {
@@ -204,10 +204,10 @@ class UtilityParser {
 
     /** Read one entry of a COPY option list, refusing what PostgreSQL's own option loop refuses. */
     private void readCopyOption(CopyOptions opts, boolean isFrom, boolean parenthesised) {
-        String opt = parser.readIdentifier().toUpperCase();
+        String opt = parser.readIdentifier().toUpperCase(java.util.Locale.ROOT);
         switch (opt) {
             case "FORMAT":
-                opts.format = parser.readIdentifier().toLowerCase();
+                opts.format = parser.readIdentifier().toLowerCase(java.util.Locale.ROOT);
                 if (!"text".equals(opts.format) && !"csv".equals(opts.format)
                         && !"binary".equals(opts.format)) {
                     throw new MemgresException(
@@ -279,14 +279,14 @@ class UtilityParser {
                 }
                 break;
             case "ON_ERROR":
-                opts.onError = parser.readIdentifier().toLowerCase();
+                opts.onError = parser.readIdentifier().toLowerCase(java.util.Locale.ROOT);
                 if (!"stop".equals(opts.onError) && !"ignore".equals(opts.onError)) {
                     throw new MemgresException(
                             "COPY ON_ERROR \"" + opts.onError + "\" not recognized", "22023");
                 }
                 break;
             case "LOG_VERBOSITY":
-                opts.logVerbosity = parser.readIdentifier().toLowerCase();
+                opts.logVerbosity = parser.readIdentifier().toLowerCase(java.util.Locale.ROOT);
                 if (!"default".equals(opts.logVerbosity) && !"verbose".equals(opts.logVerbosity)
                         && !"silent".equals(opts.logVerbosity)) {
                     throw new MemgresException(
@@ -324,7 +324,7 @@ class UtilityParser {
     }
 
     private static MemgresException unknownCopyOption(String opt) {
-        return new MemgresException("option \"" + opt.toLowerCase() + "\" not recognized", "42601");
+        return new MemgresException("option \"" + opt.toLowerCase(java.util.Locale.ROOT) + "\" not recognized", "42601");
     }
 
     /**
@@ -339,7 +339,7 @@ class UtilityParser {
             return t.value();
         }
         if ((t.type() == TokenType.KEYWORD || t.type() == TokenType.IDENTIFIER)
-                && BOOLEAN_WORDS.contains(t.value().toUpperCase())) {
+                && BOOLEAN_WORDS.contains(t.value().toUpperCase(java.util.Locale.ROOT))) {
             parser.advance();
             return t.value();
         }
@@ -348,7 +348,7 @@ class UtilityParser {
 
     /** PostgreSQL's Boolean spellings, or null when the word is not one of them. */
     private static Boolean booleanValue(String value) {
-        String v = value.trim().toLowerCase();
+        String v = value.trim().toLowerCase(java.util.Locale.ROOT);
         if ("true".equals(v) || "t".equals(v) || "yes".equals(v) || "y".equals(v)
                 || "on".equals(v) || "1".equals(v)) {
             return Boolean.TRUE;
@@ -547,7 +547,7 @@ class UtilityParser {
      * an object called name is called: COMMENT ON COLUMN t.name has to reach the column name.
      */
     private static String identifierSpelling(Token token) {
-        return token.type() == TokenType.KEYWORD ? token.value().toLowerCase() : token.value();
+        return token.type() == TokenType.KEYWORD ? token.value().toLowerCase(java.util.Locale.ROOT) : token.value();
     }
 
     /**
@@ -620,7 +620,7 @@ class UtilityParser {
             parser.advance(); // XML
             if (parser.matchKeyword("OPTION")) {
                 String mode = parser.readIdentifier(); // DOCUMENT or CONTENT
-                return new SetStmt("xmloption", mode.toLowerCase());
+                return new SetStmt("xmloption", mode.toLowerCase(java.util.Locale.ROOT));
             }
             // Otherwise fall through; treat as SET xml = ...
             if (parser.match(TokenType.EQUALS) || parser.matchKeyword("TO")) {
@@ -858,7 +858,7 @@ class UtilityParser {
         String target = parser.readIdentifier();
         // DISCARD names one of these, and anything else is a syntax error where it stands rather
         // than a discard of nothing at all.
-        if (target == null || !DISCARD_TARGETS.contains(target.toLowerCase())) {
+        if (target == null || !DISCARD_TARGETS.contains(target.toLowerCase(java.util.Locale.ROOT))) {
             throw ParseException.saying(SYNTAX_AT + targetToken.raw() + Q, targetToken, "42601");
         }
         parser.expectEndOfStatement();
@@ -1128,7 +1128,7 @@ class UtilityParser {
             // An unquoted word is folded to lower case, the way every identifier is; a quoted one
             // keeps what was written, so it matches no option and is reported as written.
             String name = nameToken.type() == TokenType.QUOTED_IDENTIFIER
-                    ? nameToken.value() : nameToken.value().toLowerCase();
+                    ? nameToken.value() : nameToken.value().toLowerCase(java.util.Locale.ROOT);
             String value = null;
             boolean numeric = false;
             if (!parser.check(TokenType.COMMA) && !parser.check(TokenType.RIGHT_PAREN)) {
@@ -1146,7 +1146,7 @@ class UtilityParser {
                 } else if (valueToken.type() == TokenType.IDENTIFIER
                         || valueToken.type() == TokenType.KEYWORD) {
                     parser.advance();
-                    value = valueToken.value().toLowerCase();
+                    value = valueToken.value().toLowerCase(java.util.Locale.ROOT);
                 } else if (valueToken.type() == TokenType.STRING_LITERAL
                         || valueToken.type() == TokenType.QUOTED_IDENTIFIER) {
                     parser.advance();
@@ -1176,7 +1176,7 @@ class UtilityParser {
             throw ParseException.saying("syntax error at end of input", first, "42601");
         }
         if (parser.check(TokenType.LEFT_PAREN)) return parser.parseStatement();
-        String word = first.value() == null ? "" : first.value().toUpperCase();
+        String word = first.value() == null ? "" : first.value().toUpperCase(java.util.Locale.ROOT);
         if (word.equals("SELECT") || word.equals("VALUES") || word.equals("TABLE")
                 || word.equals("WITH") || word.equals("INSERT") || word.equals("UPDATE")
                 || word.equals("DELETE") || word.equals("MERGE") || word.equals("DECLARE")
@@ -1354,7 +1354,7 @@ class UtilityParser {
         }
         String v = opt.value;
         if (v.equals("text") || v.equals("xml") || v.equals("json") || v.equals("yaml")) {
-            return v.toUpperCase();
+            return v.toUpperCase(java.util.Locale.ROOT);
         }
         throw new ExplainOptionError("unrecognized value for EXPLAIN option \"format\": \""
                 + opt.value + "\"", "22023");
@@ -1638,25 +1638,38 @@ class UtilityParser {
     GrantStmt parseGrantInner() {
         List<String> privileges = new ArrayList<>();
         List<String> columns = null;
+        // Each privilege carries the column list written after it, which need not be the same
+        // list as the one after the privilege before it.
+        java.util.Map<String, List<String>> columnsByPrivilege = new java.util.LinkedHashMap<>();
 
+        // The same list is read whether these turn out to be privilege names or role names, and
+        // a role keeps the case it was created with. Upper-cased for both, GRANT r TO r named a
+        // role called R and the message quoted a name nobody wrote.
+        List<String> written = new ArrayList<>();
         // Read privileges: ALL [PRIVILEGES], SELECT, INSERT, UPDATE, DELETE, ALTER SYSTEM, etc.
         do {
-            String priv = parser.readIdentifier().toUpperCase();
+            String spelled = parser.readIdentifier();
+            written.add(spelled);
+            String priv = spelled.toUpperCase(java.util.Locale.ROOT);
             if (priv.equals("ALL")) {
                 parser.matchKeyword("PRIVILEGES");
-                privileges.add("ALL");
+                priv = "ALL";
             } else if (priv.equals("ALTER") && parser.checkKeyword("SYSTEM")) {
                 parser.advance(); // consume SYSTEM
-                privileges.add("ALTER SYSTEM");
-            } else {
-                privileges.add(priv);
+                priv = "ALTER SYSTEM";
             }
+            privileges.add(priv);
             // Column-level privileges: UPDATE (col1, col2)
             if (parser.check(TokenType.LEFT_PAREN) && !parser.checkKeyword("ON")) {
                 parser.advance(); // (
-                columns = new ArrayList<>();
-                do { columns.add(parser.readIdentifier()); } while (parser.match(TokenType.COMMA));
+                List<String> own = new ArrayList<>();
+                do { own.add(parser.readIdentifier()); } while (parser.match(TokenType.COMMA));
                 parser.expect(TokenType.RIGHT_PAREN);
+                columnsByPrivilege.put(priv, own);
+                if (columns == null) columns = new ArrayList<>();
+                for (String col : own) {
+                    if (!columns.contains(col)) columns.add(col);
+                }
             }
         } while (parser.match(TokenType.COMMA));
 
@@ -1676,7 +1689,7 @@ class UtilityParser {
                 parser.expectKeyword("BY");
                 roleGrantor = parser.readIdentifier();
             }
-            return new GrantStmt(privileges, null, null, grantees, false, withAdmin, true, null, roleGrantor);
+            return new GrantStmt(written, null, null, grantees, false, withAdmin, true, null, roleGrantor);
         }
 
         // GRANT privileges ON object TO roles
@@ -1702,7 +1715,7 @@ class UtilityParser {
 
         if (parser.matchKeyword("ALL")) {
             // ALL TABLES IN SCHEMA, ALL SEQUENCES IN SCHEMA, ALL FUNCTIONS IN SCHEMA
-            String what = parser.readIdentifier().toUpperCase(); // TABLES, SEQUENCES, FUNCTIONS
+            String what = parser.readIdentifier().toUpperCase(java.util.Locale.ROOT); // TABLES, SEQUENCES, FUNCTIONS
             parser.expectKeyword("IN");
             parser.expectKeyword("SCHEMA");
             objectName = parser.readIdentifier();
@@ -1717,7 +1730,12 @@ class UtilityParser {
         } else if (parser.matchKeyword("FUNCTION") || parser.matchKeyword("PROCEDURE") || parser.matchKeyword("ROUTINE")) {
             objectType = "FUNCTION";
             objectName = parser.readIdentifier();
-            if (parser.check(TokenType.LEFT_PAREN)) parser.consumeUntilParen();
+            // The argument list says which routine of that name this is, so it travels with the
+            // name. Consumed and thrown away, a grant on one overload was a grant on whichever
+            // overload happened to be found, and a signature matching none was not noticed.
+            if (parser.check(TokenType.LEFT_PAREN)) {
+                objectName = objectName + writtenArgumentList();
+            }
         } else if (parser.matchKeyword("SCHEMA")) {
             objectType = "SCHEMA";
             objectName = parser.readIdentifier();
@@ -1762,6 +1780,13 @@ class UtilityParser {
         if (parser.matchKeywords("WITH", "GRANT")) {
             parser.expectKeyword("OPTION");
             withGrantOption = true;
+        } else if (parser.checkKeyword("WITH")) {
+            // A privilege grant carries WITH GRANT OPTION and nothing else. ADMIN OPTION belongs
+            // to a membership grant, and read as though it were the same thing a statement asking
+            // for one on a table was accepted and did neither.
+            Token with = parser.peek();
+            parser.advance();
+            throw ParseException.at(parser.isAtEnd() ? with : parser.peek());
         }
 
         // Consume optional GRANTED BY role and capture the grantor name
@@ -1772,7 +1797,8 @@ class UtilityParser {
             grantor = parser.readIdentifier();
         }
 
-        return new GrantStmt(privileges, objectType, objectName, grantees, withGrantOption, false, false, columns, grantor);
+        return new GrantStmt(privileges, objectType, objectName, grantees, withGrantOption, false,
+                false, columns, grantor).withPerPrivilegeColumns(columnsByPrivilege);
     }
 
     // ---- REVOKE ----
@@ -1792,9 +1818,14 @@ class UtilityParser {
         }
 
         List<String> privileges = new ArrayList<>();
+        // As for GRANT: the same list is read whether these are privilege names or role names,
+        // and a role keeps the case it was created with.
+        List<String> revokeWritten = new ArrayList<>();
         List<String> revokeColumns = null;
         do {
-            String priv = parser.readIdentifier().toUpperCase();
+            String spelledRevoke = parser.readIdentifier();
+            revokeWritten.add(spelledRevoke);
+            String priv = spelledRevoke.toUpperCase(java.util.Locale.ROOT);
             if (priv.equals("ALL")) {
                 parser.matchKeyword("PRIVILEGES");
                 privileges.add("ALL");
@@ -1818,7 +1849,7 @@ class UtilityParser {
             do { grantees.add(parser.readIdentifier()); } while (parser.match(TokenType.COMMA));
             boolean cascade = parser.matchKeyword("CASCADE");
             parser.matchKeyword("RESTRICT");
-            return new RevokeStmt(privileges, null, null, grantees, adminOptionFor, true, cascade);
+            return new RevokeStmt(revokeWritten, null, null, grantees, adminOptionFor, true, cascade);
         }
 
         // REVOKE privileges ON object FROM roles
@@ -1827,7 +1858,7 @@ class UtilityParser {
         String objectName;
 
         if (parser.matchKeyword("ALL")) {
-            String what = parser.readIdentifier().toUpperCase();
+            String what = parser.readIdentifier().toUpperCase(java.util.Locale.ROOT);
             parser.expectKeyword("IN");
             parser.expectKeyword("SCHEMA");
             objectName = parser.readIdentifier();
@@ -1842,7 +1873,12 @@ class UtilityParser {
         } else if (parser.matchKeyword("FUNCTION") || parser.matchKeyword("PROCEDURE") || parser.matchKeyword("ROUTINE")) {
             objectType = "FUNCTION";
             objectName = parser.readIdentifier();
-            if (parser.check(TokenType.LEFT_PAREN)) parser.consumeUntilParen();
+            // The argument list says which routine of that name this is, so it travels with the
+            // name. Consumed and thrown away, a grant on one overload was a grant on whichever
+            // overload happened to be found, and a signature matching none was not noticed.
+            if (parser.check(TokenType.LEFT_PAREN)) {
+                objectName = objectName + writtenArgumentList();
+            }
         } else if (parser.matchKeyword("SCHEMA")) {
             objectType = "SCHEMA";
             objectName = parser.readIdentifier();
@@ -1894,10 +1930,12 @@ class UtilityParser {
         parser.expectKeyword("REASSIGN");
         parser.expectKeyword("OWNED");
         parser.expectKeyword("BY");
-        String oldRole = parser.readIdentifier();
+        List<String> oldRoles = new ArrayList<>();
+        do { oldRoles.add(parser.readIdentifier()); } while (parser.match(TokenType.COMMA));
         parser.expectKeyword("TO");
         String newRole = parser.readIdentifier();
-        return new ReassignOwnedStmt(oldRole, newRole);
+        parser.expectEndOfStatement();
+        return new ReassignOwnedStmt(oldRoles, newRole);
     }
 
     // ---- DO block ----
@@ -2208,6 +2246,24 @@ class UtilityParser {
         return null;
     }
 
+    /**
+     * The parenthesised argument list as it was written, for a name that carries its signature.
+     * A routine is told apart by its arguments, so the list is part of what a statement named.
+     */
+    private String writtenArgumentList() {
+        StringBuilder out = new StringBuilder("(");
+        parser.expect(TokenType.LEFT_PAREN);
+        boolean first = true;
+        while (!parser.isAtEnd() && !parser.check(TokenType.RIGHT_PAREN)) {
+            if (parser.match(TokenType.COMMA)) { out.append(", "); first = true; continue; }
+            if (!first) out.append(' ');
+            out.append(identifierSpelling(parser.advance()));
+            first = false;
+        }
+        parser.match(TokenType.RIGHT_PAREN);
+        return out.append(')').toString();
+    }
+
     /** A word the grammar requires, reported where it is missing rather than where it ends. */
     private void expectWordOrSyntaxError(String word) {
         if (parser.matchWord(word)) return;
@@ -2346,11 +2402,11 @@ class UtilityParser {
             sb.append('.').append(identifierSpelling(parser.advance()));
         }
         if (parser.checkWord("PRECISION") || parser.checkWord("VARYING")) {
-            sb.append(' ').append(parser.advance().value().toLowerCase());
+            sb.append(' ').append(parser.advance().value().toLowerCase(java.util.Locale.ROOT));
         } else if (parser.checkWord("WITH") || parser.checkWord("WITHOUT")) {
-            sb.append(' ').append(parser.advance().value().toLowerCase());
-            if (parser.checkWord("TIME")) sb.append(' ').append(parser.advance().value().toLowerCase());
-            if (parser.checkWord("ZONE")) sb.append(' ').append(parser.advance().value().toLowerCase());
+            sb.append(' ').append(parser.advance().value().toLowerCase(java.util.Locale.ROOT));
+            if (parser.checkWord("TIME")) sb.append(' ').append(parser.advance().value().toLowerCase(java.util.Locale.ROOT));
+            if (parser.checkWord("ZONE")) sb.append(' ').append(parser.advance().value().toLowerCase(java.util.Locale.ROOT));
         }
         if (parser.check(TokenType.LEFT_PAREN)) {
             // A length or precision belongs to the written type but not to which type it is.

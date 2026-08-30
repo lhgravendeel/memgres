@@ -201,7 +201,7 @@ class DdlViewExecutor {
         if (columns == null) return;
         Set<String> seen = new HashSet<>();
         for (Column c : columns) {
-            if (!seen.add(c.getName().toLowerCase())) {
+            if (!seen.add(c.getName().toLowerCase(java.util.Locale.ROOT))) {
                 throw PgErrors.duplicateColumn(c.getName());
             }
         }
@@ -286,7 +286,7 @@ class DdlViewExecutor {
 
     private static List<String> columnNamesOf(QueryResult result) {
         List<String> names = new ArrayList<>();
-        for (Column c : result.getColumns()) names.add(c.getName().toLowerCase());
+        for (Column c : result.getColumns()) names.add(c.getName().toLowerCase(java.util.Locale.ROOT));
         return names;
     }
 
@@ -362,7 +362,7 @@ class DdlViewExecutor {
                 Set<String> emittedUsing = new HashSet<>();
                 for (RowContext.TableBinding b : bindings) {
                     for (Column c : b.table().getColumns()) {
-                        String lower = c.getName().toLowerCase();
+                        String lower = c.getName().toLowerCase(java.util.Locale.ROOT);
                         if (usingCols.contains(lower)) {
                             // USING columns are merged: emit once, unqualified so the
                             // runtime COALESCE(left, right) semantics are preserved.
@@ -404,7 +404,7 @@ class DdlViewExecutor {
             settled.add(body == item.query() ? item : withBody(item, body));
             List<String> names = item.columnNames() != null && !item.columnNames().isEmpty()
                     ? item.columnNames() : publishedNames(body);
-            if (names != null && item.name() != null) scope.put(item.name().toLowerCase(), names);
+            if (names != null && item.name() != null) scope.put(item.name().toLowerCase(java.util.Locale.ROOT), names);
         }
         return changed ? settled : items;
     }
@@ -453,13 +453,13 @@ class DdlViewExecutor {
         if (s.from().size() != 1 || !(s.from().get(0) instanceof SelectStmt.TableRef)) return null;
         SelectStmt.TableRef ref = (SelectStmt.TableRef) s.from().get(0);
         if (ref.schema() != null || ref.table() == null) return null;
-        List<String> columns = scope.get(ref.table().toLowerCase());
+        List<String> columns = scope.get(ref.table().toLowerCase(java.util.Locale.ROOT));
         if (columns == null || columns.isEmpty()) return null;
         // A WITH item publishing two columns of one name is a view PostgreSQL refuses to create,
         // so the star over it is left as it was and the refusal is reported where it already was.
         Set<String> seen = new HashSet<>();
         for (String column : columns) {
-            if (!seen.add(column.toLowerCase())) return null;
+            if (!seen.add(column.toLowerCase(java.util.Locale.ROOT))) return null;
         }
         String readAs = ref.alias() != null ? ref.alias() : ref.table();
         List<SelectStmt.SelectTarget> newTargets = new ArrayList<>();
@@ -486,7 +486,7 @@ class DdlViewExecutor {
             } else if (item instanceof SelectStmt.TableRef) {
                 SelectStmt.TableRef ref = (SelectStmt.TableRef) item;
                 if (ref.schema() == null && ref.table() != null
-                        && scope.containsKey(ref.table().toLowerCase())) {
+                        && scope.containsKey(ref.table().toLowerCase(java.util.Locale.ROOT))) {
                     return true;
                 }
             }
@@ -504,7 +504,7 @@ class DdlViewExecutor {
         if (item instanceof SelectStmt.JoinFrom) {
             SelectStmt.JoinFrom j = (SelectStmt.JoinFrom) item;
             if (j.using() != null) {
-                for (String col : j.using()) out.add(col.toLowerCase());
+                for (String col : j.using()) out.add(col.toLowerCase(java.util.Locale.ROOT));
             }
             collectUsingColumnsFromItem(j.left(), out);
             collectUsingColumnsFromItem(j.right(), out);
@@ -640,7 +640,7 @@ class DdlViewExecutor {
             SelectStmt.SelectTarget old = newTargets.get(i);
             String oldName = old.alias() != null ? old.alias() : executor.exprToAlias(old.expr());
             if (oldName != null && !oldName.equalsIgnoreCase(names.get(i))) {
-                renames.put(oldName.toLowerCase(), names.get(i));
+                renames.put(oldName.toLowerCase(java.util.Locale.ROOT), names.get(i));
             }
             newTargets.set(i, new SelectStmt.SelectTarget(old.expr(), names.get(i)));
         }
@@ -651,7 +651,7 @@ class DdlViewExecutor {
             for (SelectStmt.OrderByItem item : newOrderBy) {
                 Expression e = item.expr();
                 if (e instanceof ColumnRef && ((ColumnRef) e).table() == null && ((ColumnRef) e).column() != null) {
-                    String replacement = renames.get(((ColumnRef) e).column().toLowerCase());
+                    String replacement = renames.get(((ColumnRef) e).column().toLowerCase(java.util.Locale.ROOT));
                     if (replacement != null && !isFromColumn(s, ((ColumnRef) e).column())) {
                         rewritten.add(new SelectStmt.OrderByItem(new ColumnRef(null, replacement),
                                 item.descending(), item.nullsFirst()));

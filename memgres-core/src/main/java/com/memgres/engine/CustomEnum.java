@@ -19,7 +19,7 @@ public class CustomEnum {
 
     public CustomEnum(String schemaName, String name, List<String> labels) {
         this(name, labels);
-        if (schemaName != null && !schemaName.isEmpty()) this.schemaName = schemaName.toLowerCase();
+        if (schemaName != null && !schemaName.isEmpty()) this.schemaName = schemaName.toLowerCase(java.util.Locale.ROOT);
     }
 
     public CustomEnum(String name, List<String> labels) {
@@ -42,7 +42,7 @@ public class CustomEnum {
     }
 
     public void setSchemaName(String schemaName) {
-        if (schemaName != null && !schemaName.isEmpty()) this.schemaName = schemaName.toLowerCase();
+        if (schemaName != null && !schemaName.isEmpty()) this.schemaName = schemaName.toLowerCase(java.util.Locale.ROOT);
     }
 
     public List<String> getLabels() {

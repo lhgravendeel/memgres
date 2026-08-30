@@ -5,7 +5,19 @@ public final class DropOwnedStmt implements Statement {
     public final String role;
     public final boolean cascade;
 
+    public DropOwnedStmt(java.util.List<String> roles, boolean cascade) {
+        this.roles = roles;
+        this.role = roles.isEmpty() ? null : roles.get(0);
+        this.cascade = cascade;
+    }
+
+    /** Every role the statement named; it drops what all of them own. */
+    public java.util.List<String> roles() { return roles; }
+
+    private java.util.List<String> roles;
+
     public DropOwnedStmt(String role, boolean cascade) {
+        this.roles = java.util.Collections.singletonList(role);
         this.role = role;
         this.cascade = cascade;
     }

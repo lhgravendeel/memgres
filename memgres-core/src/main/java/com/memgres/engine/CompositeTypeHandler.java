@@ -17,7 +17,7 @@ class CompositeTypeHandler {
     String resolveCompositeTypeName(Expression expr, RowContext ctx) {
         if (expr instanceof CastExpr) {
             CastExpr cast = (CastExpr) expr;
-            String tn = cast.typeName().toLowerCase().trim();
+            String tn = cast.typeName().toLowerCase(java.util.Locale.ROOT).trim();
             if (executor.database.isCompositeType(tn)) return tn;
             // Tables also serve as composite types in PG
             if (executor.database.getTable(tn) != null) return tn;
@@ -32,7 +32,7 @@ class CompositeTypeHandler {
                 if (fields != null) {
                     for (CreateTypeStmt.CompositeField f : fields) {
                         if (f.name().equalsIgnoreCase(innerFa.field())) {
-                            String ft = f.typeName().toLowerCase().trim();
+                            String ft = f.typeName().toLowerCase(java.util.Locale.ROOT).trim();
                             if (executor.database.isCompositeType(ft)) return ft;
                             return null;
                         }
@@ -45,7 +45,7 @@ class CompositeTypeHandler {
             ColumnRef ref = (ColumnRef) expr;
             Column col = ctx.resolveColumnDef(ref.table(), ref.column());
             if (col != null && col.getCompositeTypeName() != null) {
-                return col.getCompositeTypeName().toLowerCase();
+                return col.getCompositeTypeName().toLowerCase(java.util.Locale.ROOT);
             }
             return null;
         }
@@ -58,7 +58,7 @@ class CompositeTypeHandler {
         if (expr instanceof FunctionCallExpr) {
             FunctionCallExpr fn = (FunctionCallExpr) expr;
             // populate_record / json_populate_record return the type of their first argument
-            String fname = fn.name().toLowerCase();
+            String fname = fn.name().toLowerCase(java.util.Locale.ROOT);
             // Both families fill the same record from the same base argument, so both take their
             // shape from it -- reading only the json one left (jsonb_populate_record(...)).*
             // with no columns to expand to and so no row at all.
@@ -69,7 +69,7 @@ class CompositeTypeHandler {
             }
             PgFunction pgFunc = executor.database.getFunction(fn.name());
             if (pgFunc != null) {
-                String rt = pgFunc.getReturnType().toLowerCase().trim();
+                String rt = pgFunc.getReturnType().toLowerCase(java.util.Locale.ROOT).trim();
                 if (executor.database.isCompositeType(rt)) return rt;
             }
             return null;
@@ -95,7 +95,7 @@ class CompositeTypeHandler {
                                 if (idx >= 0) {
                                     Column col = table.getColumns().get(idx);
                                     if (col.getCompositeTypeName() != null) {
-                                        return col.getCompositeTypeName().toLowerCase();
+                                        return col.getCompositeTypeName().toLowerCase(java.util.Locale.ROOT);
                                     }
                                 }
                             }
@@ -123,12 +123,12 @@ class CompositeTypeHandler {
             Column col = ctx.resolveColumnDef(ref.table(), ref.column());
             if (col != null && col.getArrayElementType() != null
                     && col.getCompositeTypeName() != null) {
-                return col.getCompositeTypeName().toLowerCase();
+                return col.getCompositeTypeName().toLowerCase(java.util.Locale.ROOT);
             }
             return null;
         }
         if (expr instanceof CastExpr) {
-            String written = ((CastExpr) expr).typeName().toLowerCase().trim();
+            String written = ((CastExpr) expr).typeName().toLowerCase(java.util.Locale.ROOT).trim();
             if (!written.endsWith("[]")) return null;
             String element = written.substring(0, written.length() - 2).trim();
             return executor.database.isCompositeType(element) ? element : null;
@@ -153,7 +153,7 @@ class CompositeTypeHandler {
         if (val instanceof java.util.Map) {
             @SuppressWarnings("unchecked")
             java.util.Map<String, Object> map = (java.util.Map<String, Object>) val;
-            Object fieldVal = map.get(fieldName.toLowerCase());
+            Object fieldVal = map.get(fieldName.toLowerCase(java.util.Locale.ROOT));
             if (fieldVal == null) fieldVal = map.get(fieldName);
             return fieldVal;
         }
@@ -328,7 +328,7 @@ class CompositeTypeHandler {
     Object coerceFieldValue(String val, String typeName, boolean quoted) {
         if (val == null) return null;
         if (val.isEmpty() && !quoted) return null;
-        String lt = typeName.toLowerCase().trim();
+        String lt = typeName.toLowerCase(java.util.Locale.ROOT).trim();
         try {
             switch (lt) {
                 case "int":

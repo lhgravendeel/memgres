@@ -23,7 +23,7 @@ final class MacaddrGrouping {
      */
     static byte[] read(String input, String typeName, int digits, int[][] groupings) {
         if (input == null) return null;
-        String s = input.trim().toLowerCase();
+        String s = input.trim().toLowerCase(java.util.Locale.ROOT);
         // A group written with a sign is a number out of range rather than a spelling this does
         // not know: PostgreSQL reads it, finds it is not a byte, and says so.
         for (int i = 1; i < s.length(); i++) {

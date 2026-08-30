@@ -88,6 +88,11 @@ public class SystemCatalog implements OidSupplier {
         oidMap.put("ns:information_schema", 13240);
         oidMap.put("ns:pg_toast", 99);
 
+        // The two tablespaces every cluster has are fixed by convention too, and a reader asking
+        // one of them where it lives names it by the OID PostgreSQL gives it.
+        oidMap.put("tablespace:pg_default", 1663);
+        oidMap.put("tablespace:pg_global", 1664);
+
         this.pgCatalogBuilder = new PgCatalogBuilder(database, this);
         this.infoSchemaBuilder = new InfoSchemaBuilder(database, this);
     }
@@ -97,10 +102,10 @@ public class SystemCatalog implements OidSupplier {
      */
     public static boolean isSystemCatalog(String schema, String table) {
         if (schema == null) {
-            String lower = table.toLowerCase();
+            String lower = table.toLowerCase(java.util.Locale.ROOT);
             return lower.startsWith("pg_") || lower.startsWith("information_schema.");
         }
-        String s = schema.toLowerCase();
+        String s = schema.toLowerCase(java.util.Locale.ROOT);
         return s.equals("pg_catalog") || s.equals("information_schema");
     }
 
@@ -154,8 +159,8 @@ public class SystemCatalog implements OidSupplier {
      * (pg_prepared_statements, pg_cursors).
      */
     public Table resolve(String schema, String tableName, Session session) {
-        String tbl = tableName.toLowerCase();
-        String sch = schema != null ? schema.toLowerCase() : null;
+        String tbl = tableName.toLowerCase(java.util.Locale.ROOT);
+        String sch = schema != null ? schema.toLowerCase(java.util.Locale.ROOT) : null;
 
         boolean isPgCatalog = (sch == null && tbl.startsWith("pg_")) || "pg_catalog".equals(sch);
         boolean isInfoSchema = "information_schema".equals(sch);

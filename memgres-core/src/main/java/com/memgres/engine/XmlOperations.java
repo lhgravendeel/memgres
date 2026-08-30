@@ -274,7 +274,7 @@ public final class XmlOperations {
         if (!saysStandalone && saidVersion.equals("1.0")) return body;
         StringBuilder decl = new StringBuilder("<?xml version=\"").append(saidVersion).append('"');
         if (saysStandalone) {
-            decl.append(" standalone=\"").append(standalone.toLowerCase()).append('"');
+            decl.append(" standalone=\"").append(standalone.toLowerCase(java.util.Locale.ROOT)).append('"');
         }
         decl.append("?>");
         return decl.toString() + body;

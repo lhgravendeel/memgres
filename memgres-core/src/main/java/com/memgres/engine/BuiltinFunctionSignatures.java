@@ -1290,6 +1290,7 @@ public final class BuiltinFunctionSignatures {
             {"to_regclass", "2205", "25", "fs", "1"},
             {"to_regproc", "24", "25", "fs", "1"},
             {"to_regprocedure", "2202", "25", "fs", "1"},
+            {"to_regrole", "4096", "25", "fs", "1"},
             {"to_regtype", "2206", "25", "fs", "1"},
             {"to_timestamp", "1184", "701", "fi", "1"},
             {"to_timestamp", "1184", "25 25", "fs", "2"},

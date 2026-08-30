@@ -64,7 +64,7 @@ class DdlTableParser {
             // Reading it as a modifier took "(PRIMARY" for a width and stopped on the KEY after it.
             String ofType = parser.readIdentifier();
             if (parser.match(TokenType.DOT)) {
-                ofType = ofType.toLowerCase() + "." + parser.readIdentifier().toLowerCase();
+                ofType = ofType.toLowerCase(java.util.Locale.ROOT) + "." + parser.readIdentifier().toLowerCase(java.util.Locale.ROOT);
             }
             List<TableConstraint> ofConstraints = new ArrayList<TableConstraint>();
             List<ColumnDef> ofColumnOptions = new ArrayList<ColumnDef>();
@@ -216,7 +216,7 @@ class DdlTableParser {
                 while (parser.matchKeyword("INCLUDING") || parser.matchKeyword("EXCLUDING")) {
                     boolean including = parser.tokens.get(parser.pos - 1).value().equals("INCLUDING");
                     Token optToken = parser.peek();
-                    String what = parser.readIdentifier().toUpperCase();
+                    String what = parser.readIdentifier().toUpperCase(java.util.Locale.ROOT);
                     if (!LIKE_OPTIONS.contains(what)) {
                         throw new ParseException("syntax error", optToken);
                     }
@@ -312,9 +312,9 @@ class DdlTableParser {
             if (parser.match(TokenType.LEFT_PAREN)) {
                 withOptions = new java.util.LinkedHashMap<>();
                 do {
-                    String key = parser.readIdentifier().toLowerCase();
+                    String key = parser.readIdentifier().toLowerCase(java.util.Locale.ROOT);
                     if (parser.match(TokenType.DOT)) {
-                        key = key + "." + parser.readIdentifier().toLowerCase();
+                        key = key + "." + parser.readIdentifier().toLowerCase(java.util.Locale.ROOT);
                     }
                     String val = null;
                     if (parser.match(TokenType.EQUALS)) {

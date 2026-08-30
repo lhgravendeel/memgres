@@ -602,6 +602,8 @@ class CatalogCoreBuilder {
                 col("xmin", DataType.INTEGER)
         );
         Table table = new Table("pg_class", cols);
+        // The TOAST relations the relations below turn out to need, written once they are known.
+        List<int[]> toastRelations = new ArrayList<>();
 
         // System catalog relations (pg_catalog schema). The names, their kind and the columns
         // behind each come from one place, so pg_class never advertises a relation the server
@@ -670,7 +672,7 @@ class CatalogCoreBuilder {
             for (Table tt : sch.getTables().values()) {
                 for (StoredConstraint sc : tt.getConstraints()) {
                     if (sc.getType() == StoredConstraint.Type.FOREIGN_KEY && sc.getReferencesTable() != null) {
-                        fkReferencedTables.add(sc.getReferencesTable().toLowerCase());
+                        fkReferencedTables.add(sc.getReferencesTable().toLowerCase(java.util.Locale.ROOT));
                     }
                 }
             }
@@ -692,21 +694,31 @@ class CatalogCoreBuilder {
                 }
                 if (database.getAllTriggers().containsKey(t.getName())) hasTriggers = true;
                 // M22: FK endpoints have internal RI triggers
-                if (hasForeignKey || fkReferencedTables.contains(t.getName().toLowerCase())) hasTriggers = true;
+                if (hasForeignKey || fkReferencedTables.contains(t.getName().toLowerCase(java.util.Locale.ROOT))) hasTriggers = true;
                 boolean hasIdx = !t.getConstraints().isEmpty() || database.getIndexColumns().keySet().stream()
                         .anyMatch(idx -> { String ti = database.getIndexTable(idx); return ti != null && ti.equalsIgnoreCase(schemaEntry.getKey() + "." + t.getName()); });
                 // Partition metadata for pg_class
                 String relkind = t.getPartitionStrategy() != null ? "p" : "r";
                 boolean relispartition = t.getPartitionParent() != null;
                 String relpartbound = relispartition ? formatPartitionBound(t) : null;
+                // A relation with somewhere to put an oversized value points at it, and that
+                // somewhere is a relation of its own, in the schema PostgreSQL keeps them in.
+                int toastOid = 0;
+                if (!"p".equals(relkind) && needsToastRelation(t)) {
+                    toastOid = oids.oid("rel:pg_toast.pg_toast_" + tblOid);
+                    toastRelations.add(new int[]{toastOid, tblOid});
+                }
                 table.insertRow(new Object[]{
                         tblOid, t.getName(), nsOid,
                         rowTypeOid(schemaEntry.getKey(), t.getName()), 0,  // reltype, reloftype
                         ownerOid,
-                        2,               // relam (heap=2)
+                        // A partitioned table holds no rows of its own, so it has no access
+                        // method: PostgreSQL leaves relam zero, and a reader joining it to pg_am
+                        // to name the method found heap for a relation with no storage at all.
+                        "p".equals(relkind) ? 0 : 2,               // relam (heap=2)
                         tblOid,          // relfilenode
                         0,               // reltablespace
-                        0, database.getAnalyzedTables().contains(schemaEntry.getKey() + "." + t.getName()) ? (double) t.getRows().size() : -1.0, 0, 0, 0, // relpages, reltuples (M22: -1 = never-analyzed), relallvisible, relallfrozen, reltoastrelid
+                        0, database.getAnalyzedTables().contains(schemaEntry.getKey() + "." + t.getName()) ? (double) t.getRows().size() : -1.0, 0, 0, toastOid, // relpages, reltuples (M22: -1 = never-analyzed), relallvisible, relallfrozen, reltoastrelid
                         hasIdx, false, relPersistence(schemaEntry.getKey(), t.isUnlogged()), relkind, // relhasindex, relisshared, relpersistence, relkind
                         (short) t.getAttributeCount(), checkCount, // relnatts, relchecks
                         // relhassubclass: a partitioned table or an inheritance parent has
@@ -719,7 +731,8 @@ class CatalogCoreBuilder {
 
                         true, String.valueOf(t.getReplicaIdentity()), relispartition, // relispopulated, relreplident, relispartition
                         0, 0, 0,            // relrewrite, relfrozenxid, relminmxid
-                        buildRelacl(AstExecutor.privilegeKey(schemaEntry.getKey(), t.getName())),
+                        buildRelacl(AstExecutor.privilegeKey(schemaEntry.getKey(), t.getName()),
+                                "TABLE"),
                         buildTableReloptions(t), relpartbound, 1 // relacl, reloptions, relpartbound, xmin
                 });
             }
@@ -743,11 +756,15 @@ class CatalogCoreBuilder {
                 sb.append("}");
                 viewRelOptions = sb.toString();
             }
+            // A materialized view stores its rows, so it has an access method and can carry
+            // indexes; a plain view stores nothing and has neither.
             table.insertRow(new Object[]{
                     vOid, vd.name(), oids.oid("ns:" + vSchema),
-                    rowTypeOid(vSchema, vd.name()), 0, viewOwnerOid, 0, vOid, 0,
+                    rowTypeOid(vSchema, vd.name()), 0, viewOwnerOid,
+                    vd.materialized() ? 2 : 0, vOid, 0,
                     0, 0.0, 0, 0, 0,
-                    false, false, relPersistence(vSchema, false), vd.materialized() ? "m" : "v",
+                    vd.materialized() && anyIndexOn(vSchema, vd.name()),
+                    false, relPersistence(vSchema, false), vd.materialized() ? "m" : "v",
                     (short) (vd.cachedColumns() != null ? vd.cachedColumns().size() : 0), (short) 0,
                     true, false, false, false, false,
 
@@ -772,7 +789,8 @@ class CatalogCoreBuilder {
                     false, false, false, false, false,
 
                     true, "n", false, 0, 0, 0,
-                    null, null, null, 1
+                    buildRelacl(AstExecutor.privilegeKey(explSeqSchema, seqName), "SEQUENCE"),
+                    null, null, 1
             });
         }
         // Every serial and identity column's sequence is one of the sequences above, created with
@@ -785,7 +803,7 @@ class CatalogCoreBuilder {
         for (Map.Entry<String, List<String>> idx : database.getIndexColumns().entrySet()) {
             String indexKey = idx.getKey();
             String indexName = Database.idxName(indexKey);
-            addedIndexNames.add(indexKey.toLowerCase());
+            addedIndexNames.add(indexKey.toLowerCase(java.util.Locale.ROOT));
             String storedTableQualified = database.getIndexTable(indexKey);
             String indexSchema = "public";
             if (storedTableQualified != null) {
@@ -793,8 +811,17 @@ class CatalogCoreBuilder {
                 if (parts.length == 2) {
                     indexSchema = parts[0];
                     String tableName = parts[1];
+                    // A materialized view holds rows, so it can be indexed, and its index is a
+                    // relation like any other. Looked for among the stored tables alone, an
+                    // index on one was left out of pg_class entirely: a dump had nothing to
+                    // recreate, and a query planned against the view could not be told it was
+                    // there.
                     Schema schema = database.getSchema(indexSchema);
-                    if (schema == null || schema.getTable(tableName) == null) continue;
+                    if (schema == null
+                            || (schema.getTable(tableName) == null
+                                && !isMaterializedView(indexSchema, tableName))) {
+                        continue;
+                    }
                 }
             } else {
                 for (Map.Entry<String, Schema> se : database.getSchemas().entrySet()) {
@@ -823,6 +850,10 @@ class CatalogCoreBuilder {
             int relamOid = resolveAccessMethodOid(idxMethod);
             // Determine if this is a partitioned index (index on a partitioned table)
             String idxRelkind = "i";
+            // An index on a partition is itself a partition of the index on the parent, and says
+            // so. Reported as a relation standing on its own, a restore had nothing to attach it
+            // to and refused the ATTACH the dump wrote.
+            boolean idxIsPartition = false;
             if (storedTableQualified != null) {
                 String[] qParts = storedTableQualified.split("\\.", 2);
                 if (qParts.length == 2) {
@@ -832,6 +863,7 @@ class CatalogCoreBuilder {
                         if (idxTable != null && idxTable.getPartitionStrategy() != null) {
                             idxRelkind = "I";
                         }
+                        idxIsPartition = idxTable != null && idxTable.getPartitionParent() != null;
                     }
                 }
             }
@@ -843,7 +875,7 @@ class CatalogCoreBuilder {
                     idxNatts, (short) 0,
                     false, false, false, false, false,
 
-                    true, "n", false, 0, 0, 0,
+                    true, "n", idxIsPartition, 0, 0, 0,
                     null, reloptionsVal, null, 1
             });
         }
@@ -854,7 +886,7 @@ class CatalogCoreBuilder {
                 for (StoredConstraint sc : tableEntry.getValue().getConstraints()) {
                     if ((sc.getType() == StoredConstraint.Type.PRIMARY_KEY || sc.getType() == StoredConstraint.Type.UNIQUE)
                             && !addedIndexNames.contains(
-                                    Database.idxKey(schemaEntry.getKey(), sc.getName()).toLowerCase())) {
+                                    Database.idxKey(schemaEntry.getKey(), sc.getName()).toLowerCase(java.util.Locale.ROOT))) {
                         int ciOid = oids.oid("rel:" + schemaEntry.getKey() + "." + sc.getName());
                         short ciNatts = (short) (sc.getColumns() != null ? sc.getColumns().size() : 0);
                         String ciRelkind = tableEntry.getValue().getPartitionStrategy() != null ? "I" : "i";
@@ -915,6 +947,23 @@ class CatalogCoreBuilder {
                     false, false, false, false, false,
                     false, true, "d", false,
                     0, 0, 0,
+                    null, null, null, 1
+            });
+        }
+
+        // A TOAST relation is a relation, in the schema PostgreSQL keeps them in, named after the
+        // relation it belongs to and holding the three columns every one of them holds. Pointed
+        // at without being written, reltoastrelid named a relation the catalogue did not have.
+        int toastNs = oids.oid("ns:pg_toast");
+        for (int[] toast : toastRelations) {
+            table.insertRow(new Object[]{
+                    toast[0], "pg_toast_" + toast[1], toastNs,
+                    0, 0, 10, 2, toast[0], 0,
+                    0, 0.0, 0, 0, 0,
+                    true, false, "p", "t",
+                    (short) 3, (short) 0,
+                    false, false, false, false, false,
+                    true, "n", false, 0, 0, 0,
                     null, null, null, 1
             });
         }
@@ -1010,6 +1059,7 @@ class CatalogCoreBuilder {
             for (Map.Entry<String, Table> tableEntry : schemaEntry.getValue().getTables().entrySet()) {
                 Table t = tableEntry.getValue();
                 int relOid = oids.oid("rel:" + schemaEntry.getKey() + "." + t.getName());
+                addSystemColumnAttributes(table, relOid);
                 addUserRelationAttributes(table, relOid, t.getColumns(), false, t);
             }
         }
@@ -1026,6 +1076,94 @@ class CatalogCoreBuilder {
         }
         addPgAttributeExtras(table);
         return table;
+    }
+
+    /**
+     * The rows a relation's system columns take in pg_attribute.
+     *
+     * <p>Every table has six of them, numbered downwards from -1, and PostgreSQL records them
+     * here beside the ones the writer declared. Left out, a query joining pg_attribute to find
+     * ctid or xmin found nothing, and a tool reading the whole attribute list of a relation saw
+     * a relation with no system columns at all.
+     */
+    private void addSystemColumnAttributes(Table table, int relOid) {
+        // Name, attnum, type OID and length, in the order PostgreSQL numbers them.
+        Object[][] systemColumns = {
+                {"ctid", (short) -1, 27, (short) 6},
+                {"xmin", (short) -2, 28, (short) 4},
+                {"cmin", (short) -3, 29, (short) 4},
+                {"xmax", (short) -4, 28, (short) 4},
+                {"cmax", (short) -5, 29, (short) 4},
+                {"tableoid", (short) -6, 26, (short) 4},
+        };
+        for (Object[] system : systemColumns) {
+            Object[] row = new Object[table.getColumns().size()];
+            // The row is filled by column name rather than by position, because pg_attribute's
+            // own column order is the catalogue's business and not this method's.
+            for (int at = 0; at < row.length; at++) {
+                switch (table.getColumns().get(at).getName()) {
+                    case "attrelid": row[at] = relOid; break;
+                    case "attname": row[at] = system[0]; break;
+                    case "attnum": row[at] = system[1]; break;
+                    case "atttypid": row[at] = system[2]; break;
+                    case "attlen": row[at] = system[3]; break;
+                    case "attndims": row[at] = 0; break;
+                    case "atttypmod": row[at] = -1; break;
+                    case "attnotnull": row[at] = true; break;
+                    case "atthasdef":
+                    case "attisdropped":
+                    case "atthasmissing":
+                    case "attbyval": row[at] = false; break;
+                    case "attislocal": row[at] = true; break;
+                    case "attinhcount":
+                    case "attcollation": row[at] = 0; break;
+                    case "attstattarget": row[at] = null; break;
+                    case "attstorage": row[at] = "p"; break;
+                    case "attalign": row[at] = "i"; break;
+                    case "attidentity":
+                    case "attgenerated":
+                    case "attcompression": row[at] = ""; break;
+                    case "xmin": row[at] = 1; break;
+                    default: row[at] = null; break;
+                }
+            }
+            table.insertRow(row);
+        }
+    }
+
+    /**
+     * The collation a column sorts by, as pg_attribute records it.
+     *
+     * <p>Zero means the column's type has no collation at all. A column of a collatable type
+     * always points at one: the collation written on it, or the database's default. Reported as
+     * zero for want of an explicit COLLATE, every text column said its type was not collatable,
+     * which is what an index or a comparison reads to decide it may not use one.
+     */
+    private int collationOidOf(Column c) {
+        if (c.getCollation() != null) {
+            return oids.oid("collation:" + c.getCollation().toLowerCase(java.util.Locale.ROOT));
+        }
+        return isCollatable(c) ? DEFAULT_COLLATION_OID : 0;
+    }
+
+    /** PostgreSQL's "default" collation, which every collatable column falls back to. */
+    private static final int DEFAULT_COLLATION_OID = 100;
+
+    /** Whether values of this column's type sort by a collation. */
+    private static boolean isCollatable(Column c) {
+        if (c.getEnumTypeName() != null || c.getCompositeTypeName() != null) return false;
+        DataType type = c.getArrayElementType() != null ? c.getArrayElementType() : c.getType();
+        if (type == null) return false;
+        switch (type) {
+            case TEXT:
+            case VARCHAR:
+            case CHAR:
+            case NAME:
+            // citext is an extension type memgres does not carry as a DataType.
+                return true;
+            default:
+                return false;
+        }
     }
 
     /** Insert one pg_attribute row per column for a user relation (table or view). */
@@ -1157,15 +1295,18 @@ class CatalogCoreBuilder {
                             hasDefault,
                             identity,  // attidentity
                             c.isVirtual() ? "v" : c.isGenerated() ? "s" : "",  // attgenerated
-                            // A column that sorts by a collation points at it; zero means none,
-                            // which is what every column said however it was declared.
-                            c.getCollation() == null ? 0
-                                    : oids.oid("collation:" + c.getCollation().toLowerCase()),
+                            // A column that sorts by a collation points at it. A column of a
+                            // collatable type always has one -- the database's default where
+                            // none was written -- and zero there means the type is not
+                            // collatable at all, which is what every text column claimed.
+                            collationOidOf(c),
                             // attndims: PG records 1 for a column declared as an array, and a
                             // client deciding whether to read the value as an array reads it.
                             1, attIsLocal, inhCount, null,
                             DataType.isArrayType(colType) || c.getArrayElementType() != null ? 1 : 0,
-                            null,  // xmin, attislocal, attinhcount, attfdwoptions, attndims, attacl
+                            // A column's ACL holds the column-level grants written on it, and
+                            // nothing else: what the relation grants is the relation's.
+                            buildColumnAcl(owner, c.getName()),
                             null,      // attoptions
                             c.getAttStattarget(), // attstattarget
                             effectiveStorage,   // attstorage
@@ -1204,8 +1345,9 @@ class CatalogCoreBuilder {
                 true,                    // attisdropped
                 false,                   // atthasdef: the default went with the column
                 "", "",                  // attidentity, attgenerated
-                c.getCollation() == null ? 0
-                        : oids.oid("collation:" + c.getCollation().toLowerCase()),
+                // A dropped column keeps the collation it had, which is what says its type was
+                // one that sorts by one.
+                collationOidOf(c),
                 1, gone.isLocal(), gone.getInheritCount(), null,
                 DataType.isArrayType(colType) || c.getArrayElementType() != null ? 1 : 0,
                 null,      // xmin, attislocal, attinhcount, attfdwoptions, attndims, attacl
@@ -1252,7 +1394,7 @@ class CatalogCoreBuilder {
     private String typeSchema(String kind, String typeName) {
         for (Map.Entry<String, Schema> entry : database.getSchemas().entrySet()) {
             if (database.getSchemaObjects(entry.getKey())
-                    .contains(kind + ":" + typeName.toLowerCase())) {
+                    .contains(kind + ":" + typeName.toLowerCase(java.util.Locale.ROOT))) {
                 return entry.getKey();
             }
         }
@@ -1261,7 +1403,7 @@ class CatalogCoreBuilder {
 
     /** True when a composite type of this name lives in this very schema. */
     private boolean compositeLivesIn(String schemaName, String name) {
-        return database.getCompositeTypes().containsKey(name.toLowerCase())
+        return database.getCompositeTypes().containsKey(name.toLowerCase(java.util.Locale.ROOT))
                 && typeSchema("composite", name)
                         .equalsIgnoreCase(schemaName == null ? "public" : schemaName);
     }
@@ -1273,7 +1415,7 @@ class CatalogCoreBuilder {
 
     private String sequenceSchema(String seqName) {
         for (Map.Entry<String, Schema> entry : database.getSchemas().entrySet()) {
-            if (database.getSchemaObjects(entry.getKey()).contains("sequence:" + seqName.toLowerCase())) {
+            if (database.getSchemaObjects(entry.getKey()).contains("sequence:" + seqName.toLowerCase(java.util.Locale.ROOT))) {
                 return entry.getKey();
             }
         }
@@ -1295,12 +1437,12 @@ class CatalogCoreBuilder {
                     if (qualified == null || !qualified.equalsIgnoreCase(schemaName + "." + t.getName())) continue;
                     String bare = Database.idxName(idx.getKey());
                     addIndexAttributeRows(table, schemaName, bare, t, idx.getValue());
-                    done.add(bare.toLowerCase());
+                    done.add(bare.toLowerCase(java.util.Locale.ROOT));
                 }
                 for (StoredConstraint sc : t.getConstraints()) {
                     if (sc.getType() != StoredConstraint.Type.PRIMARY_KEY
                             && sc.getType() != StoredConstraint.Type.UNIQUE) continue;
-                    if (done.contains(sc.getName().toLowerCase())) continue;
+                    if (done.contains(sc.getName().toLowerCase(java.util.Locale.ROOT))) continue;
                     addIndexAttributeRows(table, schemaName, sc.getName(), t, sc.getColumns());
                 }
             }
@@ -1338,14 +1480,14 @@ class CatalogCoreBuilder {
             com.memgres.engine.parser.ast.Expression e =
                     com.memgres.engine.parser.Parser.parseExpression(exprText);
             if (e instanceof com.memgres.engine.parser.ast.ColumnRef) {
-                return ((com.memgres.engine.parser.ast.ColumnRef) e).column().toLowerCase();
+                return ((com.memgres.engine.parser.ast.ColumnRef) e).column().toLowerCase(java.util.Locale.ROOT);
             }
             if (e instanceof com.memgres.engine.parser.ast.CastExpr) {
                 return indexExprName(SqlUnparser.exprToSql(
                         ((com.memgres.engine.parser.ast.CastExpr) e).expr()));
             }
             if (e instanceof com.memgres.engine.parser.ast.FunctionCallExpr) {
-                return ((com.memgres.engine.parser.ast.FunctionCallExpr) e).name().toLowerCase();
+                return ((com.memgres.engine.parser.ast.FunctionCallExpr) e).name().toLowerCase(java.util.Locale.ROOT);
             }
         } catch (Exception ignored) {
             // Unparseable expression: PG's generic name applies.
@@ -1375,7 +1517,7 @@ class CatalogCoreBuilder {
         if (e instanceof com.memgres.engine.parser.ast.FunctionCallExpr) {
             com.memgres.engine.parser.ast.FunctionCallExpr fn =
                     (com.memgres.engine.parser.ast.FunctionCallExpr) e;
-            String n = fn.name().toLowerCase();
+            String n = fn.name().toLowerCase(java.util.Locale.ROOT);
             if (INDEX_TEXT_FUNCS.contains(n)) return DataType.TEXT;
             if (INDEX_INT_FUNCS.contains(n)) return DataType.INTEGER;
             if (!fn.args().isEmpty()) return indexExprType(fn.args().get(0), t);
@@ -1503,7 +1645,7 @@ class CatalogCoreBuilder {
      * ordinary column of that view and does belong in pg_attribute.
      */
     static boolean isSystemColumn(Column c) {
-        return SYSTEM_COLUMNS.contains(c.getName().toLowerCase())
+        return SYSTEM_COLUMNS.contains(c.getName().toLowerCase(java.util.Locale.ROOT))
                 && c.getType() == DataType.INTEGER;
     }
 
@@ -1523,6 +1665,106 @@ class CatalogCoreBuilder {
      */
     private static DataType catalogColumnType(DataType dt) {
         return dt == DataType.CHAR ? DataType.INTERNAL_CHAR : dt;
+    }
+
+    /**
+     * Whether PostgreSQL would give this relation a TOAST relation to put oversized values in.
+     *
+     * <p>It does when the relation has a column that can be stored out of line at all, and either
+     * one of those columns has no width its declaration bounds -- text, an unbounded numeric, an
+     * array -- or the widest row the declaration allows would not fit a quarter of a page. So a
+     * table of a varchar(10) has none and a table of a varchar(2000) has one, because a character
+     * is up to four bytes wide. Reported as never having one, every relation said it could not
+     * store a long value, which is not what any of them do.
+     */
+    private static boolean needsToastRelation(Table t) {
+        boolean toastable = false;
+        boolean unbounded = false;
+        long dataLength = 0;
+        for (Column c : t.getColumns()) {
+            DataType dt = c.getArrayElementType() != null ? DataType.TEXT_ARRAY : c.getType();
+            if (!"p".equals(typeStorage(dt))) toastable = true;
+            short len = typeLength(dt);
+            if (len > 0) {
+                dataLength = align(dataLength, typeAlign(dt)) + len;
+            } else {
+                long max = maximumWidth(dt, CatalogHelper.attTypmod(c));
+                if (max < 0) unbounded = true;
+                else dataLength += max;
+            }
+        }
+        if (!toastable) return false;
+        if (unbounded) return true;
+        // A tuple's header, the null bitmap over its columns, and the data, each on its own
+        // eight-byte boundary; a quarter of a page is where PostgreSQL stops trying to fit one.
+        long bitmap = (t.getColumns().size() + 7) / 8;
+        long tupleLength = maxAlign(23 + bitmap) + maxAlign(dataLength);
+        return tupleLength > 2040;
+    }
+
+    /** The widest a value of this type can be where its declaration bounds it, else -1. */
+    private static long maximumWidth(DataType dt, int typmod) {
+        if (typmod < 0) return -1;
+        switch (dt) {
+            case VARCHAR:
+            case CHAR:
+                // A character is as wide as the database encoding allows one to be.
+                return (long) (typmod - 4) * 4 + 4;
+            case NUMERIC: {
+                int precision = ((typmod - 4) >> 16) & 0xFFFF;
+                return 2L * ((precision + 3) / 4 + 1) + 8;
+            }
+            case BIT:
+            case VARBIT:
+                return (typmod + 7) / 8 + 8;
+            default:
+                return -1;
+        }
+    }
+
+    private static long align(long offset, String typalign) {
+        int boundary = "d".equals(typalign) ? 8 : "i".equals(typalign) ? 4
+                : "s".equals(typalign) ? 2 : 1;
+        return (offset + boundary - 1) / boundary * boundary;
+    }
+
+    private static long maxAlign(long length) {
+        return (length + 7) / 8 * 8;
+    }
+
+    /** Whether a materialized view of this name lives in this schema. */
+    private boolean isMaterializedView(String schema, String name) {
+        for (Database.ViewDef vd : database.getViews().values()) {
+            String vSchema = vd.schemaName() != null ? vd.schemaName() : "public";
+            if (vd.materialized() && vSchema.equalsIgnoreCase(schema)
+                    && vd.name().equalsIgnoreCase(name)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Whether any index names this relation, whatever kind of relation it is. */
+    private boolean anyIndexOn(String schema, String name) {
+        String qualified = schema + "." + name;
+        for (String indexKey : database.getIndexColumns().keySet()) {
+            String on = database.getIndexTable(indexKey);
+            if (on != null && on.equalsIgnoreCase(qualified)) return true;
+        }
+        return false;
+    }
+
+    /** The pg_type row already written for this OID, or null when none has been. */
+    private static Object[] typeRowOf(Table pgType, int typeOid) {
+        for (Object[] row : pgType.getAllRows()) {
+            if (row[0] instanceof Number && ((Number) row[0]).intValue() == typeOid) return row;
+        }
+        return null;
+    }
+
+    /** One column of a base type's row, or {@code fallback} where there is no such row. */
+    private static Object typeCol(Object[] baseRow, int index, Object fallback) {
+        return baseRow == null || baseRow[index] == null ? fallback : baseRow[index];
     }
 
     Table buildPgType() {
@@ -1749,7 +1991,8 @@ class CatalogCoreBuilder {
                     0, regproc(null), 0, enumArrayOid,
                     regproc("enum_in"), regproc("enum_out"), regproc("enum_recv"), regproc("enum_send"),
                     regproc(null), regproc(null), regproc(null), "i", "p",
-                    false, 0, -1, 0, 0, null, null, null, 1
+                    false, 0, -1, 0, 0, null, null,
+                    userTypeAcl(ceEntry.getKey(), ce.getName()), 1
             });
             table.insertRow(new Object[]{
                     enumArrayOid, "_" + ce.getName(), enumNsOid, 10,
@@ -1775,7 +2018,7 @@ class CatalogCoreBuilder {
                     ctRelOid, regproc(null), 0, oids.oid("type:" + ctKey + "[]"),
                     regproc("record_in"), regproc("record_out"), regproc("record_recv"), regproc("record_send"),
                     regproc(null), regproc(null), regproc(null), "d", "x",
-                    false, 0, -1, 0, 0, null, null, null, 1
+                    false, 0, -1, 0, 0, null, null, userTypeAcl(ctKey, ctName), 1
             });
             table.insertRow(new Object[]{
                     oids.oid("type:" + ctKey + "[]"), "_" + ctName, ctNsOid, 10,
@@ -1890,14 +2133,33 @@ class CatalogCoreBuilder {
             // domain reached nothing where following it from an enum or a composite reached theirs.
             int domOid = oids.oid("type:" + domEntry.getKey());
             int domArrayOid = oids.oid("type:" + domEntry.getKey() + "[]");
+            // A domain is stored as its base type is: it holds the same values, so it is the same
+            // width, is passed the same way, is aligned and stored the same way, collates the
+            // same way, and is written out and sent by the base type's own functions. Only
+            // reading a value in belongs to the domain, because that is where its constraints
+            // are checked. Written from a fixed template, every domain claimed to be a
+            // variable-width, extended-storage, by-reference type whose output function was
+            // domain_out -- so a client sizing a domain column, or a dump reading how to print
+            // one, was told about a type that does not exist.
+            Object[] base = typeRowOf(table, baseTypeOid);
+            int domTypmod = CatalogHelper.attTypmod(dom.getBaseType(), dom.getPrecision(),
+                    dom.getScale(), dom.getIntervalQualifier());
             table.insertRow(new Object[]{
                     domOid, dom.getName(), domNsOid, 10,
-                    (short) -1, false, "d", baseTypeCat, false, true, ",",
+                    typeCol(base, 4, (short) -1), typeCol(base, 5, false),
+                    "d", baseTypeCat, false, true, ",",
                     0, regproc(null), 0, domArrayOid,
-                    regproc("domain_in"), regproc("domain_out"), regproc("domain_recv"), regproc("domain_send"),
-                    regproc(null), regproc(null), regproc(null), "i", "x",
-                    dom.isNotNull(), baseTypeOid, -1, 0, 0, null,
-                    dom.getDefaultValue(), null, 1
+                    regproc("domain_in"), typeCol(base, 16, regproc("domain_out")),
+                    regproc("domain_recv"), typeCol(base, 18, regproc("domain_send")),
+                    regproc(null), regproc(null), regproc(null),
+                    typeCol(base, 22, "i"), typeCol(base, 23, "x"),
+                    dom.isNotNull(), baseTypeOid, domTypmod, 0, typeCol(base, 28, 0),
+                    // A default is an expression the catalogue keeps in both forms, and a reader
+                    // asking for the tree it parsed to found nothing where the text was plainly
+                    // there.
+                    dom.getDefaultValue(),
+                    dom.getDefaultValue(),
+                    userTypeAcl(domEntry.getKey(), dom.getName()), 1
             });
             table.insertRow(new Object[]{
                     domArrayOid, "_" + dom.getName(), domNsOid, 10,
@@ -1978,8 +2240,11 @@ class CatalogCoreBuilder {
 
         for (String schemaName : database.getSchemas().keySet()) {
             int ownerOid = CatalogHelper.resolveOwnerOid(database, oids, "schema:" + schemaName);
-            java.util.List<String> acl = database.getSchemaAcl(schemaName);
-            String aclText = acl != null && !acl.isEmpty() ? "{" + String.join(",", acl) + "}" : null;
+            String aclText = AclItems.text("SCHEMA",
+                    CatalogHelper.ownerNameOf(database, "schema:" + schemaName),
+                    database.aclTouched("SCHEMA", schemaName),
+                    AclItems.grantsOn(database, "SCHEMA", schemaName),
+                    database.aclGranteeOrder("SCHEMA", schemaName));
             table.insertRow(new Object[]{oids.oid("ns:" + schemaName), schemaName, ownerOid, 1, aclText});
         }
         return table;
@@ -2196,7 +2461,7 @@ class CatalogCoreBuilder {
         for (PgFunction fn : allFuncs) {
             String funcSchema = fn.getSchemaName() != null ? fn.getSchemaName() : "public";
             int funcNs = funcSchema.equals("pg_catalog") ? pgCatalogNs : oids.oid("ns:" + funcSchema);
-            String lang = fn.getLanguage() != null ? fn.getLanguage().toLowerCase() : "plpgsql";
+            String lang = fn.getLanguage() != null ? fn.getLanguage().toLowerCase(java.util.Locale.ROOT) : "plpgsql";
             int langOid;
             switch (lang) {
                 case "sql":
@@ -2264,7 +2529,10 @@ class CatalogCoreBuilder {
                 boolean first = true;
                 for (Map.Entry<String, String> sc : fn.getSetClauses().entrySet()) {
                     if (!first) sb.append(",");
-                    sb.append(sc.getKey()).append("=").append(sc.getValue());
+                    // An element holding a comma is one element, and an array says so by
+                    // quoting it: a search_path of two schemas read back as two settings.
+                    sb.append(ColumnStatistics.arrayElement(
+                            GucSettings.canonicalNameOf(sc.getKey()) + "=" + sc.getValue()));
                     first = false;
                 }
                 sb.append("}");
@@ -2320,12 +2588,18 @@ class CatalogCoreBuilder {
                     oids.oid(oidKey), fn.getName(), funcNs, fnOwnerOid,
                     langOid, fn.getCost(), prorows, variadicElem, "-", kind,
                     fn.isSecurityDefiner(), fn.isLeakproof(), fn.isStrict(), retset,
-                    fn.getVolatility() != null ? fn.getVolatility().substring(0, 1).toLowerCase() : "v",
-                    fn.getParallel() != null ? fn.getParallel().substring(0, 1).toLowerCase() : "u",
+                    fn.getVolatility() != null ? fn.getVolatility().substring(0, 1).toLowerCase(java.util.Locale.ROOT) : "v",
+                    fn.getParallel() != null ? fn.getParallel().substring(0, 1).toLowerCase(java.util.Locale.ROOT) : "u",
                     nargs, ndefaults, retType,
                     oidvector(argTypesBuilder.toString()), proallargtypes, proargmodes, proargnames,
                     proargdefaults, null,
-                    fn.getBody(), null, prosqlbody, proconfig, null, 1
+                    fn.getBody(), null, prosqlbody, proconfig,
+                    AclItems.text("FUNCTION",
+                            fn.getOwner() != null ? fn.getOwner() : database.bootstrapRoleName(),
+                            database.aclTouched("FUNCTION", fn.getName()),
+                            AclItems.grantsOn(database, "FUNCTION", fn.getName()),
+                            database.aclGranteeOrder("FUNCTION", fn.getName())),
+                    1
             });
         }
 
@@ -2525,7 +2799,7 @@ class CatalogCoreBuilder {
             // single overload of a name that has several — tsquery_phrase lost the form that
             // takes a distance, because <-> names only the two-argument one.
             if (SIGNED_BUILTINS.contains(fname)) continue;
-            if (!operatorFuncs.add(fname.toLowerCase())) continue;
+            if (!operatorFuncs.add(fname.toLowerCase(java.util.Locale.ROOT))) continue;
             int left = (Integer) op[2];
             int right = (Integer) op[3];
             String argTypes = left == 0 ? String.valueOf(right)
@@ -2561,7 +2835,7 @@ class CatalogCoreBuilder {
             // read the target type off that cast: oid(bigint) returns oid, and the first row
             // naming it is the int8 -> regproc cast, so pg_proc said it returned regproc.
             if (SIGNED_BUILTINS.contains(fname)) continue;
-            if (fname.isEmpty() || !castFuncs.add(fname.toLowerCase())) continue;
+            if (fname.isEmpty() || !castFuncs.add(fname.toLowerCase(java.util.Locale.ROOT))) continue;
             table.insertRow(new Object[]{
                     oids.oid("proc:" + fname), fname, pgCatalogNs, 10,
                     internalLangOid, 1.0, 0.0, 0, "-", "f",
@@ -2579,7 +2853,7 @@ class CatalogCoreBuilder {
         Set<String> alreadyListed = new HashSet<>();
         for (Object[] existing : table.getRows()) {
             if (existing.length > 1 && existing[1] != null) {
-                alreadyListed.add(existing[1].toString().toLowerCase());
+                alreadyListed.add(existing[1].toString().toLowerCase(java.util.Locale.ROOT));
             }
         }
         // A row is a claim about what the server can do, and a name with no signature behind it
@@ -2590,7 +2864,7 @@ class CatalogCoreBuilder {
         Set<String> signed = new HashSet<>();
         for (String[] sig : BuiltinFunctionSignatures.SIGNATURES) {
             String name = sig[0];
-            if (alreadyListed.contains(name.toLowerCase())) continue;
+            if (alreadyListed.contains(name.toLowerCase(java.util.Locale.ROOT))) continue;
             // An extension's functions live in the schema the extension was installed into, and
             // nowhere at all before CREATE EXTENSION runs. Listing them in pg_catalog on a fresh
             // database advertised nine names PostgreSQL has nowhere, every one of them a call
@@ -2602,7 +2876,7 @@ class CatalogCoreBuilder {
                 String extSchema = database.getExtensionSchema(owningExtension);
                 fnNs = extSchema == null ? publicNs : oids.oid("ns:" + extSchema);
             }
-            signed.add(name.toLowerCase());
+            signed.add(name.toLowerCase(java.util.Locale.ROOT));
             String[] args = sig[2].isEmpty() ? new String[0] : sig[2].split(" ");
             int idx = signatureIndex.merge(name, 0, (a, b) -> a + 1);
             String oidKey = idx == 0 ? "proc:" + name : "proc:" + name + "#sig" + idx;
@@ -2640,8 +2914,8 @@ class CatalogCoreBuilder {
         // Names memgres evaluates that PostgreSQL has no signature for keep a bare row: without
         // one the function works when called but is invisible to anything that asks first.
         for (String builtin : BuiltinFunctionNames.NAMES) {
-            if (signed.contains(builtin.toLowerCase())) continue;
-            if (!alreadyListed.add(builtin.toLowerCase())) continue;
+            if (signed.contains(builtin.toLowerCase(java.util.Locale.ROOT))) continue;
+            if (!alreadyListed.add(builtin.toLowerCase(java.util.Locale.ROOT))) continue;
             table.insertRow(new Object[]{
                     oids.oid("proc:" + builtin), builtin, pgCatalogNs, 10,
                     internalLangOid, 1.0, 0.0, 0, "-", "f",
@@ -2822,7 +3096,7 @@ class CatalogCoreBuilder {
         Set<String> names = new HashSet<String>();
         for (Object[] existing : table.getRows()) {
             if (existing.length > 1 && existing[1] != null) {
-                names.add(existing[1].toString().toLowerCase());
+                names.add(existing[1].toString().toLowerCase(java.util.Locale.ROOT));
             }
         }
         return names;
@@ -2844,7 +3118,7 @@ class CatalogCoreBuilder {
                 if (!(row[at] instanceof RegprocValue)) continue;
                 RegprocValue fn = (RegprocValue) row[at];
                 if (fn.oid() == 0 || fn.name() == null) continue;
-                if (!listed.add(fn.name().toLowerCase())) continue;
+                if (!listed.add(fn.name().toLowerCase(java.util.Locale.ROOT))) continue;
                 String argTypes;
                 int retType;
                 // A handful of I/O functions serve more than the one type that names them, and
@@ -2886,41 +3160,57 @@ class CatalogCoreBuilder {
     }
 
     /**
-     * Build an aclitem[] string for a table based on granted privileges.
-     * Returns null if no privileges have been granted, or a PG-style aclitem array string.
+     * The aclitem[] a relation reports.
+     *
+     * <p>Null while nobody has written a grant on it, which is what says the defaults apply; once
+     * one has been written the owner's own entry stands first and the grants follow it, each with
+     * its privileges in PostgreSQL's order. Assembled from the grants alone, the owner was absent
+     * from every ACL memgres reported and the letters came out in the order they were granted.
      */
-    /** @param tableName the schema-qualified key privileges are recorded under */
-    private String buildRelacl(String tableName) {
-        Map<String, Set<String>> allPrivs = database.getAllRolePrivileges();
-        // Collect grants: grantee -> set of privilege abbreviations
-        Map<String, Set<String>> aclEntries = new java.util.LinkedHashMap<>();
-        for (Map.Entry<String, Set<String>> entry : allPrivs.entrySet()) {
-            String role = entry.getKey();
-            for (String priv : entry.getValue()) {
-                // Format: "PRIVILEGE:OBJECTTYPE:OBJECTNAME"
-                String[] parts = priv.split(":", 3);
-                if (parts.length == 3 && parts[1].equalsIgnoreCase("TABLE")
-                        && parts[2].equalsIgnoreCase(tableName)) {
-                    String abbrev = privAbbrev(parts[0]);
-                    if (abbrev != null) {
-                        aclEntries.computeIfAbsent(role, k -> new java.util.LinkedHashSet<>()).add(abbrev);
-                    }
-                }
-            }
+    /** The aclitem[] one column reports: the column-level grants somebody wrote on it. */
+    private String buildColumnAcl(Table owner, String columnName) {
+        if (owner == null) return null;
+        String schemaName = database.schemaNameOf(owner);
+        String relationName = owner.getName();
+        String key = AstExecutor.privilegeKey(schemaName, relationName) + "." + columnName;
+        return AclItems.text("COLUMN",
+                CatalogHelper.ownerNameOf(database,
+                        "table:" + AstExecutor.privilegeKey(schemaName, relationName)),
+                false, AclItems.grantsOn(database, "COLUMN", key),
+                database.aclGranteeOrder("COLUMN", key));
+    }
+
+    /**
+     * The aclitem[] a user-defined type reports, once a grant has been written on it. A domain
+     * is a type, and a grant written on it with the word DOMAIN reaches the same pg_type row --
+     * so the grants recorded under either word are read together.
+     */
+    private String userTypeAcl(String typeKey, String typeName) {
+        java.util.List<AclItems.Grant> grants =
+                new java.util.ArrayList<>(AclItems.grantsOn(database, "TYPE", typeName));
+        grants.addAll(AclItems.grantsOn(database, "DOMAIN", typeName));
+        java.util.List<String> order =
+                new java.util.ArrayList<>(database.aclGranteeOrder("TYPE", typeName));
+        for (String grantee : database.aclGranteeOrder("DOMAIN", typeName)) {
+            if (!order.contains(grantee)) order.add(grantee);
         }
-        if (aclEntries.isEmpty()) return null;
-        StringBuilder sb = new StringBuilder("{");
-        boolean first = true;
-        for (Map.Entry<String, Set<String>> entry : aclEntries.entrySet()) {
-            if (!first) sb.append(",");
-            first = false;
-            String grantee = entry.getKey().equalsIgnoreCase("public") ? "" : entry.getKey();
-            sb.append(grantee).append("=");
-            for (String a : entry.getValue()) sb.append(a);
-            sb.append("/").append("memgres"); // grantor
-        }
-        sb.append("}");
-        return sb.toString();
+        boolean touched = database.aclTouched("TYPE", typeName)
+                || database.aclTouched("DOMAIN", typeName);
+        return AclItems.text("TYPE", CatalogHelper.ownerNameOf(database, "type:" + typeKey),
+                touched, grants, order);
+    }
+
+    private String buildRelacl(String relationKey, String kind) {
+        // Ownership is recorded under the kind of object it is, and a sequence's key is its bare
+        // name: looked up as a table's, a sequence had no owner and its ACL named the role the
+        // server runs as rather than whoever created it.
+        String owner = "SEQUENCE".equals(kind)
+                ? CatalogHelper.ownerNameOf(database,
+                        "sequence:" + relationKey.substring(relationKey.indexOf('.') + 1))
+                : CatalogHelper.ownerNameOf(database, "table:" + relationKey);
+        return AclItems.text(kind, owner, database.aclTouched(kind, relationKey),
+                AclItems.grantsOn(database, kind, relationKey),
+                database.aclGranteeOrder(kind, relationKey));
     }
 
     /** Build a PG text-array string for table storage parameters (reloptions). */
@@ -2940,7 +3230,7 @@ class CatalogCoreBuilder {
 
     /** Map a privilege name to its PG aclitem abbreviation. */
     private static String privAbbrev(String priv) {
-        switch (priv.toUpperCase()) {
+        switch (priv.toUpperCase(java.util.Locale.ROOT)) {
             case "SELECT": return "r";
             case "INSERT": return "a";
             case "UPDATE": return "w";
@@ -2956,21 +3246,21 @@ class CatalogCoreBuilder {
 
     private int resolveAccessMethodOid(String method) {
         if (method == null) return 403; // default btree
-        switch (method.toLowerCase()) {
+        switch (method.toLowerCase(java.util.Locale.ROOT)) {
             case "btree": return 403;
             case "hash": return 405;
             case "gist": return 783;
             case "gin": return 2742;
             case "spgist": return 4000;
             case "brin": return 3580;
-            default: return oids.oid("am:" + method.toLowerCase());
+            default: return oids.oid("am:" + method.toLowerCase(java.util.Locale.ROOT));
         }
     }
 
     /** Resolve a type name (e.g., "int", "text", "integer") to its PG OID. */
     /** The single letter pg_proc records a parameter's mode as. */
     private static String paramModeLetter(String mode) {
-        String m = mode == null ? "in" : mode.toLowerCase().trim();
+        String m = mode == null ? "in" : mode.toLowerCase(java.util.Locale.ROOT).trim();
         switch (m) {
             case "": case "in": return "i";
             case "out": return "o";
@@ -3109,7 +3399,7 @@ class CatalogCoreBuilder {
 
     private int resolveTypeOidByName(String typeName) {
         if (typeName == null) return 0;
-        String lower = typeName.toLowerCase().trim();
+        String lower = typeName.toLowerCase(java.util.Locale.ROOT).trim();
         // pg_proc records a type OID and has nowhere to put a modifier, so numeric(10,2) is the
         // numeric type. Resolving the written name whole found nothing for any of them.
         int paren = lower.indexOf('(');
@@ -3185,7 +3475,7 @@ class CatalogCoreBuilder {
     }
 
     private static String relPersistence(String schemaName, boolean unlogged) {
-        if (schemaName != null && schemaName.toLowerCase().startsWith("pg_temp")) return "t";
+        if (schemaName != null && schemaName.toLowerCase(java.util.Locale.ROOT).startsWith("pg_temp")) return "t";
         return unlogged ? "u" : "p";
     }
 

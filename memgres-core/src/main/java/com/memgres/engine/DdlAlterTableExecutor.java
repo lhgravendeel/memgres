@@ -67,7 +67,7 @@ class DdlAlterTableExecutor {
                 if (fname == null) return false;
                 int dot = fname.lastIndexOf('.');
                 return PER_ROW_VOLATILE_FUNCTIONS.contains(
-                        (dot >= 0 ? fname.substring(dot + 1) : fname).toLowerCase());
+                        (dot >= 0 ? fname.substring(dot + 1) : fname).toLowerCase(java.util.Locale.ROOT));
             }
         });
     }
@@ -198,7 +198,7 @@ class DdlAlterTableExecutor {
     private static void refuse(String verb, String column) {
         if (!DdlDefinitionChecks.isSystemColumnName(column)) return;
         throw new MemgresException(
-                "cannot " + verb + " system column \"" + column.toLowerCase() + "\"", "0A000");
+                "cannot " + verb + " system column \"" + column.toLowerCase(java.util.Locale.ROOT) + "\"", "0A000");
     }
 
     /**
@@ -214,14 +214,14 @@ class DdlAlterTableExecutor {
         Set<String> dropped = new HashSet<>();
         for (AlterTableStmt.AlterAction action : actions) {
             if (action instanceof AlterTableStmt.DropColumn) {
-                dropped.add(((AlterTableStmt.DropColumn) action).column().toLowerCase());
+                dropped.add(((AlterTableStmt.DropColumn) action).column().toLowerCase(java.util.Locale.ROOT));
             }
         }
         for (AlterTableStmt.AlterAction action : actions) {
             if (action instanceof AlterTableStmt.AddConstraint) {
                 TableConstraint tc = ((AlterTableStmt.AddConstraint) action).constraint();
                 for (String col : constraintColumnNames(tc)) {
-                    if (dropped.contains(col.toLowerCase())) {
+                    if (dropped.contains(col.toLowerCase(java.util.Locale.ROOT))) {
                         throw new MemgresException("column \"" + col + "\" does not exist", "42703");
                     }
                 }
@@ -1096,7 +1096,7 @@ class DdlAlterTableExecutor {
             // Reject volatile/stable functions and operators in generated column expressions
             DdlExecutor.checkExpressionImmutability(genExpr, ddl.executor.database,
                     "generation expression is not immutable");
-            if (genExpr.toLowerCase().replaceAll("\\s+", "").contains("select")) {
+            if (genExpr.toLowerCase(java.util.Locale.ROOT).replaceAll("\\s+", "").contains("select")) {
                 throw new MemgresException("cannot use subquery in column generation expression", "0A000");
             }
             try {
@@ -1180,7 +1180,7 @@ class DdlAlterTableExecutor {
                         try { new java.math.BigDecimal(s.trim()); }
                         catch (NumberFormatException nfe) {
                             throw new MemgresException("invalid input syntax for type "
-                                    + dt.name().toLowerCase() + ": \"" + s + "\"", "22P02");
+                                    + dt.name().toLowerCase(java.util.Locale.ROOT) + ": \"" + s + "\"", "22P02");
                         }
                     }
                     break;
@@ -2128,7 +2128,7 @@ class DdlAlterTableExecutor {
         } catch (RuntimeException e) {
             // An expression that will not parse can only be judged by its text, which is what the
             // loose test did for every expression.
-            return exprText.toLowerCase().contains(column.toLowerCase());
+            return exprText.toLowerCase(java.util.Locale.ROOT).contains(column.toLowerCase(java.util.Locale.ROOT));
         }
         return AstWalk.anyMatch(parsed, new java.util.function.Predicate<Object>() {
             @Override public boolean test(Object n) {
@@ -2152,8 +2152,8 @@ class DdlAlterTableExecutor {
         for (Map.Entry<String, Database.ViewDef> entry : executor.database.getViews().entrySet()) {
             Database.ViewDef vd = entry.getValue();
             if (vd.query() == null) {
-                String sql = vd.sourceSQL() == null ? "" : vd.sourceSQL().toLowerCase();
-                if (sql.contains(tableName.toLowerCase()) && sql.contains(column.toLowerCase())) {
+                String sql = vd.sourceSQL() == null ? "" : vd.sourceSQL().toLowerCase(java.util.Locale.ROOT);
+                if (sql.contains(tableName.toLowerCase(java.util.Locale.ROOT)) && sql.contains(column.toLowerCase(java.util.Locale.ROOT))) {
                     found.add(vd);
                 }
                 continue;
@@ -2174,8 +2174,8 @@ class DdlAlterTableExecutor {
                 if (ref.table == null || !ref.table.equalsIgnoreCase(tableName)) return;
                 String refSchema = ref.schema != null ? ref.schema : schemaName;
                 if (refSchema != null && !refSchema.equalsIgnoreCase(schemaName)) return;
-                relationNames.add(ref.table.toLowerCase());
-                if (ref.alias != null) relationNames.add(ref.alias.toLowerCase());
+                relationNames.add(ref.table.toLowerCase(java.util.Locale.ROOT));
+                if (ref.alias != null) relationNames.add(ref.alias.toLowerCase(java.util.Locale.ROOT));
             }
         });
         if (relationNames.isEmpty()) return false;
@@ -2184,12 +2184,12 @@ class DdlAlterTableExecutor {
                 if (n instanceof ColumnRef) {
                     ColumnRef cr = (ColumnRef) n;
                     if (!column.equalsIgnoreCase(cr.column())) return false;
-                    return cr.table() == null || relationNames.contains(cr.table().toLowerCase());
+                    return cr.table() == null || relationNames.contains(cr.table().toLowerCase(java.util.Locale.ROOT));
                 }
                 if (n instanceof WildcardExpr) {
                     // A star over the relation stands for every column it has, this one included.
                     WildcardExpr w = (WildcardExpr) n;
-                    return w.table() == null || relationNames.contains(w.table().toLowerCase());
+                    return w.table() == null || relationNames.contains(w.table().toLowerCase(java.util.Locale.ROOT));
                 }
                 return false;
             }
@@ -2823,7 +2823,7 @@ class DdlAlterTableExecutor {
         }
         DdlExecutor.checkExpressionImmutability(action.expression(), executor.database,
                 "generation expression is not immutable");
-        if (action.expression().toLowerCase().replaceAll("\\s+", "").contains("select")) {
+        if (action.expression().toLowerCase(java.util.Locale.ROOT).replaceAll("\\s+", "").contains("select")) {
             throw new MemgresException(
                     "cannot use subquery in column generation expression", "0A000");
         }
@@ -3091,7 +3091,7 @@ class DdlAlterTableExecutor {
         }
         // Check for index dependencies
         if (currentType != dt && setType.usingExpr() == null) {
-            String colNameLower = alterCol.column().toLowerCase();
+            String colNameLower = alterCol.column().toLowerCase(java.util.Locale.ROOT);
             String checkTable = schemaName + "." + tableName;
             for (Map.Entry<String, java.util.List<String>> idxEntry : executor.database.getIndexColumns().entrySet()) {
                 java.util.List<String> idxCols = idxEntry.getValue();
@@ -3747,7 +3747,7 @@ class DdlAlterTableExecutor {
                 for (String col : addConstraint.constraint().columns()) {
                     if (DdlDefinitionChecks.isSystemColumnName(col)) {
                         throw new MemgresException("cannot add not-null constraint on system"
-                                + " column \"" + col.toLowerCase() + "\"", "0A000");
+                                + " column \"" + col.toLowerCase(java.util.Locale.ROOT) + "\"", "0A000");
                     }
                 }
             }
@@ -4631,7 +4631,7 @@ class DdlAlterTableExecutor {
 
     @SuppressWarnings("unchecked")
     private static boolean rowSatisfiesBounds(Object value, Table partition, String strategy) {
-        switch (strategy.toUpperCase()) {
+        switch (strategy.toUpperCase(java.util.Locale.ROOT)) {
             case "RANGE":
                 if (value == null) return false; // NULL never matches RANGE
                 if (partition.getPartitionLower() == null || partition.getPartitionUpper() == null) return true;
@@ -4788,9 +4788,9 @@ class DdlAlterTableExecutor {
             if (refNames == null) {
                 // A view that survives only as text has no tree to read, so the old, looser test
                 // is kept for it rather than leaving it naming a column that has gone.
-                String sqlLower = sql.toLowerCase();
-                if (!sqlLower.contains(tableName.toLowerCase())) continue;
-                if (!sqlLower.contains(oldCol.toLowerCase())) continue;
+                String sqlLower = sql.toLowerCase(java.util.Locale.ROOT);
+                if (!sqlLower.contains(tableName.toLowerCase(java.util.Locale.ROOT))) continue;
+                if (!sqlLower.contains(oldCol.toLowerCase(java.util.Locale.ROOT))) continue;
             }
             // An unqualified reference belongs to the renamed relation only while no other FROM
             // item supplies a column of that name; where one does, the query had to qualify it.
@@ -4879,8 +4879,8 @@ class DdlAlterTableExecutor {
                         && !refSchema.equalsIgnoreCase(schemaName)) {
                     return;
                 }
-                names.add(ref.table.toLowerCase());
-                if (ref.alias != null) names.add(ref.alias.toLowerCase());
+                names.add(ref.table.toLowerCase(java.util.Locale.ROOT));
+                if (ref.alias != null) names.add(ref.alias.toLowerCase(java.util.Locale.ROOT));
             }
         });
         return names;
@@ -4900,7 +4900,7 @@ class DdlAlterTableExecutor {
             }
         });
         for (SelectStmt.TableRef ref : refs) {
-            if (ref.table == null || refNames.contains(ref.table.toLowerCase())) continue;
+            if (ref.table == null || refNames.contains(ref.table.toLowerCase(java.util.Locale.ROOT))) continue;
             String schema = ref.schema != null ? ref.schema
                     : (schemaName != null ? schemaName : executor.defaultSchema());
             Schema holder = executor.database.getSchema(schema);
@@ -4949,7 +4949,7 @@ class DdlAlterTableExecutor {
             if (before != null && before.type() == com.memgres.engine.parser.TokenType.DOT) {
                 com.memgres.engine.parser.Token owner = i >= 2 ? tokens.get(i - 2) : null;
                 if (owner == null) continue;
-                if (refNames != null && !refNames.contains(owner.value().toLowerCase())) continue;
+                if (refNames != null && !refNames.contains(owner.value().toLowerCase(java.util.Locale.ROOT))) continue;
             } else if (qualifiedOnly) {
                 continue;
             }

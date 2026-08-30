@@ -441,6 +441,7 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                         ? session.getGucSettings().get("application_name") : "");
         sendParameterStatus(ctx, "IntervalStyle", "postgres");
         sendParameterStatus(ctx, "is_superuser", "on");
+        seedReportedParameters();
 
         backendPid = cancelRegistry.nextPid();
         // Protocol 3.2 asks for a cancel key long enough not to be guessed; 3.0 has room for four
@@ -501,14 +502,22 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
 
     private void handleQuery(ChannelHandlerContext ctx, PgWireMessage msg) {
         String sql = msg.getQuery();
+        boolean sentAnything = false;
         try {
             String[] statements = splitStatements(sql);
             boolean batchFailed = false;
+            // A Position is an offset into the string the client sent, not into whichever
+            // statement inside it went wrong: measured against the sub-statement alone, a client
+            // underlining the error in a two-statement query underlined the wrong one.
+            int scanned = 0;
             for (String stmt : statements) {
                 if (Memgres.logAllStatements) LOG.info("Executing statement: {}", stmt);
                 stmt = stmt.trim();
                 if (stmt.isEmpty()) continue;
+                int startsAt = sql.indexOf(stmt, scanned);
+                if (startsAt >= 0) scanned = startsAt + stmt.length();
                 if (batchFailed) continue;
+                sentAnything = true;
 
                 try {
                     session.setQueryState(stmt);
@@ -521,12 +530,14 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                         database.releaseXactAdvisoryLocks(session);
                     }
                     sendQueryResult(ctx, result);
-                    // Emit ParameterStatus updates for tracked GUC parameters after SET
-                    if (result.getType() == QueryResult.Type.SET) {
-                        emitParameterStatusUpdates(ctx, stmt);
-                    }
+                    // Any statement can change a reported parameter: a SET, a RESET, a call to
+                    // set_config, a DISCARD, or the COMMIT that ends a SET LOCAL's transaction.
+                    emitParameterStatusUpdates(ctx, stmt);
                 } catch (MemgresException e) {
                     enrichErrorPosition(e, stmt);
+                    if (startsAt > 0 && e.getPosition() > 0) {
+                        e.setPosition(e.getPosition() + startsAt);
+                    }
                     // Log errors that occur inside transactions — these cascade and cause
                     // all subsequent commands to fail with 25P02, making root-cause hard to find.
                     if (session != null && session.isInTransaction() && !"25P02".equals(e.getSqlState())) {
@@ -572,9 +583,25 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
             // for something that is no longer there rather than running work from before.
             preparedStatements.remove("");
             portals.remove("");
+            // A query holding no statement at all is answered with an EmptyQueryResponse, which
+            // stands where a CommandComplete would.
+            if (!sentAnything) sendEmptyQueryResponse(ctx);
             dropPortalsOutsideTransaction();
             sendReadyForQuery(ctx, session);
         }
+    }
+
+    /**
+     * A query holding no statement is still a query, and PostgreSQL answers it: an
+     * EmptyQueryResponse stands where a CommandComplete would. Passed over in silence, a client
+     * waiting for one message before the ReadyForQuery had nothing to wait for -- the extended
+     * protocol path already sent it, so the two disagreed about the same empty string.
+     */
+    private void sendEmptyQueryResponse(ChannelHandlerContext ctx) {
+        io.netty.buffer.ByteBuf buf = ctx.alloc().buffer(5);
+        buf.writeByte('I');
+        buf.writeInt(4);
+        ctx.write(buf);
     }
 
     // ---- Extended query protocol ----
@@ -677,7 +704,7 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
      */
     private static boolean endsAbortedBlock(String sql) {
         if (sql == null) return false;
-        String upper = sql.trim().toUpperCase();
+        String upper = sql.trim().toUpperCase(java.util.Locale.ROOT);
         return upper.startsWith("COMMIT") || upper.startsWith("END")
                 || upper.startsWith("ABORT") || upper.startsWith("ROLLBACK");
     }
@@ -729,14 +756,14 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
     private java.util.List<String> inferProtocolResultTypes(String sql, com.memgres.engine.parser.ast.Statement body) {
         try {
             if (sql == null) return null;
-            String upper = sql.trim().toUpperCase();
+            String upper = sql.trim().toUpperCase(java.util.Locale.ROOT);
             boolean isSelect = upper.startsWith("SELECT") || upper.startsWith("WITH") || upper.startsWith("VALUES");
             if (isSelect) {
                 // SELECT: safe to dry-run with LIMIT 0
                 com.memgres.engine.Session.TransactionStatus saved = session.getStatus();
                 try {
                     String drySql = sql.replaceAll("\\$\\d+", "NULL").replaceAll(";\\s*$", "").trim();
-                    if (!drySql.toUpperCase().contains("LIMIT")) drySql = drySql + " LIMIT 0";
+                    if (!drySql.toUpperCase(java.util.Locale.ROOT).contains("LIMIT")) drySql = drySql + " LIMIT 0";
                     com.memgres.engine.QueryResult result = session.execute(drySql, new java.util.ArrayList<>());
                     if (result.getColumns() != null && !result.getColumns().isEmpty()) {
                         java.util.List<String> types = new java.util.ArrayList<>();
@@ -828,7 +855,7 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
      */
     private static boolean carriesBindParameters(String sql) {
         if (sql == null) return false;
-        String trimmed = sql.replaceAll("^\\s+", "").toUpperCase();
+        String trimmed = sql.replaceAll("^\\s+", "").toUpperCase(java.util.Locale.ROOT);
         return trimmed.startsWith("SELECT") || trimmed.startsWith("INSERT")
                 || trimmed.startsWith("UPDATE") || trimmed.startsWith("DELETE")
                 || trimmed.startsWith("EXPLAIN") || trimmed.startsWith("WITH")
@@ -1404,7 +1431,7 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                 }
             } else {
                 // CALL with OUT params: PG sends RowDescription during Execute (not Describe)
-                String upperSql = PgWireDescribeHelper.stripLeadingComments(portal.sql()).toUpperCase();
+                String upperSql = PgWireDescribeHelper.stripLeadingComments(portal.sql()).toUpperCase(java.util.Locale.ROOT);
                 if (upperSql.startsWith("CALL") && result.getType() == QueryResult.Type.SELECT
                         && !result.getColumns().isEmpty() && !portal.rowDescriptionSent) {
                     sendRowDescription(ctx, result);
@@ -1424,10 +1451,7 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                 portal.rowReturning = rowReturning;
                 portal.completedType = result.getType();
             }
-            // Emit ParameterStatus updates for tracked GUC parameters after SET
-            if (result.getType() == QueryResult.Type.SET) {
-                emitParameterStatusUpdates(ctx, portal.sql());
-            }
+            emitParameterStatusUpdates(ctx, portal.sql());
         } catch (MemgresException e) {
             LOG.warn("[PROTO] Execute ERROR {}: {} | {}", e.getSqlState(), e.getMessage(), sqlSnip);
             enrichErrorPosition(e, portal.sql());
@@ -1520,6 +1544,12 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
 
     /** Get the PG command tag for a QueryResult type. */
     private static String commandTag(QueryResult result) {
+        // The statement that ran knows what it was, and says so. Read only off the small enum
+        // the result carries, every DROP was reported as DROP TABLE, every ALTER as CREATE
+        // TABLE, and SHOW and EXPLAIN as a SELECT -- so a client logging what it ran, or
+        // deciding what to do next from the tag, was told about a statement nobody wrote.
+        String named = result.getCommandTag();
+        if (named != null) return named;
         switch (result.getType()) {
             case SELECT:
                 return "SELECT " + result.getRows().size();
@@ -1973,6 +2003,53 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
      * Enrich a MemgresException with position information by finding the
      * referenced object name (table, column, etc.) in the SQL text.
      */
+    /** The commands that act on an object they name, rather than querying it. */
+    private static final String[] NAMES_ITS_OBJECT = {
+            "drop", "alter", "truncate", "comment", "grant", "revoke", "security label",
+            "create index", "create unique index", "reindex", "lock", "analyze", "vacuum",
+            "cluster", "refresh"};
+
+    private static boolean namesItsObjectRatherThanQueryingIt(String sql) {
+        String start = sql.trim().toLowerCase(java.util.Locale.ROOT);
+        for (String command : NAMES_ITS_OBJECT) {
+            if (start.startsWith(command)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Where a name stands in the statement, ignoring what is inside a string literal.
+     *
+     * <p>The text of a literal is a value and not a name, so a statement that happens to write
+     * the same word in quotes -- SELECT 'nosuchcol', nosuchcol -- had its error pointed at the
+     * literal rather than at the column that could not be resolved.
+     */
+    private static int findOutsideLiterals(String sql, String name) {
+        String lowerSql = sql.toLowerCase(java.util.Locale.ROOT);
+        String lowerName = name.toLowerCase(java.util.Locale.ROOT);
+        int literalStart = -1;
+        int insideALiteral = -1;
+        boolean inSingle = false;
+        boolean inDouble = false;
+        for (int i = 0; i < lowerSql.length(); i++) {
+            char c = lowerSql.charAt(i);
+            if (inSingle) {
+                if (c == '\'') inSingle = false;
+                else if (insideALiteral < 0 && lowerSql.startsWith(lowerName, i)) {
+                    // The whole literal is what a bad value is reported against, so what is
+                    // wanted is where it opens rather than where the text inside it starts.
+                    insideALiteral = literalStart;
+                }
+                continue;
+            }
+            if (c == '\'') { inSingle = true; literalStart = i; continue; }
+            if (c == '"') { inDouble = !inDouble; continue; }
+            if (!inDouble && lowerSql.startsWith(lowerName, i)) return i;
+        }
+        // A name that only ever appears inside quotes is still the name the statement wrote.
+        return insideALiteral >= 0 ? insideALiteral : lowerSql.indexOf(lowerName);
+    }
+
     private static void enrichErrorPosition(MemgresException e, String sql) {
         if (e.getPosition() > 0 || sql == null) return;
         // Errors PostgreSQL raises with no parse location of their own get no Position at all,
@@ -1993,6 +2070,12 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
         // quote a column or a relation name that the search below finds somewhere in the statement
         // anyway: for UPDATE t SET d = DEFAULT it found the "d" inside the word UPDATE.
         if (hasNoParseLocation(e.getSqlState())) return;
+        // A statement that names the object it acts on rather than querying it reports no
+        // location for a name it cannot resolve: PostgreSQL raises those errors where the
+        // statement is carried out, not where it was read. DROP, ALTER, TRUNCATE, COMMENT,
+        // GRANT and CREATE INDEX all answer with no Position, where SELECT, INSERT, UPDATE,
+        // DELETE and the query inside a CREATE VIEW all answer with one.
+        if (namesItsObjectRatherThanQueryingIt(sql)) return;
         // Extract quoted name from error message patterns like: relation "foo" does not exist
         // or column "bar" does not exist, or at or near "token"
         String name = null;
@@ -2003,11 +2086,14 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                 name = msg.substring(qStart + 1, qEnd);
             }
         }
+        // A missing routine is named without quotes, with its argument types after it: the word
+        // the statement wrote is what stands before the parenthesis.
+        if (name == null && msg.startsWith("function ")) {
+            int paren = msg.indexOf('(');
+            if (paren > 9) name = msg.substring(9, paren);
+        }
         if (name != null && !name.isEmpty()) {
-            // Find the name in the SQL (case-insensitive)
-            String lowerSql = sql.toLowerCase();
-            String lowerName = name.toLowerCase();
-            int idx = lowerSql.indexOf(lowerName);
+            int idx = findOutsideLiterals(sql, name);
             if (idx >= 0) {
                 e.setPosition(idx + 1); // 1-based
                 return;
@@ -2016,7 +2102,7 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
         // For syntax errors where no quoted name was found, try "at or near" pattern
         // or just set position to 1 for general errors
         String sqlState = e.getSqlState();
-        if ("42601".equals(sqlState) || (msg.toLowerCase().contains("syntax") && "42000".equals(sqlState))) {
+        if ("42601".equals(sqlState) || (msg.toLowerCase(java.util.Locale.ROOT).contains("syntax") && "42000".equals(sqlState))) {
             // Set position to approximately where the error is — use SELECT FROM case
             // Try to find the problematic token
             e.setPosition(1);
@@ -2032,8 +2118,8 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
      * function named in the message is not found inside a longer identifier that contains it.
      */
     private static int findToken(String sql, String token) {
-        String lowerSql = sql.toLowerCase();
-        String lowerToken = token.toLowerCase();
+        String lowerSql = sql.toLowerCase(java.util.Locale.ROOT);
+        String lowerToken = token.toLowerCase(java.util.Locale.ROOT);
         int from = 0;
         while (true) {
             int idx = lowerSql.indexOf(lowerToken, from);
@@ -2065,23 +2151,46 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
     }
 
     /** After a SET command, emit ParameterStatus messages for tracked GUC parameters. */
+    /**
+     * The parameters PostgreSQL tells a client about whenever their value changes. A client keeps
+     * its own copy of each — pgjdbc reads TimeZone to place a timestamp and DateStyle to read one
+     * back — so one that changes without being reported leaves the client working from a value
+     * the server no longer holds.
+     */
+    private static final String[] REPORTED_PARAMETERS = {
+            "application_name", "client_encoding", "DateStyle", "IntervalStyle",
+            "is_superuser", "search_path", "session_authorization",
+            "standard_conforming_strings", "TimeZone"};
+
+    /** The value last reported for each, so only a change is reported. */
+    private final java.util.Map<String, String> reportedParameters = new java.util.HashMap<>();
+
+    /** Record what the startup messages already told the client, so nothing is repeated. */
+    private void seedReportedParameters() {
+        for (String param : REPORTED_PARAMETERS) reportedParameters.put(param, currentValueOf(param));
+    }
+
+    private String currentValueOf(String param) {
+        if (session == null || session.getGucSettings() == null) return null;
+        String value = session.getGucSettings().getForDisplay(param);
+        return value == null ? "" : value;
+    }
+
+    /**
+     * Tell the client about every reported parameter whose value the statement changed.
+     *
+     * <p>Decided by looking for a parameter's name inside a statement that began "SET", nothing
+     * was reported for RESET, for set_config(), for DISCARD ALL, or for the end of the
+     * transaction a SET LOCAL was written in — and a SET that changed nothing reported a change
+     * anyway.
+     */
     private void emitParameterStatusUpdates(ChannelHandlerContext ctx, String sql) {
         if (session == null || session.getGucSettings() == null) return;
-        // Parse "SET <param> TO <value>" or "SET <param> = <value>"
-        String upper = sql.trim().toUpperCase();
-        if (!upper.startsWith("SET ")) return;
-        // Emit ParameterStatus for GUC parameters that PG 18 reports to clients.
-        // Note: pgjdbc will disconnect (08006) if DateStyle changes to non-ISO
-        // or client_encoding changes from UTF8 — this matches real PG behavior.
-        String[] tracked = {"application_name", "DateStyle", "IntervalStyle",
-                "is_superuser", "session_authorization",
-                "standard_conforming_strings", "TimeZone"};
-        for (String param : tracked) {
-            if (upper.contains(param.toUpperCase())) {
-                String val = session.getGucSettings().get(param);
-                if (val != null) {
-                    sendParameterStatus(ctx, param, val);
-                }
+        for (String param : REPORTED_PARAMETERS) {
+            String now = currentValueOf(param);
+            if (now != null && !now.equals(reportedParameters.get(param))) {
+                reportedParameters.put(param, now);
+                sendParameterStatus(ctx, param, now);
             }
         }
     }
@@ -2116,7 +2225,7 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
     /** Map severity string to numeric level (higher = more important). */
     private static int noticeSeverityLevel(String severity) {
         if (severity == null) return 5; // NOTICE default
-        switch (severity.toUpperCase()) {
+        switch (severity.toUpperCase(java.util.Locale.ROOT)) {
             case "DEBUG": case "DEBUG1": case "DEBUG2": case "DEBUG3": case "DEBUG4": case "DEBUG5":
                 return 1;
             case "LOG":

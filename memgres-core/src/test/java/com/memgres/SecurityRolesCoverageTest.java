@@ -315,6 +315,7 @@ class SecurityRolesCoverageTest {
     void grantOnFunction() {
         assertDoesNotThrow(() -> {
             exec("CREATE ROLE grant_role_func");
+            exec("CREATE FUNCTION my_func() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$");
             exec("GRANT EXECUTE ON FUNCTION my_func TO grant_role_func");
         });
     }
@@ -351,6 +352,7 @@ class SecurityRolesCoverageTest {
     void grantExecuteOnFunction() {
         assertDoesNotThrow(() -> {
             exec("CREATE ROLE grant_role_exec");
+            exec("CREATE FUNCTION some_function() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$");
             exec("GRANT EXECUTE ON FUNCTION some_function TO grant_role_exec");
         });
     }

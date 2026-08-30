@@ -31,7 +31,7 @@ class DdlObjectExecutor {
         // two types rather than one refusal.
         SchemaQualifier.requireSchema(executor.database, executor.session, stmt.schemaName());
         String schema = stmt.schemaName() != null
-                ? stmt.schemaName().toLowerCase() : executor.creationSchema();
+                ? stmt.schemaName().toLowerCase(java.util.Locale.ROOT) : executor.creationSchema();
         boolean wasShell = executor.database.getShellTypes().contains(TypeNamespace.key(schema, name));
         if (wasShell) {
             // CREATE TYPE x; twice reserves a name already reserved; any other form fills it in.
@@ -117,6 +117,11 @@ class DdlObjectExecutor {
             executor.recordUndo(new Session.CreateCompositeTypeUndo(schema, name));
         }
         if (wasShell) executor.database.getShellTypes().remove(TypeNamespace.key(schema, name));
+        // A type belongs to whoever created it, and both its ownership and the grantor written
+        // into its ACL are read from that. Recorded nowhere, every type belonged to the role
+        // the server runs as rather than to the session that made it.
+        executor.database.setObjectOwner("type:" + TypeNamespace.key(schema, name),
+                executor.currentRole());
         return QueryResult.command(QueryResult.Type.CREATE_TYPE, 0);
     }
 
@@ -821,13 +826,13 @@ class DdlObjectExecutor {
 
     private QueryResult executeAlterOperatorObj(AlterOperatorStmt stmt) {
         // Build key from schema + name + arg types
-        String l = stmt.leftArg() != null ? stmt.leftArg().toLowerCase() : "NONE";
-        String r = stmt.rightArg() != null ? stmt.rightArg().toLowerCase() : "NONE";
+        String l = stmt.leftArg() != null ? stmt.leftArg().toLowerCase(java.util.Locale.ROOT) : "NONE";
+        String r = stmt.rightArg() != null ? stmt.rightArg().toLowerCase(java.util.Locale.ROOT) : "NONE";
         String schema = "public";
         String opName = stmt.name();
         int dotIdx = opName.indexOf('.');
         if (dotIdx > 0) { schema = opName.substring(0, dotIdx); opName = opName.substring(dotIdx + 1); }
-        String key = schema.toLowerCase() + "." + opName + "(" + l + "," + r + ")";
+        String key = schema.toLowerCase(java.util.Locale.ROOT) + "." + opName + "(" + l + "," + r + ")";
 
         PgOperator op = executor.database.getOperator(key);
         if (op == null) {
@@ -864,7 +869,7 @@ class DdlObjectExecutor {
     }
 
     private QueryResult executeAlterOperatorFamilyObj(AlterOperatorStmt stmt) {
-        String key = stmt.name().toLowerCase() + ":" + stmt.method().toLowerCase();
+        String key = stmt.name().toLowerCase(java.util.Locale.ROOT) + ":" + stmt.method().toLowerCase(java.util.Locale.ROOT);
         PgOperatorFamily fam = executor.database.getOperatorFamily(key);
         if (fam == null && stmt.action() != AlterOperatorStmt.AlterAction.ADD_MEMBER
                 && stmt.action() != AlterOperatorStmt.AlterAction.DROP_MEMBER) {
@@ -899,7 +904,7 @@ class DdlObjectExecutor {
     }
 
     private QueryResult executeAlterOperatorClassObj(AlterOperatorStmt stmt) {
-        String key = stmt.name().toLowerCase() + ":" + stmt.method().toLowerCase();
+        String key = stmt.name().toLowerCase(java.util.Locale.ROOT) + ":" + stmt.method().toLowerCase(java.util.Locale.ROOT);
         PgOperatorClass cls = executor.database.getOperatorClass(key);
         if (cls == null) {
             throw new MemgresException("operator class \"" + stmt.name()
@@ -944,9 +949,9 @@ class DdlObjectExecutor {
         }
 
         // A body written for a language nothing can run is stored but never callable
-        if (stmt.language() != null && !INSTALLED_LANGUAGES.contains(stmt.language().toLowerCase())) {
+        if (stmt.language() != null && !INSTALLED_LANGUAGES.contains(stmt.language().toLowerCase(java.util.Locale.ROOT))) {
             throw new MemgresException(
-                    "language \"" + stmt.language().toLowerCase() + "\" does not exist", "42704");
+                    "language \"" + stmt.language().toLowerCase(java.util.Locale.ROOT) + "\" does not exist", "42704");
         }
 
         // Only now: there is no point asking what a language is to run before knowing it is one,
@@ -959,7 +964,7 @@ class DdlObjectExecutor {
         if (stmt.returnType() != null && !stmt.returnType().isEmpty()) {
             String retType = stmt.returnType();
             String baseRetType = retType;
-            if (baseRetType.toUpperCase().startsWith("SETOF ")) {
+            if (baseRetType.toUpperCase(java.util.Locale.ROOT).startsWith("SETOF ")) {
                 baseRetType = baseRetType.substring(6).trim();
             }
             validateTypeExists(baseRetType);
@@ -969,7 +974,7 @@ class DdlObjectExecutor {
         if (stmt.supportFunction != null) {
             String supportFn = stmt.supportFunction;
             if (executor.database.getFunction(supportFn) == null
-                    && executor.database.getFunction(supportFn.toLowerCase()) == null) {
+                    && executor.database.getFunction(supportFn.toLowerCase(java.util.Locale.ROOT)) == null) {
                 throw new MemgresException("function " + supportFn + " does not exist", "42883");
             }
         }
@@ -987,7 +992,7 @@ class DdlObjectExecutor {
                 }
                 // PL/pgSQL: reject sqlstate and sqlerrm as parameter names (they are implicit CONSTANT variables)
                 if ("plpgsql".equalsIgnoreCase(stmt.language()) && fp.name() != null) {
-                    String lowerName = fp.name().toLowerCase();
+                    String lowerName = fp.name().toLowerCase(java.util.Locale.ROOT);
                     if ("sqlstate".equals(lowerName) || "sqlerrm".equals(lowerName)) {
                         throw new MemgresException(
                                 "variable \"" + fp.name() + "\" is declared CONSTANT", "42601");
@@ -1024,7 +1029,7 @@ class DdlObjectExecutor {
                 // Every parameter also answers to its position, which is the only name an
                 // unnamed one has and what ALIAS FOR usually points at
                 paramNames.add("$" + (i + 1));
-                String mode = p.mode() == null ? "IN" : p.mode().toUpperCase();
+                String mode = p.mode() == null ? "IN" : p.mode().toUpperCase(java.util.Locale.ROOT);
                 if ("OUT".equals(mode) || "INOUT".equals(mode)) hasOutParams = true;
             }
             PlpgsqlBodyValidator.Routine routine = new PlpgsqlBodyValidator.Routine(
@@ -1042,7 +1047,7 @@ class DdlObjectExecutor {
             String retType = stmt.returnType();
             boolean needsReturnValue = retType != null && !retType.isEmpty()
                     && !"void".equalsIgnoreCase(retType) && !"trigger".equalsIgnoreCase(retType)
-                    && !retType.toUpperCase().startsWith("SETOF") && !"TABLE".equalsIgnoreCase(retType);
+                    && !retType.toUpperCase(java.util.Locale.ROOT).startsWith("SETOF") && !"TABLE".equalsIgnoreCase(retType);
             if (needsReturnValue) {
                 java.util.regex.Matcher rm = java.util.regex.Pattern.compile("\\breturn\\s*;", java.util.regex.Pattern.CASE_INSENSITIVE).matcher(stmt.body());
                 if (rm.find()) {
@@ -1060,8 +1065,8 @@ class DdlObjectExecutor {
                     String retExpr = retMatcher.group(1).trim();
                     if (!retExpr.isEmpty() && !retExpr.equalsIgnoreCase("NEXT")
                             && !retExpr.equalsIgnoreCase("QUERY")
-                            && !retExpr.toUpperCase().startsWith("QUERY ")
-                            && !retExpr.toUpperCase().startsWith("NEXT ")) {
+                            && !retExpr.toUpperCase(java.util.Locale.ROOT).startsWith("QUERY ")
+                            && !retExpr.toUpperCase(java.util.Locale.ROOT).startsWith("NEXT ")) {
                         // Try parsing as a SELECT expression
                         com.memgres.engine.parser.Parser.parse("SELECT " + retExpr);
                     }
@@ -1127,7 +1132,7 @@ class DdlObjectExecutor {
         pgFunc.setLeakproof(stmt.leakproof());
         pgFunc.setWindowFunction(stmt.windowFunction);
         pgFunc.setVolatility(stmt.volatility());
-        pgFunc.setSetClauses(stmt.setClauses());
+        pgFunc.setSetClauses(resolvedSetClauses(stmt.setClauses()));
         pgFunc.setOwner(executor.sessionUser());
         pgFunc.setAtomicBody(stmt.atomicBody);
         pgFunc.setSqlStandardBody(stmt.sqlStandardBody);
@@ -1170,6 +1175,28 @@ class DdlObjectExecutor {
     /** The languages a stock PostgreSQL has; memgres runs sql and plpgsql bodies itself. */
     private static final Set<String> INSTALLED_LANGUAGES =
             Cols.setOf("sql", "plpgsql", "c", "internal");
+
+    /**
+     * The SET clauses a routine was written with, as the catalogue keeps them.
+     *
+     * <p>SET ... FROM CURRENT takes the value the session holds when the routine is defined, so
+     * the routine carries a value and not an instruction: the clause is resolved once, here.
+     * Kept as the words "FROM CURRENT", what the catalogue reported was not a setting at all.
+     */
+    private java.util.Map<String, String> resolvedSetClauses(java.util.Map<String, String> written) {
+        if (written == null || written.isEmpty()) return written;
+        java.util.Map<String, String> resolved = new java.util.LinkedHashMap<>();
+        for (java.util.Map.Entry<String, String> e : written.entrySet()) {
+            String value = e.getValue();
+            if ("FROM CURRENT".equals(value)) {
+                value = executor.session == null ? null
+                        : executor.session.getGucSettings().getForDisplay(e.getKey());
+                if (value == null) continue;
+            }
+            resolved.put(e.getKey(), value);
+        }
+        return resolved.isEmpty() ? null : resolved;
+    }
 
     /**
      * CREATE OR REPLACE keeps the identity of the existing routine, so callers compiled against
@@ -1403,7 +1430,7 @@ class DdlObjectExecutor {
         java.util.regex.Matcher m = java.util.regex.Pattern.compile(
                 "\\bCOLLATE\\s+\"?([\\w.]+)\"?", java.util.regex.Pattern.CASE_INSENSITIVE).matcher(body);
         while (m.find()) {
-            String collation = m.group(1).toLowerCase();
+            String collation = m.group(1).toLowerCase(java.util.Locale.ROOT);
             if (collation.equals("c") || collation.equals("posix") || collation.equals("default")
                     || collation.equals("ucs_basic") || collation.equals("unicode")
                     || collation.equals("icu_root") || collation.equals("pg_c_utf8")
@@ -1433,13 +1460,13 @@ class DdlObjectExecutor {
         java.util.regex.Matcher fnMatcher = java.util.regex.Pattern.compile(
                 "(?:^|\\s)([a-zA-Z_][a-zA-Z0-9_]*)\\s*\\(").matcher(body);
         while (fnMatcher.find()) {
-            String fnName = fnMatcher.group(1).toLowerCase();
+            String fnName = fnMatcher.group(1).toLowerCase(java.util.Locale.ROOT);
             if (isKnownSqlKeyword(fnName)) continue;
             if (isBuiltinFunction(fnName)) continue;
             // Skip if preceded by INTO, FROM, TABLE, UPDATE, JOIN (table reference, not function call)
             // Also skip if preceded by ')' which indicates a table alias like ') t(col)'
             int start = fnMatcher.start(1);
-            String before = body.substring(0, start).trim().toLowerCase();
+            String before = body.substring(0, start).trim().toLowerCase(java.util.Locale.ROOT);
             if (before.endsWith("into") || before.endsWith("from") || before.endsWith("table")
                     || before.endsWith("update") || before.endsWith("join")
                     || before.endsWith("on") || before.endsWith(")")) continue;
@@ -1459,7 +1486,7 @@ class DdlObjectExecutor {
     }
 
     private boolean isKnownType(String typeName) {
-        if (BUILTIN_TYPES.contains(typeName.toLowerCase())) return true;
+        if (BUILTIN_TYPES.contains(typeName.toLowerCase(java.util.Locale.ROOT))) return true;
         if (DataType.fromPgName(typeName) != null) return true;
         if (executor.database.isCustomEnum(typeName)) return true;
         if (executor.database.isDomain(typeName)) return true;
@@ -1505,7 +1532,7 @@ class DdlObjectExecutor {
                 && ((SelectStmt) parsed).targets() != null && !((SelectStmt) parsed).targets().isEmpty()
                 && retType != null && !retType.isEmpty()
                 && !"void".equalsIgnoreCase(retType)
-                && !retType.toUpperCase().startsWith("SETOF")) {
+                && !retType.toUpperCase(java.util.Locale.ROOT).startsWith("SETOF")) {
             SelectStmt sel = (SelectStmt) parsed;
             Expression firstExpr = sel.targets().get(0).expr();
             if (firstExpr instanceof Literal
@@ -1738,7 +1765,7 @@ class DdlObjectExecutor {
         if (base.isEmpty()) return;
         // TABLE return type with column list is validated separately
         if (base.equalsIgnoreCase("TABLE")) return;
-        if (BUILTIN_TYPES.contains(base.toLowerCase())) return;
+        if (BUILTIN_TYPES.contains(base.toLowerCase(java.util.Locale.ROOT))) return;
         if (DataType.fromPgName(base) != null) return;
         if (executor.database.isCustomEnum(base)) return;
         if (executor.database.isDomain(base)) return;
@@ -1764,7 +1791,7 @@ class DdlObjectExecutor {
         // Check for function call pattern: name()
         java.util.regex.Matcher m = java.util.regex.Pattern.compile("([a-zA-Z_][a-zA-Z0-9_]*)\\s*\\(").matcher(defaultExpr);
         while (m.find()) {
-            String fnName = m.group(1).toLowerCase();
+            String fnName = m.group(1).toLowerCase(java.util.Locale.ROOT);
             // Skip built-in functions
             if (isBuiltinFunction(fnName)) continue;
             if (executor.database.getFunction(fnName) == null) {
@@ -1828,10 +1855,10 @@ class DdlObjectExecutor {
         boolean sawDefault = false;
         for (int i = 0; i < params.size(); i++) {
             PgFunction.Param p = params.get(i);
-            String mode = p.mode() == null ? "IN" : p.mode().toUpperCase();
+            String mode = p.mode() == null ? "IN" : p.mode().toUpperCase(java.util.Locale.ROOT);
             if ("OUT".equals(mode)) continue;
             if ("VARIADIC".equals(mode)) {
-                String type = p.typeName() == null ? "" : p.typeName().trim().toLowerCase();
+                String type = p.typeName() == null ? "" : p.typeName().trim().toLowerCase(java.util.Locale.ROOT);
                 type = type.replace("\"", "");
                 // VARIADIC "any" is the untyped form, which takes the arguments as they come
                 if (!type.isEmpty() && !type.endsWith("[]") && !type.equals("anyarray")
@@ -1840,7 +1867,7 @@ class DdlObjectExecutor {
                 }
                 for (int j = i + 1; j < params.size(); j++) {
                     String laterMode = params.get(j).mode() == null
-                            ? "IN" : params.get(j).mode().toUpperCase();
+                            ? "IN" : params.get(j).mode().toUpperCase(java.util.Locale.ROOT);
                     if (!"OUT".equals(laterMode)) {
                         throw new MemgresException(
                                 "VARIADIC parameter must be the last input parameter", "42P13");
@@ -1909,12 +1936,12 @@ class DdlObjectExecutor {
             "text", "varchar", "character varying", "char", "character", "name");
 
     static boolean isNumericType(String type) {
-        return NUMERIC_TYPES.contains(type.toLowerCase().trim());
+        return NUMERIC_TYPES.contains(type.toLowerCase(java.util.Locale.ROOT).trim());
     }
 
     static void checkCastReturnTypeMismatch(String castTo, String retType) {
-        String ct = castTo.toLowerCase().trim();
-        String rt = retType.toLowerCase().trim();
+        String ct = castTo.toLowerCase(java.util.Locale.ROOT).trim();
+        String rt = retType.toLowerCase(java.util.Locale.ROOT).trim();
         boolean castIsString = STRING_TYPES.contains(ct) || ct.startsWith("character varying") || ct.startsWith("character(");
         boolean retIsNumeric = NUMERIC_TYPES.contains(rt);
         boolean retIsString = STRING_TYPES.contains(rt) || rt.startsWith("character varying");
@@ -1982,7 +2009,7 @@ class DdlObjectExecutor {
         if (stmt.parsedParams == null || !stmt.isProcedure()) return;
         boolean seenDefault = false;
         for (CreateFunctionStmt.FuncParam p : stmt.parsedParams) {
-            String mode = p.mode == null ? "IN" : p.mode.toUpperCase();
+            String mode = p.mode == null ? "IN" : p.mode.toUpperCase(java.util.Locale.ROOT);
             if ("OUT".equals(mode)) {
                 if (seenDefault) {
                     throw new MemgresException(
@@ -2008,7 +2035,7 @@ class DdlObjectExecutor {
     private void rejectAggregateArgument(Expression expr) {
         if (expr == null) return;
         if (expr instanceof FunctionCallExpr
-                && CALL_AGGREGATES.contains(((FunctionCallExpr) expr).name().toLowerCase())) {
+                && CALL_AGGREGATES.contains(((FunctionCallExpr) expr).name().toLowerCase(java.util.Locale.ROOT))) {
             throw new MemgresException(
                     "aggregate functions are not allowed in CALL arguments", "42803");
         }
@@ -2112,7 +2139,7 @@ class DdlObjectExecutor {
         }
         int at = 0;
         for (PgFunction.Param p : fn.getParams()) {
-            String mode = p.mode() == null ? "IN" : p.mode().toUpperCase();
+            String mode = p.mode() == null ? "IN" : p.mode().toUpperCase(java.util.Locale.ROOT);
             if ("OUT".equals(mode)) continue;
             if (at >= argTypes.size()) break;
             String given = argTypes.get(at++);
@@ -2125,10 +2152,10 @@ class DdlObjectExecutor {
     /** Whether a value of {@code given} reaches a parameter declared {@code declared}. */
     private static boolean typeFits(String given, String declared) {
         if (declared == null) return true;
-        String want = declared.trim().toLowerCase();
+        String want = declared.trim().toLowerCase(java.util.Locale.ROOT);
         int paren = want.indexOf('(');
         if (paren > 0) want = want.substring(0, paren).trim();
-        String have = given.toLowerCase();
+        String have = given.toLowerCase(java.util.Locale.ROOT);
         if (have.equals(want)) return true;
         int haveRank = numericRank(have);
         int wantRank = numericRank(want);
@@ -2158,7 +2185,7 @@ class DdlObjectExecutor {
     /** Whether an OUT parameter comes before any parameter that takes a value. */
     private static boolean hasLeadingOut(PgFunction fn) {
         for (PgFunction.Param p : fn.getParams()) {
-            String mode = p.mode() == null ? "IN" : p.mode().toUpperCase();
+            String mode = p.mode() == null ? "IN" : p.mode().toUpperCase(java.util.Locale.ROOT);
             if ("OUT".equals(mode)) return true;
             return false;
         }
@@ -2182,7 +2209,7 @@ class DdlObjectExecutor {
         int accepted = 0;
         int total = fn.getParams().size();
         for (PgFunction.Param p : fn.getParams()) {
-            String mode = p.mode() == null ? "IN" : p.mode().toUpperCase();
+            String mode = p.mode() == null ? "IN" : p.mode().toUpperCase(java.util.Locale.ROOT);
             if ("OUT".equals(mode)) continue;
             accepted++;
             if (p.defaultExpr() == null) required++;
@@ -2224,7 +2251,7 @@ class DdlObjectExecutor {
         @SuppressWarnings("unused") boolean typesNamed = true;
         List<PgFunction.Param> outParams = new ArrayList<>();
         for (PgFunction.Param p : function.getParams()) {
-            String mode = p.mode() != null ? p.mode().toUpperCase() : "IN";
+            String mode = p.mode() != null ? p.mode().toUpperCase(java.util.Locale.ROOT) : "IN";
             if ("OUT".equals(mode)) {
                 outParams.add(p);
             } else if ("INOUT".equals(mode)) {
@@ -2273,10 +2300,10 @@ class DdlObjectExecutor {
             if (!(arg instanceof NamedArgExpr)) continue;
             NamedArgExpr named = (NamedArgExpr) arg;
             if ("__variadic__".equals(named.name())) variadic = named.value();
-            else byName.put(named.name().toLowerCase(), named.value());
+            else byName.put(named.name().toLowerCase(java.util.Locale.ROOT), named.value());
         }
         for (PgFunction.Param p : function.getParams()) {
-            String mode = p.mode() != null ? p.mode().toUpperCase() : "IN";
+            String mode = p.mode() != null ? p.mode().toUpperCase(java.util.Locale.ROOT) : "IN";
             if ("OUT".equals(mode)) {
                 if (placeholdersGiven && argIdx < stmt.args().size()
                         && !(stmt.args().get(argIdx) instanceof NamedArgExpr)) {
@@ -2284,7 +2311,7 @@ class DdlObjectExecutor {
                 }
                 continue;
             }
-            Expression named = p.name() == null ? null : byName.get(p.name().toLowerCase());
+            Expression named = p.name() == null ? null : byName.get(p.name().toLowerCase(java.util.Locale.ROOT));
             if (named != null) {
                 args.add(executor.evalExpr(named, null));
                 continue;
@@ -2446,7 +2473,7 @@ class DdlObjectExecutor {
             try {
                 trigEvents.add(PgTrigger.Event.valueOf(event));
             } catch (IllegalArgumentException e) {
-                throw new MemgresException("syntax error at or near \"" + event.toLowerCase() + "\"", "42601");
+                throw new MemgresException("syntax error at or near \"" + event.toLowerCase(java.util.Locale.ROOT) + "\"", "42601");
             }
         }
         checkTriggerShape(stmt, timing, trigEvents, triggerTableSchema, isView);
@@ -2655,7 +2682,7 @@ class DdlObjectExecutor {
         }
         if (stmt.tags() != null) {
             for (String tag : stmt.tags()) {
-                String normalized = tag.trim().toUpperCase();
+                String normalized = tag.trim().toUpperCase(java.util.Locale.ROOT);
                 if (EVENT_TRIGGER_TAGS.contains(normalized)) continue;
                 if (NON_DDL_COMMAND_TAGS.contains(normalized)) {
                     throw new MemgresException(
@@ -2839,9 +2866,9 @@ class DdlObjectExecutor {
         // one of them, so an object the same DROP takes down is no reason to refuse.
         Set<String> together = new HashSet<>();
         if (!stmt.more().isEmpty()) {
-            together.add(RelationNamespace.bareName(stmt.name()).toLowerCase());
+            together.add(RelationNamespace.bareName(stmt.name()).toLowerCase(java.util.Locale.ROOT));
             for (DropStmt other : stmt.more()) {
-                together.add(RelationNamespace.bareName(other.name()).toLowerCase());
+                together.add(RelationNamespace.bareName(other.name()).toLowerCase(java.util.Locale.ROOT));
             }
         }
         // Which of the names reach an object is settled here, before any of them goes: a name
@@ -2895,9 +2922,9 @@ class DdlObjectExecutor {
         String written = stmt.schema() != null ? stmt.schema()
                 : SchemaQualifier.qualifierOf(stmt.name());
         String schema = written != null ? written : executor.defaultSchema();
-        return stmt.objectType() + ":" + schema.toLowerCase() + "."
-                + RelationNamespace.bareName(stmt.name()).toLowerCase()
-                + (stmt.paramTypes() == null ? "" : stmt.paramTypes().toString().toLowerCase());
+        return stmt.objectType() + ":" + schema.toLowerCase(java.util.Locale.ROOT) + "."
+                + RelationNamespace.bareName(stmt.name()).toLowerCase(java.util.Locale.ROOT)
+                + (stmt.paramTypes() == null ? "" : stmt.paramTypes().toString().toLowerCase(java.util.Locale.ROOT));
     }
 
     private QueryResult executeDropOne(DropStmt stmt, Set<String> together) {
@@ -2907,7 +2934,8 @@ class DdlObjectExecutor {
         if (stmt.objectType() != DropStmt.ObjectType.SCHEMA
                 && stmt.objectType() != DropStmt.ObjectType.EXTENSION
                 && ddl.tableExecutor.checkDropSchemaExists(stmt.schema(), stmt.ifExists())) {
-            return QueryResult.command(QueryResult.Type.DROP_TABLE, 0);
+            return QueryResult.command(QueryResult.Type.DROP_TABLE, 0)
+                    .withCommandTag(dropTagOf(stmt.objectType()));
         }
         switch (stmt.objectType()) {
             case VIEW:
@@ -3046,7 +3074,7 @@ class DdlObjectExecutor {
                 // search path put it.
                 String opKey = stmt.name();
                 if (!executor.database.hasOperator(opKey) && opKey.startsWith("public.")) {
-                    String searchPathKey = executor.defaultSchema().toLowerCase()
+                    String searchPathKey = executor.defaultSchema().toLowerCase(java.util.Locale.ROOT)
                             + opKey.substring("public".length());
                     if (executor.database.hasOperator(searchPathKey)) opKey = searchPathKey;
                 }
@@ -3060,7 +3088,7 @@ class DdlObjectExecutor {
             }
             case OPERATOR_FAMILY: {
                 String famMethod = stmt.onTable() != null ? stmt.onTable() : "btree";
-                String famKey = stmt.name().toLowerCase() + ":" + famMethod.toLowerCase();
+                String famKey = stmt.name().toLowerCase(java.util.Locale.ROOT) + ":" + famMethod.toLowerCase(java.util.Locale.ROOT);
                 if (!executor.database.hasOperatorFamily(famKey)) {
                     if (!stmt.ifExists()) {
                         throw new MemgresException("operator family \"" + stmt.name()
@@ -3077,7 +3105,7 @@ class DdlObjectExecutor {
             }
             case OPERATOR_CLASS: {
                 String clsMethod = stmt.onTable() != null ? stmt.onTable() : "btree";
-                String clsKey = stmt.name().toLowerCase() + ":" + clsMethod.toLowerCase();
+                String clsKey = stmt.name().toLowerCase(java.util.Locale.ROOT) + ":" + clsMethod.toLowerCase(java.util.Locale.ROOT);
                 if (!executor.database.hasOperatorClass(clsKey)) {
                     if (!stmt.ifExists()) {
                         throw new MemgresException("operator class \"" + stmt.name()
@@ -3088,7 +3116,21 @@ class DdlObjectExecutor {
                 break;
             }
         }
-        return QueryResult.command(QueryResult.Type.DROP_TABLE, 0);
+        // The tag names the kind of object that was dropped, which the statement said and the
+        // result type does not: every one of them reported itself as DROP TABLE.
+        return QueryResult.command(QueryResult.Type.DROP_TABLE, 0)
+                .withCommandTag(dropTagOf(stmt.objectType()));
+    }
+
+    /** The tag PostgreSQL reports for a DROP of this kind of object. */
+    private static String dropTagOf(DropStmt.ObjectType kind) {
+        if (kind == null) return "DROP TABLE";
+        switch (kind) {
+            case MATERIALIZED_VIEW: return "DROP MATERIALIZED VIEW";
+            case OPERATOR_CLASS: return "DROP OPERATOR CLASS";
+            case OPERATOR_FAMILY: return "DROP OPERATOR FAMILY";
+            default: return "DROP " + kind.name().replace('_', ' ');
+        }
     }
 
     /**
@@ -3171,7 +3213,7 @@ class DdlObjectExecutor {
                 // take besides. A materialized view is named by the kind it really is, because
                 // that is the kind PostgreSQL recorded it under.
                 Database.ViewDef going = executor.database.getView(dependent);
-                if (!together.contains(RelationNamespace.bareName(dependent).toLowerCase())) {
+                if (!together.contains(RelationNamespace.bareName(dependent).toLowerCase(java.util.Locale.ROOT))) {
                     cascaded.add((going != null && going.materialized()
                             ? "materialized view " : "view ")
                             + RelationNamespace.bareName(dependent));
@@ -3189,6 +3231,9 @@ class DdlObjectExecutor {
         // other. Leaving one registered kept pg_rules describing a rule on a relation that was no
         // longer there, and a table created under the name afterwards inherited it.
         executor.database.dropRulesOn(dropViewSchema, bareViewName);
+        // A view is a relation, and a grant on it names it: both go together.
+        executor.database.removePrivilegesOnObject("TABLE",
+                AstExecutor.privilegeKey(dropViewSchema, stmt.name()));
         executor.database.removeView(stmt.name());
     }
 
@@ -3226,7 +3271,7 @@ class DdlObjectExecutor {
         if (!dependents.isEmpty() && !stmt.cascade()) {
             // PostgreSQL names an object the search path does not reach by its schema too, so the
             // reader can tell which of two same-named sequences the complaint is about.
-            boolean visible = visibleSchemas.contains(seqSchema.toLowerCase());
+            boolean visible = visibleSchemas.contains(seqSchema.toLowerCase(java.util.Locale.ROOT));
             String shown = visible ? bareSeqName : seqSchema + "." + bareSeqName;
             MemgresException e = new MemgresException("cannot drop sequence " + shown
                     + " because other objects depend on it", "2BP01");
@@ -3250,6 +3295,10 @@ class DdlObjectExecutor {
             clearSequenceDefaults(found);
         }
         executor.recordUndo(new Session.DropSequenceUndo(found.qualifiedName(), found));
+        // A sequence is a relation, and a grant on it names it: both go together.
+        executor.database.removePrivilegesOnObject("SEQUENCE",
+                AstExecutor.privilegeKey(seqSchema, bareSeqName));
+        executor.database.removeObjectOwner("sequence:" + bareSeqName);
         executor.database.removeSequence(seqSchema, bareSeqName);
         executor.database.removeObjectOwner("sequence:" + bareSeqName);
     }
@@ -3272,7 +3321,7 @@ class DdlObjectExecutor {
          * can tell which of two same-named tables the message is about.
          */
         String tableRef(java.util.List<String> searchPath) {
-            return searchPath.contains(schemaName.toLowerCase())
+            return searchPath.contains(schemaName.toLowerCase(java.util.Locale.ROOT))
                     ? table.getName() : schemaName + "." + table.getName();
         }
     }
@@ -3608,7 +3657,7 @@ class DdlObjectExecutor {
         StringBuilder sb = new StringBuilder();
         for (String t : paramTypes) {
             if (sb.length() > 0) sb.append(",");
-            String written = t == null ? "" : t.trim().toLowerCase();
+            String written = t == null ? "" : t.trim().toLowerCase(java.util.Locale.ROOT);
             String internal = GRAMMAR_TYPE_ALIASES.get(written);
             sb.append(internal != null ? "pg_catalog." + internal : written);
         }
@@ -4037,7 +4086,7 @@ class DdlObjectExecutor {
     static String typeRef(String schema, String name) {
         if (name == null) return null;
         if (schema == null || TypeNamespace.writtenSchema(name) != null) return name;
-        return schema.toLowerCase() + "." + name;
+        return schema.toLowerCase(java.util.Locale.ROOT) + "." + name;
     }
 
     /**
@@ -4188,7 +4237,7 @@ class DdlObjectExecutor {
             }
             List<Session.UndoEntry> restore = new ArrayList<>();
             Set<String> registryBack = new HashSet<>(
-                    executor.database.getSchemaObjects(stmt.name().toLowerCase()));
+                    executor.database.getSchemaObjects(stmt.name().toLowerCase(java.util.Locale.ROOT)));
             if (stmt.cascade()) {
                 dropOutsideSchemaDependents(stmt.name(), hanging, restore);
                 // A type and a sequence the schema holds are dropped with it, and CASCADE means
@@ -4205,7 +4254,7 @@ class DdlObjectExecutor {
                                 executor.database.getTriggersForTable(stmt.name(), tName),
                                 executor.database.snapshotRulesGoingWith(stmt.name(), tName)));
                     }
-                    executor.database.getAllTriggers().remove(tName.toLowerCase());
+                    executor.database.getAllTriggers().remove(tName.toLowerCase(java.util.Locale.ROOT));
                 }
                 for (String tName : tableNames) {
                     executor.database.removePrivilegesOnObject("TABLE",
@@ -4246,7 +4295,7 @@ class DdlObjectExecutor {
                     executor.database.dropRulesGoingWith(droppedSchemaName, tName);
                 }
 
-                String schemaName = stmt.name().toLowerCase();
+                String schemaName = stmt.name().toLowerCase(java.util.Locale.ROOT);
                 Set<String> registeredObjects = new HashSet<>(executor.database.getSchemaObjects(schemaName));
                 for (String entry : registeredObjects) {
                     int colonIdx = entry.indexOf(':');
@@ -4332,6 +4381,11 @@ class DdlObjectExecutor {
                 for (SchemaDependent d : hanging) cascaded.add(d.described);
                 noticeDropCascades(executor, cascaded);
             }
+            // A grant on the schema names it, and so does a grant on anything the schema held:
+            // both go when the schema does, or the role that held them could not be dropped.
+            executor.database.removePrivilegesOnObject("SCHEMA", stmt.name());
+            executor.database.removePrivilegesInSchema(stmt.name());
+            executor.database.removeObjectOwner("schema:" + stmt.name());
             executor.database.removeSchema(stmt.name());
             executor.database.removeObjectOwner("schema:" + stmt.name());
             // A rolled-back DROP SCHEMA never happened, so the schema comes back holding
@@ -4348,7 +4402,7 @@ class DdlObjectExecutor {
      */
     private void dropSchemaTypeAndSequenceDependents(String schemaName) {
         for (String entry : new ArrayList<>(
-                executor.database.getSchemaObjects(schemaName.toLowerCase()))) {
+                executor.database.getSchemaObjects(schemaName.toLowerCase(java.util.Locale.ROOT)))) {
             int colon = entry.indexOf(':');
             if (colon < 0) continue;
             String kind = entry.substring(0, colon);
@@ -4445,7 +4499,7 @@ class DdlObjectExecutor {
             found.add(relationMember(visible, schemaName, "table", t.getName()));
         }
         List<String> entries = new ArrayList<>(
-                executor.database.getSchemaObjects(schemaName.toLowerCase()));
+                executor.database.getSchemaObjects(schemaName.toLowerCase(java.util.Locale.ROOT)));
         Collections.sort(entries);
         for (String entry : entries) {
             int colon = entry.indexOf(':');
@@ -4567,7 +4621,7 @@ class DdlObjectExecutor {
             if (entry.length == 2) {
                 String vs = (String) entry[0];
                 Database.ViewDef v = (Database.ViewDef) entry[1];
-                if (!seen.add("view:" + vs.toLowerCase() + "." + v.name().toLowerCase())) continue;
+                if (!seen.add("view:" + vs.toLowerCase(java.util.Locale.ROOT) + "." + v.name().toLowerCase(java.util.Locale.ROOT))) continue;
                 String kind = v.materialized() ? "materialized view" : "view";
                 String shown = RelationNamespace.shownName(visible, vs, v.name());
                 out.add(new SchemaDependent(kind + " " + shown, kind + " " + shown + on,
@@ -4578,8 +4632,8 @@ class DdlObjectExecutor {
             String ts = (String) entry[0];
             Table t = (Table) entry[1];
             RlsPolicy p = (RlsPolicy) entry[2];
-            if (!seen.add("policy:" + ts.toLowerCase() + "." + t.getName().toLowerCase()
-                    + ":" + p.getName().toLowerCase())) {
+            if (!seen.add("policy:" + ts.toLowerCase(java.util.Locale.ROOT) + "." + t.getName().toLowerCase(java.util.Locale.ROOT)
+                    + ":" + p.getName().toLowerCase(java.util.Locale.ROOT))) {
                 continue;
             }
             String shown = "policy " + p.getName() + " on table "
@@ -4593,7 +4647,7 @@ class DdlObjectExecutor {
                 // own line, which is the one PostgreSQL reports: a whole relation on the way out
                 // stands for every column of it.
                 if (schemaName.equalsIgnoreCase(user.schemaName)) continue;
-                if (!seen.add("column:" + user.described.toLowerCase())) continue;
+                if (!seen.add("column:" + user.described.toLowerCase(java.util.Locale.ROOT))) continue;
                 out.add(new SchemaDependent(user.described, user.described + on));
             }
             // A routine written in terms of the type cannot outlive it either. One inside the
@@ -4602,7 +4656,7 @@ class DdlObjectExecutor {
             for (TypeDependents.Dependent d : TypeDependents.writtenIn(executor.database,
                     executor.systemCatalog, visible, typeNamed(typeKey))) {
                 if (routineSchemaOf(d).equalsIgnoreCase(schemaName)) continue;
-                if (!seen.add("routine:" + d.described().toLowerCase())) continue;
+                if (!seen.add("routine:" + d.described().toLowerCase(java.util.Locale.ROOT))) continue;
                 out.add(new SchemaDependent(d.described(), d.described() + " depends on "
                         + ownerKind + " " + d.typeShown(ownerShown)));
             }
@@ -4613,7 +4667,7 @@ class DdlObjectExecutor {
             for (SequenceDependent dep : findSequenceDependents(seq)) {
                 String shown = "default value for column " + dep.columnName() + " of table "
                         + dep.tableRef(visible);
-                if (!seen.add("default:" + shown.toLowerCase())) continue;
+                if (!seen.add("default:" + shown.toLowerCase(java.util.Locale.ROOT))) continue;
                 out.add(new SchemaDependent(shown, shown + on));
             }
         }
@@ -4660,15 +4714,15 @@ class DdlObjectExecutor {
     /** Whether a parsed tree calls the routine {@code schemaName.routineName}. */
     private static boolean calls(Object tree, String home, String schemaName, String routineName) {
         if (tree == null || routineName == null) return false;
-        final String wanted = routineName.toLowerCase();
-        final String schema = schemaName == null ? "public" : schemaName.toLowerCase();
-        final String where = home == null ? "public" : home.toLowerCase();
+        final String wanted = routineName.toLowerCase(java.util.Locale.ROOT);
+        final String schema = schemaName == null ? "public" : schemaName.toLowerCase(java.util.Locale.ROOT);
+        final String where = home == null ? "public" : home.toLowerCase(java.util.Locale.ROOT);
         final boolean[] found = new boolean[1];
         AstWalk.forEach(tree, node -> {
             if (found[0] || !(node instanceof FunctionCallExpr)) return;
             String written = ((FunctionCallExpr) node).name();
             if (written == null) return;
-            String bare = RelationNamespace.bareName(written).toLowerCase();
+            String bare = RelationNamespace.bareName(written).toLowerCase(java.util.Locale.ROOT);
             if (!bare.equals(wanted)) return;
             int dot = written.lastIndexOf('.');
             if (dot > 0) {
@@ -4971,7 +5025,7 @@ class DdlObjectExecutor {
     QueryResult executeCreateDomain(CreateDomainStmt stmt) {
         SchemaQualifier.requireSchema(executor.database, executor.session, stmt.schemaName());
         String domainSchema = stmt.schemaName() != null
-                ? stmt.schemaName().toLowerCase() : executor.creationSchema();
+                ? stmt.schemaName().toLowerCase(java.util.Locale.ROOT) : executor.creationSchema();
         // A domain shares one namespace per schema with every other kind of type, and only that
         // schema's: a.d and b.d are two domains. A relation's row type is in that namespace too,
         // so a table's name is taken for a domain as much as an enum's is.
@@ -5060,6 +5114,8 @@ class DdlObjectExecutor {
         executor.database.addDomain(domain);
         executor.database.registerSchemaObject(domainSchema, "domain", stmt.name());
         executor.recordUndo(new Session.CreateDomainUndo(domainSchema, stmt.name()));
+        executor.database.setObjectOwner("type:" + TypeNamespace.key(domainSchema, stmt.name()),
+                executor.currentRole());
         return QueryResult.message(QueryResult.Type.SET, "CREATE DOMAIN");
     }
 
@@ -5343,7 +5399,7 @@ class DdlObjectExecutor {
                 requireSchemaExists(stmt.newConstraintName());
                 String from = domain.getSchemaName();
                 String oldKey = TypeNamespace.key(from, domain.getName());
-                String to = stmt.newConstraintName().toLowerCase();
+                String to = stmt.newConstraintName().toLowerCase(java.util.Locale.ROOT);
                 TypeNamespace.requireFree(executor.database, to, domain.getName());
                 inStoredTypes(() -> executor.database.getDomains().remove(oldKey));
                 domain.setSchemaName(to);
@@ -5818,7 +5874,7 @@ class DdlObjectExecutor {
                             while (stripped.startsWith("(")) stripped = stripped.substring(1).trim();
                             int parenIdx = stripped.indexOf('(');
                             if (parenIdx > 0) {
-                                String funcName = stripped.substring(0, parenIdx).trim().toLowerCase();
+                                String funcName = stripped.substring(0, parenIdx).trim().toLowerCase(java.util.Locale.ROOT);
                                 if (!funcName.isEmpty()) {
                                     // SQL/JSON special forms are not regular functions — skip validation
                                     if (isJsonSpecialForm(funcName)) continue;
@@ -5886,13 +5942,13 @@ class DdlObjectExecutor {
                 String partSchema = s.schema() != null ? s.schema() : executor.defaultSchema();
                 Table partTable = executor.resolveTable(partSchema, s.table());
                 if (partTable.getPartitionStrategy() != null && partTable.getPartitionColumn() != null) {
-                    String partCol = partTable.getPartitionColumn().toLowerCase();
+                    String partCol = partTable.getPartitionColumn().toLowerCase(java.util.Locale.ROOT);
                     if (partCol.startsWith("(")) partCol = partCol.substring(1);
                     if (partCol.endsWith(")")) partCol = partCol.substring(0, partCol.length() - 1);
                     partCol = partCol.trim();
                     boolean partColFound = false;
                     for (String idxCol : s.columns()) {
-                        if (idxCol.toLowerCase().equals(partCol)) { partColFound = true; break; }
+                        if (idxCol.toLowerCase(java.util.Locale.ROOT).equals(partCol)) { partColFound = true; break; }
                     }
                     if (!partColFound) {
                         throw new MemgresException("unique constraint on partitioned table must include all partitioning columns\n"
@@ -6240,7 +6296,7 @@ class DdlObjectExecutor {
         for (java.util.Map.Entry<String, String> entry : stmt.options.entrySet()) {
             switch (entry.getKey()) {
                 case "provider":
-                    String pv = entry.getValue().toLowerCase();
+                    String pv = entry.getValue().toLowerCase(java.util.Locale.ROOT);
                     if (pv.equals("icu")) provider = "i";
                     else if (pv.equals("libc")) provider = "c";
                     else provider = pv;
@@ -6341,8 +6397,8 @@ class DdlObjectExecutor {
      * stored differently would register a cast that reinterprets one type's memory as another.
      */
     private void validateBinaryCoercible(CreateCastStmt stmt) {
-        String src = stmt.sourceType.toLowerCase();
-        String tgt = stmt.targetType.toLowerCase();
+        String src = stmt.sourceType.toLowerCase(java.util.Locale.ROOT);
+        String tgt = stmt.targetType.toLowerCase(java.util.Locale.ROOT);
         if (DataType.canonicalName(src).equals(DataType.canonicalName(tgt))) {
             throw new MemgresException("source data type and target data type are the same", "42P17");
         }
@@ -6365,7 +6421,7 @@ class DdlObjectExecutor {
      * this reports that triple as one key.
      */
     private String storageClass(String typeName) {
-        String base = typeName.toLowerCase().replaceAll("\\(.*\\)", "").trim();
+        String base = typeName.toLowerCase(java.util.Locale.ROOT).replaceAll("\\(.*\\)", "").trim();
         if (base.endsWith("[]")) return "-1/f/d";           // every array is a varlena
         if (executor.database.isCompositeType(base)) return "-1/f/d";
         if (executor.database.isCustomEnum(base)) return "4/t/i";
@@ -6437,7 +6493,7 @@ class DdlObjectExecutor {
         // version memgres actually knows can be named honestly here; the ones it accepts without
         // implementing carry no version PostgreSQL would agree with.
         if (kind.equals("extension") && extra.equals("update") && executor.session != null) {
-            String version = BUILTIN_EXTENSIONS.get(name.toLowerCase());
+            String version = BUILTIN_EXTENSIONS.get(name.toLowerCase(java.util.Locale.ROOT));
             if (version != null) {
                 executor.session.addNotice("NOTICE", "00000", "version \"" + version
                         + "\" of extension \"" + name + "\" is already installed", null);
@@ -6475,7 +6531,7 @@ class DdlObjectExecutor {
     /** Refuse a name of this kind that was never created, in PostgreSQL's words for the kind. */
     void requireObjectExists(String kind, String name) {
         if (name == null || name.isEmpty()) return;
-        String lower = name.toLowerCase();
+        String lower = name.toLowerCase(java.util.Locale.ROOT);
         Database db = executor.database;
         boolean exists;
         if (kind.equals("publication")) {
@@ -6539,13 +6595,13 @@ class DdlObjectExecutor {
     /** A rename that reports success has to move the name the object answers to. */
     private void renameRegisteredObject(String kind, String name, String newName) {
         Database db = executor.database;
-        String lower = name.toLowerCase();
+        String lower = name.toLowerCase(java.util.Locale.ROOT);
         if (kind.equals("text search configuration")) {
             Database.TsConfigDef cfg = db.getTsConfigs().get(lower);
             if (cfg == null) return;
-            if (!lower.equals(newName.toLowerCase())
-                    && (BUILTIN_TS_CONFIGS.contains(newName.toLowerCase())
-                        || db.getTsConfigs().containsKey(newName.toLowerCase()))) {
+            if (!lower.equals(newName.toLowerCase(java.util.Locale.ROOT))
+                    && (BUILTIN_TS_CONFIGS.contains(newName.toLowerCase(java.util.Locale.ROOT))
+                        || db.getTsConfigs().containsKey(newName.toLowerCase(java.util.Locale.ROOT)))) {
                 throw new MemgresException("text search configuration \"" + newName
                         + "\" already exists in schema \"" + executor.defaultSchema() + "\"", "42710");
             }
@@ -6554,9 +6610,9 @@ class DdlObjectExecutor {
         } else if (kind.equals("text search dictionary")) {
             Database.TsDictDef dict = db.getTsDicts().get(lower);
             if (dict == null) return;
-            if (!lower.equals(newName.toLowerCase())
-                    && (BUILTIN_TS_DICTS.contains(newName.toLowerCase())
-                        || db.getTsDicts().containsKey(newName.toLowerCase()))) {
+            if (!lower.equals(newName.toLowerCase(java.util.Locale.ROOT))
+                    && (BUILTIN_TS_DICTS.contains(newName.toLowerCase(java.util.Locale.ROOT))
+                        || db.getTsDicts().containsKey(newName.toLowerCase(java.util.Locale.ROOT)))) {
                 throw new MemgresException("text search dictionary \"" + newName
                         + "\" already exists in schema \"" + executor.defaultSchema() + "\"", "42710");
             }
@@ -6565,7 +6621,7 @@ class DdlObjectExecutor {
         } else if (kind.equals("server")) {
             Database.FdwServer srv = db.getForeignServer(name);
             if (srv == null) return;
-            if (db.getForeignServer(newName) != null && !lower.equals(newName.toLowerCase())) {
+            if (db.getForeignServer(newName) != null && !lower.equals(newName.toLowerCase(java.util.Locale.ROOT))) {
                 throw new MemgresException("server \"" + newName + "\" already exists", "42710");
             }
             db.removeForeignServer(name);
@@ -6573,8 +6629,8 @@ class DdlObjectExecutor {
         } else if (kind.equals("foreign-data wrapper")) {
             Database.FdwWrapper fdw = db.getForeignDataWrappers().get(lower);
             if (fdw == null) return;
-            if (db.getForeignDataWrappers().containsKey(newName.toLowerCase())
-                    && !lower.equals(newName.toLowerCase())) {
+            if (db.getForeignDataWrappers().containsKey(newName.toLowerCase(java.util.Locale.ROOT))
+                    && !lower.equals(newName.toLowerCase(java.util.Locale.ROOT))) {
                 throw new MemgresException(
                         "foreign-data wrapper \"" + newName + "\" already exists", "42710");
             }
@@ -6583,8 +6639,8 @@ class DdlObjectExecutor {
         } else if (kind.equals("subscription")) {
             Database.SubDef sub = db.getSubscriptions().get(lower);
             if (sub == null) return;
-            if (db.getSubscriptions().containsKey(newName.toLowerCase())
-                    && !lower.equals(newName.toLowerCase())) {
+            if (db.getSubscriptions().containsKey(newName.toLowerCase(java.util.Locale.ROOT))
+                    && !lower.equals(newName.toLowerCase(java.util.Locale.ROOT))) {
                 throw new MemgresException(
                         "subscription \"" + newName + "\" already exists", "42710");
             }

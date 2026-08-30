@@ -128,7 +128,7 @@ public final class BuiltinFunctionNames {
             "substring", "sum", "svals", "text", "time",
             "timeofday", "timestamp", "timestamptz", "timetz", "timezone",
             "to_ascii", "to_char", "to_date", "to_hex", "to_number", "to_regclass",
-            "to_regproc", "to_regprocedure", "to_regtype", "to_timestamp", "to_tsquery", "to_tsvector",
+            "to_regproc", "to_regprocedure", "to_regrole", "to_regtype", "to_timestamp", "to_tsquery", "to_tsvector",
             "transaction_timestamp", "translate", "trim_array", "trunc", "ts_debug",
             "ts_delete", "ts_filter", "ts_headline", "ts_lexize", "ts_parse", "ts_rank", "ts_rank_cd",
             "ts_rewrite", "ts_stat", "ts_token_type", "tsquery_phrase",

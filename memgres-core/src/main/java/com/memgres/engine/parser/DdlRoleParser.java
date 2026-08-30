@@ -35,7 +35,7 @@ class DdlRoleParser {
         while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
             Token t = parser.peek();
             if (t.type() != TokenType.KEYWORD && t.type() != TokenType.IDENTIFIER) break;
-            String kw = t.value().toUpperCase();
+            String kw = t.value().toUpperCase(java.util.Locale.ROOT);
             parser.advance();
             switch (kw) {
                 case "IN": {
@@ -117,69 +117,53 @@ class DdlRoleParser {
         return new DropRoleStmt(names, ifExists);
     }
 
-    /** Shared role option parsing for CREATE ROLE and ALTER ROLE. */
+    /** The flag options, each written with or without NO, and the attribute each sets. */
+    private static final Map<String, String> FLAG_OPTIONS = flagOptions();
+
+    private static Map<String, String> flagOptions() {
+        Map<String, String> m = new LinkedHashMap<>();
+        for (String name : new String[]{"SUPERUSER", "CREATEDB", "CREATEROLE", "LOGIN",
+                "INHERIT", "REPLICATION", "BYPASSRLS"}) {
+            m.put(name, name);
+            m.put("NO" + name, name);
+        }
+        return m;
+    }
+
+    /** The words that open a clause of the statement rather than naming an option. */
+    private static final java.util.Set<String> TAIL_WORDS = new java.util.HashSet<>(
+            java.util.Arrays.asList("IN", "ROLE", "USER", "ADMIN", "SET", "RESET", "RENAME",
+                    "WITH", "TO", "GRANTED", "SYSID", "ADD", "DROP", "GROUP"));
+
+    /**
+     * Shared role option parsing for CREATE ROLE and ALTER ROLE.
+     *
+     * <p>Every word here is an option or it is nothing. Left as a bare {@code return}, a word
+     * nobody defined ended the parse and the statement reported success with that word and
+     * everything after it discarded — so a typed option was silently not applied. And two
+     * options that contradict each other are refused rather than resolved last-one-wins.
+     */
     private void parseRoleOptions(Map<String, String> options) {
         while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
             Token t = parser.peek();
             if (t.type() != TokenType.KEYWORD && t.type() != TokenType.IDENTIFIER) break;
-            String kw = t.value().toUpperCase();
+            String kw = t.value().toUpperCase(java.util.Locale.ROOT);
+            // The tail of the statement is not an option list: these words open clauses of
+            // their own, and reading them here would take them away from the parser that wants
+            // them.
+            if (TAIL_WORDS.contains(kw)) break;
+            String flag = FLAG_OPTIONS.get(kw);
+            if (flag != null) {
+                String was = options.get(flag);
+                String now = kw.startsWith("NO") ? "false" : "true";
+                if (was != null && !was.equals(now)) {
+                    throw ParseException.saying("conflicting or redundant options", t, "42601");
+                }
+                parser.advance();
+                options.put(flag, now);
+                continue;
+            }
             switch (kw) {
-                case "SUPERUSER": {
-                    parser.advance(); options.put("SUPERUSER", "true"); 
-                    break;
-                }
-                case "NOSUPERUSER": {
-                    parser.advance(); options.put("SUPERUSER", "false"); 
-                    break;
-                }
-                case "CREATEDB": {
-                    parser.advance(); options.put("CREATEDB", "true"); 
-                    break;
-                }
-                case "NOCREATEDB": {
-                    parser.advance(); options.put("CREATEDB", "false"); 
-                    break;
-                }
-                case "CREATEROLE": {
-                    parser.advance(); options.put("CREATEROLE", "true"); 
-                    break;
-                }
-                case "NOCREATEROLE": {
-                    parser.advance(); options.put("CREATEROLE", "false"); 
-                    break;
-                }
-                case "LOGIN": {
-                    parser.advance(); options.put("LOGIN", "true"); 
-                    break;
-                }
-                case "NOLOGIN": {
-                    parser.advance(); options.put("LOGIN", "false"); 
-                    break;
-                }
-                case "INHERIT": {
-                    parser.advance(); options.put("INHERIT", "true"); 
-                    break;
-                }
-                case "NOINHERIT": {
-                    parser.advance(); options.put("INHERIT", "false"); 
-                    break;
-                }
-                case "REPLICATION": {
-                    parser.advance(); options.put("REPLICATION", "true"); 
-                    break;
-                }
-                case "NOREPLICATION": {
-                    parser.advance(); options.put("REPLICATION", "false"); 
-                    break;
-                }
-                case "BYPASSRLS": {
-                    parser.advance(); options.put("BYPASSRLS", "true"); 
-                    break;
-                }
-                case "NOBYPASSRLS": {
-                    parser.advance(); options.put("BYPASSRLS", "false"); 
-                    break;
-                }
                 case "PASSWORD": {
                     parser.advance();
                     if (parser.matchKeyword("NULL")) {
@@ -208,7 +192,8 @@ class DdlRoleParser {
                     break;
                 }
                 default: {
-                    return; 
+                    throw ParseException.saying("unrecognized role option \""
+                            + t.raw().toLowerCase(java.util.Locale.ROOT) + "\"", t, "42601");
                 }
             }
         }

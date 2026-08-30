@@ -6,9 +6,23 @@ public final class ReassignOwnedStmt implements Statement {
     public final String newRole;
 
     public ReassignOwnedStmt(String oldRole, String newRole) {
-        this.oldRole = oldRole;
+        this(java.util.Collections.singletonList(oldRole), newRole);
+    }
+
+    public ReassignOwnedStmt(java.util.List<String> oldRoles, String newRole) {
+        this.oldRoles = oldRoles;
+        this.oldRole = oldRoles.isEmpty() ? null : oldRoles.get(0);
         this.newRole = newRole;
     }
+
+    /**
+     * Every role the statement named. One statement may name several, and it reassigns what all
+     * of them own; read as one name with the rest advanced over, the others kept their objects
+     * and the statement reported success.
+     */
+    public java.util.List<String> oldRoles() { return oldRoles; }
+
+    private final java.util.List<String> oldRoles;
 
     public String oldRole() { return oldRole; }
     public String newRole() { return newRole; }

@@ -36,6 +36,6 @@ public class PgOperatorClass {
      * Key for storage: name + method.
      */
     public String getKey() {
-        return name.toLowerCase() + ":" + method.toLowerCase();
+        return name.toLowerCase(java.util.Locale.ROOT) + ":" + method.toLowerCase(java.util.Locale.ROOT);
     }
 }

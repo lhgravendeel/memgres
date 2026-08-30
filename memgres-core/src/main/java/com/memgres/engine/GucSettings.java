@@ -35,7 +35,11 @@ public class GucSettings {
             {"allow_alter_system", "on", "bool", "sighup", "Version and Platform Compatibility / Other Platforms and Clients", null, null, null, null, "Allows running the ALTER SYSTEM command.", "Can be set to off for environments where global configuration changes should be made using a different method."},
             {"allow_in_place_tablespaces", "off", "bool", "superuser", "Developer Options", null, null, null, null, "Allows tablespaces directly inside pg_tblspc, for testing."},
             {"allow_system_table_mods", "off", "bool", "superuser", "Developer Options", null, null, null, null, "Allows modifications of the structure of system tables."},
-            {"application_name", "memgres", "string", "user", "Reporting and Logging / What to Log", null, null, null, null, "Sets the application name to be reported in statistics and logs."},
+            // A connection that names itself is named that; one that does not has no name at
+            // all. Defaulting to the server's own name, RESET application_name gave every
+            // connection the same name and a reader of pg_stat_activity could not tell which
+            // client had said nothing from one that had said "memgres".
+            {"application_name", "", "string", "user", "Reporting and Logging / What to Log", null, null, null, null, "Sets the application name to be reported in statistics and logs."},
             {"archive_cleanup_command", "", "string", "sighup", "Write-Ahead Log / Archive Recovery", null, null, null, null, "Sets the shell command that will be executed at every restart point."},
             {"archive_command", "", "string", "sighup", "Write-Ahead Log / Archiving", null, null, null, null, "Sets the shell command that will be called to archive a WAL file.", "An empty string means use \"archive_library\"."},
             {"archive_library", "", "string", "sighup", "Write-Ahead Log / Archiving", null, null, null, null, "Sets the library that will be called to archive a WAL file.", "An empty string means use \"archive_command\"."},
@@ -572,7 +576,7 @@ public class GucSettings {
 
     /** The definition of a parameter, or null when memgres does not carry it. */
     public static Def definition(String name) {
-        return name == null ? null : DEFINITIONS.get(name.toLowerCase());
+        return name == null ? null : DEFINITIONS.get(name.toLowerCase(java.util.Locale.ROOT));
     }
 
     /** Every parameter definition, in name order. */
@@ -605,14 +609,14 @@ public class GucSettings {
         // but JDBC drivers expect lowercase for ParameterStatus messages.
         String normalized = value;
         if (normalized != null) {
-            String upper = normalized.trim().toUpperCase();
+            String upper = normalized.trim().toUpperCase(java.util.Locale.ROOT);
             if ("ON".equals(upper) || "OFF".equals(upper)
                     || "TRUE".equals(upper) || "FALSE".equals(upper)
                     || "YES".equals(upper) || "NO".equals(upper)) {
-                normalized = normalized.trim().toLowerCase();
+                normalized = normalized.trim().toLowerCase(java.util.Locale.ROOT);
             }
         }
-        String key = name.toLowerCase();
+        String key = name.toLowerCase(java.util.Locale.ROOT);
         // L7: remember custom (dotted) parameters so RESET keeps them as an empty placeholder.
         if (key.indexOf('.') >= 0) {
             customPlaceholders.add(key);
@@ -629,7 +633,7 @@ public class GucSettings {
 
     /** Set a transaction-scoped (LOCAL) parameter that reverts on commit/rollback. */
     public void setLocal(String name, String value) {
-        String key = name.toLowerCase();
+        String key = name.toLowerCase(java.util.Locale.ROOT);
         transactionOverrides.put(key, toBaseUnit(key, canonicalValue(key, value)));
     }
 
@@ -703,7 +707,7 @@ public class GucSettings {
 
     /** Reset a single parameter to default. */
     public void reset(String name) {
-        String key = name.toLowerCase();
+        String key = name.toLowerCase(java.util.Locale.ROOT);
         // L7: a custom placeholder stays defined with an empty value after RESET (PG behavior).
         if (customPlaceholders.contains(key)) {
             sessionOverrides.put(key, "");
@@ -730,7 +734,7 @@ public class GucSettings {
 
     /** Set a boot-time default that overrides the static default (e.g., for session_authorization). */
     public void setBootDefault(String name, String value) {
-        bootDefaults.put(name.toLowerCase(), value);
+        bootDefaults.put(name.toLowerCase(java.util.Locale.ROOT), value);
     }
 
     /**
@@ -746,7 +750,7 @@ public class GucSettings {
 
     /** Get a parameter value (transaction override, then session override, then boot default, then static default). */
     public String get(String name) {
-        String key = name.toLowerCase();
+        String key = name.toLowerCase(java.util.Locale.ROOT);
         String val = transactionOverrides.get(key);
         if (val != null) return val;
         val = sessionOverrides.get(key);
@@ -763,7 +767,7 @@ public class GucSettings {
 
     /** The value RESET would restore: the boot default, ignoring anything this session has set. */
     public String getResetValue(String name) {
-        String key = name.toLowerCase();
+        String key = name.toLowerCase(java.util.Locale.ROOT);
         String val = bootDefaults.get(key);
         if (val != null) return val;
         return DEFAULTS.get(key);
@@ -789,7 +793,7 @@ public class GucSettings {
         if (val.equalsIgnoreCase("on") || val.equalsIgnoreCase("off")
                 || val.equalsIgnoreCase("true") || val.equalsIgnoreCase("false")
                 || val.equalsIgnoreCase("yes") || val.equalsIgnoreCase("no")) {
-            return val.toLowerCase();
+            return val.toLowerCase(java.util.Locale.ROOT);
         }
         return val;
     }
@@ -1019,7 +1023,7 @@ public class GucSettings {
     static Boolean parseBool(String value) {
         String v = unquote(value);
         if (v == null) return null;
-        v = v.trim().toLowerCase();
+        v = v.trim().toLowerCase(java.util.Locale.ROOT);
         if (v.isEmpty()) return null;
         if ("on".startsWith(v) && !"o".equals(v)) return Boolean.TRUE;   // on
         if ("off".startsWith(v) && !"o".equals(v)) return Boolean.FALSE; // off, of
@@ -1254,21 +1258,27 @@ public class GucSettings {
 
     /** Check if a parameter has been explicitly set at the session level (not just the default). */
     public boolean hasSessionOverride(String name) {
-        return sessionOverrides.containsKey(name.toLowerCase()) || transactionOverrides.containsKey(name.toLowerCase());
+        return sessionOverrides.containsKey(name.toLowerCase(java.util.Locale.ROOT)) || transactionOverrides.containsKey(name.toLowerCase(java.util.Locale.ROOT));
     }
 
     /** Check if a parameter name is known (either in defaults or session overrides). */
     public boolean isKnown(String name) {
-        String key = name.toLowerCase();
+        String key = name.toLowerCase(java.util.Locale.ROOT);
         return DEFAULTS.containsKey(key) || sessionOverrides.containsKey(key);
+    }
+
+    /** The spelling PostgreSQL writes a parameter with, for a reader with no session in hand. */
+    public static String canonicalNameOf(String name) {
+        String canonical = CANONICAL_NAMES.get(name.toLowerCase(java.util.Locale.ROOT));
+        return canonical != null ? canonical : name.toLowerCase(java.util.Locale.ROOT);
     }
 
     /** Get the canonical (display) name for a parameter, preserving PG's mixed-case conventions. */
     public String getCanonicalName(String name) {
-        String canonical = CANONICAL_NAMES.get(name.toLowerCase());
+        String canonical = CANONICAL_NAMES.get(name.toLowerCase(java.util.Locale.ROOT));
         if (canonical != null) return canonical;
-        String spelled = customSpellings.get(name.toLowerCase());
-        return spelled != null ? spelled : name.toLowerCase();
+        String spelled = customSpellings.get(name.toLowerCase(java.util.Locale.ROOT));
+        return spelled != null ? spelled : name.toLowerCase(java.util.Locale.ROOT);
     }
 
     /**
@@ -1302,7 +1312,7 @@ public class GucSettings {
      */
     public static void requireKnown(String name) {
         if (name == null) return;
-        String key = name.toLowerCase();
+        String key = name.toLowerCase(java.util.Locale.ROOT);
         if (key.indexOf('.') >= 0) return;
         if (DEFINITIONS.containsKey(key)) return;
         throw new MemgresException("unrecognized configuration parameter \"" + name + "\"", "42704");
@@ -1324,7 +1334,7 @@ public class GucSettings {
             return v; // plain integers are milliseconds
         } catch (NumberFormatException ignored) {}
         // Try with unit suffix
-        value = value.toLowerCase();
+        value = value.toLowerCase(java.util.Locale.ROOT);
         if (value.endsWith("ms")) {
             try { return Long.parseLong(value.substring(0, value.length() - 2).trim()); } catch (NumberFormatException ignored) {}
         } else if (value.endsWith("s")) {

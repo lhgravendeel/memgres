@@ -118,7 +118,7 @@ class CatalogPrivilegeFunctions {
             // An attnum that names no column is not an error in PostgreSQL — the answer is unknown.
             if (column == null) return null;
         } else {
-            column = str(colArg).toLowerCase();
+            column = str(colArg).toLowerCase(java.util.Locale.ROOT);
             if (rel.table != null && rel.table.getColumnIndex(column) < 0) {
                 throw new MemgresException("column \"" + column + "\" of relation \""
                         + rel.name + "\" does not exist", "42703");
@@ -145,7 +145,7 @@ class CatalogPrivilegeFunctions {
             if (holds(role, p, "TABLE", key)) return true;
             if (rel.table == null) continue;
             for (Column col : rel.table.getColumns()) {
-                if (holds(role, p, "COLUMN", key + "." + col.getName().toLowerCase())) return true;
+                if (holds(role, p, "COLUMN", key + "." + col.getName().toLowerCase(java.util.Locale.ROOT))) return true;
             }
         }
         return false;
@@ -157,7 +157,7 @@ class CatalogPrivilegeFunctions {
         boolean withRole = a.size() >= 3;
         String role = withRole ? role(a.get(0), true) : currentUserName();
         Object schemaArg = a.get(withRole ? 1 : 0);
-        String schema = str(schemaArg).toLowerCase();
+        String schema = str(schemaArg).toLowerCase(java.util.Locale.ROOT);
         if (!(schemaArg instanceof Number) && !schemaExists(schema)) {
             throw new MemgresException("schema \"" + str(schemaArg) + "\" does not exist", "3F000");
         }
@@ -184,7 +184,7 @@ class CatalogPrivilegeFunctions {
             // PUBLIC holds CONNECT and TEMPORARY on every database unless they are revoked;
             // CREATE is the owner's alone.
             if (!p.grantOption && !"CREATE".equals(p.name)) return true;
-            if (holds(role, p, "DATABASE", db.toLowerCase())) return true;
+            if (holds(role, p, "DATABASE", db.toLowerCase(java.util.Locale.ROOT))) return true;
         }
         return false;
     }
@@ -200,7 +200,7 @@ class CatalogPrivilegeFunctions {
         int paren = bare.indexOf('(');
         if (paren >= 0) bare = bare.substring(0, paren).trim();
         if (bare.contains(".")) bare = bare.substring(bare.lastIndexOf('.') + 1);
-        bare = bare.toLowerCase();
+        bare = bare.toLowerCase(java.util.Locale.ROOT);
         if (!(fnArg instanceof Number) && !functionExists(bare)) {
             throw new MemgresException("function \"" + signature + "\" does not exist", "42883");
         }
@@ -256,7 +256,7 @@ class CatalogPrivilegeFunctions {
         for (Priv p : privs) {
             // A type's default ACL grants USAGE to PUBLIC; only the grant option is the owner's.
             if (!p.grantOption) return true;
-            if (holds(role, p, "TYPE", type.toLowerCase())) return true;
+            if (holds(role, p, "TYPE", type.toLowerCase(java.util.Locale.ROOT))) return true;
         }
         return false;
     }
@@ -277,7 +277,7 @@ class CatalogPrivilegeFunctions {
         List<Priv> privs = parsePrivileges(str(a.get(withRole ? 2 : 1)), allowed, false);
         for (Priv p : privs) {
             if (publicByDefault && !p.grantOption) return true;
-            if (holds(role, p, objectType, name.toLowerCase())) return true;
+            if (holds(role, p, objectType, name.toLowerCase(java.util.Locale.ROOT))) return true;
         }
         return false;
     }
@@ -287,7 +287,7 @@ class CatalogPrivilegeFunctions {
         if (a == null) return null;
         boolean withRole = a.size() >= 3;
         String role = withRole ? role(a.get(0), true) : currentUserName();
-        String param = str(a.get(withRole ? 1 : 0)).toLowerCase();
+        String param = str(a.get(withRole ? 1 : 0)).toLowerCase(java.util.Locale.ROOT);
         // PostgreSQL does not require the parameter to exist: an unknown GUC simply has no grants.
         List<Priv> privs = parsePrivileges(str(a.get(withRole ? 2 : 1)), PARAMETER_PRIVS, false);
         for (Priv p : privs) {
@@ -361,10 +361,10 @@ class CatalogPrivilegeFunctions {
     private String role(Object arg, boolean allowPublic) {
         if (arg instanceof Number) return currentUserName();
         String name = str(arg);
-        String lower = name.toLowerCase();
+        String lower = name.toLowerCase(java.util.Locale.ROOT);
         if (allowPublic && "public".equals(lower)) return lower;
         if (executor.database.getRoles().containsKey(lower)) return lower;
-        if (lower.equals(executor.sessionUser().toLowerCase())) return lower;
+        if (lower.equals(executor.sessionUser().toLowerCase(java.util.Locale.ROOT))) return lower;
         throw PgErrors.undefinedObject("role", name);
     }
 
@@ -413,11 +413,11 @@ class CatalogPrivilegeFunctions {
     }
 
     private Table catalogRelation(String schema, String bare) {
-        String lowerSchema = schema == null ? "" : schema.toLowerCase();
+        String lowerSchema = schema == null ? "" : schema.toLowerCase(java.util.Locale.ROOT);
         if ("information_schema".equals(lowerSchema)) {
             return executor.systemCatalog.resolve("information_schema", bare);
         }
-        if ("pg_catalog".equals(lowerSchema) || bare.toLowerCase().startsWith("pg_")) {
+        if ("pg_catalog".equals(lowerSchema) || bare.toLowerCase(java.util.Locale.ROOT).startsWith("pg_")) {
             return executor.systemCatalog.resolve("pg_catalog", bare);
         }
         return null;
@@ -431,7 +431,7 @@ class CatalogPrivilegeFunctions {
         // A dropped column keeps its number, so an attnum is not a position in what is left.
         int at = rel.table.columnIndexOfAttnum(attnum);
         if (at < 0 || at >= columns.size()) return null;
-        return columns.get(at).getName().toLowerCase();
+        return columns.get(at).getName().toLowerCase(java.util.Locale.ROOT);
     }
 
     private boolean schemaExists(String schema) {
@@ -453,7 +453,7 @@ class CatalogPrivilegeFunctions {
     }
 
     private boolean typeExists(String name) {
-        String lower = name.trim().toLowerCase();
+        String lower = name.trim().toLowerCase(java.util.Locale.ROOT);
         if (lower.endsWith("[]")) lower = lower.substring(0, lower.length() - 2).trim();
         if (CatalogMetadataFunctions.canonicalTypeName(executor.database, lower) != null) return true;
         return catalogHasName("pg_type", "typname", lower);
@@ -529,8 +529,8 @@ class CatalogPrivilegeFunctions {
     }
 
     boolean checkPrivilege(String roleName, String privilege, String objectType, String objectName) {
-        String role = roleName.toLowerCase();
-        String object = objectName.toLowerCase();
+        String role = roleName.toLowerCase(java.util.Locale.ROOT);
+        String object = objectName.toLowerCase(java.util.Locale.ROOT);
 
         Map<String, String> roleAttrs = executor.database.getRoles().get(role);
         if (roleAttrs != null && "true".equalsIgnoreCase(roleAttrs.get("SUPERUSER"))) {
@@ -552,10 +552,10 @@ class CatalogPrivilegeFunctions {
     }
 
     private static String ownerKey(String objectType, String objectName) {
-        String kind = objectType.toLowerCase();
+        String kind = objectType.toLowerCase(java.util.Locale.ROOT);
         if ("table".equals(kind) || "function".equals(kind) || "schema".equals(kind)
                 || "sequence".equals(kind) || "database".equals(kind) || "type".equals(kind)) {
-            return kind + ":" + objectName.toLowerCase();
+            return kind + ":" + objectName.toLowerCase(java.util.Locale.ROOT);
         }
         // A kind this method does not know cannot be allowed to key the same as one it does,
         // so it is marked. The marker is not an object type and cannot be written as one.
@@ -567,9 +567,9 @@ class CatalogPrivilegeFunctions {
         if (!visited.add(roleName)) return false;
 
         Set<String> privs = executor.database.getRolePrivileges(roleName);
-        String object = objectName.toLowerCase();
-        String checkKey = privilege.toUpperCase() + ":" + objectType.toUpperCase() + ":" + object;
-        String allKey = "ALL:" + objectType.toUpperCase() + ":" + object;
+        String object = objectName.toLowerCase(java.util.Locale.ROOT);
+        String checkKey = privilege.toUpperCase(java.util.Locale.ROOT) + ":" + objectType.toUpperCase(java.util.Locale.ROOT) + ":" + object;
+        String allKey = "ALL:" + objectType.toUpperCase(java.util.Locale.ROOT) + ":" + object;
         if (privs.contains(checkKey) || privs.contains(allKey)) {
             return true;
         }
@@ -594,11 +594,11 @@ class CatalogPrivilegeFunctions {
             if (guc.hasSessionOverride("role")) {
                 String role = guc.get("role");
                 if (role != null && !role.equalsIgnoreCase("NONE") && !role.equalsIgnoreCase("DEFAULT")) {
-                    return role.toLowerCase();
+                    return role.toLowerCase(java.util.Locale.ROOT);
                 }
             }
             String sessionAuth = guc.get("session_authorization");
-            if (sessionAuth != null) return sessionAuth.toLowerCase();
+            if (sessionAuth != null) return sessionAuth.toLowerCase(java.util.Locale.ROOT);
         }
         return "memgres";
     }
@@ -606,7 +606,7 @@ class CatalogPrivilegeFunctions {
     private String currentRoleName() {
         if (executor.session != null && executor.session.getGucSettings().hasSessionOverride("role")) {
             String role = executor.session.getGucSettings().get("role");
-            if (role != null) return role.toLowerCase();
+            if (role != null) return role.toLowerCase(java.util.Locale.ROOT);
         }
         return "memgres";
     }

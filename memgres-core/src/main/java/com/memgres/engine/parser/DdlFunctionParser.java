@@ -28,7 +28,7 @@ class DdlFunctionParser {
      * the word that completes it — so what was read as a parameter name is really half a type.
      */
     private static boolean continuesMultiWordType(Parser parser, String firstIdent) {
-        String head = firstIdent == null ? "" : firstIdent.toLowerCase();
+        String head = firstIdent == null ? "" : firstIdent.toLowerCase(java.util.Locale.ROOT);
         switch (head) {
             case "double":
                 return parser.checkKeyword("PRECISION") || parser.checkIdentifier("precision");
@@ -75,7 +75,7 @@ class DdlFunctionParser {
                 // Check if the next token is a reserved keyword that can't be used as a parameter name
                 Token nextTok = parser.peek();
                 if (nextTok.type() == TokenType.KEYWORD && RESERVED_PARAM_KEYWORDS.contains(nextTok.value())) {
-                    throw new ParseException("syntax error at or near \"" + nextTok.value().toLowerCase() + "\"", nextTok, "42601");
+                    throw new ParseException("syntax error at or near \"" + nextTok.value().toLowerCase(java.util.Locale.ROOT) + "\"", nextTok, "42601");
                 }
                 String firstIdent = parser.readIdentifier();
 
@@ -97,7 +97,7 @@ class DdlFunctionParser {
                 } else if (parser.checkKeyword("OUT") || parser.checkIdentifier("OUT") ||
                         parser.checkKeyword("INOUT") || parser.checkIdentifier("INOUT")) {
                     paramName = firstIdent;
-                    String actualMode = parser.advance().value().toUpperCase();
+                    String actualMode = parser.advance().value().toUpperCase(java.util.Locale.ROOT);
                     if (actualMode.equals("IN") && (parser.matchKeyword("OUT") || parser.matchIdentifier("OUT"))) actualMode = "INOUT";
                     String typeName = parser.parseTypeName();
                     parsedParams.add(new CreateFunctionStmt.FuncParam(paramName, typeName, actualMode));
@@ -241,7 +241,7 @@ class DdlFunctionParser {
         // Only the C language reads a second AS item, as the symbol inside the named object file.
         if (asItemCount > 1 && !"c".equalsIgnoreCase(language) && !"internal".equalsIgnoreCase(language)) {
             throw ParseException.saying("only one AS item needed for language \""
-                    + language.toLowerCase() + "\"", languageToken, "42P13");
+                    + language.toLowerCase(java.util.Locale.ROOT) + "\"", languageToken, "42P13");
         }
 
         CreateFunctionStmt result = new CreateFunctionStmt(name, schema, rawParams.toString().trim(), parsedParams,
@@ -443,7 +443,7 @@ class DdlFunctionParser {
         if (kw.equals("PARALLEL")) {
             opts.take(RoutineOptions.PARALLEL, t);
             parser.advance();
-            parallelRef[0] = parser.readIdentifier().toUpperCase();
+            parallelRef[0] = parser.readIdentifier().toUpperCase(java.util.Locale.ROOT);
             return true;
         }
         if (kw.equals("SUPPORT")) {
@@ -477,13 +477,15 @@ class DdlFunctionParser {
                     Token next = parser.peek();
                     if (next.type() == TokenType.KEYWORD && isFunctionAttributeKeyword(next.value())) break;
                     if (next.type() == TokenType.KEYWORD && next.value().equals("AS")) break;
-                    if (valBuf.length() > 0) valBuf.append(" ");
+                    // A list separator belongs to the item before it: a search_path of two
+                    // schemas is written "public, pg_temp", never "public , pg_temp".
+                    if (valBuf.length() > 0 && next.type() != TokenType.COMMA) valBuf.append(" ");
                     valBuf.append(next.value());
                     parser.advance();
                 }
-                setClauses.put(paramName.toLowerCase(), valBuf.toString().trim());
+                setClauses.put(paramName.toLowerCase(java.util.Locale.ROOT), valBuf.toString().trim());
             } else if (parser.matchKeywords("FROM", "CURRENT")) {
-                setClauses.put(paramName.toLowerCase(), "FROM CURRENT");
+                setClauses.put(paramName.toLowerCase(java.util.Locale.ROOT), "FROM CURRENT");
             }
             return true;
         }

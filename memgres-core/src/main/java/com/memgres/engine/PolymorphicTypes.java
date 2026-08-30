@@ -74,7 +74,7 @@ public final class PolymorphicTypes {
     }
 
     private static String baseName(String typeName) {
-        return typeName.trim().toLowerCase();
+        return typeName.trim().toLowerCase(java.util.Locale.ROOT);
     }
 
     /** True when this polymorphic name stands for an array rather than a single element. */

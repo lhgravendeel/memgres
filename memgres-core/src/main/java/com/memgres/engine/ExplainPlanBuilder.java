@@ -44,7 +44,7 @@ final class ExplainPlanBuilder {
     private ExplainPlan buildSelect(SelectStmt sel) {
         if (sel.withClauses() != null) {
             for (SelectStmt.CommonTableExpr cte : sel.withClauses()) {
-                cteNames.add(cte.name().toLowerCase());
+                cteNames.add(cte.name().toLowerCase(java.util.Locale.ROOT));
             }
         }
         ExplainPlan node = scanLayer(sel);
@@ -90,7 +90,7 @@ final class ExplainPlanBuilder {
     private ExplainPlan fromItem(SelectStmt.FromItem item) {
         if (item instanceof SelectStmt.TableRef) {
             SelectStmt.TableRef ref = (SelectStmt.TableRef) item;
-            if (ref.schema() == null && cteNames.contains(ref.table().toLowerCase())) {
+            if (ref.schema() == null && cteNames.contains(ref.table().toLowerCase(java.util.Locale.ROOT))) {
                 return new ExplainPlan("CTE Scan").on(ref.table(), ref.alias());
             }
             return new ExplainPlan("Seq Scan").on(ref.table(), ref.alias());
@@ -391,7 +391,7 @@ final class ExplainPlanBuilder {
     private static boolean containsAggregate(Expression expr) {
         if (expr instanceof FunctionCallExpr) {
             FunctionCallExpr fn = (FunctionCallExpr) expr;
-            if (AGGREGATES.contains(fn.name().toLowerCase())) return true;
+            if (AGGREGATES.contains(fn.name().toLowerCase(java.util.Locale.ROOT))) return true;
             if (fn.args() != null) {
                 for (Expression a : fn.args()) if (containsAggregate(a)) return true;
             }

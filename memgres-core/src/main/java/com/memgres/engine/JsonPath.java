@@ -810,7 +810,7 @@ final class JsonPath {
             // A name with a call after it has to be one of the methods; PostgreSQL's lexer knows
             // the method names, so an unknown one is a syntax error at the parenthesis rather than
             // a member read that happens to be followed by something.
-            String method = name.toLowerCase();
+            String method = name.toLowerCase(java.util.Locale.ROOT);
             if (!METHODS.contains(method)) throw errorAt();
             pos++;
             List<Node> args = new ArrayList<Node>();

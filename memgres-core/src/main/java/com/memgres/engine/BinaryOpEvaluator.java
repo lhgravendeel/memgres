@@ -20,7 +20,7 @@ class BinaryOpEvaluator {
     static String getRangeTypeName(Expression expr) {
         if (expr instanceof FunctionCallExpr) {
             FunctionCallExpr fn = (FunctionCallExpr) expr;
-            String name = fn.name().toLowerCase();
+            String name = fn.name().toLowerCase(java.util.Locale.ROOT);
             switch (name) {
                 case "int4range":
                 case "int8range":
@@ -138,6 +138,16 @@ class BinaryOpEvaluator {
             "interval", "uuid", "tsvector", "tsquery");
 
     /**
+     * The numeric types, which resolve a literal beside them where the operator is one two
+     * numbers share. Left out, an untyped literal next to an integer was read as a double, so a
+     * value that is not a number at all was complained about as a bad double rather than as a
+     * bad integer; beside a comparison it stayed text and the two were compared as strings.
+     */
+    private static final Set<String> NUMERIC_LITERAL_RESOLVABLE = Cols.setOf(
+            "smallint", "integer", "int", "bigint", "real", "double precision", "numeric",
+            "int2", "int4", "int8", "float4", "float8", "float", "decimal", "double");
+
+    /**
      * The type an untyped string literal on one side of {@code bin} should be read as, or null when
      * neither side is such a literal or the other side's type is not one that resolves it.
      */
@@ -170,7 +180,35 @@ class BinaryOpEvaluator {
             if (other.equals("tsquery")) return rightUntyped ? "tsvector" : null;
             if (other.equals("tsvector")) return null;
         }
+        // A number resolves a literal beside it only where the operator is one two numbers
+        // share: the arithmetic and the comparisons. Containment and the rest belong to types
+        // of their own, and reading the other operand as a number there cast a multirange to
+        // an integer.
+        if (NUMERIC_LITERAL_RESOLVABLE.contains(other)) {
+            return resolvesAgainstNumbers(bin.op()) ? other : null;
+        }
         return LITERAL_RESOLVABLE_TYPES.contains(other) ? other : null;
+    }
+
+    /** Whether two numbers share this operator, which is what lets one resolve a literal. */
+    private static boolean resolvesAgainstNumbers(BinaryExpr.BinOp op) {
+        switch (op) {
+            case ADD:
+            case SUBTRACT:
+            case MULTIPLY:
+            case DIVIDE:
+            case MODULO:
+            case POWER:
+            case EQUAL:
+            case NOT_EQUAL:
+            case LESS_THAN:
+            case LESS_EQUAL:
+            case GREATER_THAN:
+            case GREATER_EQUAL:
+                return true;
+            default:
+                return false;
+        }
     }
 
     /**
@@ -227,7 +265,7 @@ class BinaryOpEvaluator {
     /** The date/time type a declared name spells, or null when it names something else. */
     private static String canonicalDateTimeType(String declared) {
         if (declared == null) return null;
-        String t = declared.toLowerCase().trim();
+        String t = declared.toLowerCase(java.util.Locale.ROOT).trim();
         int paren = t.indexOf('(');
         if (paren > 0) t = t.substring(0, paren).trim();
         // "interval day to second" and the rest of the qualified spellings are still intervals
@@ -399,7 +437,7 @@ class BinaryOpEvaluator {
         }
         if (expr instanceof CastExpr) {
             String name = ((CastExpr) expr).typeName();
-            return name == null ? null : name.toLowerCase().trim();
+            return name == null ? null : name.toLowerCase(java.util.Locale.ROOT).trim();
         }
         if (expr instanceof ArrayExpr) {
             String element = arrayElementTypeName((ArrayExpr) expr, ctx);
@@ -577,7 +615,7 @@ class BinaryOpEvaluator {
      * pair PostgreSQL most often refuses went unjudged.
      */
     private static String canonicalOperandType(String typeName) {
-        String t = typeName.toLowerCase().trim();
+        String t = typeName.toLowerCase(java.util.Locale.ROOT).trim();
         int paren = t.indexOf('(');
         if (paren > 0) {
             int close = t.lastIndexOf(')');
@@ -726,7 +764,7 @@ class BinaryOpEvaluator {
                         && ((Literal) expr).literalType() == Literal.LiteralType.NULL);
             return untyped ? OperatorResolution.UNKNOWN : -1;
         }
-        String bare = declared.toLowerCase().trim();
+        String bare = declared.toLowerCase(java.util.Locale.ROOT).trim();
         int paren = bare.indexOf('(');
         if (paren > 0) bare = bare.substring(0, paren).trim();
         if (executor.database != null
@@ -762,7 +800,7 @@ class BinaryOpEvaluator {
 
     private static int ladderRank(String declared) {
         if (declared == null) return -1;
-        DataType type = DataType.fromPgName(declared.toLowerCase().trim());
+        DataType type = DataType.fromPgName(declared.toLowerCase(java.util.Locale.ROOT).trim());
         for (int i = 0; type != null && i < NUMERIC_LADDER.length; i++) {
             if (NUMERIC_LADDER[i] == type) return i;
         }
@@ -855,7 +893,7 @@ class BinaryOpEvaluator {
         }
         if (expr instanceof CastExpr) {
             String name = ((CastExpr) expr).typeName();
-            return name == null ? null : name.toLowerCase().trim();
+            return name == null ? null : name.toLowerCase(java.util.Locale.ROOT).trim();
         }
         if (expr instanceof Literal) {
             switch (((Literal) expr).literalType()) {
@@ -1087,7 +1125,7 @@ class BinaryOpEvaluator {
 
     /** The family a declared type belongs to, or null when it is one this rule leaves alone. */
     private static TypeFamily familyOf(String typeName) {
-        String t = typeName.toLowerCase().trim();
+        String t = typeName.toLowerCase(java.util.Locale.ROOT).trim();
         int paren = t.indexOf('(');
         if (paren > 0) t = t.substring(0, paren).trim();
         if (t.endsWith("[]")) return null;
@@ -1130,7 +1168,7 @@ class BinaryOpEvaluator {
 
     /** The name PostgreSQL prints for a type in an operator error. */
     private static String pgName(String typeName) {
-        String t = typeName.toLowerCase().trim();
+        String t = typeName.toLowerCase(java.util.Locale.ROOT).trim();
         switch (t) {
             case "int": case "int4": case "serial": return "integer";
             case "int2": case "smallserial": return "smallint";
@@ -1179,7 +1217,7 @@ class BinaryOpEvaluator {
     private String declaredGeometricType(Expression expr, RowContext ctx) {
         if (expr instanceof CastExpr) {
             String name = ((CastExpr) expr).typeName();
-            return name == null ? null : geometricTypeName(name.toLowerCase().trim());
+            return name == null ? null : geometricTypeName(name.toLowerCase(java.util.Locale.ROOT).trim());
         }
         if (expr instanceof ColumnRef && ctx != null) {
             ColumnRef ref = (ColumnRef) expr;
@@ -1243,7 +1281,7 @@ class BinaryOpEvaluator {
 
     private static boolean isCastToTextType(Expression expr) {
         if (expr instanceof CastExpr) {
-            String tn = ((CastExpr) expr).typeName().toLowerCase();
+            String tn = ((CastExpr) expr).typeName().toLowerCase(java.util.Locale.ROOT);
             return tn.equals("text") || tn.equals("varchar") || tn.startsWith("character varying");
         }
         return false;
@@ -1495,7 +1533,7 @@ class BinaryOpEvaluator {
                 throw new MemgresException("operator does not exist: json ~~ unknown", "42883");
             }
             if (bin.left() instanceof FunctionCallExpr) {
-                String fnName = ((FunctionCallExpr) bin.left()).name().toLowerCase();
+                String fnName = ((FunctionCallExpr) bin.left()).name().toLowerCase(java.util.Locale.ROOT);
                 if (fnName.equals("row_to_json") || fnName.equals("to_json") || fnName.equals("json_build_object")
                         || fnName.equals("json_build_array") || fnName.equals("json_agg") || fnName.equals("json_object")) {
                     throw new MemgresException("operator does not exist: json ~~ unknown", "42883");
@@ -2079,7 +2117,7 @@ class BinaryOpEvaluator {
                 if (left == null || right == null) return null;
                 if (left instanceof Number || left instanceof Boolean) {
                     String tn = left instanceof Integer ? "integer" : left instanceof Long ? "bigint" :
-                            left instanceof Boolean ? "boolean" : left.getClass().getSimpleName().toLowerCase();
+                            left instanceof Boolean ? "boolean" : left.getClass().getSimpleName().toLowerCase(java.util.Locale.ROOT);
                     throw new MemgresException("operator does not exist: " + tn + " ~~ unknown", "42883");
                 }
                 return AstExecutor.likeMatch(likeOperand(left), likeOperand(right), false);
@@ -2854,7 +2892,7 @@ class BinaryOpEvaluator {
 
     private static boolean isRangeTypeName(String declared) {
         if (declared == null) return false;
-        String t = declared.toLowerCase().trim();
+        String t = declared.toLowerCase(java.util.Locale.ROOT).trim();
         return RANGE_TYPES.contains(t) || RANGE_TYPES.contains(t.replace("multirange", "range"));
     }
 
@@ -3844,7 +3882,7 @@ class BinaryOpEvaluator {
                 if (left == null || right == null) return null;
                 if (left instanceof Number || left instanceof Boolean) {
                     String tn = left instanceof Integer ? "integer" : left instanceof Long ? "bigint" :
-                            left instanceof Boolean ? "boolean" : left.getClass().getSimpleName().toLowerCase();
+                            left instanceof Boolean ? "boolean" : left.getClass().getSimpleName().toLowerCase(java.util.Locale.ROOT);
                     throw new MemgresException("operator does not exist: " + tn + " ~~ unknown", "42883");
                 }
                 return AstExecutor.likeMatch(likeOperand(left), likeOperand(right), false);

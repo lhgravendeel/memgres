@@ -612,7 +612,7 @@ public class TextSearchOperations {
      */
     public static List<String> tsLexize(String dict, String token) {
         if (token == null || dict == null) return null;
-        String name = dict.toLowerCase();
+        String name = dict.toLowerCase(java.util.Locale.ROOT);
         int dot = name.lastIndexOf('.');
         if (dot >= 0) name = name.substring(dot + 1);
         if (!BUILTIN_DICTIONARIES.contains(name)) {

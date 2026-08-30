@@ -745,7 +745,7 @@ class SelectParser {
         if (columns == null) return;
         java.util.Set<String> seen = new java.util.HashSet<String>();
         for (String column : columns) {
-            if (!seen.add(column.toLowerCase())) {
+            if (!seen.add(column.toLowerCase(java.util.Locale.ROOT))) {
                 throw new com.memgres.engine.MemgresException(
                         clause + " column \"" + column + "\" specified more than once", "42701");
             }
@@ -924,7 +924,7 @@ class SelectParser {
 
         Set<String> seenNames = new HashSet<>();
         for (SelectStmt.CommonTableExpr cte : ctes) {
-            if (!seenNames.add(cte.name().toLowerCase())) {
+            if (!seenNames.add(cte.name().toLowerCase(java.util.Locale.ROOT))) {
                 throw new com.memgres.engine.MemgresException(
                         "WITH query name \"" + cte.name() + "\" specified more than once", "42712");
             }
@@ -973,7 +973,7 @@ class SelectParser {
             if (depth > 0) continue;
             // Stop at clause keywords
             if (t.type() == TokenType.KEYWORD) {
-                String v = t.value().toUpperCase();
+                String v = t.value().toUpperCase(java.util.Locale.ROOT);
                 if (v.equals("HAVING") || v.equals("ORDER") || v.equals("LIMIT") || v.equals("OFFSET")
                         || v.equals("FETCH") || v.equals("UNION") || v.equals("INTERSECT")
                         || v.equals("EXCEPT") || v.equals("WINDOW") || v.equals("FOR")) break;
@@ -1270,7 +1270,7 @@ class SelectParser {
      */
     private String firstReservedWordAfterDmlVerb() {
         for (int i = parser.pos; i < parser.tokens.size() && i < parser.pos + 8; i++) {
-            String word = parser.tokens.get(i).value().toUpperCase();
+            String word = parser.tokens.get(i).value().toUpperCase(java.util.Locale.ROOT);
             if (word.equals("INTO") || word.equals("SET") || word.equals("FROM")) return word;
         }
         return parser.pos + 1 < parser.tokens.size()
@@ -1616,7 +1616,7 @@ class SelectParser {
 
         // Check for reserved clause keywords used as table names, which indicate syntax errors
         if (parser.peek().type() == TokenType.KEYWORD) {
-            String kw = parser.peek().value().toUpperCase();
+            String kw = parser.peek().value().toUpperCase(java.util.Locale.ROOT);
             if (kw.equals("FROM") || kw.equals("WHERE") || kw.equals("GROUP") || kw.equals("ORDER")
                     || kw.equals("HAVING") || kw.equals("LIMIT") || kw.equals("OFFSET")
                     || kw.equals("UNION") || kw.equals("INTERSECT") || kw.equals("EXCEPT")
@@ -1759,7 +1759,7 @@ class SelectParser {
                 method = parser.advance().value();
             } else if (parser.peek().type() == TokenType.KEYWORD
                     || parser.peek().type() == TokenType.IDENTIFIER) {
-                method = parser.advance().value().toLowerCase();
+                method = parser.advance().value().toLowerCase(java.util.Locale.ROOT);
             } else {
                 throw ParseException.at(parser.peek());
             }
@@ -1897,7 +1897,7 @@ class SelectParser {
         // A word memgres lexes as an identifier is judged the same way, because PostgreSQL judges
         // the word and not how it was recognised: isnull and overlaps are its own either way.
         if (type != TokenType.IDENTIFIER && type != TokenType.KEYWORD) return false;
-        String word = parser.peek().value().toUpperCase();
+        String word = parser.peek().value().toUpperCase(java.util.Locale.ROOT);
         if (type == TokenType.KEYWORD && isClauseKeyword(word)) return false;
         return !KEPT_BY_THE_GRAMMAR.contains(word);
     }
@@ -1916,7 +1916,7 @@ class SelectParser {
         TokenType type = parser.peek().type();
         if (type == TokenType.QUOTED_IDENTIFIER) return true;
         if (type != TokenType.IDENTIFIER && type != TokenType.KEYWORD) return false;
-        String word = parser.peek().value().toUpperCase();
+        String word = parser.peek().value().toUpperCase(java.util.Locale.ROOT);
         if (type == TokenType.KEYWORD && isClauseKeyword(word)) return false;
         return !NOT_A_BARE_LABEL.contains(word);
     }
@@ -2456,7 +2456,7 @@ class SelectParser {
             Expression val = parser.parseExpression();
             parser.expectKeyword("AS");
             String name = parser.readIdentifier();
-            passing.put(name.toLowerCase(), val);
+            passing.put(name.toLowerCase(java.util.Locale.ROOT), val);
         } while (parser.match(TokenType.COMMA));
         return passing;
     }

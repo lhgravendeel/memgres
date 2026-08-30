@@ -23,7 +23,7 @@ class SelectCteExecutor {
      * Look up a CTE by name in the CTE stack (innermost scope first).
      */
     SelectStmt.CommonTableExpr lookupCte(String name) {
-        String lcName = name.toLowerCase();
+        String lcName = name.toLowerCase(java.util.Locale.ROOT);
         for (Map<String, SelectStmt.CommonTableExpr> scope : executor.cteStack) {
             // A scope may hold a name mapped to null: that is a WITH item deliberately hidden
             // from the body being run (see maskFor), and it must stop the search rather than let
@@ -48,7 +48,7 @@ class SelectCteExecutor {
      */
     boolean namesWithItem(String name) {
         if (name == null) return false;
-        String lcName = name.toLowerCase();
+        String lcName = name.toLowerCase(java.util.Locale.ROOT);
         for (Map<String, SelectStmt.CommonTableExpr> scope : executor.cteStack) {
             if (scope.get(lcName) != null) return true;
         }
@@ -65,7 +65,7 @@ class SelectCteExecutor {
      */
     void noteHiddenWithItem(MemgresException ex, String name) {
         if (name == null) return;
-        String lcName = name.toLowerCase();
+        String lcName = name.toLowerCase(java.util.Locale.ROOT);
         for (Map<String, SelectStmt.CommonTableExpr> scope : executor.cteStack) {
             if (!scope.containsKey(lcName)) continue;
             if (scope.get(lcName) != null) return; // visible here, so this is not the reason
@@ -130,7 +130,7 @@ class SelectCteExecutor {
     QueryResult executeCte(SelectStmt.CommonTableExpr cte) {
         QueryResult cached = executor.cteResultCache.get(cte);
         if (cached != null) return cached;
-        String cacheKey = cte.name().toLowerCase();
+        String cacheKey = cte.name().toLowerCase(java.util.Locale.ROOT);
 
         if (cte.recursive()) detectMutualRecursionCycle(cte, cacheKey);
 
@@ -245,7 +245,7 @@ class SelectCteExecutor {
         if (hasSearch && cte.searchByColumns() != null) {
             searchByIndices = new int[cte.searchByColumns().size()];
             for (int si = 0; si < cte.searchByColumns().size(); si++) {
-                String sbyCol = cte.searchByColumns().get(si).toLowerCase();
+                String sbyCol = cte.searchByColumns().get(si).toLowerCase(java.util.Locale.ROOT);
                 searchByIndices[si] = -1;
                 for (int ci = 0; ci < columns.size(); ci++) {
                     if (columns.get(ci).getName().equalsIgnoreCase(sbyCol)) {
@@ -262,7 +262,7 @@ class SelectCteExecutor {
         if (hasCycle && cte.cycleByColumns() != null) {
             cycleByIndices = new int[cte.cycleByColumns().size()];
             for (int ci2 = 0; ci2 < cte.cycleByColumns().size(); ci2++) {
-                String cbyCol = cte.cycleByColumns().get(ci2).toLowerCase();
+                String cbyCol = cte.cycleByColumns().get(ci2).toLowerCase(java.util.Locale.ROOT);
                 cycleByIndices[ci2] = -1;
                 for (int ci = 0; ci < columns.size(); ci++) {
                     if (columns.get(ci).getName().equalsIgnoreCase(cbyCol)) {
@@ -306,7 +306,7 @@ class SelectCteExecutor {
         List<List<Object>> workingSetSearchPaths = hasSearch ? new ArrayList<>(ordcolPaths) : null;
         List<List<Object>> workingSetCyclePaths = hasCycle ? new ArrayList<>(cyclePaths) : null;
 
-        String cteLower = cte.name().toLowerCase();
+        String cteLower = cte.name().toLowerCase(java.util.Locale.ROOT);
         executor.executingCtes.add(cteLower);
         executor.executingCteNodes.add(cte);
         // Stopping the loop early would return a shorter result than the query defines, with
@@ -325,7 +325,7 @@ class SelectCteExecutor {
                 throw new MemgresException(
                         "recursive query exceeded maximum number of rows (" + maxRows + ")", "54001");
             }
-            String cteName = cte.name().toLowerCase();
+            String cteName = cte.name().toLowerCase(java.util.Locale.ROOT);
             Table previousWorkingSet = executor.recursiveWorkingSets.get(cteName);
 
             if (depthFirstSearch) {
@@ -1001,7 +1001,7 @@ class SelectCteExecutor {
             if (cur instanceof SelectStmt.TableRef) {
                 SelectStmt.TableRef tr = (SelectStmt.TableRef) cur;
                 if (tr.schema() == null && tr.table() != null) {
-                    String lc = tr.table().toLowerCase();
+                    String lc = tr.table().toLowerCase(java.util.Locale.ROOT);
                     if (scopeNames.contains(lc)) out.add(lc);
                 }
                 continue;

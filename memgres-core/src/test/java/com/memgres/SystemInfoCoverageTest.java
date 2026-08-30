@@ -600,14 +600,16 @@ class SystemInfoCoverageTest {
 
     @Test
     void testPgDatabaseSize() throws SQLException {
-        long size = queryLong("SELECT pg_database_size('memgres')");
+        long size = queryLong("SELECT pg_database_size(current_database())");
         assertTrue(size >= 0, "Database size should be non-negative");
     }
 
+    /** A name has to be a database's: a size for one that is not there is a size for nothing. */
     @Test
-    void testPgDatabaseSizeAnyName() throws SQLException {
-        long size = queryLong("SELECT pg_database_size('test')");
-        assertTrue(size >= 0);
+    void testPgDatabaseSizeUnknownName() {
+        SQLException refused = assertThrows(SQLException.class,
+                () -> queryLong("SELECT pg_database_size('zsi_nosuchdb')"));
+        assertEquals("3D000", refused.getSQLState());
     }
 
     // --- pg_indexes_size(regclass) ---

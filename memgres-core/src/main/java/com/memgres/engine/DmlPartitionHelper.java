@@ -74,7 +74,7 @@ class DmlPartitionHelper {
     private boolean boundHolds(Table parent, Table partition, Object value, long rowHash) {
         String strategy = parent.getPartitionStrategy();
         if (strategy == null) return false;
-        switch (strategy.toUpperCase()) {
+        switch (strategy.toUpperCase(java.util.Locale.ROOT)) {
             case "RANGE":
                 // NULL keys never match a range partition (they go to DEFAULT or error)
                 if (containsNull(value) || partition.getPartitionLower() == null

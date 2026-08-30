@@ -438,6 +438,15 @@ class DdlAdminExecutor {
     /** PUBLIC names every role at once rather than one that has to be found in the catalog. */
     private static final String PUBLIC_ROLE = "public";
 
+    /**
+     * ALTER POLICY changes what a policy admits, not what kind of policy it is.
+     *
+     * <p>A RESTRICTIVE policy narrows what the permissive ones let through, and a PERMISSIVE one
+     * widens it: they are combined differently, so which kind a policy is decides what the
+     * relation shows. Rebuilt through a constructor that has no parameter for the kind, every
+     * altered policy came back PERMISSIVE -- and a RESTRICTIVE policy turned PERMISSIVE stops
+     * withholding the rows it was written to withhold and starts admitting them instead.
+     */
     QueryResult executeAlterPolicy(AlterPolicyStmt stmt) {
         // A qualifier on the relation says which schema holds it, and a schema that is not there
         // is what PostgreSQL reports rather than the relation being missing from it.
@@ -457,7 +466,7 @@ class DdlAdminExecutor {
         // Which clause a policy may carry follows from the command it guards, and ALTER cannot
         // change that command — so a clause the command has no use for is refused here too. A
         // SELECT or DELETE creates no row to check; an INSERT has no existing row to test.
-        String policyCommand = found.getCommand() == null ? "ALL" : found.getCommand().toUpperCase();
+        String policyCommand = found.getCommand() == null ? "ALL" : found.getCommand().toUpperCase(java.util.Locale.ROOT);
         if (stmt.withCheckExpr() != null
                 && ("SELECT".equals(policyCommand) || "DELETE".equals(policyCommand))) {
             throw PgErrors.syntax("only USING expression allowed for SELECT, DELETE");
@@ -488,7 +497,8 @@ class DdlAdminExecutor {
                 RlsPolicy p = table.getRlsPolicies().get(i);
                 if (p.getName().equalsIgnoreCase(stmt.name())) {
                     table.getRlsPolicies().set(i, new RlsPolicy(stmt.renameTo(), p.getCommand(),
-                            p.getUsingExpr(), p.getWithCheckExpr(), p.getRoles()));
+                            p.getUsingExpr(), p.getWithCheckExpr(), p.getRoles(),
+                            p.getPolicyType()));
                     break;
                 }
             }
@@ -498,7 +508,11 @@ class DdlAdminExecutor {
                 if (p.getName().equalsIgnoreCase(stmt.name())) {
                     Expression using = stmt.usingExpr() != null ? stmt.usingExpr() : p.getUsingExpr();
                     Expression withCheck = stmt.withCheckExpr() != null ? stmt.withCheckExpr() : p.getWithCheckExpr();
-                    table.getRlsPolicies().set(i, new RlsPolicy(p.getName(), p.getCommand(), using, withCheck, p.getRoles()));
+                    // A TO clause replaces the roles the policy applies to; written without one,
+                    // the policy goes on applying to the roles it already did.
+                    List<String> roles = stmt.roles().isEmpty() ? p.getRoles() : stmt.roles();
+                    table.getRlsPolicies().set(i, new RlsPolicy(p.getName(), p.getCommand(),
+                            using, withCheck, roles, p.getPolicyType()));
                     break;
                 }
             }
@@ -536,16 +550,36 @@ class DdlAdminExecutor {
             if (executor.database.hasRole(stmt.renameTo())) {
                 throw new MemgresException("role \"" + stmt.renameTo() + "\" already exists", "42710");
             }
-            Map<String, String> attrs = executor.database.getRole(stmt.name());
-            if (attrs != null) {
-                executor.database.removeRole(stmt.name());
-                executor.database.createRole(stmt.renameTo(), attrs);
-            }
+            // A rename gives the role a new name and changes nothing else about it: the grants
+            // it holds, the memberships either way, what it owns and the default privileges
+            // written for it all belong to the role. Dropped and recreated instead, every one
+            // of them was left keyed under a name nothing answered to.
+            executor.database.renameRole(stmt.name(), stmt.renameTo());
         } else if (!stmt.options().isEmpty()) {
             Map<String, String> existing = executor.database.getRole(stmt.name());
             if (existing != null) {
-                // Handle SET_CONFIG specially: append to ROLCONFIG list
+                // A parameter written here is one the server has, and a moment written here is
+                // a moment. Neither was looked at, so a typed parameter name was recorded and
+                // set nothing, and a VALID UNTIL nobody could read was stored as an expiry.
                 String setConfig = stmt.options().get("SET_CONFIG");
+                if (setConfig != null) {
+                    int eq = setConfig.indexOf('=');
+                    String parameter = eq < 0 ? setConfig : setConfig.substring(0, eq);
+                    if (GucSettings.definition(parameter) == null && !parameter.contains(".")) {
+                        throw new MemgresException("unrecognized configuration parameter \""
+                                + parameter + "\"", "42704");
+                    }
+                }
+                String validUntil = stmt.options().get("VALID_UNTIL");
+                if (validUntil != null && !validUntil.isEmpty()
+                        && !"infinity".equalsIgnoreCase(validUntil)) {
+                    try {
+                        executor.castEvaluator.applyCast(validUntil, "timestamptz");
+                    } catch (RuntimeException notATime) {
+                        throw new MemgresException("invalid input syntax for type timestamp"
+                                + " with time zone: \"" + validUntil + "\"", "22007");
+                    }
+                }
                 if (setConfig != null) {
                     String prev = existing.get("ROLCONFIG");
                     if (prev != null && !prev.isEmpty()) {
@@ -583,13 +617,42 @@ class DdlAdminExecutor {
             throw new MemgresException("role \"" + role + "\" cannot be dropped because some objects depend on it\n  "
                     + "Detail: owner of " + describeOwnedObjects(role), "2BP01");
         }
+        // A privilege granted to the role depends on it too: dropping the role would leave the
+        // grant naming somebody who is not there. PostgreSQL refuses until the grants are gone,
+        // and DROP OWNED BY is what takes them away. Scanned only for ownership, memgres dropped
+        // the role and left every grant it held pointing at nothing.
+        if (executor.database.roleHoldsPrivileges(role)) {
+            java.util.List<String> on = executor.database.privilegeDependenciesOf(role);
+            StringBuilder detail = new StringBuilder();
+            for (String object : on) {
+                if (detail.length() > 0) detail.append('\n');
+                detail.append("privileges for ").append(object);
+            }
+            MemgresException e = new MemgresException("role \"" + role
+                    + "\" cannot be dropped because some objects depend on it", "2BP01");
+            e.setDetail(detail.toString());
+            throw e;
+        }
         executor.database.removeAllRoleMemberships(role);
         executor.database.removeAllRolePrivileges(role);
         executor.database.removeRole(role);
     }
 
-    /** Drop all objects owned by the specified role. */
+    /**
+     * Drop everything the role owns, and take away everything granted to it.
+     *
+     * <p>DROP OWNED BY is what a reader runs before dropping a role, and it has to leave nothing
+     * naming the role behind: PostgreSQL removes the privileges granted to it and the default
+     * privileges written for it as well as the objects it owns. Dropping only the objects left
+     * the grants standing, so the DROP ROLE that followed was still refused.
+     */
     void executeDropOwned(String roleName) {
+        executor.database.removeAllRolePrivileges(roleName);
+        executor.database.removeDefaultAclsOf(roleName);
+        dropObjectsOwnedBy(roleName);
+    }
+
+    private void dropObjectsOwnedBy(String roleName) {
         List<String> owned = executor.database.getObjectsOwnedBy(roleName);
         for (String key : owned) {
             int colon = key.indexOf(':');
@@ -771,8 +834,8 @@ class DdlAdminExecutor {
      * the quoted name rather than as the schema it is.
      */
     private static int firstWholeWord(String text, String word) {
-        String lower = text.toLowerCase();
-        String wanted = word.toLowerCase();
+        String lower = text.toLowerCase(java.util.Locale.ROOT);
+        String wanted = word.toLowerCase(java.util.Locale.ROOT);
         for (int at = lower.indexOf(wanted); at >= 0; at = lower.indexOf(wanted, at + 1)) {
             char before = at == 0 ? ' ' : text.charAt(at - 1);
             int after = at + wanted.length();
@@ -1213,7 +1276,7 @@ class DdlAdminExecutor {
         java.util.Set<String> aliases = new java.util.LinkedHashSet<>();
         aliases.add("old");
         aliases.add("new");
-        if (on != null && on.getName() != null) aliases.add(on.getName().toLowerCase());
+        if (on != null && on.getName() != null) aliases.add(on.getName().toLowerCase(java.util.Locale.ROOT));
         // OLD and NEW in a qualification are the rows of the relation the rule is on, and their
         // columns are that relation's: PostgreSQL resolves them while it is writing the rule.
         // Leaving them unresolved stored a rule whose WHERE could never be evaluated, and the
@@ -1448,7 +1511,7 @@ class DdlAdminExecutor {
         int end = 0;
         while (end < action.length() && Character.isLetter(action.charAt(end))) end++;
         String word = action.substring(0, end);
-        if (word.isEmpty() || RULE_ACTION_COMMANDS.contains(word.toLowerCase())) return;
+        if (word.isEmpty() || RULE_ACTION_COMMANDS.contains(word.toLowerCase(java.util.Locale.ROOT))) return;
         throw PgErrors.syntax("syntax error at or near \"" + word + "\"");
     }
 
@@ -1464,7 +1527,7 @@ class DdlAdminExecutor {
         AstWalk.forEach(parsed, node -> {
             if (node instanceof SelectStmt.CommonTableExpr) {
                 String cteName = ((SelectStmt.CommonTableExpr) node).name;
-                if (cteName != null) bound.add(cteName.toLowerCase());
+                if (cteName != null) bound.add(cteName.toLowerCase(java.util.Locale.ROOT));
             }
         });
         final List<String> named = new ArrayList<>();
@@ -1483,7 +1546,7 @@ class DdlAdminExecutor {
         });
         List<String> out = new ArrayList<>();
         for (String relation : named) {
-            if (!bound.contains(RelationNamespace.bareName(relation).toLowerCase())) out.add(relation);
+            if (!bound.contains(RelationNamespace.bareName(relation).toLowerCase(java.util.Locale.ROOT))) out.add(relation);
         }
         return out;
     }
@@ -1557,7 +1620,7 @@ class DdlAdminExecutor {
             boolean newRow = ref.schema() == null && ref.table().equalsIgnoreCase("new");
             boolean reachable = priorRow ? oldInScope
                     : newRow ? newInScope
-                    : brought == null || brought.contains(ref.table().toLowerCase());
+                    : brought == null || brought.contains(ref.table().toLowerCase(java.util.Locale.ROOT));
             if (!reachable) throw unreachableRuleRelation(s, ref, oldInScope);
             if (priorRow || newRow) rejectMissingRowColumn(ref, rows);
         }
@@ -1605,7 +1668,7 @@ class DdlAdminExecutor {
     /** One name a FROM item or a write answers to: its alias, or the relation it named. */
     private static void addRuleReachableName(Set<String> named, String relation, String alias) {
         String written = alias != null ? alias : relation;
-        if (written != null) named.add(RelationNamespace.bareName(written).toLowerCase());
+        if (written != null) named.add(RelationNamespace.bareName(written).toLowerCase(java.util.Locale.ROOT));
     }
 
     /**
@@ -1634,7 +1697,7 @@ class DdlAdminExecutor {
         if (ruled && oldInScope) {
             e.setHint("Perhaps you meant to reference the table alias \"old\".");
         } else {
-            e.setDetail("There is an entry for table \"" + (row ? ref.table().toLowerCase() : "old")
+            e.setDetail("There is an entry for table \"" + (row ? ref.table().toLowerCase(java.util.Locale.ROOT) : "old")
                     + "\", but it cannot be referenced from this part of the query.");
         }
         return e;
@@ -1648,12 +1711,12 @@ class DdlAdminExecutor {
     private static void rejectMissingRowColumn(ColumnRef ref, Table rows) {
         if (rows == null || DdlDefinitionChecks.isSystemColumnName(ref.column())) return;
         if (rows.getColumnIndex(ref.column()) >= 0) return;
-        MemgresException e = new MemgresException("column " + ref.table().toLowerCase() + "."
+        MemgresException e = new MemgresException("column " + ref.table().toLowerCase(java.util.Locale.ROOT) + "."
                 + ref.column() + " does not exist", "42703");
         // OLD and NEW are relations in the rewritten query, so a near miss among the ruled
         // relation's columns is offered under the name the rule wrote rather than bare.
         String hint = RowContext.suggestClosestColumn(ref.column(), Collections.singletonList(
-                new RowContext.TableBinding(rows, ref.table().toLowerCase(), null)));
+                new RowContext.TableBinding(rows, ref.table().toLowerCase(java.util.Locale.ROOT), null)));
         if (hint != null) e.setHint(hint);
         throw e;
     }
@@ -1677,7 +1740,7 @@ class DdlAdminExecutor {
         AstWalk.forEach(node, n -> {
             if (n instanceof SelectStmt.CommonTableExpr) {
                 String cte = ((SelectStmt.CommonTableExpr) n).name;
-                if (cte != null) withItems.add(cte.toLowerCase());
+                if (cte != null) withItems.add(cte.toLowerCase(java.util.Locale.ROOT));
             } else if (n instanceof SelectStmt.SubqueryFrom || n instanceof SelectStmt.FunctionFrom) {
                 opaque[0] = true;
             } else if (n instanceof SelectStmt.TableRef) {
@@ -1699,7 +1762,7 @@ class DdlAdminExecutor {
             if (!addRuleColumnSource(sources, delete.schema(), delete.table(), null)) return null;
         }
         for (SelectStmt.TableRef ref : written) {
-            if (ref.table() == null || withItems.contains(ref.table().toLowerCase())) return null;
+            if (ref.table() == null || withItems.contains(ref.table().toLowerCase(java.util.Locale.ROOT))) return null;
             if (ref.columnAliases() != null && !ref.columnAliases().isEmpty()) return null;
             if (!addRuleColumnSource(sources, ref.schema(), ref.table(), ref.alias())) return null;
         }
@@ -1854,7 +1917,7 @@ class DdlAdminExecutor {
             // A name the select list gives an expression is one ORDER BY and GROUP BY answer to.
             if (n instanceof SelectStmt.SelectTarget) {
                 String alias = ((SelectStmt.SelectTarget) n).alias();
-                if (alias != null) outputNames.add(alias.toLowerCase());
+                if (alias != null) outputNames.add(alias.toLowerCase(java.util.Locale.ROOT));
             }
         });
         for (ColumnRef ref : refs) {
@@ -1875,7 +1938,7 @@ class DdlAdminExecutor {
                             "column reference \"" + column + "\" is ambiguous", "42702");
                 }
                 if (suppliesRuleColumn(readable, column)) continue;
-                if (outputNames.contains(column.toLowerCase())) continue;
+                if (outputNames.contains(column.toLowerCase(java.util.Locale.ROOT))) continue;
                 MemgresException e = new MemgresException(
                         "column \"" + column + "\" does not exist", "42703");
                 List<String> outOfReach = new ArrayList<>();

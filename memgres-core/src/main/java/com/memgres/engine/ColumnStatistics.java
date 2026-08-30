@@ -50,7 +50,7 @@ final class ColumnStatistics {
     }
 
     /** One element of an array literal, quoted when what it is written with would end it. */
-    private static String arrayElement(Object value) {
+    static String arrayElement(Object value) {
         if (value == null) return "NULL";
         String text = value instanceof Boolean
                 ? (((Boolean) value) ? "t" : "f") : String.valueOf(value);
@@ -89,7 +89,7 @@ final class ColumnStatistics {
         for (int c = 0; c < table.getColumns().size(); c++) {
             Column column = table.getColumns().get(c);
             ColumnStatistics stats = ofColumn(rows, c, column);
-            if (stats != null) gathered.put(column.getName().toLowerCase(), stats);
+            if (stats != null) gathered.put(column.getName().toLowerCase(java.util.Locale.ROOT), stats);
         }
         return gathered;
     }

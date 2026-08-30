@@ -747,7 +747,7 @@ public final class TypeCoercion {
             throw new MemgresException(
                     "invalid input syntax for type pg_lsn: \"" + value + "\"", "22P02");
         }
-        return lsn.toUpperCase();
+        return lsn.toUpperCase(java.util.Locale.ROOT);
     }
 
     private static boolean isHexRun(String text) {
@@ -1048,7 +1048,7 @@ public final class TypeCoercion {
     public static Double toDouble(Object val) {
         if (val instanceof Number) return ((Number) val).doubleValue();
         String s = val.toString().trim();
-        String lower = s.toLowerCase();
+        String lower = s.toLowerCase(java.util.Locale.ROOT);
         if (lower.equals("infinity") || lower.equals("inf") || lower.equals("+infinity") || lower.equals("+inf")) {
             return Double.POSITIVE_INFINITY;
         }
@@ -1427,7 +1427,7 @@ public final class TypeCoercion {
     public static Boolean toBoolean(Object val) {
         if (val instanceof Boolean) return ((Boolean) val);
         if (val instanceof Number) return ((Number) val).intValue() != 0;
-        String s = val.toString().trim().toLowerCase();
+        String s = val.toString().trim().toLowerCase(java.util.Locale.ROOT);
         if (s.equals("1")) return true;
         if (s.equals("0")) return false;
         // PG takes any prefix that names exactly one word, so "tr" is true and "fals" is false,
@@ -1510,7 +1510,7 @@ public final class TypeCoercion {
 
     /** Set the DateStyle field order used for parsing ambiguous numeric date input. */
     public static void setDateOrder(String order) {
-        DATE_ORDER.set((order == null || order.isEmpty()) ? "MDY" : order.toUpperCase());
+        DATE_ORDER.set((order == null || order.isEmpty()) ? "MDY" : order.toUpperCase(java.util.Locale.ROOT));
     }
 
     /** Current DateStyle field order used for parsing ambiguous numeric date input. */
@@ -1784,7 +1784,7 @@ public final class TypeCoercion {
     /** True when the text carries a trailing BC era marker. */
     private static boolean endsWithEra(String s) {
         String t = s.trim();
-        return t.length() > 3 && t.toUpperCase().endsWith(" BC");
+        return t.length() > 3 && t.toUpperCase(java.util.Locale.ROOT).endsWith(" BC");
     }
 
     /** The date/time text with its trailing era marker removed. */
@@ -1809,7 +1809,7 @@ public final class TypeCoercion {
             return bc.withYear(1 - bc.getYear());
         }
         // Handle special keywords
-        switch (s.toLowerCase()) {
+        switch (s.toLowerCase(java.util.Locale.ROOT)) {
             case "epoch": return LocalDate.of(1970, 1, 1);
             case "today": return nowHere().toLocalDate();
             case "yesterday": return nowHere().toLocalDate().minusDays(1);
@@ -1992,7 +1992,7 @@ public final class TypeCoercion {
                                                       String outOfRangeNoun, long maxYear) {
         java.util.regex.Matcher m = CALENDAR_LITERAL.matcher(s);
         if (!m.matches()) return null;
-        boolean bc = s.toUpperCase().endsWith(" BC");
+        boolean bc = s.toUpperCase(java.util.Locale.ROOT).endsWith(" BC");
         long written = Long.parseLong(m.group(1));
         // A BC year is a proleptic one of 1 - the written year, so 1 BC is year 0 and 4714 BC
         // is -4713. Year zero is not a year at all in either era.
@@ -2777,7 +2777,7 @@ public final class TypeCoercion {
             try {
                 LocalDateTime ldt = dtPart.contains("T") ? LocalDateTime.parse(dtPart) : LocalDate.parse(dtPart).atStartOfDay();
                 // Try timezone abbreviation first
-                String abbrevOffset = TZ_ABBREVIATIONS.get(tzName.toUpperCase());
+                String abbrevOffset = TZ_ABBREVIATIONS.get(tzName.toUpperCase(java.util.Locale.ROOT));
                 if (abbrevOffset != null) {
                     try {
                         return ldt.atOffset(ZoneOffset.of(abbrevOffset));
@@ -2855,7 +2855,7 @@ public final class TypeCoercion {
         String datePart = m.group(1);
         String timePart = m.group(2);
         String tzName = m.group(3);
-        boolean recognized = TZ_ABBREVIATIONS.containsKey(tzName.toUpperCase());
+        boolean recognized = TZ_ABBREVIATIONS.containsKey(tzName.toUpperCase(java.util.Locale.ROOT));
         if (!recognized) {
             try {
                 java.time.ZoneId.of(tzName);
@@ -3265,7 +3265,7 @@ public final class TypeCoercion {
      */
     static boolean isBinaryCollation(String collation) {
         if (collation == null) return false;
-        String lower = collation.toLowerCase().replace("\"", "");
+        String lower = collation.toLowerCase(java.util.Locale.ROOT).replace("\"", "");
         return lower.equals("c") || lower.equals("posix");
     }
 

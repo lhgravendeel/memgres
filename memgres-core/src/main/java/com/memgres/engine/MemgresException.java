@@ -201,7 +201,7 @@ public class MemgresException extends RuntimeException {
      */
     private static String inferSqlState(String message) {
         if (message == null) return "42000";
-        String lower = message.toLowerCase();
+        String lower = message.toLowerCase(java.util.Locale.ROOT);
 
         // 42P01: undefined table/relation
         if (lower.contains("table not found") || (lower.contains("relation") && lower.contains("does not exist"))

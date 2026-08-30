@@ -108,7 +108,7 @@ class DmlExecutor {
     private String mapViewColumn(String colName) {
         Map<String, String> mapping = activeViewColMap;
         if (mapping == null || colName == null) return colName;
-        String mapped = mapping.get(colName.toLowerCase());
+        String mapped = mapping.get(colName.toLowerCase(java.util.Locale.ROOT));
         return mapped != null ? mapped : colName;
     }
 
@@ -209,9 +209,9 @@ class DmlExecutor {
         if (tableName == null) return;
         String bare = tableName.contains(".")
                 ? tableName.substring(tableName.lastIndexOf('.') + 1) : tableName;
-        if (!bare.toLowerCase().startsWith("pg_")) return;
+        if (!bare.toLowerCase(java.util.Locale.ROOT).startsWith("pg_")) return;
         if (executor.systemCatalog.resolve(null, bare, executor.session) == null) return;
-        if (!"v".equals(PgCatalogRelations.relkind(bare.toLowerCase()))) return;
+        if (!"v".equals(PgCatalogRelations.relkind(bare.toLowerCase(java.util.Locale.ROOT)))) return;
         // A catalogue view is assembled from more than one relation, which is the same reason
         // PostgreSQL gives for refusing a write to any other view of that shape, and it names the
         // trigger and the rule that would take the write instead.
@@ -231,7 +231,7 @@ class DmlExecutor {
             bare = bare.substring(bare.indexOf('.') + 1);
         }
         if (schemaName == null) schemaName = executor.defaultSchema();
-        executor.session.recordRelationLock(schemaName.toLowerCase() + "." + bare.toLowerCase(), mode);
+        executor.session.recordRelationLock(schemaName.toLowerCase(java.util.Locale.ROOT) + "." + bare.toLowerCase(java.util.Locale.ROOT), mode);
     }
 
     private String resolveTableSchemaKey(String schema, Table table) {
@@ -251,7 +251,7 @@ class DmlExecutor {
         if (withClauses != null && !withClauses.isEmpty()) {
             Map<String, SelectStmt.CommonTableExpr> cteMap = new LinkedHashMap<>();
             for (SelectStmt.CommonTableExpr cte : withClauses) {
-                cteMap.put(cte.name().toLowerCase(), cte);
+                cteMap.put(cte.name().toLowerCase(java.util.Locale.ROOT), cte);
             }
             executor.cteStack.push(cteMap);
             for (SelectStmt.CommonTableExpr cte : withClauses) executor.cteResultCache.remove(cte);
@@ -463,13 +463,13 @@ class DmlExecutor {
             for (int i = 0; i < joined.getColumns().size(); i++) {
                 String name = renamed != null && i < renamed.size()
                         ? renamed.get(i) : joined.getColumns().get(i).getName();
-                names.add(name.toLowerCase());
+                names.add(name.toLowerCase(java.util.Locale.ROOT));
             }
         }
         if (names == null && resolved != null) {
             names = new HashSet<>();
             for (RowContext.OutCol out : resolved.outputColumnsOrDefault()) {
-                names.add(out.name.toLowerCase());
+                names.add(out.name.toLowerCase(java.util.Locale.ROOT));
             }
         }
         return names;
@@ -496,7 +496,7 @@ class DmlExecutor {
         if (node instanceof ColumnRef) {
             ColumnRef ref = (ColumnRef) node;
             if (ref.table() == null && ref.column() != null
-                    && beside.contains(ref.column().toLowerCase())
+                    && beside.contains(ref.column().toLowerCase(java.util.Locale.ROOT))
                     && table.getColumnIndex(ref.column()) >= 0) {
                 MemgresException e = new MemgresException(
                         "column reference \"" + ref.column() + "\" is ambiguous", "42702");
@@ -872,7 +872,7 @@ class DmlExecutor {
         // saying "column does not exist" instead would send a caller looking for a typo.
         if (activeViewExprCols != null && stmt.columns() != null) {
             for (String col : stmt.columns()) {
-                if (activeViewExprCols.contains(col.toLowerCase())) {
+                if (activeViewExprCols.contains(col.toLowerCase(java.util.Locale.ROOT))) {
                     MemgresException ex = new MemgresException("cannot insert into column \"" + col
                             + "\" of view \"" + stmt.table() + "\"", "0A000");
                     ex.setDetail(ViewUpdatability.DETAIL_NOT_COLUMN);
@@ -894,7 +894,7 @@ class DmlExecutor {
             }
             for (int i = 0; i < activeViewColNames.size() && i < widest; i++) {
                 String viewCol = activeViewColNames.get(i);
-                if (viewCol == null || !activeViewExprCols.contains(viewCol.toLowerCase())) continue;
+                if (viewCol == null || !activeViewExprCols.contains(viewCol.toLowerCase(java.util.Locale.ROOT))) continue;
                 MemgresException ex = new MemgresException("cannot insert into column \"" + viewCol
                         + "\" of view \"" + stmt.table() + "\"", "0A000");
                 ex.setDetail(ViewUpdatability.DETAIL_NOT_COLUMN);
@@ -1214,8 +1214,8 @@ class DmlExecutor {
                             // Check that all expression columns match
                             boolean allMatch = true;
                             for (int ei = 0; ei < targetExprs.size(); ei++) {
-                                String targetExpr = targetExprs.get(ei).toLowerCase().replaceAll("\\s+", "");
-                                String idxExpr = sc.getColumns().get(ei).toLowerCase().replaceAll("\\s+", "");
+                                String targetExpr = targetExprs.get(ei).toLowerCase(java.util.Locale.ROOT).replaceAll("\\s+", "");
+                                String idxExpr = sc.getColumns().get(ei).toLowerCase(java.util.Locale.ROOT).replaceAll("\\s+", "");
                                 if (!targetExpr.equals(idxExpr)) {
                                     allMatch = false;
                                     break;
@@ -1239,8 +1239,8 @@ class DmlExecutor {
                                 && sc.getColumns().size() == targetExprs.size()) {
                             boolean allMatch = true;
                             for (int ei = 0; ei < targetExprs.size(); ei++) {
-                                String targetExpr = targetExprs.get(ei).toLowerCase().replaceAll("\\s+", "");
-                                String colName = sc.getColumns().get(ei).toLowerCase();
+                                String targetExpr = targetExprs.get(ei).toLowerCase(java.util.Locale.ROOT).replaceAll("\\s+", "");
+                                String colName = sc.getColumns().get(ei).toLowerCase(java.util.Locale.ROOT);
                                 if (!targetExpr.equals(colName)) {
                                     allMatch = false;
                                     break;
@@ -1312,7 +1312,7 @@ class DmlExecutor {
                         conflictBindings.add(new RowContext.TableBinding(conflictTable, "excluded", row));
                         RowContext conflictCtx = new RowContext(conflictBindings);
                         Set<String> allCols = new HashSet<>();
-                        for (Column c : conflictTable.getColumns()) allCols.add(c.getName().toLowerCase());
+                        for (Column c : conflictTable.getColumns()) allCols.add(c.getName().toLowerCase(java.util.Locale.ROOT));
                         conflictCtx.setUsingColumns(allCols);
 
                         // First evaluate the DO UPDATE WHERE clause if present
@@ -1334,7 +1334,7 @@ class DmlExecutor {
                             if (colIdx < 0) {
                                 throw new MemgresException("Column not found: " + set.column());
                             }
-                            conflictUpdCols.add(set.column().toLowerCase());
+                            conflictUpdCols.add(set.column().toLowerCase(java.util.Locale.ROOT));
                             Column setCol = conflictTable.getColumns().get(colIdx);
                             // DO UPDATE is an UPDATE, and SET col = DEFAULT asks for the column's
                             // own default there as it does anywhere else. A stored generated column
@@ -1585,7 +1585,7 @@ class DmlExecutor {
                 // Refused now rather than when the first data row arrives: PostgreSQL never sends
                 // a CopyInResponse for a statement it has already decided against.
                 rejectGeneratedCopyColumn(table.getColumns().get(idx));
-                if (!seen.add(colName.toLowerCase())) {
+                if (!seen.add(colName.toLowerCase(java.util.Locale.ROOT))) {
                     throw new MemgresException(
                         "column \"" + colName + "\" specified more than once", "42701");
                 }
@@ -2214,7 +2214,7 @@ class DmlExecutor {
     }
 
     private boolean isPartitionedParent(String schema, String bareName) {
-        Schema s = executor.database.getSchema(schema == null ? "public" : schema.toLowerCase());
+        Schema s = executor.database.getSchema(schema == null ? "public" : schema.toLowerCase(java.util.Locale.ROOT));
         Table t = s != null ? s.getTable(bareName) : null;
         return t != null && t.getPartitionStrategy() != null;
     }
@@ -2280,7 +2280,7 @@ class DmlExecutor {
         Set<String> viewExprCols = activeViewExprCols;
         if (viewExprCols != null) {
             for (InsertStmt.SetClause set : stmt.setClauses()) {
-                if (viewExprCols.contains(set.column().toLowerCase())) {
+                if (viewExprCols.contains(set.column().toLowerCase(java.util.Locale.ROOT))) {
                     MemgresException ex = new MemgresException("cannot update column \"" + set.column()
                             + "\" of view \"" + stmt.table() + "\"", "0A000");
                     ex.setDetail(ViewUpdatability.DETAIL_NOT_COLUMN);
@@ -2320,7 +2320,7 @@ class DmlExecutor {
         executor.checkTablePrivilege("UPDATE", schemaName, stmt.table());
         // Check for attempts to assign to system columns (PG error 0A000, before replica identity check)
         for (InsertStmt.SetClause set : stmt.setClauses()) {
-            String col = set.column().toLowerCase();
+            String col = set.column().toLowerCase(java.util.Locale.ROOT);
             if (col.equals("ctid") || col.equals("xmin") || col.equals("xmax")
                     || col.equals("cmin") || col.equals("cmax") || col.equals("tableoid")) {
                 throw new MemgresException("cannot assign to system column \"" + set.column() + "\"", "0A000");
@@ -2340,7 +2340,7 @@ class DmlExecutor {
 
         // Validate: FROM table alias must not conflict with target table alias
         if (stmt.from() != null && !stmt.from().isEmpty()) {
-            String targetAlias = (stmt.alias() != null ? stmt.alias() : stmt.table()).toLowerCase();
+            String targetAlias = (stmt.alias() != null ? stmt.alias() : stmt.table()).toLowerCase(java.util.Locale.ROOT);
             for (SelectStmt.FromItem fi : stmt.from()) {
                 String fromAlias = partitionHelper.extractFromItemAlias(fi);
                 if (fromAlias != null && fromAlias.equalsIgnoreCase(targetAlias)) {
@@ -2391,7 +2391,7 @@ class DmlExecutor {
         // Compute set of updated column names (for UPDATE OF trigger filtering)
         Set<String> updatedColumnNames = new HashSet<>();
         for (InsertStmt.SetClause set : stmt.setClauses()) {
-            updatedColumnNames.add(set.column().toLowerCase());
+            updatedColumnNames.add(set.column().toLowerCase(java.util.Locale.ROOT));
         }
 
         // Every relation that stores rows for this one: its partitions and its inheritance
@@ -3563,7 +3563,7 @@ class DmlExecutor {
 
         // Validate: USING table alias must not conflict with target table alias
         if (stmt.using() != null && !stmt.using().isEmpty()) {
-            String targetAlias = (stmt.alias() != null ? stmt.alias() : stmt.table()).toLowerCase();
+            String targetAlias = (stmt.alias() != null ? stmt.alias() : stmt.table()).toLowerCase(java.util.Locale.ROOT);
             for (SelectStmt.FromItem fi : stmt.using()) {
                 String usingAlias = partitionHelper.extractFromItemAlias(fi);
                 if (usingAlias != null && usingAlias.equalsIgnoreCase(targetAlias)) {
@@ -4964,7 +4964,7 @@ class DmlExecutor {
             requireMergeTargetColumns(targetTable, andCondition, targetAlias, relationName);
             if (sets == null) continue;
             for (InsertStmt.SetClause set : sets) {
-                String col = set.column().toLowerCase();
+                String col = set.column().toLowerCase(java.util.Locale.ROOT);
                 if (col.equals("ctid") || col.equals("xmin") || col.equals("xmax")
                         || col.equals("cmin") || col.equals("cmax") || col.equals("tableoid")) {
                     throw new MemgresException(
@@ -5023,7 +5023,7 @@ class DmlExecutor {
             if (!qualifier.equalsIgnoreCase(targetAlias) && !qualifier.equalsIgnoreCase(relationName)) {
                 return;   // another relation's name: not this scope's to judge
             }
-            if (SYSTEM_COLUMNS.contains(cr.column().toLowerCase())) return;
+            if (SYSTEM_COLUMNS.contains(cr.column().toLowerCase(java.util.Locale.ROOT))) return;
             if (table.getColumnIndex(mapViewColumn(cr.column())) < 0) {
                 // PostgreSQL leaves a qualified name as it was written.
                 throw new MemgresException("column " + qualifier + "." + cr.column()
@@ -5124,7 +5124,7 @@ class DmlExecutor {
                 sets = ((MergeStmt.WhenNotMatchedBySource) clause).setClauses();
             }
             if (sets == null) continue;
-            for (InsertStmt.SetClause set : sets) assigned.add(set.column().toLowerCase());
+            for (InsertStmt.SetClause set : sets) assigned.add(set.column().toLowerCase(java.util.Locale.ROOT));
         }
         return assigned;
     }
@@ -5739,7 +5739,7 @@ class DmlExecutor {
         for (int i = 0; i < table.getColumns().size(); i++) {
             Column col = table.getColumns().get(i);
             if (!col.isVirtual()) continue;
-            String name = col.getName().toLowerCase();
+            String name = col.getName().toLowerCase(java.util.Locale.ROOT);
             if (named != null && !named.contains(name)) continue;
             if (leftToRelation.contains(name)) continue;
             fillVirtualColumn(table, row, i, col);
@@ -5772,12 +5772,12 @@ class DmlExecutor {
                 everyColumn[0] = true;
             } else if (node instanceof ColumnRef) {
                 String column = ((ColumnRef) node).column();
-                if (column != null) named.add(column.toLowerCase());
+                if (column != null) named.add(column.toLowerCase(java.util.Locale.ROOT));
             }
         });
         if (everyColumn[0] || bareStarHere(Arrays.asList(parts))) return null;
-        if (table != null && named.contains(table.getName().toLowerCase())) return null;
-        if (alias != null && named.contains(alias.toLowerCase())) return null;
+        if (table != null && named.contains(table.getName().toLowerCase(java.util.Locale.ROOT))) return null;
+        if (alias != null && named.contains(alias.toLowerCase(java.util.Locale.ROOT))) return null;
         return named;
     }
 
@@ -5930,7 +5930,7 @@ class DmlExecutor {
                 filteredColumns = filtered.get();
                 filteredSettled = true;
             }
-            return filteredColumns == null || filteredColumns.contains(column.toLowerCase());
+            return filteredColumns == null || filteredColumns.contains(column.toLowerCase(java.util.Locale.ROOT));
         }
     }
 
@@ -6210,7 +6210,7 @@ class DmlExecutor {
     }
 
     private static String refKey(ColumnRef ref) {
-        return ref.table().toLowerCase() + "." + ref.column().toLowerCase();
+        return ref.table().toLowerCase(java.util.Locale.ROOT) + "." + ref.column().toLowerCase(java.util.Locale.ROOT);
     }
 
     private static String classOf(Map<String, String> parent, String key) {
@@ -6398,7 +6398,7 @@ class DmlExecutor {
                 // query reads this one as one join with itself, in which case what compares the two
                 // is the condition of the join and is read where the rows are paired.
                 if (paired || relations == null || ref.table() == null
-                        || relations.contains(ref.table().toLowerCase())) {
+                        || relations.contains(ref.table().toLowerCase(java.util.Locale.ROOT))) {
                     usable[0] = false;
                 }
                 return;
@@ -6444,7 +6444,7 @@ class DmlExecutor {
     /** The name a statement's qualification writes the relation it acts on under. */
     private static String writtenName(String alias, Table table) {
         String written = alias != null ? alias : table.getName();
-        return written == null ? null : written.toLowerCase();
+        return written == null ? null : written.toLowerCase(java.util.Locale.ROOT);
     }
 
     /**
@@ -6521,7 +6521,7 @@ class DmlExecutor {
             if (!rule.isInstead()) continue;
             anyInstead = true;
             if (rule.getQualification() == null && rule.getBody() != null
-                    && rule.getBody().toUpperCase().contains("RETURNING")) {
+                    && rule.getBody().toUpperCase(java.util.Locale.ROOT).contains("RETURNING")) {
                 return;
             }
         }
@@ -6892,13 +6892,13 @@ class DmlExecutor {
             // which is what a column the statement leaves out asks for as well.
             if (isDefaultLiteral(valueRow.get(ci))) continue;
             values.put(colName, executor.evalExpr(valueRow.get(ci), valueCtx));
-            supplied.add(colName.toLowerCase());
+            supplied.add(colName.toLowerCase(java.util.Locale.ROOT));
         }
         // PostgreSQL fills in the default of every column the statement did not supply while it is
         // rewriting the statement, which is before the rules are applied, so NEW carries the
         // default rather than a null.
         for (Column c : table.getColumns()) {
-            if (supplied.contains(c.getName().toLowerCase()) || c.isGenerated()) continue;
+            if (supplied.contains(c.getName().toLowerCase(java.util.Locale.ROOT)) || c.isGenerated()) continue;
             values.put(c.getName(), insertRuleDefault(stmt, table, c));
         }
         putRuleGeneratedValues(stmt, table, rules, values);
@@ -7432,7 +7432,7 @@ class DmlExecutor {
             // Mark all table columns as "using" columns to suppress ambiguity
             // between primary binding and OLD/NEW bindings for unqualified refs
             Set<String> allCols = new java.util.HashSet<>();
-            for (Column c : table.getColumns()) allCols.add(c.getName().toLowerCase());
+            for (Column c : table.getColumns()) allCols.add(c.getName().toLowerCase(java.util.Locale.ROOT));
             ctx.setUsingColumns(allCols);
         }
         List<Object> values = new ArrayList<>();
@@ -7768,7 +7768,7 @@ class DmlExecutor {
         Set<String> seen = new HashSet<>();
         for (String col : columns) {
             if (col == null) continue;
-            if (!seen.add(col.toLowerCase())) {
+            if (!seen.add(col.toLowerCase(java.util.Locale.ROOT))) {
                 throw new MemgresException("column \"" + col + "\" specified more than once", "42701");
             }
         }
@@ -7976,7 +7976,7 @@ class DmlExecutor {
         if (table == null || columnNames == null) return;
         for (String name : columnNames) {
             if (name == null) continue;
-            if (systemColumnsReported && UNASSIGNABLE_SYSTEM_COLUMNS.contains(name.toLowerCase())) {
+            if (systemColumnsReported && UNASSIGNABLE_SYSTEM_COLUMNS.contains(name.toLowerCase(java.util.Locale.ROOT))) {
                 continue;
             }
             if (table.getColumnIndex(mapViewColumn(name)) < 0) {
@@ -8023,7 +8023,7 @@ class DmlExecutor {
                 throw new MemgresException(
                         "missing FROM-clause entry for table \"" + qualifier + "\"", "42P01");
             }
-            if (SYSTEM_COLUMNS.contains(cr.column().toLowerCase())) return;
+            if (SYSTEM_COLUMNS.contains(cr.column().toLowerCase(java.util.Locale.ROOT))) return;
             if (table.getColumnIndex(mapViewColumn(cr.column())) < 0) {
                 // PostgreSQL quotes a bare name and leaves a qualified one as written.
                 throw new MemgresException("column " + (qualifier == null
@@ -8062,7 +8062,7 @@ class DmlExecutor {
             if (!(node instanceof ColumnRef)) return;
             ColumnRef ref = (ColumnRef) node;
             if (ref.column() == null
-                    || !UNROUTABLE_SYSTEM_COLUMNS.contains(ref.column().toLowerCase())) {
+                    || !UNROUTABLE_SYSTEM_COLUMNS.contains(ref.column().toLowerCase(java.util.Locale.ROOT))) {
                 return;
             }
             // Only what the list reports of the written row. A sub-select reading some other
@@ -8127,10 +8127,10 @@ class DmlExecutor {
                     // them like any other name: PostgreSQL lets a write report where it put the
                     // row and which relation the row went into. There is no oid among them,
                     // because a user table stopped carrying one in PostgreSQL 12.
-                    if (RETURNABLE_SYSTEM_COLUMNS.contains(cr.column().toLowerCase())) continue;
+                    if (RETURNABLE_SYSTEM_COLUMNS.contains(cr.column().toLowerCase(java.util.Locale.ROOT))) continue;
                     if (!returningColumnExists(cr.column(), table)) {
                         if (cr.table() == null
-                                && besideNames.contains(cr.column().toLowerCase())) {
+                                && besideNames.contains(cr.column().toLowerCase(java.util.Locale.ROOT))) {
                             continue;
                         }
                         // PostgreSQL quotes a bare name and leaves a qualified one as written; the
@@ -8218,7 +8218,7 @@ class DmlExecutor {
             }
             for (int i = 0; i < joined.getColumns().size(); i++) {
                 names.add((renamed != null && i < renamed.size()
-                        ? renamed.get(i) : joined.getColumns().get(i).getName()).toLowerCase());
+                        ? renamed.get(i) : joined.getColumns().get(i).getName()).toLowerCase(java.util.Locale.ROOT));
             }
         } else if (item instanceof SelectStmt.SubqueryFrom) {
             SelectStmt.SubqueryFrom sub = (SelectStmt.SubqueryFrom) item;
@@ -8244,7 +8244,7 @@ class DmlExecutor {
             // A call producing one value per row exposes it under the name the FROM item answers
             // to, and one producing a row exposes that row under the same name.
             String named = call.alias() != null ? call.alias() : call.functionName();
-            if (named != null) names.add(named.toLowerCase());
+            if (named != null) names.add(named.toLowerCase(java.util.Locale.ROOT));
         }
     }
 
@@ -8259,9 +8259,9 @@ class DmlExecutor {
         if (select.targets() == null) return;
         for (SelectStmt.SelectTarget target : select.targets()) {
             if (target.alias() != null) {
-                names.add(target.alias().toLowerCase());
+                names.add(target.alias().toLowerCase(java.util.Locale.ROOT));
             } else if (target.expr() instanceof ColumnRef) {
-                names.add(((ColumnRef) target.expr()).column().toLowerCase());
+                names.add(((ColumnRef) target.expr()).column().toLowerCase(java.util.Locale.ROOT));
             } else if (target.expr() instanceof WildcardExpr
                     && ((WildcardExpr) target.expr()).table() == null
                     && select.from() != null) {
@@ -8272,7 +8272,7 @@ class DmlExecutor {
 
     private static void addLowered(List<String> written, Set<String> names) {
         for (String name : written) {
-            if (name != null) names.add(name.toLowerCase());
+            if (name != null) names.add(name.toLowerCase(java.util.Locale.ROOT));
         }
     }
 

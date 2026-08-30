@@ -65,7 +65,7 @@ class DmlValidationHelper {
                     DomainType domain = executor.database.getDomain(domainName);
                     if (domain != null && domain.getBaseTypeName() != null
                             && domain.getBaseTypeName().equalsIgnoreCase("citext")) {
-                        row[i] = s.toLowerCase();
+                        row[i] = s.toLowerCase(java.util.Locale.ROOT);
                     }
                 }
             }
@@ -231,7 +231,7 @@ class DmlValidationHelper {
         }
         if (!executor.database.isDomain(fieldType)) return;
         try {
-            executor.castEvaluator.applyCast(text, fieldType.toLowerCase().trim());
+            executor.castEvaluator.applyCast(text, fieldType.toLowerCase(java.util.Locale.ROOT).trim());
         } catch (MemgresException e) {
             // A type whose input function cannot read the text is not what is being judged: only
             // the constraints the type carries are, and PostgreSQL refuses the whole write when
@@ -309,7 +309,7 @@ class DmlValidationHelper {
     private void collectViewCheckExprsRecursive(String viewName, boolean cascading,
                                                   List<ViewCheck> exprs,
                                                   Set<String> visited) {
-        if (!visited.add(viewName.toLowerCase())) return;
+        if (!visited.add(viewName.toLowerCase(java.util.Locale.ROOT))) return;
         Database.ViewDef view = executor.database.getView(viewName);
         if (view == null) return;
         // Add this view's WHERE clause if it has a CHECK OPTION OR if a parent is cascading

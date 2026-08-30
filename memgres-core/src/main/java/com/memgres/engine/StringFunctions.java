@@ -314,7 +314,7 @@ class StringFunctions {
                     break;
                 }
                 if (i == start) break;
-                parts.add(input.substring(start, i).toLowerCase());
+                parts.add(input.substring(start, i).toLowerCase(java.util.Locale.ROOT));
             }
             expectingPart = false;
             while (i < n && Character.isWhitespace(input.charAt(i))) i++;
@@ -429,7 +429,7 @@ class StringFunctions {
                 java.util.Locale collLocale = null;
                 if (argExpr instanceof CollateExpr) {
                     CollateExpr ce = (CollateExpr) argExpr;
-                    String coll = ce.collation().toLowerCase().replace("\"", "");
+                    String coll = ce.collation().toLowerCase(java.util.Locale.ROOT).replace("\"", "");
                     asciiOnly = coll.equals("c") || coll.equals("posix")
                             || coll.equals("pg_catalog.c") || coll.equals("pg_catalog.posix");
                     if (!asciiOnly) {
@@ -1332,7 +1332,7 @@ class StringFunctions {
             case "initcap": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
-                String s = arg.toString().toLowerCase();
+                String s = arg.toString().toLowerCase(java.util.Locale.ROOT);
                 StringBuilder sb = new StringBuilder();
                 boolean capitalize = true;
                 for (char c : s.toCharArray()) {
@@ -1388,7 +1388,7 @@ class StringFunctions {
                 Object data = executor.evalExpr(fn.args().get(0), ctx);
                 Object fmt = executor.evalExpr(fn.args().get(1), ctx);
                 if (data == null || fmt == null) return null;
-                String format = fmt.toString().toLowerCase();
+                String format = fmt.toString().toLowerCase(java.util.Locale.ROOT);
                 byte[] bytes;
                 if (data instanceof byte[]) {
                     bytes = (byte[]) data;
@@ -1431,7 +1431,7 @@ class StringFunctions {
                 Object data = executor.evalExpr(fn.args().get(0), ctx);
                 Object fmt = executor.evalExpr(fn.args().get(1), ctx);
                 if (data == null || fmt == null) return null;
-                String format = fmt.toString().toLowerCase();
+                String format = fmt.toString().toLowerCase(java.util.Locale.ROOT);
                 if (format.equals("base64")) {
                     return ByteaOperations.decodeBase64(data.toString());
                 } else if (format.equals("hex")) {
@@ -1550,14 +1550,14 @@ class StringFunctions {
                     String keyword = formExpr instanceof ColumnRef
                             && ((ColumnRef) formExpr).table() == null
                             ? ((ColumnRef) formExpr).column() : null;
-                    if (keyword != null && NORMALIZATION_FORMS.contains(keyword.toUpperCase())) {
-                        form = keyword.toUpperCase();
+                    if (keyword != null && NORMALIZATION_FORMS.contains(keyword.toUpperCase(java.util.Locale.ROOT))) {
+                        form = keyword.toUpperCase(java.util.Locale.ROOT);
                     } else {
-                        form = String.valueOf(executor.evalExpr(formExpr, ctx)).toUpperCase();
+                        form = String.valueOf(executor.evalExpr(formExpr, ctx)).toUpperCase(java.util.Locale.ROOT);
                     }
                 }
                 if (!NORMALIZATION_FORMS.contains(form)) {
-                    throw new MemgresException("invalid normalization form: " + form.toLowerCase(), "22023");
+                    throw new MemgresException("invalid normalization form: " + form.toLowerCase(java.util.Locale.ROOT), "22023");
                 }
                 return java.text.Normalizer.normalize(arg.toString(), java.text.Normalizer.Form.valueOf(form));
             }
@@ -1895,11 +1895,11 @@ class StringFunctions {
 
 
     private boolean isReservedWord(String word) {
-        return RESERVED_WORDS.contains(word.toLowerCase());
+        return RESERVED_WORDS.contains(word.toLowerCase(java.util.Locale.ROOT));
     }
 
     private void validateEncoding(String encoding) {
-        String upper = encoding.toUpperCase();
+        String upper = encoding.toUpperCase(java.util.Locale.ROOT);
         if (!VALID_ENCODINGS.contains(upper) && !VALID_ENCODINGS.contains(upper.replace("-", ""))) {
             throw new MemgresException("encoding \"" + encoding + "\" does not exist", "22023");
         }

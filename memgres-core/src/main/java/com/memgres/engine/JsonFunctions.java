@@ -997,7 +997,7 @@ class JsonFunctions {
      */
     static List<String> recordFieldNames(Expression expr) {
         if (!(expr instanceof FunctionCallExpr)) return null;
-        String name = FunctionEvaluator.stripSchemaPrefix(((FunctionCallExpr) expr).name().toLowerCase());
+        String name = FunctionEvaluator.stripSchemaPrefix(((FunctionCallExpr) expr).name().toLowerCase(java.util.Locale.ROOT));
         if (name.equals("json_each") || name.equals("jsonb_each")
                 || name.equals("json_each_text") || name.equals("jsonb_each_text")) {
             return Cols.listOf("key", "value");

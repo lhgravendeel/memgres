@@ -275,7 +275,7 @@ public final class CatalogHelper {
     private static int intervalMask(String qualifier) {
         if (qualifier == null) return INTERVAL_FULL_RANGE;
         for (int i = 0; i < INTERVAL_RANGES.length; i++) {
-            if (INTERVAL_RANGES[i].equals(qualifier.toLowerCase())) return INTERVAL_MASKS[i];
+            if (INTERVAL_RANGES[i].equals(qualifier.toLowerCase(java.util.Locale.ROOT))) return INTERVAL_MASKS[i];
         }
         return INTERVAL_FULL_RANGE;
     }
@@ -318,7 +318,11 @@ public final class CatalogHelper {
      * nothing has none, which is -1.
      */
     public static int attTypmod(Column c) {
-        return attTypmod(c.getType(), c.getPrecision(), c.getScale(), c.getIntervalQualifier());
+        // An array's modifier is its element's: numeric(6,2)[] is an array of numeric(6,2), and
+        // PostgreSQL stores the element's modifier against the column. Read off the array type
+        // instead, every array column reported an unmodified element type.
+        DataType dt = c.getArrayElementType() != null ? c.getArrayElementType() : c.getType();
+        return attTypmod(dt, c.getPrecision(), c.getScale(), c.getIntervalQualifier());
     }
 
     /** As above, from a declaration's parts. */
@@ -510,7 +514,7 @@ public final class CatalogHelper {
         if (def.equalsIgnoreCase("current_timestamp()")
                 || def.equalsIgnoreCase("current_timestamp")) return "CURRENT_TIMESTAMP";
         if (def.equalsIgnoreCase("current_date") || def.equalsIgnoreCase("current_date()")) return "CURRENT_DATE";
-        if (def.toLowerCase().startsWith("nextval(")) return def;
+        if (def.toLowerCase(java.util.Locale.ROOT).startsWith("nextval(")) return def;
         if (def.startsWith("'") && def.endsWith("'")) {
             // The type a default is labelled with is named as the reader would write it, which
             // for a type in a schema of its own is its bare name.
@@ -616,7 +620,7 @@ public final class CatalogHelper {
     /** Map ALTER DEFAULT PRIVILEGES object type to pg_default_acl single char. */
     public static char objectTypeChar(String objectType) {
         if (objectType == null) return 'r';
-        switch (objectType.toUpperCase()) {
+        switch (objectType.toUpperCase(java.util.Locale.ROOT)) {
             case "TABLES":
                 return 'r';
             case "SEQUENCES":
@@ -781,7 +785,7 @@ public final class CatalogHelper {
     private static String withoutDefaultOpclass(Database database, Table t, String method,
                                                 String key, String opts) {
         if (opts == null || !opts.contains("opclass:")) return opts;
-        String am = method == null || method.isEmpty() ? "btree" : method.toLowerCase();
+        String am = method == null || method.isEmpty() ? "btree" : method.toLowerCase(java.util.Locale.ROOT);
         String written = DdlIndexValidator.defaultOpclass(am, indexKeyTypeName(database, t, key));
         if (written == null) return opts;
         StringBuilder kept = new StringBuilder();
@@ -857,5 +861,14 @@ public final class CatalogHelper {
             return oids.oid("role:" + owner);
         }
         return 10;
+    }
+
+    /**
+     * The name of the role an object belongs to. Every object has one, and where nothing was
+     * recorded it is the role the server runs as -- which is who created it.
+     */
+    public static String ownerNameOf(Database database, String objectKey) {
+        String owner = database.getObjectOwner(objectKey);
+        return owner != null ? owner : database.bootstrapRoleName();
     }
 }

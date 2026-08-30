@@ -43,7 +43,7 @@ class DmlTriggerHelper {
                         && updatedColumns != null) {
                     boolean matches = false;
                     for (String col : trigger.getUpdateColumns()) {
-                        if (updatedColumns.contains(col.toLowerCase())) {
+                        if (updatedColumns.contains(col.toLowerCase(java.util.Locale.ROOT))) {
                             matches = true;
                             break;
                         }
@@ -282,7 +282,7 @@ class DmlTriggerHelper {
                             if (shadowedNew != null) schema.addTable(shadowedNew);
                         }
                         if (shadowedNew == null) {
-                            executor.database.removeObjectOwner("table:" + schemaName.toLowerCase() + "." + newTransName.toLowerCase());
+                            executor.database.removeObjectOwner("table:" + schemaName.toLowerCase(java.util.Locale.ROOT) + "." + newTransName.toLowerCase(java.util.Locale.ROOT));
                         }
                     }
                     if (oldTransName != null) {
@@ -292,7 +292,7 @@ class DmlTriggerHelper {
                             if (shadowedOld != null) schema.addTable(shadowedOld);
                         }
                         if (shadowedOld == null) {
-                            executor.database.removeObjectOwner("table:" + schemaName.toLowerCase() + "." + oldTransName.toLowerCase());
+                            executor.database.removeObjectOwner("table:" + schemaName.toLowerCase(java.util.Locale.ROOT) + "." + oldTransName.toLowerCase(java.util.Locale.ROOT));
                         }
                     }
                 }
@@ -314,7 +314,7 @@ class DmlTriggerHelper {
         if (schema != null) {
             schema.addTable(transTable);
             // Register ownership so privilege checks pass when trigger function queries the transition table
-            String ownerKey = "table:" + schemaName.toLowerCase() + "." + name.toLowerCase();
+            String ownerKey = "table:" + schemaName.toLowerCase(java.util.Locale.ROOT) + "." + name.toLowerCase(java.util.Locale.ROOT);
             String role = executor.currentRole();
             if (role == null) role = executor.sessionUser();
             if (role != null) executor.database.setObjectOwner(ownerKey, role);

@@ -111,9 +111,9 @@ class DdlAlterActionParser {
                 java.util.Map<String, String> params = new java.util.LinkedHashMap<>();
                 while (!parser.isAtEnd() && !parser.check(TokenType.RIGHT_PAREN)) {
                     // A parameter may be namespaced, as toast.autovacuum_enabled is.
-                    String key = parser.readIdentifier().toLowerCase();
+                    String key = parser.readIdentifier().toLowerCase(java.util.Locale.ROOT);
                     if (parser.match(TokenType.DOT)) {
-                        key = key + "." + parser.readIdentifier().toLowerCase();
+                        key = key + "." + parser.readIdentifier().toLowerCase(java.util.Locale.ROOT);
                     }
                     String val = null;
                     if (parser.match(TokenType.EQUALS)) {
@@ -168,9 +168,9 @@ class DdlAlterActionParser {
                 List<String> names = new ArrayList<>();
                 while (!parser.isAtEnd() && !parser.check(TokenType.RIGHT_PAREN)) {
                     // A parameter may be namespaced, as toast.autovacuum_enabled is.
-                    String key = parser.readIdentifier().toLowerCase();
+                    String key = parser.readIdentifier().toLowerCase(java.util.Locale.ROOT);
                     if (parser.match(TokenType.DOT)) {
-                        key = key + "." + parser.readIdentifier().toLowerCase();
+                        key = key + "." + parser.readIdentifier().toLowerCase(java.util.Locale.ROOT);
                     }
                     names.add(key);
                     parser.match(TokenType.COMMA);
@@ -384,7 +384,7 @@ class DdlAlterActionParser {
         }
         // SET STATISTICS n / SET STORAGE type: planner hints, no-op
         if (parser.checkKeyword("SET") && parser.pos + 1 < parser.tokens.size()) {
-            String nextVal = parser.tokens.get(parser.pos + 1).value().toUpperCase();
+            String nextVal = parser.tokens.get(parser.pos + 1).value().toUpperCase(java.util.Locale.ROOT);
             if (nextVal.equals("STATISTICS")) {
                 parser.advance();
                 parser.advance();
@@ -455,7 +455,7 @@ class DdlAlterActionParser {
         }
         // SET COMPRESSION method: no-op for in-memory database, just consume method name
         if (parser.checkKeyword("SET") && parser.pos + 1 < parser.tokens.size()
-                && parser.tokens.get(parser.pos + 1).value().toUpperCase().equals("COMPRESSION")) {
+                && parser.tokens.get(parser.pos + 1).value().toUpperCase(java.util.Locale.ROOT).equals("COMPRESSION")) {
             parser.advance(); // SET
             parser.advance(); // COMPRESSION
             String method = parser.readIdentifier(); // pglz, lz4, default
@@ -512,7 +512,7 @@ class DdlAlterActionParser {
         parser.expect(TokenType.LEFT_PAREN);
         java.util.Map<String, String> options = new java.util.LinkedHashMap<String, String>();
         do {
-            String key = parser.readIdentifier().toLowerCase();
+            String key = parser.readIdentifier().toLowerCase(java.util.Locale.ROOT);
             String value = null;
             if (parser.match(TokenType.EQUALS)) {
                 StringBuilder sb = new StringBuilder();

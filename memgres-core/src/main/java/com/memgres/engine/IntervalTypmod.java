@@ -60,7 +60,7 @@ public final class IntervalTypmod {
      */
     public static IntervalTypmod fromTypeSpec(String spec) {
         if (spec == null) return null;
-        String s = spec.toLowerCase().trim();
+        String s = spec.toLowerCase(java.util.Locale.ROOT).trim();
         if (!s.startsWith("interval")) return null;
         String rest = s.substring("interval".length()).trim();
         if (rest.isEmpty()) return PLAIN;

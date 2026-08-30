@@ -192,7 +192,7 @@ public class AstExecutor {
      * it came back to rather than letting the recursion run.
      */
     QueryResult executeViewQuery(String viewName, Statement viewQuery) {
-        String key = "view:" + viewName.toLowerCase();
+        String key = "view:" + viewName.toLowerCase(java.util.Locale.ROOT);
         if (!expansionsInProgress.add(key)) {
             throw PgErrors.infiniteRecursionInRules(viewName);
         }
@@ -208,15 +208,15 @@ public class AstExecutor {
      * own table would otherwise re-enter itself for as long as the stack lasted.
      */
     boolean enterRuleExpansion(String relation, String event) {
-        return expansionsInProgress.add("rule:" + event + ":" + relation.toLowerCase());
+        return expansionsInProgress.add("rule:" + event + ":" + relation.toLowerCase(java.util.Locale.ROOT));
     }
 
     void exitRuleExpansion(String relation, String event) {
-        expansionsInProgress.remove("rule:" + event + ":" + relation.toLowerCase());
+        expansionsInProgress.remove("rule:" + event + ":" + relation.toLowerCase(java.util.Locale.ROOT));
     }
 
     boolean isRuleExpanding(String relation, String event) {
-        return expansionsInProgress.contains("rule:" + event + ":" + relation.toLowerCase());
+        return expansionsInProgress.contains("rule:" + event + ":" + relation.toLowerCase(java.util.Locale.ROOT));
     }
 
     /**
@@ -480,6 +480,32 @@ public class AstExecutor {
     }
 
     /**
+     * Whether a statement of this shape writes a catalogue row, and so needs a transaction id.
+     *
+     * <p>The ones that do not are the statements that read, the ones that arrange the session
+     * around a statement rather than running one, and the maintenance commands: measured against
+     * PostgreSQL, SET, LOCK TABLE, ANALYZE and DECLARE all leave a transaction without an id
+     * where GRANT and COMMENT give it one. A procedure call writes nothing itself — whatever its
+     * body runs comes back through here on its own account.
+     */
+    private static boolean writesCatalog(Statement stmt) {
+        if (stmt instanceof SelectStmt || stmt instanceof SetOpStmt
+                || stmt instanceof ExplainStmt || stmt instanceof TransactionStmt
+                || stmt instanceof SetStmt || stmt instanceof LockStmt
+                || stmt instanceof MaintenanceStmt || stmt instanceof DeclareCursorStmt
+                || stmt instanceof FetchStmt || stmt instanceof CloseStmt
+                || stmt instanceof PrepareStmt || stmt instanceof ExecuteStmt
+                || stmt instanceof DeallocateStmt || stmt instanceof DiscardStmt
+                || stmt instanceof ListenStmt || stmt instanceof UnlistenStmt
+                || stmt instanceof NotifyStmt || stmt instanceof CallStmt
+                || stmt instanceof CopyStmt) {
+            return false;
+        }
+        // A statement that changes rows takes its id where it writes them, not here.
+        return !isDataModifying(stmt);
+    }
+
+    /**
      * How many rows a statement of this shape writes into the catalogue.
      *
      * <p>PostgreSQL spends a command identifier on each stretch of them it has to make visible
@@ -599,12 +625,12 @@ public class AstExecutor {
             bare = bare.substring(dot + 1);
         }
         if (where != null) {
-            Schema holder = database.getSchema(where.toLowerCase());
-            return holder == null ? null : holder.getTable(bare.toLowerCase());
+            Schema holder = database.getSchema(where.toLowerCase(java.util.Locale.ROOT));
+            return holder == null ? null : holder.getTable(bare.toLowerCase(java.util.Locale.ROOT));
         }
         for (String path : relationSearchPath()) {
             Schema holder = database.getSchema(path);
-            Table found = holder == null ? null : holder.getTable(bare.toLowerCase());
+            Table found = holder == null ? null : holder.getTable(bare.toLowerCase(java.util.Locale.ROOT));
             if (found != null) return found;
         }
         return null;
@@ -618,7 +644,7 @@ public class AstExecutor {
         if (session == null) return "MDY";
         String ds = session.getGucSettings().get("datestyle");
         if (ds == null) return "MDY";
-        String lower = ds.toLowerCase();
+        String lower = ds.toLowerCase(java.util.Locale.ROOT);
         if (lower.contains("dmy")) return "DMY";
         if (lower.contains("ymd")) return "YMD";
         return "MDY";
@@ -659,6 +685,11 @@ public class AstExecutor {
         // nothing still moves the counter that the next statement's cmin reports.
         if (writesRows(stmt)) session.noteCommandIdUsed();
         session.noteCatalogRowsWritten(catalogRowsWrittenBy(stmt));
+        // A transaction gets an id of its own the moment it writes, and a statement that writes
+        // the catalogue counts: PostgreSQL hands one out for GRANT and for COMMENT as readily as
+        // for INSERT, and withholds it from SET, LOCK, ANALYZE and DECLARE. Until then the
+        // transaction holds no lock on an id, which is what pg_locks reports.
+        if (writesCatalog(stmt)) session.getTransactionId();
         boolean failed = true;
         try {
             QueryResult result = executeStatementInner(stmt);
@@ -936,7 +967,7 @@ public class AstExecutor {
             // before it looks at the schema they are in, so a missing grantee is what it names.
             if (s.grantees() != null) {
                 for (String grantee : s.grantees()) {
-                    String lower = grantee == null ? null : grantee.toLowerCase();
+                    String lower = grantee == null ? null : grantee.toLowerCase(java.util.Locale.ROOT);
                     if (lower == null || lower.equals("public") || lower.equals("current_user")
                             || lower.equals("session_user") || lower.equals("current_role")) {
                         continue;
@@ -946,7 +977,7 @@ public class AstExecutor {
                     }
                 }
             }
-            if (s.forRole() != null && !database.hasRole(s.forRole().toLowerCase())) {
+            if (s.forRole() != null && !database.hasRole(s.forRole().toLowerCase(java.util.Locale.ROOT))) {
                 throw PgErrors.undefinedObject("role", s.forRole());
             }
             if (s.inSchema() != null && database.getSchema(s.inSchema()) == null) {
@@ -999,24 +1030,32 @@ public class AstExecutor {
         }
         if (stmt instanceof ReassignOwnedStmt) {
             ReassignOwnedStmt s = (ReassignOwnedStmt) stmt;
-            String oldRole = ddlExecutor.resolveOwnerName(s.oldRole());
             String newRole = ddlExecutor.resolveOwnerName(s.newRole());
-            if (!database.hasRole(oldRole)) {
-                throw new MemgresException("role \"" + s.oldRole() + "\" does not exist", "42704");
+            // Every role the statement named has to be there before anything is moved, so a
+            // statement naming one that is not leaves the others' objects where they were.
+            for (String written : s.oldRoles()) {
+                if (!database.hasRole(ddlExecutor.resolveOwnerName(written))) {
+                    throw new MemgresException("role \"" + written + "\" does not exist", "42704");
+                }
             }
             if (!database.hasRole(newRole)) {
                 throw new MemgresException("role \"" + s.newRole() + "\" does not exist", "42704");
             }
-            database.reassignOwned(oldRole, newRole);
+            for (String written : s.oldRoles()) {
+                database.reassignOwned(ddlExecutor.resolveOwnerName(written), newRole);
+            }
             return QueryResult.message(QueryResult.Type.SET, "REASSIGN OWNED");
         }
         if (stmt instanceof DropOwnedStmt) {
             DropOwnedStmt s = (DropOwnedStmt) stmt;
-            String role = ddlExecutor.resolveOwnerName(s.role());
-            if (!database.hasRole(role)) {
-                throw new MemgresException("role \"" + s.role() + "\" does not exist", "42704");
+            for (String written : s.roles()) {
+                if (!database.hasRole(ddlExecutor.resolveOwnerName(written))) {
+                    throw new MemgresException("role \"" + written + "\" does not exist", "42704");
+                }
             }
-            ddlExecutor.executeDropOwned(role);
+            for (String written : s.roles()) {
+                ddlExecutor.executeDropOwned(ddlExecutor.resolveOwnerName(written));
+            }
             identity().sweepDead();
             return QueryResult.message(QueryResult.Type.SET, "DROP OWNED");
         }
@@ -1447,7 +1486,7 @@ public class AstExecutor {
 
     java.util.List<String> relationSearchPath() {
         java.util.LinkedHashSet<String> path = new java.util.LinkedHashSet<>();
-        String temp = session == null ? null : session.getTempSchemaName().toLowerCase();
+        String temp = session == null ? null : session.getTempSchemaName().toLowerCase(java.util.Locale.ROOT);
         // pg_temp comes first only while the search path leaves it unsaid. A path that names it
         // puts it where it was named, so "public, pg_temp" reads the permanent table of a name
         // in preference to the temporary one — and putting temp first regardless meant a
@@ -1455,7 +1494,7 @@ public class AstExecutor {
         boolean named = false;
         if (session != null) {
             for (String entry : session.getEffectiveSearchPath(false)) {
-                String lower = entry.toLowerCase();
+                String lower = entry.toLowerCase(java.util.Locale.ROOT);
                 if (lower.equals("pg_temp") || lower.equals(temp)) { named = true; break; }
             }
         }
@@ -1471,7 +1510,7 @@ public class AstExecutor {
         java.util.LinkedHashSet<String> path = new java.util.LinkedHashSet<>();
         path.add("pg_catalog");
         if (session != null) {
-            for (String s : session.getEffectiveSearchPath(false)) path.add(s.toLowerCase());
+            for (String s : session.getEffectiveSearchPath(false)) path.add(s.toLowerCase(java.util.Locale.ROOT));
         }
         path.add("public");
         return new ArrayList<>(path);
@@ -1504,9 +1543,9 @@ public class AstExecutor {
      */
     /** The key privileges on a table are stored under: schema-qualified and lower-cased. */
     static String privilegeKey(String schemaName, String tableName) {
-        String bare = tableName == null ? "" : tableName.toLowerCase();
+        String bare = tableName == null ? "" : tableName.toLowerCase(java.util.Locale.ROOT);
         if (bare.contains(".")) return bare;
-        return (schemaName == null ? "public" : schemaName.toLowerCase()) + "." + bare;
+        return (schemaName == null ? "public" : schemaName.toLowerCase(java.util.Locale.ROOT)) + "." + bare;
     }
 
     /**
@@ -1525,11 +1564,11 @@ public class AstExecutor {
         // Also treat the default "memgres"/"test"/"postgres" connecting users as superuser
         // when they have no explicit role entry (backwards-compat for existing tests)
         if (roleAttrs == null) {
-            String lower = role.toLowerCase();
+            String lower = role.toLowerCase(java.util.Locale.ROOT);
             if ("memgres".equals(lower) || "test".equals(lower) || "postgres".equals(lower)) return;
         }
         // Owner check — try both "table:" and "view:" keys since views are DML-capable
-        String qualName = schemaName.toLowerCase() + "." + tableName.toLowerCase();
+        String qualName = schemaName.toLowerCase(java.util.Locale.ROOT) + "." + tableName.toLowerCase(java.util.Locale.ROOT);
         String owner = database.getObjectOwner("table:" + qualName);
         if (owner != null && owner.equalsIgnoreCase(role)) return;
         owner = database.getObjectOwner("view:" + qualName);
@@ -1552,12 +1591,12 @@ public class AstExecutor {
 
     private boolean hasPrivilegeDirectOrInherited(String roleName, String privilege,
             String objectType, String objectName, java.util.Set<String> visited) {
-        String roleNameLower = roleName.toLowerCase();
+        String roleNameLower = roleName.toLowerCase(java.util.Locale.ROOT);
         if (visited.contains(roleNameLower)) return false;
         visited.add(roleNameLower);
         java.util.Set<String> privs = database.getRolePrivileges(roleNameLower);
-        String checkKey = privilege.toUpperCase() + ":" + objectType.toUpperCase() + ":" + objectName.toLowerCase();
-        String allKey = "ALL:" + objectType.toUpperCase() + ":" + objectName.toLowerCase();
+        String checkKey = privilege.toUpperCase(java.util.Locale.ROOT) + ":" + objectType.toUpperCase(java.util.Locale.ROOT) + ":" + objectName.toLowerCase(java.util.Locale.ROOT);
+        String allKey = "ALL:" + objectType.toUpperCase(java.util.Locale.ROOT) + ":" + objectName.toLowerCase(java.util.Locale.ROOT);
         if (privs.contains(checkKey) || privs.contains(allKey)) return true;
         // Traverse role memberships
         java.util.Map<String, java.util.Set<String>> memberships = database.getRoleMemberships();
@@ -1579,7 +1618,7 @@ public class AstExecutor {
         Map<String, String> roleAttrs = database.getRole(role);
         if (roleAttrs != null && "true".equalsIgnoreCase(roleAttrs.get("SUPERUSER"))) return true;
         if (roleAttrs == null) {
-            String lower = role.toLowerCase();
+            String lower = role.toLowerCase(java.util.Locale.ROOT);
             return "memgres".equals(lower) || "test".equals(lower) || "postgres".equals(lower);
         }
         return false;
@@ -1589,7 +1628,7 @@ public class AstExecutor {
      * Check if the given role owns a table (by schema.table lookup in object owners).
      */
     boolean isTableOwner(String role, String schemaName, String tableName) {
-        String ownerKey = "table:" + schemaName.toLowerCase() + "." + tableName.toLowerCase();
+        String ownerKey = "table:" + schemaName.toLowerCase(java.util.Locale.ROOT) + "." + tableName.toLowerCase(java.util.Locale.ROOT);
         String owner = database.getObjectOwner(ownerKey);
         return owner != null && owner.equalsIgnoreCase(role);
     }
@@ -1617,7 +1656,7 @@ public class AstExecutor {
     private void requireRelationOwner(String schemaName, String relationName, String noun) {
         if (session == null || schemaName == null || relationName == null) return;
         String owner = database.getObjectOwner(
-                "table:" + schemaName.toLowerCase() + "." + relationName.toLowerCase());
+                "table:" + schemaName.toLowerCase(java.util.Locale.ROOT) + "." + relationName.toLowerCase(java.util.Locale.ROOT));
         if (owner == null) return;
         String role = currentRole();
         if (role == null || role.equalsIgnoreCase(owner)) return;
@@ -1684,7 +1723,7 @@ public class AstExecutor {
         // before, so it is answered here and not from any schema. Writing out a schema is a
         // reference to a stored relation and never to the working set.
         if (!userQualified && !recursiveWorkingSets.isEmpty()) {
-            Table workingSet = recursiveWorkingSets.get(tableName.toLowerCase());
+            Table workingSet = recursiveWorkingSets.get(tableName.toLowerCase(java.util.Locale.ROOT));
             if (workingSet != null) return workingSet;
         }
         String tempSchemaName = session != null ? session.getTempSchemaName() : "pg_temp";
@@ -1980,14 +2019,14 @@ public class AstExecutor {
                 if (baseCol == null) {
                     // Non-column target (e.g. SELECT *, expression): positional remap not derivable.
                     allSimpleColumns = false;
-                    if (target.alias() != null) exprCols.add(target.alias().toLowerCase());
+                    if (target.alias() != null) exprCols.add(target.alias().toLowerCase(java.util.Locale.ROOT));
                 } else {
                     order.add(baseCol);
                 }
                 String viewCol = target.alias() != null ? target.alias() : baseCol;
                 viewColumnNames.add(viewCol);
                 if (viewCol != null && baseCol != null && !viewCol.equalsIgnoreCase(baseCol)) {
-                    mapping.put(viewCol.toLowerCase(), baseCol);
+                    mapping.put(viewCol.toLowerCase(java.util.Locale.ROOT), baseCol);
                 }
             }
             if (!viewColumnNames.isEmpty()) lastViewColumnNames = viewColumnNames;
@@ -2057,7 +2096,7 @@ public class AstExecutor {
         if (expr instanceof WindowFuncExpr) return true;
         if (expr instanceof FunctionCallExpr) {
             FunctionCallExpr fn = (FunctionCallExpr) expr;
-            String name = fn.name().toLowerCase();
+            String name = fn.name().toLowerCase(java.util.Locale.ROOT);
             if (name.contains(".")) name = name.substring(name.lastIndexOf('.') + 1);
             if (SelectExecutor.AGGREGATE_FUNCTIONS.contains(name)) return true;
             for (Expression arg : fn.args()) {
@@ -2156,7 +2195,7 @@ public class AstExecutor {
             return null; // identity columns handled by nextSerial() in DmlExecutor
         }
         if (defaultExpr != null) {
-            String lower = defaultExpr.toLowerCase().trim();
+            String lower = defaultExpr.toLowerCase(java.util.Locale.ROOT).trim();
             if (lower.equals("uuid_generate_v4()") || lower.equals("gen_random_uuid()")) {
                 return java.util.UUID.randomUUID();
             }
@@ -2395,7 +2434,7 @@ public class AstExecutor {
                 func.setSchemaName(newSchema);
                 // Update schema registry
                 Set<String> oldObjects = database.getSchemaObjects(oldSchema);
-                oldObjects.remove("function:" + stmt.name().toLowerCase());
+                oldObjects.remove("function:" + stmt.name().toLowerCase(java.util.Locale.ROOT));
                 database.registerSchemaObject(newSchema, "function", stmt.name());
                 return QueryResult.message(QueryResult.Type.SET, tag);
             }
@@ -2465,8 +2504,8 @@ public class AstExecutor {
                 // ROWS: PG 18 rejects ROWS for non-set-returning functions with 22023
                 if (stmt.rows() != null) {
                     boolean isSrf = func.getReturnType() != null
-                            && (func.getReturnType().toUpperCase().startsWith("SETOF")
-                                || func.getReturnType().toUpperCase().contains("TABLE"));
+                            && (func.getReturnType().toUpperCase(java.util.Locale.ROOT).startsWith("SETOF")
+                                || func.getReturnType().toUpperCase(java.util.Locale.ROOT).contains("TABLE"));
                     if (!isSrf) {
                         throw new MemgresException(
                                 "ROWS is not applicable when function does not return a set", "22023");
@@ -2771,7 +2810,7 @@ public class AstExecutor {
      * Register extension-specific objects (opfamilies, functions) when an extension is created.
      */
     private void registerExtensionObjects(String extName) {
-        switch (extName.toLowerCase()) {
+        switch (extName.toLowerCase(java.util.Locale.ROOT)) {
             case "btree_gin": {
                 // Register gin opfamilies for scalar types (PG uses int4_ops, not integer_ops)
                 for (String typeName : new String[]{"int4_ops", "text_ops", "bool_ops", "float8_ops",

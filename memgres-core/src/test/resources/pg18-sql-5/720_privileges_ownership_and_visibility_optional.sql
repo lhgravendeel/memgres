@@ -21,11 +21,13 @@ SELECT has_table_privilege(current_user, 'test_720.things', 'SELECT') AS has_sel
 -- end-expected
 SELECT has_table_privilege(current_user, 'test_720.things', 'INSERT') AS has_insert_priv;
 
+-- The relation belongs to whoever created it, so the answer is read against that role rather
+-- than against a name only one connection would produce.
 -- begin-expected
--- columns: owner_name
--- row: memgres
+-- columns: owned_by_creator
+-- row: t
 -- end-expected
-SELECT pg_get_userbyid(c.relowner) AS owner_name
+SELECT pg_get_userbyid(c.relowner) = current_user AS owned_by_creator
 FROM pg_class c
 JOIN pg_namespace n ON n.oid = c.relnamespace
 WHERE n.nspname = 'test_720'

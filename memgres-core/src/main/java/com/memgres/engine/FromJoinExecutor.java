@@ -438,7 +438,7 @@ class FromJoinExecutor {
         Set<String> usingLower = null;
         if (using != null && !using.isEmpty()) {
             usingLower = new HashSet<>();
-            for (String col : using) usingLower.add(col.toLowerCase());
+            for (String col : using) usingLower.add(col.toLowerCase(java.util.Locale.ROOT));
         }
         for (RowContext ctx : rows) {
             ctx.setOutputColumns(output);

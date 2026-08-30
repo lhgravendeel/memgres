@@ -143,7 +143,7 @@ final class IndexNameChooser {
      */
     private static String castTypeName(String typeName) {
         if (typeName == null) return null;
-        String text = typeName.trim().toLowerCase();
+        String text = typeName.trim().toLowerCase(java.util.Locale.ROOT);
         int paren = text.indexOf('(');
         if (paren >= 0) text = text.substring(0, paren).trim();
         int dot = text.lastIndexOf('.');

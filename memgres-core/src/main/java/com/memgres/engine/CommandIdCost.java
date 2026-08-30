@@ -338,7 +338,7 @@ final class CommandIdCost {
     /** How one relation is named when two of them are compared. */
     private static String relationKey(String schemaName, String name) {
         String schema = schemaName == null || schemaName.isEmpty() ? "public" : schemaName;
-        return schema.toLowerCase() + "." + (name == null ? "" : name.toLowerCase());
+        return schema.toLowerCase(java.util.Locale.ROOT) + "." + (name == null ? "" : name.toLowerCase(java.util.Locale.ROOT));
     }
 
     /** The relation a foreign key points at, as the same kind of name. */
@@ -380,7 +380,7 @@ final class CommandIdCost {
     private static String storageOf(Column column) {
         String written = column.getAttStorageOverride();
         if (written != null && !written.isEmpty()) {
-            return written.substring(0, 1).toLowerCase();
+            return written.substring(0, 1).toLowerCase(java.util.Locale.ROOT);
         }
         return CatalogCoreBuilder.typeStorage(column.getType());
     }

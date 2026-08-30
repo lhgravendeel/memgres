@@ -438,7 +438,7 @@ class SelectWindowEvaluator {
      * clause the function has no use for, and PostgreSQL says so rather than answering NULL.
      */
     private void rejectOverOnPlainFunction(WindowFuncExpr wf, QueryLevelScope scope) {
-        String name = FunctionEvaluator.stripSchemaPrefix(wf.name().toLowerCase());
+        String name = FunctionEvaluator.stripSchemaPrefix(wf.name().toLowerCase(java.util.Locale.ROOT));
         if (PlacementCheck.isWindowFunctionName(name) || select.isAggregateFunction(name)) return;
         // An ordered-set aggregate is resolved before anything is asked about the OVER clause: the
         // call answers to a catalogued signature or it does not, and only a call that does is an
@@ -1016,7 +1016,10 @@ class SelectWindowEvaluator {
     private Object[] evaluateWindowFunction(WindowFuncExpr wf, List<RowContext> contexts) {
         int n = contexts.size();
         Object[] results = new Object[n];
-        String funcName = wf.name().toLowerCase();
+        // The schema a window function is written under is not part of its name: matched with the
+        // qualifier still on it, pg_catalog.row_number() fell through every arm below and every
+        // row came back null.
+        String funcName = FunctionEvaluator.stripSchemaPrefix(wf.name().toLowerCase(java.util.Locale.ROOT));
 
         List<List<Integer>> partitions = partitionRows(wf.partitionBy(), contexts);
 
