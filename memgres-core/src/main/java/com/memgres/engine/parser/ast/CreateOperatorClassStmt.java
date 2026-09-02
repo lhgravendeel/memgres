@@ -11,15 +11,28 @@ public final class CreateOperatorClassStmt implements Statement {
     public final String method;      // btree, hash, gist, gin, etc.
     public final String familyName;  // FAMILY clause, may be null (auto-created)
 
+    /** What the AS clause listed: the strategies, and the support functions. */
+    public final java.util.List<OperatorClassItem> items;
+
     public CreateOperatorClassStmt(String schema, String name, boolean isDefault,
                                    String forType, String method, String familyName) {
+        this(schema, name, isDefault, forType, method, familyName,
+                java.util.Collections.<OperatorClassItem>emptyList());
+    }
+
+    public CreateOperatorClassStmt(String schema, String name, boolean isDefault,
+                                   String forType, String method, String familyName,
+                                   java.util.List<OperatorClassItem> items) {
         this.schema = schema;
         this.name = name;
         this.isDefault = isDefault;
         this.forType = forType;
         this.method = method;
         this.familyName = familyName;
+        this.items = items;
     }
+
+    public java.util.List<OperatorClassItem> items() { return items; }
 
     public String schema() { return schema; }
     public String name() { return name; }

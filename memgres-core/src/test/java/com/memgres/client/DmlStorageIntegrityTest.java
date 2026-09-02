@@ -42,6 +42,12 @@ class DmlStorageIntegrityTest {
         conn = DriverManager.getConnection(memgres.getJdbcUrl() + "?preferQueryMode=simple",
                 memgres.getUser(), memgres.getPassword());
         conn.setAutoCommit(true);
+        // Since PostgreSQL 15 the public schema grants CREATE to nobody, and memgres now says
+        // so too. These tests are about something else, so the grant is made once here rather
+        // than in every one of them.
+        try (java.sql.Statement grantStmt = conn.createStatement()) {
+            grantStmt.execute("GRANT CREATE ON SCHEMA public TO PUBLIC");
+        }
     }
 
     @AfterAll
@@ -2177,10 +2183,10 @@ class DmlStorageIntegrityTest {
                 + " NOT DEFERRABLE FOR EACH ROW EXECUTE FUNCTION w1i_f5()");
         exec("CREATE CONSTRAINT TRIGGER w1i_tg5f AFTER DELETE ON w1i_t5 FROM w1i_tr2"
                 + " DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION w1i_f5('x')");
-        assertEquals("CREATE CONSTRAINT TRIGGER w1i_tg5c AFTER INSERT ON public.w1i_t5"
+        assertEquals("CREATE CONSTRAINT TRIGGER w1i_tg5c AFTER INSERT ON w1i_t5"
                         + " DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION w1i_f5()",
                 scalar("SELECT pg_get_triggerdef(oid) FROM pg_trigger WHERE tgname='w1i_tg5c'"));
-        assertEquals("CREATE CONSTRAINT TRIGGER w1i_tg5n AFTER UPDATE ON public.w1i_t5"
+        assertEquals("CREATE CONSTRAINT TRIGGER w1i_tg5n AFTER UPDATE ON w1i_t5"
                         + " NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION w1i_f5()",
                 scalar("SELECT pg_get_triggerdef(oid) FROM pg_trigger WHERE tgname='w1i_tg5n'"));
         assertEquals("true", scalar("SELECT (tgconstraint <> 0)::text FROM pg_trigger"

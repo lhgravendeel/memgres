@@ -312,9 +312,9 @@ class CatalogsAgreeTest {
                     triples(s, "SELECT tgname, tgconstrindid, tgqual FROM pg_trigger "
                             + "WHERE tgname LIKE 'cg_t%' ORDER BY tgname"));
             assertEquals(List.of(
-                            "cg_t1=CREATE TRIGGER cg_t1 BEFORE INSERT ON public.cg_trg "
+                            "cg_t1=CREATE TRIGGER cg_t1 BEFORE INSERT ON cg_trg "
                                     + "FOR EACH ROW EXECUTE FUNCTION cg_tf()",
-                            "cg_t2=CREATE TRIGGER cg_t2 AFTER DELETE OR UPDATE ON public.cg_trg "
+                            "cg_t2=CREATE TRIGGER cg_t2 AFTER DELETE OR UPDATE ON cg_trg "
                                     + "FOR EACH STATEMENT EXECUTE FUNCTION cg_tf()"),
                     pairs(s, "SELECT tgname, pg_get_triggerdef(oid) FROM pg_trigger "
                             + "WHERE tgname LIKE 'cg_t%' ORDER BY tgname"));

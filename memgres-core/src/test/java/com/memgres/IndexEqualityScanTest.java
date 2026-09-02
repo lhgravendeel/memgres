@@ -30,6 +30,10 @@ class IndexEqualityScanTest {
     static void setUp() throws Exception {
         memgres = Memgres.builder().port(0).build().start();
         conn = connect();
+        // Since PostgreSQL 15 the public schema grants CREATE to nobody, and memgres now says
+        // so too. These tests are about something else, so the grant is made once here rather
+        // than in every one of them.
+        exec(conn, "GRANT CREATE ON SCHEMA public TO PUBLIC");
     }
 
     @AfterAll

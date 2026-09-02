@@ -330,6 +330,18 @@ public final class ViewDeparser {
         }
     }
 
+    /**
+     * A recursive view refers to itself, and the query behind it does that through a common table
+     * expression carrying an internal name. The definition is the view as it was written, so the
+     * name it shows is the view's own.
+     */
+    private static String viewsOwnName(String name) {
+        if (name == null || !name.startsWith("__recursive_view_") || !name.endsWith("__")) {
+            return name;
+        }
+        return name.substring("__recursive_view_".length(), name.length() - 2);
+    }
+
     private void withClause(SelectStmt select) {
         List<SelectStmt.CommonTableExpr> ctes = select.withClauses();
         if (ctes == null || ctes.isEmpty()) return;
@@ -341,7 +353,7 @@ public final class ViewDeparser {
         for (int i = 0; i < ctes.size(); i++) {
             SelectStmt.CommonTableExpr cte = ctes.get(i);
             if (i > 0) out.append(", ");
-            out.append(ident(cte.name()));
+            out.append(ident(viewsOwnName(cte.name())));
             appendNameList(cte.columnNames());
             out.append(" AS (");
             keyword("", 0, 0, 0);
@@ -769,10 +781,14 @@ public final class ViewDeparser {
             // relation of whatever schema the reader happens to be in.
             String schema = ref.schema() != null ? ref.schema() : qualifyingSchema;
             if (schema != null) out.append(ident(schema)).append('.');
-            out.append(ident(ref.table()));
+            String relation = viewsOwnName(ref.table());
+            out.append(ident(relation));
             String written = ref.alias() != null ? ref.alias() : ref.table();
             String shown = printedRelation(written);
-            if (ref.alias() != null || !shown.equals(written)) out.append(' ').append(ident(shown));
+            // An alias that says nothing the relation's name does not is not written down.
+            if ((ref.alias() != null && !shown.equals(relation)) || !shown.equals(written)) {
+                out.append(' ').append(ident(shown));
+            }
             appendColumnAliases(ref.columnAliases());
             return;
         }

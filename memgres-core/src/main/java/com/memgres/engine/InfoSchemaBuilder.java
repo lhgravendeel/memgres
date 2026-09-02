@@ -72,6 +72,39 @@ public class InfoSchemaBuilder {
      * Returns an empty table for unrecognized names.
      */
     public Table build(String tableName, Session session) {
+        return asPostgresTypesThem(tableName, buildView(tableName, session));
+    }
+
+    /**
+     * The view, with its columns carrying the types PostgreSQL gives them.
+     *
+     * <p>information_schema is defined over three domains — an identifier is a {@code name}, the
+     * descriptive and yes/no columns are {@code character varying}, a count or a length is an
+     * {@code integer}. Built with those columns declared text, every one of these views described
+     * itself to a client as text: a driver reading the metadata of a query over information_schema
+     * was told the wrong type for 222 columns across 17 views.
+     */
+    private static Table asPostgresTypesThem(String viewName, Table view) {
+        if (view == null) return view;
+        List<Column> retyped = new ArrayList<>();
+        boolean changed = false;
+        for (Column c : view.getColumns()) {
+            DataType t = InfoSchemaColumnTypes.typeOf(viewName, c.getName());
+            if (t == null || t == c.getType()) {
+                retyped.add(c);
+            } else {
+                retyped.add(new Column(c.getName(), t, c.isNullable(), c.isPrimaryKey(),
+                        c.getDefaultValue()));
+                changed = true;
+            }
+        }
+        if (!changed) return view;
+        Table out = new Table(view.getName(), retyped);
+        for (Object[] row : view.getAllRows()) out.insertRow(row);
+        return out;
+    }
+
+    private Table buildView(String tableName, Session session) {
         this.currentSession = session;
         switch (tableName) {
             case "tables":
@@ -600,7 +633,12 @@ public class InfoSchemaBuilder {
                     // view's rows. information_schema.columns is rebuilt for every statement
                     // that reads it, so paying for the content of sixty views to describe
                     // their headings would make the catalog slow for no extra truth.
-                    Table view = "columns".equals(isView) ? table : declaredView(isView);
+                    // Described from the column list as declared, which is before the types
+                    // PostgreSQL gives information_schema are put on it -- so these views, and
+                    // this one describing itself, reported their own columns as text.
+                    Table view = "columns".equals(isView)
+                            ? asPostgresTypesThem(isView, table)
+                            : asPostgresTypesThem(isView, declaredView(isView));
                     if (view == null) view = build(isView, currentSession);
                     if (view != null && !view.getColumns().isEmpty()
                             && !"dummy".equals(view.getColumns().get(0).getName())) {
@@ -2892,16 +2930,25 @@ public class InfoSchemaBuilder {
         return owner != null ? owner : fallback;
     }
 
-    /** A trigger function written the way PG writes it in triggers.action_statement. */
+    /**
+     * A trigger function written the way PG writes it in triggers.action_statement.
+     *
+     * <p>The schema goes in front only where the search path would not reach the routine without
+     * it, which is the rule every deparsed name follows.
+     */
     private String qualifiedFunctionName(String functionName, String fallbackSchema) {
         if (functionName == null || functionName.indexOf('.') >= 0) return functionName;
+        String schema = fallbackSchema;
         for (PgFunction fn : database.getFunctions().values()) {
             if (fn.getName().equalsIgnoreCase(functionName)) {
-                String schema = fn.getSchemaName() != null ? fn.getSchemaName() : "public";
-                return schema + "." + functionName;
+                schema = fn.getSchemaName() != null ? fn.getSchemaName() : "public";
+                break;
             }
         }
-        return fallbackSchema + "." + functionName;
+        // The catalogue is built without a session, so the schema every search path reaches is
+        // the one that can be left off: a routine anywhere else is written with its schema.
+        if (schema == null || "public".equalsIgnoreCase(schema)) return functionName;
+        return schema + "." + functionName;
     }
 
     /** The largest value an identity column of this type can reach. */

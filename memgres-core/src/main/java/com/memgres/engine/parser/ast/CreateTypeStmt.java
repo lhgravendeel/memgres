@@ -15,6 +15,13 @@ public final class CreateTypeStmt implements Statement {
     private String schemaName;         // CREATE TYPE schema.name — null when none was written
 
     public boolean shell() { return shell; }
+    /** Whether the statement carried a base type's definition rather than reserving a shell. */
+    private boolean baseTypeDefinition;
+
+    public boolean baseTypeDefinition() { return baseTypeDefinition; }
+
+    public void setBaseTypeDefinition(boolean value) { this.baseTypeDefinition = value; }
+
     public void setShell(boolean shell) { this.shell = shell; }
 
     /** The schema written before the name, or null when the name was written bare. */

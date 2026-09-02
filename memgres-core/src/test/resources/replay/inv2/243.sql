@@ -1,0 +1,12 @@
+-- source: investigation-2026-08.md
+-- finding: 243
+-- title: SELECT ... FOR UPDATE never re-reads the row it waited for: the waiting lock loop acquires the lock and returns, while the RowContexts were built before the wai
+-- A: BEGIN; UPDATE zz_t SET v = v + 1 WHERE i = 1;   (v was 10)
+-- B: BEGIN; SELECT v FROM zz_t WHERE i = 1 FOR UPDATE;  -- blocks
+-- A: COMMIT;
+-- A: BEGIN; DELETE FROM zz_t WHERE i = 1;
+-- B: SELECT v FROM zz_t WHERE i = 1 FOR UPDATE;  -- blocks
+-- A: COMMIT;
+-- A: BEGIN; UPDATE zz_t SET v = 42 WHERE i = 1;
+-- B: SELECT i FROM zz_t WHERE v = 10 FOR UPDATE;  -- blocks
+-- A: COMMIT;

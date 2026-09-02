@@ -45,7 +45,7 @@ public final class BinaryExpr implements Expression {
         // Regex match
         REGEX_MATCH, REGEX_IMATCH, NOT_REGEX_MATCH, NOT_REGEX_IMATCH,
         // Geometric
-        DISTANCE, APPROX_EQUAL, GEO_BELOW, GEO_ABOVE,
+        DISTANCE, APPROX_EQUAL, GEO_BELOW, GEO_ABOVE, GEO_BELOW_EQ, GEO_ABOVE_EQ,
         GEO_NOT_EXTEND_RIGHT, GEO_NOT_EXTEND_LEFT, GEO_NOT_EXTEND_ABOVE, GEO_NOT_EXTEND_BELOW,
         GEO_INTERSECTS, GEO_CLOSEST_POINT, GEO_PARALLEL, GEO_PERPENDICULAR,
         // Point alignment: point ?- point (horizontal), point ?| point (vertical)

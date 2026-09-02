@@ -1,0 +1,5 @@
+-- source: review-2026-08.md
+-- finding: Root cause 5: protocol field counts are written into 16-bit fields with no check on what produced them
+-- area: Catalog builders and the wire layer, second pass
+-- title: Root cause 5: protocol field counts are written into 16-bit fields with no check on what produced them
+-- a select list of N constants: SELECT 0,1,2,...  (N = 2000, 40000, 70000);

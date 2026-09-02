@@ -1,0 +1,5 @@
+-- source: investigation-2026-08.md
+-- finding: 317
+-- title: The extended-protocol Describe path treats any statement beginning with EXPLAIN as a safe SELECT and appends " LIMIT 0" — isSafeToDescribe only inspects the fir
+-- JDBC: conn.prepareStatement("EXPLAIN (ANALYZE, COSTS OFF) INSERT INTO zz_d1 SELECT id, v FROM zz_d2 LIMIT 2").getMetaData(); SELECT count(*) FROM zz_d1;
+-- JDBC: conn.prepareStatement("EXPLAIN (COSTS OFF) UPDATE zz_p SET v = 1").getMetaData();

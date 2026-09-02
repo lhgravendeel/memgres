@@ -21,6 +21,12 @@ class PrivilegeEnforcementTest {
                 memgres.getJdbcUrl() + "?preferQueryMode=simple",
                 memgres.getUser(), memgres.getPassword());
         conn.setAutoCommit(true);
+        // Since PostgreSQL 15 the public schema grants CREATE to nobody, and memgres now says
+        // so too. These tests are about something else, so the grant is made once here rather
+        // than in every one of them.
+        try (java.sql.Statement grantStmt = conn.createStatement()) {
+            grantStmt.execute("GRANT CREATE ON SCHEMA public TO PUBLIC");
+        }
     }
 
     @AfterAll
@@ -169,6 +175,8 @@ class PrivilegeEnforcementTest {
     @Test
     void c6_ownerHasAllPrivileges() throws Exception {
         exec("CREATE ROLE c6ro LOGIN");
+        // Since PostgreSQL 15 the public schema grants CREATE to nobody, so a role that is to
+        // make a relation there has to be given it first.
         try {
             exec("SET ROLE c6ro");
             exec("CREATE TABLE c6to(id int)");
@@ -182,6 +190,9 @@ class PrivilegeEnforcementTest {
         } finally {
             exec("RESET ROLE");
             try { exec("DROP TABLE IF EXISTS c6to"); } catch (Exception ignored) {}
+            // The grant on public belongs to the role, and a role is not dropped while it holds
+            // something.
+            try { exec("DROP OWNED BY c6ro"); } catch (Exception ignored) {}
             exec("DROP ROLE IF EXISTS c6ro");
         }
     }
@@ -254,13 +265,21 @@ class PrivilegeEnforcementTest {
         exec("CREATE ROLE m10r LOGIN");
         try {
             exec("GRANT SELECT ON m10s.m10t TO m10r");
+            // A grant on the relation is not a grant on the schema that holds it: reaching the
+            // relation at all needs USAGE, which PostgreSQL refuses without.
             exec("SET ROLE m10r");
-            List<String> result = query("SELECT * FROM m10s.m10t");
-            assertEquals(List.of(), result);
+            SQLException denied = assertThrows(SQLException.class,
+                    () -> query("SELECT * FROM m10s.m10t"));
+            assertEquals("42501", denied.getSQLState());
+            exec("RESET ROLE");
+            exec("GRANT USAGE ON SCHEMA m10s TO m10r");
+            exec("SET ROLE m10r");
+            assertEquals(List.of(), query("SELECT * FROM m10s.m10t"));
         } finally {
             exec("RESET ROLE");
             exec("DROP TABLE IF EXISTS m10s.m10t");
             exec("DROP SCHEMA IF EXISTS m10s");
+            try { exec("DROP OWNED BY m10r"); } catch (Exception ignored) { }
             exec("DROP ROLE IF EXISTS m10r");
         }
     }
@@ -282,6 +301,8 @@ class PrivilegeEnforcementTest {
         } finally {
             exec("RESET ROLE");
             exec("DROP TABLE IF EXISTS m11t");
+            try { exec("DROP OWNED BY m11reader"); } catch (Exception ignored) {}
+            try { exec("DROP OWNED BY m11creator"); } catch (Exception ignored) {}
             exec("DROP ROLE IF EXISTS m11reader");
             exec("DROP ROLE IF EXISTS m11creator");
         }

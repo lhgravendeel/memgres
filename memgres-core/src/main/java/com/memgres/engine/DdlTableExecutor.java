@@ -64,6 +64,44 @@ class DdlTableExecutor {
 
     // ---- CREATE TABLE ----
 
+    /**
+     * A default has to be a value of the column's type, and has to name things that are there.
+     *
+     * <p>PostgreSQL settles both when the table is defined rather than when a row is written, so
+     * a column defaulting to a sequence nobody created, or to text no reader of the type accepts,
+     * is refused by the CREATE. Left to the first insert, the table was made and every write into
+     * it failed.
+     */
+    private void requireUsableDefault(Expression defaultExpr, DataType columnType) {
+        if (defaultExpr == null) return;
+        AstWalk.forEach(defaultExpr, node -> {
+            if (!(node instanceof FunctionCallExpr)) return;
+            FunctionCallExpr call = (FunctionCallExpr) node;
+            String called = FunctionEvaluator.stripSchemaPrefix(
+                    call.name().toLowerCase(java.util.Locale.ROOT));
+            if (!"nextval".equals(called) && !"currval".equals(called) && !"setval".equals(called)) {
+                return;
+            }
+            if (call.args() == null || call.args().isEmpty()) return;
+            Expression named = call.args().get(0);
+            if (!(named instanceof Literal)
+                    || ((Literal) named).literalType() != Literal.LiteralType.STRING) {
+                return;
+            }
+            String sequence = String.valueOf(((Literal) named).value());
+            if (executor.database.resolveSequence(executor.relationSearchPath(), sequence) == null) {
+                throw new MemgresException(
+                        "relation \"" + sequence + "\" does not exist", "42P01");
+            }
+        });
+        // A constant is read as the column's type here and now; anything else is left to run.
+        if (defaultExpr instanceof Literal
+                && ((Literal) defaultExpr).literalType() == Literal.LiteralType.STRING
+                && columnType != null) {
+            TypeCoercion.coerce(((Literal) defaultExpr).value(), columnType);
+        }
+    }
+
     QueryResult executeCreateTable(CreateTableStmt stmt) {
         String schemaName = stmt.schema() != null ? stmt.schema() : executor.creationSchema();
         if (stmt.temporary()) {
@@ -85,6 +123,8 @@ class DdlTableExecutor {
         if ("pg_catalog".equalsIgnoreCase(schemaName) || "information_schema".equalsIgnoreCase(schemaName)) {
             throw new MemgresException("permission denied for schema " + schemaName, "42501");
         }
+        // A relation is made in a schema, and making one there is the schema's CREATE privilege.
+        if (!stmt.temporary()) executor.checkSchemaPrivilege("CREATE", schemaName);
         // ON COMMIT describes what happens to the rows at the end of the transaction that made
         // them, which only means anything for a table that lives no longer than the session.
         if (stmt.onCommitAction() != null && !stmt.temporary()) {
@@ -278,7 +318,7 @@ class DdlTableExecutor {
                 // the new table the source's defaults, its identity and its generation
                 // expression, none of which PostgreSQL copies unasked.
                 for (Column col : likeTable.getColumns()) {
-                    if (!likeColumnNames.add(col.getName().toLowerCase(java.util.Locale.ROOT))) {
+                    if (!likeColumnNames.add(col.getName())) {
                         throw PgErrors.duplicateColumn(col.getName());
                     }
                     boolean exists = inheritedColumns.stream()
@@ -357,14 +397,18 @@ class DdlTableExecutor {
             DdlDefinitionChecks.rejectUncollatableType(def.typeName(), resolved, def.collation);
             // A LIKE has already written its source's columns into this definition, so one of them
             // and a written column of the same name clash exactly as two written ones do.
-            if (!definedColumnNames.add(def.name().toLowerCase(java.util.Locale.ROOT))
-                    || likeColumnNames.contains(def.name().toLowerCase(java.util.Locale.ROOT))) {
+            // A name has already been folded by the time it arrives: an unquoted ID is id, and
+            // a quoted "ID" is ID, and the two are different columns. Folded again here, a
+            // definition PostgreSQL accepts was refused as a duplicate.
+            if (!definedColumnNames.add(def.name())
+                    || likeColumnNames.contains(def.name())) {
                 throw new MemgresException("column \"" + def.name() + "\" specified more than once", "42701");
             }
             DdlDefinitionChecks.rejectSystemColumnName(def.name());
             DdlDefinitionChecks.validateDefaultExpression(def.defaultExpr());
 
             DataType dataType = resolved.dataType();
+            requireUsableDefault(def.defaultExpr(), dataType);
             String enumTypeName = resolved.enumTypeName();
             String domainTypeName = resolved.domainTypeName();
             String compositeTypeName = resolved.compositeTypeName();
@@ -481,10 +525,12 @@ class DdlTableExecutor {
                         columns);
             }
 
-            // Override inherited column if exists
+            // Override an inherited column of the same name. The names have already been
+            // folded, so they are compared as they stand: id and "ID" are two columns, and
+            // matching them without regard to case made the second quietly replace the first.
             int existingIdx = -1;
             for (int i = 0; i < columns.size(); i++) {
-                if (columns.get(i).getName().equalsIgnoreCase(def.name())) {
+                if (columns.get(i).getName().equals(def.name())) {
                     existingIdx = i;
                     break;
                 }
@@ -719,6 +765,13 @@ class DdlTableExecutor {
                         throw new MemgresException("column \"" + trimmed + "\" named in partition key does not exist", "42703");
                     }
                     rejectGeneratedPartitionKeyColumn(table, trimmed);
+                    // A range or list partition key puts rows in order, and it is the type's
+                    // default btree operator class that does the ordering — so a type nothing
+                    // can order is one no partition key can be built over.
+                    if (!"HASH".equalsIgnoreCase(stmt.partitionBy())) {
+                        DdlDefinitionChecks.requireOrderablePartitionKey(
+                                table.getColumns().get(table.getColumnIndex(trimmed)).getType());
+                    }
                     keysAsStored.append(trimmed);
                 }
                 partCol = keysAsStored.toString();

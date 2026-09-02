@@ -24,6 +24,23 @@ public final class CreateViewStmt implements Statement {
         this(name, query, orReplace, materialized, columnNames, withData, checkOption, null);
     }
 
+    /**
+     * Whether the statement said IF NOT EXISTS, which is not the same as OR REPLACE: one leaves
+     * the relation that is already there alone, and the other builds it again.
+     */
+    private boolean ifNotExists;
+
+    /** Whether the statement said TEMPORARY, which decides where the view may go. */
+    private boolean temporary;
+
+    public boolean temporary() { return temporary; }
+
+    public CreateViewStmt withTemporary() { this.temporary = true; return this; }
+
+    public boolean ifNotExists() { return ifNotExists; }
+
+    public CreateViewStmt withIfNotExists() { this.ifNotExists = true; return this; }
+
     public CreateViewStmt(String name, Statement query, boolean orReplace, boolean materialized,
                           List<String> columnNames, boolean withData, String checkOption,
                           Map<String, String> withOptions) {

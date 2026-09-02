@@ -230,6 +230,8 @@ class FromFunctionResolver {
             return resolveJsonArrayElements(fname, alias, colAliases, evalArgs);
         if (fname.equals("jsonb_object_keys") || fname.equals("json_object_keys"))
             return resolveJsonObjectKeys(fname, alias, colAliases, evalArgs);
+        if (fname.equals("pg_get_keywords") || fname.equals("pg_catalog.pg_get_keywords"))
+            return resolvePgGetKeywords(alias, colAliases);
         if (fname.equals("pg_options_to_table") || fname.equals("pg_catalog.pg_options_to_table"))
             return resolvePgOptionsToTable(alias, colAliases, evalArgs);
         if (fname.equals("pg_get_sequence_data") || fname.equals("pg_catalog.pg_get_sequence_data"))
@@ -1358,6 +1360,30 @@ class FromFunctionResolver {
                 virtualTable.insertRow(row);
                 contexts.add(new RowContext(virtualTable, alias, row));
             }
+        }
+        return contexts;
+    }
+
+    // ---- pg_get_keywords ----
+
+    /** Every word the grammar keeps for itself, and what each one may still be used as. */
+    private List<RowContext> resolvePgGetKeywords(String alias, List<String> colAliases) {
+        String[] names = {"word", "catcode", "barelabel", "catdesc", "baredesc"};
+        DataType[] types = {DataType.TEXT, DataType.INTERNAL_CHAR, DataType.BOOLEAN,
+                DataType.TEXT, DataType.TEXT};
+        List<Column> cols = new ArrayList<>();
+        for (int i = 0; i < names.length; i++) {
+            String named = (colAliases != null && colAliases.size() > i)
+                    ? colAliases.get(i) : names[i];
+            cols.add(new Column(named, types[i], true, false, null));
+        }
+        Table virtualTable = new Table(alias != null ? alias : "pg_get_keywords", cols);
+        List<RowContext> contexts = new ArrayList<>();
+        for (PgKeywordTable.Keyword kw : PgKeywordTable.keywords()) {
+            Object[] row = new Object[]{kw.word, kw.category, kw.bareLabel,
+                    kw.categoryDescription(), kw.bareLabelDescription()};
+            virtualTable.insertRow(row);
+            contexts.add(new RowContext(virtualTable, alias, row));
         }
         return contexts;
     }

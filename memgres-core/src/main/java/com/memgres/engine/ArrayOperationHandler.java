@@ -248,7 +248,15 @@ class ArrayOperationHandler {
         ExprEvaluator.rejectWideSubqueryElements(arr.elements());
         List<Object> list = new ArrayList<>();
         for (Expression elem : arr.elements()) {
-            list.add(executor.evalExpr(elem, ctx));
+            Object value = executor.evalExpr(elem, ctx);
+            // A whole row written into a row constructor contributes its fields, not itself:
+            // ROW(t.*) is the row of t, and ROW(t.*, 9) is that row with one more field on the
+            // end. Keeping it whole made a two-column row one field wide.
+            if (arr.isRow() && namesAWholeRow(elem) && value instanceof List<?>) {
+                list.addAll((List<?>) value);
+                continue;
+            }
+            list.add(value);
         }
         if (arr.isRow()) return new AstExecutor.PgRow(list);
         checkArrayDimensions(list);
@@ -285,6 +293,11 @@ class ArrayOperationHandler {
             }
         }
         return PgArray.of(list);
+    }
+
+    /** Whether the expression is a relation's whole row written out, rather than one value. */
+    private static boolean namesAWholeRow(Expression elem) {
+        return elem instanceof CompositeStarExpr || elem instanceof WildcardExpr;
     }
 
     /** PG stores an array's dimension count in a fixed-size header, capped at MAXDIM. */

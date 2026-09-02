@@ -68,7 +68,11 @@ class DdlParser {
         if (parser.matchKeywords("CONSTRAINT", "TRIGGER")) return parseCreateTrigger(orReplace, true);
         if (parser.matchKeyword("EXTENSION")) return parseCreateExtension();
         if (parser.matchKeyword("INDEX")) return indexParser.parseCreateIndex(unique, false);
-        if (parser.matchKeyword("VIEW")) return parseCreateView(orReplace, false);
+        if (parser.matchKeyword("VIEW")) {
+            CreateViewStmt view = parseCreateView(orReplace, false);
+            if (temporary) view.withTemporary();
+            return view;
+        }
         // CREATE RECURSIVE VIEW v (cols) AS q is shorthand for a view whose body is
         // WITH RECURSIVE v (cols) AS (q) SELECT cols FROM v.
         if (parser.matchKeywords("RECURSIVE", "VIEW")) return parseCreateRecursiveView(orReplace);
@@ -460,9 +464,15 @@ class DdlParser {
                 else if (t.type() == TokenType.RIGHT_PAREN) { depth--; if (depth == 0) break; }
                 argKey.append(parser.advance().value());
             }
+            Token closed = parser.peek();
             parser.expect(TokenType.RIGHT_PAREN);
             // Parse arg types from "integer, integer" or "NONE, integer"
             String[] parts = argKey.toString().split(",");
+            // An operator is named by both of its operand types, with NONE standing for the side
+            // it has none on. One type on its own does not say which side it is.
+            if (parts.length < 2) {
+                throw ParseException.saying("missing argument", closed, "42601");
+            }
             String leftArg = parts.length > 0 ? parts[0].trim() : "NONE";
             String rightArg = parts.length > 1 ? parts[1].trim() : "NONE";
             if ("NONE".equalsIgnoreCase(leftArg)) leftArg = "NONE";
@@ -762,13 +772,38 @@ class DdlParser {
                 while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
                 return new SetStmt("alter_extension_set_schema", extName + ":" + newSchema);
             }
-            // UPDATE, ADD/DROP member and the rest change nothing memgres records, but PostgreSQL
-            // still refuses one on an extension that was never installed. A bare UPDATE also says
-            // so when the installed version is already the newest one.
-            boolean bareUpdate = parser.matchKeyword("UPDATE") && !parser.checkKeyword("TO");
+            // UPDATE TO names a version the extension has to have a path to, and ADD/DROP names
+            // an object that has to be there. Skipped to the semicolon, both were accepted
+            // whatever they named.
+            if (parser.matchKeyword("UPDATE")) {
+                if (parser.matchKeyword("TO")) {
+                    String version = parser.readIdentifierOrString();
+                    while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+                    return new SetStmt("alter_extension_update_to", extName + ":" + version);
+                }
+                while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+                return new SetStmt("alter_object", "extension" + STUB_SEP + extName + STUB_SEP + ""
+                        + STUB_SEP + "update");
+            }
+            if (parser.checkKeyword("ADD") || parser.checkKeyword("DROP")) {
+                parser.advance();
+                StringBuilder kind = new StringBuilder(parser.advance().value());
+                // A member kind may be two words: MATERIALIZED VIEW, FOREIGN TABLE, OPERATOR CLASS.
+                if (parser.checkKeyword("VIEW") || parser.checkKeyword("TABLE")
+                        || parser.checkKeyword("CLASS") || parser.checkKeyword("FAMILY")
+                        || parser.checkKeyword("OBJECT")) {
+                    kind.append(' ').append(parser.advance().value());
+                }
+                String member = parser.isAtEnd() || parser.check(TokenType.SEMICOLON)
+                        ? "" : parser.readIdentifierOrString();
+                while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+                return new SetStmt("alter_extension_member",
+                        extName + ":" + kind.toString().toLowerCase(java.util.Locale.ROOT)
+                                + ":" + member);
+            }
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
             return new SetStmt("alter_object", "extension" + STUB_SEP + extName + STUB_SEP + ""
-                    + STUB_SEP + (bareUpdate ? "update" : ""));
+                    + STUB_SEP + "");
         }
         if (parser.matchKeyword("AGGREGATE")) return parseAlterAggregate();
         // ALTER on a name that was never created is an error in PostgreSQL, so each of these
@@ -866,16 +901,25 @@ class DdlParser {
 
         List<String> events = new ArrayList<>();
         List<String> updateOfColumns = new ArrayList<>();
+        Token eventToken = parser.peek();
         String event = parser.readIdentifier().toUpperCase(java.util.Locale.ROOT);
         events.add(event);
         if (event.equals("UPDATE") && parser.matchKeyword("OF")) {
-            do { updateOfColumns.add(parser.readIdentifier().toLowerCase(java.util.Locale.ROOT)); } while (parser.match(TokenType.COMMA));
+            readTriggerColumns(updateOfColumns);
         }
         while (parser.matchKeyword("OR")) {
+            eventToken = parser.peek();
             event = parser.readIdentifier().toUpperCase(java.util.Locale.ROOT);
+            // A trigger fires on an event once: naming the same one twice says nothing the first
+            // did not, and PostgreSQL refuses it rather than firing twice.
+            if (events.contains(event)) {
+                // The grammar reports this one, so it carries the token it stopped at.
+                throw ParseException.saying("duplicate trigger events specified at or near \""
+                        + eventToken.raw() + "\"", eventToken, "42601");
+            }
             events.add(event);
             if (event.equals("UPDATE") && parser.matchKeyword("OF")) {
-                do { updateOfColumns.add(parser.readIdentifier().toLowerCase(java.util.Locale.ROOT)); } while (parser.match(TokenType.COMMA));
+                readTriggerColumns(updateOfColumns);
             }
         }
 
@@ -929,14 +973,20 @@ class DdlParser {
                     deferToken);
         }
 
-        parser.expectKeyword("FOR");
-        parser.matchKeyword("EACH");
-        boolean forEachRow = true;
+        // FOR EACH ROW / STATEMENT is optional: a trigger written without it fires once per
+        // statement, which is PostgreSQL's default. Required here, a definition PostgreSQL
+        // accepts was a syntax error, and the relation it named was never even looked for.
+        boolean forEachRow = false;
         Token levelToken = parser.peek();
-        if (parser.matchKeyword("STATEMENT")) {
-            forEachRow = false;
-        } else {
-            parser.expectKeyword("ROW");
+        if (parser.matchKeyword("FOR")) {
+            parser.matchKeyword("EACH");
+            levelToken = parser.peek();
+            if (parser.matchKeyword("STATEMENT")) {
+                forEachRow = false;
+            } else {
+                parser.expectKeyword("ROW");
+                forEachRow = true;
+            }
         }
         if (constraint && !forEachRow) {
             throw new ParseException("syntax error at or near \"" + levelToken.value() + "\"", levelToken);
@@ -1006,6 +1056,19 @@ class DdlParser {
      * A recursive view names itself in its own body. PG defines it as exactly the view whose
      * query is a WITH RECURSIVE CTE of the same name selected from, so that is what we build.
      */
+    /** The columns an UPDATE OF names, each of them once. */
+    private void readTriggerColumns(List<String> into) {
+        do {
+            Token at = parser.peek();
+            String column = parser.readIdentifier().toLowerCase(java.util.Locale.ROOT);
+            if (into.contains(column)) {
+                throw ParseException.saying(
+                        "column \"" + column + "\" specified more than once", at, "42701");
+            }
+            into.add(column);
+        } while (parser.match(TokenType.COMMA));
+    }
+
     private CreateViewStmt parseCreateRecursiveView(boolean orReplace) {
         if (parser.matchKeywords("IF", "NOT", "EXISTS")) orReplace = true;
         String name = parser.readIdentifier();
@@ -1020,6 +1083,14 @@ class DdlParser {
         parser.consumeLeadingParens(viewParens);
         Statement body = parser.tryParseSetOp(parser.parseSelect());
         parser.consumeTrailingParens(viewParens);
+
+        // A check option tests each written row against the view's own condition, and a
+        // recursive view has no single condition to test against. PostgreSQL refuses the
+        // combination rather than accepting a view that checks nothing.
+        if (parser.checkKeyword("WITH")) {
+            throw new MemgresException(
+                    "WITH CHECK OPTION not supported on recursive views", "0A000");
+        }
 
         // The body names the view to refer to itself. Point those references at the CTE instead,
         // keeping the view's name as the alias so qualified column references still read the same
@@ -1041,7 +1112,8 @@ class DdlParser {
     }
 
     CreateViewStmt parseCreateView(boolean orReplace, boolean materialized) {
-        if (parser.matchKeywords("IF", "NOT", "EXISTS")) orReplace = true;
+        boolean ifNotExists = parser.matchKeywords("IF", "NOT", "EXISTS");
+        if (ifNotExists) orReplace = true;
         String name = parser.readIdentifier();
         String viewSchema = null;
         if (parser.match(TokenType.DOT)) { viewSchema = name; name = parser.readIdentifier(); }
@@ -1065,7 +1137,10 @@ class DdlParser {
                 if (parser.matchKeyword("NO")) { parser.expectKeyword("DATA"); withData = false; }
                 else parser.expectKeyword("DATA");
             }
-            return new CreateViewStmt(name, query, orReplace, true, columnNames, withData).withSchema(viewSchema);
+            CreateViewStmt materializedView =
+                    new CreateViewStmt(name, query, orReplace, true, columnNames, withData);
+            if (ifNotExists) materializedView.withIfNotExists();
+            return materializedView.withSchema(viewSchema);
         }
 
         // Parse WITH (options) before AS, e.g. WITH (security_invoker = true)
@@ -1100,8 +1175,10 @@ class DdlParser {
             if (checkOption == null) checkOption = "CASCADED";
         }
 
-        return new CreateViewStmt(name, query, orReplace, false, columnNames, true, checkOption, withOptions)
-                .withSchema(viewSchema);
+        CreateViewStmt view = new CreateViewStmt(name, query, orReplace, false, columnNames, true,
+                checkOption, withOptions);
+        if (ifNotExists) view.withIfNotExists();
+        return view.withSchema(viewSchema);
     }
 
     /**
@@ -1219,6 +1296,13 @@ class DdlParser {
             CreateTypeStmt shell = new CreateTypeStmt(name, null, null);
             shell.setShell(true);
             shell.setSchemaName(schema);
+            // A parenthesised list here is a base type's definition, not a shell: it says how the
+            // type is read and written, which is the second step of defining one. The shell has
+            // to have been reserved first, and the executor is where that is known.
+            if (parser.check(TokenType.LEFT_PAREN)) {
+                shell.setBaseTypeDefinition(true);
+                DdlTableParser.consumeUntilParen(parser);
+            }
             return shell;
         }
         parser.expectKeyword("AS");
@@ -1277,6 +1361,12 @@ class DdlParser {
             do {
                 String fieldName = parser.readIdentifier();
                 String fieldType = parser.parseTypeName();
+                // An attribute may name the collation its values compare under, the same way a
+                // column may. Unread, the word ended the definition as a syntax error.
+                if (parser.matchKeyword("COLLATE")) {
+                    parser.readIdentifier();
+                    if (parser.match(TokenType.DOT)) parser.readIdentifier();
+                }
                 fields.add(new CreateTypeStmt.CompositeField(fieldName, fieldType));
             } while (parser.match(TokenType.COMMA));
         }
@@ -2034,9 +2124,27 @@ class DdlParser {
     }
 
     AlterDefaultPrivilegesStmt parseAlterDefaultPrivileges() {
-        String forRole = null; String inSchema = null;
-        if (parser.matchKeyword("FOR")) { parser.matchKeyword("ROLE"); parser.matchKeyword("USER"); forRole = parser.readIdentifier(); }
-        if (parser.matchKeyword("IN")) { parser.expectKeyword("SCHEMA"); inSchema = parser.readIdentifier(); }
+        // FOR ROLE and IN SCHEMA each take a list of names, and either may be written first. Read
+        // as one name apiece in a fixed order, half the spellings PostgreSQL accepts were refused
+        // as syntax errors.
+        List<String> forRoles = new ArrayList<>();
+        List<String> inSchemas = new ArrayList<>();
+        while (true) {
+            if (parser.matchKeyword("FOR")) {
+                if (!parser.matchKeyword("ROLE")) parser.matchKeyword("USER");
+                do { forRoles.add(readRoleNameOrKeyword()); } while (parser.match(TokenType.COMMA));
+                continue;
+            }
+            if (parser.checkKeyword("IN")) {
+                parser.advance();
+                parser.expectKeyword("SCHEMA");
+                do { inSchemas.add(parser.readIdentifier()); } while (parser.match(TokenType.COMMA));
+                continue;
+            }
+            break;
+        }
+        String forRole = forRoles.isEmpty() ? null : forRoles.get(0);
+        String inSchema = inSchemas.isEmpty() ? null : inSchemas.get(0);
         boolean isGrant;
         List<String> privileges = new ArrayList<>();
         if (parser.matchKeyword("GRANT")) { isGrant = true; }
@@ -2047,13 +2155,52 @@ class DdlParser {
             else { privileges.add(priv); }
         } while (parser.match(TokenType.COMMA));
         parser.expectKeyword("ON");
+        // "LARGE OBJECTS" is two words; read as one, the second became the grantee list.
         String objectType = parser.readIdentifier().toUpperCase(java.util.Locale.ROOT);
-        List<String> grantees = new ArrayList<>();
-        if (parser.matchKeyword("TO") || parser.matchKeyword("FROM")) {
-            do { grantees.add(parser.readIdentifier()); } while (parser.match(TokenType.COMMA));
+        if ("LARGE".equals(objectType)) {
+            String second = parser.readIdentifier().toUpperCase(java.util.Locale.ROOT);
+            objectType = "LARGE " + second;
         }
-        while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-        return new AlterDefaultPrivilegesStmt(forRole, inSchema, isGrant, privileges, objectType, grantees);
+        List<String> grantees = new ArrayList<>();
+        // The grantee list is not optional: without it the statement says who may do what to
+        // nobody, and PostgreSQL stops at the end of the input rather than recording it.
+        if (parser.matchKeyword("TO") || parser.matchKeyword("FROM")) {
+            do { grantees.add(readRoleNameOrKeyword()); } while (parser.match(TokenType.COMMA));
+        } else {
+            throw new ParseException("", parser.peek());
+        }
+        // PostgreSQL's grammar takes WITH GRANT OPTION here and nothing else, so a WITH that is
+        // followed by anything else stops on the word after it rather than on the WITH.
+        if (parser.matchKeyword("WITH")) {
+            parser.expectKeyword("GRANT");
+            parser.expectKeyword("OPTION");
+        }
+        parser.matchKeywords("CASCADE");
+        parser.matchKeywords("RESTRICT");
+        // Anything still standing is not part of the statement. Skipped to the semicolon, a
+        // WITH ADMIN OPTION or a GRANTED BY that PostgreSQL refuses was silently accepted.
+        if (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)
+                && !parser.check(TokenType.EOF)) {
+            throw new ParseException("", parser.peek());
+        }
+        return new AlterDefaultPrivilegesStmt(forRole, inSchema, isGrant, privileges, objectType,
+                grantees, forRoles, inSchemas);
+    }
+
+    /**
+     * A role name, or one of the keywords that stands for one.
+     *
+     * <p>CURRENT_USER, CURRENT_ROLE and SESSION_USER name whoever is running the statement.
+     * Read as ordinary identifiers they became roles called "current_user", which nobody has.
+     */
+    private String readRoleNameOrKeyword() {
+        for (String kw : new String[]{"CURRENT_USER", "CURRENT_ROLE", "SESSION_USER"}) {
+            if (parser.checkKeyword(kw)) {
+                parser.advance();
+                return kw;
+            }
+        }
+        return parser.readIdentifier();
     }
 
     // ---- Shared utilities ----
@@ -2355,13 +2502,65 @@ class DdlParser {
                 familyName = parser.readIdentifier();
             }
         }
-        // Consume AS clause (operator/function definitions) — stored in the opclass itself
-        if (parser.matchKeyword("AS")) {
-            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
-                parser.advance();
+        List<OperatorClassItem> items = new ArrayList<>();
+        if (parser.matchKeyword("AS")) items = parseOperatorClassItems();
+        return new CreateOperatorClassStmt(schema, name, isDefault, forType, method, familyName,
+                items);
+    }
+
+    /**
+     * The AS clause of an operator class or family: a comma-separated list of strategies and
+     * support functions. Read by skipping to the semicolon, none of it could be checked.
+     */
+    List<OperatorClassItem> parseOperatorClassItems() {
+        List<OperatorClassItem> items = new ArrayList<>();
+        do {
+            OperatorClassItem.Kind kind;
+            if (parser.matchKeyword("OPERATOR")) {
+                kind = OperatorClassItem.Kind.OPERATOR;
+            } else if (parser.matchKeyword("FUNCTION")) {
+                kind = OperatorClassItem.Kind.FUNCTION;
+            } else if (parser.matchKeyword("STORAGE")) {
+                readTypeName();
+                continue;
+            } else {
+                break;
             }
+            int number = Integer.parseInt(parser.advance().value());
+            // A support function may name the types it is for before its own name.
+            if (kind == OperatorClassItem.Kind.FUNCTION && parser.check(TokenType.LEFT_PAREN)) {
+                readParenTypeList();
+            }
+            StringBuilder name = new StringBuilder();
+            while (!parser.isAtEnd() && !parser.check(TokenType.COMMA)
+                    && !parser.check(TokenType.SEMICOLON) && !parser.check(TokenType.EOF)
+                    && !parser.check(TokenType.LEFT_PAREN)
+                    && !parser.checkKeyword("FOR")) {
+                name.append(parser.advance().value());
+            }
+            List<String> argTypes = parser.check(TokenType.LEFT_PAREN)
+                    ? readParenTypeList() : new ArrayList<String>();
+            // FOR SEARCH / FOR ORDER BY tails belong to the strategy and name no object.
+            if (parser.matchKeyword("FOR")) {
+                if (!parser.matchKeyword("SEARCH")) {
+                    parser.matchKeyword("ORDER");
+                    parser.matchKeyword("BY");
+                    parser.readIdentifier();
+                }
+            }
+            items.add(new OperatorClassItem(kind, number, name.toString().trim(), argTypes));
+        } while (parser.match(TokenType.COMMA));
+        return items;
+    }
+
+    private List<String> readParenTypeList() {
+        List<String> types = new ArrayList<>();
+        if (!parser.match(TokenType.LEFT_PAREN)) return types;
+        if (!parser.check(TokenType.RIGHT_PAREN)) {
+            do { types.add(readTypeName()); } while (parser.match(TokenType.COMMA));
         }
-        return new CreateOperatorClassStmt(schema, name, isDefault, forType, method, familyName);
+        parser.match(TokenType.RIGHT_PAREN);
+        return types;
     }
 
     // ---- ALTER FUNCTION / ALTER PROCEDURE ----
@@ -3378,11 +3577,20 @@ class DdlParser {
     private Statement parseCreateCollation() {
         boolean ifNotExists = parser.matchKeywords("IF", "NOT", "EXISTS");
         String name = parser.readIdentifier();
+        // A collation may be made in a named schema, and the qualifier is which schema rather
+        // than part of the name: read as one word, zq_cs.zq_sc made a collation called zq_cs.
+        String collSchema = null;
+        if (parser.match(TokenType.DOT)) {
+            collSchema = name;
+            name = parser.readIdentifier();
+        }
 
         // CREATE COLLATION name FROM existing_collation
         if (parser.matchKeyword("FROM")) {
             String from = parser.readIdentifier();
-            return new CreateCollationStmt(name, ifNotExists, from, new LinkedHashMap<>());
+            if (parser.match(TokenType.DOT)) from = parser.readIdentifier();
+            return new CreateCollationStmt(name, ifNotExists, from, new LinkedHashMap<>(),
+                    collSchema);
         }
 
         // CREATE COLLATION name (option = value, ...)
@@ -3404,7 +3612,7 @@ class DdlParser {
             parser.expect(TokenType.RIGHT_PAREN);
         }
 
-        return new CreateCollationStmt(name, ifNotExists, null, options);
+        return new CreateCollationStmt(name, ifNotExists, null, options, collSchema);
     }
 
     // ---- CREATE CAST ----

@@ -1,0 +1,8 @@
+-- source: investigation-2026-08.md
+-- finding: 250
+-- title: REPEATABLE READ conflict detection is membership of a row array in a snapshot list: a row inserted after the snapshot is not in the list (spurious 40001) and a 
+-- A: INSERT INTO zz_t VALUES (1,10,'a'),(2,20,'b'),(3,30,'c');
+-- B: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM zz_t;
+-- A: INSERT INTO zz_t VALUES (4,40,'d');
+-- B: UPDATE zz_t SET s = 'x'; SELECT count(*) FROM zz_t; COMMIT;
+-- A: SELECT i, s FROM zz_t ORDER BY i;

@@ -3,6 +3,10 @@ DROP SCHEMA IF EXISTS test_997 CASCADE;
 CREATE SCHEMA test_997;
 SET search_path TO test_997;
 
+-- begin-expected-error
+-- sqlstate: 0A000
+-- message-like: extension "vector" is not available
+-- end-expected-error
 CREATE EXTENSION IF NOT EXISTS vector;
 
 -- pgvector type is not available in memgres.

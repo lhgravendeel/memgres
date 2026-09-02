@@ -452,7 +452,7 @@ final class DateTimeTemplate {
                 return Long.toString(tm.julian);
             case "TZ": {
                 if (tm.offset == null || tm.instant == null) return "";
-                String abbrev = PgTimeZones.abbreviationOf(TypeCoercion.sessionZone(), tm.instant);
+                String abbrev = PgTimeZones.sessionAbbreviationAt(tm.instant);
                 return cs == CASE_LOWER ? abbrev.toLowerCase(java.util.Locale.ROOT) : abbrev;
             }
             case "TZH": {
@@ -1042,6 +1042,13 @@ final class DateTimeTemplate {
             if (f.hasJulian) {
                 date = LocalDate.ofEpochDay(f.julian - 2440588L);
             } else if (f.doy != 0 && (f.mon == 0 || f.mday == 0)) {
+                // A day of the year is a day of that year: 366 is a day only in a leap year, and
+                // 400 is a day in none. Added on regardless, the date ran into the year after.
+                int daysInYear = java.time.Year.of(year).length();
+                if (f.doy < 1 || f.doy > daysInYear) {
+                    throw new MemgresException("date/time field value out of range: \""
+                            + input + "\"", "22008");
+                }
                 date = LocalDate.of(year, 1, 1).plusDays(f.doy - 1L);
             } else {
                 date = LocalDate.of(year, mon, mday);

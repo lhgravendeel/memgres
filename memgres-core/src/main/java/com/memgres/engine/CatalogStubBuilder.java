@@ -285,7 +285,11 @@ class CatalogStubBuilder {
                     boolean descending = false;
                     for (String part : opts.split(" ")) {
                         if (part.startsWith("collate:")) {
-                            sb.append(" COLLATE \"").append(part.substring(8).replace("\"", "")).append('"');
+                            // A name is quoted only where it needs to be, the same as every
+                            // other identifier PostgreSQL prints: an ordinary lower-case
+                            // collation name is written plain.
+                            sb.append(" COLLATE ").append(CastEvaluator.quoteIdentIfNeeded(
+                                    part.substring(8).replace("\"", "")));
                         } else if (part.startsWith("opclass:")) {
                             sb.append(' ').append(part.substring(8));
                         } else if ("DESC".equals(part)) {
@@ -2175,7 +2179,14 @@ class CatalogStubBuilder {
                 col("comment", DataType.TEXT)
         );
         Table table = new Table("pg_available_extensions", cols);
-        table.insertRow(new Object[]{"plpgsql", "1.0", "1.0", "PL/pgSQL procedural language"});
+        // Everything this server can install, so the view and CREATE EXTENSION cannot disagree
+        // about what it has. Listing only plpgsql said the rest were unavailable while CREATE
+        // EXTENSION installed them happily.
+        for (String name : Extensions.names()) {
+            table.insertRow(new Object[]{name, Extensions.defaultVersion(name),
+                    database.hasExtension(name) ? database.getInstalledExtensions().get(name) : null,
+                    Extensions.description(name)});
+        }
         return table;
     }
 
@@ -2196,8 +2207,29 @@ class CatalogStubBuilder {
                 col("comment", DataType.TEXT)
         );
         Table table = new Table("pg_available_extension_versions", cols);
-        table.insertRow(new Object[]{"plpgsql", "1.0", true, false, true, false, "pg_catalog", null, "PL/pgSQL procedural language"});
+        // A control file offers every version it has an upgrade path to, not only the default,
+        // so an application asking which versions it may install gets the same answer here.
+        for (String name : Extensions.names()) {
+            Extensions.Entry e = Extensions.entryFor(name);
+            String installed = database.hasExtension(name)
+                    ? database.getInstalledExtensions().get(name) : null;
+            for (String version : e.versions) {
+                table.insertRow(new Object[]{name, version, version.equals(installed),
+                        true, e.trusted, e.relocatable, e.schema,
+                        e.requires == null ? null : requiredExtensionNames(e.requires),
+                        e.description});
+            }
+        }
         return table;
+    }
+
+    /** The {@code requires} list a control file writes as {@code {a,b}}, as a name array. */
+    private static List<Object> requiredExtensionNames(String braced) {
+        String inner = braced.replace("{", "").replace("}", "").trim();
+        List<Object> names = new ArrayList<>();
+        if (inner.isEmpty()) return names;
+        for (String one : inner.split(",")) names.add(one.trim());
+        return names;
     }
 
     Table buildPgConfig() {
@@ -2449,10 +2481,13 @@ class CatalogStubBuilder {
             if (!vd.materialized()) continue;
             String vSchema = vd.schemaName() != null ? vd.schemaName() : "public";
             String owner = CatalogHelper.ownerNameOf(database, "view:" + vSchema + "." + vd.name());
+            // The definition is what pg_get_viewdef answers, deparsed the same way an ordinary
+            // view's is: handing back the text the statement was written with described the same
+            // query two different ways depending on which catalogue was read.
             String definition = null;
             if (vd.query() != null) {
-                definition = vd.sourceSQL() != null ? vd.sourceSQL() : SqlUnparser.toSql(vd.query());
-                if (definition != null) definition = definition + ";";
+                definition = ViewDeparser.viewDef(vd.query(), false, 0,
+                        ViewDeparser.columnTypesOf(database, vd), null) + ";";
             }
             table.insertRow(new Object[]{
                     vSchema, vd.name(), owner, null, false, vd.populated(), definition

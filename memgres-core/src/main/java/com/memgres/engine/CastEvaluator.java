@@ -246,15 +246,26 @@ class CastEvaluator {
      * mistyped identifier into a different valid one, and it refuses the undashed form PG takes.
      */
     private static java.util.UUID parseUuid(String raw) {
-        String text = raw.trim();
-        String body = text;
+        // A UUID's text is the whole of what was written: PostgreSQL takes no surrounding
+        // whitespace, and a hyphen only where the canonical form puts one. Trimmed first, and
+        // with every hyphen skipped wherever it stood, both " a0ee… " and "a0eebc99--9c0b…"
+        // were read as perfectly good UUIDs.
+        String body = raw;
         if (body.length() >= 2 && body.charAt(0) == '{' && body.charAt(body.length() - 1) == '}') {
             body = body.substring(1, body.length() - 1);
         }
         StringBuilder digits = new StringBuilder(32);
         for (int i = 0; i < body.length(); i++) {
             char c = body.charAt(i);
-            if (c == '-') continue;
+            if (c == '-') {
+                // A hyphen separates one byte from the next, so it may only stand where an even
+                // number of hex digits has been read — never first, never last, never doubled.
+                if (digits.length() == 0 || digits.length() % 2 != 0
+                        || i + 1 >= body.length() || body.charAt(i + 1) == '-') {
+                    throw invalidUuid(raw);
+                }
+                continue;
+            }
             boolean hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
             if (!hex) throw invalidUuid(raw);
             digits.append(c);
@@ -1224,9 +1235,25 @@ class CastEvaluator {
                 return new RegroleValue(executor.systemCatalog.getOid("role:" + bare), bare);
             }
             case "regconfig":
+            case "regoperator": {
+                // An operator reference names its operands the way a reader writes them, so
+                // +(int4,int4) reads back as +(integer,integer). Passed through as written, the
+                // catalogue's spelling of the type reached the client instead of the SQL one.
+                if (val instanceof Number) return val.toString();
+                String written = val.toString().trim();
+                int lp = written.indexOf('(');
+                if (lp <= 0 || !written.endsWith(")")) return written;
+                String symbol = written.substring(0, lp);
+                String[] operands = written.substring(lp + 1, written.length() - 1).split(",");
+                StringBuilder out = new StringBuilder(symbol).append('(');
+                for (int i = 0; i < operands.length; i++) {
+                    if (i > 0) out.append(',');
+                    out.append(CatalogSystemFunctions.readableTypeName(operands[i].trim()));
+                }
+                return out.append(')').toString();
+            }
             case "regdictionary":
             case "regoper":
-            case "regoperator":
                 // reg* OID types — we don't track real OIDs for these internal objects;
                 // preserve the input name as-is so the cast round-trips to the same text.
                 return val.toString();
@@ -1441,6 +1468,13 @@ class CastEvaluator {
                     return new RegtypeValue(oid, name != null ? name : String.valueOf(oid));
                 }
                 String rtName = val.toString().trim().toLowerCase(java.util.Locale.ROOT);
+                // A regtype names a type, and a modifier written after it is not part of that
+                // name: PostgreSQL reads varchar(10) as the type varchar. Taken whole, the
+                // modifier made the name one no type answers to.
+                int rtParen = rtName.indexOf('(');
+                if (rtParen > 0 && rtName.endsWith(")")) {
+                    rtName = rtName.substring(0, rtParen).trim();
+                }
                 // Polymorphic pseudo-types are real pg_type rows, so they cast like any other name
                 if (PolymorphicTypes.isPolymorphic(rtName)) {
                     return new RegtypeValue(PolymorphicTypes.oid(rtName), rtName);
@@ -1600,6 +1634,18 @@ class CastEvaluator {
                     return new RegnamespaceValue(nsOid, nm != null ? nm : String.valueOf(nsOid));
                 }
                 String nsName = val.toString().trim();
+                // A name has to be a schema's: minting an OID for one nobody has made turned a
+                // typo into a namespace reference that resolved to nothing for ever after.
+                // The catalogue schemas are not in the schema map — they are derived — but they
+                // are schemas, and pg_catalog is the one most often named.
+                String nsLower = nsName.toLowerCase(java.util.Locale.ROOT);
+                boolean systemSchema = "pg_catalog".equals(nsLower)
+                        || "information_schema".equals(nsLower) || "pg_toast".equals(nsLower)
+                        || nsLower.startsWith("pg_temp");
+                if (!systemSchema && executor.database.getSchema(nsName) == null) {
+                    throw new MemgresException(
+                            "schema \"" + nsName + "\" does not exist", "3F000");
+                }
                 int nsOid = executor.systemCatalog.getOid("ns:" + nsName);
                 return new RegnamespaceValue(nsOid, nsName);
             }
@@ -1820,7 +1866,7 @@ class CastEvaluator {
      * Double-quote an identifier for display when it is not a plain lowercase
      * identifier (M15: regclass/regtype output quotes mixed-case names).
      */
-    private static String quoteIdentIfNeeded(String ident) {
+    static String quoteIdentIfNeeded(String ident) {
         if (ident == null || ident.isEmpty()) return ident;
         if (ident.startsWith("\"")) return ident; // already quoted
         boolean needsQuote = !Character.isLowerCase(ident.charAt(0)) && ident.charAt(0) != '_';

@@ -15,6 +15,10 @@ public final class AlterDefaultPrivilegesStmt implements Statement {
     public final String objectType;          // "SCHEMAS"
     public final List<String> grantees;
 
+    /** Every role the statement said FOR, and every schema it said IN: both clauses take a list. */
+    public final List<String> forRoles;
+    public final List<String> inSchemas;
+
     public AlterDefaultPrivilegesStmt(
             String forRole,
             String inSchema,
@@ -23,13 +27,33 @@ public final class AlterDefaultPrivilegesStmt implements Statement {
             String objectType,
             List<String> grantees
     ) {
+        this(forRole, inSchema, isGrant, privileges, objectType, grantees,
+                forRole == null ? Cols.<String>listOf() : Cols.listOf(forRole),
+                inSchema == null ? Cols.<String>listOf() : Cols.listOf(inSchema));
+    }
+
+    public AlterDefaultPrivilegesStmt(
+            String forRole,
+            String inSchema,
+            boolean isGrant,
+            List<String> privileges,
+            String objectType,
+            List<String> grantees,
+            List<String> forRoles,
+            List<String> inSchemas
+    ) {
         this.forRole = forRole;
         this.inSchema = inSchema;
         this.isGrant = isGrant;
         this.privileges = privileges;
         this.objectType = objectType;
         this.grantees = grantees;
+        this.forRoles = forRoles;
+        this.inSchemas = inSchemas;
     }
+
+    public List<String> forRoles() { return forRoles; }
+    public List<String> inSchemas() { return inSchemas; }
 
     /** Backward-compatible constructor without grantees. */
     public AlterDefaultPrivilegesStmt(String forRole, String inSchema, boolean isGrant,

@@ -1,0 +1,4 @@
+-- source: investigation-2026-08.md
+-- finding: 391
+-- title: handleQuery skips empty statements with `continue` and falls straight through to sendReadyForQuery, so a completely empty simple Query gets no EmptyQueryRespons
+-- Simple Query message with "", "   " or ";";

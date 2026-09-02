@@ -1,0 +1,11 @@
+-- source: investigation.md
+-- finding: 132
+-- title: Cursor lifecycle errors are not raised
+-- begin-expected-error
+-- sqlstate: 42601
+-- message-like: syntax error at or near "$$ declare c refcursor; begin for r in c loop null; end loop; end $$"
+-- end-expected-error
+$$ declare c refcursor; begin for r in c loop null; end loop; end $$
+--   PG: 42601 cursor FOR loop must use a bound cursor variable | mg: created
+-- opening a cursor that is already open:   PG: 42P03 cursor already in use  | mg: returns NULL
+-- fetching from a closed cursor:           PG: 34000 cursor does not exist  | mg: returns NULL;

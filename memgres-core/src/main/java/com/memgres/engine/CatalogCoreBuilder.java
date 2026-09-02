@@ -768,7 +768,9 @@ class CatalogCoreBuilder {
                     (short) (vd.cachedColumns() != null ? vd.cachedColumns().size() : 0), (short) 0,
                     true, false, false, false, false,
 
-                    !vd.materialized() || vd.populated(), "n", false,
+                    // A materialized view holds rows, so it has a replica identity like any
+                    // other relation that does; a plain view holds none and has none.
+                    !vd.materialized() || vd.populated(), vd.materialized() ? "d" : "n", false,
                     0, 0, 0,
                     null, viewRelOptions, null, 1
             });
@@ -1820,6 +1822,11 @@ class CatalogCoreBuilder {
                     || dt == DataType.TID || dt == DataType.CID
                     || dt == DataType.PG_LSN || dt == DataType.PG_NDISTINCT
                     || dt == DataType.REGCONFIG
+                    // Written out below with its own struct attributes and its own in and out
+                    // routines; emitting it here as well left two rows for the one type.
+                    || dt == DataType.ACLITEM
+                    // Registered from PgInternalTypes, with PostgreSQL's own metadata.
+                    || dt == DataType.XID8 || dt == DataType.REFCURSOR
                     || dt == DataType.PG_DEPENDENCIES || dt == DataType.PG_MCV_LIST) continue;
             String pgName = dt.getPgName();
             // One reading of the type's physical attributes, shared with the pg_attribute rows,
@@ -2085,8 +2092,13 @@ class CatalogCoreBuilder {
             // Resolve base type OID
             int baseTypeOid = 0;
             String baseTypeCat = "U";
+            // Read through the name resolver, which knows a type's spellings: matching on the
+            // catalogue name alone left a domain declared over "int" with no base type at all.
+            DataType declaredBase = dom.getBaseTypeName() == null ? null
+                    : DataType.fromPgName(dom.getBaseTypeName().replaceAll("\\(.*\\)", "").trim());
             for (DataType dt : DataType.values()) {
-                if (dt.getPgName().equalsIgnoreCase(dom.getBaseTypeName())
+                if (dt == declaredBase
+                        || dt.getPgName().equalsIgnoreCase(dom.getBaseTypeName())
                         || dt.name().equalsIgnoreCase(dom.getBaseTypeName())) {
                     baseTypeOid = dt.getOid();
                     switch (dt) {
@@ -2425,9 +2437,17 @@ class CatalogCoreBuilder {
         // Window functions (prokind='w'). PG will not let one be called as an ordinary function,
         // and a catalog that reports it as 'f' invites exactly that call.
         Map<String, Integer> winIndex = new HashMap<>();
+        // A name that is both a window function and an aggregate — rank, dense_rank, percent_rank
+        // and cume_dist all are — has already had the bare key taken by its aggregate row, and two
+        // rows sharing one OID is a duplicate key every join reads through.
+        Set<String> alsoAggregates = new java.util.HashSet<>();
+        for (String[] agg : BuiltinAggregateSignatures.AGGREGATES) {
+            alsoAggregates.add(agg[0].toLowerCase(java.util.Locale.ROOT));
+        }
         for (String[] win : BuiltinFunctionSignatures.WINDOW_FUNCTIONS) {
             String winName = win[0];
             int idx = winIndex.merge(winName, 0, (a, b) -> a + 1);
+            if (alsoAggregates.contains(winName.toLowerCase(java.util.Locale.ROOT))) idx++;
             String oidKey = idx == 0 ? "proc:" + winName : "proc:" + winName + "#win" + idx;
             String[] args = win[2].isEmpty() ? new String[0] : win[2].split(" ");
             // Parallel safe, like the aggregates; and strict exactly when the window function
@@ -2547,7 +2567,9 @@ class CatalogCoreBuilder {
             for (PgFunction.Param p : params) {
                 if (p.defaultExpr() != null && !p.defaultExpr().isEmpty()) {
                     if (defs.length() > 0) defs.append("|");
-                    defs.append(p.defaultExpr());
+                    // The catalogue holds the parsed expression, and every reader of it sees the
+                    // deparsed form rather than the characters the declaration was written with.
+                    defs.append(CatalogMetadataFunctions.deparsedDefault(p));
                 }
             }
             if (defs.length() > 0) proargdefaults = defs.toString();

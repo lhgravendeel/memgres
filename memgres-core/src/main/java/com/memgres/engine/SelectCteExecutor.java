@@ -23,7 +23,10 @@ class SelectCteExecutor {
      * Look up a CTE by name in the CTE stack (innermost scope first).
      */
     SelectStmt.CommonTableExpr lookupCte(String name) {
-        String lcName = name.toLowerCase(java.util.Locale.ROOT);
+        // A WITH item is keyed by the name it was written with: the lexer has already folded an
+        // unquoted one and left a quoted one as it stands, so "A" and a are two items and a
+        // scope keyed by the folded name could only hold one of them.
+        String lcName = name;
         for (Map<String, SelectStmt.CommonTableExpr> scope : executor.cteStack) {
             // A scope may hold a name mapped to null: that is a WITH item deliberately hidden
             // from the body being run (see maskFor), and it must stop the search rather than let

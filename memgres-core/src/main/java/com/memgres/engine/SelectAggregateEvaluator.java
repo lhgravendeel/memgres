@@ -1949,7 +1949,10 @@ class SelectAggregateEvaluator {
                 BigDecimal variance = computeVariance(vals, true);
                 if (variance == null) return null;
                 if (isFloatArgument(varArg, group)) return variance.doubleValue();
-                return trimmed(variance.setScale(16, RoundingMode.HALF_UP));
+                // The scale is part of the answer: PostgreSQL divides in numeric and keeps the
+                // digits the division was carried to, so a variance of exactly two is written
+                // 2.0000000000000000. Stripping them made it 2.
+                return variance;
             }
             case "var_samp":
             case "variance": {
@@ -1960,7 +1963,10 @@ class SelectAggregateEvaluator {
                 BigDecimal variance = computeVariance(vals, false);
                 if (variance == null) return null;
                 if (isFloatArgument(varArg, group)) return variance.doubleValue();
-                return trimmed(variance.setScale(16, RoundingMode.HALF_UP));
+                // The scale is part of the answer: PostgreSQL divides in numeric and keeps the
+                // digits the division was carried to, so a variance of exactly two is written
+                // 2.0000000000000000. Stripping them made it 2.
+                return variance;
             }
             case "stddev_pop":
             case "stddev_samp":
@@ -1975,8 +1981,7 @@ class SelectAggregateEvaluator {
                 if (isFloatArgument(arg, group)) return Math.sqrt(variance.doubleValue());
                 // The square root is taken in numeric: a double one loses the last digit of a
                 // 17-significant-figure answer, which is exactly where PG's differs.
-                return trimmed(NumericMath.sqrt(variance.setScale(16, RoundingMode.HALF_UP))
-                        .setScale(16, RoundingMode.HALF_UP));
+                return NumericMath.sqrt(variance).setScale(variance.scale(), RoundingMode.HALF_UP);
             }
             case "grouping": {
                 // The answer is an int4 bitmask, so there is room for 31 arguments and no more.
@@ -2630,17 +2635,65 @@ class SelectAggregateEvaluator {
     }
 
     /** Compute variance (population or sample) from a list of BigDecimal values. */
+    /**
+     * The variance, worked out the way PostgreSQL works it out.
+     *
+     * <p>PostgreSQL keeps the count, the sum and the sum of squares, and divides
+     * {@code N*Sxx - Sx*Sx} by {@code N*N} — or by {@code N*(N-1)} for the sample form — once, at
+     * the end. Both the value and how many digits it is carried to follow from that: the answer
+     * is a numeric, and the scale a numeric division is taken to is part of the answer.
+     */
     private static BigDecimal computeVariance(List<BigDecimal> vals, boolean population) {
         if (vals.isEmpty()) return null;
         if (!population && vals.size() < 2) return null;
         BigDecimal n = BigDecimal.valueOf(vals.size());
-        BigDecimal sum = vals.stream().reduce(BigDecimal.ZERO, BigDecimal::add);
-        BigDecimal mean = sum.divide(n, 20, RoundingMode.HALF_UP);
-        BigDecimal sumSqDiff = vals.stream()
-            .map(v -> v.subtract(mean).pow(2))
-            .reduce(BigDecimal.ZERO, BigDecimal::add);
-        BigDecimal divisor = population ? n : BigDecimal.valueOf(vals.size() - 1);
-        return sumSqDiff.divide(divisor, 20, RoundingMode.HALF_UP);
+        BigDecimal sum = BigDecimal.ZERO;
+        BigDecimal sumSquares = BigDecimal.ZERO;
+        for (BigDecimal v : vals) {
+            sum = sum.add(v);
+            sumSquares = sumSquares.add(v.multiply(v));
+        }
+        BigDecimal numerator = n.multiply(sumSquares).subtract(sum.multiply(sum));
+        if (numerator.signum() <= 0) numerator = BigDecimal.ZERO;
+        BigDecimal divisor = population
+                ? n.multiply(n)
+                : n.multiply(BigDecimal.valueOf(vals.size() - 1));
+        return numerator.divide(divisor, divisionScale(numerator, divisor), RoundingMode.HALF_UP);
+    }
+
+    /**
+     * How many decimal places a numeric division is carried to.
+     *
+     * <p>PostgreSQL keeps sixteen significant digits: it estimates where the quotient's leading
+     * digit falls and takes the scale from there, so 4/4 comes out with twenty decimal places and
+     * 20/16 with sixteen. The estimate is made in the base of ten thousand that numerics are
+     * stored in, which is why the scale moves four places at a time.
+     */
+    private static int divisionScale(BigDecimal dividend, BigDecimal divisor) {
+        if (dividend.signum() == 0) {
+            return Math.max(dividend.scale(), divisor.scale());
+        }
+        int quotientWeight = nbaseWeight(dividend) - nbaseWeight(divisor);
+        if (leadingNbaseDigit(dividend).compareTo(leadingNbaseDigit(divisor)) <= 0) {
+            quotientWeight--;
+        }
+        int scale = 16 - quotientWeight * 4;
+        scale = Math.max(scale, dividend.scale());
+        scale = Math.max(scale, divisor.scale());
+        return Math.min(Math.max(scale, 0), 1000);
+    }
+
+    /** Which group of four digits the value's leading digit falls in, counted from the point. */
+    private static int nbaseWeight(BigDecimal v) {
+        BigDecimal d = v.abs().stripTrailingZeros();
+        int digitsBeforePoint = d.precision() - d.scale();
+        return (int) Math.ceil(digitsBeforePoint / 4.0) - 1;
+    }
+
+    /** The value of that group, which is what decides between two quotients of the same weight. */
+    private static BigDecimal leadingNbaseDigit(BigDecimal v) {
+        return v.abs().movePointLeft(4 * nbaseWeight(v))
+                .setScale(0, RoundingMode.FLOOR);
     }
 
     /** Pre-computed regression statistics shared by corr, regr_slope, regr_intercept, regr_r2. */

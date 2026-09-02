@@ -77,6 +77,12 @@ class InheritedDeclarationsAndIndexesTest {
         conn = DriverManager.getConnection(memgres.getJdbcUrl() + "?preferQueryMode=simple",
                 memgres.getUser(), memgres.getPassword());
         conn.setAutoCommit(true);
+        // Since PostgreSQL 15 the public schema grants CREATE to nobody, and memgres now says
+        // so too. These tests are about something else, so the grant is made once here rather
+        // than in every one of them.
+        try (java.sql.Statement grantStmt = conn.createStatement()) {
+            grantStmt.execute("GRANT CREATE ON SCHEMA public TO PUBLIC");
+        }
     }
 
     @AfterAll

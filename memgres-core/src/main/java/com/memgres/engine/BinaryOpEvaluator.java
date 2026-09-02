@@ -17,6 +17,99 @@ class BinaryOpEvaluator {
         this.executor = executor;
     }
 
+    /** Says that a pair of operands is not a log position and a byte count, so nothing was done. */
+    private static final Object NOT_LSN_ARITHMETIC = new Object();
+
+    /**
+     * {@code pg_lsn + numeric} and {@code pg_lsn - numeric}, which answer with a log position.
+     *
+     * <p>PostgreSQL does the sum in numeric and converts the result back, so a fractional count
+     * of bytes rounds once at the end: 256 - 0.5 is 255.5, which comes back as 256. A count only
+     * adds to the right of a position — {@code integer - pg_lsn} is no operator at all — and a
+     * position that would fall outside the 64 bits one occupies is out of range.
+     */
+    private Object lsnMovedByBytes(BinaryExpr bin, Object left, Object right) {
+        boolean leftIsLsn = isPgLsnExpression(bin.left());
+        boolean rightIsLsn = isPgLsnExpression(bin.right());
+        if (leftIsLsn == rightIsLsn) return NOT_LSN_ARITHMETIC;
+        boolean subtract = bin.op() == BinaryExpr.BinOp.SUBTRACT;
+        if (!leftIsLsn && subtract) return NOT_LSN_ARITHMETIC;
+        Object position = leftIsLsn ? left : right;
+        Object count = leftIsLsn ? right : left;
+        if (!(position instanceof String) || !(count instanceof Number)) return NOT_LSN_ARITHMETIC;
+        if (left == null || right == null) return null;
+
+        java.math.BigDecimal bytes;
+        try {
+            bytes = new java.math.BigDecimal(count.toString());
+        } catch (NumberFormatException notANumber) {
+            throw new MemgresException("cannot " + (subtract ? "subtract NaN from" : "add NaN to")
+                    + " pg_lsn", "0A000");
+        }
+        java.math.BigInteger at = lsnAsBytes((String) position);
+        java.math.BigDecimal moved = subtract
+                ? new java.math.BigDecimal(at).subtract(bytes)
+                : new java.math.BigDecimal(at).add(bytes);
+        java.math.BigInteger result =
+                moved.setScale(0, java.math.RoundingMode.HALF_UP).toBigIntegerExact();
+        if (result.signum() < 0 || result.bitLength() > 64) {
+            throw new MemgresException("pg_lsn out of range", "22023");
+        }
+        return lsnText(result);
+    }
+
+    /** Whether an expression is declared to be a log position rather than the text one looks like. */
+    private static boolean isPgLsnExpression(Expression expr) {
+        if (isCastToType(expr, "pg_lsn")) return true;
+        if (expr instanceof FunctionCallExpr) {
+            return CatalogMetadataFunctions.answersWithAnLsn(
+                    FunctionEvaluator.stripSchemaPrefix(
+                            ((FunctionCallExpr) expr).name().toLowerCase(java.util.Locale.ROOT)));
+        }
+        return false;
+    }
+
+    /** The byte offset a log position stands for, as the unsigned 64-bit number it is. */
+    private static java.math.BigInteger lsnAsBytes(String lsn) {
+        String text = lsn.trim();
+        int slash = text.indexOf('/');
+        if (slash < 0) throw new MemgresException("invalid input syntax for type pg_lsn: \""
+                + lsn + "\"", "22P02");
+        return new java.math.BigInteger(text.substring(0, slash), 16).shiftLeft(32)
+                .add(new java.math.BigInteger(text.substring(slash + 1), 16));
+    }
+
+    /**
+     * The type an addition or a subtraction over log positions answers with, or null when the
+     * expression is not one: a position moved by a count of bytes is still a position, and the
+     * difference of two positions is the count of bytes between them.
+     */
+    static String lsnArithmeticTypeName(Expression expr) {
+        if (!(expr instanceof BinaryExpr)) return null;
+        BinaryExpr bin = (BinaryExpr) expr;
+        if (bin.op() != BinaryExpr.BinOp.ADD && bin.op() != BinaryExpr.BinOp.SUBTRACT) return null;
+        boolean leftIsLsn = isPgLsnExpression(bin.left());
+        boolean rightIsLsn = isPgLsnExpression(bin.right());
+        if (leftIsLsn && rightIsLsn) {
+            return bin.op() == BinaryExpr.BinOp.SUBTRACT ? "numeric" : null;
+        }
+        if (!leftIsLsn && !rightIsLsn) return null;
+        if (!leftIsLsn && bin.op() == BinaryExpr.BinOp.SUBTRACT) return null;
+        return "pg_lsn";
+    }
+
+    /** Two log positions ordered by how far along the log each one is. */
+    static int compareLsnText(String left, String right) {
+        return lsnAsBytes(left).compareTo(lsnAsBytes(right));
+    }
+
+    /** A byte offset written the way a log position is: two hexadecimal halves, upper case. */
+    private static String lsnText(java.math.BigInteger bytes) {
+        return bytes.shiftRight(32).toString(16).toUpperCase(java.util.Locale.ROOT)
+                + "/" + bytes.and(java.math.BigInteger.valueOf(0xFFFFFFFFL))
+                        .toString(16).toUpperCase(java.util.Locale.ROOT);
+    }
+
     static String getRangeTypeName(Expression expr) {
         if (expr instanceof FunctionCallExpr) {
             FunctionCallExpr fn = (FunctionCallExpr) expr;
@@ -1488,12 +1581,33 @@ class BinaryOpEvaluator {
             }
         }
 
+        // A write-ahead log position and a count of bytes: the position moves by that many
+        // bytes and stays a position. Carried as text, it reached the arithmetic as a string
+        // and was refused as "text + integer".
+        if (bin.op() == BinaryExpr.BinOp.ADD || bin.op() == BinaryExpr.BinOp.SUBTRACT) {
+            Object moved = lsnMovedByBytes(bin, left, right);
+            if (moved != NOT_LSN_ARITHMETIC) return moved;
+        }
+
         // json type (not jsonb) does not support || or - operators
         if (bin.op() == BinaryExpr.BinOp.CONCAT || bin.op() == BinaryExpr.BinOp.SUBTRACT) {
             if (isCastToType(bin.left(), "json") || isCastToType(bin.right(), "json")) {
                 String opSym = bin.op() == BinaryExpr.BinOp.CONCAT ? "||" : "-";
                 throw new MemgresException("operator does not exist: json " + opSym + " json", "42883");
             }
+        }
+
+        // A json array is written the way a range is, so a document reaching containment was
+        // read as a range and '[2,3]' was said to lie inside '[1,5]'. The declared type says
+        // which operator was written, and a document is never a range.
+        if ((bin.op() == BinaryExpr.BinOp.CONTAINS || bin.op() == BinaryExpr.BinOp.CONTAINED_BY)
+                && left != null && right != null
+                && (isJsonbExpression(bin.left(), ctx) || isJsonbExpression(bin.right(), ctx))) {
+            String container = bin.op() == BinaryExpr.BinOp.CONTAINS
+                    ? left.toString() : right.toString();
+            String held = bin.op() == BinaryExpr.BinOp.CONTAINS
+                    ? right.toString() : left.toString();
+            return JsonOperations.contains(container, held);
         }
 
         // A jsonb scalar reaches @@ looking like a tsvector would; the declared type says which
@@ -1716,6 +1830,12 @@ class BinaryOpEvaluator {
                     throw NumericLimits.valueOverflowsNumeric();
                 }
                 if (numericPower) return numericPowerScale(result);
+                // Two finite operands whose power is not finite have overflowed the type, which
+                // PostgreSQL reports rather than answering with an infinity nobody wrote.
+                if (Double.isInfinite(result) && !Double.isInfinite(powBase)
+                        && !Double.isInfinite(powExp)) {
+                    throw NumericLimits.floatOverflow();
+                }
                 return result;
             }
             case BIT_AND: {
@@ -2450,8 +2570,8 @@ class BinaryOpEvaluator {
                 boolean lIsPgArray = lIsList || (ls.startsWith("{") && !ls.startsWith("{\""));
                 boolean rIsPgArray = rIsList || (rs.startsWith("{") && !rs.startsWith("{\""));
                 if (lIsPgArray && rIsPgArray) {
-                    List<Object> la = FunctionEvaluator.parseSimplePgArray(ls);
-                    List<Object> ra = FunctionEvaluator.parseSimplePgArray(rs);
+                    List<?> la = lIsList ? (List<?>) left : FunctionEvaluator.parseSimplePgArray(ls);
+                    List<?> ra = rIsList ? (List<?>) right : FunctionEvaluator.parseSimplePgArray(rs);
                     return arrayContainsAll(ra, la);
                 }
                 if (lIsList && !rIsPgArray) {
@@ -2566,8 +2686,13 @@ class BinaryOpEvaluator {
                 boolean lArr = oLIsList || (oLs.startsWith("{") && !oLs.startsWith("{\""));
                 boolean rArr = oRIsList || (oRs.startsWith("{") && !oRs.startsWith("{\""));
                 if (lArr && rArr) {
-                    List<Object> la = FunctionEvaluator.parseSimplePgArray(oLs);
-                    List<Object> ra = FunctionEvaluator.parseSimplePgArray(oRs);
+                    // An array that is already an array keeps its values: writing it out and
+                    // reading it back made every element a string, so a numeric 1.00 stopped
+                    // being the 1.000 it equals.
+                    List<?> la = oLIsList ? (List<?>) left
+                            : FunctionEvaluator.parseSimplePgArray(oLs);
+                    List<?> ra = oRIsList ? (List<?>) right
+                            : FunctionEvaluator.parseSimplePgArray(oRs);
                     return arrayOverlaps(la, ra);
                 }
                 if (lArr != rArr && (oLIsList || oRIsList)) {
@@ -2599,6 +2724,18 @@ class BinaryOpEvaluator {
             case GEO_BELOW: {
                 if (left == null || right == null) return null;
                 return GeometricOperations.isStrictlyBelow(left.toString(), right.toString());
+            }
+            case GEO_BELOW_EQ: {
+                if (left == null || right == null) return null;
+                return GeometricOperations.isBelowByType(
+                        GeometricOperations.autoDetectPublic(left.toString()),
+                        GeometricOperations.autoDetectPublic(right.toString()));
+            }
+            case GEO_ABOVE_EQ: {
+                if (left == null || right == null) return null;
+                return GeometricOperations.isAboveByType(
+                        GeometricOperations.autoDetectPublic(left.toString()),
+                        GeometricOperations.autoDetectPublic(right.toString()));
             }
             case GEO_ABOVE: {
                 if (left == null || right == null) return null;
@@ -2652,6 +2789,12 @@ class BinaryOpEvaluator {
                 Object rObj = GeometricOperations.autoDetectPublic(right.toString());
                 if (lObj instanceof GeometricOperations.PgLseg && rObj instanceof GeometricOperations.PgLseg) {
                     return GeometricOperations.isPerpendicular((GeometricOperations.PgLseg) lObj, (GeometricOperations.PgLseg) rObj);
+                }
+                // Two lines meet at a right angle when their normals do.
+                if (lObj instanceof GeometricOperations.PgLine && rObj instanceof GeometricOperations.PgLine) {
+                    GeometricOperations.PgLine ll = (GeometricOperations.PgLine) lObj;
+                    GeometricOperations.PgLine rl = (GeometricOperations.PgLine) rObj;
+                    return ll.a() * rl.a() + ll.b() * rl.b() == 0.0;
                 }
                 throw new MemgresException("operator ?-| not supported for these types", "42883");
             }
@@ -3176,6 +3319,12 @@ class BinaryOpEvaluator {
                     throw NumericLimits.valueOverflowsNumeric();
                 }
                 if (numericPower) return numericPowerScale(result);
+                // Two finite operands whose power is not finite have overflowed the type, which
+                // PostgreSQL reports rather than answering with an infinity nobody wrote.
+                if (Double.isInfinite(result) && !Double.isInfinite(powBase)
+                        && !Double.isInfinite(powExp)) {
+                    throw NumericLimits.floatOverflow();
+                }
                 return result;
             }
             case BIT_AND: {
@@ -3756,8 +3905,13 @@ class BinaryOpEvaluator {
                 boolean lArr = oLIsList || (oLs.startsWith("{") && !oLs.startsWith("{\""));
                 boolean rArr = oRIsList || (oRs.startsWith("{") && !oRs.startsWith("{\""));
                 if (lArr && rArr) {
-                    List<Object> la = FunctionEvaluator.parseSimplePgArray(oLs);
-                    List<Object> ra = FunctionEvaluator.parseSimplePgArray(oRs);
+                    // An array that is already an array keeps its values: writing it out and
+                    // reading it back made every element a string, so a numeric 1.00 stopped
+                    // being the 1.000 it equals.
+                    List<?> la = oLIsList ? (List<?>) left
+                            : FunctionEvaluator.parseSimplePgArray(oLs);
+                    List<?> ra = oRIsList ? (List<?>) right
+                            : FunctionEvaluator.parseSimplePgArray(oRs);
                     return arrayOverlaps(la, ra);
                 }
                 if (lArr != rArr && (oLIsList || oRIsList)) {
@@ -3836,6 +3990,12 @@ class BinaryOpEvaluator {
                 Object rObj = GeometricOperations.autoDetectPublic(right.toString());
                 if (lObj instanceof GeometricOperations.PgLseg && rObj instanceof GeometricOperations.PgLseg) {
                     return GeometricOperations.isPerpendicular((GeometricOperations.PgLseg) lObj, (GeometricOperations.PgLseg) rObj);
+                }
+                // Two lines meet at a right angle when their normals do.
+                if (lObj instanceof GeometricOperations.PgLine && rObj instanceof GeometricOperations.PgLine) {
+                    GeometricOperations.PgLine ll = (GeometricOperations.PgLine) lObj;
+                    GeometricOperations.PgLine rl = (GeometricOperations.PgLine) rObj;
+                    return ll.a() * rl.a() + ll.b() * rl.b() == 0.0;
                 }
                 throw new MemgresException("operator ?-| not supported for these types", "42883");
             }

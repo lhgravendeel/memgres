@@ -120,6 +120,7 @@ public enum DataType {
     JSON_ARRAY(199, "_json"),
     JSONB_ARRAY(3807, "_jsonb"),
     INET_ARRAY(1041, "_inet"),
+    ACLITEM(1033, "aclitem"),
     ACLITEM_ARRAY(1034, "_aclitem"),
     RECORD_ARRAY(2287, "_record"),
     OID_ARRAY(1028, "_oid"),
@@ -160,6 +161,10 @@ public enum DataType {
 
     // Transaction ID type
     XID(28, "xid"),
+    /** The wide transaction id, which does not wrap round as {@code xid} does. */
+    XID8(5069, "xid8"),
+    /** A cursor's name, as a PL/pgSQL routine hands one back. */
+    REFCURSOR(1790, "refcursor"),
 
     // Where a stored tuple sits, and which command within a transaction wrote or deleted it.
     // The engine already produced values of both -- ctid, cmin, cmax -- but had no name for
@@ -278,6 +283,10 @@ public enum DataType {
             // Two types the engine already carries an OID for but had no name for, so a value
             // written as one was described to the client as text. Naming them is what lets
             // xid('100') and pg_lsn('0/16B3748') resolve at all.
+            case "xid8":
+                return XID8;
+            case "refcursor":
+                return REFCURSOR;
             case "xid":
                 return XID;
             case "tid":
@@ -358,6 +367,10 @@ public enum DataType {
                 return VARBIT;
             case "xml":
                 return XML;
+            // A row of no declared shape. A cast to one is written in ordinary SQL, and without
+            // this the cast fell through to text and described the row as a string.
+            case "record":
+                return RECORD;
             case "int4range":
                 return INT4RANGE;
             case "int8range":
@@ -400,6 +413,8 @@ public enum DataType {
             case "aclitem[]":
             case "_aclitem":
                 return ACLITEM_ARRAY;
+            case "aclitem":
+                return ACLITEM;
             default:
                 // Any other array spelling resolves through its element type, so a cast to
                 // date[] or uuid[] carries its own array OID instead of falling back to text.
@@ -468,6 +483,7 @@ public enum DataType {
             case JSONB: return JSONB_ARRAY;
             case INET: return INET_ARRAY;
             case RECORD: return RECORD_ARRAY;
+            case ACLITEM: return ACLITEM_ARRAY;
             case CIDR: return CIDR_ARRAY;
             case POINT: return POINT_ARRAY;
             case BIT: return BIT_ARRAY;
@@ -513,7 +529,7 @@ public enum DataType {
             case POINT_ARRAY: return POINT;
             case BIT_ARRAY: return BIT;
             case VARBIT_ARRAY: return VARBIT;
-            case ACLITEM_ARRAY: return null; // aclitem has no DataType of its own
+            case ACLITEM_ARRAY: return ACLITEM;
             default: return null;
         }
     }

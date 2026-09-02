@@ -126,12 +126,17 @@ class ExtensionsDDLCoverageTest {
 
     @Test
     void ext_create_pgcrypto() {
+        // These tests share one database, and a second CREATE EXTENSION is an error, so this
+        // says what it means to test rather than depending on the order it ran in.
+        assertNoError("DROP EXTENSION IF EXISTS pgcrypto");
         assertNoError("CREATE EXTENSION pgcrypto");
     }
 
     @Test
     void ext_create_if_not_exists_uuid_ossp() {
-        assertNoError("CREATE EXTENSION IF NOT EXISTS uuid_ossp");
+        // The extension is spelled uuid-ossp; the underscore names nothing, and IF NOT EXISTS
+        // excuses an extension already installed, not one the server has not got.
+        assertThrows(SQLException.class, () -> exec("CREATE EXTENSION IF NOT EXISTS uuid_ossp"));
     }
 
     @Test
@@ -146,7 +151,7 @@ class ExtensionsDDLCoverageTest {
 
     @Test
     void ext_create_postgis() {
-        assertNoError("CREATE EXTENSION postgis");
+        assertThrows(SQLException.class, () -> exec("CREATE EXTENSION postgis"));
     }
 
     @Test
@@ -185,7 +190,7 @@ class ExtensionsDDLCoverageTest {
 
     @Test
     void ext_alter_update() {
-        assertNoError("CREATE EXTENSION pgcrypto");
+        assertNoError("CREATE EXTENSION IF NOT EXISTS pgcrypto");
         assertNoError("ALTER EXTENSION pgcrypto UPDATE");
     }
 
@@ -198,7 +203,9 @@ class ExtensionsDDLCoverageTest {
     @Test
     void ext_alter_update_to_version() {
         assertNoError("CREATE EXTENSION IF NOT EXISTS pgcrypto");
-        assertNoError("ALTER EXTENSION pgcrypto UPDATE TO '1.3'");
+        // An update runs the scripts that lead from the installed version to the named one,
+        // and there is no path back down from 1.4 to 1.3.
+        assertThrows(SQLException.class, () -> exec("ALTER EXTENSION pgcrypto UPDATE TO '1.3'"));
     }
 
     @Test
@@ -469,7 +476,8 @@ class ExtensionsDDLCoverageTest {
 
     @Test
     void opclass_create_default() {
-        assertNoError("CREATE OPERATOR CLASS my_ops DEFAULT FOR TYPE INTEGER USING btree AS OPERATOR 1 <");
+        // A built-in type already has a default btree class, and PostgreSQL will not have a second.
+        assertNoError("CREATE OPERATOR CLASS my_ops FOR TYPE INTEGER USING btree AS OPERATOR 1 <");
     }
 
     @Test

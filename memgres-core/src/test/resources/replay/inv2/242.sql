@@ -1,0 +1,11 @@
+-- source: investigation-2026-08.md
+-- finding: 242
+-- title: A rolled-back transaction replays its undo entries over whatever the row holds now: UpdateUndo.undo restores oldValues into the live Object[] with no version ch
+-- A: BEGIN; UPDATE zz_t SET v = 1 WHERE i = 1; SELECT 1/0;
+-- B: BEGIN; UPDATE zz_t SET v = 2 WHERE i = 1; COMMIT;
+-- A: ROLLBACK;
+-- B: SELECT v FROM zz_t WHERE i = 1;
+-- A: BEGIN; UPDATE zz_t SET v = 1 WHERE i = 1; SELECT 1/0;
+-- B: DELETE FROM zz_t WHERE i = 1;
+-- A: ROLLBACK;
+-- B: SELECT count(*) FROM zz_t WHERE i = 1;

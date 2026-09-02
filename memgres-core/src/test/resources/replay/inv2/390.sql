@@ -1,0 +1,4 @@
+-- source: investigation-2026-08.md
+-- finding: 390
+-- title: handleExecute falls back to the unnamed prepared statement when the named portal is missing, and answers EmptyQueryResponse when that is empty too, instead of r
+-- Execute message naming a portal that was never bound;

@@ -3,6 +3,10 @@ DROP SCHEMA IF EXISTS test_996 CASCADE;
 CREATE SCHEMA test_996;
 SET search_path TO test_996;
 
+-- begin-expected-error
+-- sqlstate: 0A000
+-- message-like: extension "postgis" is not available
+-- end-expected-error
 CREATE EXTENSION IF NOT EXISTS postgis;
 
 -- PostGIS geometry type is not available in memgres.

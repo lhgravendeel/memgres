@@ -22,6 +22,44 @@ class CatalogMetadataFunctions {
      * The functions that answer with a write-ahead log position. Their value is carried as the
      * text it prints as, so pg_typeof has nothing but the name to read the type off.
      */
+    /**
+     * The statement that would define an extended statistics object again, as PostgreSQL writes
+     * it: the kinds only when they were asked for by name, and the columns in the order given.
+     */
+    private Object evalPgGetStatisticsObjDef(FunctionCallExpr fn, RowContext ctx) {
+        if (fn.args().size() != 1) return NOT_HANDLED;
+        Object oidArg = executor.evalExpr(fn.args().get(0), ctx);
+        if (oidArg == null) return null;
+        int wanted = ((Number) oidArg).intValue();
+        for (ExtendedStatistic es : executor.database.getAllExtendedStatistics().values()) {
+            if (executor.getSystemCatalog().oid("stat:" + es.getName()) != wanted) {
+                continue;
+            }
+            StringBuilder out = new StringBuilder("CREATE STATISTICS public.");
+            out.append(es.getName());
+            if (!es.getKinds().isEmpty()) {
+                out.append(" (");
+                for (int i = 0; i < es.getKinds().size(); i++) {
+                    if (i > 0) out.append(", ");
+                    out.append(es.getKinds().get(i).toLowerCase(Locale.ROOT));
+                }
+                out.append(")");
+            }
+            out.append(" ON ");
+            for (int i = 0; i < es.getColumns().size(); i++) {
+                if (i > 0) out.append(", ");
+                out.append(es.getColumns().get(i));
+            }
+            return out.append(" FROM ").append(es.getTableName()).toString();
+        }
+        return null;
+    }
+
+    /** Whether a built-in answers with a write-ahead log position. */
+    static boolean answersWithAnLsn(String name) {
+        return name != null && LSN_FUNCTIONS.contains(name);
+    }
+
     private static final Set<String> LSN_FUNCTIONS = Cols.setOf(
             "pg_switch_wal", "pg_current_wal_lsn", "pg_current_wal_insert_lsn",
             "pg_current_wal_flush_lsn", "pg_last_wal_receive_lsn", "pg_last_wal_replay_lsn");
@@ -162,6 +200,39 @@ class CatalogMetadataFunctions {
             }
             case "pg_get_indexdef":
                 return evalPgGetIndexdef(fn, ctx);
+            case "pg_get_statisticsobjdef":
+                return evalPgGetStatisticsObjDef(fn, ctx);
+            case "pg_get_function_arg_default": {
+                // The default the numbered argument takes, counting from one, or nothing when
+                // that argument has none — or when there is no such argument, or no such routine.
+                if (fn.args().size() != 2) return NOT_HANDLED;
+                Object which = executor.evalExpr(fn.args().get(0), ctx);
+                Object position = executor.evalExpr(fn.args().get(1), ctx);
+                if (which == null || position == null) return null;
+                PgFunction func = resolveFunctionValue(which);
+                if (func == null || func.getParams() == null) return null;
+                int at = ((Number) position).intValue();
+                if (at < 1 || at > func.getParams().size()) return null;
+                PgFunction.Param p = func.getParams().get(at - 1);
+                return p.defaultExpr() == null ? null : deparsedDefault(p);
+            }
+            case "pg_collation_actual_version": {
+                // The version the provider reports for the collation's locale. memgres compares
+                // through the JVM, whose ordering carries no version of its own, and the C
+                // collation has none in PostgreSQL either.
+                if (fn.args().size() != 1) return NOT_HANDLED;
+                Object oid = executor.evalExpr(fn.args().get(0), ctx);
+                return oid == null ? null : null;
+            }
+            case "pg_isolation_test_session_is_blocked": {
+                // Whether a backend is waiting on any of the given ones. Sessions here never
+                // wait on one another, so none of them is blocked.
+                if (fn.args().size() != 2) return NOT_HANDLED;
+                Object pid = executor.evalExpr(fn.args().get(0), ctx);
+                Object others = executor.evalExpr(fn.args().get(1), ctx);
+                if (pid == null || others == null) return null;
+                return Boolean.FALSE;
+            }
             case "pg_get_expr": {
                 if (fn.args().size() > 0) {
                     Object expr = executor.evalExpr(fn.args().get(0), ctx);
@@ -353,6 +424,46 @@ class CatalogMetadataFunctions {
             }
             case "pg_encoding_to_char":
                 return "UTF8";
+            case "pg_char_to_encoding": {
+                // The number PostgreSQL gives an encoding, and -1 for a name it does not know.
+                if (fn.args().isEmpty()) return null;
+                Object encArg = executor.evalExpr(fn.args().get(0), ctx);
+                if (encArg == null) return null;
+                Integer known = ENCODING_NUMBERS.get(
+                        String.valueOf(encArg).toUpperCase(java.util.Locale.ROOT));
+                return known == null ? Integer.valueOf(-1) : known;
+            }
+            case "pg_relation_filenode": {
+                // The file a relation's rows are kept in. memgres keeps them in memory, so the
+                // relation's own identity is the nearest thing it has to one.
+                if (fn.args().isEmpty()) return null;
+                Object relArg = executor.evalExpr(fn.args().get(0), ctx);
+                if (relArg == null) return null;
+                Object asOid = executor.castEvaluator.applyCast(relArg, "oid");
+                return asOid == null ? null : Integer.valueOf(executor.toInt(asOid));
+            }
+            case "pg_settings_get_flags": {
+                // What a parameter's definition says about it. The one flag a reader checks for
+                // is whether EXPLAIN reports the setting.
+                if (fn.args().isEmpty()) return null;
+                Object nameArg = executor.evalExpr(fn.args().get(0), ctx);
+                if (nameArg == null) return null;
+                String setting = String.valueOf(nameArg);
+                if (GucSettings.definition(setting) == null) {
+                    throw new MemgresException(
+                            "unrecognized configuration parameter \"" + setting + "\"", "42704");
+                }
+                return EXPLAIN_REPORTED.contains(setting.toLowerCase(java.util.Locale.ROOT))
+                        ? Cols.listOf("EXPLAIN") : Cols.<String>listOf();
+            }
+            case "row_security_active": {
+                // Whether row-level security is in force for the caller on this relation: a
+                // superuser, and the owner unless the relation forces it, are outside it.
+                if (fn.args().isEmpty()) return null;
+                Object relArg = executor.evalExpr(fn.args().get(0), ctx);
+                if (relArg == null) return null;
+                return executor.rowSecurityActiveFor(String.valueOf(relArg));
+            }
             case "shobj_description": {
                 // The shared catalogs — databases, roles, tablespaces. Their comments are kept by
                 // name rather than by schema, because nothing holds them.
@@ -481,6 +592,17 @@ class CatalogMetadataFunctions {
             }
             case "to_regtype":
                 return evalToRegtype(fn, ctx);
+            case "pg_lsn_larger":
+            case "pg_lsn_smaller": {
+                // The two positions ordered: which is further along the log, or which is not.
+                if (fn.args().size() != 2) return NOT_HANDLED;
+                Object a = executor.evalExpr(fn.args().get(0), ctx);
+                Object b = executor.evalExpr(fn.args().get(1), ctx);
+                if (a == null || b == null) return null;
+                boolean wantLarger = "pg_lsn_larger".equals(name);
+                int order = BinaryOpEvaluator.compareLsnText(a.toString(), b.toString());
+                return (wantLarger ? order >= 0 : order <= 0) ? a : b;
+            }
             case "pg_switch_wal": {
                 // Switches to a new write-ahead log file and answers with the position it wrote
                 // up to. memgres keeps no log, so there is nothing to switch and the position is
@@ -493,10 +615,14 @@ class CatalogMetadataFunctions {
                 // A write-ahead log position is carried as its own text, so the value says
                 // nothing about the type that produced it and only the declaration can.
                 Expression typeofArg = fn.args().isEmpty() ? null : fn.args().get(0);
+                // Moving a log position along the log leaves a log position, and the distance
+                // between two of them is a count of bytes.
+                String lsnArithmetic = BinaryOpEvaluator.lsnArithmeticTypeName(typeofArg);
+                if (lsnArithmetic != null) return lsnArithmetic;
                 if (typeofArg instanceof FunctionCallExpr) {
                     String called = FunctionEvaluator.stripSchemaPrefix(
                             ((FunctionCallExpr) typeofArg).name().toLowerCase(Locale.ROOT));
-                    if (LSN_FUNCTIONS.contains(called)) return "pg_lsn";
+                    if (answersWithAnLsn(called)) return "pg_lsn";
                     // A function reference is held as its name and its OID together, which is
                     // the same value for both of these; only the call says which type it is.
                     if ("to_regproc".equals(called)) return "regproc";
@@ -707,6 +833,26 @@ class CatalogMetadataFunctions {
             PgTrigger.Event.INSERT, PgTrigger.Event.DELETE,
             PgTrigger.Event.UPDATE, PgTrigger.Event.TRUNCATE};
 
+    /** A relation name with its schema in front of it only where the search path needs one. */
+    private String qualifiedIfNeeded(String schema, String name) {
+        if (schema == null || schema.isEmpty()) return name;
+        for (String onPath : executor.relationSearchPath()) {
+            if (schema.equalsIgnoreCase(onPath)) return name;
+        }
+        return schema + "." + name;
+    }
+
+    /**
+     * A routine's name as a definition writes it: qualified when it was recorded qualified and
+     * its schema is not one the search path already reaches.
+     */
+    private String qualifiedFunctionName(String recorded) {
+        if (recorded == null) return null;
+        int dot = recorded.lastIndexOf('.');
+        if (dot < 0) return recorded;
+        return qualifiedIfNeeded(recorded.substring(0, dot), recorded.substring(dot + 1));
+    }
+
     /**
      * The statement that would create this trigger, spelled the way PostgreSQL's
      * pg_get_triggerdef spells it: the relation qualified by its schema, the events in the
@@ -735,7 +881,9 @@ class CatalogMetadataFunctions {
             }
         }
         sb.append(String.join(" OR ", events));
-        sb.append(" ON ").append(schema).append('.').append(first.getTableName());
+        // A name is written with its schema only when the search path would not find it there
+        // already, which is how every pg_get_*def spells one.
+        sb.append(" ON ").append(qualifiedIfNeeded(schema, first.getTableName()));
         // The transition tables are what the trigger function reads its rows from; a definition
         // that leaves them out restores a trigger whose body cannot see the statement's work.
         String oldTable = first.getOldTransitionTable();
@@ -758,7 +906,8 @@ class CatalogMetadataFunctions {
         if (first.getWhenClause() != null && !first.getWhenClause().isEmpty()) {
             sb.append(" WHEN (").append(deparseTriggerWhen(first.getWhenClause())).append(')');
         }
-        sb.append(" EXECUTE FUNCTION ").append(first.getFunctionName()).append('(');
+        sb.append(" EXECUTE FUNCTION ").append(qualifiedFunctionName(first.getFunctionName()))
+                .append('(');
         // The arguments belong in the definition: a dump that leaves them out restores a trigger
         // whose function sees TG_NARGS = 0.
         List<String> trigArgs = null;
@@ -2569,10 +2718,52 @@ class CatalogMetadataFunctions {
             }
             sb.append(normalizePgTypeName(p.typeName()));
             if (p.defaultExpr() != null) {
-                sb.append(" DEFAULT ").append(p.defaultExpr());
+                sb.append(" DEFAULT ").append(deparsedDefault(p));
             }
         }
         return sb.toString();
+    }
+
+    /**
+     * A parameter's default as PostgreSQL writes it back.
+     *
+     * <p>What was written is not what comes back: PostgreSQL keeps the parsed expression and
+     * deparses it, and a constant is deparsed with the type it was resolved to, so {@code 'x'}
+     * for a text parameter reads {@code 'x'::text}. A constant is the case that matters — it is
+     * what a default usually is — and anything else is given back as it was written.
+     */
+    static String deparsedDefault(PgFunction.Param p) {
+        String written = p.defaultExpr().trim();
+        String castTo = castTypeNameOf(p.typeName());
+        if (castTo == null) return written;
+        if (written.equalsIgnoreCase("null")) return "NULL::" + castTo;
+        if (written.length() >= 2 && written.startsWith("'") && written.endsWith("'")
+                && written.indexOf('\'', 1) == written.length() - 1) {
+            return written + "::" + castTo;
+        }
+        // An operator expression is deparsed with its own parentheses, so that reading the text
+        // back gives the same tree whatever it stands next to.
+        if (isOperatorExpression(written)) return "(" + written + ")";
+        return written;
+    }
+
+    /** Whether the text is an operator applied to two operands rather than a single value. */
+    private static boolean isOperatorExpression(String written) {
+        if (written.startsWith("(")) return false;
+        try {
+            return com.memgres.engine.parser.Parser.parseExpression(written)
+                    instanceof com.memgres.engine.parser.ast.BinaryExpr;
+        } catch (RuntimeException notAnExpression) {
+            return false;
+        }
+    }
+
+    /** The name a cast to this type is written with: a char is a bpchar once its width is gone. */
+    private static String castTypeNameOf(String typeName) {
+        if (typeName == null) return null;
+        String bare = normalizePgTypeName(stripTypeModifier(typeName));
+        if (bare == null || bare.isEmpty()) return null;
+        return "character".equals(bare) ? "bpchar" : bare;
     }
 
     /**
@@ -2793,6 +2984,29 @@ class CatalogMetadataFunctions {
      * <p>A value is written quoted, and a parameter whose value is a list has each item quoted
      * separately: {@code SET search_path TO 'public', 'pg_temp'}.
      */
+    /** The numbers PostgreSQL gives the encodings a client is likely to name. */
+    private static final java.util.Map<String, Integer> ENCODING_NUMBERS = encodingNumbers();
+
+    private static java.util.Map<String, Integer> encodingNumbers() {
+        java.util.Map<String, Integer> m = new java.util.HashMap<String, Integer>();
+        String[] names = {"SQL_ASCII", "EUC_JP", "EUC_CN", "EUC_KR", "EUC_TW", "EUC_JIS_2004",
+                "UTF8", "MULE_INTERNAL", "LATIN1", "LATIN2", "LATIN3", "LATIN4", "LATIN5",
+                "LATIN6", "LATIN7", "LATIN8", "LATIN9", "LATIN10"};
+        for (int i = 0; i < names.length; i++) m.put(names[i], i);
+        m.put("UNICODE", 6);
+        return m;
+    }
+
+    /** The parameters EXPLAIN reports when they are not at their default. */
+    private static final java.util.Set<String> EXPLAIN_REPORTED =
+            new java.util.HashSet<String>(java.util.Arrays.asList(
+                    "work_mem", "effective_cache_size", "random_page_cost", "seq_page_cost",
+                    "cpu_tuple_cost", "cpu_index_tuple_cost", "cpu_operator_cost",
+                    "hash_mem_multiplier", "temp_buffers", "jit_above_cost",
+                    "jit_inline_above_cost", "jit_optimize_above_cost", "parallel_tuple_cost",
+                    "parallel_setup_cost", "min_parallel_table_scan_size",
+                    "min_parallel_index_scan_size", "effective_io_concurrency"));
+
     /** The role an OID was handed out for, or null when no role answers to it. */
     String roleNameOf(int oid) {
         String key = executor.systemCatalog.keyForOid(oid);

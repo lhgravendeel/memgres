@@ -714,8 +714,15 @@ public final class TypeCoercion {
                         .truncatedTo(unitFor(precision));
         }
         if (value instanceof LocalTime) {
-            return ((LocalTime) value).plusNanos(
-                    roundingNanos(((LocalTime) value).getNano(), precision)).truncatedTo(unitFor(precision));
+            LocalTime t = (LocalTime) value;
+            long carried = roundingNanos(t.getNano(), precision);
+            // Rounding the last fraction of a day forward reaches the end of it, which time
+            // holds as 24:00:00. Added to a LocalTime it wrapped round to midnight instead, so
+            // 23:59:59.9 at second precision read as the start of the day rather than its end.
+            if (carried > 0 && t.toNanoOfDay() + carried >= 86_400_000_000_000L) {
+                return TIME_END_OF_DAY;
+            }
+            return t.plusNanos(carried).truncatedTo(unitFor(precision));
         }
         return null;
     }
@@ -739,6 +746,21 @@ public final class TypeCoercion {
      * numbers with one slash between them, in capitals. Storing the text unread put anything at
      * all under the type.
      */
+    /** A displacement as PostgreSQL writes one: a sign and at least two digits of hours. */
+    private static String paddedZoneOffset(String written) {
+        if (written.length() < 2) return written;
+        char sign = written.charAt(0);
+        String rest = written.substring(1);
+        int colon = rest.indexOf(':');
+        String hours = colon < 0 ? rest : rest.substring(0, colon);
+        String after = colon < 0 ? "" : rest.substring(colon);
+        for (int i = 0; i < hours.length(); i++) {
+            if (hours.charAt(i) < '0' || hours.charAt(i) > '9') return written;
+        }
+        if (hours.length() >= 2) return written;
+        return sign + "0" + hours + after;
+    }
+
     public static String checkedLsn(Object value) {
         String lsn = value.toString().trim();
         int slash = lsn.indexOf('/');
@@ -868,6 +890,24 @@ public final class TypeCoercion {
     // ---- Conversion helpers ----
 
     private static Short toShort(Object val) {
+        // A fraction is rounded before it is judged, not cut off: 32767.6 does not fit a
+        // smallint, and truncating it to 32767 stored a value the writer did not write.
+        if (val instanceof java.math.BigDecimal) {
+            long lv;
+            try {
+                lv = ((java.math.BigDecimal) val)
+                        .setScale(0, java.math.RoundingMode.HALF_UP).longValueExact();
+            } catch (ArithmeticException tooWide) {
+                throw smallintOutOfRange();
+            }
+            if (lv < Short.MIN_VALUE || lv > Short.MAX_VALUE) throw smallintOutOfRange();
+            return (short) lv;
+        }
+        if (val instanceof Double || val instanceof Float) {
+            long lv = roundFloatToLong(((Number) val).doubleValue());
+            if (lv < Short.MIN_VALUE || lv > Short.MAX_VALUE) throw smallintOutOfRange();
+            return (short) lv;
+        }
         if (val instanceof Number) {
             Number n = (Number) val;
             long lv = n.longValue();
@@ -1188,16 +1228,56 @@ public final class TypeCoercion {
         }
     }
 
+    /**
+     * The same text with the digit separators taken out, or null when it holds none.
+     *
+     * <p>An underscore separates digits and does nothing else: it may not lead, may not trail,
+     * and may not follow another one. Text that misuses one is returned unchanged, so the parse
+     * that follows refuses it with the message naming what was actually written.
+     */
+    static String withoutDigitSeparators(String s) {
+        if (s.indexOf('_') < 0) return null;
+        StringBuilder out = new StringBuilder(s.length());
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c != '_') {
+                out.append(c);
+                continue;
+            }
+            boolean digitBefore = i > 0 && Character.isDigit(s.charAt(i - 1));
+            boolean digitAfter = i + 1 < s.length() && Character.isDigit(s.charAt(i + 1));
+            if (!digitBefore || !digitAfter) return null;
+        }
+        return out.toString();
+    }
+
     public static BigDecimal toBigDecimal(Object val) {
         if (val instanceof PgMoney) return ((PgMoney) val).getValue();
         if (val instanceof BigDecimal) return ((BigDecimal) val);
         if (val instanceof Integer) return BigDecimal.valueOf(((Integer) val));
         if (val instanceof Long) return BigDecimal.valueOf(((Long) val));
-        if (val instanceof Double) return BigDecimal.valueOf(((Double) val));
-        if (val instanceof Float) return BigDecimal.valueOf(((Float) val));
+        // A float carries an approximation, and its value as a decimal is the shortest text that
+        // reads back as the same float — which is what PostgreSQL converts, and what the client
+        // was shown when the float was printed. Taken as the exact binary value instead,
+        // 0.1::real::numeric was 0.10000000149011612 and no longer equal to 0.1.
+        if (val instanceof Double) return new BigDecimal(Double.toString((Double) val));
+        if (val instanceof Float) return new BigDecimal(Float.toString((Float) val));
         if (val instanceof Number) return BigDecimal.valueOf(((Number) val).doubleValue());
         String s = val.toString().trim();
         if (s.isEmpty()) throw new MemgresException("invalid input syntax for type numeric: \"\"", "22P02");
+        // NaN is a value numeric has, but it is not a quantity, so it takes no sign: PostgreSQL
+        // reads "NaN" and refuses "+NaN" and "-NaN". Handled by stripping a sign first, both were
+        // accepted and a value nobody could have written was stored.
+        if ((s.startsWith("+") || s.startsWith("-"))
+                && s.substring(1).trim().equalsIgnoreCase("nan")) {
+            throw new MemgresException(
+                    "invalid input syntax for type numeric: \"" + val + "\"", "22P02");
+        }
+        // An underscore may separate digits, and may only separate them: PostgreSQL reads
+        // 1_000.5 and 1_0e2, and refuses _10, 10_ and 1__0. Applied only to the integer forms,
+        // a decimal written with separators was refused outright.
+        String separated = withoutDigitSeparators(s);
+        if (separated != null) s = separated;
         try {
             return new BigDecimal(s);
         } catch (NumberFormatException e) {
@@ -1317,7 +1397,17 @@ public final class TypeCoercion {
             }
             return datePart + " " + dt.format(DateTimeFormatter.ofPattern("HH:mm:ss")) + era;
         }
-        if (val instanceof OffsetDateTime) return ((OffsetDateTime) val).toString();
+        if (val instanceof OffsetDateTime) {
+            // A moment is written in the session's zone, with the displacement that zone was at.
+            OffsetDateTime here = ((OffsetDateTime) val).atZoneSameInstant(sessionZone())
+                    .toOffsetDateTime();
+            int seconds = here.getOffset().getTotalSeconds();
+            String sign = seconds < 0 ? "-" : "+";
+            int abs = Math.abs(seconds);
+            String displacement = sign + String.format("%02d", abs / 3600)
+                    + (abs % 3600 == 0 ? "" : String.format(":%02d", (abs % 3600) / 60));
+            return toString(here.toLocalDateTime()) + displacement;
+        }
         if (val instanceof LocalTime) {
             LocalTime lt = (LocalTime) val;
             if (isEndOfDay(lt)) return "24:00:00";
@@ -1543,9 +1633,28 @@ public final class TypeCoercion {
      */
     private static final ThreadLocal<ZoneId> SESSION_ZONE = new ThreadLocal<ZoneId>();
 
+    /**
+     * The name the session's TimeZone was set to.
+     *
+     * <p>Four of the zones PostgreSQL carries — EST, HST, MST and Factory — have no Java zone
+     * identifier, so they resolve to a fixed displacement and the name is the only thing left
+     * that says which abbreviation the zone writes.
+     */
+    private static final ThreadLocal<String> SESSION_ZONE_NAME = new ThreadLocal<String>();
+
     /** Set the session TimeZone used to resolve the current date and time. */
     public static void setSessionZone(ZoneId zone) {
         SESSION_ZONE.set(zone);
+    }
+
+    /** Set the name the session TimeZone was written as, alongside the rules it resolved to. */
+    public static void setSessionZoneName(String name) {
+        SESSION_ZONE_NAME.set(name);
+    }
+
+    /** The name the session TimeZone was written as, or null outside a session. */
+    static String rawSessionZoneName() {
+        return SESSION_ZONE_NAME.get();
     }
 
     /** The bound zone, or null outside a statement — for saving and restoring it. */
@@ -2271,7 +2380,9 @@ public final class TypeCoercion {
                 String offsetPart = s.substring(tzIdx); // includes sign
                 try {
                     timePart = pgTimeText(LocalTime.parse(timePart));
-                    return timePart + offsetPart;
+                    // A displacement is written as at least two digits of hours, whatever was
+                    // typed: PostgreSQL reads -8 and writes it back as -08.
+                    return timePart + paddedZoneOffset(offsetPart);
                 } catch (DateTimeParseException e3) { /* fall through */ }
             }
         }
@@ -3628,8 +3739,11 @@ public final class TypeCoercion {
     private static LocalTime roundNanoOfDay(LocalTime t, long unit) {
         long nanos = t.toNanoOfDay();
         long rounded = ((nanos + unit / 2) / unit) * unit;
-        // Rounding up out of the day wraps, which is what PostgreSQL's 24:00:00 boundary does
-        return LocalTime.ofNanoOfDay(rounded % 86400000000000L);
+        // Rounding forward out of the day reaches its end, which time holds as 24:00:00 rather
+        // than wrapping to its start: 23:59:59.9 at second precision is the end of the day, and
+        // taking it round to midnight moved the value to the wrong day entirely.
+        if (rounded >= 86400000000000L) return TIME_END_OF_DAY;
+        return LocalTime.ofNanoOfDay(rounded);
     }
 
     private static LocalDateTime roundDateTime(LocalDateTime t, long unit) {

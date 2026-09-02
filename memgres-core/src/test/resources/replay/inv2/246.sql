@@ -1,0 +1,10 @@
+-- source: investigation-2026-08.md
+-- finding: 246
+-- title: ON CONFLICT bypasses the duplicate-key wait the plain INSERT path performs: the arbiter path calls findConflictingRow against live rows and takes the DO UPDATE/
+-- A: BEGIN; INSERT INTO zz_t VALUES (7,70);
+-- B: INSERT INTO zz_t VALUES (7,71) ON CONFLICT (i) DO UPDATE SET v = 999;
+-- A: ROLLBACK;
+-- B: SELECT count(*), string_agg(v::text,',') FROM zz_t WHERE i = 7;
+-- A: BEGIN; UPDATE zz_t SET v = 42 WHERE i = 1;
+-- B: SELECT v FROM zz_t WHERE i = 1 FOR UPDATE;  -- blocks
+-- A: COMMIT;

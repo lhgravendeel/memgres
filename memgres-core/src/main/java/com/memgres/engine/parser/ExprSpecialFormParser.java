@@ -624,11 +624,12 @@ class ExprSpecialFormParser {
     private OperatorSpec readOperatorSpec() {
         ep.expect(TokenType.LEFT_PAREN);
         String schema = null;
-        if (ep.check(TokenType.IDENTIFIER) || ep.check(TokenType.KEYWORD)) {
+        // The schema is optional: OPERATOR(+) writes the ordinary operator the long way round,
+        // and only a name followed by a dot is a schema. Requiring one made that a syntax error.
+        if ((ep.check(TokenType.IDENTIFIER) || ep.check(TokenType.KEYWORD))
+                && ep.peekAt(1).type() == TokenType.DOT) {
             schema = ep.advance().value();
-        }
-        if (!ep.match(TokenType.DOT)) {
-            throw new ParseException("Expected '.' in OPERATOR(schema.op)", ep.peek());
+            ep.expect(TokenType.DOT);
         }
         Token opTok = ep.peek();
         if (opTok.type() == TokenType.EOF || opTok.type() == TokenType.RIGHT_PAREN) {

@@ -67,7 +67,18 @@ class MathFunctions {
                     Object scaleArg = executor.evalExpr(fn.args().get(1), ctx);
                     if (scaleArg == null) return null;
                     int scale = executor.toInt(scaleArg);
-                    return toBigDecimal(arg).setScale(scale, java.math.RoundingMode.HALF_UP);
+                    // numeric holds at most 16383 digits after the point, and rounding to a
+                    // place further left than the number reaches leaves zero. Handed to setScale
+                    // as written, a scale at either end of int overflowed where PostgreSQL simply
+                    // answers.
+                    if (scale > 16383) scale = 16383;
+                    if (scale < -131072) scale = -131072;
+                    BigDecimal rounded = toBigDecimal(arg)
+                            .setScale(scale, java.math.RoundingMode.HALF_UP);
+                    // Rounded to a place left of the number, the result is zero — and numeric
+                    // writes it as 0 rather than as the exponent form a negative scale carries.
+                    // A positive scale keeps its trailing zeroes: round(1.5, 2) is 1.50.
+                    return scale < 0 && rounded.signum() == 0 ? BigDecimal.ZERO : rounded;
                 }
                 // numeric rounds half away from zero; float8 rounds half to even, which is what
                 // rint does — round(2.5::float8) is 2 and round(3.5::float8) is 4.
@@ -494,6 +505,12 @@ class MathFunctions {
                 if (Double.isNaN(val) || Double.isNaN(lo) || Double.isNaN(hi)) {
                     throw new MemgresException(
                             "operand, lower bound, and upper bound cannot be NaN", "2201G");
+                }
+                // Buckets of equal width need a width, and there is none between a finite bound
+                // and an infinite one. Divided through anyway, every operand fell in the first.
+                if (Double.isInfinite(lo) || Double.isInfinite(hi)) {
+                    throw new MemgresException(
+                            "lower and upper bounds must be finite", "2201G");
                 }
                 int count = executor.toInt(countArg);
                 // There is no bucket to fall into when none were asked for, and dividing by the

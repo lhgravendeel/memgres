@@ -210,15 +210,15 @@ class IntervalFieldsAndTriggerCatalogTest {
 
             // The reconstructed definition carries them, so a restored trigger sees the same
             // TG_NARGS and TG_ARGV the original did.
-            assertScalar("CREATE TRIGGER tc_2 BEFORE UPDATE OF v, w ON public.tc_t "
+            assertScalar("CREATE TRIGGER tc_2 BEFORE UPDATE OF v, w ON tc_t "
                             + "FOR EACH ROW EXECUTE FUNCTION tc_f('x')",
                     "SELECT pg_get_triggerdef(oid) FROM pg_trigger WHERE tgname = 'tc_2'");
-            assertScalar("CREATE TRIGGER tc_4 BEFORE INSERT ON public.tc_t "
+            assertScalar("CREATE TRIGGER tc_4 BEFORE INSERT ON tc_t "
                             + "FOR EACH ROW EXECUTE FUNCTION tc_f('abc', 'd')",
                     "SELECT pg_get_triggerdef(oid) FROM pg_trigger WHERE tgname = 'tc_4'");
             // A WHEN condition comes back in the catalog's spelling: lower-case row references,
             // a dot with no spaces around it, and a second pair of parentheses.
-            assertScalar("CREATE TRIGGER tc_3 BEFORE UPDATE OF v ON public.tc_t FOR EACH ROW "
+            assertScalar("CREATE TRIGGER tc_3 BEFORE UPDATE OF v ON tc_t FOR EACH ROW "
                             + "WHEN ((old.v IS DISTINCT FROM new.v)) EXECUTE FUNCTION tc_f()",
                     "SELECT pg_get_triggerdef(oid) FROM pg_trigger WHERE tgname = 'tc_3'");
 
@@ -421,7 +421,7 @@ class IntervalFieldsAndTriggerCatalogTest {
                     + "THEN 'yes' ELSE 'no' END FROM pg_trigger WHERE tgname = 'tgw_1'");
             assertScalar("yes", "SELECT CASE WHEN pg_get_triggerdef(oid) LIKE '%''NEW.%%''%' "
                     + "THEN 'yes' ELSE 'no' END FROM pg_trigger WHERE tgname = 'tgw_2'");
-            assertScalar("CREATE TRIGGER tgw_3 BEFORE UPDATE ON public.tgw_t FOR EACH ROW "
+            assertScalar("CREATE TRIGGER tgw_3 BEFORE UPDATE ON tgw_t FOR EACH ROW "
                             + "WHEN ((new.v <> old.v)) EXECUTE FUNCTION tgw_f()",
                     "SELECT pg_get_triggerdef(oid) FROM pg_trigger WHERE tgname = 'tgw_3'");
 
@@ -444,7 +444,7 @@ class IntervalFieldsAndTriggerCatalogTest {
 
             assertScalar("oldt|newt", "SELECT tgoldtable || '|' || tgnewtable "
                     + "FROM pg_trigger WHERE tgname = 'tgr_1'");
-            assertScalar("CREATE TRIGGER tgr_1 AFTER UPDATE ON public.tgr_t "
+            assertScalar("CREATE TRIGGER tgr_1 AFTER UPDATE ON tgr_t "
                             + "REFERENCING OLD TABLE AS oldt NEW TABLE AS newt "
                             + "FOR EACH STATEMENT EXECUTE FUNCTION tgr_f()",
                     "SELECT pg_get_triggerdef(oid) FROM pg_trigger WHERE tgname = 'tgr_1'");

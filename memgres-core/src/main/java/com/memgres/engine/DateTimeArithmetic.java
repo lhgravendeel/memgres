@@ -344,14 +344,13 @@ class DateTimeArithmetic {
         // date - integer (days)
         if (left instanceof LocalDate && right instanceof Number) return addDays((LocalDate) left, -((Number) right).longValue());
 
-        // pg_lsn - pg_lsn → bigint (byte count difference)
+        // pg_lsn - pg_lsn → numeric (byte count difference). A log position is 64 bits wide and
+        // unsigned, so the count between two of them does not fit a signed machine integer.
         if (left instanceof String && right instanceof String) {
             String ls = ((String) left).trim();
             String rs = ((String) right).trim();
             if (ls.matches("[0-9a-fA-F]+/[0-9a-fA-F]+") && rs.matches("[0-9a-fA-F]+/[0-9a-fA-F]+")) {
-                long lVal = parseLsn(ls);
-                long rVal = parseLsn(rs);
-                return lVal - rVal;
+                return new java.math.BigDecimal(lsnBytes(ls).subtract(lsnBytes(rs)));
             }
         }
 
@@ -492,13 +491,11 @@ class DateTimeArithmetic {
     }
 
     /**
-     * Parse a PostgreSQL LSN string (e.g., "0/4000000") into a long byte offset.
-     * Format is "upper32hex/lower32hex".
+     * The byte offset a log position stands for, written as {@code upper32hex/lower32hex}.
      */
-    private static long parseLsn(String lsn) {
+    private static java.math.BigInteger lsnBytes(String lsn) {
         int slashIdx = lsn.indexOf('/');
-        long upper = Long.parseLong(lsn.substring(0, slashIdx), 16);
-        long lower = Long.parseLong(lsn.substring(slashIdx + 1), 16);
-        return (upper << 32) | lower;
+        return new java.math.BigInteger(lsn.substring(0, slashIdx), 16).shiftLeft(32)
+                .add(new java.math.BigInteger(lsn.substring(slashIdx + 1), 16));
     }
 }

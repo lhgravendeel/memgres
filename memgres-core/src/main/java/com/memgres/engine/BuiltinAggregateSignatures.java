@@ -16,6 +16,22 @@ final class BuiltinAggregateSignatures {
     }
 
     static final String[][] AGGREGATES = {
+            // The ordered-set and hypothetical-set aggregates. These are catalogued the way
+            // every other aggregate is — a pg_proc row with prokind 'a' and a pg_aggregate row
+            // behind it — so a client asking what the server can compute WITHIN GROUP finds them.
+            // rank, dense_rank, percent_rank and cume_dist are also window functions; the two
+            // forms differ in their arguments, which is how PostgreSQL keeps them apart too.
+            {"cume_dist", "701", "2276"}, // cume_dist(VARIADIC "any") -> double precision
+            {"dense_rank", "20", "2276"}, // dense_rank(VARIADIC "any") -> bigint
+            {"mode", "2283", "2283"}, // mode() WITHIN GROUP (ORDER BY anyelement) -> anyelement
+            {"percent_rank", "701", "2276"}, // percent_rank(VARIADIC "any") -> double precision
+            {"percentile_cont", "1187", "1022 1186"},
+            {"percentile_cont", "1022", "1022 701"},
+            {"percentile_cont", "1186", "701 1186"},
+            {"percentile_cont", "701", "701 701"},
+            {"percentile_disc", "2277", "1022 2283"},
+            {"percentile_disc", "2283", "701 2283"},
+            {"rank", "20", "2276"}, // rank(VARIADIC "any") -> bigint
             {"array_agg", "2277", "2277"}, // array_agg(anyarray) -> anyarray
             {"array_agg", "2277", "2776"}, // array_agg(anynonarray) -> anyarray
             {"avg", "1186", "1186"}, // avg(interval) -> interval
@@ -169,9 +185,9 @@ final class BuiltinAggregateSignatures {
      * answers to it and is only missing its clause. Only the count decides, because a name and an
      * argument count is as far as PostgreSQL gets before it notices what kind of aggregate it has.
      *
-     * <p>rank, dense_rank, percent_rank and cume_dist are left out: they are window functions as
-     * well, take a variadic argument list that any count answers to, and are already told apart in
-     * {@code PlacementCheck} by whether they were written with arguments at all.
+     * <p>rank, dense_rank, percent_rank and cume_dist are not counted here: they are window
+     * functions as well, take a variadic argument list that any count answers to, and are already
+     * told apart in {@code PlacementCheck} by whether they were written with arguments at all.
      */
     static int orderedSetArity(String name) {
         if ("percentile_cont".equals(name) || "percentile_disc".equals(name)) return 2;

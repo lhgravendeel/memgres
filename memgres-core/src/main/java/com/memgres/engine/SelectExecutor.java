@@ -106,7 +106,7 @@ class SelectExecutor {
         if (stmt.withClauses() != null && !stmt.withClauses().isEmpty()) {
             Map<String, SelectStmt.CommonTableExpr> cteMap = new LinkedHashMap<>();
             for (SelectStmt.CommonTableExpr cte : stmt.withClauses()) {
-                cteMap.put(cte.name().toLowerCase(java.util.Locale.ROOT), cte);
+                cteMap.put(cte.name(), cte);
                 if (isDmlCte(cte.query())) writesFromWith = true;
             }
             // Before the scope is pushed: a refusal here must not leave a WITH scope standing on
@@ -3020,27 +3020,13 @@ class SelectExecutor {
             if (val instanceof byte[] && resultType == DataType.TEXT) {
                 resultType = DataType.BYTEA;
             }
-            String compositeName =
-                    executor.resolveCompositeTypeName(target.expr(), Cols.listOf());
-            if (resultType == DataType.ENUM) {
-                String enumTypeName = executor.resolveEnumTypeName(target.expr(), Cols.listOf());
-                columns.add(enumTypeName != null
-                        ? new Column(alias, DataType.ENUM, true, false, null, enumTypeName)
-                        : new Column(alias, DataType.TEXT, true, false, null));
-            } else if (compositeName != null) {
-                // A composite is a type of its own, and the client looks it up by its own OID.
-                columns.add(Column.ofCompositeType(alias, compositeName));
-            } else {
-                // A column an enclosing query level supplies — which is what a LATERAL projects —
-                // keeps the whole of its declared type. A bare DataType does not carry an array's
-                // element type, and an int[] read through a LATERAL called itself _int4.
-                Column outerCol = target.expr() instanceof ColumnRef
-                        ? executor.exprEvaluator.columnFromOuterContexts((ColumnRef) target.expr())
-                        : null;
-                columns.add(outerCol != null
-                        ? buildProjectedColumn(alias, target.expr(), Cols.listOf())
-                        : new Column(alias, resultType, true, false, null));
-            }
+            // The same builder a SELECT with a FROM uses, so a column describes itself the same
+            // way with or without one: an enum keeps its own name, a composite its own OID, and
+            // an array of an enum the enum's array OID. Building the column here instead left
+            // enum_range(NULL::t) describing itself as text.
+            Column built = buildProjectedColumn(alias, target.expr(), Cols.listOf());
+            columns.add(val instanceof byte[] && built.getType() == DataType.TEXT
+                    ? new Column(alias, DataType.BYTEA, true, false, null) : built);
             if (val instanceof List<?> && srfNode != null) {
                 List<?> list = (List<?>) val;
                 if (srfIndex < 0) {

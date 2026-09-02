@@ -665,13 +665,16 @@ class OperatorTest {
                     + "BEGIN RETURN a < b; END; $$ LANGUAGE plpgsql");
             stmt.execute("CREATE OPERATOR <<< (LEFTARG = text, RIGHTARG = text, FUNCTION = lt_custom)");
 
-            stmt.execute("CREATE OPERATOR CLASS my_text_ops DEFAULT FOR TYPE text USING btree AS "
+            // text already has a default btree class, so this one is an alternative rather than the
+            // default: PostgreSQL refuses a second default for a type.
+            stmt.execute("CREATE OPERATOR CLASS my_text_ops FOR TYPE text USING btree AS "
                     + "OPERATOR 1 <<<");
 
             try (ResultSet rs = stmt.executeQuery(
                     "SELECT opcname, opcdefault FROM pg_opclass WHERE opcname = 'my_text_ops'")) {
                 assertTrue(rs.next());
-                assertTrue(rs.getBoolean("opcdefault"));
+                // Not the default: the type already had one, so this class is an alternative.
+                assertFalse(rs.getBoolean("opcdefault"));
             }
         }
     }

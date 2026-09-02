@@ -195,6 +195,60 @@ class DdlAdminExecutor {
         return gucs.hasSessionOverride(setting) ? gucs.get(setting) : null;
     }
 
+    /**
+     * Fold the statement's constant expressions, the way planning does.
+     *
+     * <p>EXPLAIN does not run the statement, but it does analyse and plan it, and planning
+     * evaluates every expression that does not depend on a row. So {@code EXPLAIN SELECT 1/0}
+     * raises the division and {@code EXPLAIN SELECT 'abc'::int} the bad input, while
+     * {@code EXPLAIN SELECT a/0 FROM t} raises nothing: that one only divides once there is a row
+     * to divide. Explaining without doing this reported a plan for statements PostgreSQL refuses.
+     */
+    private void requireConstantsFold(Statement toPlan, boolean parametersMayBeUnbound) {
+        AstWalk.forEach(toPlan, node -> {
+            // A parameter nothing supplied is not a value the plan could use.
+            if (node instanceof ParamRef) {
+                if (parametersMayBeUnbound) return;
+                int at = ((ParamRef) node).index();
+                if (at < 1 || at > executor.boundParameters.size()) {
+                    throw new MemgresException("there is no parameter $" + at, "42P02");
+                }
+                return;
+            }
+            if (!(node instanceof Expression) || !isRowIndependent((Expression) node)) return;
+            executor.evalExpr((Expression) node, null);
+        });
+    }
+
+    /**
+     * Whether an expression answers the same whatever row it is read against, and so is one
+     * planning settles once: no column, no parameter left unbound, nothing that reads a row.
+     */
+    private boolean isRowIndependent(Expression expr) {
+        if (expr instanceof Literal || expr instanceof ParamRef) return false;
+        return !AstWalk.anyMatch(expr, node ->
+                node instanceof ColumnRef || node instanceof WildcardExpr
+                        || node instanceof SubqueryExpr || node instanceof ExistsExpr
+                        || node instanceof CompositeStarExpr
+                        || node instanceof SelectStmt
+                        || isVolatileCall(node));
+    }
+
+    /** Whether a node is a call whose answer may change between two rows. */
+    private boolean isVolatileCall(Object node) {
+        if (node instanceof WindowFuncExpr || node instanceof OrderedSetAggExpr) return true;
+        if (!(node instanceof FunctionCallExpr)) return false;
+        String called = FunctionEvaluator.stripSchemaPrefix(
+                ((FunctionCallExpr) node).name().toLowerCase(java.util.Locale.ROOT));
+        // A name the server has not got is not volatile, it is an error, and analysis is where
+        // PostgreSQL reports it — so the expression is settled rather than left alone.
+        if (!BuiltinFunctionNames.isCallable(called)
+                && executor.database.getFunction(called) == null) {
+            return false;
+        }
+        return !BuiltinFunctionSignatures.isImmutable(called);
+    }
+
     // ---- EXPLAIN ----
 
     /**
@@ -229,15 +283,23 @@ class DdlAdminExecutor {
             actualResult = executor.executeStatement(toRun);
         }
 
+        // GENERIC_PLAN asks for the plan a statement would get before its parameters are known,
+        // so an unbound parameter is the point of it rather than a fault.
+        if (!stmt.analyze()) requireConstantsFold(stmt.statement(), stmt.genericPlan());
+
         ExplainPlan plan = new ExplainPlanBuilder(executor, stmt.verbose()).build(stmt.statement());
 
         List<Column> planCols = Cols.listOf(new Column("QUERY PLAN", DataType.TEXT, true, false, null));
+        // A plan asked for as a document comes back as one: the column is json or xml, which is
+        // what a client parsing the plan decodes it by. YAML has no type of its own and is text.
         if (stmt.format().equals("JSON")) {
-            return QueryResult.select(planCols,
+            return QueryResult.select(
+                    Cols.listOf(new Column("QUERY PLAN", DataType.JSON, true, false, null)),
                     Collections.singletonList(new Object[]{plan.renderJson(stmt.costs())}));
         }
         if (stmt.format().equals("XML")) {
-            return QueryResult.select(planCols,
+            return QueryResult.select(
+                    Cols.listOf(new Column("QUERY PLAN", DataType.XML, true, false, null)),
                     Collections.singletonList(new Object[]{plan.renderXml(stmt.costs())}));
         }
         if (stmt.format().equals("YAML")) {
@@ -523,8 +585,26 @@ class DdlAdminExecutor {
     // ---- CREATE ROLE ----
 
     QueryResult executeCreateRole(CreateRoleStmt stmt) {
+        executor.requireRoleAdministration("create role");
+        // Names beginning pg_ belong to the server: it ships roles of its own under that prefix
+        // and reserves the rest of them, so one created here could collide with a later release.
+        if (stmt.name() != null
+                && stmt.name().toLowerCase(java.util.Locale.ROOT).startsWith("pg_")) {
+            throw new MemgresException(
+                    "role name \"" + stmt.name() + "\" is reserved", "42939");
+        }
         if (executor.database.hasRole(stmt.name())) {
             throw new MemgresException("role \"" + stmt.name() + "\" already exists", "42710");
+        }
+        // The roles this one is to be a member of have to be roles, and PostgreSQL says so
+        // before it creates anything.
+        if (stmt.inRoles() != null) {
+            for (String parentRole : stmt.inRoles()) {
+                if (!executor.database.hasRole(parentRole)) {
+                    throw new MemgresException(
+                            "role \"" + parentRole + "\" does not exist", "42704");
+                }
+            }
         }
         executor.database.createRole(stmt.name(), stmt.options());
         // M12: Process IN ROLE clause — add this role as member of specified roles
@@ -2175,6 +2255,17 @@ class DdlAdminExecutor {
     // ---- CREATE SCHEMA ----
 
     QueryResult executeCreateSchema(CreateSchemaStmt s) {
+        // A schema is made in the database, so it is the database's CREATE that is needed.
+        executor.checkDatabasePrivilege("CREATE");
+        // The role the schema is to belong to has to be a role, and PostgreSQL looks it up
+        // before it makes anything.
+        if (s.authorization() != null && !s.authorization().equalsIgnoreCase("current_user")
+                && !s.authorization().equalsIgnoreCase("session_user")
+                && !s.authorization().equalsIgnoreCase("current_role")
+                && !executor.database.hasRole(s.authorization())) {
+            throw new MemgresException(
+                    "role \"" + s.authorization() + "\" does not exist", "42704");
+        }
         if (executor.database.getSchema(s.name()) != null) {
             if (s.ifNotExists()) return QueryResult.message(QueryResult.Type.SET, "CREATE SCHEMA");
             throw new MemgresException("schema \"" + s.name() + "\" already exists", "42P06");

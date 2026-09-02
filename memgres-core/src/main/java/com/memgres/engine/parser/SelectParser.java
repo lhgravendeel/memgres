@@ -922,9 +922,11 @@ class SelectParser {
             consumeSearchCycleClauses(ctes);
         } while (parser.match(TokenType.COMMA));
 
+        // Two names differ when they are written differently: "A" and "a" are two queries, the
+        // parser having already folded whatever was written unquoted.
         Set<String> seenNames = new HashSet<>();
         for (SelectStmt.CommonTableExpr cte : ctes) {
-            if (!seenNames.add(cte.name().toLowerCase(java.util.Locale.ROOT))) {
+            if (!seenNames.add(cte.name())) {
                 throw new com.memgres.engine.MemgresException(
                         "WITH query name \"" + cte.name() + "\" specified more than once", "42712");
             }

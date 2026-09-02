@@ -133,6 +133,12 @@ class DateTimeFunctions {
                     Object zoneObj = executor.evalExpr(fn.args().get(2), ctx);
                     if (zoneObj == null) return null;
                     zone = PgTimeZones.zoneOperand(zoneObj);
+                    // Only the zoned form takes a zone, so a plain timestamp handed to it is
+                    // read as one first — which is what makes the answer a zoned one too.
+                    if (source instanceof java.time.LocalDateTime
+                            || source instanceof java.time.LocalDate) {
+                        source = TypeCoercion.toOffsetDateTime(source);
+                    }
                 }
                 return truncateDate(field, source, zone);
             }
@@ -232,11 +238,17 @@ class DateTimeFunctions {
                 int nanos = (int) Math.round((sec - secs) * 1_000_000_000);
                 // A field outside its range is the caller's mistake, reported as one rather than
                 // as the internal fault java.time raises for it.
-                if (hour < 0 || hour > 23 || minute < 0 || minute > 59 || sec < 0 || sec >= 60) {
+                // The end of the day is a time: 24:00:00 is what a day runs to, and only a
+                // moment past it is out of range.
+                boolean endOfDay = hour == 24 && minute == 0 && sec == 0;
+                if (!endOfDay
+                        && (hour < 0 || hour > 23 || minute < 0 || minute > 59
+                            || sec < 0 || sec >= 60)) {
                     throw new MemgresException("time field value out of range: " + hour + ":"
                             + twoDigits(minute) + ":" + twoDigits(secs), "22008");
                 }
-                return java.time.LocalTime.of(hour, minute, secs, nanos);
+                return endOfDay ? TypeCoercion.TIME_END_OF_DAY
+                        : java.time.LocalTime.of(hour, minute, secs, nanos);
             }
             case "isfinite": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
@@ -722,7 +734,13 @@ class DateTimeFunctions {
             case "doy": return (long) date.getDayOfYear();
             case "isodow": return (long) date.getDayOfWeek().getValue();
             case "isoyear": return (long) date.get(java.time.temporal.IsoFields.WEEK_BASED_YEAR);
-            case "decade": return (long) (year / 10);
+            // Which ten-year block the year falls in. There is no year zero, so the blocks
+            // before Christ are counted from the other end: 1 BC is in decade 0 along with the
+            // first nine years AD, and 10 BC is in decade -1.
+            case "decade": {
+                int reported = year > 0 ? year : year - 1;
+                return (long) (reported >= 0 ? reported / 10 : -((8 - reported) / 10));
+            }
             case "century": return (long) (year > 0 ? (year - 1) / 100 + 1 : year / 100 - 1);
             case "millennium": return (long) (year > 0 ? (year - 1) / 1000 + 1 : year / 1000 - 1);
             default: return null;
@@ -1055,32 +1073,118 @@ class DateTimeFunctions {
         if (s.startsWith("(") && s.endsWith(")")) {
             negative = true;
             s = s.substring(1, s.length() - 1).trim();
-        }
-        if (s.endsWith("-")) {
+        } else if (s.startsWith("<") && s.endsWith(">")) {
             negative = true;
-            s = s.substring(0, s.length() - 1).trim();
-        } else if (s.startsWith("-")) {
-            negative = true;
-            s = s.substring(1).trim();
-        } else if (s.startsWith("+")) {
-            s = s.substring(1).trim();
-        } else if (s.endsWith("+")) {
-            s = s.substring(0, s.length() - 1).trim();
+            s = s.substring(1, s.length() - 1).trim();
         }
-        // Group separators are positional noise; only the decimal marker carries meaning
-        s = s.replaceAll("[^0-9.]", "");
-        if (s.isEmpty()) {
+        // A sign written beside the digits is only a sign where the template says one may stand,
+        // so with a template it is left for the walk to find. Without one, either end will do.
+        if (fmt == null) {
+            if (s.endsWith("-")) {
+                negative = true;
+                s = s.substring(0, s.length() - 1).trim();
+            } else if (s.startsWith("-")) {
+                negative = true;
+                s = s.substring(1).trim();
+            } else if (s.startsWith("+")) {
+                s = s.substring(1).trim();
+            } else if (s.endsWith("+")) {
+                s = s.substring(0, s.length() - 1).trim();
+            }
+        }
+        String digits = fmt == null ? s.replaceAll("[^0-9.]", "") : readAgainstFormat(s, fmt);
+        if (digits.startsWith("-")) {
+            negative = !negative;
+            digits = digits.substring(1);
+        }
+        if (digits.isEmpty()) {
             // Nothing the format could read as a number was there. PG reports what it was left
             // holding, which is a blank, rather than quietly answering zero.
             throw new MemgresException("invalid input syntax for type numeric: \" \"", "22P02");
         }
         java.math.BigDecimal value;
         try {
-            value = new java.math.BigDecimal(s);
+            value = new java.math.BigDecimal(digits);
         } catch (NumberFormatException e) {
             throw new MemgresException("invalid input syntax for type numeric: \"" + input + "\"", "22P02");
         }
         return negative ? value.negate() : value;
+    }
+
+    /**
+     * The digits a format reads out of a value, position by position.
+     *
+     * <p>A template is a picture of where the characters go, not a filter: {@code to_number} walks
+     * the two together and takes what stands under each position, so {@code '999'} reads only the
+     * first three characters of {@code '12345'} and answers 123. A separator in the template
+     * expects one in the value and steps over it; a separator in the value that the template did
+     * not ask for costs the position it stands under.
+     *
+     * <p>A template that says where the decimal point goes is also saying how wide the number may
+     * be, and a value too wide for it overflows rather than being cut down to fit.
+     */
+    private String readAgainstFormat(String value, String fmt) {
+        String template = fmt.toUpperCase(java.util.Locale.ROOT).replace("FM", "");
+        StringBuilder whole = new StringBuilder();
+        StringBuilder fraction = new StringBuilder();
+        boolean pastPoint = false;
+        boolean signed = false;
+        int wholePositions = 0;
+        int fractionPositions = 0;
+        int at = 0;
+        for (int i = 0; i < template.length(); i++) {
+            char t = template.charAt(i);
+            if (t == 'M' && i + 1 < template.length() && template.charAt(i + 1) == 'I') { i++; }
+            if (t == 'P' && i + 1 < template.length() && template.charAt(i + 1) == 'R') { i++; }
+            boolean takesADigit = t == '9' || t == '0';
+            if (takesADigit) {
+                if (pastPoint) fractionPositions++; else wholePositions++;
+            }
+            if (t == '.' || t == 'D') {
+                pastPoint = true;
+                if (at < value.length() && (value.charAt(at) == '.' || value.charAt(at) == ',')) at++;
+                continue;
+            }
+            if (at >= value.length()) continue;
+            char c = value.charAt(at);
+            if (takesADigit) {
+                at++;
+                if (c >= '0' && c <= '9') {
+                    if (pastPoint) fraction.append(c); else whole.append(c);
+                } else if (c != '.' && c != ',') {
+                    // A separator the value carries still stands somewhere, and the position it
+                    // stands under reads nothing. Anything else was never this position's.
+                    at--;
+                }
+                continue;
+            }
+            // A template character that is not a digit position steps over the value character it
+            // stands for, and over nothing when the value does not carry one.
+            if ((t == ',' || t == 'G') && c == ',') at++;
+            else if ((t == 'S' || t == 'M' || t == 'P') && (c == '+' || c == '-')) {
+                if (c == '-') signed = true;
+                at++;
+            } else if ((t == 'L' || t == '$') && (c < '0' || c > '9')) at++;
+        }
+        // Digits left over once the template runs out belong to no position, unless the template
+        // never said where the point goes — then the value is simply wider than the picture.
+        boolean hasPoint = template.indexOf('.') >= 0 || template.indexOf('D') >= 0;
+        if (hasPoint) {
+            int wholeInValue = 0;
+            int fractionInValue = 0;
+            boolean seenPoint = false;
+            for (int i = 0; i < value.length(); i++) {
+                char c = value.charAt(i);
+                if (c == '.') { seenPoint = true; continue; }
+                if (c < '0' || c > '9') continue;
+                if (seenPoint) fractionInValue++; else wholeInValue++;
+            }
+            if (wholeInValue > wholePositions || fractionInValue > fractionPositions) {
+                throw new MemgresException("numeric field overflow", "22003");
+            }
+        }
+        String read = fraction.length() == 0 ? whole.toString() : whole + "." + fraction;
+        return signed ? "-" + read : read;
     }
 
 

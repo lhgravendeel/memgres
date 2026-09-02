@@ -102,7 +102,25 @@ class CatalogPrivilegeFunctions {
         for (Priv p : privs) {
             if (holds(role, p, "TABLE", key)) return true;
         }
-        return false;
+        return readableByEveryone(rel, privs);
+    }
+
+    /**
+     * Whether this is one of the relations PostgreSQL lets everybody read.
+     *
+     * <p>The catalogues and the information_schema views are granted SELECT to PUBLIC when the
+     * database is made. Answered from the recorded grants alone — and nothing grants on them,
+     * because memgres derives them rather than storing them — every role was told it could not
+     * read pg_class, which is the first thing a client asks about.
+     */
+    private boolean readableByEveryone(Rel rel, List<Priv> privs) {
+        String schema = rel.schema == null ? "" : rel.schema.toLowerCase(java.util.Locale.ROOT);
+        if (!"pg_catalog".equals(schema) && !"information_schema".equals(schema)) return false;
+        if (privs.isEmpty()) return false;
+        for (Priv p : privs) {
+            if (!"SELECT".equalsIgnoreCase(p.name) || p.grantOption) return false;
+        }
+        return true;
     }
 
     private Object hasColumnPrivilege(FunctionCallExpr fn, RowContext ctx) {
@@ -363,7 +381,8 @@ class CatalogPrivilegeFunctions {
         String name = str(arg);
         String lower = name.toLowerCase(java.util.Locale.ROOT);
         if (allowPublic && "public".equals(lower)) return lower;
-        if (executor.database.getRoles().containsKey(lower)) return lower;
+        // hasRole knows the roles PostgreSQL ships with as well as the ones somebody made.
+        if (executor.database.hasRole(lower)) return lower;
         if (lower.equals(executor.sessionUser().toLowerCase(java.util.Locale.ROOT))) return lower;
         throw PgErrors.undefinedObject("role", name);
     }
@@ -385,7 +404,18 @@ class CatalogPrivilegeFunctions {
 
     private Rel relation(Object arg) {
         if (arg instanceof Number) {
-            return new Rel(executor.defaultSchema(), str(arg), null, false);
+            // An OID names a relation, and which relation it is decides what its columns are.
+            // Left as the digits it was written with, the OID form could answer about the
+            // relation as a whole but not about a column of it.
+            String key = executor.systemCatalog.keyForOid(((Number) arg).intValue());
+            if (key == null || !key.startsWith("rel:")) {
+                return new Rel(executor.defaultSchema(), str(arg), null, false);
+            }
+            String qualified = key.substring("rel:".length());
+            int split = qualified.indexOf('.');
+            String namedSchema = split < 0 ? executor.defaultSchema() : qualified.substring(0, split);
+            String namedRelation = split < 0 ? qualified : qualified.substring(split + 1);
+            return relation(namedSchema + "." + namedRelation);
         }
         String raw = str(arg);
         String schema = executor.defaultSchema();
@@ -408,8 +438,17 @@ class CatalogPrivilegeFunctions {
         if (executor.database.getView(bare) != null) return new Rel(schema, bare, null, false);
         if (isSequence) return new Rel(schema, bare, null, true);
         Table catalog = catalogRelation(schema, bare);
-        if (catalog != null) return new Rel(schema, bare, catalog, false);
+        // A catalogue relation named without a schema was recorded as living in the search
+        // path's, so nothing downstream could tell it was a catalogue at all.
+        if (catalog != null) return new Rel(catalogSchemaOf(schema, bare), bare, catalog, false);
         throw new MemgresException("relation \"" + raw + "\" does not exist", "42P01");
+    }
+
+    /** The schema a catalogue relation is really in, whatever schema the caller wrote. */
+    private static String catalogSchemaOf(String schema, String bare) {
+        String lower = schema == null ? "" : schema.toLowerCase(java.util.Locale.ROOT);
+        if ("information_schema".equals(lower)) return "information_schema";
+        return "pg_catalog";
     }
 
     private Table catalogRelation(String schema, String bare) {
@@ -446,10 +485,9 @@ class CatalogPrivilegeFunctions {
 
     private boolean functionExists(String bare) {
         if (executor.database.getFunction(bare) != null) return true;
-        for (String builtin : BuiltinFunctionNames.NAMES) {
-            if (builtin.equals(bare)) return true;
-        }
-        return false;
+        // Every routine the server can call, not only the ones the catalogue lists: sin, gcd and
+        // to_jsonb are all callable, and asking about one said no such function exists.
+        return BuiltinFunctionNames.register().contains(bare);
     }
 
     private boolean typeExists(String name) {
@@ -605,7 +643,7 @@ class CatalogPrivilegeFunctions {
 
     private String currentRoleName() {
         if (executor.session != null && executor.session.getGucSettings().hasSessionOverride("role")) {
-            String role = executor.session.getGucSettings().get("role");
+            String role = executor.currentRole();
             if (role != null) return role.toLowerCase(java.util.Locale.ROOT);
         }
         return "memgres";

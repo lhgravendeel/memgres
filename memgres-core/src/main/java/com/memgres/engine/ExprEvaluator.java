@@ -164,7 +164,16 @@ class ExprEvaluator {
         if (expr instanceof UnaryExpr) {
             UnaryExpr un = (UnaryExpr) expr;
             rejectUnresolvablePrefixOperator(un);
-            return evalUnaryValue(un.op(), evalExpr(un.operand(), ctx));
+            Object operand = evalExpr(un.operand(), ctx);
+            // A shape's text does not always say which type it is — an open path is written the
+            // way an lseg is — so an operator over one is told what the operand was declared as.
+            geometricOperandType.set(executor.functionEvaluator.geometricFunctions.declaredGeometricTypeOf(
+                    un.operand(), ctx));
+            try {
+                return evalUnaryValue(un.op(), operand);
+            } finally {
+                geometricOperandType.remove();
+            }
         }
         if (expr instanceof FunctionCallExpr) {
             unifyVariadicArgumentTypes((FunctionCallExpr) expr);
@@ -1553,6 +1562,17 @@ class ExprEvaluator {
                 + " You might need to add an explicit type cast.", "42883");
     }
 
+    /**
+     * The type the operand of the unary operator being evaluated was declared to have, when the
+     * caller knew one. Only the geometric operators read it, and only because their operands are
+     * carried as text that several types share.
+     */
+    private final ThreadLocal<String> geometricOperandType = new ThreadLocal<String>();
+
+    private Object shapeOf(Object val) {
+        return GeometricFunctions.asDeclaredShape(geometricOperandType.get(), val.toString());
+    }
+
     Object evalUnaryValue(UnaryExpr.UnaryOp op, Object val) {
         switch (op) {
             case NOT: {
@@ -1619,28 +1639,44 @@ class ExprEvaluator {
             }
             case GEO_IS_HORIZONTAL: {
                 if (val == null) return null;
-                Object geom = GeometricOperations.autoDetectPublic(val.toString());
+                Object geom = shapeOf(val);
                 if (geom instanceof GeometricOperations.PgLseg) {
                     return GeometricOperations.isHorizontal((GeometricOperations.PgLseg) geom);
+                }
+                // A line Ax + By + C = 0 lies flat when x does not move it.
+                if (geom instanceof GeometricOperations.PgLine) {
+                    return ((GeometricOperations.PgLine) geom).a() == 0.0;
                 }
                 throw new MemgresException("operator does not exist: ?- " + GeometricOperations.pgTypeName(geom), "42883");
             }
             case GEO_IS_VERTICAL: {
                 if (val == null) return null;
-                Object geom = GeometricOperations.autoDetectPublic(val.toString());
+                Object geom = shapeOf(val);
                 if (geom instanceof GeometricOperations.PgLseg) {
                     return GeometricOperations.isVertical((GeometricOperations.PgLseg) geom);
+                }
+                if (geom instanceof GeometricOperations.PgLine) {
+                    return ((GeometricOperations.PgLine) geom).b() == 0.0;
                 }
                 throw new MemgresException("operator does not exist: ?| " + GeometricOperations.pgTypeName(geom), "42883");
             }
             case GEO_CENTER: {
                 if (val == null) return null;
-                Object geom = GeometricOperations.autoDetectPublic(val.toString());
+                Object geom = shapeOf(val);
+                // PostgreSQL defines the centre of a box, a circle, a line segment and a
+                // polygon, and of nothing else: a path has no one point that stands for it.
+                if (!(geom instanceof GeometricOperations.PgBox)
+                        && !(geom instanceof GeometricOperations.PgCircle)
+                        && !(geom instanceof GeometricOperations.PgPolygon)
+                        && !(geom instanceof GeometricOperations.PgLseg)) {
+                    throw new MemgresException("operator does not exist: @@ "
+                            + GeometricOperations.pgTypeName(geom), "42883");
+                }
                 return GeometricOperations.formatPoint(GeometricOperations.center(geom));
             }
             case GEO_LENGTH: {
                 if (val == null) return null;
-                Object geom = GeometricOperations.autoDetectPublic(val.toString());
+                Object geom = shapeOf(val);
                 double len = GeometricOperations.length(geom);
                 return (len == Math.floor(len) && !Double.isInfinite(len)) ? (Object) (long) len : (Object) len;
             }
@@ -1709,8 +1745,30 @@ class ExprEvaluator {
                 return pr.values().stream().allMatch(v -> v == null);
             }
         }
+        // A composite column holds its row as the text the type writes, so the same question has
+        // to be asked of its fields: a row of nulls IS NULL, and a row with a null in it is
+        // neither null nor not-null.
+        if (val instanceof String && isCompositeValued(isn.expr(), ctx)) {
+            List<RecordLiteral.Field> fields = RecordLiteral.parse(((String) val).trim());
+            boolean allNull = true;
+            boolean noneNull = true;
+            for (RecordLiteral.Field field : fields) {
+                boolean fieldIsNull = !field.quoted && field.text.isEmpty();
+                allNull &= fieldIsNull;
+                noneNull &= !fieldIsNull;
+            }
+            return isn.negated() ? noneNull : allNull;
+        }
         boolean isNull = val == null;
         return isn.negated() ? !isNull : isNull;
+    }
+
+    /** Whether the expression is declared to be a row of fields rather than a single value. */
+    private boolean isCompositeValued(Expression expr, RowContext ctx) {
+        List<RowContext.TableBinding> bindings = ctx == null
+                ? Collections.<RowContext.TableBinding>emptyList() : ctx.getBindings();
+        return resolveCompositeTypeName(expr, bindings) != null
+                || (expr instanceof ColumnRef && compositeOfColumn((ColumnRef) expr, bindings) != null);
     }
 
     /**
@@ -1992,7 +2050,11 @@ class ExprEvaluator {
             // A jsonb object is written between braces too, and is one value rather than a list of
             // them: "= ANY(ARRAY['{\"a\":1}'::jsonb])" compares against the object, not against a
             // member of it.
-            if (in.fromAny() && elem instanceof String && !jsonb
+            // A written-out element is one value however it is spelled, so ARRAY['{a,b}'] holds
+            // the two-character-braced string and not the two letters inside it.
+            boolean writtenOut = v instanceof Literal
+                    && ((Literal) v).literalType() == Literal.LiteralType.STRING;
+            if (in.fromAny() && elem instanceof String && !jsonb && !writtenOut
                     && ((String) elem).startsWith("{") && ((String) elem).endsWith("}")
                     && !RangeOperations.isMultirangeOrEmpty(((String) elem).trim())) {
                 String s = (String) elem;
@@ -3281,7 +3343,26 @@ class ExprEvaluator {
         labels.put("json_object_constructor", "json_object");
         labels.put("json_array_constructor", "json_array");
         labels.put("json_array_subquery", "json_array");
+        // A construct the parser rewrote into a call of its own. The name that stands for it is
+        // no routine PostgreSQL has, so the column is labelled the way the written form is: an
+        // operator answers ?column?, and a function keeps the name that was written.
+        labels.put("__similar_to_escape__", "?column?");
+        labels.put("__tsquery_not__", "?column?");
+        labels.put("__is_normalized__", "is_normalized");
+        labels.put("substring_similar", "substring");
         CONSTRUCTOR_LABELS = labels;
+    }
+
+    /** The type each of those rewritten constructs answers in. */
+    private static final Map<String, DataType> INTERNAL_FORM_TYPES;
+
+    static {
+        Map<String, DataType> types = new HashMap<>();
+        types.put("__similar_to_escape__", DataType.BOOLEAN);
+        types.put("__is_normalized__", DataType.BOOLEAN);
+        types.put("__tsquery_not__", DataType.TSQUERY);
+        types.put("substring_similar", DataType.TEXT);
+        INTERNAL_FORM_TYPES = types;
     }
 
     String exprToAlias(Expression expr) {
@@ -3293,7 +3374,12 @@ class ExprEvaluator {
             return CONSTRUCTOR_LABELS.getOrDefault(fnName,
                     dot >= 0 ? fnName.substring(dot + 1) : fnName);
         }
-        if (expr instanceof WindowFuncExpr) return ((WindowFuncExpr) expr).name();
+        if (expr instanceof WindowFuncExpr) {
+            // The schema a call was written through is no part of the column's name.
+            String windowName = ((WindowFuncExpr) expr).name();
+            int qualifier = windowName.lastIndexOf('.');
+            return qualifier >= 0 ? windowName.substring(qualifier + 1) : windowName;
+        }
         if (expr instanceof AtTimeZoneExpr) return "timezone";
         if (expr instanceof FieldAccessExpr) return ((FieldAccessExpr) expr).field();
         if (expr instanceof SubqueryExpr) {
@@ -3333,6 +3419,9 @@ class ExprEvaluator {
         }
         if (expr instanceof CustomOperatorExpr) {
             return "?column?";
+        }
+        if (expr instanceof QualifiedOperatorExpr) {
+            return exprToAlias(((QualifiedOperatorExpr) expr).inner());
         }
         if (expr instanceof OrderedSetAggExpr) return ((OrderedSetAggExpr) expr).funcName().toLowerCase(java.util.Locale.ROOT);
         if (expr instanceof JsonValueExpr) return "json_value";
@@ -3749,6 +3838,25 @@ class ExprEvaluator {
     }
 
     /**
+     * The type a written-out operator answers in: the result type of the function that implements
+     * it, or — when the symbol is one the engine has of its own — whatever that operator answers.
+     */
+    private DataType customOperatorResultType(CustomOperatorExpr cop,
+                                              List<RowContext.TableBinding> bindings) {
+        for (PgOperator candidate : executor.database.getOperatorsByName(cop.opSymbol())) {
+            PgFunction behind = executor.database.getFunction(candidate.getFunction());
+            if (behind == null || behind.getReturnType() == null) continue;
+            DataType named = DataType.fromPgName(
+                    CatalogMetadataFunctions.stripTypeModifier(behind.getReturnType()));
+            if (named != null) return named;
+        }
+        BinaryExpr.BinOp builtin = FunctionEvaluator.binaryOpForSymbol(cop.opSymbol());
+        if (builtin == null || cop.left() == null) return null;
+        return inferTypeFromContext(
+                new BinaryExpr(cop.left(), builtin, cop.right()), bindings);
+    }
+
+    /**
      * The type an operator answers in, read off its operands' declared types the way PostgreSQL
      * reads it off the catalogue entry it resolved -- never off the value that comes back. Getting
      * this wrong is not cosmetic: pgjdbc decodes a column by the type the server declared, so a
@@ -3768,6 +3876,7 @@ class ExprEvaluator {
             case LIKE: case ILIKE: case SIMILAR_TO:
             case REGEX_MATCH: case REGEX_IMATCH:
             case NOT_REGEX_MATCH: case NOT_REGEX_IMATCH:
+            case GEO_BELOW_EQ: case GEO_ABOVE_EQ:
             case CONTAINS: case CONTAINED_BY: case OVERLAP:
             case TS_MATCH: case RANGE_ADJACENT:
             case JSONB_EXISTS: case JSONB_EXISTS_ANY: case JSONB_EXISTS_ALL:
@@ -3798,6 +3907,11 @@ class ExprEvaluator {
                 if (isShiftableShape(lt) || isShiftableShape(rt)) return DataType.BOOLEAN;
                 return lt != null ? lt : rt;
             case BIT_AND: case BIT_OR: case BIT_XOR:
+                // Over two shapes # is where they meet: two boxes meet in a box, and everything
+                // else meets in a point.
+                if (op == BinaryExpr.BinOp.BIT_XOR && isShapeType(lt) && isShapeType(rt)) {
+                    return lt == DataType.BOX && rt == DataType.BOX ? DataType.BOX : DataType.POINT;
+                }
                 if (isInet(lt) || isInet(rt)) return DataType.INET;
                 if (lt == DataType.BIT || lt == DataType.VARBIT) return lt;
                 if (rt == DataType.BIT || rt == DataType.VARBIT) return rt;
@@ -3809,10 +3923,23 @@ class ExprEvaluator {
             case CONCAT:
                 return concatResultType(lt, rt);
             case ADD: case SUBTRACT: case MULTIPLY: case DIVIDE: case MODULO:
+                // Two addresses differ by a count of addresses; an address and a count give
+                // another address. An untyped operand beside an address is read as an address,
+                // which is what makes inet - '10.1.2.3' a count rather than an address.
+                if (op == BinaryExpr.BinOp.SUBTRACT && isInet(lt) && (rt == null || isInet(rt))) {
+                    return DataType.BIGINT;
+                }
                 return arithmeticResultType(op, lt, rt);
             default:
                 return null;
         }
+    }
+
+    /** Whether the type is one of the geometric shapes. */
+    private static boolean isShapeType(DataType t) {
+        return t == DataType.POINT || t == DataType.LINE || t == DataType.LSEG
+                || t == DataType.BOX || t == DataType.PATH || t == DataType.POLYGON
+                || t == DataType.CIRCLE;
     }
 
     /** The type {@code ||} answers in: an array, a document or a bit string keeps its own. */
@@ -4065,6 +4192,10 @@ class ExprEvaluator {
         // to the client as text -- a boolean field among them, which a client then read as one.
         if (expr instanceof FieldAccessExpr) {
             FieldAccessExpr fa = (FieldAccessExpr) expr;
+            // A row constructor has no name and no declared fields: its columns are f1, f2, …
+            // in the order they were written, and each is whatever that element is.
+            DataType positional = rowConstructorFieldType(fa, bindings);
+            if (positional != null) return positional;
             String composite = resolveCompositeTypeName(fa.expr(), bindings);
             if (composite == null && fa.expr() instanceof ColumnRef) {
                 composite = compositeOfColumn((ColumnRef) fa.expr(), bindings);
@@ -4131,6 +4262,21 @@ class ExprEvaluator {
         if (expr instanceof JsonQueryExpr) {
             return returningType(((JsonQueryExpr) expr).returningType, DataType.JSONB);
         }
+        // A parameter is the type the statement declared for it, whatever value was bound.
+        if (expr instanceof ParamRef) {
+            int at = ((ParamRef) expr).index();
+            if (executor != null && at >= 1 && at <= executor.boundParameterTypes.size()) {
+                String declaredParam = executor.boundParameterTypes.get(at - 1);
+                DataType named = declaredParam == null ? null
+                        : DataType.fromPgName(declaredParam.replaceAll("\\(.*\\)", "").trim());
+                if (named != null) return named;
+            }
+            if (executor != null && at >= 1 && at <= executor.boundParameters.size()) {
+                Object bound = executor.boundParameters.get(at - 1);
+                if (bound != null) return TypeCoercion.inferType(bound);
+            }
+            return null;
+        }
         if (expr instanceof CastExpr) {
             CastExpr cast = (CastExpr) expr;
             // The modifier is part of what float(p) names — 24 is a real and 25 a double
@@ -4148,6 +4294,16 @@ class ExprEvaluator {
             if (executor != null && executor.database != null
                     && executor.database.getCustomEnum(typeName.toLowerCase(java.util.Locale.ROOT)) != null) {
                 return DataType.ENUM;
+            }
+            // A domain is its base type wearing a name and a constraint, and a value of one is
+            // described by the type underneath: a numeric domain is a numeric on the wire.
+            if (executor != null && executor.database != null) {
+                DomainType domain = executor.database.getDomain(typeName);
+                if (domain != null && domain.getBaseTypeName() != null) {
+                    DataType under = DataType.fromPgName(
+                            domain.getBaseTypeName().replaceAll("\\(.*\\)", "").trim());
+                    if (under != null) return under;
+                }
             }
             return DataType.TEXT;
         }
@@ -4213,12 +4369,24 @@ class ExprEvaluator {
                     return DataType.TEXT;
             }
         }
+        // Writing an operator out with its schema does not change what it is, so the answer is
+        // whatever the operator underneath answers.
+        if (expr instanceof QualifiedOperatorExpr) {
+            return inferTypeFromContext(((QualifiedOperatorExpr) expr).inner(), bindings);
+        }
         if (expr instanceof CustomOperatorExpr) {
-            // Custom operators - can't infer return type without looking up the operator definition
-            return DataType.TEXT;
+            // What an operator answers in is what the routine behind it answers in, and an
+            // operator written the long way — OPERATOR(pg_catalog.+) — is the ordinary one.
+            CustomOperatorExpr cop = (CustomOperatorExpr) expr;
+            DataType named = customOperatorResultType(cop, bindings);
+            return named != null ? named : DataType.TEXT;
         }
         if (expr instanceof BinaryExpr) {
             BinaryExpr bin = (BinaryExpr) expr;
+            // A log position is carried as text, so which operator was written is read off the
+            // operands rather than off the types they resolved to.
+            String lsn = BinaryOpEvaluator.lsnArithmeticTypeName(bin);
+            if (lsn != null) return DataType.fromPgName(lsn);
             DataType lt = inferTypeFromContext(bin.left(), bindings);
             DataType rt = inferTypeFromContext(bin.right(), bindings);
             // An untyped literal is PostgreSQL's unknown and takes the other operand's type,
@@ -4360,6 +4528,9 @@ class ExprEvaluator {
                 // itself wrong (surfaced while fixing mtask-8 Group 2: date_trunc(...) is the
                 // generate_series start argument in ResultsMonthlyDao's months CTE, and a
                 // timestamptz value advertised/decoded as DATE corrupts pgjdbc's binary decode).
+                // Only the zoned form takes a zone, so a third argument settles the answer
+                // whatever the second one was written as.
+                if (fn.args().size() >= 3) return DataType.TIMESTAMPTZ;
                 if (fn.args().size() >= 2) {
                     DataType dt = inferTypeFromContext(fn.args().get(1), bindings);
                     // PG has no date_trunc over date or time; a date resolves through the
@@ -4534,35 +4705,21 @@ class ExprEvaluator {
                 return DataType.TEXT;
             }
             if (name.equals("array_agg")) {
-                // Derive the array type from the argument's element type. Advertising a fixed
-                // _int4 (the old hardcoding) made pgjdbc parse text elements as int in text mode
-                // ("Bad value for type int : tennet") and, worse, decode the payload as a binary
-                // int4 array in binary mode — a garbage dimension count then triggers a giant
-                // allocation (OutOfMemoryError at PgArray.readBinaryResultSet). Anything that
-                // isn't int4-family is advertised as _text: elements travel as text, which pgjdbc
-                // can always decode (enum-element arrays get their own array OID one level up,
-                // in buildResultColumn, since a bare DataType can't carry the enum's identity).
+                // The array of whatever was aggregated. Advertising a fixed _int4 (the old
+                // hardcoding) made pgjdbc parse text elements as int in text mode and decode the
+                // payload as a binary int4 array in binary mode; falling back to _text instead
+                // was safe but wrong the other way, so a timestamp array read back as strings.
+                // An element type with an array type of its own now names it. (An enum element
+                // gets its own array OID one level up, in buildResultColumn, because a bare
+                // DataType cannot carry the enum's identity.)
                 if (!fn.args().isEmpty()) {
                     DataType elem = inferTypeFromContext(fn.args().get(0), bindings);
-                    if (elem != null) {
-                        switch (elem) {
-                            case INTEGER:
-                            case SMALLINT:
-                            case SERIAL:
-                            case SMALLSERIAL:
-                                return DataType.INT4_ARRAY;
-                            // A document is not the text it prints as, and an array of them is
-                            // read back as documents: array_agg over jsonb advertised as _text
-                            // made every later reader of the array take its elements for strings,
-                            // so to_jsonb of one quoted each of them.
-                            case JSON:
-                                return DataType.JSON_ARRAY;
-                            case JSONB:
-                                return DataType.JSONB_ARRAY;
-                            default:
-                                return DataType.TEXT_ARRAY;
-                        }
+                    if (elem == DataType.SERIAL || elem == DataType.SMALLSERIAL
+                            || elem == DataType.SMALLINT) {
+                        return DataType.INT4_ARRAY;
                     }
+                    DataType array = elem == null ? null : DataType.arrayOf(elem);
+                    if (array != null) return array;
                 }
                 return DataType.TEXT_ARRAY;
             }
@@ -4765,7 +4922,11 @@ class ExprEvaluator {
             }
             for (Expression element : arr.elements()) {
                 if (isUnknownLiteral(element)) continue;
-                DataType array = DataType.arrayOf(inferTypeFromContext(element, bindings));
+                DataType held = inferTypeFromContext(element, bindings);
+                // A constructor nested inside another adds a dimension, not a type: PostgreSQL
+                // counts dimensions on the value, so ARRAY[[1,2],[3,4]] is still int4[].
+                if (element instanceof ArrayExpr && DataType.isArrayType(held)) return held;
+                DataType array = DataType.arrayOf(held);
                 if (array != null) return array;
             }
             return DataType.TEXT_ARRAY;
@@ -4813,6 +4974,8 @@ class ExprEvaluator {
      */
     private DataType declaredBuiltinResultType(String name, FunctionCallExpr fn,
                                                List<RowContext.TableBinding> bindings) {
+        DataType rewritten = INTERNAL_FORM_TYPES.get(name);
+        if (rewritten != null) return rewritten;
         if (!BuiltinCallTypes.records(name)) return null;
         List<Expression> args = fn.args() == null ? Cols.<Expression>listOf() : fn.args();
         int[] written = new int[args.size()];
@@ -4876,7 +5039,40 @@ class ExprEvaluator {
         return null;
     }
 
+    /**
+     * The type the numbered field of a row constructor holds, or null when the expression is not
+     * a field of one. {@code (ROW(1,2)).f1} is the first element and so an integer.
+     */
+    private DataType rowConstructorFieldType(FieldAccessExpr fa,
+                                             List<RowContext.TableBinding> bindings) {
+        Expression base = fa.expr();
+        while (base instanceof CastExpr
+                && "record".equalsIgnoreCase(((CastExpr) base).typeName())) {
+            base = ((CastExpr) base).expr();
+        }
+        if (!(base instanceof ArrayExpr) || !((ArrayExpr) base).isRow()) return null;
+        String field = fa.field();
+        if (field == null || field.length() < 2 || !field.startsWith("f")) return null;
+        int at;
+        try {
+            at = Integer.parseInt(field.substring(1));
+        } catch (NumberFormatException notNumbered) {
+            return null;
+        }
+        List<Expression> elements = ((ArrayExpr) base).elements();
+        if (at < 1 || elements == null || at > elements.size()) return null;
+        return inferTypeFromContext(elements.get(at - 1), bindings);
+    }
+
     String resolveCompositeTypeName(Expression expr, List<RowContext.TableBinding> bindings) {
+        // A whole row written out is the row of whatever it was taken from.
+        if (expr instanceof CompositeStarExpr) {
+            return resolveCompositeTypeName(((CompositeStarExpr) expr).expr(), bindings);
+        }
+        if (expr instanceof WildcardExpr) {
+            String named = ((WildcardExpr) expr).table();
+            return named != null && isCompositeTypeName(named) ? named : null;
+        }
         if (expr instanceof CastExpr) {
             String named = ((CastExpr) expr).typeName().replaceAll("\\(.*\\)", "").trim();
             return isCompositeTypeName(named) ? named : null;
@@ -4980,7 +5176,11 @@ class ExprEvaluator {
     private static FunctionCallExpr findArrayAggCall(Expression expr) {
         if (expr instanceof FunctionCallExpr) {
             FunctionCallExpr fn = (FunctionCallExpr) expr;
-            return FunctionEvaluator.stripSchemaPrefix(fn.name().toLowerCase(java.util.Locale.ROOT)).equals("array_agg") ? fn : null;
+            // Both of these answer with an array of whatever their first argument is, so both
+            // need the element's own identity when that element is an enum.
+            String called = FunctionEvaluator.stripSchemaPrefix(
+                    fn.name().toLowerCase(java.util.Locale.ROOT));
+            return called.equals("array_agg") || called.equals("enum_range") ? fn : null;
         }
         if (expr instanceof SubqueryExpr) {
             SubqueryExpr sq = (SubqueryExpr) expr;
@@ -5204,10 +5404,11 @@ class ExprEvaluator {
         if (arr.isRow() || arr.elements() == null || arr.elements().isEmpty()) return null;
         String settled = null;
         for (Expression element : arr.elements()) {
-            // Only one level: an array of arrays is one value of one type here, and deciding what
-            // that type is takes rules this does not have.
-            if (element instanceof ArrayExpr) return null;
-            String name = typeWrittenInQuery(element);
+            // An array of arrays is still an array of the innermost element type: PostgreSQL
+            // counts dimensions on the value, not in the type, so ARRAY[[1,2],[3,4]] is int4[].
+            String name = element instanceof ArrayExpr
+                    ? arrayElementTypeWritten((ArrayExpr) element)
+                    : typeWrittenInQuery(element);
             if (name == null) {
                 if (!isUnknownConstant(element)) return null;
                 continue;
@@ -5243,6 +5444,10 @@ class ExprEvaluator {
             case ADD: case SUBTRACT: case MULTIPLY: case DIVIDE: case MODULO: break;
             default: return null;
         }
+        // A log position is carried as text, so the arithmetic over it is told apart by what the
+        // operands were written as rather than by what they hold.
+        String lsn = BinaryOpEvaluator.lsnArithmeticTypeName(bin);
+        if (lsn != null) return lsn;
         String left = typeWrittenInQuery(bin.left());
         String right = typeWrittenInQuery(bin.right());
         if (left == null || right == null) return null;

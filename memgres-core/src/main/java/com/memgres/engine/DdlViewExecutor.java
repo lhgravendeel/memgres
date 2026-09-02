@@ -25,11 +25,50 @@ class DdlViewExecutor {
 
     // ---- CREATE VIEW ----
 
+    /** The three parameters a view takes, and which of them is a yes-or-no answer. */
+    private static final java.util.Set<String> BOOLEAN_VIEW_OPTIONS =
+            new java.util.HashSet<>(java.util.Arrays.asList("security_barrier", "security_invoker"));
+
+    /**
+     * Refuse a parameter a view has no room for, and a value it cannot read.
+     *
+     * <p>A view takes three parameters and nothing else; a name that is none of them is a typo,
+     * and a view created with one carries a setting nothing will ever read.
+     */
+    private static void requireKnownViewOptions(java.util.Map<String, String> options) {
+        if (options == null) return;
+        for (java.util.Map.Entry<String, String> option : options.entrySet()) {
+            String name = option.getKey().toLowerCase(java.util.Locale.ROOT);
+            if (!BOOLEAN_VIEW_OPTIONS.contains(name) && !"check_option".equals(name)) {
+                throw new MemgresException(
+                        "unrecognized parameter \"" + option.getKey() + "\"", "22023");
+            }
+            if (!BOOLEAN_VIEW_OPTIONS.contains(name)) continue;
+            String written = option.getValue();
+            if (written == null) continue;
+            String value = written.toLowerCase(java.util.Locale.ROOT);
+            if (!value.equals("true") && !value.equals("false")
+                    && !value.equals("on") && !value.equals("off")
+                    && !value.equals("yes") && !value.equals("no")
+                    && !value.equals("1") && !value.equals("0")) {
+                throw new MemgresException("invalid value for boolean option \""
+                        + name + "\": " + written, "22023");
+            }
+        }
+    }
+
     QueryResult executeCreateView(CreateViewStmt stmt) {
         ddl.checkPgCatalogWriteProtection();
+        requireKnownViewOptions(stmt.withOptions());
         // A CREATE that says which schema to create in is refused outright when there is no such
         // schema, before the query it would store is looked at.
         SchemaQualifier.requireSchema(executor.database, executor.session, stmt.schema());
+        // A temporary relation lives in the session's own schema, so a statement that says which
+        // schema to put it in is asking for two different places at once.
+        if (stmt.temporary() && stmt.schema() != null) {
+            throw new MemgresException(
+                    "cannot create temporary relation in non-temporary schema", "42P16");
+        }
         // A view name is taken in the schema the view goes into, not in the database at large:
         // another schema may already hold a view of that name, and this one is still free.
         String createSchema = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
@@ -48,6 +87,12 @@ class DdlViewExecutor {
         RelationNamespace.requireFree(executor.database, targetSchema, stmt.name(),
                 stmt.materialized() ? RelationNamespace.MATVIEW : RelationNamespace.VIEW);
         Database.ViewDef oldView = executor.database.getView(targetSchema, stmt.name());
+        // IF NOT EXISTS leaves what is already there alone: it does not run the query again, and
+        // a materialized view keeps the rows it was populated with.
+        if (stmt.ifNotExists() && oldView != null) {
+            return QueryResult.message(QueryResult.Type.SET,
+                    stmt.materialized() ? "CREATE MATERIALIZED VIEW" : "CREATE VIEW");
+        }
 
         if (stmt.orReplace() && oldView != null && !stmt.materialized()) {
             try {

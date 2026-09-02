@@ -2877,6 +2877,10 @@ class FromResolver {
         }
         Table table = executor.resolveTable(schemaName, tableRef.table(), userQualified);
         // C6: Enforce SELECT privilege on user tables
+        // Reaching a relation means reaching through the schema that holds it, and USAGE on the
+        // schema is what allows that. Unchecked, a role with no rights in a schema could read
+        // every relation in it.
+        executor.checkSchemaPrivilege("USAGE", schemaName);
         executor.checkTablePrivilege("SELECT", schemaName, tableRef.table());
         // A reader inside an explicit transaction holds ACCESS SHARE until it ends, which is
         // what makes a concurrent TRUNCATE or ALTER wait instead of yanking the table away.

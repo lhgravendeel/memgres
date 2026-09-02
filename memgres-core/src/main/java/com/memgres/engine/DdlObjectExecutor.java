@@ -33,6 +33,11 @@ class DdlObjectExecutor {
         String schema = stmt.schemaName() != null
                 ? stmt.schemaName().toLowerCase(java.util.Locale.ROOT) : executor.creationSchema();
         boolean wasShell = executor.database.getShellTypes().contains(TypeNamespace.key(schema, name));
+        // A base type is defined in two steps: the shell reserves the name, and this statement
+        // fills it in. Without the shell there is nothing to fill in, and PostgreSQL says so.
+        if (stmt.baseTypeDefinition() && !wasShell) {
+            throw new MemgresException("type \"" + name + "\" does not exist", "42710");
+        }
         if (wasShell) {
             // CREATE TYPE x; twice reserves a name already reserved; any other form fills it in.
             if (stmt.shell()) throw PgErrors.duplicateObject("type", name);
@@ -50,6 +55,13 @@ class DdlObjectExecutor {
         if (stmt.enumLabels() != null) {
             Set<String> seen = new HashSet<>();
             for (String label : stmt.enumLabels()) {
+                // A label is a name, so it is bounded the way every name is: PostgreSQL refuses
+                // one longer than 63 bytes rather than storing a label nothing can write back.
+                if (label != null
+                        && label.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > 63) {
+                    throw new MemgresException(
+                            "invalid enum label \"" + label + "\"", "42602");
+                }
                 if (!seen.add(label)) {
                     // PostgreSQL surfaces this as the pg_enum index it violates, not as a DDL error
                     MemgresException dup = new MemgresException("duplicate key value violates "
@@ -659,12 +671,51 @@ class DdlObjectExecutor {
      * Require a function of this name accepting exactly these argument types. Names that look
      * like PG's internal C functions are accepted unseen — memgres has no catalog of them.
      */
+    /**
+     * An operator key written back as the operator: {@code public.###@(int,int)} reads
+     * {@code integer ###@ integer}, and a prefix operator leaves its left side out.
+     */
+    private static String writtenOperator(String key) {
+        int paren = key.indexOf('(');
+        if (paren < 0 || !key.endsWith(")")) return key;
+        String name = key.substring(0, paren);
+        int dot = name.lastIndexOf('.');
+        if (dot >= 0) name = name.substring(dot + 1);
+        String[] operands = key.substring(paren + 1, key.length() - 1).split(",");
+        String left = operands.length > 0 ? operands[0].trim() : "none";
+        String right = operands.length > 1 ? operands[1].trim() : "none";
+        StringBuilder out = new StringBuilder();
+        if (!"none".equalsIgnoreCase(left)) {
+            out.append(DataType.canonicalName(left)).append(' ');
+        }
+        out.append(name);
+        if (!"none".equalsIgnoreCase(right)) {
+            out.append(' ').append(DataType.canonicalName(right));
+        }
+        return out.toString();
+    }
+
+    /** What a restriction estimator is declared over, and what a join estimator is. */
+    private static final List<String> RESTRICT_ESTIMATOR_ARGS =
+            java.util.Arrays.asList("internal", "oid", "internal", "integer");
+    private static final List<String> JOIN_ESTIMATOR_ARGS =
+            java.util.Arrays.asList("internal", "oid", "internal", "smallint", "internal");
+
+    private void requireEstimator(String named, List<String> argTypes) {
+        if (named == null || named.isEmpty()) return;
+        requireFunctionSignature(named, argTypes);
+    }
+
     private void requireFunctionSignature(String funcName, List<String> argTypes) {
         String bare = funcName.contains(".")
                 ? funcName.substring(funcName.lastIndexOf('.') + 1) : funcName;
         List<PgFunction> overloads = executor.database.getFunctionOverloads(bare);
         if (overloads.isEmpty()) {
-            if (isKnownBuiltinFunction(funcName)) return;
+            // A built-in whose signatures are recorded is held to them: PostgreSQL has int4, and
+            // does not have int4(character varying). One whose signatures are not recorded is
+            // accepted on its name, which is as much as is known about it.
+            if (builtinSignatureMatches(bare, argTypes)) return;
+            if (!BuiltinCallTypes.records(bare) && isKnownBuiltinFunction(funcName)) return;
         } else {
             for (PgFunction f : overloads) {
                 if (paramTypesMatch(f, argTypes)) return;
@@ -673,6 +724,25 @@ class DdlObjectExecutor {
         throw new MemgresException(
                 "function " + funcName + "(" + canonicalTypeList(argTypes) + ") does not exist",
                 "42883").withoutHint();
+    }
+
+    /** Whether a recorded built-in signature of this name takes exactly these argument types. */
+    private static boolean builtinSignatureMatches(String bare, List<String> argTypes) {
+        List<String> wanted = new ArrayList<>();
+        for (String written : argTypes) wanted.add(DataType.canonicalName(written));
+        for (String[] signature : BuiltinFunctionSignatures.SIGNATURES) {
+            if (!signature[0].equalsIgnoreCase(bare)) continue;
+            String declared = signature[2].trim();
+            List<String> theirs = new ArrayList<>();
+            if (!declared.isEmpty()) {
+                for (String oid : declared.split("\\s+")) {
+                    DataType type = DataType.fromOid(Integer.parseInt(oid));
+                    theirs.add(type == null ? oid : DataType.canonicalName(type.getPgName()));
+                }
+            }
+            if (theirs.equals(wanted)) return true;
+        }
+        return false;
     }
 
     /** True when the function's declared input parameters are exactly these types. */
@@ -745,6 +815,10 @@ class DdlObjectExecutor {
         if (stmt.leftArg() != null) opArgs.add(stmt.leftArg());
         if (stmt.rightArg() != null) opArgs.add(stmt.rightArg());
         requireFunctionSignature(stmt.function(), opArgs);
+        // The two estimators are routines of their own, with signatures of their own; an
+        // operator naming one the server has not got points the planner at nothing.
+        requireEstimator(stmt.restrict(), RESTRICT_ESTIMATOR_ARGS);
+        requireEstimator(stmt.join(), JOIN_ESTIMATOR_ARGS);
 
         PgOperator op = new PgOperator(stmt.name(), stmt.leftArg(), stmt.rightArg(), stmt.function());
         op.setCommutator(stmt.commutator());
@@ -761,7 +835,7 @@ class DdlObjectExecutor {
         }
         // Set owner to current user
         if (executor.session != null) {
-            String role = executor.session.getGucSettings().get("role");
+            String role = executor.currentRole();
             op.setOwner(role != null ? role : "memgres");
         }
 
@@ -775,10 +849,12 @@ class DdlObjectExecutor {
     }
 
     QueryResult executeCreateOperatorFamily(CreateOperatorFamilyStmt stmt) {
+        // A family belongs to an access method, so there has to be one.
+        AccessMethods.require(stmt.method());
         PgOperatorFamily fam = new PgOperatorFamily(stmt.name(), stmt.method());
         if (stmt.schema() != null) fam.setSchemaName(stmt.schema());
         if (executor.session != null) {
-            String role = executor.session.getGucSettings().get("role");
+            String role = executor.currentRole();
             fam.setOwner(role != null ? role : "memgres");
         }
 
@@ -793,11 +869,12 @@ class DdlObjectExecutor {
     }
 
     QueryResult executeCreateOperatorClass(CreateOperatorClassStmt stmt) {
+        checkOperatorClassDefinition(stmt);
         PgOperatorClass cls = new PgOperatorClass(stmt.name(), stmt.forType(), stmt.method(), stmt.isDefault());
         if (stmt.schema() != null) cls.setSchemaName(stmt.schema());
         cls.setFamilyName(stmt.familyName());
         if (executor.session != null) {
-            String role = executor.session.getGucSettings().get("role");
+            String role = executor.currentRole();
             cls.setOwner(role != null ? role : "memgres");
         }
 
@@ -809,6 +886,102 @@ class DdlObjectExecutor {
 
         executor.database.addOperatorClass(cls);
         return QueryResult.command(QueryResult.Type.SET, 0);
+    }
+
+    /**
+     * Everything an operator class names has to be there before it is recorded.
+     *
+     * <p>The access method, the type it is for, the family it joins, the strategy and support
+     * numbers it uses, and the operators and functions it points at. None of it was checked, so
+     * a class over a type nobody declared, using a method nobody implements, naming a strategy
+     * the method has not got, was written down and reported as created.
+     */
+    private void checkOperatorClassDefinition(CreateOperatorClassStmt stmt) {
+        AccessMethods.require(stmt.method());
+        requireOperatorClassType(stmt.forType());
+        if (stmt.familyName() != null) {
+            String key = stmt.familyName().toLowerCase(java.util.Locale.ROOT) + ":"
+                    + stmt.method().toLowerCase(java.util.Locale.ROOT);
+            if (!executor.database.hasOperatorFamily(key)) {
+                throw new MemgresException("operator family \"" + stmt.familyName()
+                        + "\" does not exist for access method \"" + stmt.method() + "\"", "42704");
+            }
+        }
+        for (OperatorClassItem item : stmt.items()) {
+            boolean isOperator = item.kind() == OperatorClassItem.Kind.OPERATOR;
+            AccessMethods.requireNumberInRange(stmt.method(), isOperator, item.number());
+            if (isOperator) {
+                requireStrategyOperator(item, stmt.forType());
+            } else if (item.name() != null && !item.name().isEmpty()) {
+                requireFunctionSignature(item.name(), item.argTypes());
+            }
+        }
+        // A type has one default operator class per access method, and the built-in types all
+        // already have theirs.
+        if (stmt.isDefault() && defaultOperatorClassExists(stmt.forType(), stmt.method())) {
+            throw new MemgresException("could not make operator class \"" + stmt.name()
+                    + "\" be default for type " + stmt.forType(), "42710");
+        }
+    }
+
+    /** The type an operator class is over has to be a type. */
+    private void requireOperatorClassType(String name) {
+        if (name == null) return;
+        String bare = name.toLowerCase(java.util.Locale.ROOT).trim();
+        while (bare.endsWith("[]")) bare = bare.substring(0, bare.length() - 2).trim();
+        if (bare.isEmpty() || DataType.fromPgName(bare) != null) return;
+        if (executor.database.isCompositeType(bare) || executor.database.getDomain(bare) != null
+                || executor.database.getCustomEnum(bare) != null
+                || executor.database.isRangeType(bare)) {
+            return;
+        }
+        throw new MemgresException("type \"" + name + "\" does not exist", "42704");
+    }
+
+    /** The operator a strategy points at has to exist for the types the class is over. */
+    private void requireStrategyOperator(OperatorClassItem item, String forType) {
+        String symbol = item.name();
+        if (symbol == null || symbol.isEmpty()) return;
+        String left = item.argTypes().isEmpty() ? forType : item.argTypes().get(0);
+        String right = item.argTypes().size() > 1 ? item.argTypes().get(1) : left;
+        // The operators the server itself provides are not in the user operator table.
+        if (PgOperatorTable.isKnownOperatorName(symbol)) return;
+        String l = left == null ? "NONE" : left.toLowerCase(java.util.Locale.ROOT);
+        String r = right == null ? "NONE" : right.toLowerCase(java.util.Locale.ROOT);
+        // An operator may be written with the schema that holds it, and then that is the only
+        // schema it is looked for in.
+        int dot = symbol.lastIndexOf('.');
+        if (dot > 0) {
+            String schema = symbol.substring(0, dot).toLowerCase(java.util.Locale.ROOT);
+            String bare = symbol.substring(dot + 1);
+            if (executor.database.hasOperator(schema + "." + bare + "(" + l + "," + r + ")")) return;
+            if (PgOperatorTable.isKnownOperatorName(bare)) return;
+        } else {
+            for (String schema : executor.relationSearchPath()) {
+                if (executor.database.hasOperator(schema + "." + symbol + "(" + l + "," + r + ")")) {
+                    return;
+                }
+            }
+        }
+        throw new MemgresException("operator does not exist: "
+                + CatalogSystemFunctions.readableTypeName(left) + " " + symbol + " "
+                + CatalogSystemFunctions.readableTypeName(right), "42883");
+    }
+
+    /** Whether this type already has a default operator class for the method. */
+    private boolean defaultOperatorClassExists(String forType, String method) {
+        for (PgOperatorClass c : executor.database.getUserOperatorClasses().values()) {
+            if (c.isDefault() && c.getMethod().equalsIgnoreCase(method)
+                    && c.getForType().equalsIgnoreCase(forType)) {
+                return true;
+            }
+        }
+        // Every built-in type ships with a default class for the two methods that index by
+        // ordering and by hashing. The others have none until somebody writes one.
+        String m = method == null ? "" : method.toLowerCase(java.util.Locale.ROOT);
+        if (!"btree".equals(m) && !"hash".equals(m)) return false;
+        return DataType.fromPgName(forType == null ? "" : forType.toLowerCase(java.util.Locale.ROOT))
+                != null;
     }
 
     QueryResult executeAlterOperator(AlterOperatorStmt stmt) {
@@ -1002,6 +1175,14 @@ class DdlObjectExecutor {
             }
         }
         validateSignature(params);
+        requireDistinctParameterNames(params);
+        // A trigger function is called by the trigger machinery, which passes its arguments
+        // through TG_ARGV rather than as parameters; one declared with parameters could never
+        // be called at all.
+        if ("trigger".equalsIgnoreCase(stmt.returnType()) && !params.isEmpty()) {
+            throw new MemgresException("trigger functions cannot have declared arguments", "42P13");
+        }
+        requireRowsOnlyForASetReturner(stmt);
 
         // A polymorphic result has to be determinable from a polymorphic argument of the same family.
         PolymorphicTypes.validateSignature(stmt.returnType(), params.stream()
@@ -1395,9 +1576,10 @@ class DdlObjectExecutor {
     }
 
     private void validateSqlFunctionBody(CreateFunctionStmt stmt, List<PgFunction.Param> params) {
+        requireBodyThatCanReturn(stmt);
         try {
             // Validate type casts, function calls, and sequences in SQL body text
-            validateSqlBodyReferences(stmt.body());
+            validateSqlBodyReferences(stmt.body(), stmt.name());
             // Validate collation references in SQL body (PG validates eagerly at CREATE time)
             validateSqlBodyCollations(stmt.body());
             List<String> bodyStmts = splitSqlStatements(stmt.body());
@@ -1446,7 +1628,12 @@ class DdlObjectExecutor {
      * Validate references in SQL function body text: type casts, function calls, sequences.
      * SQL-language functions in PG eagerly validate all object references at CREATE time.
      */
-    private void validateSqlBodyReferences(String body) {
+    /**
+     * @param beingCreated the function this body belongs to, which may call itself: PostgreSQL
+     *                     records the routine before it reads the body, so a recursive SQL
+     *                     function resolves its own name.
+     */
+    private void validateSqlBodyReferences(String body, String beingCreated) {
         // Check type casts: ::type_name
         java.util.regex.Matcher castMatcher = java.util.regex.Pattern.compile(
                 "::\\s*([a-zA-Z_][a-zA-Z0-9_]*)").matcher(body);
@@ -1470,6 +1657,7 @@ class DdlObjectExecutor {
             if (before.endsWith("into") || before.endsWith("from") || before.endsWith("table")
                     || before.endsWith("update") || before.endsWith("join")
                     || before.endsWith("on") || before.endsWith(")")) continue;
+            if (beingCreated != null && fnName.equals(unqualified(beingCreated))) continue;
             if (executor.database.getFunction(fnName) == null) {
                 throw new MemgresException("function " + fnName + "() does not exist", "42883");
             }
@@ -1483,6 +1671,12 @@ class DdlObjectExecutor {
                 throw new MemgresException("relation \"" + seqName + "\" does not exist", "42P01");
             }
         }
+    }
+
+    /** A name with any schema qualification taken off, lower cased. */
+    private static String unqualified(String name) {
+        int dot = name.lastIndexOf('.');
+        return (dot < 0 ? name : name.substring(dot + 1)).toLowerCase(java.util.Locale.ROOT);
     }
 
     private boolean isKnownType(String typeName) {
@@ -1512,6 +1706,87 @@ class DdlObjectExecutor {
                 "coalesce", "greatest", "least", "cast",
                 "count", "sum", "avg", "min", "max",
                 "begin", "do", "call", "perform", "return").contains(name);
+    }
+
+    /**
+     * A SQL function returns the result of its final statement, so a body holding no statement at
+     * all can only return a value when there is no value to return. PostgreSQL reports the
+     * mismatch against the declared type; {@code void} and a procedure are content with nothing.
+     */
+    /**
+     * Two parameters of one routine cannot share a name: the body would have no way to say which
+     * of them it meant.
+     */
+    private void requireDistinctParameterNames(List<PgFunction.Param> params) {
+        java.util.Set<String> seen = new java.util.HashSet<String>();
+        for (PgFunction.Param p : params) {
+            if (p.name() == null || p.name().isEmpty()) continue;
+            if (!seen.add(p.name().toLowerCase(java.util.Locale.ROOT))) {
+                throw new MemgresException(
+                        "parameter name \"" + p.name() + "\" used more than once", "42P13");
+            }
+        }
+    }
+
+    /**
+     * ROWS estimates how many rows a call gives back, so it says nothing about a routine that
+     * gives back one value.
+     */
+    private void requireRowsOnlyForASetReturner(CreateFunctionStmt stmt) {
+        // A negative value is the mark for "no ROWS was written".
+        if (stmt.rows() < 0) return;
+        String returns = stmt.returnType();
+        boolean setReturning = returns != null
+                && (returns.toUpperCase(java.util.Locale.ROOT).startsWith("SETOF")
+                    || returns.toUpperCase(java.util.Locale.ROOT).startsWith("TABLE"));
+        if (!setReturning) {
+            throw new MemgresException(
+                    "ROWS is not applicable when function does not return a set", "22023");
+        }
+    }
+
+    private void requireBodyThatCanReturn(CreateFunctionStmt stmt) {
+        if (stmt.isProcedure()) return;
+        String retType = stmt.returnType();
+        if (retType == null || retType.isEmpty() || "void".equalsIgnoreCase(retType)
+                || "trigger".equalsIgnoreCase(retType) || "event_trigger".equalsIgnoreCase(retType)) {
+            return;
+        }
+        for (String piece : splitSqlStatements(stmt.body())) {
+            if (!strippedOfComments(piece).isEmpty()) return;
+        }
+        // SETOF integer still reports the element type, which is what the function returns.
+        String named = retType.trim();
+        if (named.toUpperCase(java.util.Locale.ROOT).startsWith("SETOF ")) {
+            named = named.substring("SETOF ".length()).trim();
+        }
+        throw new MemgresException(
+                "return type mismatch in function declared to return " + spelledOutTypeName(named)
+                + "\n  Detail: Function's final statement must be SELECT or"
+                + " INSERT/UPDATE/DELETE RETURNING.", "42P13");
+    }
+
+    /** What is left of a body once comments and whitespace are taken away. */
+    private static String strippedOfComments(String text) {
+        if (text == null) return "";
+        StringBuilder kept = new StringBuilder();
+        for (String line : text.split("\n", -1)) {
+            String trimmed = line.trim();
+            if (trimmed.startsWith("--")) continue;
+            kept.append(trimmed);
+        }
+        return kept.toString().replace("/*", "").replace("*/", "").trim();
+    }
+
+    /** The name PostgreSQL prints for a declared type, so {@code int} reads as {@code integer}. */
+    private static String spelledOutTypeName(String declared) {
+        try {
+            String canonical = DataType.canonicalName(declared);
+            if (canonical != null && !canonical.isEmpty()) return canonical;
+        } catch (RuntimeException ignored) {
+            // A domain or a composite keeps the name it was declared with.
+        }
+        return declared;
     }
 
     private void validateSqlFunctionStatement(Statement parsed, CreateFunctionStmt stmt,
@@ -1801,18 +2076,60 @@ class DdlObjectExecutor {
     }
 
     /** Check if function name looks like a known PG internal C function (used in CREATE OPERATOR/AGGREGATE). */
+    /**
+     * Whether the server itself provides a routine of this name.
+     *
+     * <p>Read off the registers the catalogue is built from — the callable built-ins, the
+     * routines behind the built-in operators and their selectivity estimators, the built-in
+     * aggregates and the routines that read and write each type. Guessed from the shape of the
+     * name instead, every name ending in {@code eq} or {@code in} was taken for one, so an
+     * operator could be created over a function nobody had written.
+     */
     private static boolean isKnownBuiltinFunction(String rawName) {
         String name = rawName.contains(".") ? rawName.substring(rawName.lastIndexOf('.') + 1) : rawName;
-        // PG internal C functions often follow patterns: int4pl, int4eq, float8lt, texteq, etc.
-        if (name.matches("(int[248]|float[48]|numeric|text|bool|date|timestamp|interval|oid|name|char|varchar|bytea|uuid|json|jsonb|box|point|circle|path|line|lseg|polygon|inet|macaddr|bit|varbit|cash|bpchar)\\w+")) return true;
-        // Common aggregate transition/combine/final functions
-        if (name.matches("(hash|btree|gin|gist|brin|spg|pg_)\\w+")) return true;
-        if (name.matches("\\w+(recv|send|in|out|typmod|analyze|cmp|hash|eq|ne|lt|le|gt|ge|_agg|_accum|_combine|_final|_serialize|_deserialize|_transition)")) return true;
-        return false;
+        return BuiltinRoutineNames.contains(name)
+                || BUILTIN_ROUTINE_NAMES.contains(name.toLowerCase(java.util.Locale.ROOT));
+    }
+
+    private static final Set<String> BUILTIN_ROUTINE_NAMES = builtinRoutineNames();
+
+    private static Set<String> builtinRoutineNames() {
+        Set<String> names = new java.util.HashSet<String>();
+        for (String[] signature : BuiltinFunctionSignatures.SIGNATURES) {
+            names.add(signature[0].toLowerCase(java.util.Locale.ROOT));
+        }
+        for (String[] window : BuiltinFunctionSignatures.WINDOW_FUNCTIONS) {
+            names.add(window[0].toLowerCase(java.util.Locale.ROOT));
+        }
+        for (String[] aggregate : BuiltinAggregateSignatures.AGGREGATES) {
+            names.add(aggregate[0].toLowerCase(java.util.Locale.ROOT));
+        }
+        for (Object[] operator : PgOperatorTable.OPERATORS) {
+            names.add(((String) operator[5]).toLowerCase(java.util.Locale.ROOT));
+            names.add(((String) operator[11]).toLowerCase(java.util.Locale.ROOT));
+            names.add(((String) operator[12]).toLowerCase(java.util.Locale.ROOT));
+        }
+        for (Object[] cast : PgCastTable.CASTS) {
+            names.add(((String) cast[2]).toLowerCase(java.util.Locale.ROOT));
+        }
+        // The routines each type is read and written by, named the way the catalogue names them.
+        for (DataType type : DataType.values()) {
+            String bare = type.getPgName().replace("[]", "").replace("\"", "");
+            for (String suffix : new String[]{"in", "out", "recv", "send", "typmodin",
+                    "typmodout", "_typanalyze"}) {
+                names.add((bare + suffix).toLowerCase(java.util.Locale.ROOT));
+            }
+        }
+        names.remove("");
+        names.remove("-");
+        return names;
     }
 
     private static boolean isBuiltinFunction(String name) {
-        // Common built-in functions that don't need validation
+        // The register the engine dispatches calls from, so a body may name anything the engine
+        // can actually call. The list below it is the older hand-kept subset, which said no to
+        // built-ins nobody had thought to add — ascii and cardinality among them.
+        if (BuiltinFunctionNames.isCallable(name)) return true;
         return Cols.setOf("now", "current_timestamp", "current_date", "current_time",
                 "current_user", "session_user", "localtime", "localtimestamp",
                 "clock_timestamp", "statement_timestamp", "transaction_timestamp",
@@ -2380,7 +2697,12 @@ class DdlObjectExecutor {
             List<Column> columns = new ArrayList<>();
             for (PgFunction.Param p : outParams) {
                 String colName = p.name() != null ? p.name() : "column" + (columns.size() + 1);
-                columns.add(new Column(colName, DataType.TEXT, true, false, null));
+                // An output parameter comes back as the type it was declared with, which is what
+                // a client decodes it by; described as text, an integer arrived as a string.
+                DataType declaredOut = p.typeName() == null ? null
+                        : DataType.fromPgName(p.typeName().replaceAll("\\(.*\\)", "").trim());
+                columns.add(new Column(colName,
+                        declaredOut == null ? DataType.TEXT : declaredOut, true, false, null));
             }
             Object[] row;
             if (returnVal instanceof Object[]) {
@@ -3052,6 +3374,10 @@ class DdlObjectExecutor {
                 String castName = stmt.name();
                 if (castName != null && castName.contains("->")) {
                     String[] parts = castName.split("->");
+                    // A cast is between two types, and a type that is not there is what
+                    // PostgreSQL reports first: there is no cast to look for until both are.
+                    validateTypeExists(parts[0].trim());
+                    validateTypeExists(parts[1].trim());
                     int srcOid = resolveTypeOid(parts[0].trim());
                     int tgtOid = resolveTypeOid(parts[1].trim());
                     boolean exists = executor.database.getUserDefinedCasts().stream()
@@ -3080,7 +3406,11 @@ class DdlObjectExecutor {
                 }
                 if (!executor.database.hasOperator(opKey)) {
                     if (!stmt.ifExists()) {
-                        throw new MemgresException("operator does not exist: " + stmt.name(), "42704");
+                        // Named the way an operator is written: its operands around its symbol,
+                        // with the side it has none on left out.
+                        throw new MemgresException(
+                                "operator does not exist: " + writtenOperator(stmt.name()),
+                                "42883").withoutHint();
                     }
                 }
                 executor.database.removeOperator(opKey);
@@ -5749,6 +6079,14 @@ class DdlObjectExecutor {
         // subquery is reported even when the access method or the index name is also wrong.
         checkIndexExpressionsAndPredicate(s);
         Table indexTarget = resolveIndexTarget(s);
+        // The tablespace is judged once the relation is open, which is the order PostgreSQL
+        // judges them in. memgres keeps everything in memory and so has only the two tablespaces
+        // PostgreSQL always ships; a name outside them names nowhere to put the index.
+        if (s.tablespace() != null && !"pg_default".equalsIgnoreCase(s.tablespace())
+                && !"pg_global".equalsIgnoreCase(s.tablespace())) {
+            throw new MemgresException(
+                    "tablespace \"" + s.tablespace() + "\" does not exist", "42704");
+        }
         // An index nobody named still gets one: PostgreSQL derives it from the relation and from
         // what each indexed column is worth as a name, and numbers it when a relation of that name
         // already lives in the schema. Leaving the name null registered nothing at all and still
@@ -5759,7 +6097,8 @@ class DdlObjectExecutor {
                             s.columns(), s.includeColumns()),
                     s.schema(), s.table(), s.columns(), s.unique(), s.ifNotExists(),
                     s.concurrently(), s.method(), s.includeColumns(), s.whereClause(),
-                    s.columnOptions(), s.nullsNotDistinct(), s.withOptions());
+                    s.columnOptions(), s.nullsNotDistinct(), s.withOptions())
+                    .withTablespace(s.tablespace());
         }
         if (indexTarget != null) {
             DdlIndexValidator.validate(executor.database, indexTarget, s.method(), s.unique(),
@@ -6286,12 +6625,18 @@ class DdlObjectExecutor {
         boolean deterministic = true;
 
         if (stmt.fromCollation != null) {
-            // CREATE COLLATION name FROM existing_collation
-            // Just register it with default libc provider
+            // The collation copied from has to be one, or there is nothing to copy.
+            DdlDefinitionChecks.requireCollationExists(ddl.executor.database, stmt.fromCollation);
             ddl.executor.database.addCollation(new Database.CollationDef(
-                    name, "c", null, null, null, true, stmt.fromCollation));
+                    name, "c", null, null, null, true, stmt.fromCollation,
+                    collationSchema(stmt)));
             return QueryResult.message(QueryResult.Type.SET, "CREATE COLLATION");
         }
+        // Everything the definition names has to be something, and the two locale halves come
+        // as a pair. None of it was checked, so a collation over a locale nobody has, from a
+        // provider nobody implements, written with an attribute that does not exist, was
+        // recorded and reported as created.
+        checkCollationOptions(stmt.options);
 
         for (java.util.Map.Entry<String, String> entry : stmt.options.entrySet()) {
             switch (entry.getKey()) {
@@ -6316,9 +6661,106 @@ class DdlObjectExecutor {
             }
         }
 
+        // LOCALE sets both halves, which is what pg_collation records — they were left null, so
+        // a reader of collcollate and collctype saw nothing for a collation that has both.
+        if (lcCollate == null) lcCollate = locale;
+        if (lcCtype == null) lcCtype = locale;
         ddl.executor.database.addCollation(new Database.CollationDef(
-                name, provider, locale, lcCollate, lcCtype, deterministic, null));
+                name, provider, locale, lcCollate, lcCtype, deterministic, null,
+                collationSchema(stmt)));
         return QueryResult.message(QueryResult.Type.SET, "CREATE COLLATION");
+    }
+
+    /** The schema a collation is made in: the one it named, else where the session creates. */
+    private String collationSchema(CreateCollationStmt stmt) {
+        if (stmt.schemaName == null) return ddl.executor.creationSchema();
+        ddl.executor.ddlExecutor.requireSchemaExists(stmt.schemaName);
+        return stmt.schemaName;
+    }
+
+    /** The locales this server can collate under. Anything else has no locale to load. */
+    /** The locale names that stand for no locale at all, and so always exist. */
+    private static final java.util.Set<String> LOCALE_INDEPENDENT_NAMES =
+            new java.util.HashSet<String>(java.util.Arrays.asList(
+                    "c", "posix", "und", "c.utf-8", "c.utf8", "ucs_basic", "default"));
+
+    /**
+     * Whether the host could have this locale, judged by the language and country it names.
+     *
+     * <p>Which locales are actually installed is a property of the machine, so an allow-list of
+     * names would say different things on different hosts, and memgres runs wherever the JVM
+     * does. What can be decided anywhere is whether the name denotes a language and a country at
+     * all: {@code fr_FR.utf8} does and {@code zz_ZZ.nosuchlocale} does not, because {@code zz} is
+     * no language.
+     */
+    private static boolean namesAPossibleLocale(String value) {
+        String name = value.trim().toLowerCase(java.util.Locale.ROOT);
+        if (name.isEmpty()) return false;
+        if (LOCALE_INDEPENDENT_NAMES.contains(name)) return true;
+        int at = name.indexOf('@');
+        if (at >= 0) name = name.substring(0, at);
+        int dot = name.indexOf('.');
+        if (dot >= 0) name = name.substring(0, dot);
+        String[] parts = name.split("[_-]");
+        if (!java.util.Arrays.asList(java.util.Locale.getISOLanguages()).contains(parts[0])) {
+            return false;
+        }
+        if (parts.length > 1 && !parts[1].isEmpty()
+                && !java.util.Arrays.asList(java.util.Locale.getISOCountries())
+                        .contains(parts[1].toUpperCase(java.util.Locale.ROOT))) {
+            return false;
+        }
+        return parts.length <= 2;
+    }
+
+    /**
+     * Refuse a collation definition that names something the server has not got.
+     *
+     * <p>PostgreSQL checks these in a fixed order: an attribute it does not know first, then the
+     * provider, then that the two locale halves are both settled, then the locale itself, and
+     * last whether the provider can do a nondeterministic collation.
+     */
+    private void checkCollationOptions(java.util.Map<String, String> options) {
+        for (String written : options.keySet()) {
+            if (!java.util.Arrays.asList("provider", "locale", "lc_collate", "lc_ctype",
+                    "deterministic", "rules", "version").contains(written)) {
+                throw new MemgresException(
+                        "collation attribute \"" + written + "\" not recognized", "42601");
+            }
+        }
+        String provider = options.get("provider");
+        if (provider != null) {
+            String p = provider.toLowerCase(java.util.Locale.ROOT);
+            if (!p.equals("libc") && !p.equals("icu") && !p.equals("builtin")) {
+                throw new MemgresException(
+                        "unrecognized collation provider: " + provider, "42P17");
+            }
+        }
+        // LOCALE settles both halves; otherwise each has to be given.
+        if (options.get("locale") == null) {
+            if (options.get("lc_collate") == null) {
+                throw new MemgresException("parameter \"lc_collate\" must be specified", "42P17");
+            }
+            if (options.get("lc_ctype") == null) {
+                throw new MemgresException("parameter \"lc_ctype\" must be specified", "42P17");
+            }
+        }
+        // ICU takes any tag and falls back to its root collation, so it rejects nothing.
+        boolean icu = "icu".equalsIgnoreCase(provider == null ? "" : provider);
+        for (String key : new String[]{"locale", "lc_collate", "lc_ctype"}) {
+            String value = options.get(key);
+            if (value == null || icu) continue;
+            if (!namesAPossibleLocale(value)) {
+                throw new MemgresException("could not create locale \"" + value
+                        + "\": No such file or directory", "22023");
+            }
+        }
+        // Only ICU can compare two different strings as equal, and memgres provides libc.
+        if ("false".equalsIgnoreCase(options.get("deterministic"))
+                && !"icu".equalsIgnoreCase(provider == null ? "" : provider)) {
+            throw new MemgresException(
+                    "nondeterministic collations not supported with this provider", "0A000");
+        }
     }
 
     // ---- CREATE CAST ----
@@ -6343,8 +6785,19 @@ class DdlObjectExecutor {
             throw new MemgresException(
                     "source data type and target data type are the same", "42P17");
         }
-        if (executor.database.getUserDefinedCasts().stream()
-                .anyMatch(c -> (int) c[0] == sourceOid && (int) c[1] == targetOid)) {
+        // A cast the server already provides is one that already exists, whether somebody wrote
+        // it or PostgreSQL ships it.
+        boolean alreadyThere = executor.database.getUserDefinedCasts().stream()
+                .anyMatch(c -> (int) c[0] == sourceOid && (int) c[1] == targetOid);
+        if (!alreadyThere) {
+            for (Object[] shipped : PgCastTable.CASTS) {
+                if ((Integer) shipped[0] == sourceOid && (Integer) shipped[1] == targetOid) {
+                    alreadyThere = true;
+                    break;
+                }
+            }
+        }
+        if (alreadyThere) {
             throw new MemgresException("cast from type " + DataType.canonicalName(stmt.sourceType)
                     + " to type " + DataType.canonicalName(stmt.targetType) + " already exists", "42710");
         }
@@ -6371,7 +6824,12 @@ class DdlObjectExecutor {
             func = overloads.get(0);
         }
         if (func == null) {
-            if (isKnownBuiltinFunction(stmt.functionName)) return;
+            // A built-in whose signatures are recorded is held to them; one whose signatures are
+            // not is accepted on its name, which is as much as is known about it.
+            List<String> written = stmt.funcArgTypes == null
+                    ? java.util.Collections.<String>emptyList() : stmt.funcArgTypes;
+            if (builtinSignatureMatches(bare, written)) return;
+            if (!BuiltinCallTypes.records(bare) && isKnownBuiltinFunction(stmt.functionName)) return;
             throw new MemgresException("function " + stmt.functionName + "("
                     + canonicalTypeList(stmt.funcArgTypes) + ") does not exist",
                     "42883").withoutHint();
@@ -6566,6 +7024,20 @@ class DdlObjectExecutor {
                 throw new MemgresException("relation \"" + name + "\" does not exist", "42P01");
             }
             return;
+        } else if (kind.equals("table") || kind.equals("view") || kind.equals("materialized view")
+                || kind.equals("index") || kind.equals("sequence")) {
+            // A relation is reported missing the way every other statement reports one, so
+            // ALTER EXTENSION ... ADD TABLE names a relation that has to be there.
+            try {
+                executor.resolveTable(null, name);
+                return;
+            } catch (MemgresException notARelation) {
+                if (executor.database.getSequence(name) != null) return;
+                if (executor.database.getView(name) != null) return;
+                if (executor.database.hasIndex(name.toLowerCase(java.util.Locale.ROOT))) return;
+                throw new MemgresException(
+                        "relation \"" + name + "\" does not exist", "42P01");
+            }
         } else {
             return;
         }
