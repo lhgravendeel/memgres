@@ -1,0 +1,9 @@
+-- source: investigation-2026-08.md
+-- finding: 252
+-- title: SERIALIZABLE conflict detection records tables, not rows or predicates: checkSsiConflicts aborts whenever a committed serializable transaction wrote a table thi
+-- A: BEGIN ISOLATION LEVEL SERIALIZABLE; SELECT v FROM zz_t WHERE i = 1;
+-- B: BEGIN ISOLATION LEVEL SERIALIZABLE; SELECT v FROM zz_t WHERE i = 2;
+-- A: UPDATE zz_t SET v = 111 WHERE i = 1;
+-- B: UPDATE zz_t SET v = 222 WHERE i = 2;
+-- A: COMMIT;
+-- B: COMMIT;

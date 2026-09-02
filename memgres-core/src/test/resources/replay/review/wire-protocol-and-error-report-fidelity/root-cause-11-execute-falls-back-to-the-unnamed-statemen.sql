@@ -1,0 +1,5 @@
+-- source: review-2026-08.md
+-- finding: Root cause 11: Execute falls back to the unnamed statement when the portal is missing
+-- area: Wire protocol and error-report fidelity
+-- title: Root cause 11: Execute falls back to the unnamed statement when the portal is missing
+-- Execute message naming a portal that was never bound;

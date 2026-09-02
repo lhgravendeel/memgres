@@ -97,10 +97,16 @@ public class Database {
         public final String lcCtype;
         public final boolean deterministic;
         public final String fromCollation; // if created with FROM clause
+        /** The schema that holds it, which a definition may name and pg_collation reports. */
+        public final String schemaName;
         public CollationDef(String name, String provider, String locale, String lcCollate, String lcCtype, boolean deterministic, String fromCollation) {
+            this(name, provider, locale, lcCollate, lcCtype, deterministic, fromCollation, "public");
+        }
+        public CollationDef(String name, String provider, String locale, String lcCollate, String lcCtype, boolean deterministic, String fromCollation, String schemaName) {
             this.name = name; this.provider = provider; this.locale = locale;
             this.lcCollate = lcCollate; this.lcCtype = lcCtype;
             this.deterministic = deterministic; this.fromCollation = fromCollation;
+            this.schemaName = schemaName == null ? "public" : schemaName;
         }
     }
 
@@ -4177,28 +4183,53 @@ public class Database {
     // ---- Role management ----
 
     public void createRole(String name, Map<String, String> attributes) {
-        roles.put(name.toLowerCase(java.util.Locale.ROOT), new ConcurrentHashMap<>(attributes));
+        // PASSWORD NULL says the role has no password, which arrives here as an attribute with a
+        // null value — and a map that cannot hold one threw out of the middle of CREATE ROLE as
+        // an internal error, leaving the role unmade.
+        Map<String, String> kept = new ConcurrentHashMap<>();
+        if (attributes != null) {
+            for (Map.Entry<String, String> e : attributes.entrySet()) {
+                if (e.getKey() != null && e.getValue() != null) kept.put(e.getKey(), e.getValue());
+            }
+        }
+        // The name is kept as the statement wrote it. An unquoted one was folded by the parser
+        // already; a quoted one means what it says, and folding it here made "zz_MiXeD" a role
+        // nobody could find by the name they created it with.
+        roles.put(name, kept);
     }
 
+    /**
+     * The roles PostgreSQL ships with. They are granted to give a role a set of rights in one go,
+     * and pg_roles lists them without any of them being created here — so a statement naming one
+     * was told no such role exists, while the catalogue was showing it all along.
+     */
+    private static final java.util.Set<String> PREDEFINED_ROLES =
+            new java.util.HashSet<String>(java.util.Arrays.asList(
+                    "pg_database_owner", "pg_read_all_data", "pg_write_all_data", "pg_monitor",
+                    "pg_read_all_settings", "pg_read_all_stats", "pg_stat_scan_tables",
+                    "pg_read_server_files", "pg_write_server_files", "pg_execute_server_program",
+                    "pg_signal_backend", "pg_checkpoint", "pg_use_reserved_connections",
+                    "pg_create_subscription", "pg_maintain"));
+
     public boolean hasRole(String name) {
-        return roles.containsKey(name.toLowerCase(java.util.Locale.ROOT));
+        return roles.containsKey(name)
+                || PREDEFINED_ROLES.contains(name.toLowerCase(java.util.Locale.ROOT));
     }
 
     public Map<String, String> getRole(String name) {
-        return roles.get(name.toLowerCase(java.util.Locale.ROOT));
+        return roles.get(name);
     }
 
     public void removeRole(String name) {
-        String lower = name.toLowerCase(java.util.Locale.ROOT);
-        roles.remove(lower);
+        roles.remove(name);
         // Clean up memberships: remove this role as a member from all groups
         for (Set<String> members : roleMemberships.values()) {
-            members.remove(lower);
+            members.remove(name);
         }
         // Remove empty membership entries
         roleMemberships.entrySet().removeIf(e -> e.getValue().isEmpty());
         // Also remove this role's own membership entry (if it was a group)
-        roleMemberships.remove(lower);
+        roleMemberships.remove(name);
     }
 
     public Map<String, Map<String, String>> getRoles() {
@@ -4215,8 +4246,8 @@ public class Database {
      * answered to any more — a rename silently revoked every grant the role held.
      */
     public void renameRole(String from, String to) {
-        String oldName = from.toLowerCase(java.util.Locale.ROOT);
-        String newName = to.toLowerCase(java.util.Locale.ROOT);
+        String oldName = from;
+        String newName = to;
         if (oldName.equals(newName)) return;
         Map<String, String> attributes = roles.remove(oldName);
         if (attributes == null) return;
@@ -4272,24 +4303,23 @@ public class Database {
     }
 
     public void addRoleMembership(String grantedRole, String memberRole, boolean withAdminOption) {
-        roleMemberships.computeIfAbsent(grantedRole.toLowerCase(java.util.Locale.ROOT), k -> ConcurrentHashMap.newKeySet())
-                .add(memberRole.toLowerCase(java.util.Locale.ROOT));
-        String key = grantedRole.toLowerCase(java.util.Locale.ROOT) + "|" + memberRole.toLowerCase(java.util.Locale.ROOT);
+        roleMemberships.computeIfAbsent(grantedRole, k -> ConcurrentHashMap.newKeySet())
+                .add(memberRole);
+        String key = grantedRole + "|" + memberRole;
         if (withAdminOption) {
             roleAdminOptions.put(key, true);
         }
     }
 
     public boolean hasAdminOption(String grantedRole, String memberRole) {
-        return Boolean.TRUE.equals(
-                roleAdminOptions.get(grantedRole.toLowerCase(java.util.Locale.ROOT) + "|" + memberRole.toLowerCase(java.util.Locale.ROOT)));
+        return Boolean.TRUE.equals(roleAdminOptions.get(grantedRole + "|" + memberRole));
     }
 
     public void removeRoleMembership(String grantedRole, String memberRole) {
-        Set<String> members = roleMemberships.get(grantedRole.toLowerCase(java.util.Locale.ROOT));
+        Set<String> members = roleMemberships.get(grantedRole);
         if (members != null) {
-            members.remove(memberRole.toLowerCase(java.util.Locale.ROOT));
-            if (members.isEmpty()) roleMemberships.remove(grantedRole.toLowerCase(java.util.Locale.ROOT));
+            members.remove(memberRole);
+            if (members.isEmpty()) roleMemberships.remove(grantedRole);
         }
     }
 
@@ -4300,10 +4330,10 @@ public class Database {
      */
     public boolean isRoleMemberOf(String member, String role) {
         if (member == null || role == null) return false;
-        String want = role.toLowerCase(java.util.Locale.ROOT);
+        String want = role;
         Set<String> seen = ConcurrentHashMap.newKeySet();
         Deque<String> pending = new ArrayDeque<>();
-        pending.add(member.toLowerCase(java.util.Locale.ROOT));
+        pending.add(member);
         while (!pending.isEmpty()) {
             String current = pending.poll();
             if (!seen.add(current)) continue;
@@ -4316,12 +4346,12 @@ public class Database {
     }
 
     public boolean hasRoleMemberships(String roleName) {
-        Set<String> members = roleMemberships.get(roleName.toLowerCase(java.util.Locale.ROOT));
+        Set<String> members = roleMemberships.get(roleName);
         return members != null && !members.isEmpty();
     }
 
     public void removeAllRoleMemberships(String roleName) {
-        String lower = roleName.toLowerCase(java.util.Locale.ROOT);
+        String lower = roleName;
         // Remove the role as a granted role (revoke all members)
         roleMemberships.remove(lower);
         // Remove the role as a member of other roles

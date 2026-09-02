@@ -1722,14 +1722,13 @@ class UtilityParser {
             objectType = "ALL " + what + " IN SCHEMA";
         } else if (parser.matchKeyword("TABLE")) {
             objectName = parser.readIdentifier();
-            // M10: Preserve schema prefix for schema-qualified tables
             if (parser.match(TokenType.DOT)) objectName = objectName + "." + parser.readIdentifier();
         } else if (parser.matchKeyword("SEQUENCE")) {
             objectType = "SEQUENCE";
-            objectName = parser.readIdentifier();
+            objectName = qualifiedObjectName();
         } else if (parser.matchKeyword("FUNCTION") || parser.matchKeyword("PROCEDURE") || parser.matchKeyword("ROUTINE")) {
             objectType = "FUNCTION";
-            objectName = parser.readIdentifier();
+            objectName = qualifiedObjectName();
             // The argument list says which routine of that name this is, so it travels with the
             // name. Consumed and thrown away, a grant on one overload was a grant on whichever
             // overload happened to be found, and a signature matching none was not noticed.
@@ -1744,13 +1743,13 @@ class UtilityParser {
             objectName = parser.readIdentifier();
         } else if (parser.matchKeyword("DOMAIN")) {
             objectType = "DOMAIN";
-            objectName = parser.readIdentifier();
+            objectName = qualifiedObjectName();
         } else if (parser.matchKeyword("LANGUAGE")) {
             objectType = "LANGUAGE";
             objectName = parser.readIdentifier();
         } else if (parser.matchKeyword("TYPE")) {
             objectType = "TYPE";
-            objectName = parser.readIdentifier();
+            objectName = qualifiedObjectName();
         } else if (parser.matchKeyword("FOREIGN")) {
             // FOREIGN DATA WRAPPER name or FOREIGN SERVER name
             if (parser.matchKeyword("DATA")) {
@@ -1767,9 +1766,7 @@ class UtilityParser {
             objectType = "LARGE OBJECT";
             objectName = parser.advance().value(); // OID is a number, not an identifier
         } else {
-            objectName = parser.readIdentifier();
-            // M10: Preserve schema prefix for default TABLE path
-            if (parser.match(TokenType.DOT)) objectName = objectName + "." + parser.readIdentifier();
+            objectName = qualifiedObjectName();
         }
 
         parser.expectKeyword("TO");
@@ -1864,15 +1861,13 @@ class UtilityParser {
             objectName = parser.readIdentifier();
             objectType = "ALL " + what + " IN SCHEMA";
         } else if (parser.matchKeyword("TABLE")) {
-            objectName = parser.readIdentifier();
-            // M10: Preserve schema prefix
-            if (parser.match(TokenType.DOT)) objectName = objectName + "." + parser.readIdentifier();
+            objectName = qualifiedObjectName();
         } else if (parser.matchKeyword("SEQUENCE")) {
             objectType = "SEQUENCE";
-            objectName = parser.readIdentifier();
+            objectName = qualifiedObjectName();
         } else if (parser.matchKeyword("FUNCTION") || parser.matchKeyword("PROCEDURE") || parser.matchKeyword("ROUTINE")) {
             objectType = "FUNCTION";
-            objectName = parser.readIdentifier();
+            objectName = qualifiedObjectName();
             // The argument list says which routine of that name this is, so it travels with the
             // name. Consumed and thrown away, a grant on one overload was a grant on whichever
             // overload happened to be found, and a signature matching none was not noticed.
@@ -1887,13 +1882,13 @@ class UtilityParser {
             objectName = parser.readIdentifier();
         } else if (parser.matchKeyword("DOMAIN")) {
             objectType = "DOMAIN";
-            objectName = parser.readIdentifier();
+            objectName = qualifiedObjectName();
         } else if (parser.matchKeyword("LANGUAGE")) {
             objectType = "LANGUAGE";
             objectName = parser.readIdentifier();
         } else if (parser.matchKeyword("TYPE")) {
             objectType = "TYPE";
-            objectName = parser.readIdentifier();
+            objectName = qualifiedObjectName();
         } else if (parser.matchKeyword("FOREIGN")) {
             if (parser.matchKeyword("DATA")) {
                 parser.expectKeyword("WRAPPER");
@@ -2036,6 +2031,12 @@ class UtilityParser {
         // SHOW TIME ZONE is how SET TIME ZONE is read back; the setting itself is TimeZone.
         if (param.equalsIgnoreCase("TIME") && matchZone()) {
             return new SetStmt("show", "TimeZone");
+        }
+        // SESSION AUTHORIZATION is two words in the grammar and one parameter underneath, the
+        // same way SET SESSION AUTHORIZATION writes it.
+        if (param.equalsIgnoreCase("SESSION") && parser.matchKeyword("AUTHORIZATION")) {
+            parser.expectEndOfStatement();
+            return new SetStmt("show", "session_authorization");
         }
         // SHOW asks about one parameter. A comma after it starts nothing the grammar has.
         parser.expectEndOfStatement();
@@ -2250,6 +2251,19 @@ class UtilityParser {
      * The parenthesised argument list as it was written, for a name that carries its signature.
      * A routine is told apart by its arguments, so the list is part of what a statement named.
      */
+    /**
+     * An object's name, with the schema it was written with kept.
+     *
+     * <p>A sequence, a routine, a domain and a type all live in a schema, the same as a table
+     * does, and GRANT names any of them the same way. Reading only a bare identifier made
+     * {@code GRANT USAGE ON SEQUENCE s.q} a syntax error at the dot.
+     */
+    private String qualifiedObjectName() {
+        String name = parser.readIdentifier();
+        if (parser.match(TokenType.DOT)) name = name + "." + parser.readIdentifier();
+        return name;
+    }
+
     private String writtenArgumentList() {
         StringBuilder out = new StringBuilder("(");
         parser.expect(TokenType.LEFT_PAREN);

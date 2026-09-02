@@ -23,6 +23,19 @@ public final class CreateIndexStmt implements Statement {
     /** WITH (...) storage parameters, checked against what the access method accepts. */
     public final java.util.Map<String, String> withOptions;
 
+    /**
+     * The tablespace the statement named, if it named one. Kept so that the executor can judge
+     * it after the relation has been resolved, which is the order PostgreSQL judges them in.
+     */
+    private String tablespace;
+
+    public String tablespace() { return tablespace; }
+
+    public CreateIndexStmt withTablespace(String named) {
+        this.tablespace = named;
+        return this;
+    }
+
     public CreateIndexStmt(
             String name,
             String schema,

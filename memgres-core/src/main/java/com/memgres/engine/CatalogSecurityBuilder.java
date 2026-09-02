@@ -324,7 +324,9 @@ class CatalogSecurityBuilder {
                         "true".equalsIgnoreCase(attrs.getOrDefault("REPLICATION", "false")),
                         "true".equalsIgnoreCase(
                                 attrs.getOrDefault("BYPASSRLS", String.valueOf(superuser))),
-                        null, null, null
+                        // The view exists so that a password is never read through it: whatever
+                        // the role has, or has not, pg_user shows the same eight stars.
+                        "********", null, null
                 });
             }
         }

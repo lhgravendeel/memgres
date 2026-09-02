@@ -1,0 +1,44 @@
+-- source: investigation.md
+-- finding: 92
+-- title: The catalog does not describe itself ⚠️
+-- begin-expected
+-- columns: attname:name | format_type:text
+-- row: oid | oid
+-- row: relname | name
+-- row: relnamespace | oid
+-- row: reltype | oid
+-- row: reloftype | oid
+-- row: relowner | oid
+-- row: relam | oid
+-- row: relfilenode | oid
+-- row: reltablespace | oid
+-- row: relpages | integer
+-- row: reltuples | real
+-- row: relallvisible | integer
+-- row: relallfrozen | integer
+-- row: reltoastrelid | oid
+-- row: relhasindex | boolean
+-- row: relisshared | boolean
+-- row: relpersistence | "char"
+-- row: relkind | "char"
+-- row: relnatts | smallint
+-- row: relchecks | smallint
+-- row: relhasrules | boolean
+-- row: relhastriggers | boolean
+-- row: relhassubclass | boolean
+-- row: relrowsecurity | boolean
+-- row: relforcerowsecurity | boolean
+-- row: relispopulated | boolean
+-- row: relreplident | "char"
+-- row: relispartition | boolean
+-- row: relrewrite | oid
+-- row: relfrozenxid | xid
+-- row: relminmxid | xid
+-- row: relacl | aclitem[]
+-- row: reloptions | text[]
+-- row: relpartbound | pg_node_tree
+-- rowcount: 34
+-- end-expected
+SELECT attname, format_type(atttypid, atttypmod) FROM pg_attribute
+ WHERE attrelid = 'pg_class'::regclass AND attnum > 0;
+--   PG: 34 rows | mg: 0 rows;

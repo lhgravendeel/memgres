@@ -251,7 +251,7 @@ class DmlExecutor {
         if (withClauses != null && !withClauses.isEmpty()) {
             Map<String, SelectStmt.CommonTableExpr> cteMap = new LinkedHashMap<>();
             for (SelectStmt.CommonTableExpr cte : withClauses) {
-                cteMap.put(cte.name().toLowerCase(java.util.Locale.ROOT), cte);
+                cteMap.put(cte.name(), cte);
             }
             executor.cteStack.push(cteMap);
             for (SelectStmt.CommonTableExpr cte : withClauses) executor.cteResultCache.remove(cte);
@@ -8361,7 +8361,10 @@ class DmlExecutor {
                     cols.addAll(sourceTable.getColumns());
                 }
             } else if (target.alias() != null) {
-                cols.add(new Column(target.alias(), DataType.TEXT, true, false, null));
+                // Renaming a returned value does not change what it is: the column keeps the
+                // type the expression answers in, which for a column of the relation is its own.
+                cols.add(new Column(target.alias(),
+                        returnedType(target.expr(), table, sourceTable), true, false, null));
             } else if (target.expr() instanceof ColumnRef) {
                 ColumnRef cr = (ColumnRef) target.expr();
                 String colName = cr.column();
@@ -8376,9 +8379,19 @@ class DmlExecutor {
                     cols.add(new Column(colName, DataType.TEXT, true, false, null));
                 }
             } else {
-                cols.add(new Column(executor.exprToAlias(target.expr()), DataType.TEXT, true, false, null));
+                cols.add(new Column(executor.exprToAlias(target.expr()),
+                        returnedType(target.expr(), table, sourceTable), true, false, null));
             }
         }
         return cols;
+    }
+
+    /** The type a RETURNING expression answers in, read against the relations it may name. */
+    private DataType returnedType(Expression expr, Table table, Table sourceTable) {
+        List<RowContext.TableBinding> bindings = new ArrayList<>();
+        if (table != null) bindings.add(new RowContext.TableBinding(table, null, null));
+        if (sourceTable != null) bindings.add(new RowContext.TableBinding(sourceTable, null, null));
+        DataType named = executor.inferTypeFromContext(expr, bindings);
+        return named == null ? DataType.TEXT : named;
     }
 }

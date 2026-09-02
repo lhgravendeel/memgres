@@ -107,6 +107,7 @@ public class Parser extends ExpressionParser {
                         || t.type() == TokenType.STRING_LITERAL
                         || t.type() == TokenType.KEYWORD
                         || t.type() == TokenType.DOT
+                        || t.type() == TokenType.DOT_DOT
                         // A parameter left standing after the statement is as much garbage as a
                         // leftover identifier. Dropping it silently accepted "WHERE jb ? ?",
                         // where a driver's second placeholder turns the jsonb existence operator

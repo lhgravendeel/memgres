@@ -1,0 +1,10 @@
+-- source: investigation-2026-08.md
+-- finding: 386
+-- title: Parse is a stub. It neither analyses the statement (so ParseComplete is sent for SQL PostgreSQL rejects at Parse, including unknown columns, syntax errors, an u
+-- Parse 'SELECT $1' with parameterOids=[23]; Describe Statement
+-- Parse 'SELECT $1' with parameterOids=[1082]; Describe Statement
+-- Parse 'SELECT 1' with parameterOids = [23, 25]; Describe Statement
+-- Parse 'SELECT $1' with parameterOids = [999999]; Describe Statement
+-- Parse 'SELECT $1 + $2' with no OIDs; Describe Statement
+-- Parse 'SELECT nosuchcolumn_zz_vf'; Bind; Execute; Sync
+-- Also: 'SELEKT 1', and any Parse inside an aborted transaction;

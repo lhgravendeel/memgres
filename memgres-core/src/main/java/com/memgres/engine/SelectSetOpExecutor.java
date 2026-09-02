@@ -34,7 +34,7 @@ class SelectSetOpExecutor {
             SelectStmt sel = (SelectStmt) stmt.left();
             Map<String, SelectStmt.CommonTableExpr> cteMap = new LinkedHashMap<>();
             for (SelectStmt.CommonTableExpr cte : sel.withClauses()) {
-                cteMap.put(cte.name().toLowerCase(java.util.Locale.ROOT), cte);
+                cteMap.put(cte.name(), cte);
             }
             executor.cteStack.push(cteMap);
             // Every arm reads the items, so the query PostgreSQL would pull a singly-named item up

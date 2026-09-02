@@ -42,16 +42,15 @@ class TextSearchFunctions {
      * it whatever it was gave {@code 'a':1X} for a weight of {@code 'X'} -- text no reader of a
      * tsvector accepts -- and read past the end of an empty argument.
      *
-     * <p>An argument that names no weight is the caller's, so it is reported as a bad parameter
-     * with the character quoted, the way every other weight-taking function reports one. An
-     * empty argument has no first character, and the one PostgreSQL reads there is the byte that
-     * ends the string.
+     * <p>An argument that names no weight is reported the way PostgreSQL reports it: as an
+     * internal condition naming the character by its number, because the weight is a single byte
+     * and the message prints the byte. An empty argument has no first character, and the one
+     * PostgreSQL reads there is the zero that ends the string.
      */
     private static char weightGiven(String given) {
         char c = given.isEmpty() ? 0 : Character.toUpperCase(given.charAt(0));
         if (c < 'A' || c > 'D') {
-            throw new MemgresException("unrecognized weight: \""
-                    + (given.isEmpty() ? "\\000" : given.substring(0, 1)) + "\"", "22023");
+            throw new MemgresException("unrecognized weight: " + (int) c, "XX000");
         }
         return c;
     }
@@ -61,6 +60,16 @@ class TextSearchFunctions {
         char c = given.isEmpty() ? 0 : Character.toUpperCase(given.charAt(0));
         if (c < 'A' || c > 'D' || given.length() > 1) {
             throw new MemgresException("unrecognized weight: \"" + given + "\"", "22023");
+        }
+        return c;
+    }
+
+    /** The weight the three-argument setweight takes, which prints the character it read. */
+    private static char weightForNamedLexemes(String given) {
+        char c = given.isEmpty() ? 0 : Character.toUpperCase(given.charAt(0));
+        if (c < 'A' || c > 'D') {
+            throw new MemgresException("unrecognized weight: " + (c == 0 ? "" : String.valueOf(c)),
+                    "XX000");
         }
         return c;
     }
@@ -510,7 +519,12 @@ class TextSearchFunctions {
                 Object weightObj = argv.get(1);
                 if (vecObj == null || weightObj == null) return null;
                 TsVector vec = vecObj instanceof TsVector ? ((TsVector) vecObj) : toTsVector(vecObj.toString());
-                char weight = weightGiven(weightObj.toString());
+                // The two forms report a weight they cannot read differently: the one that sets
+                // every lexeme prints the byte, and the one that sets the named lexemes prints
+                // the character. Both are internal conditions in PostgreSQL.
+                char weight = argv.size() >= 3
+                        ? weightForNamedLexemes(weightObj.toString())
+                        : weightGiven(weightObj.toString());
                 if (argv.size() >= 3) {
                     Object lexArr = argv.get(2);
                     List<String> filterLexemes = new ArrayList<>();

@@ -1,0 +1,5 @@
+-- source: review-2026-08.md
+-- finding: Root cause 8: the simple-query path skips empty statements before it can answer them
+-- area: Wire protocol and error-report fidelity
+-- title: Root cause 8: the simple-query path skips empty statements before it can answer them
+-- Simple Query message with "", "   " or ";";

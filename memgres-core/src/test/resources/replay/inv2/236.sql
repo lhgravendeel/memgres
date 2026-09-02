@@ -1,0 +1,7 @@
+-- source: investigation-2026-08.md
+-- finding: 236
+-- title: Both lock-wait loops evaluate hasDeadlock() from the arriving waiter after it registers itself in waitingFor, so the session that closes the cycle is always the
+-- A: BEGIN; LOCK TABLE zz_t IN ACCESS EXCLUSIVE MODE;
+-- B: BEGIN; LOCK TABLE zz_u IN ACCESS EXCLUSIVE MODE;
+-- A: LOCK TABLE zz_u IN ACCESS EXCLUSIVE MODE;   (waits)
+-- B: LOCK TABLE zz_t IN ACCESS EXCLUSIVE MODE;

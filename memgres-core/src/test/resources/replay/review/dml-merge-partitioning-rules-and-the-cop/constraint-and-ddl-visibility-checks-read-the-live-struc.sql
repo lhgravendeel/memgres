@@ -1,0 +1,14 @@
+-- source: review-2026-08.md
+-- finding: Constraint and DDL-visibility checks read the live structures, ignoring MVCC
+-- area: DML, MERGE, partitioning, rules and the COPY/extended-protocol surface
+-- title: Constraint and DDL-visibility checks read the live structures, ignoring MVCC
+-- A: CREATE TABLE zz_vf_pp2 (id int PRIMARY KEY);
+--    CREATE TABLE zz_vf_cc (id int PRIMARY KEY, p int REFERENCES zz_vf_pp2(id));
+--    INSERT INTO zz_vf_pp2 VALUES (1);
+--    BEGIN; INSERT INTO zz_vf_cc VALUES (1,1);      -- not committed
+-- B: DELETE FROM zz_vf_pp2 WHERE id=1;
+-- A: CREATE TYPE zz_vf_ta AS (x int);
+-- B: BEGIN; CREATE TYPE zz_vf_tb AS (y int);        -- left open
+-- A: DROP TYPE zz_vf_ta;
+--    SELECT count(*) FROM pg_type WHERE typname='zz_vf_ta';
+--    CREATE TABLE zz_vf_tt2 (c zz_vf_ta);

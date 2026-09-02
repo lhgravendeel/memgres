@@ -52,6 +52,64 @@ final class AclItems {
 
     private AclItems() {}
 
+    /**
+     * The ACL an object of this kind is created with: the owner's full set of privileges, and
+     * PUBLIC's default where the kind grants one. This is what {@code acldefault} answers.
+     *
+     * <p>The single-letter kinds are the ones acldefault takes: r for a relation, s for a
+     * sequence, f for a function, T for a type, n for a schema, d for a database.
+     */
+    static String defaultAclText(String kind, String owner) {
+        // An ACL entry names a role, and the name is what it is written with; an OID in that
+        // place is not something the aclitem reader would read back.
+        String[] set = KINDS.get(normalise(fromAclDefaultLetter(kind)));
+        if (set == null) return null;
+        // Role zero is PUBLIC, which is written as no name at all — in the grantee position and
+        // in the owner's own entry alike.
+        String who = "0".equals(owner) ? "" : owner;
+        StringBuilder out = new StringBuilder("{");
+        if (set.length > 1 && set[1] != null && !set[1].isEmpty()) {
+            out.append('=').append(set[1]).append('/').append(owner).append(',');
+        }
+        out.append(who).append('=').append(set[0]).append('/').append(owner);
+        return out.append('}').toString();
+    }
+
+    /** One ACL entry, as {@code makeaclitem} writes it. */
+    static String aclItemText(String grantee, String grantor, String privileges,
+                              boolean grantOption) {
+        StringBuilder letters = new StringBuilder();
+        for (String written : privileges.split(",")) {
+            String letter = letterOf(written.trim().toUpperCase(Locale.ROOT));
+            if (letter == null) {
+                throw new MemgresException(
+                        "unrecognized privilege type: \"" + written.trim() + "\"", "22023");
+            }
+            letters.append(letter);
+            if (grantOption) letters.append('*');
+        }
+        // A grantee of PUBLIC is written as no name at all.
+        return (grantee == null ? "" : grantee) + "=" + letters + "/" + grantor;
+    }
+
+    /** acldefault names the object kind with one letter; the rest of this class uses the word. */
+    private static String fromAclDefaultLetter(String kind) {
+        if (kind == null || kind.length() != 1) return kind;
+        switch (kind.charAt(0)) {
+            case 'r': return "TABLE";
+            case 's': return "SEQUENCE";
+            case 'f': return "FUNCTION";
+            case 'T': return "TYPE";
+            case 'n': return "SCHEMA";
+            case 'd': return "DATABASE";
+            case 'l': return "LANGUAGE";
+            case 't': return "TABLESPACE";
+            case 'F': return "FOREIGN DATA WRAPPER";
+            case 'S': return "SERVER";
+            default: return kind;
+        }
+    }
+
     /** Every privilege the kind has, as its letters, or null for a kind that is not modelled. */
     static String allOf(String kind) {
         String[] set = KINDS.get(normalise(kind));

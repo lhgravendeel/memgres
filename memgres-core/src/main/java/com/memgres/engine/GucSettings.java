@@ -454,7 +454,9 @@ public class GucSettings {
      */
     private static final String[][] HIDDEN_DEFS = {
             {"is_superuser", "on", "bool", "internal", "Preset Options", null, null, null, null, "Shows whether the current user is a superuser."},
-            {"role", "test", "string", "user", "Client Connection Defaults / Statement Behavior", null, null, null, null, "Sets the current role."},
+            // A session that has not SET ROLE is running as nobody in particular, and
+            // PostgreSQL says "none" rather than naming the user it connected as.
+            {"role", "none", "string", "user", "Client Connection Defaults / Statement Behavior", null, null, null, null, "Sets the current role."},
             {"session_authorization", "test", "string", "superuser", "Client Connection Defaults / Statement Behavior", null, null, null, null, "Sets the session user name."},
             // The seed the random generator was last given. PostgreSQL keeps it out of
             // pg_settings, and SHOW answers "unavailable" because there is nothing to read back.
@@ -617,6 +619,12 @@ public class GucSettings {
             }
         }
         String key = name.toLowerCase(java.util.Locale.ROOT);
+        // A text search configuration is recorded by its qualified name, whichever way it was
+        // written: a configuration set as "english" reads back as "pg_catalog.english".
+        if ("default_text_search_config".equals(key) && normalized != null
+                && normalized.indexOf('.') < 0) {
+            normalized = "pg_catalog." + normalized.trim();
+        }
         // L7: remember custom (dotted) parameters so RESET keeps them as an empty placeholder.
         if (key.indexOf('.') >= 0) {
             customPlaceholders.add(key);

@@ -765,22 +765,15 @@ public class PlpgsqlParser {
             if (t.type() == TokenType.KEYWORD && t.value().equals("LOOP") && depth == 0) break;
             if (t.type() == TokenType.LEFT_PAREN) depth++;
             if (t.type() == TokenType.RIGHT_PAREN) depth--;
-            // Check for .. pattern (two consecutive dots)
-            if (t.type() == TokenType.DOT && i + 1 < tokens.size()
-                    && tokens.get(i + 1).type() == TokenType.DOT) {
-                return true;
-            }
+            if (t.type() == TokenType.DOT_DOT) return true;
         }
         return false;
     }
 
     private void expect2Dots() {
-        if (check(TokenType.DOT)) {
+        if (check(TokenType.DOT_DOT)) {
             advance();
-            if (check(TokenType.DOT)) {
-                advance();
-                return;
-            }
+            return;
         }
         throw syntaxError(peek());
     }
@@ -1687,8 +1680,7 @@ public class PlpgsqlParser {
         StringBuilder sb = new StringBuilder();
         while (!isAtEnd()) {
             Token t = peek();
-            if (t.type() == TokenType.DOT && pos + 1 < tokens.size()
-                    && tokens.get(pos + 1).type() == TokenType.DOT) break;
+            if (t.type() == TokenType.DOT_DOT) break;
             appendToken(sb, t);
             advance();
         }

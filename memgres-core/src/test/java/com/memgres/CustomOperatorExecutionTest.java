@@ -1354,7 +1354,9 @@ class CustomOperatorExecutionTest {
         try (Connection conn = connect(); Statement stmt = conn.createStatement()) {
             SQLException ex = assertThrows(SQLException.class,
                     () -> stmt.execute("DROP OPERATOR <+> (integer, integer)"));
-            assertEquals("42704", ex.getSQLState());
+            // An operator nobody defined is an undefined function, which is what PostgreSQL
+            // reports it as — the same condition a call to a routine that is not there raises.
+            assertEquals("42883", ex.getSQLState());
         }
     }
 

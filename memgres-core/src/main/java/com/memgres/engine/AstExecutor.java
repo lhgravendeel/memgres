@@ -106,6 +106,14 @@ public class AstExecutor {
             Collections.newSetFromMap(new IdentityHashMap<SelectStmt.CommonTableExpr, Boolean>());
     // Bound parameter values for extended query protocol ($1, $2, ...)
     List<Object> boundParameters = new ArrayList<>();
+    /**
+     * The types PREPARE declared for those parameters, when a prepared statement is running.
+     *
+     * <p>What {@code $1} is cannot be read off the value bound to it — 1.26 arrives as a number
+     * and says nothing about whether the statement asked for a numeric or a float8 — so the
+     * declaration is what a column of it is described by.
+     */
+    List<String> boundParameterTypes = new ArrayList<>();
     // Statement timestamp: frozen at statement start for now()/statement_timestamp()
     OffsetDateTime currentStatementTimestamp = null;
 
@@ -295,7 +303,10 @@ public class AstExecutor {
         TypeCoercion.setDateOrder(currentDateStyleOrder());
         // ... and the session TimeZone, which decides what "today" and CURRENT_DATE mean
         java.time.ZoneId previousZone = TypeCoercion.rawSessionZone();
+        String previousZoneName = TypeCoercion.rawSessionZoneName();
         TypeCoercion.setSessionZone(currentSessionZone());
+        TypeCoercion.setSessionZoneName(
+                session == null ? null : session.getGucSettings().get("timezone"));
         OffsetDateTime previousInstant = TypeCoercion.rawSessionInstant();
         TypeCoercion.setSessionInstant(currentInstant());
         // ... and the session IntervalStyle, which decides how an ambiguously signed interval
@@ -344,6 +355,7 @@ public class AstExecutor {
             currentStatementTimestamp = null;
             TypeCoercion.setDateOrder(previousDateOrder);
             TypeCoercion.setSessionZone(previousZone);
+            TypeCoercion.setSessionZoneName(previousZoneName);
             TypeCoercion.setSessionInstant(previousInstant);
             TypeCoercion.setIntervalStyle(previousIntervalStyle);
         }
@@ -669,7 +681,9 @@ public class AstExecutor {
             }
         }
         try {
-            return java.time.ZoneId.of(tz);
+            // Asked through the catalogue, so the zones PostgreSQL carries that Java has no
+            // identifier for — EST, HST, MST, Factory — resolve rather than falling back.
+            return PgTimeZones.zoneFor(tz);
         } catch (RuntimeException e) {
             return java.time.ZoneId.systemDefault();
         }
@@ -876,8 +890,19 @@ public class AstExecutor {
         if (stmt instanceof DropEventTriggerStmt) return ddlExecutor.executeDropEventTrigger(((DropEventTriggerStmt) stmt));
         if (stmt instanceof CreateExtensionStmt) {
             CreateExtensionStmt extStmt = (CreateExtensionStmt) stmt;
+            // An extension is available or it is not, and IF NOT EXISTS is about whether it is
+            // already installed rather than whether the server has it at all. Unchecked, any
+            // name at all reported success and left the caller waiting for what it should have
+            // brought.
+            Extensions.requireAvailable(extStmt.name());
+            // Installing one that is already installed is an error unless IF NOT EXISTS said so.
+            if (database.hasExtension(extStmt.name()) && !extStmt.ifNotExists()) {
+                throw new MemgresException(
+                        "extension \"" + extStmt.name() + "\" already exists", "42710");
+            }
             if (!extStmt.ifNotExists() || !database.hasExtension(extStmt.name())) {
-                String version = extStmt.version() != null ? extStmt.version() : "1.0";
+                String version = extStmt.version() != null ? extStmt.version()
+                        : Extensions.defaultVersion(extStmt.name());
                 database.addExtension(extStmt.name(), version, extStmt.schema());
                 registerExtensionObjects(extStmt.name());
             }
@@ -977,19 +1002,39 @@ public class AstExecutor {
                     }
                 }
             }
-            if (s.forRole() != null && !database.hasRole(s.forRole().toLowerCase(java.util.Locale.ROOT))) {
-                throw PgErrors.undefinedObject("role", s.forRole());
+            // A privilege belongs to a kind of object: SELECT is not something a function has, and
+            // EXECUTE is not something a relation has. Recorded without asking, a default nothing
+            // could ever match was written and the statement reported success.
+            DefaultAclTargets.check(s.privileges(), s.objectType(), !s.inSchemas().isEmpty());
+            List<String> roles = s.forRoles().isEmpty()
+                    ? java.util.Collections.<String>singletonList(null) : s.forRoles();
+            List<String> schemas = s.inSchemas().isEmpty()
+                    ? java.util.Collections.<String>singletonList(null) : s.inSchemas();
+            for (String written : roles) {
+                String role = resolveRoleKeyword(written);
+                if (role != null && !database.hasRole(role.toLowerCase(java.util.Locale.ROOT))
+                        && !role.equalsIgnoreCase(sessionUser())) {
+                    throw PgErrors.undefinedObject("role", role);
+                }
             }
-            if (s.inSchema() != null && database.getSchema(s.inSchema()) == null) {
-                throw new MemgresException("schema \"" + s.inSchema() + "\" does not exist", "3F000");
+            for (String schema : schemas) {
+                if (schema != null && database.getSchema(schema) == null) {
+                    throw new MemgresException("schema \"" + schema + "\" does not exist", "3F000");
+                }
             }
-            if (s.isGrant()) {
-                String grantor = s.forRole() != null ? s.forRole() : sessionUser();
-                database.addDefaultAcl(new Database.DefaultAclEntry(
-                        grantor, s.inSchema(), s.objectType(),
-                        s.privileges(), s.grantees(), true));
-            } else {
-                database.removeDefaultAcl(s.inSchema(), s.objectType(), s.grantees());
+            // One statement writes a default for every pairing of the roles and schemas it named.
+            for (String written : roles) {
+                String role = resolveRoleKeyword(written);
+                for (String schema : schemas) {
+                    if (s.isGrant()) {
+                        String grantor = role != null ? role : sessionUser();
+                        database.addDefaultAcl(new Database.DefaultAclEntry(
+                                grantor, schema, s.objectType(),
+                                s.privileges(), s.grantees(), true));
+                    } else {
+                        database.removeDefaultAcl(schema, s.objectType(), s.grantees());
+                    }
+                }
             }
             return QueryResult.message(QueryResult.Type.SET, "ALTER DEFAULT PRIVILEGES");
         }
@@ -1555,18 +1600,86 @@ public class AstExecutor {
      */
     String viewOwnerRole = null;
 
-    void checkTablePrivilege(String privilege, String schemaName, String tableName) {
-        String role = viewOwnerRole != null ? viewOwnerRole : currentRole();
-        if (role == null) return; // no session / embedded mode
-        // Superuser check (by role attribute, not hardcoded names)
+    /**
+     * Whether this role is answerable to the privilege system at all.
+     *
+     * <p>A superuser is not, and neither is the role the server was started as when nothing has
+     * been recorded about it — an embedded database in which nobody has created a role behaves as
+     * it always did.
+     */
+    boolean bypassesPrivilegeChecks(String role) {
+        if (role == null) return true;
         Map<String, String> roleAttrs = database.getRole(role);
-        if (roleAttrs != null && "true".equalsIgnoreCase(roleAttrs.get("SUPERUSER"))) return;
-        // Also treat the default "memgres"/"test"/"postgres" connecting users as superuser
-        // when they have no explicit role entry (backwards-compat for existing tests)
+        if (roleAttrs != null && "true".equalsIgnoreCase(roleAttrs.get("SUPERUSER"))) return true;
         if (roleAttrs == null) {
             String lower = role.toLowerCase(java.util.Locale.ROOT);
-            if ("memgres".equals(lower) || "test".equals(lower) || "postgres".equals(lower)) return;
+            return "memgres".equals(lower) || "test".equals(lower) || "postgres".equals(lower);
         }
+        return false;
+    }
+
+    /**
+     * Refuse what this role may not do to a schema.
+     *
+     * <p>Only tables were ever checked, so a role with no rights in a schema could create
+     * relations in it just the same. PostgreSQL takes CREATE or USAGE on the schema before it
+     * looks at the relation, and since PostgreSQL 15 the public schema grants neither to PUBLIC.
+     */
+    void checkSchemaPrivilege(String privilege, String schemaName) {
+        String role = viewOwnerRole != null ? viewOwnerRole : currentRole();
+        if (bypassesPrivilegeChecks(role) || schemaName == null) return;
+        String schema = schemaName.toLowerCase(java.util.Locale.ROOT);
+        // The catalogues are readable by everyone and writable by no one.
+        if (("pg_catalog".equals(schema) || "information_schema".equals(schema))
+                && "USAGE".equalsIgnoreCase(privilege)) {
+            return;
+        }
+        // A session's own temporary schema is its own.
+        if (session != null && schema.equalsIgnoreCase(session.getTempSchemaName())) return;
+        // The public schema is made with USAGE granted to PUBLIC and CREATE granted to nobody.
+        // Nothing records the USAGE, because it is part of the schema's initial ACL rather than
+        // a grant somebody wrote — and granting CREATE to someone does not take it away, which
+        // is what reading it off the recorded grants alone would have meant.
+        if ("public".equals(schema) && "USAGE".equalsIgnoreCase(privilege)) return;
+        String owner = database.getObjectOwner("schema:" + schema);
+        if (owner != null && owner.equalsIgnoreCase(role)) return;
+        if (hasPrivilegeDirectOrInherited(role, privilege, "SCHEMA", schema)) return;
+        if (hasPrivilegeDirectOrInherited("public", privilege, "SCHEMA", schema)) return;
+        throw new MemgresException("permission denied for schema " + schemaName, "42501");
+    }
+
+    /**
+     * Refuse what this role may not do to the database itself. Creating a schema needs CREATE on
+     * it, which is not granted to PUBLIC.
+     */
+    void checkDatabasePrivilege(String privilege) {
+        String role = viewOwnerRole != null ? viewOwnerRole : currentRole();
+        if (bypassesPrivilegeChecks(role)) return;
+        String db = session != null ? session.getDatabaseName() : "memgres";
+        if (hasPrivilegeDirectOrInherited(role, privilege, "DATABASE", db)) return;
+        if (hasPrivilegeDirectOrInherited("public", privilege, "DATABASE", db)) return;
+        throw new MemgresException("permission denied for database " + db, "42501");
+    }
+
+    /**
+     * Refuse a role-management statement to a role that may not manage roles.
+     *
+     * <p>Creating, altering and dropping a role needs the CREATEROLE attribute, or superuser.
+     * Unchecked, any role at all could make itself another one.
+     */
+    void requireRoleAdministration(String what) {
+        String role = currentRole();
+        if (bypassesPrivilegeChecks(role)) return;
+        Map<String, String> attrs = database.getRole(role);
+        if (attrs != null && "true".equalsIgnoreCase(attrs.get("CREATEROLE"))) return;
+        MemgresException e = new MemgresException("permission denied to " + what, "42501");
+        e.setDetail("Only roles with the CREATEROLE attribute may " + what + ".");
+        throw e;
+    }
+
+    void checkTablePrivilege(String privilege, String schemaName, String tableName) {
+        String role = viewOwnerRole != null ? viewOwnerRole : currentRole();
+        if (bypassesPrivilegeChecks(role)) return;
         // Owner check — try both "table:" and "view:" keys since views are DML-capable
         String qualName = schemaName.toLowerCase(java.util.Locale.ROOT) + "." + tableName.toLowerCase(java.util.Locale.ROOT);
         String owner = database.getObjectOwner("table:" + qualName);
@@ -1578,9 +1691,102 @@ public class AstExecutor {
         if (hasPrivilegeDirectOrInherited(role, privilege, "TABLE", qualName)) return;
         // Also check PUBLIC grants
         if (hasPrivilegeDirectOrInherited("public", privilege, "TABLE", qualName)) return;
+        // A grant on some of a relation's columns is a grant on the relation for the purpose of
+        // reaching it at all: PostgreSQL admits the statement and then refuses the columns that
+        // are not covered. Consulted only at relation level, the column grants SessionExecutor
+        // writes were write-only, and a query PostgreSQL answers was refused outright.
+        if (hasColumnPrivilege(role, privilege, qualName, null)) return;
+        if (hasColumnPrivilege("public", privilege, qualName, null)) return;
         // PostgreSQL leaves the name unquoted here, unlike the messages that report a relation
         // that is missing or of the wrong kind.
         throw new MemgresException("permission denied for table " + tableName, "42501");
+    }
+
+    /**
+     * Refuse a routine this role may not call.
+     *
+     * <p>EXECUTE is granted to PUBLIC when a routine is made, so this only refuses one somebody
+     * has revoked — which is exactly the case that used to do nothing at all.
+     */
+    void checkFunctionPrivilege(PgFunction routine) {
+        String role = viewOwnerRole != null ? viewOwnerRole : currentRole();
+        if (bypassesPrivilegeChecks(role) || routine == null) return;
+        String name = routine.getName();
+        if (name == null) return;
+        String owner = routine.getOwner();
+        if (owner != null && owner.equalsIgnoreCase(role)) return;
+        // A routine is made with EXECUTE granted to PUBLIC. Nothing records that, because it is
+        // the default rather than a grant somebody wrote, so until a GRANT or a REVOKE has named
+        // the routine there is nothing to read and everyone may call it.
+        if (!database.aclTouched("FUNCTION", name)) return;
+        if (hasPrivilegeDirectOrInherited(role, "EXECUTE", "FUNCTION", name)) return;
+        if (hasPrivilegeDirectOrInherited("public", "EXECUTE", "FUNCTION", name)) return;
+        throw new MemgresException("permission denied for function " + name, "42501");
+    }
+
+    /**
+     * Refuse a sequence this role may not use. Reading its value needs SELECT or USAGE, and
+     * moving it on needs UPDATE or USAGE.
+     */
+    void checkSequencePrivilege(String privilege, String schemaName, String sequenceName) {
+        String role = viewOwnerRole != null ? viewOwnerRole : currentRole();
+        if (bypassesPrivilegeChecks(role) || sequenceName == null) return;
+        String bare = sequenceName.contains(".")
+                ? sequenceName.substring(sequenceName.lastIndexOf('.') + 1) : sequenceName;
+        String qual = privilegeKey(schemaName, bare);
+        String owner = database.getObjectOwner("sequence:" + bare);
+        if (owner != null && owner.equalsIgnoreCase(role)) return;
+        for (String p : new String[]{privilege, "USAGE"}) {
+            if (hasPrivilegeDirectOrInherited(role, p, "SEQUENCE", qual)) return;
+            if (hasPrivilegeDirectOrInherited("public", p, "SEQUENCE", qual)) return;
+            if (hasPrivilegeDirectOrInherited(role, p, "SEQUENCE", bare)) return;
+            if (hasPrivilegeDirectOrInherited("public", p, "SEQUENCE", bare)) return;
+        }
+        throw new MemgresException("permission denied for sequence " + bare, "42501");
+    }
+
+    /**
+     * Whether this role holds {@code privilege} on a column of the relation — on the one named,
+     * or on any of them when {@code column} is null.
+     *
+     * <p>A column grant is recorded against {@code schema.relation.column}, so asking about the
+     * relation alone never sees one.
+     */
+    boolean hasColumnPrivilege(String roleName, String privilege, String qualName, String column) {
+        return hasColumnPrivilege(roleName, privilege, qualName, column, new java.util.HashSet<>());
+    }
+
+    private boolean hasColumnPrivilege(String roleName, String privilege, String qualName,
+            String column, java.util.Set<String> visited) {
+        String lower = roleName.toLowerCase(java.util.Locale.ROOT);
+        if (!visited.add(lower)) return false;
+        String prefix = privilege.toUpperCase(java.util.Locale.ROOT) + ":COLUMN:"
+                + qualName.toLowerCase(java.util.Locale.ROOT) + ".";
+        String allPrefix = "ALL:COLUMN:" + qualName.toLowerCase(java.util.Locale.ROOT) + ".";
+        for (String held : database.getRolePrivileges(lower)) {
+            boolean matches = held.startsWith(prefix) || held.startsWith(allPrefix);
+            if (!matches) continue;
+            if (column == null) return true;
+            String named = held.substring(held.lastIndexOf('.') + 1);
+            if (named.equalsIgnoreCase(column)) return true;
+        }
+        for (java.util.Map.Entry<String, java.util.Set<String>> entry
+                : database.getRoleMemberships().entrySet()) {
+            if (entry.getValue().contains(lower) && !visited.contains(entry.getKey())
+                    && hasColumnPrivilege(entry.getKey(), privilege, qualName, column, visited)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** CURRENT_USER, CURRENT_ROLE and SESSION_USER name whoever is running the statement. */
+    String resolveRoleKeyword(String written) {
+        if (written == null) return null;
+        String w = written.toUpperCase(java.util.Locale.ROOT);
+        if ("CURRENT_USER".equals(w) || "CURRENT_ROLE".equals(w)) return currentRole();
+        if ("SESSION_USER".equals(w)) return sessionUser();
+        return written;
     }
 
     /** Check if role has a privilege directly or through role membership. */
@@ -1670,6 +1876,30 @@ public class AstExecutor {
      * Returns true if the current role can bypass RLS (superuser/owner without FORCE, or row_security=off).
      * Throws MemgresException if row_security=off but user has no bypass privilege.
      */
+    /**
+     * Whether row-level security is in force for the caller on this relation, which is what
+     * {@code row_security_active} answers.
+     */
+    Boolean rowSecurityActiveFor(String written) {
+        String schema = defaultSchema();
+        String bare = written;
+        int dot = written.indexOf('.');
+        if (dot > 0) {
+            schema = written.substring(0, dot);
+            bare = written.substring(dot + 1);
+        }
+        Table table;
+        try {
+            table = resolveTable(schema, bare);
+        } catch (MemgresException e) {
+            if (!"42P01".equals(e.getSqlState())) throw e;
+            // A catalogue relation is a relation, and none of them carries a policy.
+            return systemCatalog.resolve(null, bare, session) != null ? Boolean.FALSE : null;
+        }
+        if (table == null || !table.isRlsEnabled()) return Boolean.FALSE;
+        return !shouldBypassRls(table, schema);
+    }
+
     boolean shouldBypassRls(Table table, String schemaName) {
         String role = currentRole();
         boolean isSuperuser = isRoleSuperuser(role);

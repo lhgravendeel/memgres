@@ -1,0 +1,9 @@
+-- source: review-2026-08.md
+-- finding: Root cause 6: Parse is a stub — no analysis, and the declared parameter OIDs are thrown away
+-- area: Wire protocol and error-report fidelity
+-- title: Root cause 6: Parse is a stub — no analysis, and the declared parameter OIDs are thrown away
+-- Parse 'SELECT $1' with parameterOids=[23] (then [1082]); Describe Statement
+-- Parse 'SELECT 1' with parameterOids = [23, 25]; Describe Statement
+-- Parse 'SELECT $1' with parameterOids = [999999]; Describe Statement
+-- Parse 'SELECT $1 + $2' with no OIDs;             Describe Statement
+-- Parse 'SELECT nosuchcolumn_zz_vf'; Bind; Execute; Sync;

@@ -1008,6 +1008,9 @@ class StringFunctions {
                 String flags = "";
                 if (fn.args().size() > 2) {
                     Object arg2 = executor.evalExpr(fn.args().get(2), ctx);
+                    // These functions are strict: given no position to start at, the answer is
+                    // nothing rather than a complaint about position zero.
+                    if (arg2 == null) return null;
                     // 3rd arg is start position (int), not flags
                     start = executor.toInt(arg2);
                     // Positions are counted from one, so there is no position zero to start at.
@@ -1050,7 +1053,10 @@ class StringFunctions {
                 String flags = "";
                 int subexpr = 0;
                 if (fn.args().size() > 2) {
-                    start = requireStart(executor.toInt(executor.evalExpr(fn.args().get(2), ctx)));
+                    Object startArg = executor.evalExpr(fn.args().get(2), ctx);
+                    // Strict: no position to start at means no answer, not a bad position.
+                    if (startArg == null) return null;
+                    start = requireStart(executor.toInt(startArg));
                 }
                 if (fn.args().size() > 3) {
                     nthMatch = requireOccurrence(
@@ -1105,7 +1111,10 @@ class StringFunctions {
                 String flags = "";
                 int subexpr = 0;
                 if (fn.args().size() > 2) {
-                    start = requireStart(executor.toInt(executor.evalExpr(fn.args().get(2), ctx)));
+                    Object startArg = executor.evalExpr(fn.args().get(2), ctx);
+                    // Strict: no position to start at means no answer, not a bad position.
+                    if (startArg == null) return null;
+                    start = requireStart(executor.toInt(startArg));
                 }
                 if (fn.args().size() > 3) {
                     nthMatch = requireOccurrence(
@@ -1463,12 +1472,15 @@ class StringFunctions {
                     if (startObj == null || (fn.args().size() > 3 && countObj == null)) return null;
                     int startPos = executor.toInt(startObj);
                     int count = countObj != null ? executor.toInt(countObj) : bReplacement.length;
-                    if (count < 0 || startPos <= 0) {
+                    // The count says where the tail resumes, not how much has to be there: a
+                    // negative one puts the tail back before the replacement, which PostgreSQL
+                    // allows. Only a position before the first byte is out of range.
+                    if (startPos <= 0) {
                         throw new MemgresException("negative substring length not allowed", "22011");
                     }
                     int start = startPos - 1; // 1-based to 0-based
                     int prefixLen = Math.min(start, bStr.length);
-                    int suffixStart = start + count;
+                    int suffixStart = Math.max(0, start + count);
                     int suffixLen = suffixStart < bStr.length ? bStr.length - suffixStart : 0;
                     byte[] result = new byte[prefixLen + bReplacement.length + suffixLen];
                     System.arraycopy(bStr, 0, result, 0, prefixLen);
@@ -1485,15 +1497,16 @@ class StringFunctions {
                 if (startObj == null || (fn.args().size() > 3 && countObj == null)) return null;
                 int startPos = executor.toInt(startObj);
                 int count = countObj != null ? executor.toInt(countObj) : replacement.length();
-                if (count < 0 || startPos <= 0) {
+                if (startPos <= 0) {
                     throw new MemgresException("negative substring length not allowed", "22011");
                 }
                 int start = startPos - 1; // 1-based to 0-based
                 String s = str.toString();
                 int held = characters(s);
+                int tailFrom = Math.max(0, start + count);
                 return charSubstring(s, 0, start)
                         + replacement
-                        + (start + count < held ? charSubstring(s, start + count, held) : "");
+                        + (tailFrom < held ? charSubstring(s, tailFrom, held) : "");
             }
             case "octet_length": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
@@ -1619,11 +1632,9 @@ class StringFunctions {
 
     /** Convert value to PG text output form. Booleans → "t"/"f". */
     private static String pgTextOutput(Object val) {
-        if (val instanceof Boolean) return ((Boolean) val) ? "t" : "f";
-        // bytea and arrays have no useful toString(); render them as PG's output functions do
-        if (val instanceof byte[]) return TypeCoercion.byteaToText((byte[]) val);
-        if (val instanceof java.util.List) return TypeCoercion.formatPgArray((java.util.List<?>) val);
-        return val.toString();
+        // The one writer every value goes through, so concat writes a timestamp the way a cast
+        // to text does. Rendering with Java's own toString put a T in the middle of one.
+        return TypeCoercion.toString(val);
     }
 
     /**

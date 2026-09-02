@@ -1,5 +1,6 @@
 package com.memgres.engine.parser;
 
+import com.memgres.engine.parser.ParseException;
 import com.memgres.engine.PgErrors;
 import com.memgres.engine.parser.ast.*;
 
@@ -23,6 +24,9 @@ class DdlIndexParser {
         String name = null;
         if (!parser.checkKeyword("ON")) {
             name = parser.readIdentifier();
+        } else if (ifNotExists) {
+            // IF NOT EXISTS is about a name, so there has to be one: PostgreSQL stops at the ON.
+            throw new ParseException("", parser.peek());
         }
 
         parser.expectKeyword("ON");
@@ -84,8 +88,9 @@ class DdlIndexParser {
             }
         }
 
+        String tablespace = null;
         if (parser.matchKeyword("TABLESPACE")) {
-            parser.readIdentifier();
+            tablespace = parser.readIdentifier();
         }
 
         String whereClause = null;
@@ -99,8 +104,9 @@ class DdlIndexParser {
             whereClause = sb.toString().trim();
         }
 
-        return new CreateIndexStmt(name, indexSchema, table, columns, unique, ifNotExists, concurrently,
-                method, includeColumns, whereClause, columnOptions, nullsNotDistinct, withOptions);
+        return new CreateIndexStmt(name, indexSchema, table, columns, unique, ifNotExists,
+                concurrently, method, includeColumns, whereClause, columnOptions, nullsNotDistinct,
+                withOptions).withTablespace(tablespace);
     }
 
     /**

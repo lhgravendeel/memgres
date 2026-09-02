@@ -447,7 +447,9 @@ public class ExpressionParser {
             if (check(TokenType.LEFT_PAREN)) {
                 advance();
                 sb.append("(");
-                sb.append(advance().value());
+                // A fractional-seconds precision is a number in the grammar, so one too large
+                // for an integer is not a number the grammar has.
+                sb.append(requireTypeModifierNumber(sb.toString()));
                 expect(TokenType.RIGHT_PAREN);
                 sb.append(")");
             }
@@ -520,6 +522,46 @@ public class ExpressionParser {
                 peek(), "42601");
     }
 
+    /**
+     * One number of a type modifier, which has to be one a modifier can hold.
+     *
+     * <p>A modifier is a 32-bit number, so PostgreSQL refuses float(9999999999) where the grammar
+     * reads it. Taken as written, it reached the code that turns a modifier into a width and
+     * escaped from there as an internal error.
+     */
+    private String requireTypeModifierNumber(String typeSoFar) {
+        Token t = peek();
+        String text = t.value();
+        // A modifier may hold a word rather than a number — geometry(Point, 4326) is a type
+        // name PostgreSQL's grammar takes — so only a number is checked for fitting in one.
+        boolean fits = true;
+        if (t.type() == TokenType.INTEGER_LITERAL) {
+            try {
+                long v = Long.parseLong(text);
+                fits = v <= Integer.MAX_VALUE && v >= Integer.MIN_VALUE;
+            } catch (NumberFormatException tooLong) {
+                fits = false;
+            }
+        }
+        if (!fits) {
+            // Some types read their modifier as an integer value — a bit string's width, a
+            // numeric's precision — so one too large for an integer is out of range. The rest
+            // take a number in the grammar itself, where one too large is not a number at all.
+            // The buffer already carries the opening parenthesis, and may carry a minus sign.
+            String type = typeSoFar.toLowerCase(java.util.Locale.ROOT).trim();
+            int paren = type.indexOf('(');
+            if (paren >= 0) type = type.substring(0, paren).trim();
+            if (type.equals("bit") || type.equals("varbit") || type.equals("bit varying")
+                    || type.equals("numeric") || type.equals("decimal")) {
+                throw new com.memgres.engine.MemgresException(
+                        "value \"" + text + "\" is out of range for type integer", "22003");
+            }
+            throw ParseException.at(t);
+        }
+        advance();
+        return text;
+    }
+
     private String finishTypeName(StringBuilder sb, boolean qualified) {
         // Handle precision: (N) or (N,M), for types not already handled above
         // PG allows negative scale in numeric(p,s), e.g. numeric(10,-2) rounds to hundreds
@@ -540,7 +582,7 @@ public class ExpressionParser {
                 advance();
                 sb.append("-");
             }
-            sb.append(advance().value()); // first number
+            sb.append(requireTypeModifierNumber(sb.toString())); // first number
             if (match(TokenType.COMMA)) {
                 sb.append(",");
                 // Handle optional minus sign for negative scale
@@ -1185,6 +1227,8 @@ public class ExpressionParser {
         // Geometric operators (DISTANCE is handled in parseOtherOps for correct precedence)
         if (match(TokenType.APPROX_EQUAL)) return new BinaryExpr(left, BinaryExpr.BinOp.APPROX_EQUAL, parseOtherOps());
         if (match(TokenType.GEO_BELOW)) return new BinaryExpr(left, BinaryExpr.BinOp.GEO_BELOW, parseOtherOps());
+        if (match(TokenType.GEO_BELOW_EQ)) return new BinaryExpr(left, BinaryExpr.BinOp.GEO_BELOW_EQ, parseOtherOps());
+        if (match(TokenType.GEO_ABOVE_EQ)) return new BinaryExpr(left, BinaryExpr.BinOp.GEO_ABOVE_EQ, parseOtherOps());
         if (match(TokenType.GEO_ABOVE)) return new BinaryExpr(left, BinaryExpr.BinOp.GEO_ABOVE, parseOtherOps());
         if (match(TokenType.GEO_NOT_EXTEND_RIGHT)) return new BinaryExpr(left, BinaryExpr.BinOp.GEO_NOT_EXTEND_RIGHT, parseOtherOps());
         if (match(TokenType.GEO_NOT_EXTEND_LEFT)) return new BinaryExpr(left, BinaryExpr.BinOp.GEO_NOT_EXTEND_LEFT, parseOtherOps());
@@ -1712,6 +1756,11 @@ public class ExpressionParser {
         // String literals
         if (check(TokenType.STRING_LITERAL)) {
             return Literal.ofString(advance().value());
+        }
+        // The national character type is bpchar, and a literal of it is written as a cast to one,
+        // which is also how PostgreSQL labels the column it comes back in.
+        if (check(TokenType.NATIONAL_STRING_LITERAL)) {
+            return new CastExpr(Literal.ofString(advance().value()), "bpchar");
         }
         if (check(TokenType.DOLLAR_STRING_LITERAL)) {
             return Literal.ofString(advance().value());

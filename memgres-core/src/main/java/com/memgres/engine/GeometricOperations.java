@@ -1260,8 +1260,8 @@ public final class GeometricOperations {
     }
 
     public static boolean boxContainsBox(PgBox outer, PgBox inner) {
-        return inner.low.x >= outer.low.x && inner.high.x <= outer.high.x
-            && inner.low.y >= outer.low.y && inner.high.y <= outer.high.y;
+        return fpGe(inner.low.x, outer.low.x) && fpLe(inner.high.x, outer.high.x)
+            && fpGe(inner.low.y, outer.low.y) && fpLe(inner.high.y, outer.high.y);
     }
 
     public static boolean circleContainsPoint(PgCircle c, PgPoint p) {
@@ -1428,8 +1428,8 @@ public final class GeometricOperations {
     // ========================================================================
 
     public static boolean overlapsBoxBox(PgBox a, PgBox b) {
-        return a.low.x <= b.high.x && a.high.x >= b.low.x
-            && a.low.y <= b.high.y && a.high.y >= b.low.y;
+        return fpLe(a.low.x, b.high.x) && fpGe(a.high.x, b.low.x)
+            && fpLe(a.low.y, b.high.y) && fpGe(a.high.y, b.low.y);
     }
 
     public static boolean overlapsCircleCircle(PgCircle a, PgCircle b) {
@@ -1779,6 +1779,21 @@ public final class GeometricOperations {
         return a == b || Math.abs(a - b) <= EPSILON;
     }
 
+    /**
+     * The four orderings, read with the same tolerance equality is read with.
+     *
+     * <p>Every geometric predicate in PostgreSQL is written this way, and it has to be: a shape
+     * whose coordinates came out of a calculation is a hair away from where it belongs, and a
+     * comparison made exactly answers that two boxes touching at a corner do not.
+     */
+    private static boolean fpLt(double a, double b) { return a + EPSILON < b; }
+
+    private static boolean fpLe(double a, double b) { return a <= b + EPSILON; }
+
+    private static boolean fpGt(double a, double b) { return a > b + EPSILON; }
+
+    private static boolean fpGe(double a, double b) { return a + EPSILON >= b; }
+
     /** A point together with how far it was from whatever was measured to it. */
     private static final class PointDist {
         final PgPoint point;
@@ -2017,16 +2032,24 @@ public final class GeometricOperations {
             if (fpEq(b.a * a.b, a.a * b.b)) return null; // parallel
             double x = (a.b * b.c - b.b * a.c) / (b.b * a.a - a.b * b.a);
             double y = -(a.a * x + a.c) / a.b;
-            return new PgPoint(x, y);
+            return new PgPoint(withoutNegativeZero(x), withoutNegativeZero(y));
         }
         if (!fpZero(b.b)) {
             if (fpEq(a.a * b.b, b.a * a.b)) return null;
             double x = (b.b * a.c - a.b * b.c) / (a.b * b.a - b.b * a.a);
             double y = -(b.a * x + b.c) / b.b;
-            return new PgPoint(x, y);
+            return new PgPoint(withoutNegativeZero(x), withoutNegativeZero(y));
         }
         // Both are vertical, so they are parallel or the same line.
         return null;
+    }
+
+    /**
+     * Zero written as zero. Negating a coordinate that came out zero leaves the sign bit set, and
+     * a point at the origin then prints as {@code (-0,0)}.
+     */
+    private static double withoutNegativeZero(double d) {
+        return d == 0.0 ? 0.0 : d;
     }
 
     public static Object intersectionGeneral(Object a, Object b) {
@@ -2083,49 +2106,70 @@ public final class GeometricOperations {
     /** << strictly left */
     public static boolean isStrictlyLeft(Object a, Object b) {
         PgBox ba = toBBox(a), bb = toBBox(b);
-        return ba.high.x < bb.low.x;
+        return fpLt(ba.high.x, bb.low.x);
     }
 
     /** >> strictly right */
     public static boolean isStrictlyRight(Object a, Object b) {
         PgBox ba = toBBox(a), bb = toBBox(b);
-        return ba.low.x > bb.high.x;
+        return fpGt(ba.low.x, bb.high.x);
     }
 
     /** <<| strictly below */
     public static boolean isStrictlyBelow(Object a, Object b) {
         PgBox ba = toBBox(a), bb = toBBox(b);
-        return ba.high.y < bb.low.y;
+        return fpLt(ba.high.y, bb.low.y);
+    }
+
+    /**
+     * {@code <^} below. A box is below another when its top does not reach the other's bottom;
+     * a point is below another when its y is the smaller, with nothing given away at equality.
+     */
+    public static boolean isBelowByType(Object a, Object b) {
+        if (a instanceof PgPoint && b instanceof PgPoint) {
+            return fpLt(((PgPoint) a).y, ((PgPoint) b).y);
+        }
+        PgBox ba = toBBox(a), bb = toBBox(b);
+        return fpLe(ba.high.y, bb.low.y);
+    }
+
+    /** {@code >^} above, the mirror of {@link #isBelowByType}. */
+    public static boolean isAboveByType(Object a, Object b) {
+        if (a instanceof PgPoint && b instanceof PgPoint) {
+            return fpGt(((PgPoint) a).y, ((PgPoint) b).y);
+        }
+        PgBox ba = toBBox(a), bb = toBBox(b);
+        return fpGe(ba.low.y, bb.high.y);
     }
 
     /** |>> strictly above */
     public static boolean isStrictlyAbove(Object a, Object b) {
         PgBox ba = toBBox(a), bb = toBBox(b);
-        return ba.low.y > bb.high.y;
+        return fpGt(ba.low.y, bb.high.y);
     }
 
     /** &< does not extend to the right of */
     public static boolean doesNotExtendRight(Object a, Object b) {
         PgBox ba = toBBox(a), bb = toBBox(b);
-        return ba.high.x <= bb.high.x;
+        return fpLe(ba.high.x, bb.high.x);
     }
 
     /** &> does not extend to the left of */
     public static boolean doesNotExtendLeft(Object a, Object b) {
         PgBox ba = toBBox(a), bb = toBBox(b);
-        return ba.low.x >= bb.low.x;
+        return fpGe(ba.low.x, bb.low.x);
     }
 
     /** &<| does not extend above */
     public static boolean doesNotExtendAbove(Object a, Object b) {
         PgBox ba = toBBox(a), bb = toBBox(b);
-        return ba.high.y <= bb.high.y;
+        return fpLe(ba.high.y, bb.high.y);
     }
 
     /** |&> does not extend below */
     public static boolean doesNotExtendBelow(Object a, Object b) {
         PgBox ba = toBBox(a), bb = toBBox(b);
-        return ba.low.y >= bb.low.y;
+        return fpGe(ba.low.y, bb.low.y);
     }
 
     // ========================================================================
@@ -2170,16 +2214,37 @@ public final class GeometricOperations {
         throw new MemgresException("operator does not exist: " + pgTypeName(oa) + " ?| " + pgTypeName(ob), "42883");
     }
 
+    /** Two segments meet at a right angle when the product of their slopes is minus one, and
+     * when one lies flat while the other stands upright. Read off the slopes, as parallel is. */
     public static boolean isPerpendicular(PgLseg a, PgLseg b) {
-        double dx1 = a.p2.x - a.p1.x, dy1 = a.p2.y - a.p1.y;
-        double dx2 = b.p2.x - b.p1.x, dy2 = b.p2.y - b.p1.y;
-        return Math.abs(dx1 * dx2 + dy1 * dy2) < EPSILON;
+        double slopeA = slopeBetween(a.p1, a.p2);
+        double slopeB = slopeBetween(b.p1, b.p2);
+        if (slopeA == 0.0) return Double.isInfinite(slopeB);
+        if (slopeB == 0.0) return Double.isInfinite(slopeA);
+        if (Double.isInfinite(slopeA) || Double.isInfinite(slopeB)) return false;
+        return fpEq(slopeA * slopeB, -1.0);
+    }
+
+    /**
+     * The slope of the line through two points: infinite where they stand one above the other,
+     * flat where they stand side by side, and the ratio otherwise. Every question about how two
+     * segments lie relative to one another is asked of their slopes, which is why two nearly
+     * parallel segments a million units long are parallel: their slopes are a hair apart, even
+     * though the cross product of their directions is not.
+     */
+    private static double slopeBetween(PgPoint p1, PgPoint p2) {
+        if (fpEq(p1.x, p2.x)) return Double.POSITIVE_INFINITY;
+        if (fpEq(p1.y, p2.y)) return 0.0;
+        return (p1.y - p2.y) / (p1.x - p2.x);
     }
 
     public static boolean isParallel(PgLseg a, PgLseg b) {
-        double dx1 = a.p2.x - a.p1.x, dy1 = a.p2.y - a.p1.y;
-        double dx2 = b.p2.x - b.p1.x, dy2 = b.p2.y - b.p1.y;
-        return Math.abs(dx1 * dy2 - dy1 * dx2) < EPSILON;
+        double slopeA = slopeBetween(a.p1, a.p2);
+        double slopeB = slopeBetween(b.p1, b.p2);
+        if (Double.isInfinite(slopeA) || Double.isInfinite(slopeB)) {
+            return Double.isInfinite(slopeA) && Double.isInfinite(slopeB);
+        }
+        return fpEq(slopeA, slopeB);
     }
 
     public static boolean isParallel(PgLine a, PgLine b) {

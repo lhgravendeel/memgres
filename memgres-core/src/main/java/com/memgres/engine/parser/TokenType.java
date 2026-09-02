@@ -63,6 +63,8 @@ public enum TokenType {
     EXCL_TILDE,      // !~
     EXCL_TILDE_STAR, // !~*
     GEO_BELOW,       // <<|
+    GEO_BELOW_EQ,    // <^
+    GEO_ABOVE_EQ,    // >^
     GEO_ABOVE,       // |>>
     GEO_NOT_EXTEND_RIGHT,  // &<
     GEO_NOT_EXTEND_LEFT,   // &>
@@ -83,7 +85,9 @@ public enum TokenType {
     RIGHT_BRACKET,   // ]
     COMMA,           // ,
     SEMICOLON,       // ;
+    NATIONAL_STRING_LITERAL, // N'…' — characters in the national character set
     DOT,             // .
+    DOT_DOT,         // .. — one token, as in PostgreSQL, where PL/pgSQL writes a range with it
     COLON,           // :
     COLON_EQUALS,    // :=
     FAT_ARROW,       // =>

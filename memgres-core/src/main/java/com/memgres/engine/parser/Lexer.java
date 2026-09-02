@@ -244,12 +244,14 @@ public class Lexer {
             return readNumber(start);
         }
 
-        // A national-character literal is an ordinary one: the N says the characters are in the
-        // national character set, which here is the only one there is. It used to be read as a
-        // type name followed by a string, so N'abc' was a cast to a type called n.
+        // A national-character literal holds the same characters an ordinary one does — there is
+        // only the one character set here — but it is a value of the national character type, so
+        // it is kept apart from a plain string. It used to be read as a type name followed by a
+        // string, so N'abc' was a cast to a type called n.
         if ((c == 'N' || c == 'n') && pos + 1 < length && sql.charAt(pos + 1) == '\'') {
             pos += 1;
-            return readStringLiteral(start);
+            Token literal = readStringLiteral(start);
+            return new Token(TokenType.NATIONAL_STRING_LITERAL, literal.value(), start);
         }
 
         // Unicode escape strings: U&'...'
@@ -307,6 +309,13 @@ public class Lexer {
             case ';':
                 return new Token(TokenType.SEMICOLON, ";", start);
             case '.':
+                // Two dots together are one token, as they are in PostgreSQL, where they write
+                // a range in PL/pgSQL. Nothing in SQL accepts one, so a run of dots is reported
+                // as ".." rather than as the first single dot of it.
+                if (pos < sql.length() && sql.charAt(pos) == '.') {
+                    pos++;
+                    return new Token(TokenType.DOT_DOT, "..", start);
+                }
                 return new Token(TokenType.DOT, ".", start);
             default:
                 return new Token(TokenType.ERROR, String.valueOf(c), start);
@@ -416,6 +425,8 @@ public class Lexer {
             case "?-": return new Token(TokenType.GEO_IS_HORIZONTAL, "?-", start);
             case "#>": return new Token(TokenType.JSON_HASH_ARROW, "#>", start);
             case "#-": return new Token(TokenType.JSON_DELETE_PATH, "#-", start);
+            case "<^": return new Token(TokenType.GEO_BELOW_EQ, "<^", start);
+            case ">^": return new Token(TokenType.GEO_ABOVE_EQ, ">^", start);
             case "&<": return new Token(TokenType.GEO_NOT_EXTEND_RIGHT, "&<", start);
             case "&>": return new Token(TokenType.GEO_NOT_EXTEND_LEFT, "&>", start);
             case "!~": return new Token(TokenType.EXCL_TILDE, "!~", start);
@@ -555,7 +566,10 @@ public class Lexer {
                             }
                             sb.appendCodePoint(val);
                         } else {
-                            sb.append(c); pos++;
+                            // A backslash in front of anything else escapes that character and
+                            // is itself dropped: E'\z' is one letter, not two.
+                            sb.append(next);
+                            pos += 2;
                         }
                         break;
                     }

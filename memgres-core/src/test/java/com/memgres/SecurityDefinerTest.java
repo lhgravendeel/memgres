@@ -19,8 +19,13 @@ class SecurityDefinerTest {
     private Memgres memgres;
 
     @BeforeEach
-    void setUp() {
+    void setUp() throws SQLException {
         memgres = Memgres.builder().port(0).build().start();
+        // Since PostgreSQL 15 the public schema grants CREATE to nobody, and memgres now says so
+        // too. These tests are about who a routine runs as, so the grant is made once here.
+        try (Connection c = connect(); Statement s = c.createStatement()) {
+            s.execute("GRANT CREATE ON SCHEMA public TO PUBLIC");
+        }
     }
 
     @AfterEach

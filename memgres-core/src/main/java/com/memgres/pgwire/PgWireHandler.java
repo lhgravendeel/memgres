@@ -384,7 +384,10 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
             if (connectingUser != null && !connectingUser.isEmpty()) {
                 session.getGucSettings().set("session_authorization", connectingUser);
                 session.getGucSettings().setBootDefault("session_authorization", connectingUser);
-                session.getGucSettings().setBootDefault("role", connectingUser);
+                // "role" says which role SET ROLE put the session into, and connecting is not
+                // that: PostgreSQL reads "none" until one is chosen. Seeded with the connecting
+                // user, current_setting('role') named a role nobody had set, and RESET ROLE had
+                // nothing to go back to.
                 session.setConnectingUser(connectingUser);
                 if (!database.hasRole(connectingUser)) {
                     database.createRole(connectingUser, new java.util.HashMap<>());
@@ -2007,7 +2010,21 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
     private static final String[] NAMES_ITS_OBJECT = {
             "drop", "alter", "truncate", "comment", "grant", "revoke", "security label",
             "create index", "create unique index", "reindex", "lock", "analyze", "vacuum",
-            "cluster", "refresh"};
+            "cluster", "refresh",
+            // A CREATE that names the object it acts on reports no location either — measured
+            // for each of these. CREATE TABLE and CREATE VIEW are not among them, because the
+            // name that fails to resolve is inside a column declaration or a query, which the
+            // parser did read from the text.
+            "create operator", "create aggregate", "create cast", "create collation",
+            "create trigger", "create policy", "create rule", "create extension",
+            "create text search", "create foreign", "create server", "create publication"};
+
+    /** Whether this state reports that a name did not resolve, rather than that text would not parse. */
+    private static boolean isAboutResolvingAName(String sqlState) {
+        if (sqlState == null) return false;
+        return sqlState.equals("42P01") || sqlState.equals("42704") || sqlState.equals("3F000")
+                || sqlState.equals("42883") || sqlState.equals("42501") || sqlState.equals("42P02");
+    }
 
     private static boolean namesItsObjectRatherThanQueryingIt(String sql) {
         String start = sql.trim().toLowerCase(java.util.Locale.ROOT);
@@ -2075,7 +2092,12 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
         // statement is carried out, not where it was read. DROP, ALTER, TRUNCATE, COMMENT,
         // GRANT and CREATE INDEX all answer with no Position, where SELECT, INSERT, UPDATE,
         // DELETE and the query inside a CREATE VIEW all answer with one.
-        if (namesItsObjectRatherThanQueryingIt(sql)) return;
+        // Only the errors about resolving what the statement named: a statement that will not
+        // parse has a place in the text whatever command it was, and suppressing the position
+        // for those took away a location PostgreSQL reports.
+        if (namesItsObjectRatherThanQueryingIt(sql) && isAboutResolvingAName(e.getSqlState())) {
+            return;
+        }
         // Extract quoted name from error message patterns like: relation "foo" does not exist
         // or column "bar" does not exist, or at or near "token"
         String name = null;
@@ -2147,7 +2169,15 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
      * a place in the text.
      */
     private static boolean hasNoParseLocation(String sqlState) {
-        return sqlState != null && (sqlState.startsWith("23") || sqlState.equals("428C9"));
+        if (sqlState == null) return false;
+        // "Already exists" is decided by looking in the catalogue, not by reading the statement,
+        // so PostgreSQL reports it with no position — measured for a role, a schema and a
+        // relation alike. Guessed from the name in the message, every CREATE that named
+        // something already there pointed at the word.
+        if (sqlState.equals("42710") || sqlState.equals("42P06") || sqlState.equals("42P07")) {
+            return true;
+        }
+        return sqlState.startsWith("23") || sqlState.equals("428C9");
     }
 
     /** After a SET command, emit ParameterStatus messages for tracked GUC parameters. */

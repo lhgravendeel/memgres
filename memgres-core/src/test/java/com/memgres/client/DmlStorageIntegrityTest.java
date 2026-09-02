@@ -42,6 +42,12 @@ class DmlStorageIntegrityTest {
         conn = DriverManager.getConnection(memgres.getJdbcUrl() + "?preferQueryMode=simple",
                 memgres.getUser(), memgres.getPassword());
         conn.setAutoCommit(true);
+        // Since PostgreSQL 15 the public schema grants CREATE to nobody, and memgres now says
+        // so too. These tests are about something else, so the grant is made once here rather
+        // than in every one of them.
+        try (java.sql.Statement grantStmt = conn.createStatement()) {
+            grantStmt.execute("GRANT CREATE ON SCHEMA public TO PUBLIC");
+        }
     }
 
     @AfterAll
@@ -1914,7 +1920,7 @@ class DmlStorageIntegrityTest {
         exec("CREATE FUNCTION hdo_trgf() RETURNS trigger AS $$ BEGIN RETURN NULL; END $$"
                 + " LANGUAGE plpgsql");
         SQLException truncTrigger = assertThrows(SQLException.class, () -> exec(
-                "CREATE TRIGGER hdo_trg INSTEAD OF TRUNCATE ON hdo_orvv FOR EACH STATEMENT"
+                "CREATE TRIGGER hdo_trg INSTEAD OF TRUNCATE ON public.hdo_orvv FOR EACH STATEMENT"
                 + " EXECUTE FUNCTION hdo_trgf()"));
         assertEquals("42809", truncTrigger.getSQLState());
 
@@ -2190,7 +2196,7 @@ class DmlStorageIntegrityTest {
         assertEquals("t", scalar("SELECT contype FROM pg_constraint WHERE conname='w1i_tg5c'"));
         // A plain trigger has no deferrability, and PG refuses the word outright
         SQLException ex = assertThrows(SQLException.class,
-                () -> exec("CREATE TRIGGER w1i_plain AFTER INSERT ON w1i_t5 DEFERRABLE"
+                () -> exec("CREATE TRIGGER w1i_plain AFTER INSERT ON public.w1i_t5 DEFERRABLE"
                         + " FOR EACH ROW EXECUTE FUNCTION w1i_f5()"));
         assertEquals("42601", ex.getSQLState());
     }
@@ -3044,7 +3050,7 @@ void theseObjectsBelongToTheRelationsOwner() throws Exception {
         assertEquals("must be owner of relation zzt_own2",
                 messageOf("DROP POLICY zzt_pol ON zzt_own2"));
         assertEquals("permission denied for table zzt_own2",
-                messageOf("CREATE TRIGGER zzt_trg2 BEFORE INSERT ON zzt_own2"
+                messageOf("CREATE TRIGGER zzt_trg2 BEFORE INSERT ON public.zzt_own2"
                         + " FOR EACH ROW EXECUTE FUNCTION zzt_ofn()"));
     } finally {
         exec("RESET ROLE");
@@ -3883,12 +3889,12 @@ void theseObjectsBelongToTheRelationsOwner() throws Exception {
         exec("CREATE FUNCTION dtr_kf() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$");
         exec("CREATE SEQUENCE dtr_ks");
         exec("CREATE MATERIALIZED VIEW dtr_kmv AS SELECT 1 AS i");
-        String onSequence = "CREATE TRIGGER dtr_ktg BEFORE INSERT ON dtr_ks"
+        String onSequence = "CREATE TRIGGER dtr_ktg BEFORE INSERT ON public.dtr_ks"
                 + " FOR EACH ROW EXECUTE FUNCTION dtr_kf()";
         assertEquals("42809", stateOf(onSequence));
         assertEquals("relation \"dtr_ks\" cannot have triggers", messageOf(onSequence));
         assertEquals("This operation is not supported for sequences.", detailOf(onSequence));
-        String onMatview = "CREATE TRIGGER dtr_ktg2 BEFORE INSERT ON dtr_kmv"
+        String onMatview = "CREATE TRIGGER dtr_ktg2 BEFORE INSERT ON public.dtr_kmv"
                 + " FOR EACH ROW EXECUTE FUNCTION dtr_kf()";
         assertEquals("42809", stateOf(onMatview));
         assertEquals("relation \"dtr_kmv\" cannot have triggers", messageOf(onMatview));
@@ -3908,12 +3914,12 @@ void theseObjectsBelongToTheRelationsOwner() throws Exception {
         exec("CREATE TRIGGER dtr_vtg2 BEFORE INSERT ON dtr_vv FOR EACH STATEMENT EXECUTE FUNCTION dtr_vf()");
         // a view that could never be written through still takes a statement-level trigger
         exec("CREATE TRIGGER dtr_vtg3 AFTER INSERT ON dtr_vk FOR EACH STATEMENT EXECUTE FUNCTION dtr_vf()");
-        assertEquals("42809", stateOf("CREATE TRIGGER dtr_vtg4 AFTER INSERT ON dtr_vv"
+        assertEquals("42809", stateOf("CREATE TRIGGER dtr_vtg4 AFTER INSERT ON public.dtr_vv"
                 + " FOR EACH ROW EXECUTE FUNCTION dtr_vf()"));
-        assertEquals("42809", stateOf("CREATE TRIGGER dtr_vtg5 AFTER INSERT ON dtr_vv"
+        assertEquals("42809", stateOf("CREATE TRIGGER dtr_vtg5 AFTER INSERT ON public.dtr_vv"
                 + " REFERENCING NEW TABLE AS dtr_nt FOR EACH STATEMENT EXECUTE FUNCTION dtr_vf()"));
         assertEquals("Triggers on views cannot have transition tables.",
-                detailOf("CREATE TRIGGER dtr_vtg6 AFTER INSERT ON dtr_vv"
+                detailOf("CREATE TRIGGER dtr_vtg6 AFTER INSERT ON public.dtr_vv"
                         + " REFERENCING NEW TABLE AS dtr_nt FOR EACH STATEMENT EXECUTE FUNCTION dtr_vf()"));
         exec("DROP VIEW dtr_vk");
         exec("DROP VIEW dtr_vv");
@@ -3926,12 +3932,12 @@ void theseObjectsBelongToTheRelationsOwner() throws Exception {
         exec("CREATE FUNCTION dtr_tf2() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$");
         exec("CREATE TABLE dtr_tp (i int) PARTITION BY RANGE (i)");
         exec("CREATE TABLE dtr_tpa PARTITION OF dtr_tp FOR VALUES FROM (0) TO (100)");
-        String onPartition = "CREATE TRIGGER dtr_ttg AFTER INSERT ON dtr_tpa"
+        String onPartition = "CREATE TRIGGER dtr_ttg AFTER INSERT ON public.dtr_tpa"
                 + " REFERENCING NEW TABLE AS dtr_nt FOR EACH ROW EXECUTE FUNCTION dtr_tf2()";
         assertEquals("0A000", stateOf(onPartition));
         assertEquals("ROW triggers with transition tables are not supported on partitions",
                 messageOf(onPartition));
-        String onParent = "CREATE TRIGGER dtr_ttg2 AFTER INSERT ON dtr_tp"
+        String onParent = "CREATE TRIGGER dtr_ttg2 AFTER INSERT ON public.dtr_tp"
                 + " REFERENCING NEW TABLE AS dtr_nt FOR EACH ROW EXECUTE FUNCTION dtr_tf2()";
         assertEquals("0A000", stateOf(onParent));
         assertEquals("\"dtr_tp\" is a partitioned table", messageOf(onParent));
@@ -3953,7 +3959,7 @@ void theseObjectsBelongToTheRelationsOwner() throws Exception {
         exec("CREATE TRIGGER dtr_wtg2 AFTER INSERT ON dtr_wt FOR EACH ROW"
                 + " WHEN (NEW.xmin IS NOT NULL) EXECUTE FUNCTION dtr_wf()");
         // a column that really is not there is still reported
-        assertEquals("42703", stateOf("CREATE TRIGGER dtr_wtg3 AFTER INSERT ON dtr_wt FOR EACH ROW"
+        assertEquals("42703", stateOf("CREATE TRIGGER dtr_wtg3 AFTER INSERT ON public.dtr_wt FOR EACH ROW"
                 + " WHEN (NEW.nosuch IS NOT NULL) EXECUTE FUNCTION dtr_wf()"));
         exec("DROP TABLE dtr_wt CASCADE");
         exec("DROP FUNCTION dtr_wf() CASCADE");
@@ -3963,7 +3969,7 @@ void theseObjectsBelongToTheRelationsOwner() throws Exception {
     void aConstraintTriggerHasNoReferencingClause() throws Exception {
         exec("CREATE FUNCTION dtr_cf() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$");
         exec("CREATE TABLE dtr_ct (i int)");
-        String withReferencing = "CREATE CONSTRAINT TRIGGER dtr_ctg AFTER INSERT ON dtr_ct"
+        String withReferencing = "CREATE CONSTRAINT TRIGGER dtr_ctg AFTER INSERT ON public.dtr_ct"
                 + " REFERENCING NEW TABLE AS dtr_nt FOR EACH ROW EXECUTE FUNCTION dtr_cf()";
         assertEquals("42601", stateOf(withReferencing));
         assertEquals("syntax error at or near \"REFERENCING\"", messageOf(withReferencing));

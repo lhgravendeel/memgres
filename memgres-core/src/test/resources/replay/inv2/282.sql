@@ -1,0 +1,4 @@
+-- source: investigation-2026-08.md
+-- finding: 282
+-- title: Protocol field counts are written into 16-bit fields with no check on what produced them, and nothing in the engine limits the size of a target list
+-- a select list of N constants: SELECT 0,1,2,...  (N = 2000, 40000, 70000);

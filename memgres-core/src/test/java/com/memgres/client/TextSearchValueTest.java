@@ -120,10 +120,11 @@ class TextSearchValueTest {
     void setweightInventsNoPosition() throws SQLException {
         assertEquals("'a' 'b'", one("SELECT setweight('a b'::tsvector, 'A')::text"));
         assertEquals("'a'", one("SELECT setweight(strip('a:1'::tsvector), 'A')::text"));
-        // A weight outside the four is the caller's mistake, reported as a bad parameter with
-        // the character quoted -- the way every other weight-taking function reports one.
-        assertEquals("22023", stateOf("SELECT setweight('a:1'::tsvector, '')"));
-        assertEquals("22023", stateOf("SELECT setweight('a:1'::tsvector, 'X')"));
+        // A weight outside the four is reported the way PostgreSQL reports it. setweight reads
+        // the weight as a byte and reports it as an internal condition; ts_filter reads a list of
+        // them and reports a bad parameter with the offending one quoted.
+        assertEquals("XX000", stateOf("SELECT setweight('a:1'::tsvector, '')"));
+        assertEquals("XX000", stateOf("SELECT setweight('a:1'::tsvector, 'X')"));
         assertEquals("22023", stateOf("SELECT ts_filter('a:1A'::tsvector, '{X}')"));
     }
 

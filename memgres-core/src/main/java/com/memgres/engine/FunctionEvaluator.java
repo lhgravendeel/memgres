@@ -87,7 +87,7 @@ class FunctionEvaluator {
     }
     private final DateTimeFunctions dateTimeFunctions;
     private final XmlFunctions xmlFunctions;
-    private final GeometricFunctions geometricFunctions;
+    final GeometricFunctions geometricFunctions;
     private final RangeFunctions rangeFunctions;
     private final NetworkFunctions networkFunctions;
     private final ByteaFunctions byteaFunctions;
@@ -704,6 +704,11 @@ class FunctionEvaluator {
         return element == null ? type.toRegtypeDisplay() : element.toRegtypeDisplay() + "[]";
     }
 
+    /** The binary operator a spelling denotes, or null when the engine has none of that name. */
+    static BinaryExpr.BinOp binaryOpForSymbol(String symbol) {
+        return symbol == null ? null : BINARY_BY_SYMBOL.get(symbol);
+    }
+
     /** The binary operator each spelling denotes, for the spellings memgres evaluates. */
     private static final Map<String, BinaryExpr.BinOp> BINARY_BY_SYMBOL = buildBinaryBySymbol();
 
@@ -748,6 +753,8 @@ class FunctionEvaluator {
         map.put("~~*", BinaryExpr.BinOp.ILIKE);
         map.put("<->", BinaryExpr.BinOp.DISTANCE);
         map.put("~=", BinaryExpr.BinOp.APPROX_EQUAL);
+        map.put("<^", BinaryExpr.BinOp.GEO_BELOW_EQ);
+        map.put(">^", BinaryExpr.BinOp.GEO_ABOVE_EQ);
         map.put("<<|", BinaryExpr.BinOp.GEO_BELOW);
         map.put("|>>", BinaryExpr.BinOp.GEO_ABOVE);
         map.put("&<", BinaryExpr.BinOp.GEO_NOT_EXTEND_RIGHT);
@@ -1617,6 +1624,8 @@ class FunctionEvaluator {
                 // A qualifier names one schema's sequence and no other's: stripping it made
                 // nextval('other.s') advance whichever sequence of that name was found first.
                 Sequence seq = requireSequence(seqName);
+                // Drawing from a sequence needs USAGE or UPDATE on it, which was never asked for.
+                executor.checkSequencePrivilege("UPDATE", seq.getSchemaName(), seq.getName());
                 long nv;
                 if (executor.session != null && seq.getCache() > 1) {
                     nv = executor.session.nextvalCached(seq);
@@ -1633,6 +1642,7 @@ class FunctionEvaluator {
                 if (currvalArg == null) return null;
                 String seqName = String.valueOf(currvalArg);
                 Sequence seq = requireSequence(seqName);
+                executor.checkSequencePrivilege("SELECT", seq.getSchemaName(), seq.getName());
                 Long drawn = executor.sessionSequenceValues.get(seq.getInstanceId());
                 if (drawn == null) {
                     throw new MemgresException("currval of sequence \"" + seq.getName()
@@ -1683,13 +1693,18 @@ class FunctionEvaluator {
                 if (setvalArg == null) return null;
                 String seqName = String.valueOf(setvalArg);
                 Sequence seq = requireSequence(seqName);
+                executor.checkSequencePrivilege("UPDATE", seq.getSchemaName(), seq.getName());
                 Object rawVal = executor.evalExpr(fn.args().get(1), ctx);
                 if (rawVal == null) return null; // PG treats setval(seq, NULL) as a no-op returning NULL
                 long val = executor.toLong(rawVal);
                 long result;
                 boolean marksCurrval = true;
                 if (fn.args().size() > 2) {
-                    boolean isCalled = executor.isTruthy(executor.evalExpr(fn.args().get(2), ctx));
+                    Object calledArg = executor.evalExpr(fn.args().get(2), ctx);
+                    // Every argument is required, so an unknown one leaves the whole call unknown
+                    // and the sequence untouched.
+                    if (calledArg == null) return null;
+                    boolean isCalled = executor.isTruthy(calledArg);
                     result = seq.setVal(val, isCalled);
                     marksCurrval = isCalled;
                 } else {
@@ -2715,12 +2730,16 @@ class FunctionEvaluator {
                 }
                 return new ArrayList<>(trgmSet);
             }
+            case "word_similarity":
+            case "strict_word_similarity":
             case "similarity": {
                 requireExtension("pg_trgm", name, fn.args().size());
                 requireArgs(fn, 2);
                 Object arg1 = executor.evalExpr(fn.args().get(0), ctx);
                 Object arg2 = executor.evalExpr(fn.args().get(1), ctx);
-                if (arg1 == null || arg2 == null) return 0.0;
+                // These are strict: given nothing to compare, the answer is nothing rather than
+                // no similarity at all.
+                if (arg1 == null || arg2 == null) return null;
                 String s1 = arg1.toString().toLowerCase(java.util.Locale.ROOT);
                 String s2 = arg2.toString().toLowerCase(java.util.Locale.ROOT);
                 Set<String> trgm1 = trigramSet(s1);
@@ -2793,7 +2812,10 @@ class FunctionEvaluator {
             }
             // ---- unicode functions ----
             case "unicode_version":
-                return Character.UnicodeScript.of('A').toString().isEmpty() ? "0.0" : System.getProperty("java.version").startsWith("1") ? "6.2" : "15.0";
+                // The Unicode release PostgreSQL 18 was built against. Read off the running JVM,
+                // the answer moved with the Java version rather than saying what the server
+                // classifies characters by.
+                return "16.0";
             case "unicode_assigned": {
                 requireArgs(fn, 1);
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
@@ -3404,6 +3426,9 @@ class FunctionEvaluator {
                     }
                 }
                 if (userFunc != null) {
+                    // Calling a routine is a privilege of its own, and it was never asked for, so
+                    // REVOKE EXECUTE ... FROM PUBLIC took nothing away from anybody.
+                    executor.checkFunctionPrivilege(userFunc);
                     // Procedures cannot be called via SELECT; must use CALL
                     if (userFunc.isProcedure()) {
                         // PostgreSQL names the routine by its argument types, the same way it

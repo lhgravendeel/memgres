@@ -72,7 +72,9 @@ class CatalogTypeSystemBuilder {
         // User-defined collations (from CREATE COLLATION)
         for (java.util.Map.Entry<String, Database.CollationDef> entry : database.getUserCollations().entrySet()) {
             Database.CollationDef coll = entry.getValue();
-            int publicNs = oids.oid("ns:public");
+            // A collation lives in the schema its definition named, not always public: reported
+            // as public regardless, a join to pg_namespace found the wrong schema.
+            int publicNs = oids.oid("ns:" + coll.schemaName);
             // An ICU collation is encoding-independent, which PostgreSQL records as collencoding
             // -1; only a libc collation is tied to one encoding. Writing 6 for both made
             // PostgreSQL's own lookup condition, "collencoding = -1 OR collencoding = the
@@ -166,9 +168,15 @@ class CatalogTypeSystemBuilder {
             String extName = entry.getKey();
             if ("plpgsql".equalsIgnoreCase(extName)) continue;
             String extVersion = entry.getValue();
+            // An extension installs its objects into a schema, and unless it says where, that
+            // is the one the search path creates in — not pg_catalog, which is where an
+            // extension nobody can move would go. It is relocatable unless it pins a schema.
             String extSchema = database.getExtensionSchema(extName);
-            int extNs = (extSchema != null) ? oids.oid("ns:" + extSchema) : pgCatalogNs;
-            table.insertRow(new Object[]{oids.oid("ext:" + extName), extName, 10, extNs, false, extVersion, null, null, 1});
+            boolean relocatable = extSchema == null;
+            if (extSchema == null) extSchema = "public";
+            int extNs = oids.oid("ns:" + extSchema);
+            table.insertRow(new Object[]{oids.oid("ext:" + extName), extName, 10, extNs,
+                    relocatable, extVersion, null, null, 1});
         }
         return table;
     }
@@ -226,6 +234,12 @@ class CatalogTypeSystemBuilder {
     }
 
 
+    /** A selectivity estimator named by the operator, or the empty reference where it has none. */
+    private RegprocValue selectivityEstimator(String name) {
+        if (name == null || name.isEmpty() || "-".equals(name)) return new RegprocValue(0, "-");
+        return new RegprocValue(oids.oid("proc:" + name), name);
+    }
+
     Table buildPgOperator() {
         List<Column> cols = Cols.listOf(
                 colNN("oid", DataType.OID), colNN("oprname", DataType.NAME),
@@ -253,7 +267,10 @@ class CatalogTypeSystemBuilder {
                     // A regproc value, so oprcode::text answers the function's name the way
                     // PostgreSQL does rather than handing the reader back an OID.
                     new RegprocValue(oids.oid("proc:" + op[5]), (String) op[5]),
-                    new RegprocValue(0, "-"), new RegprocValue(0, "-"), 1});
+                    // The routines a planner asks how selective the operator is. Reporting none
+                    // for every one of them said the planner had nothing to estimate with.
+                    selectivityEstimator((String) op[11]), selectivityEstimator((String) op[12]),
+                    1});
         }
 
         // User-defined operators
@@ -906,7 +923,8 @@ class CatalogTypeSystemBuilder {
             int idx = aggIndex.merge(aggName, 0, (a, b) -> a + 1);
             String oidKey = idx == 0 ? "proc:" + aggName : "proc:" + aggName + "#agg" + idx;
             table.insertRow(builtinAggregateRow(
-                    new RegprocValue(oids.oid(oidKey), aggName), Integer.parseInt(agg[1]), null));
+                    new RegprocValue(oids.oid(oidKey), aggName), Integer.parseInt(agg[1]),
+                    BuiltinAggregateCatalog.of(aggName, agg[2])));
         }
 
         // Populate with user-defined aggregates
@@ -920,7 +938,8 @@ class CatalogTypeSystemBuilder {
             Object combinefuncVal = agg.getCombinefunc() != null
                     ? new RegprocValue(oids.oid("proc:" + agg.getCombinefunc()), agg.getCombinefunc())
                     : new RegprocValue(0, "-");
-            Object[] row = builtinAggregateRow(aggFn, resolveTypeOid(agg.getStype()), agg.getInitcond());
+            Object[] row = builtinAggregateRow(aggFn, resolveTypeOid(agg.getStype()), null);
+            row[20] = agg.getInitcond(); // agginitval
             row[3] = sfuncVal;      // aggtransfn
             row[4] = finalfuncVal;  // aggfinalfn
             row[5] = combinefuncVal; // aggcombinefn
@@ -930,15 +949,41 @@ class CatalogTypeSystemBuilder {
     }
 
     /** A pg_aggregate row with the support functions left unclaimed rather than invented. */
-    private Object[] builtinAggregateRow(Object aggfnoid, int transType, String initval) {
+    /**
+     * One row of pg_aggregate. What PostgreSQL records for the aggregate is used where it is
+     * known — which routine accumulates, which finishes, what the accumulator is — because a row
+     * of "none" says the server cannot compute an aggregate it plainly can.
+     */
+    private Object[] builtinAggregateRow(Object aggfnoid, int transType,
+                                         BuiltinAggregateCatalog.Row measured) {
         RegprocValue none = new RegprocValue(0, "-");
+        if (measured == null) {
+            return new Object[]{
+                    aggfnoid, "n", (short) 0,
+                    none, none, none, none, none, none, none, none,
+                    false, false, "r", "r",
+                    0, transType, 0, 0, 0,
+                    null, null
+            };
+        }
         return new Object[]{
-                aggfnoid, "n", (short) 0,
-                none, none, none, none, none, none, none, none,
-                false, false, "r", "r",
-                0, transType, 0, 0, 0,
-                initval, null
+                aggfnoid, measured.kind, measured.directArgs,
+                regprocNamed(measured.transFn), regprocNamed(measured.finalFn),
+                none, none, none,
+                regprocNamed(measured.mTransFn), regprocNamed(measured.mInvTransFn),
+                regprocNamed(measured.mFinalFn),
+                measured.finalExtra, measured.mFinalExtra,
+                measured.finalModify, measured.mFinalModify,
+                measured.sortOp, measured.transType, measured.transSpace,
+                measured.mTransType, measured.mTransSpace,
+                measured.initVal, measured.mInitVal
         };
+    }
+
+    /** A routine reference by name, or the empty one where the aggregate names none. */
+    private RegprocValue regprocNamed(String name) {
+        if (name == null || name.isEmpty() || "-".equals(name)) return new RegprocValue(0, "-");
+        return new RegprocValue(oids.oid("proc:" + name), name);
     }
 
     /**

@@ -33,7 +33,10 @@ class TriggerAdvancedCompatTest {
         try (Statement s = conn.createStatement()) {
             s.execute("CREATE TABLE base_tbl (id serial PRIMARY KEY, name text, lock_val int, updated_at timestamp DEFAULT now())");
             s.execute("CREATE FUNCTION noop_trigger() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END; $$");
-            s.execute("CREATE FUNCTION notify_change(channel text) RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_notify(channel, 'changed'); RETURN NEW; END; $$");
+            // A trigger function takes no declared arguments: the trigger's arguments reach it
+            // through TG_ARGV, which is where this one reads the channel from.
+            s.execute("CREATE FUNCTION notify_change() RETURNS trigger LANGUAGE plpgsql AS $$"
+                    + " BEGIN PERFORM pg_notify(TG_ARGV[0], 'changed'); RETURN NEW; END; $$");
             s.execute("CREATE FUNCTION stmt_noop() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END; $$");
         }
     }
@@ -65,7 +68,8 @@ class TriggerAdvancedCompatTest {
 
     @Test
     void testExecuteFunctionWithMultipleArgs() throws SQLException {
-        exec("CREATE FUNCTION multi_arg_trigger(ch text, tbl text) RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END; $$");
+        exec("CREATE FUNCTION multi_arg_trigger() RETURNS trigger LANGUAGE plpgsql AS $$"
+                + " BEGIN RETURN NEW; END; $$");
         exec("CREATE TABLE multi_arg_tbl (id serial PRIMARY KEY)");
         exec("""
             CREATE TRIGGER multi_arg_trig
@@ -125,7 +129,7 @@ class TriggerAdvancedCompatTest {
     @Test
     void testReferencingOldTableWithFunctionArg() throws SQLException {
         exec("CREATE TABLE ref_fn_arg (id serial PRIMARY KEY, data text)");
-        exec("CREATE FUNCTION log_delete_with_name(tbl_name text) RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END; $$");
+        exec("CREATE FUNCTION log_delete_with_name() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END; $$");
         exec("""
             CREATE TRIGGER ref_fn_trig
             AFTER DELETE ON ref_fn_arg
@@ -138,7 +142,7 @@ class TriggerAdvancedCompatTest {
     @Test
     void testReferencingOldTableWithTwoStringArgs() throws SQLException {
         exec("CREATE TABLE ref_two_args (id serial PRIMARY KEY, data text)");
-        exec("CREATE FUNCTION log_with_context(tbl text, ctx text) RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END; $$");
+        exec("CREATE FUNCTION log_with_context() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END; $$");
         exec("""
             CREATE TRIGGER ref_two_args_trig
             AFTER DELETE ON ref_two_args
@@ -193,7 +197,7 @@ class TriggerAdvancedCompatTest {
     @Test
     void testReferencingWithSchemaQualifiedFuncAndArg() throws SQLException {
         exec("CREATE SCHEMA IF NOT EXISTS audit");
-        exec("CREATE FUNCTION audit.record_deletes(tbl text) RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END; $$");
+        exec("CREATE FUNCTION audit.record_deletes() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END; $$");
         exec("CREATE TABLE tracked_records (id serial PRIMARY KEY, data text)");
         exec("""
             CREATE TRIGGER audit_deletes
@@ -212,7 +216,7 @@ class TriggerAdvancedCompatTest {
     void testInsteadOfWithFunctionArgs() throws SQLException {
         exec("CREATE TABLE io_base (id serial PRIMARY KEY, val text)");
         exec("CREATE VIEW io_view AS SELECT * FROM io_base");
-        exec("CREATE FUNCTION handle_view_dml(op text) RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF op = 'INSERT' THEN INSERT INTO io_base (val) VALUES (NEW.val); END IF; RETURN NEW; END; $$");
+        exec("CREATE FUNCTION handle_view_dml() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF TG_ARGV[0] = 'INSERT' THEN INSERT INTO io_base (val) VALUES (NEW.val); END IF; RETURN NEW; END; $$");
         exec("""
             CREATE TRIGGER io_view_insert
             INSTEAD OF INSERT ON io_view

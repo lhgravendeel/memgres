@@ -70,6 +70,9 @@ public final class BuiltinCallTypes {
     private static final int ANYCOMPATIBLEMULTIRANGE = 5086;
     private static final int RECORD = 2249;
     private static final int ANYENUM = 3500;
+    private static final int ANYELEMENT = 2283;
+    private static final int ANYNONARRAY = 2776;
+    private static final int ANYCOMPATIBLE = 5077;
 
     private static Map<Integer, Character> buildCategories() {
         Map<Integer, Character> m = new HashMap<Integer, Character>();
@@ -107,6 +110,25 @@ public final class BuiltinCallTypes {
         int[] pseudo = {705, 2249, 2276, 2277, 2278, 2283, 2776, 5077, 5078, 5079, 5086};
         for (int i = 0; i < pseudo.length; i++) m.put(Integer.valueOf(pseudo[i]), Character.valueOf(PSEUDO));
         return m;
+    }
+
+    /** The built-in ranges, and the multiranges that collect them, told apart by type. */
+    private static final Set<Integer> RANGE_TYPES = oidSet(3904, 3906, 3908, 3910, 3912, 3926);
+    private static final Set<Integer> MULTIRANGE_TYPES =
+            oidSet(4451, 4532, 4533, 4534, 4535, 4536);
+
+    private static Set<Integer> oidSet(int... oids) {
+        Set<Integer> out = new HashSet<Integer>();
+        for (int i = 0; i < oids.length; i++) out.add(Integer.valueOf(oids[i]));
+        return out;
+    }
+
+    private static boolean isRangeType(int oid) {
+        return RANGE_TYPES.contains(Integer.valueOf(oid));
+    }
+
+    private static boolean isMultirangeType(int oid) {
+        return MULTIRANGE_TYPES.contains(Integer.valueOf(oid));
     }
 
     private static Map<Character, Integer> buildPreferred() {
@@ -397,8 +419,44 @@ public final class BuiltinCallTypes {
             return 0;
         }
         if (candidates == null || candidates.size() != 1) return 0;
-        int result = candidates.get(0).result;
-        return POLYMORPHIC.contains(Integer.valueOf(result)) ? 0 : result;
+        Signature chosen = candidates.get(0);
+        if (!POLYMORPHIC.contains(Integer.valueOf(chosen.result))) return chosen.result;
+        return concreteResultOf(chosen, argOids);
+    }
+
+    /**
+     * What a polymorphic result comes to for these arguments.
+     *
+     * <p>A signature written over {@code anyrange} says only "whatever was passed", and what was
+     * passed is in the argument list: the argument standing where the signature wrote the same
+     * polymorphic name settles it. An array and its element settle each other, so a call that
+     * takes an element and answers with an array of them can be read either way round.
+     *
+     * <p>Answers 0 when the arguments do not settle it — a user-defined type has no OID this
+     * class knows, and the caller is left to say what it knows instead.
+     */
+    private static int concreteResultOf(Signature chosen, int[] argOids) {
+        int result = chosen.result;
+        // The same polymorphic name in an argument position: that argument is the answer.
+        for (int i = 0; i < chosen.args.length && i < argOids.length; i++) {
+            if (chosen.args[i] == result && argOids[i] != UNKNOWN) return argOids[i];
+        }
+        if (result != ANYARRAY && result != ANYCOMPATIBLEARRAY && result != ANYELEMENT
+                && result != ANYCOMPATIBLE && result != ANYNONARRAY) {
+            return 0;
+        }
+        boolean wantArray = result == ANYARRAY || result == ANYCOMPATIBLEARRAY;
+        for (int i = 0; i < chosen.args.length && i < argOids.length; i++) {
+            int declared = chosen.args[i];
+            if (argOids[i] == UNKNOWN || !POLYMORPHIC.contains(Integer.valueOf(declared))) continue;
+            boolean gotArray = declared == ANYARRAY || declared == ANYCOMPATIBLEARRAY;
+            DataType given = DataType.fromOid(argOids[i]);
+            if (given == null) continue;
+            if (wantArray == gotArray) return argOids[i];
+            DataType turned = wantArray ? DataType.arrayOf(given) : DataType.elementOf(given);
+            if (turned != null) return turned.getOid();
+        }
+        return 0;
     }
 
     /**
@@ -519,6 +577,14 @@ public final class BuiltinCallTypes {
             if (declared == ANYRANGE || declared == ANYMULTIRANGE
                     || declared == ANYCOMPATIBLERANGE || declared == ANYCOMPATIBLEMULTIRANGE) {
                 if (categoryOf(argOids[i]) != RANGE) return false;
+                // A multirange is in the same category as the range it collects, so the category
+                // alone does not tell the two apart. It has to: upper_inf is declared over both,
+                // and reading either as the other left the call with two candidates and no
+                // result type. A range this class does not list is left to whichever it reaches.
+                boolean wantsMultirange =
+                        declared == ANYMULTIRANGE || declared == ANYCOMPATIBLEMULTIRANGE;
+                if (isMultirangeType(argOids[i]) && !wantsMultirange) return false;
+                if (isRangeType(argOids[i]) && wantsMultirange) return false;
                 continue;
             }
             // record stands for a row and anyenum for an enum, and for nothing else. max is

@@ -22,6 +22,33 @@ class CatalogSystemFunctions {
 
     private final AstExecutor executor;
     private final CatalogMetadataFunctions metadataFunctions;
+
+    /**
+     * The two transaction ids a snapshot opens with, read out of its text.
+     *
+     * <p>A snapshot is written {@code xmin:xmax:xip,…}, and text that is not written that way is
+     * not a snapshot at all — which is what PostgreSQL says, rather than letting the number
+     * reader's own complaint out as an internal error.
+     */
+    private static long[] snapshotNumbers(String calledAs, String written) {
+        String typeName = calledAs.startsWith("txid_") ? "txid_snapshot" : "pg_snapshot";
+        String[] parts = written.split(":", -1);
+        try {
+            long[] bounds = new long[Math.min(2, parts.length)];
+            for (int i = 0; i < bounds.length; i++) bounds[i] = Long.parseLong(parts[i].trim());
+            if (bounds.length == 0) throw new NumberFormatException(written);
+            return bounds;
+        } catch (NumberFormatException notASnapshot) {
+            throw new MemgresException("invalid input syntax for type " + typeName
+                    + ": \"" + written + "\"", "22P02");
+        }
+    }
+
+    /** The name an ACL entry writes for a role OID; an OID nobody has is written as it stands. */
+    private String aclRoleName(int oid) {
+        String named = metadataFunctions.roleNameOf(oid);
+        return named != null ? named : String.valueOf(oid);
+    }
     private final CatalogPrivilegeFunctions privilegeFunctions;
 
     CatalogSystemFunctions(AstExecutor executor) {
@@ -185,6 +212,19 @@ class CatalogSystemFunctions {
                                 ((FunctionCallExpr) rawExpr).name()
                                         .toLowerCase(java.util.Locale.ROOT)))) {
                     return "pg_lsn";
+                }
+
+                // A transaction id and a snapshot are carried as a number and as text, which say
+                // nothing about the types that produced them; the call is the only witness.
+                if (rawExpr instanceof FunctionCallExpr) {
+                    String producer = FunctionEvaluator.stripSchemaPrefix(
+                            ((FunctionCallExpr) rawExpr).name().toLowerCase(java.util.Locale.ROOT));
+                    if ("pg_current_xact_id".equals(producer)
+                            || "pg_current_xact_id_if_assigned".equals(producer)) {
+                        return "xid8";
+                    }
+                    if ("pg_current_snapshot".equals(producer)) return "pg_snapshot";
+                    if ("txid_current_snapshot".equals(producer)) return "txid_snapshot";
                 }
 
                 // CURRENT_TIME is a keyword and not a catalogued routine, and the timetz it
@@ -735,15 +775,12 @@ class CatalogSystemFunctions {
             case "pg_indexam_has_property": {
                 Object amOid = fn.args().size() > 0 ? executor.evalExpr(fn.args().get(0), ctx) : 0;
                 Object propArg = fn.args().size() > 1 ? executor.evalExpr(fn.args().get(1), ctx) : "";
+                // What an access method can do is a property of that method, not of index
+                // access in general: btree orders and enforces uniqueness, hash does neither, and
+                // a property no access method has is not a question with an answer.
+                if (amOid == null || propArg == null) return null;
                 String prop = String.valueOf(propArg).toLowerCase(java.util.Locale.ROOT);
-                switch (prop) {
-                    case "can_order":
-                    case "can_unique":
-                    case "can_multi_col":
-                        return true;
-                    default:
-                        return false;
-                }
+                return AccessMethods.hasProperty(executor.toInt(amOid), prop);
             }
             case "pg_tablespace_location": {
                 // A tablespace inside the data directory has no path of its own, which is the
@@ -858,6 +895,10 @@ class CatalogSystemFunctions {
             case "pg_ts_dict_is_visible":
             case "pg_ts_parser_is_visible":
             case "pg_ts_template_is_visible":
+            // An operator family and a statistics object are in a schema like the rest, and the
+            // built-in ones are in pg_catalog, which is always on the path.
+            case "pg_opfamily_is_visible":
+            case "pg_statistics_obj_is_visible":
                 return true;
             case "pg_table_is_visible": {
                 // Visible means reachable by its bare name, which is what the search path decides.
@@ -871,6 +912,18 @@ class CatalogSystemFunctions {
                     if (onPath.equalsIgnoreCase(schema)) return true;
                 }
                 return false;
+            }
+            case "to_regnamespace": {
+                // The regnamespace form that answers null rather than raising where no schema
+                // has the name, which is how a caller asks whether one is there at all.
+                if (fn.args().isEmpty()) return null;
+                Object nsArg = executor.evalExpr(fn.args().get(0), ctx);
+                if (nsArg == null) return null;
+                try {
+                    return executor.castEvaluator.applyCast(nsArg, "regnamespace");
+                } catch (MemgresException noSuchSchema) {
+                    return null;
+                }
             }
             case "pg_database_size": {
                 // A size is asked about a database, so the database has to be there. Answering
@@ -954,9 +1007,30 @@ class CatalogSystemFunctions {
                 return "base/16384/16385";
             }
             case "acldefault": {
-                if (!fn.args().isEmpty()) executor.evalExpr(fn.args().get(0), ctx);
-                if (fn.args().size() > 1) executor.evalExpr(fn.args().get(1), ctx);
-                return null;
+                // The ACL an object of this kind starts with: the owner's full set, and what
+                // PUBLIC holds by default. Answering null said every object type had none.
+                if (fn.args().size() < 2) return null;
+                Object kindArg = executor.evalExpr(fn.args().get(0), ctx);
+                Object ownerArg = executor.evalExpr(fn.args().get(1), ctx);
+                if (kindArg == null || ownerArg == null) return null;
+                // An ACL entry names roles, and an aclitem is written with names: an OID left in
+                // that place is not something the aclitem reader would read back.
+                return AclItems.defaultAclText(String.valueOf(kindArg),
+                        aclRoleName(executor.toInt(ownerArg)));
+            }
+            case "makeaclitem": {
+                // One ACL entry, built from the grantee, the grantor, the privileges and whether
+                // they may be passed on.
+                if (fn.args().size() < 4) return null;
+                Object granteeArg = executor.evalExpr(fn.args().get(0), ctx);
+                Object grantorArg = executor.evalExpr(fn.args().get(1), ctx);
+                Object privArg = executor.evalExpr(fn.args().get(2), ctx);
+                Object optionArg = executor.evalExpr(fn.args().get(3), ctx);
+                if (granteeArg == null || grantorArg == null || privArg == null) return null;
+                int grantee = executor.toInt(granteeArg);
+                return AclItems.aclItemText(grantee == 0 ? "" : aclRoleName(grantee),
+                        aclRoleName(executor.toInt(grantorArg)),
+                        String.valueOf(privArg), executor.isTruthy(optionArg));
             }
             case "pg_current_wal_lsn":
             case "pg_current_wal_insert_lsn":
@@ -994,11 +1068,7 @@ class CatalogSystemFunctions {
             }
             case "txid_current_snapshot":
                 return "1:1:";
-            case "txid_snapshot_xmin":
-            case "txid_snapshot_xmax":
-                return 1L;
-            case "txid_snapshot_xip":
-                return Cols.listOf();
+
             case "lo_creat":
             case "lo_create":
                 return executor.database.getLargeObjectStore().loFromBytea(0, new byte[0]);
@@ -1212,22 +1282,26 @@ class CatalogSystemFunctions {
                 }
                 return true;
             }
+            // The txid_ spellings are the older names for the same three readers, and they read
+            // the same snapshot. Answering a constant from them said every snapshot was the same.
+            case "txid_snapshot_xmin":
             case "pg_snapshot_xmin": {
                 // pg_snapshot_xmin(snapshot) → returns xmin from snapshot string
                 requireArgs(fn, 1);
                 Object snapArg = executor.evalExpr(fn.args().get(0), ctx);
                 if (snapArg == null) return null;
-                String[] parts = snapArg.toString().split(":");
-                return Long.parseLong(parts[0].trim());
+                return snapshotNumbers(name, snapArg.toString())[0];
             }
+            case "txid_snapshot_xmax":
             case "pg_snapshot_xmax": {
                 // pg_snapshot_xmax(snapshot) → returns xmax from snapshot string
                 requireArgs(fn, 1);
                 Object snapArg = executor.evalExpr(fn.args().get(0), ctx);
                 if (snapArg == null) return null;
-                String[] parts = snapArg.toString().split(":");
-                return parts.length > 1 ? Long.parseLong(parts[1].trim()) : Long.parseLong(parts[0].trim());
+                long[] bounds = snapshotNumbers(name, snapArg.toString());
+                return bounds.length > 1 ? bounds[1] : bounds[0];
             }
+            case "txid_snapshot_xip":
             case "pg_snapshot_xip": {
                 // pg_snapshot_xip(snapshot) → returns set of xids in progress
                 requireArgs(fn, 1);
@@ -1514,6 +1588,8 @@ class CatalogSystemFunctions {
                 return "date";
             case TIME:
                 return "time without time zone";
+            case TIMETZ:
+                return "time with time zone";
             case TIMESTAMP:
                 return "timestamp without time zone";
             case TIMESTAMPTZ:

@@ -352,10 +352,29 @@ public class TsVector {
     }
 
     /** The position a run of digits names, brought back to the last representable one. */
+    /**
+     * A written position, brought back to the last one a tsvector can hold.
+     *
+     * <p>The digits are read into a machine integer before anything is done with them, so a
+     * spelling wider than one keeps only the bits that fit: 4294967297 is position 1, and
+     * 2147483648 keeps nothing at all and is no position. What survives is then brought back to
+     * the last position a tsvector has room for. Clamping the spelling instead made every wide
+     * number the last position, whatever it said.
+     */
     private static int clampPosition(String digits) {
-        if (digits.length() > 9) return MAX_POSITION;
-        int value = Integer.parseInt(digits);
-        return value > MAX_POSITION ? MAX_POSITION : value;
+        java.math.BigInteger written;
+        try {
+            written = new java.math.BigInteger(digits);
+        } catch (NumberFormatException notANumber) {
+            return 0;
+        }
+        // A number too wide even for the widest machine integer stops at that integer's largest
+        // value rather than wrapping, so 2^63 is the same position 9223372036854775807 is.
+        java.math.BigInteger widest = java.math.BigInteger.valueOf(Long.MAX_VALUE);
+        if (written.compareTo(widest) > 0) written = widest;
+        int kept = written.mod(java.math.BigInteger.ONE.shiftLeft(31)).intValue();
+        if (kept == 0) return 0;
+        return kept > MAX_POSITION ? MAX_POSITION : kept;
     }
 
     public boolean matches(TsQuery query) {

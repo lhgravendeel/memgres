@@ -11,7 +11,6 @@ import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
-import java.util.TimeZone;
 
 /**
  * The zone abbreviations PostgreSQL knows, in both directions.
@@ -111,29 +110,6 @@ final class PgTimeZones {
     }
 
     /**
-     * The abbreviations the zone database still writes. Java answers with the names the locale
-     * data carries, which keeps names the zone database has since replaced with a plain
-     * displacement — ART for Argentina, BRT for Brazil — so an answer is only taken when the zone
-     * database would have written it too.
-     */
-    private static final Set<String> ZONE_WRITTEN = new HashSet<String>(Arrays.asList(
-            "ACDT", "ACST", "ADT", "AEDT", "AEST", "AKDT", "AKST", "AST", "AWDT", "AWST",
-            "BST", "CAT", "CDT", "CEST", "CET", "ChST", "CST", "EAT", "EDT", "EEST", "EET",
-            "EST", "GMT", "HDT", "HKT", "HST", "IDT", "IST", "JST", "KST", "MDT", "MSK",
-            "MST", "NDT", "NST", "NZDT", "NZST", "PDT", "PKT", "PST", "SAST", "SST", "UTC",
-            "WAT", "WEST", "WIB", "WIT", "WITA"));
-
-    /**
-     * The zones whose name the locale data still carries but the zone database no longer writes,
-     * so the displacement stands in for it.
-     */
-    private static final Set<String> ZONE_WRITES_NUMBER = new HashSet<String>(Arrays.asList(
-            "Africa/Casablanca", "Africa/El_Aaiun", "Antarctica/Casey",
-            "Antarctica/Troll", "Asia/Aden", "Asia/Amman", "Asia/Baghdad", "Asia/Bahrain",
-            "Asia/Colombo", "Asia/Damascus", "Asia/Kuwait", "Asia/Qatar", "Asia/Riyadh",
-            "Europe/Minsk", "Pacific/Bougainville", "Pacific/Pitcairn"));
-
-    /**
      * The zones PostgreSQL reports that Java does not offer as zone identifiers, and the rules
      * each of them follows. Java keeps the SystemV names PostgreSQL's zone database drops, so
      * those come off the list in the other direction.
@@ -190,6 +166,21 @@ final class PgTimeZones {
     }
 
     /**
+     * The abbreviation the session's zone writes at an instant.
+     *
+     * <p>Asked by the name the session was set to, so a zone whose name is all that distinguishes
+     * it — EST resolves to the same fixed displacement a dozen other names do — still writes the
+     * abbreviation PostgreSQL writes for it.
+     */
+    static String sessionAbbreviationAt(Instant at) {
+        String name = TypeCoercion.rawSessionZoneName();
+        if (name != null && EXTRA_ZONES.containsKey(name)) {
+            return catalogAbbreviationOf(name, at);
+        }
+        return abbreviationOf(TypeCoercion.sessionZone(), at);
+    }
+
+    /**
      * The abbreviation table's entry for a name, matched without regard to case the way
      * PostgreSQL matches it, or null when the table does not carry the name.
      */
@@ -207,20 +198,9 @@ final class PgTimeZones {
 
     /** The abbreviation a zone writes at an instant: its own name, or its displacement. */
     static String abbreviationOf(ZoneId zone, Instant at) {
-        ZoneOffset offset = zone.getRules().getOffset(at);
-        String id = zone.getId();
-        // Namibia moved off summer time and onto Central Africa Time; the locale data still
-        // answers with the name it kept while it was an hour behind.
-        if (id.equals("Africa/Windhoek")) return "CAT";
-        if (!ZONE_WRITES_NUMBER.contains(id)) {
-            // MET is the zone database's other name for CET, and writes CET's abbreviations.
-            String lookIn = id.equals("MET") ? "CET" : id;
-            boolean daylight = zone.getRules().isDaylightSavings(at);
-            String named = TimeZone.getTimeZone(lookIn)
-                    .getDisplayName(daylight, TimeZone.SHORT, Locale.ROOT);
-            if (ZONE_WRITTEN.contains(named)) return named;
-        }
-        return displacement(offset);
+        String written = PgZoneAbbreviations.at(zone, at);
+        if (written != null) return written;
+        return displacement(zone.getRules().getOffset(at));
     }
 
     /**

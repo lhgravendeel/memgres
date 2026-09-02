@@ -429,8 +429,13 @@ class DdlFunctionParser {
         if (kw.equals("COST")) {
             opts.take(RoutineOptions.COST, t);
             parser.advance();
+            Token costToken = parser.peek();
             String costVal = parser.advance().value();
             try { costRef[0] = Double.parseDouble(costVal); } catch (NumberFormatException e) { /* ignore */ }
+            // A cost is what the planner multiplies by; nothing is estimated by zero.
+            if (costRef[0] <= 0) {
+                throw ParseException.saying("COST must be positive", costToken, "22023");
+            }
             return true;
         }
         if (kw.equals("ROWS")) {
@@ -443,7 +448,16 @@ class DdlFunctionParser {
         if (kw.equals("PARALLEL")) {
             opts.take(RoutineOptions.PARALLEL, t);
             parser.advance();
+            Token safetyToken = parser.peek();
             parallelRef[0] = parser.readIdentifier().toUpperCase(java.util.Locale.ROOT);
+            // There are three things a routine can be told about running in parallel, and a word
+            // that is none of them says nothing the planner could act on.
+            if (!"SAFE".equals(parallelRef[0]) && !"RESTRICTED".equals(parallelRef[0])
+                    && !"UNSAFE".equals(parallelRef[0])) {
+                throw ParseException.saying(
+                        "parameter \"parallel\" must be SAFE, RESTRICTED, or UNSAFE",
+                        safetyToken, "42601");
+            }
             return true;
         }
         if (kw.equals("SUPPORT")) {

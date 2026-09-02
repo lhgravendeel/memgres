@@ -72,8 +72,10 @@ final class NumericLimits {
         }
         if (!(val instanceof String)) return null;
         String s = ((String) val).trim().toLowerCase(java.util.Locale.ROOT);
-        if (s.startsWith("+")) s = s.substring(1);
+        // A sign belongs to a quantity, and NaN is not one: PostgreSQL reads "NaN" and refuses
+        // "+NaN" and "-NaN". Stripping the sign before looking accepted both.
         if (s.equals("nan")) return Double.valueOf(Double.NaN);
+        if (s.startsWith("+")) s = s.substring(1);
         if (s.equals("infinity") || s.equals("inf")) return Double.valueOf(Double.POSITIVE_INFINITY);
         if (s.equals("-infinity") || s.equals("-inf")) return Double.valueOf(Double.NEGATIVE_INFINITY);
         return null;
@@ -291,7 +293,10 @@ final class NumericLimits {
     static boolean underflowedToZero(Object value, double converted) {
         if (converted != 0) return false;
         if (value instanceof BigDecimal) return ((BigDecimal) value).signum() != 0;
-        if (value instanceof Number) return false;   // a Number that reads as 0 really is 0
+        // A number too small for the narrower type converts to zero without ever having been
+        // zero, which is an underflow: 1e-46 is not 0, and float4 cannot say so. Treated as
+        // "a Number that reads as 0 really is 0", the conversion silently produced one.
+        if (value instanceof Number) return ((Number) value).doubleValue() != 0;
         try {
             return new BigDecimal(String.valueOf(value).trim()).signum() != 0;
         } catch (NumberFormatException e) {

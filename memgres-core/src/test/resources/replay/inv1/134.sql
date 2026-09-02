@@ -1,0 +1,5 @@
+-- source: investigation.md
+-- finding: 134
+-- title: `INTO STRICT` is not enforced under `EXECUTE`
+-- EXECUTE '…' INTO STRICT v, where the query returns two rows
+--   PG: P0003 query returned more than one row | mg: returns the first row;

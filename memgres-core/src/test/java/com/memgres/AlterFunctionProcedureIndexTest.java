@@ -522,8 +522,10 @@ class AlterFunctionProcedureIndexTest {
 
     @Test
     void testCreateFunctionWithAllAttributes() throws SQLException {
+        // ROWS estimates how many rows a call gives back, so it belongs only to a routine that
+        // gives back a set; PostgreSQL refuses it on one that answers with a single value.
         exec("CREATE FUNCTION cfa_f1() RETURNS int AS $$ BEGIN RETURN 1; END; $$ LANGUAGE plpgsql "
-             + "IMMUTABLE STRICT LEAKPROOF PARALLEL SAFE COST 50 ROWS 100 SECURITY DEFINER");
+             + "IMMUTABLE STRICT LEAKPROOF PARALLEL SAFE COST 50 SECURITY DEFINER");
         String vol = queryString("SELECT provolatile FROM pg_proc WHERE proname = 'cfa_f1'");
         assertEquals("i", vol);
         boolean strict = queryBoolean("SELECT proisstrict FROM pg_proc WHERE proname = 'cfa_f1'");

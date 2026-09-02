@@ -491,11 +491,34 @@ public final class XmlOperations {
         return xml.replaceFirst("^<\\?xml[^?]*\\?>\\s*", "");
     }
 
+    /**
+     * How deeply elements may nest before the document stops being well formed.
+     *
+     * <p>PostgreSQL's parser stops at 256 levels, so 256 is well formed and 257 is not. Left to
+     * itself the JDK parser has no limit and recurses until the stack runs out, which makes the
+     * answer depend on how much stack the calling thread happened to have left.
+     */
+    private static final int MAX_ELEMENT_DEPTH = 256;
+
+    private static final String MAX_DEPTH_PROPERTY =
+            "http://www.oracle.com/xml/jaxp/properties/maxElementDepth";
+
+    /** A parser factory that refuses documents nested deeper than PostgreSQL accepts. */
+    private static DocumentBuilderFactory depthLimitedFactory(int allowedDepth)
+            throws javax.xml.parsers.ParserConfigurationException {
+        DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+        factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+        try {
+            factory.setAttribute(MAX_DEPTH_PROPERTY, String.valueOf(allowedDepth));
+        } catch (IllegalArgumentException notSupported) {
+            // An implementation that does not know the property parses as it always did.
+        }
+        return factory;
+    }
+
     private static void parseDocument(String text) {
         try {
-            DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
-            factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
-            DocumentBuilder builder = factory.newDocumentBuilder();
+            DocumentBuilder builder = depthLimitedFactory(MAX_ELEMENT_DEPTH).newDocumentBuilder();
             builder.setErrorHandler(new SilentErrorHandler());
             builder.parse(new InputSource(new StringReader(text)));
         } catch (Exception e) {
@@ -509,9 +532,10 @@ public final class XmlOperations {
         String stripped = text.replaceFirst("^<\\?xml[^?]*\\?>\\s*", "");
         try {
             String wrapped = "<_root>" + stripped + "</_root>";
-            DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
-            factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
-            DocumentBuilder builder = factory.newDocumentBuilder();
+            // The wrapper is a level of its own, and the content underneath it may still nest as
+            // deeply as a document would.
+            DocumentBuilder builder =
+                    depthLimitedFactory(MAX_ELEMENT_DEPTH + 1).newDocumentBuilder();
             builder.setErrorHandler(new SilentErrorHandler());
             builder.parse(new InputSource(new StringReader(wrapped)));
         } catch (Exception e) {

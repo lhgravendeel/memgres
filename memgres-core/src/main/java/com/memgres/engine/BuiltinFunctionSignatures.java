@@ -169,6 +169,24 @@ public final class BuiltinFunctionSignatures {
     }
 
     /** Whether this signature collects a tail of arguments into its last declared type. */
+    /**
+     * Whether every signature of this name answers the same for the same arguments.
+     *
+     * <p>Planning settles an expression built out of such calls, and leaves one built out of
+     * anything else to run against a row. A name nothing here records is treated as volatile,
+     * which is the safe way round: it means the expression is left alone.
+     */
+    static boolean isImmutable(String name) {
+        if (name == null) return false;
+        boolean found = false;
+        for (String[] signature : SIGNATURES) {
+            if (!signature[0].equalsIgnoreCase(name)) continue;
+            found = true;
+            if (signature[3].indexOf('i') < 0) return false;
+        }
+        return found;
+    }
+
     static boolean isVariadic(String[] signature) {
         if (signature.length <= 4) return false;
         String fewest = signature[4];
@@ -722,6 +740,16 @@ public final class BuiltinFunctionSignatures {
             {"isfinite", "16", "1184", "fi", "1"},
             {"isfinite", "16", "1186", "fi", "1"},
             {"isopen", "16", "602", "fi", "1"},
+            {"ishorizontal", "16", "628", "fi", "1"},
+            {"ishorizontal", "16", "601", "fi", "1"},
+            {"ishorizontal", "16", "600 600", "fi", "2"},
+            {"isparallel", "16", "601 601", "fi", "2"},
+            {"isparallel", "16", "628 628", "fi", "2"},
+            {"isperp", "16", "601 601", "fi", "2"},
+            {"isperp", "16", "628 628", "fi", "2"},
+            {"isvertical", "16", "628", "fi", "1"},
+            {"isvertical", "16", "601", "fi", "1"},
+            {"isvertical", "16", "600 600", "fi", "2"},
             {"json_array_elements", "114", "114", "ti", "1"},
             {"json_array_elements_text", "25", "114", "ti", "1"},
             {"json_array_length", "23", "114", "fi", "1"},
@@ -938,12 +966,10 @@ public final class BuiltinFunctionSignatures {
             {"pg_blocking_pids", "1007", "23", "fv", "1"},
             {"pg_cancel_backend", "16", "23", "fv", "1"},
             {"pg_client_encoding", "19", "", "fs", "0"},
-            {"pg_collation_is_visible", "16", "26", "fs", "1"},
             {"pg_column_is_updatable", "16", "2205 21 16", "fs", "3"},
             {"pg_column_size", "23", "2276", "fs", "1"},
             {"pg_column_toast_chunk_id", "26", "2276", "fs", "1"},
             {"pg_conf_load_time", "1184", "", "fs", "0"},
-            {"pg_conversion_is_visible", "16", "26", "fs", "1"},
             {"pg_create_logical_replication_slot", "2249", "19 19 16 16 16", "fv", "2"},
             {"pg_create_physical_replication_slot", "2249", "19 16 16", "fv", "1"},
             {"pg_create_restore_point", "3220", "25", "fv", "1"},
@@ -959,7 +985,19 @@ public final class BuiltinFunctionSignatures {
             {"pg_database_size", "20", "26", "fv", "1"},
             {"pg_describe_object", "25", "26 26 23", "fs", "3"},
             {"pg_drop_replication_slot", "2278", "19", "fv", "1"},
+            {"pg_char_to_encoding", "23", "19", "fs", "1"},
+            {"to_regnamespace", "4089", "25", "fs", "1"},
+            {"makeaclitem", "1033", "26 26 25 16", "fi", "4"},
+            {"pg_opfamily_is_visible", "16", "26", "fs", "1"},
+            {"pg_collation_is_visible", "16", "26", "fs", "1"},
+            {"pg_conversion_is_visible", "16", "26", "fs", "1"},
+            {"pg_statistics_obj_is_visible", "16", "26", "fs", "1"},
+            {"word_similarity", "700", "25 25", "fi", "2"},
+            {"strict_word_similarity", "700", "25 25", "fi", "2"},
+            {"row_security_active", "16", "2205", "fs", "1"},
             {"pg_encoding_to_char", "19", "23", "fs", "1"},
+            {"pg_relation_filenode", "26", "2205", "fs", "1"},
+            {"pg_settings_get_flags", "1009", "25", "fs", "1"},
             {"pg_event_trigger_ddl_commands", "2249", "", "ts", "0"},
             {"pg_event_trigger_dropped_objects", "2249", "", "ts", "0"},
             {"pg_event_trigger_table_rewrite_oid", "26", "", "fs", "0"},
@@ -1017,6 +1055,13 @@ public final class BuiltinFunctionSignatures {
             {"pg_ls_tmpdir", "2249", "", "tv", "0"},
             {"pg_ls_tmpdir", "2249", "26", "tv", "1"},
             {"pg_ls_waldir", "2249", "", "tv", "0"},
+            {"pg_lsn_larger", "3220", "3220 3220", "fi", "2"},
+            {"pg_lsn_smaller", "3220", "3220 3220", "fi", "2"},
+            {"pg_get_function_arg_default", "25", "26 23", "fs", "2"},
+            {"pg_collation_actual_version", "25", "26", "fv", "1"},
+            {"pg_get_statisticsobjdef", "25", "26", "fs", "1"},
+            {"pg_identify_object", "2249", "26 26 23", "fs", "3"},
+            {"pg_isolation_test_session_is_blocked", "16", "23 1007", "fv", "2"},
             {"pg_my_temp_schema", "26", "", "fs", "0"},
             {"pg_notification_queue_usage", "701", "", "fv", "0"},
             {"pg_notify", "2278", "25 25", "fv", "2"},

@@ -81,6 +81,18 @@ public final class DdlDefinitionChecks {
                 + " default operator class for the subtype.", "42704");
     }
 
+    /**
+     * A range or list partition key orders rows by the type's default btree operator class, so a
+     * type that has none cannot be a key. PostgreSQL says so where the table is defined.
+     */
+    public static void requireOrderablePartitionKey(DataType type) {
+        if (type == null || !UNORDERED_TYPES.contains(type)) return;
+        throw new MemgresException("data type " + CatalogHelper.pgTypeName(type)
+                + " has no default operator class for access method \"btree\""
+                + "\n  Hint: You must specify an operator class for the partition key or define"
+                + " a default operator class for the data type.", "42704");
+    }
+
     // ---- column names ----
 
     /**

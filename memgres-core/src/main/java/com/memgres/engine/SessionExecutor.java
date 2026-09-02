@@ -1232,12 +1232,43 @@ class SessionExecutor {
                 String extName = val.substring(0, colonIdx);
                 String newSchema = val.substring(colonIdx + 1);
                 executor.ddlExecutor.requireObjectExists("extension", extName);
+                // The schema an extension is moved into has to be a schema.
+                if (executor.database.getSchema(newSchema) == null) {
+                    throw new MemgresException(
+                            "schema \"" + newSchema + "\" does not exist", "3F000");
+                }
                 executor.database.setExtensionSchema(extName, newSchema);
             }
             return QueryResult.message(QueryResult.Type.SET, "ALTER EXTENSION");
         }
         if (name.equals("alter_extension_update")) {
             // No-op for now - just acknowledge
+            return QueryResult.message(QueryResult.Type.SET, "ALTER EXTENSION");
+        }
+        if (name.equals("alter_extension_update_to")) {
+            String val = stmt.value();
+            int at = val.indexOf(':');
+            String extName = val.substring(0, at);
+            String version = val.substring(at + 1);
+            executor.ddlExecutor.requireObjectExists("extension", extName);
+            // memgres ships one version of each extension, so there is no path to any other:
+            // accepting the statement said an update had happened when nothing had.
+            String installed = executor.database.getInstalledExtensions()
+                    .get(extName.toLowerCase(java.util.Locale.ROOT));
+            if (!version.equals(installed)) {
+                throw new MemgresException("extension \"" + extName
+                        + "\" has no update path from version \"" + installed
+                        + "\" to version \"" + version + "\"", "22023");
+            }
+            return QueryResult.message(QueryResult.Type.SET, "ALTER EXTENSION");
+        }
+        if (name.equals("alter_extension_member")) {
+            String[] parts = stmt.value().split(":", 3);
+            executor.ddlExecutor.requireObjectExists("extension", parts[0]);
+            // The object joined to or taken out of an extension has to be there.
+            if (parts.length > 2 && !parts[2].isEmpty()) {
+                executor.ddlExecutor.requireObjectExists(parts[1], parts[2]);
+            }
             return QueryResult.message(QueryResult.Type.SET, "ALTER EXTENSION");
         }
 
@@ -1472,6 +1503,19 @@ class SessionExecutor {
             }
             return;
         }
+        // A text search configuration has to be one the server has: setting a name nothing
+        // answers to left every later to_tsvector reading a configuration that is not there.
+        if (lname.equals("default_text_search_config")) {
+            String written = unquoteSetting(value).trim();
+            String bare = written.toLowerCase(java.util.Locale.ROOT);
+            if (bare.startsWith("pg_catalog.")) bare = bare.substring("pg_catalog.".length());
+            if (!"simple".equals(bare) && !"english".equals(bare)
+                    && executor.database.getTsConfigs().get(bare) == null) {
+                throw new MemgresException("invalid value for parameter"
+                        + " \"default_text_search_config\": \"" + written + "\"", "22023");
+            }
+            return;
+        }
         if (lname.equals("timezone")) {
             String tz = value.trim();
             // Remove surrounding quotes if present
@@ -1495,7 +1539,9 @@ class SessionExecutor {
             }
             if (tz.equalsIgnoreCase("UTC") || tz.equalsIgnoreCase("LOCAL") || tz.equalsIgnoreCase("DEFAULT")) return;
             try {
-                java.time.ZoneId.of(tz);
+                // Every name the catalogue lists can be set, including the four PostgreSQL
+                // carries that Java offers no zone identifier for.
+                PgTimeZones.zoneFor(tz);
             } catch (Exception e) {
                 // A zone nobody has is an invalid value for the parameter, which is how
                 // PostgreSQL reports it, by statement or by set_config alike.
@@ -1655,7 +1701,8 @@ class SessionExecutor {
                 || lower.equals("current_role")) {
             return;
         }
-        if (executor.database.getRoles().containsKey(lower)) return;
+        // hasRole knows the roles PostgreSQL ships with as well as the ones somebody made.
+        if (executor.database.hasRole(lower)) return;
         String connecting = executor.session != null ? executor.session.getConnectingUser() : null;
         if (connecting != null && role.equalsIgnoreCase(connecting)) return;
         throw new MemgresException("role \"" + lower + "\" does not exist", "42704");
@@ -1735,7 +1782,8 @@ class SessionExecutor {
     private void requireRole(String role, String parameter) {
         if (role == null) return;
         String lower = role.toLowerCase(java.util.Locale.ROOT);
-        if (executor.database.getRoles().containsKey(lower)) return;
+        // hasRole knows the roles PostgreSQL ships with as well as the ones somebody made.
+        if (executor.database.hasRole(lower)) return;
         String connecting = executor.session != null ? executor.session.getConnectingUser() : null;
         if (connecting != null && role.equalsIgnoreCase(connecting)) return;
         throw new MemgresException("role \"" + role + "\" does not exist", "22023");
@@ -1859,6 +1907,13 @@ class SessionExecutor {
                 schema = table.substring(0, dot);
                 table = table.substring(dot + 1);
             }
+            // A sequence and a view hold no rows a lock protects, so PostgreSQL refuses to
+            // lock one rather than taking a lock nothing would ever wait on.
+            if (executor.database.getSequence(schema, table) != null
+                    || executor.database.getSequence(table) != null) {
+                throw new MemgresException(
+                        "cannot lock relation \"" + table + "\"", "42809");
+            }
             // A catalogue is a relation and can be locked like one; only user tables were looked
             // for, so LOCK TABLE pg_class said the relation was not there.
             try {
@@ -1884,6 +1939,39 @@ class SessionExecutor {
     /** The privileges a column can carry; the rest are table-wide only. */
     private static final Set<String> COLUMN_PRIVILEGES = Cols.setOf(
             "SELECT", "INSERT", "UPDATE", "REFERENCES", "ALL");
+
+    /**
+     * The privileges each other kind of object can carry.
+     *
+     * <p>A privilege that means nothing for the kind of object it was granted on is refused —
+     * SELECT is not something a schema has, and INSERT is not something a sequence has. Accepted
+     * anyway, the grant was recorded against a right nothing would ever consult.
+     */
+    private static final Map<String, Set<String>> PRIVILEGES_BY_KIND = privilegesByKind();
+
+    private static Map<String, Set<String>> privilegesByKind() {
+        Map<String, Set<String>> m = new java.util.HashMap<String, Set<String>>();
+        m.put("SCHEMA", Cols.setOf("CREATE", "USAGE", "ALL"));
+        m.put("SEQUENCE", Cols.setOf("USAGE", "SELECT", "UPDATE", "ALL"));
+        m.put("DATABASE", Cols.setOf("CREATE", "CONNECT", "TEMPORARY", "TEMP", "ALL"));
+        m.put("FUNCTION", Cols.setOf("EXECUTE", "ALL"));
+        m.put("LANGUAGE", Cols.setOf("USAGE", "ALL"));
+        m.put("DOMAIN", Cols.setOf("USAGE", "ALL"));
+        m.put("TYPE", Cols.setOf("USAGE", "ALL"));
+        m.put("FOREIGN DATA WRAPPER", Cols.setOf("USAGE", "ALL"));
+        m.put("FOREIGN SERVER", Cols.setOf("USAGE", "ALL"));
+        m.put("TABLESPACE", Cols.setOf("CREATE", "ALL"));
+        m.put("LARGE OBJECT", Cols.setOf("SELECT", "UPDATE", "ALL"));
+        return m;
+    }
+
+    /** The word PostgreSQL uses for the kind when it says a privilege does not apply to it. */
+    private static String privilegeTargetName(String kind) {
+        if ("FOREIGN DATA WRAPPER".equals(kind)) return "foreign-data wrapper";
+        if ("FOREIGN SERVER".equals(kind)) return "foreign server";
+        if ("LARGE OBJECT".equals(kind)) return "large object";
+        return kind.toLowerCase(java.util.Locale.ROOT);
+    }
 
     /**
      * Every privilege keyword the grammar knows. A name outside this set is not "you may not
@@ -1944,8 +2032,19 @@ class SessionExecutor {
                 break;
             }
             case "SEQUENCE": {
-                String schema = executor.relationSchemaOf(null, objectName);
-                String found = RelationNamespace.kindOf(executor.database, schema, objectName);
+                // A qualified name says which schema to look in, and a schema that is not there
+                // is what PostgreSQL reports first — before it asks whether the relation is.
+                String written = objectName;
+                String schema;
+                int dot = written.indexOf('.');
+                if (dot > 0) {
+                    schema = written.substring(0, dot);
+                    written = written.substring(dot + 1);
+                    SchemaQualifier.requireSchema(executor.database, executor.session, schema);
+                } else {
+                    schema = executor.relationSchemaOf(null, written);
+                }
+                String found = RelationNamespace.kindOf(executor.database, schema, written);
                 if (found == null) {
                     throw new MemgresException(
                             "relation \"" + objectName + "\" does not exist", "42P01");
@@ -2132,6 +2231,24 @@ class SessionExecutor {
                 }
             }
         }
+        // A privilege that says nothing about the kind of object it was granted on.
+        if (s.objectType() != null && s.privileges() != null) {
+            Set<String> allowed = PRIVILEGES_BY_KIND.get(s.objectType().toUpperCase(
+                    java.util.Locale.ROOT));
+            if (allowed != null) {
+                for (String priv : s.privileges()) {
+                    if (!KNOWN_PRIVILEGES.contains(priv)) {
+                        throw PgErrors.syntax("unrecognized privilege type \""
+                                + priv.toLowerCase(java.util.Locale.ROOT) + "\"");
+                    }
+                    if (!allowed.contains(priv)) {
+                        throw new MemgresException("invalid privilege type " + priv + " for "
+                                + privilegeTargetName(s.objectType().toUpperCase(
+                                        java.util.Locale.ROOT)), "0LP01");
+                    }
+                }
+            }
+        }
         // Additional TABLE grant validations
         if (s.objectType() != null && s.objectType().equals("TABLE") && s.objectName() != null) {
             boolean columnLevel = s.columns() != null && !s.columns().isEmpty();
@@ -2279,6 +2396,20 @@ class SessionExecutor {
         }
         // A REVOKE names an object the same way a GRANT does, and looks it up the same way.
         requireGrantTarget(s.objectType(), s.objectName());
+        // And it names roles the same way: taking a privilege away from a role nobody created is
+        // a statement about nothing, which PostgreSQL refuses rather than doing nothing quietly.
+        if (s.grantees() != null) {
+            for (String grantee : s.grantees()) {
+                String g = grantee.toLowerCase(java.util.Locale.ROOT);
+                if (g.equals("public") || g.equals("current_user") || g.equals("session_user")
+                        || g.equals("current_role")) {
+                    continue;
+                }
+                if (!executor.database.hasRole(grantee)) {
+                    throw new MemgresException("role \"" + grantee + "\" does not exist", "42704");
+                }
+            }
+        }
         // Validate object exists for TABLE grants
         if (s.objectType() != null && s.objectType().equals("TABLE") && s.objectName() != null) {
             // M10: Support schema-qualified names
@@ -3146,8 +3277,13 @@ class SessionExecutor {
         }
         // Bind parameters
         List<Object> savedParams = new ArrayList<>(executor.boundParameters);
+        List<String> savedParamTypes = new ArrayList<>(executor.boundParameterTypes);
         try {
             executor.boundParameters.clear();
+            executor.boundParameterTypes.clear();
+            if (prepared.paramTypes() != null) {
+                executor.boundParameterTypes.addAll(prepared.paramTypes());
+            }
             if (stmt.params() != null) {
                 for (Expression param : stmt.params()) {
                     executor.boundParameters.add(executor.evalExpr(param, null));
@@ -3186,6 +3322,8 @@ class SessionExecutor {
         } finally {
             executor.boundParameters.clear();
             executor.boundParameters.addAll(savedParams);
+            executor.boundParameterTypes.clear();
+            executor.boundParameterTypes.addAll(savedParamTypes);
         }
     }
 

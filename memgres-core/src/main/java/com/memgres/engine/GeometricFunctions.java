@@ -42,6 +42,10 @@ class GeometricFunctions {
      * reference takes it from the column. Anything else is an untyped literal, which PG itself
      * cannot resolve to an overload without a cast.
      */
+    String declaredGeometricTypeOf(Expression expr, RowContext ctx) {
+        return declaredGeometricType(expr, ctx);
+    }
+
     private String declaredGeometricType(Expression expr, RowContext ctx) {
         if (expr instanceof CastExpr) {
             String name = ((CastExpr) expr).typeName();
@@ -62,6 +66,21 @@ class GeometricFunctions {
             }
         }
         return null;
+    }
+
+    /**
+     * The value read as the type the argument was declared to be, or read from its own text when
+     * nothing declared one.
+     */
+    static Object asDeclaredShape(String declaredType, String text) {
+        if (declaredType == null) return GeometricOperations.autoDetectPublic(text);
+        return GeometricOperations.parseAs(declaredType, text);
+    }
+
+    private static MemgresException noSuchGeometricFunction(String name, String argTypes) {
+        return new MemgresException("function " + name + "(" + argTypes + ") does not exist"
+                + "\n  Hint: No function matches the given name and argument types."
+                + " You might need to add explicit type casts.", "42883");
     }
 
     /** The given type name when it names a geometric type, else null. */
@@ -182,8 +201,11 @@ class GeometricFunctions {
                 // PG defines area() for box, circle and path only. A closed path and a polygon
                 // print identically, so the value's text cannot tell them apart -- the declared
                 // type of the argument expression is what decides.
-                requireAreaShape(declaredGeometricType(fn.args().get(0), ctx), arg.toString());
-                return GeometricOperations.area(arg.toString());
+                String declared = declaredGeometricType(fn.args().get(0), ctx);
+                requireAreaShape(declared, arg.toString());
+                // An open path prints the way an lseg does and a closed one the way a polygon
+                // does, so the shape is read as the declared type rather than guessed from text.
+                return GeometricOperations.area(asDeclaredShape(declared, arg.toString()));
             }
             case "center": {
                 if (fn.args().size() != 1) {
@@ -228,6 +250,64 @@ class GeometricFunctions {
             case "npoints": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 return arg == null ? null : GeometricOperations.npoints(arg.toString());
+            }
+            case "ishorizontal":
+            case "isvertical": {
+                // Over one segment or line, or over the two points a segment runs between.
+                boolean horizontal = "ishorizontal".equals(name);
+                if (fn.args().size() == 2) {
+                    Object a = executor.evalExpr(fn.args().get(0), ctx);
+                    Object b = executor.evalExpr(fn.args().get(1), ctx);
+                    if (a == null || b == null) return null;
+                    GeometricOperations.PgPoint pa = GeometricOperations.parsePoint(a.toString());
+                    GeometricOperations.PgPoint pb = GeometricOperations.parsePoint(b.toString());
+                    return horizontal ? GeometricOperations.isHorizontal(pa, pb)
+                            : GeometricOperations.isVertical(pa, pb);
+                }
+                Object arg = executor.evalExpr(fn.args().get(0), ctx);
+                if (arg == null) return null;
+                Object shape = asDeclaredShape(
+                        declaredGeometricType(fn.args().get(0), ctx), arg.toString());
+                if (shape instanceof GeometricOperations.PgLseg) {
+                    GeometricOperations.PgLseg seg = (GeometricOperations.PgLseg) shape;
+                    return horizontal ? GeometricOperations.isHorizontal(seg)
+                            : GeometricOperations.isVertical(seg);
+                }
+                if (shape instanceof GeometricOperations.PgLine) {
+                    // A line Ax + By + C = 0 lies flat when x does not move it, and stands
+                    // upright when y does not.
+                    GeometricOperations.PgLine line = (GeometricOperations.PgLine) shape;
+                    return horizontal ? line.a() == 0.0 : line.b() == 0.0;
+                }
+                throw noSuchGeometricFunction(name, GeometricOperations.pgTypeName(shape));
+            }
+            case "isperp":
+            case "isparallel": {
+                boolean perpendicular = "isperp".equals(name);
+                Object a = executor.evalExpr(fn.args().get(0), ctx);
+                Object b = executor.evalExpr(fn.args().get(1), ctx);
+                if (a == null || b == null) return null;
+                Object left = asDeclaredShape(
+                        declaredGeometricType(fn.args().get(0), ctx), a.toString());
+                Object right = asDeclaredShape(
+                        declaredGeometricType(fn.args().get(1), ctx), b.toString());
+                if (left instanceof GeometricOperations.PgLseg
+                        && right instanceof GeometricOperations.PgLseg) {
+                    GeometricOperations.PgLseg ls = (GeometricOperations.PgLseg) left;
+                    GeometricOperations.PgLseg rs = (GeometricOperations.PgLseg) right;
+                    return perpendicular ? GeometricOperations.isPerpendicular(ls, rs)
+                            : GeometricOperations.isParallel(ls, rs);
+                }
+                if (left instanceof GeometricOperations.PgLine
+                        && right instanceof GeometricOperations.PgLine) {
+                    GeometricOperations.PgLine ll = (GeometricOperations.PgLine) left;
+                    GeometricOperations.PgLine rl = (GeometricOperations.PgLine) right;
+                    if (!perpendicular) return GeometricOperations.isParallel(ll, rl);
+                    // Two lines meet at a right angle when their normals do.
+                    return ll.a() * rl.a() + ll.b() * rl.b() == 0.0;
+                }
+                throw noSuchGeometricFunction(name, GeometricOperations.pgTypeName(left)
+                        + ", " + GeometricOperations.pgTypeName(right));
             }
             case "isclosed": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);

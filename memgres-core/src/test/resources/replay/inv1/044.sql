@@ -1,0 +1,11 @@
+-- source: investigation.md
+-- finding: 44
+-- title: `OVERLAPS` with a NULL endpoint crashes ⚠️ (7 cases)
+-- begin-expected
+-- columns: overlaps:bool
+-- row: NULL
+-- rowcount: 1
+-- end-expected
+SELECT (DATE '2001-11-30', NULL::date) OVERLAPS (DATE '2001-10-30', DATE '2001-11-01');
+--   PG: NULL
+--   mg: XX000 Internal error: Cannot invoke "Object.toString()" because "endOrInterval" is null;
