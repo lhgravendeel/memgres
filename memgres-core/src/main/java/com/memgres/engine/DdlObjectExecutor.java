@@ -3376,10 +3376,26 @@ class DdlObjectExecutor {
                     String[] parts = castName.split("->");
                     // A cast is between two types, and a type that is not there is what
                     // PostgreSQL reports first: there is no cast to look for until both are.
-                    validateTypeExists(parts[0].trim());
-                    validateTypeExists(parts[1].trim());
+                    // IF EXISTS excuses that too — a cast over a type nobody declared is a cast
+                    // that is not there, which is exactly what the clause is for.
+                    if (!stmt.ifExists()) {
+                        validateTypeExists(parts[0].trim());
+                        validateTypeExists(parts[1].trim());
+                    } else if (!isKnownType(parts[0].trim()) || !isKnownType(parts[1].trim())) {
+                        break;
+                    }
                     int srcOid = resolveTypeOid(parts[0].trim());
                     int tgtOid = resolveTypeOid(parts[1].trim());
+                    // A cast the server itself provides belongs to the server: dropping one
+                    // would take away a conversion the rest of the catalogue depends on.
+                    for (Object[] shipped : PgCastTable.CASTS) {
+                        if ((Integer) shipped[0] == srcOid && (Integer) shipped[1] == tgtOid) {
+                            throw new MemgresException("cannot drop cast from "
+                                    + DataType.canonicalName(parts[0]) + " to "
+                                    + DataType.canonicalName(parts[1])
+                                    + " because it is required by the database system", "2BP01");
+                        }
+                    }
                     boolean exists = executor.database.getUserDefinedCasts().stream()
                             .anyMatch(c -> (int) c[0] == srcOid && (int) c[1] == tgtOid);
                     if (!exists && !stmt.ifExists()) {

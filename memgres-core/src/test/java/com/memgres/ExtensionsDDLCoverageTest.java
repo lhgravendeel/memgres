@@ -317,7 +317,11 @@ class ExtensionsDDLCoverageTest {
 
     @Test
     void cast_drop_cascade() {
-        assertNoError("DROP CAST IF EXISTS (BIGINT AS INTEGER) CASCADE");
+        // A cast the server itself provides cannot be dropped, with or without CASCADE: the rest
+        // of the catalogue depends on it. IF EXISTS excuses a cast that is not there, not one
+        // that may not go.
+        assertThrows(SQLException.class,
+                () -> exec("DROP CAST IF EXISTS (BIGINT AS INTEGER) CASCADE"));
     }
 
     @Test

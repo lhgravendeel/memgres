@@ -803,7 +803,14 @@ class CatalogMetadataFunctions {
 
     private Object evalPgGetTriggerdef(FunctionCallExpr fn, RowContext ctx) {
         Object trigOidVal = fn.args().isEmpty() ? null : executor.evalExpr(fn.args().get(0), ctx);
-        if (fn.args().size() > 1) executor.evalExpr(fn.args().get(1), ctx);
+        // The second argument asks for the pretty form, and the two forms name the relation
+        // differently: the plain one always writes the schema, and the pretty one leaves it off
+        // where the search path already reaches it.
+        boolean pretty = false;
+        if (fn.args().size() > 1) {
+            Object prettyArg = executor.evalExpr(fn.args().get(1), ctx);
+            pretty = prettyArg != null && executor.isTruthy(prettyArg);
+        }
         if (trigOidVal == null) return null;
         int trigOid = executor.toInt(trigOidVal);
         for (Map.Entry<String, List<PgTrigger>> trigEntry : executor.database.getAllTriggers().entrySet()) {
@@ -821,7 +828,7 @@ class CatalogMetadataFunctions {
                 int tOid = executor.systemCatalog.getOid(
                         "trig:" + trigSchema + "." + first.getTableName() + "." + first.getName());
                 if (tOid == trigOid) {
-                    return buildTriggerDef(nameEntry.getValue(), trigSchema);
+                    return buildTriggerDef(nameEntry.getValue(), trigSchema, pretty);
                 }
             }
         }
@@ -858,7 +865,7 @@ class CatalogMetadataFunctions {
      * pg_get_triggerdef spells it: the relation qualified by its schema, the events in the
      * catalog's own order, and the WHEN condition when one was written.
      */
-    private String buildTriggerDef(List<PgTrigger> triggers, String schema) {
+    private String buildTriggerDef(List<PgTrigger> triggers, String schema, boolean pretty) {
         PgTrigger first = triggers.get(0);
         // A constraint trigger says so in its own definition and carries the deferrability that is
         // the whole point of the form: replayed without those words it comes back as an ordinary
@@ -881,9 +888,11 @@ class CatalogMetadataFunctions {
             }
         }
         sb.append(String.join(" OR ", events));
-        // A name is written with its schema only when the search path would not find it there
-        // already, which is how every pg_get_*def spells one.
-        sb.append(" ON ").append(qualifiedIfNeeded(schema, first.getTableName()));
+        // Only the pretty form leaves a schema off a name the search path already reaches; the
+        // plain form writes the relation out in full, whichever schema it is in.
+        sb.append(" ON ").append(pretty
+                ? qualifiedIfNeeded(schema, first.getTableName())
+                : schema + "." + first.getTableName());
         // The transition tables are what the trigger function reads its rows from; a definition
         // that leaves them out restores a trigger whose body cannot see the statement's work.
         String oldTable = first.getOldTransitionTable();
