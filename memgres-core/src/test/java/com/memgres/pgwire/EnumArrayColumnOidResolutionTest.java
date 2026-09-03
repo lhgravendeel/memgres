@@ -195,4 +195,53 @@ class EnumArrayColumnOidResolutionTest {
             exec(textConn, "DROP TYPE IF EXISTS eacor_scalar_enum");
         }
     }
+
+    /**
+     * A column of an array of an enum is a column of an array, and a set is what ANY searches.
+     *
+     * <p>An array of an enum carries the enum as the column's own type, with the element type
+     * beside it rather than in a distinct array {@code DataType}. Read from the type alone, the
+     * column said it was a single value, so {@code 'east' = ANY(regions)} was refused with "op
+     * ANY/ALL (array) requires array on right side" for a membership test PostgreSQL answers.
+     */
+    @Test
+    void enumArrayColumn_isASetForAnyAndAll() throws SQLException {
+        exec(textConn, "DROP TABLE IF EXISTS eacor_any");
+        exec(textConn, "DROP TYPE IF EXISTS eacor_any_enum");
+        exec(textConn, "CREATE TYPE eacor_any_enum AS ENUM ('north', 'south', 'east', 'west')");
+        exec(textConn, "CREATE TABLE eacor_any (id int primary key, name text,"
+                + " regions eacor_any_enum[])");
+        exec(textConn, "INSERT INTO eacor_any VALUES"
+                + " (1, 'acme', ARRAY['north','south']::eacor_any_enum[])");
+        exec(textConn, "INSERT INTO eacor_any VALUES"
+                + " (2, 'globex', ARRAY['east']::eacor_any_enum[])");
+        try {
+            assertEquals("globex",
+                    oneString("SELECT name FROM eacor_any WHERE 'east' = ANY(regions)"));
+            assertEquals("acme",
+                    oneString("SELECT name FROM eacor_any WHERE 'south' = ANY(regions)"));
+            // A constant already of the enum's type reads the same way.
+            assertEquals("globex", oneString("SELECT name FROM eacor_any"
+                    + " WHERE 'east'::eacor_any_enum = ANY(regions)"));
+            assertEquals("true", oneString("SELECT ('north' = ANY(regions))::text"
+                    + " FROM eacor_any WHERE id = 1"));
+            assertEquals("false", oneString("SELECT ('west' = ANY(regions))::text"
+                    + " FROM eacor_any WHERE id = 1"));
+            assertEquals("true", oneString("SELECT ('east' = ALL(regions))::text"
+                    + " FROM eacor_any WHERE id = 2"));
+            // A scalar enum column is still a single value and no set at all.
+            assertThrows(SQLException.class, () -> oneString(
+                    "SELECT ('a' = ANY(name))::text FROM eacor_any WHERE id = 1"));
+        } finally {
+            exec(textConn, "DROP TABLE IF EXISTS eacor_any");
+            exec(textConn, "DROP TYPE IF EXISTS eacor_any_enum");
+        }
+    }
+
+    private static String oneString(String sql) throws SQLException {
+        try (Statement s = textConn.createStatement(); ResultSet rs = s.executeQuery(sql)) {
+            assertTrue(rs.next(), sql);
+            return rs.getString(1);
+        }
+    }
 }

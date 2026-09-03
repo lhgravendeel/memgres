@@ -1162,9 +1162,20 @@ class BinaryOpEvaluator {
                 // A column of a composite type is of that type, whatever it is stored as. The
                 // stored type is text, and answering text said the row was a string.
                 if (b.table().getColumns().get(idx).getCompositeTypeName() != null) return null;
-                DataType t = b.table().getColumns().get(idx).getType();
+                Column def = b.table().getColumns().get(idx);
+                DataType t = def.getType();
                 if (t == DataType.INTERNAL_CHAR) return "\"char\"";
-                return t == null ? null : t.getPgName();
+                if (t == null) return null;
+                // An array of an enum carries the enum as the column's own type, with the
+                // element type beside it: read from the type alone the column was a single
+                // value, so = ANY over it had no array to search and was refused.
+                if (def.getArrayElementType() != null && !DataType.isArrayType(t)) {
+                    String element = def.getEnumTypeName() != null
+                            ? TypeNamespace.nameOfKey(def.getEnumTypeName())
+                            : def.getArrayElementType().getPgName();
+                    return element + "[]";
+                }
+                return t.getPgName();
             }
         }
         return null;
