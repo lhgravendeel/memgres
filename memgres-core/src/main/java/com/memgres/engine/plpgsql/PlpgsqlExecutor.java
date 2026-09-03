@@ -1191,6 +1191,13 @@ public class PlpgsqlExecutor {
             // the length is applied separately so an over-long initialiser is refused, not cut
             String castTo = declaredTypmod(coerceType) != null
                     ? coerceType.substring(0, coerceType.indexOf('(')).trim() : coerceType;
+            // A character type written with no width is one character wide, so the base name
+            // left behind here says something the declaration never did. What the value has to
+            // be is text; the declared width is applied to it separately.
+            if (castTo != null && ("char".equalsIgnoreCase(castTo)
+                    || "character".equalsIgnoreCase(castTo) || "bpchar".equalsIgnoreCase(castTo))) {
+                castTo = "text";
+            }
             return evalExpr("CAST(" + decl.defaultExpr() + " AS " + castTo + ")", scope);
         }
         return evalExpr(decl.defaultExpr(), scope);
@@ -1710,8 +1717,10 @@ public class PlpgsqlExecutor {
                     String[] parts = splitCommaValues(whenExprStr);
                     for (String part : parts) {
                         Object whenVal = evalExpr(part.trim(), scope);
-                        if (whenVal != null && (searchVal.equals(whenVal)
-                                || String.valueOf(searchVal).equals(String.valueOf(whenVal)))) {
+                        // The comparison is the equality operator, so it is the values that are
+                        // held against each other and not the letters they print as: 1 and 1.0
+                        // are one number, and matching on their text made them two.
+                        if (whenVal != null && astExecutor.valuesEqualPublic(searchVal, whenVal)) {
                             executeStatements(when.body(), scope);
                             return;
                         }
@@ -2428,7 +2437,11 @@ public class PlpgsqlExecutor {
             String message = "assertion failed";
             if (stmt.message() != null) {
                 Object msgVal = evalExpr(stmt.message(), scope);
-                message = msgVal != null ? msgVal.toString() : "assertion failed";
+                // The message is the value read as text, which for an array is the braces
+                // PostgreSQL writes it in rather than the Java list's own toString.
+                message = msgVal != null
+                        ? String.valueOf(astExecutor.castValue(msgVal, "text"))
+                        : "assertion failed";
             }
             throw new MemgresException(message, "P0004");
         }
@@ -3954,41 +3967,8 @@ public class PlpgsqlExecutor {
 
     /** Split a SQL body (from a SQL-language function/procedure) into individual statements. */
     private List<String> splitSqlBody(String body) {
-        List<String> result = new ArrayList<>();
-        StringBuilder current = new StringBuilder();
-        int i = 0;
-        while (i < body.length()) {
-            char c = body.charAt(i);
-            if (c == '\'') {
-                // String literal: skip to closing quote
-                current.append(c);
-                i++;
-                while (i < body.length()) {
-                    current.append(body.charAt(i));
-                    if (body.charAt(i) == '\'' && (i + 1 >= body.length() || body.charAt(i + 1) != '\'')) {
-                        i++;
-                        break;
-                    }
-                    if (body.charAt(i) == '\'' && i + 1 < body.length() && body.charAt(i + 1) == '\'') {
-                        current.append(body.charAt(i + 1));
-                        i += 2;
-                        continue;
-                    }
-                    i++;
-                }
-            } else if (c == ';') {
-                String stmt = current.toString().trim();
-                if (!stmt.isEmpty()) result.add(stmt);
-                current.setLength(0);
-                i++;
-            } else {
-                current.append(c);
-                i++;
-            }
-        }
-        String last = current.toString().trim();
-        if (!last.isEmpty()) result.add(last);
-        return result.isEmpty() ? Cols.listOf(body.trim()) : result;
+        List<String> pieces = com.memgres.engine.SqlPieces.statementsIn(body);
+        return pieces.isEmpty() ? Cols.listOf(body.trim()) : pieces;
     }
 
     // ---- Variable substitution in SQL ----
@@ -4113,6 +4093,25 @@ public class PlpgsqlExecutor {
                         appendValue(sb, null);
                         i += 2;
                         continue;
+                    }
+                    // A record has the fields of whatever row was put in it, so until one has
+                    // been there is no field to read: the name is not a name SQL can resolve some
+                    // other way, and PostgreSQL says which variable was never assigned.
+                    if ("record".equalsIgnoreCase(scope.declaredType(t.value()))
+                            && (tokens.get(i + 2).type() == TokenType.IDENTIFIER
+                                || tokens.get(i + 2).type() == TokenType.KEYWORD)
+                            && !(qualObj instanceof Map)) {
+                        if (qualObj == null) {
+                            throw new MemgresException("record \""
+                                    + t.value().toLowerCase(java.util.Locale.ROOT)
+                                    + "\" is not assigned yet", "55000");
+                        }
+                        // A row put in a record by ROW(...) carries values and no names, so no
+                        // name reaches a field of it.
+                        throw new MemgresException("record \""
+                                + t.value().toLowerCase(java.util.Locale.ROOT) + "\" has no field \""
+                                + tokens.get(i + 2).value().toLowerCase(java.util.Locale.ROOT)
+                                + "\"", "42703");
                     }
                     if (qualObj instanceof Map) {
                         @SuppressWarnings("unchecked")
@@ -4656,10 +4655,17 @@ public class PlpgsqlExecutor {
                 && t.type() != TokenType.RIGHT_BRACKET) {
             sb.append(" ");
         }
-        if (t.type() == TokenType.STRING_LITERAL) {
+        if (t.type() == TokenType.STRING_LITERAL
+                || t.type() == TokenType.DOLLAR_STRING_LITERAL) {
+            // What a dollar-quoted string holds is a string like any other, and it is written back
+            // as one: left as its bare contents, a body of SELECT $x$a;b$x$ became two statements.
             sb.append("'").append(t.value().replace("'", "''")).append("'");
         } else if (t.type() == TokenType.BIT_STRING_LITERAL) {
             sb.append("B'").append(t.value()).append("'");
+        } else if (t.type() == TokenType.QUOTED_IDENTIFIER) {
+            // The quotes are what make the name the name: without them it is folded, and a name
+            // holding anything but plain letters is not read back as one name at all.
+            sb.append('"').append(t.value().replace("\"", "\"\"")).append('"');
         } else {
             sb.append(t.value());
         }
@@ -4738,9 +4744,23 @@ public class PlpgsqlExecutor {
     private boolean matchesCondition(List<String> conditions, String sqlState) {
         for (String cond : conditions) {
             String condLower = cond.toLowerCase(java.util.Locale.ROOT).trim();
-            if (condLower.equals("others")) return !"P0004".equals(sqlState);
+            // OTHERS is every error but the two a block is never meant to swallow: a cancelled
+            // statement, which the client asked to stop, and a failed assertion, which is the
+            // author's own claim about the program. Either is caught only by its own name.
+            if (condLower.equals("others")) {
+                return !"P0004".equals(sqlState) && !"57014".equals(sqlState);
+            }
             if (condLower.startsWith("sqlstate ")) {
-                if (sqlState.equalsIgnoreCase(condLower.substring(9).trim().replace("'", ""))) return true;
+                String written = condLower.substring(9).trim().replace("'", "");
+                if (sqlState.equalsIgnoreCase(written)) return true;
+                // A code written out is matched exactly as a condition name is, and a code whose
+                // last three characters are zeroes names the whole class: SQLSTATE '22000'
+                // catches a division by zero the same way DATA_EXCEPTION does.
+                if (written.length() == 5 && written.substring(2).equals("000")
+                        && sqlState.length() == 5
+                        && sqlState.substring(0, 2).equalsIgnoreCase(written.substring(0, 2))) {
+                    return true;
+                }
                 continue;
             }
             String condSqlState = conditionToSqlState(condLower);

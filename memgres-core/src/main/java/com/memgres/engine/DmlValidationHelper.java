@@ -47,6 +47,33 @@ class DmlValidationHelper {
      * of the wrong shape is a cast it cannot make, text of the wrong shape is input its reader
      * cannot read.
      */
+    /**
+     * Refuse a value whose type the column cannot take.
+     *
+     * <p>Storing a value is an assignment, not a reading of its text: PostgreSQL looks for a cast
+     * registered implicit or assignment from what the expression produces to what the column
+     * holds, and refuses the statement where there is none. Reading the value through the two
+     * types' text forms instead let an integer be stored in a date and a boolean in an integer,
+     * neither of which PostgreSQL allows without being told to cast.
+     */
+    void requireAssignable(Expression expr, Column column) {
+        if (expr == null || column == null || column.getType() == null) return;
+        // A column whose type this engine models as something else is not judged here: what the
+        // coercion rules are for it is a question this cannot answer, and guessing would refuse
+        // statements PostgreSQL runs.
+        if (column.getEnumTypeName() != null || column.getDomainTypeName() != null
+                || column.getCompositeTypeName() != null || column.getArrayElementType() != null) {
+            return;
+        }
+        String exprType = DdlDefinitionChecks.certainTypeName(expr, null);
+        if (exprType == null || TypeCoercion.assignableFrom(exprType, column.getType())) return;
+        MemgresException e = PgErrors.datatypeMismatch("column \"" + column.getName()
+                + "\" is of type " + column.getType().toRegtypeDisplay()
+                + " but expression is of type " + exprType);
+        e.setHint("You will need to rewrite or cast the expression.");
+        throw e;
+    }
+
     Object storedValue(Object value, Column column) {
         if (column.getCompositeTypeName() != null && column.getArrayElementType() == null) {
             executor.compositeTypeHandler.requireCompositeShape(value,

@@ -1617,6 +1617,13 @@ class CatalogCoreBuilder {
         Map<String, List<Column>> shapes = new PgCatalogBuilder(database, oids).catalogShapes();
         for (Map.Entry<String, List<Column>> shape : shapes.entrySet()) {
             int relOid = oids.oid("rel:pg_catalog." + shape.getKey());
+            // A catalogue relation that is stored has the six system columns, and a reader
+            // asking pg_attribute for them was told a catalogue had none. A view has none of
+            // them -- there is no row of its own to have a ctid or a transaction number -- and
+            // listing them there gave pg_policies and pg_roles six columns they do not have.
+            if ("r".equals(PgCatalogRelations.relkind(shape.getKey()))) {
+                addSystemColumnAttributes(table, relOid);
+            }
             int attnum = 0;
             for (Column c : shape.getValue()) {
                 if (isSystemColumn(c)) continue;
@@ -2620,7 +2627,8 @@ class CatalogCoreBuilder {
                             fn.getOwner() != null ? fn.getOwner() : database.bootstrapRoleName(),
                             database.aclTouched("FUNCTION", fn.getName()),
                             AclItems.grantsOn(database, "FUNCTION", fn.getName()),
-                            database.aclGranteeOrder("FUNCTION", fn.getName())),
+                            database.aclGranteeOrder("FUNCTION", fn.getName()),
+                            database.anyPublicDefaultRevoked("FUNCTION", fn.getName())),
                     1
             });
         }
@@ -2891,6 +2899,7 @@ class CatalogCoreBuilder {
             // nowhere at all before CREATE EXTENSION runs. Listing them in pg_catalog on a fresh
             // database advertised nine names PostgreSQL has nowhere, every one of them a call
             // memgres itself refuses until the extension exists.
+            if (BuiltinFunctionSignatures.isWordRatherThanRoutine(name)) continue;
             String owningExtension = BuiltinFunctionSignatures.owningExtension(name);
             int fnNs = pgCatalogNs;
             if (owningExtension != null) {
@@ -2937,6 +2946,14 @@ class CatalogCoreBuilder {
         // one the function works when called but is invisible to anything that asks first.
         for (String builtin : BuiltinFunctionNames.NAMES) {
             if (signed.contains(builtin.toLowerCase(java.util.Locale.ROOT))) continue;
+            // A few of the names this engine evaluates are words of the grammar rather than
+            // routines -- SQL spells them without an argument list and PostgreSQL has no pg_proc
+            // row for them at all.
+            if (BuiltinFunctionSignatures.isWordRatherThanRoutine(builtin)) continue;
+            // A name an extension brings is nowhere at all until the extension is installed, and
+            // a bare row for it advertised a call this server itself refuses.
+            String bringsIt = BuiltinFunctionSignatures.owningExtension(builtin);
+            if (bringsIt != null && !database.hasExtension(bringsIt)) continue;
             if (!alreadyListed.add(builtin.toLowerCase(java.util.Locale.ROOT))) continue;
             table.insertRow(new Object[]{
                     oids.oid("proc:" + builtin), builtin, pgCatalogNs, 10,
@@ -3218,8 +3235,10 @@ class CatalogCoreBuilder {
         }
         boolean touched = database.aclTouched("TYPE", typeName)
                 || database.aclTouched("DOMAIN", typeName);
+        boolean publicGone = database.anyPublicDefaultRevoked("TYPE", typeName)
+                || database.anyPublicDefaultRevoked("DOMAIN", typeName);
         return AclItems.text("TYPE", CatalogHelper.ownerNameOf(database, "type:" + typeKey),
-                touched, grants, order);
+                touched, grants, order, publicGone);
     }
 
     private String buildRelacl(String relationKey, String kind) {

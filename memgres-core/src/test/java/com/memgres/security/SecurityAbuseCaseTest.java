@@ -423,9 +423,17 @@ class SecurityAbuseCaseTest {
 
         exec("REVOKE EXECUTE ON FUNCTION sec_fn_exec() FROM sec_execute_role");
 
+        // A routine's default ACL grants EXECUTE to PUBLIC, so taking the role's own grant away
+        // leaves the one everybody has: PostgreSQL still answers yes here.
+        boolean afterRoleRevoke = scalarBool(
+                "SELECT has_function_privilege('sec_execute_role', 'sec_fn_exec()', 'EXECUTE')");
+        assertTrue(afterRoleRevoke, "EXECUTE is still held through PUBLIC's default");
+
+        exec("REVOKE EXECUTE ON FUNCTION sec_fn_exec() FROM PUBLIC");
+
         boolean afterRevoke = scalarBool(
                 "SELECT has_function_privilege('sec_execute_role', 'sec_fn_exec()', 'EXECUTE')");
-        assertFalse(afterRevoke, "EXECUTE privilege must be absent after REVOKE");
+        assertFalse(afterRevoke, "EXECUTE privilege must be absent after REVOKE from PUBLIC");
     }
 
     // =========================================================================

@@ -124,15 +124,24 @@ class CatalogMetadataFunctions {
                 if (typeOid == null) return null;
                 int oid = typeOidOf(typeOid);
                 int typmod = -1;
+                boolean typmodGiven = false;
                 if (fn.args().size() > 1) {
                     Object modVal = executor.evalExpr(fn.args().get(1), ctx);
-                    if (modVal != null) typmod = executor.toInt(modVal);
+                    if (modVal != null) {
+                        typmod = executor.toInt(modVal);
+                        typmodGiven = true;
+                    }
                 }
-                return formatTypeByOid(oid, typmod);
+                return formatTypeByOid(oid, typmod, typmodGiven);
             }
             case "pg_get_constraintdef": {
                 if (!fn.args().isEmpty()) {
                     Object oidVal = executor.evalExpr(fn.args().get(0), ctx);
+                    // The second argument asks for the pretty form, which writes the body the way
+                    // a person writes it: with the parentheses precedence makes unnecessary left
+                    // out. Ignoring it answered with the plain form under either name.
+                    prettyConstraintDef = fn.args().size() > 1
+                            && executor.isTruthy(executor.evalExpr(fn.args().get(1), ctx));
                     if (oidVal != null) {
                         int coid = executor.toInt(oidVal);
                         for (Map.Entry<String, Schema> schemaEntry : executor.database.getSchemas().entrySet()) {
@@ -236,8 +245,16 @@ class CatalogMetadataFunctions {
             case "pg_get_expr": {
                 if (fn.args().size() > 0) {
                     Object expr = executor.evalExpr(fn.args().get(0), ctx);
+                    for (int i = 1; i < fn.args().size(); i++) executor.evalExpr(fn.args().get(i), ctx);
                     if (expr == null) return null;
-                    return expr.toString();
+                    // A stored tree is written down wrapped, so that a reader looking at the
+                    // column sees something no expression could be; this is the reader that
+                    // takes the wrapping off.
+                    String stored = expr.toString();
+                    if (stored.startsWith("{OPEXPR ") && stored.endsWith("}")) {
+                        return stored.substring("{OPEXPR ".length(), stored.length() - 1);
+                    }
+                    return stored;
                 }
                 return null;
             }
@@ -490,7 +507,7 @@ class CatalogMetadataFunctions {
                 Object classIdVal = executor.evalExpr(fn.args().get(0), ctx);
                 Object objIdVal = executor.evalExpr(fn.args().get(1), ctx);
                 Object objSubIdVal = executor.evalExpr(fn.args().get(2), ctx);
-                if (classIdVal == null || objIdVal == null) return "";
+                if (classIdVal == null || objIdVal == null) return null;
                 int classId = executor.toInt(classIdVal);
                 int objId = executor.toInt(objIdVal);
                 switch (classId) {
@@ -514,18 +531,32 @@ class CatalogMetadataFunctions {
                                 return "function " + funcName + "()";
                             }
                         }
-                        return "";
+                        return null;
                     }
                     case 1259: { // pg_class
                         for (Map.Entry<String, Integer> entry : executor.systemCatalog.getOidMap().entrySet()) {
                             if (entry.getValue() == objId && entry.getKey().startsWith("rel:")) {
                                 String fullKey = entry.getKey().substring(4); // strip "rel:"
-                                // Extract table name from schema.table
-                                String tableName = fullKey.contains(".") ? fullKey.substring(fullKey.lastIndexOf('.') + 1) : fullKey;
-                                return "table " + tableName;
+                                int dot = fullKey.lastIndexOf('.');
+                                String schema = dot < 0 ? executor.defaultSchema()
+                                        : fullKey.substring(0, dot);
+                                String relName = dot < 0 ? fullKey : fullKey.substring(dot + 1);
+                                return describeRelation(schema, relName,
+                                        executor.toInt(objSubIdVal));
                             }
                         }
-                        return "";
+                        return null;
+                    }
+                    case 1247: { // pg_type
+                        DataType shipped = DataType.fromOid(objId);
+                        if (shipped != null) return "type " + AstExecutor.pgTypeDisplayName(shipped);
+                        for (Map.Entry<String, Integer> entry
+                                : executor.systemCatalog.getOidMap().entrySet()) {
+                            if (entry.getValue() == objId && entry.getKey().startsWith("type:")) {
+                                return "type " + entry.getKey().substring(5);
+                            }
+                        }
+                        return null;
                     }
                     case 2615: { // pg_namespace
                         for (Map.Entry<String, Integer> entry : executor.systemCatalog.getOidMap().entrySet()) {
@@ -534,10 +565,10 @@ class CatalogMetadataFunctions {
                                 return "schema " + schemaName;
                             }
                         }
-                        return "";
+                        return null;
                     }
                     default:
-                        return "";
+                        return null;
                 }
             }
             case "_pg_expandarray": {
@@ -627,6 +658,19 @@ class CatalogMetadataFunctions {
                     // the same value for both of these; only the call says which type it is.
                     if ("to_regproc".equals(called)) return "regproc";
                     if ("to_regprocedure".equals(called)) return "regprocedure";
+                    // XMLSERIALIZE produces a value of the type it was asked for, so the type is
+                    // what the call names rather than the text the value happens to be held as.
+                    if ("xmlserialize".equals(called)) {
+                        List<Expression> serializeArgs = ((FunctionCallExpr) typeofArg).args();
+                        if (serializeArgs.size() >= 3) {
+                            Object written = executor.evalExpr(serializeArgs.get(2), ctx);
+                            if (written != null) {
+                                return DataType.canonicalName(
+                                        written.toString().replaceAll("\\(.*\\)", "").trim());
+                            }
+                        }
+                        return "text";
+                    }
                 }
                 return NOT_HANDLED;
             }
@@ -913,7 +957,8 @@ class CatalogMetadataFunctions {
         }
         sb.append(" FOR EACH ").append(first.isForEachStatement() ? "STATEMENT" : "ROW");
         if (first.getWhenClause() != null && !first.getWhenClause().isEmpty()) {
-            sb.append(" WHEN (").append(deparseTriggerWhen(first.getWhenClause())).append(')');
+            sb.append(" WHEN (")
+                    .append(deparseTriggerWhen(first.getWhenClause(), pretty)).append(')');
         }
         sb.append(" EXECUTE FUNCTION ").append(qualifiedFunctionName(first.getFunctionName()))
                 .append('(');
@@ -953,9 +998,11 @@ class CatalogMetadataFunctions {
      * casing it and closing up the space after its dot produced a definition that restores a
      * trigger firing on a string nobody stored.
      */
-    private static String deparseTriggerWhen(String condition) {
+    private static String deparseTriggerWhen(String condition, boolean pretty) {
         String text = condition.trim();
-        StringBuilder out = new StringBuilder("(");
+        // The plain form parenthesises the condition inside the WHEN's own parentheses; the
+        // pretty form leaves out the pair precedence makes unnecessary, which is that one.
+        StringBuilder out = new StringBuilder(pretty ? "" : "(");
         int i = 0;
         int plainFrom = 0;
         while (i < text.length()) {
@@ -977,7 +1024,7 @@ class CatalogMetadataFunctions {
             plainFrom = end;
         }
         appendRowRefsLowered(out, text.substring(plainFrom));
-        return out.append(')').toString();
+        return pretty ? out.toString() : out.append(')').toString();
     }
 
     /** Copy a stretch of condition text with {@code OLD.}/{@code NEW.} in PostgreSQL's spelling. */
@@ -1025,6 +1072,31 @@ class CatalogMetadataFunctions {
     }
 
     /** The name of the column at this attnum, or null when the relation has no such column. */
+    /**
+     * A relation named the way PostgreSQL names it when it describes an object: by the kind of
+     * relation it is, and by the column where the object is one column of it. Calling every
+     * relation a table named a view and a sequence as things the database does not hold under
+     * that name, and a sub-identifier read as nothing described the whole relation where
+     * PostgreSQL describes the one column.
+     */
+    private String describeRelation(String schemaName, String relationName, int subId) {
+        Database.ViewDef view = executor.database.getView(schemaName, relationName);
+        String kind;
+        if (view != null) {
+            kind = view.materialized() ? "materialized view" : "view";
+        } else if (executor.database.getSequence(schemaName, relationName) != null) {
+            kind = "sequence";
+        } else if (executor.database.hasIndex(schemaName, relationName)) {
+            kind = "index";
+        } else {
+            kind = "table";
+        }
+        if (subId <= 0) return kind + " " + relationName;
+        String column = columnNameAt(schemaName, relationName, subId);
+        return column == null ? kind + " " + relationName
+                : "column " + column + " of " + kind + " " + relationName;
+    }
+
     private String columnNameAt(String schemaName, String relationName, int attnum) {
         if (attnum < 1) return null;
         Database.ViewDef vd = executor.database.getView(schemaName, relationName);
@@ -1130,7 +1202,10 @@ class CatalogMetadataFunctions {
         Object tblArg = executor.evalExpr(fn.args().get(0), ctx);
         Object colArg = executor.evalExpr(fn.args().get(1), ctx);
         if (tblArg == null || colArg == null) return null;
-        String tblName = String.valueOf(tblArg);
+        // The first argument is a relation name written as text, so it is read as one: a part of
+        // it written without quotes is folded, and the folded name is what is looked for and what
+        // a complaint quotes back.
+        String tblName = Quoting.nameAsRead(String.valueOf(tblArg));
         String colName = String.valueOf(colArg);
         String explicitSchema = null;
         if (tblName.contains(".")) {
@@ -2119,6 +2194,11 @@ class CatalogMetadataFunctions {
         // count them a second time -- one function twice over is not two functions.
         for (String[] signature : BuiltinFunctionSignatures.SIGNATURES) {
             if (!signature[0].equalsIgnoreCase(name)) continue;
+            if (BuiltinFunctionSignatures.isWordRatherThanRoutine(signature[0])) continue;
+            // A routine an extension brings is one this database has only once the extension is
+            // installed, exactly as pg_proc has a row for it only then.
+            String bringsIt = BuiltinFunctionSignatures.owningExtension(signature[0]);
+            if (bringsIt != null && !executor.database.hasExtension(bringsIt)) continue;
             addUnlessPresent(found, builtinCandidate(executor, signature[0], signature[2]));
         }
         for (String[] aggregate : BuiltinAggregateSignatures.AGGREGATES) {
@@ -2301,6 +2381,9 @@ class CatalogMetadataFunctions {
         return null;
     }
 
+    /** Whether the constraint definition now being written was asked for in the pretty form. */
+    private boolean prettyConstraintDef;
+
     private String formatConstraintDef(StoredConstraint sc, String ownSchema, Table owner) {
         StringBuilder sb = new StringBuilder();
         switch (sc.getType()) {
@@ -2315,7 +2398,11 @@ class CatalogMetadataFunctions {
                 break;
             case CHECK:
                 sb.append("CHECK (")
-                        .append(RuleDeparser.deparse(sc.getCheckExpr(), RuleDeparser.forTable(owner)))
+                        .append(prettyConstraintDef
+                                ? RuleDeparser.deparsePretty(sc.getCheckExpr(),
+                                        RuleDeparser.forTable(owner))
+                                : RuleDeparser.deparse(sc.getCheckExpr(),
+                                        RuleDeparser.forTable(owner)))
                         .append(")");
                 // NO INHERIT is a clause only a CHECK carries, and PostgreSQL prints it here,
                 // ahead of the clauses every constraint kind shares. A key is non-inheritable by
@@ -2447,6 +2534,9 @@ class CatalogMetadataFunctions {
      * name is looked up where one was written.
      */
     private int typeOidOf(Object value) {
+        // A regtype already knows which type it is; reading its name back and looking that up
+        // again can only lose, because a row type's name is not one pg_type is searched by.
+        if (value instanceof RegtypeValue) return ((RegtypeValue) value).oid();
         if (value instanceof Number) return ((Number) value).intValue();
         String text = value.toString().trim();
         try {
@@ -2467,11 +2557,30 @@ class CatalogMetadataFunctions {
     }
 
     private String formatTypeByOid(int oid, int typmod) {
+        return formatTypeByOid(oid, typmod, false);
+    }
+
+    /**
+     * @param typmodGiven whether a modifier argument was written at all, which is a different
+     *     question from what it said. Asked for a type with no modifier, format_type answers with
+     *     the SQL name — {@code character}, {@code bit}. Asked for the same type with a modifier
+     *     that turns out to be none, it answers with the name the catalogue holds, quoted where
+     *     that name is a reserved word: {@code bpchar} and {@code "bit"}. A column whose width was
+     *     never declared is read the second way, so the two have to stay apart.
+     */
+    private String formatTypeByOid(int oid, int typmod, boolean typmodGiven) {
         // No type at all: PG prints a dash rather than naming whatever sits at OID zero.
         if (oid == 0) return "-";
         // PG quotes "char" so it is not read as the SQL type char; format_type is where a client
         // learns a catalog flag column is the single-byte type and not a bpchar.
         if (oid == 18) return "\"char\"";
+        // Only these two types answer differently: their SQL names mean a width of one where the
+        // catalogue's mean no width at all, so a modifier of none has to be told apart from no
+        // modifier written. Every other type answers with the same name either way.
+        if (typmodGiven && typmod < 0) {
+            if (oid == DataType.CHAR.getOid()) return "bpchar";
+            if (oid == DataType.BIT.getOid()) return "\"bit\"";
+        }
         // An array is named after its element with the modifier applied to that element, so the
         // array's own row is answered by formatting the element and adding the brackets.
         DataType arrayType = null;
@@ -2480,7 +2589,9 @@ class CatalogMetadataFunctions {
         }
         if (arrayType != null) {
             DataType element = DataType.elementOf(arrayType);
-            if (element != null) return CatalogHelper.formatType(element, null, typmod) + "[]";
+            if (element != null) {
+                return formatTypeByOid(element.getOid(), typmod, typmodGiven) + "[]";
+            }
         }
         for (DataType dt : DataType.values()) {
             if (dt.getOid() == oid) {

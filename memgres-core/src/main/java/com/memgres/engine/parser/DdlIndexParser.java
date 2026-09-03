@@ -129,7 +129,14 @@ class DdlIndexParser {
                 } while (depth > 0 && !parser.isAtEnd());
                 cols.add(expr.toString().trim());
             } else {
-                cols.add(parser.readIdentifier());
+                String named = parser.readIdentifier();
+                // A name with a call written after it is an expression, and an included column
+                // cannot be one: PostgreSQL says so rather than stopping on the parenthesis.
+                if (parser.check(TokenType.LEFT_PAREN)) {
+                    throw new com.memgres.engine.MemgresException(
+                            "expressions are not supported in included columns", "0A000");
+                }
+                cols.add(named);
             }
         } while (parser.match(TokenType.COMMA));
         return cols;

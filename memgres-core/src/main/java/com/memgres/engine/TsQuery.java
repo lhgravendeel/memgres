@@ -264,6 +264,25 @@ public class TsQuery {
      */
     private static TsQuery lexeme(String word, boolean prefix, Set<Character> weights, String config) {
         if (config == null) return new TsQuery(Op.TERM, word, prefix, weights, null, null, 0);
+        // With a configuration the word goes through the parser as well as the dictionary, and
+        // the parser may find several words in it: a quoted lexeme holding a space asks for the
+        // two words next to each other, which is a phrase. Read as one lexeme it asked for a
+        // lexeme with a space in it, which nothing indexes.
+        String[] words = word.trim().split("\\s+");
+        if (words.length > 1) {
+            TsQuery joined = null;
+            for (String part : words) {
+                if (part.isEmpty()) continue;
+                TsQuery one = oneLexeme(part, prefix, weights, config);
+                joined = joined == null ? one : phrase(joined, one, 1);
+            }
+            if (joined != null) return joined;
+        }
+        return oneLexeme(word, prefix, weights, config);
+    }
+
+    private static TsQuery oneLexeme(String word, boolean prefix, Set<Character> weights,
+                                     String config) {
         if ("simple".equalsIgnoreCase(config)) return termSimple(word, prefix, weights);
         return term(word, prefix, weights);
     }
@@ -300,9 +319,24 @@ public class TsQuery {
                 continue;
             }
             if (c == '\'') {
-                int end = input.indexOf('\'', i + 1);
-                if (end < 0) end = input.length() - 1;
-                String lexeme = input.substring(i, end + 1);
+                // Two quotes inside a quoted lexeme stand for one quote in the lexeme, so the
+                // first of a pair does not end it: 'it''s' is one lexeme with a quote in it.
+                int end = i + 1;
+                StringBuilder quoted = new StringBuilder();
+                while (end < input.length()) {
+                    if (input.charAt(end) == '\'') {
+                        if (end + 1 < input.length() && input.charAt(end + 1) == '\'') {
+                            quoted.append('\'');
+                            end += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    quoted.append(input.charAt(end));
+                    end++;
+                }
+                if (end >= input.length()) end = input.length() - 1;
+                String lexeme = "'" + quoted + "'";
                 i = end + 1;
                 // Check for trailing :*AB
                 if (i < input.length() && input.charAt(i) == ':') {
@@ -503,6 +537,8 @@ public class TsQuery {
      * nothing around it for the brackets to separate it from.
      */
     public String queryTree() {
+        // A query with nothing in it has nothing to write, not even the word for "anything".
+        if (isEmpty()) return "";
         // If the entire query is just NOT, return 'T'
         if (op == Op.NOT) return "T";
         return queryTreeInner(false, null);
@@ -512,7 +548,9 @@ public class TsQuery {
         switch (op) {
             case TERM: {
                 if (term == null || term.isEmpty()) return "T";
-                return "'" + term.replace("'", "''") + "'";
+                // A lexeme is written with everything that says which lexemes it names: the
+                // prefix star and the weights are part of what would be looked up.
+                return toStringInner(false, null);
             }
             case AND:
             case OR:
@@ -522,7 +560,11 @@ public class TsQuery {
                 String operator = op == Op.AND ? " & "
                         : op == Op.OR ? " | "
                         : phraseDistance == 1 ? " <-> " : " <" + phraseDistance + "> ";
-                if (op == Op.PHRASE && ("T".equals(l) || "T".equals(r))) return "T";
+                // A phrase and an OR are only as searchable as their weakest branch: a phrase
+                // needs both lexemes and an OR is satisfied by either, so a branch that names
+                // nothing to look up leaves the whole node naming nothing. An AND still has the
+                // other branch to look up, which is why only there is a branch dropped.
+                if (op != Op.AND && ("T".equals(l) || "T".equals(r))) return "T";
                 if ("T".equals(l) && "T".equals(r)) return "T";
                 if ("T".equals(l)) return r;
                 if ("T".equals(r)) return l;

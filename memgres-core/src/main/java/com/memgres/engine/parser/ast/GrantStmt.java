@@ -56,6 +56,36 @@ public final class GrantStmt implements Statement {
     public List<String> privileges() { return privileges; }
     public String objectType() { return objectType; }
     public String objectName() { return objectName; }
+
+    /**
+     * The further objects the same statement names, each of the same kind and taking the same
+     * privileges. Never null; empty when one object was named.
+     */
+    private java.util.List<String> moreObjects = java.util.Collections.emptyList();
+
+    /** The same statement, remembering the other objects it named. */
+    public GrantStmt withMoreObjects(java.util.List<String> names) {
+        this.moreObjects = names == null || names.isEmpty()
+                ? java.util.Collections.<String>emptyList()
+                : java.util.Collections.unmodifiableList(new java.util.ArrayList<String>(names));
+        return this;
+    }
+
+    public java.util.List<String> moreObjects() { return moreObjects; }
+
+    /** One statement per object named, in the order they were written. */
+    public java.util.List<GrantStmt> perObject() {
+        java.util.List<GrantStmt> each = new java.util.ArrayList<GrantStmt>();
+        each.add(new GrantStmt(privileges, objectType, objectName, grantees, withGrantOption,
+                withAdminOption, isRoleGrant, columns, grantor).withPerPrivilegeColumns(
+                        perPrivilegeColumns));
+        for (String other : moreObjects) {
+            each.add(new GrantStmt(privileges, objectType, other, grantees, withGrantOption,
+                    withAdminOption, isRoleGrant, columns, grantor).withPerPrivilegeColumns(
+                            perPrivilegeColumns));
+        }
+        return each;
+    }
     public List<String> grantees() { return grantees; }
     public boolean withGrantOption() { return withGrantOption; }
     public boolean withAdminOption() { return withAdminOption; }

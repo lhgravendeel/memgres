@@ -40,6 +40,45 @@ final class Quoting {
         return "\"" + name.replace("\"", "\"\"") + "\"";
     }
 
+
+    /**
+     * A name read the way PostgreSQL reads one written as text: the double quotes around a part of
+     * it are identifier quoting rather than characters of the name, and a part written without them
+     * is folded to lower case. It is this name, and not the text it was written as, that a
+     * complaint about a missing object quotes back.
+     */
+    static String nameAsRead(String written) {
+        if (written == null) return null;
+        String text = written.trim();
+        StringBuilder out = new StringBuilder();
+        StringBuilder part = new StringBuilder();
+        boolean inQuotes = false;
+        boolean quotedPart = false;
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (c == '"') {
+                if (inQuotes && i + 1 < text.length() && text.charAt(i + 1) == '"') {
+                    part.append('"');
+                    i++;
+                } else {
+                    inQuotes = !inQuotes;
+                    quotedPart = true;
+                }
+            } else if (c == '.' && !inQuotes) {
+                out.append(quotedPart ? part.toString()
+                        : part.toString().trim().toLowerCase(java.util.Locale.ROOT));
+                out.append('.');
+                part.setLength(0);
+                quotedPart = false;
+            } else {
+                part.append(c);
+            }
+        }
+        out.append(quotedPart ? part.toString()
+                : part.toString().trim().toLowerCase(java.util.Locale.ROOT));
+        return out.toString();
+    }
+
     private static boolean needsQuoting(String name) {
         if (name.isEmpty()) return true;
         char first = name.charAt(0);

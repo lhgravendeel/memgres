@@ -713,6 +713,12 @@ public class Database {
 
     public List<DefaultAclEntry> getDefaultAcls() { return defaultAcls; }
 
+    /** Forget what was set aside for a schema's objects, which a dropped schema will not hold. */
+    public void removeDefaultAclsInSchema(String schemaName) {
+        if (schemaName == null) return;
+        defaultAcls.removeIf(e -> e.schema != null && e.schema.equalsIgnoreCase(schemaName));
+    }
+
     /** Every default privilege the role wrote or was named by, which goes when the role does. */
     public void removeDefaultAclsOf(String roleName) {
         if (roleName == null) return;
@@ -2105,6 +2111,11 @@ public class Database {
         eventTriggers.remove(name.toLowerCase(java.util.Locale.ROOT));
     }
 
+    /** Whether anything at all is listening for DDL, so the common case costs nothing. */
+    public boolean hasEventTriggers() {
+        return !eventTriggers.isEmpty();
+    }
+
     public Map<String, PgEventTrigger> getAllEventTriggers() {
         return eventTriggers;
     }
@@ -2267,9 +2278,15 @@ public class Database {
     // column of the same name one shared counter.
 
     /** The key a sequence is stored under: its schema and its name, both folded. */
+    /**
+     * A sequence's key, which is its name as written and not a folded copy of it. A name is folded
+     * where it is read -- an unquoted one to lower case, a quoted one not at all -- so folding it
+     * again here made every sequence answer to every spelling of its name: a sequence created as
+     * "MiXeD" was drawn from by writing mixed, which names nothing.
+     */
     static String seqKey(String schemaName, String name) {
         String schema = schemaName == null || schemaName.isEmpty() ? "public" : schemaName;
-        return schema.toLowerCase(java.util.Locale.ROOT) + "." + name.toLowerCase(java.util.Locale.ROOT);
+        return schema.toLowerCase(java.util.Locale.ROOT) + "." + name;
     }
 
     public void addSequence(Sequence sequence) {
@@ -2308,7 +2325,7 @@ public class Database {
         Sequence pub = visibleOne(sequences.get(seqKey("public", name)));
         if (pub != null) return pub;
         for (Map.Entry<String, Sequence> e : sequences.entrySet()) {
-            if (!e.getValue().getName().equalsIgnoreCase(name)) continue;
+            if (!e.getValue().getName().equals(name)) continue;
             Sequence seq = visibleOne(e.getValue());
             if (seq != null) return seq;
         }
@@ -4321,6 +4338,12 @@ public class Database {
             members.remove(memberRole);
             if (members.isEmpty()) roleMemberships.remove(grantedRole);
         }
+        removeAdminOption(grantedRole, memberRole);
+    }
+
+    /** Takes away the right to hand a membership on, leaving the membership itself. */
+    public void removeAdminOption(String grantedRole, String memberRole) {
+        roleAdminOptions.remove(grantedRole + "|" + memberRole);
     }
 
     /**
@@ -4403,6 +4426,10 @@ public class Database {
     }
 
     public void addRolePrivilege(String role, String privilege, String objectType, String objectName) {
+        if ("public".equalsIgnoreCase(role) && objectType != null && objectName != null) {
+            revokedPublicDefaults.remove(defaultKey(objectType, objectName, privilege));
+            revokedPublicDefaults.remove(defaultKey(objectType, objectName, "ALL"));
+        }
         rolePrivileges.computeIfAbsent(role.toLowerCase(java.util.Locale.ROOT), k -> ConcurrentHashMap.newKeySet())
                 .add(privilege + ":" + objectType + ":" + objectName);
         touchAcl(objectType, objectName);
@@ -4416,8 +4443,42 @@ public class Database {
         }
     }
 
+    /**
+     * The defaults PUBLIC no longer holds, keyed by object and privilege.
+     *
+     * <p>Some kinds give PUBLIC a privilege without anybody writing a grant -- EXECUTE on a
+     * routine, USAGE on a type or a language -- and a REVOKE takes that away. There is no grant
+     * to remove, so the revocation has to be recorded as one: read only as an absence of grants,
+     * a type whose USAGE had been revoked from everyone still answered that everyone had it.
+     */
+    private final Set<String> revokedPublicDefaults = ConcurrentHashMap.newKeySet();
+
+    private static String defaultKey(String objectType, String objectName, String privilege) {
+        return (objectType == null ? "" : objectType.toUpperCase(java.util.Locale.ROOT)) + ":"
+                + (objectName == null ? "" : objectName.toLowerCase(java.util.Locale.ROOT)) + ":"
+                + (privilege == null ? "" : privilege.toUpperCase(java.util.Locale.ROOT));
+    }
+
+    /** Whether PUBLIC's default hold on this privilege has been revoked. */
+    public boolean publicDefaultRevoked(String objectType, String objectName, String privilege) {
+        return revokedPublicDefaults.contains(defaultKey(objectType, objectName, privilege))
+                || revokedPublicDefaults.contains(defaultKey(objectType, objectName, "ALL"));
+    }
+
+    /** Whether any of PUBLIC's default hold on this object has been revoked. */
+    public boolean anyPublicDefaultRevoked(String objectType, String objectName) {
+        String prefix = defaultKey(objectType, objectName, "");
+        for (String key : revokedPublicDefaults) {
+            if (key.startsWith(prefix)) return true;
+        }
+        return false;
+    }
+
     public void removeRolePrivilege(String role, String privilege, String objectType, String objectName) {
         touchAcl(objectType, objectName);
+        if ("public".equalsIgnoreCase(role) && objectType != null && objectName != null) {
+            revokedPublicDefaults.add(defaultKey(objectType, objectName, privilege));
+        }
         Set<String> privs = rolePrivileges.get(role.toLowerCase(java.util.Locale.ROOT));
         if (privs != null) {
             if ("ALL".equalsIgnoreCase(privilege)) {

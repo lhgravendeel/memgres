@@ -198,9 +198,43 @@ class TextSearchFunctions {
      * configuration created with COPY behaves as its source does, so following copyFrom lands on
      * a stemmer; a name that names nothing at all is an error, not a silent fallback.
      */
+    /**
+     * The configuration a statement that names none reads text with.
+     *
+     * <p>PostgreSQL keeps it in default_text_search_config, so it is a session's to choose: read
+     * as english whatever the session had said, a document set to be indexed under simple was
+     * stemmed and had its stop words thrown away.
+     */
+    private String sessionConfig() {
+        String written = executor.session == null ? null
+                : executor.session.getGucSettings().get("default_text_search_config");
+        if (written == null || written.trim().isEmpty()) return "english";
+        return resolveTsConfig(written);
+    }
+
     /** The configuration a name stands for, for callers outside this class. */
     String namedConfig(String rawName) {
         return resolveTsConfig(rawName);
+    }
+
+    /**
+     * The built-in configuration a user configuration's own word mapping makes it behave as, or
+     * null when it has none. Only the ordinary word tokens are consulted: they are what a
+     * document is made of, and what the two answers here differ over.
+     */
+    private String mappedWordDictionary(String configName) {
+        String dict = executor.database.getTsConfigMaps().get(configName + "\u0000asciiword");
+        if (dict == null) dict = executor.database.getTsConfigMaps().get(configName + "\u0000word");
+        if (dict == null) return null;
+        String named = dict.trim().toLowerCase(java.util.Locale.ROOT);
+        int dot = named.lastIndexOf('.');
+        if (dot >= 0) named = named.substring(dot + 1);
+        if (named.equals("simple")) return "simple";
+        if (named.endsWith("_stem")) {
+            String language = named.substring(0, named.length() - "_stem".length());
+            if (BUILTIN_TS_CONFIGS.contains(language)) return language;
+        }
+        return null;
     }
 
     private String resolveTsConfig(String rawName) {
@@ -211,6 +245,11 @@ class TextSearchFunctions {
         if (BUILTIN_TS_CONFIGS.contains(name)) return name;
 
         Map<String, Database.TsConfigDef> defined = executor.database.getTsConfigs();
+        // A mapping written onto the configuration says which dictionary its words go through,
+        // and that is what decides how they are read: a configuration copied from simple and
+        // then mapped onto a stemmer stems, whatever it was copied from.
+        String mapped = mappedWordDictionary(name);
+        if (mapped != null) return mapped;
         String current = name;
         // A chain of copies has to end somewhere; stop if it loops back on itself.
         for (int hops = 0; hops < 16; hops++) {
@@ -276,7 +315,7 @@ class TextSearchFunctions {
             case "to_tsvector": {
                 int docAt = argv.size() == 2 ? 1 : 0;
                 String configName = argv.size() == 2
-                        ? resolveTsConfig(String.valueOf(argv.get(0))) : "english";
+                        ? resolveTsConfig(String.valueOf(argv.get(0))) : sessionConfig();
                 Object text = argv.get(docAt);
                 if (text == null) return null;
                 // A document is indexed by what it holds, not by the characters it is written as:
@@ -295,14 +334,14 @@ class TextSearchFunctions {
                 // json_to_tsvector([config,] document, filter)
                 int docAt = argv.size() == 3 ? 1 : 0;
                 String configName = argv.size() == 3
-                        ? resolveTsConfig(String.valueOf(argv.get(0))) : "english";
+                        ? resolveTsConfig(String.valueOf(argv.get(0))) : sessionConfig();
                 JsonValue document = parseDocument(argv.get(docAt).toString(),
                         name.startsWith("jsonb"));
                 Set<String> filter = parseTsFilter(argv.get(docAt + 1));
                 return TsVector.fromTexts(indexedTexts(document, filter), configName);
             }
             case "to_tsquery": {
-                String config = "english";
+                String config = sessionConfig();
                 Object tsqText;
                 if (argv.size() == 2) {
                     config = resolveTsConfig(String.valueOf(argv.get(0)));
@@ -325,7 +364,7 @@ class TextSearchFunctions {
             case "plainto_tsquery": {
                 // The configuration says how the text is read, so a name that names none is an
                 // error rather than a quiet fall back to english.
-                String config = "english";
+                String config = sessionConfig();
                 String input;
                 if (argv.size() == 2) {
                     config = resolveTsConfig(String.valueOf(argv.get(0)));
@@ -338,7 +377,7 @@ class TextSearchFunctions {
             case "phraseto_tsquery": {
                 // The configuration says how the text is read, so a name that names none is an
                 // error rather than a quiet fall back to english.
-                String config = "english";
+                String config = sessionConfig();
                 String input;
                 if (argv.size() == 2) {
                     config = resolveTsConfig(String.valueOf(argv.get(0)));
@@ -351,7 +390,7 @@ class TextSearchFunctions {
             case "websearch_to_tsquery": {
                 // The configuration says how the text is read, so a name that names none is an
                 // error rather than a quiet fall back to english.
-                String config = "english";
+                String config = sessionConfig();
                 String input;
                 if (argv.size() == 2) {
                     config = resolveTsConfig(String.valueOf(argv.get(0)));
@@ -600,7 +639,7 @@ class TextSearchFunctions {
                 return query.queryTree();
             }
             case "ts_debug": {
-                String config = "english";
+                String config = sessionConfig();
                 String input;
                 if (argv.size() == 2) {
                     config = resolveTsConfig(String.valueOf(argv.get(0)));
@@ -709,7 +748,14 @@ class TextSearchFunctions {
                 return l.concat(r);
             }
             case "get_current_ts_config": {
-                return TextSearchOperations.getCurrentTsConfig();
+                // The configuration the session reads with, named as it is named: a regconfig
+                // prints the bare name, the schema everything the server ships lives in being
+                // on the search path already.
+                String written = executor.session == null ? "english"
+                        : executor.session.getGucSettings().get("default_text_search_config");
+                if (written == null || written.trim().isEmpty()) written = "english";
+                int dot = written.lastIndexOf('.');
+                return dot >= 0 ? written.substring(dot + 1) : written;
             }
             case "array_to_tsvector": {
                 Object arrObj = argv.get(0);

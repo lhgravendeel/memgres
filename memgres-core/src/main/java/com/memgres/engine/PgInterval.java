@@ -1346,6 +1346,20 @@ public class PgInterval implements Comparable<PgInterval> {
     public long normalizedMicroseconds() { return normalizedMicros(); }
 
     /**
+     * The time of day this length reaches, counted from midnight.
+     *
+     * <p>Only the sub-day part counts — a length of two days is midnight again — and the hours
+     * wrap round the clock rather than running past it, so twenty-five hours is one in the
+     * morning and a length running backwards counts back from the end of the day.
+     */
+    public java.time.LocalTime asTimeOfDay() {
+        long day = 24L * 60 * 60 * 1000000;
+        long within = microseconds % day;
+        if (within < 0) within += day;
+        return java.time.LocalTime.ofNanoOfDay(within * 1000L);
+    }
+
+    /**
      * The span this interval measures, in microseconds.
      *
      * <p>Held in more than a long can carry, because it has to be: a month is thirty days of

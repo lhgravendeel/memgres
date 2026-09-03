@@ -22,7 +22,27 @@ class ArrayOperationHandler {
      * {@code {5,6}} make a three-row array rather than four loose values. An empty array has no
      * dimensions at all and simply leaves the other operand as it was.
      */
+    /**
+     * Two arrays joined end to end.
+     *
+     * <p>The answer starts where the left array started: PostgreSQL keeps the left operand's
+     * lower bound and counts the joined elements from there, so {@code '[0:1]={1,2}' || '{3}'} is
+     * an array of three subscripted from zero. Built with the ordinary bounds instead, the
+     * subscripts every reader of the left array had been using moved by one.
+     */
     static List<Object> concatArrays(List<?> left, List<?> right) {
+        return keepingLowerBounds(left, concatElements(left, right));
+    }
+
+    /** The joined elements, subscripted from wherever the array they were added to began. */
+    static List<Object> keepingLowerBounds(List<?> original, List<Object> joined) {
+        if (!(original instanceof PgArray) || original.isEmpty()) return joined;
+        int[] bounds = ((PgArray) original).lowerBounds();
+        if (bounds == null || bounds.length == 0 || bounds[0] == 1) return joined;
+        return PgArray.of(joined, bounds, ((PgArray) original).elementType());
+    }
+
+    private static List<Object> concatElements(List<?> left, List<?> right) {
         List<Object> merged = new ArrayList<Object>();
         if (left.isEmpty() || right.isEmpty()) {
             merged.addAll(left);

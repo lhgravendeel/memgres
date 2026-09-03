@@ -190,6 +190,11 @@ class ExprSpecialFormParser {
             String val = ep.advance().value();
             // Check for optional interval qualifier: YEAR TO MONTH, DAY TO SECOND(2), etc.
             String qualifier = parseIntervalQualifier();
+            // A precision belongs in front of the literal or behind a field name, and nowhere
+            // else: "interval '5' (2)" names no field for the precision to belong to.
+            if (qualifier == null && ep.check(TokenType.LEFT_PAREN)) {
+                throw ParseException.at(ep.peek());
+            }
             String type = "interval";
             if (qualifier != null) type = type + " " + qualifier;
             if (leadingPrecision != null) type = type + leadingPrecision;
@@ -226,13 +231,37 @@ class ExprSpecialFormParser {
         if (ep.checkIntervalField()) {
             String field = ep.advance().value().toLowerCase(java.util.Locale.ROOT);
             if (ep.checkKeyword("TO") || ep.checkIdentCI("TO")) {
+                // A pair of fields runs from a wider one to a narrower one and never across a
+                // gap, and the grammar has only these seven: what it does not have is a syntax
+                // error where it stands rather than a type nobody declared. The word the error
+                // points at is the TO when the first field can begin no pair at all, and the
+                // second field when the pair itself is not one.
+                String[] allowed = allowedSecondFields(field);
+                if (allowed.length == 0) throw ParseException.at(ep.peek());
                 ep.advance(); // consume TO
-                String toField = ep.readIdentifier().toLowerCase(java.util.Locale.ROOT);
+                Token endTok = ep.peek();
+                String toField = ep.checkIntervalField()
+                        ? endTok.value().toLowerCase(java.util.Locale.ROOT) : null;
+                boolean ok = false;
+                for (String candidate : allowed) {
+                    if (candidate.equals(toField)) ok = true;
+                }
+                if (!ok) throw ParseException.at(endTok);
+                ep.advance();
                 return field + " to " + toField + parseFieldPrecision();
             }
             return field + parseFieldPrecision();
         }
         return null;
+    }
+
+    /** The fields a pair beginning with {@code first} may run to, empty when it may begin none. */
+    private static String[] allowedSecondFields(String first) {
+        if ("year".equals(first)) return new String[]{"month"};
+        if ("day".equals(first)) return new String[]{"hour", "minute", "second"};
+        if ("hour".equals(first)) return new String[]{"minute", "second"};
+        if ("minute".equals(first)) return new String[]{"second"};
+        return new String[0];
     }
 
     /** Consume the {@code (N)} a SECOND field may carry; returns "" when there is none. */
@@ -388,6 +417,11 @@ class ExprSpecialFormParser {
         if (ep.check(TokenType.STRING_LITERAL)) {
             field = ep.advance().value();
         } else {
+            // The field is written as a name, so a word reserved for the grammar cannot be one
+            // -- EXTRACT(FROM ...) is missing its field rather than naming one called FROM.
+            if (!PgKeywords.canBeColumnName(ep.peek().raw())) {
+                throw ParseException.at(ep.peek());
+            }
             field = ep.readIdentifier();
         }
         ep.expectKeyword("FROM");

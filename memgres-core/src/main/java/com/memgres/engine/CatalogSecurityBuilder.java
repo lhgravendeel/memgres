@@ -101,20 +101,24 @@ class CatalogSecurityBuilder {
         Table table = new Table("pg_database", cols);
         int tsOid = oids.oid("tablespace:pg_default");
 
-        // Add template databases (always present in PostgreSQL)
+        // Add template databases (always present in PostgreSQL). Both carry the list initdb
+        // writes for them, which gives everyone the right to connect and nothing else: read as
+        // no list at all, a template answered that every role could create temporary tables in
+        // it, which is the one right the list deliberately withholds.
+        String templateAcl = "{=c/memgres,memgres=CTc/memgres}";
         table.insertRow(new Object[]{
                 oids.oid("db:template0"), "template0", 10, 6,
                 "c", true, false, -1,
                 722, 1, tsOid,
                 "en_US.UTF-8", "en_US.UTF-8",
-                null, null, null, false, null
+                null, null, null, false, templateAcl
         });
         table.insertRow(new Object[]{
                 oids.oid("db:template1"), "template1", 10, 6,
                 "c", true, true, -1,
                 722, 1, tsOid,
                 "en_US.UTF-8", "en_US.UTF-8",
-                null, null, null, false, null
+                null, null, null, false, templateAcl
         });
 
         // Dynamically list all databases from the registry
@@ -187,27 +191,10 @@ class CatalogSecurityBuilder {
             });
         }
         // PG18 default system roles (OIDs match PG 18 dynamic assignment, starting at 6168)
-        int sysOid = 6168;
-        String[][] sysRoles = {
-            {"pg_database_owner"},
-            {"pg_read_all_data"},
-            {"pg_write_all_data"},
-            {"pg_monitor"},
-            {"pg_read_all_settings"},
-            {"pg_read_all_stats"},
-            {"pg_stat_scan_tables"},
-            {"pg_read_server_files"},
-            {"pg_write_server_files"},
-            {"pg_execute_server_program"},
-            {"pg_signal_backend"},
-            {"pg_checkpoint"},
-            {"pg_use_reserved_connections"},
-            {"pg_create_subscription"},
-            {"pg_maintain"},
-        };
+        String[][] sysRoles = PREDEFINED_SYSTEM_ROLES;
         for (String[] r : sysRoles) {
             table.insertRow(new Object[]{
-                    sysOid++, r[0],
+                    Integer.parseInt(r[1]), r[0],
                     false, // not super
                     true,  // inherit
                     false, // no createrole
@@ -285,7 +272,23 @@ class CatalogSecurityBuilder {
      */
     private static String buildRolconfig(String raw) {
         if (raw == null || raw.isEmpty()) return null;
-        return "{" + raw + "}";
+        // An element holding a comma or a space is quoted, the way an array of text is printed
+        // everywhere else: written bare, {search_path=a, b} read back as two settings.
+        StringBuilder out = new StringBuilder("{");
+        boolean first = true;
+        for (String setting : raw.split(",(?=[^ ])")) {
+            if (!first) out.append(',');
+            first = false;
+            boolean quote = setting.indexOf(',') >= 0 || setting.indexOf(' ') >= 0
+                    || setting.indexOf('"') >= 0 || setting.indexOf('\\') >= 0
+                    || setting.indexOf('{') >= 0 || setting.indexOf('}') >= 0;
+            if (!quote) {
+                out.append(setting);
+            } else {
+                out.append('"').append(setting.replace("\\", "\\\\").replace("\"", "\\\"")).append('"');
+            }
+        }
+        return out.append('}').toString();
     }
 
     Table buildPgUser() {
@@ -334,6 +337,39 @@ class CatalogSecurityBuilder {
     }
 
     /** The group roles, as PostgreSQL's pg_group view reports them. */
+    /**
+     * The roles PostgreSQL ships, each with the identifier PostgreSQL gives it. The numbers are
+     * fixed in the catalogue rather than handed out as the server starts, so they are written
+     * down here: a reader that sorts roles by their identifier sees them in the order PostgreSQL
+     * lists them in, and one that looks a number up finds the role that carries it.
+     */
+    /** The number PostgreSQL pins one of the roles it ships to. */
+    private static int predefinedRoleOid(String name) {
+        for (String[] r : PREDEFINED_SYSTEM_ROLES) {
+            if (r[0].equals(name)) return Integer.parseInt(r[1]);
+        }
+        return 0;
+    }
+
+    private static final String[][] PREDEFINED_SYSTEM_ROLES = {
+        {"pg_monitor", "3373"},
+        {"pg_read_all_settings", "3374"},
+        {"pg_read_all_stats", "3375"},
+        {"pg_stat_scan_tables", "3377"},
+        {"pg_signal_backend", "4200"},
+        {"pg_checkpoint", "4544"},
+        {"pg_use_reserved_connections", "4550"},
+        {"pg_read_server_files", "4569"},
+        {"pg_write_server_files", "4570"},
+        {"pg_execute_server_program", "4571"},
+        {"pg_database_owner", "6171"},
+        {"pg_read_all_data", "6181"},
+        {"pg_write_all_data", "6182"},
+        {"pg_create_subscription", "6304"},
+        {"pg_maintain", "6337"},
+        {"pg_signal_autovacuum_worker", "6392"},
+    };
+
     Table buildPgGroup() {
         List<Column> cols = Cols.listOf(
                 colNN("groname", DataType.NAME),
@@ -359,6 +395,12 @@ class CatalogSecurityBuilder {
                     entry.getKey(), oids.oid("role:" + entry.getKey()), members.toString()
             });
         }
+        // The roles PostgreSQL ships are roles that cannot log in, so they are groups here as
+        // much as any other: a client asking pg_group which groups there are was told of none.
+        for (String[] predefined : PREDEFINED_SYSTEM_ROLES) {
+            table.insertRow(new Object[]{
+                    predefined[0], Integer.parseInt(predefined[1]), "{}"});
+        }
         return table;
     }
 
@@ -374,6 +416,16 @@ class CatalogSecurityBuilder {
         );
         Table table = new Table("pg_auth_members", cols);
         int rowOid = 1;
+        // pg_monitor is granted the three roles it is made of, and the server ships those
+        // memberships. Listing none of them left pg_auth_members empty on a database nobody had
+        // granted anything in, where a real server has three rows in it from the start.
+        for (String held : new String[]{
+                "pg_read_all_settings", "pg_read_all_stats", "pg_stat_scan_tables"}) {
+            table.insertRow(new Object[]{
+                    rowOid++, predefinedRoleOid(held), predefinedRoleOid("pg_monitor"), 10,
+                    Boolean.FALSE, Boolean.TRUE, Boolean.TRUE
+            });
+        }
         for (Map.Entry<String, java.util.Set<String>> entry : database.getRoleMemberships().entrySet()) {
             String grantedRole = entry.getKey(); // the role being granted (roleid)
             int roleOid = oids.oid("role:" + grantedRole);
@@ -425,10 +477,16 @@ class CatalogSecurityBuilder {
                     if (policy.getRoles() != null && !policy.getRoles().isEmpty()) {
                         rolesText = "{" + String.join(",", policy.getRoles()) + "}";
                     }
+                    // What the view shows is pg_get_expr of the stored tree, which is the
+                    // deparser every other definition is written by: echoing memgres's own
+                    // spelling instead wrote CURRENT_USER as a call to a function.
                     String qualText = policy.getUsingExpr() != null
-                            ? SqlUnparser.exprToSql(policy.getUsingExpr()) : null;
+                            ? RuleDeparser.deparse(policy.getUsingExpr(), RuleDeparser.forTable(t))
+                            : null;
                     String withCheckText = policy.getWithCheckExpr() != null
-                            ? SqlUnparser.exprToSql(policy.getWithCheckExpr()) : null;
+                            ? RuleDeparser.deparse(policy.getWithCheckExpr(),
+                                    RuleDeparser.forTable(t))
+                            : null;
                     // A policy's OID is minted under its own name, not handed out in row order,
                     // so it stays the same across rebuilds and pg_description can point at it.
                     table.insertRow(new Object[]{
@@ -446,9 +504,10 @@ class CatalogSecurityBuilder {
     /** pg_policies view: one row per RLS policy, keyed by schema + table + policy name. */
     Table buildPgPolicies() {
         List<Column> cols = Cols.listOf(
-                col("schemaname", DataType.TEXT),
-                colNN("tablename", DataType.TEXT),
-                colNN("policyname", DataType.TEXT),
+                // The three names are names, which is the type a reader binds them as.
+                col("schemaname", DataType.NAME),
+                colNN("tablename", DataType.NAME),
+                colNN("policyname", DataType.NAME),
                 col("permissive", DataType.TEXT),
                 col("roles", DataType.NAME_ARRAY),
                 col("cmd", DataType.TEXT),
@@ -469,10 +528,16 @@ class CatalogSecurityBuilder {
                     } else {
                         rolesText = "{" + String.join(",", roles) + "}";
                     }
+                    // What the view shows is pg_get_expr of the stored tree, which is the
+                    // deparser every other definition is written by: echoing memgres's own
+                    // spelling instead wrote CURRENT_USER as a call to a function.
                     String qualText = policy.getUsingExpr() != null
-                            ? SqlUnparser.exprToSql(policy.getUsingExpr()) : null;
+                            ? RuleDeparser.deparse(policy.getUsingExpr(), RuleDeparser.forTable(t))
+                            : null;
                     String withCheckText = policy.getWithCheckExpr() != null
-                            ? SqlUnparser.exprToSql(policy.getWithCheckExpr()) : null;
+                            ? RuleDeparser.deparse(policy.getWithCheckExpr(),
+                                    RuleDeparser.forTable(t))
+                            : null;
                     table.insertRow(new Object[]{
                             schemaName,
                             t.getName(),
@@ -493,29 +558,61 @@ class CatalogSecurityBuilder {
     Table buildPgDefaultAcl() {
         List<Column> cols = Cols.listOf(
                 colNN("oid", DataType.INTEGER),
-                colNN("defaclrole", DataType.INTEGER),
-                colNN("defaclnamespace", DataType.INTEGER),
-                colNN("defaclobjtype", DataType.CHAR),
-                col("defaclacl", DataType.TEXT)
+                // The two identifiers are OIDs and the list is an array of ACL items, which is
+                // what a reader asking the catalogue what the columns are is told.
+                colNN("defaclrole", DataType.OID),
+                colNN("defaclnamespace", DataType.OID),
+                // The kind is one letter of PostgreSQL's own single-byte type, not a blank-padded
+                // character: a reader that asks what the column is was told the wrong type.
+                colNN("defaclobjtype", DataType.INTERNAL_CHAR),
+                col("defaclacl", DataType.ACLITEM_ARRAY)
         );
         Table table = new Table("pg_default_acl", cols);
         int rowOid = oids.oid("pg_default_acl:base");
+        // The catalogue is keyed by the role that wrote the statement, the schema and the kind
+        // of object, and the list holds every grantee. A row per statement listed the same role
+        // and schema twice, and wrote the privileges out by name where the column holds an
+        // access list nothing could read that way.
+        Map<String, List<AclItems.Grant>> byKey = new LinkedHashMap<>();
+        Map<String, Database.DefaultAclEntry> firstOfKey = new LinkedHashMap<>();
         for (Database.DefaultAclEntry entry : database.getDefaultAcls()) {
             if (!entry.isGrant) continue; // only GRANT entries are visible
+            String key = (entry.grantor == null ? "" : entry.grantor) + "\u0001"
+                    + (entry.schema == null ? "" : entry.schema) + "\u0001"
+                    + objectTypeChar(entry.objectType);
+            List<AclItems.Grant> grants =
+                    byKey.computeIfAbsent(key, k -> new ArrayList<AclItems.Grant>());
+            firstOfKey.putIfAbsent(key, entry);
+            for (String grantee : entry.grantees) {
+                for (String privilege : entry.privileges) {
+                    grants.add(new AclItems.Grant(grantee, privilege, false));
+                }
+            }
+        }
+        for (Map.Entry<String, List<AclItems.Grant>> keyed : byKey.entrySet()) {
+            Database.DefaultAclEntry entry = firstOfKey.get(keyed.getKey());
             char objType = objectTypeChar(entry.objectType);
             int nsOid = entry.schema != null ? oids.oid("ns:" + entry.schema) : 0;
-            String aclText = entry.grantees.isEmpty() ? null
-                    : String.join(",", entry.grantees) + "=" + String.join(",", entry.privileges);
-            int grantorOid = entry.grantor != null ? oids.oid("role:" + entry.grantor) : 10;
+            String grantor = entry.grantor != null ? entry.grantor : "memgres";
+            String aclText = AclItems.defaultPrivilegesText(
+                    aclKindOf(entry.objectType), grantor, keyed.getValue());
             table.insertRow(new Object[]{
                     rowOid++,
-                    grantorOid,
+                    entry.grantor != null ? oids.oid("role:" + entry.grantor) : 10,
                     nsOid,
                     String.valueOf(objType),
                     aclText
             });
         }
         return table;
+    }
+
+    /** The kind of object a default-privileges list is about, named in the singular. */
+    private static String aclKindOf(String objectType) {
+        if (objectType == null) return "TABLE";
+        String upper = objectType.toUpperCase(java.util.Locale.ROOT);
+        if (upper.endsWith("S")) upper = upper.substring(0, upper.length() - 1);
+        return upper;
     }
 
     Table buildPgStatActivity() {

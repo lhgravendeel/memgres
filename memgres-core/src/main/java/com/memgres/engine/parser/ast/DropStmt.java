@@ -74,7 +74,10 @@ public final class DropStmt implements Statement {
     }
 
     public enum ObjectType {
-        FUNCTION, PROCEDURE, TRIGGER, TYPE, INDEX, VIEW, MATERIALIZED_VIEW, SEQUENCE, SCHEMA, DOMAIN,
+        // ROUTINE is FUNCTION and PROCEDURE together: it names a routine of either kind, where
+        // each of the other two names a routine of one kind and refuses the other.
+        FUNCTION, PROCEDURE, ROUTINE,
+        TRIGGER, TYPE, INDEX, VIEW, MATERIALIZED_VIEW, SEQUENCE, SCHEMA, DOMAIN,
         EXTENSION, RULE, COLLATION, CAST, CONVERSION, AGGREGATE,
         OPERATOR, OPERATOR_CLASS, OPERATOR_FAMILY, POLICY
     }

@@ -511,7 +511,7 @@ public class InfoSchemaBuilder {
             boolean isTable = "r".equals(PgCatalogRelations.relkind(pgTable));
             table.insertRow(new Object[]{
                     catalogName(), "pg_catalog", pgTable, isTable ? "BASE TABLE" : "VIEW",
-                    null, null, null, null, null, isTable ? "YES" : "NO", "NO"
+                    null, null, null, null, null, isTable ? "YES" : "NO", "NO", null
             });
         }
 
@@ -918,7 +918,8 @@ public class InfoSchemaBuilder {
                     relationName,                           // table_name
                     col.getName(),                          // column_name
                     ordinal,                                // ordinal_position
-                    userRelation ? CatalogHelper.formatColumnDefault(col) : null, // column_default
+                    userRelation ? CatalogHelper.formatColumnDefault(col, database, currentSession)
+                            : null, // column_default
                     isNullable,                             // is_nullable
                     dataType,                               // data_type
                     charMaxLen,                             // character_maximum_length

@@ -104,7 +104,11 @@ class DdlTableExecutor {
 
     QueryResult executeCreateTable(CreateTableStmt stmt) {
         String schemaName = stmt.schema() != null ? stmt.schema() : executor.creationSchema();
-        if (stmt.temporary()) {
+        // Writing into pg_temp is asking for a temporary relation, whether or not the word TEMP
+        // was written: the schema is the session's own, and it comes into being with the first
+        // relation put in it. Read as an ordinary qualifier it named a schema nobody had made.
+        boolean temporary = stmt.temporary() || "pg_temp".equalsIgnoreCase(stmt.schema());
+        if (temporary) {
             // A temporary relation lives in the session's own schema and nowhere else, so a
             // qualifier naming another schema contradicts the word TEMP rather than choosing where
             // the table goes. pg_temp is the alias that schema answers to.
@@ -117,23 +121,24 @@ class DdlTableExecutor {
             }
             schemaName = tempSchema;
         }
-        if (stmt.schema() != null && executor.database.getSchema(stmt.schema()) == null) {
+        if (stmt.schema() != null && !temporary
+                && executor.database.getSchema(stmt.schema()) == null) {
             throw new MemgresException("schema \"" + stmt.schema() + "\" does not exist", "3F000");
         }
         if ("pg_catalog".equalsIgnoreCase(schemaName) || "information_schema".equalsIgnoreCase(schemaName)) {
             throw new MemgresException("permission denied for schema " + schemaName, "42501");
         }
         // A relation is made in a schema, and making one there is the schema's CREATE privilege.
-        if (!stmt.temporary()) executor.checkSchemaPrivilege("CREATE", schemaName);
+        if (!temporary) executor.checkSchemaPrivilege("CREATE", schemaName);
         // ON COMMIT describes what happens to the rows at the end of the transaction that made
         // them, which only means anything for a table that lives no longer than the session.
-        if (stmt.onCommitAction() != null && !stmt.temporary()) {
+        if (stmt.onCommitAction() != null && !temporary) {
             throw new MemgresException("ON COMMIT can only be used on temporary tables", "42P16");
         }
         // The schema a session's temporary relations live in comes into being with the first of
         // them, and PostgreSQL writes it as it writes any other schema.
         boolean temporarySchemaMadeWithIt =
-                stmt.temporary() && executor.database.getSchema(schemaName) == null;
+                temporary && executor.database.getSchema(schemaName) == null;
         Schema schema = executor.database.getOrCreateSchema(schemaName);
 
         // A schema holds one relation of a given name whatever its kind, so a view, sequence or
@@ -448,6 +453,10 @@ class DdlTableExecutor {
                 Sequence seq = buildIdentitySequence(def, dataType, seqName, seqSchema, stmt.name());
                 executor.database.addSequence(seq);
                 executor.database.registerSchemaObject(seqSchema, "sequence", seqName);
+                // A sequence a column brings with it is a sequence, and takes what ALTER DEFAULT
+                // PRIVILEGES set aside for one.
+                applyDefaultPrivileges(executor, seqSchema, seqName, executor.currentRole(),
+                        "SEQUENCES", "SEQUENCE");
                 // PostgreSQL writes the sequence's pg_class row before the table's own, so it is
                 // numbered here rather than left to whenever a catalog query first asked about it.
                 executor.identity().relationCreated(seqSchema, seqName);
@@ -484,6 +493,8 @@ class DdlTableExecutor {
                 seq.ownedBy(stmt.name(), def.name(), true);
                 executor.database.addSequence(seq);
                 executor.database.registerSchemaObject(schemaName, "sequence", seqName);
+                applyDefaultPrivileges(executor, schemaName, seqName, executor.currentRole(),
+                        "SEQUENCES", "SEQUENCE");
                 // Numbered here for the same reason an identity column's is: PostgreSQL writes the
                 // sequence's pg_class row before the table's, so a serial's sequence takes the
                 // lower OID of the two.
@@ -753,26 +764,39 @@ class DdlTableExecutor {
                         keysAsStored.append(expressionKeyAsStored(trimmed, columns, table));
                         continue;
                     }
-                    // Every relation carries the system columns whether or not the definition
-                    // named them, so PostgreSQL finds one written here and refuses it for what it
-                    // is rather than reporting a column the relation does not have.
-                    if (table.getColumnIndex(trimmed) < 0
-                            && DdlDefinitionChecks.isSystemColumnName(trimmed)) {
-                        throw new MemgresException("cannot use system column \"" + trimmed
+                    // A key element names a column and may write a collation and an operator
+                    // class after it, exactly as an index column does. What is judged against the
+                    // relation is the column alone; the two that follow it are judged on their
+                    // own terms, and the element is stored as written so the definition reads
+                    // back the way it was declared.
+                    String[] element = splitPartitionKeyElement(trimmed);
+                    String keyColumn = element[0];
+                    if (table.getColumnIndex(keyColumn) < 0
+                            && DdlDefinitionChecks.isSystemColumnName(keyColumn)) {
+                        throw new MemgresException("cannot use system column \"" + keyColumn
                                 + "\" in partition key", "42P17");
                     }
-                    if (table.getColumnIndex(trimmed) < 0) {
-                        throw new MemgresException("column \"" + trimmed + "\" named in partition key does not exist", "42703");
+                    if (table.getColumnIndex(keyColumn) < 0) {
+                        throw new MemgresException("column \"" + keyColumn
+                                + "\" named in partition key does not exist", "42703");
                     }
-                    rejectGeneratedPartitionKeyColumn(table, trimmed);
+                    DdlIndexValidator.checkKeyElement(executor.database, table,
+                            "HASH".equalsIgnoreCase(stmt.partitionBy()) ? "hash" : "btree",
+                            keyColumn, element[1], element[2]);
+                    rejectGeneratedPartitionKeyColumn(table, keyColumn);
                     // A range or list partition key puts rows in order, and it is the type's
                     // default btree operator class that does the ordering — so a type nothing
                     // can order is one no partition key can be built over.
                     if (!"HASH".equalsIgnoreCase(stmt.partitionBy())) {
                         DdlDefinitionChecks.requireOrderablePartitionKey(
-                                table.getColumns().get(table.getColumnIndex(trimmed)).getType());
+                                table.getColumns().get(table.getColumnIndex(keyColumn)).getType());
                     }
-                    keysAsStored.append(trimmed);
+                    keysAsStored.append(keyColumn);
+                    if (element[1] != null) {
+                        keysAsStored.append(" COLLATE ")
+                                .append(RuleDeparser.quoteIdentifier(element[1]));
+                    }
+                    if (element[2] != null) keysAsStored.append(' ').append(element[2]);
                 }
                 partCol = keysAsStored.toString();
             }
@@ -1119,18 +1143,39 @@ class DdlTableExecutor {
 
     /** M11: Apply default privileges from ALTER DEFAULT PRIVILEGES to a newly created table. */
     private void applyDefaultPrivileges(String schemaName, String tableName, String creator) {
+        applyDefaultPrivileges(executor, schemaName, tableName, creator, "TABLES", "TABLE");
+    }
+
+    /**
+     * Give a newly created object the privileges ALTER DEFAULT PRIVILEGES set aside for it.
+     *
+     * <p>Every kind of object that has default privileges gets them the same way, and each kind
+     * has its own list: a view, a materialised view and a table created from a query are all
+     * tables here, and the sequence a serial column brings with it is a sequence. Applied only
+     * where a table was created outright, everything else came out with no privileges on it at
+     * all and a grantee that had been named in advance could not read what it was promised.
+     *
+     * @param objectType how ALTER DEFAULT PRIVILEGES names the kind, in the plural
+     * @param privilegeKind how a grant on one of them names the kind, in the singular
+     */
+    static void applyDefaultPrivileges(AstExecutor executor, String schemaName, String objectName,
+                                       String creator, String objectType, String privilegeKind) {
         for (Database.DefaultAclEntry entry : executor.database.getDefaultAcls()) {
             if (!entry.isGrant) continue;
-            // Must be for TABLES
-            if (!"TABLES".equalsIgnoreCase(entry.objectType)) continue;
+            if (!objectType.equalsIgnoreCase(entry.objectType)) continue;
             // Grantor must match the creating role
             if (entry.grantor != null && !entry.grantor.equalsIgnoreCase(creator)) continue;
             // Schema must match (null = all schemas)
             if (entry.schema != null && !entry.schema.equalsIgnoreCase(schemaName)) continue;
+            // A relation's privileges are keyed by its schema-qualified name; a routine's and a
+            // schema's are keyed by the name alone, which is where a question about them looks.
+            boolean qualified = "TABLE".equalsIgnoreCase(privilegeKind)
+                    || "SEQUENCE".equalsIgnoreCase(privilegeKind);
+            String key = qualified && schemaName != null
+                    ? AstExecutor.privilegeKey(schemaName, objectName) : objectName;
             for (String grantee : entry.grantees) {
                 for (String priv : entry.privileges) {
-                    executor.database.addRolePrivilege(grantee, priv, "TABLE",
-                            AstExecutor.privilegeKey(schemaName, tableName));
+                    executor.database.addRolePrivilege(grantee, priv, privilegeKind, key);
                 }
             }
         }
@@ -1785,6 +1830,22 @@ class DdlTableExecutor {
         }
     }
 
+    /**
+     * Whether a foreign key reaches the relation being dropped: because it names it, or because it
+     * names a partitioned table this relation is a partition of. A key on the whole holds every
+     * part of it, so a partition cannot go while the key is there any more than the parent can.
+     */
+    private static boolean namesThisOrAPartitionParent(StoredConstraint fk, Table dropped,
+                                                       String name) {
+        if (fk.getReferencesTable() == null) return false;
+        if (fk.getReferencesTable().equalsIgnoreCase(name)) return true;
+        for (Table above = dropped == null ? null : dropped.getPartitionParent();
+                above != null; above = above.getPartitionParent()) {
+            if (fk.getReferencesTable().equalsIgnoreCase(above.getName())) return true;
+        }
+        return false;
+    }
+
     StoredConstraint addColumnForeignKey(Table table, ColumnDef def, String schemaName, String tableName) {
         String refTableName = def.referencesTable();
         String refSchemaName = null;
@@ -1970,6 +2031,42 @@ class DdlTableExecutor {
      * generated column is computed, and a virtual one is never stored at all, so the key would be
      * read while it still holds nothing to route by.
      */
+    /**
+     * A partition key element split into the column, the collation and the operator class.
+     *
+     * <p>The words after the column name are told apart by the {@code COLLATE} in front of one of
+     * them: what follows that keyword is the collation, and a bare word left over is the class.
+     * Either may be absent and neither is part of the column's name.
+     */
+    private static String[] splitPartitionKeyElement(String element) {
+        List<String> words = new ArrayList<>();
+        java.util.regex.Matcher m = KEY_ELEMENT_WORD.matcher(element);
+        while (m.find()) words.add(m.group());
+        if (words.isEmpty()) return new String[]{element, null, null};
+        String column = unquoteKeyWord(words.get(0));
+        String collation = null;
+        String opclass = null;
+        for (int i = 1; i < words.size(); i++) {
+            if ("collate".equalsIgnoreCase(words.get(i)) && i + 1 < words.size()) {
+                collation = unquoteKeyWord(words.get(++i));
+            } else {
+                opclass = unquoteKeyWord(words.get(i));
+            }
+        }
+        return new String[]{column, collation, opclass};
+    }
+
+    /** A word of a key element: a quoted name, or a run of characters a bare name is made of. */
+    private static final java.util.regex.Pattern KEY_ELEMENT_WORD =
+            java.util.regex.Pattern.compile("\"(?:[^\"]|\"\")*\"|[^\\s\"]+");
+
+    private static String unquoteKeyWord(String word) {
+        if (word.length() >= 2 && word.startsWith("\"") && word.endsWith("\"")) {
+            return word.substring(1, word.length() - 1).replace("\"\"", "\"");
+        }
+        return word;
+    }
+
     private void rejectGeneratedPartitionKeyColumn(Table table, String columnName) {
         if (columnName == null) return;
         int idx = table.getColumnIndex(columnName);
@@ -2332,7 +2429,7 @@ class DdlTableExecutor {
                                     .toLowerCase(java.util.Locale.ROOT))) continue;
                             for (StoredConstraint sc : otherTable.getConstraints()) {
                                 if (sc.getType() != StoredConstraint.Type.FOREIGN_KEY) continue;
-                                if (!sc.getReferencesTable().equalsIgnoreCase(name)) continue;
+                                if (!namesThisOrAPartitionParent(sc, droppedTable, name)) continue;
                                 if (sc.getReferencesSchema() != null
                                         && !sc.getReferencesSchema().equalsIgnoreCase(schemaName)) continue;
                                 dependents.add("constraint " + sc.getName() + " on table "
@@ -3028,7 +3125,10 @@ class DdlTableExecutor {
         String schemaName = stmt.schema() != null ? stmt.schema() : executor.creationSchema();
         Schema schema = executor.database.getOrCreateSchema(schemaName);
 
-        if (schema.getTable(stmt.name()) != null) {
+        // A name belongs to one relation of any kind, not to one table: a view or a sequence
+        // holds it just as firmly. Looked for among the tables alone, CREATE TABLE ... AS over
+        // the name of a view made a table beside it, and both answered to the name afterwards.
+        if (RelationNamespace.kindOf(executor.database, schemaName, stmt.name()) != null) {
             if (stmt.ifNotExists()) return QueryResult.command(QueryResult.Type.SELECT_INTO, 0);
             throw new MemgresException("relation \"" + stmt.name() + "\" already exists", "42P07");
         }
@@ -3059,6 +3159,7 @@ class DdlTableExecutor {
 
         Table table = new Table(stmt.name(), columns);
         schema.addTable(table);
+        applyDefaultPrivileges(schemaName, table.getName(), executor.currentRole());
         // A relation created under a name that once carried rules starts clean: the pg_class row
         // that remembered them went with the relation that was dropped. Only this schema's are
         // forgotten -- another schema's relation of the name is a different relation.

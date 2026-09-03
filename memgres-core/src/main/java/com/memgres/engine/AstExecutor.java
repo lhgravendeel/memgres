@@ -844,6 +844,18 @@ public class AstExecutor {
     }
 
     private QueryResult executeReadOrWrite(Statement stmt) {
+        // An event trigger on ddl_command_start runs before the command does — before the
+        // command's own options are judged, which is why a trigger that refuses is what
+        // ALTER FUNCTION ... COST -5 answers with rather than the complaint about the cost.
+        String eventTag = database.hasEventTriggers() ? getDdlTag(stmt) : null;
+        if (eventTag == null) return executeCommand(stmt);
+        fireEventTriggers("ddl_command_start", eventTag);
+        QueryResult result = executeCommand(stmt);
+        fireEventTriggers("ddl_command_end", eventTag);
+        return result;
+    }
+
+    private QueryResult executeCommand(Statement stmt) {
         checkReadOnlyTransaction(stmt);
         // FILTER belongs to a call that accumulates rows, so a statement is refused for one
         // written anywhere in it -- select list, WHERE, a CTE, a derived table, the SET list of an
@@ -864,12 +876,9 @@ public class AstExecutor {
         if (stmt instanceof UpdateStmt) return dmlExecutor.executeUpdate(((UpdateStmt) stmt));
         if (stmt instanceof DeleteStmt) return dmlExecutor.executeDelete(((DeleteStmt) stmt));
         if (stmt instanceof CreateTableStmt) {
-            String tag = getDdlTag(stmt);
-            fireEventTriggers("ddl_command_start", tag);
             Set<String> held = beforeCreatingRelation(((CreateTableStmt) stmt).name());
             QueryResult result = ddlExecutor.executeCreateTable(((CreateTableStmt) stmt));
             noteRelationCreated(((CreateTableStmt) stmt).name(), held);
-            fireEventTriggers("ddl_command_end", tag);
             return result;
         }
         if (stmt instanceof DropTableStmt) {
@@ -1132,6 +1141,11 @@ public class AstExecutor {
     }
 
     boolean valuesEqual(Object a, Object b) {
+        return constraintValidator.valuesEqual(a, b);
+    }
+
+    /** The same comparison, for the procedural reader, which is not of this package. */
+    public boolean valuesEqualPublic(Object a, Object b) {
         return constraintValidator.valuesEqual(a, b);
     }
 
@@ -1804,7 +1818,10 @@ public class AstExecutor {
         String checkKey = privilege.toUpperCase(java.util.Locale.ROOT) + ":" + objectType.toUpperCase(java.util.Locale.ROOT) + ":" + objectName.toLowerCase(java.util.Locale.ROOT);
         String allKey = "ALL:" + objectType.toUpperCase(java.util.Locale.ROOT) + ":" + objectName.toLowerCase(java.util.Locale.ROOT);
         if (privs.contains(checkKey) || privs.contains(allKey)) return true;
-        // Traverse role memberships
+        // A role takes on what the roles it belongs to have only if it inherits: one created
+        // NOINHERIT is a member of them and holds none of their privileges until it does SET
+        // ROLE. Walking every membership regardless gave it what it has to ask for.
+        if (!roleTakesOnWhatItIsAMemberOf(roleNameLower)) return false;
         java.util.Map<String, java.util.Set<String>> memberships = database.getRoleMemberships();
         for (java.util.Map.Entry<String, java.util.Set<String>> entry : memberships.entrySet()) {
             if (entry.getValue().contains(roleNameLower) && !visited.contains(entry.getKey())) {
@@ -1814,6 +1831,14 @@ public class AstExecutor {
             }
         }
         return false;
+    }
+
+    /** Whether a role takes on the privileges of the roles it is a member of. */
+    private boolean roleTakesOnWhatItIsAMemberOf(String roleName) {
+        Map<String, String> attrs = database.getRoles().get(roleName);
+        if (attrs == null) return true;
+        String written = attrs.get("INHERIT");
+        return written == null || !"false".equalsIgnoreCase(written);
     }
 
     /**
@@ -1911,8 +1936,10 @@ public class AstExecutor {
             if (isSuperuser || isOwner) return true;
             // non-owner/non-superuser with row_security=off: if any policies exist, error
             if (!table.getRlsPolicies().isEmpty()) {
-                throw new MemgresException(
-                    "query would be affected by row-level security policy for table \"" + table.getName() + "\"", "55P04");
+                // PostgreSQL reports this as a refusal to read the relation -- insufficient
+                // privilege -- rather than as an object not being in the state it must be in.
+                throw new MemgresException("query would be affected by row-level security policy"
+                        + " for table \"" + table.getName() + "\"", "42501");
             }
             return true; // no policies, no filtering needed
         }
@@ -2383,6 +2410,24 @@ public class AstExecutor {
         return false;
     }
 
+    /**
+     * The relation a foreign key names, looked for the way any other bare name is: along the
+     * search path and nowhere else. Reaching into every schema instead let a key point at a
+     * relation the statement could not have named.
+     */
+    Table resolveTableOnSearchPath(String tableName) {
+        if (tableName != null && tableName.indexOf('.') >= 0) {
+            return resolveTableAnySchema(tableName);
+        }
+        for (String schema : relationSearchPath()) {
+            Schema held = database.getSchema(schema);
+            if (held == null) continue;
+            Table t = visibleTable(held.getTable(tableName));
+            if (t != null) return t;
+        }
+        throw new MemgresException("relation \"" + tableName + "\" does not exist", "42P01");
+    }
+
     Table resolveTableAnySchema(String tableName) {
         // Handle schema-qualified names (e.g., "ks1.parent")
         if (tableName.contains(".")) {
@@ -2443,19 +2488,37 @@ public class AstExecutor {
         if (parsedExpr != null) {
             try {
                 return evalExpr(parsedExpr, null);
+            } catch (MemgresException raised) {
+                // The text is kept up to date when an object the default names moves, and the
+                // reading taken when the column was declared is not: a default over a sequence
+                // that has since changed schema is worked out from the text instead. Only a
+                // complaint about a name is read that way -- anything else is what the default
+                // really does, and PostgreSQL reports it while the row is being written.
+                if (defaultExpr == null || !namesSomethingMissing(raised)) throw raised;
             } catch (Exception e) {
                 // Fall through to string-based parsing
             }
         }
         if (defaultExpr != null) {
+            Expression expr;
             try {
-                Expression expr = new Parser(new Lexer(defaultExpr).tokenize()).parseExpression();
-                return evalExpr(expr, null);
-            } catch (Exception e) {
+                expr = new Parser(new Lexer(defaultExpr).tokenize()).parseExpression();
+            } catch (Exception unreadable) {
                 return defaultExpr;
             }
+            // A default that cannot be worked out is not a default of the text it was written
+            // as: PostgreSQL evaluates it while the row is being written and reports what went
+            // wrong. Kept as the text, a column defaulting to 1/0 was filled with "1 / 0".
+            return evalExpr(expr, null);
         }
         return null;
+    }
+
+    /** Whether a complaint is about an object the statement named rather than about a value. */
+    private static boolean namesSomethingMissing(MemgresException e) {
+        String state = e.getSqlState();
+        return "42P01".equals(state) || "42704".equals(state) || "3F000".equals(state)
+                || "42883".equals(state) || "42703".equals(state);
     }
 
     // ---- Expression alias & type inference (delegated to ExprEvaluator) ----
@@ -2994,18 +3057,51 @@ public class AstExecutor {
     /**
      * Determine the DDL command tag for a statement (e.g. "CREATE TABLE", "ALTER TABLE").
      */
+    /**
+     * The command tag a statement carries for an event trigger, or null when it carries none.
+     *
+     * <p>PostgreSQL fires event triggers for the commands that change the catalogue and for no
+     * others: a query, a write, a transaction command and everything about a role or a database
+     * are outside what an event trigger sees. The tag is what a trigger filters on, so it has to
+     * be the tag PostgreSQL uses rather than a word standing in for one.
+     */
     private String getDdlTag(Statement stmt) {
         if (stmt instanceof CreateTableStmt) return "CREATE TABLE";
         if (stmt instanceof DropTableStmt) return "DROP TABLE";
         if (stmt instanceof AlterTableStmt) return "ALTER TABLE";
         if (stmt instanceof CreateIndexStmt) return "CREATE INDEX";
         if (stmt instanceof CreateViewStmt) return "CREATE VIEW";
-        if (stmt instanceof CreateFunctionStmt) return "CREATE FUNCTION";
+        if (stmt instanceof CreateFunctionStmt) {
+            return ((CreateFunctionStmt) stmt).isProcedure() ? "CREATE PROCEDURE" : "CREATE FUNCTION";
+        }
         if (stmt instanceof CreateTypeStmt) return "CREATE TYPE";
         if (stmt instanceof CreateSequenceStmt) return "CREATE SEQUENCE";
         if (stmt instanceof CreateTriggerStmt) return "CREATE TRIGGER";
-        if (stmt instanceof DropStmt) return "DROP";
-        return "DDL";
+        if (stmt instanceof CreateSchemaStmt) return "CREATE SCHEMA";
+        if (stmt instanceof CreateDomainStmt) return "CREATE DOMAIN";
+        if (stmt instanceof CreateCastStmt) return "CREATE CAST";
+        if (stmt instanceof CreateOperatorStmt) return "CREATE OPERATOR";
+        if (stmt instanceof CreatePolicyStmt) return "CREATE POLICY";
+        if (stmt instanceof CommentStmt) return "COMMENT";
+        if (stmt instanceof GrantStmt) return "GRANT";
+        if (stmt instanceof RevokeStmt) return "REVOKE";
+        if (stmt instanceof AlterSequenceStmt) return "ALTER SEQUENCE";
+        if (stmt instanceof AlterFunctionStmt) return "ALTER FUNCTION";
+        if (stmt instanceof AlterOperatorStmt) return "ALTER OPERATOR";
+        if (stmt instanceof AlterViewStmt) return "ALTER VIEW";
+        if (stmt instanceof AlterDomainStmt) return "ALTER DOMAIN";
+        if (stmt instanceof AlterTypeStmt) return "ALTER TYPE";
+        if (stmt instanceof AlterSchemaOwnerStmt || stmt instanceof AlterSchemaRenameStmt) {
+            return "ALTER SCHEMA";
+        }
+        if (stmt instanceof DropStmt) return dropTagFor((DropStmt) stmt);
+        return null;
+    }
+
+    /** What PostgreSQL calls a DROP of each kind of object. */
+    private static String dropTagFor(DropStmt stmt) {
+        String kind = stmt.objectType() == null ? null : stmt.objectType().name();
+        return kind == null ? "DROP" : "DROP " + kind.replace('_', ' ');
     }
 
     /**
@@ -3026,12 +3122,12 @@ public class AstExecutor {
             // Find and execute the function
             PgFunction func = database.getFunction(et.getFunctionName());
             if (func != null && func.getBody() != null) {
-                try {
-                    PlpgsqlExecutor plpgsql = new PlpgsqlExecutor(this, database);
-                    plpgsql.executeEventTriggerFunction(func, tag, event);
-                } catch (Exception e) {
-                    LOG.debug("Event trigger {} function execution error: {}", et.getName(), e.getMessage());
-                }
+                PlpgsqlExecutor plpgsql = new PlpgsqlExecutor(this, database);
+                // What the function raises is what the command answers with. Swallowing it made
+                // an event trigger something the server ran and then ignored, which is the whole
+                // of what an event trigger is for: a trigger on ddl_command_start that raises
+                // stops the command from running at all.
+                plpgsql.executeEventTriggerFunction(func, tag, event);
             }
         }
     }

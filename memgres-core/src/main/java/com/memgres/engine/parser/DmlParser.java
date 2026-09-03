@@ -137,6 +137,7 @@ class DmlParser {
         List<Expression> conflictExpressionAsts = null;
         String constraintName = null;
         Expression conflictWhere = null;
+        List<String> opclasses = null;
 
         if (parser.check(TokenType.LEFT_PAREN)) {
             parser.expect(TokenType.LEFT_PAREN);
@@ -145,7 +146,14 @@ class DmlParser {
             // both is normalized to conflictExpressions (bare names carried as their own
             // text) so the executor can match structurally against a constraint's
             // expression-column text regardless of which entries are plain identifiers.
-            List<String> entries = parser.parseColumnOrExpressionList();
+            parser.columnListTakesIndexOptions = true;
+            List<String> entries;
+            try {
+                entries = parser.parseColumnOrExpressionList();
+            } finally {
+                parser.columnListTakesIndexOptions = false;
+            }
+            opclasses = parser.lastColumnListOpclasses;
             if (parser.lastColumnListHadExpression) {
                 conflictExpressions = entries;
                 conflictExpressionAsts = parser.lastColumnListExpressions;
@@ -164,7 +172,7 @@ class DmlParser {
         parser.expectKeyword("DO");
         if (parser.matchKeyword("NOTHING")) {
             return new InsertStmt.OnConflict(conflictColumns, constraintName, true, null,
-                    conflictWhere, conflictExpressions, null, conflictExpressionAsts);
+                    conflictWhere, conflictExpressions, null, conflictExpressionAsts, opclasses);
         }
 
         parser.expectKeyword("UPDATE");
@@ -176,7 +184,8 @@ class DmlParser {
             doUpdateWhere = parser.parseExpression();
         }
         return new InsertStmt.OnConflict(conflictColumns, constraintName, false, sets,
-                conflictWhere, conflictExpressions, doUpdateWhere, conflictExpressionAsts);
+                conflictWhere, conflictExpressions, doUpdateWhere, conflictExpressionAsts,
+                opclasses);
     }
 
     UpdateStmt parseUpdate() {

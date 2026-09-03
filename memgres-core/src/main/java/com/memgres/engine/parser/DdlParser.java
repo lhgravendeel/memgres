@@ -76,7 +76,13 @@ class DdlParser {
         // CREATE RECURSIVE VIEW v (cols) AS q is shorthand for a view whose body is
         // WITH RECURSIVE v (cols) AS (q) SELECT cols FROM v.
         if (parser.matchKeywords("RECURSIVE", "VIEW")) return parseCreateRecursiveView(orReplace);
-        if (parser.matchKeyword("MATERIALIZED")) {
+        if (parser.checkKeyword("MATERIALIZED")) {
+            // There is no replacing a materialized view and no making a temporary one: the grammar
+            // has neither, so the word is where the statement stops being a statement.
+            if (orReplace || temporary) {
+                throw PgErrors.syntax("syntax error at or near \"MATERIALIZED\"");
+            }
+            parser.advance();
             parser.expectKeyword("VIEW");
             return parseCreateView(orReplace, true);
         }
@@ -240,7 +246,7 @@ class DdlParser {
         DropStmt.ObjectType objectType;
         if (parser.matchKeyword("FUNCTION")) objectType = DropStmt.ObjectType.FUNCTION;
         else if (parser.matchKeyword("PROCEDURE")) objectType = DropStmt.ObjectType.PROCEDURE;
-        else if (parser.matchKeyword("ROUTINE")) objectType = DropStmt.ObjectType.FUNCTION;
+        else if (parser.matchKeyword("ROUTINE")) objectType = DropStmt.ObjectType.ROUTINE;
         else if (parser.matchKeyword("TRIGGER")) objectType = DropStmt.ObjectType.TRIGGER;
         else if (parser.matchKeyword("TYPE")) objectType = DropStmt.ObjectType.TYPE;
         else if (parser.matchKeyword("INDEX")) objectType = DropStmt.ObjectType.INDEX;
@@ -1442,10 +1448,18 @@ class DdlParser {
 
         // Parse aggregate definition body: ( SFUNC = ..., STYPE = ..., ... )
         String sfunc = null, stype = null, initcond = null, finalfunc = null, combinefunc = null, sortop = null;
+        String finalfuncModify = null, minvfunc = null, mstype = null;
+        boolean finalfuncExtra = false;
         if (parser.match(TokenType.LEFT_PAREN)) {
             while (!parser.check(TokenType.RIGHT_PAREN) && !parser.isAtEnd()) {
                 String key = parser.readIdentifier().toUpperCase(java.util.Locale.ROOT);
-                parser.match(TokenType.EQUALS);
+                // Every option but the two that stand alone is written name = value, and the
+                // equals sign is its own token: run into the value it makes one operator, which
+                // is what "SORTOP=###?#" is and why PostgreSQL stops on the whole of it.
+                if (!parser.match(TokenType.EQUALS)
+                        && !parser.check(TokenType.COMMA) && !parser.check(TokenType.RIGHT_PAREN)) {
+                    throw ParseException.at(parser.peek());
+                }
                 switch (key) {
                     case "SFUNC":
                         sfunc = parser.readIdentifier();
@@ -1480,12 +1494,21 @@ class DdlParser {
                         sortop = parser.advance().value();
                         break;
                     case "FINALFUNC_EXTRA":
+                        finalfuncExtra = readAggregateOptionValue(parser) == null
+                                || true;
+                        break;
                     case "FINALFUNC_MODIFY":
+                        finalfuncModify = readAggregateOptionValue(parser);
+                        break;
+                    case "MINVFUNC":
+                        minvfunc = readAggregateOptionValue(parser);
+                        break;
+                    case "MSTYPE":
+                        mstype = readAggregateOptionValue(parser);
+                        break;
                     case "PARALLEL":
                     case "HYPOTHETICAL":
                     case "MSFUNC":
-                    case "MINVFUNC":
-                    case "MSTYPE":
                     case "MFINALFUNC":
                     case "MFINALFUNC_EXTRA":
                     case "MFINALFUNC_MODIFY":
@@ -1513,7 +1536,13 @@ class DdlParser {
         }
 
         return new CreateAggregateStmt(name, argTypes, directArgCount, sfunc, stype, initcond,
-                finalfunc, combinefunc, sortop);
+                finalfunc, combinefunc, sortop, finalfuncModify, minvfunc, mstype, finalfuncExtra);
+    }
+
+    /** The value written after an aggregate option, or null when the option stands alone. */
+    private static String readAggregateOptionValue(Parser parser) {
+        if (parser.check(TokenType.COMMA) || parser.check(TokenType.RIGHT_PAREN)) return null;
+        return parser.advance().value();
     }
 
     /**
@@ -1795,7 +1824,10 @@ class DdlParser {
                 String part2 = null, part3 = null;
                 if (parser.match(TokenType.DOT)) { part2 = parser.readIdentifier(); if (parser.match(TokenType.DOT)) part3 = parser.readIdentifier(); }
                 if (ownedByTable != null) {
-                    if (part3 != null) { ownedByTable[0] = part2; ownedByColumn[0] = part3; }
+                    // A three-part name says which schema holds the relation. Dropped, the
+                    // relation was looked for in every schema instead, and a sequence could be
+                    // linked to a column of a table the statement had not named.
+                    if (part3 != null) { ownedByTable[0] = part1 + "." + part2; ownedByColumn[0] = part3; }
                     else if (part2 != null) { ownedByTable[0] = part1; ownedByColumn[0] = part2; }
                     else { ownedByTable[0] = part1; }
                 }
@@ -2153,6 +2185,16 @@ class DdlParser {
             String priv = parser.readIdentifier().toUpperCase(java.util.Locale.ROOT);
             if (priv.equals("ALL")) { parser.matchKeyword("PRIVILEGES"); privileges.add("ALL"); }
             else { privileges.add(priv); }
+            // A privilege may be written over named columns where a grant is made on one
+            // relation. There is no relation here -- the statement is about the relations to
+            // come -- so PostgreSQL reads the list and then says there is nothing for it to be
+            // about.
+            if (parser.check(TokenType.LEFT_PAREN)) {
+                parser.advance();
+                do { parser.readIdentifier(); } while (parser.match(TokenType.COMMA));
+                parser.expect(TokenType.RIGHT_PAREN);
+                throw new MemgresException("default privileges cannot be set for columns", "0LP01");
+            }
         } while (parser.match(TokenType.COMMA));
         parser.expectKeyword("ON");
         // "LARGE OBJECTS" is two words; read as one, the second became the grantee list.
@@ -2283,6 +2325,15 @@ class DdlParser {
     static String readHashBoundInteger(Parser parser) {
         Token tok = parser.peek();
         if (tok.type() != TokenType.INTEGER_LITERAL) {
+            throw new com.memgres.engine.MemgresException(
+                    "syntax error at or near \"" + tok.value() + "\"", "42601");
+        }
+        // The grammar's integer is a four-byte one, so a count too wide for it is a syntax error
+        // where the digits stand. Read whole and turned into a number later, it reached Java's
+        // own complaint about the text and the client saw an internal fault.
+        try {
+            Integer.parseInt(tok.value().trim());
+        } catch (NumberFormatException tooWide) {
             throw new com.memgres.engine.MemgresException(
                     "syntax error at or near \"" + tok.value() + "\"", "42601");
         }
@@ -2933,18 +2984,92 @@ class DdlParser {
                     name, null, null, method, AlterOperatorStmt.AlterAction.SET_SCHEMA, schema);
         }
         if (parser.matchKeyword("ADD")) {
-            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+            List<AlterOperatorStmt.Member> members = parseOperatorFamilyMembers(true);
             return new AlterOperatorStmt(AlterOperatorStmt.ObjectKind.OPERATOR_FAMILY,
-                    name, null, null, method, AlterOperatorStmt.AlterAction.ADD_MEMBER, null);
+                    name, null, null, method, AlterOperatorStmt.AlterAction.ADD_MEMBER, null,
+                    members);
         }
         if (parser.matchKeyword("DROP")) {
-            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+            List<AlterOperatorStmt.Member> members = parseOperatorFamilyMembers(false);
             return new AlterOperatorStmt(AlterOperatorStmt.ObjectKind.OPERATOR_FAMILY,
-                    name, null, null, method, AlterOperatorStmt.AlterAction.DROP_MEMBER, null);
+                    name, null, null, method, AlterOperatorStmt.AlterAction.DROP_MEMBER, null,
+                    members);
         }
         while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
         return new AlterOperatorStmt(AlterOperatorStmt.ObjectKind.OPERATOR_FAMILY,
                 name, null, null, method, AlterOperatorStmt.AlterAction.SET_PROPERTIES, null);
+    }
+
+    /**
+     * The OPERATOR and FUNCTION items of an ADD or DROP list.
+     *
+     * <p>An ADD names what fills the place — an operator, or a function with its own argument
+     * types — where a DROP names only the place. Everything a member may still carry after that
+     * (FOR SEARCH, FOR ORDER BY, a sort family) is read past: it says what the member is for, not
+     * which member it is.
+     */
+    private List<AlterOperatorStmt.Member> parseOperatorFamilyMembers(boolean adding) {
+        List<AlterOperatorStmt.Member> members = new ArrayList<>();
+        do {
+            boolean function;
+            if (parser.matchKeyword("OPERATOR")) function = false;
+            else if (parser.matchKeyword("FUNCTION")) function = true;
+            else break;
+            int number;
+            try {
+                number = Integer.parseInt(parser.advance().sqlText());
+            } catch (NumberFormatException e) {
+                break;
+            }
+            // A support function may say which types it is registered for before it is named,
+            // and those are the member's own operand types.
+            List<String> declared = parser.check(TokenType.LEFT_PAREN) ? parseMemberArgTypes() : null;
+            String named = null;
+            List<String> named0 = null;
+            if (adding) {
+                StringBuilder sb = new StringBuilder();
+                while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)
+                        && !parser.check(TokenType.COMMA) && !parser.check(TokenType.LEFT_PAREN)) {
+                    sb.append(parser.advance().sqlText());
+                }
+                named = sb.toString();
+                if (parser.check(TokenType.LEFT_PAREN)) named0 = parseMemberArgTypes();
+            }
+            List<String> argTypes = declared != null ? declared : named0;
+            members.add(new AlterOperatorStmt.Member(function, number, named,
+                    argTypes == null ? new ArrayList<String>() : argTypes));
+            // Anything else this item carries describes what it is for, not which member it is.
+            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)
+                    && !parser.check(TokenType.COMMA)) {
+                parser.advance();
+            }
+        } while (parser.match(TokenType.COMMA));
+        while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+        return members;
+    }
+
+    /** The parenthesised operand types of a family member. */
+    private List<String> parseMemberArgTypes() {
+        List<String> types = new ArrayList<>();
+        parser.expect(TokenType.LEFT_PAREN);
+        StringBuilder current = new StringBuilder();
+        int depth = 1;
+        while (!parser.isAtEnd()) {
+            if (parser.check(TokenType.LEFT_PAREN)) depth++;
+            if (parser.check(TokenType.RIGHT_PAREN)) {
+                if (--depth == 0) { parser.advance(); break; }
+            }
+            if (depth == 1 && parser.check(TokenType.COMMA)) {
+                parser.advance();
+                types.add(current.toString().trim());
+                current.setLength(0);
+                continue;
+            }
+            if (current.length() > 0) current.append(' ');
+            current.append(parser.advance().sqlText());
+        }
+        if (current.toString().trim().length() > 0) types.add(current.toString().trim());
+        return types;
     }
 
     // ---- ALTER OPERATOR CLASS ----
@@ -3163,8 +3288,7 @@ class DdlParser {
             return new SetStmt("alter_statistics_rename", name + "\0" + newName);
         }
         if (parser.matchKeywords("SET", "STATISTICS")) {
-            String target = parser.advance().value();
-            return new SetStmt("alter_statistics_target", name + "\0" + target);
+            return new SetStmt("alter_statistics_target", name + "\0" + readStatisticsTarget());
         }
         // Neither records anything, but the statistics object, the role and the schema all still
         // have to exist for PostgreSQL to accept the statement.
@@ -3178,6 +3302,36 @@ class DdlParser {
         }
         while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
         return new SetStmt("alter_statistics_move", name + "\0" + "" + "\0" + "");
+    }
+
+    /**
+     * The number SET STATISTICS is given, which the grammar reads as a signed integer and the
+     * statement then judges: a count of digits too wide for one is a syntax error where those
+     * digits stand -- and the sign is no part of what is named -- while a negative number other
+     * than -1, which asks for the default, is out of range. Read as whatever token came next, a
+     * minus sign was the whole target and a wide number reached Java's own complaint.
+     */
+    private String readStatisticsTarget() {
+        if (parser.matchKeyword("DEFAULT")) return "-1";
+        boolean negative = parser.match(TokenType.MINUS);
+        Token digits = parser.peek();
+        String written = parser.advance().value();
+        long magnitude;
+        try {
+            magnitude = Long.parseLong(written.trim());
+        } catch (NumberFormatException e) {
+            throw ParseException.saying("syntax error at or near \"" + written + "\"", digits,
+                    "42601");
+        }
+        if (magnitude > Integer.MAX_VALUE) {
+            throw ParseException.saying("syntax error at or near \"" + written + "\"", digits,
+                    "42601");
+        }
+        long target = negative ? -magnitude : magnitude;
+        if (target < -1) {
+            throw new MemgresException("statistics target " + target + " is too low", "22023");
+        }
+        return String.valueOf(target);
     }
 
     // ---- FDW DDL parsing ----
@@ -3642,11 +3796,14 @@ class DdlParser {
             functionName = null;
         }
 
+        // ASSIGNMENT and IMPLICIT name nothing else in the grammar, so they arrive as ordinary
+        // words rather than as keywords: matched as keywords the clause was read as saying
+        // nothing and every cast was registered explicit.
         String castContext = "e"; // explicit by default
         if (parser.matchKeyword("AS")) {
-            if (parser.matchKeyword("ASSIGNMENT")) {
+            if (parser.matchWord("ASSIGNMENT")) {
                 castContext = "a";
-            } else if (parser.matchKeyword("IMPLICIT")) {
+            } else if (parser.matchWord("IMPLICIT")) {
                 castContext = "i";
             }
         }

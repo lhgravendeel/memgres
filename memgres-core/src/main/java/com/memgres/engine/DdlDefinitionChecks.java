@@ -836,6 +836,18 @@ public final class DdlDefinitionChecks {
      * columns declared before it. Null wherever the type is not decidable from the expression
      * alone, which leaves the caller to judge nothing.
      */
+    /**
+     * The type an expression is certainly of, or null when it is not certain.
+     *
+     * <p>The same reading serves a DEFAULT and a value being stored, because PostgreSQL asks the
+     * same question of both: whether there is a coercion from what the expression produces to what
+     * the column holds. It stays one-sided — silence where the type is not certain lets the value
+     * through, which is what a wrong answer here would not.
+     */
+    public static String certainTypeName(Expression expr, java.util.List<Column> declared) {
+        return plainExpressionTypeName(expr, declared);
+    }
+
     private static String plainExpressionTypeName(Expression expr, java.util.List<Column> declared) {
         if (expr instanceof UnaryExpr && ((UnaryExpr) expr).op() == UnaryExpr.UnaryOp.NEGATE) {
             return plainExpressionTypeName(((UnaryExpr) expr).operand(), declared);

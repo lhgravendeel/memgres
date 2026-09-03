@@ -117,7 +117,59 @@ public final class BuiltinFunctionSignatures {
             {"uuid_ns_url", "uuid-ossp"},
             {"show_trgm", "pg_trgm"},
             {"similarity", "pg_trgm"},
+            {"word_similarity", "pg_trgm"},
+            {"strict_word_similarity", "pg_trgm"},
+            {"digest", "pgcrypto"},
+            {"hmac", "pgcrypto"},
+            {"crypt", "pgcrypto"},
+            {"gen_salt", "pgcrypto"},
+            {"gen_random_bytes", "pgcrypto"},
+            {"levenshtein", "fuzzystrmatch"},
+            {"soundex", "fuzzystrmatch"},
+            {"unaccent", "unaccent"},
+            {"akeys", "hstore"},
+            {"avals", "hstore"},
+            {"defined", "hstore"},
+            {"delete", "hstore"},
+            {"each", "hstore"},
+            {"exist", "hstore"},
+            {"hstore", "hstore"},
+            {"hstore_in", "hstore"},
+            {"hstore_out", "hstore"},
+            {"hstore_recv", "hstore"},
+            {"hstore_send", "hstore"},
+            {"hstore_to_array", "hstore"},
+            {"hstore_to_json", "hstore"},
+            {"hstore_to_json_loose", "hstore"},
+            {"hstore_to_jsonb", "hstore"},
+            {"hstore_to_jsonb_loose", "hstore"},
+            {"hstore_to_matrix", "hstore"},
+            {"isdefined", "hstore"},
+            {"isexists", "hstore"},
+            {"populate_record", "hstore"},
+            {"skeys", "hstore"},
+            {"slice", "hstore"},
+            {"svals", "hstore"},
+            {"pg_stat_statements_reset", "pg_stat_statements"},
     };
+
+    /**
+     * The value words SQL spells without parentheses. PostgreSQL's grammar reads them where a
+     * value belongs and has no pg_proc row for any of them, so a reader asking the catalogue what
+     * routines there are must not be told about these -- and to_regproc, which is that question
+     * asked one name at a time, answers nothing for them.
+     */
+    private static final java.util.Set<String> WORDS_RATHER_THAN_ROUTINES =
+            new java.util.HashSet<String>(java.util.Arrays.asList(
+                    "current_catalog", "current_role", "current_schema", "current_user",
+                    "session_user", "user", "current_date", "current_time", "current_timestamp",
+                    "localtime", "localtimestamp"));
+
+    /** Whether a name is one of the value words rather than a routine of the catalogue. */
+    public static boolean isWordRatherThanRoutine(String name) {
+        return name != null
+                && WORDS_RATHER_THAN_ROUTINES.contains(name.toLowerCase(java.util.Locale.ROOT));
+    }
 
     /** The extension this name belongs to, or null when it belongs to none. */
     static String owningExtension(String name) {

@@ -85,7 +85,7 @@ public final class ReplayScript {
                 else if (line.startsWith("-- title:")) title = after(line, "-- title:");
                 else if (line.startsWith("-- unrunnable:")) unrunnable = after(line, "-- unrunnable:");
                 else if (line.startsWith("-- columns:")) columns = splitCells(after(line, "-- columns:"));
-                else if (line.startsWith("-- row:")) rows.add(after(line, "-- row:"));
+                else if (line.startsWith("-- row:")) rows.add(rowValue(line));
                 else if (line.startsWith("-- rowcount:")) { /* the row list already says */ }
                 else if (line.startsWith("-- ok:")) updateCount = Integer.valueOf(after(line, "-- ok:"));
                 else if (line.startsWith("-- sqlstate:")) sqlState = after(line, "-- sqlstate:");
@@ -112,6 +112,18 @@ public final class ReplayScript {
 
     private static String after(String line, String tag) {
         return line.substring(tag.length()).trim();
+    }
+
+    /**
+     * The value a row line records, with whatever indentation it was written with kept.
+     *
+     * <p>Only the one space that separates the tag from the value is taken off. A plan line says
+     * how deep in the tree it sits by how far it is indented, so trimming a recorded row would
+     * throw away part of the answer and hold the engine to a flattened version of it.
+     */
+    private static String rowValue(String line) {
+        String value = line.substring("-- row:".length());
+        return value.startsWith(" ") ? value.substring(1) : value.trim();
     }
 
     private static List<String> splitCells(String s) {

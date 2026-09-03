@@ -330,10 +330,12 @@ public final class PlpgsqlBodyValidator {
 
     // ---- GET DIAGNOSTICS ----
 
+    // PG_CONTEXT is where the handler itself is running, which a handler may ask for as readily
+    // as anything else may: refused here, a body PostgreSQL compiles would not compile.
     private static final Set<String> STACKED_ITEMS = Cols.setOf(
             "RETURNED_SQLSTATE", "COLUMN_NAME", "CONSTRAINT_NAME", "PG_DATATYPE_NAME",
             "MESSAGE_TEXT", "TABLE_NAME", "SCHEMA_NAME", "PG_EXCEPTION_DETAIL",
-            "PG_EXCEPTION_HINT", "PG_EXCEPTION_CONTEXT");
+            "PG_EXCEPTION_HINT", "PG_EXCEPTION_CONTEXT", "PG_CONTEXT");
 
     private static final Set<String> CURRENT_ITEMS = Cols.setOf(
             "ROW_COUNT", "PG_CONTEXT", "PG_ROUTINE_OID");

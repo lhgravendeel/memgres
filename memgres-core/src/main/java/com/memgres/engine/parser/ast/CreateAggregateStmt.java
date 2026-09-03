@@ -19,6 +19,11 @@ public final class CreateAggregateStmt implements Statement {
     public final String finalfunc;   // may be null
     public final String combinefunc; // may be null
     public final String sortop;      // may be null
+    /** The options a moving aggregate and a final function carry, or null where none was given. */
+    public final String finalfuncModify;
+    public final String minvfunc;
+    public final String mstype;
+    public final boolean finalfuncExtra;
 
     public CreateAggregateStmt(String name, List<String> argTypes, String sfunc, String stype,
                                String initcond, String finalfunc, String combinefunc, String sortop) {
@@ -28,6 +33,18 @@ public final class CreateAggregateStmt implements Statement {
     public CreateAggregateStmt(String name, List<String> argTypes, int directArgCount, String sfunc,
                                String stype, String initcond, String finalfunc, String combinefunc,
                                String sortop) {
+        this(name, argTypes, directArgCount, sfunc, stype, initcond, finalfunc, combinefunc,
+                sortop, null, null, null, false);
+    }
+
+    public CreateAggregateStmt(String name, List<String> argTypes, int directArgCount, String sfunc,
+                               String stype, String initcond, String finalfunc, String combinefunc,
+                               String sortop, String finalfuncModify, String minvfunc,
+                               String mstype, boolean finalfuncExtra) {
+        this.finalfuncModify = finalfuncModify;
+        this.minvfunc = minvfunc;
+        this.mstype = mstype;
+        this.finalfuncExtra = finalfuncExtra;
         this.name = name;
         this.argTypes = argTypes;
         this.directArgCount = directArgCount;
@@ -48,6 +65,10 @@ public final class CreateAggregateStmt implements Statement {
     public String finalfunc() { return finalfunc; }
     public String combinefunc() { return combinefunc; }
     public String sortop() { return sortop; }
+    public String finalfuncModify() { return finalfuncModify; }
+    public String minvfunc() { return minvfunc; }
+    public String mstype() { return mstype; }
+    public boolean finalfuncExtra() { return finalfuncExtra; }
 
     @Override
     public boolean equals(Object o) {

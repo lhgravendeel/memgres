@@ -1849,9 +1849,11 @@ class FromResolver {
             // Check views
             Database.ViewDef view = viewFor(tableRef);
             if (view != null) {
-                // Materialized views know their columns without re-running the query
-                // (and an unpopulated matview must still be describable).
-                if (view.materialized() && view.cachedColumns() != null && !view.cachedColumns().isEmpty()) {
+                // A view's columns are settled when the view is created and kept, so describing
+                // the clause reads them off rather than running the query again. Run again here,
+                // a view over a nextval drew from the sequence twice for one read of it -- once
+                // to say what its columns were and once to answer with them.
+                if (view.cachedColumns() != null && !view.cachedColumns().isEmpty()) {
                     Table mv = new Table(alias, view.cachedColumns());
                     addBinding(bindings, asWritten(mv, alias, tableRef.columnAliases()), alias);
                     return;
@@ -2798,7 +2800,10 @@ class FromResolver {
                 String priorViewOwner = executor.viewOwnerRole;
                 String viewOwner = executor.database.getObjectOwner(
                         "view:" + viewSchema.toLowerCase(java.util.Locale.ROOT) + "." + tableRef.table().toLowerCase(java.util.Locale.ROOT));
-                if (viewOwner != null) executor.viewOwnerRole = viewOwner;
+                // A view made with security_invoker reads its relations as whoever is reading it,
+                // which is the whole of what that option says: run as the owner regardless, it
+                // handed the reader everything the owner could see.
+                if (viewOwner != null && !readsAsTheInvoker(view)) executor.viewOwnerRole = viewOwner;
                 QueryResult viewResult;
                 try {
                     viewResult = readAsDerivedRelation(alias, tableRef.columnAliases(),
@@ -3586,6 +3591,19 @@ class FromResolver {
      * between the two. A partition may order its columns differently from the table it partitions
      * and an inheritance child may carry columns its parent never declared.
      */
+    /** Whether a view reads what it reads as whoever is reading it, rather than as its owner. */
+    private static boolean readsAsTheInvoker(Database.ViewDef view) {
+        if (view == null || view.reloptions == null) return false;
+        for (java.util.Map.Entry<String, String> option : view.reloptions.entrySet()) {
+            if (!"security_invoker".equalsIgnoreCase(option.getKey())) continue;
+            String written = option.getValue();
+            return written == null || written.trim().isEmpty()
+                    || "true".equalsIgnoreCase(written.trim()) || "on".equalsIgnoreCase(written.trim())
+                    || "1".equals(written.trim());
+        }
+        return false;
+    }
+
     private static Object[] rowAsRelationAboveReadsIt(Table storage, Table above, Object[] row) {
         Object[] mapped = row;
         Table below = storage;

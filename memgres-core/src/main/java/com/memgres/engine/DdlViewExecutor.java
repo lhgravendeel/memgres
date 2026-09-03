@@ -57,6 +57,19 @@ class DdlViewExecutor {
         }
     }
 
+    /**
+     * The same query written to keep no row, where it is one whose whole answer is worked out
+     * from its select list. A query with a FROM clause is left as it stands: what its columns
+     * resolve to is settled as its rows are read, and a definition naming a relation twice is
+     * refused there rather than while the columns are being listed.
+     */
+    private static Statement keepingNoRow(Statement query) {
+        if (!(query instanceof SelectStmt)) return query;
+        SelectStmt select = (SelectStmt) query;
+        boolean fromNothing = select.from() == null || select.from().isEmpty();
+        return fromNothing && select.limit() == null ? select.keepingNoRow() : query;
+    }
+
     QueryResult executeCreateView(CreateViewStmt stmt) {
         ddl.checkPgCatalogWriteProtection();
         requireKnownViewOptions(stmt.withOptions());
@@ -200,7 +213,11 @@ class DdlViewExecutor {
         } else {
             List<Column> resolvedColumns = null;
             try {
-                QueryResult result = executor.executeStatement(query);
+                // The definition is stored for the shape it answers with, and a plain view keeps
+                // no rows: asked to keep none, the query answers with its columns and works out
+                // nothing that stands in its select list. Run whole, creating a view over a
+                // nextval moved the sequence on at the CREATE.
+                QueryResult result = executor.executeStatement(keepingNoRow(query));
                 resolvedColumns = new ArrayList<>(result.getColumns());
             } catch (MemgresException e) {
                 MemgresException fault = definitionFault(e);
@@ -214,6 +231,11 @@ class DdlViewExecutor {
         }
 
         executor.database.registerSchemaObject(viewSchema, "view", stmt.name());
+        // A view is a table as far as default privileges are concerned, and so is a
+        // materialised one: PostgreSQL sets them aside for TABLES and hands them to every
+        // relation of that kind.
+        DdlTableExecutor.applyDefaultPrivileges(executor, viewSchema, stmt.name(),
+                executor.currentRole(), "TABLES", "TABLE");
         if (oldView != null) {
             executor.recordUndo(new Session.DropViewUndo(stmt.name(), oldView));
         }

@@ -45,9 +45,21 @@ class DdlAdminExecutor {
                     // rather than refuse: the statements after this one belong to the block that
                     // was already running, not to a new one this BEGIN started, and a script that
                     // ends "its" transaction ends theirs.
-                    if (executor.session.isInTransaction()) {
+                    boolean alreadyOpen = executor.session.isInTransaction();
+                    if (alreadyOpen) {
                         executor.session.addNotice("WARNING", "25001",
                                 "there is already a transaction in progress", null);
+                    }
+                    // The modes written on a BEGIN that opens nothing are the modes of the block
+                    // already running, which is what SET TRANSACTION says -- and the level a
+                    // transaction runs at can only be chosen before it has read anything.
+                    if (alreadyOpen && executor.session.isExplicitTransactionBlock()
+                            && SessionExecutor.changesTheIsolationLevel(
+                                    executor.session, stmt.isolationLevel())
+                            && executor.session.hasRunQueryInTransaction()) {
+                        throw new MemgresException(
+                                "SET TRANSACTION ISOLATION LEVEL must be called before any query",
+                                "25001");
                     }
                     executor.session.begin();
                     executor.session.setExplicitTransactionBlock(true);
@@ -546,11 +558,11 @@ class DdlAdminExecutor {
             }
         }
         if (stmt.renameTo() != null) {
-            // Renaming onto a name another policy on this table already answers to would leave
-            // two of them with one name.
+            // Renaming onto a name a policy on this table already answers to would leave two of
+            // them with one name -- and renaming a policy to the name it already has is that
+            // same collision, which PostgreSQL refuses rather than treating as nothing to do.
             for (RlsPolicy p : table.getRlsPolicies()) {
-                if (p.getName().equalsIgnoreCase(stmt.renameTo())
-                        && !p.getName().equalsIgnoreCase(stmt.name())) {
+                if (p.getName().equalsIgnoreCase(stmt.renameTo())) {
                     throw new MemgresException("policy \"" + stmt.renameTo() + "\" for table \""
                             + stmt.table() + "\" already exists", "42710");
                 }
@@ -606,8 +618,27 @@ class DdlAdminExecutor {
                 }
             }
         }
+        // The ROLE and ADMIN clauses name members of the role being created, and they have to be
+        // roles for the same reason.
+        for (String member : membersNamedBy(stmt)) {
+            if (!executor.database.hasRole(member)) {
+                throw new MemgresException("role \"" + member + "\" does not exist", "42704");
+            }
+        }
         executor.database.createRole(stmt.name(), stmt.options());
         // M12: Process IN ROLE clause — add this role as member of specified roles
+        // The ROLE clause runs the other way from IN ROLE: those roles become members of this
+        // one, and the ones ADMIN names hold their membership with the right to grant it on.
+        if (stmt.memberRoles() != null) {
+            for (String member : stmt.memberRoles()) {
+                executor.database.addRoleMembership(stmt.name(), member, false);
+            }
+        }
+        if (stmt.adminRoles() != null) {
+            for (String member : stmt.adminRoles()) {
+                executor.database.addRoleMembership(stmt.name(), member, true);
+            }
+        }
         if (stmt.inRoles() != null) {
             for (String parentRole : stmt.inRoles()) {
                 executor.database.addRoleMembership(parentRole, stmt.name(), false);
@@ -661,22 +692,51 @@ class DdlAdminExecutor {
                     }
                 }
                 if (setConfig != null) {
-                    String prev = existing.get("ROLCONFIG");
-                    if (prev != null && !prev.isEmpty()) {
-                        existing.put("ROLCONFIG", prev + "," + setConfig);
-                    } else {
-                        existing.put("ROLCONFIG", setConfig);
-                    }
+                    existing.put("ROLCONFIG", settingsWith(existing.get("ROLCONFIG"), setConfig));
+                }
+                String resetConfig = stmt.options().get("RESET_CONFIG");
+                if (resetConfig != null) {
+                    existing.put("ROLCONFIG", resetConfig.isEmpty() ? ""
+                            : settingsWithout(existing.get("ROLCONFIG"), resetConfig));
                 }
                 // Apply other options normally
                 for (Map.Entry<String, String> e : stmt.options().entrySet()) {
-                    if (!"SET_CONFIG".equals(e.getKey())) {
+                    if (!"SET_CONFIG".equals(e.getKey()) && !"RESET_CONFIG".equals(e.getKey())) {
                         existing.put(e.getKey(), e.getValue());
                     }
                 }
             }
         }
         return QueryResult.message(QueryResult.Type.SET, "ALTER ROLE");
+    }
+
+    /**
+     * The role's settings with one written again.
+     *
+     * <p>A parameter has one setting on a role, so writing it a second time replaces the first.
+     * Added to the end instead, a role that had its search path set twice carried both settings
+     * and pg_roles listed the one it no longer had.
+     */
+    private static String settingsWith(String held, String written) {
+        int eq = written.indexOf('=');
+        String parameter = eq < 0 ? written : written.substring(0, eq);
+        StringBuilder out = new StringBuilder(settingsWithout(held, parameter));
+        if (out.length() > 0) out.append(',');
+        return out.append(written).toString();
+    }
+
+    /** The role's settings with the one for this parameter taken out. */
+    private static String settingsWithout(String held, String parameter) {
+        if (held == null || held.isEmpty()) return "";
+        StringBuilder out = new StringBuilder();
+        for (String setting : held.split(",")) {
+            int eq = setting.indexOf('=');
+            String named = eq < 0 ? setting : setting.substring(0, eq);
+            if (named.equalsIgnoreCase(parameter)) continue;
+            if (out.length() > 0) out.append(',');
+            out.append(setting);
+        }
+        return out.toString();
     }
 
     // ---- DROP ROLE ----
@@ -688,7 +748,27 @@ class DdlAdminExecutor {
         return QueryResult.message(QueryResult.Type.SET, "DROP ROLE");
     }
 
+    /** The words that stand for whoever is asking rather than for a role of that name. */
+    private static final java.util.Set<String> SPECIAL_ROLE_SPECIFIERS = Cols.setOf(
+            "current_user", "current_role", "session_user", "public");
+
+    /** Every role the ROLE and ADMIN clauses make a member of the one being created. */
+    private static List<String> membersNamedBy(CreateRoleStmt stmt) {
+        List<String> named = new ArrayList<>();
+        if (stmt.memberRoles() != null) named.addAll(stmt.memberRoles());
+        if (stmt.adminRoles() != null) named.addAll(stmt.adminRoles());
+        return named;
+    }
+
     private void dropOneRole(String role, boolean ifExists) {
+        // These name whoever is asking, or everyone, rather than a role the catalogue holds, so
+        // there is nothing here for DROP ROLE to drop -- and IF EXISTS does not excuse writing
+        // one, because the fault is in what was written and not in what is there.
+        if (role != null && SPECIAL_ROLE_SPECIFIERS.contains(
+                role.toLowerCase(java.util.Locale.ROOT))) {
+            throw new MemgresException(
+                    "cannot use special role specifier in DROP ROLE", "22023");
+        }
         if (!executor.database.hasRole(role)) {
             if (ifExists) return;
             throw new MemgresException("role \"" + role + "\" does not exist", "42704");
@@ -2274,6 +2354,11 @@ class DdlAdminExecutor {
         executor.recordUndo(new Session.CreateSchemaUndo(s.name()));
         String owner = s.authorization() != null ? s.authorization() : executor.sessionUser();
         executor.database.setObjectOwner("schema:" + s.name(), owner);
+        // A schema gets the privileges ALTER DEFAULT PRIVILEGES set aside for the schemas to
+        // come. Those are written without a schema of their own, there being nothing to write.
+        DdlTableExecutor.applyDefaultPrivileges(executor, null,
+                s.name().toLowerCase(java.util.Locale.ROOT), executor.currentRole(),
+                "SCHEMAS", "SCHEMA");
         return QueryResult.message(QueryResult.Type.SET, "CREATE SCHEMA");
     }
 }

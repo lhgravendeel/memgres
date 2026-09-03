@@ -325,9 +325,17 @@ public class PlpgsqlParser {
             boolean constant = matchKw("CONSTANT");
             String typeName = readTypeName();
             requireWritableTypeName(typeName);
+            // A declared width is read where the declaration is read, as it is for a column or a
+            // cast: a variable no value could ever fill was accepted here and refused nowhere.
+            com.memgres.engine.TypeCoercion.checkDeclaredTypeLimits(typeName);
             // A declared collation says how the variable's text compares, which is settled by the
-            // collation the database runs under; naming it is accepted and changes nothing here.
-            if (matchKw("COLLATE")) readIdent();
+            // collation the database runs under; naming it changes nothing here. It may only be
+            // named for a type that has one to change, though -- a number compares by its value,
+            // and a collation written on one is refused rather than quietly ignored.
+            if (matchKw("COLLATE")) {
+                readIdent();
+                requireCollatableType(typeName);
+            }
             boolean notNull = false;
             if (matchKw("NOT")) { matchKw("NULL"); notNull = true; }
 
@@ -353,6 +361,30 @@ public class PlpgsqlParser {
      * one that does not fit is not a length the type could have been given: PostgreSQL reports it
      * where it stands rather than accepting the declaration and finding out later.
      */
+    /** The types a collation may be written on: the ones whose values compare as text. */
+    private static final java.util.Set<String> COLLATABLE_TYPES = new java.util.HashSet<String>(
+            java.util.Arrays.asList("text", "varchar", "character varying", "char", "character",
+                    "bpchar", "name", "citext"));
+
+    /**
+     * Refuse a collation written on a type that has none. A collation says which order text is
+     * compared in, and a number, a date or a boolean is compared by what it is.
+     */
+    private void requireCollatableType(String typeName) {
+        if (typeName == null) return;
+        String bare = typeName.trim().toLowerCase(java.util.Locale.ROOT)
+                .replaceAll("\\(.*\\)", "").trim();
+        if (bare.endsWith("[]") || COLLATABLE_TYPES.contains(bare)) return;
+        // A type this parser does not know may be a domain over text or a type of the reader's
+        // own, and neither is this parser's to refuse.
+        com.memgres.engine.DataType known = com.memgres.engine.DataType.fromPgName(bare);
+        if (known == null) return;
+        // Named the way PostgreSQL names it, which is not always the spelling that was written:
+        // int and int4 are both the integer a complaint calls integer.
+        throw new com.memgres.engine.MemgresException("collations are not supported by type "
+                + com.memgres.engine.AstExecutor.pgTypeDisplayName(known), "42804");
+    }
+
     private void requireWritableTypeName(String typeName) {
         if (typeName == null) return;
         int paren = typeName.indexOf('(');

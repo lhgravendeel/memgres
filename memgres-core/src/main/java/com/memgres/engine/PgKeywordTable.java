@@ -15,7 +15,7 @@ import java.util.List;
  * <p>Each entry is {@code word|catcode|barelabel}: U unreserved, C unreserved but no function or
  * type name, T reserved but may be one, R reserved.
  */
-final class PgKeywordTable {
+public final class PgKeywordTable {
     private PgKeywordTable() {}
 
     /** One row of the report. */
@@ -189,4 +189,21 @@ final class PgKeywordTable {
     static List<Keyword> keywords() {
         return ALL;
     }
+
+    /**
+     * Whether PostgreSQL's grammar names this word at all, in any of the four categories.
+     *
+     * <p>Some productions take a bare identifier and nothing else — the one that reports an
+     * unrecognized role option is one — so what matters there is not how tightly a word is
+     * reserved but whether the grammar has a use for it.
+     */
+    public static boolean isKeyword(String word) {
+        if (word == null) return false;
+        String lower = word.toLowerCase(java.util.Locale.ROOT);
+        for (Keyword k : ALL) {
+            if (k.word.equals(lower)) return true;
+        }
+        return false;
+    }
+
 }

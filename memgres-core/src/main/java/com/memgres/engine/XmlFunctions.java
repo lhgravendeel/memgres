@@ -26,11 +26,18 @@ class XmlFunctions {
             }
             case "xmlserialize": {
                 // args: mode, xml_value, target_type
+                // The result is text, and what may be written here is a type text reaches: a
+                // width belongs to the type and is applied to the text, so varchar(5) is the same
+                // question as any other varchar(5) and answers with the same overflow.
+                String targetSpec = null;
                 if (fn.args().size() >= 3) {
-                    String targetType = String.valueOf(executor.evalExpr(fn.args().get(2), ctx)).toLowerCase(java.util.Locale.ROOT);
-                    java.util.Set<String> validTypes = Cols.setOf("text", "varchar", "character varying", "xml", "char", "character", "bytea");
-                    if (!validTypes.contains(targetType)) {
-                        throw new MemgresException("cannot cast type xml to " + targetType, "42846");
+                    targetSpec = String.valueOf(executor.evalExpr(fn.args().get(2), ctx)).trim();
+                    String targetBase = targetSpec.replaceAll("\\(.*\\)", "").trim()
+                            .toLowerCase(java.util.Locale.ROOT);
+                    java.util.Set<String> validTypes = Cols.setOf("text", "varchar", "character varying", "xml", "char", "character", "bpchar", "name", "bytea");
+                    if (!validTypes.contains(targetBase)) {
+                        throw new MemgresException("cannot cast XMLSERIALIZE result to "
+                                + DataType.canonicalName(targetBase), "42846");
                     }
                 }
                 String mode = fn.args().size() >= 1 ? String.valueOf(executor.evalExpr(fn.args().get(0), ctx)) : "content";
@@ -42,10 +49,15 @@ class XmlFunctions {
                     }
                 }
                 boolean indent = fn.args().size() >= 4 && "indent".equals(String.valueOf(executor.evalExpr(fn.args().get(3), ctx)));
-                if (indent) {
-                    return xmlVal == null ? null : XmlOperations.xmlserializeIndent(xmlVal.toString());
-                }
-                return xmlVal == null ? null : XmlOperations.xmlserialize(xmlVal.toString());
+                if (xmlVal == null) return null;
+                String serialized = indent
+                        ? XmlOperations.xmlserializeIndent(xmlVal.toString())
+                        : XmlOperations.xmlserialize(xmlVal.toString());
+                // The type written is the type the text is read as, width and all.
+                // Read as the type rather than cast to it: a value the type cannot hold is
+                // refused, not shortened until it fits.
+                return targetSpec == null || targetSpec.isEmpty() ? serialized
+                        : TypeCoercion.heldToItsType(serialized, targetSpec);
             }
             case "xmlelement": {
                 String tagName = String.valueOf(executor.evalExpr(fn.args().get(0), ctx));
@@ -179,10 +191,28 @@ class XmlFunctions {
                 boolean nulls = executor.isTruthy(executor.evalExpr(fn.args().get(1), ctx));
                 boolean tableforest = executor.isTruthy(executor.evalExpr(fn.args().get(2), ctx));
                 String targetns = String.valueOf(executor.evalExpr(fn.args().get(3), ctx));
-                // Look up table data
-                Schema schema = executor.database.getSchema("public");
-                Table tbl = schema != null ? schema.getTable(tableName) : null;
-                if (tbl == null) throw new MemgresException("table not found: " + tableName);
+                // The relation is looked for the way any relation reference is: along the search
+                // path and among the catalogues, not in public alone. A catalogue relation is a
+                // relation, and asking for one as XML is a question with an answer.
+                String tableSchema = "public";
+                String bareTable = tableName;
+                int dot = tableName.indexOf('.');
+                if (dot > 0) {
+                    tableSchema = tableName.substring(0, dot);
+                    bareTable = tableName.substring(dot + 1);
+                }
+                Table tbl;
+                try {
+                    tbl = executor.resolveTable(tableSchema, bareTable);
+                } catch (MemgresException notThere) {
+                    tbl = null;
+                }
+                if (tbl == null) tbl = executor.systemCatalog.resolve("pg_catalog", bareTable);
+                if (tbl == null) {
+                    throw new MemgresException(
+                            "relation \"" + tableName + "\" does not exist", "42P01");
+                }
+                tableName = bareTable;
                 List<String> colNames = new ArrayList<>();
                 for (Column col : tbl.getColumns()) colNames.add(col.getName());
                 return XmlOperations.tableToXml(tableName, colNames, tbl.getRows(), nulls, tableforest, targetns);

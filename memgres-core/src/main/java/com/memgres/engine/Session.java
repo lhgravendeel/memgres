@@ -408,6 +408,16 @@ public class Session {
         private List<List<RowContext.TableBinding>> provenance;
         /** Whether the query was written FOR UPDATE or FOR SHARE, which changes what is refused. */
         private boolean locking;
+        /**
+         * What fills the cursor, where it has not been filled yet.
+         *
+         * <p>DECLARE opens a portal and runs nothing: PostgreSQL plans the query then and executes
+         * it when the cursor is first read, so a row the query cannot produce is complained about
+         * at the FETCH and a sequence the query draws from is not drawn from until then. Running
+         * the query at DECLARE made both happen a statement too early -- and a cursor declared and
+         * rolled back had still moved the sequence on.
+         */
+        private Runnable opener;
 
         public CursorState(String name, List<Column> columns, List<Object[]> rows,
                            String queryText, boolean holdable, boolean binary, boolean scrollable,
@@ -432,9 +442,32 @@ public class Session {
             this(name, columns, rows, null, false, false, false, false);
         }
 
+        /**
+         * Fills the cursor from its query, once, the first time anything asks what is in it.
+         *
+         * @param filler what runs the query and adds the columns and rows it answered
+         */
+        public void filledBy(Runnable filler) { this.opener = filler; }
+
+        /** Runs the query behind this cursor, if it has not been run yet. */
+        public void open() {
+            Runnable filler = opener;
+            if (filler == null) return;
+            // Cleared first: a query that fails is not run again by the next FETCH, which is
+            // what PostgreSQL does with a portal whose execution raised.
+            opener = null;
+            filler.run();
+        }
+
         public String getName() { return name; }
-        public List<Column> getColumns() { return columns; }
-        public int getRowCount() { return rows.size(); }
+        public List<Column> getColumns() {
+            open();
+            return columns;
+        }
+        public int getRowCount() {
+            open();
+            return rows.size();
+        }
         public int getPosition() { return position; }
         public String getQueryText() { return queryText; }
         public boolean isHoldable() { return holdable; }
@@ -447,6 +480,7 @@ public class Session {
 
         /** Get row at index, or null if out of bounds. */
         public Object[] getRow(int idx) {
+            open();
             if (idx >= 0 && idx < rows.size()) return rows.get(idx);
             return null;
         }
@@ -467,6 +501,7 @@ public class Session {
          * updatable scan of it, and only such a cursor can be named by WHERE CURRENT OF.
          */
         public Object[] currentRowOf(Table table) {
+            open();
             if (provenance == null || position < 0 || position >= provenance.size()) return null;
             for (RowContext.TableBinding binding : provenance.get(position)) {
                 if (binding.row == null) continue;
@@ -477,6 +512,7 @@ public class Session {
 
         /** Whether the query behind this cursor reads {@code table} at all. */
         public boolean scans(Table table) {
+            open();
             if (provenance == null) return false;
             for (List<RowContext.TableBinding> bindings : provenance) {
                 for (RowContext.TableBinding binding : bindings) {
@@ -889,6 +925,13 @@ public class Session {
         savepoints.clear();
         queryRanInTransaction = false;
         database.clearUncommittedObjects(this);
+        // The level a transaction runs at is settled as it begins, out of the session's default:
+        // a SET SESSION CHARACTERISTICS given while it runs is for the transactions after it, and
+        // reading the default afresh each time made it this transaction's level too.
+        String startingLevel = gucSettings.get("default_transaction_isolation");
+        if (startingLevel != null && !startingLevel.isEmpty()) {
+            gucSettings.setLocal("transaction_isolation", startingLevel);
+        }
         // M13: snapshot session GUC overrides so plain SET can be rolled back
         gucSessionSnapshot = gucSettings.snapshotSessionOverrides();
         // LISTEN is undone by ROLLBACK the way any other statement is: a channel subscribed to in
@@ -3483,6 +3526,16 @@ public class Session {
     }
 
 
+    /** Whether a name is spelled the way an exported snapshot's name is: hex digits and hyphens. */
+    private static boolean isSnapshotNameShaped(String name) {
+        if (name == null || name.isEmpty()) return false;
+        for (int i = 0; i < name.length(); i++) {
+            char c = name.charAt(i);
+            if (c != '-' && Character.digit(c, 16) < 0) return false;
+        }
+        return true;
+    }
+
     /** Import an exported snapshot into this session's RR snapshots. */
     public void importSnapshot(Database db, String snapshotId) {
         // Whether the transaction may take another transaction's snapshot at all is settled
@@ -3495,6 +3548,13 @@ public class Session {
         }
         Map<String, List<Object[]>> snap = db.importSnapshot(snapshotId);
         if (snap == null) {
+            // A name spelled the way an exported snapshot is spelled is a name that could have
+            // named one, and did not: the complaint is that there is no such snapshot. Only a
+            // name that could name none at all is an invalid identifier.
+            if (isSnapshotNameShaped(snapshotId)) {
+                throw new MemgresException(
+                        "snapshot \"" + snapshotId + "\" does not exist", "42704");
+            }
             throw new MemgresException("invalid snapshot identifier: \"" + snapshotId + "\"", "22023");
         }
         rrSnapshots.clear();

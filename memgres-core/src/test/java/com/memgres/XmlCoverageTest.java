@@ -933,9 +933,11 @@ class XmlCoverageTest {
             try (ResultSet rs = st.executeQuery("SELECT table_to_xml('xml_forest_test', true, true, '')")) {
                 assertTrue(rs.next());
                 String result = rs.getString(1);
-                // Forest mode: no wrapping table element
-                assertTrue(result.contains("<row>"));
-                assertFalse(result.contains("<xml_forest_test>"));
+                // As a forest there is no wrapping element, and each row is named after what
+                // it is a row of rather than being called a row.
+                assertTrue(result.contains("<xml_forest_test xmlns:xsi="));
+                assertTrue(result.contains("</xml_forest_test>"));
+                assertFalse(result.contains("<row>"));
             }
             st.execute("DROP TABLE xml_forest_test");
         }

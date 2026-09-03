@@ -723,7 +723,8 @@ class UtilityParser {
         // parameter with neither = nor TO between them is a value the grammar has no place for.
         Token stray = parser.peek();
         if (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
-            throw ParseException.saying(SYNTAX_AT + stray.raw() + Q, stray, "42601");
+            // A string constant is named with the quotes that made it one.
+            throw ParseException.saying(SYNTAX_AT + stray.sqlText() + Q, stray, "42601");
         }
         throw ParseException.saying("syntax error at end of input", stray, "42601");
     }
@@ -857,9 +858,13 @@ class UtilityParser {
         Token targetToken = parser.peek();
         String target = parser.readIdentifier();
         // DISCARD names one of these, and anything else is a syntax error where it stands rather
-        // than a discard of nothing at all.
-        if (target == null || !DISCARD_TARGETS.contains(target.toLowerCase(java.util.Locale.ROOT))) {
-            throw ParseException.saying(SYNTAX_AT + targetToken.raw() + Q, targetToken, "42601");
+        // than a discard of nothing at all. The word is a keyword of the grammar, not a name: a
+        // quoted one is a name, and DISCARD "ALL" is refused where DISCARD ALL is the statement.
+        if (targetToken.type() == TokenType.QUOTED_IDENTIFIER
+                || target == null
+                || !DISCARD_TARGETS.contains(target.toLowerCase(java.util.Locale.ROOT))) {
+            throw ParseException.saying(SYNTAX_AT + targetToken.sqlText() + Q, targetToken,
+                    "42601");
         }
         parser.expectEndOfStatement();
         return new DiscardStmt(target);
@@ -1452,6 +1457,12 @@ class UtilityParser {
             return new DeallocateStmt(null, true);
         }
         String name = parser.readIdentifier();
+        // DEALLOCATE names one prepared statement and nothing else, so a word after the name is
+        // a fault in the statement rather than something to run and then complain about: there
+        // is no IF EXISTS here, and "DEALLOCATE IF EXISTS x" stops at the EXISTS.
+        if (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
+            throw ParseException.at(parser.peek());
+        }
         return new DeallocateStmt(name, false);
     }
 
@@ -1676,11 +1687,10 @@ class UtilityParser {
         // GRANT role TO role (role membership grant)
         if (parser.matchKeyword("TO")) {
             List<String> grantees = new ArrayList<>();
-            do { grantees.add(parser.readIdentifier()); } while (parser.match(TokenType.COMMA));
+            do { grantees.add(readGrantee()); } while (parser.match(TokenType.COMMA));
             boolean withAdmin = false;
-            if (parser.matchKeywords("WITH", "ADMIN")) {
-                parser.expectKeyword("OPTION");
-                withAdmin = true;
+            if (parser.matchKeyword("WITH")) {
+                withAdmin = readRoleGrantOptions();
             }
             // A membership grant carries GRANTED BY too, and dropping the clause here meant the
             // grantor was never a name the statement had to answer for.
@@ -1713,6 +1723,7 @@ class UtilityParser {
             return new GrantStmt(privileges, "PARAMETER", paramName, paramGrantees, false, false, false, null);
         }
 
+        List<String> more = new ArrayList<>();
         if (parser.matchKeyword("ALL")) {
             // ALL TABLES IN SCHEMA, ALL SEQUENCES IN SCHEMA, ALL FUNCTIONS IN SCHEMA
             String what = parser.readIdentifier().toUpperCase(java.util.Locale.ROOT); // TABLES, SEQUENCES, FUNCTIONS
@@ -1721,11 +1732,12 @@ class UtilityParser {
             objectName = parser.readIdentifier();
             objectType = "ALL " + what + " IN SCHEMA";
         } else if (parser.matchKeyword("TABLE")) {
-            objectName = parser.readIdentifier();
-            if (parser.match(TokenType.DOT)) objectName = objectName + "." + parser.readIdentifier();
+            objectName = qualifiedObjectName();
+            readMoreObjects(more);
         } else if (parser.matchKeyword("SEQUENCE")) {
             objectType = "SEQUENCE";
             objectName = qualifiedObjectName();
+            readMoreObjects(more);
         } else if (parser.matchKeyword("FUNCTION") || parser.matchKeyword("PROCEDURE") || parser.matchKeyword("ROUTINE")) {
             objectType = "FUNCTION";
             objectName = qualifiedObjectName();
@@ -1738,18 +1750,23 @@ class UtilityParser {
         } else if (parser.matchKeyword("SCHEMA")) {
             objectType = "SCHEMA";
             objectName = parser.readIdentifier();
+            readMoreObjects(more);
         } else if (parser.matchKeyword("DATABASE")) {
             objectType = "DATABASE";
             objectName = parser.readIdentifier();
+            readMoreObjects(more);
         } else if (parser.matchKeyword("DOMAIN")) {
             objectType = "DOMAIN";
             objectName = qualifiedObjectName();
+            readMoreObjects(more);
         } else if (parser.matchKeyword("LANGUAGE")) {
             objectType = "LANGUAGE";
             objectName = parser.readIdentifier();
+            readMoreObjects(more);
         } else if (parser.matchKeyword("TYPE")) {
             objectType = "TYPE";
             objectName = qualifiedObjectName();
+            readMoreObjects(more);
         } else if (parser.matchKeyword("FOREIGN")) {
             // FOREIGN DATA WRAPPER name or FOREIGN SERVER name
             if (parser.matchKeyword("DATA")) {
@@ -1767,11 +1784,12 @@ class UtilityParser {
             objectName = parser.advance().value(); // OID is a number, not an identifier
         } else {
             objectName = qualifiedObjectName();
+            readMoreObjects(more);
         }
 
         parser.expectKeyword("TO");
         List<String> grantees = new ArrayList<>();
-        do { grantees.add(parser.readIdentifier()); } while (parser.match(TokenType.COMMA));
+        do { grantees.add(readGrantee()); } while (parser.match(TokenType.COMMA));
 
         boolean withGrantOption = false;
         if (parser.matchKeywords("WITH", "GRANT")) {
@@ -1795,7 +1813,19 @@ class UtilityParser {
         }
 
         return new GrantStmt(privileges, objectType, objectName, grantees, withGrantOption, false,
-                false, columns, grantor).withPerPrivilegeColumns(columnsByPrivilege);
+                false, columns, grantor).withPerPrivilegeColumns(columnsByPrivilege)
+                .withMoreObjects(more);
+    }
+
+    /**
+     * The further objects named after the first, which one statement may list: the same
+     * privileges are given on, or taken from, each of them. Read as one object, the comma between
+     * two of them was a syntax error.
+     */
+    private void readMoreObjects(List<String> more) {
+        while (parser.match(TokenType.COMMA)) {
+            more.add(qualifiedObjectName());
+        }
     }
 
     // ---- REVOKE ----
@@ -1808,10 +1838,17 @@ class UtilityParser {
             parser.expectKeyword("FOR");
             grantOptionFor = true;
         }
+        // A membership carries three options and any of them may be revoked on its own, leaving
+        // the membership itself. Only ADMIN changes what this engine records; the other two are
+        // read and accepted, which is what keeps a statement PostgreSQL runs from being refused.
         boolean adminOptionFor = false;
-        if (parser.matchKeywords("ADMIN", "OPTION")) {
-            parser.expectKeyword("FOR");
-            adminOptionFor = true;
+        if (parser.checkKeyword("ADMIN") || parser.checkWord("INHERIT") || parser.checkWord("SET")) {
+            if (parser.checkKeywordAt(1, "OPTION") || parser.checkWordAt(1, "OPTION")) {
+                adminOptionFor = parser.checkKeyword("ADMIN");
+                parser.advance();
+                parser.advance();
+                parser.expectKeyword("FOR");
+            }
         }
 
         List<String> privileges = new ArrayList<>();
@@ -1843,7 +1880,7 @@ class UtilityParser {
         // REVOKE role FROM role (role membership revoke)
         if (parser.matchKeyword("FROM")) {
             List<String> grantees = new ArrayList<>();
-            do { grantees.add(parser.readIdentifier()); } while (parser.match(TokenType.COMMA));
+            do { grantees.add(readGrantee()); } while (parser.match(TokenType.COMMA));
             boolean cascade = parser.matchKeyword("CASCADE");
             parser.matchKeyword("RESTRICT");
             return new RevokeStmt(revokeWritten, null, null, grantees, adminOptionFor, true, cascade);
@@ -1854,6 +1891,7 @@ class UtilityParser {
         String objectType = "TABLE";
         String objectName;
 
+        List<String> more = new ArrayList<>();
         if (parser.matchKeyword("ALL")) {
             String what = parser.readIdentifier().toUpperCase(java.util.Locale.ROOT);
             parser.expectKeyword("IN");
@@ -1862,9 +1900,11 @@ class UtilityParser {
             objectType = "ALL " + what + " IN SCHEMA";
         } else if (parser.matchKeyword("TABLE")) {
             objectName = qualifiedObjectName();
+            readMoreObjects(more);
         } else if (parser.matchKeyword("SEQUENCE")) {
             objectType = "SEQUENCE";
             objectName = qualifiedObjectName();
+            readMoreObjects(more);
         } else if (parser.matchKeyword("FUNCTION") || parser.matchKeyword("PROCEDURE") || parser.matchKeyword("ROUTINE")) {
             objectType = "FUNCTION";
             objectName = qualifiedObjectName();
@@ -1877,18 +1917,23 @@ class UtilityParser {
         } else if (parser.matchKeyword("SCHEMA")) {
             objectType = "SCHEMA";
             objectName = parser.readIdentifier();
+            readMoreObjects(more);
         } else if (parser.matchKeyword("DATABASE")) {
             objectType = "DATABASE";
             objectName = parser.readIdentifier();
+            readMoreObjects(more);
         } else if (parser.matchKeyword("DOMAIN")) {
             objectType = "DOMAIN";
             objectName = qualifiedObjectName();
+            readMoreObjects(more);
         } else if (parser.matchKeyword("LANGUAGE")) {
             objectType = "LANGUAGE";
             objectName = parser.readIdentifier();
+            readMoreObjects(more);
         } else if (parser.matchKeyword("TYPE")) {
             objectType = "TYPE";
             objectName = qualifiedObjectName();
+            readMoreObjects(more);
         } else if (parser.matchKeyword("FOREIGN")) {
             if (parser.matchKeyword("DATA")) {
                 parser.expectKeyword("WRAPPER");
@@ -1904,19 +1949,19 @@ class UtilityParser {
             objectType = "LARGE OBJECT";
             objectName = parser.advance().value(); // OID is a number, not an identifier
         } else {
-            objectName = parser.readIdentifier();
-            // M10: Preserve schema prefix
-            if (parser.match(TokenType.DOT)) objectName = objectName + "." + parser.readIdentifier();
+            objectName = qualifiedObjectName();
+            readMoreObjects(more);
         }
 
         parser.expectKeyword("FROM");
         List<String> grantees = new ArrayList<>();
-        do { grantees.add(parser.readIdentifier()); } while (parser.match(TokenType.COMMA));
+        do { grantees.add(readGrantee()); } while (parser.match(TokenType.COMMA));
 
         boolean cascade = parser.matchKeyword("CASCADE");
         parser.matchKeyword("RESTRICT");
 
-        return new RevokeStmt(privileges, objectType, objectName, grantees, grantOptionFor, false, cascade, revokeColumns);
+        return new RevokeStmt(privileges, objectType, objectName, grantees, grantOptionFor, false,
+                cascade, revokeColumns).withMoreObjects(more);
     }
 
     // ---- REASSIGN OWNED ----
@@ -2851,7 +2896,37 @@ class UtilityParser {
     }
 
     /** Read a grantee name, which may be an identifier or a keyword like CURRENT_USER, SESSION_USER, PUBLIC. */
+    /**
+     * The options a membership grant carries, and whether ADMIN is among them.
+     *
+     * <p>A membership has three: ADMIN, INHERIT and SET, each given as {@code OPTION}, as
+     * {@code TRUE} or as {@code FALSE}. A word that is none of the three is an option nobody has;
+     * a value that is none of the three is a statement that will not parse.
+     */
+    private boolean readRoleGrantOptions() {
+        boolean admin = false;
+        do {
+            Token nameToken = parser.peek();
+            String name = nameToken.raw().toLowerCase(java.util.Locale.ROOT);
+            parser.advance();
+            boolean given;
+            if (parser.matchKeyword("OPTION") || parser.matchWord("OPTION")) given = true;
+            else if (parser.matchKeyword("TRUE") || parser.matchWord("TRUE")) given = true;
+            else if (parser.matchKeyword("FALSE") || parser.matchWord("FALSE")) given = false;
+            else throw ParseException.at(parser.peek());
+            if (!"admin".equals(name) && !"inherit".equals(name) && !"set".equals(name)) {
+                throw ParseException.saying("unrecognized role option \"" + name + "\"",
+                        nameToken, "42601");
+            }
+            if ("admin".equals(name) && given) admin = true;
+        } while (parser.match(TokenType.COMMA));
+        return admin;
+    }
+
     private String readGrantee() {
+        // GROUP in front of a name is the old spelling of a role grantee, and says nothing more
+        // than the name does: read as the name itself it looked for a role called "group".
+        parser.matchKeyword("GROUP");
         if (parser.matchKeyword("CURRENT_USER")) return "current_user";
         if (parser.matchKeyword("SESSION_USER")) return "session_user";
         if (parser.matchKeyword("CURRENT_ROLE")) return "current_user";

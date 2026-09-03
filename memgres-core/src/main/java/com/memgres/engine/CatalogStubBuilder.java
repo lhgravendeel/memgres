@@ -1129,15 +1129,26 @@ class CatalogStubBuilder {
         );
         Table table = new Table("pg_ts_template", cols);
         int pgCatNs = oids.oid("ns:pg_catalog");
-        RegprocValue none = new RegprocValue(0, "-");
-        table.insertRow(new Object[]{TMPL_SIMPLE, "simple", pgCatNs, none, none});
+        // Each template is a pair of C functions, and the catalogue names them: read as nothing
+        // at all, every template said it had no init and no lexize where PostgreSQL names both.
+        table.insertRow(new Object[]{TMPL_SIMPLE, "simple", pgCatNs,
+                new RegprocValue(3725, "dsimple_init"), new RegprocValue(3726, "dsimple_lexize")});
+        table.insertRow(new Object[]{3733, "ispell", pgCatNs,
+                new RegprocValue(3731, "dispell_init"), new RegprocValue(3732, "dispell_lexize")});
+        table.insertRow(new Object[]{3742, "thesaurus", pgCatNs,
+                new RegprocValue(3740, "thesaurus_init"),
+                new RegprocValue(3741, "thesaurus_lexize")});
         // snowball is created at initdb rather than pinned in a .dat file, so PostgreSQL's OID
         // for it is not a fixed number and memgres cannot match it. 3726 was worse than
         // arbitrary: PostgreSQL hands that OID to the function dsimple_lexize, so a client that
         // resolved it against a real server landed on something else entirely. Numbered out of
         // the way instead.
-        table.insertRow(new Object[]{TMPL_SNOWBALL, "snowball", pgCatNs, none, none});
-        table.insertRow(new Object[]{3730, "synonym", pgCatNs, none, none});
+        table.insertRow(new Object[]{TMPL_SNOWBALL, "snowball", pgCatNs,
+                new RegprocValue(0, "dsnowball_init"),
+                new RegprocValue(0, "dsnowball_lexize")});
+        table.insertRow(new Object[]{3730, "synonym", pgCatNs,
+                new RegprocValue(3728, "dsynonym_init"),
+                new RegprocValue(3729, "dsynonym_lexize")});
         return table;
     }
 

@@ -29,6 +29,35 @@ final class AclItems {
      */
     private static final String ORDER = "arwdDxtXUCTcsAm";
 
+    /**
+     * Read a value of the type, or refuse text that is not one.
+     *
+     * <p>An aclitem is a grantee, an equals sign, the privileges as their letters, a slash and
+     * the grantor. PostgreSQL reads it field by field and names the first field that will not
+     * read: text with no equals sign in it never got past the grantee, and a letter that stands
+     * for no privilege is named as the mode character it is not.
+     */
+    static String readAclItem(String text) {
+        String t = text == null ? "" : text;
+        int eq = t.indexOf('=');
+        if (eq < 0) {
+            throw new MemgresException("unrecognized key word: \"" + t + "\"", "22P02");
+        }
+        int slash = t.indexOf('/', eq);
+        String modes = slash < 0 ? t.substring(eq + 1) : t.substring(eq + 1, slash);
+        for (int i = 0; i < modes.length(); i++) {
+            char c = modes.charAt(i);
+            // A star marks the privilege before it as grantable, so it is part of the field
+            // rather than a privilege of its own.
+            if (c == '*') continue;
+            if (ORDER.indexOf(c) < 0) {
+                throw new MemgresException(
+                        "invalid mode character: must be one of \"" + ORDER + "\"", "22P02");
+            }
+        }
+        return t;
+    }
+
     /** What each kind of object has to give, and what PUBLIC holds on it without being granted. */
     private static final Map<String, String[]> KINDS = kinds();
 
@@ -166,6 +195,15 @@ final class AclItems {
      */
     static String text(String kind, String owner, boolean touched, List<Grant> grants,
                        List<String> granteeOrder) {
+        return text(kind, owner, touched, grants, granteeOrder, false);
+    }
+
+    /**
+     * @param publicDefaultGone whether PUBLIC's default hold on the object has been revoked, so
+     *     the entry the kind would otherwise seed is left out
+     */
+    static String text(String kind, String owner, boolean touched, List<Grant> grants,
+                       List<String> granteeOrder, boolean publicDefaultGone) {
         String normalised = normalise(kind);
         String[] set = KINDS.get(normalised);
         if (set == null) return null;
@@ -178,7 +216,9 @@ final class AclItems {
         String ownerName = owner == null ? "memgres" : owner;
         if (!column) {
             // PUBLIC's default comes first where there is one, then the owner's own.
-            if (set[1] != null && !set[1].isEmpty()) held.put("", new StringBuilder(set[1]));
+            if (set[1] != null && !set[1].isEmpty() && !publicDefaultGone) {
+                held.put("", new StringBuilder(set[1]));
+            }
             held.put(ownerName, new StringBuilder(set[0]));
         }
         if (grants != null) {
@@ -221,6 +261,49 @@ final class AclItems {
         }
         out.append('}');
         return first ? null : out.toString();
+    }
+
+    /**
+     * The access list a default-privileges entry holds: the grantees and their letters alone.
+     *
+     * <p>What ALTER DEFAULT PRIVILEGES sets aside is a list of grants and nothing else -- no
+     * entry for the owner, and none for PUBLIC -- so this is not the list an object carries.
+     * Written out as the privilege names instead, the column held text no reader could read as
+     * an access list.
+     */
+    static String defaultPrivilegesText(String kind, String grantor, List<Grant> grants) {
+        String[] set = KINDS.get(normalise(kind));
+        if (set == null || grants == null || grants.isEmpty()) return null;
+        Map<String, StringBuilder> held = new LinkedHashMap<>();
+        Map<String, StringBuilder> onward = new LinkedHashMap<>();
+        for (Grant grant : grants) {
+            String letters = lettersFor(grant.privilege, set[0]);
+            if (letters.isEmpty()) continue;
+            String grantee = grant.grantee == null
+                    || grant.grantee.equalsIgnoreCase("public") ? "" : grant.grantee;
+            held.computeIfAbsent(grantee, k -> new StringBuilder()).append(letters);
+            if (grant.grantable) {
+                onward.computeIfAbsent(grantee, k -> new StringBuilder()).append(letters);
+            }
+        }
+        String owner = grantor == null ? "memgres" : grantor;
+        StringBuilder out = new StringBuilder("{");
+        boolean first = true;
+        for (Map.Entry<String, StringBuilder> entry : held.entrySet()) {
+            String letters = ordered(entry.getValue().toString(), set[0]);
+            if (letters.isEmpty()) continue;
+            if (!first) out.append(',');
+            first = false;
+            out.append(entry.getKey()).append('=');
+            String grantable = onward.containsKey(entry.getKey())
+                    ? onward.get(entry.getKey()).toString() : "";
+            for (int i = 0; i < letters.length(); i++) {
+                out.append(letters.charAt(i));
+                if (grantable.indexOf(letters.charAt(i)) >= 0) out.append('*');
+            }
+            out.append('/').append(owner);
+        }
+        return first ? null : out.append('}').toString();
     }
 
     private static int placeOf(List<String> order, String grantee) {

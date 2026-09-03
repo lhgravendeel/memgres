@@ -118,8 +118,11 @@ public class RangeOperations {
         @Override
         public String toString() {
             if (isEmpty()) return "empty";
-            String lo = lowerStr != null ? lowerStr : (lower != null ? lower.toString() : "");
-            String hi = upperStr != null ? upperStr : (upper != null ? upper.toString() : "");
+            // A bound is written by its own type's output function, the same one the value would
+            // print through on its own: read as a Java object, a date before the common era came
+            // out as a negative year rather than as the year BC PostgreSQL prints.
+            String lo = lowerStr != null ? lowerStr : (lower != null ? TypeCoercion.toString(lower) : "");
+            String hi = upperStr != null ? upperStr : (upper != null ? TypeCoercion.toString(upper) : "");
             return (lowerInclusive ? "[" : "(") + quoteBound(lo) + ","
                     + quoteBound(hi) + (upperInclusive ? "]" : ")");
         }
@@ -485,7 +488,10 @@ public class RangeOperations {
     }
 
     static String formatDate(LocalDate d) {
-        return d.toString();
+        // A date is written the way a date is written anywhere else, era and all: read as a Java
+        // object, a day before the common era came out as a negative year -- and a range printed
+        // a bound no date input function would read back.
+        return TypeCoercion.toString(d);
     }
 
     /** PG's timestamp output: seconds always, fractional seconds only when there are any. */
@@ -728,6 +734,37 @@ public class RangeOperations {
     }
 
     /** Parse a range from string format: [1,10), (5,15], empty, etc. */
+    /**
+     * A key two ranges share exactly when they are the same range.
+     *
+     * <p>A range is its two bounds and which of them it includes, and each bound is a value of the
+     * subtype — so two bounds the subtype calls equal make one range, however either was written.
+     * Grouping by the written text made {@code [1,2)} and {@code [1.0,2.0)} two groups where
+     * PostgreSQL has one.
+     */
+    public static String groupingKey(String written) {
+        PgRange r;
+        try {
+            r = parse(written);
+        } catch (RuntimeException notARange) {
+            return written;
+        }
+        if (r == null) return written;
+        if (r.empty) return "empty";
+        return (r.lowerInclusive ? "[" : "(") + boundKey(r.lowerStr)
+                + "," + boundKey(r.upperStr) + (r.upperInclusive ? "]" : ")");
+    }
+
+    /** A bound written the way its own type compares it: a number without its trailing zeros. */
+    private static String boundKey(String bound) {
+        if (bound == null || bound.isEmpty()) return "";
+        try {
+            return new java.math.BigDecimal(bound).stripTrailingZeros().toPlainString();
+        } catch (NumberFormatException notANumber) {
+            return bound;
+        }
+    }
+
     public static PgRange parse(String s) {
         return parse(s, null);
     }

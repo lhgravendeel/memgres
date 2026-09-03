@@ -269,8 +269,14 @@ class CatalogConstraintBuilder {
                             confmatchtype, conpfeqop, conppeqop, conffeqop, null /*confdelsetcols*/, coninhcount,
                             connoinherit,
                             !sc.isNotEnforced(), // conenforced: true = enforced (default), false = not enforced
+                            // PostgreSQL stores the parsed tree here and only pg_get_expr reads it
+                            // back; what is kept is the text that reader answers with, wrapped so
+                            // that nothing else mistakes it for an expression of its own. Keeping
+                            // the tree's own printout instead left pg_get_expr with nothing to
+                            // deparse, and it answered with the printout.
                             sc.getType() == StoredConstraint.Type.CHECK && sc.getCheckExpr() != null
-                                    ? "{OPEXPR " + sc.getCheckExpr().toString() + "}" : null, // conbin
+                                    ? "{OPEXPR " + RuleDeparser.deparse(sc.getCheckExpr(),
+                                            RuleDeparser.forTable(t)) + "}" : null, // conbin
                             excludeOperators(t, sc), sc.isPeriod(), 0, 0, 1 // conexclop, conperiod, conparentid, contypid, xmin
                     });
                 }
@@ -629,7 +635,11 @@ class CatalogConstraintBuilder {
                             if (indkey.length() > 0) indkey.append(" ");
                             indkey.append(0);
                             if (exprParts.length() > 0) exprParts.append(", ");
-                            exprParts.append(colName);
+                            // pg_get_expr prints the stored tree, so this is the deparsed
+                            // expression -- with the parentheses the unpretty form puts round an
+                            // operator expression -- rather than the text CREATE INDEX wrote.
+                            exprParts.append(CatalogHelper.deparseIndexPredicate(database,
+                                    schemaEntry.getKey() + "." + t.getName(), colName));
                         } else {
                             if (indkey.length() > 0) indkey.append(" ");
                             indkey.append(t.attnumAt(colIdx)); // the relation's attribute number
@@ -813,7 +823,7 @@ class CatalogConstraintBuilder {
                         });
                     } else if (c.getDefaultValue() != null || c.getType() == DataType.SERIAL
                             || c.getType() == DataType.BIGSERIAL || c.getType() == DataType.SMALLSERIAL) {
-                        String formatted = formatColumnDefault(c);
+                        String formatted = formatColumnDefault(c, database, null);
                         String defaultExpr = formatted != null ? formatted
                                 : "nextval('" + t.getName() + "_" + c.getName() + "_seq'::regclass)";
                         table.insertRow(new Object[]{
@@ -837,7 +847,7 @@ class CatalogConstraintBuilder {
             for (int i = 0; i < viewColumns.size(); i++) {
                 Column c = viewColumns.get(i);
                 if (c.getDefaultValue() == null) continue;
-                String rendered = formatColumnDefault(c);
+                String rendered = formatColumnDefault(c, database, null);
                 if (rendered == null) continue;
                 table.insertRow(new Object[]{
                         oids.oid("attrdef:view:" + viewSchema + "." + vd.name() + "." + c.getName()),

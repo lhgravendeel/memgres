@@ -404,6 +404,70 @@ class SelectAggregateEvaluator {
         }
     }
 
+    /**
+     * One row per element of a set a select item produced.
+     *
+     * <p>A set-returning function is a set wherever it stands, and a grouped query is no
+     * exception: {@code unnest(array_agg(v))} answers with the values one after another rather
+     * than with the array they were gathered into, and an item written around one --
+     * {@code unnest(array_agg(v)) + 1} -- is worked out for each of them.
+     *
+     * <p>Sets of different lengths run to the longest, the shorter ones reading NULL past their
+     * end, which is what PostgreSQL has done since 10.
+     */
+    private List<Object[]> expandSetReturningTargets(SelectStmt stmt, List<Object[]> rows,
+                                                     Map<Object[], List<RowContext>> rowGroups) {
+        List<FunctionCallExpr> setCalls = new ArrayList<>();
+        for (SelectStmt.SelectTarget target : stmt.targets()) {
+            setCalls.addAll(select.collectSrfCalls(target.expr()));
+        }
+        if (setCalls.isEmpty()) return rows;
+        List<Object[]> expanded = new ArrayList<>();
+        for (Object[] row : rows) {
+            List<RowContext> group = rowGroups.get(row);
+            RowContext representative = group == null || group.isEmpty() ? null : group.get(0);
+            List<List<Object>> sets = new ArrayList<>(setCalls.size());
+            int longest = 0;
+            boolean everyOneASet = true;
+            for (FunctionCallExpr call : setCalls) {
+                Object produced = evalAggregateExpr(call, group, representative);
+                if (!(produced instanceof List<?>)) { everyOneASet = false; break; }
+                List<Object> values = new ArrayList<Object>((List<?>) produced);
+                sets.add(values);
+                if (values.size() > longest) longest = values.size();
+            }
+            if (!everyOneASet || representative == null) {
+                // Nothing to expand: the items are worked out as they stand.
+                for (int i = 0; i < stmt.targets().size(); i++) {
+                    Expression expr = stmt.targets().get(i).expr();
+                    if (select.collectSrfCalls(expr).isEmpty()) continue;
+                    row[i] = evalAggregateExpr(expr, group, representative);
+                }
+                expanded.add(row);
+                continue;
+            }
+            for (int at = 0; at < longest; at++) {
+                RowContext bound = representative.copy();
+                for (int k = 0; k < setCalls.size(); k++) {
+                    List<Object> values = sets.get(k);
+                    bound.setBoundValue(setCalls.get(k),
+                            at < values.size() ? values.get(at) : null);
+                }
+                Object[] one = java.util.Arrays.copyOf(row, row.length);
+                for (int i = 0; i < stmt.targets().size(); i++) {
+                    Expression expr = stmt.targets().get(i).expr();
+                    // An item with no set in it keeps what the group already worked out, window
+                    // functions included: those were settled over the groups as they stood.
+                    if (select.collectSrfCalls(expr).isEmpty()) continue;
+                    one[i] = evalAggregateExpr(expr, group, bound);
+                }
+                expanded.add(one);
+                rowGroups.put(one, group);
+            }
+        }
+        return expanded;
+    }
+
     private QueryResult executePlainAggregateSelect(SelectStmt stmt, List<RowContext> contexts,
                                                     List<RowContext.TableBinding> baseBindings,
                                                     List<Expression> resolvedGroupBy) {
@@ -449,6 +513,10 @@ class SelectAggregateEvaluator {
             for (int i = 0; i < stmt.targets().size(); i++) {
                 SelectStmt.SelectTarget target = stmt.targets().get(i);
                 Expression expr = target.expr();
+                // An item holding a set is worked out once the group's set has been expanded,
+                // element by element: worked out here it would be the whole set, and an item
+                // written around one -- a set plus a number -- has no value at all.
+                if (!select.collectSrfCalls(expr).isEmpty()) continue;
                 row[i] = evalAggregateExpr(expr, group, representative);
             }
 
@@ -475,6 +543,7 @@ class SelectAggregateEvaluator {
         }
 
         windows.apply(resultColumns, resultRows);
+        resultRows = expandSetReturningTargets(stmt, resultRows, rowGroups);
 
         // ORDER BY on aggregate results
         // Pre-compute ORDER BY values for aggregate expressions not in target columns
@@ -639,6 +708,12 @@ class SelectAggregateEvaluator {
         ExprEvaluator.PrecomputedValueExpr answered =
                 executor.exprEvaluator.levelFoldedFor(expr);
         if (answered != null) return answered.value();
+        // A node whose value the caller has already settled reads that value rather than being
+        // worked out again: a set-returning call standing for one of its elements is the whole
+        // set if it is asked a second time, whatever its arguments were.
+        if (representative != null && representative.hasBoundValue(expr)) {
+            return representative.getBoundValue(expr);
+        }
         if (expr instanceof FunctionCallExpr) {
             FunctionCallExpr fn = (FunctionCallExpr) expr;
             String name = FunctionEvaluator.stripSchemaPrefix(fn.name().toLowerCase(java.util.Locale.ROOT));
@@ -675,11 +750,6 @@ class SelectAggregateEvaluator {
                     }
                 }
                 return executor.functionEvaluator.evalFunction(new FunctionCallExpr(fn.name(), resolvedArgs, fn.distinct(), fn.star()), representative);
-            }
-            // A set-returning key was expanded into one row per element before the grouping ran,
-            // so this call already has its element; computing it again would answer the whole set.
-            if (representative != null && representative.hasBoundValue(fn)) {
-                return representative.getBoundValue(fn);
             }
             return executor.functionEvaluator.evalFunction(fn, representative);
         } else if (expr instanceof BinaryExpr) {
@@ -1555,11 +1625,15 @@ class SelectAggregateEvaluator {
                 if (group.isEmpty()) return null;
                 Expression arg = fn.args().get(0);
                 Expression delimExpr = fn.args().get(1);
-                Object delimVal = delimExpr != null ? executor.evalExpr(delimExpr, group.get(0)) : ",";
                 List<RowContext> orderedGroup = sortGroupForAggregate(group, fn);
                 Set<String> seen = fn.distinct() ? new LinkedHashSet<>() : null;
                 DataType keyType = seen == null ? null : distinctType(arg, group);
                 List<Object> parts = new ArrayList<>();
+                // The separator is an argument like the value is, read again for every row: what
+                // goes between two values is the separator the second of them was read with, and
+                // the first row's is never used at all. Reading it once from the first row put
+                // that row's separator between every pair.
+                List<Object> separators = new ArrayList<>();
                 boolean allBytea = true;
                 for (RowContext ctx : orderedGroup) {
                     Object val = executor.evalExpr(arg, ctx);
@@ -1567,24 +1641,26 @@ class SelectAggregateEvaluator {
                     if (seen != null && !seen.add(distinctKey(val, keyType))) continue;
                     if (!(val instanceof byte[])) allBytea = false;
                     parts.add(val);
+                    separators.add(delimExpr == null ? "," : executor.evalExpr(delimExpr, ctx));
                 }
                 if (parts.isEmpty()) return null;
                 if (allBytea) {
                     // string_agg(bytea, bytea) is a distinct aggregate returning bytea
-                    byte[] sep = delimVal instanceof byte[] ? (byte[]) delimVal : new byte[0];
                     java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
                     for (int pi = 0; pi < parts.size(); pi++) {
+                        Object at = separators.get(pi);
+                        byte[] sep = at instanceof byte[] ? (byte[]) at : new byte[0];
                         if (pi > 0) bos.write(sep, 0, sep.length);
                         byte[] pb = (byte[]) parts.get(pi);
                         bos.write(pb, 0, pb.length);
                     }
                     return bos.toByteArray();
                 }
-                // PG's aggregate treats a NULL separator as nothing at all, not as a default
-                String delim = delimVal != null ? String.valueOf(delimVal) : "";
                 StringBuilder sb = new StringBuilder();
                 for (int pi = 0; pi < parts.size(); pi++) {
-                    if (pi > 0) sb.append(delim);
+                    // PG's aggregate treats a NULL separator as nothing at all, not as a default
+                    Object at = separators.get(pi);
+                    if (pi > 0) sb.append(at != null ? String.valueOf(at) : "");
                     sb.append(parts.get(pi));
                 }
                 return sb.toString();
@@ -2004,51 +2080,19 @@ class SelectAggregateEvaluator {
                 }
                 return Integer.valueOf(mask);
             }
-            case "corr": {
-                RegressionData rd = RegressionData.compute(group, fn.args(), executor);
-                if (rd == null) return null;
-                if (rd.sumXDiffSq.compareTo(BigDecimal.ZERO) == 0 || rd.sumYDiffSq.compareTo(BigDecimal.ZERO) == 0) return null;
-                BigDecimal denom = new BigDecimal(Math.sqrt(rd.sumXDiffSq.doubleValue()) * Math.sqrt(rd.sumYDiffSq.doubleValue()));
-                // corr() is float8 whatever the inputs were
-                return rd.sumXYDiff.divide(denom, 16, RoundingMode.HALF_UP).doubleValue();
-            }
-            case "regr_slope": {
-                RegressionData rd = RegressionData.compute(group, fn.args(), executor);
-                if (rd == null) return null;
-                if (rd.sumXDiffSq.compareTo(BigDecimal.ZERO) == 0) return null;
-                BigDecimal slopeVal = rd.sumXYDiff.divide(rd.sumXDiffSq, 16, RoundingMode.HALF_UP);
-                return slopeVal.stripTrailingZeros().toPlainString();
-            }
-            case "regr_intercept": {
-                RegressionData rd = RegressionData.compute(group, fn.args(), executor);
-                if (rd == null) return null;
-                if (rd.sumXDiffSq.compareTo(BigDecimal.ZERO) == 0) return null;
-                BigDecimal slopeVal = rd.sumXYDiff.divide(rd.sumXDiffSq, 16, RoundingMode.HALF_UP);
-                BigDecimal interceptVal = rd.yMean.subtract(slopeVal.multiply(rd.xMean)).setScale(16, RoundingMode.HALF_UP);
-                return interceptVal.stripTrailingZeros().toPlainString();
-            }
-            case "regr_r2": {
-                RegressionData rd = RegressionData.compute(group, fn.args(), executor);
-                if (rd == null) return null;
-                if (rd.sumXDiffSq.compareTo(BigDecimal.ZERO) == 0 || rd.sumYDiffSq.compareTo(BigDecimal.ZERO) == 0) return null;
-                BigDecimal denom = new BigDecimal(Math.sqrt(rd.sumXDiffSq.doubleValue()) * Math.sqrt(rd.sumYDiffSq.doubleValue()));
-                BigDecimal corrVal = rd.sumXYDiff.divide(denom, 16, RoundingMode.HALF_UP);
-                BigDecimal r2Val = corrVal.pow(2).setScale(16, RoundingMode.HALF_UP);
-                return r2Val.stripTrailingZeros().toPlainString();
-            }
-            case "covar_pop": {
-                RegressionData rd = RegressionData.compute(group, fn.args(), executor);
-                if (rd == null) return null;
-                // covar_pop = sum((xi-xmean)*(yi-ymean)) / N
-                return rd.sumXYDiff.divide(BigDecimal.valueOf(rd.n), 16, RoundingMode.HALF_UP).doubleValue();
-            }
-            case "covar_samp": {
-                RegressionData rd = RegressionData.compute(group, fn.args(), executor);
-                if (rd == null) return null;
-                if (rd.n < 2) return null;
-                // covar_samp = sum((xi-xmean)*(yi-ymean)) / (N-1)
-                BigDecimal result = rd.sumXYDiff.divide(BigDecimal.valueOf(rd.n - 1), 16, RoundingMode.HALF_UP);
-                return result.stripTrailingZeros().toPlainString();
+            case "corr":
+            case "covar_pop":
+            case "covar_samp":
+            case "regr_slope":
+            case "regr_intercept":
+            case "regr_r2":
+            case "regr_avgx":
+            case "regr_avgy":
+            case "regr_sxx":
+            case "regr_syy":
+            case "regr_sxy": {
+                RegressionSums sums = RegressionSums.over(group, fn.args(), executor);
+                return sums == null ? null : sums.answer(name);
             }
             case "regr_count": {
                 if (group.isEmpty() || fn.args().size() < 2) return 0L;
@@ -2061,31 +2105,6 @@ class SelectAggregateEvaluator {
                     if (vx != null && vy != null) count++;
                 }
                 return count;
-            }
-            case "regr_avgx": {
-                RegressionData rd = RegressionData.compute(group, fn.args(), executor);
-                if (rd == null) return null;
-                return rd.xMean.stripTrailingZeros().toPlainString();
-            }
-            case "regr_avgy": {
-                RegressionData rd = RegressionData.compute(group, fn.args(), executor);
-                if (rd == null) return null;
-                return rd.yMean.stripTrailingZeros().toPlainString();
-            }
-            case "regr_sxx": {
-                RegressionData rd = RegressionData.compute(group, fn.args(), executor);
-                if (rd == null) return null;
-                return rd.sumXDiffSq.stripTrailingZeros().toPlainString();
-            }
-            case "regr_syy": {
-                RegressionData rd = RegressionData.compute(group, fn.args(), executor);
-                if (rd == null) return null;
-                return rd.sumYDiffSq.stripTrailingZeros().toPlainString();
-            }
-            case "regr_sxy": {
-                RegressionData rd = RegressionData.compute(group, fn.args(), executor);
-                if (rd == null) return null;
-                return rd.sumXYDiff.stripTrailingZeros().toPlainString();
             }
             default: {
                 // Check for user-defined aggregate
@@ -2317,6 +2336,8 @@ class SelectAggregateEvaluator {
         // jsonb is held as the text it prints as, which is not the document that text spells:
         // 1 and 1.0 are one value, and counting them by their texts counted two
         if (type == DataType.JSONB && val instanceof String) return RowKey.valueKey(val, type);
+        // A range is held as text too, and two spellings of one range are one value.
+        if (val instanceof String && RowKey.isRangeType(type)) return RowKey.valueKey(val, type);
         return distinctKey(val);
     }
 
@@ -2696,92 +2717,115 @@ class SelectAggregateEvaluator {
                 .setScale(0, RoundingMode.FLOOR);
     }
 
-    /** Pre-computed regression statistics shared by corr, regr_slope, regr_intercept, regr_r2. */
-        private static final class RegressionData {
-        public final BigDecimal xMean;
-        public final BigDecimal yMean;
-        public final BigDecimal sumXYDiff;
-        public final BigDecimal sumXDiffSq;
-        public final BigDecimal sumYDiffSq;
-        public final int n;
+    /**
+     * The six running sums the two-argument statistical aggregates are computed from.
+     *
+     * <p>PostgreSQL keeps the count and the plain sums of x, x², y, y² and xy, and every one of
+     * these aggregates is a short expression over those six numbers, worked out in double
+     * precision. The order of those operations is part of the answer: {@code (N*Syy - Sy*Sy) / N}
+     * and {@code Syy - Sy*Sy/N} are the same sum on paper and differ in the last digit in
+     * floating point, and computing them in numeric instead — as this did — gave both a different
+     * value and a different type, so every one of them came back as text.
+     */
+    private static final class RegressionSums {
+        private final double n;
+        private final double sx;
+        private final double sxx;
+        private final double sy;
+        private final double syy;
+        private final double sxy;
 
-        public RegressionData(
-                BigDecimal xMean,
-                BigDecimal yMean,
-                BigDecimal sumXYDiff,
-                BigDecimal sumXDiffSq,
-                BigDecimal sumYDiffSq,
-                int n
-        ) {
-            this.xMean = xMean;
-            this.yMean = yMean;
-            this.sumXYDiff = sumXYDiff;
-            this.sumXDiffSq = sumXDiffSq;
-            this.sumYDiffSq = sumYDiffSq;
+        private RegressionSums(double n, double sx, double sxx, double sy, double syy, double sxy) {
             this.n = n;
+            this.sx = sx;
+            this.sxx = sxx;
+            this.sy = sy;
+            this.syy = syy;
+            this.sxy = sxy;
         }
 
-        static RegressionData compute(List<RowContext> group, List<Expression> args, AstExecutor executor) {
-            if (group.isEmpty() || args.size() < 2) return null;
+        /** The sums over the rows where both arguments are there, or null when there are none. */
+        static RegressionSums over(List<RowContext> group, List<Expression> args,
+                                   AstExecutor executor) {
+            if (args.size() < 2) return null;
             Expression argY = args.get(0);
             Expression argX = args.get(1);
-            List<BigDecimal> xVals = new ArrayList<>();
-            List<BigDecimal> yVals = new ArrayList<>();
+            double n = 0, sx = 0, sxx = 0, sy = 0, syy = 0, sxy = 0;
             for (RowContext ctx : group) {
-                Object vx = executor.evalExpr(argX, ctx);
                 Object vy = executor.evalExpr(argY, ctx);
-                if (vx != null && vy != null) {
-                    xVals.add(vx instanceof BigDecimal ? ((BigDecimal) vx) : BigDecimal.valueOf(((Number) vx).doubleValue()));
-                    yVals.add(vy instanceof BigDecimal ? ((BigDecimal) vy) : BigDecimal.valueOf(((Number) vy).doubleValue()));
+                Object vx = executor.evalExpr(argX, ctx);
+                // A pair is only a pair when both halves are there; a row missing either is not
+                // an observation at all.
+                if (vx == null || vy == null) continue;
+                double x = executor.toDouble(vx);
+                double y = executor.toDouble(vy);
+                n += 1;
+                sx += x;
+                sxx += x * x;
+                sy += y;
+                syy += y * y;
+                sxy += x * y;
+            }
+            return n < 1 ? null : new RegressionSums(n, sx, sxx, sy, syy, sxy);
+        }
+
+        /** How far x spreads, times the count; the shape every one of these formulas is built on. */
+        private double spreadX() { return n * sxx - sx * sx; }
+
+        private double spreadY() { return n * syy - sy * sy; }
+
+        private double spreadXY() { return n * sxy - sx * sy; }
+
+        /**
+         * The same three spreads brought back to their own scale — the sums of squares about the
+         * mean that regr_sxx, regr_syy and regr_sxy report. The two ratios below are built from
+         * these rather than from the unscaled spreads: the quotient is the same either way on
+         * paper, but dividing first is what PostgreSQL's answer rounds to.
+         */
+        private double centredX() { return spreadX() / n; }
+
+        private double centredY() { return spreadY() / n; }
+
+        private double centredXY() { return spreadXY() / n; }
+
+        Double answer(String aggregate) {
+            switch (aggregate) {
+                case "regr_avgx":
+                    return sx / n;
+                case "regr_avgy":
+                    return sy / n;
+                case "regr_sxx":
+                    return spreadX() <= 0 ? Double.valueOf(0) : spreadX() / n;
+                case "regr_syy":
+                    return spreadY() <= 0 ? Double.valueOf(0) : spreadY() / n;
+                case "regr_sxy":
+                    return spreadXY() / n;
+                case "covar_pop":
+                    return spreadXY() / (n * n);
+                case "covar_samp":
+                    return n < 2 ? null : spreadXY() / (n * (n - 1));
+                case "regr_slope":
+                    return spreadX() <= 0 ? null : spreadXY() / spreadX();
+                case "regr_intercept":
+                    return spreadX() <= 0 ? null
+                            : (sy * sxx - sx * sxy) / spreadX();
+                case "corr": {
+                    double denominator = Math.sqrt(centredX() * centredY());
+                    return denominator == 0 ? null : centredXY() / denominator;
                 }
+                case "regr_r2": {
+                    double denominator = centredX() * centredY();
+                    // A y that never moves is perfectly explained by any x that does; an x that
+                    // never moves explains nothing, and there is no answer to give.
+                    if (denominator <= 0) return spreadX() <= 0 ? null : Double.valueOf(1);
+                    return centredXY() * centredXY() / denominator;
+                }
+                default:
+                    return null;
             }
-            if (xVals.isEmpty()) return null;
-            BigDecimal n = BigDecimal.valueOf(xVals.size());
-            BigDecimal xSum = xVals.stream().reduce(BigDecimal.ZERO, BigDecimal::add);
-            BigDecimal ySum = yVals.stream().reduce(BigDecimal.ZERO, BigDecimal::add);
-            BigDecimal xMean = xSum.divide(n, 20, RoundingMode.HALF_UP);
-            BigDecimal yMean = ySum.divide(n, 20, RoundingMode.HALF_UP);
-            BigDecimal sumXYDiff = BigDecimal.ZERO;
-            BigDecimal sumXDiffSq = BigDecimal.ZERO;
-            BigDecimal sumYDiffSq = BigDecimal.ZERO;
-            for (int i = 0; i < xVals.size(); i++) {
-                BigDecimal xd = xVals.get(i).subtract(xMean);
-                BigDecimal yd = yVals.get(i).subtract(yMean);
-                sumXYDiff = sumXYDiff.add(xd.multiply(yd));
-                sumXDiffSq = sumXDiffSq.add(xd.pow(2));
-                sumYDiffSq = sumYDiffSq.add(yd.pow(2));
-            }
-            return new RegressionData(xMean, yMean, sumXYDiff, sumXDiffSq, sumYDiffSq, xVals.size());
-        }
-
-        public BigDecimal xMean() { return xMean; }
-        public BigDecimal yMean() { return yMean; }
-        public BigDecimal sumXYDiff() { return sumXYDiff; }
-        public BigDecimal sumXDiffSq() { return sumXDiffSq; }
-        public BigDecimal sumYDiffSq() { return sumYDiffSq; }
-
-        @Override
-        public boolean equals(Object o) {
-            if (this == o) return true;
-            if (o == null || getClass() != o.getClass()) return false;
-            RegressionData that = (RegressionData) o;
-            return java.util.Objects.equals(xMean, that.xMean)
-                && java.util.Objects.equals(yMean, that.yMean)
-                && java.util.Objects.equals(sumXYDiff, that.sumXYDiff)
-                && java.util.Objects.equals(sumXDiffSq, that.sumXDiffSq)
-                && java.util.Objects.equals(sumYDiffSq, that.sumYDiffSq);
-        }
-
-        @Override
-        public int hashCode() {
-            return java.util.Objects.hash(xMean, yMean, sumXYDiff, sumXDiffSq, sumYDiffSq);
-        }
-
-        @Override
-        public String toString() {
-            return "RegressionData[xMean=" + xMean + ", " + "yMean=" + yMean + ", " + "sumXYDiff=" + sumXYDiff + ", " + "sumXDiffSq=" + sumXDiffSq + ", " + "sumYDiffSq=" + sumYDiffSq + "]";
         }
     }
+
 
     private void appendJsonVal(StringBuilder sb, Object val) {
         if (val == null) { sb.append("null"); return; }

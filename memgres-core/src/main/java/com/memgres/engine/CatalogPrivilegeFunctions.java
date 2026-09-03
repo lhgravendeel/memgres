@@ -97,6 +97,7 @@ class CatalogPrivilegeFunctions {
         boolean withRole = a.size() >= 3;
         String role = withRole ? role(a.get(0), true) : currentUserName();
         Rel rel = relation(a.get(withRole ? 1 : 0));
+        if (rel == null) return null;
         List<Priv> privs = parsePrivileges(str(a.get(withRole ? 2 : 1)), RELATION_PRIVS, false);
         String key = AstExecutor.privilegeKey(rel.schema, rel.name);
         for (Priv p : privs) {
@@ -129,6 +130,7 @@ class CatalogPrivilegeFunctions {
         boolean withRole = a.size() >= 4;
         String role = withRole ? role(a.get(0), true) : currentUserName();
         Rel rel = relation(a.get(withRole ? 1 : 0));
+        if (rel == null) return null;
         Object colArg = a.get(withRole ? 2 : 1);
         String column;
         if (colArg instanceof Number) {
@@ -157,6 +159,7 @@ class CatalogPrivilegeFunctions {
         boolean withRole = a.size() >= 3;
         String role = withRole ? role(a.get(0), true) : currentUserName();
         Rel rel = relation(a.get(withRole ? 1 : 0));
+        if (rel == null) return null;
         List<Priv> privs = parsePrivileges(str(a.get(withRole ? 2 : 1)), COLUMN_PRIVS, false);
         String key = AstExecutor.privilegeKey(rel.schema, rel.name);
         for (Priv p : privs) {
@@ -198,10 +201,17 @@ class CatalogPrivilegeFunctions {
             throw new MemgresException("database \"" + db + "\" does not exist", "3D000");
         }
         List<Priv> privs = parsePrivileges(str(a.get(withRole ? 2 : 1)), DATABASE_PRIVS, false);
+        // A template database carries the list initdb writes for it, which gives everyone the
+        // right to connect and nothing else: answered like an ordinary database, template1 said
+        // every role could create temporary tables in it.
+        boolean template = "template0".equalsIgnoreCase(db) || "template1".equalsIgnoreCase(db);
         for (Priv p : privs) {
-            // PUBLIC holds CONNECT and TEMPORARY on every database unless they are revoked;
-            // CREATE is the owner's alone.
-            if (!p.grantOption && !"CREATE".equals(p.name)) return true;
+            // PUBLIC holds CONNECT and TEMPORARY on every other database unless they are
+            // revoked; CREATE is the owner's alone.
+            if (!p.grantOption && !"CREATE".equals(p.name)
+                    && (!template || "CONNECT".equals(p.name))) {
+                return true;
+            }
             if (holds(role, p, "DATABASE", db.toLowerCase(java.util.Locale.ROOT))) return true;
         }
         return false;
@@ -224,6 +234,13 @@ class CatalogPrivilegeFunctions {
         }
         List<Priv> privs = parsePrivileges(str(a.get(withRole ? 2 : 1)), FUNCTION_PRIVS, false);
         for (Priv p : privs) {
+            // A routine's default ACL grants EXECUTE to PUBLIC, so every role holds it until it
+            // is revoked; only the grant option is the owner's. Read from the written grants
+            // alone, a routine nobody had granted anything on could be executed by nobody.
+            if (!p.grantOption
+                    && !executor.database.publicDefaultRevoked("FUNCTION", bare, p.name)) {
+                return true;
+            }
             if (holds(role, p, "FUNCTION", bare)) return true;
         }
         return false;
@@ -236,12 +253,18 @@ class CatalogPrivilegeFunctions {
         String role = withRole ? role(a.get(0), true) : currentUserName();
         Object seqArg = a.get(withRole ? 1 : 0);
         Rel rel = relation(seqArg);
+        if (rel == null) return null;
         if (!(seqArg instanceof Number) && !rel.sequence) {
             throw PgErrors.wrongObjectType("\"" + str(seqArg) + "\" is not a sequence");
         }
         List<Priv> privs = parsePrivileges(str(a.get(withRole ? 2 : 1)), SEQUENCE_PRIVS, false);
+        // A grant on a sequence may have been recorded under its bare name or under the schema
+        // and the name together -- ALTER DEFAULT PRIVILEGES names the schema it is for, so what
+        // it sets aside is filed with one. Both are the same sequence.
+        String qualified = AstExecutor.privilegeKey(rel.schema, rel.name);
         for (Priv p : privs) {
             if (holds(role, p, "SEQUENCE", rel.name)) return true;
+            if (holds(role, p, "SEQUENCE", qualified)) return true;
         }
         return false;
     }
@@ -271,10 +294,18 @@ class CatalogPrivilegeFunctions {
             throw PgErrors.undefinedObject("type", type);
         }
         List<Priv> privs = parsePrivileges(str(a.get(withRole ? 2 : 1)), USAGE_PRIVS, false);
+        String typeKey = type.toLowerCase(java.util.Locale.ROOT);
         for (Priv p : privs) {
             // A type's default ACL grants USAGE to PUBLIC; only the grant option is the owner's.
-            if (!p.grantOption) return true;
-            if (holds(role, p, "TYPE", type.toLowerCase(java.util.Locale.ROOT))) return true;
+            // A REVOKE takes the default away, and there is no grant to remove: read as an
+            // absence of grants alone, a type whose USAGE had been revoked from everyone still
+            // answered that everyone had it.
+            if (!p.grantOption
+                    && !executor.database.publicDefaultRevoked("TYPE", typeKey, p.name)
+                    && !executor.database.publicDefaultRevoked("DOMAIN", typeKey, p.name)) {
+                return true;
+            }
+            if (holds(role, p, "TYPE", typeKey)) return true;
         }
         return false;
     }
@@ -293,9 +324,15 @@ class CatalogPrivilegeFunctions {
             throw PgErrors.undefinedObject(kind, name);
         }
         List<Priv> privs = parsePrivileges(str(a.get(withRole ? 2 : 1)), allowed, false);
+        String named = name.toLowerCase(java.util.Locale.ROOT);
         for (Priv p : privs) {
-            if (publicByDefault && !p.grantOption) return true;
-            if (holds(role, p, objectType, name.toLowerCase(java.util.Locale.ROOT))) return true;
+            // A default PUBLIC holds until it is revoked, and a revocation of one is recorded
+            // rather than removing a grant that was never written.
+            if (publicByDefault && !p.grantOption
+                    && !executor.database.publicDefaultRevoked(objectType, named, p.name)) {
+                return true;
+            }
+            if (holds(role, p, objectType, named)) return true;
         }
         return false;
     }
@@ -328,6 +365,14 @@ class CatalogPrivilegeFunctions {
         return false;
     }
 
+    /**
+     * Whether {@code user} holds the membership asked about in {@code target}.
+     *
+     * <p>The three questions are different questions. MEMBER asks whether the membership is there
+     * at all; USAGE asks whether the role's privileges come with it, which they do only when
+     * every step of the chain inherits; and the WITH ADMIN OPTION form asks whether the
+     * membership may be granted on, which is recorded on the grant itself.
+     */
     private boolean isMemberOfRole(String user, String target, Priv priv) {
         if (user.equals(target)) return true;
         // A superuser is a member of every role, however the question is spelled. PostgreSQL
@@ -336,7 +381,7 @@ class CatalogPrivilegeFunctions {
         // memberships instead and answered false for a superuser who is a member of everything.
         Map<String, String> attrs = executor.database.getRoles().get(user);
         if (attrs != null && "true".equalsIgnoreCase(attrs.get("SUPERUSER"))) return true;
-        if (priv.grantOption) return false;
+        boolean needsInherit = "USAGE".equalsIgnoreCase(priv.name);
         Map<String, Set<String>> memberships = executor.database.getRoleMemberships();
         Set<String> visited = new HashSet<>();
         java.util.Queue<String> queue = new java.util.ArrayDeque<>();
@@ -346,12 +391,29 @@ class CatalogPrivilegeFunctions {
             String current = queue.poll();
             Set<String> directMembers = memberships.get(current);
             if (directMembers == null) continue;
-            if (directMembers.contains(user)) return true;
             for (String member : directMembers) {
+                boolean reaches = member.equals(user);
+                if (reaches && needsInherit && !roleInherits(member)) continue;
+                if (reaches && priv.grantOption
+                        && !executor.database.hasAdminOption(current, member)) {
+                    continue;
+                }
+                if (reaches) return true;
+                // A step of the chain that does not inherit carries no privileges past itself,
+                // so a USAGE question stops there even though the membership goes on.
+                if (needsInherit && !roleInherits(member)) continue;
                 if (visited.add(member)) queue.add(member);
             }
         }
         return false;
+    }
+
+    /** Whether a role takes on the privileges of the roles it is a member of. */
+    private boolean roleInherits(String role) {
+        Map<String, String> attrs = executor.database.getRoles().get(role);
+        if (attrs == null) return true;
+        String written = attrs.get("INHERIT");
+        return written == null || !"false".equalsIgnoreCase(written);
     }
 
     // ---- Argument resolution ----
@@ -377,7 +439,13 @@ class CatalogPrivilegeFunctions {
      * mean the current user rather than reported as missing.
      */
     private String role(Object arg, boolean allowPublic) {
-        if (arg instanceof Number) return currentUserName();
+        // A role is named by its number as well as by its name, and a number nothing answers to
+        // is a role that holds nothing rather than whoever happens to be asking.
+        if (arg instanceof Number) {
+            String key = executor.systemCatalog.keyForOid(((Number) arg).intValue());
+            return key != null && key.startsWith("role:") ? key.substring("role:".length())
+                    : "\u0000no such role";
+        }
         String name = str(arg);
         String lower = name.toLowerCase(java.util.Locale.ROOT);
         if (allowPublic && "public".equals(lower)) return lower;
@@ -402,29 +470,61 @@ class CatalogPrivilegeFunctions {
         }
     }
 
+    /**
+     * A written object name split into its schema and its own name, each read as an identifier.
+     *
+     * <p>PostgreSQL reads the text these functions are given the same way it reads a name in a
+     * statement: an unquoted part is folded to lower case, a quoted one is taken as written, and
+     * only a dot outside the quotes divides one name from another.
+     */
+    private static String[] splitIdentifierName(String written) {
+        String text = written == null ? "" : written.trim();
+        StringBuilder current = new StringBuilder();
+        String schema = null;
+        boolean quoted = false;
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (c == '"') {
+                // Two quotes inside a quoted name stand for one quote in the name itself.
+                if (quoted && i + 1 < text.length() && text.charAt(i + 1) == '"') {
+                    current.append('"');
+                    i++;
+                } else {
+                    quoted = !quoted;
+                }
+                continue;
+            }
+            if (c == '.' && !quoted) {
+                schema = current.toString();
+                current.setLength(0);
+                continue;
+            }
+            current.append(quoted ? c : Character.toLowerCase(c));
+        }
+        return new String[]{schema, current.toString()};
+    }
+
     private Rel relation(Object arg) {
         if (arg instanceof Number) {
             // An OID names a relation, and which relation it is decides what its columns are.
             // Left as the digits it was written with, the OID form could answer about the
             // relation as a whole but not about a column of it.
             String key = executor.systemCatalog.keyForOid(((Number) arg).intValue());
-            if (key == null || !key.startsWith("rel:")) {
-                return new Rel(executor.defaultSchema(), str(arg), null, false);
-            }
+            // An OID nothing answers to names no relation, and there is nothing to say about the
+            // privileges on one: PostgreSQL answers null rather than yes or no.
+            if (key == null || !key.startsWith("rel:")) return null;
             String qualified = key.substring("rel:".length());
             int split = qualified.indexOf('.');
             String namedSchema = split < 0 ? executor.defaultSchema() : qualified.substring(0, split);
             String namedRelation = split < 0 ? qualified : qualified.substring(split + 1);
             return relation(namedSchema + "." + namedRelation);
         }
-        String raw = str(arg);
-        String schema = executor.defaultSchema();
-        String bare = raw;
-        int dot = raw.indexOf('.');
-        if (dot >= 0) {
-            schema = raw.substring(0, dot);
-            bare = raw.substring(dot + 1);
-        }
+        // The name is read the way an identifier written in a statement is read: folded to lower
+        // case unless it is quoted, and split only on a dot outside the quotes. Taken as the text
+        // it was, 'ZZ_HT' named no relation and '"zz_a.dotted"' was read as a schema and a name.
+        String[] parts = splitIdentifierName(str(arg));
+        String schema = parts[0] == null ? executor.defaultSchema() : parts[0];
+        String bare = parts[1];
         boolean isSequence = executor.database.getSequence(bare) != null;
         Table table = null;
         try {
@@ -441,7 +541,10 @@ class CatalogPrivilegeFunctions {
         // A catalogue relation named without a schema was recorded as living in the search
         // path's, so nothing downstream could tell it was a catalogue at all.
         if (catalog != null) return new Rel(catalogSchemaOf(schema, bare), bare, catalog, false);
-        throw new MemgresException("relation \"" + raw + "\" does not exist", "42P01");
+        // The name is reported as it was read rather than as it was written: PostgreSQL names
+        // the relation it looked for, which is the folded, unquoted name.
+        throw new MemgresException("relation \""
+                + (parts[0] == null ? bare : parts[0] + "." + bare) + "\" does not exist", "42P01");
     }
 
     /** The schema a catalogue relation is really in, whatever schema the caller wrote. */
@@ -491,8 +594,15 @@ class CatalogPrivilegeFunctions {
     }
 
     private boolean typeExists(String name) {
-        String lower = name.trim().toLowerCase(java.util.Locale.ROOT);
+        // The name is read as an identifier, schema and all: public.t names the same type t does.
+        String[] parts = splitIdentifierName(name);
+        String lower = (parts[0] == null ? "" : parts[0] + ".") + parts[1];
         if (lower.endsWith("[]")) lower = lower.substring(0, lower.length() - 2).trim();
+        if (parts[0] != null
+                && TypeNamespace.resolve(executor.database, executor.session, lower) != null) {
+            return true;
+        }
+        if (parts[0] != null) lower = parts[1];
         if (CatalogMetadataFunctions.canonicalTypeName(executor.database, lower) != null) return true;
         return catalogHasName("pg_type", "typname", lower);
     }
@@ -612,6 +722,10 @@ class CatalogPrivilegeFunctions {
             return true;
         }
 
+        // A role holds what the roles it belongs to hold only if it inherits: one created
+        // NOINHERIT is a member of them and holds none of their privileges until it does SET
+        // ROLE, which is a different question from this one.
+        if (!roleInherits(roleName)) return false;
         Map<String, Set<String>> memberships = executor.database.getRoleMemberships();
         for (Map.Entry<String, Set<String>> entry : memberships.entrySet()) {
             String grantedRole = entry.getKey();

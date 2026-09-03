@@ -877,6 +877,25 @@ public final class SelectStmt implements Statement {
         return copy;
     }
 
+    /**
+     * The same query written to keep no row.
+     *
+     * <p>A definition is stored for the shape it answers with, not for the rows: PostgreSQL plans
+     * a view's query when the view is created and runs it when the view is read. Running it to
+     * find the columns out drew from every sequence and called every routine the select list
+     * names, so creating a view over {@code nextval} moved the sequence on.
+     */
+    public SelectStmt keepingNoRow() {
+        SelectStmt copy = new SelectStmt(distinct, distinctOn, targets, from, where, groupBy,
+                having, windowDefs, orderBy, Literal.ofInt("0"), offset, withClauses,
+                groupingSets, lockClause, false);
+        copy.fromValues = fromValues;
+        copy.joinExpression = joinExpression;
+        copy.groupingElements = groupingElements;
+        copy.groupByDistinct = groupByDistinct;
+        return copy;
+    }
+
     public boolean distinct() { return distinct; }
     public List<Expression> distinctOn() { return distinctOn; }
     public List<SelectTarget> targets() { return targets; }

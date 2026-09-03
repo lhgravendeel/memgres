@@ -279,7 +279,8 @@ class RlsEnforcementTest {
                     st.execute("SET row_security = off");
                     SQLException ex = assertThrows(SQLException.class,
                         () -> st.executeQuery("SELECT * FROM rsoe_t"));
-                    assertEquals("55P04", ex.getSQLState());
+                    // PostgreSQL reports this as a refusal to read the relation.
+                    assertEquals("42501", ex.getSQLState());
                 }
             }
         } finally {

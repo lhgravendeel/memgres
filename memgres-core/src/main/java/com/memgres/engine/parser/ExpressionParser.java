@@ -119,6 +119,15 @@ public class ExpressionParser {
         return false;
     }
 
+    /** The same question asked of the token {@code offset} places ahead. */
+    protected boolean checkWordAt(int offset, String word) {
+        int idx = pos + offset;
+        if (idx >= tokens.size()) return false;
+        Token t = tokens.get(idx);
+        return (t.type() == TokenType.KEYWORD || t.type() == TokenType.IDENTIFIER)
+                && t.value().equalsIgnoreCase(word);
+    }
+
     protected boolean checkWord(String word) {
         Token t = peek();
         return (t.type() == TokenType.KEYWORD || t.type() == TokenType.IDENTIFIER)
@@ -448,7 +457,8 @@ public class ExpressionParser {
                 advance();
                 sb.append("(");
                 // A fractional-seconds precision is a number in the grammar, so one too large
-                // for an integer is not a number the grammar has.
+                // for an integer is not a number the grammar has -- and neither is a signed one.
+                if (check(TokenType.MINUS)) throw ParseException.at(peek());
                 sb.append(requireTypeModifierNumber(sb.toString()));
                 expect(TokenType.RIGHT_PAREN);
                 sb.append(")");
@@ -510,6 +520,14 @@ public class ExpressionParser {
      * than as a syntax error. Names this engine does not know are left alone: a domain or an enum
      * is the executor's to resolve, and only it can say whether the name means anything at all.
      */
+    /**
+     * The types whose modifier PostgreSQL's grammar reads as an expression rather than as a plain
+     * number, so a sign may stand in it and the type's own bounds are what refuse it.
+     */
+    private static final java.util.Set<String> SIGNED_MODIFIER_TYPES =
+            new java.util.HashSet<>(java.util.Arrays.asList(
+                    "numeric", "decimal", "dec", "bit", "bit varying", "varbit"));
+
     private void rejectTypeModifier(String written) {
         // The one type whose name is written with its quotes is "char", and the quotes are how it
         // is told apart from char, so a name spelled that way is left to the executor.
@@ -576,9 +594,15 @@ public class ExpressionParser {
             rejectTypeModifier(sb.toString());
             advance();
             sb.append("(");
-            // A negative precision is out of range rather than unparseable, so it is read here
-            // and reported by the type's own bounds check
+            // Some types read their modifier as a value and some as a number in the grammar, and
+            // only the first kind has anywhere to put a sign: numeric(-1) is a precision out of
+            // range, where varchar(-1) and interval(-1) are statements that will not parse.
             if (check(TokenType.MINUS)) {
+                if (!SIGNED_MODIFIER_TYPES.contains(
+                        sb.substring(0, sb.length() - 1).trim()
+                                .toLowerCase(java.util.Locale.ROOT))) {
+                    throw ParseException.at(peek());
+                }
                 advance();
                 sb.append("-");
             }
@@ -714,6 +738,17 @@ public class ExpressionParser {
      */
     private static BinaryExpr.BinOp writtenOperator(Token opTok) {
         switch (opTok.type()) {
+            case PLUS: return BinaryExpr.BinOp.ADD;
+            case MINUS: return BinaryExpr.BinOp.SUBTRACT;
+            case STAR: return BinaryExpr.BinOp.MULTIPLY;
+            case SLASH: return BinaryExpr.BinOp.DIVIDE;
+            case PERCENT: return BinaryExpr.BinOp.MODULO;
+            case CARET: return BinaryExpr.BinOp.POWER;
+            case AMPERSAND: return BinaryExpr.BinOp.BIT_AND;
+            case PIPE: return BinaryExpr.BinOp.BIT_OR;
+            case HASH: return BinaryExpr.BinOp.BIT_XOR;
+            case SHIFT_LEFT: return BinaryExpr.BinOp.SHIFT_LEFT;
+            case SHIFT_RIGHT: return BinaryExpr.BinOp.SHIFT_RIGHT;
             case TS_MATCH: return BinaryExpr.BinOp.TS_MATCH;
             case CONTAINS: return BinaryExpr.BinOp.CONTAINS;
             case CONTAINED_BY: return BinaryExpr.BinOp.CONTAINED_BY;
@@ -833,9 +868,59 @@ public class ExpressionParser {
      */
     protected List<Expression> lastColumnListExpressions;
 
+    /** Whether the entry at this point is a bare column name and nothing more. */
+    private boolean namesAColumnOnItsOwn() {
+        int after = pos + 1;
+        if (after >= tokens.size()) return true;
+        TokenType next = tokens.get(after).type();
+        if (next == TokenType.COMMA || next == TokenType.RIGHT_PAREN) return true;
+        // Where the list is a list of index keys, what follows a key may be the options that key
+        // was indexed under rather than more of an expression: the name of an operator class is a
+        // bare word, and reading it as part of the key left the parenthesis unclosed.
+        if (!columnListTakesIndexOptions) return false;
+        if (next != TokenType.IDENTIFIER && next != TokenType.KEYWORD) return false;
+        // A collation is written between the key and its class and belongs to the key itself, so
+        // the key is read as the expression it is and this reads what may follow that.
+        return !"COLLATE".equalsIgnoreCase(tokens.get(after).raw());
+    }
+
+    /**
+     * Whether an entry of the next column list may carry what an index key carries. A conflict
+     * target names the keys of an index, so an operator class may be written after one -- and a
+     * direction may not, the arbiter being an index that has one already.
+     */
+    protected boolean columnListTakesIndexOptions;
+
+    /** The operator class written after each entry of the last such list, null where none was. */
+    protected List<String> lastColumnListOpclasses;
+
+    /**
+     * Read the options written after one key of a conflict target: an operator class, and nothing
+     * else. Whether the class is one that exists, and whether it is the one the index was built
+     * with, are questions for the reader that knows which relation is being written to.
+     */
+    private String readConflictTargetOptions() {
+        if (checkKeyword("ASC") || checkKeyword("DESC")) {
+            throw new MemgresException("ASC/DESC is not allowed in ON CONFLICT clause", "42P10");
+        }
+        if (checkKeyword("NULLS")) {
+            throw new MemgresException(
+                    "NULLS FIRST/LAST is not allowed in ON CONFLICT clause", "42P10");
+        }
+        if (check(TokenType.COMMA) || check(TokenType.RIGHT_PAREN) || isAtEnd()) return null;
+        if (!check(TokenType.IDENTIFIER) && !check(TokenType.KEYWORD)) return null;
+        String opclass = advance().value();
+        while (check(TokenType.DOT)) {
+            advance();
+            opclass = opclass + "." + readIdentifier();
+        }
+        return opclass;
+    }
+
     protected List<String> parseColumnOrExpressionList() {
         List<String> list = new ArrayList<>();
         List<Expression> parsed = new ArrayList<>();
+        List<String> opclasses = new ArrayList<>();
         boolean anyExpr = false;
         do {
             if (check(TokenType.LEFT_PAREN)) {
@@ -857,12 +942,34 @@ public class ExpressionParser {
                 }
                 list.add(sb.toString());
                 expect(TokenType.RIGHT_PAREN);
-            } else {
+            } else if (namesAColumnOnItsOwn()) {
                 list.add(readIdentifier());
+            } else {
+                // An entry that is not a bare name is an expression, whether or not it was
+                // written in its own parentheses: ON CONFLICT (lower(t)) names the expression an
+                // index was built on, and reading only the name stopped at the parenthesis.
+                anyExpr = true;
+                int exprStart = pos;
+                parsed.add(parseExpression());
+                StringBuilder sb = new StringBuilder();
+                for (int i = exprStart; i < pos; i++) {
+                    if (i > exprStart) {
+                        Token prev = tokens.get(i - 1);
+                        Token cur = tokens.get(i);
+                        if (prev.type() != TokenType.LEFT_PAREN && cur.type() != TokenType.RIGHT_PAREN
+                                && cur.type() != TokenType.COMMA && prev.type() != TokenType.COMMA) {
+                            sb.append(' ');
+                        }
+                    }
+                    sb.append(columnListTokenValue(tokens.get(i)));
+                }
+                list.add(sb.toString());
             }
+            opclasses.add(columnListTakesIndexOptions ? readConflictTargetOptions() : null);
         } while (match(TokenType.COMMA));
         lastColumnListHadExpression = anyExpr;
         lastColumnListExpressions = parsed;
+        lastColumnListOpclasses = opclasses;
         return list;
     }
 
@@ -1173,11 +1280,14 @@ public class ExpressionParser {
                 }
                 Expression arrayExpr = parseExpression();
                 expect(TokenType.RIGHT_PAREN);
-                if (!isAll && arrayExpr instanceof ArrayExpr) {
+                if (!isAll && arrayExpr instanceof ArrayExpr
+                        && ((ArrayExpr) arrayExpr).elements().size() != 1) {
                     // Marked as the ANY spelling even though the elements are written out, so that
                     // it is not mistaken for a written IN afterwards: the two are the same
                     // comparison but not the same construct, and a one-element IN forbids things
-                    // a one-element ANY allows.
+                    // a one-element ANY allows. An array of one element is kept whole, because
+                    // written out it would be indistinguishable from a value that is not an array
+                    // at all -- and what ANY takes is an array.
                     ArrayExpr arr = (ArrayExpr) arrayExpr;
                     return parseComparisonTail(new InExpr(left, arr.elements(), false, true));
                 }
@@ -1218,6 +1328,15 @@ public class ExpressionParser {
         if (match(TokenType.DOUBLE_TILDE_STAR)) return parseComparisonRhs(left, BinaryExpr.BinOp.ILIKE);
         if (match(TokenType.NOT_DOUBLE_TILDE)) return new UnaryExpr(UnaryExpr.UnaryOp.NOT, new BinaryExpr(left, BinaryExpr.BinOp.LIKE, parseOtherOps()));
         if (match(TokenType.NOT_DOUBLE_TILDE_STAR)) return new UnaryExpr(UnaryExpr.UnaryOp.NOT, new BinaryExpr(left, BinaryExpr.BinOp.ILIKE, parseOtherOps()));
+        // An operator the reader declared, written in front of ANY or ALL: the set is read the
+        // way it is read for a built-in operator, and each member compared with this one. Left
+        // to the level below, the word ANY was read as a call and the subquery in it as its
+        // arguments, which is a syntax error where PostgreSQL has a comparison.
+        if (check(TokenType.CUSTOM_OPERATOR)
+                && (checkKeywordAt(1, "ANY") || checkKeywordAt(1, "SOME")
+                    || checkKeywordAt(1, "ALL"))) {
+            return parseUserOperatorRhs(left, advance().value());
+        }
         // POSIX regex operators
         if (match(TokenType.TILDE)) return parseComparisonRhs(left, BinaryExpr.BinOp.REGEX_MATCH);
         if (match(TokenType.TILDE_STAR)) return parseComparisonRhs(left, BinaryExpr.BinOp.REGEX_IMATCH);
@@ -1284,6 +1403,25 @@ public class ExpressionParser {
         return comparison;
     }
 
+    /** The right-hand side of an operator the reader declared, standing in front of ANY or ALL. */
+    private Expression parseUserOperatorRhs(Expression left, String opSymbol) {
+        boolean isAll = checkKeyword("ALL");
+        advance(); // consume ANY/SOME/ALL
+        expect(TokenType.LEFT_PAREN);
+        int extraParens = Math.max(0, countLeadingParensBeforeQuery());
+        if (extraParens > 0 || checkKeyword("SELECT") || checkKeyword("WITH")
+                || checkKeyword("VALUES")) {
+            consumeLeadingParens(extraParens);
+            Statement subquery = parseSubqueryWithSetOps();
+            consumeTrailingParens(extraParens);
+            expect(TokenType.RIGHT_PAREN);
+            return new AnyAllExpr(left, BinaryExpr.BinOp.EQUAL, subquery, isAll, opSymbol);
+        }
+        Expression arrayExpr = parseExpression();
+        expect(TokenType.RIGHT_PAREN);
+        return new AnyAllArrayExpr(left, BinaryExpr.BinOp.EQUAL, arrayExpr, isAll, opSymbol);
+    }
+
     private Expression parseComparisonRhs(Expression left, BinaryExpr.BinOp op) {
         return parseComparisonRhs(left, op, false);
     }
@@ -1342,7 +1480,12 @@ public class ExpressionParser {
                 left = new BinaryExpr(left, BinaryExpr.BinOp.INET_CONTAINS_EQUALS, parseOtherOpsOperand());
             } else if (match(TokenType.DISTANCE)) {
                 left = new BinaryExpr(left, BinaryExpr.BinOp.DISTANCE, parseOtherOpsOperand());
-            } else if (check(TokenType.CUSTOM_OPERATOR)) {
+            } else if (aTildeOperatorFollows()) {
+                TokenType written = advance().type();
+                left = tildeComparison(left, written, parseOtherOpsOperand());
+            } else if (check(TokenType.CUSTOM_OPERATOR)
+                    && !checkKeywordAt(1, "ANY") && !checkKeywordAt(1, "SOME")
+                    && !checkKeywordAt(1, "ALL")) {
                 String opSymbol = advance().value();
                 left = new CustomOperatorExpr(null, opSymbol, left, parseOtherOpsOperand());
             } else {
@@ -1352,6 +1495,46 @@ public class ExpressionParser {
         return left;
     }
 
+
+    /**
+     * Whether one of the operators written with a tilde stands here, at the level PostgreSQL puts
+     * it: {@code ~} and {@code ~~} are operators like any other, not comparisons, so {@code x ~ 'a'
+     * || 'b'} matches x against a and puts a b after the answer. Read at the comparison level they
+     * took the whole concatenation as their pattern, and a chain of two of them was a syntax error
+     * where PostgreSQL parses one and then complains about the types.
+     *
+     * <p>An ANY or ALL after the operator is not an operand of it: that spelling is read where the
+     * rest of the ANY forms are read, and it is left alone here.
+     */
+    private boolean aTildeOperatorFollows() {
+        if (!check(TokenType.TILDE) && !check(TokenType.TILDE_STAR)
+                && !check(TokenType.EXCL_TILDE) && !check(TokenType.EXCL_TILDE_STAR)
+                && !check(TokenType.DOUBLE_TILDE) && !check(TokenType.DOUBLE_TILDE_STAR)
+                && !check(TokenType.NOT_DOUBLE_TILDE)
+                && !check(TokenType.NOT_DOUBLE_TILDE_STAR)) {
+            return false;
+        }
+        return !checkKeywordAt(1, "ANY") && !checkKeywordAt(1, "SOME")
+                && !checkKeywordAt(1, "ALL");
+    }
+
+    /** The test one of the tilde operators makes. */
+    private static Expression tildeComparison(Expression left, TokenType written,
+                                              Expression right) {
+        switch (written) {
+            case TILDE: return new BinaryExpr(left, BinaryExpr.BinOp.REGEX_MATCH, right);
+            case TILDE_STAR: return new BinaryExpr(left, BinaryExpr.BinOp.REGEX_IMATCH, right);
+            case EXCL_TILDE: return new BinaryExpr(left, BinaryExpr.BinOp.NOT_REGEX_MATCH, right);
+            case EXCL_TILDE_STAR:
+                return new BinaryExpr(left, BinaryExpr.BinOp.NOT_REGEX_IMATCH, right);
+            case DOUBLE_TILDE: return new BinaryExpr(left, BinaryExpr.BinOp.LIKE, right);
+            case DOUBLE_TILDE_STAR: return new BinaryExpr(left, BinaryExpr.BinOp.ILIKE, right);
+            case NOT_DOUBLE_TILDE: return new UnaryExpr(UnaryExpr.UnaryOp.NOT,
+                    new BinaryExpr(left, BinaryExpr.BinOp.LIKE, right));
+            default: return new UnaryExpr(UnaryExpr.UnaryOp.NOT,
+                    new BinaryExpr(left, BinaryExpr.BinOp.ILIKE, right));
+        }
+    }
 
     /**
      * An operand of the "other operators" level, prefix forms included. PostgreSQL puts every

@@ -151,6 +151,13 @@ class BinaryOpEvaluator {
                                  : other + " " + sym + " money"), "42883");
         }
 
+        // A bare literal beside a shape is read as a shape of that same type, which is the
+        // operator PostgreSQL resolves to: a box asked to hold '(1,1)' is asked to hold another
+        // box and fails to read one, rather than quietly taking the literal for the point it
+        // looks like.
+        if (op == BinaryExpr.BinOp.CONTAINS || op == BinaryExpr.BinOp.CONTAINED_BY) {
+            requireLiteralReadsAsOperandType(bin, ctx);
+        }
         // an lseg has no interior, so it contains nothing
         if (op == BinaryExpr.BinOp.CONTAINS && "lseg".equals(declaredGeometricType(bin.left(), ctx))) {
             String rType = declaredGeometricType(bin.right(), ctx);
@@ -635,6 +642,25 @@ class BinaryOpEvaluator {
         return new ConcatResolution(resolution, lOid, rOid);
     }
 
+    /**
+     * {@code text} where a {@code ||} resolves to the text concatenation and both its operands
+     * say what they are, and null everywhere else -- the concatenations over arrays, bit strings
+     * and the rest answer with types this does not work out, and a pair the query has not settled
+     * is left unjudged as it is everywhere else here.
+     */
+    private String textConcatResultType(BinaryExpr bin, RowContext ctx) {
+        if (bin.op() != BinaryExpr.BinOp.CONCAT) return null;
+        String lName = declaredTypeForResolution(bin.left(), ctx);
+        String rName = declaredTypeForResolution(bin.right(), ctx);
+        if (lName == null && !isUntypedStringLiteral(bin.left())) return null;
+        if (rName == null && !isUntypedStringLiteral(bin.right())) return null;
+        int lOid = operandOid(lName);
+        int rOid = operandOid(rName);
+        if (lOid < 0 || rOid < 0) return null;
+        return ConcatOperator.resolve(lOid, rOid).outcome == ConcatOperator.Outcome.TEXT_CONCAT
+                ? "text" : null;
+    }
+
     /** A resolved concatenation, with the types its two operands were written as. */
     private static final class ConcatResolution {
         static final ConcatResolution UNDECIDED = new ConcatResolution(null, 0, 0);
@@ -777,7 +803,12 @@ class BinaryOpEvaluator {
         rejectOperatorWithNoEntry(bin, ctx);
     }
 
-    /** The spelling PostgreSQL's pg_operator uses for each of the operators written here. */
+    /**
+     * How an operator is written, for a message that names it. The bitwise operators are spelled
+     * here and not in the catalogue lookup below, which reads an operator's spelling to decide
+     * whether the operands have an entry for it: {@code <<} is a shift over numbers and a
+     * containment test over networks, and one spelling would answer for both.
+     */
     static String spellingOf(BinaryExpr.BinOp op) {
         return pgSpelling(op);
     }
@@ -821,6 +852,15 @@ class BinaryOpEvaluator {
             // carry the extension's own entries; nothing but a document has a #> at all.
             case JSON_HASH_ARROW: return "#>";
             case JSON_HASH_ARROW_TEXT: return "#>>";
+            // The bitwise operators are spelled here too, so the catalogue rule can see which
+            // pairs of operands have an entry: PostgreSQL shifts an integer by an integer and a
+            // bigint by an integer, and has nothing for an integer shifted by a bigint. The same
+            // spellings belong to the network types, whose entries the catalogue also carries.
+            case BIT_AND: return "&";
+            case BIT_OR: return "|";
+            case BIT_XOR: return "#";
+            case SHIFT_LEFT: return "<<";
+            case SHIFT_RIGHT: return ">>";
             default: return null;
         }
     }
@@ -838,6 +878,14 @@ class BinaryOpEvaluator {
         int left = operandTypeOid(leftName, bin.left());
         int right = operandTypeOid(rightName, bin.right());
         if (left < 0 || right < 0) return;
+        // An extension brings operators of its own, and the catalogue this rule reads carries
+        // only the ones PostgreSQL ships: intarray declares & | - over integer arrays, so a
+        // question about a pair of arrays is one that catalogue cannot answer.
+        if (executor.database.hasExtension("intarray")
+                && leftName != null && rightName != null
+                && leftName.endsWith("[]") && rightName.endsWith("[]")) {
+            return;
+        }
         MemgresException refusal =
                 OperatorResolution.refusalFor(spelling, left, right, leftName, rightName);
         if (refusal != null) throw refusal;
@@ -990,7 +1038,11 @@ class BinaryOpEvaluator {
         }
         if (expr instanceof Literal) {
             switch (((Literal) expr).literalType()) {
-                case INTEGER: return "integer";
+                // A whole number is the narrowest of the three integer types that holds it, and
+                // that is the type a call is resolved against: make_time is declared over integer
+                // and a literal too wide for one reaches no signature it has.
+                case INTEGER:
+                    return ExprEvaluator.integerLiteralType((Literal) expr).toRegtypeDisplay();
                 case FLOAT: return "numeric";
                 case BOOLEAN: return "boolean";
                 case BIT_STRING: return "bit";
@@ -1004,6 +1056,12 @@ class BinaryOpEvaluator {
             // Anything else falls through to the operators below that name their own type.
             String arithmetic = arithmeticResultType((BinaryExpr) expr, ctx);
             if (arithmetic != null) return arithmetic;
+            // Running two values together answers with text wherever the pair resolves to the
+            // text concatenation, and that is as much part of the query as a cast is: read as
+            // saying nothing, 1 = 1 || 'x' was compared as two numbers where PostgreSQL has no
+            // operator between an integer and the text the concatenation gives.
+            String concatenated = textConcatResultType((BinaryExpr) expr, ctx);
+            if (concatenated != null) return concatenated;
         }
         if (expr instanceof UnaryExpr) {
             // A sign says nothing about the type: -4 is the integer 4 was, and reading it as
@@ -1026,6 +1084,11 @@ class BinaryOpEvaluator {
             for (int i = 0; i < args.size(); i++) {
                 String declared = declaredTypeForResolution(args.get(i), ctx);
                 DataType t = declared == null ? null : DataType.fromPgName(declared);
+                // A width is no part of which type an argument is: read whole, bit(4) named no
+                // type at all and a call over it could not be resolved.
+                if (t == null && declared != null && declared.indexOf('(') > 0) {
+                    t = DataType.fromPgName(declared.substring(0, declared.indexOf('(')).trim());
+                }
                 written[i] = t == null ? 0 : t.getOid();
             }
             DataType result = DataType.fromOid(BuiltinCallTypes.resultType(fn.name(), written));
@@ -1307,6 +1370,29 @@ class BinaryOpEvaluator {
     }
 
     /** The geometric type an operand is declared to have, or null when it carries no declaration. */
+    /**
+     * Refuse a bare literal that will not read as the shape the operator wants.
+     *
+     * <p>An operator between two shapes is resolved by the side whose type is known, and the
+     * literal beside it is then read with the reader of that type. Reading it as whatever it
+     * happens to look like resolved a different operator from the one PostgreSQL resolves.
+     */
+    private void requireLiteralReadsAsOperandType(BinaryExpr bin, RowContext ctx) {
+        String lType = declaredGeometricType(bin.left(), ctx);
+        String rType = declaredGeometricType(bin.right(), ctx);
+        if (lType != null && rType == null && isBareStringLiteral(bin.right())) {
+            GeometricOperations.parseAs(lType, ((Literal) bin.right()).value());
+        } else if (rType != null && lType == null && isBareStringLiteral(bin.left())) {
+            GeometricOperations.parseAs(rType, ((Literal) bin.left()).value());
+        }
+    }
+
+    /** A value written as a quoted string and nothing else, so its type is still open. */
+    private static boolean isBareStringLiteral(Expression expr) {
+        return expr instanceof Literal
+                && ((Literal) expr).literalType() == Literal.LiteralType.STRING;
+    }
+
     private String declaredGeometricType(Expression expr, RowContext ctx) {
         if (expr instanceof CastExpr) {
             String name = ((CastExpr) expr).typeName();
@@ -1721,6 +1807,36 @@ class BinaryOpEvaluator {
         }
 
         // Operator type mismatch validation (before coercion)
+        // A bare quoted literal beside a bit string is read as a bit string: B'101' = '101' asks
+        // whether two bit strings are the same, and reading the literal as text found no operator
+        // between the two types.
+        if (bin.op() == BinaryExpr.BinOp.EQUAL) {
+            if (left instanceof AstExecutor.PgBitString && right instanceof String
+                    && isBareStringLiteral(bin.right())) {
+                right = new AstExecutor.PgBitString((String) right);
+            } else if (right instanceof AstExecutor.PgBitString && left instanceof String
+                    && isBareStringLiteral(bin.left())) {
+                left = new AstExecutor.PgBitString((String) left);
+            }
+        }
+        // A value of a composite type is kept as the text it prints as, and a ROW written in the
+        // query is a row of values: set beside one another as they stand, a column of a composite
+        // type was a string against a record and named no operator. An operand declared to be of
+        // a composite type is read apart into its fields before the two are compared.
+        if (isComparison(bin.op()) || resolvesThroughEquality(bin.op())) {
+            String lComposite = declaredCompositeType(bin.left(), ctx);
+            if (lComposite != null && left instanceof String
+                    && right instanceof AstExecutor.PgRow) {
+                left = executor.parseCompositeToRow((String) left, lComposite);
+            }
+            String rComposite = declaredCompositeType(bin.right(), ctx);
+            if (rComposite != null && right instanceof String
+                    && left instanceof AstExecutor.PgRow) {
+                right = executor.parseCompositeToRow((String) right, rComposite);
+            }
+            refuseRowAgainstScalar(bin, left, right, lComposite, rComposite, ctx);
+        }
+
         executor.validateOperatorTypes(bin.op(), left, right);
 
         // Try built-in operator handling; if it fails due to unsupported types,
@@ -1806,7 +1922,8 @@ class BinaryOpEvaluator {
                 }
                 rejectFloatDivisionByZero(left, right);
                 return executor.numericOp(left, right, (a, b) -> a / b, BinaryOpEvaluator::divideExact,
-                    (a, b) -> a.divide(b, 20, java.math.RoundingMode.HALF_UP));
+                    (a, b) -> a.divide(b, NumericMath.divisionScale(a, b),
+                            java.math.RoundingMode.HALF_UP));
             }
             case MODULO:
                 return executor.numericOp(left, right, (a, b) -> a % b, (a, b) -> a % b,
@@ -1910,6 +2027,14 @@ class BinaryOpEvaluator {
                     String ls = (String) left;
                     Object result = GeometricOperations.intersectionGeneral(ls, rs);
                     return result != null ? GeometricOperations.format(result) : null;
+                }
+                // What is left is the integer form, and text is not a number: PostgreSQL has no
+                // # between two strings, and reading them as numbers refused the second one for
+                // its spelling rather than saying there is no such operator.
+                if (left instanceof String && right instanceof String) {
+                    throw new MemgresException("operator does not exist: text # text"
+                            + "\n  Hint: No operator matches the given name and argument types."
+                            + " You might need to add explicit type casts.", "42883");
                 }
                 { long r = executor.toLong(left) ^ executor.toLong(right);
                 return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE)
@@ -2209,10 +2334,12 @@ class BinaryOpEvaluator {
                     return ArrayOperationHandler.concatArrays((List<?>) left, (List<?>) right);
                 }
                 if (left instanceof List) {
+                    // An element added to the end lands after the last subscript the array had,
+                    // so the array still begins where it began.
                     List<?> ll = (List<?>) left;
                     List<Object> merged = new ArrayList<>(ll);
                     merged.add(right);
-                    return merged;
+                    return ArrayOperationHandler.keepingLowerBounds(ll, merged);
                 }
                 if (right instanceof List) {
                     List<?> rl = (List<?>) right;
@@ -2895,6 +3022,53 @@ class BinaryOpEvaluator {
         return false;
     }
 
+    /**
+     * Refuses a comparison between a row and something that is not one.
+     *
+     * <p>A record is compared by an operator declared over two records, so the other side has to
+     * become one: a constant with no type of its own is asked to read itself as a record, which
+     * PostgreSQL cannot do for a row whose type has no name, and anything already of another type
+     * names no operator at all. Comparing the row against the value as it stood answered for
+     * pairs a real server refuses.
+     */
+    private void refuseRowAgainstScalar(BinaryExpr bin, Object left, Object right,
+            String lComposite, String rComposite, RowContext ctx) {
+        boolean lRow = left instanceof AstExecutor.PgRow;
+        boolean rRow = right instanceof AstExecutor.PgRow;
+        if (lRow == rRow) return;
+        Expression other = lRow ? bin.right() : bin.left();
+        if (isUntypedStringLiteral(other)) {
+            throw new MemgresException(
+                    "input of anonymous composite types is not implemented", "0A000");
+        }
+        String otherName = declaredTypeForResolution(other, ctx);
+        if (otherName == null || familyOf(otherName) == null) return;
+        String rowName = (lRow ? lComposite : rComposite) == null
+                ? "record" : (lRow ? lComposite : rComposite);
+        throw missingOperator(lRow ? rowName : pgName(otherName), bin.op(),
+                lRow ? pgName(otherName) : rowName);
+    }
+
+    /**
+     * The composite type an operand is declared to be of, or {@code null} where it is declared to
+     * be of anything else. Only the declaration counts: what a value looks like says nothing, and
+     * a text operand really written as text has no operator against a record whatever it holds.
+     */
+    private String declaredCompositeType(Expression expr, RowContext ctx) {
+        if (expr instanceof CastExpr) {
+            String written = ((CastExpr) expr).typeName();
+            if (written == null) return null;
+            String name = Quoting.nameAsRead(written.trim());
+            return executor.database.isCompositeType(name) ? name : null;
+        }
+        if (expr instanceof ColumnRef && ctx != null) {
+            ColumnRef ref = (ColumnRef) expr;
+            Column def = ctx.resolveColumnDef(ref.table(), ref.column());
+            return def == null ? null : def.getCompositeTypeName();
+        }
+        return null;
+    }
+
     Object tryUserDefinedOperator(String opSymbol, Object left, Object right) {
         String leftType = AstExecutor.pgTypeNameOf(left);
         String rightType = AstExecutor.pgTypeNameOf(right);
@@ -3295,7 +3469,8 @@ class BinaryOpEvaluator {
                 }
                 rejectFloatDivisionByZero(left, right);
                 return executor.numericOp(left, right, (a, b) -> a / b, BinaryOpEvaluator::divideExact,
-                    (a, b) -> a.divide(b, 20, java.math.RoundingMode.HALF_UP));
+                    (a, b) -> a.divide(b, NumericMath.divisionScale(a, b),
+                            java.math.RoundingMode.HALF_UP));
             }
             case MODULO:
                 return executor.numericOp(left, right, (a, b) -> a % b, (a, b) -> a % b,
@@ -3386,6 +3561,14 @@ class BinaryOpEvaluator {
                     String ls = (String) left;
                     Object result = GeometricOperations.intersectionGeneral(ls, rs);
                     return result != null ? GeometricOperations.format(result) : null;
+                }
+                // What is left is the integer form, and text is not a number: PostgreSQL has no
+                // # between two strings, and reading them as numbers refused the second one for
+                // its spelling rather than saying there is no such operator.
+                if (left instanceof String && right instanceof String) {
+                    throw new MemgresException("operator does not exist: text # text"
+                            + "\n  Hint: No operator matches the given name and argument types."
+                            + " You might need to add explicit type casts.", "42883");
                 }
                 { long r = executor.toLong(left) ^ executor.toLong(right);
                 return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE)
@@ -3617,10 +3800,12 @@ class BinaryOpEvaluator {
                     return ArrayOperationHandler.concatArrays((List<?>) left, (List<?>) right);
                 }
                 if (left instanceof List) {
+                    // An element added to the end lands after the last subscript the array had,
+                    // so the array still begins where it began.
                     List<?> ll = (List<?>) left;
                     List<Object> merged = new ArrayList<>(ll);
                     merged.add(right);
-                    return merged;
+                    return ArrayOperationHandler.keepingLowerBounds(ll, merged);
                 }
                 if (right instanceof List) {
                     List<?> rl = (List<?>) right;

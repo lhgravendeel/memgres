@@ -80,6 +80,17 @@ public final class PgKeywords {
         return word != null && COL_NAME.contains(word.toUpperCase(java.util.Locale.ROOT));
     }
 
+    /**
+     * Whether this word is a plain identifier rather than any word the grammar names.
+     *
+     * <p>A few productions take a bare identifier and nothing else, so a keyword of any category
+     * never reaches them: {@code CREATE ROLE r bogus} complains about an option nobody has, and
+     * {@code CREATE ROLE r IF} is a syntax error, because only the first of the two is a name.
+     */
+    static boolean isPlainIdentifier(String word) {
+        return word != null && !com.memgres.engine.PgKeywordTable.isKeyword(word);
+    }
+
     /** Whether this word is one PostgreSQL reserves outright. */
     static boolean isReserved(String word) {
         return word != null && RESERVED.contains(word.toUpperCase(java.util.Locale.ROOT));

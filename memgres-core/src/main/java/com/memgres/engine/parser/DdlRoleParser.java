@@ -26,6 +26,8 @@ class DdlRoleParser {
         String name = parser.readIdentifier();
         Map<String, String> options = new LinkedHashMap<>();
         List<String> inRoles = new java.util.ArrayList<>();
+        List<String> memberRoles = new java.util.ArrayList<>();
+        List<String> adminRoles = new java.util.ArrayList<>();
 
         parser.matchKeyword("WITH"); // optional WITH
 
@@ -49,13 +51,15 @@ class DdlRoleParser {
                     break;
                 }
                 case "ROLE": {
-                    // ROLE name[, ...] (members)
-                    do { parser.readIdentifier(); } while (parser.match(TokenType.COMMA));
+                    // ROLE name[, ...]: these become members of the role being created, which is
+                    // the opposite direction from IN ROLE.
+                    do { memberRoles.add(parser.readIdentifier()); } while (parser.match(TokenType.COMMA));
                     break;
                 }
                 case "ADMIN": {
-                    // ADMIN name[, ...] (admin members)
-                    do { parser.readIdentifier(); } while (parser.match(TokenType.COMMA));
+                    // ADMIN name[, ...]: members again, holding their membership with the right
+                    // to grant it on.
+                    do { adminRoles.add(parser.readIdentifier()); } while (parser.match(TokenType.COMMA));
                     break;
                 }
                 case "SYSID":
@@ -68,7 +72,7 @@ class DdlRoleParser {
             }
         }
 
-        return new CreateRoleStmt(name, isUser, options, inRoles);
+        return new CreateRoleStmt(name, isUser, options, inRoles, memberRoles, adminRoles);
     }
 
     AlterRoleStmt parseAlterRole() {
@@ -88,21 +92,26 @@ class DdlRoleParser {
                 StringBuilder valBuf = new StringBuilder();
                 while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
                     Token vt = parser.advance();
-                    if (valBuf.length() > 0) valBuf.append(" ");
-                    if (vt.type() == TokenType.STRING_LITERAL) {
-                        valBuf.append(vt.value());
-                    } else {
-                        valBuf.append(vt.value());
-                    }
+                    // A list is written with commas, and the comma belongs to the value it
+                    // follows: a space put in front of every token wrote search_path = a, b
+                    // down as "a , b", which is not the value the statement set.
+                    boolean comma = vt.type() == TokenType.COMMA;
+                    if (valBuf.length() > 0 && !comma) valBuf.append(" ");
+                    valBuf.append(comma ? "," : vt.value());
                 }
                 options.put("SET_CONFIG", param + "=" + valBuf.toString().trim());
             }
             return new AlterRoleStmt(name, null, options);
         }
-        // ALTER ROLE name RESET param, no-op
+        // ALTER ROLE name RESET param takes that parameter's setting away, and RESET ALL takes
+        // every one of them: read as nothing at all, a setting the statement removed stayed on
+        // the role and was still reported by pg_roles.
         if (parser.matchKeyword("RESET")) {
+            Map<String, String> options = new LinkedHashMap<>();
+            String param = parser.matchKeyword("ALL") ? "" : parser.readIdentifier();
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-            return new AlterRoleStmt(name, null, Cols.mapOf());
+            options.put("RESET_CONFIG", param);
+            return new AlterRoleStmt(name, null, options);
         }
 
         Map<String, String> options = new LinkedHashMap<>();
@@ -207,6 +216,14 @@ class DdlRoleParser {
                     break;
                 }
                 default: {
+                    // Only a word that could be a name at all reaches the production that names
+                    // options; a reserved one never gets there and is a syntax error where it
+                    // stands, which is why IF NOT EXISTS is refused as spelling and not as an
+                    // option nobody has.
+                    if (!PgKeywords.isPlainIdentifier(t.raw())) {
+                        throw ParseException.saying("syntax error at or near \"" + t.raw() + "\"",
+                                t, "42601");
+                    }
                     throw ParseException.saying("unrecognized role option \""
                             + t.raw().toLowerCase(java.util.Locale.ROOT) + "\"", t, "42601");
                 }

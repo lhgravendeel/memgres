@@ -232,8 +232,12 @@ class FromFunctionResolver {
             return resolveJsonObjectKeys(fname, alias, colAliases, evalArgs);
         if (fname.equals("pg_get_keywords") || fname.equals("pg_catalog.pg_get_keywords"))
             return resolvePgGetKeywords(alias, colAliases);
+        if (fname.equals("pg_identify_object") || fname.equals("pg_catalog.pg_identify_object"))
+            return resolvePgIdentifyObject(alias, colAliases, evalArgs);
         if (fname.equals("pg_options_to_table") || fname.equals("pg_catalog.pg_options_to_table"))
             return resolvePgOptionsToTable(alias, colAliases, evalArgs);
+        if (fname.equals("aclexplode") || fname.equals("pg_catalog.aclexplode"))
+            return resolveAclExplode(funcFrom, alias, colAliases);
         if (fname.equals("pg_get_sequence_data") || fname.equals("pg_catalog.pg_get_sequence_data"))
             return resolvePgGetSequenceData(alias, colAliases, evalArgs);
         if (fname.equals("string_to_table")) return resolveStringToTable(alias, colAliases, evalArgs);
@@ -1388,6 +1392,74 @@ class FromFunctionResolver {
         return contexts;
     }
 
+    // ---- pg_identify_object ----
+
+    /**
+     * What an object reference points at, split into the parts a reader asks about.
+     *
+     * <p>A reference is a catalogue, a row in it and a sub-object number, and this says what kind
+     * of thing that is, which schema holds it, what it is called, and how it would be written out
+     * in full. What the identity is depends on the kind: a schema-qualified name for a relation,
+     * the bare name for a schema, and the type's own name for a type.
+     */
+    private List<RowContext> resolvePgIdentifyObject(String alias, List<String> colAliases,
+                                                     List<Object> evalArgs) {
+        String[] names = {"type", "schema", "name", "identity"};
+        List<Column> cols = new ArrayList<>();
+        for (int i = 0; i < names.length; i++) {
+            String named = (colAliases != null && colAliases.size() > i)
+                    ? colAliases.get(i) : names[i];
+            cols.add(new Column(named, DataType.TEXT, true, false, null));
+        }
+        Table virtualTable = new Table(alias != null ? alias : "pg_identify_object", cols);
+        int classId = evalArgs.size() > 0 && evalArgs.get(0) != null
+                ? executor.toInt(evalArgs.get(0)) : 0;
+        int objId = evalArgs.size() > 1 && evalArgs.get(1) != null
+                ? executor.toInt(evalArgs.get(1)) : 0;
+        Object[] row = identifyObject(classId, objId);
+        virtualTable.insertRow(row);
+        List<RowContext> contexts = new ArrayList<>();
+        contexts.add(new RowContext(virtualTable, alias, row));
+        return contexts;
+    }
+
+    /** The four things pg_identify_object says about one object reference. */
+    private Object[] identifyObject(int classId, int objId) {
+        String key = executor.systemCatalog.keyForOid(objId);
+        if (classId == 1259 && key != null && key.startsWith("rel:")) {
+            String qualified = key.substring("rel:".length());
+            int dot = qualified.indexOf('.');
+            String schema = dot < 0 ? "public" : qualified.substring(0, dot);
+            String bare = dot < 0 ? qualified : qualified.substring(dot + 1);
+            String kind = RelationNamespace.kindOf(executor.database, schema, bare);
+            return new Object[]{kind == null ? "table" : kind, schema, bare,
+                    schema + "." + bare};
+        }
+        if (classId == 2615 && key != null && key.startsWith("ns:")) {
+            String schema = key.substring("ns:".length());
+            return new Object[]{"schema", null, schema, schema};
+        }
+        if (classId == 1247) {
+            String named = CatalogCoreBuilder.otherTypeName(objId);
+            if (named == null) {
+                DataType dt = null;
+                for (DataType candidate : DataType.values()) {
+                    if (candidate.getOid() == objId) { dt = candidate; break; }
+                }
+                if (dt != null) return new Object[]{"type", "pg_catalog", dt.getPgName(),
+                        dt.toRegtypeDisplay()};
+            }
+            if (key != null && key.startsWith("type:")) {
+                String qualified = key.substring("type:".length());
+                int dot = qualified.indexOf('.');
+                String schema = dot < 0 ? "public" : qualified.substring(0, dot);
+                String bare = dot < 0 ? qualified : qualified.substring(dot + 1);
+                return new Object[]{"type", schema, bare, schema + "." + bare};
+            }
+        }
+        return new Object[]{null, null, null, null};
+    }
+
     // ---- pg_options_to_table ----
 
     private List<RowContext> resolvePgOptionsToTable(String alias, List<String> colAliases, List<Object> evalArgs) {
@@ -1398,17 +1470,61 @@ class FromFunctionResolver {
                         new Column(col2, DataType.TEXT, true, false, null)));
         List<RowContext> contexts = new ArrayList<>();
         if (!evalArgs.isEmpty() && evalArgs.get(0) != null) {
-            String input = evalArgs.get(0).toString();
-            if (input.startsWith("{") && input.endsWith("}")) {
-                input = input.substring(1, input.length() - 1);
+            // The argument is an array, and an array is a list of values here: read as one string
+            // it came back wearing the brackets Java prints a list in, so the first option kept a
+            // bracket and the last one kept another.
+            List<String> written = new ArrayList<>();
+            if (evalArgs.get(0) instanceof List<?>) {
+                for (Object element : (List<?>) evalArgs.get(0)) {
+                    if (element != null) written.add(element.toString());
+                }
+            } else {
+                String input = evalArgs.get(0).toString();
+                if (input.startsWith("{") && input.endsWith("}")) {
+                    input = input.substring(1, input.length() - 1);
+                }
+                if (!input.isEmpty()) {
+                    for (String opt : input.split(",")) written.add(opt);
+                }
             }
-            if (!input.isEmpty()) {
-                for (String opt : input.split(",")) {
+            {
+                for (String opt : written) {
                     String[] kv = opt.split("=", 2);
                     Object[] row = new Object[]{kv[0].trim(), kv.length > 1 ? kv[1].trim() : ""};
                     virtualTable.insertRow(row);
                     contexts.add(new RowContext(virtualTable, alias, row));
                 }
+            }
+        }
+        return contexts;
+    }
+
+    /**
+     * An access list read apart into the four columns it is declared with: who granted, who
+     * holds it, which privilege, and whether it may be handed on. Read as one value, a caller
+     * naming grantee found no such column.
+     */
+    private List<RowContext> resolveAclExplode(SelectStmt.FunctionFrom funcFrom, String alias,
+                                               List<String> colAliases) {
+        String[] names = {"grantor", "grantee", "privilege_type", "is_grantable"};
+        DataType[] types = {DataType.OID, DataType.OID, DataType.TEXT, DataType.BOOLEAN};
+        List<Column> cols = new ArrayList<>();
+        for (int i = 0; i < names.length; i++) {
+            String named = colAliases != null && colAliases.size() > i ? colAliases.get(i)
+                    : names[i];
+            cols.add(new Column(named, types[i], true, false, null));
+        }
+        Table virtualTable = new Table(alias != null ? alias : "aclexplode", cols);
+        List<RowContext> contexts = new ArrayList<>();
+        Object answered = executor.evalExpr(
+                new FunctionCallExpr("aclexplode", funcFrom.args(), false, false), null);
+        if (answered instanceof List<?>) {
+            for (Object item : (List<?>) answered) {
+                if (!(item instanceof AstExecutor.PgRow)) continue;
+                List<Object> values = ((AstExecutor.PgRow) item).values();
+                Object[] row = new Object[cols.size()];
+                for (int i = 0; i < row.length && i < values.size(); i++) row[i] = values.get(i);
+                contexts.add(new RowContext(virtualTable, alias, row));
             }
         }
         return contexts;
@@ -1983,6 +2099,24 @@ class FromFunctionResolver {
                 for (int i = 0; i < composite.size(); i++) {
                     fields[i] = map.get(composite.get(i).getName().toLowerCase(java.util.Locale.ROOT));
                 }
+            } else if (result instanceof AstExecutor.PgRow) {
+                List<Object> values = ((AstExecutor.PgRow) result).values();
+                for (int i = 0; i < composite.size() && i < values.size(); i++) {
+                    fields[i] = values.get(i);
+                }
+            } else if (result instanceof String && isCompositeText((String) result)) {
+                // A row that came back as the text it prints as is read apart again: put in the
+                // first column whole, a query over the routine answered with the row in one
+                // column and nulls in the rest.
+                String text = ((String) result).trim();
+                String[] parts = executor.compositeTypeHandler.splitCompositeString(
+                        text.substring(1, text.length() - 1));
+                for (int i = 0; i < composite.size() && i < parts.length; i++) {
+                    String part = parts[i].trim();
+                    fields[i] = part.isEmpty() ? null
+                            : executor.compositeTypeHandler.coerceFieldValue(part,
+                                    CatalogHelper.pgTypeName(composite.get(i).getType()));
+                }
             } else if (result != null) {
                 fields[0] = result;
             }
@@ -2000,6 +2134,13 @@ class FromFunctionResolver {
         virtualTable.insertRow(row);
         contexts.add(new RowContext(virtualTable, alias, row));
         return contexts;
+    }
+
+    /** Whether text is a row written the way a row prints: its fields inside one pair of brackets. */
+    private static boolean isCompositeText(String text) {
+        String trimmed = text.trim();
+        return trimmed.length() >= 2 && trimmed.charAt(0) == '('
+                && trimmed.charAt(trimmed.length() - 1) == ')';
     }
 
     // ---- Shared helpers ----

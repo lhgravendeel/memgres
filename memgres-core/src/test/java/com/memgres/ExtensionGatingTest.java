@@ -28,6 +28,60 @@ class ExtensionGatingTest {
         if (memgres != null) memgres.close();
     }
 
+    // ---- The catalogue says what is there, and nothing more ----
+
+    /**
+     * A name an extension brings is nowhere at all until the extension is installed: pg_proc is
+     * where a reader asks what routines there are, and a row for a call the server itself refuses
+     * is an answer nothing can act on.
+     */
+    @Test void extension_functions_are_not_in_pg_proc_until_installed() throws SQLException {
+        Memgres fresh = Memgres.builder().port(0).build().start();
+        try (Connection c = DriverManager.getConnection(fresh.getJdbcUrl() + "?preferQueryMode=simple",
+                fresh.getUser(), fresh.getPassword());
+             Statement s = c.createStatement()) {
+            try (ResultSet rs = s.executeQuery("SELECT count(*)::int FROM pg_proc"
+                    + " WHERE proname IN ('gen_salt','crypt','digest','hmac','gen_random_bytes',"
+                    + "'levenshtein','soundex','unaccent','similarity','word_similarity')")) {
+                assertTrue(rs.next());
+                assertEquals(0, rs.getInt(1));
+            }
+            try (ResultSet rs = s.executeQuery(
+                    "SELECT to_regprocedure('gen_salt(text)') IS NULL")) {
+                assertTrue(rs.next());
+                assertTrue(rs.getBoolean(1));
+            }
+            s.execute("CREATE EXTENSION pgcrypto");
+            try (ResultSet rs = s.executeQuery(
+                    "SELECT count(*)::int FROM pg_proc WHERE proname = 'gen_salt'")) {
+                assertTrue(rs.next());
+                assertTrue(rs.getInt(1) > 0);
+            }
+        } finally {
+            fresh.close();
+        }
+    }
+
+    /** A word SQL spells without parentheses is no routine of the catalogue. */
+    @Test void the_value_words_are_not_routines() throws SQLException {
+        try (Statement s = conn.createStatement()) {
+            try (ResultSet rs = s.executeQuery("SELECT count(*)::int FROM pg_proc"
+                    + " WHERE proname IN ('user','current_role','current_catalog')")) {
+                assertTrue(rs.next());
+                assertEquals(0, rs.getInt(1));
+            }
+            try (ResultSet rs = s.executeQuery("SELECT to_regproc('user') IS NULL")) {
+                assertTrue(rs.next());
+                assertTrue(rs.getBoolean(1));
+            }
+            // They are still read where a value belongs.
+            try (ResultSet rs = s.executeQuery("SELECT user")) {
+                assertTrue(rs.next());
+                assertNotNull(rs.getString(1));
+            }
+        }
+    }
+
     // ---- uuid-ossp: gated ----
 
     @Test void uuid_generate_v4_requires_extension() {

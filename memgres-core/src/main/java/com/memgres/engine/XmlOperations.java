@@ -142,10 +142,12 @@ public final class XmlOperations {
     public static String xmlcomment(String text) {
         if (text == null) return null;
         if (text.contains("--")) {
-            throw new MemgresException("XML comment must not contain \"--\"", "2200S");
+            // PostgreSQL names the thing that is wrong -- the comment -- rather than the rule
+            // it broke; what the rule was goes in the detail line, not in the message.
+            throw new MemgresException("invalid XML comment", "2200S");
         }
         if (text.endsWith("-")) {
-            throw new MemgresException("XML comment must not end with \"-\"", "2200S");
+            throw new MemgresException("invalid XML comment", "2200S");
         }
         return "<!--" + text + "-->";
     }
@@ -367,37 +369,53 @@ public final class XmlOperations {
 
     // ---- Table/Query/Schema/Database to XML ----
 
-    /** table_to_xml(table_name, nulls, tableforest, targetns) */
+    /**
+     * table_to_xml(table_name, nulls, tableforest, targetns).
+     *
+     * <p>The layout is PostgreSQL's own and every part of it is fixed: the schema-instance
+     * namespace is on the outermost element whether or not any value is null, a target namespace
+     * comes after it, the row elements sit at the left margin with their fields indented two
+     * spaces, and a blank line stands between the outermost element and the rows it holds. As a
+     * forest there is no outermost element, so each row carries the namespaces and the blank line
+     * follows every row.
+     */
     public static String tableToXml(String tableName, List<String> columnNames, List<Object[]> rows,
                                      boolean nulls, boolean tableforest, String targetns) {
+        // As a forest the rows are the whole answer, so each one is named after what it is a row
+        // of; inside a table element they are simply rows.
+        return tableToXml(tableName, tableforest ? tableName : "row", columnNames, rows, nulls,
+                tableforest, targetns);
+    }
+
+    private static String tableToXml(String tableName, String rowName, List<String> columnNames,
+                                     List<Object[]> rows, boolean nulls, boolean tableforest,
+                                     String targetns) {
+        StringBuilder namespaces = new StringBuilder(
+                " xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"");
+        if (targetns != null && !targetns.isEmpty()) {
+            namespaces.append(" xmlns=\"").append(escapeXmlAttr(targetns)).append("\"");
+        }
         StringBuilder sb = new StringBuilder();
-        String ns = (targetns != null && !targetns.isEmpty()) ? targetns : "";
         if (!tableforest) {
-            sb.append("<").append(tableName);
-            if (!ns.isEmpty()) {
-                sb.append(" xmlns=\"").append(escapeXmlAttr(ns)).append("\"");
-            }
-            if (nulls) {
-                sb.append(" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"");
-            }
-            sb.append(">\n");
+            sb.append("<").append(tableName).append(namespaces).append(">\n\n");
         }
         for (Object[] row : rows) {
-            sb.append("  <row>\n");
+            sb.append("<").append(rowName)
+                    .append(tableforest ? namespaces.toString() : "").append(">\n");
             for (int i = 0; i < columnNames.size(); i++) {
                 Object val = i < row.length ? row[i] : null;
                 String colName = columnNames.get(i);
                 if (val == null) {
                     if (nulls) {
-                        sb.append("    <").append(colName).append(" xsi:nil=\"true\"/>\n");
+                        sb.append("  <").append(colName).append(" xsi:nil=\"true\"/>\n");
                     }
                 } else {
-                    sb.append("    <").append(colName).append(">")
+                    sb.append("  <").append(colName).append(">")
                       .append(escapeXml(val.toString()))
                       .append("</").append(colName).append(">\n");
                 }
             }
-            sb.append("  </row>\n");
+            sb.append("</").append(rowName).append(">\n\n");
         }
         if (!tableforest) {
             sb.append("</").append(tableName).append(">\n");
@@ -408,7 +426,9 @@ public final class XmlOperations {
     /** query_to_xml(query, nulls, tableforest, targetns): same structure as table_to_xml but for query results. */
     public static String queryToXml(List<String> columnNames, List<Object[]> rows,
                                      boolean nulls, boolean tableforest, String targetns) {
-        return tableToXml("table", columnNames, rows, nulls, tableforest, targetns);
+        // A query's rows are rows of nothing in particular, so they are named "row" whether or
+        // not there is a table element around them.
+        return tableToXml("table", "row", columnNames, rows, nulls, tableforest, targetns);
     }
 
     // ---- Internal helpers ----

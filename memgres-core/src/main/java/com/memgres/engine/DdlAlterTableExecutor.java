@@ -3802,14 +3802,9 @@ class DdlAlterTableExecutor {
                         (sc.getType() == StoredConstraint.Type.UNIQUE ? "UNIQUE" : "PRIMARY KEY")
                         + " constraints cannot be marked NOT VALID");
             }
-            // The index a key is built on takes a relation name, so a name another relation
-            // already owns is reported as that before the key is judged.
-            if (addConstraint.constraint().name() != null
-                    && (sc.getType() == StoredConstraint.Type.UNIQUE
-                        || sc.getType() == StoredConstraint.Type.PRIMARY_KEY)) {
-                RelationNamespace.requireFree(executor.database, schemaName, sc.getName(), null);
-            }
-            // A second primary key is refused for what it is, whatever it was going to be called.
+            // A second primary key is refused for what it is, before anything about the name it
+            // was going to be given: a table that already has one has no room for another,
+            // whatever the index behind it would have been called.
             if (sc.getType() == StoredConstraint.Type.PRIMARY_KEY) {
                 for (StoredConstraint existing : table.getConstraints()) {
                     if (existing.getType() == StoredConstraint.Type.PRIMARY_KEY) {
@@ -3817,6 +3812,13 @@ class DdlAlterTableExecutor {
                                 + stmt.table() + "\" are not allowed", "42P16");
                     }
                 }
+            }
+            // The index a key is built on takes a relation name, so a name another relation
+            // already owns is reported as that before the key is judged.
+            if (addConstraint.constraint().name() != null
+                    && (sc.getType() == StoredConstraint.Type.UNIQUE
+                        || sc.getType() == StoredConstraint.Type.PRIMARY_KEY)) {
+                RelationNamespace.requireFree(executor.database, schemaName, sc.getName(), null);
             }
             if (sc.getName() != null && table.getConstraint(sc.getName()) != null) {
                 throw new MemgresException("constraint \"" + sc.getName() + "\" for relation \"" + stmt.table() + "\" already exists", "42710");
@@ -4062,7 +4064,7 @@ class DdlAlterTableExecutor {
         if (sc.getReferencesSchema() != null) {
             refTable = executor.resolveTable(sc.getReferencesSchema(), sc.getReferencesTable());
         } else {
-            refTable = executor.resolveTableAnySchema(sc.getReferencesTable());
+            refTable = executor.resolveTableOnSearchPath(sc.getReferencesTable());
         }
         for (String refCol : sc.getReferencesColumns()) {
             if (refTable.getColumnIndex(refCol) < 0) {

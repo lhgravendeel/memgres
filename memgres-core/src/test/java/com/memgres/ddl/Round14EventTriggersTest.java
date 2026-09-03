@@ -259,4 +259,39 @@ class Round14EventTriggersTest {
                 () -> exec("CREATE EVENT TRIGGER r14_bad ON not_an_event EXECUTE FUNCTION r14_bad_fn()"));
         assertNotNull(ex.getMessage());
     }
+
+    // =========================================================================
+    // H. What a trigger that refuses stops
+    // =========================================================================
+
+    /**
+     * An event trigger runs before the command it is watching, so one that raises stops the
+     * command from running at all — and it stops it before the command's own options are judged,
+     * which is why a refusing trigger is what a bad option answers with too.
+     */
+    @Test
+    void a_trigger_that_raises_stops_the_command() throws SQLException {
+        exec("CREATE OR REPLACE FUNCTION r14_no_fn() RETURNS event_trigger LANGUAGE plpgsql"
+                + " AS $$ BEGIN RAISE EXCEPTION 'event trigger says no'; END $$");
+        exec("CREATE EVENT TRIGGER r14_no ON ddl_command_start EXECUTE FUNCTION r14_no_fn()");
+        try {
+            for (String ddl : new String[]{
+                    "CREATE TABLE r14_blocked (i int)",
+                    "CREATE FUNCTION r14_blocked_fn() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+                    "CREATE SEQUENCE r14_blocked_seq CACHE 4294967296",
+                    "CREATE TABLE r14_blocked_p (i int) PARTITION BY RANGE (i)",
+                    "DROP OPERATOR #%# (int, int)"}) {
+                SQLException ex = assertThrows(SQLException.class, () -> exec(ddl), ddl);
+                assertEquals("P0001", ex.getSQLState(), ddl);
+                assertTrue(ex.getMessage().contains("event trigger says no"), ddl);
+            }
+            // A query is not a command an event trigger watches.
+            assertEquals(1, scalarInt("SELECT 1"));
+        } finally {
+            exec("DROP EVENT TRIGGER r14_no");
+        }
+        // And with the trigger gone the same commands run.
+        exec("CREATE TABLE r14_blocked (i int)");
+        exec("DROP TABLE r14_blocked");
+    }
 }

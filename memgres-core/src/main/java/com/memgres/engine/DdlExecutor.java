@@ -253,7 +253,17 @@ class DdlExecutor {
             Schema s = executor.database.getSchema(schemaName);
             if (s != null) refTable = s.getTable(refTableName);
         }
-        if (refTable == null) refTable = resolveTableOrNull(refTableName);
+        // A bare name is looked for along the search path and nowhere else: reaching into every
+        // schema let a key point at a relation the statement could not have named, and the
+        // relation PostgreSQL says is missing was quietly found in a schema nobody mentioned.
+        if (refTable == null) {
+            for (String onPath : executor.relationSearchPath()) {
+                Schema held = executor.database.getSchema(onPath);
+                if (held == null) continue;
+                refTable = held.getTable(refTableName);
+                if (refTable != null) break;
+            }
+        }
         if (refTable == null) {
             throw new MemgresException("relation \"" + refTableName + "\" does not exist", "42P01");
         }
@@ -1150,14 +1160,17 @@ class DdlExecutor {
      * but allows user-defined volatile functions in expression indexes.
      */
     static void checkBuiltinVolatileInExpression(String exprStr, Database db, String errorMsg) {
+        // A name running on into more letters is a different name: a column called
+        // localtime_col carries the letters of localtime and is not it, and an index over such a
+        // column was refused for holding a value function it does not hold.
         String norm = exprStr.toLowerCase(java.util.Locale.ROOT).replaceAll("\\s+", "");
         for (String fn : BUILTIN_VOLATILE_FUNCTIONS) {
-            if (norm.contains(fn + "(")) {
+            if (namesWord(norm, fn + "(")) {
                 throw new MemgresException(errorMsg, "42P17");
             }
         }
         for (String id : BUILTIN_VOLATILE_IDENTIFIERS) {
-            if (norm.contains(id)) {
+            if (namesWord(norm, id)) {
                 throw new MemgresException(errorMsg, "42P17");
             }
         }
@@ -1168,18 +1181,10 @@ class DdlExecutor {
      * Falls back to string matching if parsing fails.
      */
     static void checkExpressionImmutability(String exprStr, Database db, String errorMsg) {
-        // Fast path: check for built-in volatile names in the raw string
-        String norm = exprStr.toLowerCase(java.util.Locale.ROOT).replaceAll("\\s+", "");
-        for (String fn : BUILTIN_VOLATILE_FUNCTIONS) {
-            if (norm.contains(fn + "(")) {
-                throw new MemgresException(errorMsg, "42P17");
-            }
-        }
-        for (String id : BUILTIN_VOLATILE_IDENTIFIERS) {
-            if (norm.contains(id)) {
-                throw new MemgresException(errorMsg, "42P17");
-            }
-        }
+        // A name running on into more letters is a different name: a column called
+        // current_date_col carries the letters of current_date and is not it, and a generation
+        // expression over such a column was refused as volatile.
+        checkBuiltinVolatileInExpression(exprStr, db, errorMsg);
 
         // Parse expression and do AST-based checking for user-defined functions/operators
         try {
@@ -1188,8 +1193,28 @@ class DdlExecutor {
         } catch (MemgresException e) {
             throw e; // Re-throw volatility errors
         } catch (Exception ignored) {
-            // If parsing fails, the string-based check above is sufficient
+            // If parsing fails, the names written in the text are all there is to judge.
         }
+    }
+
+    /**
+     * Whether the text names this word, rather than merely holding its letters somewhere: a name
+     * running on into more letters, digits or underscores is a different name.
+     */
+    private static boolean namesWord(String text, String word) {
+        int at = text.indexOf(word);
+        while (at >= 0) {
+            boolean beforeIsName = at > 0 && isNameCharacter(text.charAt(at - 1));
+            int after = at + word.length();
+            boolean afterIsName = after < text.length() && isNameCharacter(text.charAt(after));
+            if (!beforeIsName && !afterIsName) return true;
+            at = text.indexOf(word, at + 1);
+        }
+        return false;
+    }
+
+    private static boolean isNameCharacter(char c) {
+        return Character.isLetterOrDigit(c) || c == '_' || c == '$';
     }
 
     /** Parse a partition bound value string to an appropriate type. */
@@ -1282,6 +1307,12 @@ class DdlExecutor {
                     i = j;
                     continue;
                 }
+                // A name behind a cast marker is the type being cast to, not a column: reading it
+                // as one made s::uuid a reference to a column called uuid.
+                if (followsACastMarker(expr, i)) {
+                    i = j;
+                    continue;
+                }
                 result.add(expr.substring(i, j));
                 i = j;
                 continue;
@@ -1289,6 +1320,13 @@ class DdlExecutor {
             i++;
         }
         return result;
+    }
+
+    /** Whether the name starting at {@code at} stands behind a {@code ::}. */
+    private static boolean followsACastMarker(String expr, int at) {
+        int back = at - 1;
+        while (back >= 0 && Character.isWhitespace(expr.charAt(back))) back--;
+        return back >= 1 && expr.charAt(back) == ':' && expr.charAt(back - 1) == ':';
     }
 
     private static final Set<String> SQL_KEYWORDS_AND_FUNCTIONS = new HashSet<>(Arrays.asList(

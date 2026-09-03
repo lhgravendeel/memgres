@@ -16,6 +16,45 @@ class DmlConflictHelper {
         this.executor = executor;
     }
 
+    /**
+     * Hold each operator class written in a conflict target against the key it was written after.
+     *
+     * <p>A target names the keys of an index, and a key is only that key under the class it is
+     * compared with: {@code ON CONFLICT (i text_pattern_ops)} over an integer column names a key
+     * no index has. A class the server does not ship is not a mismatch but a name that reaches
+     * nothing, which is a complaint of its own.
+     */
+    private void requireArbiterOpclasses(Table table, List<String> columns, List<String> opclasses) {
+        if (opclasses == null) return;
+        for (int i = 0; i < columns.size() && i < opclasses.size(); i++) {
+            String written = opclasses.get(i);
+            if (written == null) continue;
+            String name = written;
+            int dot = written.lastIndexOf('.');
+            if (dot > 0) {
+                String schema = written.substring(0, dot);
+                if (!"pg_catalog".equalsIgnoreCase(schema)
+                        && executor.database.getSchema(schema.toLowerCase(Locale.ROOT)) == null) {
+                    throw new MemgresException("schema \"" + schema + "\" does not exist", "3F000");
+                }
+                name = written.substring(dot + 1);
+            }
+            if (!CatalogTypeSystemBuilder.shippedClassExists("btree", name)
+                    && !executor.database.getUserOperatorClasses().containsKey(name)) {
+                throw new MemgresException("operator class \"" + name + "\" does not exist"
+                        + " for access method \"btree\"", "42704");
+            }
+            int index = table.getColumnIndex(columns.get(i));
+            if (index < 0) continue;
+            String indexed = CatalogTypeSystemBuilder.defaultClassFor("btree",
+                    table.getColumns().get(index).getType().getOid());
+            if (indexed != null && !indexed.equals(name)) {
+                throw new MemgresException("there is no unique or exclusion constraint matching"
+                        + " the ON CONFLICT specification", "42P10");
+            }
+        }
+    }
+
     /** Find an existing row that conflicts with the proposed row on the specified conflict target. */
     Object[] findConflictingRow(Table table, Object[] proposedRow, InsertStmt.OnConflict onConflict) {
         // Handle expression-based conflict targets (e.g. ON CONFLICT ((lower(email))))
@@ -67,6 +106,7 @@ class DmlConflictHelper {
                     throw new MemgresException("column \"" + col + "\" of relation \"" + table.getName() + "\" does not exist", "42703");
                 }
             }
+            requireArbiterOpclasses(table, explicitCols, onConflict.opclasses());
             // Validate that the specified conflict columns match a unique constraint or primary key
             boolean hasMatchingUnique = false;
             for (StoredConstraint sc : table.getConstraints()) {
@@ -121,6 +161,10 @@ class DmlConflictHelper {
                 }
                 return null;
             }
+            // The index treats every null key as unlike every other, which is what a key means
+            // unless it was declared NULLS NOT DISTINCT: there the rows are compared instead, and
+            // one null is the same key as another.
+            if (sc.isNullsNotDistinct() && anyNull(proposedVals)) break;
             TableIndex idx = table.getIndex(sc.getName());
             if (idx != null) {
                 Object[] conflict = idx.findConflict(proposedRow, null);
@@ -141,12 +185,38 @@ class DmlConflictHelper {
         return null;
     }
 
+    private static boolean anyNull(Object[] values) {
+        for (Object v : values) {
+            if (v == null) return true;
+        }
+        return false;
+    }
+
     /** Whether a partial index holds a row, which is what its own predicate decides. */
     private boolean indexHolds(Table table, Expression predicate, Object[] row) {
         return executor.isTruthy(executor.evalExpr(predicate, new RowContext(table, null, row)));
     }
 
     /** Whether an existing row carries the same key as the row being written. */
+    /** Whether a key over exactly these columns was declared to treat nulls as equal. */
+    private boolean keyOverTheseColumnsTreatsNullsAsEqual(Table table, List<String> cols) {
+        for (StoredConstraint sc : table.getConstraints()) {
+            if (sc.getType() != StoredConstraint.Type.PRIMARY_KEY
+                    && sc.getType() != StoredConstraint.Type.UNIQUE) {
+                continue;
+            }
+            if (!sc.isNullsNotDistinct()) continue;
+            List<String> scCols = sc.getColumns();
+            if (scCols == null || scCols.size() != cols.size()) continue;
+            boolean same = true;
+            for (int i = 0; i < cols.size(); i++) {
+                if (!cols.get(i).equalsIgnoreCase(scCols.get(i))) { same = false; break; }
+            }
+            if (same) return true;
+        }
+        return false;
+    }
+
     private boolean sameKey(Object[] existingRow, int[] colIndices, Object[] proposedVals) {
         for (int i = 0; i < colIndices.length; i++) {
             if (!executor.valuesEqual(proposedVals[i], existingRow[colIndices[i]])) return false;
@@ -158,11 +228,15 @@ class DmlConflictHelper {
     private Object[] findRowByColumns(Table table, Object[] proposedRow, List<String> cols) {
         int[] colIndices = new int[cols.size()];
         Object[] proposedVals = new Object[cols.size()];
+        // A null is unlike every other value and so conflicts with nothing — unless the key it
+        // is part of was declared NULLS NOT DISTINCT, which is the whole of what that clause
+        // says. Refusing to look made the insert fail on the key it was told how to handle.
+        boolean nullsCollide = keyOverTheseColumnsTreatsNullsAsEqual(table, cols);
         for (int i = 0; i < cols.size(); i++) {
             colIndices[i] = table.getColumnIndex(cols.get(i));
             if (colIndices[i] < 0) return null;
             proposedVals[i] = proposedRow[colIndices[i]];
-            if (proposedVals[i] == null) return null; // NULL never conflicts
+            if (proposedVals[i] == null && !nullsCollide) return null;
         }
         // Try index lookup
         for (StoredConstraint sc : table.getConstraints()) {
@@ -175,6 +249,9 @@ class DmlConflictHelper {
                 if (!cols.get(i).equalsIgnoreCase(scCols.get(i))) { colMatch = false; break; }
             }
             if (!colMatch) continue;
+            // As above: a key declared NULLS NOT DISTINCT is compared row by row, because the
+            // index has no entry for a null key to find.
+            if (sc.isNullsNotDistinct() && anyNull(proposedVals)) break;
             TableIndex idx = table.getIndex(sc.getName());
             if (idx != null) {
                 return idx.findConflict(proposedRow, null);
