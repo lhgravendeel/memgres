@@ -1270,12 +1270,15 @@ class CustomOperatorExecutionTest {
             stmt.execute("CREATE OPERATOR |!=| (LEFTARG = integer, RIGHTARG = integer, FUNCTION = bool_neg, "
                     + "NEGATOR = |=|, COMMUTATOR = |!=|)");
 
-            // Check oprresult is non-zero (should be boolean OID)
+            // Check oprresult is non-zero (should be boolean OID). oprcode is a regproc, so it
+            // reads back as the function's name; the number behind it is asked for as an oid.
             try (ResultSet rs = stmt.executeQuery(
-                    "SELECT oprresult, oprcode, oprcom, oprnegate FROM pg_operator WHERE oprname = '|=|'")) {
+                    "SELECT oprresult, oprcode::oid AS oprcode_oid, oprcode::text AS oprcode_name,"
+                    + " oprcom, oprnegate FROM pg_operator WHERE oprname = '|=|'")) {
                 assertTrue(rs.next());
                 assertTrue(rs.getInt("oprresult") != 0, "oprresult should be populated");
-                assertTrue(rs.getInt("oprcode") != 0, "oprcode should be populated");
+                assertTrue(rs.getInt("oprcode_oid") != 0, "oprcode should be populated");
+                assertEquals("bool_eq", rs.getString("oprcode_name"));
                 assertTrue(rs.getInt("oprcom") != 0, "oprcom should be populated (self-commutator)");
                 assertTrue(rs.getInt("oprnegate") != 0, "oprnegate should be populated");
             }

@@ -803,8 +803,34 @@ class SelectWindowEvaluator {
         }
     }
 
-    /** The declared type of an offset that is a plain column, or null when it is anything else. */
+    /**
+     * The type an offset was written with, or null where nothing settles it.
+     *
+     * <p>A cast says what its value is, a number is the narrowest type that holds it, and a quoted
+     * constant is nothing until something asks it to be. Only a column was read before, so an
+     * offset written as anything else reached the frame unjudged: {@code RANGE BETWEEN '1'::text
+     * PRECEDING} over an integer column measured a distance in a type that cannot measure one.
+     */
     private static DataType staticType(Expression offset, List<RowContext.TableBinding> bindings) {
+        if (offset instanceof CastExpr) {
+            try {
+                return DataType.fromPgName(((CastExpr) offset).typeName());
+            } catch (RuntimeException notAType) {
+                return null;
+            }
+        }
+        if (offset instanceof Literal) {
+            Literal literal = (Literal) offset;
+            if (literal.literalType() == Literal.LiteralType.FLOAT) return DataType.NUMERIC;
+            if (literal.literalType() != Literal.LiteralType.INTEGER) return null;
+            try {
+                java.math.BigInteger written = new java.math.BigInteger(literal.value().trim());
+                if (written.bitLength() < 32) return DataType.INTEGER;
+                return written.bitLength() < 64 ? DataType.BIGINT : DataType.NUMERIC;
+            } catch (NumberFormatException notWhole) {
+                return DataType.NUMERIC;
+            }
+        }
         if (!(offset instanceof ColumnRef) || bindings == null) return null;
         ColumnRef ref = (ColumnRef) offset;
         for (RowContext.TableBinding binding : bindings) {
@@ -841,9 +867,17 @@ class SelectWindowEvaluator {
                 || type == DataType.INTERVAL;
     }
 
+    /**
+     * Whether a distance in the offset's type can be measured along the ordering column's.
+     *
+     * <p>A whole number steps along a whole-numbered column and a fraction does not; every number
+     * steps along a numeric or a float, which each hold one. What a date, a time or a timestamp is
+     * a distance apart is an interval and nothing else, so a number of them is no distance at all.
+     */
     private static boolean compatibleRangeOffset(DataType orderType, DataType offsetType) {
         if (isIntegral(orderType)) return isIntegral(offsetType);
         if (isNumeric(orderType)) return isNumeric(offsetType);
+        if (supportsRangeOffset(orderType)) return offsetType == DataType.INTERVAL;
         return true;
     }
 
@@ -1296,7 +1330,8 @@ class SelectWindowEvaluator {
             // that row's own v. Read once with no row at all, a column named in either place was
             // simply not there to resolve.
             RowContext here = contexts.get(sortedPartition.get(i));
-            Object defaultVal = wf.args().size() > 2 ? executor.evalExpr(wf.args().get(2), here) : null;
+            Object defaultVal = wf.args().size() > 2
+                    ? defaultOfTheValuesType(wf, contexts, here) : null;
             long step = 1;
             if (wf.args().size() > 1) {
                 Integer offset = integerArgument(wf, 1, here);
@@ -1327,6 +1362,24 @@ class SelectWindowEvaluator {
             }
             results[sortedPartition.get(i)] = val;
         }
+    }
+
+    /**
+     * The value the call falls back to, read as the type of the value it stands in for.
+     *
+     * <p>What lag and lead answer with is one type however the row is reached, so a default
+     * written with no type of its own -- a quoted literal -- is that type too: {@code lag(v, 1,
+     * 'zz')} over an integer column is a fallback that does not read as an integer, and there is
+     * no answer to give rather than the letters themselves.
+     */
+    private Object defaultOfTheValuesType(WindowFuncExpr wf, List<RowContext> contexts,
+                                          RowContext here) {
+        Object written = executor.evalExpr(wf.args().get(2), here);
+        List<RowContext.TableBinding> scope = contexts.isEmpty()
+                ? new ArrayList<RowContext.TableBinding>() : contexts.get(0).getBindings();
+        if (written == null || declaredType(wf.args().get(2), scope) != null) return written;
+        DataType asked = declaredType(wf.args().get(0), scope);
+        return asked == null ? written : TypeCoercion.coerce(written, asked);
     }
 
     /**

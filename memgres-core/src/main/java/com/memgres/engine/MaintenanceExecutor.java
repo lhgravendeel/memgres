@@ -154,9 +154,41 @@ final class MaintenanceExecutor {
                         + stmt.name() + "\"", "42704");
             }
         } else {
+            requireIndexOfTable(stmt);
             executor.database.setClusteredIndex(stmt.indexName());
         }
         return QueryResult.message(QueryResult.Type.SET, "CLUSTER");
+    }
+
+    /**
+     * The index a CLUSTER names has to be one of the relation's. A name that reaches none was
+     * written down as the relation's clustered index all the same, so a later CLUSTER on the
+     * relation ordered it by an index nobody has.
+     */
+    private void requireIndexOfTable(MaintenanceStmt stmt) {
+        String schema = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
+        Schema held = executor.database.getSchema(schema);
+        Table table = held == null ? null : held.getTable(stmt.name());
+        if (table != null) {
+            for (StoredConstraint sc : table.getConstraints()) {
+                if ((sc.getType() == StoredConstraint.Type.PRIMARY_KEY
+                        || sc.getType() == StoredConstraint.Type.UNIQUE)
+                        && stmt.indexName().equalsIgnoreCase(sc.getName())) {
+                    return;
+                }
+            }
+        }
+        String owner = executor.database.hasIndex(schema, stmt.indexName())
+                ? executor.database.getIndexTable(stmt.indexName()) : null;
+        if (owner == null) {
+            throw new MemgresException("index \"" + stmt.indexName() + "\" for table \""
+                    + stmt.name() + "\" does not exist", "42704");
+        }
+        String bare = owner.contains(".") ? owner.substring(owner.indexOf('.') + 1) : owner;
+        if (!bare.equalsIgnoreCase(stmt.name())) {
+            throw new MemgresException("\"" + stmt.indexName() + "\" is not an index for table \""
+                    + stmt.name() + "\"", "42809");
+        }
     }
 
     private boolean hasClusteredIndex(String tableName) {

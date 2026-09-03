@@ -33,7 +33,11 @@ final class TypeNamespace {
      */
     static String key(String schema, String name) {
         String s = schema == null || schema.isEmpty() ? "public" : schema.toLowerCase(Locale.ROOT);
-        return s + "." + name.toLowerCase(Locale.ROOT);
+        // The name is the name as written: it was folded where it was read -- an unquoted one to
+        // lower case, a quoted one not at all -- and folding it again here made every type answer
+        // to every spelling of its name, so a type created as "MiXeD" was reached by writing
+        // mixed, which names nothing.
+        return s + "." + name;
     }
 
     /** The schema half of a key. */
@@ -79,10 +83,9 @@ final class TypeNamespace {
             String exact = key(schema, bare(written));
             return keys.contains(exact) ? exact : null;
         }
-        String lower = written.toLowerCase(Locale.ROOT);
-        String pub = "public." + lower;
+        String pub = "public." + written;
         if (keys.contains(pub)) return pub;
-        String suffix = "." + lower;
+        String suffix = "." + written;
         String found = null;
         for (String k : keys) {
             if (k.endsWith(suffix)) {
@@ -103,10 +106,9 @@ final class TypeNamespace {
     static String resolve(Database db, Session session, String written) {
         if (db == null || written == null) return null;
         if (writtenSchema(written) != null) return find(db.typeKeys(), written);
-        String lower = written.toLowerCase(Locale.ROOT);
         Collection<String> keys = db.typeKeys();
         for (String schema : searchPath(db, session)) {
-            String candidate = schema + "." + lower;
+            String candidate = schema + "." + written;
             if (keys.contains(candidate)) return candidate;
         }
         // Only the search path answers an unqualified name. Falling back to any schema at all
@@ -137,19 +139,23 @@ final class TypeNamespace {
     static String resolveParts(Database db, Session session, String schema, String name) {
         if (db == null || name == null) return null;
         Collection<String> keys = db.typeKeys();
-        String lower = name.toLowerCase(Locale.ROOT);
         if (schema != null) {
-            String candidate = schema.toLowerCase(Locale.ROOT) + "." + lower;
+            String candidate = schema.toLowerCase(Locale.ROOT) + "." + name;
             return keys.contains(candidate) ? candidate : null;
         }
         for (String s : searchPath(db, session)) {
-            String candidate = s + "." + lower;
+            String candidate = s + "." + name;
             if (keys.contains(candidate)) return candidate;
         }
         return null;
     }
 
     /** Schemas an unqualified type name is looked up in, in precedence order. */
+    /** The schemas a bare name is looked for in, in order. */
+    static List<String> searchPathOf(Database db, Session session) {
+        return searchPath(db, session);
+    }
+
     private static List<String> searchPath(Database db, Session session) {
         LinkedHashSet<String> path = new LinkedHashSet<String>();
         if (session != null) {

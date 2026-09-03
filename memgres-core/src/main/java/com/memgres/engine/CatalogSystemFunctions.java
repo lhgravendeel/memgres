@@ -403,6 +403,15 @@ class CatalogSystemFunctions {
                     }
                 }
 
+                // What COALESCE and a CASE answer with is settled from all their branches taken
+                // together, and the value that came back from one of them does not say what they
+                // settled on: COALESCE(1, 1.5) answers with the numeric one, whose value reads
+                // as an integer.
+                if (rawExpr instanceof CaseExpr || isBranchingCall(rawExpr)) {
+                    DataType settled = executor.exprEvaluator.inferExprType(rawExpr);
+                    if (settled != null) return pgTypeDisplayName(settled);
+                }
+
                 // An empty array says nothing about what it would have held, so the call's own
                 // declaration decides: pg_blocking_pids answers an integer array whether or not
                 // anything is blocking.
@@ -597,6 +606,9 @@ class CatalogSystemFunctions {
                     return "text[]";
                 }
                 if (arg instanceof BigDecimal) return "numeric";
+                // An amount of money is its own type, and prints with a currency sign no other
+                // type prints: read through the general shape rule it was reported as text.
+                if (arg instanceof PgMoney) return "money";
                 DataType dt = TypeCoercion.inferType(arg);
                 return dt != null ? pgTypeDisplayName(dt) : arg.getClass().getSimpleName().toLowerCase(java.util.Locale.ROOT);
             }
@@ -694,6 +706,13 @@ class CatalogSystemFunctions {
             case "pg_drop_replication_slot": {
                 if (!fn.args().isEmpty()) {
                     String slotName = String.valueOf(executor.evalExpr(fn.args().get(0), ctx));
+                    // A slot that is not there is not a slot to drop, and PostgreSQL says so
+                    // rather than doing nothing quietly.
+                    if (!executor.database.getReplicationSlots().containsKey(
+                            slotName.toLowerCase(java.util.Locale.ROOT))) {
+                        throw new MemgresException(
+                                "replication slot \"" + slotName + "\" does not exist", "42704");
+                    }
                     executor.database.removeReplicationSlot(slotName);
                 }
                 return null;  // void function
@@ -751,7 +770,9 @@ class CatalogSystemFunctions {
             case "pg_stat_reset_shared": {
                 if (!fn.args().isEmpty()) {
                     Object arg = executor.evalExpr(fn.args().get(0), ctx);
-                    String target = arg != null ? arg.toString().toLowerCase(java.util.Locale.ROOT) : "";
+                    // The target is a name PostgreSQL matches letter for letter, so WAL is not
+                    // the wal it ships: reading it folded accepted a target nothing answers to.
+                    String target = arg != null ? arg.toString() : "";
                     java.util.Set<String> validTargets = new java.util.HashSet<>(java.util.Arrays.asList(
                             "archiver", "bgwriter", "checkpointer", "io", "recovery_prefetch",
                             "slru", "wal"));
@@ -907,8 +928,17 @@ class CatalogSystemFunctions {
                 Object tableOid = executor.evalExpr(fn.args().get(0), ctx);
                 if (tableOid == null) return null;
                 String schema = schemaOfRelation(tableOid);
-                if (schema == null) return true;
-                for (String onPath : executor.searchPathSchemas()) {
+                if (schema == null || executor.session == null) return true;
+                // The catalogue's own schema and the session's temporary one are reachable
+                // whether or not they were written down; every other schema is reachable only
+                // because the path names it. Reading the path with public added to the end -- as
+                // the resolver does, to find a relation nobody qualified -- said a table in
+                // public was reachable from a session whose path does not name it.
+                if ("pg_catalog".equalsIgnoreCase(schema)
+                        || schema.equalsIgnoreCase(executor.session.getTempSchemaName())) {
+                    return true;
+                }
+                for (String onPath : executor.session.getEffectiveSearchPath(false)) {
                     if (onPath.equalsIgnoreCase(schema)) return true;
                 }
                 return false;
@@ -973,7 +1003,17 @@ class CatalogSystemFunctions {
                 if (!fn.args().isEmpty()) {
                     Object val = executor.evalExpr(fn.args().get(0), ctx);
                     if (val == null) return 0;
-                    // Compute payload size in bytes + varlena header (4 bytes)
+                    // A type of fixed width takes that width and no more: only a value whose
+                    // length varies carries the four-byte header that says how long it is.
+                    // Giving every value a header said a boolean took eight bytes.
+                    Integer fixed = fixedWidthOf(val);
+                    if (fixed != null) return fixed;
+                    if (val instanceof java.math.BigDecimal) {
+                        return numericStorageSize((java.math.BigDecimal) val);
+                    }
+                    if (val instanceof java.util.List) {
+                        return arrayStorageSize((java.util.List<?>) val);
+                    }
                     int payloadBytes;
                     if (val instanceof byte[]) {
                         payloadBytes = ((byte[]) val).length;
@@ -983,12 +1023,6 @@ class CatalogSystemFunctions {
                         } catch (java.io.UnsupportedEncodingException e) {
                             payloadBytes = ((String) val).length();
                         }
-                    } else if (val instanceof Number) {
-                        if (val instanceof Integer || val instanceof Short) payloadBytes = 4;
-                        else if (val instanceof Long) payloadBytes = 8;
-                        else if (val instanceof Float) payloadBytes = 4;
-                        else if (val instanceof Double) payloadBytes = 8;
-                        else payloadBytes = val.toString().length();
                     } else {
                         payloadBytes = val.toString().length();
                     }
@@ -1214,9 +1248,12 @@ class CatalogSystemFunctions {
             }
             case "pg_current_xact_id_if_assigned":
             case "txid_current_if_assigned": {
-                // Returns null if no transaction is currently active
-                if (executor.session != null && executor.session.isInTransaction()) {
-                    return executor.session.getTransactionId();
+                // An identifier is handed out when a transaction first writes, so a transaction
+                // that has only read has none to answer with -- and asking for one here would be
+                // assigning it, which is the one thing this function is written not to do.
+                if (executor.session != null && executor.session.isInTransaction()
+                        && executor.session.hasAssignedTransactionId()) {
+                    return executor.session.peekTransactionId();
                 }
                 return null;
             }
@@ -1416,7 +1453,8 @@ class CatalogSystemFunctions {
         if (unit.isEmpty()) return 0;
         switch (unit.toLowerCase(java.util.Locale.ROOT)) {
             case "b":
-            case "byte":
+            // The singular is not a unit PostgreSQL reads: it lists bytes, B, kB and the rest,
+            // and "1 byte" is a size written in a unit that is not one of them.
             case "bytes": return 0;
             case "kb": return 10;
             case "mb": return 20;
@@ -1425,6 +1463,15 @@ class CatalogSystemFunctions {
             case "pb": return 50;
             default: return -1;
         }
+    }
+
+    /** Whether a call answers with the one type its arguments settle on between them. */
+    private static boolean isBranchingCall(Expression expr) {
+        if (!(expr instanceof FunctionCallExpr)) return false;
+        String name = FunctionEvaluator.stripSchemaPrefix(
+                ((FunctionCallExpr) expr).name().toLowerCase(java.util.Locale.ROOT));
+        return name.equals("coalesce") || name.equals("greatest") || name.equals("least")
+                || name.equals("nullif");
     }
 
     /** True for the types a math routine can resolve to, where inference is reliable. */
@@ -1707,6 +1754,68 @@ class CatalogSystemFunctions {
             unit++;
         }
         return size + " " + units[unit];
+    }
+
+    /**
+     * How many bytes a value of a fixed-width type takes, or null when its type has no fixed
+     * width. These are the widths PostgreSQL stores them in, which is what pg_column_size reports.
+     */
+    private static Integer fixedWidthOf(Object val) {
+        if (val instanceof Boolean) return 1;
+        if (val instanceof Short) return 2;
+        if (val instanceof Integer || val instanceof Float) return 4;
+        if (val instanceof Long || val instanceof Double) return 8;
+        if (val instanceof java.util.UUID) return 16;
+        if (val instanceof java.time.LocalDate) return 4;
+        if (val instanceof java.time.LocalDateTime || val instanceof java.time.OffsetDateTime
+                || val instanceof java.time.LocalTime) {
+            return 8;
+        }
+        if (val instanceof java.time.OffsetTime) return 12;
+        if (val instanceof PgInterval) return 16;
+        return null;
+    }
+
+    /**
+     * The bytes an array takes: the varlena header, the array's own header — how many dimensions
+     * it has, where its data begins and what its elements are — a size and a lower bound for each
+     * dimension, and then the elements themselves.
+     */
+    private static int arrayStorageSize(java.util.List<?> elements) {
+        int total = 4 + 12 + 8;
+        for (Object element : elements) {
+            if (element == null) continue;
+            Integer fixed = fixedWidthOf(element);
+            if (fixed != null) {
+                total += fixed;
+            } else if (element instanceof java.math.BigDecimal) {
+                total += numericStorageSize((java.math.BigDecimal) element);
+            } else {
+                total += String.valueOf(element).length() + 4;
+            }
+        }
+        return total;
+    }
+
+    /**
+     * The bytes a numeric takes: the varlena header, the two-byte header of its own, and two
+     * bytes for each base-ten-thousand digit it is made of. A digit group of zeroes at either end
+     * is not stored, which is why a whole power of ten is as small as a single figure.
+     */
+    private static int numericStorageSize(java.math.BigDecimal value) {
+        java.math.BigDecimal stripped = value.stripTrailingZeros();
+        if (stripped.signum() == 0) return 6;
+        int scale = Math.max(stripped.scale(), 0);
+        String digits = stripped.unscaledValue().abs().toString();
+        int wholeDigits = digits.length() - scale;
+        // The groups are aligned on the decimal point, so each side is padded out to a multiple
+        // of four before the groups are counted.
+        int leadPad = wholeDigits <= 0 ? -wholeDigits % 4 : (4 - wholeDigits % 4) % 4;
+        int emptyLeadingGroups = wholeDigits <= 0 ? -wholeDigits / 4 : 0;
+        int trailPad = (4 - scale % 4) % 4;
+        int totalDigits = leadPad + digits.length() + trailPad;
+        int groups = totalDigits / 4 - emptyLeadingGroups;
+        return 6 + 2 * Math.max(groups, 0);
     }
 
 }

@@ -174,6 +174,15 @@ class DdlObjectExecutor {
                 && executor.database.getCompositeTypes().containsKey(named)) {
             return executeAlterCompositeType(stmt);
         }
+        // Every type has an owner, so OWNER TO names one whatever kind of type it is. Only the
+        // enums were looked up, so giving away a composite or a domain said no such type.
+        if (stmt.action() == AlterTypeStmt.Action.OWNER_TO && named != null
+                && !executor.database.getCustomEnums().containsKey(named)) {
+            requireOwnerExists(stmt.value());
+            executor.database.setObjectOwner("type:" + named,
+                    executor.ddlExecutor.resolveOwnerName(stmt.value()));
+            return QueryResult.command(QueryResult.Type.ALTER_TYPE, 0);
+        }
         // A range is a type like the others and answers to the statements that name a type. Only
         // the enums were looked up below, so a range could not be renamed or moved at all.
         if (stmt.action() == AlterTypeStmt.Action.RENAME_TO
@@ -624,6 +633,23 @@ class DdlObjectExecutor {
             throw new MemgresException("aggregate stype must be specified", "42P13");
         }
 
+        // The state type is what the whole definition is written in terms of, so a name that is
+        // no type is reported before anything is looked up in terms of it.
+        validateTypeExists(stmt.stype());
+        // FINALFUNC_MODIFY says how the final function may treat the state, and it has three
+        // answers; a word that is none of them is a fault in the statement.
+        if (stmt.finalfuncModify() != null
+                && !FINALFUNC_MODIFY_VALUES.contains(
+                        stmt.finalfuncModify().toUpperCase(java.util.Locale.ROOT))) {
+            throw new MemgresException("parameter \"finalfunc_modify\" must be READ_ONLY,"
+                    + " SHAREABLE, or READ_WRITE", "42601");
+        }
+        // The moving-aggregate functions belong to the moving state, so naming one without
+        // saying what that state is describes nothing.
+        if (stmt.minvfunc() != null && stmt.mstype() == null) {
+            throw new MemgresException(
+                    "aggregate minvfunc must not be specified without mstype", "42P13");
+        }
         // The transition function takes the running state plus the aggregated arguments; an
         // ordered-set aggregate's direct arguments go to the final function instead.
         List<String> transArgs = new ArrayList<>();
@@ -631,7 +657,16 @@ class DdlObjectExecutor {
         transArgs.addAll(aggregatedArgTypes(stmt));
         requireFunctionSignature(stmt.sfunc(), transArgs);
         if (stmt.finalfunc() != null) {
-            requireFunctionSignature(stmt.finalfunc(), Cols.listOf(stmt.stype()));
+            // FINALFUNC_EXTRA hands the aggregate's own arguments to the final function as well,
+            // so what the function has to take is a longer list than the state alone.
+            List<String> finalArgs = new ArrayList<>();
+            finalArgs.add(stmt.stype());
+            if (stmt.finalfuncExtra()) finalArgs.addAll(aggregatedArgTypes(stmt));
+            requireFunctionSignature(stmt.finalfunc(), finalArgs);
+        }
+        // The initial state is a value of the state type, read by that type's own reader.
+        if (stmt.initcond() != null) {
+            executor.castValue(stmt.initcond(), stmt.stype());
         }
 
         PgAggregate existing = executor.database.getAggregate(stmt.name());
@@ -654,6 +689,10 @@ class DdlObjectExecutor {
         executor.database.addAggregate(agg);
         return QueryResult.command(QueryResult.Type.SET, 0);
     }
+
+    /** What FINALFUNC_MODIFY may say about how the final function treats the state. */
+    private static final Set<String> FINALFUNC_MODIFY_VALUES =
+            Cols.setOf("READ_ONLY", "SHAREABLE", "READ_WRITE");
 
     /** The argument types the transition function receives, i.e. everything after ORDER BY. */
     private static List<String> aggregatedArgTypes(CreateAggregateStmt stmt) {
@@ -810,6 +849,12 @@ class DdlObjectExecutor {
             throw new MemgresException("operator function must be specified", "42P13");
         }
 
+        // The operand types are read before the function is looked for: an operator over a type
+        // nobody declared names no type, and there is no signature to look for until both sides
+        // name one. Looked for first, the complaint was about a routine whose name the statement
+        // never got wrong.
+        validateTypeExists(stmt.leftArg());
+        validateTypeExists(stmt.rightArg());
         // Validate that the backing function exists (skip for well-known built-in PG functions)
         List<String> opArgs = new ArrayList<>();
         if (stmt.leftArg() != null) opArgs.add(stmt.leftArg());
@@ -1042,16 +1087,18 @@ class DdlObjectExecutor {
     }
 
     private QueryResult executeAlterOperatorFamilyObj(AlterOperatorStmt stmt) {
+        // Who the new owner is to be is settled before anything else, and before the family is
+        // even looked for: a role that is not there is what PostgreSQL reports for
+        // ALTER OPERATOR FAMILY nosuchfamily USING btree OWNER TO nosuchrole.
+        requireNewOwnerExists(stmt);
+        // A family belongs to an access method, so a method nothing implements is reported before
+        // the family is looked for inside it.
+        AccessMethods.require(stmt.method());
         String key = stmt.name().toLowerCase(java.util.Locale.ROOT) + ":" + stmt.method().toLowerCase(java.util.Locale.ROOT);
         PgOperatorFamily fam = executor.database.getOperatorFamily(key);
-        if (fam == null && stmt.action() != AlterOperatorStmt.AlterAction.ADD_MEMBER
-                && stmt.action() != AlterOperatorStmt.AlterAction.DROP_MEMBER) {
+        if (fam == null) {
             throw new MemgresException("operator family \"" + stmt.name()
                     + "\" does not exist for access method \"" + stmt.method() + "\"", "42704");
-        }
-        if (fam == null) {
-            // ADD/DROP MEMBER on non-existent family — just accept
-            return QueryResult.command(QueryResult.Type.SET, 0);
         }
 
         switch (stmt.action()) {
@@ -1064,11 +1111,12 @@ class DdlObjectExecutor {
                 executor.database.addOperatorFamily(fam);
                 break;
             case SET_SCHEMA:
+                SchemaQualifier.requireSchema(executor.database, executor.session, stmt.value());
                 fam.setSchemaName(stmt.value());
                 break;
             case ADD_MEMBER:
             case DROP_MEMBER:
-                // Members are tracked conceptually but we don't maintain a member list
+                alterFamilyMembers(stmt, fam);
                 break;
             default:
                 break;
@@ -1076,7 +1124,60 @@ class DdlObjectExecutor {
         return QueryResult.command(QueryResult.Type.SET, 0);
     }
 
+    /**
+     * Fill or empty the places an ADD or DROP list names.
+     *
+     * <p>A place is a number and a pair of operand types, and the access method decides which
+     * numbers it has at all. What fills the place has to exist to be put there; and a place that
+     * was never filled cannot be emptied, which is what PostgreSQL says by naming the number and
+     * the types back to the writer.
+     */
+    private void alterFamilyMembers(AlterOperatorStmt stmt, PgOperatorFamily fam) {
+        boolean adding = stmt.action() == AlterOperatorStmt.AlterAction.ADD_MEMBER;
+        for (AlterOperatorStmt.Member member : stmt.members()) {
+            AccessMethods.requireNumberInRange(stmt.method(), !member.function, member.number);
+            // A member covers a pair of operands, and one type named where two belong leaves the
+            // clause unfinished rather than describing some other member.
+            if (member.argTypes.size() < 2) {
+                throw new MemgresException("missing argument", "42601");
+            }
+            List<String> canonical = new ArrayList<>();
+            for (String written : member.argTypes) {
+                validateTypeExists(written);
+                canonical.add(DataType.canonicalName(written));
+            }
+            String place = (member.function ? "f" : "o") + member.written(canonical);
+            if (adding) {
+                if (!member.function && member.named != null && !member.named.isEmpty()
+                        && canonical.size() == 2
+                        && !executor.database.hasOperator("public." + member.named
+                                + "(" + canonical.get(0) + "," + canonical.get(1) + ")")
+                        && !PgOperatorTable.exists(member.named, canonical.get(0),
+                                canonical.get(1))) {
+                    throw new MemgresException("operator does not exist: " + canonical.get(0)
+                            + " " + member.named + " " + canonical.get(1), "42883");
+                }
+                fam.addMember(place, new PgOperatorFamily.Member(member.function, member.number,
+                        canonical.get(0), canonical.get(1), member.named));
+            } else if (!fam.removeMember(place)) {
+                throw new MemgresException((member.function ? "function " : "operator ")
+                        + member.written(canonical) + " does not exist in operator family \""
+                        + stmt.name() + "\"", "42704");
+            }
+        }
+    }
+
+    /** The role an OWNER TO names has to be one the server has, whatever is being altered. */
+    private void requireNewOwnerExists(AlterOperatorStmt stmt) {
+        if (stmt.action() != AlterOperatorStmt.AlterAction.OWNER_TO || stmt.value() == null) return;
+        String owner = executor.ddlExecutor.resolveOwnerName(stmt.value());
+        if (!executor.database.hasRole(owner)) {
+            throw new MemgresException("role \"" + stmt.value() + "\" does not exist", "42704");
+        }
+    }
+
     private QueryResult executeAlterOperatorClassObj(AlterOperatorStmt stmt) {
+        requireNewOwnerExists(stmt);
         String key = stmt.name().toLowerCase(java.util.Locale.ROOT) + ":" + stmt.method().toLowerCase(java.util.Locale.ROOT);
         PgOperatorClass cls = executor.database.getOperatorClass(key);
         if (cls == null) {
@@ -1094,6 +1195,7 @@ class DdlObjectExecutor {
                 executor.database.addOperatorClass(cls);
                 break;
             case SET_SCHEMA:
+                SchemaQualifier.requireSchema(executor.database, executor.session, stmt.value());
                 cls.setSchemaName(stmt.value());
                 break;
             default:
@@ -1157,7 +1259,7 @@ class DdlObjectExecutor {
             for (CreateFunctionStmt.FuncParam fp : stmt.parsedParams()) {
                 // Validate parameter types exist (PG validates at CREATE time)
                 if (fp.typeName() != null) {
-                    validateTypeExists(fp.typeName());
+                    validateTypeExists(executor, fp.typeName(), false);
                 }
                 // Validate default expression function references
                 if (fp.defaultExpr() != null) {
@@ -1337,6 +1439,12 @@ class DdlObjectExecutor {
         }
         executor.database.registerSchemaObject(funcSchema, "function", stmt.name());
         executor.database.setObjectOwner("function:" + stmt.name(), executor.sessionUser());
+        // A routine gets the privileges ALTER DEFAULT PRIVILEGES set aside for the routines to
+        // come, as a relation does: applied to relations alone, a grantee promised EXECUTE in
+        // advance was promised nothing.
+        DdlTableExecutor.applyDefaultPrivileges(executor, funcSchema,
+                stmt.name().toLowerCase(java.util.Locale.ROOT), executor.currentRole(),
+                "FUNCTIONS", "FUNCTION");
         // A routine is identified by its schema and its argument types, so that is what the undo
         // holds: rolling back one added overload must not take the other overloads of that name,
         // nor the same name in another schema, with it.
@@ -1592,7 +1700,8 @@ class DdlObjectExecutor {
                 String bodyTrimmed = stmt.body().trim().replaceAll(";\\s*$", "").trim();
                 if (bodyTrimmed.equalsIgnoreCase("SELECT")) {
                     throw new MemgresException(
-                            "return type mismatch in function declared to return " + (stmt.returnType() != null ? stmt.returnType() : "unknown")
+                            "return type mismatch in function declared to return "
+                            + spelledOutTypeName(stmt.returnType() != null ? stmt.returnType() : "unknown")
                             + "\n  Detail: Function's final statement must be SELECT or INSERT/UPDATE/DELETE RETURNING.",
                             "42P13");
                 }
@@ -1610,7 +1719,8 @@ class DdlObjectExecutor {
      */
     private void validateSqlBodyCollations(String body) {
         java.util.regex.Matcher m = java.util.regex.Pattern.compile(
-                "\\bCOLLATE\\s+\"?([\\w.]+)\"?", java.util.regex.Pattern.CASE_INSENSITIVE).matcher(body);
+                "\\bCOLLATE\\s+\"?([\\w.]+)\"?", java.util.regex.Pattern.CASE_INSENSITIVE)
+                .matcher(withoutStringContents(body));
         while (m.find()) {
             String collation = m.group(1).toLowerCase(java.util.Locale.ROOT);
             if (collation.equals("c") || collation.equals("posix") || collation.equals("default")
@@ -1633,12 +1743,48 @@ class DdlObjectExecutor {
      *                     records the routine before it reads the body, so a recursive SQL
      *                     function resolves its own name.
      */
+    /**
+     * The body with the contents of every string literal blanked out.
+     *
+     * <p>These checks read the body as text rather than as a parse tree, and a word inside a
+     * string is not a word of the statement: {@code SELECT 'COLLATE nosuch'} names no collation,
+     * and {@code SELECT 'x::nosuchtype'} casts to nothing. The quotes are left where they are so
+     * every other offset in the text is unchanged.
+     */
+    private static String withoutStringContents(String body) {
+        if (body == null) return "";
+        StringBuilder out = new StringBuilder(body.length());
+        boolean inString = false;
+        for (int i = 0; i < body.length(); i++) {
+            char c = body.charAt(i);
+            if (c == '\'') {
+                inString = !inString;
+                out.append(c);
+                continue;
+            }
+            out.append(inString && c != '\n' ? ' ' : c);
+        }
+        return out.toString();
+    }
+
     private void validateSqlBodyReferences(String body, String beingCreated) {
         // Check type casts: ::type_name
+        // A type name may say which schema to look in, and the qualifier is part of the name
+        // rather than a name of its own: reading only as far as the dot made pg_catalog.text a
+        // cast to a type called pg_catalog.
+        String scannable = withoutStringContents(body);
         java.util.regex.Matcher castMatcher = java.util.regex.Pattern.compile(
-                "::\\s*([a-zA-Z_][a-zA-Z0-9_]*)").matcher(body);
+                "::\\s*([a-zA-Z_][a-zA-Z0-9_]*)(?:\\s*\\.\\s*([a-zA-Z_][a-zA-Z0-9_]*))?")
+                .matcher(scannable);
         while (castMatcher.find()) {
-            String typeName = castMatcher.group(1);
+            String typeName = castMatcher.group(2) == null ? castMatcher.group(1)
+                    : castMatcher.group(1) + "." + castMatcher.group(2);
+            String bare = castMatcher.group(2) == null ? typeName : castMatcher.group(2);
+            // A built-in answers to pg_catalog's name as well as to none.
+            if ("pg_catalog".equalsIgnoreCase(castMatcher.group(1)) && castMatcher.group(2) != null
+                    && isKnownType(bare)) {
+                continue;
+            }
             if (!isKnownType(typeName)) {
                 throw new MemgresException("type \"" + typeName + "\" does not exist", "42704");
             }
@@ -1798,7 +1944,8 @@ class DdlObjectExecutor {
                 && (((SelectStmt) parsed).from() == null || ((SelectStmt) parsed).from().isEmpty())) {
             SelectStmt sel = (SelectStmt) parsed;
             throw new MemgresException(
-                    "return type mismatch in function declared to return " + (retType != null ? retType : "integer")
+                    "return type mismatch in function declared to return "
+                    + spelledOutTypeName(retType != null ? retType : "integer")
                     + "\n  Detail: Function's final statement must be SELECT or INSERT/UPDATE/DELETE RETURNING.",
                     "42P13");
         }
@@ -1815,7 +1962,8 @@ class DdlObjectExecutor {
                 Literal lit = (Literal) firstExpr;
                 if (isNumericType(retType)) {
                     throw new MemgresException(
-                            "return type mismatch in function declared to return " + retType
+                            "return type mismatch in function declared to return "
+                                    + spelledOutTypeName(retType)
                                     + "\n  Detail: Actual return type is text.", "42P13");
                 }
             }
@@ -2035,6 +2183,15 @@ class DdlObjectExecutor {
 
     /** Shared with the PL/pgSQL body validator, which checks declared variable types the same way. */
     static void validateTypeExists(AstExecutor executor, String typeName) {
+        validateTypeExists(executor, typeName, true);
+    }
+
+    /**
+     * @param quoted whether the name is wrapped in quotes when it is reported missing. Everywhere
+     *     PostgreSQL looks a type name up it quotes it, except in a routine's parameter list,
+     *     where the list is written back as it was read.
+     */
+    static void validateTypeExists(AstExecutor executor, String typeName, boolean quoted) {
         if (typeName == null || typeName.isEmpty()) return;
         String base = typeName.replaceAll("\\(.*\\)", "").replace("[]", "").trim();
         if (base.isEmpty()) return;
@@ -2054,7 +2211,9 @@ class DdlObjectExecutor {
         // Also check public schema
         Schema pub = executor.database.getSchema("public");
         if (pub != null && pub.getTable(base) != null) return;
-        throw new MemgresException("type \"" + base + "\" does not exist", "42704");
+        throw new MemgresException(quoted
+                ? "type \"" + base + "\" does not exist"
+                : "type " + base + " does not exist", "42704");
     }
 
     /**
@@ -2265,52 +2424,21 @@ class DdlObjectExecutor {
         boolean castIsNumeric = NUMERIC_TYPES.contains(ct);
         if (castIsString && retIsNumeric) {
             throw new MemgresException(
-                    "return type mismatch in function declared to return " + retType
+                    "return type mismatch in function declared to return " + spelledOutTypeName(retType)
                             + "\n  Detail: Actual return type is text.", "42P13");
         }
         if (castIsNumeric && retIsString) {
             throw new MemgresException(
-                    "return type mismatch in function declared to return " + retType
+                    "return type mismatch in function declared to return " + spelledOutTypeName(retType)
                             + "\n  Detail: Actual return type is integer.", "42P13");
         }
     }
 
     /** Split SQL body into individual statements separated by semicolons. */
+    /** The statements a routine's body is written as. */
     private List<String> splitSqlStatements(String body) {
-        List<String> result = new ArrayList<>();
-        StringBuilder current = new StringBuilder();
-        int i = 0;
-        while (i < body.length()) {
-            char c = body.charAt(i);
-            if (c == '\'') {
-                current.append(c);
-                i++;
-                while (i < body.length()) {
-                    current.append(body.charAt(i));
-                    if (body.charAt(i) == '\'' && (i + 1 >= body.length() || body.charAt(i + 1) != '\'')) {
-                        i++;
-                        break;
-                    }
-                    if (body.charAt(i) == '\'' && i + 1 < body.length() && body.charAt(i + 1) == '\'') {
-                        current.append(body.charAt(i + 1));
-                        i += 2;
-                        continue;
-                    }
-                    i++;
-                }
-            } else if (c == ';') {
-                String stmt2 = current.toString().trim();
-                if (!stmt2.isEmpty()) result.add(stmt2);
-                current.setLength(0);
-                i++;
-            } else {
-                current.append(c);
-                i++;
-            }
-        }
-        String last = current.toString().trim();
-        if (!last.isEmpty()) result.add(last);
-        return result.isEmpty() ? Cols.listOf(body.trim()) : result;
+        List<String> pieces = SqlPieces.statementsIn(body);
+        return pieces.isEmpty() ? Cols.listOf(body.trim()) : pieces;
     }
 
     // ---- CALL ----
@@ -2392,6 +2520,14 @@ class DdlObjectExecutor {
 
     private String callArgumentType(Expression arg) {
         if (arg instanceof CastExpr) return ((CastExpr) arg).typeName();
+        // A bare quoted literal has no type yet -- PostgreSQL calls it unknown and lets it reach
+        // a parameter of any type, which is then what reads it. Calling it text made
+        // CALL p('1.5') miss a p(int) that PostgreSQL reaches and then complains about the value.
+        if (arg instanceof Literal
+                && (((Literal) arg).literalType() == Literal.LiteralType.STRING
+                    || ((Literal) arg).literalType() == Literal.LiteralType.NULL)) {
+            return "unknown";
+        }
         Object value;
         try {
             value = executor.evalExpr(arg, null);
@@ -2407,6 +2543,37 @@ class DdlObjectExecutor {
         if (value instanceof Double) return "double precision";
         if (value instanceof String) return "text";
         return "unknown";
+    }
+
+    /** A value read as the type the parameter it is being passed to was declared with. */
+    private Object argumentAsDeclared(Object value, String typeName) {
+        if (value == null || typeName == null || typeName.trim().isEmpty()) return value;
+        try {
+            return executor.castValue(value, typeName);
+        } catch (MemgresException e) {
+            // A type this engine does not read here is not one to refuse the call over.
+            if ("42704".equals(e.getSqlState())) return value;
+            throw e;
+        }
+    }
+
+    /**
+     * Whether the name belongs to a routine this server has that is not a procedure.
+     *
+     * <p>CALL is for procedures, and a name that is a function is not one it can reach — so what
+     * PostgreSQL reports is the routine it found and what kind it is, rather than saying nothing
+     * of the name exists.
+     */
+    private boolean namesARoutineThatIsNotAProcedure(String callName) {
+        String bare = callName.substring(callName.indexOf('.') + 1)
+                .toLowerCase(java.util.Locale.ROOT);
+        List<PgFunction> declared = executor.database.getFunctionOverloads(bare);
+        if (declared != null) {
+            for (PgFunction f : declared) {
+                if (!f.isProcedure()) return true;
+            }
+        }
+        return BuiltinFunctionNames.contains(bare) || BuiltinRoutineNames.contains(bare);
     }
 
     /**
@@ -2547,9 +2714,23 @@ class DdlObjectExecutor {
             rejectAggregateArgument(arg);
         }
         String callName = stmt.name();
+        // A written schema is opened before the procedure inside it is looked for, so naming one
+        // that is not there is reported as the missing schema rather than as a missing procedure.
+        int callDot = callName.indexOf('.');
+        if (callDot > 0) {
+            SchemaQualifier.requireSchema(executor.database, executor.session,
+                    callName.substring(0, callDot));
+        }
         List<String> argTypes = callArgumentTypes(stmt.args());
         PgFunction function = resolveProcedure(callName, stmt.args().size(), argTypes);
         if (function == null) {
+            // A routine of that name that is not a procedure is a different complaint: CALL is
+            // for procedures, and PostgreSQL names the routine it found rather than saying there
+            // is none.
+            if (namesARoutineThatIsNotAProcedure(callName)) {
+                throw new MemgresException(stmt.name() + "(" + String.join(", ", argTypes)
+                        + ") is not a procedure", "42809");
+            }
             // A procedure is its name and the types it takes, so a call that matches no
             // signature names the types it was written with. Looking the name up alone found
             // whichever overload was stored first and ran it on the wrong arguments.
@@ -2654,7 +2835,11 @@ class DdlObjectExecutor {
                 argIdx++;
             }
             if (argIdx < stmt.args().size()) {
-                args.add(executor.evalExpr(stmt.args().get(argIdx++), null));
+                // A value reaching a parameter is read as that parameter's type, which is where
+                // an unknown literal is finally settled: CALL p('1.5') on a p(int) is the
+                // integer's own reader refusing 1.5, not a procedure nobody has.
+                args.add(argumentAsDeclared(executor.evalExpr(stmt.args().get(argIdx++), null),
+                        p.typeName()));
             } else if (p.defaultExpr() != null && !p.defaultExpr().isEmpty()) {
                 args.add(executor.evalExpr(
                         com.memgres.engine.parser.Parser.parseExpression(p.defaultExpr()), null));
@@ -2805,11 +2990,13 @@ class DdlObjectExecutor {
         checkTriggerWhen(stmt, trigEvents, triggerTableSchema, isView);
         if (stmt.functionName() != null) {
             PgFunction trigFunc = executor.database.getFunction(stmt.functionName());
-            if (trigFunc == null) {
+            // The server provides trigger functions of its own, and one of them is as much a
+            // function to call as anything a reader wrote.
+            if (trigFunc == null && !DmlTriggerHelper.isBuiltinTriggerFunction(stmt.functionName())) {
                 throw new MemgresException("function " + stmt.functionName() + "() does not exist",
                         "42883").withoutHint();
             }
-            String trigRetType = trigFunc.getReturnType();
+            String trigRetType = trigFunc == null ? null : trigFunc.getReturnType();
             if (trigRetType != null && !trigRetType.isEmpty()
                     && !"trigger".equalsIgnoreCase(trigRetType) && !"void".equalsIgnoreCase(trigRetType)) {
                 throw new MemgresException("function " + stmt.functionName() + " must return type trigger", "42P17");
@@ -3272,6 +3459,7 @@ class DdlObjectExecutor {
                 break;
             case FUNCTION:
             case PROCEDURE:
+            case ROUTINE:
                 dropFunction(stmt);
                 break;
             case TRIGGER:
@@ -3349,11 +3537,15 @@ class DdlObjectExecutor {
                 break;
             }
             case COLLATION: {
-                // Which locale-derived collations a machine has is a property of the machine, so
-                // an unknown name is not something to refuse — but IF EXISTS still says what it
-                // skipped when memgres has no collation of that name.
+                // A collation this server does not have is one it cannot drop, and what it has is
+                // what pg_collation lists: a name that is not there is refused the way a missing
+                // table is, and IF EXISTS says what it skipped instead.
                 if (executor.database.getCollation(stmt.name()) == null) {
-                    if (stmt.ifExists()) noticeSkipped("collation \"" + stmt.name() + "\"");
+                    if (!stmt.ifExists()) {
+                        throw new MemgresException("collation \"" + stmt.name()
+                                + "\" for encoding \"UTF8\" does not exist", "42704");
+                    }
+                    noticeSkipped("collation \"" + stmt.name() + "\"");
                     break;
                 }
                 // A column that sorts by this collation is written in terms of it, and
@@ -3367,7 +3559,17 @@ class DdlObjectExecutor {
                 break;
             }
             case CONVERSION: {
-                break; // no-op
+                // A conversion has no behaviour here, but its name is remembered when it is
+                // created: dropping one that was never created is refused rather than reported
+                // as done, which is what left the next statement to fail somewhere unrelated.
+                String bare = RelationNamespace.bareName(stmt.name());
+                if (!executor.database.hasStubObject("conversion", bare)) {
+                    if (stmt.ifExists()) break;
+                    throw new MemgresException(
+                            "conversion \"" + stmt.name() + "\" does not exist", "42704");
+                }
+                executor.database.removeStubObject("conversion", bare);
+                break;
             }
             case CAST: {
                 // name is encoded as "sourceType->targetType"
@@ -3614,6 +3816,7 @@ class DdlObjectExecutor {
         // Check for dependent columns
         List<SequenceDependent> dependents = findSequenceDependents(found);
         List<String> visibleSchemas = executor.searchPathSchemas();
+        requireNoIdentityColumnNeedsIt(dependents, bareSeqName, seqSchema, visibleSchemas);
         if (!dependents.isEmpty() && !stmt.cascade()) {
             // PostgreSQL names an object the search path does not reach by its schema too, so the
             // reader can tell which of two same-named sequences the complaint is about.
@@ -3650,6 +3853,30 @@ class DdlObjectExecutor {
     }
 
     /** A column whose default draws from a particular sequence, and the table that holds it. */
+    /**
+     * Refuse to drop a sequence an identity column is made of.
+     *
+     * <p>An identity column does not merely default to a sequence: the sequence is part of what
+     * the column is, so it goes when the column goes and not before -- CASCADE included, which
+     * offers to drop what depends on the sequence and cannot offer to drop half a column.
+     */
+    private void requireNoIdentityColumnNeedsIt(List<SequenceDependent> dependents,
+                                                String bareSeqName, String seqSchema,
+                                                List<String> visibleSchemas) {
+        for (SequenceDependent dep : dependents) {
+            String written = dep.column.getDefaultValue();
+            if (written == null || !written.contains("__identity__")) continue;
+            boolean visible = visibleSchemas.contains(seqSchema.toLowerCase(java.util.Locale.ROOT));
+            String shown = visible ? bareSeqName : seqSchema + "." + bareSeqName;
+            MemgresException e = new MemgresException("cannot drop sequence " + shown
+                    + " because column " + dep.columnName() + " of table "
+                    + dep.tableRef(visibleSchemas) + " requires it", "2BP01");
+            e.setHint("You can drop column " + dep.columnName() + " of table "
+                    + dep.tableRef(visibleSchemas) + " instead.");
+            throw e;
+        }
+    }
+
     private static final class SequenceDependent {
         final String schemaName;
         final Table table;
@@ -3881,6 +4108,24 @@ class DdlObjectExecutor {
         }
     }
 
+    /**
+     * Refuse a drop that names a routine of the other kind.
+     *
+     * <p>DROP FUNCTION names a function and DROP PROCEDURE a procedure; DROP ROUTINE names either.
+     * A routine of the name that is not of the kind written is the wrong kind of object rather
+     * than a missing one, and IF EXISTS does not excuse it: it excuses a name that reaches
+     * nothing, and this name reaches something.
+     */
+    private void requireRoutineKind(DropStmt stmt, List<PgFunction> candidates) {
+        if (stmt.objectType() == DropStmt.ObjectType.ROUTINE) return;
+        boolean wantProcedure = stmt.objectType() == DropStmt.ObjectType.PROCEDURE;
+        for (PgFunction candidate : candidates) {
+            if (candidate.isProcedure() == wantProcedure) return;
+        }
+        throw new MemgresException(stmt.name() + "(" + pgArgumentList(stmt.paramTypes()) + ")"
+                + " is not a " + (wantProcedure ? "procedure" : "function"), "42809");
+    }
+
     private void dropFunction(DropStmt stmt) {
         // An unqualified DROP only reaches the schemas the search_path makes visible.
         String schema = stmt.schema() != null ? stmt.schema() : visibleSchemaOfFunction(stmt.name());
@@ -3910,6 +4155,7 @@ class DdlObjectExecutor {
                     + "(" + pgArgumentList(stmt.paramTypes()) + ")");
             return;
         }
+        requireRoutineKind(stmt, candidates);
         // A trigger runs its function every time the relation it sits on is written, so the
         // function is not the definer's alone to drop: PostgreSQL refuses while a trigger depends
         // on it, names the trigger, and takes the trigger along when CASCADE is written.
@@ -3936,6 +4182,10 @@ class DdlObjectExecutor {
         }
         if (executor.database.getFunctionOverloads(stmt.name()).isEmpty()) {
             executor.database.removeObjectOwner("function:" + stmt.name());
+            // A grant belongs to the routine, so it goes with it. Left behind, the role it was
+            // written to could not be dropped: the database still held a grant on a routine
+            // nobody could name.
+            executor.database.removePrivilegesOnObject("FUNCTION", stmt.name());
         }
     }
 
@@ -4425,6 +4675,9 @@ class DdlObjectExecutor {
         executor.database.unregisterSchemaObject(schema,
                 isEnum ? "enum" : isComposite ? "composite" : isRange ? "range"
                         : isDomain ? "domain" : "shell", bare);
+        // The type is gone, so nobody owns it: a role that owned one it no longer has is a role
+        // nothing depends on, and could not be dropped while the ownership was still recorded.
+        executor.database.removeObjectOwner("type:" + key);
         executor.database.addComment("type", key, null);
     }
 
@@ -4702,6 +4955,9 @@ class DdlObjectExecutor {
                                 restore.add(new Session.DropFunctionUndo(schemaName, objName, going));
                             }
                             executor.database.removeFunction(schemaName, objName);
+                            // A grant on the routine names it, and the routine is going: left
+                            // behind, the grant named a role nothing could drop.
+                            executor.database.removePrivilegesOnObject("FUNCTION", objName);
                             break;
                         }
                         case "view": {
@@ -4731,6 +4987,9 @@ class DdlObjectExecutor {
             // both go when the schema does, or the role that held them could not be dropped.
             executor.database.removePrivilegesOnObject("SCHEMA", stmt.name());
             executor.database.removePrivilegesInSchema(stmt.name());
+            // A list of privileges set aside for the objects a schema will hold goes with the
+            // schema: kept behind, it named a role nothing could drop and a schema nobody has.
+            executor.database.removeDefaultAclsInSchema(stmt.name());
             executor.database.removeObjectOwner("schema:" + stmt.name());
             executor.database.removeSchema(stmt.name());
             executor.database.removeObjectOwner("schema:" + stmt.name());
@@ -5236,6 +5495,8 @@ class DdlObjectExecutor {
         executor.database.addSequence(seq);
         executor.database.markUncommittedObject(seq, executor.session);
         executor.database.registerSchemaObject(seqSchema, "sequence", seqName);
+        DdlTableExecutor.applyDefaultPrivileges(executor, seqSchema, seqName,
+                executor.currentRole(), "SEQUENCES", "SEQUENCE");
         executor.recordUndo(new Session.CreateSequenceUndo(seq.qualifiedName()));
         executor.database.setObjectOwner("sequence:" + seqName, executor.sessionUser());
         return QueryResult.message(QueryResult.Type.SET, "CREATE SEQUENCE");
@@ -5352,17 +5613,26 @@ class DdlObjectExecutor {
             seq.setOwnedByColumn(null);
             return;
         }
-        Table tbl = null;
-        for (Schema s : executor.database.getSchemas().values()) {
-            tbl = s.getTable(tblName);
-            if (tbl != null) break;
-        }
+        String bare = RelationNamespace.bareName(tblName);
+        int dot = tblName.lastIndexOf('.');
+        String written = dot > 0 ? tblName.substring(0, dot) : null;
+        String tableSchema = executor.relationSchemaOf(written, bare);
+        Schema held = tableSchema == null ? null : executor.database.getSchema(tableSchema);
+        Table tbl = held == null ? null : held.getTable(bare);
         if (tbl == null) throw new MemgresException("relation \"" + tblName + "\" does not exist", "42P01");
+        // A sequence a column owns is dropped with the column, so it has to be somewhere the
+        // column's own schema can take it with: PostgreSQL refuses to link one across schemas.
+        // Linked anyway, a sequence in public was answered for by pg_get_serial_sequence for a
+        // column of a table in another schema, and outlived the table it belonged to.
+        if (!tableSchema.equalsIgnoreCase(seq.getSchemaName())) {
+            throw new MemgresException(
+                    "sequence must be in same schema as table it is linked to", "55000");
+        }
         if (colName != null && tbl.getColumnIndex(colName) < 0) {
             throw new MemgresException(
                     "column \"" + colName + "\" of relation \"" + tblName + "\" does not exist", "42703");
         }
-        seq.setOwnedByTable(tblName);
+        seq.setOwnedByTable(bare);
         seq.setOwnedByColumn(colName);
     }
 
@@ -5447,6 +5717,9 @@ class DdlObjectExecutor {
             if (checkName == null) checkName = generatedCheckName(domain);
             domain.addConstraint(checkName, check.expr().toString(), check.expr());
         }
+        // A domain's default is evaluated with nothing in scope, exactly as a column's is, so the
+        // same expressions are refused in both.
+        DdlDefinitionChecks.validateDefaultExpression(stmt.defaultExpr());
         // Keep the base type's modifier: information_schema.domains describes a domain the way
         // it describes a column, so varchar(12) has to know it is twelve characters wide.
         int[] typmod = parseTypmod(stmt.baseType());
@@ -6374,10 +6647,11 @@ class DdlObjectExecutor {
                                 try {
                                     Object val = executor.evalExpr(expr, rowCtx);
                                     keyValues.add(val);
-                                    keyBuilder.append(val == null ? "\0NULL\0" : val.toString()).append('\1');
+                                    appendKeyPart(keyBuilder,
+                                            val == null ? "\0NULL\0" : val.toString());
                                 } catch (Exception e) {
                                     keyValues.add(null);
-                                    keyBuilder.append("\0ERR\0").append('\1');
+                                    appendKeyPart(keyBuilder, "\0ERR\0");
                                 }
                             }
                         } else {
@@ -6390,8 +6664,8 @@ class DdlObjectExecutor {
                                     // the type says they are equal: writing them out and
                                     // comparing the text made numeric 1.0 and 1.00 two keys, so
                                     // a unique index was built over rows that violate it.
-                                    keyBuilder.append(val == null ? "\0NULL\0"
-                                            : TypeCoercion.keyText(val)).append('\1');
+                                    appendKeyPart(keyBuilder, val == null ? "\0NULL\0"
+                                            : TypeCoercion.keyText(val));
                                 }
                             }
                         }
@@ -6780,6 +7054,18 @@ class DdlObjectExecutor {
     }
 
     // ---- CREATE CAST ----
+
+    /**
+     * Add one column's contribution to a key built as text.
+     *
+     * <p>Each part carries its own length, so where one part ends and the next begins never
+     * depends on what is in them: joined by a separator alone, two rows whose values differ only
+     * in where that character falls made the same key, and a unique index over them could not be
+     * built.
+     */
+    private static void appendKeyPart(StringBuilder key, String part) {
+        key.append(part.length()).append(':').append(part);
+    }
 
     QueryResult executeCreateCast(CreateCastStmt stmt) {
         validateTypeExists(stmt.sourceType);

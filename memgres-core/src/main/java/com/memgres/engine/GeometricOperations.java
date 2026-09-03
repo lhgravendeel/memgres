@@ -3,6 +3,7 @@ package com.memgres.engine;
 import com.memgres.engine.util.Cols;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -670,6 +671,122 @@ public final class GeometricOperations {
     // Formatting methods
     // ========================================================================
 
+    /**
+     * The shape a literal already written as text is: read by the reader whose spelling it fits.
+     *
+     * <p>A geometric value is carried as the text its own type writes, and each of the seven
+     * spells itself differently enough to be told apart — a circle by its angle brackets, a box
+     * by two points with nothing around them, a polygon by the parentheses around its list. This
+     * is how a cast between two of them finds the shape it was handed.
+     */
+    public static Object readWhicheverShape(String text) {
+        if (text == null) return null;
+        String t = text.trim();
+        if (t.isEmpty()) return null;
+        try {
+            if (t.startsWith("<")) return parseCircle(t);
+            if (t.startsWith("{")) return parseLine(t);
+            if (t.startsWith("[")) {
+                List<PgPoint> pts = parsePointList(t.substring(1, t.length() - 1));
+                return pts.size() == 2 ? (Object) new PgLseg(pts.get(0), pts.get(1))
+                        : new PgPath(pts, false);
+            }
+            // What is left is a list of points: with parentheses around the whole list it is a
+            // closed shape, and without them it is a bare point or the two corners of a box.
+            if (t.startsWith("((")) return parsePolygon(t);
+            List<PgPoint> pts = parsePointList(t);
+            if (pts.size() == 1) return pts.get(0);
+            if (pts.size() == 2) return new PgBox(pts.get(0), pts.get(1));
+            return new PgPolygon(pts);
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    /**
+     * The shape {@code source} becomes when read as {@code target}, or null when the two are not
+     * types PostgreSQL converts between structurally.
+     *
+     * <p>These conversions are not text round trips. A box read as a point is its centre, as a
+     * polygon its four corners, as a circle the circle through them; a polygon read as a point is
+     * the mean of its vertices. Writing one out and reading it back as the other gives an answer
+     * that is not even the same shape.
+     */
+    public static Object convertShape(Object shape, String target) {
+        String to = target == null ? "" : target.toLowerCase(java.util.Locale.ROOT);
+        if (shape instanceof PgBox) {
+            PgBox b = (PgBox) shape;
+            PgPoint centre = new PgPoint((b.high.x + b.low.x) / 2, (b.high.y + b.low.y) / 2);
+            if (to.equals("point")) return centre;
+            if (to.equals("polygon")) {
+                return new PgPolygon(Arrays.asList(
+                        new PgPoint(b.low.x, b.low.y), new PgPoint(b.low.x, b.high.y),
+                        new PgPoint(b.high.x, b.high.y), new PgPoint(b.high.x, b.low.y)));
+            }
+            if (to.equals("circle")) {
+                double dx = b.high.x - b.low.x;
+                double dy = b.high.y - b.low.y;
+                return new PgCircle(centre, Math.sqrt(dx * dx + dy * dy) / 2);
+            }
+        }
+        if (shape instanceof PgCircle) {
+            PgCircle c = (PgCircle) shape;
+            if (to.equals("point")) return c.center;
+            if (to.equals("box")) {
+                // The largest square the circle holds, which is the circle's own radius scaled
+                // down by the diagonal of a unit square.
+                double half = c.radius / Math.sqrt(2);
+                return new PgBox(new PgPoint(c.center.x + half, c.center.y + half),
+                        new PgPoint(c.center.x - half, c.center.y - half));
+            }
+            if (to.equals("polygon")) return toPolygon(c, CIRCLE_POLYGON_POINTS);
+        }
+        if (shape instanceof PgLseg && to.equals("point")) {
+            PgLseg l = (PgLseg) shape;
+            return new PgPoint((l.p1.x + l.p2.x) / 2, (l.p1.y + l.p2.y) / 2);
+        }
+        if (shape instanceof PgPolygon) {
+            List<PgPoint> pts = ((PgPolygon) shape).points;
+            if (pts.isEmpty()) return null;
+            if (to.equals("point")) return meanOf(pts);
+            if (to.equals("box")) {
+                double minX = pts.get(0).x, maxX = minX, minY = pts.get(0).y, maxY = minY;
+                for (PgPoint q : pts) {
+                    minX = Math.min(minX, q.x); maxX = Math.max(maxX, q.x);
+                    minY = Math.min(minY, q.y); maxY = Math.max(maxY, q.y);
+                }
+                return new PgBox(new PgPoint(maxX, maxY), new PgPoint(minX, minY));
+            }
+            if (to.equals("circle")) {
+                PgPoint centre = meanOf(pts);
+                double total = 0;
+                for (PgPoint q : pts) {
+                    total += Math.sqrt((q.x - centre.x) * (q.x - centre.x)
+                            + (q.y - centre.y) * (q.y - centre.y));
+                }
+                return new PgCircle(centre, total / pts.size());
+            }
+        }
+        if (shape instanceof PgPoint && to.equals("box")) {
+            PgPoint q = (PgPoint) shape;
+            return new PgBox(q, q);
+        }
+        return null;
+    }
+
+    /** How many corners PostgreSQL gives the polygon it draws round a circle. */
+    private static final int CIRCLE_POLYGON_POINTS = 12;
+
+    private static PgPoint meanOf(List<PgPoint> pts) {
+        double x = 0;
+        double y = 0;
+        for (PgPoint q : pts) {
+            x += q.x;
+            y += q.y;
+        }
+        return new PgPoint(x / pts.size(), y / pts.size());
+    }
+
     public static String format(Object geom) {
         if (geom instanceof PgPoint) return formatPoint(((PgPoint) geom));
         if (geom instanceof PgLine) return formatLine(((PgLine) geom));
@@ -895,9 +1012,10 @@ public final class GeometricOperations {
     // ========================================================================
 
     public static double distancePointPoint(PgPoint a, PgPoint b) {
-        double dx = a.x - b.x;
-        double dy = a.y - b.y;
-        return Math.sqrt(dx * dx + dy * dy);
+        // Squaring both legs first overflows where the distance itself does not, so a point at
+        // 1e308 was said to be an infinity away from the origin; and the scaled form rounds the
+        // last digit differently, which is the answer PostgreSQL prints.
+        return pgHypot(a.x - b.x, a.y - b.y);
     }
 
     public static double distancePointLine(PgPoint p, PgLine l) {
@@ -2340,6 +2458,11 @@ public final class GeometricOperations {
     }
 
     public static PgPolygon toPolygon(PgCircle c, int npts) {
+        // A polygon is made of corners, and two is the fewest a shape can have: asked for fewer
+        // PostgreSQL refuses rather than handing back a polygon with nothing in it.
+        if (npts < 2) {
+            throw new MemgresException("must request at least 2 points", "22023");
+        }
         // Match PG's circle_poly: first vertex at (cx - r, cy), winding as
         // x = cx - cos(i*step)*r, y = cy + sin(i*step)*r.
         List<PgPoint> pts = new ArrayList<>();

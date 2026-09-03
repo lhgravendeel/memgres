@@ -30,6 +30,39 @@ final class PgOperatorTable {
     }
 
     /**
+     * Whether the server ships an operator of this name over this pair of operand types.
+     *
+     * <p>The types are compared by the name the catalogue writes them under, so a caller that has
+     * canonicalised {@code int8} to {@code bigint} asks the same question either way.
+     */
+    static boolean exists(String name, String left, String right) {
+        if (name == null) return false;
+        int leftOid = typeOid(left);
+        int rightOid = typeOid(right);
+        if (leftOid == 0 || rightOid == 0) return true;   // a type this does not know: not judged
+        for (Object[] op : OPERATORS) {
+            if (!name.equals(op[0])) continue;
+            if (asInt(op[2]) == leftOid && asInt(op[3]) == rightOid) return true;
+        }
+        return false;
+    }
+
+    private static int typeOid(String written) {
+        if (written == null) return 0;
+        String bare = written.trim();
+        boolean array = bare.endsWith("[]");
+        if (array) bare = bare.substring(0, bare.length() - 2).trim();
+        DataType dt = DataType.fromPgName(bare);
+        if (dt == null) return 0;
+        DataType resolved = array ? DataType.arrayOf(dt) : dt;
+        return resolved == null ? 0 : resolved.getOid();
+    }
+
+    private static int asInt(Object value) {
+        return value instanceof Number ? ((Number) value).intValue() : 0;
+    }
+
+    /**
      * The full table. It is assembled from several methods because a single array
      * initialiser of this size does not fit in one method's bytecode.
      */

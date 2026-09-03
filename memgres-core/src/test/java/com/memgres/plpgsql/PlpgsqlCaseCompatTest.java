@@ -524,6 +524,37 @@ class PlpgsqlCaseCompatTest {
     }
 
     // ========================================================================
+    // 15b. A simple CASE compares values, not the text they print as
+    // ========================================================================
+
+    /**
+     * The comparison a simple CASE makes is the equality operator's, so {@code 1} matches
+     * {@code 1.0}: they are one number written two ways, and only their text differs.
+     */
+    @Test
+    @DisplayName("PG-vs-Memgres #15b: a simple CASE compares values")
+    void testSimpleCaseComparesValues() throws Exception {
+        try (Statement stmt = conn.createStatement()) {
+            stmt.execute("CREATE FUNCTION plcase_widths(x int) RETURNS text AS $$"
+                    + " BEGIN CASE x WHEN 1.0 THEN RETURN 'one';"
+                    + " WHEN 2.00 THEN RETURN 'two'; ELSE RETURN 'other'; END CASE; END $$"
+                    + " LANGUAGE plpgsql");
+            stmt.execute("CREATE FUNCTION plcase_widths2(x numeric) RETURNS text AS $$"
+                    + " BEGIN CASE x WHEN 1 THEN RETURN 'one'; ELSE RETURN 'other'; END CASE; END $$"
+                    + " LANGUAGE plpgsql");
+            try (ResultSet rs = stmt.executeQuery(
+                    "SELECT plcase_widths(1) AS r1, plcase_widths(2) AS r2,"
+                            + " plcase_widths(3) AS r3, plcase_widths2(1.0) AS r4")) {
+                assertTrue(rs.next());
+                assertEquals("one", rs.getString("r1"));
+                assertEquals("two", rs.getString("r2"));
+                assertEquals("other", rs.getString("r3"));
+                assertEquals("one", rs.getString("r4"));
+            }
+        }
+    }
+
+    // ========================================================================
     // 16. Both simple and searched CASE in one function
     // ========================================================================
 

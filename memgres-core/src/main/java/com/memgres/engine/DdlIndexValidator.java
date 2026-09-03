@@ -396,6 +396,27 @@ final class DdlIndexValidator {
      * at all. Passed over rather than asked, an index was built over a collation nothing uses,
      * and PostgreSQL names the type it was asked for by the name the reader wrote it under.
      */
+    /**
+     * The same two checks a partition key needs, over a key element written as one string.
+     *
+     * <p>A partition key element is spelled the way an index column is — the column, then a
+     * collation, then an operator class — and PostgreSQL holds it to the same two rules: the
+     * type has to have a collation for one to be named on it, and the class has to be one the
+     * access method has.
+     */
+    static void checkKeyElement(Database database, Table table, String am, String column,
+                                String collation, String opclass) {
+        StringBuilder opts = new StringBuilder();
+        if (collation != null) opts.append("collate:").append(collation);
+        if (opclass != null) {
+            if (opts.length() > 0) opts.append(' ');
+            opts.append("opclass:").append(opclass);
+        }
+        String written = opts.toString();
+        checkCollatable(database, table, column, written);
+        checkOpclass(database, table, am, column, written);
+    }
+
     private static void checkCollatable(Database database, Table table, String column, String opts) {
         if (!opts.contains("collate:")) return;
         int colIdx = table.getColumnIndex(column);
@@ -879,7 +900,9 @@ final class DdlIndexValidator {
     static void validateIncludeColumns(Table table, List<String> includeColumns) {
         if (includeColumns == null) return;
         for (String col : includeColumns) {
-            if (col.contains("(") || col.contains(")") || col.contains(" ")) {
+            // A name written in quotes may hold a space, so a space is no sign of an expression:
+            // INCLUDE ("my col") names a column and was refused as though it were a call.
+            if (col.contains("(") || col.contains(")")) {
                 throw PgErrors.notImplemented("expressions are not supported in included columns");
             }
             if (table.getColumnIndex(col) < 0) {

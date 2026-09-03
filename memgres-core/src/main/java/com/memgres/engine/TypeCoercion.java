@@ -285,15 +285,15 @@ public final class TypeCoercion {
             return value;
         }
         if (base.equals("varchar") || base.equals("character varying")) {
-            String s = value.toString();
+            String s = withoutOverhangingSpaces(value.toString(), first);
             if (s.length() > first) {
                 throw new MemgresException(
                         "value too long for type character varying(" + first + ")", "22001");
             }
-            return value;
+            return s;
         }
         if (base.equals("char") || base.equals("character") || base.equals("bpchar")) {
-            String s = value.toString();
+            String s = withoutOverhangingSpaces(value.toString(), first);
             if (s.length() > first) {
                 throw new MemgresException(
                         "value too long for type character(" + first + ")", "22001");
@@ -793,15 +793,16 @@ public final class TypeCoercion {
     private static Object applyPrecision(Object value, DataType type, Column column) {
         // VARCHAR(n) enforcement
         if (type == DataType.VARCHAR && column.getPrecision() != null && value instanceof String) {
-            String s = (String) value;
+            String s = withoutOverhangingSpaces((String) value, column.getPrecision());
             if (s.length() > column.getPrecision()) {
                 throw new MemgresException("value too long for type character varying(" + column.getPrecision() + ")", "22001");
             }
+            value = s;
         }
         // CHAR(n) padding
         if (type == DataType.CHAR && column.getPrecision() != null && value instanceof String) {
-            String s = (String) value;
             int n = column.getPrecision();
+            String s = withoutOverhangingSpaces((String) value, n);
             if (s.length() > n) {
                 throw new MemgresException("value too long for type character(" + n + ")", "22001");
             }
@@ -1260,8 +1261,12 @@ public final class TypeCoercion {
         // reads back as the same float — which is what PostgreSQL converts, and what the client
         // was shown when the float was printed. Taken as the exact binary value instead,
         // 0.1::real::numeric was 0.10000000149011612 and no longer equal to 0.1.
-        if (val instanceof Double) return new BigDecimal(Double.toString((Double) val));
-        if (val instanceof Float) return new BigDecimal(Float.toString((Float) val));
+        // The text is the one the float prints as, which is the shortest that reads back as the
+        // same float and carries no trailing zero: taken from Java's own spelling, 1::real became
+        // the numeric 1.0, which prints a decimal place PostgreSQL does not.
+        if (val instanceof Double || val instanceof Float) {
+            return new BigDecimal(toString(val));
+        }
         if (val instanceof Number) return BigDecimal.valueOf(((Number) val).doubleValue());
         String s = val.toString().trim();
         if (s.isEmpty()) throw new MemgresException("invalid input syntax for type numeric: \"\"", "22P02");
@@ -1281,6 +1286,11 @@ public final class TypeCoercion {
         try {
             return new BigDecimal(s);
         } catch (NumberFormatException e) {
+            // An exponent past the widest one there is names no number numeric can hold, which is
+            // an overflow rather than text that could not be read.
+            if (e.getMessage() != null && e.getMessage().contains("exponent digits")) {
+                throw new MemgresException("value overflows numeric format", "22003");
+            }
             // numeric's input function reads the non-decimal integer forms and the underscore
             // separator exactly as int4's does, so '0x2a'::numeric is 42 and not an error
             java.math.BigInteger whole = parseIntegerText(s);
@@ -1876,6 +1886,20 @@ public final class TypeCoercion {
         TZ_ABBREVIATIONS.put("NZDT", "+13:00");
     }
 
+    /**
+     * The text with any spaces past the declared width taken off.
+     *
+     * <p>A character type refuses what will not fit, and trailing spaces are the one thing it
+     * drops instead: they carry nothing, and a column three characters wide holds {@code 'abc   '}
+     * as {@code 'abc'} rather than refusing it. Anything else hanging over the width is a value
+     * the column cannot hold.
+     */
+    private static String withoutOverhangingSpaces(String text, int width) {
+        int end = text.length();
+        while (end > width && text.charAt(end - 1) == ' ') end--;
+        return end == text.length() ? text : text.substring(0, end);
+    }
+
     public static Object toLocalDateOrBc(Object val) {
         if (val instanceof String) {
             String s = (String) val;
@@ -1913,6 +1937,10 @@ public final class TypeCoercion {
         String s = val.toString().trim();
         LocalDateTime calendar = parseCalendarLiteral(s, val.toString(), "date", DATE_MAX_YEAR);
         if (calendar != null) return calendar.toLocalDate();
+        // The field reader comes before the era suffix is stripped: a two-digit year is widened to
+        // a century only in the common era, so 'January 8, 99 BC' is the year 99 BC and not 1999.
+        PgDateTimeDecoder.Fields decoded = PgDateTimeDecoder.decode(s, val.toString());
+        if (decoded != null && decoded.hasDate()) return decoded.date();
         if (endsWithEra(s)) {
             LocalDate bc = toLocalDate(stripEra(s));
             return bc.withYear(1 - bc.getYear());
@@ -2255,6 +2283,10 @@ public final class TypeCoercion {
         if (val instanceof LocalTime) return ((LocalTime) val);
         if (val instanceof LocalDateTime) return ((LocalDateTime) val).toLocalTime();
         if (val instanceof OffsetDateTime) return ((OffsetDateTime) val).toLocalTime();
+        // A length of time read as a time of day is the clock the length would carry a day past
+        // midnight to: the days are dropped and the hours wrap, so 25 hours is one in the morning
+        // and a length running backwards counts back from the end of the day.
+        if (val instanceof PgInterval) return ((PgInterval) val).asTimeOfDay();
         String s = val.toString().trim();
         // Handle special keywords
         if (s.equalsIgnoreCase("allballs")) return LocalTime.MIDNIGHT;
@@ -2313,6 +2345,11 @@ public final class TypeCoercion {
                         + tail.group(1).toLowerCase(java.util.Locale.ROOT)
                         + "\" not recognized", "22023");
             }
+            // A time of day may name a zone, and a time without one reads it and then drops it.
+            if (tail.matches()) {
+                LocalTime named = clockLiteral(s.substring(0, tail.start(1)).trim());
+                if (named != null) return named;
+            }
             if (!s.matches("\\d{1,2}:\\d{2}(:\\d{2})?.*") && !s.matches(CLOCK_LITERAL.pattern())) {
                 throw new MemgresException(
                         "invalid input syntax for type time: \"" + val + "\"", "22007");
@@ -2329,6 +2366,17 @@ public final class TypeCoercion {
     public static String toTimeTz(Object val) {
         if (val instanceof String) {
             // already formatted timetz string; pass through
+        }
+        // A moment read as a time of day is the clock it shows in the session's own zone, with
+        // that zone's displacement kept: the date is what is dropped, not the zone.
+        if (val instanceof OffsetDateTime) {
+            OffsetDateTime here = ((OffsetDateTime) val).atZoneSameInstant(sessionZone())
+                    .toOffsetDateTime();
+            return pgTimeText(here.toLocalTime()) + writtenOffset(here.getOffset());
+        }
+        if (val instanceof LocalDateTime) {
+            return pgTimeText(((LocalDateTime) val).toLocalTime())
+                    + writtenOffset(offsetOfZoneNow(sessionZone()));
         }
         String s = val.toString().trim();
         requireDisplacementInRange(s, val.toString());
@@ -2383,7 +2431,14 @@ public final class TypeCoercion {
                     // A displacement is written as at least two digits of hours, whatever was
                     // typed: PostgreSQL reads -8 and writes it back as -08.
                     return timePart + paddedZoneOffset(offsetPart);
-                } catch (DateTimeParseException e3) { /* fall through */ }
+                } catch (DateTimeParseException e3) {
+                    // The clock in front of the displacement is read the same way it is read on
+                    // its own, so '040506-08' names the same reading as '04:05:06-08'.
+                    LocalTime compact = compactOrMeridiemTime(timePart);
+                    if (compact != null) {
+                        return pgTimeText(compact) + paddedZoneOffset(offsetPart);
+                    }
+                }
             }
         }
 
@@ -2414,6 +2469,14 @@ public final class TypeCoercion {
             if (clock != null && !(toString(clock) + zone).equals(s)) {
                 return toTimeTz(toString(clock) + zone);
             }
+        }
+        // A timetz may name its zone rather than write the displacement out, and the name stands
+        // for a fixed displacement out of PostgreSQL's abbreviation table.
+        PgDateTimeDecoder.Fields decoded = PgDateTimeDecoder.decode(s, val.toString());
+        if (decoded != null && decoded.time != null && decoded.year == null
+                && decoded.month == null && decoded.day == null) {
+            return pgTimeText(decoded.time) + writtenOffset(decoded.offset == null
+                    ? offsetOfZoneNow(sessionZone()) : decoded.offset);
         }
         String errCode = s.matches("\\d{1,2}:\\d{2}(:\\d{2})?.*")
                 || s.matches(CLOCK_LITERAL.pattern()) ? "22008" : "22007";
@@ -2694,9 +2757,17 @@ public final class TypeCoercion {
         if (val instanceof LocalDate) return ((LocalDate) val).atStartOfDay();
         if (val instanceof OffsetDateTime) return ((OffsetDateTime) val).atZoneSameInstant(sessionZone()).toLocalDateTime();
         String s = val.toString().trim();
+        requireDisplacementInRange(s, val.toString());
         LocalDateTime calendar = parseCalendarLiteral(s, val.toString(), "timestamp",
                 TIMESTAMP_MAX_YEAR);
         if (calendar != null) return calendar;
+        // As for a date: the field reader runs before the era suffix is stripped, because the
+        // century a two-digit year belongs to is a question only a common-era year has.
+        PgDateTimeDecoder.Fields decoded = PgDateTimeDecoder.decode(s, val.toString());
+        if (decoded != null && decoded.hasDate()) {
+            // A timestamp without time zone reads whatever zone was written and then drops it.
+            return decoded.date().atTime(decoded.time == null ? LocalTime.MIDNIGHT : decoded.time);
+        }
         // A BC era suffix means a proleptic year of 1 - the written year: 44 BC is ISO year -43
         if (endsWithEra(s)) {
             String body = stripEra(s);
@@ -2789,9 +2860,14 @@ public final class TypeCoercion {
                         toLocalTime(trailingYear.group(2)));
             } catch (MemgresException e) { /* fall through to the error below */ }
         }
-        // Use 22008 for well-formatted but out-of-range timestamps
-        String errCode = val.toString().trim().matches("\\d{4}-\\d{2}-\\d{2}.*") ? "22008" : "22007";
-        throw new MemgresException("invalid input syntax for type timestamp: \"" + val + "\"", errCode);
+        MemgresException zoneFault = unknownTrailingZone(val.toString());
+        if (zoneFault != null) throw zoneFault;
+        // A field PostgreSQL could not read at all makes the literal bad input, whatever the date
+        // written in front of it looked like. Only a date whose own fields name nothing real is
+        // reported as out of range, and those have been answered further up.
+        throw new MemgresException("invalid input syntax for type timestamp: \"" + val + "\"",
+                trailingWordFault(val.toString()) ? "22007"
+                        : val.toString().trim().matches("\\d{4}-\\d{2}-\\d{2}.*") ? "22008" : "22007");
     }
 
     /**
@@ -2871,6 +2947,17 @@ public final class TypeCoercion {
                 }
             }
         }
+        // The field reader, for the literals written with a month name, a zone abbreviation or a
+        // displacement the layouts above do not cover. A literal naming no zone is read in the
+        // session's own, which is what makes it a moment at all.
+        PgDateTimeDecoder.Fields decoded = PgDateTimeDecoder.decode(s, val.toString());
+        if (decoded != null && decoded.hasDate()) {
+            LocalDateTime wall =
+                    decoded.date().atTime(decoded.time == null ? LocalTime.MIDNIGHT : decoded.time);
+            return checkInstantRange(decoded.offset == null
+                    ? wall.atZone(zone).toOffsetDateTime()
+                    : wall.atOffset(decoded.offset), val.toString());
+        }
         // Handle special keywords
         if (s.equalsIgnoreCase("epoch")) return OffsetDateTime.of(1970, 1, 1, 0, 0, 0, 0, ZoneOffset.UTC);
         if (s.equalsIgnoreCase("now")) return OffsetDateTime.now(zone);
@@ -2920,16 +3007,47 @@ public final class TypeCoercion {
         }
         // Use 22008 "out of range" for well-formatted but out-of-range dates (e.g., 2024-02-30);
         // garbage input gets 22007 with PG's "invalid input syntax" wording.
+        MemgresException zoneFault = unknownTrailingZone(val.toString());
+        if (zoneFault != null) throw zoneFault;
         if (val.toString().trim().matches("\\d{4}-\\d{2}-\\d{2}.*")) {
             // A whole date followed by something that is not a time of day is a syntax problem,
             // not a range one -- PG rejects '2001-01-01-05' with 22007.
-            if (isValidDatePrefixWithTrailer(val.toString().trim())) {
+            if (isValidDatePrefixWithTrailer(val.toString().trim())
+                    || trailingWordFault(val.toString())) {
                 throw new MemgresException(
                         "invalid input syntax for type timestamp with time zone: \"" + val + "\"", "22007");
             }
             throw new MemgresException("date/time field value out of range: \"" + val + "\"", "22008");
         }
         throw new MemgresException("invalid input syntax for type timestamp with time zone: \"" + val + "\"", "22007");
+    }
+
+    /** A literal whose last field is a word rather than a number, and that word. */
+    private static final java.util.regex.Pattern TRAILING_WORD =
+            java.util.regex.Pattern.compile(".*[\\s\\d]([A-Za-z][A-Za-z0-9_/+-]*)");
+
+    /**
+     * True when the literal ends in a word PostgreSQL could not make a field of. A word there is
+     * the whole literal's problem — the text is not a timestamp — rather than a date field that
+     * overflowed, so it is reported as bad input and not as a value out of range.
+     */
+    private static boolean trailingWordFault(String written) {
+        java.util.regex.Matcher m = TRAILING_WORD.matcher(written.trim());
+        return m.matches() && PgTimeZones.offsetOf(m.group(1)) == null;
+    }
+
+    /**
+     * The zone a literal named and PostgreSQL could not find, if that is what is wrong with it.
+     *
+     * <p>A field with a slash in it is looked for in the zone database, and PostgreSQL names it
+     * when it is not there. A word without one is only ever an abbreviation, and a word that is no
+     * abbreviation leaves the whole literal unreadable rather than the zone merely unknown.
+     */
+    private static MemgresException unknownTrailingZone(String written) {
+        java.util.regex.Matcher m = TRAILING_WORD.matcher(written.trim());
+        if (!m.matches() || m.group(1).indexOf('/') < 0) return null;
+        return new MemgresException("time zone \""
+                + m.group(1).toLowerCase(java.util.Locale.ROOT) + "\" not recognized", "22023");
     }
 
     /** A yyyy-MM-dd with an offset and no time of day; a bare '-' offset needs a space before it. */

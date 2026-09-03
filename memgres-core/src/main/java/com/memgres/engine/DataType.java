@@ -603,11 +603,18 @@ public enum DataType {
             case DATEMULTIRANGE: return "datemultirange";
             case TSMULTIRANGE: return "tsmultirange";
             case TSTZMULTIRANGE: return "tstzmultirange";
-            case TEXT_ARRAY: return "text[]";
-            case INT4_ARRAY: return "integer[]";
-            case NAME_ARRAY: return "name[]";
-            case ACLITEM_ARRAY: return "aclitem[]";
-            default: return pgName;
+            default:
+                // An array is written as its element type with brackets after it. The catalogue
+                // keeps the name with the underscore in front — _int4 — and everywhere a type is
+                // named to a reader it is integer[], so an array has no display name of its own.
+                if (pgName.length() > 1 && pgName.charAt(0) == '_') {
+                    DataType element = fromPgName(pgName.substring(1));
+                    if (element != null && element != this) {
+                        return element.toRegtypeDisplay() + "[]";
+                    }
+                    return pgName.substring(1) + "[]";
+                }
+                return pgName;
         }
     }
 

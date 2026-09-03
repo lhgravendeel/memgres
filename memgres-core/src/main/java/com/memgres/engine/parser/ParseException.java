@@ -27,7 +27,11 @@ public class ParseException extends MemgresException {
             return "syntax error at end of input";
         }
         // The word as the statement spelled it. A keyword's value is folded to upper case for
-        // matching, and quoting that named a word nobody had written.
+        // matching, and quoting that named a word nobody had written; a string constant is named
+        // with the quotes that made it one, which is how PostgreSQL names it.
+        if (token != null && token.type() == TokenType.STRING_LITERAL) {
+            return "syntax error at or near \"" + token.sqlText() + "\"";
+        }
         return "syntax error at or near \"" + (token == null ? "" : token.raw()) + "\"";
     }
 

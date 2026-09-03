@@ -28,7 +28,12 @@ class CastEvaluator {
             Object[] arr = (Object[]) val;
             if (arr.length > 0) first = arr[0];
         }
-        return first instanceof AstExecutor.PgRow ? "record[]" : "array";
+        if (first instanceof AstExecutor.PgRow) return "record[]";
+        // An array is named after its element, so what a cast could not be made from is
+        // integer[] rather than the bare word: the reader has to know which array it was.
+        String element = val instanceof PgArray ? ((PgArray) val).elementType() : null;
+        if (element == null) element = DdlDefinitionChecks.runtimeTypeName(first);
+        return element == null ? "array" : DataType.canonicalName(element) + "[]";
     }
 
     /** The name PostgreSQL puts in a message for an integer type, whichever alias was written. */
@@ -147,6 +152,38 @@ class CastEvaluator {
      * element that the search path finds. Reading the whole key as a name to resolve found nothing,
      * so every array of a user type printed with a qualifier PostgreSQL leaves off.
      */
+    /**
+     * The type key for the row type of a relation of this name, or null when no relation has one.
+     *
+     * <p>The kinds that hold rows have a row type; a sequence and an index do not, and neither
+     * does a name nothing answers to.
+     */
+    private String relationRowTypeKey(String written) {
+        String schema = qualifierOf(written);
+        String bare = unquoteName(schema == null ? written
+                : written.substring(written.lastIndexOf('.') + 1));
+        String found = schema != null
+                ? (RelationNamespace.kindOf(executor.database, schema, bare) == null ? null : schema)
+                : RelationNamespace.schemaHolding(
+                        executor.database, executor.searchPathSchemas(), bare);
+        if (found == null) return null;
+        String kind = RelationNamespace.kindOf(executor.database, found, bare);
+        if (RelationNamespace.SEQUENCE.equals(kind) || RelationNamespace.INDEX.equals(kind)) {
+            return null;
+        }
+        return TypeNamespace.key(found, bare);
+    }
+
+    /** The domain's base type written out with the modifier the domain was declared with. */
+    private static String baseTypeSpecOf(DomainType domain) {
+        String base = domain.getBaseTypeName() != null && domain.getBaseType() == null
+                ? domain.getBaseTypeName() : domain.getBaseType().getPgName();
+        if (domain.getPrecision() == null) return base;
+        return domain.getScale() == null
+                ? base + "(" + domain.getPrecision() + ")"
+                : base + "(" + domain.getPrecision() + "," + domain.getScale() + ")";
+    }
+
     private String userTypeDisplay(String typeKey) {
         String key = typeKey;
         String suffix = "";
@@ -506,6 +543,12 @@ class CastEvaluator {
         return result;
     }
 
+    /** Whether a name, spelled as it was written, is a type this database holds. */
+    private boolean namesAStoredType(String written) {
+        if (written == null || written.isEmpty() || written.indexOf('[') >= 0) return false;
+        return TypeNamespace.resolve(executor.database, executor.session, written) != null;
+    }
+
     private Object applyCastResolved(Object val, String typeSpec, boolean fromUnknownLiteral) {
         // Which type a bare name denotes is the search path's answer, and it is settled once here
         // so everything downstream reads the same one: with search_path = b, ::e is b's e.
@@ -571,12 +614,13 @@ class CastEvaluator {
         }
 
         TypeCoercion.checkDeclaredTypeLimits(lowerSpec);
-        // Handle float(p): p <= 24 means REAL, p >= 25 means DOUBLE PRECISION
+        // float(p) names a type by its mantissa rather than declaring a width: p up to 24 is a
+        // real and above it a double precision, and the value is then read as that type by that
+        // type's own rules -- so what a real cannot hold is out of range here too.
         if (lowerSpec.startsWith("float(")) {
             String pStr = lowerSpec.replaceAll(".*\\((\\d+)\\).*", "$1");
             int p = Integer.parseInt(pStr);
-            if (p <= 24) return TypeCoercion.toFloat(val);
-            else return TypeCoercion.toDouble(val);
+            return applyCast(val, p <= 24 ? "real" : "double precision", fromUnknownLiteral);
         }
         // Handle numeric(precision, scale) and apply scale for proper formatting
         if (lowerSpec.startsWith("numeric(") || lowerSpec.startsWith("decimal(")) {
@@ -647,9 +691,19 @@ class CastEvaluator {
         // produces has to be narrowed to a real when p allows only a real's mantissa.
         DataType floatWidth = typeSpec.indexOf('(') > 0
                 ? DataType.fromPgName(typeSpec.toLowerCase(java.util.Locale.ROOT).trim()) : null;
-        if (floatWidth == DataType.REAL) return TypeCoercion.toFloat(val);
-        if (floatWidth == DataType.DOUBLE_PRECISION) return TypeCoercion.toDouble(val);
-        String typeName = typeSpec.toLowerCase(java.util.Locale.ROOT).replaceAll("\\(.*\\)", "").trim();
+        // float(p) names a type by its mantissa, and the type it names is judged by its own
+        // rules: float(24) is a real, so what a real cannot hold is out of range here too.
+        if (floatWidth == DataType.REAL) return applyCast(val, "real", fromUnknownLiteral);
+        if (floatWidth == DataType.DOUBLE_PRECISION) {
+            return applyCast(val, "double precision", fromUnknownLiteral);
+        }
+        // A name is folded to reach the types this engine ships, whose names are all lower case.
+        // A name that already reaches a type of this database is left as it was written: a type
+        // created with quotes keeps the letters it was created with, and folding them away made
+        // "MiXeD" answer to mixed, which names nothing.
+        String writtenName = typeSpec.replaceAll("\\(.*\\)", "").trim();
+        String typeName = namesAStoredType(writtenName)
+                ? writtenName : writtenName.toLowerCase(java.util.Locale.ROOT);
         // Handle array casting: when value is a List or PG array literal string, cast each element
         boolean isArrayCast = typeName.contains("[]");
         typeName = typeName.replace("[]", "").trim();
@@ -679,12 +733,23 @@ class CastEvaluator {
                         : (val instanceof PgArray ? ((PgArray) val).lowerBounds() : null);
                 return PgArray.of(castList, bounds, typeName);
             }
+            // A value that is neither an array nor text an array literal could be written in is
+            // not one element of an array either: there is no cast from a type to an array of
+            // it, and dropping the brackets quietly made one.
+            String sourceName = DdlDefinitionChecks.runtimeTypeName(val);
+            if (sourceName != null) {
+                throw new MemgresException("cannot cast type " + sourceName + " to "
+                        + DataType.canonicalName(typeName) + "[]", "42846");
+            }
         }
         // Types PostgreSQL ships that memgres holds no value class for. A cast to one is legal SQL
         // there, so refusing it as a type that does not exist refused a statement PostgreSQL runs;
         // the text is kept as written, which is what every one of them prints. A type this
         // database has been told about under the same name is its own and answers first.
         if (KEPT_AS_WRITTEN.contains(typeName) && !isDeclaredByThisDatabase(typeName)) {
+            // An aclitem has fields of its own, and text that is not one of them is refused the
+            // way any type refuses input its reader cannot read.
+            if ("aclitem".equals(typeName)) return AclItems.readAclItem(val.toString());
             return val.toString();
         }
         switch (typeName) {
@@ -782,6 +847,14 @@ class CastEvaluator {
             case "char":
             case "character":
             case "name": {
+                // A character type written with no width is one character wide, so what a value
+                // becomes when read as one is its first character and no more. The width is the
+                // whole of what the name says when it says nothing else.
+                if (("char".equals(typeName) || "character".equals(typeName))
+                        && typeSpec.indexOf('(') < 0) {
+                    String whole = applyCast(val, "text", fromUnknownLiteral).toString();
+                    return whole.isEmpty() ? " " : whole.substring(0, 1);
+                }
                 // An infinity is written as the word it is, not as the instant standing for it.
                 String infinite = TypeCoercion.infinityText(val);
                 if (infinite != null) return infinite;
@@ -1071,19 +1144,24 @@ class CastEvaluator {
                 return new AstExecutor.PgBitString(bitStr);
             }
             case "point":
-                return GeometricOperations.format(GeometricOperations.parsePoint(val.toString()));
             case "line":
-                return GeometricOperations.format(GeometricOperations.parseLine(val.toString()));
             case "lseg":
-                return GeometricOperations.format(GeometricOperations.parseLseg(val.toString()));
             case "box":
-                return GeometricOperations.format(GeometricOperations.parseBox(val.toString()));
             case "path":
-                return GeometricOperations.format(GeometricOperations.parsePath(val.toString()));
             case "polygon":
-                return GeometricOperations.format(GeometricOperations.parsePolygon(val.toString()));
-            case "circle":
-                return GeometricOperations.format(GeometricOperations.parseCircle(val.toString()));
+            case "circle": {
+                // Between two shapes the conversion is structural, not a text round trip: a box
+                // read as a point is its centre, and writing the box out and reading it back as
+                // a point never was a point at all. A bare quoted literal is not a shape yet
+                // though -- it is text the target type's own reader reads, and reading it as
+                // whatever it looks like would make '(1,2),(3,4),(5,6)' a box.
+                Object converted = fromUnknownLiteral ? null
+                        : GeometricOperations.convertShape(
+                                GeometricOperations.readWhicheverShape(val.toString()), typeName);
+                if (converted != null) return GeometricOperations.format(converted);
+                return GeometricOperations.format(
+                        GeometricOperations.parseAs(typeName, val.toString()));
+            }
             case "tsvector": {
                 if (val instanceof TsVector) return val;
                 String tsInput = val.toString();
@@ -1335,7 +1413,11 @@ class CastEvaluator {
                     // If not found, return as-is (number)
                     return val;
                 }
-                String relName = val.toString().trim();
+                // The text is a relation name and is read as one: quotes around a part of it are
+                // identifier quoting, a part without them is folded, and the spaces around the
+                // whole are no part of any name. It is the name so read that is looked for, and
+                // that a complaint quotes back -- not the text the statement wrote.
+                String relName = Quoting.nameAsRead(val.toString());
                 // An all-digit string is an OID written out, which PG takes verbatim without
                 // looking anything up -- that is how a catalog dump round-trips a regclass
                 if (relName.matches("\\d+")) {
@@ -1346,21 +1428,12 @@ class CastEvaluator {
                     }
                 }
                 String schemaPrefix = null;
-                if (relName.contains(".")) {
-                    int dotIdx = relName.lastIndexOf('.');
+                String lowerName = relName;
+                int dotIdx = relName.lastIndexOf('.');
+                if (dotIdx > 0) {
                     schemaPrefix = relName.substring(0, dotIdx);
-                    relName = relName.substring(dotIdx + 1);
+                    lowerName = relName.substring(dotIdx + 1);
                 }
-                // M15: Handle quoted identifiers — preserve case if double-quoted
-                boolean relQuoted = relName.startsWith("\"") && relName.endsWith("\"") && relName.length() > 1;
-                if (relQuoted) {
-                    relName = relName.substring(1, relName.length() - 1);
-                }
-                if (schemaPrefix != null && schemaPrefix.startsWith("\"") && schemaPrefix.endsWith("\"") && schemaPrefix.length() > 1) {
-                    schemaPrefix = schemaPrefix.substring(1, schemaPrefix.length() - 1);
-                }
-                // PG lowercases unquoted identifiers
-                String lowerName = relQuoted ? relName : relName.toLowerCase(java.util.Locale.ROOT);
                 // Validate relation exists before returning OID
                 boolean rcExists = false;
                 if (schemaPrefix != null) {
@@ -1406,7 +1479,7 @@ class CastEvaluator {
                     }
                 }
                 if (!rcExists) {
-                    throw new MemgresException("relation \"" + val + "\" does not exist", "42P01");
+                    throw new MemgresException("relation \"" + relName + "\" does not exist", "42P01");
                 }
                 int regOid;
                 String displayName;
@@ -1468,6 +1541,26 @@ class CastEvaluator {
                     return new RegtypeValue(oid, name != null ? name : String.valueOf(oid));
                 }
                 String rtName = val.toString().trim().toLowerCase(java.util.Locale.ROOT);
+                // A type name may say which schema to look in, and PostgreSQL looks only there.
+                // A built-in answers to its own schema's name as well as to none, which is what
+                // lets a catalogue query write pg_catalog.int4 and mean the integer; a schema
+                // that is not there at all is the fault reported, rather than the type not
+                // being in a schema nobody has.
+                String rtSchema = qualifierOf(rtName);
+                if (rtSchema != null) {
+                    // The catalogue schemas are derived rather than held in the schema map, and
+                    // they are schemas all the same.
+                    boolean derived = "pg_catalog".equals(rtSchema)
+                            || "information_schema".equals(rtSchema)
+                            || "pg_toast".equals(rtSchema) || rtSchema.startsWith("pg_temp");
+                    if (!derived && executor.database.getSchema(rtSchema) == null) {
+                        throw new MemgresException(
+                                "schema \"" + rtSchema + "\" does not exist", "3F000");
+                    }
+                    if ("pg_catalog".equals(rtSchema)) {
+                        rtName = unquoteName(rtName.substring(rtName.lastIndexOf('.') + 1));
+                    }
+                }
                 // A regtype names a type, and a modifier written after it is not part of that
                 // name: PostgreSQL reads varchar(10) as the type varchar. Taken whole, the
                 // modifier made the name one no type answers to.
@@ -1534,7 +1627,23 @@ class CastEvaluator {
                 // and which schema's is settled by the qualifier written or by the search path.
                 String userTypeKey =
                         TypeNamespace.resolve(executor.database, executor.session, rtName);
+                // Every relation that has rows has a type of its own name, which is the type one
+                // of its rows is. A table is as much a type as a composite declared outright:
+                // 't'::regtype names the row a query over t returns. A sequence has no rows and
+                // so has no type of its own.
                 if (dt == null && userTypeKey == null) {
+                    String rowTypeKey = relationRowTypeKey(rtName);
+                    if (rowTypeKey != null) {
+                        // Written the way the type is named for this session: bare where the
+                        // search path reaches the relation, qualified where it does not.
+                        String rowSchema = TypeNamespace.schemaOfKey(rowTypeKey);
+                        String rowName = TypeNamespace.nameOfKey(rowTypeKey);
+                        String reached = RelationNamespace.schemaHolding(
+                                executor.database, executor.searchPathSchemas(), rowName);
+                        return new RegtypeValue(
+                                executor.systemCatalog.getOid("type:" + rowTypeKey),
+                                rowSchema.equals(reached) ? rowName : rowTypeKey);
+                    }
                     throw new MemgresException("type \"" + val + "\" does not exist", "42704");
                 }
                 // Return RegtypeValue with canonical type name and OID
@@ -1600,7 +1709,7 @@ class CastEvaluator {
                             canonical = "bytea";
                             break;
                         default:
-                            canonical = dt.getPgName();
+                            canonical = dt.toRegtypeDisplay();
                             break;
                     }
                     return new RegtypeValue(dt.getOid(), canonical);
@@ -1670,7 +1779,10 @@ class CastEvaluator {
                         d = base == null ? null : executor.database.getDomain(base);
                     }
                     DomainType root = chain.get(0);
-                    Object coerced = applyCast(val, root.getBaseType().getPgName());
+                    // The domain is its base type with everything the declaration said about it,
+                    // the modifier included: a numeric(3,2) domain rounds to two places and
+                    // overflows past three digits exactly as the column type would.
+                    Object coerced = applyCast(val, baseTypeSpecOf(root), fromUnknownLiteral);
                     for (DomainType d : chain) {
                         checkDomainConstraints(d, typeName, coerced);
                     }
@@ -1860,6 +1972,32 @@ class CastEvaluator {
             return quoteIdentIfNeeded(table);
         }
         return quoteIdentIfNeeded(schema) + "." + quoteIdentIfNeeded(table);
+    }
+
+    /**
+     * The schema a written type name says to look in, or null when it names none.
+     *
+     * <p>A name of its own may hold a dot, and one written in quotes says so: {@code "a.b"} is a
+     * single name and not a schema and a type. Only a dot outside the quotes divides one name
+     * from another.
+     */
+    private static String qualifierOf(String written) {
+        boolean quoted = false;
+        for (int i = 0; i < written.length(); i++) {
+            char c = written.charAt(i);
+            if (c == '"') quoted = !quoted;
+            else if (c == '.' && !quoted) return unquoteName(written.substring(0, i));
+        }
+        return null;
+    }
+
+    /** A name with the quotes it was written in taken off. */
+    private static String unquoteName(String name) {
+        String t = name.trim();
+        if (t.length() >= 2 && t.startsWith("\"") && t.endsWith("\"")) {
+            return t.substring(1, t.length() - 1).replace("\"\"", "\"");
+        }
+        return t;
     }
 
     /**

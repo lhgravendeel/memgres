@@ -103,6 +103,12 @@ public final class InsertStmt implements Statement {
          * what matches a stored index's own text; the tree is what a check of the statement reads.
          */
         public final List<Expression> conflictExpressionAsts;
+        /**
+         * The operator class written after each target entry, with a null where none was, or null
+         * when none was written at all. A target names the keys of an index, and a key indexed
+         * under one class is not the same key under another.
+         */
+        public final List<String> opclasses;
 
         public OnConflict(
                 List<String> columns,
@@ -138,6 +144,22 @@ public final class InsertStmt implements Statement {
                 Expression doUpdateWhereClause,
                 List<Expression> conflictExpressionAsts
         ) {
+            this(columns, constraint, doNothing, doUpdate, whereClause, conflictExpressions,
+                    doUpdateWhereClause, conflictExpressionAsts, null);
+        }
+
+        public OnConflict(
+                List<String> columns,
+                String constraint,
+                boolean doNothing,
+                List<SetClause> doUpdate,
+                Expression whereClause,
+                List<String> conflictExpressions,
+                Expression doUpdateWhereClause,
+                List<Expression> conflictExpressionAsts,
+                List<String> opclasses
+        ) {
+            this.opclasses = opclasses;
             this.columns = columns;
             this.constraint = constraint;
             this.doNothing = doNothing;
@@ -165,6 +187,7 @@ public final class InsertStmt implements Statement {
         public List<String> conflictExpressions() { return conflictExpressions; }
         public Expression doUpdateWhereClause() { return doUpdateWhereClause; }
         public List<Expression> conflictExpressionAsts() { return conflictExpressionAsts; }
+        public List<String> opclasses() { return opclasses; }
 
         @Override
         public boolean equals(Object o) {

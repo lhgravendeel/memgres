@@ -83,8 +83,32 @@ final class PgRegex {
         try {
             return Pattern.compile(translate(body, opts), javaFlags(opts));
         } catch (PatternSyntaxException e) {
-            throw new MemgresException("invalid regular expression: " + e.getDescription(), "2201B");
+            throw new MemgresException(
+                    "invalid regular expression: " + pgWording(e.getDescription()), "2201B");
         }
+    }
+
+    /**
+     * What PostgreSQL calls the fault the Java engine described.
+     *
+     * <p>The two engines find the same faults and word them differently, and it is the message
+     * that reaches the reader: PostgreSQL says the parentheses are not balanced where Java says a
+     * group is unclosed, and says a quantifier has no operand where Java calls the quantifier a
+     * dangling meta character. A description this does not know is passed through, because a
+     * message in the wrong words is better than none.
+     */
+    private static String pgWording(String javaDescription) {
+        if (javaDescription == null) return "";
+        String d = javaDescription;
+        if (d.startsWith("Unclosed group") || d.startsWith("Unmatched closing")) {
+            return "parentheses () not balanced";
+        }
+        if (d.startsWith("Unclosed character class")) return "brackets [] not balanced";
+        if (d.startsWith("Dangling meta character")) return "quantifier operand invalid";
+        if (d.startsWith("Unclosed counted closure")) return "braces {} not balanced";
+        if (d.startsWith("Illegal repetition range")) return "invalid repetition count(s)";
+        if (d.startsWith("Illegal character range")) return "invalid character range";
+        return d;
     }
 
     private static boolean applyOption(Options opts, char c) {
@@ -157,7 +181,11 @@ final class PgRegex {
             char c = pattern.charAt(i);
             if (escape != null && c == escape.charValue()) {
                 // An escape at the very end has nothing to make literal and is dropped.
-                if (i + 1 < pattern.length()) appendLiteral(out, pattern.charAt(i + 1));
+                // What follows one is handed to the regular expression as an escape of its own,
+                // which is what PostgreSQL does: SIMILAR TO's escape takes the pattern
+                // characters' meaning away, and where the character had none to take away the
+                // regular expression's reading of it stands -- \b is a backspace, not a b.
+                if (i + 1 < pattern.length()) out.append('\\').append(pattern.charAt(i + 1));
                 i += 2;
                 continue;
             }
@@ -267,7 +295,9 @@ final class PgRegex {
                 } else if (next == 'd' || next == 'D' || next == 's' || next == 'S'
                         || next == 'w' || next == 'W') {
                     out.append(classEscape(next));
-                } else if (next >= '0' && next <= '9') {
+                } else if (entryEscapeCharacter(next)) {
+                    i = appendEntryEscape(p, i - 2, out);
+                } else if (next >= '1' && next <= '9') {
                     i = appendDigitEscape(p, i - 2, out);
                 } else if (Character.isLetterOrDigit(next) && KNOWN_ESCAPES.indexOf(next) < 0) {
                     throw invalidEscape();
@@ -323,6 +353,78 @@ final class PgRegex {
      * {@code '\141'} uses for {@code a}; Java writes that with a leading zero and read the same
      * text as a reference to group 141. One or two digits stay a back reference.
      */
+    /** Whether the letter after a backslash names a character by itself rather than a class. */
+    private static boolean entryEscapeCharacter(char next) {
+        return next == 'b' || next == 'B' || next == 'v' || next == 'x' || next == 'U'
+                || next == '0';
+    }
+
+    /**
+     * A character-entry escape, written the way Java spells the character it names.
+     *
+     * <p>PostgreSQL's {@code \b} is a backspace wherever it stands and {@code \B} is a lone
+     * backslash, both of which Java reads as assertions about word boundaries; {@code \v} is a
+     * vertical tab where Java's is a class of every vertical space; {@code \x} takes as many
+     * hexadecimal digits as follow it where Java's takes two, so {@code \x41c} is one Cyrillic
+     * letter and not an A before a c; and {@code \U} takes eight. Read by Java's rules these
+     * matched other characters than the pattern named.
+     *
+     * @param at the index of the backslash
+     * @return the index just past the escape
+     */
+    private static int appendEntryEscape(String p, int at, StringBuilder out) {
+        switch (p.charAt(at + 1)) {
+            case 'b': return appendCodePoint(out, 0x08, at + 2);
+            case 'B': return appendCodePoint(out, '\\', at + 2);
+            case 'v': return appendCodePoint(out, 0x0b, at + 2);
+            case 'U': return appendHexEscape(p, at + 2, 8, out);
+            case 'x': return appendHexEscape(p, at + 2, -1, out);
+            // A run of octal digits opening with a zero is the character it counts, never a
+            // reference to a group: \0 on its own is the null character.
+            default: return appendOctalEscape(p, at + 1, out);
+        }
+    }
+
+    /** One character named by its number, spelled so that Java reads it as that character. */
+    private static int appendCodePoint(StringBuilder out, int codePoint, int end) {
+        out.append("\\x{").append(Integer.toHexString(codePoint)).append('}');
+        return end;
+    }
+
+    /**
+     * The character a hexadecimal escape names.
+     *
+     * @param at the index of the first digit
+     * @param exactly how many digits the escape takes, or {@code -1} where it takes all that
+     *     follow
+     */
+    private static int appendHexEscape(String p, int at, int exactly, StringBuilder out) {
+        int end = at;
+        while (end < p.length() && (exactly < 0 || end - at < exactly)
+                && isHexDigit(p.charAt(end))) {
+            end++;
+        }
+        if (end == at || (exactly > 0 && end - at != exactly) || end - at > 8) {
+            throw invalidEscape();
+        }
+        long value = Long.parseLong(p.substring(at, end), 16);
+        if (value > Character.MAX_CODE_POINT) throw invalidEscape();
+        return appendCodePoint(out, (int) value, end);
+    }
+
+    /** The character an octal escape opening with a zero names, of at most three digits. */
+    private static int appendOctalEscape(String p, int at, StringBuilder out) {
+        int end = at;
+        while (end < p.length() && end - at < 3 && p.charAt(end) >= '0' && p.charAt(end) <= '7') {
+            end++;
+        }
+        return appendCodePoint(out, Integer.parseInt(p.substring(at, end), 8), end);
+    }
+
+    private static boolean isHexDigit(char c) {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+    }
+
     private static int appendDigitEscape(String p, int at, StringBuilder out) {
         int end = at + 1;
         while (end < p.length() && end - at <= 3 && p.charAt(end) >= '0' && p.charAt(end) <= '7') {
@@ -411,10 +513,9 @@ final class PgRegex {
                     String members = classEscape(next);
                     if (members.startsWith("[^")) cls.append(members);
                     else cls.append(members, 1, members.length() - 1);
-                } else if (next == 'b') {
-                    // \b is a word boundary outside brackets and a backspace inside one, which
-                    // is a character Java refuses to spell that way.
-                    cls.append("\\x08");
+                } else if (entryEscapeCharacter(next)) {
+                    i = appendEntryEscape(p, i, cls);
+                    continue;
                 } else {
                     cls.append(c).append(next);
                 }

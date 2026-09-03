@@ -17,6 +17,34 @@ public final class RevokeStmt implements Statement {
     public final boolean cascade;
     public final List<String> columns;
 
+    /**
+     * The further objects the same statement names, each of the same kind and losing the same
+     * privileges. Never null; empty when one object was named.
+     */
+    private List<String> moreObjects = java.util.Collections.emptyList();
+
+    /** The same statement, remembering the other objects it named. */
+    public RevokeStmt withMoreObjects(List<String> names) {
+        this.moreObjects = names == null || names.isEmpty()
+                ? java.util.Collections.<String>emptyList()
+                : java.util.Collections.unmodifiableList(new java.util.ArrayList<String>(names));
+        return this;
+    }
+
+    public List<String> moreObjects() { return moreObjects; }
+
+    /** One statement per object named, in the order they were written. */
+    public List<RevokeStmt> perObject() {
+        List<RevokeStmt> each = new java.util.ArrayList<RevokeStmt>();
+        each.add(new RevokeStmt(privileges, objectType, objectName, grantees, grantOptionFor,
+                isRoleGrant, cascade, columns));
+        for (String other : moreObjects) {
+            each.add(new RevokeStmt(privileges, objectType, other, grantees, grantOptionFor,
+                    isRoleGrant, cascade, columns));
+        }
+        return each;
+    }
+
     public RevokeStmt(
             List<String> privileges,
             String objectType,

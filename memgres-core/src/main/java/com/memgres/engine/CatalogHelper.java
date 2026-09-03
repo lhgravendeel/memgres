@@ -505,6 +505,16 @@ public final class CatalogHelper {
 
     /** Format a column default for information_schema / pg_attrdef, matching PG conventions. */
     public static String formatColumnDefault(Column col) {
+        return formatColumnDefault(col, null, null);
+    }
+
+    /**
+     * @param database and {@code session} decide how a sequence named in a {@code nextval} is
+     *     written back: PostgreSQL prints it as a regclass, which is bare where the search path
+     *     reaches the sequence and qualified where it does not. Without them the name is left as
+     *     written, which is what a caller with no session to ask can honestly say.
+     */
+    public static String formatColumnDefault(Column col, Database database, Session session) {
         String def = col.getDefaultValue();
         if (def == null) return null;
         if (def.startsWith("__identity__")) return null;
@@ -514,7 +524,9 @@ public final class CatalogHelper {
         if (def.equalsIgnoreCase("current_timestamp()")
                 || def.equalsIgnoreCase("current_timestamp")) return "CURRENT_TIMESTAMP";
         if (def.equalsIgnoreCase("current_date") || def.equalsIgnoreCase("current_date()")) return "CURRENT_DATE";
-        if (def.toLowerCase(java.util.Locale.ROOT).startsWith("nextval(")) return def;
+        if (def.toLowerCase(java.util.Locale.ROOT).startsWith("nextval(")) {
+            return nextvalAsRegclass(def, database, session);
+        }
         if (def.startsWith("'") && def.endsWith("'")) {
             // The type a default is labelled with is named as the reader would write it, which
             // for a type in a schema of its own is its bare name.
@@ -662,6 +674,37 @@ public final class CatalogHelper {
     }
 
     /** Find a table by name across all schemas. */
+    /** The sequence a nextval names, written the way a regclass writes a relation name. */
+    private static final java.util.regex.Pattern NEXTVAL_SEQUENCE =
+            java.util.regex.Pattern.compile("(?i)^(nextval\\(\\s*')([^']*)('\\s*(?:::\\s*regclass\\s*)?\\))$");
+
+    private static String nextvalAsRegclass(String def, Database database, Session session) {
+        java.util.regex.Matcher m = NEXTVAL_SEQUENCE.matcher(def.trim());
+        if (!m.matches()) return def;
+        String written = m.group(2);
+        String schema = null;
+        String bare = written;
+        int dot = written.indexOf('.');
+        if (dot > 0) {
+            schema = written.substring(0, dot);
+            bare = written.substring(dot + 1);
+        }
+        String shown = written;
+        if (database != null) {
+            String reached = RelationNamespace.schemaHolding(
+                    database, TypeNamespace.searchPathOf(database, session), bare);
+            if (reached != null && (schema == null || reached.equalsIgnoreCase(schema))) {
+                shown = bare;
+            } else if (schema == null) {
+                // Not on the path: the sequence is named with the schema that holds it.
+                String holder = RelationNamespace.schemaHolding(database,
+                        new java.util.ArrayList<>(database.getSchemas().keySet()), bare);
+                shown = holder == null ? bare : holder + "." + bare;
+            }
+        }
+        return m.group(1) + shown + "'::regclass)";
+    }
+
     public static Table findTable(Database database, String tableName) {
         for (Schema schema : database.getSchemas().values()) {
             Table t = schema.getTable(tableName);

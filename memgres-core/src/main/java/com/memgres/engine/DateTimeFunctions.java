@@ -278,7 +278,13 @@ class DateTimeFunctions {
                 PgInterval iv = TypeCoercion.toInterval(intervalObj);
                 // A month is not a fixed number of microseconds, so there is no bin width to
                 // count with; PG refuses the stride rather than picking a length for it.
-                if (iv.isInfinite() || iv.getMonths() != 0) {
+                // An endless stride is not a width that is too awkward to count with but no width
+                // at all, and PostgreSQL says which of the two it met.
+                if (iv.isInfinite()) {
+                    throw new MemgresException(
+                            "timestamps cannot be binned into infinite intervals", "22008");
+                }
+                if (iv.getMonths() != 0) {
                     throw new MemgresException(
                             "timestamps cannot be binned into intervals containing months or years", "0A000");
                 }

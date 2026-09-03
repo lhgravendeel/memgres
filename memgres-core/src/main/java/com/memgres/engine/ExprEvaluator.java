@@ -213,7 +213,9 @@ class ExprEvaluator {
                 }
                 return val;
             }
-            return null;
+            // A statement asking for a parameter nobody supplied is asking for something that is
+            // not there. Answering NULL made "SELECT $1" a query rather than the mistake it is.
+            throw new MemgresException("there is no parameter $" + p.index(), "42P02");
         }
         if (expr instanceof WildcardExpr) {
             WildcardExpr wc = (WildcardExpr) expr;
@@ -524,7 +526,14 @@ class ExprEvaluator {
                 // or infinity reaches here spelled out; BigDecimal has no form for any of them.
                 Double special = NumericLimits.specialNumericOrNull(lit.value());
                 if (special != null) return special;
-                return new java.math.BigDecimal(lit.value());
+                // A constant has to be a value numeric can hold: an exponent past the widest one
+                // there is names no number, and reading it left the digits it would have taken to
+                // write it out -- or an internal failure where the exponent would not even parse.
+                try {
+                    return NumericLimits.check(new java.math.BigDecimal(lit.value()));
+                } catch (NumberFormatException tooWide) {
+                    throw NumericLimits.valueOverflowsNumeric();
+                }
             }
             case STRING:
                 return lit.value();
@@ -561,48 +570,15 @@ class ExprEvaluator {
                     ref.schema() + "." + ref.table() + "." + ref.column());
             ref = new ColumnRef(ref.schema(), ref.table(), ref.column());
         }
-        // pg_catalog.current_user etc.; treat as the system function directly
-        if ("pg_catalog".equalsIgnoreCase(ref.table()) || "information_schema".equalsIgnoreCase(ref.table())) {
-            String col = ref.column().toLowerCase(java.util.Locale.ROOT);
-            switch (col) {
-                case "current_user":
-                case "current_role": {
-                    // Respect SECURITY DEFINER role override via GUC
-                    if (executor.session != null) {
-                        GucSettings guc = executor.session.getGucSettings();
-                        if (guc.hasSessionOverride("role")) {
-                            String role = guc.get("role");
-                            if (role != null && !role.equalsIgnoreCase("NONE") && !role.equalsIgnoreCase("DEFAULT")) {
-                                return role;
-                            }
-                        }
-                    }
-                    return executor.sessionUser();
-                }
-                case "session_user": {
-                    return executor.sessionUser();
-                }
-                case "current_database":
-                case "current_catalog": {
-                    return executor.session != null ? executor.session.getDatabaseName() : "memgres";
-                }
-                case "current_schema": {
-                    return "public";
-                }
-                case "current_schemas": {
-                    return new Object[]{"public"};
-                }
-                case "pg_backend_pid": {
-                    return 12345;
-                }
-                case "inet_server_addr": {
-                    return "127.0.0.1";
-                }
-            }
-        }
+        // A name with a schema in front of it and no parentheses after it is a column of a
+        // relation: PostgreSQL reads pg_catalog.current_schema as the schema's column and says
+        // there is no such relation in the query. Read as the value word instead, a qualified
+        // name answered where PostgreSQL refuses one.
         if (ctx == null) {
-            // No row context, check for system columns
-            String col = ref.column().toLowerCase(java.util.Locale.ROOT);
+            // No row context, check for system columns. A name with a schema in front of it is a
+            // column of a relation whatever it is called, so the value words are only read as
+            // values when nothing qualifies them.
+            String col = ref.table() != null ? "" : ref.column().toLowerCase(java.util.Locale.ROOT);
             switch (col) {
                 case "current_user":
                 case "current_role": {
@@ -1887,6 +1863,11 @@ class ExprEvaluator {
                 if (element == null) element = elementByDeclaredType(other, ctx);
                 if (element != null) {
                     other = element;
+                } else if (isNotAnArray(other, ctx)) {
+                    // What this spelling takes is an array: a value that is not one is not a set
+                    // of anything to compare against, and 1 = ANY(1) answered as though it were.
+                    throw new MemgresException(
+                            "op ANY/ALL (array) requires array on right side", "42809");
                 } else if (executor.binaryOpEvaluator.declaredTypeForResolution(other, ctx) == null) {
                     // Nothing here says whether this is an array or a single value, so there is
                     // no pair of types to resolve an operator between.
@@ -1990,6 +1971,12 @@ class ExprEvaluator {
         // Regular IN (value list)
         boolean found = false;
         boolean hasNull = false;
+        // A constant with no type of its own takes the type of what it is compared against, and
+        // one that does not read as that type is refused rather than compared as text.
+        if (in.fromAny() && in.values().size() == 1 && val != null) {
+            val = asTheElementsType(in.expr(), val,
+                    elementsOf(evalExpr(in.values().get(0), ctx)));
+        }
         for (Expression v : in.values()) {
             Object elem = evalExpr(v, ctx);
             if (elem == null) {
@@ -2052,8 +2039,12 @@ class ExprEvaluator {
             // member of it.
             // A written-out element is one value however it is spelled, so ARRAY['{a,b}'] holds
             // the two-character-braced string and not the two letters inside it.
+            // A written-out element is one value however it is spelled -- unless it is the whole
+            // of what ANY was given, in which case it is the array itself and is read as one:
+            // 1 = ANY('{1,2}') asks about the two numbers.
             boolean writtenOut = v instanceof Literal
-                    && ((Literal) v).literalType() == Literal.LiteralType.STRING;
+                    && ((Literal) v).literalType() == Literal.LiteralType.STRING
+                    && in.values().size() > 1;
             if (in.fromAny() && elem instanceof String && !jsonb && !writtenOut
                     && ((String) elem).startsWith("{") && ((String) elem).endsWith("}")
                     && !RangeOperations.isMultirangeOrEmpty(((String) elem).trim())) {
@@ -2788,16 +2779,20 @@ class ExprEvaluator {
             boolean hasNull = false;
             for (Object[] row : subResult.getRows()) {
                 Object elem = subqueryElement(row, leftWidth);
-                if (elem == null) { hasNull = true; continue; }
-                if (!evalComparisonOp(aa.op(), leftVal, elem)) return false;
+                Boolean answered = elem == null ? null
+                        : comparisonAgainst(aa.op(), aa.userOp(), leftVal, elem);
+                if (answered == null) { hasNull = true; continue; }
+                if (!answered.booleanValue()) return false;
             }
             return hasNull ? null : true;
         } else {
             boolean hasNull = false;
             for (Object[] row : subResult.getRows()) {
                 Object elem = subqueryElement(row, leftWidth);
-                if (elem == null) { hasNull = true; continue; }
-                if (evalComparisonOp(aa.op(), leftVal, elem)) return true;
+                Boolean answered = elem == null ? null
+                        : comparisonAgainst(aa.op(), aa.userOp(), leftVal, elem);
+                if (answered == null) { hasNull = true; continue; }
+                if (answered.booleanValue()) return true;
             }
             return hasNull ? null : false;
         }
@@ -2887,17 +2882,27 @@ class ExprEvaluator {
         // The array is read by the one array reader, so a quoted element holding a comma stays
         // one element.
         List<?> elements = PgArray.from(arrayVal);
-        if (elements == null) elements = Cols.listOf(arrayVal);
+        if (elements == null) {
+            // ANY and ALL written this way take an array, and a value that is not one is not a
+            // set of anything to compare against: read as a set of one, 1 = ANY(1) answered.
+            throw new MemgresException(
+                    "op ANY/ALL (array) requires array on right side", "42809");
+        }
         // An array with nothing in it settles the answer without comparing anything, which is why
         // it answers even for a NULL on the left: there is nothing there to be unknown about.
         if (elements.isEmpty()) return aaa.isAll();
         if (leftVal == null) return null;
+        // A constant with no type of its own takes the array's element type, and a constant that
+        // does not read as one is refused rather than compared as text.
+        leftVal = asTheElementsType(aaa.left(), leftVal, elements);
         if (aaa.isAll()) {
             boolean hasNull = false;
             for (Object elem : elements) {
                 if (elem == null) { hasNull = true; continue; }
                 Object e = elem instanceof String ? ((String) elem).trim() : elem;
-                if (!evalComparisonOp(aaa.op(), leftVal, e)) return false;
+                Boolean answered = comparisonAgainst(aaa.op(), aaa.userOp(), leftVal, e);
+                if (answered == null) { hasNull = true; continue; }
+                if (!answered.booleanValue()) return false;
             }
             return hasNull ? null : true;
         } else {
@@ -2905,10 +2910,108 @@ class ExprEvaluator {
             for (Object elem : elements) {
                 if (elem == null) { hasNull = true; continue; }
                 Object e = elem instanceof String ? ((String) elem).trim() : elem;
-                if (evalComparisonOp(aaa.op(), leftVal, e)) return true;
+                Boolean answeredAny = comparisonAgainst(aaa.op(), aaa.userOp(), leftVal, e);
+                if (answeredAny == null) { hasNull = true; continue; }
+                if (answeredAny.booleanValue()) return true;
             }
             return hasNull ? null : false;
         }
+    }
+
+    /**
+     * The one type a set of branches settles on.
+     *
+     * <p>PostgreSQL takes them all together rather than reading the first: the branches of a CASE
+     * and the arguments of COALESCE answer with one type, and where two of them are numbers of
+     * different widths it is the wider one -- a smallint beside a bigint is a bigint, and an
+     * integer beside a numeric is a numeric. A branch with no type of its own says nothing, and
+     * where none of them says anything the answer is text.
+     */
+    private DataType typeTheBranchesSettleOn(List<Expression> branches,
+                                             List<RowContext.TableBinding> bindings) {
+        DataType settled = null;
+        for (Expression branch : branches) {
+            if (branch == null || isUnknownLiteral(branch)) continue;
+            DataType branchType = inferTypeFromContext(branch, bindings);
+            if (branchType == null) continue;
+            if (settled == null || settled == branchType) {
+                settled = branchType;
+                continue;
+            }
+            // Two numbers settle on the wider of the two; anything else keeps what was settled,
+            // which is the branch PostgreSQL would have taken as its candidate.
+            if (TypeCoercion.categoryOf(settled) == TypeCoercion.TypeCategory.NUMERIC
+                    && TypeCoercion.categoryOf(branchType) == TypeCoercion.TypeCategory.NUMERIC) {
+                settled = TypeCoercion.promoteNumeric(settled, branchType);
+            }
+        }
+        return settled == null ? DataType.TEXT : settled;
+    }
+
+    /** The values an array holds, or an empty list when the value is not an array. */
+    private static List<?> elementsOf(Object value) {
+        List<?> elements = PgArray.from(value);
+        return elements == null ? Cols.listOf() : elements;
+    }
+
+    /**
+     * Whether an operand is something the query says is not an array. A name whose type nothing
+     * here settles, and a constant with no type of its own, both say nothing: an unadorned string
+     * becomes an array where an array is asked for.
+     */
+    private boolean isNotAnArray(Expression expr, RowContext ctx) {
+        if (expr instanceof SubqueryExpr || expr instanceof ArraySubqueryExpr) return false;
+        if (expr instanceof Literal
+                && ((Literal) expr).literalType() == Literal.LiteralType.STRING) {
+            return false;
+        }
+        String declared = executor.binaryOpEvaluator.declaredTypeForResolution(expr, ctx);
+        return declared != null && !declared.endsWith("[]");
+    }
+
+    /**
+     * The left operand read as the array's elements are typed, where it was written with no type
+     * of its own. Compared as it stood, {@code 'a' = ANY(ARRAY[1])} answered false instead of
+     * saying that the letter a is not an integer.
+     */
+    private Object asTheElementsType(Expression left, Object leftVal, List<?> elements) {
+        if (!(left instanceof Literal)
+                || ((Literal) left).literalType() != Literal.LiteralType.STRING) {
+            return leftVal;
+        }
+        for (Object element : elements) {
+            if (element == null) continue;
+            DataType elementType = DataType.fromPgName(AstExecutor.pgTypeNameOf(element));
+            if (elementType == null || elementType == DataType.TEXT) return leftVal;
+            return TypeCoercion.coerce(leftVal, elementType);
+        }
+        return leftVal;
+    }
+
+    /**
+     * What a comparison against one member of the set answers, which may be neither true nor
+     * false: two rows that agree everywhere but a null field settle to unknown, and an ANY over
+     * a set holding such a member is unknown rather than false. Read as a plain boolean, the
+     * unknown became false and the whole test answered false where PostgreSQL answers nothing.
+     */
+    private Boolean comparisonAgainst(BinaryExpr.BinOp op, String userOp,
+                                      Object left, Object right) {
+        if (userOp != null) {
+            Object answered = executor.binaryOpEvaluator.tryUserDefinedOperator(userOp, left, right);
+            if (answered == null) {
+                throw new MemgresException("operator does not exist: "
+                        + AstExecutor.pgTypeNameOf(left) + " " + userOp + " "
+                        + AstExecutor.pgTypeNameOf(right)
+                        + "\n  Hint: No operator matches the given name and argument types."
+                        + " You might need to add explicit type casts.", "42883");
+            }
+            return Boolean.valueOf(executor.isTruthy(answered));
+        }
+        if (left instanceof AstExecutor.PgRow || right instanceof AstExecutor.PgRow) {
+            Object answered = executor.binaryOpEvaluator.evalBinaryValues(op, left, right);
+            return answered == null ? null : Boolean.valueOf(executor.isTruthy(answered));
+        }
+        return Boolean.valueOf(evalComparisonOp(op, left, right));
     }
 
     private boolean evalComparisonOp(BinaryExpr.BinOp op, Object left, Object right) {
@@ -4292,9 +4395,16 @@ class ExprEvaluator {
             // from such casts advertises the real enum type via resolveEnumTypeName below instead
             // of the generic (OID-0) placeholder.
             if (executor != null && executor.database != null
-                    && executor.database.getCustomEnum(typeName.toLowerCase(java.util.Locale.ROOT)) != null) {
+                    && (executor.database.getCustomEnum(typeName) != null
+                        || executor.database.getCustomEnum(
+                                typeName.toLowerCase(java.util.Locale.ROOT)) != null)) {
                 return DataType.ENUM;
             }
+            // The five domains information_schema is written in are domains too, and answer to
+            // their qualified names alone: read as a name this database does not carry, a value
+            // cast to one was described to the reader as text rather than as what it is.
+            DataType standard = InformationSchemaTypes.baseTypeOf(cast.typeName());
+            if (standard != null) return standard;
             // A domain is its base type wearing a name and a constraint, and a value of one is
             // described by the type underneath: a numeric domain is a numeric on the wire.
             if (executor != null && executor.database != null) {
@@ -4501,6 +4611,17 @@ class ExprEvaluator {
                 DataType sub = rangeSubtypeOf(inferTypeFromContext(fn.args().get(0), bindings));
                 if (sub != null) return sub;
             }
+            // A part of a bit string is a bit string, and a part of a bytea is a bytea: what
+            // substring answers with is the type it was handed. Answered as text, an operator
+            // over the result was resolved for text and there is none.
+            if ((name.equals("substring") || name.equals("substr") || name.equals("overlay"))
+                    && !fn.args().isEmpty()) {
+                DataType handed = inferTypeFromContext(fn.args().get(0), bindings);
+                if (handed == DataType.BIT || handed == DataType.VARBIT
+                        || handed == DataType.BYTEA) {
+                    return handed;
+                }
+            }
             if (name.equals("lower") || name.equals("upper") || name.equals("trim")
                     || name.equals("ltrim") || name.equals("rtrim") || name.equals("replace")
                     || name.equals("substring") || name.equals("concat")
@@ -4544,16 +4665,7 @@ class ExprEvaluator {
             if (name.equals("coalesce") || name.equals("nullif") || name.equals("greatest") || name.equals("least")) {
                 // An untyped literal is read as whatever the other arguments settle on, so
                 // GREATEST('10', 9) is an integer -- taking the first argument's type made it text
-                for (Expression arg : fn.args()) {
-                    if (isUnknownLiteral(arg)) continue;
-                    DataType dt = inferTypeFromContext(arg, bindings);
-                    if (dt != null) return dt;
-                }
-                for (Expression arg : fn.args()) {
-                    DataType dt = inferTypeFromContext(arg, bindings);
-                    if (dt != null) return dt;
-                }
-                return DataType.TEXT;
+                return typeTheBranchesSettleOn(fn.args(), bindings);
             }
             DataType arrayResult = arrayFunctionResultType(name, fn, bindings);
             if (arrayResult != null) return arrayResult;
@@ -4891,11 +5003,10 @@ class ExprEvaluator {
         if (expr instanceof IsJsonExpr) return DataType.BOOLEAN;
         if (expr instanceof CaseExpr) {
             CaseExpr c = (CaseExpr) expr;
-            if (!c.whenClauses().isEmpty()) {
-                return inferTypeFromContext(c.whenClauses().get(0).result(), bindings);
-            }
-            if (c.elseExpr() != null) return inferTypeFromContext(c.elseExpr(), bindings);
-            return DataType.TEXT;
+            List<Expression> branches = new ArrayList<Expression>();
+            for (CaseExpr.WhenClause when : c.whenClauses()) branches.add(when.result());
+            if (c.elseExpr() != null) branches.add(c.elseExpr());
+            return typeTheBranchesSettleOn(branches, bindings);
         }
         if (expr instanceof SubqueryExpr) {
             SubqueryExpr sq = (SubqueryExpr) expr;
@@ -5011,7 +5122,7 @@ class ExprEvaluator {
      * The type PostgreSQL gives a whole-number constant: int4 while it fits, then int8, then
      * numeric. The value decides, not the way it was written.
      */
-    private static DataType integerLiteralType(Literal lit) {
+    static DataType integerLiteralType(Literal lit) {
         Object value = lit.value();
         java.math.BigInteger written;
         try {
@@ -5124,8 +5235,12 @@ class ExprEvaluator {
             return null;
         }
         if (expr instanceof CastExpr) {
-            String typeName = ((CastExpr) expr).typeName().replaceAll("\\(.*\\)", "").trim().toLowerCase(java.util.Locale.ROOT);
-            return executor.database.getCustomEnum(typeName) != null ? typeName : null;
+            // The name as written names the enum when it was created with those letters; folded,
+            // it names the one created without quotes. Both are looked for, in that order.
+            String written = ((CastExpr) expr).typeName().replaceAll("\\(.*\\)", "").trim();
+            if (executor.database.getCustomEnum(written) != null) return written;
+            String folded = written.toLowerCase(java.util.Locale.ROOT);
+            return executor.database.getCustomEnum(folded) != null ? folded : null;
         }
         if (expr instanceof FunctionCallExpr) {
             FunctionCallExpr fn = (FunctionCallExpr) expr;
@@ -5310,10 +5425,24 @@ class ExprEvaluator {
             return;
         }
         if (left > 1 && isWrittenScalar(bin.right())) {
+            refuseReadingAnUnnamedRow(bin.right());
             throw noRecordOperator(typeNameOf(bin.right()), false);
         }
         if (right > 1 && isWrittenScalar(bin.left())) {
+            refuseReadingAnUnnamedRow(bin.left());
             throw noRecordOperator(typeNameOf(bin.left()), true);
+        }
+    }
+
+    /**
+     * A constant with no type of its own set against a row is asked to read itself as that row,
+     * and a row written in the query has no type name to read it by. PostgreSQL says so where a
+     * constant of any other type simply names no operator.
+     */
+    private static void refuseReadingAnUnnamedRow(Expression scalar) {
+        if (isUntypedStringLiteral(scalar)) {
+            throw new MemgresException(
+                    "input of anonymous composite types is not implemented", "0A000");
         }
     }
 

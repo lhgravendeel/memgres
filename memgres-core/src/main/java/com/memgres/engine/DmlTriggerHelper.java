@@ -26,6 +26,61 @@ class DmlTriggerHelper {
         return role != null && role.equalsIgnoreCase("replica");
     }
 
+    /** The trigger functions the server provides rather than a reader having written them. */
+    static boolean isBuiltinTriggerFunction(String name) {
+        if (name == null) return false;
+        String bare = name.substring(name.indexOf('.') + 1).toLowerCase(java.util.Locale.ROOT);
+        return bare.equals("tsvector_update_trigger")
+                || bare.equals("tsvector_update_trigger_column");
+    }
+
+    /**
+     * Fill the vector column a {@code tsvector_update_trigger} names from the text columns it
+     * names, under the configuration it names.
+     *
+     * <p>The arguments are the column to fill, then either the configuration itself or the column
+     * holding its name, then the text columns to read. What goes in is the concatenation of those
+     * columns read as a document, which is the whole of what this trigger is for.
+     */
+    private Object[] applyTsvectorUpdate(PgTrigger trigger, Object[] newRow, Table table) {
+        List<String> args = trigger.getArgs();
+        if (newRow == null || args == null || args.size() < 3) return newRow;
+        boolean namesTheConfigColumn = trigger.getFunctionName() != null
+                && trigger.getFunctionName().toLowerCase(java.util.Locale.ROOT)
+                        .endsWith("tsvector_update_trigger_column");
+        int target = table.getColumnIndex(unquoted(args.get(0)));
+        if (target < 0) return newRow;
+        String config = unquoted(args.get(1));
+        if (namesTheConfigColumn) {
+            int configColumn = table.getColumnIndex(config);
+            config = configColumn < 0 || newRow[configColumn] == null
+                    ? "english" : String.valueOf(newRow[configColumn]);
+        }
+        config = config.substring(config.indexOf('.') + 1);
+        StringBuilder document = new StringBuilder();
+        for (int i = 2; i < args.size(); i++) {
+            int from = table.getColumnIndex(unquoted(args.get(i)));
+            if (from < 0 || newRow[from] == null) continue;
+            if (document.length() > 0) document.append(' ');
+            document.append(newRow[from]);
+        }
+        Object[] updated = java.util.Arrays.copyOf(newRow, newRow.length);
+        updated[target] = TsVector.fromText(document.toString(), config);
+        return updated;
+    }
+
+    /** An argument as written, with the quotes a trigger definition keeps taken off. */
+    private static String unquoted(String written) {
+        String t = written == null ? "" : written.trim();
+        if (t.length() >= 2 && t.startsWith("'") && t.endsWith("'")) {
+            return t.substring(1, t.length() - 1);
+        }
+        if (t.length() >= 2 && t.startsWith("\"") && t.endsWith("\"")) {
+            return t.substring(1, t.length() - 1);
+        }
+        return t;
+    }
+
     Object[] executeTriggers(List<PgTrigger> triggers, PgTrigger.Timing timing,
                              PgTrigger.Event event, Object[] newRow, Object[] oldRow, Table table) {
         return executeTriggers(triggers, timing, event, newRow, oldRow, table, null);
@@ -88,6 +143,10 @@ class DmlTriggerHelper {
                             plExec.executeTriggerFunction(function, capturedNew, capturedOld, table, capturedTrigger);
                         }
                     });
+                    continue;
+                }
+                if (isBuiltinTriggerFunction(trigger.getFunctionName())) {
+                    newRow = applyTsvectorUpdate(trigger, newRow, table);
                     continue;
                 }
                 PgFunction function = executor.database.getFunction(trigger.getFunctionName());

@@ -289,7 +289,11 @@ final class NumericMath {
         if (n == 0) return BigDecimal.ONE.setScale(rscale);
         // An exact power of a wide base can be far wider than numeric could ever hold, so the
         // size is checked before it is built rather than after the heap has grown to fit it.
-        double digits = (double) n * (decimalWeight(base) + 1.0);
+        // What decides that is how many figures stand before the point, which is the base's own
+        // logarithm times the exponent: counting the base's digits instead made 10^100000 twice
+        // as wide as it is and refused a power PostgreSQL answers.
+        double digits = n <= 0 ? 0
+                : (double) n * lnAsDouble(base.abs()) * LOG10_E + 1.0;
         if (digits > 131072) throw NumericLimits.valueOverflowsNumeric();
         if (n > 0) {
             BigDecimal exact = base.pow(n);
@@ -306,4 +310,38 @@ final class NumericMath {
             throw new MemgresException("cannot take logarithm of a negative number", "2201E");
         }
     }
+    /**
+     * How many decimal places a division answers with.
+     *
+     * <p>PostgreSQL chooses the scale from the operands rather than fixing one: enough places for
+     * sixteen significant digits of the quotient, and never fewer than either operand already
+     * had. Fixing a scale of twenty instead made 10.00 / 4 answer with twenty places where
+     * PostgreSQL gives sixteen, and 1e-10 / 3 with twenty where PostgreSQL gives twenty-eight.
+     *
+     * <p>The weights are counted the way PostgreSQL stores a numeric, in groups of four decimal
+     * digits, because that is what its own estimate of the quotient's weight is made of.
+     */
+    static int divisionScale(java.math.BigDecimal dividend, java.math.BigDecimal divisor) {
+        int[] left = weightAndLeadingGroup(dividend);
+        int[] right = weightAndLeadingGroup(divisor);
+        int quotientWeight = left[0] - right[0];
+        // Where the leading groups are equal the quotient may still be smaller, so PostgreSQL
+        // assumes it is and keeps one group more.
+        if (left[1] <= right[1]) quotientWeight--;
+        int scale = 16 - quotientWeight * 4;
+        scale = Math.max(scale, Math.max(dividend.scale(), 0));
+        scale = Math.max(scale, Math.max(divisor.scale(), 0));
+        return Math.max(0, Math.min(scale, 1000));
+    }
+
+    /** A value's weight in groups of four decimal digits, and the leading group itself. */
+    private static int[] weightAndLeadingGroup(java.math.BigDecimal value) {
+        if (value == null || value.signum() == 0) return new int[]{0, 0};
+        java.math.BigDecimal magnitude = value.abs().stripTrailingZeros();
+        int mostSignificant = magnitude.precision() - magnitude.scale() - 1;
+        int weight = Math.floorDiv(mostSignificant, 4);
+        java.math.BigDecimal leading = magnitude.movePointLeft(4 * weight);
+        return new int[]{weight, leading.setScale(0, java.math.RoundingMode.FLOOR).intValue()};
+    }
+
 }

@@ -537,7 +537,10 @@ class SelectParser {
         List<SelectStmt.OrderByItem> orderBy = null;
         if (parser.checkKeyword("ORDER")) {
             if (!parser.matchKeywords("ORDER", "BY")) {
-                throw new ParseException("syntax error at or near \"" + parser.peek().value() + "\"", parser.peek());
+                // ORDER only ever opens the clause, so it is read as opening one and what went
+                // wrong is whatever stands where BY belongs -- or the end of the statement.
+                parser.advance();
+                throw ParseException.at(parser.peek());
             }
             orderBy = parser.parseOrderByList();
             sawOrderBy = true;
@@ -861,6 +864,13 @@ class SelectParser {
 
         List<SelectStmt.CommonTableExpr> ctes = new ArrayList<>();
         do {
+            // A WITH item is named the way a table is, so a word the grammar reserves cannot be
+            // one: WITH select AS (...) is a statement that will not parse, not a query over an
+            // item called select.
+            if (parser.peek().type() == TokenType.KEYWORD
+                    && !PgKeywords.canBeColumnName(parser.peek().raw())) {
+                throw ParseException.at(parser.peek());
+            }
             String name = parser.readIdentifier();
 
             // Optional column name list
@@ -1919,7 +1929,9 @@ class SelectParser {
         if (type == TokenType.QUOTED_IDENTIFIER) return true;
         if (type != TokenType.IDENTIFIER && type != TokenType.KEYWORD) return false;
         String word = parser.peek().value().toUpperCase(java.util.Locale.ROOT);
-        if (type == TokenType.KEYWORD && isClauseKeyword(word)) return false;
+        // The list below is the whole of the rule: a word that opens a clause elsewhere is a label
+        // here all the same, there being nothing else a word after a select item can be. Refusing
+        // those as well made SELECT a natural a syntax error over a column called natural.
         return !NOT_A_BARE_LABEL.contains(word);
     }
 

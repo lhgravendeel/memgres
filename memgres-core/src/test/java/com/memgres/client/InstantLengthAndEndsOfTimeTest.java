@@ -230,6 +230,93 @@ class InstantLengthAndEndsOfTimeTest {
         assertEquals("22007", stateOf("SELECT date '2001-01-01-05'"));
     }
 
+    /**
+     * A literal is read field by field, so the order the fields come in barely matters and a
+     * weekday name does not matter at all.
+     */
+    @Test
+    void aDateIsReadFieldByField() throws SQLException {
+        assertEquals("1999-01-08", one("SELECT (date '08-Jan-99')::text"));
+        assertEquals("1999-01-08", one("SELECT (date 'Jan-08-99')::text"));
+        assertEquals("1999-01-08", one("SELECT (date 'Jan 8 99')::text"));
+        assertEquals("1999-01-08", one("SELECT (date '8 Jan 99')::text"));
+        assertEquals("1999-01-08", one("SELECT (date 'Mon Jan 8 1999')::text"));
+        assertEquals("1999-01-08 04:05:06",
+                one("SELECT (timestamp '04:05:06 Jan 8 1999')::text"));
+        assertEquals("1999-01-08 04:05:06",
+                one("SELECT (timestamp 'January 8 04:05:06 1999 PST')::text"));
+    }
+
+    /**
+     * A year written with two digits belongs to the century that puts it nearest today, and only
+     * in the common era: an era marker at the end is what keeps a two-digit year as itself.
+     */
+    @Test
+    void aTwoDigitYearTakesACentury() throws SQLException {
+        assertEquals("2069-01-08", one("SELECT (date 'Jan 8 69')::text"));
+        assertEquals("1970-01-08", one("SELECT (date 'Jan 8 70')::text"));
+        assertEquals("0100-01-08", one("SELECT (date 'Jan 8 100')::text"));
+        assertEquals("0099-01-08 BC", one("SELECT (date 'January 8, 99 BC')::text"));
+        assertEquals("0099-01-08 BC", one("SELECT (date '08-Jan-99 BC')::text"));
+        assertEquals("22008", stateOf("SELECT date 'Jan 8 0 BC'"));
+    }
+
+    /** A date written as one run of digits, and a date written as a day of its year. */
+    @Test
+    void aDateMayBeWrittenWithoutSeparators() throws SQLException {
+        assertEquals("1999-01-08", one("SELECT (date '990108')::text"));
+        assertEquals("2000-01-08", one("SELECT (date '000108')::text"));
+        assertEquals("1999-01-08", one("SELECT (date '1999.008')::text"));
+        assertEquals("1999-01-08", one("SELECT (date '1999-008')::text"));
+        // The count may run past the year's own end, and then names a day in the next one.
+        assertEquals("2000-01-01", one("SELECT (date '1999.366')::text"));
+        assertEquals("2000-12-31", one("SELECT (date '2000.366')::text"));
+        assertEquals("22007", stateOf("SELECT date '1999.000'"));
+        assertEquals("22007", stateOf("SELECT date '1999.400'"));
+        assertEquals("22007", stateOf("SELECT date '1999.08'"));
+    }
+
+    /**
+     * A number that could be a day is one; a number too large for that, written where a day would
+     * stand, is a field out of range rather than a literal that will not read.
+     */
+    @Test
+    void whichNumberOfADateIsTheDay() throws SQLException {
+        assertEquals("22008", stateOf("SELECT date 'Jan 99 8'"));
+        assertEquals("22008", stateOf("SELECT date 'Jan 32 1999'"));
+        assertEquals("22008", stateOf("SELECT date '99-Jan-08'"));
+        assertEquals("22007", stateOf("SELECT date '99 Jan 8'"));
+        assertEquals("22007", stateOf("SELECT date 'garbage Jan 8 1999'"));
+        assertEquals("22007", stateOf("SELECT date 'Jan 8 1999 garbage'"));
+    }
+
+    /** A time of day may name its zone, and a time without one reads it and then drops it. */
+    @Test
+    void aTimeMayNameItsZone() throws SQLException {
+        assertEquals("04:05:06-08", one("SELECT (timetz '04:05:06 PST')::text"));
+        assertEquals("04:05:06-08", one("SELECT (timetz '040506-08')::text"));
+        assertEquals("04:05:06+00", one("SELECT (timetz '04:05:06 zulu')::text"));
+        assertEquals("04:05:06", one("SELECT (time '04:05:06 PST')::text"));
+        assertEquals("1999-01-08 04:05:06", one("SELECT (timestamp '1999-01-08 04:05:06 zulu')::text"));
+    }
+
+    /**
+     * A word PostgreSQL could not read leaves the whole literal unreadable, whatever the date in
+     * front of it looked like; only a name it looked for in the zone database is reported as the
+     * zone it could not find.
+     */
+    @Test
+    void whichFaultAWordAfterATimestampIs() throws SQLException {
+        assertEquals("22007", stateOf("SELECT timestamp '2024-01-01 10:00:00 GARBAGE'"));
+        assertEquals("22007", stateOf("SELECT timestamp '2024-01-01 nonsense'"));
+        assertEquals("22007", stateOf("SELECT timestamp '2024-01-01x'"));
+        assertEquals("22009", stateOf("SELECT timestamp '2024-01-01 10:00:00 +99'"));
+        assertEquals("22023", stateOf("SELECT timestamp '2024-01-01 10:00:00 Europe/Nowhere'"));
+        assertTrue(messageOf("SELECT timestamp '2024-01-01 10:00:00 Europe/Nowhere'")
+                .contains("time zone \"europe/nowhere\" not recognized"));
+        assertEquals("22007", stateOf("SELECT timestamptz '2024-01-01 10:00:00 GARBAGE'"));
+    }
+
     /** What follows a date has to be a time or a zone; a word that is neither was never one. */
     @Test
     void whatMayBeWrittenAfterADate() throws SQLException {

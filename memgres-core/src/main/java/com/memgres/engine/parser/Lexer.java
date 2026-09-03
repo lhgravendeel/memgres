@@ -249,9 +249,12 @@ public class Lexer {
         // it is kept apart from a plain string. It used to be read as a type name followed by a
         // string, so N'abc' was a cast to a type called n.
         if ((c == 'N' || c == 'n') && pos + 1 < length && sql.charAt(pos + 1) == '\'') {
+            String marker = String.valueOf(c);
             pos += 1;
             Token literal = readStringLiteral(start);
-            return new Token(TokenType.NATIONAL_STRING_LITERAL, literal.value(), start);
+            // The marker is kept as the token's written form: a clause that takes a plain string
+            // and not this stops on the letter, which is the letter PostgreSQL names.
+            return new Token(TokenType.NATIONAL_STRING_LITERAL, literal.value(), start, marker);
         }
 
         // Unicode escape strings: U&'...'
@@ -520,6 +523,7 @@ public class Lexer {
                     default: {
                         // Octal escape: \ooo (1-3 octal digits)
                         if (next >= '0' && next <= '7') {
+                            int escStart = pos;
                             int val = next - '0';
                             pos += 2;
                             for (int oi = 0; oi < 2 && pos < length; oi++) {
@@ -527,9 +531,19 @@ public class Lexer {
                                 if (oc >= '0' && oc <= '7') { val = val * 8 + (oc - '0'); pos++; }
                                 else break;
                             }
+                            // A string is a run of characters and the zero byte is not one of
+                            // them: it ends a string rather than standing in it, so it cannot be
+                            // written into one.
+                            if (val == 0) {
+                                throw ParseException.saying(
+                                        "invalid byte sequence for encoding \"UTF8\": 0x00",
+                                        new Token(TokenType.ERROR, sql.substring(escStart, pos),
+                                                escStart), "22021");
+                            }
                             sb.append((char) val);
                         } else if (next == 'x' || next == 'X') {
                             // Hex escape: \xHH (1-2 hex digits)
+                            int escStart = pos;
                             pos += 2;
                             int val = 0;
                             int hexCount = 0;
@@ -540,6 +554,12 @@ public class Lexer {
                                 val = val * 16 + hv;
                                 pos++;
                                 hexCount++;
+                            }
+                            if (val == 0 && hexCount > 0) {
+                                throw ParseException.saying(
+                                        "invalid byte sequence for encoding \"UTF8\": 0x00",
+                                        new Token(TokenType.ERROR, sql.substring(escStart, pos),
+                                                escStart), "22021");
                             }
                             sb.append((char) val);
                         } else if (next == 'u' || next == 'U') {
@@ -558,11 +578,30 @@ public class Lexer {
                             // Eight hex digits reach well past the last code point there is, so a
                             // number naming no character is the escape's fault and PostgreSQL
                             // quotes the escape back as the statement wrote it.
-                            if (!Character.isValidCodePoint(val)) {
+                            if (!Character.isValidCodePoint(val) || val == 0) {
                                 String written = sql.substring(escapeStart, pos);
                                 throw ParseException.saying(
                                         "invalid Unicode escape value at or near \"" + written + "\"",
                                         new Token(TokenType.ERROR, written, escapeStart), "42601");
+                            }
+                            // Half of a surrogate pair is not a character: it only names one
+                            // together with its other half, and written alone it names nothing.
+                            if (Character.isSurrogate((char) val)) {
+                                int low = Character.isHighSurrogate((char) val)
+                                        ? followingLowSurrogateEscape() : -1;
+                                if (low < 0) {
+                                    // A low surrogate is wrong where it stands and is quoted back;
+                                    // a high one is only wrong once what follows it is read, so
+                                    // what follows is what the fault is reported at.
+                                    String at = Character.isHighSurrogate((char) val)
+                                            ? whatFollowsAnEscape()
+                                            : sql.substring(escapeStart, pos);
+                                    throw ParseException.saying(
+                                            "invalid Unicode surrogate pair at or near \"" + at + "\"",
+                                            new Token(TokenType.ERROR, at, pos), "42601");
+                                }
+                                sb.append((char) val).append((char) low);
+                                break;
                             }
                             sb.appendCodePoint(val);
                         } else {
@@ -596,6 +635,45 @@ public class Lexer {
      * backslash. The clause was not read at all, so the escape character could never be changed
      * and every literal that named one was a syntax error at the clause.
      */
+    /** The escape written at the read point, or the one character there if it is not one. */
+    private String whatFollowsAnEscape() {
+        if (pos >= length) return "";
+        if (sql.charAt(pos) == '\\' && pos + 1 < length) {
+            char marker = sql.charAt(pos + 1);
+            if (marker == 'u' || marker == 'U') {
+                int digits = marker == 'u' ? 4 : 8;
+                int end = pos + 2;
+                while (end < length && end < pos + 2 + digits
+                        && Character.digit(sql.charAt(end), 16) >= 0) {
+                    end++;
+                }
+                return sql.substring(pos, end);
+            }
+        }
+        return sql.substring(pos, pos + 1);
+    }
+
+    /**
+     * The low surrogate written straight after the escape just read, or -1 if there is none. The
+     * escape is consumed when there is one: the two halves are read together as one character.
+     */
+    private int followingLowSurrogateEscape() {
+        if (pos + 2 >= length || sql.charAt(pos) != '\\') return -1;
+        char marker = sql.charAt(pos + 1);
+        if (marker != 'u' && marker != 'U') return -1;
+        int digits = marker == 'u' ? 4 : 8;
+        int val = 0;
+        for (int i = 0; i < digits; i++) {
+            if (pos + 2 + i >= length) return -1;
+            int uv = Character.digit(sql.charAt(pos + 2 + i), 16);
+            if (uv < 0) return -1;
+            val = val * 16 + uv;
+        }
+        if (!Character.isLowSurrogate((char) val)) return -1;
+        pos += 2 + digits;
+        return val;
+    }
+
     private char readUescape() {
         int mark = pos;
         while (pos < length && Character.isWhitespace(sql.charAt(pos))) pos++;
@@ -647,15 +725,48 @@ public class Lexer {
                 }
                 cp = cp * 16 + digit;
             }
-            if (cp > Character.MAX_CODE_POINT) {
-                throw ParseException.saying(
-                        "invalid Unicode escape value at or near \"" + val + "\"",
+            // The zero byte is not a character a string may hold, and a number past the last code
+            // point names no character at all.
+            if (cp > Character.MAX_CODE_POINT || cp == 0) {
+                throw ParseException.saying("invalid Unicode escape value",
                         new Token(TokenType.ERROR, val, start), "42601");
+            }
+            // Half of a surrogate pair names a character only together with its other half, which
+            // has to be written as the very next escape; alone it names nothing at all.
+            if (Character.isSurrogate((char) cp)) {
+                int[] low = Character.isHighSurrogate((char) cp)
+                        ? escapeAt(val, escape, from + digits) : null;
+                if (low == null || !Character.isLowSurrogate((char) low[0])) {
+                    throw ParseException.saying("invalid Unicode surrogate pair",
+                            new Token(TokenType.ERROR, val, start), "42601");
+                }
+                sb.append((char) cp).append((char) low[0]);
+                i = low[1] - 1;
+                continue;
             }
             sb.appendCodePoint(cp);
             i = from + digits - 1;
         }
         return sb.toString();
+    }
+
+    /**
+     * The escape written at {@code i}, as its value and the index just past it, or null if no
+     * whole escape is written there.
+     */
+    private int[] escapeAt(String val, char escape, int i) {
+        if (i >= val.length() || val.charAt(i) != escape || i + 1 >= val.length()) return null;
+        if (val.charAt(i + 1) == escape) return null;
+        int digits = val.charAt(i + 1) == '+' ? 6 : 4;
+        int from = val.charAt(i + 1) == '+' ? i + 2 : i + 1;
+        if (from + digits > val.length()) return null;
+        int cp = 0;
+        for (int k = from; k < from + digits; k++) {
+            int digit = Character.digit(val.charAt(k), 16);
+            if (digit < 0) return null;
+            cp = cp * 16 + digit;
+        }
+        return new int[] {cp, from + digits};
     }
 
     private Token readUnicodeIdentifier(int start) {
@@ -781,15 +892,32 @@ public class Lexer {
         }
     }
 
+    /** What PostgreSQL calls a base when it names one in a complaint. */
+    private static String baseName(int radix) {
+        return radix == 16 ? "hexadecimal" : radix == 8 ? "octal" : "binary";
+    }
+
     private Token readNumber(int start) {
         StringBuilder sb = new StringBuilder();
         boolean hasDecimal = false;
 
         // PostgreSQL 16 added non-decimal integer literals. Without them 0x10 lexed as the number
         // 0 followed by the identifier x10, which is trailing junk.
-        if (sql.charAt(pos) == '0' && pos + 2 < length) {
+        if (sql.charAt(pos) == '0' && pos + 1 < length) {
             int radix = radixOf(sql.charAt(pos + 1));
-            if (radix > 0 && Character.digit(sql.charAt(pos + 2), radix) >= 0) {
+            // A marker with no digit of its own base behind it is a number of that base with
+            // nothing in it, which PostgreSQL names by the base rather than calling the marker
+            // junk after a zero.
+            if (radix > 0
+                    && (pos + 2 >= length || Character.digit(sql.charAt(pos + 2), radix) < 0)
+                    && (pos + 2 >= length || !Character.isLetterOrDigit(sql.charAt(pos + 2)))) {
+                String written = sql.substring(pos, pos + 2);
+                throw ParseException.saying("invalid " + baseName(radix)
+                        + " integer at or near \"" + written + "\"",
+                        new Token(TokenType.ERROR, written, start), "42601");
+            }
+            if (radix > 0 && pos + 2 < length
+                    && Character.digit(sql.charAt(pos + 2), radix) >= 0) {
                 pos += 2;
                 StringBuilder digits = new StringBuilder();
                 while (pos < length) {
@@ -853,8 +981,15 @@ public class Lexer {
 
         // PG rejects number immediately followed by letter (e.g., 123abc)
         if (pos < length && Character.isLetter(sql.charAt(pos)) && sql.charAt(pos) != 'e' && sql.charAt(pos) != 'E') {
+            // The whole word is named, not just the letter the number ran into: PostgreSQL
+            // points at "123abc" rather than at "123a".
+            int end = pos;
+            while (end < length && (Character.isLetterOrDigit(sql.charAt(end))
+                    || sql.charAt(end) == '_')) {
+                end++;
+            }
             throw ParseException.saying("trailing junk after numeric literal at or near \""
-                    + sb + sql.charAt(pos) + "\"",
+                    + sb + sql.substring(pos, end) + "\"",
                     new Token(TokenType.ERROR, sb.toString(), start), "42601");
         }
         return new Token(hasDecimal ? TokenType.FLOAT_LITERAL : TokenType.INTEGER_LITERAL,

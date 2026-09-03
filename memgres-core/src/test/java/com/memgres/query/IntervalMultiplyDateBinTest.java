@@ -59,6 +59,32 @@ class IntervalMultiplyDateBinTest {
         }
     }
 
+    /** A stride is a width, and an endless one is no width rather than an awkward one. */
+    @Test void date_bin_infinite_stride() throws Exception {
+        try (Connection c = newConn(); Statement s = c.createStatement()) {
+            for (String stride : new String[] {"infinity", "-infinity"}) {
+                SQLException raised = assertThrows(SQLException.class, () -> s.execute(
+                        "SELECT date_bin(interval '" + stride + "', TIMESTAMP '2020-01-01',"
+                                + " TIMESTAMP '2001-01-01')"));
+                assertEquals("22008", raised.getSQLState());
+                assertTrue(raised.getMessage()
+                        .contains("timestamps cannot be binned into infinite intervals"),
+                        raised.getMessage());
+            }
+            // A width made of months is a width that is not always the same, which is another
+            // complaint, and no width at all is a third.
+            SQLException months = assertThrows(SQLException.class, () -> s.execute(
+                    "SELECT date_bin(interval '1 month', TIMESTAMP '2020-01-01',"
+                            + " TIMESTAMP '2001-01-01')"));
+            assertEquals("0A000", months.getSQLState());
+            SQLException zero = assertThrows(SQLException.class, () -> s.execute(
+                    "SELECT date_bin(interval '0 day', TIMESTAMP '2020-01-01',"
+                            + " TIMESTAMP '2001-01-01')"));
+            assertEquals("22008", zero.getSQLState());
+            assertTrue(zero.getMessage().contains("stride must be greater than zero"));
+        }
+    }
+
     @Test void age_single_arg_uses_midnight() throws Exception {
         // age(timestamp) uses current_date (midnight), not now()
         // We can't test exact value, but verify it doesn't throw

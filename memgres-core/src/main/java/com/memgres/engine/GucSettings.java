@@ -645,6 +645,19 @@ public class GucSettings {
         transactionOverrides.put(key, toBaseUnit(key, canonicalValue(key, value)));
     }
 
+    /**
+     * Put a parameter back to its default for this transaction alone.
+     *
+     * <p>SET LOCAL x TO DEFAULT is a SET LOCAL and not a RESET: the default holds until the
+     * transaction ends and the session's own value comes back. Resetting the session outright
+     * threw that value away, so a value set before the transaction was gone after it.
+     */
+    public void resetLocal(String name) {
+        String key = name.toLowerCase(java.util.Locale.ROOT);
+        String base = bootDefaults.containsKey(key) ? bootDefaults.get(key) : DEFAULTS.get(key);
+        transactionOverrides.put(key, base == null ? "" : base);
+    }
+
     /** Clear all transaction-scoped overrides (called on commit/rollback). */
     public void clearTransactionOverrides() {
         transactionOverrides.clear();

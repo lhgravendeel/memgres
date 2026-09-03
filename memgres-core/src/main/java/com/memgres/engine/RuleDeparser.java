@@ -259,6 +259,140 @@ public final class RuleDeparser {
     }
 
     /**
+     * The same expression written the way PostgreSQL's pretty form writes it.
+     *
+     * <p>The plain form parenthesises every operator, so that the text reads back as the tree it
+     * came from whatever the reader knows of precedence. The pretty form is for a person, and
+     * leaves out the parentheses around the operators whose reading is never in doubt: AND, OR
+     * and NOT, and whatever stands directly under one of them. Every other operator keeps its
+     * parentheses -- {@code CHECK ((a + b) > 0)} -- because that is where PostgreSQL keeps them.
+     */
+    public static String deparsePretty(Expression e, ColumnTypes cols) {
+        if (e == null) return "true";
+        try {
+            return pretty(e, true, cols == null ? NO_COLUMNS : cols, null);
+        } catch (RuntimeException ex) {
+            return deparse(e, cols);
+        }
+    }
+
+    /**
+     * One node of the pretty form. {@code bare} says whether this node may be written without the
+     * parentheses the plain form puts around it, which is so at the top and under AND, OR or NOT.
+     */
+    private static String pretty(Expression expr, boolean bare, ColumnTypes cols, PgType target) {
+        Expression e = fold(expr);
+        if (e instanceof BinaryExpr) {
+            BinaryExpr b = (BinaryExpr) e;
+            if (b.op() == BinaryExpr.BinOp.AND || b.op() == BinaryExpr.BinOp.OR) {
+                List<Expression> operands = new ArrayList<Expression>();
+                flatten(b, b.op(), operands);
+                StringBuilder sb = new StringBuilder();
+                for (int i = 0; i < operands.size(); i++) {
+                    if (i > 0) sb.append(b.op() == BinaryExpr.BinOp.AND ? " AND " : " OR ");
+                    sb.append(pretty(operands.get(i), true, cols, PgType.of(DataType.BOOLEAN)));
+                }
+                return bare ? sb.toString() : "(" + sb + ")";
+            }
+        }
+        if (e instanceof UnaryExpr && ((UnaryExpr) e).op() == UnaryExpr.UnaryOp.NOT
+                && !(((UnaryExpr) e).operand() instanceof LikeExpr)) {
+            String text = "NOT " + pretty(((UnaryExpr) e).operand(), true, cols,
+                    PgType.of(DataType.BOOLEAN));
+            return bare ? text : "(" + text + ")";
+        }
+        // BETWEEN is a pair of comparisons joined by AND, and that AND loses its parentheses here
+        // as any other does -- the two comparisons under it lose theirs with it.
+        if (e instanceof BetweenExpr && !((BetweenExpr) e).symmetric()) {
+            BetweenExpr b = (BetweenExpr) e;
+            String join = b.negated() ? " OR " : " AND ";
+            String lo = withoutOuterParentheses(comparison(b.expr(),
+                    b.negated() ? BinaryExpr.BinOp.LESS_THAN : BinaryExpr.BinOp.GREATER_EQUAL,
+                    b.low(), cols));
+            String hi = withoutOuterParentheses(comparison(b.expr(),
+                    b.negated() ? BinaryExpr.BinOp.GREATER_THAN : BinaryExpr.BinOp.LESS_EQUAL,
+                    b.high(), cols));
+            String text = lo + join + hi;
+            return bare ? text : "(" + text + ")";
+        }
+        // A comparison keeps its own parentheses unless it stands under AND, OR or NOT, and each
+        // side of it is written the same way -- which is what lets the arithmetic inside one lose
+        // the parentheses its own precedence makes unnecessary.
+        if (e instanceof BinaryExpr && isComparison(((BinaryExpr) e).op())) {
+            BinaryExpr b = (BinaryExpr) e;
+            PgType[] tg = operandTargets(b.op(), typeOf(b.left(), cols), typeOf(b.right(), cols));
+            String text = pretty(b.left(), false, cols, tg[0]) + " " + operatorText(b.op())
+                    + " " + pretty(b.right(), false, cols, tg[1]);
+            return bare ? text : "(" + text + ")";
+        }
+        if (e instanceof BinaryExpr && arithmeticPriority(((BinaryExpr) e).op()) > 0) {
+            BinaryExpr b = (BinaryExpr) e;
+            PgType[] tg = operandTargets(b.op(), typeOf(b.left(), cols), typeOf(b.right(), cols));
+            String text = arithmeticSide(b.left(), b.op(), true, cols, tg[0])
+                    + " " + operatorText(b.op()) + " "
+                    + arithmeticSide(b.right(), b.op(), false, cols, tg[1]);
+            return bare ? text : "(" + text + ")";
+        }
+        String plain = render(e, target, cols, false);
+        return bare ? withoutOuterParentheses(plain) : plain;
+    }
+
+    /**
+     * An operand of {@code + - * / %}, written without its parentheses where PostgreSQL writes it
+     * so: a multiplication standing under an addition needs none, and neither does the left of two
+     * operators that bind equally -- {@code a - b - c} is that subtraction and no other, while
+     * {@code a - (b - c)} is a different one and keeps the parentheses that say so.
+     */
+    private static String arithmeticSide(Expression child, BinaryExpr.BinOp parentOp,
+                                         boolean onTheLeft, ColumnTypes cols, PgType target) {
+        Expression node = fold(child);
+        int childPriority = node instanceof BinaryExpr
+                ? arithmeticPriority(((BinaryExpr) node).op()) : 0;
+        int parentPriority = arithmeticPriority(parentOp);
+        boolean bare = childPriority > parentPriority
+                || (childPriority > 0 && childPriority == parentPriority && onTheLeft);
+        return pretty(node, bare, cols, target);
+    }
+
+    /** The six operators a comparison is written with. */
+    private static boolean isComparison(BinaryExpr.BinOp op) {
+        switch (op) {
+            case EQUAL: case NOT_EQUAL: case LESS_THAN:
+            case GREATER_THAN: case LESS_EQUAL: case GREATER_EQUAL: return true;
+            default: return false;
+        }
+    }
+
+    /** How tightly one of the operators PostgreSQL's pretty form knows binds; 0 for any other. */
+    private static int arithmeticPriority(BinaryExpr.BinOp op) {
+        switch (op) {
+            case ADD: case SUBTRACT: return 1;
+            case MULTIPLY: case DIVIDE: case MODULO: return 2;
+            default: return 0;
+        }
+    }
+
+    /** The text with the one pair of parentheses that wraps the whole of it taken off. */
+    private static String withoutOuterParentheses(String text) {
+        if (text.length() < 2 || text.charAt(0) != '(') return text;
+        int depth = 0;
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (c == '\'') {
+                i = text.indexOf('\'', i + 1);
+                if (i < 0) return text;
+                continue;
+            }
+            if (c == '(') depth++;
+            else if (c == ')') {
+                depth--;
+                if (depth == 0) return i == text.length() - 1 ? text.substring(1, i) : text;
+            }
+        }
+        return text;
+    }
+
+    /**
      * Deparses a value in a context that wants a particular type — a VALUES item written against
      * a known column, say — so that an untyped literal is printed in that type's own form.
      */

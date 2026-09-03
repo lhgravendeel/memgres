@@ -1320,17 +1320,15 @@ class PgPreparedStatementsCursorsTest {
     @Test
     void prepareWithAsInAliasPreservesVerbatimSql() throws Exception {
         exec("DEALLOCATE ALL");
-        // The body contains " AS " in a column alias — extraction must find the PREPARE AS, not the alias
+        // What is kept is the whole statement, PREPARE and all: it is what would have to be
+        // sent again to prepare the same thing.
         exec("PREPARE as_alias AS SELECT 1 AS my_alias");
         try (Statement st = conn.createStatement();
              ResultSet rs = st.executeQuery(
                      "SELECT statement FROM pg_prepared_statements WHERE name = 'as_alias'")) {
             assertTrue(rs.next());
             String stmt = rs.getString("statement");
-            assertTrue(stmt.toUpperCase().startsWith("SELECT"),
-                    "Statement should start with SELECT, got: " + stmt);
-            assertTrue(stmt.contains("my_alias"),
-                    "Statement should contain the alias: " + stmt);
+            assertEquals("PREPARE as_alias AS SELECT 1 AS my_alias", stmt);
         }
         exec("DEALLOCATE as_alias");
     }
@@ -1436,8 +1434,8 @@ class PgPreparedStatementsCursorsTest {
                      "SELECT statement FROM pg_prepared_statements WHERE name = 'cm_plan'")) {
             assertTrue(rs.next());
             String stmt = rs.getString("statement");
-            assertTrue(stmt.toUpperCase().startsWith("SELECT"),
-                    "Should extract body after AS, not inside comment: " + stmt);
+            // The whole statement is kept, comment and all.
+            assertEquals("PREPARE /* comment */ cm_plan AS SELECT 1", stmt);
         }
         exec("DEALLOCATE cm_plan");
     }
@@ -1445,15 +1443,14 @@ class PgPreparedStatementsCursorsTest {
     @Test
     void prepareWithLineCommentContainingAs() throws Exception {
         exec("DEALLOCATE ALL");
-        // Line comment contains " AS " but the real AS is after the comment
+        // A line comment holding " AS " is kept along with everything else.
         exec("PREPARE lc_plan -- AS comment\n AS SELECT 1");
         try (Statement st = conn.createStatement();
              ResultSet rs = st.executeQuery(
                      "SELECT statement FROM pg_prepared_statements WHERE name = 'lc_plan'")) {
             assertTrue(rs.next());
             String stmt = rs.getString("statement");
-            assertTrue(stmt.toUpperCase().startsWith("SELECT"),
-                    "Should skip line comment and find real AS: " + stmt);
+            assertEquals("PREPARE lc_plan -- AS comment\n AS SELECT 1", stmt);
         }
         exec("DEALLOCATE lc_plan");
     }

@@ -763,7 +763,7 @@ class ConstraintValidator {
         if (sc.getReferencesSchema() != null) {
             refTable = executor.resolveTable(sc.getReferencesSchema(), sc.getReferencesTable());
         } else {
-            refTable = executor.resolveTableAnySchema(sc.getReferencesTable());
+            refTable = executor.resolveTableOnSearchPath(sc.getReferencesTable());
         }
 
         int[] fkColIndices = new int[sc.getColumns().size()];
@@ -1056,6 +1056,20 @@ class ConstraintValidator {
             if (piece.containsRange(wanted)) return true;
         }
         return false;
+    }
+
+    /**
+     * Whether an exclusion constraint refuses a row: the same test as below, asked rather than
+     * raised. ON CONFLICT DO NOTHING is told about a row an exclusion constraint would refuse and
+     * leaves it out, which is not the same as letting the write fail.
+     */
+    boolean exclusionRefuses(Table table, Object[] newRow, StoredConstraint sc) {
+        try {
+            validateExclude(table, newRow, sc, null);
+            return false;
+        } catch (MemgresException refused) {
+            return true;
+        }
     }
 
     private void validateExclude(Table table, Object[] newRow, StoredConstraint sc, Object[] excludeRow) {
@@ -2567,7 +2581,17 @@ class ConstraintValidator {
         if (value instanceof MacaddrValue) return "macaddr";
         if (value instanceof Macaddr8Value) return "macaddr8";
         if (value instanceof PgTid) return "tid";
-        if (value instanceof List) return "integer[]";
+        // Money is carried as its own value and prints with a currency sign; read as text, an
+        // amount added to an amount was reported as text rather than as the money it is.
+        if (value instanceof PgMoney) return "money";
+        // An array is named after what it holds. Every one was called an array of integers, so a
+        // complaint about an array of text named a call nobody made.
+        if (value instanceof List) {
+            for (Object element : (List<?>) value) {
+                if (element != null) return pgTypeNameOf(element) + "[]";
+            }
+            return "text[]";
+        }
         return "text";
     }
 

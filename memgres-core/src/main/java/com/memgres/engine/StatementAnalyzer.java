@@ -1223,10 +1223,20 @@ final class StatementAnalyzer {
      * still not got the one property a sort asks of it.
      */
     private void rejectSortOperatorWithNoEntry(SelectStmt.OrderByItem item) {
+        requireOrderingOperator(executor, item, inScope());
+    }
+
+    /**
+     * The same question asked where a sort is run rather than read: a client that sends its
+     * statement whole is never Parsed for, so a sort clause reached the comparator with an
+     * operator nothing had held to the two demands above.
+     */
+    static void requireOrderingOperator(AstExecutor executor, SelectStmt.OrderByItem item,
+                                        List<RowContext.TableBinding> bindings) {
         BinaryExpr.BinOp op = item.usingOperator();
         if (op == null || item.expr() == null) return;
         executor.binaryOpEvaluator.rejectUnresolvableOperator(
-                new BinaryExpr(item.expr(), op, item.expr()), new RowContext(inScope()));
+                new BinaryExpr(item.expr(), op, item.expr()), new RowContext(bindings));
         MemgresException e = new MemgresException("operator "
                 + BinaryOpEvaluator.spellingOf(op) + " is not a valid ordering operator", "42809");
         e.setHint("Ordering operators must be \"<\" or \">\" members of btree operator families.");

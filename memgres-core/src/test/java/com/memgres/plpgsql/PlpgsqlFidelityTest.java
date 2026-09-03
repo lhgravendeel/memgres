@@ -665,4 +665,89 @@ class PlpgsqlFidelityTest {
             assertEquals("22023", ex.getSQLState());
         }
     }
+
+    /**
+     * A width is read where the declaration is read: a variable no value could ever fill is
+     * refused as the declaration is made, exactly as a column of that width is.
+     */
+    @Test
+    void a_declared_width_no_value_could_fill() throws SQLException {
+        try (Statement s = conn.createStatement()) {
+            SQLException ex = assertThrows(SQLException.class, () -> s.execute(
+                    "CREATE FUNCTION plf_charbig() RETURNS int AS $$"
+                            + " DECLARE v char(20000000) := 'a'; BEGIN RETURN length(v); END $$"
+                            + " LANGUAGE plpgsql"));
+            assertEquals("22023", ex.getSQLState());
+            assertTrue(ex.getMessage().contains("length for type char cannot exceed 10485760"),
+                    "unexpected message: " + ex.getMessage());
+            // A width a value can fill is declared without complaint.
+            s.execute("CREATE FUNCTION plf_charok() RETURNS int AS $$"
+                    + " DECLARE v char(20) := 'a'; BEGIN RETURN length(v); END $$ LANGUAGE plpgsql");
+            s.execute("DROP FUNCTION plf_charok()");
+        }
+    }
+
+    /**
+     * A record has the fields of whatever row was put in it, so until one has been there is no
+     * field to read: PostgreSQL says which variable was never assigned, and a row put in by
+     * ROW(...) carries values and no names, so no name reaches a field of that either.
+     */
+    @Test
+    void a_record_read_before_a_row_was_put_in_it() throws SQLException {
+        try (Statement s = conn.createStatement()) {
+            SQLException never = assertThrows(SQLException.class, () -> s.execute(
+                    "DO $$ DECLARE r record; BEGIN IF r.nm IS NULL THEN NULL; END IF; END $$"));
+            assertEquals("55000", never.getSQLState());
+            assertTrue(never.getMessage().contains("record \"r\" is not assigned yet"),
+                    "unexpected message: " + never.getMessage());
+            SQLException nameless = assertThrows(SQLException.class, () -> s.execute(
+                    "DO $$ DECLARE r record; BEGIN r := row(1);"
+                            + " IF r.nm IS NULL THEN NULL; END IF; END $$"));
+            assertEquals("42703", nameless.getSQLState());
+            assertTrue(nameless.getMessage().contains("record \"r\" has no field \"nm\""),
+                    "unexpected message: " + nameless.getMessage());
+        }
+    }
+
+    /**
+     * A statement that was cancelled is not caught by WHEN OTHERS: the client asked for it to
+     * stop, and a block that swallowed it would go on running.
+     */
+    @Test
+    void what_others_does_not_catch() throws SQLException {
+        try (Statement s = conn.createStatement()) {
+            SQLException cancelled = assertThrows(SQLException.class, () -> s.execute(
+                    "DO $$ BEGIN RAISE SQLSTATE '57014'; EXCEPTION WHEN OTHERS THEN NULL; END $$"));
+            assertEquals("57014", cancelled.getSQLState());
+            // Caught by its own name, it is caught.
+            s.execute("DO $$ BEGIN RAISE SQLSTATE '57014';"
+                    + " EXCEPTION WHEN query_canceled THEN NULL; END $$");
+            // Every other error is what OTHERS is for.
+            s.execute("DO $$ BEGIN RAISE SQLSTATE '22012';"
+                    + " EXCEPTION WHEN OTHERS THEN NULL; END $$");
+        }
+    }
+
+    /**
+     * A collation says which order text is compared in, so it may only be declared on a variable
+     * whose values compare as text: a number is compared by what it is, and a collation written
+     * on one is refused rather than quietly ignored.
+     */
+    @Test
+    void a_collation_declared_on_a_type_that_has_none() throws SQLException {
+        try (Statement s = conn.createStatement()) {
+            SQLException ex = assertThrows(SQLException.class, () ->
+                    s.execute("DO $$ DECLARE x int COLLATE \"C\"; BEGIN NULL; END $$"));
+            assertEquals("42804", ex.getSQLState());
+            assertTrue(ex.getMessage().contains("collations are not supported by type integer"),
+                    "unexpected message: " + ex.getMessage());
+            assertEquals("42804", assertThrows(SQLException.class, () ->
+                    s.execute("DO $$ DECLARE x date COLLATE \"C\"; BEGIN NULL; END $$"))
+                    .getSQLState());
+            // The types that do compare as text take one.
+            s.execute("DO $$ DECLARE x text COLLATE \"C\"; BEGIN NULL; END $$");
+            s.execute("DO $$ DECLARE x varchar(5) COLLATE \"C\"; BEGIN NULL; END $$");
+            s.execute("DO $$ DECLARE x text[] COLLATE \"C\"; BEGIN NULL; END $$");
+        }
+    }
 }

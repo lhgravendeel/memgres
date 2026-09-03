@@ -32,7 +32,7 @@ public final class InformationSchemaTypes {
     static {
         Map<String, DataType> m = new LinkedHashMap<String, DataType>();
         m.put("cardinal_number", DataType.INTEGER);
-        m.put("character_data", DataType.TEXT);
+        m.put("character_data", DataType.VARCHAR);
         m.put("sql_identifier", DataType.NAME);
         m.put("yes_or_no", DataType.VARCHAR);
         m.put("time_stamp", DataType.TIMESTAMPTZ);

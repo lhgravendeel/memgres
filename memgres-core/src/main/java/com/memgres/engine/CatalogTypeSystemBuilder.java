@@ -102,13 +102,24 @@ class CatalogTypeSystemBuilder {
                 col("rngsubdiff", DataType.REGPROC)
         );
         Table table = new Table("pg_range", cols);
-        // PG built-in range types: rngtypid, rngsubtype, rngmultitypid, rngcollation, rngsubopc, rngcanonical, rngsubdiff
-        table.insertRow(new Object[]{3904, 23,   4451, 0, 0, 0, 0}); // int4range   → int4,      int4multirange
-        table.insertRow(new Object[]{3906, 1700, 4532, 0, 0, 0, 0}); // numrange    → numeric,   nummultirange
-        table.insertRow(new Object[]{3908, 1114, 4533, 0, 0, 0, 0}); // tsrange     → timestamp, tsmultirange
-        table.insertRow(new Object[]{3910, 1184, 4534, 0, 0, 0, 0}); // tstzrange   → timestamptz, tstzmultirange
-        table.insertRow(new Object[]{3912, 1082, 4535, 0, 0, 0, 0}); // daterange   → date,      datemultirange
-        table.insertRow(new Object[]{3926, 20,   4536, 0, 0, 0, 0}); // int8range   → int8,      int8multirange
+        // The range types PostgreSQL ships, with the numbers it ships them under: rngtypid,
+        // rngsubtype, rngmultitypid, rngcollation, rngsubopc, rngcanonical, rngsubdiff. The last
+        // three are what makes a range a range rather than a pair of values — which operator
+        // class orders the bounds, how a discrete range is folded to its canonical form, and how
+        // far apart two bounds are — and a planner reads all three. Only a discrete range has a
+        // canonical function, which is why the three continuous ones carry none.
+        table.insertRow(new Object[]{3904, 23,   4451, 0, 1978,
+                rangeProc("int4range_canonical"), rangeProc("int4range_subdiff")});
+        table.insertRow(new Object[]{3906, 1700, 4532, 0, 3125,
+                rangeProc("-"), rangeProc("numrange_subdiff")});
+        table.insertRow(new Object[]{3908, 1114, 4533, 0, 3128,
+                rangeProc("-"), rangeProc("tsrange_subdiff")});
+        table.insertRow(new Object[]{3910, 1184, 4534, 0, 3127,
+                rangeProc("-"), rangeProc("tstzrange_subdiff")});
+        table.insertRow(new Object[]{3912, 1082, 4535, 0, 3122,
+                rangeProc("daterange_canonical"), rangeProc("daterange_subdiff")});
+        table.insertRow(new Object[]{3926, 20,   4536, 0, 3124,
+                rangeProc("int8range_canonical"), rangeProc("int8range_subdiff")});
 
         // User-defined range types. A range orders its bounds with the subtype's default btree
         // class and comes with a multirange type of its own; both columns were left at zero, so a
@@ -126,6 +137,12 @@ class CatalogTypeSystemBuilder {
                     new RegprocValue(0, "-"), new RegprocValue(0, "-")});
         }
         return table;
+    }
+
+    /** A range's canonical or difference function, or the dash PostgreSQL prints for none. */
+    private RegprocValue rangeProc(String name) {
+        return "-".equals(name) ? new RegprocValue(0, "-")
+                : new RegprocValue(oids.oid("proc:" + name), name);
     }
 
     /** The OID of the default btree operator class over a type, or 0 when it has none. */
@@ -282,48 +299,53 @@ class CatalogTypeSystemBuilder {
             int opOid = oids.oid("operator:" + schemaName + "." + op.getKey());
             int leftOid = resolveTypeOid(op.getLeftArg());
             int rightOid = resolveTypeOid(op.getRightArg());
-            int comOid = 0;
-            if (op.getCommutator() != null) {
-                // Self-referencing commutator: use own OID
-                if (op.getCommutator().equals(op.getName())) {
-                    comOid = opOid;
-                }
-            }
-            // Resolve oprcode (backing function OID) and oprresult (return type OID)
-            int opcodeOid = 0;
+            // A commutator naming another operator is a reference to that operator, which is
+            // what a reader follows from oprcom to find it. Resolving only the self-referencing
+            // case left every ordinary pair pointing at nothing.
+            int comOid = op.getCommutator() == null ? 0
+                    : op.getCommutator().equals(op.getName()) ? opOid
+                    : userOperatorOid(op.getCommutator());
+            // oprcode names the function that performs the operator, and pg_operator holds it as
+            // a regproc: a reader joins it to pg_proc and prints it by name, so it has to be the
+            // number pg_proc filed that function under.
+            RegprocValue opcode = new RegprocValue(0, "-");
             int resultOid = 0;
             if (op.getFunction() != null) {
                 PgFunction func = database.getFunction(op.getFunction());
                 if (func != null) {
-                    opcodeOid = oids.oid("func:" + op.getFunction().toLowerCase(java.util.Locale.ROOT));
+                    opcode = new RegprocValue(oids.oid("proc:" + func.getName()), func.getName());
                     if (func.getReturnType() != null) {
                         resultOid = resolveTypeOid(func.getReturnType());
                     }
                 }
             }
             // Resolve oprnegate (negator operator OID)
-            int negOid = 0;
-            if (op.getNegator() != null) {
-                if (op.getNegator().equals(op.getName())) {
-                    negOid = opOid; // Self-referencing negator
-                } else {
-                    // Try to find the negator operator
-                    for (Map.Entry<String, PgOperator> negEntry : database.getUserOperators().entrySet()) {
-                        if (negEntry.getValue().getName().equals(op.getNegator())) {
-                            String negSchema = negEntry.getValue().getSchemaName() != null ? negEntry.getValue().getSchemaName() : "public";
-                            negOid = oids.oid("operator:" + negSchema + "." + negEntry.getValue().getKey());
-                            break;
-                        }
-                    }
-                }
-            }
+            int negOid = op.getNegator() == null ? 0
+                    : op.getNegator().equals(op.getName()) ? opOid
+                    : userOperatorOid(op.getNegator());
+            // RESTRICT and JOIN name the routines a planner asks how selective the operator is,
+            // and the statement that created it may name them. Reported as absent whatever was
+            // written, an operator declared with eqsel said the planner had nothing to estimate
+            // with; an operator declared with neither still prints a dash rather than a zero.
             table.insertRow(new Object[]{opOid, op.getName(), ns, ownerOid,
                     op.getKind(), op.isMerges(), op.isHashes(),
                     leftOid, rightOid, resultOid, comOid, negOid,
-                    opcodeOid, 0, 0, 1});
+                    opcode, selectivityEstimator(op.getRestrict()),
+                    selectivityEstimator(op.getJoin()), 1});
         }
 
         return table;
+    }
+
+    /** The OID of the user operator of this name, or 0 when no operator answers to it. */
+    private int userOperatorOid(String name) {
+        for (Map.Entry<String, PgOperator> entry : database.getUserOperators().entrySet()) {
+            PgOperator other = entry.getValue();
+            if (!other.getName().equals(name)) continue;
+            String schema = other.getSchemaName() != null ? other.getSchemaName() : "public";
+            return oids.oid("operator:" + schema + "." + other.getKey());
+        }
+        return 0;
     }
 
     /**
@@ -376,6 +398,29 @@ class CatalogTypeSystemBuilder {
             if ("~!@#%^&|`?\\".indexOf(c) >= 0) return false;
         }
         return true;
+    }
+
+    /** Whether one of the operator classes PostgreSQL ships for an access method has this name. */
+    static boolean shippedClassExists(String method, String name) {
+        for (Object[] c : OPCLASSES) {
+            if (c[1].equals(method) && c[0].equals(name)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * The class an access method indexes values of a type under when the index says nothing, or
+     * null where the type has no such class. It is the class a key is compared under, so a target
+     * naming a different one names a different key.
+     */
+    static String defaultClassFor(String method, int typeOid) {
+        for (Object[] c : OPCLASSES) {
+            if (c[1].equals(method) && Boolean.TRUE.equals(c[3])
+                    && ((Integer) c[2]).intValue() == typeOid) {
+                return (String) c[0];
+            }
+        }
+        return null;
     }
 
     private int resolveTypeOid(String typeName) {
@@ -2139,6 +2184,23 @@ class CatalogTypeSystemBuilder {
                     oids.oid((String) r[0]), oids.oid((String) r[1]),
                     r[2], r[3], r[4], r[5], r[6], r[8],
                     r[7] == null ? 0 : oids.oid((String) r[7]), 1});
+        }
+        // The comparisons a family somebody built has been given. A family with none is a family
+        // no index can use, so a reader asking what one holds is asking a real question, and it
+        // was told every user family was empty.
+        for (Map.Entry<String, PgOperatorFamily> entry : database.getUserOperatorFamilies().entrySet()) {
+            PgOperatorFamily fam = entry.getValue();
+            int famOid = oids.oid("opfamily:" + fam.getKey());
+            int amOid = resolveAccessMethodOid(fam.getMethod());
+            for (PgOperatorFamily.Member member : fam.members()) {
+                if (member.function) continue;
+                table.insertRow(new Object[]{
+                        oids.oid("amop:" + famOid + ":" + member.number + ":" + member.leftType
+                                + ":" + member.rightType),
+                        famOid, resolveTypeOid(member.leftType), resolveTypeOid(member.rightType),
+                        (short) member.number, "s",
+                        userOperatorOid(member.named), amOid, 0, 1});
+            }
         }
         return table;
     }

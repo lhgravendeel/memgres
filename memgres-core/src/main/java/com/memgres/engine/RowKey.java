@@ -58,6 +58,9 @@ final class RowKey {
         if (type == DataType.JSONB && val instanceof String) {
             return JsonOperations.jsonbKey((String) val);
         }
+        if (val instanceof String && isRangeType(type)) {
+            return RangeOperations.groupingKey((String) val);
+        }
         return val;
     }
 
@@ -71,7 +74,9 @@ final class RowKey {
         DataType[] types = new DataType[columns.size()];
         for (int i = 0; i < columns.size(); i++) {
             types[i] = columns.get(i).getType();
-            if (types[i] == DataType.JSONB) any = true;
+            // The types are kept only where one of them changes how a value is keyed: a document
+            // and a range are both held as text, and the text is not what either of them is.
+            if (types[i] == DataType.JSONB || isRangeType(types[i])) any = true;
         }
         return any ? types : null;
     }
@@ -106,7 +111,9 @@ final class RowKey {
             types[i] = executor.exprEvaluator.inferTypeFromContext(exprs.get(i), bindings);
             MemgresException e = OperatorResolution.noEqualityFor(types[i]);
             if (e != null) throw e;
-            if (types[i] == DataType.JSONB) any = true;
+            // The types are kept only where one of them changes how a value is keyed: a document
+            // and a range are both held as text, and the text is not what either of them is.
+            if (types[i] == DataType.JSONB || isRangeType(types[i])) any = true;
         }
         return any ? types : null;
     }
@@ -242,7 +249,25 @@ final class RowKey {
         if (type == DataType.JSONB && val instanceof String) {
             return "\0JSB" + JsonOperations.jsonbKey((String) val);
         }
+        // A range is its two bounds, and each bound is a value of the subtype: two numerics that
+        // are equal make one range however either was written, so '[1,2)' and '[1.0,2.0)' group
+        // together. Keyed by the text they were written as they made two groups.
+        if (val instanceof String && isRangeType(type)) {
+            return "\0RNG" + RangeOperations.groupingKey((String) val);
+        }
         return valueKey(val);
+    }
+
+    /** Whether values of this type are ranges, whose bounds carry the subtype's own equality. */
+    static boolean isRangeType(DataType type) {
+        if (type == null) return false;
+        switch (type) {
+            case INT4RANGE: case INT8RANGE: case NUMRANGE:
+            case DATERANGE: case TSRANGE: case TSTZRANGE:
+                return true;
+            default:
+                return false;
+        }
     }
 
     /** Compute a value-based key string for a single value (for GROUP BY). */

@@ -50,6 +50,9 @@ class FunctionEvaluator {
     /** PG's NOTIFY payload must stay under 8000 bytes. */
     private static final int NOTIFY_PAYLOAD_LIMIT = 8000;
 
+    /** How long a name may be, counting the terminator PostgreSQL keeps room for. */
+    private static final int NAMEDATALEN = 64;
+
 
     private static final Logger LOG = LoggerFactory.getLogger(FunctionEvaluator.class);
 
@@ -880,11 +883,13 @@ class FunctionEvaluator {
      * Checks that a required extension is installed. PG 18 requires CREATE EXTENSION
      * before extension functions become available. Throws 42883 if not installed.
      */
-    private void requireExtension(String extensionName, String functionName, int argCount) {
+    private void requireExtension(String extensionName, FunctionCallExpr fn, RowContext ctx) {
         if (!executor.database.hasExtension(extensionName)) {
-            String sig = functionName + "(" + String.join(", ",
-                    java.util.Collections.nCopies(argCount, "unknown")) + ")";
-            throw new MemgresException("function " + sig + " does not exist", "42883");
+            // Named the way every other missing function is: by the types the call was written
+            // with. Calling each argument unknown named a call nobody made, so a size written as
+            // a number was reported back as a constant of no type at all.
+            throw new MemgresException("function " + fn.name() + "(" + argTypeNames(fn, ctx)
+                    + ") does not exist", "42883");
         }
     }
 
@@ -1212,10 +1217,10 @@ class FunctionEvaluator {
             case "uuidv4":
                 return java.util.UUID.randomUUID();
             case "uuid_generate_v4":
-                requireExtension("uuid-ossp", name, fn.args().size());
+                requireExtension("uuid-ossp", fn, ctx);
                 return java.util.UUID.randomUUID();
             case "uuid_generate_v1": {
-                requireExtension("uuid-ossp", name, fn.args().size());
+                requireExtension("uuid-ossp", fn, ctx);
                 // UUID v1: timestamp + node (MAC) based
                 // Use current time since UUID epoch (Oct 15, 1582) in 100-ns intervals
                 long uuidEpochOffset = 122192928000000000L; // 100-ns intervals between UUID epoch and Unix epoch
@@ -1234,7 +1239,7 @@ class FunctionEvaluator {
                 return new java.util.UUID(msb, lsb);
             }
             case "uuid_generate_v3": {
-                requireExtension("uuid-ossp", name, fn.args().size());
+                requireExtension("uuid-ossp", fn, ctx);
                 // UUID v3: MD5-based namespace UUID
                 requireArgs(fn, 2);
                 Object nsArg = executor.evalExpr(fn.args().get(0), ctx);
@@ -1244,7 +1249,7 @@ class FunctionEvaluator {
                 return uuid3(namespace, nameArg.toString());
             }
             case "uuid_generate_v5": {
-                requireExtension("uuid-ossp", name, fn.args().size());
+                requireExtension("uuid-ossp", fn, ctx);
                 // UUID v5: SHA-1-based namespace UUID
                 requireArgs(fn, 2);
                 Object nsArg = executor.evalExpr(fn.args().get(0), ctx);
@@ -1254,13 +1259,13 @@ class FunctionEvaluator {
                 return uuid5(namespace, nameArg.toString());
             }
             case "uuid_nil":
-                requireExtension("uuid-ossp", name, fn.args().size());
+                requireExtension("uuid-ossp", fn, ctx);
                 return java.util.UUID.fromString("00000000-0000-0000-0000-000000000000");
             case "uuid_ns_dns":
-                requireExtension("uuid-ossp", name, fn.args().size());
+                requireExtension("uuid-ossp", fn, ctx);
                 return java.util.UUID.fromString("6ba7b810-9dad-11d1-80b4-00c04fd430c8");
             case "uuid_ns_url":
-                requireExtension("uuid-ossp", name, fn.args().size());
+                requireExtension("uuid-ossp", fn, ctx);
                 return java.util.UUID.fromString("6ba7b811-9dad-11d1-80b4-00c04fd430c8");
             case "uuidv7": {
                 if (!fn.args().isEmpty()) {
@@ -1320,6 +1325,7 @@ class FunctionEvaluator {
                 return crc32c(byteaOf(arg));
             }
             case "gen_random_bytes": {
+                requireExtension("pgcrypto", fn, ctx);
                 requireArgs(fn, 1);
                 int size = TypeCoercion.toInteger(executor.evalExpr(fn.args().get(0), ctx));
                 byte[] bytes = new byte[size];
@@ -1327,7 +1333,7 @@ class FunctionEvaluator {
                 return bytes;
             }
             case "digest": {
-                requireExtension("pgcrypto", name, fn.args().size());
+                requireExtension("pgcrypto", fn, ctx);
                 // pgcrypto: digest(data, type) → bytea hash
                 requireArgs(fn, 2);
                 Object dataArg = executor.evalExpr(fn.args().get(0), ctx);
@@ -1358,7 +1364,7 @@ class FunctionEvaluator {
                 }
             }
             case "hmac": {
-                requireExtension("pgcrypto", name, fn.args().size());
+                requireExtension("pgcrypto", fn, ctx);
                 // pgcrypto: hmac(data, key, type) → bytea HMAC
                 requireArgs(fn, 3);
                 Object dataArg = executor.evalExpr(fn.args().get(0), ctx);
@@ -1397,7 +1403,7 @@ class FunctionEvaluator {
                 }
             }
             case "gen_salt": {
-                requireExtension("pgcrypto", name, fn.args().size());
+                requireExtension("pgcrypto", fn, ctx);
                 // pgcrypto: gen_salt(type [, iter_count]) → text salt string
                 requireArgs(fn, 1);
                 Object typeArg = executor.evalExpr(fn.args().get(0), ctx);
@@ -1445,6 +1451,12 @@ class FunctionEvaluator {
                 // the channel name and the payload rather than truncating either
                 if (channel == null || channel.toString().trim().isEmpty()) {
                     throw new MemgresException("channel name cannot be empty", "22023");
+                }
+                // A channel is named by an identifier, and an identifier is held to the same
+                // sixty-three bytes here as anywhere else -- longer is refused rather than cut.
+                if (channel.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8).length
+                        > NAMEDATALEN - 1) {
+                    throw new MemgresException("channel name too long", "22023");
                 }
                 if (payload != null && payload.toString()
                         .getBytes(java.nio.charset.StandardCharsets.UTF_8).length
@@ -2220,17 +2232,30 @@ class FunctionEvaluator {
                 if (acl == null) {
                     return new ArrayList<>(); // NULL ACL = no privileges = 0 rows
                 }
-                // Parse ACL strings like "{postgres=arwdDxt/postgres,=r/postgres}"
+                // An access list is a list of items -- "postgres=arwdDxt/postgres" and the rest.
+                // It arrives either as the values it holds or as the text it prints as; read as
+                // one string whatever it was, a list of values kept the brackets Java prints
+                // around a list, so the first item began with one and the last ended with one.
                 List<Object> rows = new ArrayList<>();
-                String aclStr = acl.toString().trim();
-                if (aclStr.startsWith("{")) aclStr = aclStr.substring(1);
-                if (aclStr.endsWith("}")) aclStr = aclStr.substring(0, aclStr.length() - 1);
-                if (aclStr.isEmpty()) {
-                    return rows;
+                List<String> items = new ArrayList<>();
+                if (acl instanceof List<?>) {
+                    for (Object element : (List<?>) acl) {
+                        if (element != null) items.add(element.toString().trim());
+                    }
+                } else {
+                    String aclStr = acl.toString().trim();
+                    if (aclStr.startsWith("{")) aclStr = aclStr.substring(1);
+                    if (aclStr.endsWith("}")) aclStr = aclStr.substring(0, aclStr.length() - 1);
+                    for (String written : aclStr.split(",")) {
+                        if (!written.trim().isEmpty()) items.add(written.trim());
+                    }
                 }
-                for (String item : aclStr.split(",")) {
-                    item = item.trim();
-                    if (item.isEmpty()) continue;
+                if (items.isEmpty()) {
+                    // A list with nothing in it has no dimension at all, which is what
+                    // PostgreSQL complains about rather than answering with no rows.
+                    throw new MemgresException("ACL arrays must be one-dimensional", "22023");
+                }
+                for (String item : items) {
                     // Format: grantee=privs/grantor  (empty grantee = PUBLIC)
                     int eqIdx = item.indexOf('=');
                     int slashIdx = item.indexOf('/');
@@ -2238,8 +2263,11 @@ class FunctionEvaluator {
                     String granteeStr = item.substring(0, eqIdx);
                     String privs = item.substring(eqIdx + 1, slashIdx);
                     String grantorStr = item.substring(slashIdx + 1);
-                    long grantorOid = 10; // default superuser OID
-                    long granteeOid = granteeStr.isEmpty() ? 0 : 10;
+                    // The two roles are named in the item, and the catalogue has a number for
+                    // each of them. Answered as the bootstrap role whoever they were, an ACL
+                    // read apart said every grant had been made to the same role.
+                    long grantorOid = roleOidNamed(grantorStr);
+                    long granteeOid = granteeStr.isEmpty() ? 0 : roleOidNamed(granteeStr);
                     for (int i = 0; i < privs.length(); i++) {
                         char c = privs.charAt(i);
                         boolean grantable = (i + 1 < privs.length() && privs.charAt(i + 1) == '*');
@@ -2266,6 +2294,9 @@ class FunctionEvaluator {
                             case 't':
                                 privType = "TRIGGER";
                                 break;
+                            case 'm':
+                                privType = "MAINTAIN";
+                                break;
                             case 'X':
                                 privType = "EXECUTE";
                                 break;
@@ -2289,8 +2320,13 @@ class FunctionEvaluator {
                                 break;
                         }
                         if (privType != null) {
-                            // Return as composite row: (grantor, grantee, privilege_type, is_grantable)
-                            rows.add("(" + grantorOid + "," + granteeOid + "," + privType + "," + grantable + ")");
+                            // A row of four values, not the text one prints as: read from a FROM
+                            // clause the four are columns, and a caller naming grantee found no
+                            // such column where the row was one string.
+                            rows.add(new AstExecutor.PgRow(Cols.listOf(
+                                    (Object) Integer.valueOf((int) grantorOid),
+                                    Integer.valueOf((int) granteeOid), privType,
+                                    Boolean.valueOf(grantable))));
                         }
                     }
                 }
@@ -2717,7 +2753,7 @@ class FunctionEvaluator {
             }
             // ---- pg_trgm extension ----
             case "show_trgm": {
-                requireExtension("pg_trgm", name, fn.args().size());
+                requireExtension("pg_trgm", fn, ctx);
                 requireArgs(fn, 1);
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
@@ -2733,7 +2769,7 @@ class FunctionEvaluator {
             case "word_similarity":
             case "strict_word_similarity":
             case "similarity": {
-                requireExtension("pg_trgm", name, fn.args().size());
+                requireExtension("pg_trgm", fn, ctx);
                 requireArgs(fn, 2);
                 Object arg1 = executor.evalExpr(fn.args().get(0), ctx);
                 Object arg2 = executor.evalExpr(fn.args().get(1), ctx);
@@ -2785,7 +2821,7 @@ class FunctionEvaluator {
             }
             // ---- fuzzystrmatch extension ----
             case "levenshtein": {
-                requireExtension("fuzzystrmatch", name, fn.args().size());
+                requireExtension("fuzzystrmatch", fn, ctx);
                 requireArgs(fn, 2);
                 Object arg1 = executor.evalExpr(fn.args().get(0), ctx);
                 Object arg2 = executor.evalExpr(fn.args().get(1), ctx);
@@ -2793,7 +2829,7 @@ class FunctionEvaluator {
                 return levenshteinDistance(arg1.toString(), arg2.toString());
             }
             case "soundex": {
-                requireExtension("fuzzystrmatch", name, fn.args().size());
+                requireExtension("fuzzystrmatch", fn, ctx);
                 requireArgs(fn, 1);
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
@@ -2801,7 +2837,7 @@ class FunctionEvaluator {
             }
             // ---- unaccent extension ----
             case "unaccent": {
-                requireExtension("unaccent", name, fn.args().size());
+                requireExtension("unaccent", fn, ctx);
                 requireArgs(fn, 1);
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
@@ -3068,14 +3104,14 @@ class FunctionEvaluator {
             // hstore extension functions
             // =================================================================
             case "akeys": {
-                requireExtension("hstore", name, fn.args().size());
+                requireExtension("hstore", fn, ctx);
                 Object val = executor.evalExpr(fn.args().get(0), ctx);
                 if (val == null) return null;
                 HstoreValue h = toHstore(val);
                 return h.keys();
             }
             case "avals": {
-                requireExtension("hstore", name, fn.args().size());
+                requireExtension("hstore", fn, ctx);
                 Object val = executor.evalExpr(fn.args().get(0), ctx);
                 if (val == null) return null;
                 HstoreValue h = toHstore(val);
@@ -3086,7 +3122,7 @@ class FunctionEvaluator {
             case "each": {
                 // These are set-returning functions — they work in FROM clauses via FromFunctionResolver,
                 // and in SELECT target list via SRF expansion (returning a List).
-                requireExtension("hstore", name, fn.args().size());
+                requireExtension("hstore", fn, ctx);
                 Object val = executor.evalExpr(fn.args().get(0), ctx);
                 if (val == null) return null;
                 HstoreValue h = toHstore(val);
@@ -3105,7 +3141,7 @@ class FunctionEvaluator {
             }
             case "exist":
             case "isexists": {
-                requireExtension("hstore", name, fn.args().size());
+                requireExtension("hstore", fn, ctx);
                 Object val = executor.evalExpr(fn.args().get(0), ctx);
                 Object key = executor.evalExpr(fn.args().get(1), ctx);
                 if (val == null || key == null) return null;
@@ -3114,7 +3150,7 @@ class FunctionEvaluator {
             }
             case "defined":
             case "isdefined": {
-                requireExtension("hstore", name, fn.args().size());
+                requireExtension("hstore", fn, ctx);
                 Object val = executor.evalExpr(fn.args().get(0), ctx);
                 Object key = executor.evalExpr(fn.args().get(1), ctx);
                 if (val == null || key == null) return null;
@@ -3122,7 +3158,7 @@ class FunctionEvaluator {
                 return h.defined(key.toString());
             }
             case "delete": {
-                requireExtension("hstore", name, fn.args().size());
+                requireExtension("hstore", fn, ctx);
                 Object val = executor.evalExpr(fn.args().get(0), ctx);
                 Object key = executor.evalExpr(fn.args().get(1), ctx);
                 if (val == null) return null;
@@ -3147,7 +3183,7 @@ class FunctionEvaluator {
                 return h.deleteKey(key.toString());
             }
             case "slice": {
-                requireExtension("hstore", name, fn.args().size());
+                requireExtension("hstore", fn, ctx);
                 Object val = executor.evalExpr(fn.args().get(0), ctx);
                 Object keysObj = executor.evalExpr(fn.args().get(1), ctx);
                 if (val == null) return null;
@@ -3159,7 +3195,7 @@ class FunctionEvaluator {
                 return h.slice(keys);
             }
             case "populate_record": {
-                requireExtension("hstore", name, fn.args().size());
+                requireExtension("hstore", fn, ctx);
                 if (fn.args().size() != 2)
                     throw new MemgresException("function populate_record requires 2 arguments", "42883");
                 String typeName = executor.resolveCompositeTypeName(fn.args().get(0), ctx);
@@ -3174,7 +3210,7 @@ class FunctionEvaluator {
                 return executor.compositeTypeHandler.populateFromHstore(baseArg, hs, fields);
             }
             case "hstore": {
-                requireExtension("hstore", name, fn.args().size());
+                requireExtension("hstore", fn, ctx);
                 if (fn.args().size() == 2) {
                     // hstore(keys text[], vals text[]) or hstore(key text, val text)
                     Object keysObj = executor.evalExpr(fn.args().get(0), ctx);
@@ -3257,14 +3293,14 @@ class FunctionEvaluator {
                 throw new MemgresException("function hstore() requires 1 or 2 arguments", "42883");
             }
             case "hstore_to_json": {
-                requireExtension("hstore", name, fn.args().size());
+                requireExtension("hstore", fn, ctx);
                 Object val = executor.evalExpr(fn.args().get(0), ctx);
                 if (val == null) return null;
                 HstoreValue h = toHstore(val);
                 return hstoreToJsonString(h);
             }
             case "hstore_to_jsonb": {
-                requireExtension("hstore", name, fn.args().size());
+                requireExtension("hstore", fn, ctx);
                 Object val = executor.evalExpr(fn.args().get(0), ctx);
                 if (val == null) return null;
                 HstoreValue h = toHstore(val);
@@ -3272,14 +3308,14 @@ class FunctionEvaluator {
             }
             case "hstore_to_json_loose":
             case "hstore_to_jsonb_loose": {
-                requireExtension("hstore", name, fn.args().size());
+                requireExtension("hstore", fn, ctx);
                 Object val = executor.evalExpr(fn.args().get(0), ctx);
                 if (val == null) return null;
                 HstoreValue h = toHstore(val);
                 return hstoreToJsonLooseString(h);
             }
             case "hstore_to_array": {
-                requireExtension("hstore", name, fn.args().size());
+                requireExtension("hstore", fn, ctx);
                 Object val = executor.evalExpr(fn.args().get(0), ctx);
                 if (val == null) return null;
                 HstoreValue h = toHstore(val);
@@ -3292,7 +3328,7 @@ class FunctionEvaluator {
                 return result;
             }
             case "hstore_to_matrix": {
-                requireExtension("hstore", name, fn.args().size());
+                requireExtension("hstore", fn, ctx);
                 Object val = executor.evalExpr(fn.args().get(0), ctx);
                 if (val == null) return null;
                 HstoreValue h = toHstore(val);
@@ -3792,7 +3828,7 @@ class FunctionEvaluator {
      * line -- and only a name that reaches no relation at all is reported as one that is not there.
      */
     private Sequence requireSequence(String written) {
-        String seqName = regclassName(written);
+        String seqName = Quoting.nameAsRead(written);
         Sequence seq = resolveSequence(seqName);
         if (seq != null) return seq;
         int dot = seqName.indexOf('.');
@@ -3814,42 +3850,6 @@ class FunctionEvaluator {
             throw wrongKind;
         }
         throw new MemgresException("relation \"" + seqName + "\" does not exist", "42P01");
-    }
-
-    /**
-     * A regclass argument's text read the way PostgreSQL reads it: as a relation name, so the
-     * double quotes around a part of it are identifier quoting rather than characters of the name,
-     * and a part written without them is folded to lower case. It is this name, and not the text it
-     * was written as, that a complaint about a missing relation quotes back.
-     */
-    private static String regclassName(String written) {
-        if (written == null) return null;
-        String text = written.trim();
-        StringBuilder out = new StringBuilder();
-        StringBuilder part = new StringBuilder();
-        boolean inQuotes = false;
-        boolean quotedPart = false;
-        for (int i = 0; i < text.length(); i++) {
-            char c = text.charAt(i);
-            if (c == '"') {
-                if (inQuotes && i + 1 < text.length() && text.charAt(i + 1) == '"') {
-                    part.append('"');
-                    i++;
-                } else {
-                    inQuotes = !inQuotes;
-                    quotedPart = true;
-                }
-            } else if (c == '.' && !inQuotes) {
-                out.append(quotedPart ? part.toString() : part.toString().trim().toLowerCase(java.util.Locale.ROOT));
-                out.append('.');
-                part.setLength(0);
-                quotedPart = false;
-            } else {
-                part.append(c);
-            }
-        }
-        out.append(quotedPart ? part.toString() : part.toString().trim().toLowerCase(java.util.Locale.ROOT));
-        return out.toString();
     }
 
     /**
@@ -4957,6 +4957,14 @@ class FunctionEvaluator {
      * functions take a precision rather than an argument, so a call with none written keeps
      * every digit it has.
      */
+    /** The number the catalogue files a role under, or 10 for the role the server bootstraps. */
+    private int roleOidNamed(String roleName) {
+        if (roleName == null || roleName.isEmpty()) return 0;
+        int oid = executor.systemCatalog.getOid("role:"
+                + roleName.trim().toLowerCase(java.util.Locale.ROOT));
+        return oid == 0 ? 10 : oid;
+    }
+
     private Object keptToPrecision(Object reading, FunctionCallExpr fn, RowContext ctx) {
         if (fn.args() == null || fn.args().isEmpty()) return reading;
         Object asked = executor.evalExpr(fn.args().get(0), ctx);

@@ -114,12 +114,28 @@ public class Parser extends ExpressionParser {
                         // into a parameter and leaves the first one with nothing to do.
                         || t.type() == TokenType.PARAM
                         || t.type() == TokenType.STAR) {
+                    // A word that only ever opens a clause is read as opening one, so what is
+                    // wrong is whatever came after it rather than the word itself: PostgreSQL
+                    // points at the x in "SELECT 1 GROUP x", and at the end of the input when
+                    // nothing came after it at all.
+                    if (t.type() == TokenType.KEYWORD && OPENS_A_CLAUSE.contains(
+                            t.value().toUpperCase(java.util.Locale.ROOT))) {
+                        parser.advance();
+                        throw ParseException.at(parser.peek());
+                    }
                     throw new ParseException("syntax error at or near \"" + t.value() + "\"", t);
                 }
             }
         }
         return stmt;
     }
+
+    /**
+     * Words that open a clause and cannot stand for anything else, so a statement that ends at
+     * one of them ended in the middle of the clause it opened rather than after the word.
+     */
+    private static final java.util.Set<String> OPENS_A_CLAUSE =
+            new java.util.HashSet<>(java.util.Arrays.asList("GROUP", "ORDER"));
 
     public static List<Statement> parseAll(String sql) {
         Lexer lexer = new Lexer(sql);

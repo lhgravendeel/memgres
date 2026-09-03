@@ -1469,6 +1469,11 @@ class SelectExecutor {
         // first: SELECT * FROM t ORDER BY 2 means the table's second column.
         List<SelectStmt.SelectTarget> ordinalTargets = expandTargetsForOrdinals(stmt.targets(), baseBindings, baseOutput);
         List<SelectStmt.OrderByItem> resolvedOrderBy = resolveOrderBy(stmt.orderBy(), ordinalTargets);
+        if (resolvedOrderBy != null) {
+            for (SelectStmt.OrderByItem item : resolvedOrderBy) {
+                StatementAnalyzer.requireOrderingOperator(executor, item, baseBindings);
+            }
+        }
 
         // Validate: for SELECT DISTINCT, ORDER BY expressions must appear in select list
         if (stmt.distinct() && (stmt.distinctOn() == null || stmt.distinctOn().isEmpty()) && resolvedOrderBy != null && !resolvedOrderBy.isEmpty()) {
@@ -2247,7 +2252,8 @@ class SelectExecutor {
                 if (named != null) expr = named;
             }
 
-            resolved.add(new SelectStmt.OrderByItem(expr, item.descending(), item.nullsFirst()));
+            resolved.add(new SelectStmt.OrderByItem(expr, item.descending(), item.nullsFirst(),
+                    item.usingOperator()));
         }
         return resolved;
     }
@@ -2917,12 +2923,28 @@ class SelectExecutor {
 
     // ---- SELECT without FROM ----
 
+    /** The shape a FROM-less query answers with, and none of the answers, for a query with none. */
+    private QueryResult noAnswerFrom(SelectStmt stmt) {
+        List<Column> columns = new ArrayList<>();
+        for (SelectStmt.SelectTarget target : stmt.targets()) {
+            String alias = target.alias();
+            if (alias == null) alias = executor.exprToAlias(target.expr());
+            columns.add(buildProjectedColumn(alias, target.expr(), Cols.listOf()));
+        }
+        return QueryResult.select(columns, new ArrayList<Object[]>());
+    }
+
     private QueryResult executeSelectExpressions(SelectStmt stmt) {
         // A FROM-less SELECT has one row and nothing to sort, but its ORDER BY is still analysed:
         // an ordinal outside the select list is out of range and a constant that is not an
         // integer names no column. Skipping the resolve here let SELECT 1 AS a ORDER BY NULL
         // through where every other shape of SELECT already refused it.
-        resolveOrderBy(stmt.orderBy(), stmt.targets());
+        for (SelectStmt.OrderByItem item : resolveOrderBy(stmt.orderBy(), stmt.targets()) == null
+                ? java.util.Collections.<SelectStmt.OrderByItem>emptyList()
+                : resolveOrderBy(stmt.orderBy(), stmt.targets())) {
+            StatementAnalyzer.requireOrderingOperator(executor, item,
+                    java.util.Collections.<RowContext.TableBinding>emptyList());
+        }
         if (hasWindowFunctionInTargets(stmt.targets())) {
             Table virtualTable = new Table("__virtual__",
                     Cols.listOf(new Column("__dummy__", DataType.INTEGER, true, false, null)));
@@ -2932,19 +2954,17 @@ class SelectExecutor {
             List<RowContext> virtualContexts = Cols.listOf(virtualCtx);
             return windowEvaluator.executeWindowSelect(stmt, virtualContexts, virtualCtx.getBindings());
         }
-        if (stmt.limit() != null) limitOffsetValue(stmt.limit(), true);
+        long writtenLimit = stmt.limit() != null ? limitOffsetValue(stmt.limit(), true) : -1;
         if (stmt.offset() != null) limitOffsetValue(stmt.offset(), false);
+        // A limit of none asks for no row, and a row that is never asked for is never worked
+        // out: what stands in the select list is not evaluated at all. Working the list out
+        // first and cutting the answer afterwards called a nextval the query never had to call.
+        // An OFFSET is not the same thing: the row is produced and then stepped over, so what
+        // the select list names is called either way.
+        if (writtenLimit == 0) return noAnswerFrom(stmt);
         if (stmt.where() != null) {
             Object whereVal = executor.evalExpr(stmt.where(), null);
-            if (!executor.isTruthy(whereVal)) {
-                List<Column> columns = new ArrayList<>();
-                for (SelectStmt.SelectTarget target : stmt.targets()) {
-                    String alias = target.alias();
-                    if (alias == null) alias = executor.exprToAlias(target.expr());
-                    columns.add(buildProjectedColumn(alias, target.expr(), Cols.listOf()));
-                }
-                return QueryResult.select(columns, new ArrayList<>());
-            }
+            if (!executor.isTruthy(whereVal)) return noAnswerFrom(stmt);
         }
 
         List<Column> columns = new ArrayList<>();
@@ -3108,7 +3128,7 @@ class SelectExecutor {
         return rows;
     }
 
-    private boolean isSrfCall(Expression expr) {
+    boolean isSrfCall(Expression expr) {
         return findSrfCall(expr) != null;
     }
 

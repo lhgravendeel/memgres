@@ -284,7 +284,14 @@ class DdlTableParser {
         if (parser.matchKeywords("PARTITION", "BY")) {
             if (parser.matchKeyword("RANGE")) partitionBy = "RANGE";
             else if (parser.matchKeyword("LIST")) partitionBy = "LIST";
-            else { parser.expectKeyword("HASH"); partitionBy = "HASH"; }
+            else if (parser.matchKeyword("HASH")) partitionBy = "HASH";
+            else {
+                // A word here is read as the strategy it claims to be, so one that names no
+                // strategy is refused as that rather than as a word out of place.
+                throw new MemgresException("unrecognized partitioning strategy \""
+                        + parser.advance().raw().toLowerCase(java.util.Locale.ROOT) + "\"",
+                        "22023");
+            }
             parser.expect(TokenType.LEFT_PAREN);
             StringBuilder partColBuf = new StringBuilder(readPartitionElement());
             int partElements = 1;

@@ -645,7 +645,19 @@ final class BooleanContext {
      */
     private static String bitwiseResult(BinaryExpr.BinOp op, String left, String right) {
         if (!isIntegerType(left) || !isIntegerType(right)) return null;
-        if (op == BinaryExpr.BinOp.SHIFT_LEFT || op == BinaryExpr.BinOp.SHIFT_RIGHT) return left;
+        if (op == BinaryExpr.BinOp.SHIFT_LEFT || op == BinaryExpr.BinOp.SHIFT_RIGHT) {
+            // A shift is declared over a count that is an integer, so a bigint on the right
+            // names no operator at all. PostgreSQL resolves the operator while it reads the
+            // clause and complains about that before it asks whether the clause is a condition:
+            // answered with the left type regardless, integer >> bigint was reported as an
+            // integer where a condition was wanted rather than as the operator there is none of.
+            MemgresException missing = OperatorResolution.refusalFor(
+                    op == BinaryExpr.BinOp.SHIFT_LEFT ? "<<" : ">>",
+                    DataType.fromPgName(left).getOid(), DataType.fromPgName(right).getOid(),
+                    left, right);
+            if (missing != null) throw missing;
+            return left;
+        }
         return left.equals(right) ? left : null;
     }
 

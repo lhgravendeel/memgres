@@ -583,11 +583,20 @@ class DmlExecutor {
         rejectAmbiguousBesideExcluded(oc, table);
         // Arbitration needs a unique index to decide which row was hit; a CHECK or foreign
         // key has none, so there is nothing to conflict against.
-        if (named != null && named.getType() != StoredConstraint.Type.PRIMARY_KEY
+        if (named != null && named.getType() == StoredConstraint.Type.EXCLUDE) {
+            // An exclusion constraint says which rows may not stand together, not which row an
+            // existing key belongs to, so there is no row for an update to act on -- but a write
+            // it refuses is still a conflict, and DO NOTHING leaves that row out.
+            if (oc.doUpdate() != null) {
+                throw new MemgresException(
+                        "ON CONFLICT DO UPDATE not supported with exclusion constraints", "42809");
+            }
+        } else if (named != null && named.getType() != StoredConstraint.Type.PRIMARY_KEY
                 && named.getType() != StoredConstraint.Type.UNIQUE) {
             throw new MemgresException(
                     "constraint in ON CONFLICT clause has no associated index", "42809");
         }
+        requireArbitrableConstraints(oc, table, named);
         if (oc.doUpdate() != null) {
             for (InsertStmt.SetClause set : oc.doUpdate()) {
                 int colIdx = table.getColumnIndex(set.column());
@@ -619,6 +628,54 @@ class DmlExecutor {
     }
 
     /**
+     * Refuse an arbiter whose constraint is deferrable.
+     *
+     * <p>Arbitration happens as the row is written, and a deferrable constraint is one whose test
+     * may be put off to the end of the transaction: there is nothing to arbitrate on yet. Which
+     * constraints would arbitrate is settled before any row is read, so the statement is refused
+     * whether or not anything would have conflicted -- and a target that names one of the other
+     * constraints is a target that arbitrates on that one alone.
+     */
+    private void requireArbitrableConstraints(InsertStmt.OnConflict oc, Table table,
+                                              StoredConstraint named) {
+        List<StoredConstraint> arbiters = new ArrayList<>();
+        if (named != null) {
+            arbiters.add(named);
+        } else {
+            List<String> target = oc.columns();
+            for (StoredConstraint sc : table.getConstraints()) {
+                if (sc.getType() != StoredConstraint.Type.PRIMARY_KEY
+                        && sc.getType() != StoredConstraint.Type.UNIQUE
+                        && sc.getType() != StoredConstraint.Type.EXCLUDE) {
+                    continue;
+                }
+                if (target != null && !target.isEmpty() && !namesTheSameColumns(target, sc)) continue;
+                arbiters.add(sc);
+            }
+        }
+        for (StoredConstraint sc : arbiters) {
+            if (sc.isDeferrable()) {
+                throw new MemgresException("ON CONFLICT does not support deferrable unique"
+                        + " constraints/exclusion constraints as arbiters", "55000");
+            }
+        }
+    }
+
+    /** Whether a conflict target names exactly the columns a constraint is over. */
+    private boolean namesTheSameColumns(List<String> target, StoredConstraint sc) {
+        List<String> columns = sc.getColumns();
+        if (columns == null || columns.size() != target.size()) return false;
+        for (String written : target) {
+            boolean found = false;
+            for (String held : columns) {
+                if (held.equalsIgnoreCase(written)) { found = true; break; }
+            }
+            if (!found) return false;
+        }
+        return true;
+    }
+
+    /**
      * The columns the ON CONFLICT clause arbitrates on, or null when they cannot be determined
      * from the statement alone (an expression target, for instance).
      */
@@ -632,6 +689,30 @@ class DmlExecutor {
             }
         }
         return null;
+    }
+
+    /**
+     * Whether an exclusion constraint the clause arbitrates on would refuse this row.
+     *
+     * <p>A target that names no index at all arbitrates on every constraint the relation has, an
+     * exclusion constraint included; one that names a constraint arbitrates on that one. Only a
+     * unique key was asked, so a row an exclusion constraint refused broke the write that DO
+     * NOTHING was written to let through.
+     */
+    private boolean refusedByAnArbitratingExclusion(Table table, Object[] row,
+                                                    InsertStmt.OnConflict oc) {
+        boolean noTarget = (oc.columns() == null || oc.columns().isEmpty())
+                && (oc.conflictExpressions() == null || oc.conflictExpressions().isEmpty());
+        if (!noTarget && oc.constraint() == null) return false;
+        for (StoredConstraint sc : table.getConstraints()) {
+            if (sc.getType() != StoredConstraint.Type.EXCLUDE) continue;
+            if (oc.constraint() != null
+                    && (sc.getName() == null || !sc.getName().equalsIgnoreCase(oc.constraint()))) {
+                continue;
+            }
+            if (executor.constraintValidator.exclusionRefuses(table, row, sc)) return true;
+        }
+        return false;
     }
 
     /**
@@ -799,6 +880,11 @@ class DmlExecutor {
         activeViewWriteTarget = executor.database.getView(schemaName, stmt.table());
         // C6: Enforce INSERT privilege
         executor.checkTablePrivilege("INSERT", schemaName, stmt.table());
+        // An ON CONFLICT that updates writes rows already there, so it asks for UPDATE as well:
+        // checked as an insert alone, a role with INSERT could rewrite every row it collided with.
+        if (stmt.onConflict() != null && stmt.onConflict().doUpdate() != null) {
+            executor.checkTablePrivilege("UPDATE", schemaName, stmt.table());
+        }
         // Check table-level locks (blocks if ACCESS EXCLUSIVE held by another session)
         executor.database.checkTableLockForDml(schemaName + "." + stmt.table(), executor.session);
 
@@ -940,6 +1026,19 @@ class DmlExecutor {
         Set<Integer> ruleSuppressedRows = insteadClaimedRows(insertRules, valueRows,
                 valueRowContexts, stmt, table);
 
+        // A VALUES list is one relation, and every row of a relation has the same columns: a row
+        // written shorter than another is not a row that leaves the rest at their defaults, it is
+        // a list PostgreSQL will not read at all. That is settled before the rows are held
+        // against the table, because it is wrong whatever the table looks like.
+        if (stmt.values() != null && stmt.values().size() > 1) {
+            int first = stmt.values().get(0).size();
+            for (List<Expression> valueRow : stmt.values()) {
+                if (valueRow.size() != first) {
+                    throw new MemgresException(
+                            "VALUES lists must all be the same length", "42601");
+                }
+            }
+        }
         // Pre-validate all rows' column counts before inserting any rows (atomicity)
         for (List<Expression> valueRow : valueRows) {
             if (stmt.columns() != null && stmt.columns().size() != valueRow.size()) {
@@ -1019,6 +1118,8 @@ class DmlExecutor {
                         filledCols.add(colIdx);
                         continue;
                     }
+                    validationHelper.requireAssignable(valueRow.get(i),
+                            table.getColumns().get(colIdx));
                     Object val = executor.evalExpr(valueRow.get(i), valueCtx);
                     row[colIdx] = validationHelper.storedValue(val, table.getColumns().get(colIdx));
                     filledCols.add(colIdx);
@@ -1031,6 +1132,8 @@ class DmlExecutor {
                     if (genCol.isGenerated()) {
                         throw new MemgresException("cannot insert a non-DEFAULT value into column \"" + genCol.getName() + "\"\n  Detail: Column \"" + genCol.getName() + "\" is a generated column.", "428C9");
                     }
+                    validationHelper.requireAssignable(valueRow.get(i),
+                            table.getColumns().get(i));
                     Object val = executor.evalExpr(valueRow.get(i), valueCtx);
                     row[i] = validationHelper.storedValue(val, table.getColumns().get(i));
                     filledCols.add(i);
@@ -1289,6 +1392,10 @@ class DmlExecutor {
                 }
                 rejectSecondUpdateOfSameKey(stmt.onConflict(), conflictTable, row, conflictKeysActedOn);
                 Object[] conflictRow = conflictHelper.findConflictingRow(conflictTable, row, stmt.onConflict());
+                if (conflictRow == null && stmt.onConflict().doNothing()
+                        && refusedByAnArbitratingExclusion(conflictTable, row, stmt.onConflict())) {
+                    continue;
+                }
                 if (conflictRow != null) {
                     if (stmt.onConflict().doNothing()) {
                         // DO NOTHING: skip this row
@@ -1345,6 +1452,7 @@ class DmlExecutor {
                                 newRow[colIdx] = assignedDefault(conflictTable, setCol);
                                 continue;
                             }
+                            validationHelper.requireAssignable(set.value(), setCol);
                             Object val = executor.evalExpr(set.value(), conflictCtx);
                             newRow[colIdx] = validationHelper.storedValue(val, setCol);
                         }
@@ -1365,6 +1473,18 @@ class DmlExecutor {
                             elsewhere.setDetail("The result tuple would appear in a different"
                                     + " partition than the original tuple.");
                             throw elsewhere;
+                        }
+                        // The row this rewrites is a row an UPDATE writes, so the update policies
+                        // hold over it: the one that says which rows may be rewritten is asked
+                        // about the row already there, and the one that says what may be written
+                        // about the row this leaves.
+                        if (conflictTable.isRlsEnabled()) {
+                            String conflictRlsSchema = stmt.schema() != null
+                                    ? stmt.schema() : executor.defaultSchema();
+                            if (!executor.shouldBypassRls(conflictTable, conflictRlsSchema)) {
+                                enforceRlsUsingForUpdate(conflictTable, conflictRow);
+                                enforceRlsWithCheck(conflictTable, newRow, "UPDATE");
+                            }
                         }
                         // Validate constraints BEFORE mutating the row to avoid index corruption
                         partitionHelper.checkPartitionConstraint(conflictTable, newRow);
@@ -2892,6 +3012,39 @@ class DmlExecutor {
     }
 
     /**
+     * Refuse to rewrite a row the update policies do not admit.
+     *
+     * <p>A policy's USING expression says which rows the statement may act on. An UPDATE that
+     * finds no such row simply updates nothing; an ON CONFLICT DO UPDATE has already found the
+     * row it collided with, so there is a row it may not act on and PostgreSQL says so.
+     */
+    private void enforceRlsUsingForUpdate(Table table, Object[] existing) {
+        String effectiveRole = executor.currentRole();
+        RowContext ctx = new RowContext(table, null, existing);
+        boolean granted = false;
+        List<RlsPolicy> restrictive = new ArrayList<>();
+        for (RlsPolicy policy : table.getRlsPolicies()) {
+            if (!policy.appliesTo("UPDATE") || !policy.appliesToRole(effectiveRole)) continue;
+            if (policy.getUsingExpr() == null) continue;
+            if (policy.isRestrictive()) {
+                restrictive.add(policy);
+            } else if (Boolean.TRUE.equals(executor.evalExpr(policy.getUsingExpr(), ctx))) {
+                granted = true;
+            }
+        }
+        if (!granted) {
+            throw new MemgresException("new row violates row-level security policy"
+                    + " (USING expression) for table \"" + table.getName() + "\"", "42501");
+        }
+        for (RlsPolicy policy : restrictive) {
+            if (!Boolean.TRUE.equals(executor.evalExpr(policy.getUsingExpr(), ctx))) {
+                throw new MemgresException("new row violates row-level security policy"
+                        + " (USING expression) for table \"" + table.getName() + "\"", "42501");
+            }
+        }
+    }
+
+    /**
      * Enforce RLS WITH CHECK policies for INSERT/UPDATE.
      * Throws 42501 if the new row doesn't satisfy all applicable WITH CHECK policies,
      * or if no policies apply (default-deny).
@@ -3293,6 +3446,9 @@ class DmlExecutor {
                         table.getColumns().get(colIdx));
                 continue;
             }
+            if (set.subField() == null) {
+                validationHelper.requireAssignable(set.value(), table.getColumns().get(colIdx));
+            }
             Object val = executor.evalExpr(set.value(), ctx);
             // Handle composite field update: SET col.field = value
             if (set.subField() != null) {
@@ -3451,14 +3607,10 @@ class DmlExecutor {
             values.set(fieldIdx, null);
         }
 
-        // Reconstruct as string representation
-        StringBuilder sb = new StringBuilder("(");
-        for (int i = 0; i < values.size(); i++) {
-            if (i > 0) sb.append(",");
-            if (values.get(i) != null) sb.append(values.get(i));
-        }
-        sb.append(")");
-        return sb.toString();
+        // Written back as the row it is, so each field is quoted where it has to be: joined with
+        // commas and nothing else, a field holding a comma became two fields and the value could
+        // not be read back at all.
+        return new AstExecutor.PgRow(values).toPgText();
     }
 
     // ---- DELETE ----
@@ -6542,6 +6694,7 @@ class DmlExecutor {
      */
     private List<List<Expression>> insertSourceRows(InsertStmt stmt) {
         if (stmt.selectStmt() == null) return stmt.values();
+        requireSourceAssignable(stmt);
         QueryResult subResult = executor.executeStatement(stmt.selectStmt());
         List<List<Expression>> valueRows = new ArrayList<>();
         for (Object[] subRow : subResult.getRows()) {
@@ -6552,6 +6705,28 @@ class DmlExecutor {
             valueRows.add(exprRow);
         }
         return valueRows;
+    }
+
+    /**
+     * Refuse a source whose columns the target's cannot take.
+     *
+     * <p>The question is the same one a VALUES list is held to, asked of the query's own result
+     * columns: storing a value is an assignment, and each column of the query has to reach the
+     * column it is being put into by a cast registered implicit or assignment.
+     */
+    private void requireSourceAssignable(InsertStmt stmt) {
+        if (!(stmt.selectStmt() instanceof SelectStmt)) return;
+        SelectStmt select = (SelectStmt) stmt.selectStmt();
+        if (select.targets() == null) return;
+        Table table = executor.resolveTable(stmt.schema(), stmt.table(), stmt.schema() != null);
+        if (table == null) return;
+        for (int i = 0; i < select.targets().size(); i++) {
+            int colIdx = stmt.columns() == null || stmt.columns().isEmpty() ? i
+                    : table.getColumnIndex(stmt.columns().get(i));
+            if (colIdx < 0 || colIdx >= table.getColumns().size()) continue;
+            validationHelper.requireAssignable(select.targets().get(i).expr(),
+                    table.getColumns().get(colIdx));
+        }
     }
 
     /**
