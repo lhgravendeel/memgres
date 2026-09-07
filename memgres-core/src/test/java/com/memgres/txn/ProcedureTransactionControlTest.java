@@ -968,8 +968,12 @@ class ProcedureTransactionControlTest {
                 s.execute("BEGIN ISOLATION LEVEL SERIALIZABLE");
                 s.execute("CALL ptc_chain_isolation()");
             } catch (SQLException ignored) {
-                // May error
+                // A procedure cannot end a transaction the caller opened, so this is refused.
             }
+            // The transaction the caller opened is the caller's to end, and it is aborted:
+            // PostgreSQL ignores every command until one does. Left open, the read below is
+            // refused rather than answering the empty log.
+            s.execute("ROLLBACK");
         }
         List<String> msgs = getLogMessages();
         assertEquals(0, msgs.size(), "chain_isolation: PG expects 0 rows in ptc_log");

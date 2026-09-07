@@ -237,6 +237,11 @@ final class MaintenanceExecutor {
                     executor.database.recordAnalyzedColumns(
                             where + "." + stmt.name(), stmt.columns());
                     gatherStatistics(where + "." + stmt.name(), table, stmt.columns());
+                    // A partitioned table holds no rows of its own: analysing it is analysing the
+                    // partitions the rows are really in, and PostgreSQL records each of them as
+                    // analysed. Left out, every partition went on reporting that it had never
+                    // been looked at, which is what a planner reads to decide it knows nothing.
+                    analysePartitionsOf(table, where, now);
                 }
             }
             if (analysing) markStatisticsAnalysed(stmt.name());
@@ -289,6 +294,21 @@ final class MaintenanceExecutor {
     }
 
     /** The columns an ANALYZE names are columns of the relation it names. */
+    /** Analyse each partition of a partitioned table, and each of theirs in turn. */
+    private void analysePartitionsOf(Table table, String schemaName, java.time.OffsetDateTime now) {
+        List<Table> partitions = table.getPartitions();
+        if (partitions == null) return;
+        for (Table part : partitions) {
+            String where = part.getSchemaName() != null ? part.getSchemaName() : schemaName;
+            String relation = where + "." + part.getName();
+            executor.database.recordAnalyzedTable(relation);
+            part.setLastAnalyze(now);
+            executor.database.recordAnalyzedColumns(relation, null);
+            gatherStatistics(relation, part, null);
+            analysePartitionsOf(part, where, now);
+        }
+    }
+
     private void requireColumns(Table table, String relation, List<String> columns) {
         for (String column : columns) {
             if (table.getColumnIndex(column) < 0) {

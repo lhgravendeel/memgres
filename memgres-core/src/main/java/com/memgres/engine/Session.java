@@ -566,6 +566,12 @@ public class Session {
         this.executor = new AstExecutor(database, this);
         // Sync max_connections GUC with the actual database setting
         gucSettings.set("max_connections", String.valueOf(database.getMaxConnections()));
+        gucSettings.reportsSuperuserWith(new GucSettings.SuperuserCheck() {
+            @Override
+            public boolean isSuperuserNow() {
+                return executor.isRoleSuperuser(executor.currentRole());
+            }
+        });
         // Register with database for MVCC visibility
         database.registerSession(this);
     }
@@ -1823,6 +1829,19 @@ public class Session {
      * name: two functions each declaring a cursor called {@code c} open two different portals, and
      * the name is what a caller handed the refcursor back has to FETCH from.
      */
+    /**
+     * The statement the session's unnamed portal is holding, or null where none is open.
+     *
+     * <p>The extended protocol's unnamed portal is a cursor as far as pg_cursors is concerned,
+     * and PostgreSQL lists it under the empty name. A row invented for it whether or not one was
+     * open told a client in simple query mode that a cursor it never declared was there.
+     */
+    private volatile String openUnnamedPortalSql;
+
+    public void setOpenUnnamedPortal(String sql) { this.openUnnamedPortalSql = sql; }
+
+    public String openUnnamedPortalSql() { return openUnnamedPortalSql; }
+
     public String nextUnnamedPortal() {
         return "<unnamed portal " + unnamedPortals.incrementAndGet() + ">";
     }
@@ -3813,8 +3832,28 @@ public class Session {
             stmtScopeMark = undoLog.size();
             stmtScopeOutsideTransaction = status != TransactionStatus.IN_TRANSACTION;
             releaseStatementImages();
+            writtenThisStatement.clear();
         }
         stmtScopeDepth++;
+    }
+
+    /**
+     * The rows this statement has already written, which it may not write again.
+     *
+     * <p>Every part of one statement reads the same snapshot, so a row a data-modifying WITH item
+     * has already updated or deleted is not a row the rest of the statement can act on: PostgreSQL
+     * passes over it. Acted on twice, {@code WITH a AS (UPDATE t ... RETURNING id) DELETE FROM t
+     * WHERE id IN (SELECT id FROM a)} deleted the row it had just updated.
+     */
+    private final Set<Object[]> writtenThisStatement =
+            Collections.newSetFromMap(new IdentityHashMap<Object[], Boolean>());
+
+    public void noteRowWritten(Object[] row) {
+        if (row != null) writtenThisStatement.add(row);
+    }
+
+    public boolean rowAlreadyWrittenThisStatement(Object[] row) {
+        return row != null && writtenThisStatement.contains(row);
     }
 
     /**
@@ -4033,6 +4072,125 @@ public class Session {
      * attribute goes on being part of the type for every session, and the placeholder a rolled-back
      * drop left behind goes on holding a number no statement ever took.
      */
+    /**
+     * The labels an enum had before a value was added to it.
+     *
+     * <p>DDL is transactional, so an ALTER whose transaction rolls back never happened. Recorded
+     * nowhere, a label added inside a transaction that was rolled back stayed on the type, and
+     * every later read of it saw a value the database had agreed to forget.
+     */
+    /**
+     * What a relation's triggers of one name were before a statement changed them.
+     *
+     * <p>CREATE TRIGGER, CREATE OR REPLACE TRIGGER and DROP TRIGGER all rewrite the same entry,
+     * and a rolled-back transaction has to put back what was there. Applied straight onto the
+     * live registry with nothing recorded, a trigger created in a transaction that was rolled
+     * back went on firing, and one dropped in one stayed gone.
+     */
+    public static final class TriggerUndo implements UndoEntry {
+        private final String tableName;
+        private final String triggerName;
+        private final List<PgTrigger> before;
+
+        public TriggerUndo(String tableName, String triggerName, List<PgTrigger> before) {
+            this.tableName = tableName;
+            this.triggerName = triggerName;
+            this.before = before == null ? new ArrayList<PgTrigger>() : new ArrayList<PgTrigger>(before);
+        }
+
+        @Override
+        public void undo(Database db) {
+            if (tableName == null || triggerName == null) return;
+            db.removeTrigger(triggerName, tableName);
+            for (PgTrigger t : before) db.addTrigger(t);
+        }
+
+        @Override
+        public String toString() {
+            return "TriggerUndo[table=" + tableName + ",trigger=" + triggerName + "]";
+        }
+    }
+
+    public static final class AlterEnumUndo implements UndoEntry {
+        public final String typeKey;
+        private final List<String> labels;
+
+        public AlterEnumUndo(String typeKey, List<String> labels) {
+            this.typeKey = typeKey;
+            this.labels = labels == null ? null : new ArrayList<String>(labels);
+        }
+
+        @Override
+        public void undo(Database db) {
+            if (labels == null) return;
+            CustomEnum held = db.getCustomEnums().get(typeKey);
+            if (held == null) return;
+            held.getLabels().clear();
+            held.getLabels().addAll(labels);
+        }
+
+        public String typeKey() { return typeKey; }
+
+        @Override
+        public String toString() {
+            return "AlterEnumUndo[typeKey=" + typeKey + "]";
+        }
+    }
+
+    /**
+     * What a sequence was set to before an ALTER SEQUENCE changed it.
+     *
+     * <p>As with an enum: an ALTER that rolls back never happened, and a sequence left with the
+     * increment or the bounds a rolled-back statement gave it hands out numbers nobody asked for.
+     */
+    public static final class AlterSequenceUndo implements UndoEntry {
+        public final String seqName;
+        private final long incrementBy;
+        private final long minValue;
+        private final long maxValue;
+        private final long startWith;
+        private final boolean cycle;
+        private final int cache;
+        /** Where the sequence stood, which RESTART moves and a rollback has to move back. */
+        private final long currentValue;
+        private final boolean wasCalled;
+
+        public AlterSequenceUndo(Sequence seq) {
+            this.seqName = seq.qualifiedName();
+            this.incrementBy = seq.getIncrementBy();
+            this.minValue = seq.getMinValue();
+            this.maxValue = seq.getMaxValue();
+            this.startWith = seq.getStartWith();
+            this.cycle = seq.isCycle();
+            this.cache = seq.getCache();
+            this.currentValue = seq.currValRaw();
+            this.wasCalled = seq.isCalled();
+        }
+
+        @Override
+        public void undo(Database db) {
+            Sequence held = db.getSequence(seqName);
+            if (held == null) return;
+            held.setIncrementBy(incrementBy);
+            held.setMinValue(minValue);
+            held.setMaxValue(maxValue);
+            held.setStartWith(startWith);
+            held.setCycle(cycle);
+            held.setCache(cache);
+            // RESTART is an ALTER like any other, and a rolled-back one never happened: put the
+            // sequence back where it stood, so the next value is the one it would have given.
+            if (wasCalled) held.setVal(currentValue);
+            else held.restart(currentValue);
+        }
+
+        public String seqName() { return seqName; }
+
+        @Override
+        public String toString() {
+            return "AlterSequenceUndo[seqName=" + seqName + "]";
+        }
+    }
+
     public static final class AlterCompositeTypeUndo implements UndoEntry {
         public final String typeKey;
         private final List<com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField> fields;

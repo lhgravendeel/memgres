@@ -183,6 +183,16 @@ class DmlExecutor {
         }
     }
 
+    /** The rows another part of this statement has not already written. */
+    private List<Object[]> rowsThisStatementHasNotWritten(List<Object[]> rows) {
+        if (executor.session == null || rows == null || rows.isEmpty()) return rows;
+        List<Object[]> kept = new ArrayList<>(rows.size());
+        for (Object[] row : rows) {
+            if (!executor.session.rowAlreadyWrittenThisStatement(row)) kept.add(row);
+        }
+        return kept;
+    }
+
     /** Record row metadata update (new ctid after UPDATE). */
     void recordRowUpdateMeta(String schema, Table table, Object[] row) {
         if (executor.session != null && executor.database != null) {
@@ -193,7 +203,10 @@ class DmlExecutor {
         }
         // The row now holds what this statement wrote, so a relation reading it through columns of
         // its own has to be shown the same values.
-        if (executor.session != null) executor.session.rowWasUpdatedInPlace(row);
+        if (executor.session != null) {
+            executor.session.rowWasUpdatedInPlace(row);
+            executor.session.noteRowWritten(row);
+        }
     }
 
     /** Resolve the schema-qualified key for a table's row metadata.
@@ -212,11 +225,55 @@ class DmlExecutor {
         if (!bare.toLowerCase(java.util.Locale.ROOT).startsWith("pg_")) return;
         if (executor.systemCatalog.resolve(null, bare, executor.session) == null) return;
         if (!"v".equals(PgCatalogRelations.relkind(bare.toLowerCase(java.util.Locale.ROOT)))) return;
+        // A rule that stands in for the write is what the Hint below offers, and the relation may
+        // already carry one: pg_settings ships an unconditional ON UPDATE DO INSTEAD rule, so an
+        // UPDATE of it is the rule's to take rather than a write to refuse.
+        if (anUnconditionalInsteadRuleTakes(bare, verb)) return;
         // A catalogue view is assembled from more than one relation, which is the same reason
         // PostgreSQL gives for refusing a write to any other view of that shape, and it names the
         // trigger and the rule that would take the write instead.
         throw ViewUpdatability.cannotWrite(verb, bare,
                 ViewUpdatability.DETAIL_NOT_SINGLE_RELATION, executor.viewDmlByMerge);
+    }
+
+    /**
+     * The schema whose rules a written relation name reaches.
+     *
+     * <p>A catalogue relation lives in pg_catalog whatever the search path says, and pg_settings
+     * carries the rules PostgreSQL ships on it. Looked for along the search path alone, those
+     * rules belonged to a schema the name never resolved to and never fired.
+     */
+    private String ruleSchemaOf(String writtenSchema, String relation) {
+        if (writtenSchema == null && relation != null
+                && executor.systemCatalog.resolve("pg_catalog", relation, executor.session) != null) {
+            return "pg_catalog";
+        }
+        return executor.relationSchemaOf(writtenSchema, relation);
+    }
+
+    /** The columns a rule action that is a query answers in, worked out without running it. */
+    private List<Column> queryActionShape(String action) {
+        try {
+            com.memgres.engine.parser.ast.Statement parsed =
+                    com.memgres.engine.parser.Parser.parse(action);
+            if (!(parsed instanceof SelectStmt)) return null;
+            QueryResult described = executor.executeStatement(((SelectStmt) parsed).keepingAtMost(0));
+            List<Column> cols = described.getColumns();
+            return cols == null || cols.isEmpty() ? null : cols;
+        } catch (RuntimeException notAQueryHere) {
+            return null;
+        }
+    }
+
+    /** Whether the relation carries a rule that takes this write outright. */
+    private boolean anUnconditionalInsteadRuleTakes(String relation, String verb) {
+        String event = "update".equals(verb) ? "UPDATE"
+                : "delete from".equals(verb) ? "DELETE" : "INSERT";
+        for (Database.StoredRule rule
+                : executor.database.getRules("pg_catalog", relation, event)) {
+            if (rule.isInstead() && rule.getQualification() == null) return true;
+        }
+        return false;
     }
 
     /**
@@ -1554,12 +1611,19 @@ class DmlExecutor {
             }
         }
 
-        // Fire queued AFTER ROW triggers (use leaf partition table for correct TG_TABLE_NAME)
-        for (int i = 0; i < afterRowTriggerNewRows.size(); i++) {
-            Table trigTable = afterRowTriggerTables.get(i);
-            triggerHelper.executeTriggers(rowTriggersIn(insertRowTriggers, trigTable, triggers),
-                    PgTrigger.Timing.AFTER, PgTrigger.Event.INSERT, afterRowTriggerNewRows.get(i), null, trigTable);
-        }
+        // Fire queued AFTER ROW triggers (use leaf partition table for correct TG_TABLE_NAME).
+        // A trigger that declared a transition table reads the rows the whole statement wrote,
+        // and reads them at every firing -- see withTransitionTables.
+        final List<PgTrigger> afterRowKinds = triggers;
+        triggerHelper.withTransitionTables(triggers, table, insertedRows, null, () -> {
+            for (int i = 0; i < afterRowTriggerNewRows.size(); i++) {
+                Table trigTable = afterRowTriggerTables.get(i);
+                triggerHelper.executeTriggers(
+                        rowTriggersIn(insertRowTriggers, trigTable, afterRowKinds),
+                        PgTrigger.Timing.AFTER, PgTrigger.Event.INSERT,
+                        afterRowTriggerNewRows.get(i), null, trigTable);
+            }
+        });
 
         // Fire statement-level AFTER triggers with transition tables
         triggerHelper.fireStatementTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.INSERT, table, insertedRows, null);
@@ -1837,7 +1901,7 @@ class DmlExecutor {
         // them: a COPY that wrote the schema out looked for them under "schema.relation" and found
         // none, and every trigger of a relation named that way was silently skipped.
         List<PgTrigger> triggers = enabledTriggers(
-                executor.database.getTriggersForTable(beforeCopyTable.getName()));
+                executor.database.getTriggersForTable(beforeCopyTable));
         if (!triggers.isEmpty()) {
             Object[] modified = triggerHelper.executeTriggers(triggers, PgTrigger.Timing.BEFORE, PgTrigger.Event.INSERT, row, null, beforeCopyTable);
             if (modified == null) return null; // BEFORE trigger returned null = skip row
@@ -1859,7 +1923,7 @@ class DmlExecutor {
         // it somewhere else. Running each row's AFTER as the row went let that trigger read a
         // relation the statement had not finished writing.
         List<PgTrigger> afterCopyTriggers = targetTable == beforeCopyTable ? triggers
-                : enabledTriggers(executor.database.getTriggersForTable(targetTable.getName()));
+                : enabledTriggers(executor.database.getTriggersForTable(targetTable));
         if (!afterCopyTriggers.isEmpty()) {
             copyAfterRowTriggers.add(afterCopyTriggers);
             copyAfterRowTables.add(targetTable);
@@ -1921,7 +1985,7 @@ class DmlExecutor {
         discardCopyFrom();
         Table table = copyRelationOf(stmt);
         List<PgTrigger> declared = enabledTriggers(
-                executor.database.getTriggersForTable(table.getName()));
+                executor.database.getTriggersForTable(table));
         // Only a transition table reads the written rows back, so nothing is kept when no AFTER
         // statement trigger of this relation declared one.
         boolean collects = false;
@@ -2369,14 +2433,15 @@ class DmlExecutor {
         // INSTEAD NOTHING rule means no update happens and none of the checks below apply. A rule
         // with a WHERE takes only the rows it holds for out of the statement.
         List<Expression> insteadSuppress = new ArrayList<>();
-        QueryResult ruled = applyInsteadRule(executor.relationSchemaOf(stmt.schema(), stmt.table()),
+        String ruleSchema = ruleSchemaOf(stmt.schema(), stmt.table());
+        QueryResult ruled = applyInsteadRule(ruleSchema,
                 stmt.table(), "UPDATE", QueryResult.Type.UPDATE,
                 stmt.where(), stmt.setClauses(), stmt.alias(), stmt.from(), stmt.returning(),
                 insteadSuppress);
         if (ruled != null) return ruled;
         // A DO ALSO rule is added to the statement, so its actions run against the rows as they
         // are now and the statement then goes on to do its own work.
-        applyAlsoRule(executor.relationSchemaOf(stmt.schema(), stmt.table()),
+        applyAlsoRule(ruleSchema,
                 stmt.table(), "UPDATE", stmt.where(), stmt.setClauses(),
                 stmt.alias(), stmt.from());
         String schemaName = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
@@ -2391,6 +2456,9 @@ class DmlExecutor {
         // An UPDATE names one row at a time; there is no group behind it to aggregate and no
         // result to number a window against, in either the assignments or the WHERE.
         checkUpdatePlacement(stmt, table);
+        // What each assignment produces is held to the column's type here, before any row is
+        // read: the statement is refused whether or not the qualification matches anything.
+        requireSetClausesAssignable(stmt.setClauses(), table);
         // Capture view column mapping before further resolveTable calls clobber it (renamed-column views).
         captureViewTarget();
         activeViewWriteTarget = executor.database.getView(schemaName, stmt.table());
@@ -2684,6 +2752,8 @@ class DmlExecutor {
             for (int i = 0; i < matchedRows.size(); i++) {
                 Object[] row = matchedRows.get(i);
                 if (updated.contains(row)) continue; // Each row updated at most once
+                if (executor.session != null
+                        && executor.session.rowAlreadyWrittenThisStatement(row)) continue;
                 // A qualified INSTEAD rule has already spoken for the rows its WHERE holds for.
                 if (!insteadSuppress.isEmpty()) {
                     Object[] proposed = Arrays.copyOf(row, row.length);
@@ -2840,6 +2910,11 @@ class DmlExecutor {
                     updateWouldHaveWritten);
         }
 
+        // Every part of one statement reads the same snapshot, so a row a data-modifying WITH
+        // item has already written is not one the rest of the statement may write again:
+        // PostgreSQL passes over it. Written twice, WITH a AS (UPDATE t ... RETURNING id) DELETE
+        // FROM t WHERE id IN (SELECT id FROM a) deleted the row it had just updated.
+        rows = rowsThisStatementHasNotWritten(rows);
         // A qualified INSTEAD rule has already spoken for the rows its WHERE holds for.
         if (!insteadSuppress.isEmpty()) {
             List<Object[]> keptRows = new ArrayList<>();
@@ -2980,13 +3055,18 @@ class DmlExecutor {
             }
         }
 
-        // Fire queued AFTER ROW triggers
-        for (PendingAfterRow pending : simpleAfterRows) {
-            triggerHelper.executeTriggers(
-                    rowTriggersIn(updateRowTriggers, pending.relation, triggers),
-                    PgTrigger.Timing.AFTER, pending.event, pending.newRow, pending.oldRow,
-                    pending.relation, updatedColumnNames);
-        }
+        // Fire queued AFTER ROW triggers, with the rows the whole statement wrote in scope for
+        // any trigger that declared a transition table -- see withTransitionTables.
+        final List<PgTrigger> updateAfterKinds = triggers;
+        final Set<String> updateAfterColumns = updatedColumnNames;
+        triggerHelper.withTransitionTables(triggers, table, simpleNewRows, simpleOldRows, () -> {
+            for (PendingAfterRow pending : simpleAfterRows) {
+                triggerHelper.executeTriggers(
+                        rowTriggersIn(updateRowTriggers, pending.relation, updateAfterKinds),
+                        PgTrigger.Timing.AFTER, pending.event, pending.newRow, pending.oldRow,
+                        pending.relation, updateAfterColumns);
+            }
+        });
 
         // Fire statement-level AFTER UPDATE triggers with transition tables
         triggerHelper.fireStatementTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.UPDATE, table, simpleNewRows, simpleOldRows);
@@ -3408,6 +3488,25 @@ class DmlExecutor {
         String tName = table.getName();
         for (Object[] row : rows) {
             executor.database.lockRowWaiting(tName, row, executor.session, "UPDATE");
+        }
+    }
+
+    /**
+     * What each SET clause assigns, held to the column's type before any row is touched.
+     *
+     * <p>PostgreSQL settles this while it reads the statement, so an assignment the column cannot
+     * take is refused whether or not the qualification matches a row. Judged as each row was
+     * written instead, the same UPDATE was refused over a relation holding rows and accepted over
+     * an empty one.
+     */
+    void requireSetClausesAssignable(List<InsertStmt.SetClause> setClauses, Table table) {
+        if (setClauses == null || table == null) return;
+        for (InsertStmt.SetClause set : setClauses) {
+            if (set.subscripts() != null || set.subField() != null) continue;
+            int colIdx = table.getColumnIndex(mapViewColumn(set.column()));
+            if (colIdx < 0) continue;
+            if (isDefaultLiteral(set.value())) continue;
+            validationHelper.requireAssignable(set.value(), table.getColumns().get(colIdx));
         }
     }
 
@@ -3923,6 +4022,12 @@ class DmlExecutor {
                     deleteWouldHaveTaken);
         }
 
+        // A row another part of this statement has already written is not one this part may
+        // write again -- see rowsThisStatementHasNotWritten.
+        if (executor.session != null) {
+            toDelete.removeIf(r -> executor.session.rowAlreadyWrittenThisStatement(r));
+            deleteOrder.removeIf(r -> executor.session.rowAlreadyWrittenThisStatement(r));
+        }
         // RLS USING filter for DELETE: remove rows that don't pass the DELETE policies, and the
         // SELECT policies too when the statement reads a column of the target
         if (rlsDeleteActive) {
@@ -4056,14 +4161,19 @@ class DmlExecutor {
         }
         deleted = deletedRows.size();
 
-        // Fire queued AFTER DELETE row triggers
+        // Fire queued AFTER DELETE row triggers, with the rows the whole statement took in
+        // scope for any trigger that declared a transition table -- see withTransitionTables.
         if (anyRowTriggers(deleteRowTriggers)) {
-            for (int i = 0; i < oldRowsForTransition.size(); i++) {
-                Table firesOn = deletedFrom.get(i);
-                triggerHelper.executeTriggers(rowTriggersIn(deleteRowTriggers, firesOn, triggers),
-                        PgTrigger.Timing.AFTER, PgTrigger.Event.DELETE, null,
-                        oldRowsForTransition.get(i), firesOn);
-            }
+            final List<PgTrigger> deleteAfterKinds = triggers;
+            triggerHelper.withTransitionTables(triggers, table, null, oldRowsForTransition, () -> {
+                for (int i = 0; i < oldRowsForTransition.size(); i++) {
+                    Table firesOn = deletedFrom.get(i);
+                    triggerHelper.executeTriggers(
+                            rowTriggersIn(deleteRowTriggers, firesOn, deleteAfterKinds),
+                            PgTrigger.Timing.AFTER, PgTrigger.Event.DELETE, null,
+                            oldRowsForTransition.get(i), firesOn);
+                }
+            });
         }
 
         // Fire statement-level AFTER DELETE triggers with transition tables
@@ -5540,7 +5650,10 @@ class DmlExecutor {
      * relation it was declared on, and plain inheritance children inherit no triggers at all.
      */
     private List<PgTrigger> rowTriggersFor(Table table, String named) {
-        List<PgTrigger> own = executor.database.getTriggersForTable(named);
+        List<PgTrigger> own = table != null && named != null
+                && named.equalsIgnoreCase(table.getName())
+                ? executor.database.getTriggersForTable(table)
+                : executor.database.getTriggersForTable(named);
         // A write through an auto-updatable view is rewritten onto the base relation, so the base
         // relation's triggers are the ones that fire. Looking them up under the name the statement
         // wrote found only the view's, which has none — the rows were written and every BEFORE and
@@ -5548,7 +5661,7 @@ class DmlExecutor {
         // stay first, so the INSTEAD OF scan reads them before anything the base relation adds.
         if (table != null && table.getName() != null && !table.getName().equalsIgnoreCase(named)) {
             List<PgTrigger> throughView = new ArrayList<PgTrigger>(own);
-            throughView.addAll(executor.database.getTriggersForTable(table.getName()));
+            throughView.addAll(executor.database.getTriggersForTable(table));
             own = throughView;
         }
         return own;
@@ -6738,12 +6851,20 @@ class DmlExecutor {
     private static final class RuleAnswer {
         private Table shape;
         private final List<Object[]> rows = new ArrayList<>();
+        /** The columns of the last action that was itself a query, which are what it answers in. */
+        private List<Column> selected;
     }
 
     /** Keep what a rule action answered with, for a statement whose RETURNING it stands in for. */
     private static void collectRuleAnswer(RuleAnswer answer, QueryResult actionResult) {
         if (answer == null || actionResult == null || actionResult.getRows() == null) return;
         if (actionResult.getColumns() == null || actionResult.getColumns().isEmpty()) return;
+        // A rule whose action is a query answers the statement with that query's rows, whether or
+        // not the statement wrote a RETURNING: DO INSTEAD SELECT is how pg_settings takes an
+        // UPDATE. Kept only for a RETURNING, such a statement answered with a bare command tag.
+        if (actionResult.getType() == QueryResult.Type.SELECT) {
+            answer.selected = actionResult.getColumns();
+        }
         answer.rows.addAll(actionResult.getRows());
     }
 
@@ -6834,7 +6955,7 @@ class DmlExecutor {
         // leaves the statement to report its own count for the rest.
         int count = 0;
         boolean answersReturning = wholeStatement && returning != null && !returning.isEmpty();
-        RuleAnswer answer = answersReturning ? new RuleAnswer() : null;
+        RuleAnswer answer = wholeStatement ? new RuleAnswer() : null;
         for (Database.StoredRule rule : rules) {
             if (!rule.isInstead()) continue;
             if (!wholeStatement && rule.getQualification() != null) {
@@ -6850,6 +6971,9 @@ class DmlExecutor {
         }
         if (answersReturning) {
             return insteadRuleReturning(returning, answer.shape, alias, type, count, answer.rows);
+        }
+        if (answer != null && answer.selected != null) {
+            return QueryResult.select(answer.selected, answer.rows);
         }
         return wholeStatement ? QueryResult.command(type, count) : null;
     }
@@ -7002,6 +7126,18 @@ class DmlExecutor {
             }
         } finally {
             executor.exitRuleExpansion(tableName, event);
+        }
+        // A statement that touched no row still answers in the shape the rule's query would have:
+        // PostgreSQL rewrites the statement into that query, and a query that matched nothing is
+        // still a query. Left unasked, such a statement answered with a bare command tag.
+        if (answer != null && answer.selected == null && affected.getRows().isEmpty()) {
+            for (String action : actions) {
+                List<Column> shape = queryActionShape(action);
+                if (shape != null) {
+                    answer.selected = shape;
+                    break;
+                }
+            }
         }
         for (int a = actions.length - 1; a >= 0; a--) {
             if (actionSetsTag[a]) return actionCounts[a];
@@ -8515,7 +8651,7 @@ class DmlExecutor {
      */
     private List<Column> returningStarColumns(Table table) {
         int[] projection = viewProjection(table);
-        if (projection == null) return table.getColumns();
+        if (projection == null) return describedAgainst(table, table.getColumns());
         List<String> names = targetViewColumns();
         List<Column> cols = new ArrayList<>(projection.length);
         for (int i = 0; i < projection.length; i++) {
@@ -8537,9 +8673,14 @@ class DmlExecutor {
                 }
             } else if (target.alias() != null) {
                 // Renaming a returned value does not change what it is: the column keeps the
-                // type the expression answers in, which for a column of the relation is its own.
-                cols.add(new Column(target.alias(),
-                        returnedType(target.expr(), table, sourceTable), true, false, null));
+                // type the expression answers in, which for a column of the relation is its own,
+                // and it is still described against the relation it came from.
+                Column renamed = new Column(target.alias(),
+                        returnedType(target.expr(), table, sourceTable), true, false, null);
+                int renamedFrom = target.expr() instanceof ColumnRef
+                        ? table.getColumnIndex(mapViewColumn(((ColumnRef) target.expr()).column()))
+                        : -1;
+                cols.add(renamedFrom >= 0 ? describedAgainst(table, renamed, renamedFrom) : renamed);
             } else if (target.expr() instanceof ColumnRef) {
                 ColumnRef cr = (ColumnRef) target.expr();
                 String colName = cr.column();
@@ -8548,8 +8689,9 @@ class DmlExecutor {
                     Column base = table.getColumns().get(idx);
                     // The answer carries the name the statement wrote, which through a view whose
                     // columns are renamed is the view's name and not the base relation's.
-                    cols.add(colName.equalsIgnoreCase(base.getName()) ? base
-                            : new Column(colName, base.getType(), base.isNullable(), false, null));
+                    Column answered = colName.equalsIgnoreCase(base.getName()) ? base
+                            : new Column(colName, base.getType(), base.isNullable(), false, null);
+                    cols.add(describedAgainst(table, answered, idx));
                 } else {
                     cols.add(new Column(colName, DataType.TEXT, true, false, null));
                 }
@@ -8559,6 +8701,33 @@ class DmlExecutor {
             }
         }
         return cols;
+    }
+
+    /**
+     * A returned column described as a column of the relation it came from.
+     *
+     * <p>A client asks the catalogue what a column is, using the relation and column number the
+     * row description carries: that is how pgjdbc decides an integer column with a sequence
+     * behind it is a serial. Left unset on a RETURNING column -- where a SELECT sets them -- the
+     * same column was described one way when it was selected and another when it was returned.
+     */
+    private List<Column> describedAgainst(Table table, List<Column> columns) {
+        List<Column> described = new ArrayList<>(columns.size());
+        for (int i = 0; i < columns.size(); i++) {
+            described.add(describedAgainst(table, columns.get(i), i));
+        }
+        return described;
+    }
+
+    private Column describedAgainst(Table table, Column column, int colIdx) {
+        if (table == null || column == null || column.getTableOid() != 0) return column;
+        String schema = table.getSchemaName() == null ? "public" : table.getSchemaName();
+        int relOid = executor.systemCatalog.getOid("rel:" + schema + "." + table.getName());
+        if (relOid == 0) return column;
+        Column described = column.copy();
+        described.setTableOid(relOid);
+        described.setAttNum((short) table.attnumAt(colIdx));
+        return described;
     }
 
     /** The type a RETURNING expression answers in, read against the relations it may name. */

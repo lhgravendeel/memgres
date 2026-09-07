@@ -131,6 +131,18 @@ public class PlpgsqlParser {
      * as a syntax error naming the token it stopped at; reporting it as an internal error instead
      * tells the caller nothing they can act on and hides a plain typo behind a fault report.
      */
+    /**
+     * A condition or value the statement needs and the writer left out.
+     *
+     * <p>PostgreSQL names the token it found where the expression should have been -- the THEN of
+     * an IF with no condition, the LOOP of a WHILE with none, the semicolon after a bare RETURN --
+     * rather than saying the body ends too soon or nothing at all.
+     */
+    static MemgresException missingExpression(Token found) {
+        String at = found == null || found.type() == TokenType.EOF ? ";" : found.raw();
+        return new MemgresException("missing expression at or near \"" + at + "\"", "42601");
+    }
+
     static MemgresException syntaxError(Token t) {
         if (t == null || t.type() == TokenType.EOF) {
             return new MemgresException("syntax error at end of input", "42601");
@@ -666,14 +678,14 @@ public class PlpgsqlParser {
 
     private PlpgsqlStatement parseIf() {
         matchKw("IF");
-        String condition = collectUntilKeyword("THEN");
+        String condition = requireExpressionUntilKeyword("THEN");
         matchKw("THEN");
         List<PlpgsqlStatement> thenBody = parseStatements("ELSIF", "ELSEIF", "ELSE", "END");
         List<PlpgsqlStatement.ElsifClause> elsifs = new ArrayList<>();
 
         while (checkKw("ELSIF") || checkKw("ELSEIF")) {
             advance();
-            String elsifCond = collectUntilKeyword("THEN");
+            String elsifCond = requireExpressionUntilKeyword("THEN");
             matchKw("THEN");
             List<PlpgsqlStatement> elsifBody = parseStatements("ELSIF", "ELSEIF", "ELSE", "END");
             elsifs.add(new PlpgsqlStatement.ElsifClause(elsifCond, elsifBody));
@@ -733,7 +745,7 @@ public class PlpgsqlParser {
 
     private PlpgsqlStatement parseWhile(String label) {
         matchKw("WHILE");
-        String condition = collectUntilKeyword("LOOP");
+        String condition = requireExpressionUntilKeyword("LOOP");
         matchKw("LOOP");
         List<PlpgsqlStatement> body = parseStatements("END");
         endLoop(label);
@@ -1658,6 +1670,16 @@ public class PlpgsqlParser {
         return new CollectedSql(sb.toString(), intos, froms, lastSelect, returning);
     }
 
+    /**
+     * The same, for a place the grammar requires an expression: an empty one is the writer having
+     * left it out, which PostgreSQL reports against the keyword that followed.
+     */
+    private String requireExpressionUntilKeyword(String keyword) {
+        String written = collectUntilKeyword(keyword);
+        if (written.isEmpty()) throw missingExpression(peek());
+        return written;
+    }
+
     private String collectUntilKeyword(String keyword) {
         int collectedFrom = pos;
         StringBuilder sb = new StringBuilder();
@@ -1734,7 +1756,11 @@ public class PlpgsqlParser {
             // a space in it became two names.
             sb.append('"').append(t.value().replace("\"", "\"\"")).append('"');
         } else {
-            sb.append(t.value());
+            // The word as it was written, not as the lexer folded it: SQL folds an unquoted name
+            // for itself, and what this text is for besides running is being quoted back in a
+            // complaint. Written folded, a misspelled statement was reported at "retrn" where
+            // PostgreSQL reports it at "RETRN" -- the word the author actually typed.
+            sb.append(t.raw());
         }
     }
 }

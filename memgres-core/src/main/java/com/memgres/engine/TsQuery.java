@@ -227,14 +227,17 @@ public class TsQuery {
             return result;
         }
         pos[0]++;
-        // Remove surrounding quotes if present
-        if (t.startsWith("'") && t.endsWith("'") && t.length() > 1) {
+        // A quoted lexeme is the whole of what the quotes hold: a modifier is what follows the
+        // closing quote, and the tokenizer has already taken one off where there was one. Looked
+        // for inside the quotes as well, 'a:b' was read as the lexeme a carrying weight B.
+        boolean wasQuoted = t.startsWith("'") && t.endsWith("'") && t.length() > 1;
+        if (wasQuoted) {
             t = t.substring(1, t.length() - 1);
         }
         // Check for weight/prefix modifiers: word:*AB or word:AB or word:*
         boolean isPrefix = false;
         Set<Character> ws = null;
-        int colonIdx = t.indexOf(':');
+        int colonIdx = wasQuoted ? -1 : t.indexOf(':');
         if (colonIdx > 0) {
             String modifier = t.substring(colonIdx + 1);
             t = t.substring(0, colonIdx);

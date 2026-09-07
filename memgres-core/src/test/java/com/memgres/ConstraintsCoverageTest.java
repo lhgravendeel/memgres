@@ -1060,6 +1060,7 @@ class ConstraintsCoverageTest {
 
     @Test
     void exclusion_usingGistParsed() throws SQLException {
+        exec("CREATE EXTENSION IF NOT EXISTS btree_gist");
         exec("CREATE TABLE t (id INT, room INT, val INT, EXCLUDE USING gist (room WITH =, val WITH =))");
         exec("INSERT INTO t VALUES (1, 100, 5)");
         assertEquals(1, queryInt("SELECT COUNT(*) FROM t"));
@@ -1074,6 +1075,7 @@ class ConstraintsCoverageTest {
 
     @Test
     void exclusion_withWhereParsed() throws SQLException {
+        exec("CREATE EXTENSION IF NOT EXISTS btree_gist");
         exec("CREATE TABLE t (id INT, room INT, active BOOLEAN, EXCLUDE USING gist (room WITH =) WHERE (active))");
         exec("INSERT INTO t VALUES (1, 100, true)");
         assertEquals(1, queryInt("SELECT COUNT(*) FROM t"));

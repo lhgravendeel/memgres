@@ -151,6 +151,11 @@ class DdlTableExecutor {
                 }
                 return QueryResult.command(QueryResult.Type.CREATE_TABLE, 0);
             }
+            // PostgreSQL reads the definition before it asks whether the name is free, so a
+            // statement that is wrong in both ways is reported as wrong rather than as a
+            // collision. IF NOT EXISTS is the exception: it stops at the name and never looks at
+            // what follows, which is why the checks below are only made here.
+            rejectIncoherentDefinition(stmt);
             throw new MemgresException("relation \"" + stmt.name() + "\" already exists", "42P07");
         }
         // A table carries a row type of its own name, so a name an enum, a domain or a range
@@ -218,7 +223,10 @@ class DdlTableExecutor {
                             break;
                         }
                     }
-                    if (existing == null) { inheritedColumns.add(col); continue; }
+                    // The child's column is its own, not the parent's: sharing the object made
+                    // an ALTER of either relation's column reach both, so SET STORAGE on a child
+                    // changed the parent's storage too.
+                    if (existing == null) { inheritedColumns.add(col.copy()); continue; }
                     // Two parents contributing one column have to agree about what it holds:
                     // the child gets one column, so a second parent's wider type has nowhere
                     // to go and its rows would silently change shape on the way in.
@@ -453,6 +461,12 @@ class DdlTableExecutor {
                 Sequence seq = buildIdentitySequence(def, dataType, seqName, seqSchema, stmt.name());
                 executor.database.addSequence(seq);
                 executor.database.registerSchemaObject(seqSchema, "sequence", seqName);
+                // A statement that fails never happened, and the sequence its column would have
+                // brought with it is part of the statement: left behind, a CREATE TABLE refused
+                // for something further down the definition still took the name, so the sequence
+                // outlived a table that was never made.
+                executor.recordUndo(new Session.CreateSequenceUndo(
+                        seqSchema + "." + seqName));
                 // A sequence a column brings with it is a sequence, and takes what ALTER DEFAULT
                 // PRIVILEGES set aside for one.
                 applyDefaultPrivileges(executor, seqSchema, seqName, executor.currentRole(),
@@ -493,6 +507,8 @@ class DdlTableExecutor {
                 seq.ownedBy(stmt.name(), def.name(), true);
                 executor.database.addSequence(seq);
                 executor.database.registerSchemaObject(schemaName, "sequence", seqName);
+                executor.recordUndo(new Session.CreateSequenceUndo(
+                        schemaName + "." + seqName));
                 applyDefaultPrivileges(executor, schemaName, seqName, executor.currentRole(),
                         "SEQUENCES", "SEQUENCE");
                 // Numbered here for the same reason an identity column's is: PostgreSQL writes the
@@ -503,7 +519,8 @@ class DdlTableExecutor {
                 notNull = true;
             }
             if (def.defaultExpr() != null) {
-                defaultVal = DdlExecutor.exprToDefaultString(def.defaultExpr());
+                defaultVal = DdlExecutor.exprToDefaultString(def.defaultExpr(),
+                        dataType == null ? null : CatalogHelper.pgTypeName(dataType));
                 if (dataType != null && TypeCoercion.categoryOf(dataType) == TypeCoercion.TypeCategory.NUMERIC) {
                     // Only a bare string literal is read with the column type's input function:
                     // it is still of type unknown, so the number is what it has to name. A literal
@@ -624,6 +641,7 @@ class DdlTableExecutor {
                     enumTypeName, colPrecision, colScale, def.generatedExpr(), def.generatedVirtual(),
                     domainTypeName, compositeTypeName, arrayElementType);
             col.setCollation(def.collation);
+            col.setArrayDimensions(resolved.getArrayDimensions());
             // A range is a type of its own, as an enum and a composite are, and the column is a
             // column of it however its values are carried underneath.
             col.setRangeTypeName(resolved.rangeTypeName());
@@ -911,6 +929,9 @@ class DdlTableExecutor {
                     DdlDefinitionChecks.requireKeyColumnsExist(table, tc.includedColumns());
                     if (tc.type() == TableConstraint.ConstraintType.EXCLUDE) {
                         DdlDefinitionChecks.requireExclusionCapableAccessMethod(tc.excludeMethod());
+                        // The index behind the constraint needs an operator class for each key.
+                        DdlDefinitionChecks.requireExclusionKeyOpclass(executor.database, table,
+                                tc.columns(), tc.excludeMethod());
                         // And with an operator the index can compare either way round.
                         DdlDefinitionChecks.requireCommutativeExclusionOperators(
                                 table, tc.excludeElements());
@@ -1195,6 +1216,40 @@ class DdlTableExecutor {
                 SchemaQualifier.resolveAlias(executor.session, writtenSchema), parentName, true);
     }
 
+    /**
+     * A partition's columns: the partitioned table's, with whatever the statement restated about
+     * them applied to the partition's own copies.
+     *
+     * <p>A partition takes its shape from the table it belongs to, but it may say something more
+     * about a column of its own -- a default, a NOT NULL. That is the partition's and not the
+     * parent's, so the column has to be a copy: shared, a default written on one partition
+     * appeared on the parent and on every sibling.
+     */
+    private List<Column> partitionColumns(Table parent, CreateTableStmt stmt, String schemaName) {
+        List<Column> columns = new ArrayList<>();
+        for (Column parentCol : parent.getColumns()) columns.add(parentCol.copy());
+        if (stmt.columns() == null) return columns;
+        for (ColumnDef restated : stmt.columns()) {
+            int at = -1;
+            for (int i = 0; i < columns.size(); i++) {
+                if (columns.get(i).getName().equalsIgnoreCase(restated.name())) { at = i; break; }
+            }
+            if (at < 0) {
+                throw new MemgresException("column \"" + restated.name() + "\" of relation \""
+                        + stmt.name() + "\" does not exist", "42703");
+            }
+            Column col = columns.get(at);
+            if (restated.defaultExpr() != null) {
+                DataType type = col.getType();
+                columns.set(at, col.withDefault(DdlExecutor.exprToDefaultString(
+                        restated.defaultExpr(),
+                        type == null ? null : CatalogHelper.pgTypeName(type))));
+            }
+            if (restated.notNull()) columns.set(at, columns.get(at).withNullable(false));
+        }
+        return columns;
+    }
+
     private QueryResult createPartitionOfTable(CreateTableStmt stmt, Schema schema, String schemaName) {
         Table parent = resolveParentRelation(
                 stmt.partitionOfParentSchema(), stmt.partitionOfParent(), schemaName);
@@ -1204,7 +1259,8 @@ class DdlTableExecutor {
             throw new MemgresException("\"" + stmt.partitionOfParent() + "\" is not partitioned",
                     "42P17");
         }
-        Table partition = new Table(stmt.name(), new ArrayList<>(parent.getColumns()));
+        Table partition = new Table(stmt.name(),
+                partitionColumns(parent, stmt, schemaName));
         partition.setPartitionParent(parent);
         // A partition declares nothing of its own: the NOT NULL on its columns is the partitioned
         // table's rule, and PostgreSQL goes on reporting that table's constraint name for it.
@@ -1764,6 +1820,50 @@ class DdlTableExecutor {
             } else sb.append(v);
         }
         return sb.toString();
+    }
+
+    /**
+     * The faults PostgreSQL finds in a table definition before it looks at whether the name is
+     * free: a column declared twice, a column whose type is not there, an identity sequence whose
+     * options contradict each other, and a key naming a column the definition does not declare.
+     *
+     * <p>Nothing here writes anything. It runs only where a relation of the name already stands,
+     * to say what PostgreSQL would have said first; every one of these is checked again on the
+     * ordinary path, where the definition is actually stored.
+     */
+    private void rejectIncoherentDefinition(CreateTableStmt stmt) {
+        if (stmt.columns() == null) return;
+        Set<String> declared = new LinkedHashSet<>();
+        for (ColumnDef def : stmt.columns()) {
+            if (def.typeName() == null) continue;
+            DdlExecutor.ResolvedType resolved = ddl.resolveColumnType(def.typeName(), null);
+            if (!declared.add(def.name())) {
+                throw new MemgresException(
+                        "column \"" + def.name() + "\" specified more than once", "42701");
+            }
+            if (def.identity() != null) {
+                DataType dt = resolved.dataType();
+                buildIdentitySequence(def, dt, stmt.name() + "_" + def.name() + "_seq",
+                        stmt.schema(), stmt.name());
+            }
+        }
+        if (stmt.constraints() == null) return;
+        Set<String> folded = new HashSet<>();
+        for (String name : declared) folded.add(name.toLowerCase(java.util.Locale.ROOT));
+        for (TableConstraint c : stmt.constraints()) {
+            if (c.type() != TableConstraint.ConstraintType.PRIMARY_KEY
+                    && c.type() != TableConstraint.ConstraintType.UNIQUE) {
+                continue;
+            }
+            if (c.columns() == null) continue;
+            for (String written : c.columns()) {
+                if (written == null) continue;
+                if (!folded.contains(written.toLowerCase(java.util.Locale.ROOT))) {
+                    throw new MemgresException(
+                            "column \"" + written + "\" named in key does not exist", "42703");
+                }
+            }
+        }
     }
 
     /**
@@ -2867,7 +2967,7 @@ class DdlTableExecutor {
                 executor.recordUndo(new Session.TruncateUndo(childSchema, child.getName(),
                         new ArrayList<>(child.getRows()), child.getSerialCounter(),
                         child.getTupleIdCounter()));
-                List<PgTrigger> childTriggers = executor.database.getTriggersForTable(child.getName());
+                List<PgTrigger> childTriggers = executor.database.getTriggersForTable(child);
                 fireTruncateStatementTriggers(childTriggers, PgTrigger.Timing.BEFORE, child);
                 child.deleteAll();
                 child.resetTupleIdCounter(0);
@@ -3025,7 +3125,7 @@ class DdlTableExecutor {
                                     target.getTupleIdCounter()));
                         }
                         // Fire BEFORE TRUNCATE statement-level triggers
-                        List<PgTrigger> triggers = executor.database.getTriggersForTable(bareName);
+                        List<PgTrigger> triggers = executor.database.getTriggersForTable(table);
                         for (PgTrigger trig : triggers) {
                             if (!trig.isDisabled() && trig.getEvent() == PgTrigger.Event.TRUNCATE
                                     && trig.getTiming() == PgTrigger.Timing.BEFORE && trig.isForEachStatement()) {

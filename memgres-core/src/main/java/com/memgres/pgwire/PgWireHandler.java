@@ -586,6 +586,7 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
             // for something that is no longer there rather than running work from before.
             preparedStatements.remove("");
             portals.remove("");
+            if (session != null) session.setOpenUnnamedPortal(null);
             // A query holding no statement at all is answered with an EmptyQueryResponse, which
             // stands where a CommandComplete would.
             if (!sentAnything) sendEmptyQueryResponse(ctx);
@@ -1065,6 +1066,9 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                 || stmtDescribed.getOrDefault(stmtName, false);
         portal.stmtName = stmtName;
         portals.put(portalName, portal);
+        // The unnamed portal is a cursor as far as pg_cursors is concerned, and PostgreSQL lists
+        // it under the empty name while it is open.
+        if (portalName.isEmpty() && session != null) session.setOpenUnnamedPortal(prepared.sql());
 
         if (Memgres.logAllStatements) LOG.info("[PROTO] Bind portal='{}' stmt='{}' params={} rowDescAlready={}",
                 portalName, stmtName, paramValues.size(), portal.rowDescriptionSent);
@@ -1502,9 +1506,13 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
      * transaction, which is why an unfinished portal does not outlive the ReadyForQuery.
      */
     private void dropPortalsOutsideTransaction() {
-        if (!portals.isEmpty() && (session == null || !session.isInTransaction())) {
-            portals.clear();
-        }
+        if (session != null && session.isInTransaction()) return;
+        if (!portals.isEmpty()) portals.clear();
+        // A cursor without WITH HOLD lives no longer than the transaction that opened it, and in
+        // autocommit that is one statement. Only the explicit COMMIT swept them, so a cursor a
+        // routine opened and did not close stayed open for the rest of the session -- and every
+        // call of that routine left another behind for pg_cursors to list.
+        if (session != null) session.destroyNonHoldableCursors();
     }
 
     /** The first result format code that is neither text nor binary, or -1 when they all are. */

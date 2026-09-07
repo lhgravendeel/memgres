@@ -408,6 +408,12 @@ public final class SelectStmt implements Statement {
         public final boolean only;
         /** The alias list of {@code t AS z(c1, c2)}: renames the relation's first columns. */
         public final List<String> columnAliases;
+        /**
+         * The catalog a three-part name wrote, or null where the name has two parts or fewer.
+         * PostgreSQL reaches only the catalog it is connected to, and which one that is is a
+         * question for the session rather than for the grammar.
+         */
+        public String catalog;
 
         /** Retarget this reference at the same relation under its new schema and name. */
         public void retarget(String newSchema, String newTable) {
@@ -889,6 +895,24 @@ public final class SelectStmt implements Statement {
         SelectStmt copy = new SelectStmt(distinct, distinctOn, targets, from, where, groupBy,
                 having, windowDefs, orderBy, Literal.ofInt("0"), offset, withClauses,
                 groupingSets, lockClause, false);
+        copy.fromValues = fromValues;
+        copy.joinExpression = joinExpression;
+        copy.groupingElements = groupingElements;
+        copy.groupByDistinct = groupByDistinct;
+        return copy;
+    }
+
+    /**
+     * The same query written to keep at most this many rows.
+     *
+     * <p>Used where the query reading this one can only ever look at that many: a subquery in FROM
+     * under a LIMIT need not produce more than the LIMIT asks for, and producing more is work --
+     * and memory -- spent on rows nothing will read.
+     */
+    public SelectStmt keepingAtMost(long rows) {
+        SelectStmt copy = new SelectStmt(distinct, distinctOn, targets, from, where, groupBy,
+                having, windowDefs, orderBy, Literal.ofInt(Long.toString(rows)), offset,
+                withClauses, groupingSets, lockClause, withTies);
         copy.fromValues = fromValues;
         copy.joinExpression = joinExpression;
         copy.groupingElements = groupingElements;

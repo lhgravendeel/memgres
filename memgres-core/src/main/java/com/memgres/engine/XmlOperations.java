@@ -38,22 +38,48 @@ public final class XmlOperations {
         return text;
     }
 
-    /** Validate a string as XML content (for ::xml cast). Throws 2200N on failure. */
+    /**
+     * Validate a string as XML for the {@code ::xml} cast, the way {@code xmloption} says to.
+     *
+     * <p>An implicit parse reads its text as a document or as a content fragment depending on
+     * that setting, and a session that has asked for documents means it: taking anything that
+     * parses either way let {@code 'text'::xml} through under {@code xmloption = document}, where
+     * PostgreSQL refuses it.
+     */
+    public static String validateXmlCast(String text, boolean asDocument) {
+        if (text == null) return null;
+        if (!asDocument) return validateXmlCast(text);
+        String trimmed = text.trim();
+        try {
+            parseDocument(trimmed);
+        } catch (MemgresException e) {
+            throw invalidXml(true, extractXmlError(trimmed));
+        }
+        return trimmed;
+    }
+
+    /**
+     * Validate a string as XML content (for the {@code ::xml} cast). Throws 2200N on failure.
+     *
+     * <p>The value is the text it was written as. A content fragment may be surrounded by
+     * whitespace, and that whitespace is part of the fragment: trimmed away on the way in,
+     * {@code ' <a/> '::xml} came back as {@code <a/>} and no longer read as what was written.
+     */
     public static String validateXmlCast(String text) {
         if (text == null) return null;
-        text = text.trim();
+        String trimmed = text.trim();
         // Try as document first
         try {
-            parseDocument(text);
+            parseDocument(trimmed);
             return text;
         } catch (MemgresException e) {
             // Try as content
         }
         // Try as content — this throws 2200N on failure
         try {
-            parseContent(text);
+            parseContent(trimmed);
         } catch (MemgresException e) {
-            throw invalidXml(false, extractXmlError(text));
+            throw invalidXml(false, extractXmlError(trimmed));
         }
         return text;
     }
@@ -67,6 +93,10 @@ public final class XmlOperations {
     /** XMLSERIALIZE with INDENT: pretty-print XML with indentation. */
     public static String xmlserializeIndent(String xml) {
         if (xml == null) return null;
+        // Indenting starts at the first thing there is to indent, so whitespace in front of the
+        // fragment goes; whitespace after it is a text node of the fragment like any other and
+        // stays. Trimmed at both ends, a fragment written with a trailing space lost it.
+        String trailing = trailingWhitespaceOf(xml);
         try {
             DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
             dbf.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
@@ -81,11 +111,18 @@ public final class XmlOperations {
 
             StringWriter writer = new StringWriter();
             transformer.transform(new DOMSource(doc), new StreamResult(writer));
-            return writer.toString().trim();
+            return writer.toString().trim() + trailing;
         } catch (Exception e) {
             // Fallback: return as-is
             return xml;
         }
+    }
+
+    /** The whitespace a value ends with, which indenting leaves where it is. */
+    private static String trailingWhitespaceOf(String xml) {
+        int end = xml.length();
+        while (end > 0 && Character.isWhitespace(xml.charAt(end - 1))) end--;
+        return end == xml.length() ? "" : xml.substring(end);
     }
 
     /** IS DOCUMENT: returns true if the xml value is a well-formed XML document (single root element). */

@@ -183,7 +183,9 @@ class DdlExecutor {
     QueryResult executeCreateRole(CreateRoleStmt stmt) { return adminExecutor.executeCreateRole(stmt); }
     QueryResult executeAlterRole(AlterRoleStmt stmt) { return adminExecutor.executeAlterRole(stmt); }
     QueryResult executeDropRole(DropRoleStmt stmt) { return adminExecutor.executeDropRole(stmt); }
-    void executeDropOwned(String roleName) { adminExecutor.executeDropOwned(roleName); }
+    void executeDropOwned(String roleName, boolean cascade) {
+        adminExecutor.executeDropOwned(roleName, cascade);
+    }
 
     // ---- Shared helpers used by multiple delegates ----
 
@@ -380,7 +382,14 @@ class DdlExecutor {
                 return chk;
             }
             case FOREIGN_KEY: {
-                if (name == null) name = tableName + "_" + String.join("_", tc.columns()) + "_fkey";
+                // Two foreign keys over one column are two constraints, and PostgreSQL numbers
+                // the second: t_a_fkey and t_a_fkey1. Given the same name, the second replaced
+                // the first in a catalogue keyed by name, so a table with two of them reported
+                // one twice and enforced whichever had been stored last.
+                if (name == null) {
+                    name = uniqueConstraintName(
+                            tableName + "_" + String.join("_", tc.columns()) + "_fkey", existing);
+                }
                 String fkRefTable = tc.referencesTable();
                 String fkRefSchema = null;
                 if (fkRefTable != null && fkRefTable.contains(".")) {
@@ -541,6 +550,13 @@ class DdlExecutor {
         public final String compositeTypeName;
         public final DataType arrayElementType;
         public final boolean domainNotNull;
+        private int arrayDimensions;
+
+        public int getArrayDimensions() { return arrayDimensions; }
+
+        public void setArrayDimensions(int arrayDimensions) {
+            this.arrayDimensions = arrayDimensions;
+        }
 
         public ResolvedType(
                 DataType dataType,
@@ -684,7 +700,12 @@ class DdlExecutor {
 
         DataType dataType;
         if (isArray) {
-            DataType arrayDataType = DataType.fromPgName(fullTypeName);
+            // PostgreSQL has one array type per element type however many dimensions a value
+            // has, so text[][] is a text[]. Looked up under the whole written name, a column
+            // with more than one pair of brackets found no array type and was recorded as a
+            // plain text column.
+            DataType arrayDataType = DataType.fromPgName(baseType + "[]");
+            if (arrayDataType == null) arrayDataType = DataType.fromPgName(fullTypeName);
             dataType = (arrayDataType != null) ? arrayDataType : DataType.fromPgName(baseType);
         } else {
             dataType = DataType.fromPgName(baseType);
@@ -790,6 +811,14 @@ class DdlExecutor {
 
         ResolvedType resolved = new ResolvedType(dataType, enumTypeName, domainTypeName,
                 compositeTypeName, arrayElementType, domainNotNull);
+        // How many pairs of brackets the declaration was written with. PostgreSQL keeps the
+        // count here and nowhere else, because there is one array type per element type whatever
+        // the count is: a text[][] column reports attndims 2 and format_type text[].
+        int dims = 0;
+        for (int at = fullTypeName.indexOf("[]"); at >= 0; at = fullTypeName.indexOf("[]", at + 2)) {
+            dims++;
+        }
+        resolved.setArrayDimensions(dims);
         resolved.setRangeTypeName(rangeTypeName);
         resolved.setDomainTypmod(domainPrecision, domainScale, domainInterval);
         // How the reader would have written the domain's name is settled here, while the session
@@ -814,20 +843,86 @@ class DdlExecutor {
     // ---- Static helpers ----
 
     /** An operand written with the parentheses that keep it the operand it is. */
-    private static String grouped(Expression operand) {
-        String text = exprToDefaultString(operand);
+    private static String grouped(Expression operand, String labelType) {
+        String text = render(operand, labelType, false);
         return operand instanceof BinaryExpr || operand instanceof CustomOperatorExpr
                 ? "(" + text + ")" : text;
     }
 
+    /** The constructs whose arguments PostgreSQL reads as the type the whole expression is. */
+    private static final Set<String> COERCING_CALLS =
+            Cols.setOf("coalesce", "nullif", "greatest", "least");
+
     /** Convert an Expression AST to a default-value string representation. */
     static String exprToDefaultString(Expression expr) {
-        if (expr instanceof FunctionCallExpr) {
+        return exprToDefaultString(expr, null);
+    }
+
+    /**
+     * The same, with the type the column was declared as.
+     *
+     * <p>A value written out inside a CASE or a COALESCE is of no type of its own until the
+     * column settles one, and PostgreSQL writes the settled type into the text it keeps: the
+     * default of a text column reads back as {@code COALESCE(NULL::text, 'c'::text)}. Written
+     * without the labels, the text said less than PostgreSQL's does about how it will be read.
+     */
+    static String exprToDefaultString(Expression expr, String labelType) {
+        return render(expr, labelType, false);
+    }
+
+    /** True for a value written out that carries no type of its own: a string, or NULL. */
+    private static boolean carriesNoType(Expression expr) {
+        if (!(expr instanceof Literal)) return false;
+        Literal lit = (Literal) expr;
+        return lit.value() == null || lit.literalType() == Literal.LiteralType.STRING;
+    }
+
+    private static String render(Expression expr, String labelType, boolean labelHere) {
+        if (labelHere && labelType != null && carriesNoType(expr)) {
+            return render(expr, labelType, false) + "::" + labelType;
+        }
+        if (expr instanceof CaseExpr) {
+            // PostgreSQL prints a CASE over several lines, opening with one of its own, and
+            // reads every branch as the type the column settled on. Left unhandled, the whole
+            // expression fell through to the word "null" and the column was recorded as having
+            // no default at all.
+            CaseExpr ce = (CaseExpr) expr;
+            StringBuilder sb = new StringBuilder("\nCASE");
+            if (ce.operand() != null) sb.append(' ').append(render(ce.operand(), labelType, false));
+            for (CaseExpr.WhenClause when : ce.whenClauses()) {
+                sb.append("\n    WHEN ").append(render(when.condition(), labelType, false))
+                        .append(" THEN ").append(render(when.result(), labelType, true));
+            }
+            if (ce.elseExpr() != null) {
+                sb.append("\n    ELSE ").append(render(ce.elseExpr(), labelType, true));
+            }
+            return sb.append("\nEND").toString();
+        } else if (expr instanceof SubscriptExpr) {
+            // An element taken out of something is written with the something in parentheses,
+            // which is how PostgreSQL prints it and how it reads back as the same expression.
+            SubscriptExpr sub = (SubscriptExpr) expr;
+            StringBuilder sb = new StringBuilder("(")
+                    .append(render(sub.base(), labelType, false)).append(')');
+            for (SubscriptExpr.Subscript one : sub.subscripts()) {
+                sb.append('[');
+                if (one.lower() != null) sb.append(render(one.lower(), labelType, false));
+                if (one.slice()) sb.append(':');
+                if (one.upper() != null && one.slice()) {
+                    sb.append(render(one.upper(), labelType, false));
+                } else if (one.upper() != null && one.lower() == null) {
+                    sb.append(render(one.upper(), labelType, false));
+                }
+                sb.append(']');
+            }
+            return sb.toString();
+        } else if (expr instanceof FunctionCallExpr) {
             FunctionCallExpr fn = (FunctionCallExpr) expr;
+            boolean coerces = COERCING_CALLS.contains(
+                    fn.name().toLowerCase(java.util.Locale.ROOT));
             StringBuilder sb = new StringBuilder(fn.name()).append("(");
             for (int i = 0; i < fn.args().size(); i++) {
                 if (i > 0) sb.append(", ");
-                sb.append(exprToDefaultString(fn.args().get(i)));
+                sb.append(render(fn.args().get(i), labelType, coerces));
             }
             sb.append(")");
             return sb.toString();
@@ -842,13 +937,14 @@ class DdlExecutor {
             return ref.column();
         } else if (expr instanceof CastExpr) {
             CastExpr cast = (CastExpr) expr;
-            return exprToDefaultString(cast.expr()) + "::" + cast.typeName();
+            return render(cast.expr(), labelType, false) + "::" + cast.typeName();
         } else if (expr instanceof CustomOperatorExpr) {
             CustomOperatorExpr cop = (CustomOperatorExpr) expr;
             if (cop.left() != null) {
-                return grouped(cop.left()) + " " + cop.opSymbol() + " " + grouped(cop.right());
+                return grouped(cop.left(), labelType) + " " + cop.opSymbol() + " "
+                        + grouped(cop.right(), labelType);
             } else {
-                return cop.opSymbol() + " " + grouped(cop.right());
+                return cop.opSymbol() + " " + grouped(cop.right(), labelType);
             }
         } else if (expr instanceof BinaryExpr) {
             BinaryExpr bin = (BinaryExpr) expr;
@@ -907,7 +1003,7 @@ class DdlExecutor {
             // text is what the default is stored as and what the catalogue re-reads it from, so
             // grouping the writer put in has to survive the round trip: written flat, a default
             // of (2 + 3) * 4 read back as 2 + 3 * 4 and reported itself as 2 + (3 * 4).
-            return grouped(bin.left()) + " " + op + " " + grouped(bin.right());
+            return grouped(bin.left(), labelType) + " " + op + " " + grouped(bin.right(), labelType);
         } else if (expr instanceof UnaryExpr) {
             UnaryExpr un = (UnaryExpr) expr;
             String op;
@@ -925,7 +1021,7 @@ class DdlExecutor {
                     op = un.op().name();
                     break;
             }
-            return op + exprToDefaultString(un.operand());
+            return op + render(un.operand(), labelType, false);
         } else if (expr instanceof ArrayExpr) {
             // Without this an ARRAY[...] default fell through to the "null" below, so the column
             // was recorded as having no default at all and every insert that relied on it
@@ -934,7 +1030,7 @@ class DdlExecutor {
             StringBuilder sb = new StringBuilder(arr.isRow() ? "ROW(" : "ARRAY[");
             for (int i = 0; i < arr.elements().size(); i++) {
                 if (i > 0) sb.append(", ");
-                sb.append(exprToDefaultString(arr.elements().get(i)));
+                sb.append(render(arr.elements().get(i), labelType, false));
             }
             return sb.append(arr.isRow() ? ")" : "]").toString();
         }
@@ -1159,6 +1255,85 @@ class DdlExecutor {
      * Used for CREATE INDEX — PG enforces immutability for built-in volatile functions
      * but allows user-defined volatile functions in expression indexes.
      */
+    /**
+     * The casts PostgreSQL declares no more than stable, written as "from>to".
+     *
+     * <p>Any reading of a {@code timestamptz} depends on the session's TimeZone, and so does
+     * writing one; a date, a timestamp or an interval written out depends on the session's
+     * DateStyle or IntervalStyle, and reading a date or a timestamp from text depends on DateStyle
+     * as well. A value that changes with a setting cannot be an index key, because the same row
+     * would belong in two places depending on who looked.
+     */
+    private static final Set<String> STABLE_CASTS = Cols.setOf(
+            "timestamptz>date", "timestamptz>timestamp", "timestamptz>time", "timestamptz>text",
+            "timestamp>timestamptz", "timestamp>text",
+            "date>timestamptz", "date>text",
+            "interval>text",
+            "text>date", "text>timestamp", "text>timestamptz",
+            "time>timetz");
+
+    /** Refuse an index key whose value depends on a session setting rather than on the row. */
+    static void rejectStableCastInIndex(Table table, Expression expr) {
+        walkForStableCast(table, expr);
+    }
+
+    private static void walkForStableCast(Table table, Object node) {
+        if (node == null) return;
+        if (node instanceof CastExpr) {
+            CastExpr cast = (CastExpr) node;
+            String to = canonicalCastType(cast.typeName());
+            String from = canonicalCastType(castSourceType(table, cast.expr()));
+            if (to != null && from != null && STABLE_CASTS.contains(from + ">" + to)) {
+                throw new MemgresException(
+                        "functions in index expression must be marked IMMUTABLE", "42P17");
+            }
+        }
+        if (node instanceof Iterable) {
+            for (Object o : (Iterable<?>) node) walkForStableCast(table, o);
+            return;
+        }
+        if (!node.getClass().getName().startsWith("com.memgres.engine.parser.ast.")) return;
+        for (java.lang.reflect.Field field : node.getClass().getDeclaredFields()) {
+            if (java.lang.reflect.Modifier.isStatic(field.getModifiers())) continue;
+            try {
+                field.setAccessible(true);
+                walkForStableCast(table, field.get(node));
+            } catch (Exception e) { /* inaccessible: treat as leaf */ }
+        }
+    }
+
+    /** The type the value being cast already has, from the column or the cast below it. */
+    private static String castSourceType(Table table, Expression source) {
+        if (source instanceof CastExpr) return ((CastExpr) source).typeName();
+        if (source instanceof Literal
+                && ((Literal) source).literalType() == Literal.LiteralType.STRING) {
+            return "text";
+        }
+        if (source instanceof ColumnRef && table != null) {
+            int at = table.getColumnIndex(((ColumnRef) source).column());
+            if (at < 0) return null;
+            DataType held = table.getColumns().get(at).getType();
+            return held == null ? null : held.getPgName();
+        }
+        return null;
+    }
+
+    /** A type name reduced to the word PostgreSQL keys its casts by. */
+    private static String canonicalCastType(String written) {
+        if (written == null) return null;
+        String bare = written.trim().toLowerCase(java.util.Locale.ROOT)
+                .replaceAll("\\(.*\\)", "").trim();
+        switch (bare) {
+            case "timestamp with time zone": return "timestamptz";
+            case "timestamp without time zone": return "timestamp";
+            case "time with time zone": return "timetz";
+            case "time without time zone": return "time";
+            case "character varying": case "varchar": case "character": case "bpchar":
+                return "text";
+            default: return bare;
+        }
+    }
+
     static void checkBuiltinVolatileInExpression(String exprStr, Database db, String errorMsg) {
         // A name running on into more letters is a different name: a column called
         // localtime_col carries the letters of localtime and is not it, and an index over such a

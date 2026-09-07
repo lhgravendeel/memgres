@@ -10,8 +10,11 @@ package com.memgres.engine.parser.ast;
  */
 public final class ColumnRef implements Expression {
     public final String catalog;
-    public final String schema;
-    public final String table;
+    // schema/table are mutable for the same reason SelectStmt.TableRef's are: ALTER TABLE ...
+    // RENAME TO has to retarget the stored view ASTs that already name this relation, and a
+    // SELECT * is expanded at creation into references qualified by the relation's own name.
+    public String schema;
+    public String table;
     public final String column;
 
     public ColumnRef(String catalog, String schema, String table, String column) {
@@ -27,6 +30,12 @@ public final class ColumnRef implements Expression {
 
     public ColumnRef(String column) {
         this(null, null, column);
+    }
+
+    /** Retarget this reference at the same relation under its new schema and name. */
+    public void retarget(String newSchema, String newTable) {
+        this.schema = newSchema;
+        this.table = newTable;
     }
 
     public ColumnRef(String table, String column) {

@@ -171,6 +171,11 @@ public final class BuiltinFunctionSignatures {
                 && WORDS_RATHER_THAN_ROUTINES.contains(name.toLowerCase(java.util.Locale.ROOT));
     }
 
+    /** Every routine name an extension owns, paired with the extension that owns it. */
+    static String[][] extensionOwnedNames() {
+        return EXTENSION_OWNED;
+    }
+
     /** The extension this name belongs to, or null when it belongs to none. */
     static String owningExtension(String name) {
         if (name == null) return null;

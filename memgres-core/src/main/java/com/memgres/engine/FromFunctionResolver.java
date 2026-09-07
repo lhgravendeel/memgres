@@ -2695,6 +2695,13 @@ class FromFunctionResolver {
     private List<RowContext> resolvePgPartitionTree(String alias, List<String> colAliases, List<Object> evalArgs) {
         if (evalArgs.isEmpty() || evalArgs.get(0) == null) return new ArrayList<>();
         String tableName = evalArgs.get(0).toString();
+        // A catalogue relation is a relation, and asking about its partition tree is asking about
+        // a relation that is in none: PostgreSQL answers with no rows rather than saying there is
+        // no such relation.
+        if (PgCatalogRelations.ALL.contains(
+                RelationNamespace.bareName(tableName).toLowerCase(java.util.Locale.ROOT))) {
+            return new ArrayList<>();
+        }
         Table rootTable = executor.resolveTableAnySchema(tableName);
         if (rootTable == null) {
             throw new MemgresException("relation \"" + tableName + "\" does not exist", "42P01");
@@ -2713,8 +2720,18 @@ class FromFunctionResolver {
         Table virtualTable = new Table(alias, cols);
         List<RowContext> contexts = new ArrayList<>();
 
-        // Recursively collect partition tree
-        collectPartitionTree(rootTable, null, 0, virtualTable, alias, contexts);
+        // A relation that is neither a partitioned table nor a partition of one is not in any
+        // tree, and PostgreSQL answers with no rows at all. Answered with the relation itself,
+        // an ordinary table was reported as a partition tree of one, so a caller counting the
+        // rows to ask whether a relation is partitioned was always told yes.
+        Table above = rootTable.getPartitionParent();
+        List<Table> below = rootTable.getPartitions();
+        if (above == null && (below == null || below.isEmpty())) return contexts;
+
+        // The tree is walked from here down, but the row for this relation still names whatever
+        // stands above it: pg_partition_tree('child') says which table the child belongs to.
+        collectPartitionTree(rootTable, above == null ? null : above.getName(), 0,
+                virtualTable, alias, contexts);
         return contexts;
     }
 
@@ -2917,6 +2934,58 @@ class FromFunctionResolver {
 
     // ---- XMLTABLE ----
 
+    /** What marks the argument that carries an XMLTABLE's namespace prefixes. */
+    private static final String XML_NAMESPACES_MARK = "xmlns=:";
+
+    /** Whether this argument of an XMLTABLE carries its namespace prefixes rather than a column. */
+    static boolean namesXmlNamespaces(String written) {
+        return written != null && written.startsWith(XML_NAMESPACES_MARK);
+    }
+
+    /** Read the prefix and URI pairs an XMLTABLE declared out of the argument that carries them. */
+    private static void readXmlNamespaces(String written, java.util.Map<String, String> into) {
+        String body = written.substring(
+                XML_NAMESPACES_MARK.length());
+        java.util.List<String> parts = new ArrayList<>();
+        int at = 0;
+        while (at < body.length()) {
+            int colon = body.indexOf(':', at);
+            if (colon < 0) break;
+            int len = Integer.parseInt(body.substring(at, colon));
+            parts.add(len < 0 ? null : body.substring(colon + 1, colon + 1 + len));
+            at = colon + 1 + Math.max(len, 0);
+        }
+        for (int i = 0; i + 1 < parts.size(); i += 2) into.put(parts.get(i), parts.get(i + 1));
+    }
+
+    /** The prefixes an XPath expression may use, as the XPath engine wants them. */
+    private static javax.xml.namespace.NamespaceContext namespaceContext(
+            final java.util.Map<String, String> declared) {
+        return new javax.xml.namespace.NamespaceContext() {
+            @Override
+            public String getNamespaceURI(String prefix) {
+                String uri = declared.get(prefix);
+                return uri == null ? javax.xml.XMLConstants.NULL_NS_URI : uri;
+            }
+
+            @Override
+            public String getPrefix(String uri) {
+                for (java.util.Map.Entry<String, String> e : declared.entrySet()) {
+                    if (e.getValue().equals(uri)) return e.getKey();
+                }
+                return null;
+            }
+
+            @Override
+            public java.util.Iterator<String> getPrefixes(String uri) {
+                String prefix = getPrefix(uri);
+                return prefix == null
+                        ? java.util.Collections.<String>emptyList().iterator()
+                        : java.util.Collections.singletonList(prefix).iterator();
+            }
+        };
+    }
+
     private List<RowContext> resolveXmlTable(SelectStmt.FunctionFrom funcFrom, String alias) {
         List<Expression> args = funcFrom.args();
         if (args.size() < 2) return new ArrayList<>();
@@ -2932,10 +3001,17 @@ class FromFunctionResolver {
         List<String> colPaths = new ArrayList<>();
         List<String> colDefaults = new ArrayList<>();
         List<Boolean> colNotNull = new ArrayList<>();
+        // The prefixes the query declared, if it declared any: they arrive as one more argument
+        // at the end, marked so it is not read as a column definition.
+        final java.util.Map<String, String> namespaces = new java.util.LinkedHashMap<>();
         for (int i = 2; i < args.size(); i++) {
             String def = args.get(i) instanceof com.memgres.engine.parser.ast.Literal
                     ? ((com.memgres.engine.parser.ast.Literal) args.get(i)).value()
                     : executor.evalExpr(args.get(i), null).toString();
+            if (namesXmlNamespaces(def)) {
+                readXmlNamespaces(def, namespaces);
+                continue;
+            }
             String[] parts = splitColumnDefinition(def);
             colNames.add(parts[0]);
             colTypes.add(parts[1] == null ? "text" : parts[1]);
@@ -2949,10 +3025,15 @@ class FromFunctionResolver {
         try {
             javax.xml.parsers.DocumentBuilderFactory factory = javax.xml.parsers.DocumentBuilderFactory.newInstance();
             factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+            // A prefix in the path only means anything if the document is read with its
+            // namespaces in mind; read without them, x:root matched an element literally called
+            // that and the path found nothing wherever the document really used a namespace.
+            factory.setNamespaceAware(!namespaces.isEmpty());
             javax.xml.parsers.DocumentBuilder builder = factory.newDocumentBuilder();
             org.w3c.dom.Document doc = builder.parse(new org.xml.sax.InputSource(new java.io.StringReader(xmlStr)));
             javax.xml.xpath.XPathFactory xpathFactory = javax.xml.xpath.XPathFactory.newInstance();
             javax.xml.xpath.XPath xp = xpathFactory.newXPath();
+            if (!namespaces.isEmpty()) xp.setNamespaceContext(namespaceContext(namespaces));
             org.w3c.dom.NodeList rows = (org.w3c.dom.NodeList) xp.evaluate(xpath, doc, javax.xml.xpath.XPathConstants.NODESET);
 
             List<Column> cols = new ArrayList<>();

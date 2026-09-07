@@ -68,6 +68,28 @@ public final class CreateAggregateStmt implements Statement {
     public String finalfuncModify() { return finalfuncModify; }
     public String minvfunc() { return minvfunc; }
     public String mstype() { return mstype; }
+
+    /**
+     * The rest of the moving-aggregate declaration, and the parallel-safety word.
+     *
+     * <p>These are set after the node is built rather than passed to it, because the node already
+     * has three constructors and every caller of each of them would otherwise have to be changed
+     * to say nothing about options it does not use.
+     */
+    private String msfunc;
+    private String minitcond;
+    private String parallel;
+
+    public String msfunc() { return msfunc; }
+    public String minitcond() { return minitcond; }
+    public String parallel() { return parallel; }
+
+    public void setMovingAggregate(String msfunc, String minitcond) {
+        this.msfunc = msfunc;
+        this.minitcond = minitcond;
+    }
+
+    public void setParallel(String parallel) { this.parallel = parallel; }
     public boolean finalfuncExtra() { return finalfuncExtra; }
 
     @Override

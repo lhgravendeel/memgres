@@ -252,8 +252,7 @@ class DmlTriggerHelper {
         if (session.statementTriggersFired(child, event)) {
             return session.referentialStatement(child, event);
         }
-        final String named = child.getName();
-        List<PgTrigger> triggers = executor.database.getTriggersForTable(named);
+        List<PgTrigger> triggers = executor.database.getTriggersForTable(child);
         boolean anyAfter = false;
         boolean collecting = false;
         for (PgTrigger trigger : triggers) {
@@ -269,7 +268,7 @@ class DmlTriggerHelper {
         runStatementTriggers(triggers, PgTrigger.Timing.BEFORE, event, child, null, null);
         if (anyAfter) {
             session.addEndOfStatementTrigger(() -> runStatementTriggers(
-                    executor.database.getTriggersForTable(named), PgTrigger.Timing.AFTER, event,
+                    executor.database.getTriggersForTable(child), PgTrigger.Timing.AFTER, event,
                     child, event == PgTrigger.Event.DELETE ? null : acting.newRows,
                     event == PgTrigger.Event.INSERT ? null : acting.oldRows));
         }
@@ -298,6 +297,65 @@ class DmlTriggerHelper {
             }
         }
         runStatementTriggers(triggers, timing, event, table, newRows, oldRows);
+    }
+
+    /**
+     * Run a body with the transition tables these triggers declare in scope.
+     *
+     * <p>A transition table holds the rows the whole statement wrote, and PostgreSQL puts it in
+     * scope for every trigger that declared one -- a FOR EACH ROW trigger as much as a statement
+     * one, which is why each firing of a row trigger sees the same complete set. Built only for
+     * the statement triggers, a row trigger reading its transition table was told there was no
+     * such relation.
+     *
+     * <p>The name may collide with a real table. PostgreSQL scopes transition tables to the
+     * statement, so the real one is shadowed and put back after -- never destroyed.
+     */
+    void withTransitionTables(List<PgTrigger> triggers, Table table,
+                              List<Object[]> newRows, List<Object[]> oldRows, Runnable body) {
+        String newTransName = null;
+        String oldTransName = null;
+        for (PgTrigger trigger : triggers) {
+            if (newTransName == null) newTransName = trigger.getNewTransitionTable();
+            if (oldTransName == null) oldTransName = trigger.getOldTransitionTable();
+        }
+        if ((newTransName == null || newRows == null) && (oldTransName == null || oldRows == null)) {
+            body.run();
+            return;
+        }
+        String schemaName = executor.defaultSchema();
+        Schema transScope = executor.database.getSchema(schemaName);
+        Table shadowedNew = null;
+        Table shadowedOld = null;
+        try {
+            if (newTransName != null && newRows != null) {
+                if (transScope != null) shadowedNew = transScope.getTable(newTransName);
+                createTransitionTable(newTransName, schemaName, table, newRows);
+            }
+            if (oldTransName != null && oldRows != null) {
+                if (transScope != null) shadowedOld = transScope.getTable(oldTransName);
+                createTransitionTable(oldTransName, schemaName, table, oldRows);
+            }
+            body.run();
+        } finally {
+            putTransitionTableBack(schemaName, newTransName, newRows, shadowedNew);
+            putTransitionTableBack(schemaName, oldTransName, oldRows, shadowedOld);
+        }
+    }
+
+    private void putTransitionTableBack(String schemaName, String transName,
+                                        List<Object[]> rows, Table shadowed) {
+        if (transName == null || rows == null) return;
+        Schema schema = executor.database.getSchema(schemaName);
+        if (schema != null) {
+            schema.removeTable(transName);
+            if (shadowed != null) schema.addTable(shadowed);
+        }
+        if (shadowed == null) {
+            executor.database.removeObjectOwner("table:"
+                    + schemaName.toLowerCase(java.util.Locale.ROOT) + "."
+                    + transName.toLowerCase(java.util.Locale.ROOT));
+        }
     }
 
     private void runStatementTriggers(List<PgTrigger> triggers, PgTrigger.Timing timing,

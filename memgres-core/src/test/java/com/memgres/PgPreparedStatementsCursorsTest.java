@@ -395,7 +395,8 @@ class PgPreparedStatementsCursorsTest {
             try (Statement st = conn.createStatement();
                  ResultSet rs = st.executeQuery("SELECT count(*) FROM pg_cursors")) {
                 assertTrue(rs.next());
-                assertEquals(1, rs.getInt(1)); // implicit portal remains
+                // Simple query mode opens no unnamed portal, so CLOSE ALL leaves none.
+                assertEquals(0, rs.getInt(1));
             }
         } finally {
             conn.rollback();
@@ -495,7 +496,8 @@ class PgPreparedStatementsCursorsTest {
                 try (Statement st = conn2.createStatement();
                      ResultSet rs = st.executeQuery("SELECT count(*) FROM pg_cursors")) {
                     assertTrue(rs.next());
-                    assertEquals(1, rs.getInt(1), "Second session should only see its own implicit portal");
+                    assertEquals(0, rs.getInt(1),
+                            "Second session sees none of the first session's cursors");
                 }
             }
             exec("CLOSE iso_cur");
@@ -674,18 +676,18 @@ class PgPreparedStatementsCursorsTest {
         try {
             exec("DECLARE rbcur1 CURSOR FOR SELECT 1");
             exec("DECLARE rbcur2 CURSOR WITH HOLD FOR SELECT 2");
-            // Both exist (+ implicit portal = 3)
+            // Both exist; simple query mode opens no unnamed portal beside them.
             try (Statement st = conn.createStatement();
                  ResultSet rs = st.executeQuery("SELECT count(*) FROM pg_cursors")) {
                 assertTrue(rs.next());
-                assertEquals(3, rs.getInt(1));
+                assertEquals(2, rs.getInt(1));
             }
             conn.rollback();
-            // PG destroys ALL cursors on ROLLBACK (including WITH HOLD), but implicit portal remains
+            // PG destroys ALL cursors on ROLLBACK, including WITH HOLD ones.
             try (Statement st = conn.createStatement();
                  ResultSet rs = st.executeQuery("SELECT count(*) FROM pg_cursors")) {
                 assertTrue(rs.next());
-                assertEquals(1, rs.getInt(1), "Only implicit portal should remain after ROLLBACK");
+                assertEquals(0, rs.getInt(1), "No cursor should remain after ROLLBACK");
             }
         } finally {
             conn.setAutoCommit(true);

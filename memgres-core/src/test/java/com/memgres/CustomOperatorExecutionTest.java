@@ -1373,7 +1373,8 @@ class CustomOperatorExecutionTest {
 
             SQLException ex = assertThrows(SQLException.class,
                     () -> stmt.execute("CREATE OPERATOR <+> (LEFTARG = integer, RIGHTARG = integer, FUNCTION = my_add)"));
-            assertEquals("42710", ex.getSQLState());
+            // An operator already there is a duplicate routine, which is what PostgreSQL calls it.
+            assertEquals("42723", ex.getSQLState());
         }
     }
 

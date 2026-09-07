@@ -14,6 +14,13 @@ import java.util.stream.Collectors;
  * Extracted from SelectExecutor to separate concerns.
  */
 class SelectAggregateEvaluator {
+    /** Whether a value is a whole number, which is what makes a total of them a whole number too. */
+    private static boolean isWholeNumber(Object val) {
+        return val instanceof Integer || val instanceof Long
+                || val instanceof Short || val instanceof Byte
+                || val instanceof java.math.BigInteger;
+    }
+
     private final SelectExecutor select;
     private final AstExecutor executor;
 
@@ -144,7 +151,17 @@ class SelectAggregateEvaluator {
 
     QueryResult executeGroupingSetsSelect(SelectStmt stmt, List<RowContext> contexts,
                                            List<RowContext.TableBinding> baseBindings) {
-        List<List<Expression>> groupingSets = stmt.groupingSets();
+        // The grand total -- the set that groups by nothing -- is answered first, which is the
+        // order PostgreSQL's own plans emit these in whichever way the sets were written. The
+        // standard leaves the order of an unsorted grouping-sets result open, so this is about
+        // agreeing with a real server rather than about a rule the query states.
+        List<List<Expression>> groupingSets = new ArrayList<>();
+        for (List<Expression> set : stmt.groupingSets()) {
+            if (set == null || set.isEmpty()) groupingSets.add(set);
+        }
+        for (List<Expression> set : stmt.groupingSets()) {
+            if (set != null && !set.isEmpty()) groupingSets.add(set);
+        }
         List<Expression> fixedGroupBy = new ArrayList<>();
 
         List<Column> resultColumns = new ArrayList<>();
@@ -157,6 +174,16 @@ class SelectAggregateEvaluator {
         List<Object[]> allResultRows = new ArrayList<>();
         List<SelectStmt.OrderByItem> resolvedOrderBy = select.resolveOrderBy(stmt.orderBy(), stmt.targets());
         GroupedWindowPass windows = new GroupedWindowPass(stmt, resolvedOrderBy);
+        // The sort keys the select list does not carry, worked out per answered row below.
+        final List<Expression> offListKeys = new ArrayList<>();
+        final Map<Object[], Object[]> offListValues = new IdentityHashMap<>();
+        if (resolvedOrderBy != null) {
+            for (SelectStmt.OrderByItem item : resolvedOrderBy) {
+                if (select.resolveOrderByToColumnIndex(item.expr(), stmt.targets()) < 0) {
+                    offListKeys.add(item.expr());
+                }
+            }
+        }
 
         for (List<Expression> groupingSet : groupingSets) {
             List<Expression> effectiveGroupBy = new ArrayList<>(fixedGroupBy);
@@ -215,6 +242,17 @@ class SelectAggregateEvaluator {
                     if (!executor.isTruthy(havingResult)) continue;
                 }
                 allResultRows.add(row);
+                // A sort key the select list does not carry is still a key: ORDER BY a over
+                // GROUPING SETS ((a), ()) sorts by the grouping column, which is NULL for the
+                // set that does not group by it. Read only from the select list, every such key
+                // was nothing and the rows came back in whatever order the sets were answered in.
+                if (!offListKeys.isEmpty()) {
+                    Object[] keys = new Object[offListKeys.size()];
+                    for (int ki = 0; ki < offListKeys.size(); ki++) {
+                        keys[ki] = evalAggregateExpr(offListKeys.get(ki), group, maskedRep);
+                    }
+                    offListValues.put(row, keys);
+                }
                 windows.recordRow(group, maskedRep);
             }
         }
@@ -237,10 +275,15 @@ class SelectAggregateEvaluator {
                 for (int oi = 0; oi < ob.size(); oi++) {
                     SelectStmt.OrderByItem item = ob.get(oi);
                     int colIdx = select.resolveOrderByToColumnIndex(item.expr(), stmt.targets());
+                    int offAt = colIdx >= 0 ? -1 : offListKeys.indexOf(item.expr());
                     Object va = colIdx >= 0 ? a[colIdx]
-                            : windowKeys[oi] != null ? windowKeys[oi][emittedAt.get(a)] : null;
+                            : windowKeys[oi] != null ? windowKeys[oi][emittedAt.get(a)]
+                            : offAt >= 0 && offListValues.containsKey(a)
+                                ? offListValues.get(a)[offAt] : null;
                     Object vb = colIdx >= 0 ? b[colIdx]
-                            : windowKeys[oi] != null ? windowKeys[oi][emittedAt.get(b)] : null;
+                            : windowKeys[oi] != null ? windowKeys[oi][emittedAt.get(b)]
+                            : offAt >= 0 && offListValues.containsKey(b)
+                                ? offListValues.get(b)[offAt] : null;
                     if (va == null && vb == null) continue;
                     if (va == null || vb == null) {
                         boolean nullsFirst = item.nullsFirst() != null ? item.nullsFirst() : item.descending();
@@ -384,6 +427,8 @@ class SelectAggregateEvaluator {
     QueryResult executeAggregateSelect(SelectStmt stmt, List<RowContext> contexts,
                                         List<RowContext.TableBinding> baseBindings) {
         GroupingScope enclosing = groupingScope.get();
+        List<RowContext.TableBinding> enclosingShape = shapeOfAggregatedRows;
+        shapeOfAggregatedRows = baseBindings;
         try {
             if (stmt.groupingSets() != null && !stmt.groupingSets().isEmpty()) {
                 return executeGroupingSetsSelect(stmt, contexts, baseBindings);
@@ -401,6 +446,7 @@ class SelectAggregateEvaluator {
             return executePlainAggregateSelect(stmt, contexts, baseBindings, resolvedGroupBy);
         } finally {
             groupingScope.set(enclosing);
+            shapeOfAggregatedRows = enclosingShape;
         }
     }
 
@@ -921,7 +967,7 @@ class SelectAggregateEvaluator {
     // ---- Ordered-set aggregates ----
 
     private Object evalOrderedSetAggregate(OrderedSetAggExpr osa, List<RowContext> group) {
-        String name = osa.funcName().toLowerCase(java.util.Locale.ROOT);
+        String name = builtinOrderedSetBehind(osa.funcName());
         List<SelectStmt.OrderByItem> orderBy = osa.withinGroupOrderBy();
         checkOrderedSetArity(osa, group);
         // The direct arguments are typed from the query, not from whichever rows a FILTER left,
@@ -953,10 +999,15 @@ class SelectAggregateEvaluator {
         }
 
         Expression orderExpr = (orderBy != null && !orderBy.isEmpty()) ? orderBy.get(0).expr() : null;
+        // A declared aggregate says what it sorts over, and its rows arrive as that type: one
+        // declared ORDER BY float8 answers in float8 however the query wrote its values. Read as
+        // they came, a percentile over numeric literals answered 2.0 where PostgreSQL answers 2.
+        String sortedAs = declaredOrderedType(osa.funcName());
         List<Object> vals = new ArrayList<>();
         for (RowContext ctx : sorted) {
             Object v = orderExpr != null ? executor.evalExpr(orderExpr, ctx) : null;
-            if (v != null) vals.add(v);
+            if (v == null) continue;
+            vals.add(sortedAs == null ? v : executor.castEvaluator.applyCast(v, sortedAs));
         }
 
         switch (name) {
@@ -1055,6 +1106,54 @@ class SelectAggregateEvaluator {
                 throw notAnOrderedSetAggregate(osa, group);
             }
         }
+    }
+
+    /**
+     * The built-in ordered-set aggregate a written name comes to.
+     *
+     * <p>An ordered-set aggregate somebody declared is made of the same pieces PostgreSQL's own
+     * are: {@code CREATE AGGREGATE p (float8 ORDER BY float8) (SFUNC = ordered_set_transition,
+     * FINALFUNC = percentile_cont_float8_final)} is percentile_cont under another name, and it is
+     * the final function that says which. Read as a name of its own, such an aggregate was one
+     * this engine had never heard of.
+     */
+    private String builtinOrderedSetBehind(String written) {
+        String name = written.toLowerCase(java.util.Locale.ROOT);
+        PgAggregate declared = executor.database.getAggregate(name);
+        if (declared == null || declared.getFinalfunc() == null) return name;
+        String behind = ORDERED_SET_FINALS.get(
+                declared.getFinalfunc().toLowerCase(java.util.Locale.ROOT));
+        return behind != null ? behind : name;
+    }
+
+    /** The type a declared ordered-set aggregate sorts over, or null where none was declared. */
+    private String declaredOrderedType(String written) {
+        PgAggregate declared =
+                executor.database.getAggregate(written.toLowerCase(java.util.Locale.ROOT));
+        if (declared == null || declared.getArgTypes() == null) return null;
+        String[] args = declared.getArgTypes();
+        int direct = declared.getDirectArgCount();
+        if (direct < 0 || direct >= args.length) return null;
+        return args[direct];
+    }
+
+    /** Which built-in each of PostgreSQL's ordered-set final functions belongs to. */
+    private static final Map<String, String> ORDERED_SET_FINALS = orderedSetFinals();
+
+    private static Map<String, String> orderedSetFinals() {
+        Map<String, String> byFinal = new HashMap<>();
+        byFinal.put("percentile_cont_float8_final", "percentile_cont");
+        byFinal.put("percentile_cont_interval_final", "percentile_cont");
+        byFinal.put("percentile_cont_float8_multi_final", "percentile_cont");
+        byFinal.put("percentile_cont_interval_multi_final", "percentile_cont");
+        byFinal.put("percentile_disc_final", "percentile_disc");
+        byFinal.put("percentile_disc_multi_final", "percentile_disc");
+        byFinal.put("mode_final", "mode");
+        byFinal.put("hypothetical_rank_final", "rank");
+        byFinal.put("hypothetical_dense_rank_final", "dense_rank");
+        byFinal.put("hypothetical_percent_rank_final", "percent_rank");
+        byFinal.put("hypothetical_cume_dist_final", "cume_dist");
+        return byFinal;
     }
 
     /** The ordered-set aggregates that rank a hypothetical row against the group. */
@@ -1511,7 +1610,7 @@ class SelectAggregateEvaluator {
                             }
                             if (val instanceof PgMoney) isMoney = true;
                             bdSum = bdSum.add(SelectExecutor.toBigDecimal(val));
-                            if (!(val instanceof Integer || val instanceof Long)) allInts = false;
+                            if (!isWholeNumber(val)) allInts = false;
                         }
                     } else {
                         for (RowContext ctx : group) {
@@ -1527,7 +1626,7 @@ class SelectAggregateEvaluator {
                                 }
                                 if (val instanceof PgMoney) isMoney = true;
                                 bdSum = bdSum.add(SelectExecutor.toBigDecimal(val));
-                                if (!(val instanceof Integer || val instanceof Long)) allInts = false;
+                                if (!isWholeNumber(val)) allInts = false;
                             }
                         }
                     }
@@ -2117,9 +2216,23 @@ class SelectAggregateEvaluator {
         }
     }
 
+    /**
+     * The shape the rows being aggregated were read from, kept so that an aggregate over none of
+     * them can still be held to its declared argument types.
+     *
+     * <p>A group with no rows in it has no row to read a type off, but the relation it came from
+     * still has columns: an aggregate whose argument does not fit is a call that names no
+     * aggregate, and PostgreSQL says so whether or not the qualification kept anything.
+     */
+    private List<RowContext.TableBinding> shapeOfAggregatedRows;
+
     /** The type an aggregate's argument offers, from what it was written as. */
     private String aggregateArgumentType(Expression arg, List<RowContext> group) {
         RowContext sample = group == null || group.isEmpty() ? null : group.get(0);
+        if (sample == null && shapeOfAggregatedRows != null
+                && !shapeOfAggregatedRows.isEmpty()) {
+            sample = new RowContext(shapeOfAggregatedRows);
+        }
         String declared = executor.binaryOpEvaluator.declaredTypeForResolution(arg, sample);
         if (declared == null && sample != null) {
             // A column whose declaration says nothing still holds a value, and what that value is

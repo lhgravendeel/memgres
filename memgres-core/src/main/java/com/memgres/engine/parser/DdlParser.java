@@ -566,12 +566,22 @@ class DdlParser {
             int depth = 0;
             while (!parser.isAtEnd()) {
                 if (depth == 0 && (parser.check(TokenType.COMMA) || parser.check(TokenType.RIGHT_PAREN))) break;
+                // An ordered-set aggregate is named with ORDER BY between its direct arguments
+                // and its sort ones, and that is a separator like a comma: swallowed into the
+                // argument beside it, the whole clause read as one type of that name, and
+                // DROP AGGREGATE could not name an aggregate it had just created.
+                if (depth == 0 && parser.checkKeyword("ORDER")) break;
                 if (parser.check(TokenType.LEFT_PAREN)) depth++;
                 if (parser.check(TokenType.RIGHT_PAREN)) depth--;
                 words.add(parser.advance().value());
             }
-            if (!"OUT".equals(mode)) {
+            if (!"OUT".equals(mode) && !words.isEmpty()) {
                 types.add(String.join(" ", withoutParameterName(words)));
+            }
+            if (parser.checkKeyword("ORDER")) {
+                parser.advance();
+                parser.expectKeyword("BY");
+                continue;
             }
             parser.match(TokenType.COMMA);
         }
@@ -688,6 +698,19 @@ class DdlParser {
             if (parser.matchKeyword("SET") && parser.check(TokenType.LEFT_PAREN)) {
                 Map<String, String> opts = parseViewWithOptions();
                 return new AlterViewStmt(writtenView, null, viewIfExists, AlterViewStmt.Action.SET_OPTIONS, opts);
+            }
+            // RESET names the options to put back to their defaults, and is written as a list of
+            // bare names. Left unread, it fell through to the ALTER TABLE actions and the option
+            // it named went on standing.
+            if (parser.matchKeyword("RESET") && parser.check(TokenType.LEFT_PAREN)) {
+                parser.expect(TokenType.LEFT_PAREN);
+                Map<String, String> reset = new LinkedHashMap<>();
+                do {
+                    reset.put(parser.readIdentifier().toLowerCase(java.util.Locale.ROOT), null);
+                } while (parser.match(TokenType.COMMA));
+                parser.expect(TokenType.RIGHT_PAREN);
+                return new AlterViewStmt(writtenView, null, viewIfExists,
+                        AlterViewStmt.Action.SET_OPTIONS, reset);
             }
             // As for a materialized view above: the remaining actions are ALTER TABLE actions
             // about this relation, and only that path can tell a column default -- which a view
@@ -1449,6 +1472,7 @@ class DdlParser {
         // Parse aggregate definition body: ( SFUNC = ..., STYPE = ..., ... )
         String sfunc = null, stype = null, initcond = null, finalfunc = null, combinefunc = null, sortop = null;
         String finalfuncModify = null, minvfunc = null, mstype = null;
+        String msfunc = null, minitcond = null, parallel = null;
         boolean finalfuncExtra = false;
         if (parser.match(TokenType.LEFT_PAREN)) {
             while (!parser.check(TokenType.RIGHT_PAREN) && !parser.isAtEnd()) {
@@ -1506,13 +1530,19 @@ class DdlParser {
                     case "MSTYPE":
                         mstype = readAggregateOptionValue(parser);
                         break;
-                    case "PARALLEL":
-                    case "HYPOTHETICAL":
                     case "MSFUNC":
+                        msfunc = readAggregateOptionValue(parser);
+                        break;
+                    case "MINITCOND":
+                        minitcond = readAggregateOptionValue(parser);
+                        break;
+                    case "PARALLEL":
+                        parallel = readAggregateOptionValue(parser);
+                        break;
+                    case "HYPOTHETICAL":
                     case "MFINALFUNC":
                     case "MFINALFUNC_EXTRA":
                     case "MFINALFUNC_MODIFY":
-                    case "MINITCOND":
                     case "MSSPACE":
                     case "SERIALFUNC":
                     case "DESERIALFUNC":
@@ -1535,8 +1565,12 @@ class DdlParser {
             parser.expect(TokenType.RIGHT_PAREN);
         }
 
-        return new CreateAggregateStmt(name, argTypes, directArgCount, sfunc, stype, initcond,
-                finalfunc, combinefunc, sortop, finalfuncModify, minvfunc, mstype, finalfuncExtra);
+        CreateAggregateStmt built = new CreateAggregateStmt(name, argTypes, directArgCount, sfunc,
+                stype, initcond, finalfunc, combinefunc, sortop, finalfuncModify, minvfunc, mstype,
+                finalfuncExtra);
+        built.setMovingAggregate(msfunc, minitcond);
+        built.setParallel(parallel);
+        return built;
     }
 
     /** The value written after an aggregate option, or null when the option stands alone. */
@@ -1601,6 +1635,7 @@ class DdlParser {
             parser.advance();
             parseRuleActionList(commands);
         } else {
+            requireRuleAction();
             StringBuilder sb = new StringBuilder();
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
                 sb.append(ruleCommandToken(parser.advance())).append(' ');
@@ -1609,6 +1644,25 @@ class DdlParser {
         }
         return new CreateRuleStmt(name, event, schema, table, action, commands,
                 where.length() == 0 ? null : where.toString().trim(), orReplace);
+    }
+
+    /**
+     * The statements a rule's action may be made of.
+     *
+     * <p>A rule rewrites a query into other queries, so its action is one of those: a SELECT, an
+     * INSERT, an UPDATE, a DELETE or a NOTIFY, and nothing else. PostgreSQL's grammar has no
+     * place for anything more, so a CREATE or a DROP written there is a syntax error at the word
+     * itself. Read as a command like any other, the rule was stored and the statement was refused
+     * for something else entirely -- or accepted, and the rule fired DDL on every insert.
+     */
+    private static final java.util.Set<String> RULE_ACTIONS =
+            Cols.setOf("SELECT", "INSERT", "UPDATE", "DELETE", "NOTIFY", "VALUES", "WITH");
+
+    private void requireRuleAction() {
+        Token at = parser.peek();
+        String word = at.value() == null ? "" : at.value().toUpperCase(java.util.Locale.ROOT);
+        if (RULE_ACTIONS.contains(word)) return;
+        throw ParseException.saying("syntax error at or near \"" + at.value() + "\"", at, "42601");
     }
 
     /**

@@ -477,8 +477,17 @@ final class DdlIndexValidator {
             }
             opclassName = opclassName.substring(dot + 1);
         }
+        // A class a reader defined is a class the method has, and the type it was declared FOR
+        // is the type it accepts. Only the ones PostgreSQL ships were looked for, so an index
+        // written over a class the same session had just created was refused as naming one that
+        // does not exist.
+        PgOperatorClass defined = database == null ? null
+                : database.getOperatorClass(
+                        opclassName.toLowerCase(java.util.Locale.ROOT) + ":" + am);
         Map<String, String> byName = OPCLASSES.get(am);
-        if (byName == null || !byName.containsKey(opclassName.toLowerCase(java.util.Locale.ROOT))) {
+        boolean shipped = byName != null
+                && byName.containsKey(opclassName.toLowerCase(java.util.Locale.ROOT));
+        if (defined == null && !shipped) {
             throw new MemgresException("operator class \"" + opclassName
                     + "\" does not exist for access method \"" + am + "\"", "42704");
         }
@@ -487,7 +496,8 @@ final class DdlIndexValidator {
             // and it names the class here without quoting it.
             throw new MemgresException("operator class " + opclassName + " has no options", "22023");
         }
-        String accepts = byName.get(opclassName.toLowerCase(java.util.Locale.ROOT));
+        String accepts = defined != null ? DataType.canonicalName(defined.getForType())
+                : byName.get(opclassName.toLowerCase(java.util.Locale.ROOT));
         if (accepts == null) return;
         int colIdx = table.getColumnIndex(column);
         if (colIdx < 0) return;   // an unknown column is reported by the caller's own check

@@ -257,6 +257,30 @@ class CatalogTypeSystemBuilder {
         return new RegprocValue(oids.oid("proc:" + name), name);
     }
 
+    /**
+     * The number PostgreSQL pins one of the collations it ships to, or 0 for a collation it
+     * imports or a reader created.
+     *
+     * <p>The rows below carry these numbers, and anything else pointing at a collation has to
+     * carry the same one: minted separately, a column declared {@code COLLATE "C"} pointed at a
+     * number no row in pg_collation answers to, so looking its collation up found nothing.
+     */
+    static int pinnedCollationOid(String name) {
+        if (name == null) return 0;
+        String bare = name.trim();
+        if (bare.startsWith("\"") && bare.endsWith("\"") && bare.length() > 1) {
+            bare = bare.substring(1, bare.length() - 1);
+        }
+        if ("default".equalsIgnoreCase(bare)) return 100;
+        if ("C".equalsIgnoreCase(bare)) return 950;
+        if ("POSIX".equalsIgnoreCase(bare)) return 951;
+        if ("ucs_basic".equalsIgnoreCase(bare)) return 962;
+        if ("pg_c_utf8".equalsIgnoreCase(bare)) return 811;
+        if ("pg_unicode_fast".equalsIgnoreCase(bare)) return 6411;
+        if ("unicode".equalsIgnoreCase(bare)) return 963;
+        return 0;
+    }
+
     Table buildPgOperator() {
         List<Column> cols = Cols.listOf(
                 colNN("oid", DataType.OID), colNN("oprname", DataType.NAME),
@@ -377,6 +401,40 @@ class CatalogTypeSystemBuilder {
         if (signature == null || signature.isEmpty()) return 0;
         Integer oid = BUILTIN_OPERATOR_OIDS.get(signature);
         return oid == null ? 0 : oid.intValue();
+    }
+
+    /**
+     * The operator an aggregate's SORTOP names, as an OID.
+     *
+     * <p>SORTOP is written as a bare symbol, and the operator it names is the one over the
+     * aggregate's own argument type -- {@code SORTOP = <} on an aggregate of int is
+     * {@code <(integer,integer)}. Recorded as zero, pg_aggregate said the aggregate had no sort
+     * operator, so MIN and MAX could not be recognised as one over it.
+     */
+    private int sortOperatorOid(PgAggregate agg) {
+        String symbol = agg.getSortop();
+        String[] args = agg.getArgTypes();
+        if (symbol == null || args == null || args.length == 0) return 0;
+        int operand = resolveTypeOid(args[0]);
+        if (operand == 0) return 0;
+        return builtinOperatorOid(symbol, operand, operand);
+    }
+
+    /**
+     * The signature of the built-in operator with this OID, written the way a reader writes one,
+     * or null when the catalogue holds no operator of that number.
+     */
+    static String builtinOperatorSignature(int oid) {
+        if (oid == 0) return null;
+        for (Object[] op : PgOperatorTable.OPERATORS) {
+            if (((Integer) op[10]).intValue() != oid) continue;
+            DataType left = DataType.fromOid(((Number) op[2]).intValue());
+            DataType right = DataType.fromOid(((Number) op[3]).intValue());
+            if (left == null || right == null) return null;
+            return op[0] + "(" + CatalogSystemFunctions.pgTypeDisplayName(left) + ","
+                    + CatalogSystemFunctions.pgTypeDisplayName(right) + ")";
+        }
+        return null;
     }
 
     /** The OID of the built-in operator with this name and operand types, or 0. */
@@ -858,8 +916,61 @@ class CatalogTypeSystemBuilder {
 
     /** The OID of a built-in operator class. */
     private int opclassOid(String name, String amName) {
-        if ("int4_ops".equals(name) && "btree".equals(amName)) return INT4_OPS_OID;
+        if ("btree".equals(amName)) {
+            Integer pinned = PINNED_BTREE_OPCLASS_OIDS.get(name);
+            if (pinned != null) return pinned.intValue();
+        }
         return oids.oid(OPCLASS_KEYS.get(name + "/" + amName));
+    }
+
+    /**
+     * The numbers PostgreSQL pins the btree operator classes it ships to.
+     *
+     * <p>An index's {@code indclass} and a partitioned table's {@code partclass} are these
+     * numbers, and a reader joins them back to pg_opclass by them. Minted per database instead,
+     * the numbers agreed with nothing a real server reports and only int4_ops happened to match.
+     */
+    private static final Map<String, Integer> PINNED_BTREE_OPCLASS_OIDS = pinnedBtreeOpclassOids();
+
+    private static Map<String, Integer> pinnedBtreeOpclassOids() {
+        Map<String, Integer> m = new LinkedHashMap<>();
+        String[] pairs = {
+            "array_ops=10000", "bit_ops=10002", "bool_ops=10003", "bpchar_ops=10004",
+            "bpchar_pattern_ops=4219", "bytea_ops=10006", "char_ops=10007", "cidr_ops=10009",
+            "date_ops=3122", "enum_ops=10069", "float4_ops=10012", "float8_ops=3123",
+            "inet_ops=10015", "int2_ops=1979", "int4_ops=1978", "int8_ops=3124",
+            "interval_ops=10022", "jsonb_ops=10088", "macaddr8_ops=10026", "macaddr_ops=10024",
+            "money_ops=10047", "multirange_ops=10080", "name_ops=10028", "numeric_ops=3125",
+            "oid_ops=1981", "oidvector_ops=10032", "pg_lsn_ops=10067", "range_ops=10076",
+            "record_image_ops=10036", "record_ops=10034", "text_ops=3126",
+            "text_pattern_ops=4217", "tid_ops=10050", "time_ops=10038", "timestamp_ops=3128",
+            "timestamptz_ops=3127", "timetz_ops=10041", "tsquery_ops=10074",
+            "tsvector_ops=10071", "uuid_ops=10065", "varbit_ops=10043", "varchar_ops=10044",
+            "varchar_pattern_ops=4218", "xid8_ops=10053",
+        };
+        for (String pair : pairs) {
+            int at = pair.indexOf('=');
+            m.put(pair.substring(0, at), Integer.valueOf(pair.substring(at + 1)));
+        }
+        return m;
+    }
+
+    /** The number PostgreSQL pins a named btree operator class to, or 0 for one it does not ship. */
+    static int pinnedBtreeOpclassOid(String name) {
+        Integer pinned = name == null ? null : PINNED_BTREE_OPCLASS_OIDS.get(name);
+        return pinned == null ? 0 : pinned.intValue();
+    }
+
+    /** The number the default btree operator class over a type carries, or 0 where it has none. */
+    static int pinnedDefaultBtreeOpclassOid(int typeOid) {
+        for (Object[] c : OPCLASSES) {
+            if ("btree".equals(c[1]) && Boolean.TRUE.equals(c[3])
+                    && ((Integer) c[2]).intValue() == typeOid) {
+                Integer pinned = PINNED_BTREE_OPCLASS_OIDS.get((String) c[0]);
+                return pinned == null ? 0 : pinned.intValue();
+            }
+        }
+        return 0;
     }
 
     /** The OID of a built-in operator family. */
@@ -988,6 +1099,29 @@ class CatalogTypeSystemBuilder {
             row[3] = sfuncVal;      // aggtransfn
             row[4] = finalfuncVal;  // aggfinalfn
             row[5] = combinefuncVal; // aggcombinefn
+            // The moving-aggregate half of the definition and the sort operator, where the
+            // statement wrote them. Left as they were built, an aggregate declared with MSFUNC
+            // and MINVFUNC reported neither, so pg_aggregate said the server could not compute
+            // it over a sliding frame at all.
+            if (agg.getMtransfn() != null) {
+                row[8] = new RegprocValue(
+                        oids.oid("proc:" + agg.getMtransfn()), agg.getMtransfn());
+            }
+            if (agg.getMinvtransfn() != null) {
+                row[9] = new RegprocValue(
+                        oids.oid("proc:" + agg.getMinvtransfn()), agg.getMinvtransfn());
+            }
+            if (agg.getMstype() != null) row[18] = resolveTypeOid(agg.getMstype());
+            row[21] = agg.getMinitcond(); // aggminitval
+            if (agg.getSortop() != null) row[15] = sortOperatorOid(agg);
+            // An ordered-set aggregate is a kind of its own, and how many of its arguments stand
+            // in front of WITHIN GROUP is part of what it is. Recorded as an ordinary aggregate,
+            // it said it took none of them that way, and a reader could not tell it apart from
+            // one that is called without WITHIN GROUP at all.
+            if (agg.getDirectArgCount() >= 0) {
+                row[1] = "o";
+                row[2] = (short) agg.getDirectArgCount();
+            }
             table.insertRow(row);
         }
         return table;

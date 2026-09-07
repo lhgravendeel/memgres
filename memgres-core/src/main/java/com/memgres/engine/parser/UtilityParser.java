@@ -1689,8 +1689,11 @@ class UtilityParser {
             List<String> grantees = new ArrayList<>();
             do { grantees.add(readGrantee()); } while (parser.match(TokenType.COMMA));
             boolean withAdmin = false;
+            Boolean inheritsThrough = null;
             if (parser.matchKeyword("WITH")) {
-                withAdmin = readRoleGrantOptions();
+                RoleGrantOptions given = readRoleGrantOptions();
+                withAdmin = given.admin;
+                inheritsThrough = given.inherit;
             }
             // A membership grant carries GRANTED BY too, and dropping the clause here meant the
             // grantor was never a name the statement had to answer for.
@@ -1699,7 +1702,8 @@ class UtilityParser {
                 parser.expectKeyword("BY");
                 roleGrantor = parser.readIdentifier();
             }
-            return new GrantStmt(written, null, null, grantees, false, withAdmin, true, null, roleGrantor);
+            return new GrantStmt(written, null, null, grantees, false, withAdmin, true, null, roleGrantor)
+                    .withInheritOption(inheritsThrough);
         }
 
         // GRANT privileges ON object TO roles
@@ -2903,24 +2907,31 @@ class UtilityParser {
      * {@code TRUE} or as {@code FALSE}. A word that is none of the three is an option nobody has;
      * a value that is none of the three is a statement that will not parse.
      */
-    private boolean readRoleGrantOptions() {
-        boolean admin = false;
+    /** What a membership grant's WITH clause said. */
+    private static final class RoleGrantOptions {
+        boolean admin;
+        Boolean inherit;
+    }
+
+    private RoleGrantOptions readRoleGrantOptions() {
+        RoleGrantOptions given = new RoleGrantOptions();
         do {
             Token nameToken = parser.peek();
             String name = nameToken.raw().toLowerCase(java.util.Locale.ROOT);
             parser.advance();
-            boolean given;
-            if (parser.matchKeyword("OPTION") || parser.matchWord("OPTION")) given = true;
-            else if (parser.matchKeyword("TRUE") || parser.matchWord("TRUE")) given = true;
-            else if (parser.matchKeyword("FALSE") || parser.matchWord("FALSE")) given = false;
+            boolean written;
+            if (parser.matchKeyword("OPTION") || parser.matchWord("OPTION")) written = true;
+            else if (parser.matchKeyword("TRUE") || parser.matchWord("TRUE")) written = true;
+            else if (parser.matchKeyword("FALSE") || parser.matchWord("FALSE")) written = false;
             else throw ParseException.at(parser.peek());
             if (!"admin".equals(name) && !"inherit".equals(name) && !"set".equals(name)) {
                 throw ParseException.saying("unrecognized role option \"" + name + "\"",
                         nameToken, "42601");
             }
-            if ("admin".equals(name) && given) admin = true;
+            if ("admin".equals(name) && written) given.admin = true;
+            if ("inherit".equals(name)) given.inherit = Boolean.valueOf(written);
         } while (parser.match(TokenType.COMMA));
-        return admin;
+        return given;
     }
 
     private String readGrantee() {

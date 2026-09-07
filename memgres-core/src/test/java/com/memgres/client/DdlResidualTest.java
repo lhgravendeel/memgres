@@ -221,6 +221,8 @@ class DdlResidualTest {
 
     @Test
     void uniqueWithoutOverlapsIsATemporalKey() throws Exception {
+        // A temporal key indexes its scalar columns with gist, which needs btree_gist.
+        exec("CREATE EXTENSION IF NOT EXISTS btree_gist");
         exec("CREATE TABLE dr_wo (id int, valid_at daterange,"
                 + " CONSTRAINT dr_woc UNIQUE (id, valid_at WITHOUT OVERLAPS))");
         exec("INSERT INTO dr_wo VALUES (1,'[2020-01-01,2021-01-01)')");
@@ -234,6 +236,7 @@ class DdlResidualTest {
 
     @Test
     void theUnnamedAndPrimaryKeySpellingsReadTheSame() throws Exception {
+        exec("CREATE EXTENSION IF NOT EXISTS btree_gist");
         assertAccepted("CREATE TABLE dr_wo2 (id int, valid_at daterange,"
                 + " UNIQUE (id, valid_at WITHOUT OVERLAPS))");
         assertAccepted("CREATE TABLE dr_wo3 (id int, valid_at daterange,"

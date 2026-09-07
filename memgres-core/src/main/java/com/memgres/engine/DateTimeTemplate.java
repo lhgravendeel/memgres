@@ -635,6 +635,9 @@ final class DateTimeTemplate {
         int year, cc, mon, mday, doy, hh, mi, ss, ms, us;
         int yysz;
         boolean bc, pm, clock12, hasYear, hasJulian;
+        /** The ISO week date fields, and whether the template named each of them. */
+        int isoWeek, isoDow, isoDoy, week;
+        boolean hasIsoWeek, hasIsoDow, hasIsoDoy, hasWeek, isoYear, hasGregorianDate;
         long julian;
         int tzHours, tzMinutes;
         boolean tzNegative, hasZone;
@@ -722,6 +725,7 @@ final class DateTimeTemplate {
                 f.year = readInt(s, 4, key, slurp)[0];
                 f.yysz = 4;
                 f.hasYear = true;
+                f.isoYear |= canon(key).charAt(0) == 'I';
                 break;
             }
             case "YYY":
@@ -730,6 +734,7 @@ final class DateTimeTemplate {
                 f.year = r[1] < 4 ? adjustYear(r[0]) : r[0];
                 f.yysz = 3;
                 f.hasYear = true;
+                f.isoYear |= canon(key).charAt(0) == 'I';
                 break;
             }
             case "YY":
@@ -738,6 +743,7 @@ final class DateTimeTemplate {
                 f.year = r[1] < 4 ? adjustYear(r[0]) : r[0];
                 f.yysz = 2;
                 f.hasYear = true;
+                f.isoYear |= canon(key).charAt(0) == 'I';
                 break;
             }
             case "Y":
@@ -746,6 +752,7 @@ final class DateTimeTemplate {
                 f.year = r[1] < 4 ? adjustYear(r[0]) : r[0];
                 f.yysz = 1;
                 f.hasYear = true;
+                f.isoYear |= canon(key).charAt(0) == 'I';
                 break;
             }
             case "Y,YYY": {
@@ -760,13 +767,19 @@ final class DateTimeTemplate {
                 break;
             case "MM":
                 f.mon = readInt(s, 2, key, slurp)[0];
+                f.hasGregorianDate = true;
                 break;
             case "DD":
                 f.mday = readInt(s, 2, key, slurp)[0];
+                f.hasGregorianDate = true;
                 break;
             case "DDD":
-            case "IDDD":
                 f.doy = readInt(s, 3, key, slurp)[0];
+                f.hasGregorianDate = true;
+                break;
+            case "IDDD":
+                f.isoDoy = readInt(s, 3, key, slurp)[0];
+                f.hasIsoDoy = true;
                 break;
             case "HH":
             case "HH12":
@@ -823,12 +836,19 @@ final class DateTimeTemplate {
                 readInt(s, 1, key, slurp);
                 break;
             case "WW":
+                f.week = readInt(s, 2, key, slurp)[0];
+                f.hasWeek = true;
+                break;
             case "IW":
-                readInt(s, 2, key, slurp);
+                f.isoWeek = readInt(s, 2, key, slurp)[0];
+                f.hasIsoWeek = true;
                 break;
             case "D":
-            case "ID":
                 readInt(s, 1, key, slurp);
+                break;
+            case "ID":
+                f.isoDow = readInt(s, 1, key, slurp)[0];
+                f.hasIsoDow = true;
                 break;
             case "TZH":
                 if (s.has() && s.peek() == '-') {
@@ -1003,7 +1023,36 @@ final class DateTimeTemplate {
                 && !(c >= 'A' && c <= 'Z') && !(c >= 'a' && c <= 'z') && !(c >= '0' && c <= '9');
     }
 
+    /**
+     * The Monday PostgreSQL counts an ISO year from: the Monday of the week the fourth of January
+     * falls in, which is by definition week one.
+     */
+    private static LocalDate isoYearStart(int year) {
+        LocalDate fourth = LocalDate.of(year, 1, 4);
+        return fourth.minusDays(fourth.getDayOfWeek().getValue() - 1L);
+    }
+
+    /**
+     * Refuse a template that names the date in both calendars at once.
+     *
+     * <p>An ISO week date and an ordinary one are two ways of saying which day is meant, and
+     * PostgreSQL will not read half of each: {@code IYYY-MM-DD} and {@code YYYY-IW-ID} are both
+     * refused. Read as though the two agreed, whichever half the reader happened to use decided
+     * the answer and the other was silently thrown away.
+     */
+    private static void requireOneDateConvention(Fields f) {
+        boolean isoDate = f.hasIsoWeek || f.hasIsoDow || f.hasIsoDoy;
+        boolean mixed = (f.isoYear && f.hasGregorianDate)
+                || (isoDate && f.hasYear && !f.isoYear);
+        if (!mixed) return;
+        MemgresException e = new MemgresException(
+                "invalid combination of date conventions", "22007");
+        e.setHint("Do not mix Gregorian and ISO week date conventions in a formatting template.");
+        throw e;
+    }
+
     private static LocalDateTime assemble(Fields f, String input) {
+        requireOneDateConvention(f);
         int year;
         int mon = f.mon == 0 ? 1 : f.mon;
         int mday = f.mday == 0 ? 1 : f.mday;
@@ -1041,6 +1090,20 @@ final class DateTimeTemplate {
         try {
             if (f.hasJulian) {
                 date = LocalDate.ofEpochDay(f.julian - 2440588L);
+            } else if (f.hasIsoDoy) {
+                // A day of the ISO year is counted from the Monday that year begins on, which is
+                // not the first of January: ISO 2006 begins on the second.
+                date = isoYearStart(year).plusDays(f.isoDoy - 1L);
+            } else if (f.hasIsoWeek) {
+                // Week one is the week the fourth of January falls in, and the day within it is
+                // Monday unless one was written. Read as nothing at all, every ISO week date came
+                // back as the first of January.
+                date = isoYearStart(year).plusDays((f.isoWeek - 1L) * 7L
+                        + (f.hasIsoDow ? f.isoDow - 1L : 0L));
+            } else if (f.hasWeek) {
+                // The ordinary week number counts from the first of January in sevens, and the
+                // day within the week says nothing: PostgreSQL answers with the week's first day.
+                date = LocalDate.of(year, 1, 1).plusDays((f.week - 1L) * 7L);
             } else if (f.doy != 0 && (f.mon == 0 || f.mday == 0)) {
                 // A day of the year is a day of that year: 366 is a day only in a leap year, and
                 // 400 is a day in none. Added on regardless, the date ran into the year after.

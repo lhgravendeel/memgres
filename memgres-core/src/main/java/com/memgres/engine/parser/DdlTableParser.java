@@ -142,6 +142,11 @@ class DdlTableParser {
                 parentSchema = parentName;
                 parentName = parser.readIdentifier();
             }
+            // A partition may restate its columns to say something extra about them -- a default
+            // of its own, a NOT NULL -- between the parent's name and the bound. Left unread, the
+            // opening parenthesis ended the statement as far as the reader was concerned, so the
+            // bound was never read at all and the partition held no slot of the parent's key.
+            List<ColumnDef> partitionColumnOptions = readPartitionColumnOptions();
             List<String> bounds = new ArrayList<>();
             if (parser.matchKeyword("DEFAULT")) {
                 bounds.add("DEFAULT");
@@ -196,7 +201,8 @@ class DdlTableParser {
                 parser.expect(TokenType.RIGHT_PAREN);
             }
             CreateTableStmt partition = new CreateTableStmt(schema, name, ifNotExists, temporary,
-                    Cols.listOf(), Cols.listOf(), null, subPartBy, subPartCol, parentName, bounds);
+                    partitionColumnOptions, Cols.listOf(), null, subPartBy, subPartCol, parentName,
+                    bounds);
             partition.setPartitionOfParentSchema(parentSchema);
             return partition;
         }
@@ -247,7 +253,7 @@ class DdlTableParser {
                 }
                 constraints.add(tc);
             } else {
-                ColumnDef colDef = parseColumnDef();
+                ColumnDef colDef = parseColumnDef(columns.isEmpty() && constraints.isEmpty());
                 columns.add(colDef);
                 while (!pendingColumnChecks.isEmpty()) {
                     constraints.add(pendingColumnChecks.remove(0));
@@ -387,7 +393,20 @@ class DdlTableParser {
     }
 
     ColumnDef parseColumnDef() {
+        return parseColumnDef(false);
+    }
+
+    /**
+     * @param firstInList whether nothing has been read from the list yet. A column with no type
+     *     is where PostgreSQL's grammar runs out of input while it is still deciding what kind of
+     *     list this is, so the first one is reported as the end of input and a later one as the
+     *     token that could not follow.
+     */
+    ColumnDef parseColumnDef(boolean firstInList) {
         String colName = parser.readColumnName();
+        if (firstInList && parser.check(TokenType.RIGHT_PAREN)) {
+            throw new MemgresException("syntax error at end of input", "42601");
+        }
         String typeName = parser.parseTypeName();
         return parseColumnQualifiers(colName, serialSpelling(typeName));
     }
@@ -1343,6 +1362,42 @@ class DdlTableParser {
 
     /**
      * Read a partition key element. This can be a simple column name or an expression
+     * The column options a partition may restate between the parent's name and its bound.
+     *
+     * <p>Each names a column the partition already has, and says something more about it: a
+     * default of its own, or a NOT NULL. The column keeps the type the partitioned table gave it,
+     * so none is written here -- which is why these cannot be read as ordinary column definitions.
+     *
+     * @return the options, or an empty list when the statement wrote none
+     */
+    private List<ColumnDef> readPartitionColumnOptions() {
+        List<ColumnDef> out = new ArrayList<>();
+        if (!parser.check(TokenType.LEFT_PAREN)) return out;
+        parser.advance();
+        do {
+            String column = parser.readIdentifier();
+            parser.matchKeywords("WITH", "OPTIONS");
+            Expression defaultExpr = null;
+            boolean notNull = false;
+            while (true) {
+                if (parser.matchKeyword("DEFAULT")) {
+                    defaultExpr = parser.parseExpression();
+                } else if (parser.matchKeywords("NOT", "NULL")) {
+                    notNull = true;
+                } else if (parser.matchKeyword("NULL")) {
+                    notNull = false;
+                } else {
+                    break;
+                }
+            }
+            out.add(new ColumnDef(column, null, null, null, notNull, false, false,
+                    defaultExpr, null, null, null, null, null, null, null, null, false, false));
+        } while (parser.match(TokenType.COMMA));
+        parser.expect(TokenType.RIGHT_PAREN);
+        return out;
+    }
+
+    /**
      * like date_trunc('month', col). We capture raw SQL text, handling nested parens.
      */
     private String readPartitionElement() {

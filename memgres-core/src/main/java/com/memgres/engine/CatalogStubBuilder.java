@@ -1438,7 +1438,10 @@ class CatalogStubBuilder {
         );
         Table t = new Table("pg_largeobject_metadata", cols);
         for (Long loid : database.getLargeObjectStore().getOids()) {
-            t.insertRow(new Object[]{ loid.intValue(), 10, null });
+            // An OID is unsigned, and a large object may be asked for under a number above two
+            // billion. Narrowed to an int, that number came back negative, so the catalogue
+            // disagreed with the number lo_create had just answered with.
+            t.insertRow(new Object[]{ loid, 10, null });
         }
         return t;
     }
@@ -1653,6 +1656,12 @@ class CatalogStubBuilder {
                     break;
                 }
             }
+            // A row here is collected statistics, not a declaration: PostgreSQL shows nothing
+            // for an object nobody has ANALYZEd, because there is nothing yet to show. Listed on
+            // creation, the view reported statistics that had never been gathered.
+            if (!database.getAnalyzedTables().contains(schemaName + "." + es.getTableName())) {
+                continue;
+            }
             // Build attnames as PG array string
             StringBuilder attnames = new StringBuilder("{");
             for (int i = 0; i < es.getColumns().size(); i++) {
@@ -1779,18 +1788,30 @@ class CatalogStubBuilder {
                     }
                     partattrs = attrsBuf.toString();
                 }
-                // One entry per key column, the way PostgreSQL writes them. The operator class
-                // is still reported as 0 — memgres does not record which one a partition key was
-                // resolved through — but the vector is now the length the rest of the row says
-                // it is.
-                StringBuilder zeros = new StringBuilder();
+                // One entry per key column, the way PostgreSQL writes them. A key resolves
+                // through the default operator class of the column's type, which is the number a
+                // reader joins back to pg_opclass; reported as zero, the row said the key was
+                // compared by nothing at all.
+                StringBuilder classes = new StringBuilder();
+                StringBuilder collations = new StringBuilder();
+                String[] keyCols = partCol == null ? new String[0] : partCol.split(",");
                 for (int ci = 0; ci < partnatts; ci++) {
-                    if (ci > 0) zeros.append(' ');
-                    zeros.append('0');
+                    if (ci > 0) { classes.append(' '); collations.append(' '); }
+                    int opclass = 0;
+                    if (ci < keyCols.length) {
+                        int colIdx = t.getColumnIndex(keyCols[ci].trim());
+                        Column keyCol = colIdx >= 0 ? t.getColumns().get(colIdx) : null;
+                        if (keyCol != null && keyCol.getType() != null) {
+                            opclass = CatalogTypeSystemBuilder.pinnedDefaultBtreeOpclassOid(
+                                    keyCol.getType().getOid());
+                        }
+                    }
+                    classes.append(opclass);
+                    collations.append('0');
                 }
                 table.insertRow(new Object[]{
                         tblOid, strategy, partnatts, defOid,
-                        partattrs, zeros.toString(), zeros.toString(), null
+                        partattrs, classes.toString(), collations.toString(), null
                 });
             }
         }
@@ -2079,17 +2100,21 @@ class CatalogStubBuilder {
                         creationTimeStr
                 });
             }
-            // PG shows an implicit unnamed portal cursor ("<unnamed portal 1>") for the
-            // currently executing query. This is visible in pg_cursors even in simple query mode.
-            String implicitCreationTimeStr = formatTimestamptz(java.time.OffsetDateTime.now());
-            table.insertRow(new Object[]{
-                    "<unnamed portal 1>",
-                    "SELECT count(*)::integer AS count FROM pg_cursors",
-                    false,
-                    false,
-                    true,
-                    implicitCreationTimeStr
-            });
+            // The extended protocol's unnamed portal is a cursor too, and PostgreSQL lists it
+            // under the empty name while it is open. A row invented for it whether or not one
+            // was open told a client in simple query mode that a cursor it never declared was
+            // there, under a name PostgreSQL does not use.
+            String unnamedSql = session.openUnnamedPortalSql();
+            if (unnamedSql != null) {
+                table.insertRow(new Object[]{
+                        "",
+                        unnamedSql,
+                        false,
+                        false,
+                        true,
+                        formatTimestamptz(java.time.OffsetDateTime.now())
+                });
+            }
         }
         return table;
     }

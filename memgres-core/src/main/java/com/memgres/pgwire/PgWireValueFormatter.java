@@ -480,6 +480,13 @@ class PgWireValueFormatter {
             int composite = session.resolveOid(session.typeOidKey(col.getCompositeTypeName()));
             if (composite != 0) return composite;
         }
+        // A range a reader defined has an OID of its own, and the column carries which range it
+        // was written as. Without this the column was advertised as text and a client resolving
+        // it against pg_type found the wrong row.
+        if (col != null && col.getRangeTypeName() != null && session != null) {
+            int range = session.resolveOid(session.typeOidKey(col.getRangeTypeName()));
+            if (range != 0) return range;
+        }
         // For array columns, advertise the array OID instead of scalar
         if (col != null && col.getArrayElementType() != null && col.getArrayElementType() != DataType.ENUM) {
             DataType arrayOid = scalarToArrayOid(col.getArrayElementType());

@@ -193,6 +193,10 @@ class CastEvaluator {
         }
         String bare = TypeNamespace.nameOfKey(key);
         String resolved = TypeNamespace.resolve(executor.database, executor.session, bare);
+        // A relation's row type is a type too, and it is reached by the relation's own name: it
+        // is not in the type register, so resolving it there found nothing and every such type
+        // printed with a qualifier PostgreSQL leaves off when the search path reaches it.
+        if (resolved == null) resolved = relationRowTypeKey(bare);
         return (key.equals(resolved) ? bare : key) + suffix;
     }
 
@@ -211,6 +215,43 @@ class CastEvaluator {
         String name = key.substring(5);
         int suffix = name.indexOf('#');
         return suffix > 0 ? name.substring(0, suffix) : name;
+    }
+
+    /** Whether the session has asked for text read as xml to be read as a whole document. */
+    private boolean xmlIsReadAsDocument() {
+        if (executor.session == null) return false;
+        String option = executor.session.getGucSettings().get("xmloption");
+        return option != null && option.trim().equalsIgnoreCase("document");
+    }
+
+    /** The operator an OID names, or null where no operator answers to it. */
+    private String operatorNameForOid(int oid) {
+        String key = executor.systemCatalog.keyForOid(oid);
+        if (key != null && key.startsWith("operator:")) {
+            String rest = key.substring("operator:".length());
+            int paren = rest.indexOf('(');
+            if (paren > 0) rest = rest.substring(0, paren);
+            int dot = rest.lastIndexOf('.');
+            return dot > 0 ? rest.substring(dot + 1) : rest;
+        }
+        for (Object[] op : PgOperatorTable.OPERATORS) {
+            if (((Integer) op[10]).intValue() == oid) return (String) op[0];
+        }
+        return null;
+    }
+
+    /** The argument types a routine of this name is declared over, as PostgreSQL writes them. */
+    private String identityArgumentsOf(String name) {
+        java.util.List<PgFunction> overloads = executor.database.getFunctionOverloads(name);
+        if (overloads == null || overloads.isEmpty()) return "";
+        PgFunction fn = overloads.get(0);
+        if (fn.getParams() == null || fn.getParams().isEmpty()) return "";
+        StringBuilder out = new StringBuilder();
+        for (PgFunction.Param p : fn.getParams()) {
+            if (out.length() > 0) out.append(',');
+            out.append(DataType.canonicalName(p.typeName));
+        }
+        return out.toString();
     }
 
     /** The role an OID was handed out for, or null when no role answers to it. */
@@ -536,9 +577,9 @@ class CastEvaluator {
         // A name holds 63 bytes and no more, so a longer string cast to one is truncated rather
         // than kept whole: a name is what identifies an object, and the server has no room for
         // more of it than that.
-        if (result instanceof String && ((String) result).length() > 63
+        if (result instanceof String
                 && "name".equals(typeSpec == null ? null : typeSpec.trim().toLowerCase(java.util.Locale.ROOT))) {
-            return ((String) result).substring(0, 63);
+            return com.memgres.engine.util.Strs.truncateName((String) result);
         }
         return result;
     }
@@ -1172,7 +1213,7 @@ class CastEvaluator {
             case "tsquery":
                 return val instanceof TsQuery ? ((TsQuery) val) : TsQuery.parse(val.toString());
             case "xml":
-                return XmlOperations.validateXmlCast(val.toString());
+                return XmlOperations.validateXmlCast(val.toString(), xmlIsReadAsDocument());
             case "int4range":
             case "int8range":
             case "numrange":
@@ -1317,7 +1358,15 @@ class CastEvaluator {
                 // An operator reference names its operands the way a reader writes them, so
                 // +(int4,int4) reads back as +(integer,integer). Passed through as written, the
                 // catalogue's spelling of the type reached the client instead of the SQL one.
-                if (val instanceof Number) return val.toString();
+                // An OID names an operator the catalogue holds, and reading it back is what the
+                // cast is for: handed back as the number it came in as, an aggregate's sort
+                // operator read as a bare integer where PostgreSQL writes its whole signature.
+                if (val instanceof Number) {
+                    String named = CatalogTypeSystemBuilder.builtinOperatorSignature(
+                            ((Number) val).intValue());
+                    if (named == null) return val.toString();
+                    return named;
+                }
                 String written = val.toString().trim();
                 int lp = written.indexOf('(');
                 if (lp <= 0 || !written.endsWith(")")) return written;
@@ -1330,8 +1379,19 @@ class CastEvaluator {
                 }
                 return out.append(')').toString();
             }
+            case "regoper": {
+                // A catalog column holding an operator reference is read as
+                // oprnegate::regoper::text, and answering with the number is answering with what
+                // the reader already had. A reference to nothing stays the zero it is.
+                if (val instanceof Number) {
+                    int operOid = ((Number) val).intValue();
+                    if (operOid == 0) return val.toString();
+                    String known = operatorNameForOid(operOid);
+                    return known == null ? val.toString() : known;
+                }
+                return val.toString();
+            }
             case "regdictionary":
-            case "regoper":
                 // reg* OID types — we don't track real OIDs for these internal objects;
                 // preserve the input name as-is so the cast round-trips to the same text.
                 return val.toString();
@@ -1508,7 +1568,14 @@ class CastEvaluator {
                     int procOidIn = ((Number) val).intValue();
                     if (procOidIn == 0) return new RegprocValue(0, "-");
                     String known = procNameForOid(procOidIn);
-                    return known != null ? new RegprocValue(procOidIn, known) : val;
+                    if (known == null) return val;
+                    // A regprocedure names the routine's whole signature, which is what tells two
+                    // overloads apart; a regproc names it by name alone. Written the same way,
+                    // castfunc::regprocedure answered with a name that could mean either.
+                    if ("regprocedure".equals(typeName)) {
+                        known = known + "(" + identityArgumentsOf(known) + ")";
+                    }
+                    return new RegprocValue(procOidIn, known);
                 }
                 // A schema written in front of the name is part of what is being named: a
                 // function of that name in another schema is not the one asked for, and no
@@ -1936,6 +2003,10 @@ class CastEvaluator {
             // unambiguous has no work to do in it: the bare name is what PostgreSQL sends there,
             // however the cast happened to be written.
             ex.setDatatype(TypeNamespace.bare(domainName));
+            // Which schema holds the domain is one of the fields PostgreSQL sends with the
+            // complaint, so a client reading the fields rather than the sentence can tell two
+            // domains of the same name apart.
+            ex.setSchema(TypeNamespace.schemaOf(executor.database, domainName));
             throw ex;
         }
     }

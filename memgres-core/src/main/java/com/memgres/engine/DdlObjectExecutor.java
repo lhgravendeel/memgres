@@ -199,6 +199,7 @@ class DdlObjectExecutor {
             executor.database.unregisterSchemaObject(schema, "range", bare);
             executor.database.registerSchemaObject(schema, "range", stmt.value());
             executor.database.moveComment("type", named, TypeNamespace.key(schema, stmt.value()));
+            moveTypeOwner(named, TypeNamespace.key(schema, stmt.value()));
             retargetTypeColumns(named, TypeNamespace.key(schema, stmt.value()));
             executor.identity().typeRenamed("r", named, TypeNamespace.key(schema, stmt.value()));
             return QueryResult.command(QueryResult.Type.ALTER_TYPE, 0);
@@ -224,6 +225,13 @@ class DdlObjectExecutor {
             throw new MemgresException("type \"" + stmt.typeName() + "\" does not exist", "42704");
         }
 
+        // DDL is transactional, so an ALTER whose transaction rolls back never happened: without
+        // a record of what the type held, a label added inside a rolled-back transaction stayed
+        // on the enum and every later read saw a value the database had agreed to forget.
+        if (stmt.action() == AlterTypeStmt.Action.ADD_VALUE
+                || stmt.action() == AlterTypeStmt.Action.RENAME_VALUE) {
+            executor.recordUndo(new Session.AlterEnumUndo(typeKey, existing.getLabels()));
+        }
         switch (stmt.action()) {
             case ADD_VALUE: {
                 if (stmt.ifNotExists() && existing.isValidLabel(stmt.value())) break;
@@ -263,6 +271,7 @@ class DdlObjectExecutor {
                 executor.database.unregisterSchemaObject(schema, "enum", TypeNamespace.nameOfKey(typeKey));
                 executor.database.registerSchemaObject(schema, "enum", stmt.value());
                 executor.database.moveComment("type", typeKey, TypeNamespace.key(schema, stmt.value()));
+                moveTypeOwner(typeKey, TypeNamespace.key(schema, stmt.value()));
                 retargetTypeColumns(typeKey, TypeNamespace.key(schema, stmt.value()));
                 // A column declared with the old word is not rewritten, so the old word goes on
                 // answering with this type's OID.
@@ -280,11 +289,17 @@ class DdlObjectExecutor {
                 executor.database.unregisterSchemaObject(from, "enum", bare);
                 executor.database.registerSchemaObject(stmt.value(), "enum", bare);
                 executor.database.moveComment("type", typeKey, TypeNamespace.key(stmt.value(), bare));
+                moveTypeOwner(typeKey, TypeNamespace.key(stmt.value(), bare));
                 retargetTypeColumns(typeKey, TypeNamespace.key(stmt.value(), bare));
                 break;
             }
             case OWNER_TO: {
                 requireOwnerExists(stmt.value());
+                // Giving an enum away is what makes the new role its owner. Checked and then
+                // forgotten, the type went on belonging to whoever had created it, so pg_type
+                // named the wrong owner and DROP ROLE let the new one go while it held a type.
+                executor.database.setObjectOwner("type:" + typeKey,
+                        executor.ddlExecutor.resolveOwnerName(stmt.value()));
                 break;
             }
         }
@@ -421,6 +436,7 @@ class DdlObjectExecutor {
                         schema, "composite", TypeNamespace.nameOfKey(typeKey));
                 executor.database.registerSchemaObject(schema, "composite", stmt.value());
                 executor.database.moveComment("type", typeKey, TypeNamespace.key(schema, stmt.value()));
+                moveTypeOwner(typeKey, TypeNamespace.key(schema, stmt.value()));
                 retargetTypeColumns(typeKey, TypeNamespace.key(schema, stmt.value()));
                 executor.identity().typeRenamed("c", typeKey, TypeNamespace.key(schema, stmt.value()));
                 // A composite type owns a pg_class row of its own, which is the same relation
@@ -439,6 +455,7 @@ class DdlObjectExecutor {
                 executor.database.unregisterSchemaObject(from, "composite", bare);
                 executor.database.registerSchemaObject(stmt.value(), "composite", bare);
                 executor.database.moveComment("type", typeKey, TypeNamespace.key(stmt.value(), bare));
+                moveTypeOwner(typeKey, TypeNamespace.key(stmt.value(), bare));
                 retargetTypeColumns(typeKey, TypeNamespace.key(stmt.value(), bare));
                 // Same object, new schema: the pg_class row it owns goes with it.
                 executor.identity().relationRenamed("c", from, bare, stmt.value(), bare);
@@ -685,6 +702,9 @@ class DdlObjectExecutor {
                 stmt.sortop(),
                 stmt.argTypes() != null ? stmt.argTypes().toArray(new String[0]) : new String[0]
         );
+        agg.setMovingAggregate(stmt.msfunc(), stmt.minvfunc(), stmt.mstype(), stmt.minitcond());
+        agg.setDirectArgCount(stmt.directArgCount());
+        agg.setParallel(stmt.parallel());
         agg.setSchemaName(executor.defaultSchema());
         executor.database.addAggregate(agg);
         return QueryResult.command(QueryResult.Type.SET, 0);
@@ -756,8 +776,20 @@ class DdlObjectExecutor {
             if (builtinSignatureMatches(bare, argTypes)) return;
             if (!BuiltinCallTypes.records(bare) && isKnownBuiltinFunction(funcName)) return;
         } else {
+            boolean qualified = funcName.contains(".");
+            String writtenSchema = qualified
+                    ? funcName.substring(0, funcName.lastIndexOf('.')) : null;
             for (PgFunction f : overloads) {
-                if (paramTypesMatch(f, argTypes)) return;
+                if (!paramTypesMatch(f, argTypes)) continue;
+                String held = Database.schemaOf(f);
+                // A name written with its schema names that schema's routine; a bare one is
+                // looked for along the search path and nowhere else. Reading the register by
+                // name alone found a routine the statement could not have named, so an operator
+                // was built over a function the session could not call.
+                if (qualified ? writtenSchema.equalsIgnoreCase(held)
+                        : executor.schemaOnSearchPath(held)) {
+                    return;
+                }
             }
         }
         throw new MemgresException(
@@ -884,13 +916,62 @@ class DdlObjectExecutor {
             op.setOwner(role != null ? role : "memgres");
         }
 
-        // Check for duplicate
-        if (executor.database.hasOperator(op.getKey())) {
-            throw new MemgresException("operator " + stmt.name() + " already exists", "42710");
+        // An operator filed as a promise -- named as somebody's negator or commutator and never
+        // created -- is exactly what this statement is here to fill in, so creating it is not
+        // creating one twice. Only one that already has a function behind it is a duplicate.
+        PgOperator already = executor.database.getOperator(op.getKey());
+        if (already != null) {
+            if (already.getFunction() != null) {
+                throw new MemgresException("operator " + stmt.name() + " already exists", "42723");
+            }
+            if (op.getCommutator() == null) op.setCommutator(already.getCommutator());
+            if (op.getNegator() == null) op.setNegator(already.getNegator());
         }
 
         executor.database.addOperator(op);
+        // A negator or commutator naming an operator that is not there yet is a promise that it
+        // will be, and PostgreSQL files a shell for it: a row with a name, the operand types the
+        // reference implies and no function behind it, with the two pointing at each other. Left
+        // unfiled, the name reached nothing and the operator that named it pointed at nothing.
+        fileShellFor(op, stmt.negator(), false);
+        fileShellFor(op, stmt.commutator(), true);
         return QueryResult.command(QueryResult.Type.SET, 0);
+    }
+
+    /**
+     * File the operator a NEGATOR or COMMUTATOR names, or point an existing one back at this.
+     *
+     * <p>A commutator takes the same operands the other way round, which is why the shell it
+     * needs is declared with the types reversed; a negator takes them as written.
+     */
+    private void fileShellFor(PgOperator op, String named, boolean commutator) {
+        if (named == null || named.isEmpty() || named.equals(op.getName())) return;
+        String left = commutator ? op.getRightArg() : op.getLeftArg();
+        String right = commutator ? op.getLeftArg() : op.getRightArg();
+        PgOperator other = null;
+        for (PgOperator candidate : executor.database.getOperatorsByName(named)) {
+            if (sameArg(candidate.getLeftArg(), left) && sameArg(candidate.getRightArg(), right)) {
+                other = candidate;
+                break;
+            }
+        }
+        if (other == null) {
+            other = new PgOperator(named, left, right, null);
+            other.setSchemaName(op.getSchemaName());
+            other.setOwner(op.getOwner());
+            executor.database.addOperator(other);
+        }
+        if (commutator) {
+            if (other.getCommutator() == null) other.setCommutator(op.getName());
+        } else {
+            if (other.getNegator() == null) other.setNegator(op.getName());
+        }
+    }
+
+    /** Whether two written operand types name the same thing, either of them possibly absent. */
+    private static boolean sameArg(String one, String other) {
+        if (one == null || other == null) return one == other;
+        return one.trim().equalsIgnoreCase(other.trim());
     }
 
     QueryResult executeCreateOperatorFamily(CreateOperatorFamilyStmt stmt) {
@@ -930,7 +1011,34 @@ class DdlObjectExecutor {
         }
 
         executor.database.addOperatorClass(cls);
+        // A class's operators belong to the family it joins, which is where pg_amop reads them
+        // from. Recorded on neither, a family a class had just filled reported itself empty, so
+        // a reader asking what comparisons an index could use was told there were none.
+        recordClassOperators(stmt);
         return QueryResult.command(QueryResult.Type.SET, 0);
+    }
+
+    /** Give the family this class joins the strategy operators the class was written with. */
+    private void recordClassOperators(CreateOperatorClassStmt stmt) {
+        if (stmt.familyName() == null) return;
+        String key = stmt.familyName().toLowerCase(java.util.Locale.ROOT) + ":"
+                + stmt.method().toLowerCase(java.util.Locale.ROOT);
+        PgOperatorFamily fam = executor.database.getOperatorFamily(key);
+        if (fam == null) return;
+        String forType = DataType.canonicalName(stmt.forType());
+        for (OperatorClassItem item : stmt.items()) {
+            // The operand types a strategy covers are the class's own type on both sides unless
+            // the item named a pair of its own.
+            List<String> args = item.argTypes();
+            String left = args != null && args.size() == 2
+                    ? DataType.canonicalName(args.get(0)) : forType;
+            String right = args != null && args.size() == 2
+                    ? DataType.canonicalName(args.get(1)) : forType;
+            boolean function = item.kind() != OperatorClassItem.Kind.OPERATOR;
+            String place = (function ? "f" : "o") + item.number() + "(" + left + "," + right + ")";
+            fam.addMember(place, new PgOperatorFamily.Member(function, item.number(),
+                    left, right, item.name()));
+        }
     }
 
     /**
@@ -1334,7 +1442,10 @@ class DdlObjectExecutor {
             if (needsReturnValue) {
                 java.util.regex.Matcher rm = java.util.regex.Pattern.compile("\\breturn\\s*;", java.util.regex.Pattern.CASE_INSENSITIVE).matcher(stmt.body());
                 if (rm.find()) {
-                    throw new MemgresException("RETURN must have a return value for function returning " + retType, "42601");
+                    // PostgreSQL reads the RETURN and finds a semicolon where the value should
+                    // have been, and names that: a bare RETURN in a function that returns
+                    // something is an expression the writer left out.
+                    throw new MemgresException("missing expression at or near \";\"", "42601");
                 }
             }
             // Try to parse SQL expressions inside the PL/pgSQL body (PG validates at creation time).
@@ -1360,7 +1471,10 @@ class DdlObjectExecutor {
             }
         }
 
-        String funcSchema = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
+        // A routine nobody put a schema on lands in the first schema the search path names that
+        // can be created in. Read from the schema a bare name resolves to, one created with an
+        // empty path landed in public, which is a schema the reader had excluded.
+        String funcSchema = stmt.schema() != null ? stmt.schema() : executor.creationSchema();
 
         // Check for duplicate function. Functions are a per-schema namespace, so a same-named
         // function with the same argument types in another schema is a different function.
@@ -2585,7 +2699,15 @@ class DdlObjectExecutor {
             String[] parts = callName.split("\\.", 2);
             candidates = executor.database.getFunctionOverloads(parts[0], parts[1]);
         } else {
-            candidates = executor.database.getFunctionOverloads(callName);
+            // A bare name is looked for along the search path and nowhere else, as an
+            // unqualified routine reference always is. Read from the register by name alone, a
+            // procedure in a schema the session could not name was called anyway.
+            candidates = new ArrayList<>();
+            for (PgFunction candidate : executor.database.getFunctionOverloads(callName)) {
+                if (executor.schemaOnSearchPath(Database.schemaOf(candidate))) {
+                    candidates.add(candidate);
+                }
+            }
         }
         if (candidates == null || candidates.isEmpty()) return null;
         // Prefer a signature the arguments actually fit; fall back to one that merely takes that
@@ -2858,8 +2980,14 @@ class DdlObjectExecutor {
             returnVal = plExec.executeFunction(function, args);
         } catch (RuntimeException e) {
             procedureFailed = true;
-            // Rollback the transaction on procedure error
-            if (executor.session != null) {
+            // Only the transaction this CALL opened is this CALL's to end. A transaction the
+            // caller opened is the caller's, and ending it here committed work the caller went on
+            // to roll back -- so a CALL inside BEGIN ... ROLLBACK kept its rows, and the rows
+            // written before it kept theirs too.
+            // A transaction nobody wrote a BEGIN for is the statement's own, and a statement that
+            // failed has to leave it behind; one the caller opened stays open and aborted, which
+            // is its writer's to end.
+            if (executor.session != null && !executor.session.isExplicitTransactionBlock()) {
                 Session.TransactionStatus st = executor.session.getStatus();
                 if (st == Session.TransactionStatus.IN_TRANSACTION || st == Session.TransactionStatus.FAILED) {
                     executor.session.rollback();
@@ -2867,8 +2995,9 @@ class DdlObjectExecutor {
             }
             throw e;
         } finally {
-            // After procedure returns successfully, commit any trailing implicit transaction
-            if (!procedureFailed && executor.session != null) {
+            // After procedure returns successfully, commit the transaction the CALL opened
+            if (!procedureFailed && executor.session != null
+                    && !executor.session.isExplicitTransactionBlock()) {
                 Session.TransactionStatus st = executor.session.getStatus();
                 if (st == Session.TransactionStatus.IN_TRANSACTION) {
                     executor.session.commit();
@@ -3002,6 +3131,9 @@ class DdlObjectExecutor {
                 throw new MemgresException("function " + stmt.functionName() + " must return type trigger", "42P17");
             }
         }
+        // What this statement is about to change, so a rollback can put it back.
+        executor.recordUndo(new Session.TriggerUndo(stmt.table(), stmt.name(),
+                triggersNamed(stmt.table(), stmt.name())));
         if (stmt.orReplace()) {
             executor.database.removeTrigger(stmt.name(), stmt.table());
         }
@@ -3502,6 +3634,10 @@ class DdlObjectExecutor {
                 executor.database.unregisterSchemaObject(TypeNamespace.schemaOfKey(key),
                         "domain", TypeNamespace.nameOfKey(key));
                 executor.database.addComment("type", key, null);
+                // A domain is a type, so it is owned as one, and the record of who owns it has to
+                // go with it: left standing, it named its owner as a role something still depends
+                // on, and DROP ROLE refused for a domain that was no longer there.
+                executor.database.removeObjectOwner("type:" + key);
                 executor.identity().typeDropped("d", key);
                 break;
             }
@@ -4010,6 +4146,16 @@ class DdlObjectExecutor {
             noticeSkipped("index \"" + bareIndexName + "\"");
             return;
         }
+        // An index attached to a partitioned table's index exists because that one does, and
+        // goes when it goes. Dropping it on its own would leave the parent index with a partition
+        // it no longer covers, so PostgreSQL refuses and names the index to drop instead.
+        String attachedTo = executor.database.getIndexParentMap().get(indexKey);
+        if (attachedTo != null) {
+            MemgresException e = new MemgresException("cannot drop index " + bareIndexName
+                    + " because index " + Database.idxName(attachedTo) + " requires it", "2BP01");
+            e.setHint("You can drop index " + Database.idxName(attachedTo) + " instead.");
+            throw e;
+        }
         String storedTable = executor.database.getIndexTable(indexKey);
         // What the index enforced on its table goes with it, and comes back with it: a unique
         // index is recorded twice over, once as an index and once as the rule its table is
@@ -4038,6 +4184,49 @@ class DdlObjectExecutor {
         // first.
         executor.recordUndo(new DroppedIndexUndo(executor.database, indexKey, indexOwner, enforced));
         executor.database.removeIndex(indexSchema, bareIndexName);
+        dropIndexesAttachedTo(indexKey);
+    }
+
+    /**
+     * Drop the copies a partitioned index has on the partitions below it.
+     *
+     * <p>An index on a partitioned table is not an index over any rows of its own: every
+     * partition carries a copy attached to it, and the copy exists because the parent index does.
+     * Dropping only the parent left each partition still indexed by something nothing owned, and
+     * the name of that copy still taken.
+     */
+    private void dropIndexesAttachedTo(String parentKey) {
+        if (parentKey == null) return;
+        for (Map.Entry<String, String> attached
+                : new ArrayList<>(executor.database.getIndexParentMap().entrySet())) {
+            if (!parentKey.equalsIgnoreCase(attached.getValue())) continue;
+            String childKey = attached.getKey();
+            String childSchema = Database.idxSchema(childKey);
+            String childName = Database.idxName(childKey);
+            Table childOwner = null;
+            List<StoredConstraint> childEnforced = new ArrayList<>();
+            String ownerName = executor.database.getIndexTable(childKey);
+            if (ownerName != null) {
+                int dot = ownerName.indexOf('.');
+                try {
+                    Table t = executor.resolveTable(dot >= 0 ? ownerName.substring(0, dot) : "public",
+                            dot >= 0 ? ownerName.substring(dot + 1) : ownerName);
+                    for (StoredConstraint sc : t.getConstraints()) {
+                        if (sc.getName() != null && sc.getName().equalsIgnoreCase(childName)) {
+                            childEnforced.add(sc);
+                        }
+                    }
+                    childOwner = t;
+                    t.getConstraints().removeIf(sc -> sc.getName().equalsIgnoreCase(childName));
+                } catch (MemgresException ignored) { }
+            }
+            executor.recordUndo(new DroppedIndexUndo(executor.database, childKey, childOwner,
+                    childEnforced));
+            executor.database.removeIndex(childSchema, childName);
+            executor.database.getIndexParentMap().remove(childKey);
+            // A partition may itself be partitioned, and its copy is the parent of theirs.
+            dropIndexesAttachedTo(childKey);
+        }
     }
 
     /**
@@ -4160,6 +4349,10 @@ class DdlObjectExecutor {
         // function is not the definer's alone to drop: PostgreSQL refuses while a trigger depends
         // on it, names the trigger, and takes the trigger along when CASCADE is written.
         refuseOrCascadeTriggerDependents(stmt);
+        // An operator is defined by the routine that performs it, so the routine is not the
+        // definer's alone to drop: PostgreSQL refuses while an operator depends on it, names the
+        // operator, and takes the operator along when CASCADE is written.
+        refuseOrCascadeOperatorDependents(stmt);
         if (stmt.paramTypes() != null) {
             executor.database.removeFunction(schema, stmt.name(), stmt.paramTypes());
         } else {
@@ -4229,6 +4422,61 @@ class DdlObjectExecutor {
             executor.database.removeTrigger(t.getName(), t.getTableName());
         }
         noticeDropCascades(executor, cascaded);
+    }
+
+    /**
+     * The operators a function being dropped performs. PostgreSQL records the dependency when the
+     * operator is created, so the function cannot go while an operator still calls it -- the
+     * operator would resolve to nothing and every expression using it would fail -- and CASCADE
+     * drops the operator with it.
+     */
+    private void refuseOrCascadeOperatorDependents(DropStmt stmt) {
+        List<PgOperator> dependents = new ArrayList<>();
+        for (PgOperator op : executor.database.getUserOperators().values()) {
+            if (op.getFunction() == null) continue;
+            if (RelationNamespace.bareName(op.getFunction()).equalsIgnoreCase(stmt.name())) {
+                dependents.add(op);
+            }
+        }
+        if (dependents.isEmpty()) return;
+        // A dependency names the routine by the types it resolved to -- integer, not the
+        // grammar's alias under pg_catalog, which is the spelling a missing-function message uses.
+        String written = stmt.name() + "(" + resolvedArgumentList(stmt.paramTypes()) + ")";
+        if (!stmt.cascade()) {
+            List<String> lines = new ArrayList<>();
+            for (PgOperator op : dependents) {
+                lines.add(operatorNamed(op) + " depends on function " + written);
+            }
+            MemgresException e = new MemgresException("cannot drop function " + written
+                    + " because other objects depend on it", "2BP01");
+            e.setDetail(dependencyDetail(lines));
+            e.setHint("Use DROP ... CASCADE to drop the dependent objects too.");
+            throw e;
+        }
+        List<String> cascaded = new ArrayList<>();
+        for (PgOperator op : dependents) {
+            cascaded.add(operatorNamed(op));
+            executor.database.removeOperator(op.getKey());
+        }
+        noticeDropCascades(executor, cascaded);
+    }
+
+    /** An argument list written with the type names the arguments resolved to. */
+    private static String resolvedArgumentList(List<String> paramTypes) {
+        if (paramTypes == null || paramTypes.isEmpty()) return "";
+        StringBuilder sb = new StringBuilder();
+        for (String t : paramTypes) {
+            if (sb.length() > 0) sb.append(',');
+            sb.append(t == null ? "" : DataType.canonicalName(t.trim()));
+        }
+        return sb.toString();
+    }
+
+    /** An operator named the way PostgreSQL names it in a dependency: spelling and operand types. */
+    private static String operatorNamed(PgOperator op) {
+        String left = op.getLeftArg() == null ? "NONE" : DataType.canonicalName(op.getLeftArg());
+        String right = op.getRightArg() == null ? "NONE" : DataType.canonicalName(op.getRightArg());
+        return "operator " + op.getName() + "(" + left + "," + right + ")";
     }
 
     /**
@@ -4303,6 +4551,11 @@ class DdlObjectExecutor {
             // is keyed by the relation's bare name. PostgreSQL names the relation as it was
             // written when it is not there, and without its schema when the trigger is not.
             String written = stmt.onTable();
+            // A qualifier names the schema the relation is in, and a schema that is not there is
+            // what is missing: reported as a missing relation, the message named a relation in a
+            // schema nobody had made, which told a reader to look for the wrong thing.
+            SchemaQualifier.requireSchema(executor.database, executor.session,
+                    TypeNamespace.writtenSchema(written));
             String onSchema = executor.relationSchemaOf(null, written);
             String onTable = RelationNamespace.bareName(written);
             List<PgTrigger> tableTriggers = executor.database.getTriggersForTable(onSchema, onTable);
@@ -4340,8 +4593,20 @@ class DdlObjectExecutor {
                         ? "trigger \"" + stmt.name() + "\" for relation \"" + onTable + "\""
                         : "relation \"" + written + "\"");
             }
+            executor.recordUndo(new Session.TriggerUndo(onTable, stmt.name(),
+                    triggersNamed(onTable, stmt.name())));
             executor.database.removeTrigger(stmt.name(), onTable);
         }
+    }
+
+    /** The triggers of one name a relation carries, as they stand before a statement changes them. */
+    private List<PgTrigger> triggersNamed(String tableName, String triggerName) {
+        List<PgTrigger> named = new ArrayList<PgTrigger>();
+        if (tableName == null || triggerName == null) return named;
+        for (PgTrigger t : executor.database.getTriggersForTable(tableName)) {
+            if (t.getName().equalsIgnoreCase(triggerName)) named.add(t);
+        }
+        return named;
     }
 
     /**
@@ -4508,6 +4773,7 @@ class DdlObjectExecutor {
         inStoredTypes(() -> executor.database.getDomains().remove(key));
         executor.database.unregisterSchemaObject(schema, "domain", bare);
         executor.database.addComment("type", key, null);
+        executor.database.removeObjectOwner("type:" + key);
         executor.identity().typeDropped("d", key);
     }
 
@@ -4679,6 +4945,20 @@ class DdlObjectExecutor {
         // nothing depends on, and could not be dropped while the ownership was still recorded.
         executor.database.removeObjectOwner("type:" + key);
         executor.database.addComment("type", key, null);
+    }
+
+    /**
+     * Carry a type's ownership across a rename or a move. A type keeps its owner when it changes
+     * name or schema, but ownership is recorded under the name: left where it was, the record
+     * named a type that is no longer there — so the renamed type belonged to nobody, and the role
+     * could not be dropped on account of a type it no longer owned.
+     */
+    private void moveTypeOwner(String fromKey, String toKey) {
+        if (fromKey == null || toKey == null || fromKey.equalsIgnoreCase(toKey)) return;
+        String owner = executor.database.getObjectOwner("type:" + fromKey);
+        if (owner == null) return;
+        executor.database.removeObjectOwner("type:" + fromKey);
+        executor.database.setObjectOwner("type:" + toKey, owner);
     }
 
     /** A written type name: the schema the statement gave, when it gave one, and the name. */
@@ -4853,7 +5133,10 @@ class DdlObjectExecutor {
                                 executor.database.getTriggersForTable(stmt.name(), tName),
                                 executor.database.snapshotRulesGoingWith(stmt.name(), tName)));
                     }
-                    executor.database.getAllTriggers().remove(tName.toLowerCase(java.util.Locale.ROOT));
+                    // Only this schema's triggers go with it: the registry is keyed by the bare
+                    // relation name, so clearing the whole entry took the triggers on a relation
+                    // of the same name in another schema down with the schema being dropped.
+                    executor.database.removeTriggersForTable(stmt.name(), tName);
                 }
                 for (String tName : tableNames) {
                     executor.database.removePrivilegesOnObject("TABLE",
@@ -5469,7 +5752,8 @@ class DdlObjectExecutor {
         // A qualified name puts the sequence in the schema it names, and it is that schema's
         // relations the name has to be free of. A temporary sequence lands in this session's
         // temporary schema, which is a schema like any other.
-        String seqSchema = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
+        String seqSchema = stmt.schema() != null ? stmt.schema()
+                : stmt.temporary() ? executor.defaultSchema() : executor.creationSchema();
         if (stmt.temporary() && executor.session != null) {
             seqSchema = executor.session.getTempSchemaName();
             // The temporary schema has to be a schema the engine really holds, or a later
@@ -5545,6 +5829,10 @@ class DdlObjectExecutor {
                     bareName, RelationNamespace.SEQUENCE);
             throw new MemgresException("relation \"" + stmt.name() + "\" does not exist", "42P01");
         }
+        // As with an enum: an ALTER that rolls back never happened, and a sequence left with the
+        // increment or the bounds a rolled-back statement gave it hands out numbers nobody asked
+        // for -- and goes on doing so for the rest of the session.
+        executor.recordUndo(new Session.AlterSequenceUndo(seq));
         String seqSchema = seq.getSchemaName();
         if (stmt.setSchema() != null) {
             requireSchemaExists(stmt.setSchema());
@@ -5609,8 +5897,7 @@ class DdlObjectExecutor {
     /** Attach a sequence to a table column, or detach it for OWNED BY NONE. */
     private void applySequenceOwnedBy(Sequence seq, String tblName, String colName) {
         if ("NONE".equalsIgnoreCase(tblName)) {
-            seq.setOwnedByTable(null);
-            seq.setOwnedByColumn(null);
+            seq.ownedByNobody();
             return;
         }
         String bare = RelationNamespace.bareName(tblName);
@@ -6008,6 +6295,7 @@ class DdlObjectExecutor {
                 executor.database.unregisterSchemaObject(domSchema, "domain", domain.getName());
                 executor.database.registerSchemaObject(domSchema, "domain", newName);
                 executor.database.moveComment("type", oldKey, newKey);
+                moveTypeOwner(oldKey, newKey);
                 retargetDomainColumns(oldKey, newKey);
                 // The same domain under a new name: a column declared with the old word goes on
                 // reading this domain, so the OID stays with it.
@@ -6027,12 +6315,18 @@ class DdlObjectExecutor {
                 executor.database.registerSchemaObject(to, "domain", domain.getName());
                 String newKey = TypeNamespace.key(to, domain.getName());
                 executor.database.moveComment("type", oldKey, newKey);
+                moveTypeOwner(oldKey, newKey);
                 retargetDomainColumns(oldKey, newKey);
                 executor.identity().typeRenamed("d", oldKey, newKey);
                 break;
             }
             case "OWNER_TO": {
                 requireOwnerExists(stmt.newConstraintName());
+                // A domain is given away like any other type, and the record of who owns it is
+                // what pg_type reports and what DROP ROLE follows.
+                executor.database.setObjectOwner(
+                        "type:" + TypeNamespace.key(domain.getSchemaName(), domain.getName()),
+                        executor.ddlExecutor.resolveOwnerName(stmt.newConstraintName()));
                 break;
             }
             case "NO_OP": {
@@ -6170,7 +6464,6 @@ class DdlObjectExecutor {
      * silently returns fewer rows than the same query answered from the heap.
      */
     private void checkIndexExpressionsAndPredicate(CreateIndexStmt s) {
-        rejectIndexOverSystemColumns(s);
         if (s.columns() != null) {
             for (String col : s.columns()) {
                 // An index key is kept as the text it was written as, so its type names are read
@@ -6354,7 +6647,13 @@ class DdlObjectExecutor {
         // The relation is opened before the statement is analysed, and opening it starts by
         // finding the schema it was written under.
         SchemaQualifier.requireSchema(executor.database, executor.session, s.schema());
-        String indexSchema = s.schema() != null ? s.schema() : executor.defaultSchema();
+        // An index lives where its relation lives, not where the session happens to be writing:
+        // an unqualified name found further along the search path takes its index with it.
+        // Filed under the default schema, the index was recorded in a schema that did not hold
+        // the relation it indexed, and its name was taken there instead.
+        String indexSchema = s.schema() != null ? s.schema()
+                : s.table() != null ? executor.relationSchemaOf(null, s.table())
+                : executor.defaultSchema();
         // An index is part of the relation's own definition, so adding one is the owner's to do.
         // A role holding nothing but SELECT could build an index over the whole table.
         if (s.table() != null) executor.requireTableOwner(indexSchema, s.table());
@@ -6376,6 +6675,10 @@ class DdlObjectExecutor {
             throw new MemgresException(
                     "tablespace \"" + s.tablespace() + "\" does not exist", "42704");
         }
+        // A key over a system column is refused once the relation is open and the tablespace has
+        // been judged, which is the order PostgreSQL judges them in. Refused first, a statement
+        // naming a relation that is not there was answered about its key instead.
+        rejectIndexOverSystemColumns(s);
         // An index nobody named still gets one: PostgreSQL derives it from the relation and from
         // what each indexed column is worth as a name, and numbers it when a relation of that name
         // already lives in the schema. Leaving the name null registered nothing at all and still
@@ -6457,6 +6760,12 @@ class DdlObjectExecutor {
                             }
                             Expression idxExpr =
                                 com.memgres.engine.parser.Parser.parseExpression(exprToParse);
+                            // A cast is a function too, and some of them are no more than stable:
+                            // reading a timestamptz as a date depends on the session's TimeZone,
+                            // and writing a date out depends on its DateStyle. Left unchecked, an
+                            // index was built over a key whose value changes with a setting, so
+                            // the same row was in two places depending on who looked.
+                            DdlExecutor.rejectStableCastInIndex(idxTable, idxExpr);
                             // Create a dummy row context with default non-null values
                             Object[] dummyRow = new Object[idxTable.getColumns().size()];
                             for (int di = 0; di < idxTable.getColumns().size(); di++) {
@@ -6492,8 +6801,12 @@ class DdlObjectExecutor {
                             RowContext dummyCtx = new RowContext(idxTable, idxTable.getName(), dummyRow);
                             executor.evalExpr(idxExpr, dummyCtx);
                         } catch (MemgresException me) {
+                            // 42P17 is this method's own refusal of a key that is not immutable,
+                            // and it has to reach the client: swallowed as an evaluation error,
+                            // the index was built over a key whose value depends on a setting.
                             if ("42883".equals(me.getSqlState()) || "42804".equals(me.getSqlState())
                                     || "42702".equals(me.getSqlState()) || "42P18".equals(me.getSqlState())
+                                    || "42P17".equals(me.getSqlState())
                                     || me.getMessage() != null && me.getMessage().contains("operator does not exist")) {
                                 throw me;
                             }
@@ -6709,8 +7022,10 @@ class DdlObjectExecutor {
         }
         if (s.name() != null && s.columns() != null) {
             // An index lives in the schema of the table it indexes, and it is that schema's
-            // relations its name has to be free of -- not every schema's at once.
-            String idxSchemaForMeta = s.schema() != null ? s.schema() : executor.defaultSchema();
+            // relations its name has to be free of -- not every schema's at once. Which schema
+            // that is has already been settled from the relation, so a table found further along
+            // the search path takes its index with it rather than leaving it in the default one.
+            String idxSchemaForMeta = indexSchema;
             executor.database.addIndex(idxSchemaForMeta, s.name(), s.columns());
             // Store index metadata (table name, uniqueness, method, WHERE clause)
             executor.database.addIndexMeta(idxSchemaForMeta, s.name(),
@@ -7077,6 +7392,12 @@ class DdlObjectExecutor {
         int castFunc = 0; // 0 for binary coercible / without function
         if (castMethod.equals("f")) {
             validateCastFunction(stmt);
+            // The routine that performs the cast is named by its number, which is what a reader
+            // joins castfunc back to pg_proc by. Left at zero, pg_cast said a cast written WITH
+            // FUNCTION had no function at all.
+            castFunc = executor.getSystemCatalog().getOid(
+                    "proc:" + RelationNamespace.bareName(stmt.functionName)
+                            .toLowerCase(java.util.Locale.ROOT));
         } else if (castMethod.equals("b")) {
             validateBinaryCoercible(stmt);
         }

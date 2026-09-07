@@ -1631,11 +1631,11 @@ ROW: 2
 SQL: SELECT a, sum(c) FROM s GROUP BY GROUPING SETS ((a), ())
 RESULT: 2 columns, 5 rows
 COLUMNS: a, sum
+ROW: NULL | 60
 ROW: 1 | 10
 ROW: 2 | 20
 ROW: 3 | 30
 ROW: NULL | NULL
-ROW: NULL | 60
 --- STMT 29 ---
 SQL: SELECT grouping(a) FROM s
 ERROR [42803]: ERROR: arguments to GROUPING must be grouping expressions of the associated query level
@@ -2061,7 +2061,7 @@ COLUMNS: x, y
 ROW: 1 | ok
 --- STMT 16 ---
 SQL: CALL p_ins(1, 'a')
-ERROR [42883]: ERROR: procedure p_ins(integer, text) does not exist
+ERROR [42883]: ERROR: procedure p_ins(integer, unknown) does not exist
 --- STMT 17 ---
 SQL: SELECT * FROM proc_t ORDER BY id
 RESULT: 2 columns, 0 rows
@@ -2094,7 +2094,7 @@ SQL: CALL no_such_proc()
 ERROR [42883]: ERROR: procedure no_such_proc() does not exist
 --- STMT 26 ---
 SQL: CREATE FUNCTION badf(a int) RETURNS int LANGUAGE SQL AS $$ SELECT $$
-ERROR [42P13]: ERROR: return type mismatch in function declared to return int
+ERROR [42P13]: ERROR: return type mismatch in function declared to return integer
 --- STMT 27 ---
 SQL: CREATE OR REPLACE FUNCTION badpl() RETURNS int LANGUAGE plpgsql AS $$ BEGIN RETURN; END $$
 ERROR [42601]: ERROR: RETURN must have a return value for function returning int
@@ -3608,10 +3608,10 @@ ROW:   ->  Seq Scan on admin_t
 SQL: EXPLAIN ANALYZE SELECT * FROM admin_t WHERE id = 1
 RESULT: 1 columns, 4 rows
 COLUMNS: QUERY PLAN
-ROW: Seq Scan on admin_t  (cost=0.00..0.01 rows=1 width=4) (actual time=0.218..0.218 rows=1.00 loops=1)
+ROW: Seq Scan on admin_t  (cost=0.00..0.01 rows=1 width=4) (actual time=0.300..0.300 rows=1.00 loops=1)
 ROW:   Filter: (id = 1)
-ROW: Planning Time: 0.042 ms
-ROW: Execution Time: 0.417 ms
+ROW: Planning Time: 0.050 ms
+ROW: Execution Time: 0.505 ms
 --- STMT 24 ---
 SQL: ANALYZE admin_t
 OK: 0 rows affected
@@ -4058,7 +4058,7 @@ OK: 20 rows affected
 SQL: SELECT count(*) FROM sample_t TABLESAMPLE SYSTEM (50)
 RESULT: 1 columns, 1 rows
 COLUMNS: count
-ROW: 11
+ROW: 13
 --- STMT 28 ---
 SQL: SELECT count(*) FROM sample_t TABLESAMPLE BERNOULLI (50) REPEATABLE (123)
 RESULT: 1 columns, 1 rows
@@ -4446,7 +4446,7 @@ SQL: SELECT xpath('not_xpath(', xmlparse(document '<root><a>1</a></root>'))
 ERROR [10608]: ERROR: invalid XPath expression: not_xpath(
 --- STMT 41 ---
 SQL: SELECT xmlserialize(document xmlelement(name x, 'abc') AS int)
-ERROR [42846]: ERROR: cannot cast type xml to int
+ERROR [42846]: ERROR: cannot cast XMLSERIALIZE result to integer
 --- STMT 42 ---
 SQL: SELECT to_tsquery('english', 'quick & & fox')
 ERROR [42601]: ERROR: syntax error in tsquery: "quick & & fox"
@@ -4652,16 +4652,16 @@ RESULT: 0 columns, 0 rows
 COLUMNS: 
 --- STMT 14 ---
 SQL: SELECT * FROM p WHERE a = 1 ORDER BY b GROUP BY a
-ERROR [42601]: ERROR: syntax error at or near "GROUP"
+ERROR [42601]: ERROR: syntax error at or near "BY"
 --- STMT 15 ---
 SQL: SELECT * FROM p GROUP BY a WHERE a = 1
 ERROR [42601]: ERROR: syntax error at or near "WHERE"
 --- STMT 16 ---
 SQL: SELECT * FROM p HAVING a = 1 GROUP BY a
-ERROR [42601]: ERROR: syntax error at or near "GROUP"
+ERROR [42601]: ERROR: syntax error at or near "BY"
 --- STMT 17 ---
 SQL: SELECT * FROM p LIMIT 1 ORDER BY a
-ERROR [42601]: ERROR: syntax error at or near "ORDER"
+ERROR [42601]: ERROR: syntax error at or near "BY"
 --- STMT 18 ---
 SQL: SELECT * FROM p OFFSET 1 LIMIT
 ERROR [42601]: ERROR: syntax error at end of input
@@ -4683,7 +4683,7 @@ SQL: INSERT INTO p (a b) VALUES (1, 'x')
 ERROR [42601]: ERROR: syntax error at or near "b"
 --- STMT 24 ---
 SQL: INSERT INTO p VALUES (1 'x')
-ERROR [42601]: ERROR: syntax error at or near "x"
+ERROR [42601]: ERROR: syntax error at or near "'x'"
 --- STMT 25 ---
 SQL: INSERT INTO p SELECT FROM p
 OK: 1 rows affected
@@ -4868,7 +4868,7 @@ SQL: SELECT * FROM ROWS FROM (generate_series(1,2),) AS x(a,b)
 ERROR [42601]: ERROR: syntax error at or near ")"
 --- STMT 84 ---
 SQL: SELECT xmlparse( '<x/>' )
-ERROR [42601]: ERROR: syntax error at or near "<x/>"
+ERROR [42601]: ERROR: syntax error at or near "'<x/>'"
 --- STMT 85 ---
 SQL: SELECT to_tsquery('english', )
 ERROR [42601]: ERROR: syntax error at or near ")"
@@ -6062,18 +6062,18 @@ OK: 0 rows affected
 SQL: INSERT INTO upsert_t(code, note) VALUES ('A', 'a1'), ('B', 'b1') RETURNING id, code, note, updated_at
 RESULT: 4 columns, 2 rows
 COLUMNS: id, code, note, updated_at
-ROW: 1 | A | a1 | 2026-08-30 12:04:16.492935+00
-ROW: 2 | B | b1 | 2026-08-30 12:04:16.492935+00
+ROW: 1 | A | a1 | 2026-09-04 14:54:54.38015+00
+ROW: 2 | B | b1 | 2026-09-04 14:54:54.38015+00
 --- STMT 12 ---
 SQL: -- returning / generated-key shaped cases INSERT INTO upsert_t(code) VALUES ('C') RETURNING *
 RESULT: 4 columns, 1 rows
 COLUMNS: id, code, note, updated_at
-ROW: 3 | C | d | 2026-08-30 12:04:16.493654+00
+ROW: 3 | C | d | 2026-09-04 14:54:54.380968+00
 --- STMT 13 ---
 SQL: INSERT INTO upsert_t(id, code, note) OVERRIDING SYSTEM VALUE VALUES (100, 'SYS', 'sys') RETURNING *
 RESULT: 4 columns, 1 rows
 COLUMNS: id, code, note, updated_at
-ROW: 100 | SYS | sys | 2026-08-30 12:04:16.494086+00
+ROW: 100 | SYS | sys | 2026-09-04 14:54:54.398878+00
 --- STMT 14 ---
 SQL: ALTER TABLE upsert_t ALTER COLUMN id SET GENERATED BY DEFAULT
 OK: 0 rows affected
@@ -6081,7 +6081,7 @@ OK: 0 rows affected
 SQL: INSERT INTO upsert_t(id, code, note) VALUES (200, 'MAN', 'manual') RETURNING *
 RESULT: 4 columns, 1 rows
 COLUMNS: id, code, note, updated_at
-ROW: 200 | MAN | manual | 2026-08-30 12:04:16.494928+00
+ROW: 200 | MAN | manual | 2026-09-04 14:54:54.400149+00
 --- STMT 16 ---
 SQL: ALTER TABLE upsert_t ALTER COLUMN id SET GENERATED ALWAYS
 OK: 0 rows affected
@@ -6093,12 +6093,12 @@ COLUMNS: id, code, note, updated_at
 SQL: INSERT INTO upsert_t(code, note) VALUES ('A', 'a3') ON CONFLICT (code) DO UPDATE SET note = EXCLUDED.note, updated_at = CURRENT_TIMESTAMP RETURNING id, code, note, updated_at
 RESULT: 4 columns, 1 rows
 COLUMNS: id, code, note, updated_at
-ROW: 1 | A | a3 | 2026-08-30 12:04:16.503433+00
+ROW: 1 | A | a3 | 2026-09-04 14:54:54.407036+00
 --- STMT 19 ---
 SQL: INSERT INTO upsert_t(code, note) VALUES ('B', 'b2') ON CONFLICT ON CONSTRAINT upsert_t_code_key DO UPDATE SET note = EXCLUDED.note RETURNING *
 RESULT: 4 columns, 1 rows
 COLUMNS: id, code, note, updated_at
-ROW: 2 | B | b2 | 2026-08-30 12:04:16.492935+00
+ROW: 2 | B | b2 | 2026-09-04 14:54:54.38015+00
 --- STMT 20 ---
 SQL: INSERT INTO upsert_t(code, note) VALUES ('D', 'd1'), ('E', 'e1') RETURNING id, code, note
 RESULT: 3 columns, 2 rows
@@ -6109,7 +6109,7 @@ ROW: 8 | E | e1
 SQL: INSERT INTO upsert_t(code, note) VALUES ('D', 'd2') ON CONFLICT (code) DO UPDATE SET note = EXCLUDED.note WHERE upsert_t.note <> EXCLUDED.note RETURNING *
 RESULT: 4 columns, 1 rows
 COLUMNS: id, code, note, updated_at
-ROW: 7 | D | d2 | 2026-08-30 12:04:16.504664+00
+ROW: 7 | D | d2 | 2026-09-04 14:54:54.408532+00
 --- STMT 22 ---
 SQL: UPDATE upsert_t SET note = note WHERE code = 'A' RETURNING id, code, note
 RESULT: 3 columns, 1 rows
@@ -6127,13 +6127,13 @@ COLUMNS: id, code, note, updated_at
 SQL: SELECT * FROM upsert_t ORDER BY id
 RESULT: 4 columns, 7 rows
 COLUMNS: id, code, note, updated_at
-ROW: 1 | A | a3 | 2026-08-30 12:04:16.503433+00
-ROW: 2 | B | b2 | 2026-08-30 12:04:16.492935+00
-ROW: 3 | C | d | 2026-08-30 12:04:16.493654+00
-ROW: 7 | D | d2 | 2026-08-30 12:04:16.504664+00
-ROW: 8 | E | e1 | 2026-08-30 12:04:16.504664+00
-ROW: 100 | SYS | sys | 2026-08-30 12:04:16.494086+00
-ROW: 200 | MAN | manual | 2026-08-30 12:04:16.494928+00
+ROW: 1 | A | a3 | 2026-09-04 14:54:54.407036+00
+ROW: 2 | B | b2 | 2026-09-04 14:54:54.38015+00
+ROW: 3 | C | d | 2026-09-04 14:54:54.380968+00
+ROW: 7 | D | d2 | 2026-09-04 14:54:54.408532+00
+ROW: 8 | E | e1 | 2026-09-04 14:54:54.408532+00
+ROW: 100 | SYS | sys | 2026-09-04 14:54:54.398878+00
+ROW: 200 | MAN | manual | 2026-09-04 14:54:54.400149+00
 --- STMT 26 ---
 SQL: -- bad upsert / returning cases INSERT INTO upsert_t(code, note) VALUES ('A', 'dup') ON CONFLICT (note) DO NOTHING
 ERROR [42P10]: ERROR: there is no unique or exclusion constraint matching the ON CONFLICT specification
@@ -6469,7 +6469,7 @@ OK: 3 rows affected
 SQL: -- common app-shaped datetime and filter expressions SELECT CURRENT_DATE, CURRENT_TIMESTAMP, LOCALTIMESTAMP
 RESULT: 3 columns, 1 rows
 COLUMNS: current_date, current_timestamp, localtimestamp
-ROW: 2026-08-30 | 2026-08-30 12:04:17.209525+00 | 2026-08-30 12:04:17.209525
+ROW: 2026-09-04 | 2026-09-04 14:54:55.322421+00 | 2026-09-04 14:54:55.322421
 --- STMT 13 ---
 SQL: SELECT date_trunc('day', created_at), date_trunc('hour', local_ts) FROM app_t ORDER BY id
 RESULT: 2 columns, 3 rows
@@ -6559,10 +6559,10 @@ SQL: -- bad app-shaped cases SELECT note LIKE 'a%' ESCAPE 'xx' FROM app_t
 ERROR [22025]: ERROR: invalid escape string
 --- STMT 27 ---
 SQL: SELECT note ~ '(' FROM app_t
-ERROR [2201B]: ERROR: invalid regular expression: Unclosed group
+ERROR [2201B]: ERROR: invalid regular expression: parentheses () not balanced
 --- STMT 28 ---
 SQL: SELECT regexp_replace('abc', '(', 'x')
-ERROR [2201B]: ERROR: invalid regular expression: Unclosed group
+ERROR [2201B]: ERROR: invalid regular expression: parentheses () not balanced
 --- STMT 29 ---
 SQL: SELECT date_trunc('nonesuch', created_at) FROM app_t
 ERROR [22023]: ERROR: unit "nonesuch" not recognized for type timestamp with time zone
@@ -7324,24 +7324,27 @@ RESULT: 4 columns, 3 rows
 COLUMNS: id, tenant_id, note, deleted_at
 ROW: 1 | 10 | a | NULL
 ROW: 2 | 20 | b | NULL
-ROW: 3 | 10 | c | 2026-08-30 12:04:19.283888+00
+ROW: 3 | 10 | c | 2026-09-04 14:54:57.99627+00
 --- STMT 17 ---
 SQL: ALTER TABLE tenant_data FORCE ROW LEVEL SECURITY
 OK: 0 rows affected
 --- STMT 18 ---
 SQL: SELECT * FROM tenant_data ORDER BY id
-RESULT: 4 columns, 2 rows
+RESULT: 4 columns, 3 rows
 COLUMNS: id, tenant_id, note, deleted_at
 ROW: 1 | 10 | a | NULL
-ROW: 3 | 10 | c | 2026-08-30 12:04:19.283888+00
+ROW: 2 | 20 | b | NULL
+ROW: 3 | 10 | c | 2026-09-04 14:54:57.99627+00
 --- STMT 19 ---
 SQL: ALTER POLICY tenant_select_pol ON tenant_data USING (tenant_id = current_setting('compat.tenant_id')::int AND deleted_at IS NULL)
 OK: 0 rows affected
 --- STMT 20 ---
 SQL: SELECT * FROM tenant_data ORDER BY id
-RESULT: 4 columns, 1 rows
+RESULT: 4 columns, 3 rows
 COLUMNS: id, tenant_id, note, deleted_at
 ROW: 1 | 10 | a | NULL
+ROW: 2 | 20 | b | NULL
+ROW: 3 | 10 | c | 2026-09-04 14:54:57.99627+00
 --- STMT 21 ---
 SQL: DROP POLICY tenant_mod_pol ON tenant_data
 OK: 0 rows affected
@@ -7646,23 +7649,23 @@ OK: 4 rows affected
 SQL: -- common repository query shapes SELECT * FROM repo_account WHERE id = 1
 RESULT: 6 columns, 1 rows
 COLUMNS: id, email, active, deleted_at, version, created_at
-ROW: 1 | a@example.com | t | NULL | 0 | 2026-08-30 12:04:19.752609+00
+ROW: 1 | a@example.com | t | NULL | 0 | 2026-09-04 14:54:58.603318+00
 --- STMT 15 ---
 SQL: SELECT * FROM repo_account WHERE email = 'a@example.com'
 RESULT: 6 columns, 1 rows
 COLUMNS: id, email, active, deleted_at, version, created_at
-ROW: 1 | a@example.com | t | NULL | 0 | 2026-08-30 12:04:19.752609+00
+ROW: 1 | a@example.com | t | NULL | 0 | 2026-09-04 14:54:58.603318+00
 --- STMT 16 ---
 SQL: SELECT * FROM repo_account WHERE deleted_at IS NULL ORDER BY id
 RESULT: 6 columns, 2 rows
 COLUMNS: id, email, active, deleted_at, version, created_at
-ROW: 1 | a@example.com | t | NULL | 0 | 2026-08-30 12:04:19.752609+00
-ROW: 2 | b@example.com | f | NULL | 0 | 2026-08-30 12:04:19.752609+00
+ROW: 1 | a@example.com | t | NULL | 0 | 2026-09-04 14:54:58.603318+00
+ROW: 2 | b@example.com | f | NULL | 0 | 2026-09-04 14:54:58.603318+00
 --- STMT 17 ---
 SQL: SELECT * FROM repo_account WHERE active IS TRUE ORDER BY id
 RESULT: 6 columns, 1 rows
 COLUMNS: id, email, active, deleted_at, version, created_at
-ROW: 1 | a@example.com | t | NULL | 0 | 2026-08-30 12:04:19.752609+00
+ROW: 1 | a@example.com | t | NULL | 0 | 2026-09-04 14:54:58.603318+00
 --- STMT 18 ---
 SQL: SELECT EXISTS (SELECT 1 FROM repo_account WHERE email = 'missing@example.com')
 RESULT: 1 columns, 1 rows
@@ -7683,21 +7686,21 @@ ROW: 2 | 1 | 40.00
 SQL: SELECT o.* FROM repo_order o WHERE o.account_id = 1 ORDER BY o.created_at DESC, o.id DESC LIMIT 2 OFFSET 0
 RESULT: 5 columns, 2 rows
 COLUMNS: id, account_id, status, total, created_at
-ROW: 3 | 1 | done | 30.00 | 2026-08-30 12:04:19.753043+00
-ROW: 2 | 1 | open | 20.00 | 2026-08-30 12:04:19.753043+00
+ROW: 3 | 1 | done | 30.00 | 2026-09-04 14:54:58.603744+00
+ROW: 2 | 1 | open | 20.00 | 2026-09-04 14:54:58.603744+00
 --- STMT 22 ---
 SQL: SELECT o.* FROM repo_order o WHERE (o.created_at, o.id) < (CURRENT_TIMESTAMP, 999999) ORDER BY o.created_at DESC, o.id DESC LIMIT 10
 RESULT: 5 columns, 4 rows
 COLUMNS: id, account_id, status, total, created_at
-ROW: 4 | 2 | open | 40.00 | 2026-08-30 12:04:19.753043+00
-ROW: 3 | 1 | done | 30.00 | 2026-08-30 12:04:19.753043+00
-ROW: 2 | 1 | open | 20.00 | 2026-08-30 12:04:19.753043+00
-ROW: 1 | 1 | open | 10.00 | 2026-08-30 12:04:19.753043+00
+ROW: 4 | 2 | open | 40.00 | 2026-09-04 14:54:58.603744+00
+ROW: 3 | 1 | done | 30.00 | 2026-09-04 14:54:58.603744+00
+ROW: 2 | 1 | open | 20.00 | 2026-09-04 14:54:58.603744+00
+ROW: 1 | 1 | open | 10.00 | 2026-09-04 14:54:58.603744+00
 --- STMT 23 ---
 SQL: UPDATE repo_account SET version = version + 1 WHERE id = 1 AND version = 0 RETURNING *
 RESULT: 6 columns, 1 rows
 COLUMNS: id, email, active, deleted_at, version, created_at
-ROW: 1 | a@example.com | t | NULL | 1 | 2026-08-30 12:04:19.752609+00
+ROW: 1 | a@example.com | t | NULL | 1 | 2026-09-04 14:54:58.603318+00
 --- STMT 24 ---
 SQL: UPDATE repo_account SET version = version + 1 WHERE id = 1 AND version = 0 RETURNING *
 RESULT: 6 columns, 0 rows
@@ -7706,7 +7709,7 @@ COLUMNS: id, email, active, deleted_at, version, created_at
 SQL: INSERT INTO repo_account(email, active) VALUES ('d@example.com', true) ON CONFLICT (email) DO NOTHING RETURNING *
 RESULT: 6 columns, 1 rows
 COLUMNS: id, email, active, deleted_at, version, created_at
-ROW: 4 | d@example.com | t | NULL | 0 | 2026-08-30 12:04:22.658348+00
+ROW: 4 | d@example.com | t | NULL | 0 | 2026-09-04 14:54:59.244164+00
 --- STMT 26 ---
 SQL: SELECT ra.id, ra.email, ro.id AS order_id, ro.status, ro.total FROM repo_account ra LEFT JOIN repo_order ro ON ro.account_id = ra.id WHERE ra.deleted_at IS NULL ORDER BY ra.id, ro.id
 RESULT: 5 columns, 5 rows

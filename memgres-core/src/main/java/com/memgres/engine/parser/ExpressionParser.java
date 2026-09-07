@@ -1091,7 +1091,7 @@ public class ExpressionParser {
             if (matchKeyword("DOCUMENT")) {
                 return new IsBooleanExpr(left, negated ? IsBooleanExpr.BooleanTest.IS_NOT_DOCUMENT : IsBooleanExpr.BooleanTest.IS_DOCUMENT);
             }
-            // IS [NOT] JSON [VALUE | OBJECT | ARRAY | SCALAR] [WITH UNIQUE KEYS]
+            // IS [NOT] JSON [VALUE | OBJECT | ARRAY | SCALAR] [{WITH|WITHOUT} UNIQUE [KEYS]]
             if (matchKeyword("JSON")) {
                 IsJsonExpr.JsonType jt = null;
                 if (matchKeyword("OBJECT")) jt = IsJsonExpr.JsonType.OBJECT;
@@ -1102,10 +1102,15 @@ public class ExpressionParser {
                 else if (checkKeyword("NULL")) throw new ParseException("syntax error at or near \"NULL\"", peek());
                 else if (checkIdentCI("STRING")) throw new ParseException("syntax error at or near \"STRING\"", peek());
                 else if (checkIdentCI("NUMBER")) throw new ParseException("syntax error at or near \"NUMBER\"", peek());
+                // WITHOUT UNIQUE is what the test does anyway, so it is written and nothing more
+                // is asked; and KEYS may be left off either way. Only WITH UNIQUE KEYS was read,
+                // so the three spellings PostgreSQL also accepts were syntax errors.
                 boolean uniqueKeys = false;
                 if (matchKeywords("WITH", "UNIQUE")) {
-                    expectKeyword("KEYS");
+                    matchKeyword("KEYS");
                     uniqueKeys = true;
+                } else if (matchKeywords("WITHOUT", "UNIQUE")) {
+                    matchKeyword("KEYS");
                 }
                 return new IsJsonExpr(left, negated, jt, uniqueKeys);
             }
@@ -1852,6 +1857,19 @@ public class ExpressionParser {
         validateCollationStatic(collation, peek());
     }
 
+    /** The encodings an operating system's locale name ends with, which no schema is called. */
+    private static final java.util.Set<String> LOCALE_ENCODINGS = new java.util.HashSet<String>(
+            java.util.Arrays.asList("utf8", "utf-8", "iso88591", "iso8859-1", "iso885915",
+                    "latin1", "latin2", "latin9", "euc_jp", "eucjp", "euc_kr", "euckr",
+                    "euc_cn", "euccn", "sjis", "big5", "gbk", "gb18030", "koi8r", "koi8u",
+                    "win1251", "win1252", "cp1251", "cp1252", "ascii"));
+
+    /** Whether the part after the last dot names a character encoding rather than a collation. */
+    private static boolean namesAnEncoding(String lower) {
+        int dot = lower.lastIndexOf('.');
+        return dot >= 0 && LOCALE_ENCODINGS.contains(lower.substring(dot + 1));
+    }
+
     static void validateCollationStatic(String collation, Token errorToken) {
         // Accept all collation names at parse time; unknown collations are validated
         // at runtime by ExprEvaluator.validateCollationAtRuntime which has access
@@ -1862,8 +1880,11 @@ public class ExpressionParser {
         String lower = collation.toLowerCase(java.util.Locale.ROOT).replace("\"", "");
         if (KNOWN_COLLATIONS.contains(lower)) return;
         if (lower.startsWith("pg_catalog.")) return;
-        // Locale-like names with dots (en_US.utf8) are OS collations not available in memgres
-        if (lower.contains(".") && !lower.startsWith("c.")) {
+        // Locale-like names with dots (en_US.utf8) are OS collations not available in memgres.
+        // A schema-qualified name has a dot too, though, and that is a name the catalogue may
+        // well hold: only a name whose last part is an encoding is a locale. Refused on the dot
+        // alone, a collation created in a schema of its own could never be written down.
+        if (lower.contains(".") && !lower.startsWith("c.") && namesAnEncoding(lower)) {
             com.memgres.engine.MemgresException ex = new com.memgres.engine.MemgresException(
                     "collation \"" + collation + "\" for encoding \"UTF8\" does not exist", "42704");
             if (errorToken != null && errorToken.position() > 0) ex.setPosition(errorToken.position());
@@ -2412,6 +2433,22 @@ public class ExpressionParser {
                 }
             }
             args = parseFunctionArgList();
+            // JSON(expr [FORMAT JSON [ENCODING ...]] [{WITH|WITHOUT} UNIQUE [KEYS]]) is the
+            // SQL/JSON constructor, and its clauses stand inside the parentheses where an
+            // argument list would end. Read as an ordinary call, the word WITH was a syntax
+            // error and the form could not be written at all.
+            if ("json".equalsIgnoreCase(name) && args.size() == 1) {
+                if (matchKeyword("FORMAT")) {
+                    expectKeyword("JSON");
+                    if (matchKeyword("ENCODING")) advance();
+                }
+                if (matchKeywords("WITH", "UNIQUE")) {
+                    matchKeyword("KEYS");
+                    args = Cols.listOf(args.get(0), Literal.ofString("unique_keys"));
+                } else if (matchKeywords("WITHOUT", "UNIQUE")) {
+                    matchKeyword("KEYS");
+                }
+            }
             // Check for ORDER BY inside aggregate: string_agg(expr, delim ORDER BY ...)
             if (checkKeyword("ORDER")) {
                 innerOrderBy = parseOrderByClause();

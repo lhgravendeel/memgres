@@ -87,7 +87,9 @@ class NotEnforcedConstraintTest {
 
     @Test
     void exclude_without_not_enforced_is_accepted() throws SQLException {
-        // Plain EXCLUDE (without NOT ENFORCED) should still be accepted (as DDL stub)
+        // Plain EXCLUDE (without NOT ENFORCED) should still be accepted (as DDL stub).
+        // gist has no operator class for a scalar type until btree_gist adds one.
+        exec("CREATE EXTENSION IF NOT EXISTS btree_gist");
         exec("CREATE TABLE t1(id int, room int, during tsrange, " +
              "CONSTRAINT excl_room EXCLUDE USING gist (room WITH =, during WITH &&))");
     }

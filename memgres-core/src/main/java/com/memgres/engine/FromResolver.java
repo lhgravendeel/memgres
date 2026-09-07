@@ -1625,6 +1625,16 @@ class FromResolver {
      * and nothing else: another schema's view of the same name is a different relation, and a
      * table in the named schema is what the reference means when that schema holds no such view.
      */
+    /** Refuses a relation named in a catalog this session is not connected to. */
+    private void rejectOtherCatalog(SelectStmt.TableRef tableRef) {
+        if (tableRef.catalog == null) return;
+        String current = executor.session != null ? executor.session.getDatabaseName() : null;
+        if (current != null && current.equalsIgnoreCase(tableRef.catalog)) return;
+        throw new MemgresException("cross-database references are not implemented: \""
+                + tableRef.catalog + "." + tableRef.schema() + "." + tableRef.table() + "\"",
+                "0A000");
+    }
+
     Database.ViewDef viewFor(SelectStmt.TableRef tableRef) {
         if (tableRef.schema() != null) {
             return executor.database.getView(tableRef.schema(), tableRef.table());
@@ -1833,6 +1843,9 @@ class FromResolver {
     }
 
     private void resolveTableBindingsFromItem(SelectStmt.FromItem item, List<RowContext.TableBinding> bindings) {
+        // The clause is described before it is read, and a catalog this session is not connected
+        // to is refused as soon as the name is looked at -- there is no relation to look for.
+        if (item instanceof SelectStmt.TableRef) rejectOtherCatalog((SelectStmt.TableRef) item);
         if (item instanceof SelectStmt.TableRef) {
             SelectStmt.TableRef tableRef = (SelectStmt.TableRef) item;
             String schemaName = tableRef.schema() != null ? tableRef.schema() : executor.defaultSchema();
@@ -1933,6 +1946,10 @@ class FromResolver {
                 for (int i = 2; i < funcFrom.args().size(); i++) {
                     Expression arg = funcFrom.args().get(i);
                     String def = arg instanceof Literal ? ((Literal) arg).value() : arg.toString();
+                    // The prefixes an XMLNAMESPACES clause declared travel in the argument list
+                    // too, and they are not a column: read as one, the clause was taken for a
+                    // column definition and its first word for a length.
+                    if (FromFunctionResolver.namesXmlNamespaces(def)) continue;
                     String[] parts = FromFunctionResolver.splitColumnDefinition(def);
                     DataType dt = parts[1] == null ? null : DataType.fromPgName(parts[1]);
                     cols.add(new Column(parts[0], dt != null ? dt : DataType.TEXT, true, false, null));
@@ -2342,6 +2359,9 @@ class FromResolver {
         }
         if (lookupCteFor(tableRef) != null) return;
         if (viewFor(tableRef) != null) return;
+        // A name in a catalog this session is not connected to reaches no relation to look for,
+        // and that is what PostgreSQL says about it rather than that the relation is missing.
+        rejectOtherCatalog(tableRef);
 
         String schemaName = tableRef.schema() != null ? tableRef.schema() : executor.defaultSchema();
         boolean userQualified = tableRef.schema() != null;
@@ -2420,6 +2440,69 @@ class FromResolver {
             resolvedItems.add(resolveFromItem(fromItem));
         }
         return crossProductContexts(resolvedItems);
+    }
+
+    /**
+     * The rows a lateral item is run for: those the qualification already holds for.
+     *
+     * <p>Only a predicate that can be judged from what is in hand is applied; one that speaks of
+     * the lateral item's own columns is left for the statement's own WHERE, which applies every
+     * predicate again in any case.
+     */
+    private List<RowContext> narrowedBeforeLateral(List<RowContext> accumulated,
+                                                   List<Expression> wherePredicates) {
+        if (accumulated == null || accumulated.isEmpty() || wherePredicates.isEmpty()) {
+            return accumulated;
+        }
+        List<RowContext> kept = accumulated;
+        for (Expression pred : wherePredicates) {
+            if (kept.isEmpty() || !canEvaluatePredicate(pred, kept.get(0))) continue;
+            try {
+                List<RowContext> narrowed = new ArrayList<>(kept.size());
+                for (RowContext ctx : kept) {
+                    if (executor.isTruthy(executor.evalExpr(pred, ctx))) narrowed.add(ctx);
+                }
+                kept = narrowed;
+            } catch (RuntimeException notJudgeableYet) {
+                // A predicate that turns out to need what is not in scope yet is the statement's
+                // own WHERE to apply, once the lateral item has put its columns there.
+                return accumulated;
+            }
+        }
+        return kept;
+    }
+
+    /** The relations the FROM items written before this one put in scope, rows or no rows. */
+    private List<RowContext.TableBinding> shapeOfItemsBefore(List<SelectStmt.FromItem> fromItems,
+                                                             int itemIdx) {
+        List<RowContext.TableBinding> shape = new ArrayList<>();
+        for (int i = 0; i < itemIdx; i++) shape.addAll(resolveItemShape(fromItems.get(i)));
+        return shape;
+    }
+
+    /**
+     * Hold a function-in-FROM's arguments to the names in scope, without reading any row.
+     *
+     * <p>Only the names are being checked: whatever else an argument would do is the business of
+     * the rows it would have been evaluated against, and there are none.
+     */
+    private void refuseUnknownNamesInArgs(SelectStmt.FunctionFrom funcFrom,
+                                          List<RowContext.TableBinding> left) {
+        if (funcFrom.args() == null || funcFrom.args().isEmpty()) return;
+        executor.outerContextStack.push(new RowContext(new ArrayList<>(left)));
+        try {
+            for (Expression arg : funcFrom.args()) {
+                try {
+                    executor.evalExpr(arg, null);
+                } catch (MemgresException e) {
+                    if ("42703".equals(e.getSqlState()) || "42P01".equals(e.getSqlState())) throw e;
+                } catch (RuntimeException e) {
+                    // Not a question about names.
+                }
+            }
+        } finally {
+            executor.outerContextStack.pop();
+        }
     }
 
     /**
@@ -2502,6 +2585,18 @@ class FromResolver {
                 // like pg_get_sequence_data(seqrelid) degrades to a bare string and
                 // crashes — pg_dump hits exactly that on a database with no sequences.
                 SelectStmt.FunctionFrom funcFrom = (SelectStmt.FunctionFrom) fromItem;
+                // A qualification that speaks only of the relations already in hand decides which
+                // of their rows the function is run for. Left until after the join, the function
+                // was evaluated for rows the statement had already excluded -- and one of those
+                // rows holding something the function could not read failed the whole statement.
+                accumulated = narrowedBeforeLateral(accumulated, wherePredicates);
+                // With no left row the function is never evaluated, and a name in its arguments
+                // was never looked for: a query reading a column no relation has answered with an
+                // empty result rather than saying the column does not exist. What names are in
+                // scope is known from the items alone, so the arguments are held to them here.
+                if (accumulated.isEmpty()) {
+                    refuseUnknownNamesInArgs(funcFrom, shapeOfItemsBefore(fromItems, itemIdx));
+                }
                 List<RowContext> newAccumulated = new ArrayList<>();
                 for (RowContext leftCtx : accumulated) {
                     executor.outerContextStack.push(leftCtx);
@@ -2759,6 +2854,10 @@ class FromResolver {
      * disagree about it.
      */
     private List<RowContext> resolveTableRef(SelectStmt.TableRef tableRef, Expression indexWhere) {
+        // A name written with three parts names a catalog, and PostgreSQL reaches only the one
+        // it is connected to. Read as two parts and a stray dot, such a name was a syntax error
+        // where PostgreSQL says what it is that it cannot do.
+        rejectOtherCatalog(tableRef);
         // Check CTEs first
         SelectStmt.CommonTableExpr cte = lookupCteFor(tableRef);
         if (cte != null) {
@@ -3203,7 +3302,26 @@ class FromResolver {
 
     private List<RowContext> applyRlsFiltering(List<RowContext> contexts, Table table, String schemaName) {
         if (executor.shouldBypassRls(table, schemaName)) return contexts;
-        return filterByRlsUsing(contexts, table, "SELECT");
+        List<RowContext> visible = filterByRlsUsing(contexts, table, "SELECT");
+        // A row a query means to lock is a row it means to write, so it has to pass the policies
+        // that govern writing as well as the ones that govern reading. Filtered as an ordinary
+        // read, SELECT ... FOR UPDATE handed back rows the reader was not allowed to lock -- and
+        // a relation with a read policy and no write policy locked every row it could see.
+        if (locksRowsOf(table)) visible = filterByRlsUsing(visible, table, "UPDATE");
+        return visible;
+    }
+
+    /** Whether the query being resolved asks to lock the rows it reads from this relation. */
+    private boolean locksRowsOf(Table table) {
+        if (!(currentQuery instanceof SelectStmt)) return false;
+        SelectStmt.LockClause lock = ((SelectStmt) currentQuery).lockClause();
+        if (lock == null) return false;
+        // FOR UPDATE OF names the relations it locks; without a list it locks all of them.
+        if (lock.ofTables == null || lock.ofTables.isEmpty()) return true;
+        for (String named : lock.ofTables) {
+            if (named != null && named.equalsIgnoreCase(table.getName())) return true;
+        }
+        return false;
     }
 
     /** Filter rows by RLS USING policies for the given command. Shared by SELECT/UPDATE/DELETE. */
@@ -3257,9 +3375,13 @@ class FromResolver {
 
     private List<RowContext> resolveSubquery(SelectStmt.SubqueryFrom subqFrom) {
         String alias = subqFrom.alias() != null ? subqFrom.alias() : "subquery";
+        // A subquery under a LIMIT need not produce more rows than the LIMIT asks for. Run whole,
+        // a query reading one row of a twenty-million-row series built all twenty million first.
+        final long cap = pushableRowCap(subqFrom);
         QueryResult subResult = readAsDerivedRelation(alias, subqFrom.columnAliases(), () -> {
             if (subqFrom.subquery() instanceof SelectStmt) {
-                return executor.executeSelect((SelectStmt) subqFrom.subquery());
+                SelectStmt inner = (SelectStmt) subqFrom.subquery();
+                return executor.executeSelect(cap >= 0 ? inner.keepingAtMost(cap) : inner);
             }
             return executor.executeStatement(subqFrom.subquery());
         });
@@ -3273,6 +3395,66 @@ class FromResolver {
             virtualTable.insertRow(row);
         }
         return derivedContexts(virtualTable, alias);
+    }
+
+    /**
+     * The most rows this FROM subquery can contribute to the query reading it, or -1 when every
+     * row it produces may matter.
+     *
+     * <p>Only where the reading query cannot look past that many: it must take its rows from this
+     * item alone, keep all of them, put none of them in order, and say how many it wants as a
+     * plain number. Anything that decides how many rows come out only after they are all in hand
+     * -- a WHERE, a GROUP BY, DISTINCT, an ORDER BY, a window, WITH TIES -- means the last row
+     * produced may still be one of the first returned, so nothing can be cut.
+     *
+     * <p>And the subquery itself must put nothing in order and ask for no count of its own: with
+     * an ORDER BY, which rows come first is its own answer to give, and cutting it short would
+     * change which rows those are.
+     */
+    private long pushableRowCap(SelectStmt.SubqueryFrom item) {
+        if (item.lateral() || !(item.subquery() instanceof SelectStmt)) return -1;
+        if (!(currentQuery instanceof SelectStmt)) return -1;
+        SelectStmt outer = (SelectStmt) currentQuery;
+        if (outer.from() == null || outer.from().size() != 1 || outer.from().get(0) != item) {
+            return -1;
+        }
+        if (outer.where() != null || outer.having() != null) return -1;
+        if (outer.distinct() || outer.withTies()) return -1;
+        if (outer.groupBy() != null && !outer.groupBy().isEmpty()) return -1;
+        if (outer.groupingSets() != null && !outer.groupingSets().isEmpty()) return -1;
+        if (outer.orderBy() != null && !outer.orderBy().isEmpty()) return -1;
+        if (outer.windowDefs() != null && !outer.windowDefs().isEmpty()) return -1;
+        if (outer.lockClause() != null) return -1;
+        Long limit = wholeNumberOf(outer.limit());
+        if (limit == null) return -1;
+        Long offset = outer.offset() == null ? Long.valueOf(0) : wholeNumberOf(outer.offset());
+        if (offset == null) return -1;
+        // A select list that answers over the rows, or one row per value of a set, decides how
+        // many rows come out for itself.
+        if (outer.targets() != null) {
+            for (SelectStmt.SelectTarget target : outer.targets()) {
+                if (executor.selectExecutor.isSrfCall(target.expr())) return -1;
+                if (executor.selectExecutor.containsAggregate(target.expr())) return -1;
+                if (ExprSearch.holdsWindowFunction(target.expr())) return -1;
+            }
+        }
+        SelectStmt inner = (SelectStmt) item.subquery();
+        if (inner.orderBy() != null && !inner.orderBy().isEmpty()) return -1;
+        if (inner.limit() != null || inner.offset() != null) return -1;
+        return limit + offset;
+    }
+
+    /** A count written as a plain whole number, or null when it is anything else. */
+    private static Long wholeNumberOf(Expression expr) {
+        if (!(expr instanceof Literal)) return null;
+        Literal lit = (Literal) expr;
+        if (lit.literalType() != Literal.LiteralType.INTEGER || lit.value() == null) return null;
+        try {
+            long value = Long.parseLong(lit.value().trim());
+            return value < 0 ? null : Long.valueOf(value);
+        } catch (NumberFormatException e) {
+            return null;
+        }
     }
 
     /**
@@ -3607,14 +3789,25 @@ class FromResolver {
     private static Object[] rowAsRelationAboveReadsIt(Table storage, Table above, Object[] row) {
         Object[] mapped = row;
         Table below = storage;
-        while (below != null && below != above) {
-            Table next = below.getPartitionParent();
-            if (next != null) mapped = below.rowToParent(mapped);
-            else next = below.getInheritParents().isEmpty() ? null : below.getInheritParents().get(0);
-            if (next == null) break;
-            below = next;
+        // A partition may order its columns differently from the table it partitions, and each
+        // step up rearranges the row into the order the relation above declares.
+        while (below != null && below != above && below.getPartitionParent() != null) {
+            mapped = below.rowToParent(mapped);
+            below = below.getPartitionParent();
         }
-        int width = above.getColumns().size();
-        return mapped.length == width ? mapped : Arrays.copyOf(mapped, width);
+        if (below == above) {
+            int width = above.getColumns().size();
+            return mapped.length == width ? mapped : Arrays.copyOf(mapped, width);
+        }
+        // An inheritance child carries its parents' columns and may carry more, in whatever
+        // order its own declaration settled them in, so the relation above reads its columns by
+        // name. Taken by position, a child of two parents handed the first parent's value to the
+        // second parent's column, and reading that parent answered with the wrong column.
+        Object[] asAbove = new Object[above.getColumns().size()];
+        for (int i = 0; i < asAbove.length; i++) {
+            int at = below.getColumnIndex(above.getColumns().get(i).getName());
+            asAbove[i] = at >= 0 && at < mapped.length ? mapped[at] : null;
+        }
+        return asAbove;
     }
 }

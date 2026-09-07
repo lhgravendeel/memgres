@@ -871,7 +871,7 @@ public class Lexer {
                                 "zero-length delimited identifier at or near \"\"\"\"",
                                 new Token(TokenType.ERROR, "\"\"", start), "42601");
                     }
-                    if (qid.length() > 63) qid = qid.substring(0, 63);
+                    qid = com.memgres.engine.util.Strs.truncateName(qid);
                     return new Token(TokenType.QUOTED_IDENTIFIER, qid, start);
                 }
             } else {
@@ -1023,7 +1023,7 @@ public class Lexer {
         // so MÜLLER is the column mÜller and müller names nothing; folding the whole word made
         // the two the same name and the one PostgreSQL rejects was found.
         String id = foldAsciiOnly(word);
-        if (id.length() > 63) id = id.substring(0, 63);
+        id = com.memgres.engine.util.Strs.truncateName(id);
         return new Token(TokenType.IDENTIFIER, id, start, word);
     }
 

@@ -234,11 +234,31 @@ class CatalogSecurityBuilder {
                     r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7],
                     r[10],  // rolbypassrls
                     r[8],   // rolconnlimit
-                    r[12],  // rolpassword
+                    // pg_roles masks the password to eight stars for every role alike; pg_authid
+                    // is the table behind it and holds what was really stored, which is the
+                    // verifier, and nothing at all for a role that has no password. Copied from
+                    // the view, it showed the mask, so a reader asking which method a role's
+                    // password was encrypted with was told about the stars.
+                    storedPasswordOf(r[1]),
                     r[9]    // rolvaliduntil
             });
         }
         return table;
+    }
+
+    /** Whether a policy's role list names PUBLIC, which stands for every role there is. */
+    private static boolean namesPublic(java.util.List<String> roles) {
+        for (String role : roles) {
+            if ("public".equalsIgnoreCase(role)) return true;
+        }
+        return false;
+    }
+
+    /** The verifier stored for a role, or null when the role was given no password. */
+    private Object storedPasswordOf(Object rolname) {
+        if (rolname == null) return null;
+        Map<String, String> attrs = database.getRole(String.valueOf(rolname));
+        return attrs == null ? null : attrs.get("PASSWORD");
     }
 
     private static Object parseValidUntil(String raw) {
@@ -432,13 +452,25 @@ class CatalogSecurityBuilder {
             for (String memberRole : entry.getValue()) {
                 int memberOid = oids.oid("role:" + memberRole);
                 boolean admin = database.hasAdminOption(grantedRole, memberRole);
+                // What the grant said about inheriting is recorded on the membership, so a
+                // membership granted WITH INHERIT FALSE says so here rather than claiming the
+                // member takes on everything the granted role holds.
+                Boolean saidByTheGrant = database.membershipInherits(grantedRole, memberRole);
+                boolean inherits = saidByTheGrant != null ? saidByTheGrant.booleanValue()
+                        : !"false".equalsIgnoreCase(memberInheritAttribute(memberRole));
                 table.insertRow(new Object[]{
                         rowOid++, roleOid, memberOid, 10 /* bootstrap superuser */,
-                        admin, true, true
+                        admin, inherits, true
                 });
             }
         }
         return table;
+    }
+
+    /** The INHERIT attribute the member role was created with, or null where it has none. */
+    private String memberInheritAttribute(String memberRole) {
+        Map<String, String> attrs = database.getRoles().get(memberRole);
+        return attrs == null ? null : attrs.get("INHERIT");
     }
 
     Table buildPgPolicy() {
@@ -448,7 +480,9 @@ class CatalogSecurityBuilder {
                 colNN("polrelid", DataType.OID),
                 col("polcmd", DataType.INTERNAL_CHAR),
                 col("polpermissive", DataType.BOOLEAN),
-                col("polroles", DataType.TEXT),
+                // The roles a policy is for are held as their numbers, and PUBLIC is zero:
+                // a policy written without a TO clause is for everyone and carries {0}.
+                col("polroles", DataType.OID_ARRAY),
                 // A policy's expressions are parse trees in PG, not text a client can read back
                 col("polqual", DataType.PG_NODE_TREE),
                 col("polwithcheck", DataType.PG_NODE_TREE),
@@ -473,10 +507,27 @@ class CatalogSecurityBuilder {
                         }
                     }
                     boolean permissive = !"RESTRICTIVE".equalsIgnoreCase(policy.getPolicyType());
-                    String rolesText = null;
-                    if (policy.getRoles() != null && !policy.getRoles().isEmpty()) {
-                        rolesText = "{" + String.join(",", policy.getRoles()) + "}";
+                    // Reported as the names it was written with -- and as nothing at all where
+                    // the policy named no role -- the column said it held no roles for a policy
+                    // that is for every role there is.
+                    StringBuilder roleOids = new StringBuilder("{");
+                    if (policy.getRoles() == null || policy.getRoles().isEmpty()
+                            || namesPublic(policy.getRoles())) {
+                        // PUBLIC is every role there is, so naming it alongside others says no
+                        // more than naming it alone: PostgreSQL records the one entry. Listing
+                        // the others beside it said the policy was for some roles and for
+                        // everybody at once, which is not a thing a reader can act on.
+                        roleOids.append('0');
+                    } else {
+                        boolean firstRole = true;
+                        for (String role : policy.getRoles()) {
+                            if (!firstRole) roleOids.append(',');
+                            firstRole = false;
+                            roleOids.append("public".equalsIgnoreCase(role)
+                                    ? 0 : oids.oid("role:" + role.toLowerCase(java.util.Locale.ROOT)));
+                        }
                     }
+                    String rolesText = roleOids.append('}').toString();
                     // What the view shows is pg_get_expr of the stored tree, which is the
                     // deparser every other definition is written by: echoing memgres's own
                     // spelling instead wrote CURRENT_USER as a call to a function.
@@ -523,7 +574,10 @@ class CatalogSecurityBuilder {
                 for (RlsPolicy policy : t.getRlsPolicies()) {
                     String rolesText;
                     List<String> roles = policy.getRoles();
-                    if (roles == null || roles.isEmpty()) {
+                    // The view reads pg_policy's own list, where PUBLIC beside other roles is
+                    // recorded as PUBLIC alone: it is every role there is, so the others say
+                    // nothing more.
+                    if (roles == null || roles.isEmpty() || namesPublic(roles)) {
                         rolesText = "{public}";
                     } else {
                         rolesText = "{" + String.join(",", roles) + "}";

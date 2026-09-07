@@ -15,6 +15,20 @@ class CompositeTypeHandler {
     }
 
     String resolveCompositeTypeName(Expression expr, RowContext ctx) {
+        // A parameter is of the type the PREPARE declared for it, which is the only thing that
+        // says what its value is: read without that, a composite handed to EXECUTE was a record
+        // of no particular type and naming a field of it identified no column.
+        if (expr instanceof ParamRef) {
+            int at = ((ParamRef) expr).index() - 1;
+            List<String> declared = executor.boundParameterTypes;
+            if (at >= 0 && at < declared.size() && declared.get(at) != null) {
+                String written = declared.get(at).trim().toLowerCase(java.util.Locale.ROOT);
+                if (executor.database.isCompositeType(written)) return written;
+                String key = TypeNamespace.resolve(executor.database, executor.session, written);
+                if (key != null && executor.database.isCompositeType(key)) return key;
+            }
+            return null;
+        }
         if (expr instanceof CastExpr) {
             CastExpr cast = (CastExpr) expr;
             String tn = cast.typeName().toLowerCase(java.util.Locale.ROOT).trim();

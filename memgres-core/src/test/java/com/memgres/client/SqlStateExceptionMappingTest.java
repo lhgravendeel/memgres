@@ -210,6 +210,8 @@ class SqlStateExceptionMappingTest {
     // --- 23P01: exclusion_violation ---
 
     @Test void exclusion_constraint_violation() throws Exception {
+        // gist has no operator class for text until btree_gist adds one.
+        exec("CREATE EXTENSION IF NOT EXISTS btree_gist");
         exec("CREATE TABLE ss_excl(room text, during tsrange, EXCLUDE USING gist (room WITH =, during WITH &&))");
         exec("INSERT INTO ss_excl VALUES ('A', '[2024-01-01, 2024-01-10)')");
         try {

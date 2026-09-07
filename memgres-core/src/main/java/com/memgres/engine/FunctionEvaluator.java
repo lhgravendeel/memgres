@@ -27,6 +27,40 @@ class FunctionEvaluator {
     private static final int SERIES_LIMIT = 10_000_000;
 
     /**
+     * A series of whole numbers, worked out one value at a time.
+     *
+     * <p>It is a list because everything downstream reads a set-returning call's answer as one,
+     * and this is the same list -- the same values in the same order -- built as it is read
+     * rather than before. A caller that wants the first row of a twenty-million-row series should
+     * not have to wait for, or find room for, the other twenty million.
+     */
+    static final class IntegerSeries extends java.util.AbstractList<Object> {
+        private final long start;
+        private final long step;
+        private final int count;
+
+        IntegerSeries(long start, long stop, long step) {
+            this.start = start;
+            this.step = step;
+            long span = step > 0 ? stop - start : start - stop;
+            long produced = span < 0 ? 0 : span / Math.abs(step) + 1;
+            this.count = (int) Math.min(produced, (long) SERIES_LIMIT);
+        }
+
+        @Override
+        public Object get(int index) {
+            if (index < 0 || index >= count) throw new IndexOutOfBoundsException();
+            long v = start + step * (long) index;
+            return (v >= Integer.MIN_VALUE && v <= Integer.MAX_VALUE) ? (Object) (int) v : (Object) v;
+        }
+
+        @Override
+        public int size() {
+            return count;
+        }
+    }
+
+    /**
      * An enum with no labels has no first or last value. Reading one off the empty list reached
      * the client as an internal error about an array index.
      */
@@ -1301,11 +1335,18 @@ class FunctionEvaluator {
             }
             // json(text) is the constructor behind JSON '...'; it validates and yields a json value.
             case "json": {
-                requireArgs(fn, 1);
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
                 String text = arg.toString();
                 ExprEvaluator.requireJson(text);
+                // WITH UNIQUE KEYS arrives as a second argument the parser wrote: the document is
+                // read again, this time refusing a key that appears twice.
+                if (fn.args().size() > 1) {
+                    JsonParser.Shape shape = JsonParser.shapeOf(text);
+                    if (shape != null && !shape.uniqueKeys) {
+                        throw new MemgresException("duplicate JSON object key value", "22030");
+                    }
+                }
                 return text;
             }
             case "crc32": {
@@ -1574,17 +1615,10 @@ class FunctionEvaluator {
                 if (step == 0) {
                     throw new MemgresException("step size cannot equal zero", "22023");
                 }
-                List<Object> result = new ArrayList<>();
-                if (step > 0) {
-                    for (long v = start; v <= stop; v += step) {
-                        result.add((v >= Integer.MIN_VALUE && v <= Integer.MAX_VALUE) ? (int) v : v);
-                    }
-                } else if (step < 0) {
-                    for (long v = start; v >= stop; v += step) {
-                        result.add((v >= Integer.MIN_VALUE && v <= Integer.MAX_VALUE) ? (int) v : v);
-                    }
-                }
-                return result;
+                // Worked out where it is read rather than built up front: held as a list of
+                // values, the series was built whole before anything could look at it, and a
+                // query PostgreSQL answers at once ran the engine out of memory.
+                return new IntegerSeries(start, stop, step);
             }
             case "generate_subscripts": {
                 // generate_subscripts(anyarray, dim [, reverse]) → set of integer subscripts
@@ -3186,7 +3220,9 @@ class FunctionEvaluator {
                 requireExtension("hstore", fn, ctx);
                 Object val = executor.evalExpr(fn.args().get(0), ctx);
                 Object keysObj = executor.evalExpr(fn.args().get(1), ctx);
-                if (val == null) return null;
+                // slice is strict, so no list of keys is no answer -- not the empty slice. Read
+                // as "no keys were named", a null key array handed back an empty hstore.
+                if (val == null || keysObj == null) return null;
                 HstoreValue h = toHstore(val);
                 List<String> keys = new ArrayList<>();
                 if (keysObj instanceof List) {
@@ -3397,7 +3433,13 @@ class FunctionEvaluator {
                                 if (!visibleSchemas.contains(sc)) visibleSchemas.add(sc);
                             }
                         }
-                        if (!visibleSchemas.contains("public")) visibleSchemas.add("public");
+                        // public is on the path because the default path names it, not because
+                        // it is always reachable: a session that set the path to something else
+                        // cannot write a bare name and reach public, and PostgreSQL says the
+                        // function does not exist rather than finding one the query never named.
+                        if (searchPath == null || searchPath.trim().isEmpty()) {
+                            visibleSchemas.add("public");
+                        }
                         // Group by search_path position so the earliest schema holding this name wins,
                         // the way PG resolves an unqualified routine reference.
                         List<PgFunction> filtered = new ArrayList<>();
@@ -3554,15 +3596,25 @@ class FunctionEvaluator {
                             } else if (pName != null && namedMap.containsKey(pName)) {
                                 args.add(executor.evalExpr(namedMap.get(pName), ctx));
                             } else if (p.defaultExpr() != null) {
-                                // Evaluate default expression
+                                // A default is an expression the call evaluates, and what goes
+                                // wrong while evaluating it is what the call raises: swallowed
+                                // and answered with null, a default of 1/0 handed the body a
+                                // null where PostgreSQL says division by zero. Only a failure
+                                // this engine could not have meant is still passed over, because
+                                // refusing a call PostgreSQL runs is the worse of the two.
+                                Object defaultVal;
                                 try {
-                                    QueryResult defaultResult = executor.execute("SELECT " + p.defaultExpr());
-                                    Object defaultVal = (!defaultResult.getRows().isEmpty() && defaultResult.getRows().get(0).length > 0)
+                                    QueryResult defaultResult =
+                                            executor.execute("SELECT " + p.defaultExpr());
+                                    defaultVal = (!defaultResult.getRows().isEmpty()
+                                            && defaultResult.getRows().get(0).length > 0)
                                             ? defaultResult.getRows().get(0)[0] : null;
-                                    args.add(defaultVal);
-                                } catch (Exception e) {
-                                    args.add(null);
+                                } catch (MemgresException raised) {
+                                    throw raised;
+                                } catch (RuntimeException e) {
+                                    defaultVal = null;
                                 }
+                                args.add(defaultVal);
                             } else {
                                 // Required parameter missing
                                 throw new MemgresException("function " + name + "(" +
@@ -3811,10 +3863,36 @@ class FunctionEvaluator {
         return null;
     }
 
+    /** A written type name that reaches nothing is reported the way any missing type is. */
+    private void requireWrittenTypeExists(String written) {
+        if (written == null) return;
+        String bare = Quoting.nameAsRead(written.trim()).toLowerCase(java.util.Locale.ROOT);
+        while (bare.endsWith("[]")) bare = bare.substring(0, bare.length() - 2).trim();
+        if (bare.isEmpty() || DataType.fromPgName(bare) != null) return;
+        if (executor.database.isCompositeType(bare) || executor.database.getDomain(bare) != null
+                || executor.database.getCustomEnum(bare) != null
+                || executor.database.isRangeType(bare)) {
+            return;
+        }
+        String qualified = executor.castEvaluator.qualifyUserType(bare);
+        if (qualified != null && !qualified.equals(bare)
+                && (executor.database.isCompositeType(qualified)
+                    || executor.database.getDomain(qualified) != null
+                    || executor.database.getCustomEnum(qualified) != null
+                    || executor.database.isRangeType(qualified))) {
+            return;
+        }
+        throw PgErrors.undefinedObject("type", written.trim());
+    }
+
     private String resolveEnumTypeFromArg(Expression arg, RowContext ctx) {
         if (arg instanceof CastExpr) {
             // enum_range(NULL::e) reads the e the search path names, not some other schema's.
             CastExpr cast = (CastExpr) arg;
+            // A cast still has to name a type that exists, wherever it is written. Read for its
+            // name alone, a cast to a type nobody defined made enum_range answer nothing instead
+            // of saying there is no such type.
+            requireWrittenTypeExists(cast.typeName());
             return executor.castEvaluator.qualifyUserType(cast.typeName());
         }
         Object val = executor.evalExpr(arg, ctx);

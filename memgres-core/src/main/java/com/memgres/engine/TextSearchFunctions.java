@@ -626,6 +626,13 @@ class TextSearchFunctions {
                 TsQuery left = leftObj instanceof TsQuery ? ((TsQuery) leftObj) : TsQuery.parse(leftObj.toString());
                 TsQuery right = rightObj instanceof TsQuery ? ((TsQuery) rightObj) : TsQuery.parse(rightObj.toString());
                 int dist = argv.size() >= 3 ? executor.toInt(argv.get(2)) : 1;
+                // The distance is how many lexemes apart the two may stand, and a phrase
+                // operator holds it in two bytes: a count outside what one holds names no
+                // distance at all, and PostgreSQL says so rather than writing it down.
+                if (dist < 0 || dist > 16384) {
+                    throw new MemgresException("distance in phrase operator must be an integer"
+                            + " value between zero and 16384 inclusive", "22023");
+                }
                 return TextSearchOperations.tsqueryPhrase(left, right, dist);
             }
             case "numnode": {

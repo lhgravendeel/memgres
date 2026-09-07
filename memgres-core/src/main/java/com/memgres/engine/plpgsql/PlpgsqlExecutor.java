@@ -95,7 +95,28 @@ public class PlpgsqlExecutor {
         final Map<String, String> aliases = new LinkedHashMap<>();
         final java.util.Set<String> outputOnlyVars = new java.util.HashSet<>();
         final Scope parent;
-        int lastRowCount = 0;
+        private int lastRowCount = 0;
+
+        /**
+         * ROW_COUNT belongs to the call, not to the block.
+         *
+         * <p>A statement inside a nested BEGIN ... END is a statement of the same function, and
+         * what it affected is what GET DIAGNOSTICS reads afterwards. Kept per block, the count
+         * died with the block: an INSERT of three rows inside one reported none outside it.
+         */
+        void recordRowCount(int rows) {
+            outermost().lastRowCount = rows;
+        }
+
+        int rowCount() {
+            return outermost().lastRowCount;
+        }
+
+        private Scope outermost() {
+            Scope s = this;
+            while (s.parent != null) s = s.parent;
+            return s;
+        }
         /** Label of the block that opened this scope, so {@code label.var} can reach it. */
         String label;
 
@@ -1086,7 +1107,11 @@ public class PlpgsqlExecutor {
                 scope.constrainedTypes.put(key, coerceType);
                 defaultVal = applyDeclaredTypmod(defaultVal, coerceType);
             }
-            scope.declareTyped(decl.name(), defaultVal, decl.typeName());
+            // A row given as the declaration's own initialiser is spread over the variable's
+            // field names the same way one assigned later is: stored whole, every field of a
+            // variable declared with := ROW(...) read back as nothing.
+            scope.declareTyped(decl.name(),
+                    coerceRowValue(decl.typeName(), defaultVal), decl.typeName());
         }
 
         if (block.exceptionHandlers().isEmpty()) {
@@ -1848,7 +1873,12 @@ public class PlpgsqlExecutor {
     }
 
     private void executeForQuery(PlpgsqlStatement.ForQueryStmt stmt, Scope scope) {
-        String sql = substituteVariables(stmt.sql(), scope);
+        // FOR r IN c LOOP, where c is a cursor the block declared, loops over what that cursor
+        // was declared to read: PostgreSQL opens it, runs the body over its rows, and closes it
+        // again. Taken for a query written out in full, the cursor's name was handed to the
+        // parser as SQL and the loop was a syntax error.
+        String sql = loopedCursorQuery(stmt.sql(), scope);
+        if (sql == null) sql = substituteVariables(stmt.sql(), scope);
         QueryResult result = astExecutor.execute(sql);
 
         List<String> varNames = stmt.varNames();
@@ -1898,6 +1928,85 @@ public class PlpgsqlExecutor {
             declareLoopRow(scope, loopScope, varNames.get(0), result, new Object[0]);
         }
         scope.set("found", anyIteration);
+    }
+
+    /**
+     * The query behind a bare cursor name a FOR loop was written over, or null where what was
+     * written is not one.
+     */
+    private String loopedCursorQuery(String written, Scope scope) {
+        if (written == null) return null;
+        String name = written.trim();
+        // A cursor declared with arguments is looped over with them: FOR r IN c(2) LOOP.
+        String argList = null;
+        if (name.endsWith(")")) {
+            int open = name.indexOf('(');
+            if (open <= 0) return null;
+            argList = name.substring(open + 1, name.length() - 1);
+            name = name.substring(0, open).trim();
+        }
+        if (name.isEmpty() || !isPlainName(name) || !scope.has(name)) return null;
+        Object bound = scope.get(name);
+        if (bound instanceof CursorState) {
+            CursorState open = (CursorState) bound;
+            // A cursor already open is a cursor this loop cannot open, which is what PostgreSQL
+            // says rather than reading its rows a second time.
+            if (!open.closed) {
+                throw new MemgresException("cursor \"" + open.portal + "\" already in use", "42P03");
+            }
+            bound = open.source;
+        }
+        if (!(bound instanceof BoundCursor)) return null;
+        BoundCursor cursor = (BoundCursor) bound;
+        Scope argScope = argList == null ? scope
+                : bindLoopedCursorArgs(cursor, argList, scope);
+        return substituteVariables(nameBareParamColumns(cursor.sql, cursor.params), argScope);
+    }
+
+    /** The cursor's parameters, bound to what the loop wrote between its parentheses. */
+    private Scope bindLoopedCursorArgs(BoundCursor cursor, String argList, Scope scope) {
+        Scope argScope = new Scope(scope);
+        List<String> written = splitTopLevel(argList);
+        for (int p = 0; p < cursor.params.size(); p++) {
+            Object value = p < written.size() ? evalExpr(written.get(p), scope) : null;
+            argScope.declare(cursor.params.get(p), value);
+        }
+        return argScope;
+    }
+
+    /** Split a written argument list on the commas that are not inside brackets or quotes. */
+    private static List<String> splitTopLevel(String argList) {
+        List<String> parts = new ArrayList<>();
+        int depth = 0;
+        boolean inQuote = false;
+        StringBuilder current = new StringBuilder();
+        for (int i = 0; i < argList.length(); i++) {
+            char c = argList.charAt(i);
+            if (c == '\'') inQuote = !inQuote;
+            if (!inQuote) {
+                if (c == '(' || c == '[') depth++;
+                else if (c == ')' || c == ']') depth--;
+                else if (c == ',' && depth == 0) {
+                    parts.add(current.toString().trim());
+                    current.setLength(0);
+                    continue;
+                }
+            }
+            current.append(c);
+        }
+        if (current.length() > 0) parts.add(current.toString().trim());
+        return parts;
+    }
+
+    /** Whether the text is one plain identifier and nothing else. */
+    private static boolean isPlainName(String written) {
+        for (int i = 0; i < written.length(); i++) {
+            char c = written.charAt(i);
+            boolean ok = i == 0 ? (Character.isLetter(c) || c == '_')
+                    : (Character.isLetterOrDigit(c) || c == '_' || c == '$');
+            if (!ok) return false;
+        }
+        return true;
     }
 
     private void executeForExecute(PlpgsqlStatement.ForExecuteStmt stmt, Scope scope) {
@@ -2259,6 +2368,29 @@ public class PlpgsqlExecutor {
     }
 
     @SuppressWarnings("unchecked")
+    /**
+     * A value joining a set of a composite type, read apart into that type's fields.
+     *
+     * <p>The set's rows are rows of the composite, so a whole row handed over is spread across
+     * its columns; anything the type does not name fields for is left as it stands.
+     */
+    private Object rowOfComposite(String elementType, Object value) {
+        if (elementType == null || value == null) return value;
+        if (database.getCompositeType(elementType) == null
+                && database.getRowType(elementType) == null) {
+            return value;
+        }
+        if (value instanceof AstExecutor.PgRow) {
+            return ((AstExecutor.PgRow) value).values().toArray();
+        }
+        if (value instanceof String && looksLikeCompositeText((String) value)) {
+            AstExecutor.PgRow parsed =
+                    astExecutor.parseCompositeToRow((String) value, elementType);
+            if (parsed != null) return parsed.values().toArray();
+        }
+        return value;
+    }
+
     private void executeReturnNext(PlpgsqlStatement.ReturnNextStmt stmt, Scope scope) {
         String expr = stmt.valueExpr();
         Object value;
@@ -2282,6 +2414,10 @@ public class PlpgsqlExecutor {
             if (elementType != null && database.getRowType(elementType) == null) {
                 value = astExecutor.castValue(value, elementType);
             }
+            // A set of a composite type is a set of rows of that type, so a row handed to
+            // RETURN NEXT joins it as its fields. Kept whole, the row went into the first column
+            // and the rest of the composite's columns answered with nothing.
+            value = rowOfComposite(elementType, value);
         }
         List<Object> results = (List<Object>) scope.get("__return_next_results__");
         if (results != null) {
@@ -2426,7 +2562,11 @@ public class PlpgsqlExecutor {
             passed = (Boolean) condVal;
         } else if (condVal != null) {
             String text = String.valueOf(condVal).trim();
-            if (condVal instanceof String && BOOLEAN_TEXT.containsKey(text.toLowerCase(java.util.Locale.ROOT))) {
+            // Whatever it is, PostgreSQL reads it with boolean's input function, which takes the
+            // words and the two digits and nothing else: ASSERT 1 passes and ASSERT 0 fails,
+            // while 42 is not a boolean at all. Reading only a string that way, a number reached
+            // the complaint below however it was written -- so ASSERT 1 was refused.
+            if (BOOLEAN_TEXT.containsKey(text.toLowerCase(java.util.Locale.ROOT))) {
                 passed = BOOLEAN_TEXT.get(text.toLowerCase(java.util.Locale.ROOT));
             } else {
                 throw new MemgresException(
@@ -2521,7 +2661,13 @@ public class PlpgsqlExecutor {
                 break;
             case "EXCEPTION": {
                 String sqlState = "P0001";
-                if (errcode != null) sqlState = conditionToSqlState(errcode);
+                if (errcode != null) {
+                    String named = conditionToSqlState(errcode);
+                    // 00000 is successful completion, which is not a thing a raise can be about:
+                    // PostgreSQL leaves the raise's own code alone rather than reporting an
+                    // error whose state says nothing went wrong.
+                    if (!"00000".equals(named)) sqlState = named;
+                }
                 MemgresException ex = new MemgresException(message != null ? message : "PL/pgSQL exception", sqlState);
                 if (detail != null) ex.setDetail(detail);
                 if (hint != null) ex.setHint(hint);
@@ -2705,7 +2851,7 @@ public class PlpgsqlExecutor {
                 result = astExecutor.execute(one);
             }
             if (result == null) return;
-            scope.lastRowCount = result.getAffectedRows();
+            scope.recordRowCount(result.getAffectedRows());
 
             // Note: PG's EXECUTE never changes FOUND (it does update GET DIAGNOSTICS ROW_COUNT)
             if (stmt.intoVars() != null) {
@@ -2798,7 +2944,18 @@ public class PlpgsqlExecutor {
                     int numStart = i + 1;
                     int numEnd = numStart;
                     while (numEnd < len && Character.isDigit(sql.charAt(numEnd))) numEnd++;
-                    int idx = Integer.parseInt(sql.substring(numStart, numEnd));
+                    String written = sql.substring(numStart, numEnd);
+                    // A parameter number is an int, and the text being run is whatever was built:
+                    // parsing it without a guard let the NumberFormatException out as an internal
+                    // error, where PostgreSQL says the number is too large and where.
+                    int idx;
+                    try {
+                        idx = Integer.parseInt(written);
+                    } catch (NumberFormatException e) {
+                        throw new MemgresException(
+                                "parameter number too large at or near \"$" + written + "\"",
+                                "42601");
+                    }
                     if (idx >= 1 && idx <= literals.size()) {
                         out.append(literals.get(idx - 1));
                     } else if (idx >= 1) {
@@ -2845,7 +3002,7 @@ public class PlpgsqlExecutor {
         }
 
         QueryResult result = astExecutor.execute(sql);
-        scope.lastRowCount = result.getAffectedRows();
+        scope.recordRowCount(result.getAffectedRows());
 
         // PG sets FOUND after INSERT/UPDATE/DELETE/MERGE based on whether at least one row
         // was affected (rows skipped by a BEFORE trigger returning NULL do not count)
@@ -2886,7 +3043,7 @@ public class PlpgsqlExecutor {
      */
     private void executeCallInPlpgsql(String originalSql, String substitutedSql, Scope scope) {
         QueryResult result = astExecutor.execute(substitutedSql);
-        scope.lastRowCount = result.getAffectedRows();
+        scope.recordRowCount(result.getAffectedRows());
 
         // If the CALL returned a result set (OUT/INOUT params), bind them back to variables
         if (result.getType() == QueryResult.Type.SELECT && !result.getRows().isEmpty()
@@ -3176,6 +3333,17 @@ public class PlpgsqlExecutor {
     private Map<String, Object> rowValueAsRecord(String declaredType, Object value) {
         if (value == null || value instanceof Map) return null;
         List<String> fields = rowTypeFields(declaredType);
+        // A variable declared record takes its shape from whatever is assigned to it, and a row
+        // written without a type of its own names its fields f1, f2 and so on -- which is how
+        // PostgreSQL names the columns of a bare ROW. Left without names, r := row(1,2) made a
+        // record whose fields nothing could reach.
+        if (fields == null && "record".equalsIgnoreCase(String.valueOf(declaredType).trim())
+                && value instanceof AstExecutor.PgRow) {
+            List<Object> bare = ((AstExecutor.PgRow) value).values();
+            Map<String, Object> unnamed = new LinkedHashMap<String, Object>();
+            for (int i = 0; i < bare.size(); i++) unnamed.put("f" + (i + 1), bare.get(i));
+            return unnamed;
+        }
         if (fields == null) return null;
         List<Object> values;
         if (value instanceof AstExecutor.PgRow) {
@@ -3547,7 +3715,7 @@ public class PlpgsqlExecutor {
             } else {
                 switch (itemName) {
                     case "ROW_COUNT":
-                        value = scope.lastRowCount;
+                        value = scope.rowCount();
                         break;
                     case "FOUND":
                         value = scope.get("found");
@@ -3745,6 +3913,17 @@ public class PlpgsqlExecutor {
             // the caller would see a short result set with no signal
             throw new MemgresException("cursor \"" + gone + "\" does not exist", "34000");
         }
+        // A refcursor variable may hold nothing but a portal name -- that is what one function
+        // hands another, and what makes returning a refcursor worth doing. Read only as a cursor
+        // this body had opened itself, a portal opened elsewhere looked like an unopened
+        // variable, so the routine that was handed one could not read from it at all.
+        if (cursorObj instanceof String && session != null) {
+            Session.CursorState shared = session.getCursor(((String) cursorObj).trim());
+            if (shared != null) {
+                fetchFromSharedPortal(stmt, scope, shared);
+                return;
+            }
+        }
         if (!(cursorObj instanceof CursorState)) {
             // An unopened cursor variable still holds no portal, which is what PG reports
             throw new MemgresException(
@@ -3753,10 +3932,25 @@ public class PlpgsqlExecutor {
         CursorState cursor = (CursorState) cursorObj;
         int count = 1;
         if (stmt.countExpr() != null) {
-            Object countVal = evalExpr(stmt.countExpr(), scope);
-            count = countVal == null ? 1 : toInt(countVal);
+            // ALL is a count, not a number: it means every remaining row, in whichever direction
+            // was written. Read as an expression it evaluated to nothing and the count fell back
+            // to one, so MOVE ALL went a single row forward and the FETCH after it read the
+            // second row where PostgreSQL reads the last.
+            if ("ALL".equalsIgnoreCase(stmt.countExpr().trim())) {
+                count = cursor.result.getRows().size() + 1;
+            } else {
+                Object countVal = evalExpr(stmt.countExpr(), scope);
+                count = countVal == null ? 1 : toInt(countVal);
+            }
         }
+        int before = cursor.position;
         Object[] row = cursor.move(stmt.direction(), count);
+        // A MOVE reports how many rows it passed over, which is what GET DIAGNOSTICS reads.
+        // Left at whatever the last statement set, a MOVE of two said nothing had moved. The
+        // places before the first row and after the last are not rows, so a MOVE that runs off
+        // the end counts the rows there were and not the step that took it past them.
+        int total = cursor.result == null ? 0 : cursor.result.getRows().size();
+        scope.recordRowCount(Math.abs(onARow(cursor.position, total) - onARow(before, total)));
         if (row != null) {
             if (stmt.intoVars() != null) storeFetchedRow(scope, stmt.intoVars(), cursor.result, row);
             scope.set("found", true);
@@ -3816,6 +4010,48 @@ public class PlpgsqlExecutor {
      * The portal name a cursor variable still carries after its portal has gone, or null when the
      * variable names a cursor that is open or has never been opened at all.
      */
+    /**
+     * Read from a portal this body did not open, moving it as PostgreSQL moves it.
+     *
+     * <p>The portal's position belongs to the portal and not to the variable naming it, so it is
+     * read from the session's cursor and written back: two routines fetching from one refcursor
+     * take successive rows, as they do in PostgreSQL.
+     *
+     * <p>The two carry the position differently -- the session counts from zero with -1 for
+     * "before the first row", and this body counts from one with 0 for the same place -- so the
+     * one is converted to the other and back.
+     */
+    private void fetchFromSharedPortal(PlpgsqlStatement.FetchStmt stmt, Scope scope,
+                                       Session.CursorState shared) {
+        int rowCount = shared.getRowCount();
+        List<Object[]> rows = new ArrayList<>();
+        for (int i = 0; i < rowCount; i++) rows.add(shared.getRow(i));
+        QueryResult asResult = QueryResult.select(shared.getColumns(), rows);
+        CursorState moving = new CursorState(asResult, shared.getName(), null);
+        moving.position = shared.getPosition() + 1;
+        int count = 1;
+        if (stmt.countExpr() != null) {
+            if ("ALL".equalsIgnoreCase(stmt.countExpr().trim())) {
+                count = rowCount + 1;
+            } else {
+                Object countVal = evalExpr(stmt.countExpr(), scope);
+                count = countVal == null ? 1 : toInt(countVal);
+            }
+        }
+        Object[] row = moving.move(stmt.direction(), count);
+        shared.setPosition(moving.position - 1);
+        if (row != null) {
+            if (stmt.intoVars() != null) storeFetchedRow(scope, stmt.intoVars(), asResult, row);
+            scope.set("found", true);
+            return;
+        }
+        if (stmt.intoVars() != null) {
+            storeFetchedRow(scope, stmt.intoVars(), asResult,
+                    new Object[asResult.getColumns().size()]);
+        }
+        scope.set("found", false);
+    }
+
     private String missingPortal(Object cursorObj) {
         if (cursorObj instanceof CursorState) {
             CursorState cursor = (CursorState) cursorObj;
@@ -4078,6 +4314,21 @@ public class PlpgsqlExecutor {
                         && i + 2 < tokens.size()
                         && tokens.get(i + 1).type() == TokenType.DOT) {
                     Object qualObj = scope.get(t.value().toLowerCase(java.util.Locale.ROOT));
+                    // r.* is every field of the record, written out in order: it is how a whole
+                    // row variable is handed to an INSERT. Read as a field called "*", it was
+                    // reported as a field the record has not got.
+                    if (tokens.get(i + 2).type() == TokenType.STAR && qualObj instanceof Map) {
+                        Map<?, ?> whole = (Map<?, ?>) qualObj;
+                        boolean firstField = true;
+                        for (Object v : whole.values()) {
+                            if (!firstField) sb.append(", ");
+                            firstField = false;
+                            appendValue(sb, v);
+                        }
+                        if (firstField) appendValue(sb, null);
+                        i += 2;
+                        continue;
+                    }
                     // A variable whose declaration names its fields is read the same way whether
                     // or not a row has been stored in it yet, and a field it has not got is an
                     // error rather than a name for SQL to resolve some other way.
@@ -4748,7 +4999,11 @@ public class PlpgsqlExecutor {
             // statement, which the client asked to stop, and a failed assertion, which is the
             // author's own claim about the program. Either is caught only by its own name.
             if (condLower.equals("others")) {
-                return !"P0004".equals(sqlState) && !"57014".equals(sqlState);
+                // A handler may name several conditions, and OTHERS not matching says nothing
+                // about the ones written beside it: answering here ended the search, so
+                // WHEN OTHERS OR assert_failure caught no assertion at all.
+                if (!"P0004".equals(sqlState) && !"57014".equals(sqlState)) return true;
+                continue;
             }
             if (condLower.startsWith("sqlstate ")) {
                 String written = condLower.substring(9).trim().replace("'", "");
@@ -4956,4 +5211,10 @@ public class PlpgsqlExecutor {
         if (e instanceof NumberFormatException) return "22000"; // data_exception
         return "P0001";
     }
+
+    /** A cursor position clamped to the rows there are, so the ends are not counted as rows. */
+    private static int onARow(int position, int total) {
+        return Math.max(0, Math.min(position, total));
+    }
+
 }

@@ -207,10 +207,10 @@ class CatalogStubArrayColumnTypeTest {
         exec("DROP TABLE IF EXISTS csa_p CASCADE");
         exec("CREATE TABLE csa_p (a int, b int) PARTITION BY RANGE (a, b)");
         try {
-            // PostgreSQL: 2 | 1 2 | <two opclass oids> | 0 0. memgres does not record which
-            // operator class a key was resolved through, so both oidvectors read 0 — but they
-            // are now as long as partnatts says, where a two-column key used to describe one.
-            assertEquals("2|1 2|0 0|0 0", one(
+            // A key resolves through the default operator class of its column's type, and that
+            // class carries the number PostgreSQL pins it to -- int4_ops is 1978 for both
+            // columns here. The collations are zero because an integer has none.
+            assertEquals("2|1 2|1978 1978|0 0", one(
                     "SELECT partnatts, partattrs::text, partclass::text, partcollation::text"
                             + " FROM pg_partitioned_table WHERE partrelid = 'csa_p'::regclass"));
         } finally {

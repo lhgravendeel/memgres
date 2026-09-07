@@ -440,6 +440,20 @@ class DdlAdminExecutor {
     // ---- CREATE POLICY ----
 
     QueryResult executeCreatePolicy(CreatePolicyStmt stmt) {
+        // The roles a policy names are settled before anything is looked up about the relation:
+        // a policy written for a role nobody created is reported as that, whatever is wrong with
+        // the relation it was written on.
+        if (stmt.roles() != null) {
+            for (String role : stmt.roles()) {
+                if (role.equalsIgnoreCase("public") || role.equalsIgnoreCase("current_user")
+                        || role.equalsIgnoreCase("session_user") || role.equalsIgnoreCase("current_role")) {
+                    continue;
+                }
+                if (!executor.database.hasRole(role)) {
+                    throw PgErrors.undefinedObject("role", role);
+                }
+            }
+        }
         // A qualifier on the relation says which schema holds it, and a schema that is not there
         // is what PostgreSQL reports rather than the relation being missing from it.
         SchemaQualifier.requireSchema(executor.database, executor.session, stmt.schema());
@@ -467,17 +481,6 @@ class DdlAdminExecutor {
             if (existing.getName().equalsIgnoreCase(stmt.name())) {
                 throw new MemgresException("policy \"" + stmt.name() + "\" for table \""
                         + stmt.table() + "\" already exists", "42710");
-            }
-        }
-        if (stmt.roles() != null) {
-            for (String role : stmt.roles()) {
-                if (role.equalsIgnoreCase("public") || role.equalsIgnoreCase("current_user")
-                        || role.equalsIgnoreCase("session_user") || role.equalsIgnoreCase("current_role")) {
-                    continue;
-                }
-                if (!executor.database.hasRole(role)) {
-                    throw PgErrors.undefinedObject("role", role);
-                }
             }
         }
         // StoredExprCheck names the same context and reaches the boolean check itself, after the
@@ -522,6 +525,19 @@ class DdlAdminExecutor {
      * withholding the rows it was written to withhold and starts admitting them instead.
      */
     QueryResult executeAlterPolicy(AlterPolicyStmt stmt) {
+        // Every role a TO clause names has to exist, and PostgreSQL settles that before it looks
+        // anything up about the relation -- so a policy is never left applying to a role that is
+        // not there, and a statement naming both a missing role and a missing relation reports
+        // the role.
+        // Every role a TO clause names has to exist. PostgreSQL checks them before it changes
+        // anything, so a policy is never left applying to a role that is not there.
+        for (String role : stmt.roles()) {
+            if (PUBLIC_ROLE.equalsIgnoreCase(role)) continue;
+            String resolved = executor.ddlExecutor.resolveOwnerName(role);
+            if (!executor.database.hasRole(resolved)) {
+                throw new MemgresException("role \"" + resolved + "\" does not exist", "42704");
+            }
+        }
         // A qualifier on the relation says which schema holds it, and a schema that is not there
         // is what PostgreSQL reports rather than the relation being missing from it.
         SchemaQualifier.requireSchema(executor.database, executor.session, stmt.schema());
@@ -547,15 +563,6 @@ class DdlAdminExecutor {
         }
         if (stmt.usingExpr() != null && "INSERT".equals(policyCommand)) {
             throw PgErrors.syntax("only WITH CHECK expression allowed for INSERT");
-        }
-        // Every role a TO clause names has to exist. PostgreSQL checks them before it changes
-        // anything, so a policy is never left applying to a role that is not there.
-        for (String role : stmt.roles()) {
-            if (PUBLIC_ROLE.equalsIgnoreCase(role)) continue;
-            String resolved = executor.ddlExecutor.resolveOwnerName(role);
-            if (!executor.database.hasRole(resolved)) {
-                throw new MemgresException("role \"" + resolved + "\" does not exist", "42704");
-            }
         }
         if (stmt.renameTo() != null) {
             // Renaming onto a name a policy on this table already answers to would leave two of
@@ -701,8 +708,18 @@ class DdlAdminExecutor {
                 }
                 // Apply other options normally
                 for (Map.Entry<String, String> e : stmt.options().entrySet()) {
-                    if (!"SET_CONFIG".equals(e.getKey()) && !"RESET_CONFIG".equals(e.getKey())) {
-                        existing.put(e.getKey(), e.getValue());
+                    if ("SET_CONFIG".equals(e.getKey()) || "RESET_CONFIG".equals(e.getKey())) {
+                        continue;
+                    }
+                    // PASSWORD NULL takes the password away, and the map the attributes are held
+                    // in cannot hold a null: put there, it threw out of the middle of ALTER ROLE
+                    // as an internal error. A password that was given is encrypted here, where it
+                    // is given, as CREATE ROLE encrypts one.
+                    if (e.getValue() == null) {
+                        existing.remove(e.getKey());
+                    } else {
+                        existing.put(e.getKey(), "PASSWORD".equals(e.getKey())
+                                ? PgScramVerifier.of(e.getValue()) : e.getValue());
                     }
                 }
             }
@@ -742,10 +759,29 @@ class DdlAdminExecutor {
     // ---- DROP ROLE ----
 
     QueryResult executeDropRole(DropRoleStmt stmt) {
+        // One statement, so either every name goes or none does: dropped as the list was walked,
+        // a DROP ROLE whose second name reached nothing had already taken the first, and the role
+        // that was there was gone even though the statement was refused.
+        for (String role : stmt.names()) {
+            requireRoleDroppable(role, stmt.ifExists());
+        }
         for (String role : stmt.names()) {
             dropOneRole(role, stmt.ifExists());
         }
         return QueryResult.message(QueryResult.Type.SET, "DROP ROLE");
+    }
+
+    /** Everything DROP ROLE settles about one name before any of them is taken away. */
+    private void requireRoleDroppable(String role, boolean ifExists) {
+        if (role != null && SPECIAL_ROLE_SPECIFIERS.contains(
+                role.toLowerCase(java.util.Locale.ROOT))) {
+            throw new MemgresException(
+                    "cannot use special role specifier in DROP ROLE", "22023");
+        }
+        if (!executor.database.hasRole(role)) {
+            if (ifExists) return;
+            throw new MemgresException("role \"" + role + "\" does not exist", "42704");
+        }
     }
 
     /** The words that stand for whoever is asking rather than for a role of that name. */
@@ -806,13 +842,19 @@ class DdlAdminExecutor {
      * privileges written for it as well as the objects it owns. Dropping only the objects left
      * the grants standing, so the DROP ROLE that followed was still refused.
      */
-    void executeDropOwned(String roleName) {
+    void executeDropOwned(String roleName, boolean cascade) {
         executor.database.removeAllRolePrivileges(roleName);
         executor.database.removeDefaultAclsOf(roleName);
-        dropObjectsOwnedBy(roleName);
+        dropObjectsOwnedBy(roleName, cascade);
     }
 
-    private void dropObjectsOwnedBy(String roleName) {
+    /**
+     * @param cascade whether the statement was written CASCADE. Without it PostgreSQL refuses to
+     *     drop anything another object still depends on, as every drop does; dropped with
+     *     CASCADE regardless, DROP OWNED BY took a table down and left the foreign key that
+     *     referenced it naming nothing.
+     */
+    private void dropObjectsOwnedBy(String roleName, boolean cascade) {
         List<String> owned = executor.database.getObjectsOwnedBy(roleName);
         for (String key : owned) {
             int colon = key.indexOf(':');
@@ -823,7 +865,8 @@ class DdlAdminExecutor {
                 case "table": {
                     int dot = name.indexOf('.');
                     if (dot > 0) {
-                        ddl.tableExecutor.dropSingleTable(name.substring(0, dot), name.substring(dot + 1), true, true);
+                        ddl.tableExecutor.dropSingleTable(name.substring(0, dot),
+                                name.substring(dot + 1), true, cascade);
                     }
                     break;
                 }

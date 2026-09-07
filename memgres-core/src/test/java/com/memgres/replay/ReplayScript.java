@@ -85,7 +85,7 @@ public final class ReplayScript {
                 else if (line.startsWith("-- title:")) title = after(line, "-- title:");
                 else if (line.startsWith("-- unrunnable:")) unrunnable = after(line, "-- unrunnable:");
                 else if (line.startsWith("-- columns:")) columns = splitCells(after(line, "-- columns:"));
-                else if (line.startsWith("-- row:")) rows.add(rowValue(line));
+                else if (line.startsWith("-- row:")) rows.add(rowValue(leftTrimmed(raw)));
                 else if (line.startsWith("-- rowcount:")) { /* the row list already says */ }
                 else if (line.startsWith("-- ok:")) updateCount = Integer.valueOf(after(line, "-- ok:"));
                 else if (line.startsWith("-- sqlstate:")) sqlState = after(line, "-- sqlstate:");
@@ -119,8 +119,17 @@ public final class ReplayScript {
      *
      * <p>Only the one space that separates the tag from the value is taken off. A plan line says
      * how deep in the tree it sits by how far it is indented, so trimming a recorded row would
-     * throw away part of the answer and hold the engine to a flattened version of it.
+     * throw away part of the answer and hold the engine to a flattened version of it. The same
+     * holds at the other end: a value PostgreSQL answered with may end in a space, and a record
+     * that dropped it held the engine to an answer PostgreSQL never gave.
      */
+    /** The line with its leading whitespace taken off and its trailing whitespace kept. */
+    private static String leftTrimmed(String raw) {
+        int i = 0;
+        while (i < raw.length() && Character.isWhitespace(raw.charAt(i))) i++;
+        return raw.substring(i);
+    }
+
     private static String rowValue(String line) {
         String value = line.substring("-- row:".length());
         return value.startsWith(" ") ? value.substring(1) : value.trim();

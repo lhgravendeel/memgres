@@ -501,6 +501,28 @@ class CatalogCoreBuilder {
         return oids.oid(TypeNamespace.oidKey(schemaName, relName) + "[]");
     }
 
+    /**
+     * How many rows the last ANALYZE found, or -1 where the relation has never been analysed.
+     *
+     * <p>A partitioned table holds no rows of its own: what it has is what its partitions hold,
+     * and PostgreSQL reports that total. Counted from its own storage, a partitioned table that
+     * had just been analysed reported no rows at all, and a planner reading it would have taken
+     * the relation for an empty one.
+     */
+    private double analysedRowCount(String schemaName, Table t) {
+        if (!database.getAnalyzedTables().contains(schemaName + "." + t.getName())) return -1.0;
+        return (double) rowsWithPartitions(t);
+    }
+
+    private static int rowsWithPartitions(Table t) {
+        int total = t.getRows().size();
+        List<Table> partitions = t.getPartitions();
+        if (partitions != null) {
+            for (Table part : partitions) total += rowsWithPartitions(part);
+        }
+        return total;
+    }
+
     /** The OID of a relation's row type, which pg_class.reltype names. */
     private int rowTypeOid(String schemaName, String relName) {
         return oids.oid(TypeNamespace.oidKey(schemaName, relName));
@@ -718,7 +740,7 @@ class CatalogCoreBuilder {
                         "p".equals(relkind) ? 0 : 2,               // relam (heap=2)
                         tblOid,          // relfilenode
                         0,               // reltablespace
-                        0, database.getAnalyzedTables().contains(schemaEntry.getKey() + "." + t.getName()) ? (double) t.getRows().size() : -1.0, 0, 0, toastOid, // relpages, reltuples (M22: -1 = never-analyzed), relallvisible, relallfrozen, reltoastrelid
+                        0, analysedRowCount(schemaEntry.getKey(), t), 0, 0, toastOid, // relpages, reltuples (-1 = never analysed), relallvisible, relallfrozen, reltoastrelid
                         hasIdx, false, relPersistence(schemaEntry.getKey(), t.isUnlogged()), relkind, // relhasindex, relisshared, relpersistence, relkind
                         (short) t.getAttributeCount(), checkCount, // relnatts, relchecks
                         // relhassubclass: a partitioned table or an inheritance parent has
@@ -1143,13 +1165,40 @@ class CatalogCoreBuilder {
      */
     private int collationOidOf(Column c) {
         if (c.getCollation() != null) {
+            // A collation the server ships carries a number PostgreSQL pins, and pg_collation's
+            // rows carry it: minted under a key of its own instead, a column declared
+            // COLLATE "C" pointed at a number no row answers to.
+            int pinned = CatalogTypeSystemBuilder.pinnedCollationOid(c.getCollation());
+            if (pinned != 0) return pinned;
             return oids.oid("collation:" + c.getCollation().toLowerCase(java.util.Locale.ROOT));
         }
-        return isCollatable(c) ? DEFAULT_COLLATION_OID : 0;
+        if (!isCollatable(c)) return 0;
+        // name is the type the catalogue's own names are held as, and it sorts by C rather than
+        // by the database's collation -- a name has to order the same way whatever locale the
+        // database was created in. Given the default like any other text column, a name column
+        // pointed at a collation PostgreSQL never gives it.
+        DataType type = c.getArrayElementType() != null ? c.getArrayElementType() : c.getType();
+        return type == DataType.NAME || type == DataType.NAME_ARRAY
+                ? C_COLLATION_OID : DEFAULT_COLLATION_OID;
     }
 
     /** PostgreSQL's "default" collation, which every collatable column falls back to. */
     private static final int DEFAULT_COLLATION_OID = 100;
+
+    /** The C collation, which is what a name sorts by. */
+    private static final int C_COLLATION_OID = 950;
+
+    /**
+     * How many dimensions a column's declaration was written with. PostgreSQL keeps the written
+     * count and nothing else -- there is one array type per element type -- so a column declared
+     * text[][] reports two here while format_type still says text[]. Reported as one for every
+     * array, a client reading this to size a value was told a matrix was a list.
+     */
+    private static int attndimsOf(Column c, DataType colType) {
+        boolean array = DataType.isArrayType(colType) || c.getArrayElementType() != null;
+        if (!array) return 0;
+        return c.getArrayDimensions() > 0 ? c.getArrayDimensions() : 1;
+    }
 
     /** Whether values of this column's type sort by a collation. */
     private static boolean isCollatable(Column c) {
@@ -1305,7 +1354,7 @@ class CatalogCoreBuilder {
                             // attndims: PG records 1 for a column declared as an array, and a
                             // client deciding whether to read the value as an array reads it.
                             1, attIsLocal, inhCount, null,
-                            DataType.isArrayType(colType) || c.getArrayElementType() != null ? 1 : 0,
+                            attndimsOf(c, colType),
                             // A column's ACL holds the column-level grants written on it, and
                             // nothing else: what the relation grants is the relation's.
                             buildColumnAcl(owner, c.getName()),
@@ -2000,7 +2049,7 @@ class CatalogCoreBuilder {
             // same "type:<name>[]" OID for "<name>[]"-typed columns.
             int enumArrayOid = oids.oid("type:" + ceEntry.getKey() + "[]");
             table.insertRow(new Object[]{
-                    enumOid, ce.getName(), enumNsOid, 10,
+                    enumOid, ce.getName(), enumNsOid, resolveOwnerOid(database, oids, "type:" + ceEntry.getKey()),
                     (short) 4, true, "e", "E", false, true, ",",
                     0, regproc(null), 0, enumArrayOid,
                     regproc("enum_in"), regproc("enum_out"), regproc("enum_recv"), regproc("enum_send"),
@@ -2009,7 +2058,7 @@ class CatalogCoreBuilder {
                     userTypeAcl(ceEntry.getKey(), ce.getName()), 1
             });
             table.insertRow(new Object[]{
-                    enumArrayOid, "_" + ce.getName(), enumNsOid, 10,
+                    enumArrayOid, "_" + ce.getName(), enumNsOid, resolveOwnerOid(database, oids, "type:" + ceEntry.getKey()),
                     (short) -1, false, "b", "A", false, true, ",",
                     0, regproc("array_subscript_handler"), enumOid, 0,
                     regproc("array_in"), regproc("array_out"), regproc("array_recv"), regproc("array_send"),
@@ -2027,7 +2076,7 @@ class CatalogCoreBuilder {
             int ctNsOid = oids.oid("ns:" + ctSchema);
             int ctRelOid = oids.oid("rel:" + ctSchema + "." + ctName);
             table.insertRow(new Object[]{
-                    oids.oid("type:" + ctKey), ctName, ctNsOid, 10,
+                    oids.oid("type:" + ctKey), ctName, ctNsOid, resolveOwnerOid(database, oids, "type:" + ctKey),
                     (short) -1, false, "c", "C", false, true, ",",
                     ctRelOid, regproc(null), 0, oids.oid("type:" + ctKey + "[]"),
                     regproc("record_in"), regproc("record_out"), regproc("record_recv"), regproc("record_send"),
@@ -2035,7 +2084,7 @@ class CatalogCoreBuilder {
                     false, 0, -1, 0, 0, null, null, userTypeAcl(ctKey, ctName), 1
             });
             table.insertRow(new Object[]{
-                    oids.oid("type:" + ctKey + "[]"), "_" + ctName, ctNsOid, 10,
+                    oids.oid("type:" + ctKey + "[]"), "_" + ctName, ctNsOid, resolveOwnerOid(database, oids, "type:" + ctKey),
                     (short) -1, false, "b", "A", false, true, ",",
                     0, regproc("array_subscript_handler"), oids.oid("type:" + ctKey), 0,
                     regproc("array_in"), regproc("array_out"), regproc("array_recv"), regproc("array_send"),
@@ -2164,7 +2213,7 @@ class CatalogCoreBuilder {
             int domTypmod = CatalogHelper.attTypmod(dom.getBaseType(), dom.getPrecision(),
                     dom.getScale(), dom.getIntervalQualifier());
             table.insertRow(new Object[]{
-                    domOid, dom.getName(), domNsOid, 10,
+                    domOid, dom.getName(), domNsOid, resolveOwnerOid(database, oids, "type:" + domEntry.getKey()),
                     typeCol(base, 4, (short) -1), typeCol(base, 5, false),
                     "d", baseTypeCat, false, true, ",",
                     0, regproc(null), 0, domArrayOid,
@@ -2181,7 +2230,7 @@ class CatalogCoreBuilder {
                     userTypeAcl(domEntry.getKey(), dom.getName()), 1
             });
             table.insertRow(new Object[]{
-                    domArrayOid, "_" + dom.getName(), domNsOid, 10,
+                    domArrayOid, "_" + dom.getName(), domNsOid, resolveOwnerOid(database, oids, "type:" + domEntry.getKey()),
                     (short) -1, false, "b", "A", false, true, ",",
                     0, regproc("array_subscript_handler"), domOid, 0,
                     regproc("array_in"), regproc("array_out"), regproc("array_recv"), regproc("array_send"),
@@ -2808,7 +2857,7 @@ class CatalogCoreBuilder {
             table.insertRow(new Object[]{
                     oids.oid("proc:" + agg.getName()), agg.getName(), aggNs, 10,
                     oids.oid("lang:internal"), 1.0, 0.0, 0, "-", "a",
-                    false, false, false, false, "i", "u",
+                    false, false, false, false, "i", parallelOf(agg),
                     aggNargs, (short) 0, aggRetType,
                     oidvector(aggArgs.toString()), null, null, null, null, null,
                     null, null, null, null, null, 1
@@ -2983,6 +3032,22 @@ class CatalogCoreBuilder {
      * <p>Only pg_catalog rows are touched. A user function named {@code concat(any)} is that
      * user's function and PostgreSQL's numbers say nothing about it.
      */
+    /**
+     * The letter pg_proc records for how safely an aggregate may be run in parallel.
+     *
+     * <p>PARALLEL SAFE, RESTRICTED and UNSAFE are s, r and u; nothing written is unsafe, which is
+     * PostgreSQL's default. Read and thrown away by the parser, every aggregate was recorded as
+     * unsafe whatever it had been declared.
+     */
+    private static String parallelOf(PgAggregate agg) {
+        String written = agg.getParallel();
+        if (written == null) return "u";
+        String word = written.trim().toLowerCase(java.util.Locale.ROOT);
+        if (word.equals("safe")) return "s";
+        if (word.equals("restricted")) return "r";
+        return "u";
+    }
+
     private void applyRecordedProcRows(Table table, int pgCatalogNs) {
         int nameAt = table.getColumnIndex("proname");
         int nsAt = table.getColumnIndex("pronamespace");

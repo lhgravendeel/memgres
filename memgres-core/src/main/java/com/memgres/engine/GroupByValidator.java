@@ -97,6 +97,11 @@ final class GroupByValidator {
         for (Expression g : grouped) groupedForms.add(canon(g, bindings));
 
         Check check = new Check(groupedForms, determining, bindings);
+        // HAVING is read against the relations the query is over, and never against the names
+        // the select list gives its own results: PostgreSQL settles that while it analyses the
+        // clause, before it judges the grouping at all. Judged the other way round, a HAVING
+        // naming an output alias was reported as a select item that had not been grouped.
+        if (stmt.having() != null) rejectUnknownColumnsAtThisLevel(stmt.having(), check);
         for (SelectStmt.SelectTarget t : targets) check.walk(t.expr());
         if (stmt.distinctOn() != null) {
             // DISTINCT ON keys are output expressions of the grouped result like any other, so
@@ -653,6 +658,29 @@ final class GroupByValidator {
 
     // ---- The ungrouped-expression walk ----
 
+    /**
+     * The column references a clause makes at this query level, leaving nested queries alone.
+     *
+     * <p>A subquery reads its own FROM and the levels above it, so a name in one says nothing
+     * about whether this level has a column of that name: walked into, an EXISTS over another
+     * relation had its columns reported as columns this query does not have.
+     */
+    private static void rejectUnknownColumnsAtThisLevel(Expression expr, Check check) {
+        if (expr == null) return;
+        if (expr instanceof com.memgres.engine.parser.ast.SubqueryExpr
+                || expr instanceof com.memgres.engine.parser.ast.ExistsExpr
+                || expr instanceof com.memgres.engine.parser.ast.ArraySubqueryExpr
+                || expr instanceof com.memgres.engine.parser.ast.AnyAllExpr) {
+            return;
+        }
+        check.rejectUnknownColumnPublicly(expr);
+        AstWalk.forEachChild(expr, child -> {
+            if (child instanceof Expression) {
+                rejectUnknownColumnsAtThisLevel((Expression) child, check);
+            }
+        });
+    }
+
     private final class Check {
         private final Set<String> groupedForms;
         private final List<Expression> determining;
@@ -729,6 +757,10 @@ final class GroupByValidator {
          * qualified one, a system column and anything reached through a relation this walk could
          * not resolve are left to the grouping-expression message.
          */
+        void rejectUnknownColumnPublicly(Object node) {
+            if (node instanceof Expression) rejectUnknownColumn((Expression) node);
+        }
+
         private void rejectUnknownColumn(Expression arg) {
             if (!(arg instanceof ColumnRef)) return;
             ColumnRef ref = (ColumnRef) arg;

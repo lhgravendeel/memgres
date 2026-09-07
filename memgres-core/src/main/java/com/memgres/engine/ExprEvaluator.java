@@ -611,6 +611,10 @@ class ExprEvaluator {
                         throw new MemgresException("column \"" + ref.column() + "\" does not exist", "42703");
                     }
                     // Try outer contexts (for LATERAL subqueries with no FROM clause)
+                    // A relation in an outer scope is still one the reader could have meant, so a
+                    // near miss there is worth suggesting. Discarded with the refusal it arrived
+                    // on, the suggestion was lost and the complaint came out bare.
+                    MemgresException suggested = null;
                     if (!executor.outerContextStack.isEmpty()) {
                         for (Iterator<RowContext> it = executor.outerContextStack.descendingIterator(); it.hasNext(); ) {
                             RowContext outer = it.next();
@@ -623,6 +627,10 @@ class ExprEvaluator {
                                 return result;
                             } catch (MemgresException e) {
                                 if (!"42703".equals(e.getSqlState()) && !"42P01".equals(e.getSqlState())) throw e;
+                                if (suggested == null && "42703".equals(e.getSqlState())
+                                        && e.getHint() != null) {
+                                    suggested = e;
+                                }
                             }
                         }
                     }
@@ -630,6 +638,7 @@ class ExprEvaluator {
                     if (ref.table() != null) {
                         throw new MemgresException("missing FROM-clause entry for table \"" + ref.table() + "\"", "42P01");
                     }
+                    if (suggested != null) throw suggested;
                     // Nothing resolves this name. Returning it as text would let a typo become a
                     // plausible-looking value that defeats the column's declared type.
                     throw new MemgresException(
@@ -701,6 +710,10 @@ class ExprEvaluator {
                 }
             }
             // Try outer contexts (for correlated subqueries)
+            // A relation in an outer scope is still a relation the reader could have meant, so a
+            // near miss there is worth suggesting. Discarded with the refusal it came on, the
+            // suggestion was lost and the complaint arrived bare.
+            MemgresException suggested = null;
             for (Iterator<RowContext> it = executor.outerContextStack.descendingIterator(); it.hasNext(); ) {
                 RowContext outer = it.next();
                 try {
@@ -709,10 +722,12 @@ class ExprEvaluator {
                     return result;
                 } catch (MemgresException e) {
                     if (!"42703".equals(e.getSqlState())) throw e;
+                    if (suggested == null && e.getHint() != null) suggested = e;
                     // not in this outer context either, continue
                 }
             }
             if (notHere != null) throw notHere;
+            if (suggested != null) throw suggested;
             throw new MemgresException(
                     "column \"" + ref.column() + "\" does not exist", "42703");
         } else {
@@ -1162,6 +1177,14 @@ class ExprEvaluator {
                 "operator does not exist: " + leftType + " " + cop.opSymbol() + " " + rightType, "42883");
         }
 
+        // An operator filed as a promise -- named as somebody's negator or commutator and never
+        // created -- has operand types and nothing to run. Using it is a different complaint from
+        // using one that was never declared at all.
+        if (pgOp.getFunction() == null) {
+            throw new MemgresException("operator is only a shell: "
+                    + (cop.isUnary() ? "" : leftType + " ") + cop.opSymbol() + " " + rightType,
+                    "42883");
+        }
         // Resolve the backing function
         String funcName = pgOp.getFunction();
         PgFunction func = executor.database.getFunction(funcName);
@@ -1229,16 +1252,19 @@ class ExprEvaluator {
             schemas.add(schema.toLowerCase(java.util.Locale.ROOT));
         } else {
             schemas.add("pg_catalog");
-            schemas.add("public");
-            if (executor.session != null) {
-                String sp = executor.session.getGucSettings().get("search_path");
-                if (sp != null) {
-                    for (String s : sp.split(",")) {
-                        String trimmed = s.trim().replace("\"", "").replace("'", "");
-                        if (!trimmed.isEmpty() && !"$user".equals(trimmed)
-                                && !schemas.contains(trimmed.toLowerCase(java.util.Locale.ROOT))) {
-                            schemas.add(trimmed.toLowerCase(java.util.Locale.ROOT));
-                        }
+            String sp = executor.session == null ? null
+                    : executor.session.getGucSettings().get("search_path");
+            // public is on the path because the default path names it, not because it is always
+            // reachable: a session that set the path to something else cannot write a bare
+            // operator and reach public, and PostgreSQL says no such operator exists.
+            if (sp == null || sp.trim().isEmpty()) {
+                schemas.add("public");
+            } else {
+                for (String s : sp.split(",")) {
+                    String trimmed = s.trim().replace("\"", "").replace("'", "");
+                    if (!trimmed.isEmpty() && !"$user".equals(trimmed)
+                            && !schemas.contains(trimmed.toLowerCase(java.util.Locale.ROOT))) {
+                        schemas.add(trimmed.toLowerCase(java.util.Locale.ROOT));
                     }
                 }
             }
@@ -2263,36 +2289,10 @@ class ExprEvaluator {
                         "could not determine polymorphic type because input has type \"" + typeName + "\"", "42P18");
             }
         }
-        boolean hasNumericLiteral = false;
-        boolean hasNonNumericStringLiteral = false;
-        String badValue = null;
-        for (CaseExpr.WhenClause when : c.whenClauses()) {
-            if (when.result() instanceof Literal) {
-                Literal lit = (Literal) when.result();
-                if (lit.literalType() == Literal.LiteralType.INTEGER || lit.literalType() == Literal.LiteralType.FLOAT) {
-                    hasNumericLiteral = true;
-                } else if (lit.literalType() == Literal.LiteralType.STRING) {
-                    try { new java.math.BigDecimal(lit.value()); } catch (NumberFormatException e) {
-                        hasNonNumericStringLiteral = true;
-                        badValue = lit.value();
-                    }
-                }
-            }
-        }
-        if (c.elseExpr() instanceof Literal) {
-            Literal lit = (Literal) c.elseExpr();
-            if (lit.literalType() == Literal.LiteralType.INTEGER || lit.literalType() == Literal.LiteralType.FLOAT) {
-                hasNumericLiteral = true;
-            } else if (lit.literalType() == Literal.LiteralType.STRING) {
-                try { new java.math.BigDecimal(lit.value()); } catch (NumberFormatException e) {
-                    hasNonNumericStringLiteral = true;
-                    badValue = lit.value();
-                }
-            }
-        }
-        if (hasNumericLiteral && hasNonNumericStringLiteral) {
-            throw new MemgresException("invalid input syntax for type integer: \"" + badValue + "\"", "22P02");
-        }
+        // A branch written out as a string is read as the type the branches settle on, which
+        // unifyResultTypes below does for every construct alike. Answered here instead, the type
+        // was named integer whatever the numeric branch actually was, so a CASE beside 1.5 said
+        // the value would not read as an integer where PostgreSQL says numeric.
         // Check for composite vs non-composite type mismatch across branches
         boolean hasComposite = false;
         boolean hasNonComposite = false;
@@ -2997,15 +2997,15 @@ class ExprEvaluator {
     private Boolean comparisonAgainst(BinaryExpr.BinOp op, String userOp,
                                       Object left, Object right) {
         if (userOp != null) {
-            Object answered = executor.binaryOpEvaluator.tryUserDefinedOperator(userOp, left, right);
-            if (answered == null) {
+            Object answered = executor.binaryOpEvaluator.userDefinedOperatorResult(userOp, left, right);
+            if (answered == BinaryOpEvaluator.NO_USER_OPERATOR) {
                 throw new MemgresException("operator does not exist: "
                         + AstExecutor.pgTypeNameOf(left) + " " + userOp + " "
                         + AstExecutor.pgTypeNameOf(right)
                         + "\n  Hint: No operator matches the given name and argument types."
                         + " You might need to add explicit type casts.", "42883");
             }
-            return Boolean.valueOf(executor.isTruthy(answered));
+            return answered == null ? null : Boolean.valueOf(executor.isTruthy(answered));
         }
         if (left instanceof AstExecutor.PgRow || right instanceof AstExecutor.PgRow) {
             Object answered = executor.binaryOpEvaluator.evalBinaryValues(op, left, right);
@@ -3970,6 +3970,19 @@ class ExprEvaluator {
      * which PostgreSQL resolves against the other side, so it does not drag the pair to text.
      * Returns null when this table has no answer, leaving the caller's text default in place.
      */
+    /** The type a user-declared operator of this spelling answers in for these operands. */
+    private DataType declaredOperatorResultType(BinaryExpr.BinOp op, DataType lt, DataType rt) {
+        if (lt == null || rt == null) return null;
+        String spelling = BinaryOpEvaluator.opSymbol(op);
+        if (spelling == null || executor.database.getOperatorsByName(spelling).isEmpty()) return null;
+        PgOperator declared = resolveOperator(null, spelling, lt.getPgName(), rt.getPgName());
+        if (declared == null) return null;
+        PgFunction behind = executor.database.getFunction(declared.getFunction());
+        if (behind == null || behind.getReturnType() == null) return null;
+        return DataType.fromPgName(
+                CatalogMetadataFunctions.stripTypeModifier(behind.getReturnType()));
+    }
+
     private static DataType binaryResultType(BinaryExpr.BinOp op, DataType lt, DataType rt) {
         switch (op) {
             // Every one of these asks a yes/no question, whatever its operands are made of
@@ -4380,6 +4393,19 @@ class ExprEvaluator {
             }
             return null;
         }
+        if (expr instanceof FunctionCallExpr
+                && "xmlserialize".equalsIgnoreCase(((FunctionCallExpr) expr).name())
+                && ((FunctionCallExpr) expr).args().size() >= 3) {
+            // The clause says which type it serialises to, and that is the type of what it
+            // answers with: reported as text whatever was written, XMLSERIALIZE(... AS
+            // varchar(20)) told a reader it had a text column.
+            Expression named = ((FunctionCallExpr) expr).args().get(2);
+            if (named instanceof Literal) {
+                DataType serialised = DataType.fromPgName(
+                        ((Literal) named).value().replaceAll("\\(.*\\)", "").trim());
+                if (serialised != null) return serialised;
+            }
+        }
         if (expr instanceof CastExpr) {
             CastExpr cast = (CastExpr) expr;
             // The modifier is part of what float(p) names — 24 is a real and 25 a double
@@ -4503,6 +4529,11 @@ class ExprEvaluator {
             // so it must not drag the pair back to text.
             if (isUnknownLiteral(bin.left())) lt = null;
             if (isUnknownLiteral(bin.right())) rt = null;
+            // An operator somebody declared for these operands answers in the type its own
+            // function returns, whatever the shipped operator of the same spelling answers in:
+            // a "##" created over two texts was described as a point.
+            DataType declared = declaredOperatorResultType(bin.op(), lt, rt);
+            if (declared != null) return declared;
             DataType resolved = binaryResultType(bin.op(), lt, rt);
             return resolved != null ? resolved : DataType.TEXT;
         }
@@ -5176,6 +5207,18 @@ class ExprEvaluator {
     }
 
     String resolveCompositeTypeName(Expression expr, List<RowContext.TableBinding> bindings) {
+        // A parameter is of the type the PREPARE declared for it, which is what says what its
+        // value is. Without that, a field taken from a composite parameter had no type to be
+        // described with and the column was reported as text.
+        if (expr instanceof ParamRef) {
+            int at = ((ParamRef) expr).index() - 1;
+            List<String> declared = executor.boundParameterTypes;
+            if (at >= 0 && at < declared.size() && declared.get(at) != null) {
+                String named = declared.get(at).replaceAll("\\(.*\\)", "").trim();
+                if (isCompositeTypeName(named)) return named;
+            }
+            return null;
+        }
         // A whole row written out is the row of whatever it was taken from.
         if (expr instanceof CompositeStarExpr) {
             return resolveCompositeTypeName(((CompositeStarExpr) expr).expr(), bindings);
@@ -5322,6 +5365,15 @@ class ExprEvaluator {
      *       pgjdbc.</li>
      * </ul>
      */
+    /** The user-defined range type an expression was written as, or null. */
+    private String writtenRangeTypeName(Expression expr) {
+        if (!(expr instanceof CastExpr)) return null;
+        String written = ((CastExpr) expr).typeName();
+        if (written == null) return null;
+        String key = TypeNamespace.resolve(executor.database, executor.session, written.trim());
+        return key != null && executor.database.isRangeType(key) ? key : null;
+    }
+
     Column buildResultColumn(String alias, Expression expr, List<RowContext.TableBinding> bindings) {
         // A column an enclosing level supplies is that column: a LATERAL that projects one keeps
         // everything the type is made of, not just the DataType — an int[] exposed through a
@@ -5360,7 +5412,13 @@ class ExprEvaluator {
         }
         String compositeName = resolveCompositeTypeName(expr, bindings);
         if (compositeName != null) return Column.ofCompositeType(alias, compositeName);
-        return new Column(alias, targetType, true, false, null);
+        Column projected = new Column(alias, targetType, true, false, null);
+        // A range a reader defined is a type of its own, with a row in pg_type and an OID of its
+        // own, and a value cast to it is of that type. Described by what it is carried as, the
+        // column said text, so a client resolving the column against pg_type found the wrong row.
+        String rangeName = writtenRangeTypeName(expr);
+        if (rangeName != null) projected.setRangeTypeName(rangeName);
+        return projected;
     }
 
     // ---- JSON path parsing ----

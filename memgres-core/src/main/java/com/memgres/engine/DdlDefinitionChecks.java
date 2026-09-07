@@ -416,6 +416,42 @@ public final class DdlDefinitionChecks {
     }
 
     /**
+     * An exclusion constraint's key columns, held to the access method it names.
+     *
+     * <p>An exclusion constraint is enforced by an index, and an index key needs an operator class
+     * the method can compare with. Checked only for the btree methods, {@code EXCLUDE USING gist
+     * (a WITH <>)} over an integer was recorded and enforced nothing -- gist has no class for a
+     * scalar type until btree_gist adds one.
+     */
+    public static void requireExclusionKeyOpclass(Database database, Table table,
+                                                  java.util.List<String> columns, String method) {
+        if (columns == null || table == null) return;
+        String am = method == null || method.isEmpty() ? "btree" : method.toLowerCase(java.util.Locale.ROOT);
+        // An extension brings operator classes of its own: btree_gist and btree_gin add the
+        // scalar types to their methods, and a server with one installed indexes what this rule
+        // would otherwise turn away.
+        if (database != null
+                && (("gist".equals(am) && database.hasExtension("btree_gist"))
+                    || ("gin".equals(am) && database.hasExtension("btree_gin")))) {
+            return;
+        }
+        for (String written : columns) {
+            if (written == null || isExpressionKeyElement(written)) continue;
+            int at = table.getColumnIndex(written);
+            if (at < 0) continue;   // a column that is not there is reported by the caller
+            String typeName = DdlIndexValidator.indexedTypeName(table.getColumns().get(at));
+            if (typeName == null || DdlIndexValidator.defaultOpclass(am, typeName) != null) {
+                continue;
+            }
+            MemgresException e = new MemgresException("data type " + typeName
+                    + " has no default operator class for access method \"" + am + "\"", "42704");
+            e.setHint("You must specify an operator class for the index or define a default"
+                    + " operator class for the data type.");
+            throw e;
+        }
+    }
+
+    /**
      * The existence half alone, for the payload columns of an {@code INCLUDE} clause: those are
      * carried in the index rather than compared, so naming one twice is not a key collision.
      */
@@ -559,6 +595,11 @@ public final class DdlDefinitionChecks {
         if (name.startsWith("pg_catalog.")) name = name.substring("pg_catalog.".length());
         if (BUILTIN_COLLATIONS.contains(name)) return;
         if (db != null && db.getCollation(name) != null) return;
+        // A collation lives in a schema like anything else, and a name may say which: only the
+        // pg_catalog qualifier was taken off, so a collation written with its own schema was
+        // looked for under a name nothing is filed under.
+        int dot = name.lastIndexOf('.');
+        if (dot > 0 && db != null && db.getCollation(name.substring(dot + 1)) != null) return;
         throw new MemgresException("collation \"" + collation
                 + "\" for encoding \"UTF8\" does not exist", "42704");
     }

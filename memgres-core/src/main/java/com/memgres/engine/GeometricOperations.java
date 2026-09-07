@@ -432,7 +432,17 @@ public final class GeometricOperations {
                         return sign * (double) Long.parseLong(digits.substring(2), 16);
                     }
                 }
-                return Double.parseDouble(token.replaceAll("(?i)^([-+]?)inf$", "$1Infinity"));
+                double read = Double.parseDouble(
+                        token.replaceAll("(?i)^([-+]?)inf$", "$1Infinity"));
+                // A coordinate is a double precision, and a number too large for one is out of
+                // range rather than an infinity: read as infinite, a point written with an
+                // exponent past what a double holds was stored and printed as (Infinity,0).
+                if (Double.isInfinite(read) && !token.matches("(?i)[-+]?inf(inity)?")) {
+                    throw new MemgresException(
+                            "\"" + token + "\" is out of range for type double precision",
+                            "22003");
+                }
+                return read;
             } catch (NumberFormatException e) {
                 throw bad();
             }
@@ -607,6 +617,13 @@ public final class GeometricOperations {
             double c = r.number();
             r.expect('}');
             r.end();
+            // Ax + By + C = 0 describes a line only where A and B are not both zero: with both
+            // zero the equation is about no set of points at all. Stored anyway, a line nothing
+            // lies on was carried around and every test against it answered.
+            if (a == 0.0 && b == 0.0) {
+                throw new MemgresException(
+                        "invalid line specification: A and B cannot both be zero", "22P02");
+            }
             return new PgLine(a, b, c);
         }
         List<PgPoint> pts = readPoints(s, "line", "[(", "])", 2, 2);
@@ -770,6 +787,21 @@ public final class GeometricOperations {
         if (shape instanceof PgPoint && to.equals("box")) {
             PgPoint q = (PgPoint) shape;
             return new PgBox(q, q);
+        }
+        if (shape instanceof PgPath) {
+            PgPath path = (PgPath) shape;
+            if (to.equals("polygon")) {
+                // A polygon is a closed figure, so the path has to be closed already: an open
+                // one has no inside to be the polygon's. Read as text instead, the square
+                // brackets an open path is written with were refused as bad polygon input,
+                // which says the wrong thing about a path PostgreSQL can read perfectly well.
+                if (!path.closed) {
+                    throw new MemgresException(
+                            "open path cannot be converted to polygon", "22023");
+                }
+                return new PgPolygon(Cols.listCopyOf(path.points));
+            }
+            if (to.equals("point")) return meanOf(path.points);
         }
         return null;
     }

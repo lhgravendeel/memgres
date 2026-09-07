@@ -1035,13 +1035,18 @@ public class AstExecutor {
             for (String written : roles) {
                 String role = resolveRoleKeyword(written);
                 for (String schema : schemas) {
+                    // The list belongs to the role that set it aside -- the one FOR ROLE named,
+                    // or the role the session is running as. Recorded as the session's login
+                    // instead, a list a role wrote under SET ROLE was filed against somebody else
+                    // and pg_default_acl named the wrong owner; and a REVOKE reads the same role,
+                    // because a role only takes back a default of its own.
+                    String grantor = role != null ? role : currentRole();
                     if (s.isGrant()) {
-                        String grantor = role != null ? role : sessionUser();
                         database.addDefaultAcl(new Database.DefaultAclEntry(
                                 grantor, schema, s.objectType(),
                                 s.privileges(), s.grantees(), true));
                     } else {
-                        database.removeDefaultAcl(schema, s.objectType(), s.grantees());
+                        database.removeDefaultAcl(grantor, schema, s.objectType(), s.grantees());
                     }
                 }
             }
@@ -1108,7 +1113,7 @@ public class AstExecutor {
                 }
             }
             for (String written : s.roles()) {
-                ddlExecutor.executeDropOwned(ddlExecutor.resolveOwnerName(written));
+                ddlExecutor.executeDropOwned(ddlExecutor.resolveOwnerName(written), s.cascade());
             }
             identity().sweepDead();
             return QueryResult.message(QueryResult.Type.SET, "DROP OWNED");
@@ -1565,6 +1570,36 @@ public class AstExecutor {
         return new ArrayList<>(path);
     }
 
+    /**
+     * Whether a bare name written in a query can reach this schema.
+     *
+     * <p>An unqualified function or operator is looked for along the search path and nowhere else:
+     * a path naming a schema that is not there reaches nothing, and PostgreSQL says the function
+     * does not exist rather than finding one somewhere the query never named. The lookup itself is
+     * a flat map keyed by name, which is why this is asked separately -- and why public is not
+     * assumed here, though the fallback that reads relations still assumes it.
+     *
+     * <p>pg_catalog is always reachable, as is the session's own temporary schema.
+     */
+    boolean schemaOnSearchPath(String schema) {
+        if (schema == null) return true;
+        String want = schema.toLowerCase(java.util.Locale.ROOT);
+        if (want.equals("pg_catalog") || want.equals("information_schema")) return true;
+        if (session == null) return true;
+        if (want.equals(session.getTempSchemaName().toLowerCase(java.util.Locale.ROOT))) return true;
+        for (String entry : session.getEffectiveSearchPath(false)) {
+            String named = entry.trim().toLowerCase(java.util.Locale.ROOT);
+            if (named.equals("pg_temp")) {
+                if (want.equals(session.getTempSchemaName().toLowerCase(java.util.Locale.ROOT))) {
+                    return true;
+                }
+                continue;
+            }
+            if (named.equals(want)) return true;
+        }
+        return false;
+    }
+
     java.util.List<String> searchPathSchemas() {
         java.util.LinkedHashSet<String> path = new java.util.LinkedHashSet<>();
         path.add("pg_catalog");
@@ -1821,9 +1856,9 @@ public class AstExecutor {
         // A role takes on what the roles it belongs to have only if it inherits: one created
         // NOINHERIT is a member of them and holds none of their privileges until it does SET
         // ROLE. Walking every membership regardless gave it what it has to ask for.
-        if (!roleTakesOnWhatItIsAMemberOf(roleNameLower)) return false;
         java.util.Map<String, java.util.Set<String>> memberships = database.getRoleMemberships();
         for (java.util.Map.Entry<String, java.util.Set<String>> entry : memberships.entrySet()) {
+            if (!inheritsThrough(entry.getKey(), roleNameLower)) continue;
             if (entry.getValue().contains(roleNameLower) && !visited.contains(entry.getKey())) {
                 if (hasPrivilegeDirectOrInherited(entry.getKey(), privilege, objectType, objectName, visited)) {
                     return true;
@@ -1831,6 +1866,18 @@ public class AstExecutor {
             }
         }
         return false;
+    }
+
+    /**
+     * Whether one membership hands its privileges down.
+     *
+     * <p>The grant may say so itself -- PostgreSQL records INHERIT per membership -- and where it
+     * said nothing the member role's own setting decides.
+     */
+    private boolean inheritsThrough(String grantedRole, String memberRole) {
+        Boolean saidByTheGrant = database.membershipInherits(grantedRole, memberRole);
+        if (saidByTheGrant != null) return saidByTheGrant.booleanValue();
+        return roleTakesOnWhatItIsAMemberOf(memberRole);
     }
 
     /** Whether a role takes on the privileges of the roles it is a member of. */
@@ -1844,6 +1891,13 @@ public class AstExecutor {
     /**
      * Check if a role is a superuser (by rolsuper attribute, or backwards-compat for default connecting users).
      */
+    /** Whether the role was created with BYPASSRLS, which frees it from every policy. */
+    boolean bypassesRls(String role) {
+        if (role == null) return false;
+        Map<String, String> roleAttrs = database.getRole(role);
+        return roleAttrs != null && "true".equalsIgnoreCase(roleAttrs.get("BYPASSRLS"));
+    }
+
     boolean isRoleSuperuser(String role) {
         if (role == null) return true; // no session / embedded mode
         Map<String, String> roleAttrs = database.getRole(role);
@@ -1930,11 +1984,20 @@ public class AstExecutor {
         boolean isSuperuser = isRoleSuperuser(role);
         boolean isOwner = isTableOwner(role, schemaName, table.getName());
 
-        // Check SET row_security GUC
+        // A superuser, and a role created with BYPASSRLS, always bypass row security: FORCE
+        // takes away the owner's exemption and nobody else's. Read as though FORCE bound them
+        // too, a superuser reading a table it had just forced saw none of its own rows, and a
+        // role given BYPASSRLS was filtered by every policy it was meant to be free of.
+        boolean bypasses = isSuperuser || bypassesRls(role)
+                || (isOwner && !table.isRlsForced());
+
+        // row_security = off says the reader would rather be refused than quietly shown less
+        // than the whole relation. It is only a refusal for somebody the policies would really
+        // have applied to: an owner who has forced them on themselves is one of those, and
+        // letting them through said the setting meant nothing to the role most likely to set it.
         String rowSecurityGuc = session != null ? session.getGucSettings().get("row_security") : "on";
         if ("off".equalsIgnoreCase(rowSecurityGuc)) {
-            if (isSuperuser || isOwner) return true;
-            // non-owner/non-superuser with row_security=off: if any policies exist, error
+            if (bypasses) return true;
             if (!table.getRlsPolicies().isEmpty()) {
                 // PostgreSQL reports this as a refusal to read the relation -- insufficient
                 // privilege -- rather than as an object not being in the state it must be in.
@@ -1943,12 +2006,7 @@ public class AstExecutor {
             }
             return true; // no policies, no filtering needed
         }
-
-        // Superuser bypasses unless FORCE RLS
-        if (isSuperuser && !table.isRlsForced()) return true;
-        // Owner bypasses unless FORCE RLS
-        if (isOwner && !table.isRlsForced()) return true;
-        return false;
+        return bypasses;
     }
 
     Table resolveTable(String schemaName, String tableName) {
@@ -3034,6 +3092,12 @@ public class AstExecutor {
         if (stmt instanceof TruncateStmt) command = "TRUNCATE TABLE";
         else if (stmt instanceof GrantStmt) command = "GRANT";
         else if (stmt instanceof RevokeStmt) command = "REVOKE";
+        // A comment and a label are written into the catalogue, so they change the database as
+        // much as any DDL does: accepted, they were the one kind of write a read-only
+        // transaction let through.
+        else if (stmt instanceof CommentStmt) {
+            command = ((CommentStmt) stmt).isSecurityLabel() ? "SECURITY LABEL" : "COMMENT";
+        }
         else if (cls.startsWith("Create") || cls.startsWith("Alter") || cls.startsWith("Drop")) {
             command = commandTagOf(cls);
         } else return;

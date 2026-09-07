@@ -177,8 +177,17 @@ class RlsEnforcementTest {
 
     // === Owner vs FORCE ===
 
+    /**
+     * FORCE takes away the owner's exemption -- but only an owner who has one to lose. A
+     * superuser bypasses row security whatever the table says, so this is read as a role that is
+     * not one: written as the session's own user, the test was describing a superuser and would
+     * have passed only where FORCE bound them too, which PostgreSQL says it does not.
+     */
     @Test
     void ownerForce_ownerFilteredWhenForced() throws Exception {
+        exec("CREATE ROLE of_owner LOGIN");
+        exec("GRANT CREATE ON SCHEMA public TO of_owner");
+        exec("SET ROLE of_owner");
         exec("CREATE TABLE of_t(id int, val text)");
         exec("INSERT INTO of_t VALUES (1,'a'),(2,'b')");
         exec("ALTER TABLE of_t ENABLE ROW LEVEL SECURITY");
@@ -194,6 +203,9 @@ class RlsEnforcementTest {
             assertEquals(List.of("2"), query("SELECT count(*)::int FROM of_t"));
         } finally {
             exec("DROP TABLE of_t");
+            exec("RESET ROLE");
+            exec("REVOKE CREATE ON SCHEMA public FROM of_owner");
+            exec("DROP ROLE of_owner");
         }
     }
 
@@ -216,8 +228,13 @@ class RlsEnforcementTest {
         }
     }
 
+    /**
+     * A superuser is never filtered, forced or not. FORCE says the owner gives up the exemption
+     * owning the table gives them; it says nothing about the exemption being a superuser gives.
+     * Asserted the other way round, this recorded a filtering PostgreSQL does not do.
+     */
     @Test
-    void superuserForce_superuserFilteredWhenForced() throws Exception {
+    void superuserForce_superuserStillBypasses() throws Exception {
         exec("CREATE ROLE suf_role SUPERUSER LOGIN");
         exec("CREATE TABLE suf_t(id int)");
         exec("INSERT INTO suf_t VALUES (1),(2)");
@@ -231,8 +248,8 @@ class RlsEnforcementTest {
             exec("RESET ROLE");
             exec("ALTER TABLE suf_t FORCE ROW LEVEL SECURITY");
             exec("SET ROLE suf_role");
-            // FORCE: superuser is filtered
-            assertEquals(List.of("1"), query("SELECT count(*)::int FROM suf_t"));
+            // And still bypasses: FORCE binds the owner, not every role there is.
+            assertEquals(List.of("2"), query("SELECT count(*)::int FROM suf_t"));
         } finally {
             exec("RESET ROLE");
             exec("ALTER TABLE suf_t NO FORCE ROW LEVEL SECURITY");
@@ -243,8 +260,17 @@ class RlsEnforcementTest {
 
     // === SET row_security=off ===
 
+    /**
+     * row_security = off says the reader would rather be refused than quietly shown less than the
+     * whole relation, so it is a refusal for anybody the policies would really have applied to --
+     * an owner who has forced them on themselves included. Read as a bypass for the owner, the
+     * setting meant nothing to the role most likely to set it.
+     */
     @Test
-    void rowSecurityOff_ownerBypasses() throws Exception {
+    void rowSecurityOff_forcedOwnerIsRefused() throws Exception {
+        exec("CREATE ROLE rso_owner LOGIN");
+        exec("GRANT CREATE ON SCHEMA public TO rso_owner");
+        exec("SET ROLE rso_owner");
         exec("CREATE TABLE rso_t(id int)");
         exec("INSERT INTO rso_t VALUES (1),(2)");
         exec("ALTER TABLE rso_t ENABLE ROW LEVEL SECURITY");
@@ -253,13 +279,20 @@ class RlsEnforcementTest {
         try {
             // Owner with FORCE sees filtered
             assertEquals(List.of("1"), query("SELECT count(*)::int FROM rso_t"));
-            // row_security=off bypasses for owner
+            // And with row_security off is refused rather than filtered
             exec("SET row_security = off");
+            SQLException refused = assertThrows(SQLException.class,
+                    () -> query("SELECT count(*)::int FROM rso_t"));
+            assertEquals("42501", refused.getSQLState());
+            // Without FORCE the owner bypasses, so there is nothing to refuse.
+            exec("ALTER TABLE rso_t NO FORCE ROW LEVEL SECURITY");
             assertEquals(List.of("2"), query("SELECT count(*)::int FROM rso_t"));
         } finally {
             exec("SET row_security = on");
-            exec("ALTER TABLE rso_t NO FORCE ROW LEVEL SECURITY");
             exec("DROP TABLE rso_t");
+            exec("RESET ROLE");
+            exec("REVOKE CREATE ON SCHEMA public FROM rso_owner");
+            exec("DROP ROLE rso_owner");
         }
     }
 

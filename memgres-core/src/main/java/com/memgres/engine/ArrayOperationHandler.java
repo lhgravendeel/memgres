@@ -305,7 +305,13 @@ class ArrayOperationHandler {
                         if (!lower.equals("nan") && !lower.equals("infinity") && !lower.equals("-infinity")
                                 && !lower.equals("+infinity") && !lower.equals("inf") && !lower.equals("-inf")) {
                             try { new java.math.BigDecimal(s); } catch (NumberFormatException e) {
-                                throw new MemgresException("invalid input syntax for type integer: \"" + s + "\"", "22P02");
+                                // The element is read as the type the constructor settled on, so
+                                // that is the type the complaint names: beside 1.5 the elements
+                                // are numeric, and calling them integer described a reading
+                                // PostgreSQL never attempted.
+                                throw new MemgresException("invalid input syntax for type "
+                                        + numericTypeNameOf(firstNonNull) + ": \"" + s + "\"",
+                                        "22P02");
                             }
                         }
                     }
@@ -313,6 +319,18 @@ class ArrayOperationHandler {
             }
         }
         return PgArray.of(list);
+    }
+
+    /** How PostgreSQL names the type of a number the constructor has already settled on. */
+    private static String numericTypeNameOf(Object value) {
+        if (value instanceof java.math.BigDecimal || value instanceof java.math.BigInteger) {
+            return "numeric";
+        }
+        if (value instanceof Double) return "double precision";
+        if (value instanceof Float) return "real";
+        if (value instanceof Long) return "bigint";
+        if (value instanceof Short) return "smallint";
+        return "integer";
     }
 
     /** Whether the expression is a relation's whole row written out, rather than one value. */
