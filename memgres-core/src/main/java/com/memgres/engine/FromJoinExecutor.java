@@ -364,10 +364,61 @@ class FromJoinExecutor {
             // other side is declared, so char(3) 'a' and char(6) 'a' are the same key.
             key.blankPadded = leftType == DataType.CHAR || rightType == DataType.CHAR;
             DataType common = commonNumericType(leftType, rightType);
-            if (common == null) continue;
-            key.common = common;
-            shape.output.set(i, shape.output.get(i).withType(common));
+            // Two sides of one type settle on it without any conversion, so there is nothing to
+            // record as a common type -- but which of them supplies the value still depends on
+            // the modifier each was declared with, so the question is asked either way.
+            DataType settled = common != null ? common
+                    : (leftType != null && leftType == rightType ? leftType : null);
+            if (settled == null) continue;
+            RowContext.OutCol merged = shape.output.get(i);
+            if (common != null) {
+                key.common = common;
+                merged = merged.withType(common);
+            }
+            // A merged column's value comes from whichever side already holds the type both were
+            // read as: PostgreSQL has nothing to convert there, so that side's value is the one
+            // it exposes. Taken from the left whatever its type, an int joined to a numeric
+            // showed the int's 3 where PostgreSQL shows the numeric's 3.00 -- the same number,
+            // written as the column's own type says it is written.
+            if (holdsCommonExactly(key.right, rightShape, settled)
+                    && !holdsCommonExactly(key.left, leftShape, settled)) {
+                merged = rotated(merged, key.left.bindings.length);
+            }
+            shape.output.set(i, merged);
         }
+    }
+
+    /**
+     * Whether this side's key column is declared as the type the two settled on, and with no
+     * modifier narrowing it.
+     *
+     * <p>A numeric(10,2) is not the numeric the pair settled on: reading it as one is a
+     * conversion, and PostgreSQL takes the merged value from the side that needs none.
+     */
+    private static boolean holdsCommonExactly(RowContext.OutCol col,
+                                              List<RowContext.TableBinding> shape,
+                                              DataType common) {
+        if (col.bindings[0] >= shape.size()) return false;
+        Table table = shape.get(col.bindings[0]).table();
+        if (table.isFunctionResult()) return false;
+        if (col.columns[0] >= table.getColumns().size()) return false;
+        Column column = table.getColumns().get(col.columns[0]);
+        if (column.getType() != common) return false;
+        return column.getPrecision() == null && column.getScale() == null;
+    }
+
+    /** The same merged column with the sides read in the other order. */
+    private static RowContext.OutCol rotated(RowContext.OutCol merged, int firstHalf) {
+        int n = merged.bindings.length;
+        if (firstHalf <= 0 || firstHalf >= n) return merged;
+        int[] bindings = new int[n];
+        int[] columns = new int[n];
+        for (int i = 0; i < n; i++) {
+            int from = (i + firstHalf) % n;
+            bindings[i] = merged.bindings[from];
+            columns[i] = merged.columns[from];
+        }
+        return new RowContext.OutCol(merged.name, bindings, columns, merged.type);
     }
 
     /**

@@ -29,6 +29,9 @@ class TemporalForeignKeyTest {
     void setUp() throws Exception {
         memgres = Memgres.builder().port(0).build().start();
         conn = DriverManager.getConnection(memgres.getJdbcUrl(), memgres.getUser(), memgres.getPassword());
+        // A temporal key indexes its scalar columns with gist, and gist has no class for a
+        // scalar type until btree_gist adds one -- which is what PostgreSQL needs here too.
+        exec("CREATE EXTENSION IF NOT EXISTS btree_gist");
         exec("CREATE TABLE tfk_p (id int, v daterange, PRIMARY KEY (id, v WITHOUT OVERLAPS))");
         exec("INSERT INTO tfk_p VALUES (1, daterange('2020-01-01','2020-06-01'))");
         exec("INSERT INTO tfk_p VALUES (1, daterange('2020-06-01','2021-01-01'))");

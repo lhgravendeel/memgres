@@ -1259,8 +1259,10 @@ public class InfoSchemaBuilder {
         );
         Table table = new Table("routines", cols);
         int specificSeq = 1;
+        // A routine is one row per signature, not one per name: two overloads are two routines,
+        // and reading the by-name map alone listed only whichever of them it happened to hold.
         for (Map.Entry<String, PgFunction> entry : database.getFunctions().entrySet()) {
-            PgFunction fn = entry.getValue();
+            for (PgFunction fn : overloadsOf(entry.getKey(), entry.getValue())) {
             String schema = fn.getSchemaName() != null ? fn.getSchemaName() : "public";
             String routineType = fn.isProcedure() ? "PROCEDURE" : "FUNCTION";
             String returnType = fn.getReturnType() != null ? fn.getReturnType() : "void";
@@ -1367,8 +1369,18 @@ public class InfoSchemaBuilder {
                     null,                // result_cast_maximum_cardinality
                     null                 // result_cast_dtd_identifier
             });
+            }
         }
         return table;
+    }
+
+    /**
+     * Every routine filed under this name, or the one the by-name map holds where the overload
+     * list has none. A routine is one row per signature, and the map holds one entry per name.
+     */
+    private List<PgFunction> overloadsOf(String name, PgFunction held) {
+        List<PgFunction> overloads = database.getFunctionOverloads(name);
+        return overloads == null || overloads.isEmpty() ? Cols.listOf(held) : overloads;
     }
 
     private Table buildIsSequences() {
@@ -1892,6 +1904,22 @@ public class InfoSchemaBuilder {
                 new Column("created", DataType.TIMESTAMPTZ, true, false, null)
         );
         Table table = new Table("triggers", cols);
+        // Which trigger of a relation fires first, and second: PostgreSQL fires the triggers of
+        // one relation and event in name order, and numbers them here in that order. Reported as
+        // one for every trigger, the view said a relation's triggers all fired at the same
+        // moment, which is the one thing this column is there to say they do not.
+        Map<String, Integer> orderWithinRelation = new java.util.HashMap<>();
+        for (Map.Entry<String, List<PgTrigger>> relation : database.getAllTriggers().entrySet()) {
+            List<PgTrigger> byNameOrder = new java.util.ArrayList<>(relation.getValue());
+            byNameOrder.sort((l, r) -> l.getName().compareToIgnoreCase(r.getName()));
+            Map<String, Integer> nextForEvent = new java.util.HashMap<>();
+            for (PgTrigger t : byNameOrder) {
+                String event = t.getEvent().name();
+                int at = nextForEvent.merge(event, 1, Integer::sum);
+                orderWithinRelation.put(t.getTableName() + "\u0001" + t.getName()
+                        + "\u0001" + event, at);
+            }
+        }
         // Group triggers by name to combine multiple events
         Map<String, List<PgTrigger>> byName = new java.util.LinkedHashMap<>();
         for (Map.Entry<String, List<PgTrigger>> entry : database.getAllTriggers().entrySet()) {
@@ -1929,7 +1957,8 @@ public class InfoSchemaBuilder {
                         catalogName(),          // event_object_catalog
                         ownSchema,              // event_object_schema
                         trig.getTableName(),    // event_object_table
-                        1,                      // action_order
+                        orderWithinRelation.getOrDefault(trig.getTableName() + "\u0001"
+                                + trig.getName() + "\u0001" + event, 1), // action_order
                         null,                   // action_condition
                         actionStmt,             // action_statement
                         orientation,            // action_orientation
@@ -1965,23 +1994,43 @@ public class InfoSchemaBuilder {
         return table;
     }
 
+    /**
+     * The roles this session may take on: itself, everything it is a member of however many steps
+     * away, and -- for a superuser -- every role there is, because a superuser may SET ROLE to any
+     * of them. Listing the session's own role and its direct memberships alone left the view
+     * naming one role where a real server names them all.
+     */
+    private java.util.Set<String> enabledRoleNames() {
+        String currentUser = currentSession != null && currentSession.getConnectingUser() != null
+                ? currentSession.getConnectingUser() : "memgres";
+        java.util.Set<String> enabled = new java.util.LinkedHashSet<>();
+        Map<String, String> attrs = database.getRoles().get(
+                currentUser.toLowerCase(java.util.Locale.ROOT));
+        if (attrs != null && "true".equalsIgnoreCase(attrs.get("SUPERUSER"))) {
+            enabled.addAll(database.getRoles().keySet());
+            enabled.add(currentUser);
+            return enabled;
+        }
+        enabled.add(currentUser);
+        boolean grew = true;
+        while (grew) {
+            grew = false;
+            for (Map.Entry<String, java.util.Set<String>> entry
+                    : database.getRoleMemberships().entrySet()) {
+                for (String member : entry.getValue()) {
+                    if (enabled.contains(member) && enabled.add(entry.getKey())) grew = true;
+                }
+            }
+        }
+        return enabled;
+    }
+
     private Table buildIsEnabledRoles() {
         List<Column> cols = Cols.listOf(
                 new Column("role_name", DataType.TEXT, true, false, null)
         );
         Table table = new Table("enabled_roles", cols);
-        // Current user is always an enabled role
-        String currentUser = currentSession != null && currentSession.getConnectingUser() != null
-                ? currentSession.getConnectingUser() : "memgres";
-        table.insertRow(new Object[]{currentUser});
-        // Also include all roles the current user is a member of
-        if (database.getRoleMemberships() != null) {
-            for (Map.Entry<String, java.util.Set<String>> entry : database.getRoleMemberships().entrySet()) {
-                if (entry.getValue().contains(currentUser)) {
-                    table.insertRow(new Object[]{entry.getKey()});
-                }
-            }
-        }
+        for (String role : enabledRoleNames()) table.insertRow(new Object[]{role});
         return table;
     }
 
@@ -1992,13 +2041,16 @@ public class InfoSchemaBuilder {
                 new Column("is_grantable", DataType.TEXT, true, false, null)
         );
         Table table = new Table("applicable_roles", cols);
-        String currentUser = currentSession != null && currentSession.getConnectingUser() != null
-                ? currentSession.getConnectingUser() : "memgres";
-        if (database.getRoleMemberships() != null) {
-            for (Map.Entry<String, java.util.Set<String>> entry : database.getRoleMemberships().entrySet()) {
-                if (entry.getValue().contains(currentUser)) {
-                    table.insertRow(new Object[]{currentUser, entry.getKey(), "NO"});
-                }
+        // One row per membership whose member is a role this session may take on -- not only the
+        // memberships of the session's own role. Read that way, a membership between two other
+        // roles was invisible to a superuser who may use both of them.
+        java.util.Set<String> enabled = enabledRoleNames();
+        for (Map.Entry<String, java.util.Set<String>> entry
+                : database.getRoleMemberships().entrySet()) {
+            for (String member : entry.getValue()) {
+                if (!enabled.contains(member)) continue;
+                table.insertRow(new Object[]{member, entry.getKey(),
+                        database.hasAdminOption(entry.getKey(), member) ? "YES" : "NO"});
             }
         }
         return table;

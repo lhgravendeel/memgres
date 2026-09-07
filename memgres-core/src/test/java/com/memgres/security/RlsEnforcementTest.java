@@ -11,6 +11,11 @@ import static org.junit.jupiter.api.Assertions.*;
 /**
  * Tests that Row-Level Security policies actually filter data.
  *
+ * <p>Every test here runs as a role that is not a superuser and owns the tables it makes. That is
+ * the only vantage point from which any of this can be observed: a superuser bypasses row
+ * security whatever a table says, forced or not, so the same statements read as the session's own
+ * user would show every row and say nothing about whether the policies work.
+ *
  * Key PG behaviors:
  * - ENABLE ROW LEVEL SECURITY activates RLS for non-superuser roles
  * - FORCE ROW LEVEL SECURITY makes RLS apply even to table owners
@@ -32,11 +37,25 @@ class RlsEnforcementTest {
                 memgres.getJdbcUrl() + "?preferQueryMode=simple",
                 memgres.getUser(), memgres.getPassword());
         conn.setAutoCommit(true);
+        try (Statement s = conn.createStatement()) {
+            s.execute("CREATE ROLE rls_tenant LOGIN");
+            s.execute("GRANT CREATE ON SCHEMA public TO rls_tenant");
+            s.execute("SET ROLE rls_tenant");
+        }
     }
 
     @AfterAll
     static void tearDown() throws Exception {
-        if (conn != null) conn.close();
+        if (conn != null) {
+            try (Statement s = conn.createStatement()) {
+                s.execute("RESET ROLE");
+                s.execute("REVOKE CREATE ON SCHEMA public FROM rls_tenant");
+                s.execute("DROP ROLE rls_tenant");
+            } catch (SQLException ignored) {
+                // The connection is closing either way.
+            }
+            conn.close();
+        }
         if (memgres != null) memgres.close();
     }
 

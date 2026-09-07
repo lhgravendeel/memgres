@@ -912,6 +912,51 @@ class CatalogConstraintBuilder {
             }
         }
 
+        // What a relation is made of depends on the relation, and that is most of what pg_depend
+        // holds about an ordinary table. Recorded nowhere, a reader following the graph to find
+        // what would go with a table -- which is what DROP consults and what pg_dump orders by --
+        // was told the table had nothing hanging off it at all.
+        int pgTypeClassOid = oids.oid("rel:pg_catalog.pg_type");
+        int pgConstraintClassOid = oids.oid("rel:pg_catalog.pg_constraint");
+        for (Map.Entry<String, Schema> schemaEntry : database.getSchemas().entrySet()) {
+            String schemaName = schemaEntry.getKey();
+            for (Table t : schemaEntry.getValue().getTables().values()) {
+                int relOid = oids.oid("rel:" + schemaName + "." + t.getName());
+                // The row type is part of the relation and cannot be dropped on its own, which
+                // is what "internal" says.
+                table.insertRow(new Object[]{pgTypeClassOid,
+                        oids.oid(TypeNamespace.oidKey(schemaName, t.getName())), 0,
+                        pgClassOid, relOid, 0, "i"});
+                for (StoredConstraint sc : t.getConstraints()) {
+                    if (sc.getName() == null) continue;
+                    int conOid = oids.oid(constraintKey(schemaName, t.getName(), sc.getName()));
+                    // A constraint belongs to the columns it is written over: it goes when they
+                    // go, and it is theirs to be dropped with -- "auto".
+                    for (int attnum : constrainedAttnums(t, sc)) {
+                        table.insertRow(new Object[]{pgConstraintClassOid, conOid, 0,
+                                pgClassOid, relOid, attnum, "a"});
+                    }
+                    // A foreign key also names another relation's columns, and that is a
+                    // dependency of its own: the referenced table cannot go while the key stands,
+                    // which is "normal" rather than automatic.
+                    if (sc.getType() != StoredConstraint.Type.FOREIGN_KEY) continue;
+                    String refSchema = sc.getReferencesSchema() != null
+                            ? sc.getReferencesSchema() : schemaName;
+                    Schema refHolder = database.getSchema(refSchema);
+                    Table refTable = refHolder == null ? null
+                            : refHolder.getTable(sc.getReferencesTable());
+                    if (refTable == null) continue;
+                    int refRelOid = oids.oid("rel:" + refSchema + "." + refTable.getName());
+                    for (String refColumn : sc.getReferencesColumns()) {
+                        int at = refTable.getColumnIndex(refColumn);
+                        if (at < 0) continue;
+                        table.insertRow(new Object[]{pgConstraintClassOid, conOid, 0,
+                                pgClassOid, refRelOid, refTable.attnumAt(at), "n"});
+                    }
+                }
+            }
+        }
+
         // View dependencies: rewrite rule -> referenced table (via pg_rewrite)
         int pgRewriteClassOid = oids.oid("rel:pg_catalog.pg_rewrite");
         for (Database.ViewDef vd : database.getViews().values()) {
@@ -938,7 +983,51 @@ class CatalogConstraintBuilder {
         table.insertRow(new Object[]{pgProcClassOid, oids.oid("proc:plpgsql_inline_handler"), 0, pgExtensionClassOid, plpgsqlExtOid, 0, "e"});
         table.insertRow(new Object[]{pgProcClassOid, oids.oid("proc:plpgsql_validator"), 0, pgExtensionClassOid, plpgsqlExtOid, 0, "e"});
 
+        // Every other installed extension owns its routines the same way, and that ownership is
+        // what a reader follows from pg_depend to find what an extension brought. Recorded only
+        // for plpgsql, an installed extension looked like it had contributed nothing.
+        java.util.Set<String> already = new java.util.HashSet<>();
+        for (String[] owned : BuiltinFunctionSignatures.extensionOwnedNames()) {
+            String extension = owned[1];
+            if ("plpgsql".equals(extension) || !database.hasExtension(extension)) continue;
+            if (!already.add(extension + ":" + owned[0])) continue;
+            table.insertRow(new Object[]{pgProcClassOid, oids.oid("proc:" + owned[0]), 0,
+                    pgExtensionClassOid, oids.oid("ext:" + extension), 0, "e"});
+        }
+        // An extension that brings a type owns that type, which is the other thing a reader
+        // follows from pg_depend to find what it contributed. citext and hstore each bring one
+        // and no routine of their own, so an installed one looked like it had brought nothing.
+        int typeClassOid = oids.oid("rel:pg_catalog.pg_type");
+        for (String[] brought : EXTENSION_TYPES) {
+            if (!database.hasExtension(brought[1])) continue;
+            DataType named = DataType.fromPgName(brought[0]);
+            if (named == null) continue;
+            table.insertRow(new Object[]{typeClassOid, named.getOid(), 0,
+                    pgExtensionClassOid, oids.oid("ext:" + brought[1]), 0, "e"});
+        }
+
         return table;
+    }
+
+    /** The types each contrib extension brings, as the name and the extension that brings it. */
+    private static final String[][] EXTENSION_TYPES = {
+            {"citext", "citext"},
+            {"hstore", "hstore"},
+            {"cube", "cube"},
+            {"ltree", "ltree"},
+            {"isn", "isn"},
+    };
+
+    /** The attribute numbers a constraint is written over, in the order it names them. */
+    private static java.util.List<Integer> constrainedAttnums(Table t, StoredConstraint sc) {
+        java.util.List<Integer> out = new java.util.ArrayList<>();
+        java.util.List<String> named = sc.getColumns();
+        if (named == null) return out;
+        for (String column : named) {
+            int at = t.getColumnIndex(column);
+            if (at >= 0) out.add(Integer.valueOf(t.attnumAt(at)));
+        }
+        return out;
     }
 
     Table buildPgRewrite() {
@@ -1601,7 +1690,11 @@ class CatalogConstraintBuilder {
                     }
                 }
                 if (opclassName != null) {
-                    return oids.oid("opclass:" + opclassName);
+                    // A named class carries the number PostgreSQL pins it to, which is what a
+                    // reader joins pg_index.indclass back to pg_opclass by.
+                    int pinnedByName =
+                            CatalogTypeSystemBuilder.pinnedBtreeOpclassOid(opclassName);
+                    return pinnedByName != 0 ? pinnedByName : oids.oid("opclass:" + opclassName);
                 }
             }
         }
@@ -1611,39 +1704,15 @@ class CatalogConstraintBuilder {
             int ci = t.getColumnIndex(colName);
             if (ci >= 0) {
                 DataType dt = t.getColumns().get(ci).getType();
-                switch (dt) {
-                    case INTEGER:
-                    case SERIAL:
-                        return 1978; // int4_ops
-                    case TEXT:
-                    case VARCHAR:
-                    case CHAR:
-                        return oids.oid("opclass:text_ops");
-                    case BIGINT:
-                    case BIGSERIAL:
-                        return oids.oid("opclass:int8_ops");
-                    case SMALLINT:
-                    case SMALLSERIAL:
-                        return oids.oid("opclass:int2_ops");
-                    case BOOLEAN:
-                        return oids.oid("opclass:bool_ops");
-                    case REAL:
-                        return oids.oid("opclass:float4_ops");
-                    case DOUBLE_PRECISION:
-                        return oids.oid("opclass:float8_ops");
-                    case NUMERIC:
-                        return oids.oid("opclass:numeric_ops");
-                    case DATE:
-                        return oids.oid("opclass:date_ops");
-                    case TIMESTAMP:
-                        return oids.oid("opclass:timestamp_ops");
-                    case TIMESTAMPTZ:
-                        return oids.oid("opclass:timestamptz_ops");
-                    case UUID:
-                        return oids.oid("opclass:uuid_ops");
-                    default:
-                        return 1978; // fallback to int4_ops
+                // A key resolves through the default operator class of the column's type, and
+                // that class carries the number PostgreSQL pins it to: minted per database
+                // instead, pg_index.indclass pointed at rows pg_opclass does not have.
+                if (dt != null) {
+                    int pinned =
+                            CatalogTypeSystemBuilder.pinnedDefaultBtreeOpclassOid(dt.getOid());
+                    if (pinned != 0) return pinned;
                 }
+                return 1978; // fallback to int4_ops
             }
         }
         return 1978; // default fallback

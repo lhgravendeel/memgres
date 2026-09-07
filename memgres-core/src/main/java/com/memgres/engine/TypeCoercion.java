@@ -1168,7 +1168,15 @@ public final class TypeCoercion {
                 try {
                     value = new java.math.BigInteger(written);
                 } catch (NumberFormatException e) {
-                    continue; // not a whole number, so the checks below say what it is instead
+                    // A modifier is an integer, so a word standing where one belongs is input
+                    // the integer reader cannot read. Passed over, numeric(5,abc) was accepted
+                    // and the routine it declared failed later on something unrelated.
+                    if (!written.isEmpty() && !"*".equals(written)) {
+                        throw new MemgresException(
+                                "invalid input syntax for type integer: \"" + written + "\"",
+                                "22P02");
+                    }
+                    continue;
                 }
                 if (value.bitLength() > 31) {
                     throw new MemgresException("value \"" + written
@@ -1266,6 +1274,12 @@ public final class TypeCoercion {
         // the numeric 1.0, which prints a decimal place PostgreSQL does not.
         if (val instanceof Double || val instanceof Float) {
             return new BigDecimal(toString(val));
+        }
+        // A whole number is exact, and going through a double gave it a fractional part it never
+        // had: a smallint read as a numeric came back as 1.0, which is not how PostgreSQL writes 1.
+        if (val instanceof java.math.BigInteger) return new BigDecimal((java.math.BigInteger) val);
+        if (val instanceof Short || val instanceof Byte) {
+            return BigDecimal.valueOf(((Number) val).longValue());
         }
         if (val instanceof Number) return BigDecimal.valueOf(((Number) val).doubleValue());
         String s = val.toString().trim();
@@ -1914,6 +1928,20 @@ public final class TypeCoercion {
         return toLocalDate(val);
     }
 
+    /**
+     * The same complaint, naming what was written rather than the part of it that was read.
+     *
+     * <p>An era suffix is taken off before the rest is read, so a fault found in the rest named a
+     * literal shorter than the one in the query: PostgreSQL quotes the whole of what it was given.
+     */
+    private static MemgresException namingTheWholeLiteral(
+            MemgresException e, String read, String written) {
+        String message = e.getMessage();
+        if (message == null || !message.contains("\"" + read + "\"")) return e;
+        return new MemgresException(
+                message.replace("\"" + read + "\"", "\"" + written + "\""), e.getSqlState());
+    }
+
     /** True when the text carries a trailing BC era marker. */
     private static boolean endsWithEra(String s) {
         String t = s.trim();
@@ -1935,6 +1963,7 @@ public final class TypeCoercion {
         if (val instanceof LocalDateTime) return ((LocalDateTime) val).toLocalDate();
         if (val instanceof OffsetDateTime) return ((OffsetDateTime) val).atZoneSameInstant(sessionZone()).toLocalDate();
         String s = val.toString().trim();
+        requireLeadingDisplacementInRange(s, val.toString());
         LocalDateTime calendar = parseCalendarLiteral(s, val.toString(), "date", DATE_MAX_YEAR);
         if (calendar != null) return calendar.toLocalDate();
         // The field reader comes before the era suffix is stripped: a two-digit year is widened to
@@ -1942,7 +1971,13 @@ public final class TypeCoercion {
         PgDateTimeDecoder.Fields decoded = PgDateTimeDecoder.decode(s, val.toString());
         if (decoded != null && decoded.hasDate()) return decoded.date();
         if (endsWithEra(s)) {
-            LocalDate bc = toLocalDate(stripEra(s));
+            String body = stripEra(s);
+            LocalDate bc;
+            try {
+                bc = toLocalDate(body);
+            } catch (MemgresException e) {
+                throw namingTheWholeLiteral(e, body, val.toString());
+            }
             return bc.withYear(1 - bc.getYear());
         }
         // Handle special keywords
@@ -2771,7 +2806,12 @@ public final class TypeCoercion {
         // A BC era suffix means a proleptic year of 1 - the written year: 44 BC is ISO year -43
         if (endsWithEra(s)) {
             String body = stripEra(s);
-            LocalDateTime bc = toLocalDateTime(body);
+            LocalDateTime bc;
+            try {
+                bc = toLocalDateTime(body);
+            } catch (MemgresException e) {
+                throw namingTheWholeLiteral(e, body, val.toString());
+            }
             return bc.withYear(1 - bc.getYear());
         }
         // Handle PG 'infinity' / '-infinity' special values
@@ -2884,6 +2924,7 @@ public final class TypeCoercion {
      * text that is not a timestamp.
      */
     private static void requireDisplacementInRange(String s, String written) {
+        requireLeadingDisplacementInRange(s, written);
         java.util.regex.Matcher m = WRITTEN_DISPLACEMENT.matcher(s);
         if (!m.matches()) return;
         int hours = Integer.parseInt(m.group(2));
@@ -2894,6 +2935,28 @@ public final class TypeCoercion {
             throw new MemgresException(
                     "time zone displacement out of range: \"" + written + "\"", "22009");
         }
+    }
+
+    /**
+     * A minus sign in front of the year, with three digits or more behind it.
+     *
+     * <p>PostgreSQL's date reader takes a signed number at the start of a literal for a time zone
+     * rather than for a year, so {@code '-2020-01-01'} is a displacement of two thousand and
+     * twenty hours and is out of range. One or two digits are too few to be read that way and
+     * stay an input error, which is why the count is written into the pattern.
+     */
+    private static final java.util.regex.Pattern LEADING_DISPLACEMENT =
+            java.util.regex.Pattern.compile("-\\d{3,}\\b.*");
+
+    /**
+     * Refuse a literal whose year is written with a minus sign in front of it. Read as a negative
+     * year instead, {@code '-2020-01-01'} became 2021 BC -- a date PostgreSQL never returns for
+     * that text, and one a caller had no way of knowing was not what they wrote.
+     */
+    private static void requireLeadingDisplacementInRange(String s, String written) {
+        if (s == null || !LEADING_DISPLACEMENT.matcher(s).matches()) return;
+        throw new MemgresException(
+                "time zone displacement out of range: \"" + written + "\"", "22009");
     }
 
     /** A date and a clock written with no separators inside either of them. */
@@ -3496,6 +3559,30 @@ public final class TypeCoercion {
         if (collation == null) return false;
         String lower = collation.toLowerCase(java.util.Locale.ROOT).replace("\"", "");
         return lower.equals("c") || lower.equals("posix");
+    }
+
+    /**
+     * The locale a written collation name sorts by.
+     *
+     * <p>A collation a reader created is a name for a locale, and it sorts the way that locale
+     * does: {@code CREATE COLLATION mine (LOCALE = 'C')} orders as C. Read as a name and nothing
+     * else, only the two collations PostgreSQL ships under those words were recognised, and every
+     * collation a reader made fell back to the database's ordering however it had been declared.
+     */
+    static String localeOfCollation(Database database, String written) {
+        if (database == null || written == null) return written;
+        String bare = written.replace("\"", "");
+        int dot = bare.lastIndexOf('.');
+        if (dot > 0) bare = bare.substring(dot + 1);
+        Database.CollationDef held = database.getCollation(bare);
+        if (held == null) return written;
+        if (held.lcCollate != null && !held.lcCollate.isEmpty()) return held.lcCollate;
+        if (held.locale != null && !held.locale.isEmpty()) return held.locale;
+        // A collation made FROM another one sorts the way that one does.
+        if (held.fromCollation != null && !held.fromCollation.equalsIgnoreCase(bare)) {
+            return localeOfCollation(database, held.fromCollation);
+        }
+        return written;
     }
 
     /**

@@ -210,6 +210,10 @@ public class TsVector {
     }
 
     private static void addPosition(Map<String, List<PosEntry>> lexemes, String lexeme, int position) {
+        // A word too long for a tsvector to hold is left out of the document rather than refused:
+        // the parser hands it over and the dictionary has nowhere to put it. Only a tsvector
+        // written out as a literal complains, because there the word is what was asked for.
+        if (!wordFits(lexeme)) return;
         if (position > MAX_POSITION) position = MAX_POSITION;
         List<PosEntry> entries = lexemes.computeIfAbsent(lexeme, k -> new ArrayList<>());
         // PG caps at 255 positions per lexeme (MAXNUMPOS)
@@ -318,6 +322,10 @@ public class TsVector {
                     // else (a stray letter, say) means the literal is malformed, and PG says so
                     if (i < len && input.charAt(i) == ',') {
                         i++;
+                        // A comma promises another position, so the token cannot end there.
+                        if (i >= len || Character.isWhitespace(input.charAt(i))) {
+                            throw syntaxErrorIn(input);
+                        }
                     } else {
                         if (i < len && !Character.isWhitespace(input.charAt(i))) {
                             throw syntaxErrorIn(input);
@@ -327,6 +335,7 @@ public class TsVector {
                 }
                 if (!any) throw syntaxErrorIn(input);
             }
+            requireWordFits(lexeme);
             List<PosEntry> held = lexemes.get(lexeme);
             if (held == null) {
                 lexemes.put(lexeme, entries);
@@ -336,6 +345,27 @@ public class TsVector {
         }
         if (lexemes.isEmpty()) return null;
         return new TsVector(normaliseAll(lexemes));
+    }
+
+    /** The longest a lexeme may be, in bytes, which is what PostgreSQL stores one in. */
+    public static final int LONGEST_WORD = 2046;
+
+    /**
+     * A lexeme longer than a tsvector can hold is refused rather than stored short. The limit is
+     * counted in bytes, which is what the stored form measures, not in characters.
+     */
+    static void requireWordFits(String lexeme) {
+        int bytes = lexeme.getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+        if (bytes > LONGEST_WORD) {
+            throw new MemgresException("word is too long (" + bytes + " bytes, max "
+                    + LONGEST_WORD + " bytes)", "54000");
+        }
+    }
+
+    /** Whether a word is short enough for a tsvector to hold, for the readers that drop one. */
+    public static boolean wordFits(String lexeme) {
+        return lexeme != null
+                && lexeme.getBytes(java.nio.charset.StandardCharsets.UTF_8).length <= LONGEST_WORD;
     }
 
     private static MemgresException syntaxErrorIn(String input) {

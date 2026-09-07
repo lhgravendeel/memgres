@@ -270,6 +270,19 @@ public class Sequence {
     /** True when the engine made this sequence for a serial or identity column. */
     public boolean isInternal() { return internal; }
 
+    /**
+     * Let go of the column this sequence was made for.
+     *
+     * <p>OWNED BY NONE takes away the dependency as well as the ownership, so the sequence
+     * outlives the table it was made with. Left standing, the sequence was still recognised as
+     * the one behind the column's default and went with the table after all.
+     */
+    public void ownedByNobody() {
+        this.ownedByTable = null;
+        this.ownedByColumn = null;
+        this.internal = false;
+    }
+
     public boolean isUnlogged() { return unlogged; }
     public void setUnlogged(boolean unlogged) { this.unlogged = unlogged; }
 }

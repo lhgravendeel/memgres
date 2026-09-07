@@ -405,11 +405,18 @@ public class Table {
         if (children.isEmpty() && partitions.isEmpty()) return rows;
         List<Object[]> allRows = new ArrayList<>(rows);
         for (Table child : children) {
-            // Map child rows to parent column layout
+            // A child carries its parents' columns and may carry more, in whatever order its own
+            // declaration settled them in, so this relation reads its columns by name. Taken by
+            // position, a child of two parents handed the first parent's value to the second.
+            int[] fromChild = new int[columns.size()];
+            for (int i = 0; i < columns.size(); i++) {
+                fromChild[i] = child.getColumnIndex(columns.get(i).getName());
+            }
             for (Object[] childRow : child.getAllRows()) {
                 Object[] parentRow = new Object[columns.size()];
-                for (int i = 0; i < columns.size() && i < childRow.length; i++) {
-                    parentRow[i] = childRow[i];
+                for (int i = 0; i < columns.size(); i++) {
+                    int at = fromChild[i];
+                    parentRow[i] = at >= 0 && at < childRow.length ? childRow[at] : null;
                 }
                 allRows.add(parentRow);
             }
@@ -489,10 +496,20 @@ public class Table {
             allRows.add(new RowWithSource(this, row));
         }
         for (Table child : children) {
+            // A child carries its parents' columns and may carry more, in whatever order its own
+            // declaration settled them in, so this relation reads its columns by name. Taken by
+            // position, a child of two parents handed the first parent's value to the second
+            // parent's column, and reading that parent answered with the wrong column.
+            int[] fromChild = new int[columns.size()];
+            for (int i = 0; i < columns.size(); i++) {
+                fromChild[i] = child.getColumnIndex(columns.get(i).getName());
+            }
             for (RowWithSource childRws : child.getAllRowsWithSource()) {
                 Object[] parentRow = new Object[columns.size()];
-                for (int i = 0; i < columns.size() && i < childRws.row().length; i++) {
-                    parentRow[i] = childRws.row()[i];
+                for (int i = 0; i < columns.size(); i++) {
+                    int at = fromChild[i];
+                    parentRow[i] = at >= 0 && at < childRws.row().length
+                            ? childRws.row()[at] : null;
                 }
                 allRows.add(new RowWithSource(childRws.source(), parentRow, childRws.stored()));
             }
@@ -1098,6 +1115,18 @@ public class Table {
      * @throws MemgresException 23502 if a PRIMARY KEY column contains NULLs,
      *                          23505 if the key columns contain duplicate values
      */
+    /** This relation's own rows and its partitions', leaving inheritance children out. */
+    private List<Object[]> rowsOfThisRelationAndItsPartitions() {
+        if (partitions.isEmpty()) return rows;
+        List<Object[]> all = new ArrayList<>(rows);
+        for (Table partition : partitions) {
+            for (Object[] row : partition.rowsOfThisRelationAndItsPartitions()) {
+                all.add(partition.rowToParent(row));
+            }
+        }
+        return all;
+    }
+
     public void validateNewUniqueConstraint(StoredConstraint sc) {
         if (sc.getType() != StoredConstraint.Type.PRIMARY_KEY && sc.getType() != StoredConstraint.Type.UNIQUE) return;
         if (sc.getExpressionColumns() != null && !sc.getExpressionColumns().isEmpty()) return;
@@ -1110,7 +1139,12 @@ public class Table {
         }
         int[] colIndices = resolveColumnIndices(sc.getColumns());
         if (colIndices == null) return;
-        List<Object[]> allRows = getAllRows();
+        // A unique index belongs to the relation it is built on, and inheritance never carries
+        // one down: a child's rows are not this relation's to hold unique. Read together, a
+        // parent and a child each holding the same value could not be given a UNIQUE constraint
+        // PostgreSQL creates. A partitioned table is the other way round -- its partitions hold
+        // its rows -- so those still count.
+        List<Object[]> allRows = rowsOfThisRelationAndItsPartitions();
         if (sc.getType() == StoredConstraint.Type.PRIMARY_KEY) {
             // PG: ADD PRIMARY KEY implies NOT NULL; existing NULLs abort with 23502
             for (Object[] row : allRows) {

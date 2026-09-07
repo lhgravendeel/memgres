@@ -1042,7 +1042,12 @@ public final class RuleDeparser {
             // Brackets are written back as brackets, so a rule that reads an array element still
             // reads that element when its definition is read back.
             SubscriptExpr sub = (SubscriptExpr) e;
-            StringBuilder sb = new StringBuilder(deparse(sub.base(), cols));
+            // Anything but a plain name is written in parentheses, which is how PostgreSQL
+            // prints it: (ARRAY[7, 8, 9])[2], where a column is written col[2]. Left bare, the
+            // brackets read as part of the constructor rather than as a subscript of it.
+            String base = deparse(sub.base(), cols);
+            if (!(sub.base() instanceof ColumnRef)) base = "(" + base + ")";
+            StringBuilder sb = new StringBuilder(base);
             for (SubscriptExpr.Subscript one : sub.subscripts()) {
                 sb.append('[');
                 if (one.lower() != null) sb.append(deparse(one.lower(), cols));

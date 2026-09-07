@@ -525,7 +525,14 @@ class CatalogPrivilegeFunctions {
         String[] parts = splitIdentifierName(str(arg));
         String schema = parts[0] == null ? executor.defaultSchema() : parts[0];
         String bare = parts[1];
-        boolean isSequence = executor.database.getSequence(bare) != null;
+        // A sequence is looked for where the name says to look: in the schema written, or along
+        // the search path when none was. Found by its bare name whatever schema held it, a
+        // sequence in another schema answered as though the name had reached it -- so a question
+        // about a name that reaches nothing came back "no" instead of saying there is no such
+        // relation.
+        boolean isSequence = parts[0] == null
+                ? executor.database.resolveSequence(executor.relationSearchPath(), bare) != null
+                : executor.database.getSequence(schema, bare) != null;
         Table table = null;
         try {
             table = executor.resolveTable(schema, bare);
@@ -716,8 +723,13 @@ class CatalogPrivilegeFunctions {
 
         Set<String> privs = executor.database.getRolePrivileges(roleName);
         String object = objectName.toLowerCase(java.util.Locale.ROOT);
-        String checkKey = privilege.toUpperCase(java.util.Locale.ROOT) + ":" + objectType.toUpperCase(java.util.Locale.ROOT) + ":" + object;
-        String allKey = "ALL:" + objectType.toUpperCase(java.util.Locale.ROOT) + ":" + object;
+        String wanted = privilege.toUpperCase(java.util.Locale.ROOT);
+        String checkKey = wanted + ":" + objectType.toUpperCase(java.util.Locale.ROOT) + ":" + object;
+        // ALL stands for every privilege of the kind, and the right to hand one on is a different
+        // privilege from holding it: a grant of ALL without WITH GRANT OPTION answered yes to
+        // "SELECT WITH GRANT OPTION", which the grantee had not been given.
+        String allKey = (wanted.endsWith("_GRANT_OPTION") ? "ALL_GRANT_OPTION:" : "ALL:")
+                + objectType.toUpperCase(java.util.Locale.ROOT) + ":" + object;
         if (privs.contains(checkKey) || privs.contains(allKey)) {
             return true;
         }

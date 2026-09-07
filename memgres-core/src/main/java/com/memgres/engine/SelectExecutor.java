@@ -124,6 +124,13 @@ class SelectExecutor {
         if (writesFromWith && executor.session != null) executor.session.beginCommandWrites();
 
         try {
+            // PostgreSQL works out what a query's constants come to while it plans, so a
+            // qualification holding one that cannot be read is refused whether or not the
+            // relation has a row in it. Evaluated only as each row was tested, the same query
+            // over an empty relation quietly answered nothing -- so a cast that could never have
+            // worked looked like a query with no matches.
+            requireConstantsReadable(stmt.where());
+            requireConstantsReadable(stmt.having());
             QueryResult result = executeSelectInner(stmt);
             // Force-execute any unreferenced DML CTEs (PG always executes data-modifying CTEs)
             if (stmt.withClauses() != null) {
@@ -141,6 +148,42 @@ class SelectExecutor {
             }
             if (writesFromWith && executor.session != null) executor.session.endCommandWrites();
         }
+    }
+
+    /**
+     * Read every constant the qualification holds, so that one which cannot be read is reported
+     * whether or not there is a row to test it against.
+     *
+     * <p>Only a subtree whose leaves are all values written into the query, and whose calls are
+     * ones that answer the same way every time: anything reading a column is about a row, and
+     * anything volatile is a different value each time it is asked.
+     */
+    private void requireConstantsReadable(Expression expr) {
+        if (expr == null) return;
+        if (isWrittenConstant(expr)) {
+            executor.evalExpr(expr, null);
+            return;
+        }
+        if (expr instanceof BinaryExpr) {
+            requireConstantsReadable(((BinaryExpr) expr).left());
+            requireConstantsReadable(((BinaryExpr) expr).right());
+        } else if (expr instanceof UnaryExpr) {
+            requireConstantsReadable(((UnaryExpr) expr).operand());
+        } else if (expr instanceof CastExpr) {
+            requireConstantsReadable(((CastExpr) expr).expr());
+        }
+    }
+
+    /** Whether every leaf of this expression is a value the query was written with. */
+    private boolean isWrittenConstant(Expression expr) {
+        if (expr instanceof Literal) return true;
+        if (expr instanceof CastExpr) return isWrittenConstant(((CastExpr) expr).expr());
+        if (expr instanceof UnaryExpr) return isWrittenConstant(((UnaryExpr) expr).operand());
+        if (expr instanceof BinaryExpr) {
+            BinaryExpr bin = (BinaryExpr) expr;
+            return isWrittenConstant(bin.left()) && isWrittenConstant(bin.right());
+        }
+        return false;
     }
 
     private static boolean isDmlCte(Statement stmt) {
@@ -1750,7 +1793,8 @@ class SelectExecutor {
                         String collation = item.expr() instanceof CollateExpr
                                 ? ((CollateExpr) item.expr()).collation() : null;
                         if (collation != null && va instanceof String && vb instanceof String) {
-                            cmp = TypeCoercion.compareStringsWithCollation((String) va, (String) vb, collation);
+                            cmp = TypeCoercion.compareStringsWithCollation((String) va, (String) vb,
+                                    TypeCoercion.localeOfCollation(executor.database, collation));
                         } else {
                             cmp = executor.compareValues(va, vb);
                         }
@@ -2789,7 +2833,8 @@ class SelectExecutor {
                     } else {
                         String collation = collationLookups.get(idx);
                         if (collation != null && va instanceof String && vb instanceof String) {
-                            cmp = TypeCoercion.compareStringsWithCollation((String) va, (String) vb, collation);
+                            cmp = TypeCoercion.compareStringsWithCollation((String) va, (String) vb,
+                                    TypeCoercion.localeOfCollation(executor.database, collation));
                         } else if (arrayKeys.get(idx)) {
                             cmp = executor.compareValues(
                                     TypeCoercion.arrayForCompare(va), TypeCoercion.arrayForCompare(vb));
@@ -3081,7 +3126,8 @@ class SelectExecutor {
                             String collation = item.expr() instanceof CollateExpr
                                     ? ((CollateExpr) item.expr()).collation() : null;
                             if (collation != null && va instanceof String && vb instanceof String) {
-                                cmp = TypeCoercion.compareStringsWithCollation((String) va, (String) vb, collation);
+                                cmp = TypeCoercion.compareStringsWithCollation((String) va, (String) vb,
+                                    TypeCoercion.localeOfCollation(executor.database, collation));
                             } else {
                                 cmp = executor.compareValues(va, vb);
                             }
@@ -4354,6 +4400,12 @@ class SelectExecutor {
         if (val instanceof Long) return java.math.BigDecimal.valueOf(((Long) val));
         if (val instanceof Double) return java.math.BigDecimal.valueOf(((Double) val));
         if (val instanceof Float) return java.math.BigDecimal.valueOf(((Float) val));
+        // A whole number is exact, and going through double gave it a fractional part it never
+        // had: a total of smallints came back as 7.0, which is not how PostgreSQL writes 7.
+        if (val instanceof java.math.BigInteger) return new java.math.BigDecimal((java.math.BigInteger) val);
+        if (val instanceof Short || val instanceof Byte) {
+            return java.math.BigDecimal.valueOf(((Number) val).longValue());
+        }
         if (val instanceof Number) return java.math.BigDecimal.valueOf(((Number) val).doubleValue());
         return new java.math.BigDecimal(val.toString());
     }

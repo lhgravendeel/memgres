@@ -1034,6 +1034,7 @@ class ExprSpecialFormParser {
         String returningType = null;
         if (ep.matchKeyword("RETURNING")) {
             returningType = ep.parseTypeName();
+            matchReturningFormat();
         }
         JsonExistsExpr.OnBehavior[] on = new JsonExistsExpr.OnBehavior[2];
         Expression[] defaults = new Expression[2];
@@ -1056,6 +1057,7 @@ class ExprSpecialFormParser {
         String returningType = null;
         if (ep.matchKeyword("RETURNING")) {
             returningType = ep.parseTypeName();
+            matchReturningFormat();
         }
         JsonQueryExpr.WrapperBehavior wrapper = JsonQueryExpr.WrapperBehavior.NONE;
         if (ep.matchKeyword("WITH")) {
@@ -1092,6 +1094,19 @@ class ExprSpecialFormParser {
         ep.expect(TokenType.RIGHT_PAREN);
         return new JsonQueryExpr(input, path, returningType, passing, wrapper, quotes,
                 on[0], defaults[0], on[1], defaults[1]);
+    }
+
+    /**
+     * The {@code FORMAT JSON [ENCODING ...]} a RETURNING clause may carry.
+     *
+     * <p>It says the result is written as JSON text rather than as a value of the type named,
+     * which is what these functions answer with anyway. Left unread, the word FORMAT was a syntax
+     * error and a form PostgreSQL accepts could not be written at all.
+     */
+    private void matchReturningFormat() {
+        if (!ep.matchKeyword("FORMAT")) return;
+        ep.expectKeyword("JSON");
+        if (ep.matchKeyword("ENCODING")) ep.advance();
     }
 
     /**
@@ -1167,6 +1182,7 @@ class ExprSpecialFormParser {
         String returningType = null;
         if (ep.matchKeyword("RETURNING")) {
             returningType = ep.parseTypeName();
+            matchReturningFormat();
         }
         ep.expect(TokenType.RIGHT_PAREN);
         // normalize to function call with optional type hint
@@ -1195,6 +1211,7 @@ class ExprSpecialFormParser {
         if (ep.checkKeyword("SELECT") || ep.checkKeyword("WITH")) {
             Statement subquery = ep.parseSubqueryWithSetOps();
             String subqueryType = ep.matchKeyword("RETURNING") ? ep.parseTypeName() : null;
+            if (subqueryType != null) matchReturningFormat();
             ep.expect(TokenType.RIGHT_PAREN);
             // Wrap as json_array_subquery function call
             return returning(new FunctionCallExpr("json_array_subquery",
@@ -1217,6 +1234,7 @@ class ExprSpecialFormParser {
         } else if (ep.matchKeyword("ABSENT")) { ep.expectKeyword("ON"); ep.expectKeyword("NULL"); }
         // RETURNING type
         String type = ep.matchKeyword("RETURNING") ? ep.parseTypeName() : null;
+        if (type != null) matchReturningFormat();
         ep.expect(TokenType.RIGHT_PAREN);
         // Pack nullOnNull flag as an extra Literal arg
         args.add(Literal.ofString(nullOnNull ? "null_on_null" : "absent_on_null"));
@@ -1265,10 +1283,12 @@ class ExprSpecialFormParser {
         } else if (ep.matchKeyword("ABSENT")) { ep.expectKeyword("ON"); ep.expectKeyword("NULL"); }
         // WITH UNIQUE KEYS / WITHOUT UNIQUE KEYS
         boolean uniqueKeys = false;
-        if (ep.matchKeyword("WITH")) { ep.expectKeyword("UNIQUE"); ep.expectKeyword("KEYS"); uniqueKeys = true; }
-        else if (ep.matchKeyword("WITHOUT")) { ep.expectKeyword("UNIQUE"); ep.expectKeyword("KEYS"); }
+        // KEYS may be left off either way, so the clause is read as PostgreSQL reads it.
+        if (ep.matchKeyword("WITH")) { ep.expectKeyword("UNIQUE"); ep.matchKeyword("KEYS"); uniqueKeys = true; }
+        else if (ep.matchKeyword("WITHOUT")) { ep.expectKeyword("UNIQUE"); ep.matchKeyword("KEYS"); }
         // RETURNING type
         String type = ep.matchKeyword("RETURNING") ? ep.parseTypeName() : null;
+        if (type != null) matchReturningFormat();
         ep.expect(TokenType.RIGHT_PAREN);
         // Pack flags as extra args
         args.add(Literal.ofString(nullOnNull ? "null_on_null" : "absent_on_null"));
@@ -1298,6 +1318,7 @@ class ExprSpecialFormParser {
         if (ep.matchKeyword("NULL")) { ep.expectKeyword("ON"); ep.expectKeyword("NULL"); nullOnNull = true; }
         else if (ep.matchKeyword("ABSENT")) { ep.expectKeyword("ON"); ep.expectKeyword("NULL"); }
         String type = ep.matchKeyword("RETURNING") ? ep.parseTypeName() : null;
+        if (type != null) matchReturningFormat();
         ep.expect(TokenType.RIGHT_PAREN);
         // Create as special aggregate function call
         List<Expression> args = Cols.listOf(arg,
@@ -1335,9 +1356,11 @@ class ExprSpecialFormParser {
             nullOnNull = false;
         }
         boolean uniqueKeys = false;
-        if (ep.matchKeyword("WITH")) { ep.expectKeyword("UNIQUE"); ep.expectKeyword("KEYS"); uniqueKeys = true; }
-        else if (ep.matchKeyword("WITHOUT")) { ep.expectKeyword("UNIQUE"); ep.expectKeyword("KEYS"); }
+        // KEYS may be left off either way, so the clause is read as PostgreSQL reads it.
+        if (ep.matchKeyword("WITH")) { ep.expectKeyword("UNIQUE"); ep.matchKeyword("KEYS"); uniqueKeys = true; }
+        else if (ep.matchKeyword("WITHOUT")) { ep.expectKeyword("UNIQUE"); ep.matchKeyword("KEYS"); }
         String type = ep.matchKeyword("RETURNING") ? ep.parseTypeName() : null;
+        if (type != null) matchReturningFormat();
         ep.expect(TokenType.RIGHT_PAREN);
         List<Expression> args = new ArrayList<>();
         args.add(key);

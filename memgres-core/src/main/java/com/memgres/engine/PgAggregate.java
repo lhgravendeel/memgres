@@ -38,4 +38,50 @@ public class PgAggregate {
     public String[] getArgTypes() { return argTypes; }
     public String getSchemaName() { return schemaName; }
     public void setSchemaName(String schemaName) { this.schemaName = schemaName; }
+
+    /**
+     * The moving-aggregate half of the definition, and how safely the aggregate may be run in
+     * parallel.
+     *
+     * <p>These are what a window frame that slides forward uses: MSFUNC adds a row and MINVFUNC
+     * takes one away, over an accumulator of its own type and starting value. Consumed by the
+     * parser and thrown away, an aggregate declared with all of them was recorded as having none,
+     * so pg_aggregate said the server could not compute it that way -- and PARALLEL SAFE was read
+     * and forgotten, so pg_proc called every aggregate unsafe.
+     */
+    private String mtransfn;
+    private String minvtransfn;
+    private String mstype;
+    private String minitcond;
+    private String parallel;
+
+    public String getMtransfn() { return mtransfn; }
+    public String getMinvtransfn() { return minvtransfn; }
+    public String getMstype() { return mstype; }
+    public String getMinitcond() { return minitcond; }
+    public String getParallel() { return parallel; }
+
+    public void setMovingAggregate(String mtransfn, String minvtransfn, String mstype,
+                                   String minitcond) {
+        this.mtransfn = mtransfn;
+        this.minvtransfn = minvtransfn;
+        this.mstype = mstype;
+        this.minitcond = minitcond;
+    }
+
+    public void setParallel(String parallel) { this.parallel = parallel; }
+
+    /**
+     * How many of the arguments stand in front of WITHIN GROUP, or -1 for an ordinary aggregate.
+     *
+     * <p>An ordered-set aggregate is written {@code (direct args ORDER BY sort args)} and is a
+     * different kind of aggregate: PostgreSQL records it as kind "o" and says how many of its
+     * arguments are direct. Read and thrown away, every such aggregate was recorded as an
+     * ordinary one taking no direct arguments at all.
+     */
+    private int directArgCount = -1;
+
+    public int getDirectArgCount() { return directArgCount; }
+
+    public void setDirectArgCount(int directArgCount) { this.directArgCount = directArgCount; }
 }

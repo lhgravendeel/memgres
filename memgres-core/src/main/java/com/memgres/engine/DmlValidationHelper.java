@@ -3,6 +3,8 @@ package com.memgres.engine;
 import com.memgres.engine.util.Cols;
 
 import com.memgres.engine.parser.ast.CreateTypeStmt;
+import com.memgres.engine.parser.ast.ArrayExpr;
+import com.memgres.engine.parser.ast.CastExpr;
 import com.memgres.engine.parser.ast.Expression;
 import com.memgres.engine.parser.ast.SelectStmt;
 
@@ -36,6 +38,7 @@ class DmlValidationHelper {
                 + " violates check constraint \"" + constraintName + "\"", "23514");
         ex.setConstraint(constraintName);
         ex.setDatatype(TypeNamespace.bare(domainName));
+        ex.setSchema(TypeNamespace.schemaOf(executor.database, domainName));
         return ex;
     }
 
@@ -61,6 +64,11 @@ class DmlValidationHelper {
         // A column whose type this engine models as something else is not judged here: what the
         // coercion rules are for it is a question this cannot answer, and guessing would refuse
         // statements PostgreSQL runs.
+        // A composite and an array of that composite are two types, and PostgreSQL has no cast
+        // either way: a row written where a list of them belongs, or a list where one belongs, is
+        // refused. Read as text of the other's shape, the row went in as a malformed literal and
+        // the list went in whole -- and a later read of it could not be made sense of at all.
+        requireCompositeShapeMatches(expr, column);
         if (column.getEnumTypeName() != null || column.getDomainTypeName() != null
                 || column.getCompositeTypeName() != null || column.getArrayElementType() != null) {
             return;
@@ -72,6 +80,57 @@ class DmlValidationHelper {
                 + " but expression is of type " + exprType);
         e.setHint("You will need to rewrite or cast the expression.");
         throw e;
+    }
+
+    /**
+     * Refuse a composite written where an array of it belongs, or the other way round.
+     *
+     * <p>Only where the expression says outright which of the two it is -- a cast to the type, or
+     * a constructor of them. Anything that says neither is left alone, because refusing a
+     * statement PostgreSQL runs is the worse failure of the two.
+     */
+    private void requireCompositeShapeMatches(Expression expr, Column column) {
+        String composite = column.getCompositeTypeName();
+        if (composite == null) return;
+        Boolean writesArray = writesArrayOfComposite(expr, composite);
+        if (writesArray == null) return;
+        boolean columnIsArray = column.getArrayElementType() != null;
+        if (writesArray.booleanValue() == columnIsArray) return;
+        String bare = TypeNamespace.nameOfKey(composite);
+        MemgresException e = PgErrors.datatypeMismatch("column \"" + column.getName()
+                + "\" is of type " + bare + (columnIsArray ? "[]" : "")
+                + " but expression is of type " + bare + (writesArray.booleanValue() ? "[]" : ""));
+        e.setHint("You will need to rewrite or cast the expression.");
+        throw e;
+    }
+
+    /**
+     * TRUE when the expression is certainly an array of this composite, FALSE when it is certainly
+     * one of them, and null when it says neither.
+     */
+    private Boolean writesArrayOfComposite(Expression expr, String composite) {
+        if (expr instanceof CastExpr) {
+            String written = ((CastExpr) expr).typeName();
+            if (written == null) return null;
+            String bare = written.trim();
+            boolean array = bare.endsWith("[]");
+            if (array) bare = bare.substring(0, bare.length() - 2).trim();
+            String key = TypeNamespace.resolve(executor.database, executor.session, bare);
+            if (key == null || !key.equalsIgnoreCase(composite)) return null;
+            return Boolean.valueOf(array);
+        }
+        if (expr instanceof ArrayExpr && !((ArrayExpr) expr).isRow()) {
+            ArrayExpr arr = (ArrayExpr) expr;
+            if (arr.elements() == null || arr.elements().isEmpty()) return null;
+            // Every element has to say it is one of them; one that says nothing says nothing
+            // about the constructor either.
+            for (Expression element : arr.elements()) {
+                Boolean elementIsArray = writesArrayOfComposite(element, composite);
+                if (elementIsArray == null || elementIsArray.booleanValue()) return null;
+            }
+            return Boolean.TRUE;
+        }
+        return null;
     }
 
     Object storedValue(Object value, Column column) {

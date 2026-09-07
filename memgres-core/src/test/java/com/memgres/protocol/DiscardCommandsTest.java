@@ -77,8 +77,10 @@ class DiscardCommandsTest {
             try (ResultSet rs = st.executeQuery(
                     "SELECT count(*)::integer AS count FROM pg_cursors")) {
                 assertTrue(rs.next(), "Expected a result row");
-                assertEquals(2, rs.getInt("count"),
-                        "pg_cursors should report 2 cursors after declaring a WITH HOLD cursor");
+                // Simple query mode opens no unnamed portal, so the WITH HOLD cursor is the
+                // only one pg_cursors lists -- which is what a real server reports here.
+                assertEquals(1, rs.getInt("count"),
+                        "pg_cursors should report the WITH HOLD cursor and nothing else");
             }
 
             // Cleanup
@@ -111,8 +113,8 @@ class DiscardCommandsTest {
             try (ResultSet rs = st.executeQuery(
                     "SELECT count(*)::integer AS count FROM pg_cursors")) {
                 assertTrue(rs.next(), "Expected a result row");
-                assertEquals(1, rs.getInt("count"),
-                        "pg_cursors should report 1 after DISCARD ALL closes the WITH HOLD cursor");
+                assertEquals(0, rs.getInt("count"),
+                        "pg_cursors should report none after DISCARD ALL closes the cursor");
             }
         }
     }
@@ -171,8 +173,10 @@ class DiscardCommandsTest {
             try (ResultSet rs = st.executeQuery(
                     "SELECT count(*)::integer AS cur_count FROM pg_cursors")) {
                 assertTrue(rs.next(), "Expected a result row");
-                assertEquals(2, rs.getInt("cur_count"),
-                        "pg_cursors should report 2 cursors after declaring a WITH HOLD cursor");
+                // Simple query mode opens no unnamed portal, so the WITH HOLD cursor is the
+                // only one pg_cursors lists -- which is what a real server reports here.
+                assertEquals(1, rs.getInt("cur_count"),
+                        "pg_cursors should report the WITH HOLD cursor and nothing else");
             }
 
             // Cleanup
@@ -208,8 +212,8 @@ class DiscardCommandsTest {
             try (ResultSet rs = st.executeQuery(
                     "SELECT count(*)::integer AS cur_count FROM pg_cursors")) {
                 assertTrue(rs.next(), "Expected a result row");
-                assertEquals(1, rs.getInt("cur_count"),
-                        "pg_cursors should report 1 after DISCARD ALL closes the WITH HOLD cursor");
+                assertEquals(0, rs.getInt("cur_count"),
+                        "pg_cursors should report none after DISCARD ALL closes the cursor");
             }
         }
     }
@@ -239,8 +243,8 @@ class DiscardCommandsTest {
             try (ResultSet rs = st.executeQuery(
                     "SELECT count(*)::integer AS count FROM pg_cursors")) {
                 assertTrue(rs.next(), "Expected a result row");
-                assertEquals(2, rs.getInt("count"),
-                        "pg_cursors should report 2 after DISCARD PLANS (cursors unaffected)");
+                assertEquals(1, rs.getInt("count"),
+                        "pg_cursors should still report the cursor after DISCARD PLANS");
             }
 
             // Cleanup

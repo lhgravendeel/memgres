@@ -770,8 +770,26 @@ public class GucSettings {
     }
 
     /** Get a parameter value (transaction override, then session override, then boot default, then static default). */
+    /** What answers whether the session is acting as a superuser, for the preset that reports it. */
+    public interface SuperuserCheck {
+        boolean isSuperuserNow();
+    }
+
+    private SuperuserCheck superuserCheck;
+
+    /** Say what to ask about the session's role, so is_superuser follows it. */
+    public void reportsSuperuserWith(SuperuserCheck check) {
+        this.superuserCheck = check;
+    }
+
     public String get(String name) {
         String key = name.toLowerCase(java.util.Locale.ROOT);
+        // is_superuser is a preset: PostgreSQL computes it from whoever the session is acting as,
+        // it is not a value anybody stored. Read from the table it was seeded in, it stayed "on"
+        // across a SET ROLE to a role that is nothing of the kind.
+        if (key.equals("is_superuser") && superuserCheck != null) {
+            return superuserCheck.isSuperuserNow() ? "on" : "off";
+        }
         String val = transactionOverrides.get(key);
         if (val != null) return val;
         val = sessionOverrides.get(key);

@@ -66,6 +66,15 @@ final class AstRelationRenamer {
                 Collections.newSetFromMap(new IdentityHashMap<Object, Boolean>());
         boolean changed;
         boolean found;
+        /**
+         * Whether a column reference qualified by the old bare name, at the node being looked at,
+         * is a reference to this relation.
+         *
+         * <p>A SELECT * is expanded when the view is created, and the references it leaves are
+         * qualified by the relation's own name. Left alone by a rename, they named a relation
+         * that was gone -- so the view could not be read and its definition printed the old name.
+         */
+        boolean qualifierNamesRelation;
 
         Walk(String schema, String name, String newSchema, String newName) {
             this.schema = schema;
@@ -92,6 +101,21 @@ final class AstRelationRenamer {
                 changed = true;
                 return;
             }
+            if (node instanceof com.memgres.engine.parser.ast.ColumnRef) {
+                com.memgres.engine.parser.ast.ColumnRef ref =
+                        (com.memgres.engine.parser.ast.ColumnRef) node;
+                if (!qualifierNamesRelation || ref.table == null) return;
+                if (!name.equalsIgnoreCase(ref.table)) return;
+                if (ref.schema != null && schema != null && !schema.equalsIgnoreCase(ref.schema)) return;
+                if (bound.contains(ref.table.toLowerCase(java.util.Locale.ROOT))) return;
+                found = true;
+                if (newName == null) return;
+                String targetSchema = ref.schema;
+                if (newSchema != null && !newSchema.equalsIgnoreCase(schema)) targetSchema = newSchema;
+                ref.retarget(targetSchema, newName);
+                changed = true;
+                return;
+            }
             if (node instanceof SelectStmt) {
                 SelectStmt select = (SelectStmt) node;
                 Set<String> inner = bound;
@@ -101,7 +125,14 @@ final class AstRelationRenamer {
                         if (cte != null && cte.name() != null) inner.add(cte.name().toLowerCase(java.util.Locale.ROOT));
                     }
                 }
-                visitFields(select, inner);
+                boolean outer = qualifierNamesRelation;
+                Boolean saysHere = fromSaysWhatTheNameMeans(select.from());
+                if (saysHere != null) qualifierNamesRelation = saysHere.booleanValue();
+                try {
+                    visitFields(select, inner);
+                } finally {
+                    qualifierNamesRelation = outer;
+                }
                 return;
             }
             if (node instanceof Iterable) {
@@ -120,6 +151,49 @@ final class AstRelationRenamer {
             }
             if (!isAstNode(node)) return;
             visitFields(node, bound);
+        }
+
+        /**
+         * What a FROM clause says the old bare name means inside its query: this relation, or
+         * something else that was given the name, or nothing -- in which case an enclosing query
+         * has the say.
+         */
+        private Boolean fromSaysWhatTheNameMeans(java.util.List<SelectStmt.FromItem> from) {
+            if (from == null || from.isEmpty()) return null;
+            Boolean says = null;
+            for (SelectStmt.FromItem item : from) {
+                Boolean here = itemSaysWhatTheNameMeans(item);
+                if (here == null) continue;
+                if (!here.booleanValue()) return Boolean.FALSE;
+                says = Boolean.TRUE;
+            }
+            return says;
+        }
+
+        private Boolean itemSaysWhatTheNameMeans(SelectStmt.FromItem item) {
+            if (item instanceof SelectStmt.JoinFrom) {
+                SelectStmt.JoinFrom join = (SelectStmt.JoinFrom) item;
+                Boolean left = itemSaysWhatTheNameMeans(join.left());
+                Boolean right = itemSaysWhatTheNameMeans(join.right());
+                if (Boolean.FALSE.equals(left) || Boolean.FALSE.equals(right)) return Boolean.FALSE;
+                return Boolean.TRUE.equals(left) || Boolean.TRUE.equals(right) ? Boolean.TRUE : null;
+            }
+            if (item instanceof SelectStmt.TableRef) {
+                SelectStmt.TableRef ref = (SelectStmt.TableRef) item;
+                if (ref.alias() != null) {
+                    return name.equalsIgnoreCase(ref.alias()) ? Boolean.FALSE : null;
+                }
+                return matches(ref, schema, name) ? Boolean.TRUE : null;
+            }
+            if (item instanceof SelectStmt.SubqueryFrom) {
+                String alias = ((SelectStmt.SubqueryFrom) item).alias;
+                return alias != null && name.equalsIgnoreCase(alias) ? Boolean.FALSE : null;
+            }
+            if (item instanceof SelectStmt.FunctionFrom) {
+                String alias = ((SelectStmt.FunctionFrom) item).alias;
+                return alias != null && name.equalsIgnoreCase(alias) ? Boolean.FALSE : null;
+            }
+            return null;
         }
 
         private void visitFields(Object node, Set<String> bound) {

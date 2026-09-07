@@ -469,6 +469,31 @@ public final class PlpgsqlBodyValidator {
      * PERFORM for running a query for its effect and INTO for keeping its row; a bare SELECT is
      * neither, and running it anyway threw the rows away silently.
      */
+    /**
+     * Refuse a statement in the body that is not SQL at all.
+     *
+     * <p>PostgreSQL compiles a routine when it is created, and a body it cannot read never
+     * becomes a routine that only fails when somebody calls it. A statement the plpgsql reader
+     * does not recognise is collected to be run as SQL, and one that is not SQL either -- a
+     * misspelled RETURN -- was collected and stored, so the fault surfaced at the first call
+     * rather than at the CREATE that wrote it.
+     *
+     * <p>Only the spelling is judged here, as PostgreSQL judges it: a statement naming a relation
+     * that does not exist yet is still a statement, and the routine may well be created before
+     * the table it reads.
+     */
+    private void requireStatementParses(String sql) {
+        if (sql == null || sql.trim().isEmpty()) return;
+        try {
+            com.memgres.engine.parser.Parser.parse(sql);
+        } catch (com.memgres.engine.parser.ParseException e) {
+            throw e;
+        } catch (RuntimeException e) {
+            // Anything that is not a complaint about the spelling belongs to whatever the
+            // statement names, and that is not settled until the routine runs.
+        }
+    }
+
     public static void requireDestination(PlpgsqlStatement.SqlStmt stmt) {
         if (stmt.intoVars() != null && !stmt.intoVars().isEmpty()) return;
         String sql = stmt.sql();
@@ -590,6 +615,7 @@ public final class PlpgsqlBodyValidator {
         } else if (stmt instanceof PlpgsqlStatement.SqlStmt) {
             PlpgsqlStatement.SqlStmt sql = (PlpgsqlStatement.SqlStmt) stmt;
             checkWritable(sql.intoVars());
+            requireStatementParses(sql.sql());
         } else if (stmt instanceof PlpgsqlStatement.ExecuteStmt) {
             checkWritable(((PlpgsqlStatement.ExecuteStmt) stmt).intoVars());
         } else if (stmt instanceof PlpgsqlStatement.FetchStmt) {

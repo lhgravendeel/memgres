@@ -137,6 +137,24 @@ public class Column {
     }
 
     /** Copy of this column with a new name; every other attribute is preserved. */
+    /**
+     * A column of this shape that belongs to another relation.
+     *
+     * <p>A child takes its parent's columns as columns of its own, and what is done to one of
+     * them afterwards is done to that relation alone: PostgreSQL's SET STORAGE on a child leaves
+     * the parent's storage where it was. Handed the parent's own column, the child and the parent
+     * shared one, and every ALTER of either reached both.
+     */
+    public Column copy() {
+        Column c = new Column(name, type, nullable, primaryKey, defaultValue, enumTypeName,
+                precision, scale, generatedExpr, virtual, domainTypeName, compositeTypeName,
+                arrayElementType);
+        copyRuntimeAttrsTo(c);
+        c.parsedDefaultExpr = parsedDefaultExpr;
+        c.arrayDimensions = arrayDimensions;
+        return c;
+    }
+
     public Column withName(String newName) {
         Column c = new Column(newName, type, nullable, primaryKey, defaultValue, enumTypeName,
                 precision, scale, generatedExpr, virtual, domainTypeName, compositeTypeName, arrayElementType);
@@ -243,6 +261,17 @@ public class Column {
     public DataType getArrayElementType() { return arrayElementType; }
     public int getTableOid() { return tableOid; }
     public void setTableOid(int tableOid) { this.tableOid = tableOid; }
+    /**
+     * How many bracket pairs the declaration was written with, or 0 for a column that is not an
+     * array. PostgreSQL has one array type per element type however many dimensions a value has,
+     * and records the written count here alone -- so text[][] is a text[] whose attndims is 2.
+     */
+    private int arrayDimensions;
+
+    public int getArrayDimensions() { return arrayDimensions; }
+
+    public void setArrayDimensions(int arrayDimensions) { this.arrayDimensions = arrayDimensions; }
+
     public short getAttNum() { return attNum; }
     public void setAttNum(short attNum) { this.attNum = attNum; }
     public Integer getAttStattarget() { return attStattarget; }

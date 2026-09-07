@@ -128,6 +128,40 @@ class CatalogSystemFunctions {
     /**
      * The schema holding the relation this regclass names, or null when it cannot be told.
      */
+    /** The relation's own name, without the schema that holds it. */
+    private String bareNameOfRelation(Object regclass) {
+        String written = regclass.toString();
+        int dot = written.lastIndexOf('.');
+        if (dot > 0) return written.substring(dot + 1).replace("\"", "");
+        Integer oid = null;
+        if (regclass instanceof Number) oid = Integer.valueOf(((Number) regclass).intValue());
+        else if (regclass instanceof RegclassValue) {
+            oid = Integer.valueOf(((RegclassValue) regclass).oid());
+        }
+        if (oid != null) {
+            for (java.util.Map.Entry<String, Integer> e
+                    : executor.systemCatalog.getOidMap().entrySet()) {
+                if (e.getValue().equals(oid) && e.getKey().startsWith("rel:")) {
+                    String key = e.getKey().substring(4);
+                    int at = key.lastIndexOf('.');
+                    return at > 0 ? key.substring(at + 1) : key;
+                }
+            }
+        }
+        return null;
+    }
+
+    /** Waits the given number of milliseconds, reporting a cancel or a timeout as PostgreSQL does. */
+    private static void sleepFor(long millis) {
+        if (millis <= 0) return;
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw StatementCancel.canceled();
+        }
+    }
+
     private String schemaOfRelation(Object regclass) {
         String written = regclass.toString();
         int dot = written.lastIndexOf('.');
@@ -225,6 +259,10 @@ class CatalogSystemFunctions {
                     }
                     if ("pg_current_snapshot".equals(producer)) return "pg_snapshot";
                     if ("txid_current_snapshot".equals(producer)) return "txid_snapshot";
+                    // A serialised document is text, and a document that opens with a brace looks
+                    // exactly like an array written out: read from the value, JSON_SERIALIZE of an
+                    // object was reported as an array of text.
+                    if ("json_serialize".equals(producer)) return "text";
                 }
 
                 // CURRENT_TIME is a keyword and not a catalogued routine, and the timetz it
@@ -744,14 +782,33 @@ class CatalogSystemFunctions {
             case "pg_sleep_for": {
                 if (!fn.args().isEmpty()) {
                     Object arg = executor.evalExpr(fn.args().get(0), ctx);
-                    if (arg != null && !(arg instanceof PgInterval)) PgInterval.parse(arg.toString());
+                    PgInterval waited = arg == null ? null
+                            : (arg instanceof PgInterval ? (PgInterval) arg
+                                : PgInterval.parse(arg.toString()));
+                    // The interval says how long to wait, and waiting is what the call is for:
+                    // read only to check it was an interval, it returned at once and a caller
+                    // timing itself against the clock saw no time pass.
+                    // Months and days are counted as PostgreSQL counts them for a wait: a day
+                    // is 24 hours and a month 30 days, which is what the interval's own
+                    // normalisation uses.
+                    if (waited != null && !waited.isPositiveInfinity()
+                            && !waited.isNegativeInfinity()) {
+                        sleepFor(waited.normalizedMicroseconds() / 1000L);
+                    }
                 }
                 return VOID_RESULT;
             }
             case "pg_sleep_until": {
                 if (!fn.args().isEmpty()) {
                     Object arg = executor.evalExpr(fn.args().get(0), ctx);
-                    if (arg != null) executor.castEvaluator.applyCast(arg, "timestamptz");
+                    if (arg != null) {
+                        Object until = executor.castEvaluator.applyCast(arg, "timestamptz");
+                        // The moment named is when the wait ends; one already past ends it now.
+                        if (until instanceof java.time.OffsetDateTime) {
+                            sleepFor(java.time.Duration.between(java.time.OffsetDateTime.now(),
+                                    (java.time.OffsetDateTime) until).toMillis());
+                        }
+                    }
                 }
                 return VOID_RESULT;
             }
@@ -938,8 +995,16 @@ class CatalogSystemFunctions {
                         || schema.equalsIgnoreCase(executor.session.getTempSchemaName())) {
                     return true;
                 }
+                // Reachable means the bare name reaches this relation and not another: the first
+                // schema on the path holding a relation of that name is the one the name gets,
+                // and every other relation of that name is shadowed. Answering yes for any
+                // schema the path mentions said both of two same-named relations were reachable
+                // unqualified, which no search path can make true.
+                String bare = bareNameOfRelation(tableOid);
+                if (bare == null) return true;
                 for (String onPath : executor.session.getEffectiveSearchPath(false)) {
-                    if (onPath.equalsIgnoreCase(schema)) return true;
+                    if (RelationNamespace.kindOf(executor.database, onPath, bare) == null) continue;
+                    return Boolean.valueOf(onPath.equalsIgnoreCase(schema));
                 }
                 return false;
             }
@@ -1104,8 +1169,19 @@ class CatalogSystemFunctions {
                 return "1:1:";
 
             case "lo_creat":
-            case "lo_create":
+                // lo_creat takes a mode and picks the number itself; lo_create is given the
+                // number to use. Both were read as neither, so a large object asked for under a
+                // number of the caller's choosing came back under one they had not asked for and
+                // could not open again.
                 return executor.database.getLargeObjectStore().loFromBytea(0, new byte[0]);
+            case "lo_create": {
+                long asked = 0;
+                if (!fn.args().isEmpty()) {
+                    Object oidArg = executor.evalExpr(fn.args().get(0), ctx);
+                    if (oidArg instanceof Number) asked = ((Number) oidArg).longValue();
+                }
+                return executor.database.getLargeObjectStore().loFromBytea(asked, new byte[0]);
+            }
             case "lo_from_bytea": {
                 long reqOid = 0;
                 byte[] data = new byte[0];

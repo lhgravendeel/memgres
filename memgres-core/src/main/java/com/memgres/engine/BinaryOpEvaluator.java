@@ -861,6 +861,11 @@ class BinaryOpEvaluator {
             case BIT_XOR: return "#";
             case SHIFT_LEFT: return "<<";
             case SHIFT_RIGHT: return ">>";
+            // "Same as" is declared over the four shapes that have an area or a place of their
+            // own -- a point, a box, a polygon and a circle -- and over nothing else. Left
+            // unspelled, a segment compared with a segment was answered rather than refused.
+            case APPROX_EQUAL: return "~=";
+            case GEO_CLOSEST_POINT: return "##";
             default: return null;
         }
     }
@@ -886,9 +891,20 @@ class BinaryOpEvaluator {
                 && leftName.endsWith("[]") && rightName.endsWith("[]")) {
             return;
         }
+        // An operator somebody created is an operator, and the catalogue this rule reads holds
+        // only the ones PostgreSQL ships. Refused against that list alone, a "#" declared for two
+        // texts was reported as not existing before it was ever looked for.
+        if (userOperatorExists(spelling, leftName, rightName)) return;
         MemgresException refusal =
                 OperatorResolution.refusalFor(spelling, left, right, leftName, rightName);
         if (refusal != null) throw refusal;
+    }
+
+    /** Whether the database carries an operator of this spelling that these operands reach. */
+    private boolean userOperatorExists(String spelling, String leftName, String rightName) {
+        if (leftName == null || rightName == null) return false;
+        if (executor.database.getOperatorsByName(spelling).isEmpty()) return false;
+        return executor.exprEvaluator.resolveOperator(null, spelling, leftName, rightName) != null;
     }
 
     /**
@@ -1155,6 +1171,17 @@ class BinaryOpEvaluator {
                 // binding is a base table costs a walk of the schemas.
                 if (ref.table() != null && !ref.table().equalsIgnoreCase(b.alias())
                         && (b.table() == null || !ref.table().equalsIgnoreCase(b.table().getName()))) continue;
+                // A call in FROM settles the type of what it produces, and where this engine
+                // worked that out it is recorded beside the column rather than guessed from the
+                // value. That is a declaration like any other: passed over because the binding
+                // is a function result, unnest of a text array offered nothing, so text @> text
+                // was resolved from the shapes of the two strings and answered where PostgreSQL
+                // has no such operator.
+                if (b.table() != null && b.table().isFunctionResult()) {
+                    int at = b.table().getColumnIndex(ref.column());
+                    if (at < 0) continue;
+                    return DefinedTypes.typeIn(b.table(), at);
+                }
                 if (!readsItsColumnTypes(b.table())) continue;
                 int idx = b.table().getColumnIndex(ref.column());
                 if (idx < 0) continue;
@@ -1857,19 +1884,19 @@ class BinaryOpEvaluator {
                     isJsonOperand(bin.left(), ctx) || isJsonOperand(bin.right(), ctx));
         } catch (ClassCastException | NumberFormatException e) {
             // Built-in handling doesn't support these types — try user-defined operator
-            String opSymbol = binOpToSymbol(bin.op());
+            String opSymbol = symbolForUserLookup(bin.op());
             if (opSymbol != null) {
-                Object result = tryUserDefinedOperator(opSymbol, left, right);
-                if (result != null || (left == null || right == null)) return result;
+                Object result = userDefinedOperatorResult(opSymbol, left, right);
+                if (result != NO_USER_OPERATOR) return result;
             }
             throw e; // No user-defined operator either, rethrow
         } catch (MemgresException e) {
             // Only try fallback for "operator does not exist" errors
             if ("42883".equals(e.getSqlState())) {
-                String opSymbol = binOpToSymbol(bin.op());
+                String opSymbol = symbolForUserLookup(bin.op());
                 if (opSymbol != null) {
-                    Object result = tryUserDefinedOperator(opSymbol, left, right);
-                    if (result != null || (left == null || right == null)) return result;
+                    Object result = userDefinedOperatorResult(opSymbol, left, right);
+                    if (result != NO_USER_OPERATOR) return result;
                 }
             }
             throw e;
@@ -3080,15 +3107,36 @@ class BinaryOpEvaluator {
         return null;
     }
 
+    /** What {@link #userDefinedOperatorResult} answers where no user-defined operator was found. */
+    static final Object NO_USER_OPERATOR = new Object();
+
     Object tryUserDefinedOperator(String opSymbol, Object left, Object right) {
+        Object answered = userDefinedOperatorResult(opSymbol, left, right);
+        return answered == NO_USER_OPERATOR ? null : answered;
+    }
+
+    /**
+     * What a user-defined operator answers, or {@link #NO_USER_OPERATOR} where there is none.
+     *
+     * <p>An operator that answers nothing is not an operator that is missing. Told the two apart
+     * only by a null return, a fallback discarded a user-defined operator's own NULL and reported
+     * that the operator did not exist.
+     */
+    Object userDefinedOperatorResult(String opSymbol, Object left, Object right) {
         String leftType = AstExecutor.pgTypeNameOf(left);
         String rightType = AstExecutor.pgTypeNameOf(right);
         ExprEvaluator exprEval = executor.exprEvaluator;
         PgOperator op = exprEval.resolveOperator(null, opSymbol, leftType, rightType);
-        if (op == null) return null;
+        if (op == null) return NO_USER_OPERATOR;
 
+        // An operator filed as a promise has a name and operand types and nothing to run: using
+        // it is a different complaint from using one that was never declared at all.
+        if (op.getFunction() == null) {
+            throw new MemgresException("operator is only a shell: "
+                    + leftType + " " + opSymbol + " " + rightType, "42883");
+        }
         PgFunction func = executor.database.getFunction(op.getFunction());
-        if (func == null) return null;
+        if (func == null) return NO_USER_OPERATOR;
 
         if (func.isStrict()) {
             if (left == null || right == null) return null;
@@ -3152,7 +3200,13 @@ class BinaryOpEvaluator {
     }
 
     static String opSymbol(BinaryExpr.BinOp op) {
-        return binOpToSymbol(op);
+        return symbolForUserLookup(op);
+    }
+
+    /** How an operator is spelled when looking for a user-declared one of the same name. */
+    private static String symbolForUserLookup(BinaryExpr.BinOp op) {
+        String symbol = binOpToSymbol(op);
+        return symbol != null ? symbol : pgSpelling(op);
     }
 
     private static String binOpToSymbol(BinaryExpr.BinOp op) {
@@ -3436,6 +3490,22 @@ class BinaryOpEvaluator {
     Object evalBinaryValues(BinaryExpr.BinOp op, Object left, Object right) {
         // Apply type validation before computation
         executor.validateOperatorTypes(op, left, right);
+        try {
+            return evalBuiltinValues(op, left, right);
+        } catch (MemgresException e) {
+            // An operator PostgreSQL does not define between these types may still be one the
+            // user defined. Reached through this path, a "#" declared for two texts was reported
+            // as not existing, because only the other evaluation path ever looked for it.
+            if (!"42883".equals(e.getSqlState())) throw e;
+            String opSymbol = symbolForUserLookup(op);
+            if (opSymbol == null) throw e;
+            Object answered = userDefinedOperatorResult(opSymbol, left, right);
+            if (answered == NO_USER_OPERATOR) throw e;
+            return answered;
+        }
+    }
+
+    private Object evalBuiltinValues(BinaryExpr.BinOp op, Object left, Object right) {
         switch (op) {
             case ADD:
                 if (left instanceof InetValue && right instanceof Number) {

@@ -73,9 +73,16 @@ class DdlViewExecutor {
     QueryResult executeCreateView(CreateViewStmt stmt) {
         ddl.checkPgCatalogWriteProtection();
         requireKnownViewOptions(stmt.withOptions());
-        // A CREATE that says which schema to create in is refused outright when there is no such
-        // schema, before the query it would store is looked at.
-        SchemaQualifier.requireSchema(executor.database, executor.session, stmt.schema());
+        // PostgreSQL analyses what the view would read before it settles where to put it, so a
+        // definition naming a relation that is not there is reported as that even when the schema
+        // the view was to be created in is missing too. Reported the other way round, the reader
+        // was sent to create a schema that would not have made the statement work.
+        try {
+            SchemaQualifier.requireSchema(executor.database, executor.session, stmt.schema());
+        } catch (MemgresException noSuchSchema) {
+            requireDefinitionNamesSomething(stmt.query());
+            throw noSuchSchema;
+        }
         // A temporary relation lives in the session's own schema, so a statement that says which
         // schema to put it in is asking for two different places at once.
         if (stmt.temporary() && stmt.schema() != null) {
@@ -84,7 +91,10 @@ class DdlViewExecutor {
         }
         // A view name is taken in the schema the view goes into, not in the database at large:
         // another schema may already hold a view of that name, and this one is still free.
-        String createSchema = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
+        // A view nobody put a schema on lands in the first schema the search path names that can
+        // be created in, which an empty path does not name at all.
+        String createSchema = stmt.schema() != null ? stmt.schema()
+                : stmt.temporary() ? executor.defaultSchema() : executor.creationSchema();
         if (!stmt.orReplace() && executor.database.hasView(createSchema, stmt.name())) {
             throw new MemgresException("relation \"" + stmt.name() + "\" already exists", "42P07");
         }
@@ -172,8 +182,15 @@ class DdlViewExecutor {
 
         // "view will be a temporary view": a view whose query reads a temp table cannot outlive
         // the session, so PG puts it in the temp namespace instead of leaving a dangling view.
-        if (referencesTempTable(query)) {
-            viewSchema = executor.session != null ? executor.session.getTempSchemaName() : viewSchema;
+        // The word TEMP asks for the same thing outright; read as nothing but a promise to drop
+        // the view later, a temporary view stood in public and the catalogue said so.
+        if (stmt.temporary() || referencesTempTable(query)) {
+            if (executor.session != null) {
+                viewSchema = executor.session.getTempSchemaName();
+                // The temporary schema has to be one the engine really holds, or a later
+                // statement that writes pg_temp is told there is no such schema to write.
+                executor.database.getOrCreateSchema(viewSchema);
+            }
         }
 
         int rowCount = 0;
@@ -610,6 +627,24 @@ class DdlViewExecutor {
      * about the rows it would read. Storing it defers the error to every read of the view, where
      * a view over an ungrouped column answered with an arbitrary row's value.
      */
+    /**
+     * Hold a view's definition to the names it uses, without keeping anything it answers.
+     *
+     * <p>Only the names are being settled here: whatever else running the query would report is
+     * the business of the statement that really runs it.
+     */
+    private void requireDefinitionNamesSomething(Statement query) {
+        if (query == null) return;
+        try {
+            executor.executeStatement(query);
+        } catch (MemgresException e) {
+            MemgresException fault = definitionFault(e);
+            if (fault != null) throw fault;
+        } catch (RuntimeException ignored) {
+            // Not a question about names.
+        }
+    }
+
     private MemgresException definitionFault(MemgresException e) {
         if ("42P01".equals(e.getSqlState()) && e.getMessage() != null
                 && e.getMessage().contains("does not exist")
@@ -798,15 +833,33 @@ class DdlViewExecutor {
                 requireViewKind(stmt);
                 throw new MemgresException("view \"" + stmt.name() + "\" does not exist", "42P01");
             }
-            // Merge new options into existing reloptions
+            // Merge new options into existing reloptions. A value of null is what RESET writes,
+            // and it takes the option away rather than setting it to nothing.
             Map<String, String> merged = new LinkedHashMap<>();
             if (existing.reloptions() != null) merged.putAll(existing.reloptions());
-            if (stmt.setOptions() != null) merged.putAll(stmt.setOptions());
+            String checkOption = existing.checkOption();
+            if (stmt.setOptions() != null) {
+                for (Map.Entry<String, String> option : stmt.setOptions().entrySet()) {
+                    // check_option is not an ordinary storage option: it is what the view
+                    // promises about the rows written through it, and information_schema reads
+                    // it from there. Merged into the reloptions alone, ALTER VIEW SET
+                    // (check_option='local') changed nothing a reader could see.
+                    if ("check_option".equalsIgnoreCase(option.getKey())) {
+                        checkOption = option.getValue() == null ? null
+                                : option.getValue().toUpperCase(java.util.Locale.ROOT);
+                    }
+                    if (option.getValue() == null) {
+                        merged.remove(option.getKey());
+                    } else {
+                        merged.put(option.getKey(), option.getValue());
+                    }
+                }
+            }
             executor.database.removeView(stmt.name());
             executor.database.addView(new Database.ViewDef(existing.name(), existing.schemaName(), existing.query(),
                     existing.orReplace(), existing.materialized(),
                     existing.cachedColumns(), existing.cachedRows(), existing.sourceSQL(),
-                    existing.checkOption(), merged, existing.populated()));
+                    checkOption, merged, existing.populated()));
         }
         if (stmt.action() == AlterViewStmt.Action.NO_OP) {
             Database.ViewDef existing = executor.database.getView(stmt.name());

@@ -181,6 +181,8 @@ class ParserSyntaxGapsTest {
     @Test
     void aTemporalPrimaryKeyRejectsAnOverlappingPeriod() throws Exception {
         exec("DROP TABLE IF EXISTS psg_t CASCADE");
+        // A temporal key indexes its scalar columns with gist, which needs btree_gist.
+        exec("CREATE EXTENSION IF NOT EXISTS btree_gist");
         exec("CREATE TABLE psg_t (id int, valid daterange,"
                 + " PRIMARY KEY (id, valid WITHOUT OVERLAPS))");
         exec("INSERT INTO psg_t VALUES (1,'[2020-01-01,2021-01-01)')");
@@ -191,6 +193,8 @@ class ParserSyntaxGapsTest {
     @Test
     void aTemporalPrimaryKeyAllowsAdjacentPeriods() throws Exception {
         exec("DROP TABLE IF EXISTS psg_t2 CASCADE");
+        // A temporal key indexes its scalar columns with gist, which needs btree_gist.
+        exec("CREATE EXTENSION IF NOT EXISTS btree_gist");
         exec("CREATE TABLE psg_t2 (id int, valid daterange,"
                 + " PRIMARY KEY (id, valid WITHOUT OVERLAPS))");
         exec("INSERT INTO psg_t2 VALUES (1,'[2020-01-01,2021-01-01)')");
@@ -202,6 +206,8 @@ class ParserSyntaxGapsTest {
     @Test
     void aTemporalPrimaryKeyAllowsADifferentKey() throws Exception {
         exec("DROP TABLE IF EXISTS psg_t3 CASCADE");
+        // A temporal key indexes its scalar columns with gist, which needs btree_gist.
+        exec("CREATE EXTENSION IF NOT EXISTS btree_gist");
         exec("CREATE TABLE psg_t3 (id int, valid daterange,"
                 + " PRIMARY KEY (id, valid WITHOUT OVERLAPS))");
         exec("INSERT INTO psg_t3 VALUES (1,'[2020-01-01,2021-01-01)')");

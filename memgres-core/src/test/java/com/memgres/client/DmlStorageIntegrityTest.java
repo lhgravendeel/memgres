@@ -3749,6 +3749,8 @@ void theseObjectsBelongToTheRelationsOwner() throws Exception {
 
     @Test
     void anExclusionOnNotEqualIsEnforced() throws Exception {
+        // gist has no operator class for a scalar type until btree_gist adds one.
+        exec("CREATE EXTENSION IF NOT EXISTS btree_gist");
         exec("CREATE TABLE zzc3_x6 (a int, EXCLUDE USING gist (a WITH <>))");
         assertEquals(1, update("INSERT INTO zzc3_x6 VALUES (1)"));
         // PG 18: 23P01 -- 2 is unlike 1, and unlike is what this constraint excludes.

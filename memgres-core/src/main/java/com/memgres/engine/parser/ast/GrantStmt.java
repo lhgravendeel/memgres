@@ -73,6 +73,23 @@ public final class GrantStmt implements Statement {
 
     public java.util.List<String> moreObjects() { return moreObjects; }
 
+    /**
+     * Whether a membership grant said the member takes on what the granted role holds.
+     *
+     * <p>PostgreSQL records INHERIT per membership, not only per role: {@code GRANT a TO b WITH
+     * INHERIT FALSE} makes b a member of a that holds none of a's privileges until it does SET
+     * ROLE. Null where the statement said nothing and the member role's own setting decides.
+     */
+    private Boolean inheritOption;
+
+    /** The same statement, remembering what it said about INHERIT. */
+    public GrantStmt withInheritOption(Boolean inherit) {
+        this.inheritOption = inherit;
+        return this;
+    }
+
+    public Boolean inheritOption() { return inheritOption; }
+
     /** One statement per object named, in the order they were written. */
     public java.util.List<GrantStmt> perObject() {
         java.util.List<GrantStmt> each = new java.util.ArrayList<GrantStmt>();

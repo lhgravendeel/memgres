@@ -694,10 +694,17 @@ public class Database {
 
     public void addDefaultAcl(DefaultAclEntry entry) { defaultAcls.add(entry); }
 
-    public void removeDefaultAcl(String schema, String objectType, List<String> grantees) {
+    /**
+     * Take back a default a role set aside. A list belongs to the role that wrote it, so only that
+     * role's is taken back: matched on the schema and the grantee alone, one REVOKE took away
+     * every role's list for the schema, and defaults nobody had touched went with it.
+     */
+    public void removeDefaultAcl(String grantor, String schema, String objectType,
+            List<String> grantees) {
         defaultAcls.removeIf(e -> e.isGrant
                 && objectTypeMatches(e.objectType, objectType)
                 && schemaMatches(e.schema, schema)
+                && (grantor == null || grantor.equalsIgnoreCase(e.grantor))
                 && grantees.stream().anyMatch(g -> e.grantees.contains(g)));
     }
 
@@ -912,6 +919,7 @@ public class Database {
 
     public Database() {
         schemas.put("public", new Schema("public"));
+        seedSystemRules();
         // Default superuser roles (similar to PG's postgres role)
         createRole("memgres", Cols.mapOf("SUPERUSER", "true", "LOGIN", "true"));
         createRole("postgres", Cols.mapOf("SUPERUSER", "true", "LOGIN", "true"));
@@ -1126,6 +1134,17 @@ public class Database {
         Schema renamed = new Schema(newName);
         for (Map.Entry<String, Table> t : existing.getTables().entrySet()) {
             renamed.addTable(t.getValue());
+        }
+        // A view reads the relation, not the name the relation was reached by, and every relation
+        // the schema holds has just been reached by a new one. Left as they were written, a view
+        // over a relation in the renamed schema named a schema that was gone: it could not be
+        // read, and its printed definition said so.
+        List<String> moved = new ArrayList<>(existing.getTables().keySet());
+        for (ViewDef v : views.values()) {
+            if (v.query() == null) continue;
+            for (String relation : moved) {
+                AstRelationRenamer.retarget(v.query(), oldName, relation, newName, relation);
+            }
         }
         schemas.remove(oldName);
         schemas.put(newName, renamed);
@@ -1608,7 +1627,10 @@ public class Database {
         // A name that carries its schema names one schema's function and no other's, so it is
         // answered from that schema: looking the whole "schema.fn" text up as a bare name found
         // nothing, and a trigger written to call one was refused for a function that exists.
-        int dot = name == null ? -1 : name.lastIndexOf('.');
+        // No name names no function, and an operator filed as a promise has no function behind
+        // it: asking for the one it does not have must answer nothing rather than fail.
+        if (name == null) return null;
+        int dot = name.lastIndexOf('.');
         if (dot > 0) {
             return getFunction(name.substring(0, dot), name.substring(dot + 1));
         }
@@ -1938,6 +1960,23 @@ public class Database {
         List<PgTrigger> list = triggers.get(tableName.toLowerCase(java.util.Locale.ROOT));
         if (list == null || list.isEmpty()) return Cols.listOf();
         List<PgTrigger> sorted = new ArrayList<>(list);
+        sorted.sort(java.util.Comparator.comparing(t -> t.getName().toLowerCase(java.util.Locale.ROOT)));
+        return sorted;
+    }
+
+    /**
+     * The triggers one relation carries, which are its own and not a namesake's.
+     *
+     * <p>The registry is keyed by the bare relation name, so two schemas each holding a {@code t}
+     * share an entry: a trigger declared on {@code s.t} fired for a write to {@code public.t},
+     * which is a relation it was never attached to.
+     */
+    public List<PgTrigger> getTriggersForTable(Table table) {
+        if (table == null || table.getName() == null) return Cols.listOf();
+        String schema = schemaNameOf(table);
+        if (schema == null) return getTriggersForTable(table.getName());
+        List<PgTrigger> mine = getTriggersForTable(schema, table.getName());
+        List<PgTrigger> sorted = new ArrayList<>(mine);
         sorted.sort(java.util.Comparator.comparing(t -> t.getName().toLowerCase(java.util.Locale.ROOT)));
         return sorted;
     }
@@ -2494,6 +2533,28 @@ public class Database {
      * Only a rule on the same relation is replaced: another schema's relation of that name keeps
      * whatever it was written with.
      */
+    /**
+     * The rules PostgreSQL ships on its own views.
+     *
+     * <p>pg_settings is writable through a pair of them: an UPDATE that keeps a parameter's name
+     * is turned into a call of set_config, and any other UPDATE does nothing. Without them the
+     * view was refused as one nothing could write to, so the way PostgreSQL lets a client change
+     * a parameter through SQL did not work at all.
+     */
+    private void seedSystemRules() {
+        addRule("pg_catalog", "pg_settings_n", "pg_settings", "UPDATE", true, null, null);
+        addRuleDefinition("pg_catalog", "pg_settings_n", "pg_settings",
+                "CREATE RULE pg_settings_n AS\n    ON UPDATE TO pg_catalog.pg_settings"
+                        + " DO INSTEAD NOTHING;");
+        addRule("pg_catalog", "pg_settings_u", "pg_settings", "UPDATE", true,
+                "SELECT set_config(old.name, new.setting, false) AS set_config",
+                "new.name = old.name");
+        addRuleDefinition("pg_catalog", "pg_settings_u", "pg_settings",
+                "CREATE RULE pg_settings_u AS\n    ON UPDATE TO pg_catalog.pg_settings\n"
+                        + "   WHERE (new.name = old.name) DO  SELECT set_config(old.name,"
+                        + " new.setting, false) AS set_config;");
+    }
+
     public void addRule(String schema, String ruleName, String table, String event, boolean instead,
                         String body, String qualification) {
         String key = table.toLowerCase(java.util.Locale.ROOT);
@@ -4206,7 +4267,11 @@ public class Database {
         Map<String, String> kept = new ConcurrentHashMap<>();
         if (attributes != null) {
             for (Map.Entry<String, String> e : attributes.entrySet()) {
-                if (e.getKey() != null && e.getValue() != null) kept.put(e.getKey(), e.getValue());
+                if (e.getKey() == null || e.getValue() == null) continue;
+                // A password is encrypted where it is given and never held as it was written,
+                // which is what pg_authid reports the method of.
+                kept.put(e.getKey(), "PASSWORD".equals(e.getKey())
+                        ? PgScramVerifier.of(e.getValue()) : e.getValue());
             }
         }
         // The name is kept as the statement wrote it. An unquoted one was folded by the parser
@@ -4320,13 +4385,34 @@ public class Database {
     }
 
     public void addRoleMembership(String grantedRole, String memberRole, boolean withAdminOption) {
+        addRoleMembership(grantedRole, memberRole, withAdminOption, null);
+    }
+
+    /**
+     * Record a membership, and what the grant said about the member taking on its privileges.
+     *
+     * <p>PostgreSQL records INHERIT per membership as well as per role: {@code GRANT a TO b WITH
+     * INHERIT FALSE} makes b a member of a that holds none of a's privileges until it does SET
+     * ROLE. Read from the member role's own attribute alone, that grant handed b everything a had.
+     */
+    public void addRoleMembership(String grantedRole, String memberRole, boolean withAdminOption,
+                                  Boolean inheritOption) {
         roleMemberships.computeIfAbsent(grantedRole, k -> ConcurrentHashMap.newKeySet())
                 .add(memberRole);
         String key = grantedRole + "|" + memberRole;
         if (withAdminOption) {
             roleAdminOptions.put(key, true);
         }
+        if (inheritOption == null) roleInheritOptions.remove(key);
+        else roleInheritOptions.put(key, inheritOption);
     }
+
+    /** What one membership said about inheriting, or null where it said nothing. */
+    public Boolean membershipInherits(String grantedRole, String memberRole) {
+        return roleInheritOptions.get(grantedRole + "|" + memberRole);
+    }
+
+    private final Map<String, Boolean> roleInheritOptions = new ConcurrentHashMap<>();
 
     public boolean hasAdminOption(String grantedRole, String memberRole) {
         return Boolean.TRUE.equals(roleAdminOptions.get(grantedRole + "|" + memberRole));
@@ -4339,6 +4425,7 @@ public class Database {
             if (members.isEmpty()) roleMemberships.remove(grantedRole);
         }
         removeAdminOption(grantedRole, memberRole);
+        roleInheritOptions.remove(grantedRole + "|" + memberRole);
     }
 
     /** Takes away the right to hand a membership on, leaving the membership itself. */
@@ -4441,6 +4528,50 @@ public class Database {
                 if (!order.contains(role.toLowerCase(java.util.Locale.ROOT))) order.add(role.toLowerCase(java.util.Locale.ROOT));
             }
         }
+    }
+
+    /**
+     * The grants one role made to another, keyed by the role that made them.
+     *
+     * <p>A grant made by somebody who holds the privilege WITH GRANT OPTION depends on that
+     * holding: PostgreSQL will not take the option away and leave the grant behind, so a plain
+     * REVOKE is refused while one stands and CASCADE takes both. Recorded nowhere, the two roles
+     * looked alike, so RESTRICT let the first go and left the second granted by nobody.
+     *
+     * <p>The key is the grantor, the privilege, the object type and the object; the value is the
+     * roles that were granted it.
+     */
+    private final Map<String, Set<String>> onwardGrants = new ConcurrentHashMap<>();
+
+    private static String onwardKey(String grantor, String privilege, String objectType,
+                                    String objectName) {
+        return (grantor == null ? "" : grantor.toLowerCase(java.util.Locale.ROOT)) + ":"
+                + (privilege == null ? "" : privilege.toUpperCase(java.util.Locale.ROOT)) + ":"
+                + (objectType == null ? "" : objectType.toUpperCase(java.util.Locale.ROOT)) + ":"
+                + (objectName == null ? "" : objectName.toLowerCase(java.util.Locale.ROOT));
+    }
+
+    /** Record that one role passed a privilege on to another. */
+    public void recordOnwardGrant(String grantor, String grantee, String privilege,
+                                  String objectType, String objectName) {
+        if (grantor == null || grantee == null) return;
+        if (grantor.equalsIgnoreCase(grantee)) return;
+        onwardGrants.computeIfAbsent(onwardKey(grantor, privilege, objectType, objectName),
+                k -> ConcurrentHashMap.newKeySet())
+                .add(grantee.toLowerCase(java.util.Locale.ROOT));
+    }
+
+    /** The roles this one passed the privilege on to, or an empty set. */
+    public Set<String> onwardGranteesOf(String grantor, String privilege, String objectType,
+                                        String objectName) {
+        Set<String> held = onwardGrants.get(onwardKey(grantor, privilege, objectType, objectName));
+        return held == null ? java.util.Collections.<String>emptySet() : held;
+    }
+
+    /** Forget what a role passed on, once the privilege it passed on is gone. */
+    public void forgetOnwardGrants(String grantor, String privilege, String objectType,
+                                   String objectName) {
+        onwardGrants.remove(onwardKey(grantor, privilege, objectType, objectName));
     }
 
     /**

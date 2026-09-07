@@ -1682,10 +1682,22 @@ class SelectParser {
 
         String schema = null;
         String tableName = name1;
+        String writtenCatalog = null;
 
         if (parser.match(TokenType.DOT)) {
             schema = name1;
             tableName = parser.readIdentifier();
+
+            // A name written with three parts names a catalog, and which catalog the session is
+            // connected to is a question for the session: the name is kept whole here and judged
+            // where that is known. Read as two parts and a stray dot, a relation in another
+            // catalog was a syntax error where PostgreSQL says what it is that it cannot do.
+            if (parser.check(TokenType.DOT)) {
+                parser.advance();
+                writtenCatalog = schema;
+                schema = tableName;
+                tableName = parser.readIdentifier();
+            }
 
             // Schema-qualified function call: schema.func(args) [AS alias]
             if (!only && parser.check(TokenType.LEFT_PAREN)) {
@@ -1799,7 +1811,10 @@ class SelectParser {
                 tsArgs, alias != null ? alias : tableName, null);
         }
 
-        return new SelectStmt.TableRef(schema, tableName, alias, only, columnAliases);
+        SelectStmt.TableRef ref =
+                new SelectStmt.TableRef(schema, tableName, alias, only, columnAliases);
+        ref.catalog = writtenCatalog;
+        return ref;
     }
 
     SelectStmt.JoinType tryParseJoinType() {
@@ -2214,6 +2229,10 @@ class SelectParser {
     private SelectStmt.FromItem parseXmlTableFromItem(boolean lateral) {
         parser.advance(); // consume XMLTABLE
         parser.expect(TokenType.LEFT_PAREN);
+        // XMLNAMESPACES stands in front of the path and says what the prefixes in it mean. Read
+        // as an ordinary expression, the word AS inside it ended the argument and the whole form
+        // was a syntax error, so a path written with a prefix could not be written at all.
+        String namespaces = parseXmlNamespaces();
         // Parse XPath expression (string literal)
         Expression xpath = parser.parseExpression();
         // PASSING clause
@@ -2290,8 +2309,43 @@ class SelectParser {
                     + part(colDefaults.get(i))
                     + part(colNotNull.get(i).booleanValue() ? "t" : "f")));
         }
+        if (namespaces != null) args.add(new Literal(Literal.LiteralType.STRING, namespaces));
         return new SelectStmt.FunctionFrom("__xmltable__", args, alias, null);
     }
+
+    /**
+     * The XMLNAMESPACES clause, as prefix and URI pairs, or null when none was written.
+     *
+     * <p>Each pair is written with its length in front of it, as the column definitions are, and
+     * the whole is marked so the reader can tell it from one of those.
+     */
+    private String parseXmlNamespaces() {
+        if (!parser.matchKeyword("XMLNAMESPACES") && !parser.matchIdentifier("XMLNAMESPACES")) {
+            return null;
+        }
+        parser.expect(TokenType.LEFT_PAREN);
+        StringBuilder out = new StringBuilder(XML_NAMESPACES_MARK);
+        do {
+            // A default namespace would have to be applied to every unprefixed name in the path,
+            // which PostgreSQL does not do either -- it says so rather than reading the clause
+            // and quietly ignoring what it says.
+            if (parser.checkKeyword("DEFAULT")) {
+                throw new com.memgres.engine.MemgresException(
+                        "DEFAULT namespace is not supported", "0A000");
+            }
+            Expression uri = parser.parseExpression();
+            parser.expectKeyword("AS");
+            String prefix = parser.readIdentifier();
+            String uriText = uri instanceof Literal ? ((Literal) uri).value() : String.valueOf(uri);
+            out.append(part(prefix)).append(part(uriText));
+        } while (parser.match(TokenType.COMMA));
+        parser.expect(TokenType.RIGHT_PAREN);
+        parser.expect(TokenType.COMMA);
+        return out.toString();
+    }
+
+    /** What marks the argument that carries an XMLTABLE's namespace prefixes. */
+    public static final String XML_NAMESPACES_MARK = "xmlns=:";
 
     /** One part of an XMLTABLE column definition, written as its length, a colon and the text. */
     private static String part(String text) {

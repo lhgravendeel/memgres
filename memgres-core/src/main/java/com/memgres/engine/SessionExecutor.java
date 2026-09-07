@@ -1842,7 +1842,30 @@ class SessionExecutor {
 
     private void executePlpgsqlBlock(String body) {
         PlpgsqlExecutor plExec = new PlpgsqlExecutor(executor, executor.database, executor.session);
-        plExec.executeDoBlock(body);
+        // A DO block may end the transaction it runs in and begin another, exactly as a procedure
+        // may, so it runs in a transaction of its own when the session has none. Without that
+        // frame a block that ended with COMMIT or ROLLBACK left a transaction open behind it, and
+        // the statements after it were never committed at all.
+        if (executor.session != null
+                && executor.session.getStatus() == Session.TransactionStatus.IDLE) {
+            executor.session.begin();
+        }
+        boolean failed = true;
+        try {
+            plExec.executeDoBlock(body);
+            failed = false;
+        } finally {
+            // Only a transaction nobody wrote a BEGIN for is this statement's to end.
+            if (executor.session != null && !executor.session.isExplicitTransactionBlock()) {
+                Session.TransactionStatus st = executor.session.getStatus();
+                if (st == Session.TransactionStatus.FAILED) {
+                    executor.session.rollback();
+                } else if (st == Session.TransactionStatus.IN_TRANSACTION) {
+                    if (failed) executor.session.rollback();
+                    else executor.session.commit();
+                }
+            }
+        }
     }
 
     // ---- DISCARD ----
@@ -2211,7 +2234,8 @@ class SessionExecutor {
                             throw new MemgresException("role \"" + granted
                                     + "\" is a member of role \"" + member2 + "\"", "0LP01");
                         }
-                        executor.database.addRoleMembership(granted, member2, s.withAdminOption());
+                        executor.database.addRoleMembership(granted, member2, s.withAdminOption(),
+                                s.inheritOption());
                     }
                 }
             }
@@ -2401,6 +2425,29 @@ class SessionExecutor {
                         }
                     }
                 }
+            } else if (s.objectType().startsWith("ALL SEQUENCES IN SCHEMA")) {
+                // The same for every other kind the clause names. Recorded against the clause
+                // itself rather than the objects it stands for, the grant was a privilege on a
+                // relation called "all sequences in schema s": nothing could be asked about a
+                // sequence, and nothing could be dropped while the entry stood.
+                for (String grantee : s.grantees()) {
+                    for (String priv : s.privileges()) {
+                        for (String bare : sequenceNamesIn(s.objectName())) {
+                            executor.database.addRolePrivilege(grantee, priv, "SEQUENCE",
+                                    AstExecutor.privilegeKey(s.objectName(), bare));
+                        }
+                    }
+                }
+            } else if (s.objectType().startsWith("ALL FUNCTIONS IN SCHEMA")
+                    || s.objectType().startsWith("ALL ROUTINES IN SCHEMA")
+                    || s.objectType().startsWith("ALL PROCEDURES IN SCHEMA")) {
+                for (String grantee : s.grantees()) {
+                    for (String priv : s.privileges()) {
+                        for (String bare : routineNamesIn(s.objectName())) {
+                            executor.database.addRolePrivilege(grantee, priv, "FUNCTION", bare);
+                        }
+                    }
+                }
             } else {
                 for (String grantee : s.grantees()) {
                     for (String priv : s.privileges()) {
@@ -2416,6 +2463,11 @@ class SessionExecutor {
                             if (s.withGrantOption()) {
                                 executor.database.addRolePrivilege(grantee, priv + "_GRANT_OPTION", s.objectType(), bareObjectName);
                             }
+                            // Who made the grant is what a later REVOKE has to know: a grant made
+                            // by a role holding the option depends on that option, and PostgreSQL
+                            // will not take the option away and leave the grant standing.
+                            executor.database.recordOnwardGrant(executor.currentRole(), grantee,
+                                    priv, s.objectType(), bareObjectName);
                         }
                     }
                 }
@@ -2425,6 +2477,30 @@ class SessionExecutor {
         // it carries the owner's own entry and PostgreSQL's ordering rather than one item per
         // statement written in whatever order the statements arrived.
         return QueryResult.message(QueryResult.Type.SET, "GRANT");
+    }
+
+    /** The bare names of the sequences one schema holds. */
+    private List<String> sequenceNamesIn(String schemaName) {
+        List<String> named = new ArrayList<>();
+        if (schemaName == null) return named;
+        for (Sequence seq : executor.database.getSequences().values()) {
+            String home = seq.getSchemaName() == null ? "public" : seq.getSchemaName();
+            if (home.equalsIgnoreCase(schemaName)) named.add(seq.getName());
+        }
+        return named;
+    }
+
+    /** The names of the routines one schema holds, as the privilege registry keys them. */
+    private List<String> routineNamesIn(String schemaName) {
+        List<String> named = new ArrayList<>();
+        if (schemaName == null) return named;
+        for (PgFunction fn : executor.database.getFunctions().values()) {
+            String home = fn.getSchemaName() == null ? "public" : fn.getSchemaName();
+            if (home.equalsIgnoreCase(schemaName) && !named.contains(fn.getName())) {
+                named.add(fn.getName());
+            }
+        }
+        return named;
     }
 
     QueryResult executeRevoke(RevokeStmt s) {
@@ -2519,6 +2595,49 @@ class SessionExecutor {
                 }
                 return QueryResult.message(QueryResult.Type.SET, "REVOKE");
             }
+            if (s.objectType().startsWith("ALL SEQUENCES IN SCHEMA")) {
+                for (String grantee : s.grantees()) {
+                    for (String priv : s.privileges()) {
+                        for (String bare : sequenceNamesIn(s.objectName())) {
+                            String key = AstExecutor.privilegeKey(s.objectName(), bare);
+                            executor.database.removeRolePrivilege(grantee, priv, "SEQUENCE", key);
+                            executor.database.removeRolePrivilege(
+                                    grantee, priv + "_GRANT_OPTION", "SEQUENCE", key);
+                        }
+                    }
+                }
+                return QueryResult.message(QueryResult.Type.SET, "REVOKE");
+            }
+            if (s.objectType().startsWith("ALL FUNCTIONS IN SCHEMA")
+                    || s.objectType().startsWith("ALL ROUTINES IN SCHEMA")
+                    || s.objectType().startsWith("ALL PROCEDURES IN SCHEMA")) {
+                for (String grantee : s.grantees()) {
+                    for (String priv : s.privileges()) {
+                        for (String bare : routineNamesIn(s.objectName())) {
+                            executor.database.removeRolePrivilege(grantee, priv, "FUNCTION", bare);
+                            executor.database.removeRolePrivilege(
+                                    grantee, priv + "_GRANT_OPTION", "FUNCTION", bare);
+                        }
+                    }
+                }
+                return QueryResult.message(QueryResult.Type.SET, "REVOKE");
+            }
+            // A grant the revokee made depends on the option being taken away, and PostgreSQL
+            // refuses to leave it standing: RESTRICT -- which is what a REVOKE says when it says
+            // nothing -- reports that dependent privileges exist, and CASCADE takes them too.
+            if (!s.cascade() && !s.grantOptionFor()) {
+                for (String grantee : s.grantees()) {
+                    for (String priv : s.privileges()) {
+                        if (!executor.database.onwardGranteesOf(
+                                grantee, priv, s.objectType(), bareObjName).isEmpty()) {
+                            MemgresException e = new MemgresException(
+                                    "dependent privileges exist", "2BP01");
+                            e.setHint("Use CASCADE to revoke them too.");
+                            throw e;
+                        }
+                    }
+                }
+            }
             for (String grantee : s.grantees()) {
                 for (String priv : s.privileges()) {
                     if (s.columns() != null && !s.columns().isEmpty()) {
@@ -2533,6 +2652,13 @@ class SessionExecutor {
                         // Also remove grant option when revoking the privilege itself
                         executor.database.removeRolePrivilege(grantee, priv + "_GRANT_OPTION", s.objectType(), bareObjName);
                     }
+                }
+            }
+            // Whatever the revokee had passed on is gone with the privilege it was passed from.
+            for (String grantee : s.grantees()) {
+                for (String priv : s.privileges()) {
+                    executor.database.forgetOnwardGrants(
+                            grantee, priv, s.objectType(), bareObjName);
                 }
             }
             // CASCADE: also revoke matching privileges from all other roles on same object
@@ -2751,6 +2877,15 @@ class SessionExecutor {
      * Infer result column types from a prepared statement body.
      * Returns null for DML without RETURNING (PG behavior).
      */
+    /** Refuse an execution whose answer no longer has the shape the PREPARE settled. */
+    private void requireResultTypeUnchanged(Session.PreparedStmt prepared) {
+        List<String> settled = prepared.resultTypes();
+        if (settled == null || settled.isEmpty()) return;
+        List<String> now = inferResultTypes(prepared.body());
+        if (now == null || settled.equals(now)) return;
+        throw new MemgresException("cached plan must not change result type", "0A000");
+    }
+
     private List<String> inferResultTypes(Statement body) {
         try {
             // For SELECT: safe dry-run with LIMIT 0
@@ -2969,12 +3104,192 @@ class SessionExecutor {
         collectParamCastTypes(body, castTo);
         List<String> filled = new ArrayList<>(declared == null
                 ? java.util.Collections.<String>emptyList() : declared);
+        // A parameter compared with a column, or written where one goes, takes that column's
+        // type: PostgreSQL settles a prepared statement's parameters from how the statement uses
+        // them, not from casts alone. Read from casts only, a statement whose parameters were all
+        // used plainly reported that it took no parameters at all.
+        Map<Integer, String> usedAs = new HashMap<>();
+        collectParamUseTypes(body, usedAs);
+        Set<Integer> used = new HashSet<>();
+        collectParamIndexes(body, used);
         for (int i = filled.size() + 1; i <= highest; i++) {
-            String written = castTo.get(Integer.valueOf(i));
+            Integer at = Integer.valueOf(i);
+            // A parameter the statement never writes has nothing to settle it, and PostgreSQL
+            // says so rather than guessing; leaving it out is what lets that check fire.
+            if (!used.contains(at)) return filled;
+            String written = castTo.get(at);
+            if (written == null) written = usedAs.get(at);
+            // A parameter standing on its own as an output column has nothing to settle it and
+            // nothing that needs settling, so PostgreSQL reads it as text. Anywhere else -- under
+            // IS NULL, inside a call -- it stays indeterminate and PostgreSQL says so, which is
+            // why text is not the answer everywhere.
+            if (written == null && standsAloneAsOutput(body, i)) written = "text";
             if (written == null) return filled;   // nothing to say about this one or any after it
             filled.add(DataType.canonicalName(written));
         }
         return filled;
+    }
+
+    /** Whether the statement writes this parameter as an output column and nothing more. */
+    private static boolean standsAloneAsOutput(Statement body, int index) {
+        if (!(body instanceof SelectStmt)) return false;
+        SelectStmt select = (SelectStmt) body;
+        if (select.targets() == null) return false;
+        boolean asOutput = false;
+        for (SelectStmt.SelectTarget target : select.targets()) {
+            if (target.expr() instanceof ParamRef
+                    && ((ParamRef) target.expr()).index() == index) {
+                asOutput = true;
+            }
+        }
+        if (!asOutput) return false;
+        // It has to be the only place it is written: one that also stands under an operator or
+        // inside a call is settled by that, or by nothing, and PostgreSQL refuses it there.
+        return countParamWrites(body, index) == 1;
+    }
+
+    /** How many times the statement writes this parameter. */
+    private static int countParamWrites(Object node, int index) {
+        if (node == null) return 0;
+        if (node instanceof ParamRef) {
+            return ((ParamRef) node).index() == index ? 1 : 0;
+        }
+        int seen = 0;
+        if (node instanceof Iterable) {
+            for (Object o : (Iterable<?>) node) seen += countParamWrites(o, index);
+            return seen;
+        }
+        if (!isAstNodeClass(node.getClass())) return 0;
+        for (java.lang.reflect.Field field : node.getClass().getDeclaredFields()) {
+            if (java.lang.reflect.Modifier.isStatic(field.getModifiers())) continue;
+            try {
+                field.setAccessible(true);
+                seen += countParamWrites(field.get(node), index);
+            } catch (Exception e) { /* inaccessible: treat as leaf */ }
+        }
+        return seen;
+    }
+
+    /**
+     * The type each parameter takes from how the statement uses it: the column it is compared
+     * with, the column it is assigned to, or the column of the INSERT it stands in for.
+     */
+    private void collectParamUseTypes(Statement body, Map<Integer, String> found) {
+        if (body instanceof InsertStmt) {
+            collectInsertParamTypes((InsertStmt) body, found);
+            return;
+        }
+        List<Table> inScope = new ArrayList<>();
+        if (body instanceof SelectStmt) {
+            SelectStmt select = (SelectStmt) body;
+            if (select.from() != null) {
+                for (SelectStmt.FromItem item : select.from()) {
+                    if (!(item instanceof SelectStmt.TableRef)) continue;
+                    SelectStmt.TableRef ref = (SelectStmt.TableRef) item;
+                    Table t = tableOrNull(ref.schema(), ref.table());
+                    if (t != null) inScope.add(t);
+                }
+            }
+        } else if (body instanceof UpdateStmt) {
+            Table t = tableOrNull(null, ((UpdateStmt) body).table());
+            if (t != null) inScope.add(t);
+        } else if (body instanceof DeleteStmt) {
+            Table t = tableOrNull(null, ((DeleteStmt) body).table());
+            if (t != null) inScope.add(t);
+        }
+        if (inScope.isEmpty()) return;
+        collectComparedParamTypes(body, inScope, found);
+    }
+
+    /** The relation a name reaches, or null where it reaches none. */
+    private Table tableOrNull(String schema, String name) {
+        if (name == null) return null;
+        try {
+            String s = schema;
+            String bare = name;
+            int dot = bare.indexOf('.');
+            if (s == null && dot > 0) {
+                s = bare.substring(0, dot);
+                bare = bare.substring(dot + 1);
+            }
+            return executor.resolveTable(s == null ? executor.defaultSchema() : s, bare);
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    /** The type of a column any of these relations holds under this name, or null. */
+    private static String columnTypeIn(List<Table> tables, String column) {
+        for (Table t : tables) {
+            int at = t.getColumnIndex(column);
+            if (at < 0) continue;
+            Column col = t.getColumns().get(at);
+            return col.getType() == null ? null : CatalogHelper.pgTypeName(col.getType());
+        }
+        return null;
+    }
+
+    /** Every parameter written beside a column, anywhere in the statement. */
+    private void collectComparedParamTypes(Object node, List<Table> inScope,
+                                           Map<Integer, String> found) {
+        if (node == null) return;
+        if (node instanceof BinaryExpr) {
+            BinaryExpr bin = (BinaryExpr) node;
+            noteParamBeside(bin.left(), bin.right(), inScope, found);
+            noteParamBeside(bin.right(), bin.left(), inScope, found);
+        }
+        if (node instanceof InsertStmt.SetClause) {
+            InsertStmt.SetClause set = (InsertStmt.SetClause) node;
+            if (set.value instanceof ParamRef) {
+                String type = columnTypeIn(inScope, set.column);
+                if (type != null) {
+                    found.put(Integer.valueOf(((ParamRef) set.value).index()), type);
+                }
+            }
+        }
+        if (node instanceof Iterable) {
+            for (Object o : (Iterable<?>) node) collectComparedParamTypes(o, inScope, found);
+            return;
+        }
+        if (!isAstNodeClass(node.getClass())) return;
+        for (java.lang.reflect.Field field : node.getClass().getDeclaredFields()) {
+            if (java.lang.reflect.Modifier.isStatic(field.getModifiers())) continue;
+            try {
+                field.setAccessible(true);
+                collectComparedParamTypes(field.get(node), inScope, found);
+            } catch (Exception e) { /* inaccessible: treat as leaf */ }
+        }
+    }
+
+    private static void noteParamBeside(Object maybeParam, Object maybeColumn,
+                                        List<Table> inScope, Map<Integer, String> found) {
+        if (!(maybeParam instanceof ParamRef) || !(maybeColumn instanceof ColumnRef)) return;
+        String type = columnTypeIn(inScope, ((ColumnRef) maybeColumn).column());
+        if (type != null) found.put(Integer.valueOf(((ParamRef) maybeParam).index()), type);
+    }
+
+    /** The column each parameter of an INSERT stands in for. */
+    private void collectInsertParamTypes(InsertStmt insert, Map<Integer, String> found) {
+        Table target = tableOrNull(insert.schema(), insert.table());
+        if (target == null || insert.values() == null) return;
+        List<String> columns = insert.columns();
+        for (List<Expression> row : insert.values()) {
+            for (int i = 0; i < row.size(); i++) {
+                if (!(row.get(i) instanceof ParamRef)) continue;
+                String columnName = columns != null && i < columns.size() ? columns.get(i)
+                        : (i < target.getColumns().size()
+                                ? target.getColumns().get(i).getName() : null);
+                if (columnName == null) continue;
+                String type = columnTypeIn(java.util.Collections.singletonList(target), columnName);
+                if (type != null) {
+                    found.put(Integer.valueOf(((ParamRef) row.get(i)).index()), type);
+                }
+            }
+        }
+        // A parameter compared with a column in the ON CONFLICT clause is a comparison like any
+        // other, and reads the target's columns.
+        collectComparedParamTypes(insert.onConflict,
+                java.util.Collections.singletonList(target), found);
     }
 
     /** The type each parameter is cast to where the statement casts one. */
@@ -3371,6 +3686,11 @@ class SessionExecutor {
         if (prepared == null) {
             throw new MemgresException("prepared statement \"" + stmt.name() + "\" does not exist", "26000");
         }
+        // PostgreSQL keeps a prepared statement's analysed plan and revalidates it before every
+        // execution: a relation it reads that has gained a column, or whose column has changed
+        // type, changes the shape of the answer. Re-analysed from scratch each time, the client
+        // was handed a different shape than the one it had been told to expect.
+        requireResultTypeUnchanged(prepared);
         // Validate parameter count: use max of explicit types and inferred param refs from $N
         int declaredCount = (prepared.paramTypes() != null && !prepared.paramTypes().isEmpty())
                 ? prepared.paramTypes().size() : 0;
@@ -3409,6 +3729,11 @@ class SessionExecutor {
                         try {
                             Object coerced = executor.castEvaluator.applyCast(val, declaredType);
                             executor.boundParameters.set(pi, coerced);
+                        } catch (MemgresException me) {
+                            // A type that refuses a value says why: a domain's check violation is
+                            // a complaint about the constraint, not about how the value was
+                            // spelled, and rewriting it lost which constraint was broken.
+                            throw me;
                         } catch (Exception e) {
                             throw new MemgresException(
                                     "invalid input syntax for type " + declaredType + ": \"" + val + "\"",
@@ -3526,6 +3851,12 @@ class SessionExecutor {
     // ---- Cursors ----
 
     QueryResult executeDeclareCursor(DeclareCursorStmt stmt) {
+        // The query is analysed before anything else is asked: PostgreSQL reads the statement
+        // through before it decides what to do with it, so a DECLARE naming a relation that is
+        // not there says so whether or not it stands in a transaction block. Asked the other way
+        // round, the query's own fault was hidden behind the rule about where a cursor may be
+        // opened, and fixing the transaction only moved the complaint.
+        new StatementAnalyzer(executor).analyze(stmt.query());
         // PG: non-holdable cursors require an explicit transaction block
         if (!stmt.withHold() && !executor.session.isExplicitTransactionBlock()) {
             throw new MemgresException("DECLARE CURSOR can only be used in transaction blocks", "25P01");
@@ -3533,10 +3864,6 @@ class SessionExecutor {
         if (executor.session.getCursor(stmt.name()) != null) {
             throw new MemgresException("cursor \"" + stmt.name() + "\" already exists", "42P03");
         }
-        // The query is analysed here and run when the cursor is first read: DECLARE opens a
-        // portal, and PostgreSQL raises what the names in the query are wrong about now and what
-        // running it turns out to be wrong about at the FETCH.
-        new StatementAnalyzer(executor).analyze(stmt.query());
         // PG stores the full DECLARE statement in pg_cursors.statement, not just the query.
         String queryText = executor.currentRawSql != null ? executor.currentRawSql.trim() :
                 ("DECLARE " + stmt.name() + (stmt.scroll ? " SCROLL" : "")
@@ -3682,12 +4009,11 @@ class SessionExecutor {
                     lastTarget = pos + 1 + i;
                     addRow(result, cursor, lastTarget);
                 }
-                // PG: position advances even if rows not found
-                if (result.isEmpty() && count > 0) {
-                    cursor.setPosition(Math.min(lastTarget, total));
-                } else if (!result.isEmpty()) {
-                    cursor.setPosition(pos + result.size());
-                }
+                // Every step is a move, whether or not there was a row there to return: a fetch
+                // of three that found one row still went three places on, and stopping at the row
+                // it found left the cursor short of where PostgreSQL leaves it -- so the next
+                // fetch backward answered with a row that had already been read.
+                cursor.setPosition(Math.min(lastTarget, total));
                 break;
             }
             case FORWARD_ALL:
@@ -3709,10 +4035,8 @@ class SessionExecutor {
                     lastTarget = pos - 1 - i;
                     addRow(result, cursor, lastTarget);
                 }
-                // PG: position moves backward even if rows not found
-                if (result.isEmpty() && count > 0) {
-                    cursor.setPosition(Math.max(lastTarget, -1));
-                }
+                // As forward: the count is how far the cursor goes, not how many rows it found.
+                cursor.setPosition(Math.max(lastTarget, -1));
                 break;
             }
             case BACKWARD_ALL: {
